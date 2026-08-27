@@ -2368,6 +2368,71 @@ impl SpawnRefusal {
     }
 }
 
+/// Why this spawn is refused on delegation depth, or `None` to allow it.
+///
+/// The whole permitted tree is Orchestrator -> SubOrchestrator -> Worker.
+/// Enforced here, at the authority side, because prompt text that asks a
+/// coordinator not to spawn coordinators is a request, not a cap -- and an
+/// unbounded delegation tree is precisely the cost failure this phase exists
+/// to bound. A refusal is `SpawnRefusal::policy`, never `::channel`: a
+/// headless fallback would route straight around the cap.
+pub(crate) fn depth_refusal(
+    parent_role: prompt::PromptRole,
+    requested: prompt::PromptRole,
+) -> Option<String> {
+    match (parent_role, requested) {
+        (_, prompt::PromptRole::Orchestrator) => {
+            Some("a spawned pane is never a full orchestrator seat".to_string())
+        }
+        (prompt::PromptRole::Worker, _) => {
+            Some("a worker may not delegate onward (delegation depth cap: 2)".to_string())
+        }
+        (prompt::PromptRole::SubOrchestrator, prompt::PromptRole::SubOrchestrator) => {
+            Some("a sub-orchestrator may not spawn another (delegation depth cap: 2)".to_string())
+        }
+        _ => None,
+    }
+}
+
+/// The PARENT session's role for [`depth_refusal`], resolved from data this
+/// dashboard already trusts -- never from anything `req` itself claims about
+/// its own lineage. Mirrors `spawn_launch_mode_pin`'s own discipline (see its
+/// doc comment): a spawn request is untrusted JSON any process that can reach
+/// the requests directory can hand-write, so `req.parent_session` is used
+/// only as a KEY into this dashboard's own live pane list, never trusted as
+/// an assertion of role by itself.
+///
+/// `req.parent_session` naming one of this dashboard's own live panes reads
+/// as `PromptRole::Worker`: every pane `fulfill_spawn_request` has ever
+/// spawned is one in every way this process can currently observe
+/// (`PaneSpec::role` is read and discarded by `Pane::spawn`, so there is no
+/// in-process record of a live pane ever being anything else -- see that
+/// field's own doc comment in `pane.rs`). This is also the fail-closed
+/// answer: a genuine SubOrchestrator pane's own further delegation is
+/// refused by this along with a genuine Worker's, rather than risk crediting
+/// a forged id with more privilege than this dashboard can actually verify.
+///
+/// A `parent_session` naming no pane this dashboard tracks -- absent, or a
+/// value matching nothing live -- reads as `PromptRole::Orchestrator`: the
+/// same allowance a plain, un-dashboarded `zirv ctx agent` invocation (an
+/// operator typing at a bare terminal, which this dashboard cannot see at
+/// all) already has today. A forged value here cannot grant a KNOWN pane
+/// more than the cap already refuses it; it can only leave an unrelated
+/// request exactly as unrestricted as every request was before this cap
+/// existed -- narrowing only, never widening.
+fn parent_role_for(req: &spawnreq::SpawnRequest, panes: &[Pane]) -> prompt::PromptRole {
+    let is_known_pane = req.parent_session.as_deref().is_some_and(|parent| {
+        panes
+            .iter()
+            .any(|pane| sessions::short_id(pane.session_id()) == parent)
+    });
+    if is_known_pane {
+        prompt::PromptRole::Worker
+    } else {
+        prompt::PromptRole::Orchestrator
+    }
+}
+
 /// Whether the task-prompt fallback (`worker_task_prompt`, below) has
 /// anywhere safe to put its text this launch. Both fallback blocks contain
 /// characters `guard_cmd_shim_reparse` refuses on a reparsed argv (embedded
@@ -2475,7 +2540,13 @@ fn compose_worker_prompt(
         false,
         cfg,
         adapter,
-        prompt::PromptRole::Worker,
+        // Issue #155, Phase 5(c): the role the REQUEST asks for, not a
+        // hardcoded Worker -- `spawnreq::role_of` already reads an unstated
+        // or unrecognised `req.role` as `PromptRole::Worker`, so this is a
+        // strict widening only for a request that named
+        // `"sub-orchestrator"` and was not refused by the depth cap in
+        // `fulfill_spawn_request` below.
+        spawnreq::role_of(req),
         state,
         super::state::now_secs(),
         if req.interactive {
@@ -2726,11 +2797,67 @@ fn fulfill_spawn_request(
     // now gates the actual heavy COMMAND a pane's agent runs, at
     // `script_runner::Command::invoke` (`permit::acquire`), so an idle pane
     // holds nothing and never counts against it.
+    // Issue #155, Phase 5(c): the delegation depth cap. `parent_role_for`
+    // never trusts `req` for its own lineage (see its own doc comment); a
+    // refusal here is policy, the same reasoning the pane cap and the agent
+    // gate right below already apply.
+    let parent_role = parent_role_for(req, panes);
+    if let Some(reason) = depth_refusal(parent_role, spawnreq::role_of(req)) {
+        return Err(SpawnRefusal::policy(reason));
+    }
     if let Some(reason) = cfg.agents.refusal(&req.agent) {
         return Err(SpawnRefusal::policy(reason));
     }
     let adapter = adapters::select(Some(&req.agent), &[], cfg)
         .map_err(|e| SpawnRefusal::policy(e.to_string()))?;
+
+    // Issue #155, Phase 6(c): the spawn gate -- quota pressure refuses NEW
+    // delegated work, never rotation of a session already running (see
+    // `pace::spawn_gate`'s own doc comment). Placed right after the depth
+    // cap, ahead of the more expensive prompt-composition work below, in the
+    // same cheapest-and-most-hostile-first order this function's own doc
+    // comment promises. Re-applies the SAME check `agent.rs::run_with`
+    // already evaluated against this very request before it was ever
+    // written to disk, so a request that reaches a dashboard other than the
+    // one that check consulted (a live-dashboard fallback, a request that
+    // sat claimed for a while) is held to an equally fresh reading rather
+    // than trusting a decision that may now be stale. `req.force` carries
+    // forward whatever `--force` the requester already decided (see
+    // `SpawnRequest::force`'s own doc comment) -- this re-verifies the usage
+    // reading, it does not re-litigate the operator's own choice to
+    // override it. A `Refuse` becomes `SpawnRefusal::policy`, never
+    // `::channel`: falling back to a headless run would route straight
+    // around the gate (the headless path is gated too, by the identical
+    // check in `agent::run_with`), the same reasoning the pane cap and the
+    // depth cap above already apply. The dashboard has no `--force` of its
+    // own, so the refusal text says so: an operator who wants to override it
+    // here raises `pace.spawn_hard_pct`, or runs `zirv ctx agent --force`
+    // directly instead.
+    let now = super::state::now_secs();
+    let (collector, estimator) =
+        super::pace::current_windows(state, &cfg.pace, now, adapter.provider());
+    let gate = super::pace::spawn_gate(&collector, estimator.as_ref(), now, &cfg.pace);
+    if let Some(note) = super::pace::describe_spawn_gate(&gate) {
+        if super::agent::spawn_blocked(&gate, req.force) {
+            return Err(SpawnRefusal::policy(format!(
+                "{note} -- dashboards have no --force; raise pace.spawn_hard_pct, or run `zirv \
+                 ctx agent --force` directly to override"
+            )));
+        }
+        let overridden = matches!(gate, super::pace::SpawnGate::Refuse { .. }) && req.force;
+        let suffix = if overridden {
+            " (--force: spawning anyway)"
+        } else {
+            ""
+        };
+        push_error(
+            errors,
+            format!(
+                "{} pane for {}: {note}{suffix}",
+                req.agent, req.requested_by
+            ),
+        );
+    }
 
     let session_id = SessionId::new_v4().to_string();
     let registry_short = sessions::short_id(&session_id);
@@ -5073,6 +5200,29 @@ pub fn run_dashboard(
                                                     // TUI right now -- this is the one
                                                     // spawn path that can honestly say so.
                                                     interactive: true,
+                                                    // The overlay asks for an agent and
+                                                    // a prompt, nothing else: no role,
+                                                    // no group, and no parent session --
+                                                    // this spawn IS the delegation root,
+                                                    // the same as an operator typing
+                                                    // `zirv ctx agent` at a plain
+                                                    // terminal (`parent_role_for` reads
+                                                    // an absent `parent_session` as
+                                                    // `PromptRole::Orchestrator`).
+                                                    role: None,
+                                                    parent_session: None,
+                                                    work_group_id: None,
+                                                    // The Spawn overlay has no
+                                                    // `--force` of its own (see
+                                                    // `fulfill_spawn_request`'s
+                                                    // own gate comment): an
+                                                    // operator who wants to
+                                                    // override the ceiling from
+                                                    // here raises `pace.
+                                                    // spawn_hard_pct`, or runs
+                                                    // `zirv ctx agent --force`
+                                                    // directly instead.
+                                                    force: false,
                                                 };
                                                 let panes_before_spawn = panes.len();
                                                 // `trusted_interactive: true` --
@@ -8767,6 +8917,13 @@ mod tests {
             // scripted/headless shape builds its own request literal with
             // `interactive: false` instead of going through this helper.
             interactive: true,
+            // No lineage: matches the overlay's own real construction (see
+            // its call site above), which is the delegation root, not a
+            // spawn on some other session's behalf.
+            role: None,
+            parent_session: None,
+            work_group_id: None,
+            force: false,
         }
     }
 
@@ -9587,6 +9744,197 @@ mod tests {
         assert!(reason.contains("dash.max_panes"), "got {reason}");
     }
 
+    /// Issue #155, Phase 5(a): the depth cap is enforced HERE, at the
+    /// authority side, not by prompt text. Orchestrator -> SubOrchestrator ->
+    /// Worker is the whole tree; a SubOrchestrator asking for another
+    /// coordinator is refused, and a Worker may spawn nothing at all.
+    #[test]
+    fn the_delegation_depth_cap_is_enforced_at_the_spawn_gate() {
+        assert_eq!(
+            depth_refusal(
+                prompt::PromptRole::Orchestrator,
+                prompt::PromptRole::SubOrchestrator
+            ),
+            None
+        );
+        assert_eq!(
+            depth_refusal(prompt::PromptRole::Orchestrator, prompt::PromptRole::Worker),
+            None
+        );
+        assert_eq!(
+            depth_refusal(
+                prompt::PromptRole::SubOrchestrator,
+                prompt::PromptRole::Worker
+            ),
+            None
+        );
+
+        let refused = depth_refusal(
+            prompt::PromptRole::SubOrchestrator,
+            prompt::PromptRole::SubOrchestrator,
+        )
+        .expect("a sub-orchestrator may not spawn another");
+        assert!(
+            refused.contains("depth"),
+            "the reason must say why: {refused}"
+        );
+
+        assert!(depth_refusal(prompt::PromptRole::Worker, prompt::PromptRole::Worker).is_some());
+        assert!(
+            depth_refusal(
+                prompt::PromptRole::SubOrchestrator,
+                prompt::PromptRole::Orchestrator
+            )
+            .is_some(),
+            "nothing may spawn a full Orchestrator seat"
+        );
+    }
+
+    /// A refused depth is a POLICY refusal, never a retryable one: falling
+    /// back to a headless run would route straight around the cap, the same
+    /// reasoning the pane cap and the agent gate already apply.
+    #[test]
+    fn a_depth_refusal_is_not_retryable() {
+        let refusal = SpawnRefusal::policy("delegation depth cap reached".to_string());
+        assert!(!refusal.retryable);
+    }
+
+    /// Security property: `parent_role_for` never trusts anything `req`
+    /// claims about its own lineage. An absent `parent_session`, and a
+    /// forged one naming a session this dashboard has never spawned, must
+    /// both read exactly the same way -- the "no known parent" default
+    /// (`PromptRole::Orchestrator`) -- because neither is distinguishable
+    /// from an operator's own direct `zirv ctx agent` invocation.
+    #[test]
+    fn parent_role_for_never_trusts_the_requests_own_claimed_lineage() {
+        let panes: Vec<Pane> = Vec::new();
+
+        let mut req = spawn_request("do the work", Path::new("/repo"));
+        req.parent_session = None;
+        assert_eq!(
+            parent_role_for(&req, &panes),
+            prompt::PromptRole::Orchestrator
+        );
+
+        // A forged id naming no pane this dashboard tracks: same answer as
+        // no lineage at all, never more privileged.
+        req.parent_session = Some("deadbeef".to_string());
+        assert_eq!(
+            parent_role_for(&req, &panes),
+            prompt::PromptRole::Orchestrator
+        );
+    }
+
+    /// The other half of the same property: a `parent_session` that DOES
+    /// name one of this dashboard's own live panes reads as `Worker` --
+    /// every pane this process has ever spawned is one, in every way this
+    /// process can currently observe -- which is what actually makes the
+    /// depth cap bite for a real delegation chain, not just for a forged one.
+    #[cfg(unix)]
+    #[test]
+    fn parent_role_for_reads_a_live_pane_of_this_dashboard_as_a_worker() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+
+        let spec = PaneSpec {
+            agent_name: "test-agent".to_string(),
+            argv: trivial_argv(),
+            role: prompt::PromptRole::Worker,
+            verb: sessions::Verb::Dash,
+            session_id: "22222222-3333-4444-8555-666666666666".to_string(),
+            title: "wrk test".to_string(),
+        };
+        let panes = vec![
+            Pane::spawn(
+                spec,
+                &state,
+                &repo,
+                &repo,
+                (80, 24),
+                &[],
+                true,
+                pane::DEFAULT_IDLE_QUIET,
+            )
+            .expect("spawn"),
+        ];
+
+        let mut req = spawn_request("do the work", &repo);
+        req.parent_session = Some(sessions::short_id("22222222-3333-4444-8555-666666666666"));
+        assert_eq!(parent_role_for(&req, &panes), prompt::PromptRole::Worker);
+
+        // A DIFFERENT id, not in `panes` at all, still reads as unrestricted
+        // -- the presence of an unrelated live pane must not change that.
+        req.parent_session = Some("ffffffff".to_string());
+        assert_eq!(
+            parent_role_for(&req, &panes),
+            prompt::PromptRole::Orchestrator
+        );
+    }
+
+    /// End-to-end through `fulfill_spawn_request` itself: a request claiming
+    /// to be a delegation FROM one of this dashboard's own live panes, and
+    /// asking for `"sub-orchestrator"`, is refused before any adapter is
+    /// resolved or anything is spawned -- proving the depth cap is actually
+    /// wired into the gate sequence, not just correct in isolation.
+    #[cfg(unix)]
+    #[test]
+    fn fulfill_spawn_request_refuses_a_worker_panes_own_delegation_via_the_depth_cap() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let cfg = CtxConfig::default();
+
+        let spec = PaneSpec {
+            agent_name: "test-agent".to_string(),
+            argv: trivial_argv(),
+            role: prompt::PromptRole::Worker,
+            verb: sessions::Verb::Dash,
+            session_id: "33333333-4444-5555-8666-777777777777".to_string(),
+            title: "wrk test".to_string(),
+        };
+        let mut panes = vec![
+            Pane::spawn(
+                spec,
+                &state,
+                &repo,
+                &repo,
+                (80, 24),
+                &[],
+                true,
+                pane::DEFAULT_IDLE_QUIET,
+            )
+            .expect("spawn"),
+        ];
+        let mut queues: Vec<VecDeque<String>> = vec![VecDeque::new()];
+        let mut errors = Vec::new();
+
+        let mut req = spawn_request("do the work", &repo);
+        req.role = Some("sub-orchestrator".to_string());
+        req.parent_session = Some(sessions::short_id("33333333-4444-5555-8666-777777777777"));
+
+        let refusal = fulfill_spawn_request(
+            &req,
+            false,
+            &mut panes,
+            &mut queues,
+            &cfg,
+            &state,
+            &repo,
+            (80, 24),
+            &tmp.path().join("requests"),
+            &mut errors,
+        )
+        .expect_err("a worker pane may not delegate onward");
+        assert!(refusal.reason.contains("depth"), "got {}", refusal.reason);
+        assert!(
+            !refusal.retryable,
+            "must be a policy refusal -- a headless fallback would route around the cap"
+        );
+    }
+
     /// T10: the coverage gap this closes -- a worker pane spawn request
     /// arriving while the account is genuinely at the pacing ceiling must be
     /// refused, the same way `wrap`'s own launch-time gate now refuses (see
@@ -9597,6 +9945,17 @@ mod tests {
     /// `Pane::spawn` is ever reached (no real agent binary needed to prove
     /// it, mirroring `refusal_for`'s own "every assertion is on a refusal
     /// before any spawn" contract).
+    ///
+    /// Issue #155, Phase 6(c) update: at the default config, 99.9% now trips
+    /// `pace::spawn_gate`'s own `spawn_hard_pct` (95%) before this function
+    /// ever reaches the older `pace::interactive_gate` check below (`max_
+    /// percent` 99%) -- the newer, stricter, spawn-specific gate wins, and
+    /// this test now pins ITS wording. The older gate's own `Refuse` arm is
+    /// consequently unreachable through this path at any default config
+    /// (`spawn_hard_pct` < `max_percent`); its `Pause`/advisory arm still
+    /// fires independently for the band below `spawn_hard_pct`, which is a
+    /// deliberate, currently-harmless overlap rather than a regression --
+    /// see the two gates' own doc comments for why they stay distinct knobs.
     #[test]
     fn fulfill_spawn_request_refuses_a_worker_pane_when_usage_is_at_the_ceiling() {
         let repo = std::env::current_dir().expect("cwd");
@@ -9635,7 +9994,7 @@ mod tests {
 
         let refusal = result.expect_err("usage at the ceiling must refuse the spawn");
         assert!(
-            refusal.reason.contains("refusing to launch"),
+            refusal.reason.contains("pace.spawn_hard_pct"),
             "got {}",
             refusal.reason
         );
@@ -9646,6 +10005,112 @@ mod tests {
         );
         assert!(!refusal.retryable, "not a channel failure -- policy");
         assert!(panes.is_empty(), "no pane was ever spawned");
+    }
+
+    /// Issue #155, Phase 6(c): isolates `spawn_gate`'s own `spawn_hard_pct`
+    /// (95%) from the older `pace::interactive_gate`'s `max_percent` (99%)
+    /// -- 96% trips ONLY the new gate (the old one only `Pause`s below its
+    /// own 99% ceiling, which never blocks), proving this gate is what
+    /// actually refuses in the band between the two thresholds, not the
+    /// pre-existing one.
+    #[test]
+    fn fulfill_spawn_request_refuses_a_worker_pane_between_spawn_hard_pct_and_max_percent() {
+        let repo = std::env::current_dir().expect("cwd");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let now = crate::commands::ctx::state::now_secs();
+        window::store(
+            &state,
+            &crate::commands::ctx::window::UsageWindows {
+                five_hour: Some(crate::commands::ctx::window::Window {
+                    used_percentage: 96.0,
+                    resets_at: now + 600,
+                    observed_at: now,
+                }),
+                seven_day: None,
+            },
+        )
+        .expect("store collector state above spawn_hard_pct");
+
+        let cfg = CtxConfig::default();
+        let mut panes: Vec<Pane> = Vec::new();
+        let mut queues: Vec<VecDeque<String>> = Vec::new();
+        let mut errors = Vec::new();
+        let result = fulfill_spawn_request(
+            &spawn_request("do the work", &repo),
+            false,
+            &mut panes,
+            &mut queues,
+            &cfg,
+            &state,
+            &repo,
+            (80, 24),
+            &tmp.path().join("requests"),
+            &mut errors,
+        );
+
+        let refusal = result.expect_err("96% must refuse via spawn_hard_pct alone");
+        assert!(
+            refusal.reason.contains("pace.spawn_hard_pct"),
+            "got {}",
+            refusal.reason
+        );
+        assert!(!refusal.retryable, "not a channel failure -- policy");
+        assert!(panes.is_empty(), "no pane was ever spawned");
+    }
+
+    /// The companion: `req.force` overrides the same 96% reading, proving
+    /// the override actually reaches `fulfill_spawn_request`'s own gate --
+    /// not just `agent.rs`'s copy of the decision -- via the notice this
+    /// gate leaves once it lets a forced request through (`(--force:
+    /// spawning anyway)`), rather than asserting on whatever the real
+    /// pane-spawn machinery further down does with no real agent binary
+    /// configured in this test environment.
+    #[test]
+    fn fulfill_spawn_request_a_forced_request_overrides_the_spawn_gate() {
+        let repo = std::env::current_dir().expect("cwd");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let now = crate::commands::ctx::state::now_secs();
+        window::store(
+            &state,
+            &crate::commands::ctx::window::UsageWindows {
+                five_hour: Some(crate::commands::ctx::window::Window {
+                    used_percentage: 96.0,
+                    resets_at: now + 600,
+                    observed_at: now,
+                }),
+                seven_day: None,
+            },
+        )
+        .expect("store collector state above spawn_hard_pct");
+
+        let cfg = CtxConfig::default();
+        let mut panes: Vec<Pane> = Vec::new();
+        let mut queues: Vec<VecDeque<String>> = Vec::new();
+        let mut errors = Vec::new();
+        let mut req = spawn_request("do the work", &repo);
+        req.force = true;
+        let _ = fulfill_spawn_request(
+            &req,
+            false,
+            &mut panes,
+            &mut queues,
+            &cfg,
+            &state,
+            &repo,
+            (80, 24),
+            &tmp.path().join("requests"),
+            &mut errors,
+        );
+
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("--force: spawning anyway")),
+            "force must let the reading through with a visible override notice, not a silent \
+             pass: {errors:?}"
+        );
     }
 
     /// I, the High-severity regression this round closes: before

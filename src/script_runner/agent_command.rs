@@ -183,6 +183,11 @@ fn run_supervised(agent: &str, prompt: &str, flags: &[String], repo: &Path) -> R
         prompt: Some(prompt.to_string()),
         max_restarts: None,
         timeout_secs: None,
+        // No budget knobs on a script `agent:` step (issue #155, Phase
+        // 5(d) is `zirv ctx agent`-only for now) -- `None` is the same
+        // unbounded behaviour this step always had.
+        budget_tokens: None,
+        max_tool_calls: None,
         command: flags.to_vec(),
         simple: false,
     };

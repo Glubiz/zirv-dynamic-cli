@@ -205,12 +205,12 @@ pub enum PromptRole {
     /// `dash::fulfill_spawn_request` -- prompt text that asks nicely is not a
     /// cap. Gets neither `HARNESS_PROMPT` nor the roster: which harnesses run
     /// stays the Orchestrator's decision.
-    // No production caller yet -- issue #155 Task 5.1 (this task) is the
-    // prompt layer only; Task 5.3's `dash::fulfill_spawn_request` is the
-    // first real consumer, for the delegation-depth cap. Same dormancy
-    // pattern as `optimize.rs`'s own `Layer::trust`; this module's own
-    // tests exercise every path in the meantime.
-    #[allow(dead_code)]
+    //
+    // Issue #155 Task 5.1 added this variant with no production caller yet;
+    // Task 5.3's `spawnreq::role_of` (constructing it from a validated
+    // `SpawnRequest::role`) and `dash::fulfill_spawn_request`'s depth cap
+    // are the first real consumers, so the `#[allow(dead_code)]` that used
+    // to sit here is gone.
     SubOrchestrator,
     /// A delegated, headless worker. Never gets the harness layer: a worker
     /// is not the one deciding which harnesses run, and teaching it to

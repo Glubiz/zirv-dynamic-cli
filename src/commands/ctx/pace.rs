@@ -254,6 +254,96 @@ pub fn decide(
     }
 }
 
+/// Issue #155, Phase 6(c): whether quota pressure permits starting NEW
+/// delegated work -- never a signal about restarting a session already
+/// running. Restarting a session because it is expensive would discard a
+/// warm cache and re-read the whole context, the single most expensive
+/// possible reaction to a cost signal, so `rot.rs`/`score.rs` deliberately
+/// never read `pace`/`window` data at all (see `rot.rs`'s own purity test)
+/// and this gate is consulted only at the two places NEW work is actually
+/// created: `agent::run_with` (before `try_join_dashboard`) and
+/// `dash::fulfill_spawn_request` (after the delegation depth cap).
+/// Deliberately distinct thresholds from `max_percent`/`soft_percent`: those
+/// tune how an ALREADY-RUNNING supervised loop paces itself (throttle, then
+/// wait), while `spawn_soft_pct`/`spawn_hard_pct` tune whether a session
+/// should be allowed to start spending at all -- a stricter, earlier ceiling
+/// is the point, not a duplicate of the pacing one.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SpawnGate {
+    /// Below the soft band, pacing disabled, or no binding usage data at
+    /// all: start normally, nothing shown.
+    Proceed,
+    /// At or above `spawn_soft_pct`, below `spawn_hard_pct`: informational
+    /// only -- the spawn still proceeds.
+    Warn {
+        window: &'static str,
+        percent: f64,
+        source: Source,
+    },
+    /// At or above `spawn_hard_pct`: refuse by default. Only `--force`
+    /// (`agent.rs`'s own flag, threaded through `dash::SpawnRequest::force`
+    /// for a pane spawn) overrides it -- see `spawn_blocked` in `agent.rs`.
+    Refuse {
+        window: &'static str,
+        percent: f64,
+        source: Source,
+    },
+}
+
+/// PURE: the same collector-then-estimator layering `decide` applies just
+/// above (`binding`/`worst`, both reused rather than re-implemented), so this
+/// gate and the pacing verdict can never disagree about which window is
+/// binding or which source is authoritative. `!cfg.enabled` and "nothing
+/// binding at all" both read as `Proceed` -- blindness must never become a
+/// refusal, the same reasoning `decide`'s own `Unknown` arm and T8's
+/// `blind_delay_secs` already apply, see `no_usage_reading_proceeds_rather_
+/// than_refusing` below.
+pub fn spawn_gate(
+    collector: &UsageWindows,
+    estimator: Option<&UsageWindows>,
+    now: u64,
+    cfg: &PaceConfig,
+) -> SpawnGate {
+    if !cfg.enabled {
+        return SpawnGate::Proceed;
+    }
+
+    let collector_worst = worst(
+        binding(&collector.five_hour, now, cfg),
+        binding(&collector.seven_day, now, cfg),
+    );
+
+    let (source, picked) = match collector_worst {
+        Some(found) => (Source::Collector, Some(found)),
+        None if cfg.estimator => (
+            Source::Estimator,
+            estimator
+                .and_then(|windows| worst(windows.five_hour.as_ref(), windows.seven_day.as_ref())),
+        ),
+        None => (Source::None, None),
+    };
+
+    let Some((name, window)) = picked else {
+        return SpawnGate::Proceed;
+    };
+
+    if window.used_percentage >= cfg.spawn_hard_pct {
+        return SpawnGate::Refuse {
+            window: name,
+            percent: window.used_percentage,
+            source,
+        };
+    }
+    if window.used_percentage >= cfg.spawn_soft_pct {
+        return SpawnGate::Warn {
+            window: name,
+            percent: window.used_percentage,
+            source,
+        };
+    }
+    SpawnGate::Proceed
+}
+
 /// Deterministic spread so several supervisors on one machine do not all wake
 /// in the same second. Not cryptographic, just decorrelating. A zero seed is
 /// treated as "no entropy available" and adds no offset, exactly like a zero
@@ -351,6 +441,34 @@ pub fn describe(decision: &PaceDecision) -> String {
         PaceDecision::Unknown => {
             "usage state unknown, no usage data from a fresh collector reading or a configured estimator budget, proceeding without pacing".to_string()
         }
+    }
+}
+
+/// The operator-facing line for a `SpawnGate`, or `None` for `Proceed` (which
+/// has nothing to say and nothing to print). Names the window, the
+/// percentage, the data source, and -- for a refusal -- how to override it,
+/// mirroring `describe`'s own shape for `PaceDecision` above.
+pub fn describe_spawn_gate(gate: &SpawnGate) -> Option<String> {
+    match gate {
+        SpawnGate::Proceed => None,
+        SpawnGate::Warn {
+            window,
+            percent,
+            source,
+        } => Some(format!(
+            "{window} window at {percent:.1}% ({} data), approaching the spawn ceiling \
+             (pace.spawn_hard_pct) -- starting anyway",
+            source.as_str()
+        )),
+        SpawnGate::Refuse {
+            window,
+            percent,
+            source,
+        } => Some(format!(
+            "{window} window at {percent:.1}% ({} data), at or above pace.spawn_hard_pct -- \
+             refusing to start new delegated work; this never affects a session already running",
+            source.as_str()
+        )),
     }
 }
 
@@ -1095,6 +1213,21 @@ mod tests {
         }
     }
 
+    /// The `spawn_gate` tests below call with `now == 0` rather than `NOW`
+    /// (no reset-time arithmetic to anchor there, unlike `decide`'s own
+    /// tests), so `observed_at` is used directly rather than as an offset
+    /// from `NOW`: `age_secs(window, 0) == 0.saturating_sub(observed_at) ==
+    /// 0` for any positive `observed_at`, which is comfortably fresh under
+    /// the default `collector_max_age_secs` (900) -- hence "fresh five-hour
+    /// reading" at every call site below. `resets_at` is set far in the
+    /// future so `binding`'s own staleness fallback never matters here.
+    fn collector_at(percent: f64, observed_at: u64) -> UsageWindows {
+        UsageWindows {
+            five_hour: window(percent, observed_at + 999_999, observed_at),
+            seven_day: None,
+        }
+    }
+
     #[test]
     fn below_soft_percent_proceeds_unthrottled() {
         let d = decide(&collector(79.0), None, NOW, &PaceConfig::default());
@@ -1158,6 +1291,115 @@ mod tests {
             decide(&collector(98.0), None, NOW, &cfg),
             PaceDecision::Proceed { .. }
         ));
+    }
+
+    /// Issue #155, Phase 6(c): quota pressure gates SCHEDULING, never
+    /// rotation. Restarting a session because it is expensive throws away a
+    /// warm cache and re-reads the whole context -- the most expensive
+    /// possible response to a cost signal. Declining to start NEW work is the
+    /// cheap one.
+    #[test]
+    fn the_spawn_gate_warns_at_the_soft_band_and_refuses_at_the_hard_one() {
+        let cfg = PaceConfig::default();
+        assert_eq!(cfg.spawn_soft_pct, 80.0);
+        assert_eq!(cfg.spawn_hard_pct, 95.0);
+        let at = |pct| collector_at(pct, 1_000); // fresh five-hour reading
+
+        assert_eq!(spawn_gate(&at(10.0), None, 0, &cfg), SpawnGate::Proceed);
+        assert_eq!(spawn_gate(&at(79.9), None, 0, &cfg), SpawnGate::Proceed);
+        assert!(matches!(
+            spawn_gate(&at(80.0), None, 0, &cfg),
+            SpawnGate::Warn { .. }
+        ));
+        assert!(matches!(
+            spawn_gate(&at(94.9), None, 0, &cfg),
+            SpawnGate::Warn { .. }
+        ));
+        assert!(matches!(
+            spawn_gate(&at(95.0), None, 0, &cfg),
+            SpawnGate::Refuse { .. }
+        ));
+        assert!(matches!(
+            spawn_gate(&at(100.0), None, 0, &cfg),
+            SpawnGate::Refuse { .. }
+        ));
+    }
+
+    /// No reading at all is `Proceed`. Blindness must never become a
+    /// refusal: this gate would then block every delegation on a machine
+    /// that has never wired a statusline tee, which is a common, legitimate
+    /// setup.
+    #[test]
+    fn no_usage_reading_proceeds_rather_than_refusing() {
+        assert_eq!(
+            spawn_gate(&UsageWindows::default(), None, 0, &PaceConfig::default()),
+            SpawnGate::Proceed
+        );
+    }
+
+    /// Disabled pacing disables this gate too -- one switch, as the operator
+    /// expects, and the same first thing `decide` checks.
+    #[test]
+    fn disabled_pacing_disables_the_spawn_gate() {
+        let cfg = PaceConfig {
+            enabled: false,
+            ..PaceConfig::default()
+        };
+        assert_eq!(
+            spawn_gate(&collector_at(99.0, 1_000), None, 0, &cfg),
+            SpawnGate::Proceed
+        );
+    }
+
+    /// The estimator is consulted only when the collector has nothing
+    /// binding, exactly as `decide` already layers its two sources -- a
+    /// fresher lower-priority layer never overrides a fresh collector.
+    #[test]
+    fn the_estimator_is_the_fallback_source_not_an_override() {
+        let cfg = PaceConfig::default();
+        let estimator = collector_at(99.0, 1_000);
+        assert!(matches!(
+            spawn_gate(&UsageWindows::default(), Some(&estimator), 0, &cfg),
+            SpawnGate::Refuse {
+                source: Source::Estimator,
+                ..
+            }
+        ));
+        assert_eq!(
+            spawn_gate(&collector_at(5.0, 1_000), Some(&estimator), 0, &cfg),
+            SpawnGate::Proceed
+        );
+    }
+
+    /// Issue #155, Phase 6(c): `spawn_gate` never appears in `rot.rs`'s own
+    /// decision (see `rot_stays_pure_of_pace_and_window_data` in `rot.rs`),
+    /// and this pins the other half of the same boundary one level down --
+    /// `spawn_gate` refusing a NEW spawn must never leak into `decide`'s own
+    /// hard-pause threshold, which is what an already-running supervised
+    /// loop paces its cadence against. The two gates read the exact same
+    /// `UsageWindows`, but `spawn_gate`'s own hard ceiling (`spawn_hard_pct`,
+    /// 95%) is deliberately stricter than `decide`'s (`max_percent`, 99%),
+    /// so a reading that trips `spawn_gate`'s `Refuse` is still comfortably
+    /// inside `decide`'s own `Slow` band, never its hard `WaitUntil` --
+    /// proving the two ceilings are independent knobs, not one gate wearing
+    /// two names.
+    #[test]
+    fn a_spawn_refusal_never_changes_the_rotation_relevant_pacing_verdict() {
+        let cfg = PaceConfig::default();
+        let readings = collector_at(96.0, 1_000);
+
+        assert!(matches!(
+            spawn_gate(&readings, None, 0, &cfg),
+            SpawnGate::Refuse { .. }
+        ));
+        assert!(
+            !matches!(
+                decide(&readings, None, 0, &cfg),
+                PaceDecision::WaitUntil { .. }
+            ),
+            "a spawn refusal at 96% must not force decide's own hard pause; decide's hard \
+             ceiling is max_percent (99%), unmoved by spawn_hard_pct"
+        );
     }
 
     #[test]

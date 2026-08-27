@@ -20,30 +20,37 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use super::config::{CtxConfig, EnvLookup, env_from_process};
-use super::event::{SessionId, SessionRef};
+use super::event::{NormalizedEvent, SessionId, SessionRef};
 use super::pace;
 use super::rot::Verdict;
 use super::signal::{self, TurnSignal};
 use super::state::{StateDir, now_secs};
 use super::supervise::{self, Outcome, Tick};
-use super::{CtxResult, adapters, handoff, log, score};
+use super::{CtxResult, adapters, agent, handoff, log, score};
 
 /// The restart budget is spent and the session is still rotting. Callers apply
 /// their own policy from here.
 pub const EXIT_ROT_EXHAUSTED: i32 = 75;
 /// Wall-clock timeout with no restarts left.
 pub const EXIT_TIMEOUT: i32 = 76;
+/// A `--budget-tokens`/`--max-tool-calls` ceiling was reached (issue #155,
+/// Phase 5(d)). Unlike the two codes above, this is never followed by a
+/// restart: a budget checkpoints the run once and stops it for good.
+pub const EXIT_BUDGET_EXHAUSTED: i32 = 77;
 
 /// The supervisor reports its own outcomes through the same `i32` an agent's
 /// exit code arrives on, so "exited with code 75" reads as something the
 /// agent did rather than as zirv giving up. Shared by `zirv ctx agent`
 /// (agent.rs) and script `agent:` steps (agent_command.rs), which both
-/// delegate to this supervisor and want the same wording for the same two
+/// delegate to this supervisor and want the same wording for the same three
 /// outcomes.
 pub fn describe_exit(code: i32) -> String {
     match code {
         EXIT_ROT_EXHAUSTED => "the session kept rotting and the restart budget ran out".to_string(),
         EXIT_TIMEOUT => "the supervised run hit its wall-clock timeout".to_string(),
+        EXIT_BUDGET_EXHAUSTED => {
+            "the token/tool-call budget was spent and the run was stopped".to_string()
+        }
         other => format!("exited with code {other}"),
     }
 }
@@ -68,6 +75,14 @@ pub struct ExecArgs {
     /// Wall-clock limit for the whole supervised run.
     #[arg(long)]
     pub timeout_secs: Option<u64>,
+    /// Token ceiling for this run (issue #155, Phase 5(d)). Checkpoints at
+    /// `agent::BUDGET_SOFT_FRACTION` of the ceiling and stops -- never
+    /// restarted, and never a signal to change models. `None` is unbounded.
+    #[arg(long)]
+    pub budget_tokens: Option<u64>,
+    /// Tool-call ceiling for this run, independent of `budget_tokens`.
+    #[arg(long)]
+    pub max_tool_calls: Option<u32>,
     /// The headless agent command, after `--`.
     #[arg(allow_hyphen_values = true, last = true)]
     pub command: Vec<String>,
@@ -681,6 +696,19 @@ pub(crate) fn run_with_clock<W: Write>(
     let max_restarts = args.max_restarts.unwrap_or(cfg.supervise.max_restarts);
     let timeout = Duration::from_secs(args.timeout_secs.unwrap_or(cfg.supervise.max_cycle_secs));
     let poll = Duration::from_millis(cfg.supervise.poll_ms);
+    // Issue #155, Phase 5(d): the CEILING is fixed for the whole run, same as
+    // `max_restarts`/`timeout` above. Known scope limit: SPEND is measured
+    // against the current child's own transcript only (`supervise_run`'s
+    // budget check reads `transcript` directly), so a rot/timeout/nudge
+    // restart -- which mints a fresh transcript, same as every restart
+    // already does -- starts that count over rather than carrying prior
+    // children's spend forward. Bounding one continuous, unrestarted run is
+    // the common case this closes; bounding a run across its own restarts is
+    // follow-up work.
+    let worker_budget = agent::WorkerBudget {
+        tokens: args.budget_tokens,
+        tool_calls: args.max_tool_calls,
+    };
 
     let socket_path = state.socket_for(session.as_str());
     let server = match signal::SignalServer::bind(&socket_path) {
@@ -938,6 +966,12 @@ pub(crate) fn run_with_clock<W: Write>(
         let mut rotted = false;
         let mut limit_hit = false;
         let mut nudged_by: Option<String> = None;
+        // Issue #155, Phase 5(d): fresh per iteration too -- the child a
+        // restart mints is a fresh transcript, so its own soft-warn latch and
+        // exhaustion flag start over along with it (see `worker_budget`'s own
+        // doc comment for the scope this implies).
+        let mut budget_soft_warned = false;
+        let mut budget_exhausted = false;
 
         // C3: reset below whenever this run reported a turn of its own.
         let mut progressed = false;
@@ -960,7 +994,33 @@ pub(crate) fn run_with_clock<W: Write>(
             nudge_restarts,
             cfg.supervise.max_nudges,
             can_restart,
+            &transcript,
+            worker_budget,
+            &mut budget_soft_warned,
+            &mut budget_exhausted,
         )?;
+
+        if budget_exhausted {
+            let _ = log::append(
+                &state,
+                &log::Decision {
+                    ts: now_secs(),
+                    session: session.as_str(),
+                    verb: "exec",
+                    verdict: "budget",
+                    score: 0,
+                    action: "kill",
+                    detail: &transcript.display().to_string(),
+                },
+            );
+            writeln!(
+                w,
+                "zirv ctx exec: token/tool-call budget exhausted, stopping (exit \
+                 {EXIT_BUDGET_EXHAUSTED})"
+            )?;
+            session_guard.release();
+            return Ok(EXIT_BUDGET_EXHAUSTED);
+        }
 
         // C3: the budget is *consecutive* nudge restarts, which is what
         // `[supervise] max_nudges` has always been documented as. It was
@@ -1564,6 +1624,15 @@ fn supervise_run(
     nudges_used: u32,
     max_nudges: u32,
     can_restart: bool,
+    // Issue #155, Phase 5(d): a budget checkpoint, independent of rot/nudge/
+    // limit above. `transcript` is read directly here rather than folded
+    // into `scorer`'s own bounded fold, because a budget needs this child's
+    // whole cumulative spend, which `RotState`'s windowed segments do not
+    // retain once the window has moved past them.
+    transcript: &Path,
+    budget: agent::WorkerBudget,
+    soft_warned: &mut bool,
+    budget_exhausted: &mut bool,
 ) -> CtxResult<Outcome> {
     let mut tick = || {
         if pace::scan_for_limit(
@@ -1624,6 +1693,39 @@ fn supervise_run(
                 },
             );
             return Tick::Continue;
+        }
+        // Issue #155, Phase 5(d): skipped entirely when no ceiling is
+        // configured (every delegation before 2.35.0, and the common case
+        // even after), so the extra transcript read below is paid only by a
+        // run that actually asked to be bounded.
+        if (budget.tokens.is_some() || budget.tool_calls.is_some())
+            && let Ok(body) = std::fs::read_to_string(transcript)
+        {
+            let usage = adapter.transcript_usage(&body).unwrap_or_default();
+            let tool_calls = adapter
+                .parse_events(&body)
+                .iter()
+                .filter(|event| matches!(event, NormalizedEvent::ToolCall { .. }))
+                .count();
+            let tool_calls = u32::try_from(tool_calls).unwrap_or(u32::MAX);
+            match agent::budget_state(&budget, &usage, tool_calls) {
+                agent::BudgetState::HardStop { used, limit } => {
+                    eprintln!(
+                        "zirv ctx exec: token/tool-call budget exhausted ({used}/{limit}); \
+                         stopping now -- this run will not restart"
+                    );
+                    *budget_exhausted = true;
+                    return Tick::Stop("budget");
+                }
+                agent::BudgetState::SoftWarn { used, limit } if !*soft_warned => {
+                    *soft_warned = true;
+                    eprintln!(
+                        "zirv ctx exec: {used}/{limit} of the token/tool-call budget spent -- \
+                         wrap up and checkpoint your result soon"
+                    );
+                }
+                agent::BudgetState::SoftWarn { .. } | agent::BudgetState::Ok => {}
+            }
         }
         // A scoring failure must never kill a healthy run.
         match scorer.poll(adapter, score_cfg) {
@@ -2216,6 +2318,8 @@ mod tests {
             transcript: None,
             prompt: None,
             max_restarts: Some(0),
+            budget_tokens: None,
+            max_tool_calls: None,
             timeout_secs: Some(60),
             simple: true,
             command,
@@ -2249,6 +2353,8 @@ mod tests {
             transcript: Some(transcript_for(&home, tmp.path(), session)),
             prompt: Some("do the work".to_string()),
             max_restarts: Some(2),
+            budget_tokens: None,
+            max_tool_calls: None,
             timeout_secs: Some(60),
             simple: false,
             command: fake_agent_command(session),
@@ -2293,6 +2399,8 @@ mod tests {
             transcript: Some(transcript_for(&home, tmp.path(), session)),
             prompt: Some("do the work".to_string()),
             max_restarts: Some(2),
+            budget_tokens: None,
+            max_tool_calls: None,
             timeout_secs: Some(60),
             simple: false,
             command: fake_agent_command(session),
@@ -2337,6 +2445,8 @@ mod tests {
             transcript: Some(transcript_for(&home, tmp.path(), session)),
             prompt: Some("do the work".to_string()),
             max_restarts: Some(0),
+            budget_tokens: None,
+            max_tool_calls: None,
             timeout_secs: Some(60),
             simple: false,
             command: fake_agent_command(session),
@@ -2370,6 +2480,8 @@ mod tests {
             transcript: Some(transcript_for(&home, tmp.path(), session)),
             prompt: Some("do the work".to_string()),
             max_restarts: Some(1),
+            budget_tokens: None,
+            max_tool_calls: None,
             timeout_secs: Some(60),
             simple: false,
             command: fake_agent_command(session),
@@ -2467,6 +2579,8 @@ mod tests {
             transcript: Some(transcript_for(&home, tmp.path(), session)),
             prompt: Some("do the work".to_string()),
             max_restarts: Some(1),
+            budget_tokens: None,
+            max_tool_calls: None,
             timeout_secs: Some(60),
             simple: false,
             command: fake_agent_command(session),
@@ -2519,6 +2633,8 @@ mod tests {
             transcript: Some(transcript_for(&home, tmp.path(), session)),
             prompt: None,
             max_restarts: Some(2),
+            budget_tokens: None,
+            max_tool_calls: None,
             timeout_secs: Some(60),
             simple: false,
             command,
@@ -2567,6 +2683,8 @@ mod tests {
             transcript: Some(transcript_for(&home, tmp.path(), session)),
             prompt: None,
             max_restarts: Some(2),
+            budget_tokens: None,
+            max_tool_calls: None,
             timeout_secs: Some(60),
             simple: false,
             command,
@@ -2599,6 +2717,8 @@ mod tests {
             transcript: None,
             prompt: None,
             max_restarts: None,
+            budget_tokens: None,
+            max_tool_calls: None,
             timeout_secs: None,
             simple: false,
             command: Vec::new(),
@@ -2630,6 +2750,8 @@ mod tests {
             transcript: None,
             prompt: None,
             max_restarts: None,
+            budget_tokens: None,
+            max_tool_calls: None,
             timeout_secs: None,
             simple: false,
             command: vec!["true".to_string()],
@@ -2715,6 +2837,8 @@ mod tests {
             transcript: Some(transcript_for(&home, tmp.path(), session)),
             prompt: Some("do the work".to_string()),
             max_restarts: Some(1),
+            budget_tokens: None,
+            max_tool_calls: None,
             timeout_secs: Some(60),
             simple: false,
             command: fake_agent_command(session),
@@ -2770,6 +2894,8 @@ mod tests {
             transcript: Some(transcript_for(&home, tmp.path(), session)),
             prompt: Some("do the work".to_string()),
             max_restarts: Some(0),
+            budget_tokens: None,
+            max_tool_calls: None,
             timeout_secs: Some(1),
             simple: false,
             command: fake_agent_command(session),
@@ -2788,6 +2914,58 @@ mod tests {
         );
         let log = std::fs::read_to_string(state.join("logs/decisions.jsonl")).expect("log");
         assert!(log.contains("\"verdict\":\"timeout\""), "got {log}");
+    }
+
+    /// Issue #155, Phase 5(d), end to end: `hang` mode writes its whole
+    /// transcript (12 turns, well over the tiny budget below) then never
+    /// exits, so the very first budget check after spawn -- not the
+    /// deadline, set generously long here -- is what actually stops it.
+    /// Proves `EXIT_BUDGET_EXHAUSTED` is wired all the way from `ExecArgs`
+    /// through `supervise_run`'s tick to the exit code `run_with` returns,
+    /// and that it terminates outright rather than restarting.
+    #[test]
+    fn a_token_budget_stops_a_hanging_child_before_its_wall_clock_deadline() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let state = tmp.path().join("state");
+        let session = "77777777-2222-4333-8444-555555555555";
+        let mut env = base_env(&state);
+        // Fast polling, so the first budget check lands well inside the test
+        // timeout below rather than waiting out the 2s production default.
+        env.insert("ZIRV_CTX_POLL_MS".to_string(), "50".to_string());
+
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        unsafe {
+            std::env::set_var("FAKE_AGENT_MODE", "hang");
+        }
+        let args = ExecArgs {
+            agent: Some("claude".to_string()),
+            session_id: Some(session.to_string()),
+            transcript: Some(transcript_for(&home, tmp.path(), session)),
+            prompt: Some("do the work".to_string()),
+            max_restarts: Some(0),
+            // Far below what `hang` mode's own fixed 12-turn transcript
+            // totals (24 assistant events x 20_000 cache-read tokens each).
+            budget_tokens: Some(10_000),
+            max_tool_calls: None,
+            timeout_secs: Some(30),
+            simple: false,
+            command: fake_agent_command(session),
+        };
+        let started = std::time::Instant::now();
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE");
+        }
+
+        assert_eq!(code.expect("runs"), EXIT_BUDGET_EXHAUSTED);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "the budget check must fire long before the 30s deadline"
+        );
+        let log = std::fs::read_to_string(state.join("logs/decisions.jsonl")).expect("log");
+        assert!(log.contains("\"verdict\":\"budget\""), "got {log}");
     }
 
     #[cfg(unix)]
@@ -2817,6 +2995,8 @@ mod tests {
             transcript: Some(transcript_for(&home, tmp.path(), session)),
             prompt: Some("do the work".to_string()),
             max_restarts: Some(0),
+            budget_tokens: None,
+            max_tool_calls: None,
             timeout_secs: Some(30),
             simple: false,
             command,
@@ -2849,6 +3029,8 @@ mod tests {
             transcript: Some(transcript_for(&home, tmp.path(), session)),
             prompt: Some("do the work".to_string()),
             max_restarts: Some(0),
+            budget_tokens: None,
+            max_tool_calls: None,
             timeout_secs: Some(30),
             simple: false,
             command: fake_agent_command(session),
@@ -2909,6 +3091,8 @@ mod tests {
             // Zero budget: a limit hit must park even with no restarts allowed,
             // because a park is not a restart.
             max_restarts: Some(0),
+            budget_tokens: None,
+            max_tool_calls: None,
             timeout_secs: Some(60),
             simple: false,
             command: fake_agent_command(session),
@@ -2959,6 +3143,8 @@ mod tests {
             transcript: Some(transcript_for(&home, tmp.path(), session)),
             prompt: Some("do the work".to_string()),
             max_restarts: Some(0),
+            budget_tokens: None,
+            max_tool_calls: None,
             timeout_secs: Some(60),
             simple: false,
             command: fake_agent_command(session),
@@ -3002,6 +3188,8 @@ mod tests {
             transcript: Some(transcript_for(&home, tmp.path(), session)),
             prompt: Some("do the work".to_string()),
             max_restarts: Some(0),
+            budget_tokens: None,
+            max_tool_calls: None,
             timeout_secs: Some(60),
             simple: false,
             command: fake_agent_command(session),
@@ -3049,6 +3237,8 @@ mod tests {
             transcript: Some(transcript_for(&home, tmp.path(), session)),
             prompt: Some("do the work".to_string()),
             max_restarts: Some(0),
+            budget_tokens: None,
+            max_tool_calls: None,
             timeout_secs: Some(60),
             simple: false,
             command: fake_agent_command(session),
@@ -3096,6 +3286,8 @@ mod tests {
             transcript: Some(transcript_for(&home, tmp.path(), session)),
             prompt: Some("do the work".to_string()),
             max_restarts: Some(1),
+            budget_tokens: None,
+            max_tool_calls: None,
             timeout_secs: Some(60),
             simple: false,
             command: fake_agent_command(session),
@@ -3150,6 +3342,8 @@ mod tests {
             transcript: Some(transcript_for(&home, tmp.path(), session)),
             prompt: Some("do the work".to_string()),
             max_restarts: Some(1),
+            budget_tokens: None,
+            max_tool_calls: None,
             timeout_secs: Some(60),
             simple: false,
             command,
@@ -3208,6 +3402,8 @@ mod tests {
             transcript: Some(transcript_for(&home, tmp.path(), session)),
             prompt: Some("do the work".to_string()),
             max_restarts: Some(1),
+            budget_tokens: None,
+            max_tool_calls: None,
             timeout_secs: Some(60),
             simple: false,
             command: fake_agent_command(session),
@@ -3282,6 +3478,8 @@ mod tests {
             transcript: Some(transcript_for(&home, tmp.path(), session)),
             prompt: Some("do the work".to_string()),
             max_restarts: Some(0),
+            budget_tokens: None,
+            max_tool_calls: None,
             timeout_secs: Some(60),
             simple: false,
             command: fake_agent_command(session),
@@ -3356,6 +3554,8 @@ mod tests {
             transcript: None,
             prompt: Some("do the work".to_string()),
             max_restarts: Some(0),
+            budget_tokens: None,
+            max_tool_calls: None,
             timeout_secs: Some(60),
             simple: false,
             // No trailing command: zirv builds the launch itself
@@ -3446,6 +3646,8 @@ mod tests {
             transcript: None,
             prompt: Some("do the work".to_string()),
             max_restarts: Some(0),
+            budget_tokens: None,
+            max_tool_calls: None,
             timeout_secs: Some(60),
             simple: true,
             command: Vec::new(),
@@ -3515,6 +3717,8 @@ mod tests {
             // would resolve it.
             prompt: None,
             max_restarts: Some(0),
+            budget_tokens: None,
+            max_tool_calls: None,
             timeout_secs: Some(60),
             simple: false,
             command: vec![
@@ -3608,6 +3812,8 @@ mod tests {
             transcript: None,
             prompt: None,
             max_restarts: Some(0),
+            budget_tokens: None,
+            max_tool_calls: None,
             timeout_secs: Some(30),
             simple: false,
             command: vec![
@@ -3713,6 +3919,8 @@ mod tests {
             transcript: None,
             prompt: Some("do the work".to_string()),
             max_restarts: Some(0),
+            budget_tokens: None,
+            max_tool_calls: None,
             timeout_secs: Some(30),
             simple: false,
             command: vec![
@@ -3789,6 +3997,8 @@ mod tests {
             transcript: None,
             prompt: Some("do the work".to_string()),
             max_restarts: Some(0),
+            budget_tokens: None,
+            max_tool_calls: None,
             timeout_secs: Some(30),
             simple: true,
             command: Vec::new(),
@@ -3929,6 +4139,8 @@ mod tests {
             transcript: None,
             prompt: Some("do the work".to_string()),
             max_restarts: Some(0),
+            budget_tokens: None,
+            max_tool_calls: None,
             timeout_secs: Some(30),
             simple: false,
             command: Vec::new(),
@@ -3997,6 +4209,8 @@ mod tests {
             transcript: Some(transcript_for(&home, tmp.path(), session)),
             prompt: Some("do the work".to_string()),
             max_restarts: Some(0),
+            budget_tokens: None,
+            max_tool_calls: None,
             timeout_secs: Some(60),
             simple: false,
             command: fake_agent_command(session),
@@ -4067,6 +4281,8 @@ mod tests {
             transcript: Some(transcript_for(&home, tmp.path(), session1)),
             prompt: Some("do the work".to_string()),
             max_restarts: Some(0),
+            budget_tokens: None,
+            max_tool_calls: None,
             timeout_secs: Some(60),
             simple: false,
             command: fake_agent_command(session1),
@@ -4094,6 +4310,8 @@ mod tests {
             transcript: Some(transcript_for(&home, tmp.path(), session2)),
             prompt: Some("do more work".to_string()),
             max_restarts: Some(0),
+            budget_tokens: None,
+            max_tool_calls: None,
             timeout_secs: Some(60),
             simple: false,
             command: fake_agent_command(session2),
@@ -4155,6 +4373,8 @@ mod tests {
             transcript: Some(transcript_for(&home, tmp.path(), session)),
             prompt: Some("do the work".to_string()),
             max_restarts: Some(0),
+            budget_tokens: None,
+            max_tool_calls: None,
             timeout_secs: Some(60),
             simple: false,
             command: fake_agent_command(session),
@@ -4211,6 +4431,8 @@ mod tests {
             transcript: Some(transcript_for(&home, tmp.path(), session)),
             prompt: Some("do the work".to_string()),
             max_restarts: Some(0),
+            budget_tokens: None,
+            max_tool_calls: None,
             timeout_secs: Some(60),
             simple: false,
             // `adapters::select` still resolves and readies "claude" (via
@@ -4284,6 +4506,8 @@ mod tests {
             transcript: Some(transcript_for(&home, tmp.path(), session)),
             prompt: Some("do the work".to_string()),
             max_restarts: Some(0),
+            budget_tokens: None,
+            max_tool_calls: None,
             timeout_secs: Some(60),
             simple: false,
             command: fake_agent_command(session),
@@ -4329,6 +4553,8 @@ mod tests {
             transcript: Some(transcript_for(&home, tmp.path(), session)),
             prompt: Some("do the work".to_string()),
             max_restarts: Some(1),
+            budget_tokens: None,
+            max_tool_calls: None,
             timeout_secs: Some(60),
             simple: false,
             command,
@@ -4387,6 +4613,8 @@ mod tests {
             transcript: Some(transcript_for(&home, tmp.path(), session)),
             prompt: Some("do the work".to_string()),
             max_restarts: Some(0),
+            budget_tokens: None,
+            max_tool_calls: None,
             timeout_secs: Some(60),
             simple: false,
             command: fake_agent_command(session),
@@ -4573,6 +4801,8 @@ mod tests {
             transcript: Some(transcript_for(&home, tmp.path(), session)),
             prompt: Some("do the work".to_string()),
             max_restarts: Some(0),
+            budget_tokens: None,
+            max_tool_calls: None,
             timeout_secs: Some(30),
             simple: false,
             command: fake_agent_command(session),
@@ -4655,6 +4885,8 @@ mod tests {
             // Zero rot-restart budget: proves the nudge restart below is not
             // drawing from it.
             max_restarts: Some(0),
+            budget_tokens: None,
+            max_tool_calls: None,
             timeout_secs: Some(30),
             simple: false,
             command: fake_agent_command(session),
@@ -4729,6 +4961,8 @@ mod tests {
             transcript: Some(transcript_for(&home, tmp.path(), session)),
             prompt: Some("do the work".to_string()),
             max_restarts: Some(0),
+            budget_tokens: None,
+            max_tool_calls: None,
             timeout_secs: Some(30),
             simple: false,
             command: fake_agent_command(session),
@@ -4824,6 +5058,8 @@ mod tests {
             transcript: Some(transcript_for(&home, tmp.path(), session)),
             prompt: Some("do the work".to_string()),
             max_restarts: Some(0),
+            budget_tokens: None,
+            max_tool_calls: None,
             // Short enough that the second (ignored-nudge) hang ends the
             // run on its own once the cap has been proven, rather than
             // hanging the test forever.

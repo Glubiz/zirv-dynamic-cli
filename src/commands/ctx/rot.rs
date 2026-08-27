@@ -489,6 +489,50 @@ mod tests {
     use crate::commands::ctx::config::ScoreConfig;
     use crate::commands::ctx::event::{Capabilities, NormalizedEvent, input_hash};
 
+    /// Issue #155, Phase 6(c): `rot.rs` stays pure -- no filesystem, clock,
+    /// env, network, AND no visibility into quota/usage data (`pace`/
+    /// `window`), so a session 97% through its five-hour window scores
+    /// exactly like one at 3%. Quota pressure gates NEW spawns only
+    /// (`pace::spawn_gate`, consulted from `agent.rs`/`dash/mod.rs`) --
+    /// restarting a session because it is expensive would discard a warm
+    /// cache and re-read the whole context, the single most expensive
+    /// possible reaction to a cost signal. This scans this file's own
+    /// PRODUCTION code (everything before the `#[cfg(test)]` marker that
+    /// starts this very module) for a reference to either module, rather
+    /// than merely asserting the invariant in prose, so a future `use
+    /// super::pace` or a `window::`-qualified path compiles clean and then
+    /// silently reintroduces the coupling this test exists to forbid.
+    /// Scoped to the PRODUCTION half of the file on purpose: this test's own
+    /// needles below would otherwise trip on themselves once included, and
+    /// the bare word "window" is legitimately this module's own vocabulary
+    /// (`ScoreConfig::window`, `RotState`'s own bounded turn window) used
+    /// dozens of times, which a whole-file substring search would misfire
+    /// on.
+    #[test]
+    fn rot_stays_pure_of_pace_and_window_data() {
+        const THIS_FILE: &str = include_str!("rot.rs");
+        let production_code = THIS_FILE
+            .split("#[cfg(test)]")
+            .next()
+            .expect("this file always has a #[cfg(test)] module");
+        for needle in [
+            "use super::pace",
+            "use super::window",
+            "super::pace::",
+            "super::window::",
+            "pace::",
+            "window::",
+            "UsageWindows",
+        ] {
+            assert!(
+                !production_code.contains(needle),
+                "rot.rs's production code must never read quota/usage data -- found `{needle}`; \
+                 a scheduling gate on quota belongs in pace.rs's spawn_gate, never in rot's own \
+                 scoring"
+            );
+        }
+    }
+
     fn full_caps() -> Capabilities {
         Capabilities {
             marker_signal: true,

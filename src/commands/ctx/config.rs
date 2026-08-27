@@ -260,6 +260,27 @@ pub struct PaceConfig {
     /// cycles that would otherwise spend against the account with nobody
     /// watching. See [[Usage and Pacing]]/[[Known Issues]].
     pub blind_delay_secs: u64,
+    /// Issue #155, Phase 6(c): the soft/hard band for `pace::spawn_gate`,
+    /// which gates whether a NEW delegated worker may be spawned at all
+    /// (`agent::run_with`, `dash::fulfill_spawn_request`) -- never whether an
+    /// already-running session gets restarted. Restarting a session because
+    /// it is expensive would discard a warm cache and re-read the whole
+    /// context, the single most expensive possible reaction to a cost
+    /// signal, so `rot.rs`/`score.rs` never read these (or any other
+    /// `pace`/`window` field) at all. Deliberately distinct from `max_
+    /// percent`/`soft_percent` above, which tune an already-running
+    /// supervised loop's own cadence: a spawn is new spend the operator has
+    /// not yet committed to, so it earns a stricter, earlier ceiling than
+    /// pacing an existing one. `REPO_FORBIDDEN`: a repo checkout must not be
+    /// able to change when the operator's account stops accepting new work,
+    /// in either direction.
+    pub spawn_soft_pct: f64,
+    /// See `spawn_soft_pct` just above. At or above this, `agent::run_with`/
+    /// `dash::fulfill_spawn_request` refuse the spawn outright unless
+    /// overridden (`agent::run_with`'s own `--force`, or `dash::SpawnRequest
+    /// ::force` carrying that same choice into a pane spawn).
+    /// `REPO_FORBIDDEN`, same reasoning as `spawn_soft_pct`.
+    pub spawn_hard_pct: f64,
 }
 
 impl Default for PaceConfig {
@@ -281,6 +302,8 @@ impl Default for PaceConfig {
             poll_min_interval_secs: 60,
             use_credits: UseCreditsConfig::default(),
             blind_delay_secs: 60,
+            spawn_soft_pct: 80.0,
+            spawn_hard_pct: 95.0,
         }
     }
 }
@@ -1130,6 +1153,16 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         EnvKind::Int,
     ),
     (
+        "ZIRV_CTX_PACE_SPAWN_SOFT_PCT",
+        &["pace", "spawn_soft_pct"],
+        EnvKind::Float,
+    ),
+    (
+        "ZIRV_CTX_PACE_SPAWN_HARD_PCT",
+        &["pace", "spawn_hard_pct"],
+        EnvKind::Float,
+    ),
+    (
         "ZIRV_CTX_PACE_USE_CREDITS_CLAUDE",
         &["pace", "use_credits", "claude"],
         EnvKind::Bool,
@@ -1743,6 +1776,19 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
         &["pace", "blind_delay_secs"],
         "ZIRV_CTX_PACE_BLIND_DELAY_SECS",
     ),
+    // Issue #155, Phase 6(c): `pace::spawn_gate`'s own soft/hard band --
+    // whether a NEW delegated worker may be spawned at all, never whether an
+    // already-running session gets restarted (see `SpawnGate`'s own doc
+    // comment for why the two must stay independent). A repo checkout must
+    // not be able to change when the operator's account stops accepting new
+    // work, in EITHER direction: raising either percentage would let a
+    // checkout spend past a ceiling the operator set, and lowering one would
+    // let a checkout throttle delegation for an operator who did not ask for
+    // it -- the same "the checkout is not the operator" trust asymmetry
+    // every other entry in this list enforces, applied to a refusal
+    // threshold instead of a byte cap or a switch.
+    (&["pace", "spawn_soft_pct"], "ZIRV_CTX_PACE_SPAWN_SOFT_PCT"),
+    (&["pace", "spawn_hard_pct"], "ZIRV_CTX_PACE_SPAWN_HARD_PCT"),
     // `chat.model` is deliberately ABSENT from this list. See `ChatConfig`'s
     // own doc comment and the spec's "Orchestrator model" section
     // (docs/superpowers/specs/2026-08-13-zirv-dashboard-design.md): unlike
@@ -2874,6 +2920,18 @@ mod tests {
     }
 
     #[test]
+    fn spawn_gate_thresholds_are_settable_from_the_operators_own_env() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let env = env_map(&[
+            ("ZIRV_CTX_PACE_SPAWN_SOFT_PCT", "70"),
+            ("ZIRV_CTX_PACE_SPAWN_HARD_PCT", "90"),
+        ]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert_eq!(cfg.pace.spawn_soft_pct, 70.0);
+        assert_eq!(cfg.pace.spawn_hard_pct, 90.0);
+    }
+
+    #[test]
     fn a_non_numeric_percent_is_rejected_with_the_variable_named() {
         let repo = tempfile::tempdir().expect("tempdir");
         let env = env_map(&[("ZIRV_CTX_PACE_MAX_PERCENT", "loads")]);
@@ -2898,6 +2956,47 @@ mod tests {
         assert_eq!(cfg.poll_min_interval_secs, 60);
         assert!(!cfg.use_credits.claude);
         assert!(!cfg.use_credits.codex);
+    }
+
+    #[test]
+    fn pace_gains_spawn_soft_and_hard_pct_defaults() {
+        let cfg = PaceConfig::default();
+        assert_eq!(cfg.spawn_soft_pct, 80.0);
+        assert_eq!(cfg.spawn_hard_pct, 95.0);
+    }
+
+    /// Issue #155, Phase 6(c): unlike `pace.enabled`/`max_percent`/
+    /// `soft_percent` (which a repo may repo-narrow -- see `a_repo_layer_
+    /// may_only_narrow_pace_enabled_max_percent_and_soft_percent` below),
+    /// `spawn_soft_pct`/`spawn_hard_pct` are `REPO_FORBIDDEN` outright: a
+    /// checkout may not move either threshold in EITHER direction, not even
+    /// to tighten it. Raising either would let a checkout spend past a
+    /// ceiling the operator set; a repo-narrowing fold (the `pace.max_
+    /// percent` shape) would let a checkout throttle delegation for an
+    /// operator who never asked for that either -- a spawn gate has no safe
+    /// direction for an untrusted layer to move it, so both are blocked
+    /// outright instead.
+    #[test]
+    fn a_repo_ctx_toml_cannot_move_the_spawn_gate_thresholds_in_either_direction() {
+        for repo_toml in [
+            "[pace]\nspawn_soft_pct = 10.0\n",
+            "[pace]\nspawn_soft_pct = 99.0\n",
+            "[pace]\nspawn_hard_pct = 10.0\n",
+            "[pace]\nspawn_hard_pct = 99.9\n",
+        ] {
+            let repo = tempfile::tempdir().expect("repo");
+            let home = tempfile::tempdir().expect("home");
+            let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+            std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+            std::fs::write(repo.path().join(".zirv/ctx.toml"), repo_toml).expect("write");
+            let empty: HashMap<String, String> = HashMap::new();
+            let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+                .expect_err(&format!("a repo may not set: {repo_toml}"));
+            assert!(
+                is_repo_forbidden(err.as_ref()),
+                "must be a security refusal for {repo_toml}: {err}"
+            );
+        }
     }
 
     #[test]
@@ -4613,6 +4712,8 @@ mod tests {
         ("pace", "poll_enabled"),
         ("pace", "poll_min_interval_secs"),
         ("pace", "blind_delay_secs"),
+        ("pace", "spawn_soft_pct"),
+        ("pace", "spawn_hard_pct"),
         ("pace.use_credits", "claude"),
         ("pace.use_credits", "codex"),
         ("optimize", "enabled"),
