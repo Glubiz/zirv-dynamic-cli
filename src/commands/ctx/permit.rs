@@ -68,11 +68,19 @@ pub fn is_heavy(command: &str, extra_patterns: &[String]) -> bool {
         })
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct PermitRecord {
-    pid: u32,
-    label: String,
-    acquired_at: u64,
+/// One held permit, as read back from `<state>/permits/`. `pub`, and its
+/// fields with it (issue #162): a refusal or a wait that cannot say WHO
+/// holds the budget is undiagnosable, so both `status.rs`'s occupancy line
+/// and `script_runner`'s wait message read these back through
+/// [`live_records`] rather than only a bare count. `label` is whatever the
+/// acquiring caller wants an operator to see -- `script_runner::command::
+/// heavy_permit_for` sets it to the session identity plus the classified
+/// command when a session id is available, or the bare command otherwise.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PermitRecord {
+    pub pid: u32,
+    pub label: String,
+    pub acquired_at: u64,
 }
 
 /// `<state>/permits/<pid>-<uuid>.json`, one file per held permit -- mirrors
@@ -96,20 +104,24 @@ impl Drop for HeavyPermit {
     }
 }
 
-/// How many heavy-operation permits are currently held. Walks `<state>/
-/// permits/`, sweeping (and not counting) any entry whose owning pid is no
-/// longer alive -- reusing `sessions::is_alive`, the same liveness probe
-/// `sessions::list` sweeps dead session records with, rather than a second,
-/// independently-drifting copy -- so a permit left behind by a killed or
-/// crashed holder never wedges the budget forever. A directory that does
-/// not exist yet, or a file that fails to read or parse, both read as "not
-/// held": zero permits on a fresh machine, and one malformed file must
-/// never fail the whole count.
-pub fn live_count(state: &StateDir) -> usize {
+/// Every heavy-operation permit currently held, sweeping (and never
+/// including) any entry whose owning pid is no longer alive -- reusing
+/// `sessions::is_alive`, the same liveness probe `sessions::list` sweeps
+/// dead session records with, rather than a second, independently-drifting
+/// copy -- so a permit left behind by a killed or crashed holder never
+/// wedges the budget forever. A directory that does not exist yet, or a
+/// file that fails to read or parse, both read as "not held": nothing on a
+/// fresh machine, and one malformed file must never fail the whole listing.
+///
+/// Exposed as records, not just a count (issue #162): `status.rs`'s
+/// occupancy line and `script_runner`'s wait message both need to name WHO
+/// holds the budget, and reading both off this same function is what makes
+/// the two guaranteed to never disagree.
+pub fn live_records(state: &StateDir) -> Vec<PermitRecord> {
     let Ok(entries) = std::fs::read_dir(permits_dir(state)) else {
-        return 0;
+        return Vec::new();
     };
-    let mut count = 0;
+    let mut found = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
@@ -122,12 +134,18 @@ pub fn live_count(state: &StateDir) -> usize {
             continue;
         };
         if is_alive(record.pid) {
-            count += 1;
+            found.push(record);
         } else {
             let _ = std::fs::remove_file(&path);
         }
     }
-    count
+    found
+}
+
+/// How many heavy-operation permits are currently held -- see
+/// [`live_records`] for the per-holder detail this counts.
+pub fn live_count(state: &StateDir) -> usize {
+    live_records(state).len()
 }
 
 /// Grants a permit when fewer than `limit` are currently live, `None`
@@ -250,5 +268,21 @@ mod tests {
             "a dead owner's permit does not count"
         );
         assert!(acquire(&state, 1, "cargo build").is_some());
+    }
+
+    /// Issue #162: a refusal or a wait that cannot say WHO holds the budget
+    /// is undiagnosable. `live_records` must report the label each holder
+    /// was acquired with, not just how many there are.
+    #[test]
+    fn live_records_reports_each_holders_own_label() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let _held =
+            acquire(&state, 1, "session ab12cd34: cargo nextest run").expect("permit granted");
+
+        let records = live_records(&state);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].label, "session ab12cd34: cargo nextest run");
+        assert_eq!(records[0].pid, std::process::id());
     }
 }

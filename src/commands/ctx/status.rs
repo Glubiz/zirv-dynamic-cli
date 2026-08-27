@@ -304,21 +304,34 @@ pub fn run_with<W: Write>(
     let session_records = sessions::list(&state);
 
     // Issue #155, Phase 5(e): the machine-wide heavy-OPERATION budget's
-    // current occupancy -- live permits (`permit::live_count`), not live
+    // current occupancy -- live permits (`permit::live_records`), not live
     // `Verb::Exec | Verb::Dash` session records: a session registration is
     // no longer a heavy event by itself, only an actual classified command
-    // running inside one (`script_runner::Command::invoke`) is. Degrades
-    // silently (omits the line entirely) on a config load error --
-    // `cfg_result` may already be an `Err` reported above (a
-    // `REPO_FORBIDDEN` rejection or any other load failure), and this is not
-    // a second place to repeat that failure.
+    // running inside one (`script_runner::Command::invoke`) is. The
+    // ceiling shown is `cfg.supervise.max_heavy_operations` as THIS
+    // invocation's own `CtxConfig::load` just resolved it -- never a cached
+    // or stale value -- so it is always the limit actually in force for the
+    // process rendering this line (issue #162(c)). Degrades silently (omits
+    // the line entirely) on a config load error -- `cfg_result` may already
+    // be an `Err` reported above (a `REPO_FORBIDDEN` rejection or any other
+    // load failure), and this is not a second place to repeat that failure.
+    //
+    // Issue #162(b): a refusal or wait that cannot say WHO holds the budget
+    // is undiagnosable, so every live permit is also listed by pid and
+    // label -- the identical `permit::live_records` read `script_runner`'s
+    // own wait message uses, so the two can never name a holder
+    // differently.
     if let Ok(cfg) = &cfg_result {
-        let live_heavy = permit::live_count(&state);
+        let live_permits = permit::live_records(&state);
         writeln!(
             w,
-            "heavy operations: {live_heavy} of {} slots in use",
+            "heavy operations: {} of {} slots in use",
+            live_permits.len(),
             cfg.supervise.max_heavy_operations
         )?;
+        for record in &live_permits {
+            writeln!(w, "  pid {} -- {}", record.pid, record.label)?;
+        }
     }
 
     writeln!(w, "\nsessions:")?;
@@ -984,9 +997,13 @@ mod tests {
     }
 
     /// Issue #155, Phase 5(e): `heavy operations: N of M slots in use`
-    /// counts live permits (`permit::live_count`), not live session
+    /// counts live permits (`permit::live_records`), not live session
     /// records -- a session that is not actually running a classified heavy
     /// command holds nothing.
+    ///
+    /// Issue #162(b): the occupant is also named by pid and label, so an
+    /// operator who sees a full budget can tell WHAT is holding it rather
+    /// than only how many things are.
     #[test]
     fn status_reports_the_heavy_operations_budget_occupancy() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -1000,7 +1017,8 @@ mod tests {
         let home = tempfile::tempdir().expect("tempdir");
         let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
 
-        let held = permit::acquire(&state, 3, "cargo build").expect("permit granted");
+        let held =
+            permit::acquire(&state, 3, "session ab12cd34: cargo build").expect("permit granted");
 
         let mut out = Vec::new();
         run_with(&StatusArgs { decisions: 5 }, &mut out, tmp.path(), &|k| {
@@ -1012,6 +1030,13 @@ mod tests {
         assert!(
             text.contains("heavy operations: 1 of 3 slots in use"),
             "got {text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "pid {} -- session ab12cd34: cargo build",
+                std::process::id()
+            )),
+            "the occupant must be named, not just counted: got {text}"
         );
 
         drop(held);
