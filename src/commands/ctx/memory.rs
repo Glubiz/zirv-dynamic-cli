@@ -1631,6 +1631,28 @@ pub(super) fn is_temporary_or_generic(body: &str) -> bool {
         .any(|pattern| lower.contains(pattern))
 }
 
+/// Whether a raw harvest candidate `(key, body)` -- BEFORE any truncation --
+/// looks credential-shaped, reusing the shared-scope guard's own rule
+/// (`sensitive_shared_match`) rather than a second copy of it. Built as a
+/// minimal probe `Entry` (harvest candidates carry no tags/paths yet, so
+/// those are left empty; only `key`/`body` are ever populated by a harvest
+/// answer). Pure, like `filter_durable_candidates` itself.
+fn harvest_candidate_credential_match(key: &str, body: &str) -> Option<String> {
+    let probe = Entry {
+        key: key.to_string(),
+        written_by: String::new(),
+        written: 0,
+        verified: 0,
+        source: String::new(),
+        body: body.to_string(),
+        importance: None,
+        confidence: None,
+        tags: Vec::new(),
+        paths: Vec::new(),
+    };
+    sensitive_shared_match(&probe)
+}
+
 /// The durability filter (issue #37): a PURE, deterministic function over
 /// already-parsed `(key, body)` candidates -- no model, no filesystem, no
 /// clock -- so it is directly testable against every reject-list category
@@ -1640,11 +1662,19 @@ pub(super) fn is_temporary_or_generic(body: &str) -> bool {
 /// Applied in order, each check independent of the others: a malformed key
 /// (`validate_shared_key` -- not lowercase kebab-case, too long, all-hyphen,
 /// or a reserved Windows device name) is dropped; a body matching
-/// `is_temporary_or_generic` is dropped; the body is then truncated to
-/// `cfg.memory.max_entry_bytes` (the same per-entry cap every other entry in
-/// this store gets) and dropped entirely if truncation leaves nothing but
-/// whitespace. Only survivors count against the two NEW per-session caps
-/// issue #37 asks for: `cfg.memory.harvest_max_entries` (stops accepting
+/// `is_temporary_or_generic` is dropped; a body that looks credential-shaped
+/// (`harvest_candidate_credential_match`, checked against the RAW body here,
+/// BEFORE truncation) is dropped -- issue #172 cross-review: this filter
+/// used to truncate first and let `write_durable`'s own credential check run
+/// only on the ALREADY-truncated body, so a long credential straddling the
+/// truncation boundary could be sheared down to a tail too short for
+/// `review::detect_token_shape`'s length gates and land, partially, in the
+/// repo-committed bank -- the check now runs where `upsert_shared` itself
+/// already gets the order right: guard first, truncate second; the body is
+/// then truncated to `cfg.memory.max_entry_bytes` (the same per-entry cap
+/// every other entry in this store gets) and dropped entirely if truncation
+/// leaves nothing but whitespace. Only survivors count against the two NEW
+/// per-session caps issue #37 asks for: `cfg.memory.harvest_max_entries` (stops accepting
 /// once reached, keeping the model's own answer order as a priority order)
 /// and `cfg.memory.harvest_max_bytes` (a cumulative budget over
 /// every accepted body; a single candidate that alone would blow the
@@ -1661,6 +1691,9 @@ pub fn filter_durable_candidates(
             continue;
         }
         if is_temporary_or_generic(body) {
+            continue;
+        }
+        if harvest_candidate_credential_match(key, body).is_some() {
             continue;
         }
         let body = crate::utils::truncate_bytes(body.clone(), Some(cfg.memory.max_entry_bytes));
@@ -1806,6 +1839,32 @@ pub fn harvest_durable(
     let answer =
         super::handoff::run_model(adapter, model, &durable_harvest_prompt(handoff), timeout)?;
     let candidates = parse_harvest(&answer);
+    // Logged here, against the RAW candidates, rather than inside the pure
+    // `filter_durable_candidates` (which drops a credential-shaped candidate
+    // silently, the same as its other reject categories): this is the one
+    // place in the harvest pipeline with both `state` (to log) and the
+    // model's un-truncated answer still in hand, so the skip is observable
+    // (`harvest-skipped`, the same idiom `write_durable`'s own credential
+    // check and already-explicit-key skip already use) rather than a silent
+    // drop the operator has no way to notice.
+    for (key, body) in &candidates {
+        if let Some(matched) = harvest_candidate_credential_match(key, body) {
+            let _ = super::log::append(
+                state,
+                &super::log::Decision {
+                    ts: now_secs(),
+                    session: "n/a",
+                    verb: "memory",
+                    verdict: "n/a",
+                    score: 0,
+                    action: "harvest-skipped",
+                    detail: &format!(
+                        "'{key}' looks credential-shaped ({matched}); refusing to harvest it into the shared bank"
+                    ),
+                },
+            );
+        }
+    }
     let accepted = filter_durable_candidates(&candidates, cfg);
     let written = write_durable(repo, state, slug, &accepted, cfg, now_secs())?;
     // Issue #87: a one-line summary on the `zirv ▸` channel every time a
@@ -3777,13 +3836,66 @@ This should not appear in the body.\n";
 
     #[test]
     fn filter_accepts_a_genuinely_durable_fact() {
+        // Key and body are deliberately guard-safe (issue #172 cross-review:
+        // filter_durable_candidates now also runs the shared-scope
+        // credential guard, so a key/body that merely SOUNDS like it might
+        // hold a secret -- without this fixture ever intending to test that
+        // -- would otherwise make this "accepts a fine fact" test fail for
+        // an unrelated reason; the guard itself has its own dedicated tests
+        // below).
         let cfg = CtxConfig::default();
         let candidates = vec![(
-            "staging-db-creds".to_string(),
-            "The staging DB creds live in 1Password under staging-db.".to_string(),
+            "release-runbook".to_string(),
+            "The release runbook lives in the internal wiki under docs.".to_string(),
         )];
         let accepted = filter_durable_candidates(&candidates, &cfg);
         assert_eq!(accepted.len(), 1, "a real fact must survive: {accepted:?}");
+    }
+
+    #[test]
+    fn filter_drops_a_credential_that_truncation_would_otherwise_shear_below_the_token_shape_gate()
+    {
+        // Issue #172 cross-review: a real bypass. `filter_durable_candidates`
+        // used to truncate every body to `max_entry_bytes` BEFORE anything
+        // downstream (`write_durable`'s own credential check) ever looked at
+        // it, so a long credential straddling the truncation boundary got
+        // sheared down to a tail too short for `review::detect_token_shape`'s
+        // length gates (`sk-[A-Za-z0-9_-]{20,}`) to fire, and the truncated
+        // remnant landed in the repo-committed shared bank anyway. This is
+        // the exact scenario the reviewer proved it with: a 533-byte body of
+        // 500 filler bytes followed by a 33-byte `sk-`-shaped secret, with
+        // `max_entry_bytes = 512` -- truncating first leaves only `sk-` plus
+        // 9 of the secret's 30 characters, well under the 20-character
+        // minimum the regex requires, so the old code accepted it.
+        let mut cfg = CtxConfig::default();
+        cfg.memory.max_entry_bytes = 512;
+        let secret = format!("sk-{}", "B".repeat(30));
+        assert_eq!(
+            secret.len(),
+            33,
+            "sanity: the secret alone is unambiguously token-shaped"
+        );
+        // The token-shape regex is deliberately anchored (see
+        // `review::TOKEN_SHAPE_RE`'s own doc comment) so it cannot fire in
+        // the middle of an ordinary word: the character immediately before
+        // `sk-` must not itself be alphanumeric. The filler therefore ends
+        // in a space, not another letter, so the FULL (untruncated) body is
+        // unambiguously token-shaped -- the point under test is truncation
+        // order, not the anchor rule itself.
+        let filler = format!("{} ", "a".repeat(499));
+        let body = format!("{filler}{secret}");
+        assert_eq!(
+            body.len(),
+            533,
+            "sanity: matches the reviewer's boundary-shear scenario"
+        );
+
+        let candidates = vec![("infra-notes".to_string(), body)];
+        let accepted = filter_durable_candidates(&candidates, &cfg);
+        assert!(
+            accepted.is_empty(),
+            "a credential-shaped candidate must never survive truncation into the accepted list: {accepted:?}"
+        );
     }
 
     #[test]
