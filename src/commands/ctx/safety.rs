@@ -3664,6 +3664,63 @@ fn builtin_escape_allow() -> Vec<Rule> {
         .collect()
 }
 
+/// Lexically resolves `.`/`..` path components and collapses repeated `/`
+/// separators, exactly the way a real shell's path resolution would --
+/// text-only, no filesystem access (this whole module stays pure, see
+/// `rot.rs`'s identical discipline). `..` past the top of the walk simply
+/// has nothing left to pop: this function can never know whether a real
+/// parent exists above whatever root it was handed, so it stays put rather
+/// than going negative. Returns the resolved, non-empty component list --
+/// an EMPTY result means `path` lexically reduces to nothing beyond
+/// whatever root it started from (e.g. `/`, `//`, `/.`, `/./`, `/..`,
+/// `/../` all resolve to the same empty list).
+fn resolve_lexical_path_components(path: &str) -> Vec<&str> {
+    let mut components: Vec<&str> = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                components.pop();
+            }
+            other => components.push(other),
+        }
+    }
+    components
+}
+
+/// Whether `token` is, after lexical resolution, the filesystem root or an
+/// ENTIRE home directory (this account's own, `~`, or -- since `~user`
+/// names a *different* account's whole home, the identical unbounded shape
+/// -- any other's) rather than a path bounded to a real subtree.
+///
+/// Review round 3 (2026-08-27, CRITICAL): the exact-literal check this
+/// replaced (`matches!(token, "/" | "~" | "~/")`) only ever caught the
+/// three spellings written out by hand -- `//`, `/.`, `/./`, `/..`, `/../`
+/// (all lexically identical to `/` on any POSIX filesystem: `.`/`..` at
+/// root have nowhere to go, and a doubled separator collapses) and a bare
+/// `~user` (someone else's whole home, never enumerated by name here) all
+/// sailed straight through to the seeded `find *` family's silent `Allow`.
+/// Enumerating spellings one PoC at a time does not converge -- this
+/// normalizes instead: an absolute path lexically resolves via
+/// [`resolve_lexical_path_components`] and is root-wide exactly when
+/// nothing survives the walk; a `~`-form splits off the (possibly empty)
+/// username before the first `/` -- no slash at all means the whole token
+/// IS the bare `~`/`~user` form (root-wide outright, since there is no
+/// subdirectory left to be bounded to) -- and resolves whatever follows
+/// the same way. A relative path (no leading `/` or `~`) is left alone:
+/// this classifier cannot know whether the launch's own working directory
+/// is itself at or above a sensitive root, the same non-goal
+/// `generated_path` already documents for the identical reason.
+fn is_root_wide_or_whole_home_path(token: &str) -> bool {
+    if let Some(rest) = token.strip_prefix('~') {
+        return match rest.split_once('/') {
+            Some((_user, after)) => resolve_lexical_path_components(after).is_empty(),
+            None => true,
+        };
+    }
+    token.starts_with('/') && resolve_lexical_path_components(token).is_empty()
+}
+
 /// Whether `command` is a `find` invocation whose starting-point argument
 /// is the filesystem root or the home directory -- an unbounded scan of
 /// everything readable, as opposed to a `find ./src -name '*.rs'` style
@@ -3671,7 +3728,7 @@ fn builtin_escape_allow() -> Vec<Rule> {
 /// built-in escape-allow family, but a root-wide scan must never ride that
 /// seed to `Allow` just because its family matches.
 ///
-/// Review round 2 (2026-08-27), CRITICAL: this used to trust a fixed
+/// Review round 2 (2026-08-27, CRITICAL): this used to trust a fixed
 /// `tokens[1]` outright, so a leading find OPTION (`-H`/`-L`/`-P`/...)
 /// ahead of the real starting-point shifted the root path clean out of the
 /// position this check looked at -- `find -H / -iname id_rsa` rode the
@@ -3685,6 +3742,12 @@ fn builtin_escape_allow() -> Vec<Rule> {
 /// same `$`/backtick disqualification [`generated_path`] already applies
 /// for the identical reason; a legitimate substitution false-positives
 /// into `Ask`, never into a silent bypass.
+///
+/// Review round 3 (2026-08-27, CRITICAL): the exact-match root/home check
+/// is now [`is_root_wide_or_whole_home_path`]'s lexical normalization --
+/// see that function's own doc comment for why `//`, `/.`, `/./`, `/..`,
+/// `/../`, and a bare `~user` all had to close in one pass rather than as
+/// individually enumerated literals.
 fn is_root_wide_find_scan(command: &str) -> bool {
     let Some(tokens) = sql_tokens(&collapse_whitespace(command)) else {
         return false;
@@ -3698,7 +3761,7 @@ fn is_root_wide_find_scan(command: &str) -> bool {
     tokens
         .iter()
         .skip(1)
-        .any(|token| matches!(token.as_str(), "/" | "~" | "~/") || token.contains(['$', '`']))
+        .any(|token| token.contains(['$', '`']) || is_root_wide_or_whole_home_path(token))
 }
 
 /// Issue #147 amendment: a family matching `escape_allow` (built-in or
@@ -6841,6 +6904,107 @@ mod tests {
         assert!(
             text.contains(r#""permissionDecision":"ask""#),
             "an unquoted command substitution in the path position must not escape unproven: got {text}"
+        );
+    }
+
+    /// Shared PoC runner for review round 3 (2026-08-27, CRITICAL):
+    /// `is_root_wide_find_scan` used to compare a starting-point token
+    /// against an EXACT literal set (`"/"`/`"~"`/`"~/"`), so every
+    /// textually-different but lexically-identical root spelling sailed
+    /// through -- `//`, `/.`, `/./`, `/..`, `/../`, and a bare `~user`
+    /// (someone else's whole home, the identical unbounded-scan shape as a
+    /// bare `~`) all still reached a silent `Allow` via the seeded `find *`
+    /// family on the previous round's fix. Each PoC here is a real,
+    /// shell-equivalent spelling of the filesystem root or a whole home
+    /// directory.
+    fn assert_find_command_asks(command: &str) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = super::super::testenv::HomeGuard::set(home.path());
+        let empty: HashMap<String, String> = HashMap::new();
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("loads");
+
+        let stdin = format!(
+            r#"{{"tool_name":"Bash","tool_input":{{"command":"{command}","dangerouslyDisableSandbox":true}},"permission_mode":"default"}}"#
+        );
+        let mut out = Vec::new();
+        run_check_hook_mode(&cfg, &mut out, &stdin).expect("runs");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            text.contains(r#""permissionDecision":"ask""#),
+            "`{command}` lexically resolves to a root-wide (or whole-home) scan and must not \
+             escape: got {text}"
+        );
+    }
+
+    #[test]
+    fn a_seeded_find_never_escapes_a_root_wide_scan_via_a_doubled_slash() {
+        assert_find_command_asks("find // -iname id_rsa");
+    }
+
+    #[test]
+    fn a_seeded_find_never_escapes_a_root_wide_scan_via_a_dot_component() {
+        assert_find_command_asks("find /. -iname id_rsa");
+    }
+
+    #[test]
+    fn a_seeded_find_never_escapes_a_root_wide_scan_via_a_dot_slash_component() {
+        assert_find_command_asks("find /./ -iname id_rsa");
+    }
+
+    #[test]
+    fn a_seeded_find_never_escapes_a_root_wide_scan_via_a_dot_dot_component() {
+        assert_find_command_asks("find /.. -iname id_rsa");
+    }
+
+    /// The `/../` (trailing-slash) variant, distinct from the bare `/..`
+    /// case above: `..` at the root has no parent to walk to and must
+    /// lexically resolve back to root either way, never partway "above" it.
+    #[test]
+    fn a_seeded_find_never_escapes_a_root_wide_scan_via_a_trailing_dot_dot_component() {
+        assert_find_command_asks("find /../ -iname id_rsa");
+    }
+
+    /// A bare `~user` (no slash at all) names that user's ENTIRE home
+    /// directory -- the identical unbounded shape as a bare `~`, just for a
+    /// different, potentially higher-privileged account (`/root`, `/var/root`).
+    /// Enumerating usernames is not this text-only screen's job; refusing to
+    /// prove any bare `~user` bounded is.
+    #[test]
+    fn a_seeded_find_never_escapes_a_root_wide_scan_via_a_bare_other_users_home() {
+        assert_find_command_asks("find ~root -iname id_rsa");
+    }
+
+    /// The combined shape: a leading option (round-2's own fix target)
+    /// stacked on a doubled-slash root spelling (this round's), proving
+    /// neither fix alone was ever meant to stand in for the other.
+    #[test]
+    fn a_seeded_find_never_escapes_a_root_wide_scan_via_a_leading_flag_and_a_doubled_slash() {
+        assert_find_command_asks("find -H // -iname id_rsa");
+    }
+
+    /// POSITIVE case: the normalization above must not over-deny ordinary,
+    /// genuinely bounded `find` usage into uselessness. An absolute path
+    /// naming a real subtree -- never lexically reducible to `/` no matter
+    /// how many `.`/`..` components a caller writes -- must keep escaping
+    /// silently, exactly like the pre-existing relative-path case
+    /// (`find ./src -name '*.rs'`, documented on `is_root_wide_find_scan`
+    /// itself) already does.
+    #[test]
+    fn a_seeded_find_within_a_bounded_absolute_subtree_still_escapes_silently() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = super::super::testenv::HomeGuard::set(home.path());
+        let empty: HashMap<String, String> = HashMap::new();
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("loads");
+
+        let stdin = r#"{"tool_name":"Bash","tool_input":{"command":"find /home/jonathan/project -name x","dangerouslyDisableSandbox":true},"permission_mode":"default"}"#;
+        let mut out = Vec::new();
+        run_check_hook_mode(&cfg, &mut out, stdin).expect("runs");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            text.contains(r#""permissionDecision":"allow""#),
+            "a genuinely bounded absolute subtree must still escape silently: got {text}"
         );
     }
 
