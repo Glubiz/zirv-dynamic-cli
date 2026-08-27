@@ -3874,6 +3874,172 @@ fn target_is_confined(target: &str, scratchpad_roots: &[String]) -> bool {
         .any(|root| !root.is_empty() && normalized.starts_with(root.as_str()))
 }
 
+/// Issue #168, design decision (d): scans `segment` (already heredoc-
+/// redacted by the caller) for unquoted output-redirection targets -- `>`,
+/// `>>`, `<`, digit-prefixed (`1>`/`2>`) and `&>`/`&>>` forms, with or
+/// without a space before the target text. `None` means a redirection
+/// operator was found with NOTHING usable after it (a dangling operator at
+/// the very end of the segment) -- ambiguous, never guessed at. `&1`/`&2`
+/// (descriptor duplication, e.g. `2>&1`) names no filesystem path at all and
+/// is recognized and skipped, not treated as ambiguous: this is a character-
+/// level scan (unlike a whitespace-token split), so it cannot miss a glued
+/// operator the way a token-based scan could, and every quote/escape rule
+/// mirrors [`contains_unquoted_redirection`] so the two can never disagree
+/// about which `>`/`<` in the text is live shell syntax versus quoted data.
+fn scan_redirection_targets(segment: &str) -> Option<Vec<String>> {
+    let chars: Vec<char> = segment.chars().collect();
+    let mut targets = Vec::new();
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    let mut i = 0usize;
+    while i < chars.len() {
+        let c = chars[i];
+        if escaped {
+            escaped = false;
+            i += 1;
+            continue;
+        }
+        if c == '\\' && quote != Some('\'') {
+            escaped = true;
+            i += 1;
+            continue;
+        }
+        if let Some(active) = quote {
+            if c == active {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        if matches!(c, '\'' | '"' | '`') {
+            quote = Some(c);
+            i += 1;
+            continue;
+        }
+        let is_digit_prefixed_redirect = c.is_ascii_digit() && chars.get(i + 1) == Some(&'>');
+        let is_amp_redirect = c == '&' && chars.get(i + 1) == Some(&'>');
+        if !(c == '>' || c == '<' || is_amp_redirect || is_digit_prefixed_redirect) {
+            i += 1;
+            continue;
+        }
+        let mut j = if is_amp_redirect || is_digit_prefixed_redirect {
+            i + 2
+        } else {
+            i + 1
+        };
+        if chars.get(j) == Some(&'>') {
+            j += 1;
+        }
+        while chars.get(j) == Some(&' ') {
+            j += 1;
+        }
+        let target_start = j;
+        while j < chars.len() && !chars[j].is_whitespace() && chars[j] != '>' && chars[j] != '<' {
+            j += 1;
+        }
+        let target: String = chars[target_start..j].iter().collect();
+        if target.is_empty() {
+            // A dangling operator with nothing after it at all -- ambiguous.
+            return None;
+        }
+        if !matches!(target.as_str(), "&1" | "&2") {
+            targets.push(target);
+        }
+        i = j;
+    }
+    Some(targets)
+}
+
+/// Issue #168, design decision (d): one segment's write targets, or `None`
+/// if this cannot be confidently resolved -- either a dangling redirection
+/// operator ([`scan_redirection_targets`] itself), or a `tee` argument
+/// containing `$`/backtick so it cannot be proven a literal path.
+fn segment_write_targets(segment: &str) -> Option<Vec<String>> {
+    let mut targets = scan_redirection_targets(segment)?;
+    if let Some(tokens) = sql_tokens(&collapse_whitespace(segment))
+        && let Some(first) = tokens.first()
+        && sql_program_name(first) == "tee"
+    {
+        for token in tokens.iter().skip(1) {
+            if token.starts_with('-') {
+                continue;
+            }
+            if token.contains(['$', '`']) {
+                return None;
+            }
+            targets.push(token.clone());
+        }
+    }
+    Some(targets)
+}
+
+/// Issue #168, design decision (d): whether every write target across every
+/// segment of `command` is `/dev/null` or beneath one of `scratchpad_roots`.
+/// `None` -- no opinion, exactly today's un-analyzed behavior -- whenever
+/// `scratchpad_roots` is empty, any segment's own targets cannot be
+/// confidently resolved (see [`segment_write_targets`]), a target contains
+/// `$`/backtick (built through substitution/expansion this text-only module
+/// cannot resolve -- distinct from a target merely containing `~`/a glob
+/// character, which [`target_is_confined`] can confidently call "not
+/// confined" without further ambiguity), or -- CRITICAL -- `command` names
+/// no write target at all (no redirection, no `tee`). That last case matters
+/// because this function's caller only ever widens a verdict when it
+/// returns `Some(true)`: without this guard, ANY command with zero writes
+/// (an ordinary `kubectl exec -it pod -- sh`, a bare `2>&1` with nothing
+/// else) would vacuously satisfy "every target is confined" and get widened
+/// to `Allow` just for not writing anywhere at all -- which is not what this
+/// design decision is for (a compound that DOES write, confined to the
+/// scratchpad). `None` here correctly leaves such a command to classify
+/// exactly as it does today. Heredoc bodies are redacted first, the same as
+/// every other classifier in this module.
+pub(crate) fn write_targets_confined(command: &str, scratchpad_roots: &[String]) -> Option<bool> {
+    if scratchpad_roots.is_empty() {
+        return None;
+    }
+    let sanitized = redact_single_quoted_heredocs(command);
+    let mut confined = true;
+    let mut saw_any_target = false;
+    for segment in split_segments(&sanitized) {
+        let targets = segment_write_targets(&segment)?;
+        for target in &targets {
+            saw_any_target = true;
+            if target.contains(['$', '`']) {
+                return None;
+            }
+            if !target_is_confined(target, scratchpad_roots) {
+                confined = false;
+            }
+        }
+    }
+    if !saw_any_target {
+        return None;
+    }
+    Some(confined)
+}
+
+/// Issue #168, design decision (d): true when every one of `command`'s
+/// normalized executable candidates evaluates to `Allow`, or to the plain,
+/// no-rule-matched mode default -- the check [`write_targets_confined`]'s
+/// caller needs before it will widen a compound's default `Ask` to `Allow`:
+/// an explicit operator/repo `ask` rule, or any `deny` rule, naming one
+/// segment must still win, never be silently overridden just because that
+/// segment also happens to write somewhere confined.
+fn every_segment_is_allow_or_unmatched_default(
+    policy: &SafetyPolicy,
+    command: &str,
+    fallback: Verdict,
+) -> bool {
+    let candidates = normalize_segments(command);
+    if candidates.is_empty() {
+        return false;
+    }
+    candidates.iter().all(|candidate| {
+        let outcome = evaluate_candidate_outcome(policy, candidate, fallback);
+        outcome.verdict == Verdict::Allow
+            || (outcome.verdict == fallback && outcome.matched.is_none())
+    })
+}
+
 /// Issue #168, design decision (a): a GET-only `curl`/`wget` -- no `-X`/
 /// `--request` other than `GET`, no body-uploading flag, and any `-o`/
 /// `-O`/`--output` target confined per [`target_is_confined`].
@@ -4542,6 +4708,28 @@ fn run_check_hook_mode_with_env<W: Write>(
 
     let evidence = evaluate_with_attestation_evidence(&cfg.safety, &effective_command, mode, env);
     let mut outcome = evidence.outcome.clone();
+    // Issue #168, design decision (d): a compound whose every write target
+    // is confined to the session scratchpad is treated as `Allow` even when
+    // it would otherwise rely on the unmatched-command mode default. Checked
+    // BEFORE the sandbox-retry branch below so the same widening survives an
+    // unsandboxed retry too (see that branch's `already_scratchpad_confined`
+    // short-circuit).
+    if outcome.verdict != Verdict::Deny
+        && every_segment_is_allow_or_unmatched_default(
+            &cfg.safety,
+            &effective_command,
+            cfg.safety.default_verdict(mode),
+        )
+        && write_targets_confined(&effective_command, &scratchpad_roots) == Some(true)
+    {
+        outcome = Outcome {
+            verdict: Verdict::Allow,
+            matched: Some(Rule {
+                pattern: "<scratchpad: confined write>".to_string(),
+                origin: Origin::BuiltIn,
+            }),
+        };
+    }
     // Claude marks an explicit retry outside its OS sandbox on the Bash
     // input itself. That boundary must never inherit an ordinary command's
     // silent `allow`: a human approves it interactively, while a headless
@@ -4560,7 +4748,13 @@ fn run_check_hook_mode_with_env<W: Write>(
     //   ([`escape_allow_matches`]) -- an operator-attested retry the
     //   sandbox would otherwise force a fresh prompt for on every repeat.
     if payload.tool_input.dangerously_disable_sandbox && outcome.verdict != Verdict::Deny {
-        outcome = if outcome.verdict == Verdict::Allow
+        let already_scratchpad_confined = outcome
+            .matched
+            .as_ref()
+            .is_some_and(|rule| rule.pattern == "<scratchpad: confined write>");
+        outcome = if already_scratchpad_confined {
+            outcome
+        } else if outcome.verdict == Verdict::Allow
             && is_sandbox_bypass_safe_gh_command(&effective_command)
         {
             Outcome {
@@ -5075,6 +5269,141 @@ mod tests {
             text.contains(r#""permissionDecision":"ask""#),
             "an unknown-root cd ahead of rm -rf must still ask: got {text}"
         );
+    }
+
+    // -- write_targets_confined (issue #168, decision d) ------------------
+
+    #[test]
+    fn write_targets_confined_allows_dev_null_and_scratchpad_targets() {
+        let roots = vec!["/tmp/claude".to_string()];
+        for command in [
+            "echo hi > /dev/null",
+            "some-tool --flag > /tmp/claude/out.log",
+            "some-tool --flag >> /tmp/claude/out.log",
+            "some-tool 2> /tmp/claude/err.log",
+            "some-tool | tee /tmp/claude/combined.log",
+            "some-tool | tee -a /tmp/claude/combined.log",
+            "git log && echo done > /tmp/claude/marker",
+        ] {
+            assert_eq!(
+                write_targets_confined(command, &roots),
+                Some(true),
+                "{command}"
+            );
+        }
+    }
+
+    /// CRITICAL regression lock: a command with NO write target at all --
+    /// no redirection, or one that resolves to descriptor duplication only
+    /// (`2>&1`, no path) -- must never vacuously satisfy "every target is
+    /// confined". Without this, an arbitrary unmatched command with zero
+    /// writes (`kubectl exec -it pod -- sh`) would be silently widened to
+    /// `Allow` by the caller just for not writing anywhere at all.
+    #[test]
+    fn write_targets_confined_has_no_opinion_when_there_is_no_write_target_at_all() {
+        let roots = vec!["/tmp/claude".to_string()];
+        for command in ["kubectl exec -it pod -- sh", "some-tool 2>&1", "git log"] {
+            assert_eq!(write_targets_confined(command, &roots), None, "{command}");
+        }
+    }
+
+    #[test]
+    fn write_targets_confined_rejects_targets_outside_the_scratchpad() {
+        let roots = vec!["/tmp/claude".to_string()];
+        for command in [
+            "echo hi > /etc/passwd",
+            "some-tool >> ~/.bashrc",
+            "some-tool | tee /etc/shadow",
+        ] {
+            assert_eq!(
+                write_targets_confined(command, &roots),
+                Some(false),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn write_targets_confined_has_no_opinion_on_unparseable_targets() {
+        let roots = vec!["/tmp/claude".to_string()];
+        for command in ["some-tool > $OUT", "some-tool > \"$(mktemp)\""] {
+            assert_eq!(write_targets_confined(command, &roots), None, "{command}");
+        }
+    }
+
+    #[test]
+    fn write_targets_confined_returns_none_with_no_scratchpad_roots_configured() {
+        assert_eq!(write_targets_confined("echo hi > /dev/null", &[]), None);
+    }
+
+    #[test]
+    fn a_scratchpad_confined_compound_allows_headlessly_even_unmatched() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = super::super::testenv::HomeGuard::set(home.path());
+        let empty: HashMap<String, String> = HashMap::new();
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("loads");
+
+        let scratchpad = scratchpad_write_root(&std::env::temp_dir());
+        let command = format!("some-totally-unknown-tool --flag > {scratchpad}/out.log");
+        let stdin = format!(
+            r#"{{"tool_name":"Bash","tool_input":{{"command":"{command}"}},"permission_mode":"dontAsk"}}"#
+        );
+        let mut out = Vec::new();
+        run_check_hook_mode(&cfg, &mut out, &stdin).expect("runs");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            !text.contains(r#""permissionDecision":"ask""#) && !text.contains("deny"),
+            "a scratchpad-confined write from an otherwise-unmatched command must not prompt: got {text}"
+        );
+    }
+
+    #[test]
+    fn a_scratchpad_confined_compound_survives_an_unsandboxed_retry() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = super::super::testenv::HomeGuard::set(home.path());
+        let empty: HashMap<String, String> = HashMap::new();
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("loads");
+
+        let scratchpad = scratchpad_write_root(&std::env::temp_dir());
+        let command = format!("grep -r TODO . > {scratchpad}/todos.log");
+        let stdin = format!(
+            r#"{{"tool_name":"Bash","tool_input":{{"command":"{command}","dangerouslyDisableSandbox":true}},"permission_mode":"default"}}"#
+        );
+        let mut out = Vec::new();
+        run_check_hook_mode(&cfg, &mut out, &stdin).expect("runs");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            text.contains(r#""permissionDecision":"allow""#),
+            "got {text}"
+        );
+        assert!(!text.contains("unsandboxed retry"), "got {text}");
+    }
+
+    #[test]
+    fn a_write_outside_the_scratchpad_still_escalates_even_if_otherwise_unmatched() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = super::super::testenv::HomeGuard::set(home.path());
+        let empty: HashMap<String, String> = HashMap::new();
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("loads");
+
+        // "auto" (maps to Headless, since it is not "default"/"plan"/
+        // "acceptEdits") rather than "default" or "dontAsk": "default" is
+        // Interactive, whose own unmatched-command default is `Allow` (the
+        // primary #83 acceptance criterion) and would trivially pass this
+        // assertion without the write ever mattering; "dontAsk" is Headless
+        // but suppresses an `Ask` verdict to no output at all (`hook_output`'s
+        // `Verdict::Ask if dont_ask => return None`). Headless + non-
+        // "dontAsk" is what surfaces the unmatched-command HEADLESS default
+        // (`Ask`) as explicit text, genuinely exercising the "write outside
+        // the scratchpad still escalates" invariant this test is named for.
+        let stdin = r#"{"tool_name":"Bash","tool_input":{"command":"some-totally-unknown-tool > /etc/passwd"},"permission_mode":"auto"}"#;
+        let mut out = Vec::new();
+        run_check_hook_mode(&cfg, &mut out, stdin).expect("runs");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(text.contains(r#""permissionDecision":"ask""#), "got {text}");
     }
 
     #[test]
