@@ -1,6 +1,6 @@
 use std::io::Write;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::CtxResult;
 use super::state::StateDir;
@@ -70,6 +70,63 @@ pub fn tail(state: &StateDir, count: usize) -> CtxResult<Vec<String>> {
     Ok(lines[from..].to_vec())
 }
 
+/// The owned, deserializable counterpart of [`SafetyDecision`] (which
+/// borrows and is serialize-only) -- what a reader (issue #147's
+/// `permissions.rs` audit correlation) parses one logged line back into.
+/// Field names/shape mirror `SafetyDecision` exactly; kept as a separate
+/// type rather than making the borrowed one `Deserialize` too, the same
+/// split every other borrowed-for-writing/owned-for-reading pair in this
+/// codebase uses.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SafetyDecisionRecord {
+    pub ts: u64,
+    pub session: String,
+    /// Kept for parity with every field `SafetyDecision` writes, and for a
+    /// future correlator that wants it -- `permissions.rs`'s own audit
+    /// correlation (issue #147) infers launch mode from context instead
+    /// (which branch matched `verdict`/`matched_pattern`), so it does not
+    /// read this field today.
+    #[allow(dead_code)]
+    pub mode: String,
+    pub verdict: String,
+    pub command_sha256: String,
+    #[serde(default)]
+    pub matched_pattern: Option<String>,
+}
+
+/// Reads every parseable line across every day-bucketed
+/// `<state>/logs/safety-decisions/*.jsonl` file, oldest file first (file
+/// names are zero-padded day numbers, so lexicographic order is
+/// chronological). A line that fails to parse is skipped, not fatal --
+/// matching every other best-effort state-dir reader in this codebase; an
+/// absent directory returns an empty vec rather than an error, since "no
+/// safety decisions logged yet" is the common case, not a failure.
+pub fn read_safety_decisions(state: &StateDir) -> Vec<SafetyDecisionRecord> {
+    let dir = state.logs().join(SAFETY_LOG_DIR);
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut files: Vec<_> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("jsonl"))
+        .collect();
+    files.sort();
+
+    let mut out = Vec::new();
+    for path in files {
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        for line in text.lines() {
+            if let Ok(record) = serde_json::from_str::<SafetyDecisionRecord>(line) {
+                out.push(record);
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -112,6 +169,66 @@ mod tests {
 
         let all = std::fs::read_to_string(state.logs().join("decisions.jsonl")).expect("read");
         assert_eq!(all.lines().count(), 3);
+    }
+
+    /// Issue #147: `read_safety_decisions` reads every day-bucketed
+    /// safety-decisions file back, in file order, and skips a line that
+    /// fails to parse rather than failing the whole read.
+    #[test]
+    fn read_safety_decisions_reads_every_bucket_and_skips_bad_lines() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        state.ensure().expect("ensure");
+
+        append_safety(
+            &state,
+            &SafetyDecision {
+                ts: 1_700_000_000,
+                session: "s1",
+                mode: "interactive",
+                verdict: "ask",
+                command_sha256: "aaa",
+                policy_sha256: "p",
+                launch_policy_sha256: None,
+                attestation: "not-present",
+                matched_pattern: Some("<sandbox: unsandboxed retry>"),
+                origin: Some("built-in"),
+                platform: "linux",
+            },
+        )
+        .expect("append");
+        append_safety(
+            &state,
+            &SafetyDecision {
+                ts: 1_700_086_400, // next day bucket
+                session: "s1",
+                mode: "headless",
+                verdict: "allow",
+                command_sha256: "bbb",
+                policy_sha256: "p",
+                launch_policy_sha256: None,
+                attestation: "not-present",
+                matched_pattern: Some("<sandbox: escape_allow>"),
+                origin: Some("built-in"),
+                platform: "linux",
+            },
+        )
+        .expect("append");
+
+        // A stray unparseable line in one of the bucket files must not
+        // break reading the rest.
+        let dir = state.logs().join(SAFETY_LOG_DIR);
+        let bad_file = dir.join("0000000001.jsonl");
+        std::fs::write(&bad_file, "not json\n").expect("write");
+
+        let records = read_safety_decisions(&state);
+        assert_eq!(records.len(), 2, "got {records:?}");
+        assert_eq!(records[0].command_sha256, "aaa");
+        assert_eq!(records[1].command_sha256, "bbb");
+        assert_eq!(
+            records[1].matched_pattern.as_deref(),
+            Some("<sandbox: escape_allow>")
+        );
     }
 
     /// The log names sessions, repositories and transcript paths, so on a

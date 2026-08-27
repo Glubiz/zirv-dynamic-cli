@@ -724,6 +724,19 @@ fn set_home_ctx_toml_string(
 /// it would add before ever writing anything, so a `--dry-run` and a real
 /// write report the identical split.
 pub(crate) fn read_home_safety_allow(home: &Path) -> SetupResult<Vec<String>> {
+    read_home_safety_key(home, "allow")
+}
+
+/// Issue #147: `escape_allow` sibling of `read_home_safety_allow` above,
+/// read by `permissions::run_compile`'s `--escape` mode.
+pub(crate) fn read_home_safety_escape_allow(home: &Path) -> SetupResult<Vec<String>> {
+    read_home_safety_key(home, "escape_allow")
+}
+
+/// Shared body: reads `~/.zirv/ctx.toml`'s current `[safety] <key>` array.
+/// Empty (not an error) when the file, the `[safety]` table, or `key` is
+/// absent.
+fn read_home_safety_key(home: &Path, key: &str) -> SetupResult<Vec<String>> {
     let path = home
         .join(crate::utils::SCRIPT_DIR_NAME)
         .join(ctx::config::CTX_CONFIG_FILE);
@@ -731,13 +744,13 @@ pub(crate) fn read_home_safety_allow(home: &Path) -> SetupResult<Vec<String>> {
         return Ok(Vec::new());
     }
     let root: toml::Table = toml::from_str(&std::fs::read_to_string(&path)?)?;
-    Ok(safety_allow_array(&root))
+    Ok(safety_array(&root, key))
 }
 
-fn safety_allow_array(root: &toml::Table) -> Vec<String> {
+fn safety_array(root: &toml::Table, key: &str) -> Vec<String> {
     root.get("safety")
         .and_then(toml::Value::as_table)
-        .and_then(|safety| safety.get("allow"))
+        .and_then(|safety| safety.get(key))
         .and_then(toml::Value::as_array)
         .map(|arr| {
             arr.iter()
@@ -795,6 +808,39 @@ pub(crate) fn union_home_safety_allow(
     home: &Path,
     additions: &[String],
 ) -> SetupResult<Vec<String>> {
+    union_home_safety_key(home, "allow", additions)
+}
+
+/// Issue #147: `escape_allow` sibling of `union_home_safety_allow` above,
+/// written by `permissions::run_compile --escape`. Same contract: home
+/// layer only, additive, backed up first -- `safety.escape_allow` is
+/// `REPO_FORBIDDEN` for the identical reason `safety.allow` is.
+pub(crate) fn union_home_safety_escape_allow(
+    home: &Path,
+    additions: &[String],
+) -> SetupResult<Vec<String>> {
+    union_home_safety_key(home, "escape_allow", additions)
+}
+
+/// Shared body: unions `additions` into `~/.zirv/ctx.toml`'s `[safety]
+/// <key>` array (creating the file/table/key as needed, mirroring
+/// `set_home_ctx_toml_value`'s own read-mutate-write shape) and returns
+/// exactly the patterns that were newly added. Never removes or reorders an
+/// existing entry -- only appends genuinely new ones, deduped via
+/// `union_allow_patterns` against what is already saved. Targets ONLY the
+/// home layer, exactly like every `set_home_ctx_toml_*` writer above: a repo
+/// path is never touched, and every `key` this is called with is
+/// `REPO_FORBIDDEN` precisely so a repo layer could not do this to itself
+/// even if it tried.
+///
+/// Backs up the pre-write file to `ctx.toml.bak` first, best effort -- a
+/// failed backup must not block a write already behind a confirmed operator
+/// command (`zirv ctx permissions compile`, never run implicitly). Comments
+/// in the file are lost on rewrite, the same accepted trade-off every other
+/// writer here already makes (`toml::Table` round-trips values, not source
+/// text) -- the caller is responsible for warning about that; this function
+/// only writes.
+fn union_home_safety_key(home: &Path, key: &str, additions: &[String]) -> SetupResult<Vec<String>> {
     let path = home
         .join(crate::utils::SCRIPT_DIR_NAME)
         .join(ctx::config::CTX_CONFIG_FILE);
@@ -803,7 +849,7 @@ pub(crate) fn union_home_safety_allow(
     } else {
         toml::Table::new()
     };
-    let existing = safety_allow_array(&root);
+    let existing = safety_array(&root, key);
     let (added, _duplicates) = union_allow_patterns(&existing, additions);
     if added.is_empty() {
         return Ok(added);
@@ -827,7 +873,7 @@ pub(crate) fn union_home_safety_allow(
     let mut merged = existing;
     merged.extend(added.iter().cloned());
     safety_table.insert(
-        "allow".to_string(),
+        key.to_string(),
         toml::Value::Array(merged.into_iter().map(toml::Value::String).collect()),
     );
 

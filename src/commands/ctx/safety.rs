@@ -35,6 +35,15 @@
 //!   sets `safety.allow` at all -- there is no narrowing reading of adding
 //!   an allow entry (unlike `deny`/`ask`, evaluated *after* both), so it is
 //!   forbidden outright rather than folded, mirroring `sandbox.extra_allow`.
+//! - **`escape_allow`** (issue #147) is the identical operator-home-layer-
+//!   only story, one narrower domain down: it clears a family for a
+//!   `--dangerously-disable-sandbox` retry specifically, not the ordinary
+//!   sandboxed path `allow` governs. Also `REPO_FORBIDDEN`, for the same
+//!   widening-only reason. Unlike `allow`, it carries a built-in seed
+//!   (`builtin_escape_allow`) -- the read-only shell-utility families most
+//!   sandbox-escape prompts turned out to be -- gated behind a per-segment
+//!   credential/root-scan screen (`escape_denied_by_screen`) that a family
+//!   match alone can never bypass.
 //! - **`default`** (the verdict for a command matching nothing) is
 //!   `REPO_FORBIDDEN` outright too, for the same reason: it is a single
 //!   scalar with no narrowing direction of its own.
@@ -191,6 +200,16 @@ pub struct SafetyPolicy {
     pub deny: Vec<Rule>,
     pub ask: Vec<Rule>,
     pub allow: Vec<Rule>,
+    /// Issue #147: patterns an operator has pre-cleared for a `--dangerously-
+    /// disable-sandbox` retry specifically -- NOT folded into `allow`, which
+    /// governs the sandboxed default path. Matched against every executable
+    /// segment of the retried command (see `escape_allow_matches`), so a
+    /// compound where only one segment qualifies still falls through to the
+    /// ordinary Ask/Deny escalation. Operator-home-layer only, the same
+    /// widening-only reasoning as `allow` -- see the module doc and
+    /// `REPO_FORBIDDEN`'s `safety.escape_allow` entry. Empty by default:
+    /// unlike `allow`, there is no built-in escape set.
+    pub escape_allow: Vec<Rule>,
     /// The verdict for a command matching no rule on a HEADLESS launch.
     /// Unchanged: `Ask`, which claude's `dontAsk` mode turns into a refusal.
     /// Nobody is present to answer, so an unclassified command is an
@@ -218,6 +237,7 @@ impl Default for SafetyPolicy {
             deny: builtin_deny(),
             ask: builtin_ask(),
             allow: builtin_allow(),
+            escape_allow: builtin_escape_allow(),
             default: Verdict::Ask,
             interactive_default: Verdict::Allow,
             sql: SqlMode::On,
@@ -247,7 +267,7 @@ pub fn policy_fingerprint(policy: &SafetyPolicy) -> Result<String, serde_json::E
     Ok(sha256_hex(&serde_json::to_vec(policy)?))
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
@@ -413,7 +433,7 @@ pub struct Outcome {
 /// command, and are not part of the safety classifier's domain -- claude's
 /// own projection re-adds them directly, see `adapters::claude::
 /// ClaudeAdapter::default_sandbox_args`).
-fn command_pattern_from_bash_rule(rule: &str) -> Option<String> {
+pub(crate) fn command_pattern_from_bash_rule(rule: &str) -> Option<String> {
     rule.strip_prefix("Bash(")
         .and_then(|s| s.strip_suffix(')'))
         .map(str::to_string)
@@ -3204,6 +3224,7 @@ struct SafetyLayer {
     deny: Vec<String>,
     ask: Vec<String>,
     allow: Vec<String>,
+    escape_allow: Vec<String>,
     default: Option<Verdict>,
     interactive_default: Option<Verdict>,
     sql: Option<SqlMode>,
@@ -3232,10 +3253,10 @@ fn rules_from(patterns: &[String], origin: Origin) -> Vec<Rule> {
 /// absent when that file has no `[safety]` section) before its own deep
 /// merge; `env` is the operator override that sits above both.
 ///
-/// `repo`'s own `allow`/`default` fields are never read here, even if
-/// present: `config::reject_untrusted_keys` already hard-errors a repo file
-/// that sets either before this function is ever reached (see
-/// `REPO_FORBIDDEN`), so by the time a `repo` value arrives here it is
+/// `repo`'s own `allow`/`escape_allow`/`default` fields are never read here,
+/// even if present: `config::reject_untrusted_keys` already hard-errors a
+/// repo file that sets any of them before this function is ever reached
+/// (see `REPO_FORBIDDEN`), so by the time a `repo` value arrives here it is
 /// guaranteed not to carry them -- this is defense in depth, not the
 /// primary enforcement.
 pub fn resolve(
@@ -3287,6 +3308,24 @@ pub fn resolve(
         }
     };
 
+    // Issue #147: `escape_allow` gets the identical operator-home-layer-only
+    // treatment as `allow` above (see `REPO_FORBIDDEN`'s `safety.escape_allow`
+    // entry and this arm never reads `repo_layer.escape_allow` -- the same
+    // defense in depth `allow` already has), plus a built-in seed
+    // (`builtin_escape_allow`) `allow` has none of.
+    let escape_allow = match env("ZIRV_CTX_SAFETY_ESCAPE_ALLOW") {
+        Some(raw) => {
+            let mut escape_allow = builtin_escape_allow();
+            escape_allow.extend(rules_from(&split_csv_list(&raw), Origin::Env));
+            escape_allow
+        }
+        None => {
+            let mut escape_allow = builtin_escape_allow();
+            escape_allow.extend(rules_from(&home_layer.escape_allow, Origin::Operator));
+            escape_allow
+        }
+    };
+
     let default = match env("ZIRV_CTX_SAFETY_DEFAULT") {
         Some(raw) => Verdict::parse(&raw).ok_or_else(|| {
             format!("ZIRV_CTX_SAFETY_DEFAULT: expected allow, ask or deny, got '{raw}'")
@@ -3318,6 +3357,7 @@ pub fn resolve(
         deny,
         ask,
         allow,
+        escape_allow,
         default,
         interactive_default,
         sql,
@@ -3569,6 +3609,248 @@ fn is_sandbox_bypass_safe_gh_command(command: &str) -> bool {
         .any(|&(n, v)| n == noun && v == verb)
 }
 
+/// The credential/config paths Claude's own native OS sandbox denies
+/// reading by default (`adapters::claude::launch_settings_value`'s
+/// `sandbox.filesystem.denyRead`) -- the single source both that array and
+/// [`sensitive_credential_path`] derive from, so the two can never drift
+/// apart (issue #147 amendment, 2026-08-26). An unsandboxed
+/// `--dangerously-disable-sandbox` retry runs entirely outside that OS
+/// boundary, which is exactly why [`escape_denied_by_screen`] re-checks
+/// every escape-allowed candidate against it.
+#[cfg_attr(windows, allow(dead_code))]
+pub(crate) const SANDBOX_DENY_READ_HOME_PATHS: &[&str] = &[
+    "~/.ssh",
+    "~/.aws",
+    "~/.azure",
+    "~/.config/gcloud",
+    "~/.config/gh/hosts.yml",
+    "~/.kube/config",
+    "~/.docker/config.json",
+    "~/.npmrc",
+    "~/.pypirc",
+    "~/.netrc",
+    "~/.git-credentials",
+];
+
+/// Issue #147 (2026-08-26 operator evidence): the read-only shell-utility
+/// subset of `adapters::SHIPPED_POSTURE_ALLOW`'s own "Read-only shell
+/// utilities" block (`ls`/`grep`/`rg`/`cat`/`head`/`tail`/`wc`/`find`/
+/// `echo`/`pwd`/`which`/`where`/`diff`/`sort`/`uniq`/`tr`/`cut`) -- most
+/// interactive sandbox-escape asks turned out to be unsandboxed retries of
+/// exactly these tools reading paths outside the sandbox's default
+/// write/read scope (zirv's own state/log directories, most often). Seeded
+/// into `SafetyPolicy::escape_allow` as a BUILT-IN default via
+/// [`builtin_escape_allow`], alongside the operator's own entries.
+/// [`escape_denied_by_screen`] still gates every one of these, seeded or
+/// operator-added alike -- matching a family here proves nothing about
+/// what one specific invocation actually touches.
+const SANDBOX_ESCAPE_BUILTIN_PROGRAMS: &[&str] = &[
+    "ls", "grep", "rg", "cat", "head", "tail", "wc", "find", "echo", "pwd", "which", "where",
+    "diff", "sort", "uniq", "tr", "cut",
+];
+
+/// The built-in `escape_allow` seed: [`builtin_allow`]'s own rules (so the
+/// origin label stays `built-in`, unchanged) filtered down to
+/// [`SANDBOX_ESCAPE_BUILTIN_PROGRAMS`] by matching each rule's leading
+/// token -- a filter over the one already-declared source rather than a
+/// second copy of the glob text.
+fn builtin_escape_allow() -> Vec<Rule> {
+    builtin_allow()
+        .into_iter()
+        .filter(|rule| {
+            let program = rule.pattern.split(' ').next().unwrap_or("");
+            SANDBOX_ESCAPE_BUILTIN_PROGRAMS.contains(&program)
+        })
+        .collect()
+}
+
+/// Lexically resolves `.`/`..` path components and collapses repeated `/`
+/// separators, exactly the way a real shell's path resolution would --
+/// text-only, no filesystem access (this whole module stays pure, see
+/// `rot.rs`'s identical discipline). `..` past the top of the walk simply
+/// has nothing left to pop: this function can never know whether a real
+/// parent exists above whatever root it was handed, so it stays put rather
+/// than going negative. Returns the resolved, non-empty component list --
+/// an EMPTY result means `path` lexically reduces to nothing beyond
+/// whatever root it started from (e.g. `/`, `//`, `/.`, `/./`, `/..`,
+/// `/../` all resolve to the same empty list).
+fn resolve_lexical_path_components(path: &str) -> Vec<&str> {
+    let mut components: Vec<&str> = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                components.pop();
+            }
+            other => components.push(other),
+        }
+    }
+    components
+}
+
+/// Whether `token` is, after lexical resolution, the filesystem root or an
+/// ENTIRE home directory (this account's own, `~`, or -- since `~user`
+/// names a *different* account's whole home, the identical unbounded shape
+/// -- any other's) rather than a path bounded to a real subtree.
+///
+/// Review round 3 (2026-08-27, CRITICAL): the exact-literal check this
+/// replaced (`matches!(token, "/" | "~" | "~/")`) only ever caught the
+/// three spellings written out by hand -- `//`, `/.`, `/./`, `/..`, `/../`
+/// (all lexically identical to `/` on any POSIX filesystem: `.`/`..` at
+/// root have nowhere to go, and a doubled separator collapses) and a bare
+/// `~user` (someone else's whole home, never enumerated by name here) all
+/// sailed straight through to the seeded `find *` family's silent `Allow`.
+/// Enumerating spellings one PoC at a time does not converge -- this
+/// normalizes instead: an absolute path lexically resolves via
+/// [`resolve_lexical_path_components`] and is root-wide exactly when
+/// nothing survives the walk; a `~`-form splits off the (possibly empty)
+/// username before the first `/` -- no slash at all means the whole token
+/// IS the bare `~`/`~user` form (root-wide outright, since there is no
+/// subdirectory left to be bounded to) -- and resolves whatever follows
+/// the same way. A relative path (no leading `/` or `~`) is left alone:
+/// this classifier cannot know whether the launch's own working directory
+/// is itself at or above a sensitive root, the same non-goal
+/// `generated_path` already documents for the identical reason.
+fn is_root_wide_or_whole_home_path(token: &str) -> bool {
+    if let Some(rest) = token.strip_prefix('~') {
+        return match rest.split_once('/') {
+            Some((_user, after)) => resolve_lexical_path_components(after).is_empty(),
+            None => true,
+        };
+    }
+    token.starts_with('/') && resolve_lexical_path_components(token).is_empty()
+}
+
+/// Whether `command` is a `find` invocation whose starting-point argument
+/// is the filesystem root or the home directory -- an unbounded scan of
+/// everything readable, as opposed to a `find ./src -name '*.rs'` style
+/// search bounded to a subtree. Issue #147 amendment: `find *` is a seeded
+/// built-in escape-allow family, but a root-wide scan must never ride that
+/// seed to `Allow` just because its family matches.
+///
+/// Review round 2 (2026-08-27, CRITICAL): this used to trust a fixed
+/// `tokens[1]` outright, so a leading find OPTION (`-H`/`-L`/`-P`/...)
+/// ahead of the real starting-point shifted the root path clean out of the
+/// position this check looked at -- `find -H / -iname id_rsa` rode the
+/// seeded family straight to `Allow` with no root-wide screening at all.
+/// Mirrors [`is_risky_find_exec`]'s own stance a few hundred lines above:
+/// scan every token rather than trusting one fixed position. Also denies a
+/// starting-point built through an unquoted command substitution (`find
+/// $(echo /) -iname id_rsa`) -- a real shell could resolve that to `/` at
+/// execution time with no literal `/` ever appearing in this text-only
+/// screen's input, so it cannot be proven bounded. Root-wide-or-refuse,
+/// same `$`/backtick disqualification [`generated_path`] already applies
+/// for the identical reason; a legitimate substitution false-positives
+/// into `Ask`, never into a silent bypass.
+///
+/// Review round 3 (2026-08-27, CRITICAL): the exact-match root/home check
+/// is now [`is_root_wide_or_whole_home_path`]'s lexical normalization --
+/// see that function's own doc comment for why `//`, `/.`, `/./`, `/..`,
+/// `/../`, and a bare `~user` all had to close in one pass rather than as
+/// individually enumerated literals.
+fn is_root_wide_find_scan(command: &str) -> bool {
+    let Some(tokens) = sql_tokens(&collapse_whitespace(command)) else {
+        return false;
+    };
+    let Some(first) = tokens.first() else {
+        return false;
+    };
+    if sql_program_name(first) != "find" {
+        return false;
+    }
+    tokens
+        .iter()
+        .skip(1)
+        .any(|token| token.contains(['$', '`']) || is_root_wide_or_whole_home_path(token))
+}
+
+/// Issue #147 amendment: a family matching `escape_allow` (built-in or
+/// operator) proves nothing about what one specific retried invocation
+/// actually touches. An unsandboxed retry bypasses the OS sandbox's own
+/// `denyRead` protection entirely, so this re-checks every token against
+/// [`sensitive_upload_path`] (the existing credential-path/`.env`
+/// classifier -- a proven superset of [`SANDBOX_DENY_READ_HOME_PATHS`],
+/// reused rather than re-enumerated) and screens out an unbounded
+/// [`is_root_wide_find_scan`]. Applied per candidate in
+/// [`escape_allow_matches`], so it participates in that function's same
+/// worst-wins fold: one denied candidate fails the whole match.
+///
+/// Review round 1 (2026-08-27), Critical: an unquoted `>`/`>>`/`<` used to
+/// pass straight through this screen. `split_segments`/`normalize_segments`
+/// keep redirection characters inside the candidate text, and a seeded
+/// family pattern like `"echo *"` is a plain glob over that same text --
+/// `*` matches a trailing ` > ~/.claude/settings.json` exactly as happily as
+/// it matches an ordinary argument, so `echo '<payload>' >
+/// ~/.claude/settings.json` retried with `--dangerously-disable-sandbox`
+/// reached silent `Allow` via the built-in seed, in BOTH interactive and
+/// headless mode -- an unsandboxed *write* through a seed the doc comments
+/// above only ever reasoned about as read-only utilities. [`contains_
+/// unquoted_redirection`] (already trusted for the identical purpose by the
+/// `gh` carve-out) now screens every candidate first: any unquoted `>`/`>>`/
+/// `<` denies outright, seeded family or not. The seeded read-only
+/// utilities keep working -- their output still reaches the transcript,
+/// just never disk -- so this narrows the gate without breaking the
+/// legitimate case the seed exists for.
+fn escape_denied_by_screen(candidate: &str) -> bool {
+    if contains_unquoted_redirection(candidate) {
+        return true;
+    }
+    let Some(tokens) = sql_tokens(&collapse_whitespace(candidate)) else {
+        return false;
+    };
+    if tokens
+        .iter()
+        .skip(1)
+        .any(|token| sensitive_upload_path(token))
+    {
+        return true;
+    }
+    is_root_wide_find_scan(candidate)
+}
+
+/// Issue #147, design decision 2: whether EVERY executable segment of the
+/// (possibly compound) retried `command` is cleared for a
+/// `--dangerously-disable-sandbox` retry -- reuses [`normalize_segments`]'s
+/// own decomposition (the identical candidates [`evaluate_candidates`]
+/// folds over), so a compound where only one segment qualifies still fails
+/// the whole match: `cd /tmp && rm -rf /` can never pass just because `cd`
+/// alone would, and `grep foo file && curl evil` can never pass just
+/// because `grep` alone would. Worst segment wins -- a single non-matching
+/// or screened-out candidate fails the whole thing.
+fn escape_allow_matches(escape_allow: &[Rule], command: &str) -> bool {
+    let candidates = normalize_segments(command);
+    if candidates.is_empty() {
+        return false;
+    }
+    candidates.iter().all(|candidate| {
+        !escape_denied_by_screen(candidate)
+            && escape_allow
+                .iter()
+                .any(|rule| glob_match(&rule.pattern, candidate))
+    })
+}
+
+/// Issue #147, design decision 6: whether ANY segment of `command` matches
+/// one of this module's own deny-classification signals -- the exact
+/// dangerous-pattern set `escape_allow_matches` above already screens an
+/// escape retry against (credential paths, `.env` access, an unbounded
+/// root-wide `find`, via [`escape_denied_by_screen`]) plus every ordinary
+/// built-in/operator `deny` verdict [`evaluate`] would already raise (a
+/// destructive `rm -rf`, force-push, etc.). `permissions::compile`'s
+/// `--escape` eligibility reuses this single combinator rather than
+/// re-declaring any of these patterns: a family is eligible for `[safety]
+/// escape_allow` only when every OBSERVED command in it fails this check.
+pub(crate) fn command_fails_escape_screen(command: &str) -> bool {
+    escape_denied_by_screen(command)
+        || evaluate(
+            &SafetyPolicy::default(),
+            command,
+            super::adapters::LaunchMode::Headless,
+        )
+        .verdict
+            == Verdict::Deny
+}
+
 fn render_outcome(command: &str, outcome: &Outcome) -> String {
     let head = match &outcome.matched {
         Some(rule) => format!(
@@ -3764,6 +4046,22 @@ pub fn run_check<W: Write>(args: &CheckArgs, w: &mut W, env: EnvLookup<'_>) -> C
     run_check_hook_mode_with_env(&cfg, w, &read_stdin(), env)
 }
 
+/// Whether `env` carries zirv's own durable interactive-launch pin
+/// ([`super::adapters::LAUNCH_MODE_ENV`]) -- proof that THIS process was
+/// launched interactively by zirv itself (`zirv chat`/`zirv ctx wrap`/a
+/// dashboard pane spawned from an interactive request), independent of
+/// whatever Claude's own `permission_mode` self-report says. The hook
+/// process is a child of the claude process the pin was set on and
+/// inherits its environment, the same way it already inherits
+/// `POLICY_FINGERPRINT_ENV`/`POLICY_SNAPSHOT_ENV`. An exact-match comparison
+/// against the one value the pin is ever set to, not a mere presence check:
+/// an env var holding any other string (or absent entirely) reads as "not
+/// provably zirv-interactive-launched," the fail-closed default.
+fn launch_mode_pinned_interactive(env: EnvLookup<'_>) -> bool {
+    env(super::adapters::LAUNCH_MODE_ENV).as_deref()
+        == Some(super::adapters::LAUNCH_MODE_INTERACTIVE_VALUE)
+}
+
 /// The hook-mode core of `run_check`, split out so it can be tested by
 /// feeding it a raw stdin payload directly rather than the process's actual
 /// stdin (which `run_check` only reads lazily, once it knows this is hook
@@ -3789,10 +4087,20 @@ fn run_check_hook_mode_with_env<W: Write>(
     // the values claude documents as a human-attended session prove someone
     // is present to answer a prompt. Everything else -- `"dontAsk"`,
     // `"auto"`, `"bypassPermissions"`, an unrecognized value, or a missing
-    // field (empty string) -- fails closed to `Headless`.
-    let mode = match payload.permission_mode.as_str() {
-        "default" | "plan" | "acceptEdits" => super::adapters::LaunchMode::Interactive,
-        _ => super::adapters::LaunchMode::Headless,
+    // field (empty string) -- fails closed to `Headless`, UNLESS zirv's own
+    // durable launch-time pin proves this process was interactively
+    // launched by zirv itself regardless of what Claude's own self-reported
+    // mode says (issue #147 amendment: an operator's native `defaultMode`
+    // of `"auto"` used to defeat this check for every genuinely interactive
+    // session). See `launch_mode_pinned_interactive`.
+    let mode = if launch_mode_pinned_interactive(env)
+        || matches!(
+            payload.permission_mode.as_str(),
+            "default" | "plan" | "acceptEdits"
+        ) {
+        super::adapters::LaunchMode::Interactive
+    } else {
+        super::adapters::LaunchMode::Headless
     };
     let evidence = evaluate_with_attestation_evidence(&cfg.safety, command, mode, env);
     let mut outcome = evidence.outcome.clone();
@@ -3801,12 +4109,18 @@ fn run_check_hook_mode_with_env<W: Write>(
     // silent `allow`: a human approves it interactively, while a headless
     // worker has nobody to ask and is denied. Preserve a stronger semantic
     // deny and its more specific explanation when the command already hit
-    // one. The one carved-out exception (2026-08-25): `gh` always needs to
-    // read its own credential config, which the sandbox denies outright, so
-    // every `gh` call is already an unsandboxed retry -- a single, simple,
-    // read-only `gh` invocation ([`is_sandbox_bypass_safe_gh_command`]) that
-    // was already `Allow` before this check runs skips the escalation
-    // entirely rather than being turned into a prompt/denial.
+    // one. Two carved-out exceptions skip the escalation entirely, rather
+    // than being turned into a prompt/denial, PROVIDED the base verdict was
+    // already `Allow`:
+    // - (2026-08-25) `gh` always needs to read its own credential config,
+    //   which the sandbox denies outright, so every `gh` call is already an
+    //   unsandboxed retry -- a single, simple, read-only `gh` invocation
+    //   ([`is_sandbox_bypass_safe_gh_command`]) qualifies.
+    // - (Issue #147) every executable segment of the retried command
+    //   matches `[safety] escape_allow` (built-in seed plus the operator's
+    //   own entries) AND clears the credential/root-scan screen
+    //   ([`escape_allow_matches`]) -- an operator-attested retry the
+    //   sandbox would otherwise force a fresh prompt for on every repeat.
     if payload.tool_input.dangerously_disable_sandbox && outcome.verdict != Verdict::Deny {
         outcome = if outcome.verdict == Verdict::Allow && is_sandbox_bypass_safe_gh_command(command)
         {
@@ -3814,6 +4128,16 @@ fn run_check_hook_mode_with_env<W: Write>(
                 verdict: Verdict::Allow,
                 matched: Some(Rule {
                     pattern: "<sandbox: read-only gh>".to_string(),
+                    origin: Origin::BuiltIn,
+                }),
+            }
+        } else if outcome.verdict == Verdict::Allow
+            && escape_allow_matches(&cfg.safety.escape_allow, command)
+        {
+            Outcome {
+                verdict: Verdict::Allow,
+                matched: Some(Rule {
+                    pattern: "<sandbox: escape_allow>".to_string(),
                     origin: Origin::BuiltIn,
                 }),
             }
@@ -4268,6 +4592,7 @@ mod tests {
             deny: deny.iter().map(|p| rule(p)).collect(),
             ask: ask.iter().map(|p| rule(p)).collect(),
             allow: allow.iter().map(|p| rule(p)).collect(),
+            escape_allow: Vec::new(),
             default,
             interactive_default: Verdict::Allow,
             sql: SqlMode::On,
@@ -6030,6 +6355,23 @@ mod tests {
         assert!(policy.deny.iter().any(|r| r.pattern == "echo narrow"));
     }
 
+    /// Issue #147, defense in depth for `escape_allow`: identical to
+    /// `resolve_never_reads_allow_or_default_from_the_repo_layer` above.
+    #[test]
+    fn resolve_never_reads_escape_allow_from_the_repo_layer() {
+        let repo =
+            table("[safety]\nescape_allow = [\"curl *\"]\n").and_then(|v| v.get("safety").cloned());
+        let empty = env_from(&[]);
+        let policy = resolve(None, repo, &|k| empty.get(k).cloned()).expect("resolves");
+        assert!(
+            !policy
+                .escape_allow
+                .iter()
+                .any(|r| r.pattern == "curl *" && r.origin == Origin::Repo),
+            "a repo-carried escape_allow entry must never be read"
+        );
+    }
+
     #[test]
     fn the_operator_may_add_allow_entries_and_change_the_default() {
         let home = table("[safety]\nallow = [\"just test*\"]\ndefault = \"deny\"\n")
@@ -6043,6 +6385,59 @@ mod tests {
                 .any(|r| r.pattern == "just test*" && r.origin == Origin::Operator)
         );
         assert_eq!(policy.default, Verdict::Deny);
+    }
+
+    /// Issue #147: `escape_allow` resolves the identical way `allow` does
+    /// above -- home layer only, additive to the built-in seed -- and the
+    /// built-in read-only-utility seed is always present regardless.
+    #[test]
+    fn the_operator_may_add_escape_allow_entries_on_top_of_the_builtin_seed() {
+        let home = table("[safety]\nescape_allow = [\"just test*\"]\n")
+            .and_then(|v| v.get("safety").cloned());
+        let empty = env_from(&[]);
+        let policy = resolve(home, None, &|k| empty.get(k).cloned()).expect("resolves");
+        assert!(
+            policy
+                .escape_allow
+                .iter()
+                .any(|r| r.pattern == "just test*" && r.origin == Origin::Operator)
+        );
+        assert!(
+            policy
+                .escape_allow
+                .iter()
+                .any(|r| r.pattern == "grep *" && r.origin == Origin::BuiltIn),
+            "the built-in read-only-utility seed must still be present: {:?}",
+            policy.escape_allow
+        );
+    }
+
+    #[test]
+    fn the_environment_may_replace_the_contributed_escape_allow_list_but_keeps_builtins() {
+        let home = table("[safety]\nescape_allow = [\"just home*\"]\n")
+            .and_then(|v| v.get("safety").cloned());
+        let vars = env_from(&[("ZIRV_CTX_SAFETY_ESCAPE_ALLOW", "just env-only*")]);
+        let policy = resolve(home, None, &|k| vars.get(k).cloned()).expect("resolves");
+        assert!(
+            !policy
+                .escape_allow
+                .iter()
+                .any(|r| r.pattern == "just home*")
+        );
+        assert!(
+            policy
+                .escape_allow
+                .iter()
+                .any(|r| r.pattern == "just env-only*" && r.origin == Origin::Env)
+        );
+        assert!(
+            policy
+                .escape_allow
+                .iter()
+                .any(|r| r.pattern == "grep *" && r.origin == Origin::BuiltIn),
+            "the built-in seed survives the env override too: {:?}",
+            policy.escape_allow
+        );
     }
 
     #[test]
@@ -6259,6 +6654,424 @@ mod tests {
                 "mode {mode}: got {text}"
             );
             assert!(text.contains("unsandboxed retry"), "got {text}");
+        }
+    }
+
+    /// Issue #147, design decision 2: an operator's own `[safety]
+    /// escape_allow` entry clears a retried family in BOTH launch modes,
+    /// provided the base semantic verdict was already `Allow`. A brand-new
+    /// family (not built in) needs `[safety] allow` too, for the same
+    /// reason `[safety] allow` alone is what makes ANY new family visible
+    /// headlessly in the first place -- `escape_allow` layers the
+    /// sandbox-escape gate on top, it does not replace that first step.
+    ///
+    /// Verified through the audit log rather than stdout: `hook_output`
+    /// stays silent for BOTH `allow` and `ask` under `dontAsk` (only an
+    /// explicit `deny` is ever printed headlessly -- see its own doc
+    /// comment), so stdout alone cannot distinguish "escape-allowed" from
+    /// "fell through to ask" in headless mode. `audit_hook_decision` records
+    /// every decision regardless.
+    #[test]
+    fn operator_escape_allow_grants_allow_in_both_modes_for_an_already_allowed_family() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".zirv/ctx.toml"),
+            "[safety]\nallow = [\"just test *\"]\nescape_allow = [\"just test *\"]\n",
+        )
+        .expect("write");
+        let _home = super::super::testenv::HomeGuard::set(home.path());
+        let empty: HashMap<String, String> = HashMap::new();
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("loads");
+        assert!(
+            cfg.safety
+                .escape_allow
+                .iter()
+                .any(|r| r.pattern == "just test *" && r.origin == Origin::Operator),
+            "the operator entry must resolve into the policy: {:?}",
+            cfg.safety.escape_allow
+        );
+
+        for mode in ["default", "dontAsk"] {
+            let state = tempfile::tempdir().expect("state");
+            let env = env_from(&[(
+                super::super::state::STATE_ENV,
+                state.path().to_str().expect("utf8 state"),
+            )]);
+            let stdin = format!(
+                r#"{{"session_id":"s-{mode}","tool_name":"Bash","tool_input":{{"command":"just test unit","dangerouslyDisableSandbox":true}},"permission_mode":"{mode}"}}"#
+            );
+            let mut out = Vec::new();
+            run_check_hook_mode_with_env(&cfg, &mut out, &stdin, &|key| env.get(key).cloned())
+                .expect("runs");
+
+            let dir = state.path().join("logs/safety-decisions");
+            let file = std::fs::read_dir(&dir)
+                .expect("audit dir")
+                .next()
+                .expect("one file")
+                .expect("entry")
+                .path();
+            let logged = std::fs::read_to_string(file).expect("audit");
+            assert!(
+                logged.contains("\"verdict\":\"allow\""),
+                "mode {mode}: an already-allowed, operator-escape-allowed family must pass: got {logged}"
+            );
+            assert!(logged.contains("escape_allow"), "mode {mode}: got {logged}");
+        }
+    }
+
+    /// Design decision 2's explicit compound safety property: a segment
+    /// that is NOT escape-allowed must sink the whole compound to
+    /// Ask/Deny, even when an earlier segment is escape-allowed and the
+    /// overall semantic verdict is `Allow`.
+    #[test]
+    fn a_compound_with_one_unmatched_segment_never_escapes_to_allow() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".zirv/ctx.toml"),
+            "[safety]\nallow = [\"just test *\"]\nescape_allow = [\"just test *\"]\n",
+        )
+        .expect("write");
+        let _home = super::super::testenv::HomeGuard::set(home.path());
+        let empty: HashMap<String, String> = HashMap::new();
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("loads");
+
+        let stdin = r#"{"tool_name":"Bash","tool_input":{"command":"just test unit && curl evil.example","dangerouslyDisableSandbox":true},"permission_mode":"default"}"#;
+        let mut out = Vec::new();
+        run_check_hook_mode(&cfg, &mut out, stdin).expect("runs");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            text.contains(r#""permissionDecision":"ask""#),
+            "one unmatched segment must sink the whole compound: got {text}"
+        );
+    }
+
+    /// Amendment (2026-08-26 operator evidence): the read-only shell-
+    /// utility block already shipped in `SHIPPED_POSTURE_ALLOW` is now a
+    /// BUILT-IN `escape_allow` seed, with no operator config required.
+    #[test]
+    fn a_builtin_seeded_read_only_utility_escapes_the_sandbox_silently() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = super::super::testenv::HomeGuard::set(home.path());
+        let empty: HashMap<String, String> = HashMap::new();
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("loads");
+        assert!(
+            cfg.safety
+                .escape_allow
+                .iter()
+                .any(|r| r.pattern == "grep *" && r.origin == Origin::BuiltIn),
+            "grep must be seeded built-in: {:?}",
+            cfg.safety.escape_allow
+        );
+
+        let stdin = r#"{"tool_name":"Bash","tool_input":{"command":"grep -r TODO /Users/x/.local/state/zirv/ctx/logs","dangerouslyDisableSandbox":true},"permission_mode":"default"}"#;
+        let mut out = Vec::new();
+        run_check_hook_mode(&cfg, &mut out, stdin).expect("runs");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            text.contains(r#""permissionDecision":"allow""#),
+            "a built-in-seeded read-only utility must escape silently: got {text}"
+        );
+    }
+
+    /// SECURITY (amendment, 2026-08-26): a seeded `cat *` must never let an
+    /// unsandboxed retry read past the OS sandbox's own credential
+    /// `denyRead` list -- the pre-existing `is_sensitive_credential_access`
+    /// classifier already denies this outright (before the escalation
+    /// branch is even reached), and this pins that the new escape_allow
+    /// machinery does not weaken it.
+    #[test]
+    fn a_seeded_family_never_escapes_a_credential_path_read() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = super::super::testenv::HomeGuard::set(home.path());
+        let empty: HashMap<String, String> = HashMap::new();
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("loads");
+
+        for mode in ["default", "dontAsk"] {
+            let stdin = format!(
+                r#"{{"tool_name":"Bash","tool_input":{{"command":"cat ~/.ssh/id_rsa","dangerouslyDisableSandbox":true}},"permission_mode":"{mode}"}}"#
+            );
+            let mut out = Vec::new();
+            run_check_hook_mode(&cfg, &mut out, &stdin).expect("runs");
+            let text = String::from_utf8(out).expect("utf8");
+            assert!(
+                text.contains(r#""permissionDecision":"deny""#),
+                "mode {mode}: a credential-path read must never escape, seeded or not: got {text}"
+            );
+        }
+    }
+
+    /// SECURITY (amendment, 2026-08-26): a seeded `find *` must never let a
+    /// root-wide scan ride the family match to `Allow` -- `escape_denied_
+    /// by_screen`'s `is_root_wide_find_scan` gate.
+    #[test]
+    fn a_seeded_find_never_escapes_a_root_wide_scan() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = super::super::testenv::HomeGuard::set(home.path());
+        let empty: HashMap<String, String> = HashMap::new();
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("loads");
+        assert!(
+            cfg.safety
+                .escape_allow
+                .iter()
+                .any(|r| r.pattern == "find *"),
+            "find must be seeded built-in: {:?}",
+            cfg.safety.escape_allow
+        );
+
+        let stdin = r#"{"tool_name":"Bash","tool_input":{"command":"find / -name x","dangerouslyDisableSandbox":true},"permission_mode":"default"}"#;
+        let mut out = Vec::new();
+        run_check_hook_mode(&cfg, &mut out, stdin).expect("runs");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            text.contains(r#""permissionDecision":"ask""#),
+            "a root-wide find must never escape even though `find *` is seeded: got {text}"
+        );
+    }
+
+    /// SECURITY (review round 2, 2026-08-27, CRITICAL): `is_root_wide_
+    /// find_scan` used to trust a fixed `tokens[1]` outright, so a leading
+    /// find OPTION (`-H`/`-L`/`-P`/...) ahead of the real starting-point
+    /// argument shifted the root path clean out of the position this check
+    /// looked at -- `find -H / -iname id_rsa` rode the seeded `find *`
+    /// escape family straight to a silent, unauthenticated root-wide
+    /// credential scan with no prompt at all. Concrete PoC from the
+    /// finding.
+    #[test]
+    fn a_seeded_find_never_escapes_a_root_wide_scan_behind_a_leading_flag() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = super::super::testenv::HomeGuard::set(home.path());
+        let empty: HashMap<String, String> = HashMap::new();
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("loads");
+
+        let stdin = r#"{"tool_name":"Bash","tool_input":{"command":"find -H / -iname id_rsa","dangerouslyDisableSandbox":true},"permission_mode":"default"}"#;
+        let mut out = Vec::new();
+        run_check_hook_mode(&cfg, &mut out, stdin).expect("runs");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            text.contains(r#""permissionDecision":"ask""#),
+            "a leading -H must not shift the root path past the scan gate: got {text}"
+        );
+    }
+
+    /// Companion to the test above: a leading flag ahead of a home-relative
+    /// root scan (`~`), plus an expression option trailing the path, must
+    /// still be screened.
+    #[test]
+    fn a_seeded_find_never_escapes_a_root_wide_home_scan_behind_a_leading_flag() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = super::super::testenv::HomeGuard::set(home.path());
+        let empty: HashMap<String, String> = HashMap::new();
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("loads");
+
+        let stdin = r#"{"tool_name":"Bash","tool_input":{"command":"find -L ~ -name x","dangerouslyDisableSandbox":true},"permission_mode":"default"}"#;
+        let mut out = Vec::new();
+        run_check_hook_mode(&cfg, &mut out, stdin).expect("runs");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            text.contains(r#""permissionDecision":"ask""#),
+            "a leading -L must not shift the home-relative root path past the scan gate: got {text}"
+        );
+    }
+
+    /// SECURITY (review round 2, 2026-08-27, CRITICAL): a starting-point
+    /// built through an unquoted command substitution can resolve to `/` at
+    /// real-shell-execution time without this text-only screen ever seeing
+    /// the literal string `/` anywhere in the command -- `find $(echo /)
+    /// -iname id_rsa` must not be provably bounded just because no token is
+    /// literally a root marker.
+    #[test]
+    fn a_seeded_find_never_escapes_a_root_wide_scan_built_through_a_command_substitution() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = super::super::testenv::HomeGuard::set(home.path());
+        let empty: HashMap<String, String> = HashMap::new();
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("loads");
+
+        let stdin = r#"{"tool_name":"Bash","tool_input":{"command":"find $(echo /) -iname id_rsa","dangerouslyDisableSandbox":true},"permission_mode":"default"}"#;
+        let mut out = Vec::new();
+        run_check_hook_mode(&cfg, &mut out, stdin).expect("runs");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            text.contains(r#""permissionDecision":"ask""#),
+            "an unquoted command substitution in the path position must not escape unproven: got {text}"
+        );
+    }
+
+    /// Shared PoC runner for review round 3 (2026-08-27, CRITICAL):
+    /// `is_root_wide_find_scan` used to compare a starting-point token
+    /// against an EXACT literal set (`"/"`/`"~"`/`"~/"`), so every
+    /// textually-different but lexically-identical root spelling sailed
+    /// through -- `//`, `/.`, `/./`, `/..`, `/../`, and a bare `~user`
+    /// (someone else's whole home, the identical unbounded-scan shape as a
+    /// bare `~`) all still reached a silent `Allow` via the seeded `find *`
+    /// family on the previous round's fix. Each PoC here is a real,
+    /// shell-equivalent spelling of the filesystem root or a whole home
+    /// directory.
+    fn assert_find_command_asks(command: &str) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = super::super::testenv::HomeGuard::set(home.path());
+        let empty: HashMap<String, String> = HashMap::new();
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("loads");
+
+        let stdin = format!(
+            r#"{{"tool_name":"Bash","tool_input":{{"command":"{command}","dangerouslyDisableSandbox":true}},"permission_mode":"default"}}"#
+        );
+        let mut out = Vec::new();
+        run_check_hook_mode(&cfg, &mut out, &stdin).expect("runs");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            text.contains(r#""permissionDecision":"ask""#),
+            "`{command}` lexically resolves to a root-wide (or whole-home) scan and must not \
+             escape: got {text}"
+        );
+    }
+
+    #[test]
+    fn a_seeded_find_never_escapes_a_root_wide_scan_via_a_doubled_slash() {
+        assert_find_command_asks("find // -iname id_rsa");
+    }
+
+    #[test]
+    fn a_seeded_find_never_escapes_a_root_wide_scan_via_a_dot_component() {
+        assert_find_command_asks("find /. -iname id_rsa");
+    }
+
+    #[test]
+    fn a_seeded_find_never_escapes_a_root_wide_scan_via_a_dot_slash_component() {
+        assert_find_command_asks("find /./ -iname id_rsa");
+    }
+
+    #[test]
+    fn a_seeded_find_never_escapes_a_root_wide_scan_via_a_dot_dot_component() {
+        assert_find_command_asks("find /.. -iname id_rsa");
+    }
+
+    /// The `/../` (trailing-slash) variant, distinct from the bare `/..`
+    /// case above: `..` at the root has no parent to walk to and must
+    /// lexically resolve back to root either way, never partway "above" it.
+    #[test]
+    fn a_seeded_find_never_escapes_a_root_wide_scan_via_a_trailing_dot_dot_component() {
+        assert_find_command_asks("find /../ -iname id_rsa");
+    }
+
+    /// A bare `~user` (no slash at all) names that user's ENTIRE home
+    /// directory -- the identical unbounded shape as a bare `~`, just for a
+    /// different, potentially higher-privileged account (`/root`, `/var/root`).
+    /// Enumerating usernames is not this text-only screen's job; refusing to
+    /// prove any bare `~user` bounded is.
+    #[test]
+    fn a_seeded_find_never_escapes_a_root_wide_scan_via_a_bare_other_users_home() {
+        assert_find_command_asks("find ~root -iname id_rsa");
+    }
+
+    /// The combined shape: a leading option (round-2's own fix target)
+    /// stacked on a doubled-slash root spelling (this round's), proving
+    /// neither fix alone was ever meant to stand in for the other.
+    #[test]
+    fn a_seeded_find_never_escapes_a_root_wide_scan_via_a_leading_flag_and_a_doubled_slash() {
+        assert_find_command_asks("find -H // -iname id_rsa");
+    }
+
+    /// POSITIVE case: the normalization above must not over-deny ordinary,
+    /// genuinely bounded `find` usage into uselessness. An absolute path
+    /// naming a real subtree -- never lexically reducible to `/` no matter
+    /// how many `.`/`..` components a caller writes -- must keep escaping
+    /// silently, exactly like the pre-existing relative-path case
+    /// (`find ./src -name '*.rs'`, documented on `is_root_wide_find_scan`
+    /// itself) already does.
+    #[test]
+    fn a_seeded_find_within_a_bounded_absolute_subtree_still_escapes_silently() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = super::super::testenv::HomeGuard::set(home.path());
+        let empty: HashMap<String, String> = HashMap::new();
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("loads");
+
+        let stdin = r#"{"tool_name":"Bash","tool_input":{"command":"find /home/jonathan/project -name x","dangerouslyDisableSandbox":true},"permission_mode":"default"}"#;
+        let mut out = Vec::new();
+        run_check_hook_mode(&cfg, &mut out, stdin).expect("runs");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            text.contains(r#""permissionDecision":"allow""#),
+            "a genuinely bounded absolute subtree must still escape silently: got {text}"
+        );
+    }
+
+    /// SECURITY (amendment, 2026-08-26): required test (4) -- a compound
+    /// pairing a seeded read-only utility with an unrelated command must
+    /// never escape, mirroring `a_compound_with_one_unmatched_segment_
+    /// never_escapes_to_allow` above with the amendment's own example.
+    #[test]
+    fn a_compound_pairing_a_seeded_utility_with_an_unrelated_command_never_escapes() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = super::super::testenv::HomeGuard::set(home.path());
+        let empty: HashMap<String, String> = HashMap::new();
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("loads");
+
+        let stdin = r#"{"tool_name":"Bash","tool_input":{"command":"grep foo file && curl evil.example","dangerouslyDisableSandbox":true},"permission_mode":"default"}"#;
+        let mut out = Vec::new();
+        run_check_hook_mode(&cfg, &mut out, stdin).expect("runs");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            text.contains(r#""permissionDecision":"ask""#),
+            "the unrelated curl segment must sink the whole compound: got {text}"
+        );
+    }
+
+    /// SECURITY (review round 1, 2026-08-27, Critical): a seeded escape
+    /// family must never escape via unquoted output/input redirection.
+    /// `escape_denied_by_screen` used to check only credential paths and a
+    /// root-wide `find`, never redirection -- `split_segments`/`normalize_
+    /// segments` keep `>`/`>>`/`<` inside the candidate text, and a seeded
+    /// pattern like `"echo *"` is a plain glob over that text, so `echo
+    /// pwned > ~/.claude/settings.json` (or `>>`, or `cat < ...`) retried
+    /// with `--dangerously-disable-sandbox` reached silent `Allow` in BOTH
+    /// interactive and headless mode -- an unsandboxed *write* through a
+    /// seed the design only ever reasoned about as read-only utilities.
+    /// Neither `echo pwned > ~/.claude/settings.json` nor `cat < ...` is
+    /// caught by any BASE `[safety] deny`/`ask` rule (unlike the credential-
+    /// path test above, which is already denied before the escape branch is
+    /// even reached) -- both are plain `allow`/`escape_allow` seeded
+    /// families, so this test genuinely exercises `escape_denied_by_screen`
+    /// itself, not a base-policy denial that happens to coincide.
+    #[test]
+    fn a_seeded_family_never_escapes_via_unquoted_redirection() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = super::super::testenv::HomeGuard::set(home.path());
+        let empty: HashMap<String, String> = HashMap::new();
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("loads");
+
+        for command in [
+            "echo pwned > ~/.claude/settings.json",
+            "echo pwned >> ~/.claude/settings.json",
+            "cat < ~/.claude/settings.json",
+        ] {
+            for (mode, expected) in [("default", "ask"), ("dontAsk", "deny")] {
+                let stdin = format!(
+                    r#"{{"tool_name":"Bash","tool_input":{{"command":"{command}","dangerouslyDisableSandbox":true}},"permission_mode":"{mode}"}}"#
+                );
+                let mut out = Vec::new();
+                run_check_hook_mode(&cfg, &mut out, &stdin).expect("runs");
+                let text = String::from_utf8(out).expect("utf8");
+                assert!(
+                    text.contains(&format!(r#""permissionDecision":"{expected}""#)),
+                    "command {command:?} mode {mode}: unquoted redirection must never escape, \
+                     seeded or not: got {text}"
+                );
+            }
         }
     }
 
@@ -6641,6 +7454,62 @@ mod tests {
         assert!(
             text.contains("\"permissionDecision\":\"ask\""),
             "got {text}"
+        );
+    }
+
+    /// Issue #147 amendment (2026-08-26): an operator whose native
+    /// `defaultMode` is anything other than `"default"`/`"plan"`/
+    /// `"acceptEdits"` (the operator's own global `"auto"`, in the field
+    /// evidence that filed this) had every genuinely interactive session --
+    /// one zirv itself launched via `zirv chat`/`zirv ctx wrap`/a dashboard
+    /// pane spawned from an interactive request -- silently fall to the
+    /// fail-closed `Headless` posture on Claude's self-reported
+    /// `permission_mode` alone, asking on everything a human was right there
+    /// to approve. `run_check_hook_mode_with_env` must additionally trust
+    /// zirv's own durable launch-time pin (`adapters::LAUNCH_MODE_ENV`, set
+    /// only by a real zirv interactive launch seam and inherited by the hook
+    /// process as a child of that same claude process): present, an "auto"
+    /// self-report is overridden and classifies `Interactive`; absent,
+    /// today's self-reported-mode-only behavior is unchanged.
+    #[test]
+    fn run_check_hook_mode_trusts_zirvs_own_interactive_launch_pin_over_a_self_reported_auto_mode()
+    {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = super::super::testenv::HomeGuard::set(home.path());
+        let empty: HashMap<String, String> = HashMap::new();
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("loads");
+        let stdin = r#"{"tool_name":"Bash","tool_input":{"command":"some-unknown-tool --flag"},"permission_mode":"auto"}"#;
+
+        // WITHOUT the pin: unchanged from today -- "auto" is not a proven-
+        // interactive self-report, so this fails closed to Headless (`ask`,
+        // never `allow`).
+        let unpinned: HashMap<String, String> = HashMap::new();
+        let mut out = Vec::new();
+        run_check_hook_mode_with_env(&cfg, &mut out, stdin, &|k| unpinned.get(k).cloned())
+            .expect("runs");
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            !text.contains("\"permissionDecision\":\"allow\""),
+            "no pin set: must stay fail-closed to Headless regardless of permission_mode: got {text}"
+        );
+
+        // WITH the pin: zirv's own launch record proves this session is
+        // interactive, so the same "auto" self-report now classifies
+        // Interactive and the unmatched command gets the interactive
+        // default (`allow`).
+        let pinned = env_from(&[(
+            super::super::adapters::LAUNCH_MODE_ENV,
+            super::super::adapters::LAUNCH_MODE_INTERACTIVE_VALUE,
+        )]);
+        let mut out = Vec::new();
+        run_check_hook_mode_with_env(&cfg, &mut out, stdin, &|k| pinned.get(k).cloned())
+            .expect("runs");
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("\"permissionDecision\":\"allow\""),
+            "pin set: zirv's own interactive launch record must override an unproven self-reported \
+             mode: got {text}"
         );
     }
 

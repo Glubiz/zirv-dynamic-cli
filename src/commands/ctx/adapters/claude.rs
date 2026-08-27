@@ -437,6 +437,16 @@ impl ClaudeAdapter {
         let policy_dir = dir.join("policies");
         let policy_path = policy_dir.join(format!("{fingerprint}.json"));
         let path = dir.join(format!("claude-launch-settings-{fingerprint}.json"));
+        // Issue #147: `zirv ctx send` (and any other mail write) must
+        // succeed inside a sandboxed session, so the mailbox tree -- and
+        // ONLY the mailbox tree, never the policy-snapshot/attestation or
+        // log directories right above it -- is allow-listed for write.
+        // Best-effort: a state-dir resolution failure just omits the entry,
+        // it never blocks materializing the rest of this settings layer.
+        let mail_dir =
+            super::super::state::StateDir::resolve(&super::super::config::env_from_process())
+                .ok()
+                .map(|state| state.mail());
         let result = (|| -> std::io::Result<()> {
             super::super::state::create_private_dir_all(&dir)?;
             super::super::state::create_private_dir_all(&policy_dir)?;
@@ -444,8 +454,8 @@ impl ClaudeAdapter {
                 serde_json::to_string_pretty(safety).map_err(std::io::Error::other)?;
             policy_body.push('\n');
             super::super::state::write_private(&policy_path, &policy_body)?;
-            let settings =
-                launch_settings_value(safety, &policy_path).map_err(std::io::Error::other)?;
+            let settings = launch_settings_value(safety, &policy_path, mail_dir.as_deref())
+                .map_err(std::io::Error::other)?;
             let mut body =
                 serde_json::to_string_pretty(&settings).map_err(std::io::Error::other)?;
             body.push('\n');
@@ -466,10 +476,27 @@ impl ClaudeAdapter {
 /// using, and a later reset or minimal Claude profile cannot silently remove
 /// it. The operator's ordinary settings remain in force for keys omitted
 /// here; Claude merges hook arrays across settings levels and applies the
-/// most restrictive PreToolUse verdict (`deny > ask > allow`).
+/// most restrictive PreToolUse verdict (`deny > ask > allow`) among hooks.
+///
+/// Issue #147: this layer deliberately carries NO native
+/// `permissions.ask`/`permissions.deny` rule naming
+/// `Bash(dangerouslyDisableSandbox:true)`. One used to sit here; it is
+/// documented behavior (code.claude.com/docs/en/permissions, "Extend
+/// permissions with hooks") that a native settings rule is evaluated
+/// independently of a PreToolUse hook's own decision -- a settings `ask`
+/// rule still prompts even when the hook returns `allow`. That made every
+/// hook-side `allow` for a sandbox-escape retry a no-op, including the
+/// existing read-only-`gh` carve-out and the new `[safety] escape_allow`
+/// gate (`safety::run_check_hook_mode_with_env`): an operator who pre-
+/// cleared a family kept getting re-prompted on every repeat regardless.
+/// The attested, fail-closed safety hook is now the SOLE zirv-side decision
+/// point for an escape; the operator's own native rules, if any, still
+/// apply on top, per the same documented precedence.
+#[cfg_attr(windows, allow(unused_variables))]
 fn launch_settings_value(
     safety: &super::super::safety::SafetyPolicy,
     policy_path: &Path,
+    mail_write_dir: Option<&Path>,
 ) -> Result<Value, serde_json::Error> {
     let fingerprint = super::super::safety::policy_fingerprint(safety)?;
     #[cfg_attr(windows, allow(unused_mut))]
@@ -485,7 +512,6 @@ fn launch_settings_value(
             }]
         },
         "permissions": {
-            "ask": ["Bash(dangerouslyDisableSandbox:true)"],
             "deny": [
                 "Read(~/.ssh/**)",
                 "Read(~/.aws/**)",
@@ -511,9 +537,22 @@ fn launch_settings_value(
     // but not native Windows. On supported hosts it is the hard containment
     // boundary beneath Zirv's semantic classifier: compatible Bash commands
     // need no prompt, initialization fails closed, and an incompatible
-    // command may leave the sandbox only through the explicit ask rule above.
+    // command may leave the sandbox only through the safety hook's own
+    // escape gate above.
     #[cfg(not(windows))]
     if let Some(object) = settings.as_object_mut() {
+        let mut filesystem = serde_json::json!({
+            "denyRead": super::super::safety::SANDBOX_DENY_READ_HOME_PATHS
+        });
+        // Issue #147: `zirv ctx send`'s mailbox writes (`state.mail()`) must
+        // work inside the sandbox -- by default a sandboxed command may only
+        // write to the working directory and the session temp directory.
+        // Deliberately narrow: only the mail tree, never the policy-
+        // snapshot/attestation or log directories that sit alongside it
+        // under the same state root.
+        if let Some(mail_dir) = mail_write_dir {
+            filesystem["allowWrite"] = serde_json::json!([mail_dir.display().to_string()]);
+        }
         object.insert(
             "sandbox".to_string(),
             serde_json::json!({
@@ -521,21 +560,7 @@ fn launch_settings_value(
             "autoAllowBashIfSandboxed": true,
             "allowUnsandboxedCommands": true,
             "failIfUnavailable": true,
-            "filesystem": {
-                "denyRead": [
-                    "~/.ssh",
-                    "~/.aws",
-                    "~/.azure",
-                    "~/.config/gcloud",
-                    "~/.config/gh/hosts.yml",
-                    "~/.kube/config",
-                    "~/.docker/config.json",
-                    "~/.npmrc",
-                    "~/.pypirc",
-                    "~/.netrc",
-                    "~/.git-credentials"
-                ]
-            }
+            "filesystem": filesystem
             }),
         );
     }
@@ -1073,11 +1098,20 @@ impl AgentAdapter for ClaudeAdapter {
     /// **Cross-harness permissions (2026-08-24): Design B.** A live probe
     /// against Claude Code 2.1.241 reached `permissionMode: default`, but the
     /// account rate-limited before the Bash request, so whether a hook's
-    /// `"ask"` overrides a native `Bash(*)` allow could not be established.
-    /// The conservative projection therefore emits no blanket Bash allow:
-    /// the hook's explicit `"allow"` carries ordinary commands, while an
-    /// ask verdict cannot accidentally be bypassed by native pre-approval.
-    /// Every projected launch also carries a Zirv-owned `--settings` layer
+    /// `"ask"` overrides a native `Bash(*)` allow could not be established
+    /// live. **Answered (2026-08-26, issue #147) by the documented behavior**
+    /// (code.claude.com/docs/en/permissions, "Extend permissions with
+    /// hooks"; code.claude.com/docs/en/hooks, "Decision control"): a native
+    /// settings rule is evaluated INDEPENDENTLY of a PreToolUse hook's own
+    /// decision -- a settings `ask` rule still prompts even when the hook
+    /// returns `allow`, and a settings `deny` beats a hook `allow` outright.
+    /// So a hook's `"ask"`/`"allow"` never overrides a native `Bash(*)`
+    /// allow OR ask/deny rule either way; native rules and the hook are two
+    /// independent gates a command must clear. The conservative projection
+    /// therefore still emits no blanket Bash allow: the hook's explicit
+    /// `"allow"` carries ordinary commands, while an ask verdict cannot
+    /// accidentally be bypassed by native pre-approval. Every projected
+    /// launch also carries a Zirv-owned `--settings` layer
     /// that attests this hook for the process. On macOS/Linux/WSL2 it enables
     /// Claude's OS sandbox in auto-allow mode, fails closed if that boundary
     /// cannot start, denies common credential paths to Bash and the built-in
@@ -1306,6 +1340,7 @@ mod tests {
         launch_settings_value(
             &Default::default(),
             Path::new("zirv-test-safety-policy.json"),
+            None,
         )
         .expect("settings")
     }
@@ -1918,8 +1953,17 @@ mod tests {
     /// layer. This is the attestation that the command classifier is really
     /// installed for this process; relying on a one-time global setup leaves
     /// upgraded, reset, and deliberately minimal profiles unguarded.
+    ///
+    /// Issue #147: the native `Bash(dangerouslyDisableSandbox:true)` ask
+    /// rule this test used to pin here is now ABSENT -- documented behavior
+    /// (code.claude.com/docs/en/permissions) is that a native settings rule
+    /// is evaluated independently of a PreToolUse hook's own decision, so
+    /// that rule silently defeated every hook-side allow for an escape
+    /// retry (the gh carve-out, and the new `[safety] escape_allow` gate).
+    /// The attested safety hook is now the sole zirv-side decision point.
     #[test]
-    fn launch_settings_attest_the_safety_hook_and_sandbox_escape_gate() {
+    fn launch_settings_attest_the_safety_hook_and_no_longer_inject_the_native_sandbox_escape_ask_rule()
+     {
         let settings = test_launch_settings();
         assert_eq!(settings["disableAllHooks"], false);
         assert_eq!(
@@ -1931,11 +1975,11 @@ mod tests {
             Some(&serde_json::json!("zirv ctx safety check"))
         );
         assert!(
-            settings["permissions"]["ask"]
+            !settings["permissions"]["ask"]
                 .as_array()
                 .is_some_and(|rules| rules
                     .contains(&serde_json::json!("Bash(dangerouslyDisableSandbox:true)"))),
-            "an unsandboxed retry must cross an explicit approval boundary: {settings}"
+            "the native ask rule must be gone -- it silently defeated every hook-side allow: {settings}"
         );
         assert_eq!(settings["env"]["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"], "1");
     }
@@ -1944,7 +1988,7 @@ mod tests {
     fn launch_settings_bind_the_hook_to_an_immutable_policy_snapshot() {
         let policy = super::super::super::safety::SafetyPolicy::default();
         let policy_path = Path::new("C:/safe/policies/policy.json");
-        let settings = launch_settings_value(&policy, policy_path).expect("settings");
+        let settings = launch_settings_value(&policy, policy_path, None).expect("settings");
         let expected =
             super::super::super::safety::policy_fingerprint(&policy).expect("fingerprint");
 
@@ -1977,6 +2021,39 @@ mod tests {
             .as_array()
             .expect("built-in Read credential denials");
         assert!(read_denies.iter().any(|entry| entry == "Read(~/.ssh/**)"));
+    }
+
+    /// Issue #147: `zirv ctx send`'s mailbox writes must work inside the
+    /// sandbox, but ONLY the mail tree -- never the policy-snapshot/
+    /// attestation directory that sits right alongside it under the same
+    /// state root.
+    #[cfg(not(windows))]
+    #[test]
+    fn launch_settings_allow_write_to_the_mail_dir_but_never_the_policy_snapshot_dir() {
+        let policy = super::super::super::safety::SafetyPolicy::default();
+        let policy_path = Path::new("/state/logs/policies/abc123.json");
+        let mail_dir = Path::new("/state/mail");
+        let settings =
+            launch_settings_value(&policy, policy_path, Some(mail_dir)).expect("settings");
+        let allow_write = settings["sandbox"]["filesystem"]["allowWrite"]
+            .as_array()
+            .expect("allowWrite must be present when a mail dir is given");
+        assert!(
+            allow_write.iter().any(|entry| entry == "/state/mail"),
+            "the mail dir must be allow-listed for write: {settings}"
+        );
+        assert!(
+            !allow_write
+                .iter()
+                .any(|entry| entry.as_str().is_some_and(|s| s.contains("policies"))),
+            "the policy-snapshot/attestation dir must never be allow-listed for write: {settings}"
+        );
+
+        // No mail dir resolved (best-effort failure): no allowWrite key at
+        // all, never an empty-but-present one that could mask a future bug.
+        let settings_without_mail =
+            launch_settings_value(&policy, policy_path, None).expect("settings");
+        assert!(settings_without_mail["sandbox"]["filesystem"]["allowWrite"].is_null());
     }
 
     #[test]
@@ -2025,9 +2102,16 @@ mod tests {
             &std::fs::read_to_string(path).expect("read materialized settings"),
         )
         .expect("valid settings JSON");
+        // Mirrors exactly how `launch_settings_path` computes the mail
+        // directory it passes through -- see that method's own doc comment.
+        let mail_dir = super::super::super::state::StateDir::resolve(
+            &super::super::super::config::env_from_process(),
+        )
+        .ok()
+        .map(|state| state.mail());
         assert_eq!(
             written,
-            launch_settings_value(&policy, &policy_path).expect("settings")
+            launch_settings_value(&policy, &policy_path, mail_dir.as_deref()).expect("settings")
         );
         let snapshotted: super::super::super::safety::SafetyPolicy = serde_json::from_str(
             &std::fs::read_to_string(policy_path).expect("read policy snapshot"),

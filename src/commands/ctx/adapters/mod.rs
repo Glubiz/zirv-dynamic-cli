@@ -45,6 +45,46 @@ pub const AGENT_ENV: &str = "ZIRV_CTX_AGENT";
 /// exactly like `SESSION_ENV`/`SOCKET_ENV`.
 pub const SEAT_MODEL_ENV: &str = "ZIRV_CTX_SEAT_MODEL";
 
+/// Set on every child zirv itself launches interactively -- `zirv chat`,
+/// `zirv ctx wrap`, or a dashboard pane spawned from a request that vouches
+/// a human is present (`SpawnRequest.interactive`) -- so `zirv ctx safety
+/// check` (a `PreToolUse` hook that runs as a child of that same claude
+/// process, inheriting its environment the same way any other zirv-owned
+/// launch env var reaches it) can prove `LaunchMode::Interactive` from
+/// zirv's OWN launch record rather than trusting only Claude's
+/// self-reported `permission_mode` (issue #147 amendment, 2026-08-26): an
+/// operator whose native `defaultMode` is anything other than
+/// `"default"`/`"plan"`/`"acceptEdits"` (`"auto"`, in the field evidence
+/// that filed this) had every genuinely interactive session silently fall
+/// to the fail-closed Headless posture, asking on everything a human was
+/// right there to approve. See `safety::launch_mode_pinned_interactive` for
+/// the read side.
+///
+/// Listed in `sessions::SUPERVISION_ENV` so it is scrubbed, not inherited,
+/// by a nested launch: a headless worker spawned from inside an interactive
+/// session (`exec`/`loop`, or a dashboard pane fulfilling a non-interactive
+/// request) must decide its OWN interactivity fresh, never borrow its
+/// parent's proof.
+pub const LAUNCH_MODE_ENV: &str = "ZIRV_CTX_LAUNCH_MODE";
+/// The one value [`LAUNCH_MODE_ENV`] is ever set to. Any other value, or its
+/// absence, reads as "not provably zirv-interactive-launched" -- absence is
+/// the fail-closed default, not a second, spoofable "false" value.
+pub const LAUNCH_MODE_INTERACTIVE_VALUE: &str = "interactive";
+
+/// The `(key, value)` pair a real interactive-launch seam pushes into its
+/// child's env vector -- `None` for [`LaunchMode::Headless`], so a headless
+/// launch adds nothing rather than a second, spoofable "not interactive"
+/// value alongside the pin.
+pub fn launch_mode_pin_env(mode: LaunchMode) -> Option<(String, String)> {
+    match mode {
+        LaunchMode::Interactive => Some((
+            LAUNCH_MODE_ENV.to_string(),
+            LAUNCH_MODE_INTERACTIVE_VALUE.to_string(),
+        )),
+        LaunchMode::Headless => None,
+    }
+}
+
 /// How one argv token spells a model-selecting flag -- `--model`/`-m`, in
 /// separated (bare, value is the next token), joined-by-`=`
 /// (`--model=x`/`-m=x`), or (short form only) attached (`-mx`) form. Shared

@@ -1859,6 +1859,18 @@ pub fn run_with(
         })
         .unwrap_or_default();
     turn_env.push((adapters::AGENT_ENV.to_string(), adapter.name().to_string()));
+    // Issue #147 amendment: the durable interactive-launch pin
+    // (`adapters::LAUNCH_MODE_ENV`), set from the identical `interactive_
+    // launch` signal `policy_extra` above already used to pick this
+    // launch's `LaunchMode` -- never re-derived, so the two can never
+    // disagree about whether this session is interactive. `None` for a
+    // headless wrap: nothing is added, matching every other absent-signal
+    // case the hook already fails closed on.
+    if let Some((key, value)) =
+        adapters::launch_mode_pin_env(launch_mode_from_interactive(interactive_launch))
+    {
+        turn_env.push((key, value));
+    }
     // The seat this session sits in, for the `zirv ctx hook pretool` guard
     // running inside it. Orchestrator-only, and preferring an operator's own
     // `--model`/`--model=` passthrough in `rest` (the same flag vector this

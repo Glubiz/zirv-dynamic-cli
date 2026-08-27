@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-25
+last-verified: 2026-08-26
 ---
 
 # Untrusted Configuration
@@ -83,6 +83,7 @@ Plus a third, read-only case: `zirv ctx optimize` reads the repo's own CLAUDE.md
 | `context.max_harness_bytes` | `ZIRV_CTX_CONTEXT_MAX_HARNESS_BYTES` |
 | `context.max_harness_roster_bytes` | `ZIRV_CTX_CONTEXT_MAX_HARNESS_ROSTER_BYTES` |
 | `safety.allow` | `ZIRV_CTX_SAFETY_ALLOW` |
+| `safety.escape_allow` | `ZIRV_CTX_SAFETY_ESCAPE_ALLOW` |
 | `safety.default` | `ZIRV_CTX_SAFETY_DEFAULT` |
 | `safety.interactive_default` | `ZIRV_CTX_SAFETY_INTERACTIVE_DEFAULT` |
 | `safety.sql` | `ZIRV_CTX_SAFETY_SQL` |
@@ -137,6 +138,8 @@ The `&&` is the trust boundary: a repo's `enabled = true` is a silent no-op (the
 `[safety]` (`src/commands/ctx/safety.rs`) is a third surface built on a narrowing fold rather than one uniform deep merge. `deny`/`ask` are lifted from every layer and **unioned**: a repo may add to either, because evaluation checks deny, then ask, then allow, so either contribution can only narrow. `ask` is therefore trusted like `deny`, not like `allow`; it can interrupt an interactive session but cannot make a matched command less restricted.
 
 `allow`, `default`, `interactive_default`, and `sql` are `REPO_FORBIDDEN`. Adding an allow has no narrowing reading. Changing either unmatched-command default can loosen the corresponding launch—especially `interactive_default`, whose shipped value is already `allow`, the loosest verdict available. Turning `sql` off can remove the classifier's `Ask` narrowing from a write-shaped database command. Only the operator may choose any of those through `~/.zirv/ctx.toml` or `ZIRV_CTX_SAFETY_ALLOW`/`_DEFAULT`/`_INTERACTIVE_DEFAULT`/`_SQL`.
+
+`escape_allow` (issue #147, 2026-08-26) is `REPO_FORBIDDEN` for the identical reason as `allow`, one narrower domain down: it clears a family for a `--dangerously-disable-sandbox` retry specifically, so adding an entry can only ever loosen that gate, never narrow it. Only the operator may add to it, through `~/.zirv/ctx.toml` or `ZIRV_CTX_SAFETY_ESCAPE_ALLOW`. See [[Command Safety]] for the full mechanism (the built-in seed, the per-segment credential/root-scan screen a family match can never bypass).
 
 The environment sits above the fold and replaces only the operator+repo contribution, never the built-ins derived from `adapters::SHIPPED_POSTURE_ALLOW`/`_ASK`/`_DENY`. `zirv ctx safety check|explain --mode` reads the resolved `SafetyPolicy`; every Zirv-supervised Claude launch atomically writes an operator-owned `~/.zirv/runtime/policies/<sha256>.json` snapshot plus `claude-launch-settings-<sha256>.json` and names the latter with `--settings`, while `zirv setup apply` persists the same evaluator for launches outside Zirv. The hook verifies the snapshot fingerprint, evaluates both launch and current policy, and keeps the stricter result: repo narrowing can apply live, but operator widening requires a relaunch, and tampering asks interactively/denies headlessly. The generated layer is outside the checkout and a repo cannot widen or disable it; a write failure falls back without adding a broad shell allow. Codex has no verified per-command projection, so its sandbox/approval flags are not described as carrying these rules—see [[Ctx Adapters]] and [[Command Safety]].
 
