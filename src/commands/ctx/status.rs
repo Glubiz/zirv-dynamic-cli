@@ -3,6 +3,7 @@ use std::path::Path;
 
 use super::adapters::{self, AGENT_ENV, DefaultOrigin};
 use super::config::{CtxConfig, EnvLookup, env_from_process};
+use super::group;
 use super::handoff::latest_for_repo;
 use super::mail;
 use super::permit;
@@ -133,6 +134,168 @@ fn sessions_lines(
             .into_iter()
             .map(|short| format!("  {short}  (no record)")),
     );
+
+    lines
+}
+
+/// The header line for one work-group block: scope/limits/budget/deadline
+/// when `group` is a record this listing actually loaded (`group::list`), or
+/// just the bare `fallback_id` when it is not -- a delegation naming an
+/// unknown or never-written group id must still be shown, not dropped.
+fn group_header(group: Option<&group::WorkGroup>, fallback_id: &str) -> String {
+    let Some(wg) = group else {
+        return format!("  {fallback_id}");
+    };
+    let status = if wg.closed_at.is_some() {
+        "closed"
+    } else {
+        "open"
+    };
+    let mut header = format!(
+        "  {} [{status}] scope=\"{}\" child_limit={}",
+        wg.work_group_id, wg.scope, wg.child_limit
+    );
+    if let Some(budget) = wg.token_budget {
+        header.push_str(&format!(" budget={budget}"));
+    }
+    if let Some(deadline) = wg.deadline_secs {
+        header.push_str(&format!(" deadline={deadline}s"));
+    }
+    header
+}
+
+/// Appends one block to `lines`: `header`, then one indented line per
+/// delegation in `children` (its session id, agent, model, the four raw
+/// token classes -- same `"input {} | cache_creation {} | cache_read {} |
+/// output {}"` phrasing `usage::render_sessions` already uses for these same
+/// four classes -- wall time, and outcome), then a per-group total. A
+/// delegation whose session is still `Liveness::Live` shows `running`
+/// instead of its logged `outcome`, which is a snapshot from before the
+/// session finished.
+fn push_group_block(
+    lines: &mut Vec<String>,
+    header: String,
+    children: &[&log::DelegationRow],
+    live_sessions: &std::collections::BTreeSet<&str>,
+) {
+    lines.push(header);
+
+    let mut totals = [0u64; 4];
+    for row in children {
+        let outcome = if live_sessions.contains(row.session.as_str()) {
+            "running"
+        } else {
+            row.outcome.as_str()
+        };
+        let model = row
+            .model
+            .as_deref()
+            .map(|m| format!(" ({m})"))
+            .unwrap_or_default();
+        lines.push(format!(
+            "    {}  {}{model}  input {} | cache_creation {} | cache_read {} | output {}  wall {}  {outcome}",
+            row.session,
+            row.agent,
+            row.input_tokens,
+            row.cache_creation_input_tokens,
+            row.cache_read_input_tokens,
+            row.output_tokens,
+            format_age(row.wall_ms / 1000),
+        ));
+        totals[0] = totals[0].saturating_add(row.input_tokens);
+        totals[1] = totals[1].saturating_add(row.cache_creation_input_tokens);
+        totals[2] = totals[2].saturating_add(row.cache_read_input_tokens);
+        totals[3] = totals[3].saturating_add(row.output_tokens);
+    }
+
+    lines.push(format!(
+        "    total: input {} | cache_creation {} | cache_read {} | output {}",
+        totals[0], totals[1], totals[2], totals[3]
+    ));
+}
+
+/// Issue #155, Phase 5(f): the work-group tree -- what each delegated child
+/// has cost so far, which is the question "was delegating cheaper than doing
+/// it here" reduces to. PURE (no fs/clock/env), so it is tested without a
+/// state directory; `status::run_with` supplies its three inputs from
+/// `group::list`, `log::read_delegations` and the same `sessions::list`
+/// result it already fetched once for the sessions section below.
+///
+/// One block per group that actually has at least one delegation (`group::
+/// list`'s own newest-first order) -- a group with none is not shown, same
+/// "nothing to show is nothing shown" rule the rest of `status` follows.
+/// Then one block per group id a delegation names that this listing never
+/// loaded (the group's own file was never written, or has since been swept)
+/// -- still shown, headed by the bare id, never silently dropped. Then,
+/// last, every delegation naming no group at all, under a final "ungrouped"
+/// heading -- a one-off delegation is still spend.
+pub fn group_tree_lines(
+    groups: &[group::WorkGroup],
+    delegations: &[log::DelegationRow],
+    records: &[(sessions::Record, Liveness)],
+) -> Vec<String> {
+    if delegations.is_empty() {
+        return Vec::new();
+    }
+
+    let live_sessions: std::collections::BTreeSet<&str> = records
+        .iter()
+        .filter(|(_, liveness)| *liveness == Liveness::Live)
+        .map(|(record, _)| record.session.as_str())
+        .collect();
+
+    let mut lines = Vec::new();
+    let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+
+    for wg in groups {
+        let children: Vec<&log::DelegationRow> = delegations
+            .iter()
+            .filter(|d| d.work_group_id.as_deref() == Some(wg.work_group_id.as_str()))
+            .collect();
+        if children.is_empty() {
+            continue;
+        }
+        seen.insert(wg.work_group_id.as_str());
+        push_group_block(
+            &mut lines,
+            group_header(Some(wg), ""),
+            &children,
+            &live_sessions,
+        );
+    }
+
+    let mut orphan_ids: Vec<&str> = delegations
+        .iter()
+        .filter_map(|d| d.work_group_id.as_deref())
+        .filter(|id| !seen.contains(id))
+        .collect();
+    orphan_ids.sort_unstable();
+    orphan_ids.dedup();
+    for id in orphan_ids {
+        let children: Vec<&log::DelegationRow> = delegations
+            .iter()
+            .filter(|d| d.work_group_id.as_deref() == Some(id))
+            .collect();
+        push_group_block(
+            &mut lines,
+            group_header(None, id),
+            &children,
+            &live_sessions,
+        );
+    }
+
+    let ungrouped: Vec<&log::DelegationRow> = delegations
+        .iter()
+        .filter(|d| d.work_group_id.is_none())
+        .collect();
+    if !ungrouped.is_empty() {
+        push_group_block(
+            &mut lines,
+            group_header(None, "ungrouped"),
+            &ungrouped,
+            &live_sessions,
+        );
+    }
 
     lines
 }
@@ -331,6 +494,28 @@ pub fn run_with<W: Write>(
         )?;
         for record in &live_permits {
             writeln!(w, "  pid {} -- {}", record.pid, record.label)?;
+        }
+    }
+
+    // Issue #155, Phase 5(f): the work-group tree, right after the
+    // heavy-operations block above (that line is the machine-wide OPERATION
+    // budget; this is one orchestrator's own delegation tree, a different
+    // question) and before the plain sessions list below. `group::list` and
+    // `log::read_delegations` are both already best-effort, tolerant readers
+    // of their own on-disk state -- a missing/empty `delegations.jsonl`, a
+    // corrupt line, or a group id that names no group record ever written,
+    // all degrade to "nothing to add" rather than an error, so nothing extra
+    // is checked here. `session_records` is the exact same `sessions::list`
+    // result already fetched above -- `sessions_lines`'s own doc comment
+    // explains why a second call here would be wrong (it sweeps a stale
+    // record's file off disk as a side effect of being called at all).
+    let groups = group::list(&state);
+    let delegations = log::read_delegations(&state, 200);
+    let group_tree = group_tree_lines(&groups, &delegations, &session_records);
+    if !group_tree.is_empty() {
+        writeln!(w, "\nwork groups:")?;
+        for line in &group_tree {
+            writeln!(w, "{line}")?;
         }
     }
 
@@ -1711,5 +1896,313 @@ mod tests {
             .unwrap_or("");
         assert!(line.contains('1'), "one entry: {line}");
         assert!(line.contains("5d"), "the oldest entry's age: {line}");
+    }
+
+    fn sample_group(id: &str, scope: &str) -> group::WorkGroup {
+        group::WorkGroup {
+            work_group_id: id.to_string(),
+            parent_session_id: "sess-parent".to_string(),
+            scope: scope.to_string(),
+            child_limit: 3,
+            token_budget: None,
+            deadline_secs: None,
+            completion_contract: "report by mail".to_string(),
+            created_at: 1_700_000_000,
+            closed_at: None,
+        }
+    }
+
+    fn delegation_row(
+        work_group_id: &str,
+        session: &str,
+        agent: &str,
+        input_tokens: u64,
+        cache_read_input_tokens: u64,
+        output_tokens: u64,
+    ) -> log::DelegationRow {
+        log::DelegationRow {
+            ts: 1_700_000_000,
+            session: session.to_string(),
+            parent_session: "sess-parent".to_string(),
+            work_group_id: Some(work_group_id.to_string()),
+            agent: agent.to_string(),
+            model: None,
+            input_tokens,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens,
+            output_tokens,
+            wall_ms: 5_000,
+            exit_code: 0,
+            outcome: "ok".to_string(),
+        }
+    }
+
+    fn ungrouped_delegation_row(session: &str, agent: &str) -> log::DelegationRow {
+        let mut row = delegation_row("unused", session, agent, 0, 0, 0);
+        row.work_group_id = None;
+        row
+    }
+
+    /// Issue #155, Phase 5(f): an orchestrator can see what its own
+    /// delegation tree has cost, per child, in raw classes -- which is the
+    /// question "was delegating cheaper than doing it here" reduces to.
+    #[test]
+    fn the_group_tree_shows_each_child_with_its_own_spend() {
+        let groups = vec![sample_group("wg-1", "phase 5 implementation")];
+        let delegations = vec![
+            delegation_row("wg-1", "sess-a", "codex", 1_000, 91_000, 500),
+            delegation_row("wg-1", "sess-b", "claude", 2_000, 40_000, 900),
+        ];
+        let lines = group_tree_lines(&groups, &delegations, &[]);
+        let text = lines.join("\n");
+
+        assert!(text.contains("wg-1"), "got {text}");
+        assert!(text.contains("phase 5 implementation"), "the scope: {text}");
+        assert!(text.contains("sess-a"), "each child: {text}");
+        assert!(text.contains("sess-b"), "each child: {text}");
+        assert!(text.contains("codex"), "and which harness ran it: {text}");
+        assert!(text.contains("91000"), "raw cache-read spend: {text}");
+    }
+
+    /// A delegation with no group is not lost -- it is listed under a plain
+    /// "ungrouped" heading, because a one-off delegation is still spend.
+    #[test]
+    fn ungrouped_delegations_are_still_listed() {
+        let delegations = vec![ungrouped_delegation_row("sess-c", "codex")];
+        let text = group_tree_lines(&[], &delegations, &[]).join("\n");
+        assert!(text.contains("ungrouped"), "got {text}");
+        assert!(text.contains("sess-c"), "got {text}");
+    }
+
+    /// Nothing to show is nothing shown -- no empty heading on a machine that
+    /// has never delegated.
+    #[test]
+    fn no_groups_and_no_delegations_render_nothing() {
+        assert!(group_tree_lines(&[], &[], &[]).is_empty());
+    }
+
+    /// A delegation's `work_group_id` naming a group this listing never
+    /// loaded (the group's own file was never written, or has since been
+    /// swept) is not dropped -- either way the spend happened, and the bare
+    /// id still identifies which batch it belongs to.
+    #[test]
+    fn a_delegation_naming_an_unknown_group_still_shows_up() {
+        let delegations = vec![delegation_row("wg-ghost", "sess-d", "codex", 100, 200, 50)];
+        let text = group_tree_lines(&[], &delegations, &[]).join("\n");
+        assert!(
+            text.contains("wg-ghost"),
+            "the bare id still names it: {text}"
+        );
+        assert!(text.contains("sess-d"), "got {text}");
+    }
+
+    /// A session that is still live overrides its own last-logged outcome:
+    /// that logged value is a snapshot from before the session finished, and
+    /// "running" is more accurate than replaying a stale outcome.
+    #[test]
+    fn a_still_live_session_shows_running_not_its_recorded_outcome() {
+        let groups = vec![sample_group("wg-1", "phase 5 implementation")];
+        let mut row = delegation_row("wg-1", "sess-a", "codex", 100, 200, 50);
+        row.session = "sess-a-full-id".to_string();
+        row.outcome = "failed".to_string();
+        let record = sessions::Record::new(
+            "sess-a-full-id",
+            "codex",
+            std::path::Path::new("/repo"),
+            sessions::Verb::Exec,
+        );
+        let text = group_tree_lines(&groups, &[row], &[(record, Liveness::Live)]).join("\n");
+        assert!(text.contains("running"), "got {text}");
+        assert!(
+            !text.contains("failed"),
+            "must not show the stale outcome: {text}"
+        );
+    }
+
+    /// End-to-end: no `delegations.jsonl` at all (the common case -- `zirv
+    /// ctx agent` has never successfully delegated on this machine) must not
+    /// add a "work groups:" section, and must not disturb anything else
+    /// `status` renders.
+    #[test]
+    fn status_shows_no_work_groups_section_when_no_delegations_file_exists() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        state.ensure().expect("ensure");
+        let env = env_for(state.root());
+
+        let mut out = Vec::new();
+        let code = run_with(&StatusArgs { decisions: 5 }, &mut out, tmp.path(), &|k| {
+            env.get(k).cloned()
+        })
+        .expect("runs");
+        assert_eq!(code, 0);
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(!text.contains("work groups:"), "got {text}");
+        assert!(text.contains("no supervised sessions"), "got {text}");
+    }
+
+    /// End-to-end: a present-but-empty `delegations.jsonl` behaves exactly
+    /// like an absent one.
+    #[test]
+    fn status_shows_no_work_groups_section_when_the_delegations_file_is_empty() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        state.ensure().expect("ensure");
+        std::fs::write(state.logs().join(log::DELEGATION_FILE), "").expect("write empty");
+        let env = env_for(state.root());
+
+        let mut out = Vec::new();
+        let code = run_with(&StatusArgs { decisions: 5 }, &mut out, tmp.path(), &|k| {
+            env.get(k).cloned()
+        })
+        .expect("runs");
+        assert_eq!(code, 0);
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(!text.contains("work groups:"), "got {text}");
+    }
+
+    /// End-to-end: every real, on-disk delegation currently has
+    /// `work_group_id: None` (Task 5.3 hasn't threaded a real id through
+    /// yet) -- it must still show up, under the ungrouped heading, right
+    /// after the heavy-operations block Task 5.5 renders.
+    #[test]
+    fn status_lists_ungrouped_delegations_after_the_heavy_operations_block() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        state.ensure().expect("ensure");
+        log::append_delegation(
+            &state,
+            &log::Delegation {
+                ts: 1_700_000_000,
+                session: "sess-child",
+                parent_session: "sess-parent",
+                work_group_id: None,
+                agent: "codex",
+                model: Some("gpt-5-codex"),
+                input_tokens: 1_000,
+                cache_creation_input_tokens: 8_000,
+                cache_read_input_tokens: 91_000,
+                output_tokens: 500,
+                wall_ms: 42_000,
+                exit_code: 0,
+                outcome: "ok",
+            },
+        )
+        .expect("append");
+        let env = env_for(state.root());
+
+        let mut out = Vec::new();
+        let code = run_with(&StatusArgs { decisions: 5 }, &mut out, tmp.path(), &|k| {
+            env.get(k).cloned()
+        })
+        .expect("runs");
+        assert_eq!(code, 0);
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(text.contains("work groups:"), "got {text}");
+        assert!(text.contains("ungrouped"), "got {text}");
+        assert!(text.contains("sess-child"), "got {text}");
+
+        let heavy_at = text.find("heavy operations:");
+        let sessions_at = text.find("\nsessions:");
+        let groups_at = text.find("work groups:");
+        if let (Some(heavy_at), Some(groups_at), Some(sessions_at)) =
+            (heavy_at, groups_at, sessions_at)
+        {
+            assert!(
+                heavy_at < groups_at && groups_at < sessions_at,
+                "the group tree sits right after the heavy-operations block \
+                 and before the sessions list: {text}"
+            );
+        }
+    }
+
+    /// End-to-end: a delegation whose `work_group_id` names a group this
+    /// state dir never wrote a record for must not crash `status` or drop
+    /// the rest of its output -- it still shows up, quietly, by its bare id.
+    #[test]
+    fn status_shows_a_delegation_with_an_unknown_group_id_without_failing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        state.ensure().expect("ensure");
+        log::append_delegation(
+            &state,
+            &log::Delegation {
+                ts: 1_700_000_000,
+                session: "sess-ghost-child",
+                parent_session: "sess-parent",
+                work_group_id: Some("wg-never-written"),
+                agent: "claude",
+                model: None,
+                input_tokens: 10,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+                output_tokens: 5,
+                wall_ms: 1_000,
+                exit_code: 0,
+                outcome: "ok",
+            },
+        )
+        .expect("append");
+        let env = env_for(state.root());
+
+        let mut out = Vec::new();
+        let code = run_with(&StatusArgs { decisions: 5 }, &mut out, tmp.path(), &|k| {
+            env.get(k).cloned()
+        })
+        .expect("runs");
+        assert_eq!(code, 0, "an unknown group id must not fail the command");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(text.contains("wg-never-written"), "got {text}");
+        assert!(
+            text.contains("mail:"),
+            "the rest of status still renders: {text}"
+        );
+    }
+
+    /// End-to-end: a corrupt line in `delegations.jsonl` (a truncated
+    /// concurrent write) must not take down `status` -- the rest of the
+    /// file's rows still render.
+    #[test]
+    fn status_skips_a_corrupt_delegation_line_without_failing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        state.ensure().expect("ensure");
+        log::append_delegation(
+            &state,
+            &log::Delegation {
+                ts: 1_700_000_000,
+                session: "sess-good",
+                parent_session: "sess-parent",
+                work_group_id: None,
+                agent: "codex",
+                model: None,
+                input_tokens: 1,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+                output_tokens: 1,
+                wall_ms: 100,
+                exit_code: 0,
+                outcome: "ok",
+            },
+        )
+        .expect("append");
+        {
+            let mut file = crate::commands::ctx::state::open_private_append(
+                &state.logs().join(log::DELEGATION_FILE),
+            )
+            .expect("open");
+            use std::io::Write as _;
+            writeln!(file, "not json").expect("write corrupt line");
+        }
+        let env = env_for(state.root());
+
+        let mut out = Vec::new();
+        let code = run_with(&StatusArgs { decisions: 5 }, &mut out, tmp.path(), &|k| {
+            env.get(k).cloned()
+        })
+        .expect("runs");
+        assert_eq!(code, 0, "a corrupt line must not fail the command");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(text.contains("sess-good"), "got {text}");
     }
 }
