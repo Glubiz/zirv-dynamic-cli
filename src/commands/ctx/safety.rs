@@ -3869,9 +3869,15 @@ fn target_is_confined(target: &str, scratchpad_roots: &[String]) -> bool {
         return false;
     }
     let normalized = target.replace('\\', "/");
-    scratchpad_roots
-        .iter()
-        .any(|root| !root.is_empty() && normalized.starts_with(root.as_str()))
+    // Code review fix (CRITICAL): exact match OR root-plus-separator, the
+    // same boundary guard `strip_known_root_cd_prefix` already applies to
+    // its own root comparison -- a plain `starts_with` let a SIBLING
+    // directory whose name merely shares the root's text as a prefix
+    // (`/tmp/claude-evil` against root `/tmp/claude`) ride through as
+    // "confined" with nothing separating the two paths.
+    scratchpad_roots.iter().any(|root| {
+        !root.is_empty() && (normalized == *root || normalized.starts_with(&format!("{root}/")))
+    })
 }
 
 /// Issue #168, design decision (d): scans `segment` (already heredoc-
@@ -5351,6 +5357,41 @@ mod tests {
             text.contains(r#""permissionDecision":"ask""#),
             "an unknown-root cd ahead of rm -rf must still ask: got {text}"
         );
+    }
+
+    // -- target_is_confined (code review fix, CRITICAL) --------------------
+
+    /// `target_is_confined` used to gate confinement on a plain `starts_
+    /// with`, so a SIBLING directory whose name merely shares the root's
+    /// text as a prefix (`/tmp/claude-evil`) was wrongly treated as beneath
+    /// `/tmp/claude`. Must require the exact root, or the root followed by a
+    /// path separator -- the same boundary guard `strip_known_root_cd_
+    /// prefix` already applies to its own root comparison.
+    #[test]
+    fn target_is_confined_rejects_a_sibling_prefix_path() {
+        let roots = vec!["/tmp/claude".to_string()];
+        assert!(
+            !target_is_confined("/tmp/claude-evil/x", &roots),
+            "a sibling directory must never be treated as confined"
+        );
+        assert!(
+            !target_is_confined("/tmp/claude-evil", &roots),
+            "a sibling directory (no trailing component) must never be treated as confined"
+        );
+        // The exact root, and a genuine child, still qualify.
+        assert!(target_is_confined("/tmp/claude", &roots));
+        assert!(target_is_confined("/tmp/claude/out.log", &roots));
+    }
+
+    /// A backslash-spelled target beneath a sibling directory must be
+    /// rejected the same way, after the function's own `\`-to-`/`
+    /// normalization -- the boundary guard must apply post-normalization,
+    /// not just on whichever spelling happens to be handed in.
+    #[test]
+    fn target_is_confined_rejects_a_sibling_prefix_path_with_backslashes() {
+        let roots = vec!["C:/tmp/claude".to_string()];
+        assert!(!target_is_confined(r"C:\tmp\claude-evil\x", &roots));
+        assert!(target_is_confined(r"C:\tmp\claude\out.log", &roots));
     }
 
     // -- write_targets_confined (issue #168, decision d) ------------------
