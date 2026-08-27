@@ -5,6 +5,7 @@ use super::adapters::{self, AGENT_ENV, DefaultOrigin};
 use super::config::{CtxConfig, EnvLookup, env_from_process};
 use super::handoff::latest_for_repo;
 use super::mail;
+use super::permit;
 use super::sessions::{self, Liveness};
 use super::state::{StateDir, repo_slug};
 use super::{CtxResult, log};
@@ -300,30 +301,37 @@ pub fn run_with<W: Write>(
         Err(_) => writeln!(w, "mail: (unreadable)")?,
     }
 
-    // Fetched exactly once and shared below: `sessions::list` sweeps a
-    // stale record's file from disk as a side effect of being called at all
-    // (see its own doc comment), so calling it twice in this same pass --
-    // once for the heavy-worker count, once for `sessions_lines` -- would
-    // have the second call find the first call's swept record already gone,
-    // silently dropping it from the `sessions:` listing below.
     let session_records = sessions::list(&state);
 
-    // Issue #133: the machine-wide heavy-worker budget's current occupancy.
-    // Sourced from the same `Verb::Exec | Verb::Dash` enumeration the
-    // `exec.rs`/`dash::fulfill_spawn_request` gates use
-    // (`sessions::count_heavy_workers_among`, over the shared `list` result
-    // above), so this line and what those gates would actually refuse never
-    // disagree. Degrades silently (omits the line entirely) on a config load
-    // error -- `cfg_result` may already be an `Err` reported above (a
-    // `REPO_FORBIDDEN` rejection or any other load failure), and this is not
-    // a second place to repeat that failure.
+    // Issue #155, Phase 5(e): the machine-wide heavy-OPERATION budget's
+    // current occupancy -- live permits (`permit::live_records`), not live
+    // `Verb::Exec | Verb::Dash` session records: a session registration is
+    // no longer a heavy event by itself, only an actual classified command
+    // running inside one (`script_runner::Command::invoke`) is. The
+    // ceiling shown is `cfg.supervise.max_heavy_operations` as THIS
+    // invocation's own `CtxConfig::load` just resolved it -- never a cached
+    // or stale value -- so it is always the limit actually in force for the
+    // process rendering this line (issue #162(c)). Degrades silently (omits
+    // the line entirely) on a config load error -- `cfg_result` may already
+    // be an `Err` reported above (a `REPO_FORBIDDEN` rejection or any other
+    // load failure), and this is not a second place to repeat that failure.
+    //
+    // Issue #162(b): a refusal or wait that cannot say WHO holds the budget
+    // is undiagnosable, so every live permit is also listed by pid and
+    // label -- the identical `permit::live_records` read `script_runner`'s
+    // own wait message uses, so the two can never name a holder
+    // differently.
     if let Ok(cfg) = &cfg_result {
-        let live_heavy = sessions::count_heavy_workers_among(&session_records);
+        let live_permits = permit::live_records(&state);
         writeln!(
             w,
-            "heavy workers: {live_heavy} of {} slots in use",
-            cfg.supervise.max_heavy_workers
+            "heavy operations: {} of {} slots in use",
+            live_permits.len(),
+            cfg.supervise.max_heavy_operations
         )?;
+        for record in &live_permits {
+            writeln!(w, "  pid {} -- {}", record.pid, record.label)?;
+        }
     }
 
     writeln!(w, "\nsessions:")?;
@@ -988,32 +996,29 @@ mod tests {
         assert!(text.contains("mail: 2 unread"), "got {text}");
     }
 
-    /// Issue #133: `heavy workers: N of M slots in use` counts the same
-    /// `Verb::Exec | Verb::Dash` enumeration the `exec.rs`/`dash` gates use
-    /// (`sessions::count_heavy_workers`) against the resolved
-    /// `supervise.max_heavy_workers`.
+    /// Issue #155, Phase 5(e): `heavy operations: N of M slots in use`
+    /// counts live permits (`permit::live_records`), not live session
+    /// records -- a session that is not actually running a classified heavy
+    /// command holds nothing.
+    ///
+    /// Issue #162(b): the occupant is also named by pid and label, so an
+    /// operator who sees a full budget can tell WHAT is holding it rather
+    /// than only how many things are.
     #[test]
-    fn status_reports_the_heavy_worker_budget_occupancy() {
+    fn status_reports_the_heavy_operations_budget_occupancy() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(tmp.path().join("state"));
         state.ensure().expect("ensure");
         let mut env = env_for(state.root());
         env.insert(
-            "ZIRV_CTX_SUPERVISE_MAX_HEAVY_WORKERS".to_string(),
+            "ZIRV_CTX_SUPERVISE_MAX_HEAVY_OPERATIONS".to_string(),
             "3".to_string(),
         );
         let home = tempfile::tempdir().expect("tempdir");
         let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
 
-        let occupant = sessions::SessionGuard::register(
-            &state,
-            sessions::Record::new(
-                "66666666-2222-4333-8444-555555555555",
-                "claude",
-                tmp.path(),
-                sessions::Verb::Exec,
-            ),
-        );
+        let held =
+            permit::acquire(&state, 3, "session ab12cd34: cargo build").expect("permit granted");
 
         let mut out = Vec::new();
         run_with(&StatusArgs { decisions: 5 }, &mut out, tmp.path(), &|k| {
@@ -1023,19 +1028,27 @@ mod tests {
         let text = String::from_utf8(out).expect("utf8");
 
         assert!(
-            text.contains("heavy workers: 1 of 3 slots in use"),
+            text.contains("heavy operations: 1 of 3 slots in use"),
             "got {text}"
         );
+        assert!(
+            text.contains(&format!(
+                "pid {} -- session ab12cd34: cargo build",
+                std::process::id()
+            )),
+            "the occupant must be named, not just counted: got {text}"
+        );
 
-        drop(occupant);
+        drop(held);
     }
 
     /// A `REPO_FORBIDDEN` config rejection must not add a second failure
     /// mode on top of the `CONFIG REJECTED` line already reported above --
-    /// the heavy-worker line is simply omitted, degrading silently the same
-    /// way `describe_injection_fallback` already does for an `Err` config.
+    /// the heavy-operations line is simply omitted, degrading silently the
+    /// same way `describe_injection_fallback` already does for an `Err`
+    /// config.
     #[test]
-    fn status_omits_the_heavy_worker_line_when_config_fails_to_load() {
+    fn status_omits_the_heavy_operations_line_when_config_fails_to_load() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(tmp.path().join("state"));
         state.ensure().expect("ensure");
@@ -1046,7 +1059,7 @@ mod tests {
         std::fs::create_dir_all(tmp.path().join(".zirv")).expect("mkdir");
         std::fs::write(
             tmp.path().join(".zirv/ctx.toml"),
-            "[supervise]\nmax_heavy_workers = 99\n",
+            "[supervise]\nmax_heavy_operations = 99\n",
         )
         .expect("write");
 
@@ -1058,7 +1071,7 @@ mod tests {
         let text = String::from_utf8(out).expect("utf8");
 
         assert!(
-            !text.contains("heavy workers:"),
+            !text.contains("heavy operations:"),
             "must degrade silently on a config load error: {text}"
         );
     }

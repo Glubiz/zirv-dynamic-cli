@@ -1990,7 +1990,12 @@ fn visit_executable_nodes(command: &str, depth: usize, candidates: &mut Vec<Stri
 /// exactly): the "raw command" candidate must not carry a commit message's
 /// prose either, or `evaluate_candidates`'s worst-case fold would still deny
 /// on it regardless of what every other candidate says.
-fn normalize_segments(command: &str) -> Vec<String> {
+///
+/// `pub(crate)` (issue #155): also the candidate extraction `permit::
+/// is_heavy` reuses, so a heavy command hidden behind `sh -c` or a `&&`
+/// chain is classified by the same matcher this module's own policy checks
+/// use, rather than a second, independently-drifting copy.
+pub(crate) fn normalize_segments(command: &str) -> Vec<String> {
     let sanitized = redact_single_quoted_heredocs(command);
     let raw_candidate = redact_opaque_message(&sanitized).unwrap_or_else(|| sanitized.clone());
     let mut candidates = vec![raw_candidate];

@@ -26,6 +26,7 @@ pub mod memory_optimize;
 pub mod optimize;
 pub mod pace;
 pub mod permissions;
+pub mod permit;
 pub mod policy;
 pub mod poll;
 pub mod prompt;
