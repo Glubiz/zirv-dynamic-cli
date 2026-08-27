@@ -3933,6 +3933,39 @@ pub(crate) fn is_read_only_escape_safe(command: &str, scratchpad_roots: &[String
     })
 }
 
+/// Issue #168, design decision (b): whether EVERY executable segment of
+/// `command` is `zirv ctx <anything>`, or one of the bare `zirv help`/
+/// `zirv version`/`zirv memory`/`zirv context` built-ins (no further
+/// subcommand). `zirv ctx` is what performs the very attestation/safety
+/// checks this module implements -- a broken launch snapshot must not lock
+/// zirv's own supervision commands out from correcting it (see Task 4's
+/// self-heal, which this carve-out complements on the retry path
+/// specifically). Deliberately excludes `zirv agent`, `zirv chat`, and any
+/// other zirv subcommand or script name that launches a subprocess of its
+/// own -- narrower than the blanket `Bash(zirv *)` shipped allow rule.
+pub(crate) fn is_zirv_ctx_escape_safe(command: &str) -> bool {
+    let candidates = normalize_segments(command);
+    if candidates.is_empty() {
+        return false;
+    }
+    candidates.iter().all(|candidate| {
+        let Some(tokens) = sql_tokens(&collapse_whitespace(candidate)) else {
+            return false;
+        };
+        let Some(first) = tokens.first() else {
+            return false;
+        };
+        if sql_program_name(first) != "zirv" {
+            return false;
+        }
+        match tokens.get(1).map(String::as_str) {
+            Some("ctx") => true,
+            Some("help" | "version" | "memory" | "context") => tokens.len() == 2,
+            _ => false,
+        }
+    })
+}
+
 /// Lexically resolves `.`/`..` path components and collapses repeated `/`
 /// separators, exactly the way a real shell's path resolution would --
 /// text-only, no filesystem access (this whole module stays pure, see
@@ -4414,6 +4447,14 @@ fn run_check_hook_mode_with_env<W: Write>(
                     origin: Origin::BuiltIn,
                 }),
             }
+        } else if outcome.verdict == Verdict::Allow && is_zirv_ctx_escape_safe(command) {
+            Outcome {
+                verdict: Verdict::Allow,
+                matched: Some(Rule {
+                    pattern: "<sandbox: zirv ctx>".to_string(),
+                    origin: Origin::BuiltIn,
+                }),
+            }
         } else if outcome.verdict == Verdict::Allow
             && is_read_only_escape_safe(command, &scratchpad_roots)
         {
@@ -4752,6 +4793,74 @@ mod tests {
                 );
             }
         }
+    }
+
+    // -- is_zirv_ctx_escape_safe (issue #168, decision b) -----------------
+
+    #[test]
+    fn zirv_ctx_escape_safe_qualifies_ctx_and_bare_builtins() {
+        for command in [
+            "zirv ctx status",
+            "zirv ctx remember foo bar",
+            "zirv ctx send --to worker-1 hello",
+            "zirv help",
+            "zirv version",
+            "zirv memory",
+            "zirv context",
+            "zirv ctx status && zirv ctx remember foo",
+        ] {
+            assert!(is_zirv_ctx_escape_safe(command), "{command} should qualify");
+        }
+    }
+
+    #[test]
+    fn zirv_ctx_escape_safe_rejects_agent_chat_and_arbitrary_scripts() {
+        for command in [
+            "zirv agent codex \"do the thing\"",
+            "zirv chat",
+            "zirv build",
+            "zirv ctx status && rm -rf /",
+            "zirv",
+        ] {
+            assert!(
+                !is_zirv_ctx_escape_safe(command),
+                "{command} should not qualify"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unsandboxed_retry_of_zirv_ctx_allows_silently_even_headless() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = super::super::testenv::HomeGuard::set(home.path());
+        let empty: HashMap<String, String> = HashMap::new();
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("loads");
+
+        // Under "default" an explicit `allow` is stated (that is what keeps
+        // the interactive prompt gate silent -- see `hook_output`'s own doc
+        // comment). Under "dontAsk" an `Allow` verdict is ALWAYS silent (no
+        // output at all, pre-existing and unrelated to this task -- see
+        // `hook_output_is_silent_for_allow_under_dont_ask_and_names_other_
+        // decisions`); the invariant this test actually checks for that mode
+        // is simply that it never asks or denies.
+        let stdin_default = r#"{"tool_name":"Bash","tool_input":{"command":"zirv ctx status","dangerouslyDisableSandbox":true},"permission_mode":"default"}"#;
+        let mut out = Vec::new();
+        run_check_hook_mode(&cfg, &mut out, stdin_default).expect("runs");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            text.contains(r#""permissionDecision":"allow""#),
+            "zirv ctx status (default): got {text}"
+        );
+
+        let stdin_dont_ask = r#"{"tool_name":"Bash","tool_input":{"command":"zirv ctx status","dangerouslyDisableSandbox":true},"permission_mode":"dontAsk"}"#;
+        let mut out = Vec::new();
+        run_check_hook_mode(&cfg, &mut out, stdin_dont_ask).expect("runs");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            !text.contains("ask") && !text.contains("deny"),
+            "zirv ctx status (dontAsk): must never ask or deny, got {text}"
+        );
     }
 
     #[test]
