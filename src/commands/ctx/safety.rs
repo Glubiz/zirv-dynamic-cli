@@ -4517,11 +4517,22 @@ fn mode_consequence(verdict: Verdict, mode: super::adapters::LaunchMode) -> &'st
 /// (every pre-existing caller, and any attested one whose snapshot agrees
 /// with today's policy) leaves this function's output byte-for-byte what it
 /// was before this parameter existed.
+/// Code review fix: `status` (`AttestedEvaluation.status`) now also drives an
+/// explicit note when it is `"self-healed"` -- previously this function only
+/// ever read `divergence`, so a self-healed evaluation (an invalid, missing,
+/// or hash-mismatched launch attestation, `self_healed_evaluation`) produced
+/// an explanation indistinguishable from an ordinary, fully-verified one.
+/// Both callers -- `hook_output`'s own `permissionDecisionReason` (what an
+/// operator/transcript viewer actually sees for a live decision) and
+/// `run_explain` (`zirv ctx safety explain`, run separately after the fact)
+/// -- now surface it. `"not-present"`/`"valid"` add nothing, matching
+/// today's behavior exactly.
 fn explain_text(
     command: &str,
     outcome: &Outcome,
     mode: super::adapters::LaunchMode,
     divergence: SnapshotDivergence,
+    status: &str,
 ) -> String {
     let head = match &outcome.matched {
         Some(rule) => format!(
@@ -4547,6 +4558,13 @@ fn explain_text(
              policy.",
             current_verdict.label()
         ));
+    }
+    if status == "self-healed" {
+        text.push_str(
+            " Note: the launch attestation self-healed -- the pinned launch-snapshot file was \
+             missing, unreadable, or did not match its expected fingerprint, so this reflects \
+             your current policy directly rather than an unverifiable launch snapshot.",
+        );
     }
     text
 }
@@ -4590,6 +4608,7 @@ fn hook_output(
     outcome: &Outcome,
     permission_mode: &str,
     divergence: SnapshotDivergence,
+    status: &str,
 ) -> Option<String> {
     let dont_ask = permission_mode == "dontAsk";
     let decision = match outcome.verdict {
@@ -4626,6 +4645,7 @@ fn hook_output(
                         super::adapters::LaunchMode::Interactive
                     },
                     divergence,
+                    status,
                 ),
             }
         })
@@ -4909,6 +4929,7 @@ fn run_check_hook_mode_with_env<W: Write>(
         &outcome,
         &payload.permission_mode,
         evidence.divergence,
+        evidence.status,
     ) {
         writeln!(w, "{output}")?;
     }
@@ -5002,7 +5023,13 @@ pub fn run_explain<W: Write>(args: &ExplainArgs, w: &mut W, env: EnvLookup<'_>) 
     writeln!(
         w,
         "{}",
-        explain_text(&command, &evidence.outcome, args.mode, evidence.divergence)
+        explain_text(
+            &command,
+            &evidence.outcome,
+            args.mode,
+            evidence.divergence,
+            evidence.status,
+        )
     )?;
     Ok(evidence.outcome.verdict.exit_code())
 }
@@ -6031,6 +6058,85 @@ mod tests {
         assert_eq!(evidence.outcome.verdict, Verdict::Allow);
     }
 
+    /// Code review fix: the hook's own `permissionDecisionReason` (what an
+    /// operator or transcript viewer actually sees for a live decision) must
+    /// also name a self-healed attestation -- not just `zirv ctx safety
+    /// explain`, run separately and after the fact.
+    #[test]
+    fn the_hook_reason_names_a_self_healed_attestation() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = super::super::testenv::HomeGuard::set(home.path());
+        let snapshot_dir = tempfile::tempdir().expect("tempdir");
+        let snapshot = snapshot_dir.path().join("policy.json");
+        std::fs::write(&snapshot, "not valid json at all").expect("writes garbage");
+        let env = env_from(&[
+            (
+                POLICY_FINGERPRINT_ENV,
+                "irrelevant-since-file-is-unreadable",
+            ),
+            (POLICY_SNAPSHOT_ENV, snapshot.to_str().expect("utf8 path")),
+        ]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("loads");
+
+        let stdin = r#"{"tool_name":"Bash","tool_input":{"command":"cargo test"},"permission_mode":"default"}"#;
+        let mut out = Vec::new();
+        run_check_hook_mode_with_env(&cfg, &mut out, stdin, &|k| env.get(k).cloned())
+            .expect("runs");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            text.to_lowercase().contains("self-heal"),
+            "the hook's own decision reason must name a self-healed attestation: got {text}"
+        );
+    }
+
+    /// Code review fix (verification, not a production change): the audit
+    /// log already carries `evidence.status` verbatim (`audit_hook_decision`
+    /// passes `attestation: evidence.status`), so a self-healed evaluation
+    /// must already show up as `"attestation":"self-healed"` in the JSONL
+    /// record. Regression-locked here so a future refactor cannot silently
+    /// drop it.
+    #[test]
+    fn the_audit_log_records_a_self_healed_attestation() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let state = tempfile::tempdir().expect("state");
+        let _home = super::super::testenv::HomeGuard::set(home.path());
+        let snapshot_dir = tempfile::tempdir().expect("tempdir");
+        let snapshot = snapshot_dir.path().join("policy.json");
+        std::fs::write(&snapshot, "not valid json at all").expect("writes garbage");
+        let env = env_from(&[
+            (
+                POLICY_FINGERPRINT_ENV,
+                "irrelevant-since-file-is-unreadable",
+            ),
+            (POLICY_SNAPSHOT_ENV, snapshot.to_str().expect("utf8 path")),
+            (
+                super::super::state::STATE_ENV,
+                state.path().to_str().expect("utf8 state"),
+            ),
+        ]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("loads");
+
+        let stdin = r#"{"session_id":"abc","tool_name":"Bash","tool_input":{"command":"cargo test"},"permission_mode":"default"}"#;
+        let mut out = Vec::new();
+        run_check_hook_mode_with_env(&cfg, &mut out, stdin, &|k| env.get(k).cloned())
+            .expect("runs");
+
+        let dir = state.path().join("logs/safety-decisions");
+        let file = std::fs::read_dir(dir)
+            .expect("audit dir")
+            .next()
+            .expect("one file")
+            .expect("entry")
+            .path();
+        let text = std::fs::read_to_string(file).expect("audit");
+        assert!(
+            text.contains(r#""attestation":"self-healed""#),
+            "got {text}"
+        );
+    }
+
     /// Issue #139: the divergence direction itself, computed straight from
     /// `evaluate_with_attestation_evidence` -- not merely the outcome
     /// (already covered by `an_attested_launch_keeps_the_stricter_policy_
@@ -6179,6 +6285,44 @@ mod tests {
         assert!(
             !text.contains("launch snapshot"),
             "no attestation in play, so no divergence note: {text}"
+        );
+    }
+
+    /// Code review fix: `zirv ctx safety explain` used to silently evaluate
+    /// against the current policy on a self-healed attestation, with no
+    /// indication anything was wrong -- an operator reading the explanation
+    /// would have no way to know the launch snapshot was invalid and the
+    /// answer came from self-heal rather than a verified attestation.
+    #[test]
+    fn run_explain_names_a_self_healed_attestation() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).expect("mkdir home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+
+        let snapshot = tmp.path().join("policy.json");
+        std::fs::write(&snapshot, "not valid json at all").expect("writes garbage");
+        let env = env_from(&[
+            (
+                POLICY_FINGERPRINT_ENV,
+                "irrelevant-since-file-is-unreadable",
+            ),
+            (POLICY_SNAPSHOT_ENV, snapshot.to_str().expect("utf8 path")),
+        ]);
+
+        let args = ExplainArgs {
+            repo,
+            mode: LaunchMode::Interactive,
+            command: vec!["cargo".to_string(), "test".to_string()],
+        };
+        let mut out = Vec::new();
+        run_explain(&args, &mut out, &|k| env.get(k).cloned()).expect("runs");
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.to_lowercase().contains("self-heal"),
+            "an invalid attestation snapshot must be named as self-healed, not silently ignored: {text}"
         );
     }
 
@@ -7716,6 +7860,7 @@ mod tests {
             &allow,
             "default",
             SnapshotDivergence::Unchanged,
+            "not-present",
         )
         .expect("an allow must be stated, not implied by silence");
         assert!(
@@ -7740,7 +7885,8 @@ mod tests {
                 "npm install",
                 &allow,
                 "dontAsk",
-                SnapshotDivergence::Unchanged
+                SnapshotDivergence::Unchanged,
+                "not-present"
             )
             .is_none()
         );
@@ -8196,7 +8342,16 @@ mod tests {
             verdict: Verdict::Allow,
             matched: None,
         };
-        assert!(hook_output("ls", &allow, "dontAsk", SnapshotDivergence::Unchanged).is_none());
+        assert!(
+            hook_output(
+                "ls",
+                &allow,
+                "dontAsk",
+                SnapshotDivergence::Unchanged,
+                "not-present"
+            )
+            .is_none()
+        );
 
         let deny = Outcome {
             verdict: Verdict::Deny,
@@ -8205,8 +8360,14 @@ mod tests {
                 origin: Origin::BuiltIn,
             }),
         };
-        let output = hook_output("rm -rf /", &deny, "default", SnapshotDivergence::Unchanged)
-            .expect("deny produces output");
+        let output = hook_output(
+            "rm -rf /",
+            &deny,
+            "default",
+            SnapshotDivergence::Unchanged,
+            "not-present",
+        )
+        .expect("deny produces output");
         assert!(output.contains("\"permissionDecision\":\"deny\""));
         assert!(output.contains("\"hookEventName\":\"PreToolUse\""));
 
@@ -8217,8 +8378,14 @@ mod tests {
                 origin: Origin::BuiltIn,
             }),
         };
-        let output = hook_output("git push", &ask, "default", SnapshotDivergence::Unchanged)
-            .expect("ask produces output");
+        let output = hook_output(
+            "git push",
+            &ask,
+            "default",
+            SnapshotDivergence::Unchanged,
+            "not-present",
+        )
+        .expect("ask produces output");
         assert!(output.contains("\"permissionDecision\":\"ask\""));
     }
 
@@ -8239,7 +8406,16 @@ mod tests {
                 origin: Origin::BuiltIn,
             }),
         };
-        assert!(hook_output("git push", &ask, "dontAsk", SnapshotDivergence::Unchanged).is_none());
+        assert!(
+            hook_output(
+                "git push",
+                &ask,
+                "dontAsk",
+                SnapshotDivergence::Unchanged,
+                "not-present"
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -8251,8 +8427,14 @@ mod tests {
                 origin: Origin::BuiltIn,
             }),
         };
-        let output = hook_output("rm -rf /", &deny, "dontAsk", SnapshotDivergence::Unchanged)
-            .expect("deny still denies");
+        let output = hook_output(
+            "rm -rf /",
+            &deny,
+            "dontAsk",
+            SnapshotDivergence::Unchanged,
+            "not-present",
+        )
+        .expect("deny still denies");
         assert!(output.contains("\"permissionDecision\":\"deny\""));
     }
 
@@ -8268,8 +8450,14 @@ mod tests {
                 origin: Origin::BuiltIn,
             }),
         };
-        let output = hook_output("git push", &ask, "", SnapshotDivergence::Unchanged)
-            .expect("ask still asks");
+        let output = hook_output(
+            "git push",
+            &ask,
+            "",
+            SnapshotDivergence::Unchanged,
+            "not-present",
+        )
+        .expect("ask still asks");
         assert!(output.contains("\"permissionDecision\":\"ask\""));
     }
 
@@ -9276,6 +9464,7 @@ mod tests {
             &ask,
             LaunchMode::Interactive,
             SnapshotDivergence::Unchanged,
+            "not-present",
         );
         assert!(interactive.contains("built-in"), "got {interactive}");
         assert!(interactive.contains("prompts"), "got {interactive}");
@@ -9285,6 +9474,7 @@ mod tests {
             &ask,
             LaunchMode::Headless,
             SnapshotDivergence::Unchanged,
+            "not-present",
         );
         assert!(headless.contains("fails closed"), "got {headless}");
         assert!(
@@ -9310,6 +9500,7 @@ mod tests {
             SnapshotDivergence::SnapshotStricter {
                 current_verdict: Verdict::Allow,
             },
+            "valid",
         );
         assert!(
             text.contains("launch snapshot"),
@@ -9344,11 +9535,45 @@ mod tests {
             &ask,
             LaunchMode::Interactive,
             SnapshotDivergence::Unchanged,
+            "not-present",
         );
         assert!(
             !text.contains("launch snapshot"),
             "must not mention a snapshot that never diverged: {text}"
         );
+    }
+
+    /// Code review fix: `status: "self-healed"` must add an explicit note;
+    /// every other status (`"not-present"`/`"valid"`) must add nothing, the
+    /// same additive-only contract the divergence note already has.
+    #[test]
+    fn explain_text_names_a_self_healed_attestation_but_only_that_status() {
+        let allow = Outcome {
+            verdict: Verdict::Allow,
+            matched: None,
+        };
+        let healed = explain_text(
+            "cargo test",
+            &allow,
+            LaunchMode::Interactive,
+            SnapshotDivergence::Unchanged,
+            "self-healed",
+        );
+        assert!(healed.to_lowercase().contains("self-heal"), "got {healed}");
+
+        for status in ["not-present", "valid"] {
+            let text = explain_text(
+                "cargo test",
+                &allow,
+                LaunchMode::Interactive,
+                SnapshotDivergence::Unchanged,
+                status,
+            );
+            assert!(
+                !text.to_lowercase().contains("self-heal"),
+                "status {status} must not mention self-heal: {text}"
+            );
+        }
     }
 
     /// An unmatched command explains the DIFFERENT default it hit per mode --
@@ -9442,6 +9667,7 @@ mod tests {
             &ask,
             &mode_of(LaunchMode::Interactive),
             SnapshotDivergence::Unchanged,
+            "not-present",
         )
         .expect("an interactive launch must genuinely prompt");
         assert!(
@@ -9455,6 +9681,7 @@ mod tests {
                 &ask,
                 &mode_of(LaunchMode::Headless),
                 SnapshotDivergence::Unchanged,
+                "not-present",
             )
             .is_none(),
             "a headless launch has nobody to prompt: the hook must fall through"
@@ -9467,7 +9694,8 @@ mod tests {
                 "git push --force x",
                 &ask,
                 "dontAsk",
-                SnapshotDivergence::Unchanged
+                SnapshotDivergence::Unchanged,
+                "not-present"
             )
             .is_none()
         );
@@ -9484,8 +9712,14 @@ mod tests {
             }),
         };
         for mode in ["dontAsk", "default", ""] {
-            let output = hook_output("sudo rm -rf /", &deny, mode, SnapshotDivergence::Unchanged)
-                .expect("deny still denies");
+            let output = hook_output(
+                "sudo rm -rf /",
+                &deny,
+                mode,
+                SnapshotDivergence::Unchanged,
+                "not-present",
+            )
+            .expect("deny still denies");
             assert!(
                 output.contains("\"permissionDecision\":\"deny\""),
                 "mode {mode}: got {output}"
