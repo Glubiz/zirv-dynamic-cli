@@ -64,8 +64,9 @@ outcomes, including failures, plainly.
 - Before reporting development work done, run this harness's own /code-review over the full diff \
 at a single-reviewer effort level (low or medium), routed to the review model named in the \
 harness roster, never this seat's own model, and never a high-or-above fan-out, which forks \
-agents that inherit the seat's expensive model. A session that also carries the zirv meta-harness \
-layer follows that layer's cross-harness review round on top.";
+agents that inherit the seat's expensive model. If a `zirv workflow` review gate is active for \
+this change, that gate is the single source of truth and this native review does not run at all: \
+`zirv workflow review run` is the round.";
 
 /// Claude's own layer for a delegated **Worker** session (see
 /// `AgentAdapter::worker_system_prompt`), spliced in place of
@@ -3131,6 +3132,22 @@ mod tests {
             ),
             "the model-routing bullet's pin clause must carve out the review-model exception: \
              {ORCHESTRATOR_PROMPT}"
+        );
+    }
+
+    /// The specific sentence being corrected: the orchestrator layer used to
+    /// say a session carrying the zirv meta-harness layer follows that
+    /// layer's cross-harness review round "on top" of its own /code-review.
+    /// That instruction is what turned one change into three review rounds.
+    #[test]
+    fn the_orchestrator_layer_no_longer_stacks_a_review_round_on_top() {
+        assert!(
+            !ORCHESTRATOR_PROMPT.contains("on top"),
+            "the stacking instruction must be gone"
+        );
+        assert!(
+            ORCHESTRATOR_PROMPT.contains("zirv workflow"),
+            "and must instead defer to the workflow gate when one is active"
         );
     }
 
