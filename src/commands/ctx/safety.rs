@@ -4413,11 +4413,6 @@ fn launch_mode_pinned_interactive(env: EnvLookup<'_>) -> bool {
         == Some(super::adapters::LAUNCH_MODE_INTERACTIVE_VALUE)
 }
 
-/// The hook-mode core of `run_check`, split out so it can be tested by
-/// feeding it a raw stdin payload directly rather than the process's actual
-/// stdin (which `run_check` only reads lazily, once it knows this is hook
-/// mode -- reading it eagerly here would make CLI mode block waiting on
-/// stdin that never arrives).
 /// Issue #168: the actual filesystem scratchpad root (`<temp_dir>/claude`)
 /// a write/output target must fall beneath to count as session-scratchpad-
 /// confined -- forward-slash-normalized, no trailing separator, the same
@@ -4431,6 +4426,75 @@ fn scratchpad_write_root(temp_dir: &std::path::Path) -> String {
     format!("{}/claude", normalized.trim_end_matches('/'))
 }
 
+/// Issue #168, design decision (e): if `command` begins with a literal (no
+/// `$`, backtick, `~`, or glob character), single-token `cd <path>` segment
+/// followed by `&&`, `;`, or a newline, and `<path>` resolves under one of
+/// `allowed_roots` OR contains a `.claude/worktrees` path component anywhere,
+/// returns the remainder with that leading segment stripped -- e.g. `cd
+/// <worktree> && git log` becomes `git log`, so the compound is classified
+/// by the real work alone instead of the unmatched-by-any-rule `cd` segment
+/// dragging the whole thing to the mode default. `None` leaves `command`
+/// untouched: no leading `cd` at all, an unproven/dynamic path, a `cd`
+/// containing `..` (this classifier is text-only and cannot re-resolve a
+/// relative escape), or a bare `cd <path>` with nothing chained after it
+/// (left to classify exactly as it does today).
+pub(crate) fn strip_known_root_cd_prefix(
+    command: &str,
+    allowed_roots: &[String],
+) -> Option<String> {
+    let trimmed = command.trim_start();
+    let rest = trimmed.strip_prefix("cd ")?;
+    let (split_at, sep_len) = ["&&", ";", "\n"]
+        .iter()
+        .filter_map(|sep| rest.find(sep).map(|idx| (idx, sep.len())))
+        .min_by_key(|&(idx, _)| idx)?;
+    let (path_token, remainder) = {
+        let (head, tail) = rest.split_at(split_at);
+        (head.trim(), tail[sep_len..].trim())
+    };
+    if path_token.is_empty() || remainder.is_empty() {
+        return None;
+    }
+    if path_token.split_whitespace().count() != 1
+        || path_token.contains(['$', '`', '~', '*', '?'])
+        || path_token.contains("..")
+    {
+        return None;
+    }
+    let normalized = strip_quotes(path_token).replace('\\', "/");
+    let under_worktrees =
+        normalized.contains(".claude/worktrees/") || normalized.ends_with(".claude/worktrees");
+    let under_allowed_root = allowed_roots.iter().any(|root| {
+        !root.is_empty() && (normalized == *root || normalized.starts_with(&format!("{root}/")))
+    });
+    if under_worktrees || under_allowed_root {
+        Some(remainder.to_string())
+    } else {
+        None
+    }
+}
+
+/// The roots [`strip_known_root_cd_prefix`] treats as known-safe `cd`
+/// targets: the session scratchpad, and this process's own working
+/// directory (the repo root, for a hook process launched from inside it).
+fn cd_allow_roots(scratchpad_root: &str) -> Vec<String> {
+    let mut roots = vec![scratchpad_root.to_string()];
+    if let Ok(cwd) = std::env::current_dir() {
+        roots.push(
+            cwd.to_string_lossy()
+                .replace('\\', "/")
+                .trim_end_matches('/')
+                .to_string(),
+        );
+    }
+    roots
+}
+
+/// The hook-mode core of `run_check`, split out so it can be tested by
+/// feeding it a raw stdin payload directly rather than the process's actual
+/// stdin (which `run_check` only reads lazily, once it knows this is hook
+/// mode -- reading it eagerly here would make CLI mode block waiting on
+/// stdin that never arrives).
 fn run_check_hook_mode_with_env<W: Write>(
     cfg: &CtxConfig,
     w: &mut W,
@@ -4466,7 +4530,17 @@ fn run_check_hook_mode_with_env<W: Write>(
     } else {
         super::adapters::LaunchMode::Headless
     };
-    let evidence = evaluate_with_attestation_evidence(&cfg.safety, command, mode, env);
+    // Issue #168, design decision (e): a leading, literal `cd <known-root>`
+    // prefix is classified away so `cd <worktree> && git log` is judged by
+    // `git log` alone. `command` (the ORIGINAL, unstripped text) is still
+    // what reaches `hook_output`/`audit_hook_decision` below, so the log and
+    // any denial message always name what was actually run.
+    let scratchpad_roots = vec![scratchpad_write_root(&std::env::temp_dir())];
+    let cd_roots = cd_allow_roots(&scratchpad_roots[0]);
+    let effective_command =
+        strip_known_root_cd_prefix(command, &cd_roots).unwrap_or_else(|| command.to_string());
+
+    let evidence = evaluate_with_attestation_evidence(&cfg.safety, &effective_command, mode, env);
     let mut outcome = evidence.outcome.clone();
     // Claude marks an explicit retry outside its OS sandbox on the Bash
     // input itself. That boundary must never inherit an ordinary command's
@@ -4485,9 +4559,9 @@ fn run_check_hook_mode_with_env<W: Write>(
     //   own entries) AND clears the credential/root-scan screen
     //   ([`escape_allow_matches`]) -- an operator-attested retry the
     //   sandbox would otherwise force a fresh prompt for on every repeat.
-    let scratchpad_roots = vec![scratchpad_write_root(&std::env::temp_dir())];
     if payload.tool_input.dangerously_disable_sandbox && outcome.verdict != Verdict::Deny {
-        outcome = if outcome.verdict == Verdict::Allow && is_sandbox_bypass_safe_gh_command(command)
+        outcome = if outcome.verdict == Verdict::Allow
+            && is_sandbox_bypass_safe_gh_command(&effective_command)
         {
             Outcome {
                 verdict: Verdict::Allow,
@@ -4496,7 +4570,7 @@ fn run_check_hook_mode_with_env<W: Write>(
                     origin: Origin::BuiltIn,
                 }),
             }
-        } else if outcome.verdict == Verdict::Allow && is_zirv_ctx_escape_safe(command) {
+        } else if outcome.verdict == Verdict::Allow && is_zirv_ctx_escape_safe(&effective_command) {
             Outcome {
                 verdict: Verdict::Allow,
                 matched: Some(Rule {
@@ -4505,7 +4579,7 @@ fn run_check_hook_mode_with_env<W: Write>(
                 }),
             }
         } else if outcome.verdict == Verdict::Allow
-            && is_read_only_escape_safe(command, &scratchpad_roots)
+            && is_read_only_escape_safe(&effective_command, &scratchpad_roots)
         {
             Outcome {
                 verdict: Verdict::Allow,
@@ -4515,7 +4589,7 @@ fn run_check_hook_mode_with_env<W: Write>(
                 }),
             }
         } else if outcome.verdict == Verdict::Allow
-            && escape_allow_matches(&cfg.safety.escape_allow, command)
+            && escape_allow_matches(&cfg.safety.escape_allow, &effective_command)
         {
             Outcome {
                 verdict: Verdict::Allow,
@@ -4909,6 +4983,97 @@ mod tests {
         assert!(
             !text.contains("ask") && !text.contains("deny"),
             "zirv ctx status (dontAsk): must never ask or deny, got {text}"
+        );
+    }
+
+    // -- strip_known_root_cd_prefix (issue #168, decision e) --------------
+
+    #[test]
+    fn cd_prefix_strips_a_known_worktree_or_scratchpad_root() {
+        let roots = vec!["/repo".to_string(), "/tmp/claude".to_string()];
+        assert_eq!(
+            strip_known_root_cd_prefix("cd /repo && git log", &roots).as_deref(),
+            Some("git log")
+        );
+        assert_eq!(
+            strip_known_root_cd_prefix("cd /repo/sub && git log", &roots).as_deref(),
+            Some("git log")
+        );
+        assert_eq!(
+            strip_known_root_cd_prefix("cd /tmp/claude/out; ls", &roots).as_deref(),
+            Some("ls")
+        );
+        assert_eq!(
+            strip_known_root_cd_prefix("cd /anywhere/.claude/worktrees/feat && cargo fmt", &roots)
+                .as_deref(),
+            Some("cargo fmt")
+        );
+    }
+
+    #[test]
+    fn cd_prefix_leaves_unknown_or_dynamic_paths_untouched() {
+        let roots = vec!["/repo".to_string()];
+        for command in [
+            "cd /etc && rm -rf .",
+            "cd $HOME/evil && rm -rf .",
+            "cd `pwd`/x && rm -rf .",
+            "cd ~ && rm -rf .",
+            "cd /repo",
+            "cd /repo/../../etc && cat shadow",
+        ] {
+            assert!(
+                strip_known_root_cd_prefix(command, &roots).is_none(),
+                "{command} must not be stripped"
+            );
+        }
+    }
+
+    #[test]
+    fn a_cd_into_the_process_working_directory_then_git_log_allows_headlessly() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = super::super::testenv::HomeGuard::set(home.path());
+        let empty: HashMap<String, String> = HashMap::new();
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("loads");
+
+        let cwd = std::env::current_dir()
+            .expect("cwd")
+            .to_string_lossy()
+            .replace('\\', "/");
+        let command = format!("cd {cwd} && git log");
+        let stdin = format!(
+            r#"{{"tool_name":"Bash","tool_input":{{"command":"{command}"}},"permission_mode":"dontAsk"}}"#
+        );
+        let mut out = Vec::new();
+        run_check_hook_mode(&cfg, &mut out, &stdin).expect("runs");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            !text.contains(r#""permissionDecision":"ask""#) && !text.contains("deny"),
+            "cd into the process cwd then a plain git log must classify by git log alone: got {text}"
+        );
+    }
+
+    #[test]
+    fn a_cd_into_an_unknown_root_then_a_destructive_command_still_escalates() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = super::super::testenv::HomeGuard::set(home.path());
+        let empty: HashMap<String, String> = HashMap::new();
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("loads");
+
+        // "default" (interactive-ish) rather than "dontAsk": an `Ask`
+        // verdict under `dontAsk` is deliberately silent (no output at all
+        // -- pre-existing, unrelated to this task, see `hook_output`'s own
+        // doc comment on `Verdict::Ask if dont_ask => return None`), so
+        // "default" is what lets this test observe the escalation as
+        // explicit text rather than mere silence that could mean anything.
+        let stdin = r#"{"tool_name":"Bash","tool_input":{"command":"cd /etc && rm -rf ."},"permission_mode":"default"}"#;
+        let mut out = Vec::new();
+        run_check_hook_mode(&cfg, &mut out, stdin).expect("runs");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            text.contains(r#""permissionDecision":"ask""#),
+            "an unknown-root cd ahead of rm -rf must still ask: got {text}"
         );
     }
 
