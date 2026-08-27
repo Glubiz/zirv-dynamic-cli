@@ -1598,6 +1598,35 @@ pub(crate) fn run_with_clock<W: Write>(
     }
 }
 
+/// Reads `transcript` fresh and evaluates `budget` against it, counting tool
+/// calls via `adapter.parse_events`. `None` when neither ceiling is
+/// configured (the common case, and every delegation before 2.35.0) or the
+/// transcript cannot be read yet -- a read failure here must never be fatal,
+/// since it can just mean the child has not flushed its first line.
+///
+/// Shared by `supervise_run`'s own tick (checked on every poll while the
+/// child is alive) and its post-exit check just below (issue #155 review
+/// finding C1): factored out so the two call sites can never drift on how
+/// "spent" is computed.
+fn evaluate_worker_budget(
+    adapter: &dyn adapters::AgentAdapter,
+    budget: agent::WorkerBudget,
+    transcript: &Path,
+) -> Option<agent::BudgetState> {
+    if budget.tokens.is_none() && budget.tool_calls.is_none() {
+        return None;
+    }
+    let body = std::fs::read_to_string(transcript).ok()?;
+    let usage = adapter.transcript_usage(&body).unwrap_or_default();
+    let tool_calls = adapter
+        .parse_events(&body)
+        .iter()
+        .filter(|event| matches!(event, NormalizedEvent::ToolCall { .. }))
+        .count();
+    let tool_calls = u32::try_from(tool_calls).unwrap_or(u32::MAX);
+    Some(agent::budget_state(&budget, &usage, tool_calls))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn supervise_run(
     child: &mut std::process::Child,
@@ -1694,38 +1723,27 @@ fn supervise_run(
             );
             return Tick::Continue;
         }
-        // Issue #155, Phase 5(d): skipped entirely when no ceiling is
-        // configured (every delegation before 2.35.0, and the common case
-        // even after), so the extra transcript read below is paid only by a
-        // run that actually asked to be bounded.
-        if (budget.tokens.is_some() || budget.tool_calls.is_some())
-            && let Ok(body) = std::fs::read_to_string(transcript)
-        {
-            let usage = adapter.transcript_usage(&body).unwrap_or_default();
-            let tool_calls = adapter
-                .parse_events(&body)
-                .iter()
-                .filter(|event| matches!(event, NormalizedEvent::ToolCall { .. }))
-                .count();
-            let tool_calls = u32::try_from(tool_calls).unwrap_or(u32::MAX);
-            match agent::budget_state(&budget, &usage, tool_calls) {
-                agent::BudgetState::HardStop { used, limit } => {
-                    eprintln!(
-                        "zirv ctx exec: token/tool-call budget exhausted ({used}/{limit}); \
-                         stopping now -- this run will not restart"
-                    );
-                    *budget_exhausted = true;
-                    return Tick::Stop("budget");
-                }
-                agent::BudgetState::SoftWarn { used, limit } if !*soft_warned => {
-                    *soft_warned = true;
-                    eprintln!(
-                        "zirv ctx exec: {used}/{limit} of the token/tool-call budget spent -- \
-                         wrap up and checkpoint your result soon"
-                    );
-                }
-                agent::BudgetState::SoftWarn { .. } | agent::BudgetState::Ok => {}
+        // Issue #155, Phase 5(d): `evaluate_worker_budget` itself skips the
+        // transcript read entirely when no ceiling is configured (every
+        // delegation before 2.35.0, and the common case even after), so a
+        // run that never asked to be bounded pays nothing extra here.
+        match evaluate_worker_budget(adapter, budget, transcript) {
+            Some(agent::BudgetState::HardStop { used, limit }) => {
+                eprintln!(
+                    "zirv ctx exec: token/tool-call budget exhausted ({used}/{limit}); \
+                     stopping now -- this run will not restart"
+                );
+                *budget_exhausted = true;
+                return Tick::Stop("budget");
             }
+            Some(agent::BudgetState::SoftWarn { used, limit }) if !*soft_warned => {
+                *soft_warned = true;
+                eprintln!(
+                    "zirv ctx exec: {used}/{limit} of the token/tool-call budget spent -- \
+                     wrap up and checkpoint your result soon"
+                );
+            }
+            Some(agent::BudgetState::SoftWarn { .. } | agent::BudgetState::Ok) | None => {}
         }
         // A scoring failure must never kill a healthy run.
         match scorer.poll(adapter, score_cfg) {
@@ -1736,7 +1754,32 @@ fn supervise_run(
             _ => Tick::Continue,
         }
     };
-    supervise::supervise_child(child, deadline, poll, &mut tick)
+    let outcome = supervise::supervise_child(child, deadline, poll, &mut tick)?;
+
+    // C1 (issue #155 review finding): `supervise_child` checks `try_wait`
+    // for a completed child *before* ever calling the tick above, so a
+    // child that writes an over-budget final transcript and then exits
+    // between two polls can race past the very last tick that would have
+    // caught it -- and report its own clean exit code instead of the
+    // budget stop its transcript actually earned. Caught here as a final
+    // check on the transcript the child left behind, gated on
+    // `Exited(0)` specifically: a child that exited with its own failure
+    // code keeps that code untouched, since overriding it with a budget
+    // verdict here would erase a real failure that may have nothing to do
+    // with the budget at all.
+    if !*budget_exhausted
+        && matches!(outcome, Outcome::Exited(0))
+        && let Some(agent::BudgetState::HardStop { used, limit }) =
+            evaluate_worker_budget(adapter, budget, transcript)
+    {
+        eprintln!(
+            "zirv ctx exec: token/tool-call budget exhausted ({used}/{limit}) in the child's \
+             final transcript; stopping now -- this run will not restart"
+        );
+        *budget_exhausted = true;
+    }
+
+    Ok(outcome)
 }
 
 pub fn run<W: Write>(args: &ExecArgs, w: &mut W) -> CtxResult<i32> {
@@ -2966,6 +3009,142 @@ mod tests {
         );
         let log = std::fs::read_to_string(state.join("logs/decisions.jsonl")).expect("log");
         assert!(log.contains("\"verdict\":\"budget\""), "got {log}");
+    }
+
+    /// C1 (issue #155 review finding): `supervise_child` checks `try_wait`
+    /// for a completed child *before* ever running the tick that evaluates
+    /// the budget, so a child that writes its whole transcript and exits
+    /// promptly -- exactly what `healthy` mode does -- can race past every
+    /// tick that would have caught it and report its own clean `0` instead
+    /// of the budget stop its transcript actually earned. The `hang`-mode
+    /// budget test above cannot exercise this path at all, since a hanging
+    /// child never exits on its own; this one proves the post-exit check
+    /// added to `supervise_run` (not the tick) is what catches it.
+    #[test]
+    fn a_clean_exit_with_an_over_budget_final_transcript_reports_budget_exhausted() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let state = tmp.path().join("state");
+        let session = "88888888-2222-4333-8444-555555555555";
+        let mut env = base_env(&state);
+        env.insert("ZIRV_CTX_POLL_MS".to_string(), "50".to_string());
+
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        unsafe {
+            std::env::set_var("FAKE_AGENT_MODE", "healthy");
+        }
+        let args = ExecArgs {
+            agent: Some("claude".to_string()),
+            session_id: Some(session.to_string()),
+            transcript: Some(transcript_for(&home, tmp.path(), session)),
+            prompt: Some("do the work".to_string()),
+            max_restarts: Some(2),
+            // Far below `healthy` mode's fixed 12-turn transcript total (24
+            // assistant events x 20_000 cache-read tokens each). The child
+            // exits on its own well before `max_restarts` above could ever
+            // matter -- this is the "clean, over-budget exit" case, not a
+            // restart.
+            budget_tokens: Some(10_000),
+            max_tool_calls: None,
+            timeout_secs: Some(30),
+            simple: false,
+            command: fake_agent_command(session),
+        };
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE");
+        }
+
+        assert_eq!(
+            code.expect("runs"),
+            EXIT_BUDGET_EXHAUSTED,
+            "a clean exit must not hide an over-budget final transcript"
+        );
+        let log = std::fs::read_to_string(state.join("logs/decisions.jsonl")).expect("log");
+        assert!(log.contains("\"verdict\":\"budget\""), "got {log}");
+    }
+
+    /// The other half of C1: a clean exit whose final transcript is
+    /// comfortably under budget must be returned untouched, not overridden
+    /// just because a budget was configured at all.
+    #[test]
+    fn a_clean_under_budget_exit_keeps_its_own_code() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let state = tmp.path().join("state");
+        let session = "99999999-2222-4333-8444-555555555555";
+        let env = base_env(&state);
+
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        unsafe {
+            std::env::set_var("FAKE_AGENT_MODE", "healthy");
+        }
+        let args = ExecArgs {
+            agent: Some("claude".to_string()),
+            session_id: Some(session.to_string()),
+            transcript: Some(transcript_for(&home, tmp.path(), session)),
+            prompt: Some("do the work".to_string()),
+            max_restarts: Some(2),
+            // Comfortably above `healthy` mode's fixed 480_000-token total.
+            budget_tokens: Some(1_000_000),
+            max_tool_calls: None,
+            timeout_secs: Some(30),
+            simple: false,
+            command: fake_agent_command(session),
+        };
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE");
+        }
+
+        assert_eq!(code.expect("runs"), 0);
+    }
+
+    /// C1's asymmetry: a child that exited with its OWN failure code keeps
+    /// that code even when its final transcript is over budget -- only a
+    /// clean (`0`) exit is eligible to be overridden with
+    /// `EXIT_BUDGET_EXHAUSTED`, so a budget verdict never erases a real
+    /// failure it may have nothing to do with.
+    #[test]
+    fn a_failed_exit_with_an_over_budget_transcript_keeps_its_failure_code() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let state = tmp.path().join("state");
+        let session = "10101010-2222-4333-8444-555555555555";
+        let mut env = base_env(&state);
+        env.insert("ZIRV_CTX_POLL_MS".to_string(), "50".to_string());
+
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        unsafe {
+            // `fail` mode writes the same over-budget transcript `healthy`
+            // does, then exits 3.
+            std::env::set_var("FAKE_AGENT_MODE", "fail");
+        }
+        let args = ExecArgs {
+            agent: Some("claude".to_string()),
+            session_id: Some(session.to_string()),
+            transcript: Some(transcript_for(&home, tmp.path(), session)),
+            prompt: Some("do the work".to_string()),
+            max_restarts: Some(0),
+            budget_tokens: Some(10_000),
+            max_tool_calls: None,
+            timeout_secs: Some(30),
+            simple: false,
+            command: fake_agent_command(session),
+        };
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE");
+        }
+
+        assert_eq!(
+            code.expect("runs"),
+            3,
+            "a real failure code must survive an over-budget final transcript"
+        );
     }
 
     #[cfg(unix)]
