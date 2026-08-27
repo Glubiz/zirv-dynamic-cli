@@ -522,6 +522,29 @@ fn verdict_rank(verdict: Verdict) -> u8 {
     }
 }
 
+/// The per-candidate analyzer chain [`evaluate_candidates`]'s own fold loop
+/// applies to every normalized executable candidate -- extracted (issue
+/// #168) so a caller that needs one candidate's own verdict in isolation
+/// (`every_segment_is_allow_or_unmatched_default`, Task 6) can run the
+/// identical chain without a second, drifting copy of these seven analyzer
+/// calls.
+fn evaluate_candidate_outcome(
+    policy: &SafetyPolicy,
+    candidate: &str,
+    fallback: Verdict,
+) -> Outcome {
+    let base = evaluate_single(policy, candidate, fallback);
+    let outcome = apply_sql_outcome(policy, candidate, base);
+    let outcome = apply_credential_outcome(candidate, outcome);
+    let outcome = apply_network_outcome(candidate, outcome);
+    let outcome = apply_recursive_delete_outcome(candidate, outcome);
+    let outcome = apply_vcs_outcome(candidate, outcome);
+    let outcome = apply_distribution_outcome(candidate, outcome);
+    let outcome = apply_orchestrator_outcome(candidate, outcome);
+    let outcome = apply_pipe_to_shell_outcome(candidate, outcome);
+    apply_find_exec_outcome(candidate, outcome)
+}
+
 /// The candidate fold: the raw command plus every string
 /// [`normalize_segments`] derives from it, resolved to the single most
 /// restrictive [`Outcome`] (deny > ask > allow). Each candidate receives
@@ -576,16 +599,7 @@ fn evaluate_candidates(
 
     let mut worst: Option<(u8, Outcome)> = None;
     for candidate in candidates {
-        let base = evaluate_single(policy, &candidate, fallback);
-        let outcome = apply_sql_outcome(policy, &candidate, base);
-        let outcome = apply_credential_outcome(&candidate, outcome);
-        let outcome = apply_network_outcome(&candidate, outcome);
-        let outcome = apply_recursive_delete_outcome(&candidate, outcome);
-        let outcome = apply_vcs_outcome(&candidate, outcome);
-        let outcome = apply_distribution_outcome(&candidate, outcome);
-        let outcome = apply_orchestrator_outcome(&candidate, outcome);
-        let outcome = apply_pipe_to_shell_outcome(&candidate, outcome);
-        let outcome = apply_find_exec_outcome(&candidate, outcome);
+        let outcome = evaluate_candidate_outcome(policy, &candidate, fallback);
         let rank = verdict_rank(outcome.verdict);
         let is_worse = match &worst {
             Some((best_rank, _)) => rank > *best_rank,
@@ -4287,6 +4301,35 @@ mod tests {
 
     fn table(text: &str) -> Option<toml::Value> {
         Some(toml::from_str::<toml::Value>(text).expect("test toml parses"))
+    }
+
+    /// Task 1 (issue #168): `evaluate_candidate_outcome` must reproduce
+    /// exactly what `evaluate_candidates`'s own fold already does for a
+    /// single, unambiguous candidate -- this is a refactor extracting the
+    /// analyzer chain, not a behavior change.
+    #[test]
+    fn evaluate_candidate_outcome_matches_the_existing_fold_for_a_single_candidate() {
+        let policy = SafetyPolicy::default();
+        for (command, expected) in [
+            ("git status", Verdict::Allow),
+            ("git push --force origin main", Verdict::Ask),
+            // Under the shipped default policy, plain `rm -rf` is an ASK
+            // family (`Bash(rm -rf *)` in `SHIPPED_POSTURE_ASK`) -- only
+            // `rm -rf*zirv*` is DENY. This row locks in that actual default
+            // behavior through the extracted chain, not a hypothetical one.
+            ("rm -rf /", Verdict::Ask),
+            ("rm -rf /home/user/zirv", Verdict::Deny),
+            ("some-totally-unknown-tool --flag", Verdict::Ask),
+        ] {
+            let direct = evaluate_candidate_outcome(&policy, command, Verdict::Ask);
+            let via_evaluate_candidates =
+                evaluate_candidates(&policy, command, Verdict::Ask, LaunchMode::Headless);
+            assert_eq!(direct.verdict, expected, "{command}");
+            assert_eq!(
+                direct.verdict, via_evaluate_candidates.verdict,
+                "{command}: extracted chain must agree with the fold"
+            );
+        }
     }
 
     #[test]
