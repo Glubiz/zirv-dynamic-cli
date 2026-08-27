@@ -749,12 +749,65 @@ fn is_regular_file(path: &Path) -> bool {
 /// never observes a partial file, and two concurrent upserts of the same key
 /// each write in full before either `rename` lands -- the result is always
 /// one of the two complete entries, never a mix of both.
+/// Case-insensitive substrings whose presence in a shared-scope key or body
+/// mark the entry as probably holding a live credential rather than a
+/// durable, safe-to-commit repository fact (issue #172). Deliberately blunt,
+/// the same style `workflow::review::is_sensitive_name`'s own
+/// `name.contains("credential")`/`name.contains("secret")` already use for a
+/// sibling problem (screening an untracked file before a review package): a
+/// false positive costs the writer a private `remember` or an explicit
+/// `--allow-sensitive` retry; a false negative commits a secret to every
+/// future clone of the repository.
+const SENSITIVE_SHARED_TERMS: &[&str] = &[
+    "password",
+    "passwd",
+    "secret",
+    "token",
+    "api-key",
+    "api_key",
+    "apikey",
+    "credential",
+    "creds",
+    "private-key",
+    "private_key",
+];
+
+fn sensitive_shared_term(haystack: &str) -> Option<&'static str> {
+    let lower = haystack.to_ascii_lowercase();
+    SENSITIVE_SHARED_TERMS
+        .iter()
+        .copied()
+        .find(|term| lower.contains(term))
+}
+
+/// Whether `entry` looks credential-shaped rather than a durable,
+/// safe-to-commit repository fact: a deny-list term in the key or body
+/// (`sensitive_shared_term`), or a known token shape in the body
+/// (`review::detect_token_shape` -- OpenAI/GitHub/Slack/AWS-style keys, a PEM
+/// private-key block, a JWT -- reused rather than duplicated, since the
+/// `regex` crate and these exact families are already a workspace
+/// dependency). `None` means nothing matched. Pure (no I/O), so both
+/// `upsert_shared` (a hard refusal) and `write_durable`'s harvest loop (a
+/// skip-and-log, never an abort) can call it without either owning its own
+/// copy of the rule.
+fn sensitive_shared_match(entry: &Entry) -> Option<String> {
+    if let Some(term) = sensitive_shared_term(&entry.key) {
+        return Some(format!("the term '{term}' in its key"));
+    }
+    if let Some(term) = sensitive_shared_term(&entry.body) {
+        return Some(format!("the term '{term}' in its body"));
+    }
+    crate::commands::workflow::review::detect_token_shape(&entry.body)
+        .map(|family| format!("a {family} in its body"))
+}
+
 fn upsert_shared(
     repo: &Path,
     state: &StateDir,
     slug: &str,
     cfg: &CtxConfig,
     entry: &Entry,
+    allow_sensitive: bool,
 ) -> CtxResult<PathBuf> {
     if !MemoryScope::Shared.enabled(cfg) {
         let reason = MemoryScope::Shared.disabled_reason(cfg);
@@ -782,8 +835,36 @@ fn upsert_shared(
         }
     }
 
+    if !allow_sensitive && let Some(matched) = sensitive_shared_match(entry) {
+        return Err(format!(
+            "memory key '{}' looks like it holds a credential ({matched}); the shared bank at .zirv/memory/ is committed to the repository and readable by anyone with checkout access. Store it in the private bank instead (drop --repo), or pass --allow-sensitive to store it in the shared bank anyway.",
+            entry.key
+        )
+        .into());
+    }
+
     super::state::write_shared(&path, &entry.to_markdown())?;
     Ok(path)
+}
+
+/// Explicit escape hatch for a human who has deliberately decided a shared
+/// entry should be committed despite looking credential-shaped (`zirv ctx
+/// remember --repo --allow-sensitive`, issue #172). Every other shared-scope
+/// writer -- `upsert_scoped` (and so every automatic path through it:
+/// `zirv memory remember --shared`, `zirv memory optimize --apply`'s
+/// consolidation) -- always calls `upsert_shared` with `allow_sensitive =
+/// false`, and `write_durable`'s harvest loop skips a flagged candidate
+/// before ever reaching `upsert_scoped` for it (see below) -- so this bypass
+/// exists on exactly one, explicitly-named, human-invoked path and nowhere
+/// else.
+pub fn upsert_shared_allow_sensitive(
+    repo: &Path,
+    state: &StateDir,
+    slug: &str,
+    cfg: &CtxConfig,
+    entry: &Entry,
+) -> CtxResult<PathBuf> {
+    upsert_shared(repo, state, slug, cfg, entry, true)
 }
 
 /// Scope-aware upsert: `Private` delegates unchanged to `remember` above;
@@ -812,7 +893,7 @@ pub fn upsert_scoped(
 ) -> CtxResult<PathBuf> {
     match scope {
         MemoryScope::Private => remember(state, slug, entry, cfg),
-        MemoryScope::Shared => upsert_shared(repo, state, slug, cfg, entry),
+        MemoryScope::Shared => upsert_shared(repo, state, slug, cfg, entry, false),
     }
 }
 
@@ -1593,6 +1674,23 @@ fn write_durable(
             tags: Vec::new(),
             paths: Vec::new(),
         };
+        if let Some(matched) = sensitive_shared_match(&entry) {
+            let _ = super::log::append(
+                state,
+                &super::log::Decision {
+                    ts: now,
+                    session: "n/a",
+                    verb: "memory",
+                    verdict: "n/a",
+                    score: 0,
+                    action: "harvest-skipped",
+                    detail: &format!(
+                        "'{key}' looks credential-shaped ({matched}); refusing to harvest it into the shared bank"
+                    ),
+                },
+            );
+            continue;
+        }
         upsert_scoped(MemoryScope::Shared, repo, state, slug, cfg, &entry)?;
         written += 1;
     }
@@ -1712,6 +1810,12 @@ pub struct RememberArgs {
     /// is: `cfg.memory.enabled && cfg.memory.shared_enabled`.
     #[arg(long, default_value_t = false)]
     pub repo: bool,
+    /// Store into the shared bank even though its key or body looks
+    /// credential-shaped (`memory::sensitive_shared_match`). Has no effect
+    /// without `--repo`, and no effect on the private bank, which the guard
+    /// never inspects at all.
+    #[arg(long, default_value_t = false)]
+    pub allow_sensitive: bool,
     /// NOT a CLI flag on `zirv ctx remember` -- `#[arg(skip)]` always
     /// leaves this at its default (`None`) here. `zirv memory remember`'s
     /// private arm (`memory_cli.rs`, the only surface with `--importance`)
@@ -1846,8 +1950,12 @@ pub fn run_remember_with<W: Write>(
                 // exists to set it yet.
                 paths: Vec::new(),
             };
-            let path = upsert_scoped(scope, repo, &state, &slug, &cfg, &entry)
-                .map_err(|e| format!("zirv ctx remember: {e}"))?;
+            let path = if scope == MemoryScope::Shared && args.allow_sensitive {
+                upsert_shared_allow_sensitive(repo, &state, &slug, &cfg, &entry)
+            } else {
+                upsert_scoped(scope, repo, &state, &slug, &cfg, &entry)
+            }
+            .map_err(|e| format!("zirv ctx remember: {e}"))?;
             writeln!(
                 w,
                 "zirv ctx remember: stored '{}' in the {bank_label} bank at {}",
@@ -2036,7 +2144,7 @@ mod tests {
             written,
             verified: written,
             source: "explicit".to_string(),
-            body: "the staging DB creds live in 1Password.".to_string(),
+            body: "the build must pass locally before every release.".to_string(),
             importance: None,
             confidence: None,
             tags: Vec::new(),
@@ -2699,6 +2807,7 @@ This should not appear in the body.\n";
             text_file: None,
             verify: false,
             repo: false,
+            allow_sensitive: false,
             importance: None,
             confidence: None,
             tags: Vec::new(),
@@ -2739,6 +2848,7 @@ This should not appear in the body.\n";
             text_file: None,
             verify: false,
             repo: true,
+            allow_sensitive: false,
             importance: None,
             confidence: None,
             tags: Vec::new(),
@@ -2779,6 +2889,7 @@ This should not appear in the body.\n";
             text_file: None,
             verify: false,
             repo: true,
+            allow_sensitive: false,
             importance: None,
             confidence: None,
             tags: Vec::new(),
@@ -2824,6 +2935,7 @@ This should not appear in the body.\n";
             text_file: None,
             verify: true,
             repo: true,
+            allow_sensitive: false,
             importance: None,
             confidence: None,
             tags: Vec::new(),
@@ -2872,6 +2984,7 @@ This should not appear in the body.\n";
             text_file: None,
             verify: true,
             repo: false,
+            allow_sensitive: false,
             importance: None,
             confidence: None,
             tags: Vec::new(),
@@ -2920,6 +3033,7 @@ This should not appear in the body.\n";
             text_file: None,
             verify: false,
             repo: false,
+            allow_sensitive: false,
             importance: None,
             confidence: None,
             tags: Vec::new(),
@@ -3608,12 +3722,12 @@ This should not appear in the body.\n";
         let cfg = CtxConfig::default();
 
         let explicit = Entry {
-            key: "staging-db-creds".to_string(),
+            key: "release-runbook".to_string(),
             written_by: "claude".to_string(),
             written: 1_000,
             verified: 1_000,
             source: "explicit".to_string(),
-            body: "the staging DB creds live in 1Password.".to_string(),
+            body: "the release runbook lives in the internal wiki.".to_string(),
             importance: None,
             confidence: None,
             tags: Vec::new(),
@@ -3645,8 +3759,8 @@ This should not appear in the body.\n";
 
         let accepted = vec![
             (
-                "staging-db-creds".to_string(),
-                "creds moved to Vault under staging-db (inferred)".to_string(),
+                "release-runbook".to_string(),
+                "runbook moved to the new wiki space (inferred)".to_string(),
             ),
             ("build-cmd".to_string(), "cargo build --release".to_string()),
         ];
@@ -3660,7 +3774,7 @@ This should not appear in the body.\n";
             &state,
             "-work-repo",
             &cfg,
-            "staging-db-creds",
+            "release-runbook",
         )
         .expect("read")
         .expect("still there");
@@ -4355,12 +4469,266 @@ This should not appear in the body.\n";
             &state,
             "-irrelevant",
             &cfg,
-            &sample("staging-db-creds", 2),
+            &sample("deploy-notes", 2),
         )
         .expect("upsert b");
 
         assert!(dir.join("build-cmd.md").exists());
-        assert!(dir.join("staging-db-creds.md").exists());
+        assert!(dir.join("deploy-notes.md").exists());
+    }
+
+    #[test]
+    fn upsert_scoped_shared_refuses_a_key_that_looks_credential_shaped() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let cfg = CtxConfig::default();
+        let mut entry = sample("staging-db-creds", 1);
+        entry.body = "see the ops runbook for details.".to_string();
+
+        let err = upsert_scoped(
+            MemoryScope::Shared,
+            repo.path(),
+            &state,
+            "-irrelevant",
+            &cfg,
+            &entry,
+        )
+        .expect_err("a key containing 'creds' must be refused");
+        assert!(err.to_string().contains("credential"), "got {err}");
+        assert!(
+            !repo
+                .path()
+                .join(".zirv/memory/staging-db-creds.md")
+                .exists(),
+            "nothing must be written when the guard refuses"
+        );
+    }
+
+    #[test]
+    fn upsert_scoped_shared_refuses_a_body_containing_a_denylisted_term() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let cfg = CtxConfig::default();
+        let mut entry = sample("deploy-notes", 1);
+        entry.body = "the deploy token is rotated weekly.".to_string();
+
+        let err = upsert_scoped(
+            MemoryScope::Shared,
+            repo.path(),
+            &state,
+            "-irrelevant",
+            &cfg,
+            &entry,
+        )
+        .expect_err("a body containing 'token' must be refused");
+        assert!(err.to_string().contains("credential"), "got {err}");
+    }
+
+    #[test]
+    fn upsert_scoped_shared_refuses_a_body_containing_a_pem_private_key_block() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let cfg = CtxConfig::default();
+        let mut entry = sample("deploy-key-notes", 1);
+        entry.body =
+            "-----BEGIN RSA PRIVATE KEY-----\nMIIBOgIBAAJBAK\n-----END RSA PRIVATE KEY-----"
+                .to_string();
+
+        let err = upsert_scoped(
+            MemoryScope::Shared,
+            repo.path(),
+            &state,
+            "-irrelevant",
+            &cfg,
+            &entry,
+        )
+        .expect_err("a PEM private-key block must be refused");
+        assert!(err.to_string().contains("credential"), "got {err}");
+    }
+
+    #[test]
+    fn upsert_scoped_shared_refuses_a_body_containing_an_aws_or_github_token_shape() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let cfg = CtxConfig::default();
+
+        let mut aws_entry = sample("infra-notes", 1);
+        aws_entry.body = "rotate AKIAABCDEFGHIJKLMNOP if it leaks.".to_string();
+        let err = upsert_scoped(
+            MemoryScope::Shared,
+            repo.path(),
+            &state,
+            "-irrelevant",
+            &cfg,
+            &aws_entry,
+        )
+        .expect_err("an AWS-shaped access key id must be refused");
+        assert!(err.to_string().contains("credential"), "got {err}");
+
+        let mut gh_entry = sample("ci-notes", 2);
+        gh_entry.body = "old value was ghp_abcdefghijklmnopqrstuvwxyz0123456789.".to_string();
+        let err = upsert_scoped(
+            MemoryScope::Shared,
+            repo.path(),
+            &state,
+            "-irrelevant",
+            &cfg,
+            &gh_entry,
+        )
+        .expect_err("a GitHub-shaped token must be refused");
+        assert!(err.to_string().contains("credential"), "got {err}");
+    }
+
+    #[test]
+    fn upsert_shared_allow_sensitive_bypasses_the_credential_guard() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let cfg = CtxConfig::default();
+        let mut entry = sample("staging-db-creds", 1);
+        entry.body = "see the ops runbook for details.".to_string();
+
+        let path = upsert_shared_allow_sensitive(repo.path(), &state, "-irrelevant", &cfg, &entry)
+            .expect("an explicit override must be allowed to write it anyway");
+        assert!(path.is_file());
+        assert!(
+            path.ends_with("staging-db-creds.md"),
+            "got {}",
+            path.display()
+        );
+    }
+
+    #[test]
+    fn upsert_scoped_private_never_consults_the_shared_credential_guard() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let cfg = CtxConfig::default();
+        let mut entry = sample("staging-db-creds", 1);
+        entry.body = "the token rotates weekly.".to_string();
+
+        let path = upsert_scoped(
+            MemoryScope::Private,
+            repo.path(),
+            &state,
+            "-irrelevant",
+            &cfg,
+            &entry,
+        )
+        .expect("the private scope never runs the shared-only credential guard");
+        assert!(path.is_file());
+    }
+
+    #[test]
+    fn write_durable_skips_a_credential_shaped_candidate_but_still_writes_the_rest() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let cfg = CtxConfig::default();
+
+        let accepted = vec![
+            ("build-cmd".to_string(), "cargo build --release".to_string()),
+            (
+                "staging-db-creds".to_string(),
+                "the staging DB creds live in 1Password.".to_string(),
+            ),
+            (
+                "deploy-notes".to_string(),
+                "deploy with zirv ctx exec".to_string(),
+            ),
+        ];
+        let written = write_durable(repo.path(), &state, "-work-repo", &accepted, &cfg, 1_000)
+            .expect("write_durable must not abort the whole batch");
+        assert_eq!(
+            written, 2,
+            "the credential-shaped candidate is skipped, the other two land"
+        );
+
+        assert!(
+            get_scoped(
+                MemoryScope::Shared,
+                repo.path(),
+                &state,
+                "-work-repo",
+                &cfg,
+                "build-cmd"
+            )
+            .expect("get")
+            .is_some()
+        );
+        assert!(
+            get_scoped(
+                MemoryScope::Shared,
+                repo.path(),
+                &state,
+                "-work-repo",
+                &cfg,
+                "deploy-notes"
+            )
+            .expect("get")
+            .is_some()
+        );
+        assert!(
+            get_scoped(
+                MemoryScope::Shared,
+                repo.path(),
+                &state,
+                "-work-repo",
+                &cfg,
+                "staging-db-creds"
+            )
+            .expect("get")
+            .is_none(),
+            "the flagged candidate must never be written"
+        );
+    }
+
+    #[test]
+    fn ctx_remember_repo_refuses_a_credential_shaped_key_unless_allow_sensitive_is_set() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let state_dir = repo.path().join("state");
+        let env = env_map(&[(state::STATE_ENV, state_dir.to_str().expect("utf8"))]);
+        let mut stdin = std::io::Cursor::new(Vec::<u8>::new());
+
+        let args = RememberArgs {
+            key: "staging-db-creds".to_string(),
+            text: Some("see the ops runbook for details.".to_string()),
+            text_file: None,
+            verify: false,
+            repo: true,
+            allow_sensitive: false,
+            importance: None,
+            confidence: None,
+            tags: Vec::new(),
+        };
+        let mut out = Vec::new();
+        let err = run_remember_with(
+            &args,
+            &mut out,
+            repo.path(),
+            &|k| env.get(k).cloned(),
+            &mut stdin,
+        )
+        .expect_err("a credential-shaped key must be refused without --allow-sensitive");
+        assert!(err.to_string().contains("credential"), "got {err}");
+
+        let allowed = RememberArgs {
+            allow_sensitive: true,
+            ..args
+        };
+        let mut out2 = Vec::new();
+        run_remember_with(
+            &allowed,
+            &mut out2,
+            repo.path(),
+            &|k| env.get(k).cloned(),
+            &mut stdin,
+        )
+        .expect("--allow-sensitive must permit the write");
+        assert!(
+            repo.path()
+                .join(".zirv/memory/staging-db-creds.md")
+                .is_file()
+        );
     }
 
     /// Acceptance criterion: updating a key updates its stable file rather

@@ -53,7 +53,7 @@ case "${FAKE_MODEL_MODE:-good}" in
   garbage) printf 'I had a look and things seem mostly fine.\n' ;;
   harvest)
     printf 'build-cmd: cargo build --release\n'
-    printf 'staging-db-creds: staging DB creds live in 1Password under staging-db\n'
+    printf 'release-runbook: release runbook lives in the internal wiki under docs\n'
     ;;
   consolidate)
     key=$(printf '%s\n' "$prompt" | sed -n 's/^- \(.*\) (KEEP THIS KEY):.*/\1/p' | "$head_bin" -n1)
