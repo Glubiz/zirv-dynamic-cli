@@ -9825,11 +9825,7 @@ mod tests {
         let state = StateDir::from_root(tmp.path().join("state"));
         let repo = tmp.path().join("repo");
         std::fs::create_dir_all(&repo).expect("mkdir repo");
-        let mut cfg = CtxConfig::default();
-        // The first pane below already occupies a heavy-worker slot; this
-        // test is about the depth cap, not the (separately tested) heavy-
-        // worker budget, so it must not preempt the check being tested.
-        cfg.supervise.max_heavy_workers = 10;
+        let cfg = CtxConfig::default();
 
         let spec = PaneSpec {
             agent_name: "test-agent".to_string(),
