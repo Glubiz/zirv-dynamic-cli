@@ -275,6 +275,10 @@ pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
 pub const POLICY_FINGERPRINT_ENV: &str = "ZIRV_CTX_SAFETY_POLICY_SHA256";
 pub const POLICY_SNAPSHOT_ENV: &str = "ZIRV_CTX_SAFETY_POLICY_FILE";
 
+// Issue #168: no longer called (self-heal replaced its use in
+// evaluate_with_attestation_evidence) -- kept as the documented pre-#168
+// shape referenced by nearby doc comments.
+#[allow(dead_code)]
 fn attestation_failure(mode: super::adapters::LaunchMode) -> Outcome {
     Outcome {
         verdict: if mode.is_interactive() {
@@ -332,6 +336,58 @@ struct AttestedEvaluation {
     divergence: SnapshotDivergence,
 }
 
+/// Issue #168, design decision (c): what an invalid attestation snapshot
+/// (absent one of the two env vars, an unreadable/unparseable file, or a
+/// hash mismatch) now produces INSTEAD of the old blanket `attestation_
+/// failure(mode)` (interactive `Ask`/headless `Deny` on every single
+/// command for the rest of the session, with no way out short of a
+/// restart). A broken snapshot proves nothing about `current` -- the
+/// in-process policy this same launch already resolved from `~/.zirv/
+/// ctx.toml` and any repo `.zirv/ctx.toml` -- so this falls back to
+/// evaluating `current` alone, exactly like the "no attestation configured
+/// at all" case, and best-effort re-materializes the snapshot file at
+/// `snapshot_path` (when one was named) so the NEXT command in this same
+/// session attests cleanly again instead of re-detecting the identical
+/// broken file every time. The re-materialization write failing is
+/// silently ignored: it only ever improves the next call, never gates this
+/// one. `status: "self-healed"` distinguishes this path in the audit log
+/// and from both `"not-present"` and `"valid"`.
+fn self_healed_evaluation(
+    current: &SafetyPolicy,
+    command: &str,
+    mode: super::adapters::LaunchMode,
+    current_fingerprint: String,
+    launch_fingerprint: Option<String>,
+    snapshot_path: Option<&str>,
+) -> AttestedEvaluation {
+    if let Some(path) = snapshot_path {
+        let _ = rematerialize_policy_snapshot(path, current);
+    }
+    AttestedEvaluation {
+        outcome: evaluate(current, command, mode),
+        current_fingerprint,
+        launch_fingerprint,
+        status: "self-healed",
+        divergence: SnapshotDivergence::Unchanged,
+    }
+}
+
+/// Best-effort rewrite of the policy snapshot file at `path` from `policy` --
+/// the identical body `adapters::claude::launch_settings_path` writes at
+/// launch, reused here (via the same pretty-JSON-plus-trailing-newline
+/// shape) so a self-heal and a fresh launch can never format the snapshot
+/// two different ways. Errors are the caller's to ignore: this is a repair
+/// attempt for the NEXT command, never a gate on the current one.
+fn rematerialize_policy_snapshot(path: &str, policy: &SafetyPolicy) -> std::io::Result<()> {
+    let mut body = serde_json::to_string_pretty(policy).map_err(std::io::Error::other)?;
+    body.push('\n');
+    let path = std::path::Path::new(path);
+    if let Some(parent) = path.parent() {
+        super::state::create_private_dir_all(parent)?;
+    }
+    super::state::write_private(path, &body)
+}
+
 fn evaluate_with_attestation_evidence(
     current: &SafetyPolicy,
     command: &str,
@@ -353,36 +409,39 @@ fn evaluate_with_attestation_evidence(
             }
             (Some(fingerprint), Some(path)) => (fingerprint, path),
             (fingerprint, _) => {
-                return AttestedEvaluation {
-                    outcome: attestation_failure(mode),
+                return self_healed_evaluation(
+                    current,
+                    command,
+                    mode,
                     current_fingerprint,
-                    launch_fingerprint: fingerprint,
-                    status: "invalid",
-                    divergence: SnapshotDivergence::Unchanged,
-                };
+                    fingerprint,
+                    None,
+                );
             }
         };
 
-    let launch = std::fs::read_to_string(snapshot_path)
+    let launch = std::fs::read_to_string(&snapshot_path)
         .ok()
         .and_then(|body| serde_json::from_str::<SafetyPolicy>(&body).ok());
     let Some(launch) = launch else {
-        return AttestedEvaluation {
-            outcome: attestation_failure(mode),
+        return self_healed_evaluation(
+            current,
+            command,
+            mode,
             current_fingerprint,
-            launch_fingerprint: Some(expected_fingerprint),
-            status: "invalid",
-            divergence: SnapshotDivergence::Unchanged,
-        };
+            Some(expected_fingerprint),
+            Some(snapshot_path.as_str()),
+        );
     };
     if policy_fingerprint(&launch).ok().as_deref() != Some(expected_fingerprint.as_str()) {
-        return AttestedEvaluation {
-            outcome: attestation_failure(mode),
+        return self_healed_evaluation(
+            current,
+            command,
+            mode,
             current_fingerprint,
-            launch_fingerprint: Some(expected_fingerprint),
-            status: "invalid",
-            divergence: SnapshotDivergence::Unchanged,
-        };
+            Some(expected_fingerprint),
+            Some(snapshot_path.as_str()),
+        );
     }
 
     let current_outcome = evaluate(current, command, mode);
@@ -407,16 +466,6 @@ fn evaluate_with_attestation_evidence(
         status: "valid",
         divergence,
     }
-}
-
-#[cfg(test)]
-fn evaluate_with_attestation(
-    current: &SafetyPolicy,
-    command: &str,
-    mode: super::adapters::LaunchMode,
-    env: EnvLookup<'_>,
-) -> Outcome {
-    evaluate_with_attestation_evidence(current, command, mode, env).outcome
 }
 
 /// One evaluated command: the verdict, and the rule that produced it
@@ -4900,8 +4949,14 @@ mod tests {
         );
     }
 
+    /// Issue #168, design decision (c): a widened-and-tampered snapshot no
+    /// longer fails the whole session closed -- it self-heals to the
+    /// current, in-process policy (the trusted source: this same process
+    /// already resolved it from `~/.zirv/ctx.toml` and the repo's own
+    /// `.zirv/ctx.toml`), and never LOOSENS beyond what the current policy
+    /// itself would allow.
     #[test]
-    fn an_attested_launch_keeps_the_stricter_policy_and_fails_closed_on_tampering() {
+    fn a_tampered_attestation_snapshot_self_heals_to_the_current_policy() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let snapshot = tmp.path().join("policy.json");
         let launch = SafetyPolicy::default();
@@ -4916,30 +4971,113 @@ mod tests {
             (POLICY_SNAPSHOT_ENV, snapshot.to_str().expect("utf8 path")),
         ]);
 
-        let mut widened_now = launch.clone();
-        widened_now.ask.clear();
-        let still_ask = evaluate_with_attestation(
-            &widened_now,
-            "git push --force origin main",
-            LaunchMode::Interactive,
-            &|key| env.get(key).cloned(),
-        );
-        assert_eq!(still_ask.verdict, Verdict::Ask);
-
-        std::fs::write(&snapshot, "{}").expect("tamper snapshot");
-        for (mode, verdict) in [
-            (LaunchMode::Interactive, Verdict::Ask),
-            (LaunchMode::Headless, Verdict::Deny),
+        let current = SafetyPolicy::default();
+        // `cargo test` matches the shipped `Bash(cargo *)` allow family
+        // (mode-independent), proving self-heal evaluates the command's own
+        // classification rather than the old blanket failure. The unmatched
+        // command shows the per-MODE default still applies correctly under
+        // self-heal (interactive `Allow`, headless `Ask`) -- not some third,
+        // attestation-specific behavior. `rm -rf /` shows a semantically
+        // classified (ask-family) command keeps its real verdict too. The
+        // snapshot is re-tampered before EACH iteration: since `current`
+        // equals the original `launch` here (both `SafetyPolicy::default()`),
+        // the first self-heal's own best-effort rematerialization would
+        // otherwise "fix" the file for every later iteration in this loop,
+        // masking the very thing being tested.
+        for (mode, command, expected) in [
+            (LaunchMode::Interactive, "cargo test", Verdict::Allow),
+            (
+                LaunchMode::Headless,
+                "some-tool-zirv-has-never-heard-of",
+                Verdict::Ask,
+            ),
+            (LaunchMode::Headless, "rm -rf /", Verdict::Ask),
         ] {
-            let outcome = evaluate_with_attestation(&widened_now, "cargo test", mode, &|key| {
-                env.get(key).cloned()
+            std::fs::write(&snapshot, "{}").expect("tamper snapshot");
+            let evidence = evaluate_with_attestation_evidence(&current, command, mode, &|k| {
+                env.get(k).cloned()
             });
-            assert_eq!(outcome.verdict, verdict, "{mode:?}: {outcome:?}");
             assert_eq!(
-                outcome.matched.as_ref().map(|rule| rule.pattern.as_str()),
-                Some("<attestation: invalid launch policy snapshot>")
+                evidence.outcome.verdict, expected,
+                "{mode:?} {command}: {evidence:?}"
             );
+            assert_eq!(evidence.status, "self-healed");
         }
+    }
+
+    /// The self-heal must never widen past what `current` itself already
+    /// says: a policy an operator has explicitly NARROWED still denies,
+    /// even with a broken snapshot on disk.
+    #[test]
+    fn a_tampered_attestation_snapshot_still_honors_a_narrowed_current_policy() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let snapshot = tmp.path().join("policy.json");
+        std::fs::write(&snapshot, "not valid json at all").expect("writes garbage");
+        let env = env_from(&[
+            (
+                POLICY_FINGERPRINT_ENV,
+                "irrelevant-since-file-is-unreadable",
+            ),
+            (POLICY_SNAPSHOT_ENV, snapshot.to_str().expect("utf8 path")),
+        ]);
+
+        let mut narrowed = SafetyPolicy::default();
+        narrowed.deny.push(Rule {
+            pattern: "terraform destroy*".to_string(),
+            origin: Origin::Operator,
+        });
+        let evidence = evaluate_with_attestation_evidence(
+            &narrowed,
+            "terraform destroy",
+            LaunchMode::Interactive,
+            &|k| env.get(k).cloned(),
+        );
+        assert_eq!(evidence.outcome.verdict, Verdict::Deny);
+        assert_eq!(evidence.status, "self-healed");
+    }
+
+    /// Self-heal best-effort re-materializes the snapshot file so the NEXT
+    /// command in the same session attests cleanly again.
+    #[test]
+    fn self_heal_rewrites_the_snapshot_file_from_the_current_policy() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let snapshot = tmp.path().join("nested").join("policy.json");
+        let env = env_from(&[
+            (POLICY_FINGERPRINT_ENV, "stale-fingerprint"),
+            (POLICY_SNAPSHOT_ENV, snapshot.to_str().expect("utf8 path")),
+        ]);
+        let current = SafetyPolicy::default();
+
+        let first = evaluate_with_attestation_evidence(
+            &current,
+            "cargo test",
+            LaunchMode::Headless,
+            &|k| env.get(k).cloned(),
+        );
+        assert_eq!(first.status, "self-healed");
+        assert!(snapshot.exists(), "the snapshot file must be rewritten");
+
+        let rewritten: SafetyPolicy =
+            serde_json::from_str(&std::fs::read_to_string(&snapshot).expect("read"))
+                .expect("valid policy JSON");
+        assert_eq!(rewritten, current);
+    }
+
+    /// Missing exactly one of the two attestation env vars is the same
+    /// "invalid" shape as a corrupt file -- it must self-heal too, not fall
+    /// through to some third behavior.
+    #[test]
+    fn a_partial_attestation_pair_self_heals() {
+        let env = env_from(&[(POLICY_FINGERPRINT_ENV, "some-fingerprint")]);
+        let current = SafetyPolicy::default();
+        let evidence = evaluate_with_attestation_evidence(
+            &current,
+            "cargo test",
+            LaunchMode::Interactive,
+            &|k| env.get(k).cloned(),
+        );
+        assert_eq!(evidence.status, "self-healed");
+        assert_eq!(evidence.outcome.verdict, Verdict::Allow);
     }
 
     /// Issue #139: the divergence direction itself, computed straight from
