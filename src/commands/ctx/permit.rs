@@ -19,13 +19,19 @@
 //! `safety::evaluate` holds, so classification is testable without touching
 //! the machine. All I/O lives in [`acquire`]/[`live_count`].
 //!
-//! Cross-process atomicity is deliberately NOT closed here: the count-then-
-//! write window is the same TOCTOU today's heavy-worker gate documents, the
-//! budget exists to keep concurrency low rather than enforce an exact
-//! ceiling, and closing it needs a cross-process lock this state directory
-//! has never had.
+//! Cross-process atomicity: [`acquire`] claims one of `limit` numbered slot
+//! files (`slot-0.json` .. `slot-<limit - 1>.json`) with an exclusive
+//! `create_new` open -- the same collision-as-the-open-result idiom
+//! `dash::spawnreq`'s own request files and `memory`'s per-key entries use.
+//! `create_new` is a single atomic filesystem operation on both Windows and
+//! Unix, so when two processes race for the same slot index exactly one
+//! `open` succeeds; the loser moves on to the next index rather than both
+//! believing they hold the budget. This replaces an earlier count-then-write
+//! window that let two concurrent callers both observe a free slot and both
+//! acquire, exceeding `max_heavy_operations`.
 
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -83,10 +89,46 @@ pub struct PermitRecord {
     pub acquired_at: u64,
 }
 
-/// `<state>/permits/<pid>-<uuid>.json`, one file per held permit -- mirrors
-/// `StateDir::sessions()`'s own per-record layout.
+/// `<state>/permits/slot-<n>.json`, one file per budget slot (`n` in
+/// `0..limit`) rather than one per holder -- the slot's own filename is what
+/// [`acquire`] contends on via `create_new`, so the numbered layout (not
+/// `StateDir::sessions()`'s per-record `<pid>-<uuid>.json` naming this used
+/// before) is what makes the claim atomic.
 fn permits_dir(state: &StateDir) -> PathBuf {
     state.root().join("permits")
+}
+
+/// `<dir>/slot-<slot>.json` -- the one file a given budget slot lives at,
+/// shared between [`acquire`] (which contends on it) and tests.
+fn slot_path(dir: &Path, slot: usize) -> PathBuf {
+    dir.join(format!("slot-{slot}.json"))
+}
+
+/// Creates `path` exclusively (fails if it already exists) and writes
+/// `contents` in one call -- the same collision-as-the-open-result idiom
+/// `dash::spawnreq::create_new_private` and `memory`'s per-key entries use,
+/// duplicated locally rather than shared across modules this deep in two
+/// different subsystems. Private (0600) on Unix, plain on Windows (which has
+/// no equivalent bit); `create_new` itself is what supplies the atomicity on
+/// both platforms.
+#[cfg(unix)]
+fn create_new_private(path: &Path, contents: &str) -> std::io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(contents.as_bytes())
+}
+
+#[cfg(not(unix))]
+fn create_new_private(path: &Path, contents: &str) -> std::io::Result<()> {
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    file.write_all(contents.as_bytes())
 }
 
 /// One held slot in the machine-wide heavy-operation budget. Releases its
@@ -148,29 +190,63 @@ pub fn live_count(state: &StateDir) -> usize {
     live_records(state).len()
 }
 
-/// Grants a permit when fewer than `limit` are currently live, `None`
-/// otherwise. Best-effort like every other piece of state-dir housekeeping
-/// in this codebase: a permit that cannot be written is simply not granted
-/// rather than failing the caller outright.
+/// Grants a permit when one of `limit` numbered slots can be claimed
+/// exclusively, `None` when every slot is already taken. Best-effort like
+/// every other piece of state-dir housekeeping in this codebase: a permit
+/// that cannot be written is simply not granted rather than failing the
+/// caller outright.
+///
+/// Atomic across processes (finding B1): earlier this counted live permits
+/// and then wrote a new one, a count-then-create window in which two
+/// processes could both observe a free slot and both acquire, exceeding
+/// `limit`. Now the count is never trusted as the admission decision --
+/// [`live_records`] is still called first, but only to sweep dead holders'
+/// files out of the way; the ACTUAL decision is each candidate slot's own
+/// `create_new`, a single atomic filesystem operation on both Windows and
+/// Unix. Two processes racing for the same index can never both succeed:
+/// exactly one `open` wins, and the loser tries the next index instead of
+/// believing it holds the budget.
 pub fn acquire(state: &StateDir, limit: usize, label: &str) -> Option<HeavyPermit> {
-    if live_count(state) >= limit {
+    if limit == 0 {
         return None;
     }
     let dir = permits_dir(state);
     state::create_private_dir_all(&dir).ok()?;
-    let path = dir.join(format!(
-        "{}-{}.json",
-        std::process::id(),
-        uuid::Uuid::new_v4()
-    ));
+
+    // Sweeps any slot whose owning pid is dead, freeing it for reuse below --
+    // see `live_records`'s own doc comment. `live_count` is a cheap fast
+    // path ONLY, not the admission decision: skipping the slot loop entirely
+    // when every slot already looked live avoids `limit` doomed `create_new`
+    // attempts in the common contended case. A stale or racing count here
+    // can only make this function too conservative (refuse when a slot was
+    // about to free up), never too permissive -- the loop below, not this
+    // check, is what enforces `limit`.
+    if live_count(state) >= limit {
+        return None;
+    }
+
     let record = PermitRecord {
         pid: std::process::id(),
         label: label.to_string(),
         acquired_at: state::now_secs(),
     };
     let json = serde_json::to_string_pretty(&record).ok()?;
-    state::write_private(&path, &json).ok()?;
-    Some(HeavyPermit { path })
+
+    for slot in 0..limit {
+        let path = slot_path(&dir, slot);
+        match create_new_private(&path, &json) {
+            Ok(()) => return Some(HeavyPermit { path }),
+            // Someone else already holds this slot (the expected, common
+            // case under contention) -- try the next index.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            // Any other I/O error on this one slot (e.g. a transient
+            // permission hiccup) is not fatal to the whole attempt either --
+            // best-effort, same as every other state-dir write in this
+            // module.
+            Err(_) => continue,
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -250,6 +326,49 @@ mod tests {
         assert!(
             acquire(&state, 1, "cargo build").is_some(),
             "the slot is free again"
+        );
+    }
+
+    /// Finding B1: acquisition used to be count-then-create with no lock, so
+    /// two racing callers could both observe a free slot and both acquire,
+    /// exceeding `limit`. Races `threads` real OS threads against a budget of
+    /// 1 with a `Barrier` to line them up as close to simultaneously as this
+    /// process can manage, and asserts the OUTCOME rather than the timing:
+    /// however the race actually interleaves, `create_new`'s own atomicity
+    /// must mean exactly one acquisition ever succeeds -- never zero (the old
+    /// code could never grant none when a slot was free) and never more than
+    /// one (the bug this test exists to catch).
+    #[test]
+    fn concurrent_acquisitions_never_exceed_the_limit() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        const THREADS: usize = 16;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(THREADS));
+
+        // Held for the whole race so every granted permit is still live when
+        // counted -- an ungated `Drop` racing the count below would make a
+        // momentarily-too-low reading look like a pass for the wrong reason.
+        let held: Vec<Option<HeavyPermit>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..THREADS)
+                .map(|i| {
+                    let state = state.clone();
+                    let barrier = barrier.clone();
+                    scope.spawn(move || {
+                        barrier.wait();
+                        acquire(&state, 1, &format!("racer-{i}"))
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("racer thread must not panic"))
+                .collect()
+        });
+
+        let granted = held.iter().filter(|permit| permit.is_some()).count();
+        assert_eq!(
+            granted, 1,
+            "a budget of 1 must grant exactly one permit even when {THREADS} threads race for it"
         );
     }
 
