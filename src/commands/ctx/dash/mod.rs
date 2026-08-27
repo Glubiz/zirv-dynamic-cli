@@ -10575,7 +10575,9 @@ mod tests {
     /// exactly once against its group -- the rollback added for the failure
     /// paths above (see `fulfill_spawn_request_rolls_back_admission_when_a_
     /// later_step_refuses`) must never also undo a genuine admission for a
-    /// pane that actually launched.
+    /// pane that actually launched. Windows-only like the other `.cmd`-shim
+    /// spawn tests above: the shim is a batch file a Unix runner cannot exec.
+    #[cfg(windows)]
     #[test]
     fn fulfill_spawn_request_spawning_a_pane_still_counts_exactly_one_admission() {
         let tmp = crate::commands::ctx::testenv::repo();
