@@ -1852,6 +1852,12 @@ pub struct ForgetArgs {
     /// Remove every entry in this repository's memory bank.
     #[arg(long, default_value_t = false)]
     pub all: bool,
+    /// Forget from the shared, repository-owned bank (`<repo>/.zirv/memory/`)
+    /// instead of the private, machine-local one (issue #172). Not
+    /// supported together with `--all`, since `forget_all` only ever clears
+    /// the private bank.
+    #[arg(long, default_value_t = false)]
+    pub repo: bool,
 }
 
 /// `env(key)`, treating a missing or blank value as `"unknown"` -- the same
@@ -2073,6 +2079,12 @@ pub fn run_forget_with<W: Write>(
     let slug = repo_slug(repo);
 
     if args.all {
+        if args.repo {
+            return Err(
+                "zirv ctx forget: --all clears only the local bank; pass a --key with --repo to remove one shared entry instead"
+                    .into(),
+            );
+        }
         forget_all(&state, &slug)?;
         writeln!(w, "zirv ctx forget: cleared the memory bank")?;
         return Ok(0);
@@ -2080,10 +2092,22 @@ pub fn run_forget_with<W: Write>(
     let Some(key) = &args.key else {
         return Err("zirv ctx forget: pass a key, or --all".into());
     };
-    if forget(&state, &slug, key)? {
-        writeln!(w, "zirv ctx forget: removed '{key}'")?;
+    let scope = if args.repo {
+        MemoryScope::Shared
     } else {
-        writeln!(w, "zirv ctx forget: no entry for '{key}'")?;
+        MemoryScope::Private
+    };
+    let bank_label = if args.repo { "repo" } else { "local" };
+    if forget_scoped(scope, repo, &state, &slug, key)? {
+        writeln!(
+            w,
+            "zirv ctx forget: removed '{key}' from the {bank_label} bank"
+        )?;
+    } else {
+        writeln!(
+            w,
+            "zirv ctx forget: no entry for '{key}' in the {bank_label} bank"
+        )?;
     }
     Ok(0)
 }
@@ -3216,6 +3240,7 @@ This should not appear in the body.\n";
         let forget_args = ForgetArgs {
             key: Some("build-cmd".to_string()),
             all: false,
+            repo: false,
         };
         let mut forget_out = Vec::new();
         run_forget_with(&forget_args, &mut forget_out, tmp.path(), &|k| {
@@ -3236,11 +3261,66 @@ This should not appear in the body.\n";
         let args = ForgetArgs {
             key: None,
             all: false,
+            repo: false,
         };
         let mut out = Vec::new();
         let err = run_forget_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned())
             .expect_err("neither a key nor --all was given");
         assert!(err.to_string().contains("--all"), "got {err}");
+    }
+
+    #[test]
+    fn ctx_forget_repo_removes_a_shared_entry_without_touching_the_local_one() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state_dir = repo.path().join("state");
+        let state = StateDir::from_root(state_dir.clone());
+        let cfg = CtxConfig::default();
+        let slug = repo_slug(repo.path());
+
+        remember(&state, &slug, &sample("build-cmd", 1), &cfg).expect("remember private");
+        upsert_scoped(
+            MemoryScope::Shared,
+            repo.path(),
+            &state,
+            &slug,
+            &cfg,
+            &sample("build-cmd", 1),
+        )
+        .expect("upsert shared");
+
+        let env = env_map(&[(state::STATE_ENV, state_dir.to_str().expect("utf8"))]);
+        let args = ForgetArgs {
+            key: Some("build-cmd".to_string()),
+            all: false,
+            repo: true,
+        };
+        let mut out = Vec::new();
+        run_forget_with(&args, &mut out, repo.path(), &|k| env.get(k).cloned()).expect("forget");
+
+        assert!(
+            !repo.path().join(".zirv/memory/build-cmd.md").exists(),
+            "the shared entry must be removed"
+        );
+        assert!(
+            get(&state, &slug, "build-cmd").expect("get").is_some(),
+            "the local entry must be untouched"
+        );
+    }
+
+    #[test]
+    fn ctx_forget_all_with_repo_is_refused() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state_dir = repo.path().join("state");
+        let env = env_map(&[(state::STATE_ENV, state_dir.to_str().expect("utf8"))]);
+        let args = ForgetArgs {
+            key: None,
+            all: true,
+            repo: true,
+        };
+        let mut out = Vec::new();
+        let err = run_forget_with(&args, &mut out, repo.path(), &|k| env.get(k).cloned())
+            .expect_err("--all --repo is not supported");
+        assert!(err.to_string().contains("--repo"), "got {err}");
     }
 
     // N5/issue #34: the memory prompt layer's own source, `render_for_prompt`
