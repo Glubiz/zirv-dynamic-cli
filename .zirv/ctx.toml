@@ -76,7 +76,8 @@ model = "fable"
 # backoff_base_secs = 60             # base backoff between restart attempts
 # on_failure = "notify-send done"    # REPO-FORBIDDEN (ZIRV_CTX_ON_FAILURE): shell command run on failure. Default: unset.
 # max_nudges = 3                     # consecutive nudge-driven restarts tolerated before nudges are ignored
-# max_heavy_workers = 1              # REPO-FORBIDDEN (ZIRV_CTX_SUPERVISE_MAX_HEAVY_WORKERS): machine-wide cap on live unattended workers (issue #133)
+# max_heavy_operations = 1           # REPO-FORBIDDEN (ZIRV_CTX_SUPERVISE_MAX_HEAVY_OPERATIONS): machine-wide cap on concurrent heavy commands (issue #155, replacing #133's max_heavy_workers)
+# max_heavy_workers = 1              # DEPRECATED alias for max_heavy_operations. REPO-FORBIDDEN (ZIRV_CTX_SUPERVISE_MAX_HEAVY_WORKERS)
 
 # [handoff]
 # model = "haiku"                    # REPO-FORBIDDEN (ZIRV_CTX_MODEL): distiller/judgment model override. Default: unset (adapter decides).

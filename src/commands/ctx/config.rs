@@ -93,32 +93,50 @@ pub struct SuperviseConfig {
     /// this names no binary, shell command, or model choice, only how many
     /// times a session tolerates being interrupted.
     pub max_nudges: u32,
-    /// Issue #133: the machine-wide cap on live "heavy" workers --
-    /// unattended supervised sessions that can run real build/test-class
-    /// load with nobody watching (`Verb::Exec`, including `zirv agent`'s
-    /// headless fallback which delegates straight into `exec::run_with`, and
-    /// `Verb::Dash` dashboard worker panes -- see
-    /// `sessions::count_heavy_workers`'s own doc comment for exactly which
-    /// verbs count and why). Refuse-not-queue: a spawn that would exceed
-    /// this is rejected outright at `exec.rs`'s registration point and
-    /// `dash::fulfill_spawn_request`, not queued, because a BSOD-triggering
-    /// incident (four kernel bugchecks in 12 minutes, issue #133's own
-    /// evidence) was two concurrent cold `cargo build` + full-nextest
-    /// workloads run under zirv supervision with no governance at all.
-    /// Defaults to 1: the two-parallel-worktree reproduction in #133 needed
-    /// only two to blue-screen the host, so the safe default is a single
-    /// heavy worker at a time -- an operator who has verified their own
-    /// machine can take more raises this explicitly.
+    /// Issue #155, Phase 5(e): how many HEAVY OPERATIONS may run
+    /// concurrently on this machine -- classified commands (`cargo build`/
+    /// `test`/`nextest`/`clippy`/`package`/`publish`, plus
+    /// `heavy_command_patterns`), each holding a permit for the duration of
+    /// the child process (`permit::acquire`/`permit::HeavyPermit`), checked
+    /// at `script_runner::Command::invoke`, the single seam where a zirv
+    /// script runs a shell command. Replaces `max_heavy_workers`, which
+    /// counted live `Verb::Exec | Verb::Dash` session records and so was
+    /// blind to what those sessions were actually doing: an idle worker
+    /// consumed the whole budget while a busy orchestrator running a full
+    /// nextest sweep consumed none of it.
     ///
-    /// `REPO_FORBIDDEN`, the same trust asymmetry as `dash.max_panes`: a
-    /// checked-out repo raising its own concurrency budget is exactly the
-    /// case the cap exists for, so only `~/.zirv/ctx.toml` or
-    /// `ZIRV_CTX_SUPERVISE_MAX_HEAVY_WORKERS` may set it. Deliberately
-    /// **not** under `[agents]` -- that table is reserved for the distinct,
-    /// per-agent `<repo>/.zirv/.settings.toml` gate (see
+    /// `max_heavy_workers` is still accepted as a DEPRECATED ALIAS,
+    /// rewritten onto this key before deserialisation: these structs are
+    /// `deny_unknown_fields`, so an operator's existing `~/.zirv/ctx.toml`
+    /// (or `ZIRV_CTX_SUPERVISE_MAX_HEAVY_WORKERS`) would otherwise hard-fail
+    /// on upgrade. The new key wins when both are present.
+    ///
+    /// Defaults to 1, unchanged from issue #133: the two-parallel-worktree
+    /// reproduction there needed only two concurrent cold `cargo build` +
+    /// full-nextest workloads to blue-screen the host four times in twelve
+    /// minutes, so the safe default is a single heavy operation at a time --
+    /// an operator who has verified their own machine can take more raises
+    /// this explicitly.
+    ///
+    /// `REPO_FORBIDDEN` under BOTH spellings, unchanged from #133: a
+    /// checked-out repo raising the machine-wide concurrency budget is
+    /// exactly the case the cap exists for, so only `~/.zirv/ctx.toml` or
+    /// the matching `ZIRV_CTX_SUPERVISE_MAX_HEAVY_*` env var may set it.
+    /// Deliberately **not** under `[agents]` -- that table is reserved for
+    /// the distinct, per-agent `<repo>/.zirv/.settings.toml` gate (see
     /// `agents_in_ctx_toml_is_rejected_so_the_two_files_stay_distinct`) --
     /// this is a `[supervise]` key like every other cap in this struct.
-    pub max_heavy_workers: usize,
+    pub max_heavy_operations: usize,
+    /// Extra command patterns an operator classifies as heavy on their own
+    /// machine, ADDED to the built-in set (`permit::BUILTIN_HEAVY_PATTERNS`),
+    /// never replacing it -- `permit::is_heavy` always checks the built-ins
+    /// regardless of what this holds. A repo layer may add entries (adding
+    /// is narrowing), but the built-ins can never be removed by any layer.
+    /// Not `REPO_FORBIDDEN`: unlike `max_heavy_operations` itself, adding a
+    /// pattern can only make MORE commands wait for a permit, never fewer,
+    /// so a repo checkout widening this list cannot reproduce issue #133's
+    /// ungoverned-concurrency incident.
+    pub heavy_command_patterns: Vec<String>,
 }
 
 impl Default for SuperviseConfig {
@@ -132,7 +150,8 @@ impl Default for SuperviseConfig {
             backoff_base_secs: 60,
             on_failure: None,
             max_nudges: 3,
-            max_heavy_workers: 1,
+            max_heavy_operations: 1,
+            heavy_command_patterns: Vec::new(),
         }
     }
 }
@@ -1008,6 +1027,11 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         &["supervise", "max_heavy_workers"],
         EnvKind::Int,
     ),
+    (
+        "ZIRV_CTX_SUPERVISE_MAX_HEAVY_OPERATIONS",
+        &["supervise", "max_heavy_operations"],
+        EnvKind::Int,
+    ),
     ("ZIRV_CTX_MODEL", &["handoff", "model"], EnvKind::Str),
     (
         "ZIRV_CTX_HANDOFF_TIMEOUT_SECS",
@@ -1642,12 +1666,20 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     (&["dash", "max_panes"], "ZIRV_CTX_DASH_MAX_PANES"),
     // Issue #133: same trust asymmetry as `dash.max_panes` right above, one
     // level up -- a repo checkout must not be able to raise the machine-wide
-    // heavy-worker budget any more than it can raise the one dashboard's own
-    // pane cap. See `SuperviseConfig::max_heavy_workers`'s own doc comment
-    // for the BSOD incident this defends against.
+    // heavy-operation budget any more than it can raise the one dashboard's
+    // own pane cap. See `SuperviseConfig::max_heavy_operations`'s own doc
+    // comment for the BSOD incident this defends against.
     (
         &["supervise", "max_heavy_workers"],
         "ZIRV_CTX_SUPERVISE_MAX_HEAVY_WORKERS",
+    ),
+    // Issue #155, Phase 5(e): `max_heavy_operations` is the renamed key --
+    // same trust posture as `max_heavy_workers` right above, which stays
+    // forbidden too as a deprecated alias (see `CtxConfig::load`'s pre-
+    // deserialise rewrite).
+    (
+        &["supervise", "max_heavy_operations"],
+        "ZIRV_CTX_SUPERVISE_MAX_HEAVY_OPERATIONS",
     ),
     // Mouse capture takes over the terminal's own text selection, so which
     // way that trade goes is the operator's call about their own terminal,
@@ -2012,6 +2044,25 @@ impl CtxConfig {
             }
         }
 
+        // Issue #155, Phase 5(e): `supervise.max_heavy_workers` is a
+        // deprecated alias for `max_heavy_operations`, rewritten here --
+        // after every layer, including the `ENV_MAP` loop just above, has
+        // already contributed -- because `SuperviseConfig` is
+        // `deny_unknown_fields` and an old key surviving to `try_into()`
+        // below would hard-fail the load rather than degrade gracefully.
+        // Positioned after `ENV_MAP` rather than alongside the `pace`/
+        // `context` re-insertions above so the deprecated
+        // `ZIRV_CTX_SUPERVISE_MAX_HEAVY_WORKERS` env var (still in
+        // `ENV_MAP`, unchanged) gets the identical rewrite a deprecated TOML
+        // key gets, instead of leaving its own stray `max_heavy_workers`
+        // entry behind. The new key wins whenever both spellings ended up
+        // set, regardless of which layer or env var supplied either one.
+        if let Some(old) = take_nested(&mut merged, "supervise", "max_heavy_workers")
+            && value_at(&merged, &["supervise", "max_heavy_operations"]).is_none()
+        {
+            insert_path(&mut merged, &["supervise", "max_heavy_operations"], old);
+        }
+
         let mut cfg: Self = toml::Value::Table(merged)
             .try_into()
             .map_err(|e| format!("invalid ctx config: {e}"))?;
@@ -2296,9 +2347,14 @@ mod tests {
         assert_eq!(SuperviseConfig::default().max_restarts, 2);
         assert_eq!(SuperviseConfig::default().max_nudges, 3);
         assert_eq!(
-            SuperviseConfig::default().max_heavy_workers,
+            SuperviseConfig::default().max_heavy_operations,
             1,
-            "issue #133: a single heavy worker at a time is the safe default"
+            "issue #133: a single heavy operation at a time is the safe default"
+        );
+        assert_eq!(
+            SuperviseConfig::default().heavy_command_patterns,
+            Vec::<String>::new(),
+            "the built-in set is baked into permit::is_heavy, not duplicated here"
         );
         assert_eq!(
             HandoffConfig::default().model,
@@ -3719,33 +3775,88 @@ mod tests {
         assert_eq!(cfg.supervise.max_nudges, 5);
     }
 
-    /// Issue #133: `supervise.max_heavy_workers` reads from its own env var
-    /// like every other `supervise.*` key.
+    /// Issue #155, Phase 5(e): the deprecated `ZIRV_CTX_SUPERVISE_MAX_HEAVY_
+    /// WORKERS` env var still sets the renamed `max_heavy_operations` key --
+    /// the same alias treatment the deprecated TOML key gets, so an
+    /// operator's existing shell profile keeps working across the upgrade.
     #[test]
-    fn max_heavy_workers_env_override_sets_the_key() {
+    fn max_heavy_workers_env_override_sets_the_new_key() {
         let repo = tempfile::tempdir().expect("tempdir");
         let env = env_map(&[("ZIRV_CTX_SUPERVISE_MAX_HEAVY_WORKERS", "4")]);
         let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
-        assert_eq!(cfg.supervise.max_heavy_workers, 4);
+        assert_eq!(cfg.supervise.max_heavy_operations, 4);
     }
 
-    /// Issue #133: `max_heavy_workers` is `REPO_FORBIDDEN`, the same trust
-    /// asymmetry as `dash.max_panes` -- a checked-out repo raising its own
-    /// concurrency budget is exactly the case the cap exists for.
+    /// The renamed key reads from its own env var like every other
+    /// `supervise.*` key.
     #[test]
-    fn a_repository_config_may_not_set_max_heavy_workers() {
+    fn max_heavy_operations_env_override_sets_the_key() {
         let repo = tempfile::tempdir().expect("tempdir");
-        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        let env = env_map(&[("ZIRV_CTX_SUPERVISE_MAX_HEAVY_OPERATIONS", "4")]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert_eq!(cfg.supervise.max_heavy_operations, 4);
+    }
+
+    /// Issue #155, Phase 5(e): `supervise.max_heavy_workers` is renamed to
+    /// `max_heavy_operations`. The old spelling must still PARSE, not merely
+    /// be documented: `CtxConfig`'s structs are `deny_unknown_fields`, an
+    /// installed older binary hard-errors on an unknown key, and an
+    /// operator's existing `~/.zirv/ctx.toml` has to keep working across the
+    /// upgrade in both directions.
+    #[test]
+    fn the_deprecated_max_heavy_workers_alias_still_sets_the_new_key() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
         std::fs::write(
-            repo.path().join(".zirv/ctx.toml"),
-            "[supervise]\nmax_heavy_workers = 99\n",
+            home.path().join(".zirv").join(CTX_CONFIG_FILE),
+            "[supervise]\nmax_heavy_workers = 2\n",
         )
         .expect("write");
 
-        let empty = env_map(&[]);
-        let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
-            .expect_err("max_heavy_workers must be REPO_FORBIDDEN");
-        assert!(err.to_string().contains("max_heavy_workers"), "got {err}");
+        let repo = tempfile::tempdir().expect("repo");
+        let empty: HashMap<String, String> = HashMap::new();
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("loads");
+        assert_eq!(cfg.supervise.max_heavy_operations, 2);
+    }
+
+    /// The new spelling wins when both are present -- an operator mid-
+    /// migration must not get the old value silently.
+    #[test]
+    fn the_new_key_wins_over_the_deprecated_alias() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".zirv").join(CTX_CONFIG_FILE),
+            "[supervise]\nmax_heavy_workers = 2\nmax_heavy_operations = 4\n",
+        )
+        .expect("write");
+
+        let repo = tempfile::tempdir().expect("repo");
+        let empty: HashMap<String, String> = HashMap::new();
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("loads");
+        assert_eq!(cfg.supervise.max_heavy_operations, 4);
+    }
+
+    /// Both spellings stay `REPO_FORBIDDEN`: a checked-out repo raising the
+    /// machine-wide concurrency budget is the exact case issue #133's BSOD
+    /// incident created it for, and a renamed key must not become a hole.
+    #[test]
+    fn neither_spelling_may_come_from_a_repo_layer() {
+        for key in ["max_heavy_operations", "max_heavy_workers"] {
+            let repo = tempfile::tempdir().expect("repo");
+            std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+            std::fs::write(
+                repo.path().join(".zirv").join(CTX_CONFIG_FILE),
+                format!("[supervise]\n{key} = 8\n"),
+            )
+            .expect("write");
+            let empty: HashMap<String, String> = HashMap::new();
+            let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+                .expect_err("a repo layer must be rejected");
+            assert!(err.to_string().contains(key), "got {err}");
+        }
     }
 
     /// S1-class boundary, same rationale as `prompt.max_repo_bytes` and
@@ -4364,6 +4475,7 @@ mod tests {
         ("supervise", "backoff_base_secs"),
         ("supervise", "on_failure"),
         ("supervise", "max_nudges"),
+        ("supervise", "max_heavy_operations"),
         ("supervise", "max_heavy_workers"),
         ("handoff", "model"),
         ("handoff", "tail_items"),

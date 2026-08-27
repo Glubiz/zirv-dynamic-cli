@@ -14,6 +14,7 @@ pub mod dash;
 pub mod drift;
 pub mod event;
 pub mod exec;
+pub mod group;
 pub mod handoff;
 pub mod handover;
 pub mod hook;
@@ -25,6 +26,7 @@ pub mod memory_optimize;
 pub mod optimize;
 pub mod pace;
 pub mod permissions;
+pub mod permit;
 pub mod policy;
 pub mod poll;
 pub mod prompt;
@@ -389,6 +391,8 @@ pub enum CtxVerb {
     Handover(handover::HandoverArgs),
     /// Audit recent transcripts for escalated/denied permission requests.
     Permissions(permissions::PermissionsArgs),
+    /// Open, inspect or close a bounded group of delegated work.
+    Group(group::GroupArgs),
 }
 
 /// What a clap parse failure costs, which is not the same for every verb.
@@ -477,6 +481,7 @@ pub fn dispatch(args: &[String]) -> i32 {
         CtxVerb::Safety(a) => safety::run(a, &mut out),
         CtxVerb::Handover(a) => handover::run(a, &mut out),
         CtxVerb::Permissions(a) => permissions::run(a, &mut out),
+        CtxVerb::Group(a) => group::run(a, &mut out),
     };
 
     match result {

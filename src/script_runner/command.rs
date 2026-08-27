@@ -120,6 +120,13 @@ impl Command {
                 .stderr(Stdio::inherit());
         }
 
+        // Issue #155: hold a machine-wide permit for the duration of a
+        // classified heavy command. Best effort by design -- a state
+        // directory that cannot be resolved must never stop a script from
+        // running -- and the guard's `Drop` releases the slot when the child
+        // exits, however it exits.
+        let _permit = heavy_permit_for(command, context.get("cwd").map(String::as_str)).await;
+
         if let Some(var) = &self.capture {
             let out = shell.output().await?;
             if !out.status.success() {
@@ -154,6 +161,95 @@ impl Command {
     ) -> Result<(), String> {
         let substituted = self.substituted_command(context);
         check_unresolved(&self.command, &substituted)
+    }
+}
+
+/// Issue #155: resolves the state dir and config from the process
+/// environment and classifies `command` against the heavy-operation pattern
+/// set, returning `None` for anything that is not heavy -- or when the state
+/// directory or config cannot be resolved at all. Best-effort, the same as
+/// every other piece of state-dir housekeeping in this codebase: a script
+/// must never fail just because zirv's own supervision state could not be
+/// found. `cwd` mirrors `agent_command::resolve_repo`'s own preference for a
+/// script's own `cd`-tracked directory over the process's real one, since
+/// `Command`'s `cd` handling only ever updates `context["cwd"]` (see
+/// `execute`'s own handling), never `std::env::set_current_dir`.
+async fn heavy_permit_for(
+    command: &str,
+    cwd: Option<&str>,
+) -> Option<crate::commands::ctx::permit::HeavyPermit> {
+    use crate::commands::ctx::config::{CtxConfig, env_from_process};
+    use crate::commands::ctx::permit;
+    use crate::commands::ctx::state::StateDir;
+
+    let env = env_from_process();
+    let state = StateDir::resolve(&env).ok()?;
+    let repo = cwd
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::current_dir().ok())?;
+    let cfg = CtxConfig::load(&repo, &env).ok()?;
+
+    if !permit::is_heavy(command, &cfg.supervise.heavy_command_patterns) {
+        return None;
+    }
+
+    let limit = cfg.supervise.max_heavy_operations;
+    let label = permit_label(&env, command);
+    // Refuse-not-queue is right for a *spawn* (issue #133's own gate, now
+    // `dash::fulfill_spawn_request`) but wrong for a command the operator
+    // already put in a script -- failing `zirv test` outright because a
+    // background build is running would be worse than waiting for it. Polls
+    // on a bounded interval up to a generous cap, then proceeds without a
+    // permit rather than blocking a script forever.
+    const POLL_INTERVAL: Duration = Duration::from_millis(500);
+    const MAX_WAIT: Duration = Duration::from_secs(600);
+    let mut waited = Duration::ZERO;
+    let mut announced = false;
+    loop {
+        if let Some(permit) = permit::acquire(&state, limit, &label) {
+            return Some(permit);
+        }
+        if waited >= MAX_WAIT {
+            return None;
+        }
+        if !announced {
+            // Issue #162: a wait that cannot say WHO holds the budget is
+            // undiagnosable -- the same complaint that made the old
+            // heavy-worker refusal's own advice ("see `zirv ctx status`")
+            // point at a list that never named the actual holder. Read off
+            // `permit::live_records`, the exact same source `zirv ctx
+            // status`'s own occupancy line reads, so the two can never
+            // disagree about who is holding a slot.
+            let holders: Vec<String> = permit::live_records(&state)
+                .into_iter()
+                .map(|record| record.label)
+                .collect();
+            eprintln!(
+                "zirv: waiting for a heavy-operation slot ({limit} in use: {}) before running `{command}`",
+                holders.join(", ")
+            );
+            announced = true;
+        }
+        sleep(POLL_INTERVAL).await;
+        waited += POLL_INTERVAL;
+    }
+}
+
+/// Issue #162: names WHO holds a permit, not just what it is running --
+/// `session <short>: <command>` when this process is itself supervised (the
+/// common case: a `zirv test`/`zirv build` invoked from inside an agent's
+/// own shell, which inherits `ZIRV_CTX_SESSION` from its supervisor), or the
+/// bare command when it is not (an operator's own unsupervised terminal).
+/// Whatever this returns is what both `zirv ctx status`'s occupancy line and
+/// this module's own wait message name -- they read the same on-disk record
+/// back through `permit::live_records`, so they cannot drift apart.
+fn permit_label(env: &impl Fn(&str) -> Option<String>, command: &str) -> String {
+    match env(crate::commands::ctx::adapters::SESSION_ENV) {
+        Some(session) => format!(
+            "session {}: {command}",
+            crate::commands::ctx::sessions::short_id(&session)
+        ),
+        None => command.to_string(),
     }
 }
 
@@ -241,5 +337,129 @@ mod tests {
         let result = command.substituted_command(&params);
 
         assert_eq!(result, "echo Alice is 30 years old");
+    }
+
+    /// Issue #155: a classified heavy command acquires a permit for as long
+    /// as it is held, and releases it on drop -- the same lifecycle
+    /// `permit::a_permit_is_bounded_and_released_on_drop` pins for
+    /// `permit::acquire` itself, exercised here through the actual seam
+    /// `Command::invoke` calls.
+    #[tokio::test]
+    async fn heavy_permit_for_acquires_and_releases_a_permit_for_a_heavy_command() {
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let repo = crate::commands::ctx::testenv::repo();
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let _state_env = crate::commands::ctx::testenv::VarGuard::set(&[(
+            crate::commands::ctx::state::STATE_ENV,
+            Some(state_dir.path().to_str().expect("utf8 path")),
+        )]);
+
+        let state = crate::commands::ctx::state::StateDir::resolve(
+            &crate::commands::ctx::config::env_from_process(),
+        )
+        .expect("resolve state dir");
+
+        let permit = heavy_permit_for(
+            "cargo build",
+            Some(repo.path().to_str().expect("utf8 path")),
+        )
+        .await
+        .expect("a heavy command acquires a permit");
+        assert_eq!(crate::commands::ctx::permit::live_count(&state), 1);
+
+        drop(permit);
+        assert_eq!(crate::commands::ctx::permit::live_count(&state), 0);
+    }
+
+    /// A command outside the heavy classification never touches the budget
+    /// at all.
+    #[tokio::test]
+    async fn heavy_permit_for_is_none_for_a_light_command() {
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let repo = crate::commands::ctx::testenv::repo();
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let _state_env = crate::commands::ctx::testenv::VarGuard::set(&[(
+            crate::commands::ctx::state::STATE_ENV,
+            Some(state_dir.path().to_str().expect("utf8 path")),
+        )]);
+
+        let permit =
+            heavy_permit_for("git status", Some(repo.path().to_str().expect("utf8 path"))).await;
+        assert!(permit.is_none(), "a light command must not hold a permit");
+    }
+
+    /// Issue #162(a): the acceptance criterion is that a delegation dying
+    /// during startup must leave the budget exactly as it found it. In this
+    /// codebase's old design a session registered against the budget before
+    /// it could fail; in this one only an actual classified command holds a
+    /// permit, for exactly the duration of its own child process -- so a
+    /// command that fails still releases on the way out through ordinary
+    /// `?`/`Drop`, proven here through the real seam (`Command::execute`)
+    /// rather than only `heavy_permit_for` in isolation.
+    #[tokio::test]
+    async fn a_failing_heavy_command_still_releases_its_permit() {
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let repo = crate::commands::ctx::testenv::repo();
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let _state_env = crate::commands::ctx::testenv::VarGuard::set(&[(
+            crate::commands::ctx::state::STATE_ENV,
+            Some(state_dir.path().to_str().expect("utf8 path")),
+        )]);
+
+        let state = crate::commands::ctx::state::StateDir::resolve(
+            &crate::commands::ctx::config::env_from_process(),
+        )
+        .expect("resolve state dir");
+
+        // Classifies as heavy (`cargo build*`) and fails immediately on its
+        // own bad flag -- no real build ever starts, matching #162's own
+        // "dies during startup" shape.
+        let command = Command {
+            command: "cargo build --this-flag-does-not-exist".to_string(),
+            capture: None,
+            description: None,
+            options: None,
+        };
+        let mut context = HashMap::new();
+        context.insert("cwd".to_string(), repo.path().to_string_lossy().to_string());
+
+        let result = command.execute(&mut context).await;
+        assert!(
+            result.is_err(),
+            "the classified-heavy command must fail as invoked"
+        );
+        assert_eq!(
+            crate::commands::ctx::permit::live_count(&state),
+            0,
+            "a permit acquired by a command that then fails must not survive it"
+        );
+    }
+
+    /// Issue #162(b): a wait/occupancy message that cannot say WHO holds the
+    /// budget is undiagnosable. Inside a supervised session (`ZIRV_CTX_
+    /// SESSION` set, the common case for a `zirv test`/`zirv build` step run
+    /// from an agent's own shell) the label names the session.
+    #[test]
+    fn permit_label_names_the_supervising_session_when_present() {
+        let env = |key: &str| {
+            (key == crate::commands::ctx::adapters::SESSION_ENV)
+                .then(|| "11111111-2222-4333-8444-555555555555".to_string())
+        };
+        assert_eq!(
+            permit_label(&env, "cargo nextest run"),
+            "session 11111111: cargo nextest run"
+        );
+    }
+
+    /// Outside any supervised session (an operator's own unsupervised
+    /// terminal), the label degrades to the bare command -- there is no
+    /// session identity to name.
+    #[test]
+    fn permit_label_falls_back_to_the_bare_command_when_unsupervised() {
+        let env = |_: &str| None;
+        assert_eq!(permit_label(&env, "cargo build"), "cargo build");
     }
 }

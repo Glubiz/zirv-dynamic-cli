@@ -2720,30 +2720,12 @@ fn fulfill_spawn_request(
             cfg.dash.max_panes
         )));
     }
-    // Issue #133: the machine-wide sibling of the pane cap right above,
-    // counting the same `Verb::Exec | Verb::Dash` enumeration `exec.rs`'s own
-    // gate uses (`sessions::count_heavy_workers`) rather than this dashboard's
-    // own `panes.len()` -- a fresh pane here would add to the same budget a
-    // bare `zirv ctx exec` or another dashboard's own panes already spend.
-    // `SpawnRefusal::policy`, not `::channel`: falling back to a headless run
-    // would simply route around the budget (the headless path is gated too,
-    // by the identical check in `exec.rs`), the same reasoning `max_panes`
-    // right above already applies.
-    //
-    // Review round 1 (2026-08-26), cross-process TOCTOU: this count-then-
-    // register window is not atomic across processes -- a concurrent
-    // `zirv ctx exec` launch (or another dashboard's own spawn) can read the
-    // same live count before either side has registered, so the budget can
-    // be exceeded by one under simultaneous launches. Not closed here; see
-    // `exec.rs`'s identical gate for the full reasoning.
-    let live_heavy = sessions::count_heavy_workers(state);
-    if live_heavy >= cfg.supervise.max_heavy_workers {
-        return Err(SpawnRefusal::policy(format!(
-            "machine-wide heavy-worker budget reached ({live_heavy} of \
-             {} slots in use, supervise.max_heavy_workers)",
-            cfg.supervise.max_heavy_workers
-        )));
-    }
+    // Issue #155, Phase 5(e): the former machine-wide heavy-worker gate here
+    // (`sessions::count_heavy_workers`, refusing a spawn outright) is gone --
+    // a worker pane is no longer a heavy event just by existing. The budget
+    // now gates the actual heavy COMMAND a pane's agent runs, at
+    // `script_runner::Command::invoke` (`permit::acquire`), so an idle pane
+    // holds nothing and never counts against it.
     if let Some(reason) = cfg.agents.refusal(&req.agent) {
         return Err(SpawnRefusal::policy(reason));
     }
@@ -9603,62 +9585,6 @@ mod tests {
         let reason = refusal_for(&spawn_request("do the work", &repo), &cfg, &repo);
         assert!(reason.contains("pane limit reached"), "got {reason}");
         assert!(reason.contains("dash.max_panes"), "got {reason}");
-    }
-
-    /// Issue #133: the machine-wide sibling of the pane-cap test right
-    /// above -- a live `Exec` record elsewhere on the machine (not this
-    /// dashboard's own `panes` vector) must still refuse a new worker pane,
-    /// with a non-retryable (`policy`) refusal so the requester's headless
-    /// fallback does not simply route around the same budget `exec.rs`'s own
-    /// gate enforces.
-    #[test]
-    fn fulfill_spawn_request_refuses_once_the_machine_wide_heavy_worker_budget_is_reached() {
-        let repo = std::env::current_dir().expect("cwd");
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let state = StateDir::from_root(tmp.path().join("state"));
-
-        // Occupies the only slot; kept alive for the whole test so its
-        // record stays on disk through the `fulfill_spawn_request` call.
-        let occupant = sessions::SessionGuard::register(
-            &state,
-            sessions::Record::new(
-                "77777777-2222-4333-8444-555555555555",
-                "claude",
-                &repo,
-                sessions::Verb::Exec,
-            ),
-        );
-
-        let mut cfg = CtxConfig::default();
-        cfg.supervise.max_heavy_workers = 1;
-        let mut panes: Vec<Pane> = Vec::new();
-        let mut queues: Vec<VecDeque<String>> = Vec::new();
-        let mut errors = Vec::new();
-        let refusal = fulfill_spawn_request(
-            &spawn_request("do the work", &repo),
-            false,
-            &mut panes,
-            &mut queues,
-            &cfg,
-            &state,
-            &repo,
-            (80, 24),
-            &tmp.path().join("requests"),
-            &mut errors,
-        )
-        .expect_err("a full heavy-worker budget must refuse the spawn");
-
-        assert!(
-            refusal.reason.contains("heavy-worker budget"),
-            "got {}",
-            refusal.reason
-        );
-        assert!(
-            !refusal.retryable,
-            "must be a policy refusal -- a headless fallback would route around the same budget"
-        );
-
-        drop(occupant);
     }
 
     /// T10: the coverage gap this closes -- a worker pane spawn request
