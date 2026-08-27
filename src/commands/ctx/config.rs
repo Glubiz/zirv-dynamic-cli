@@ -2080,8 +2080,11 @@ impl CtxConfig {
         // array) silently clobber the home layer's entries instead of
         // adding to them. Lifted out and unioned once both layers are in
         // hand, same as `extra_deny`.
-        let home_heavy_patterns =
-            string_array(take_nested(&mut merged, "supervise", "heavy_command_patterns"));
+        let home_heavy_patterns = string_array(take_nested(
+            &mut merged,
+            "supervise",
+            "heavy_command_patterns",
+        ));
 
         // Read on its own first: the repo layer is the one layer that comes
         // from a checkout rather than from the operator.
