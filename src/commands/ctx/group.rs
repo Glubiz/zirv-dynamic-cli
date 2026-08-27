@@ -145,6 +145,38 @@ pub fn admit_child(state: &StateDir, id: &str) -> CtxResult<()> {
     Ok(())
 }
 
+/// Re-review (2026-08-27) finding 1: rolls back one admission granted by
+/// [`admit_child`] when the spawn/delegation it was granted for turns out to
+/// fail before a child is ever actually launched -- both real choke points
+/// (`agent::run_with`'s headless path, `dash::fulfill_spawn_request`'s pane
+/// path) call this on every failure between a successful `admit_child` and
+/// the point the child is definitely running. Saturating-decrements
+/// `admitted_children`, never below zero.
+///
+/// Best-effort, unlike `admit_child`: logs to stderr and returns rather than
+/// propagating a second error over the original spawn failure that triggered
+/// the rollback -- an operator who already sees a spawn error must not also
+/// see "the state file wouldn't decrement" stacked on top of it. Same
+/// load-modify-write, non-locking pattern as `admit_child`/`close`: losing a
+/// rollback to a race just leaves the count one high until the group is
+/// inspected, never wrongly grants an extra admission.
+pub fn rollback_admission(state: &StateDir, id: &str) {
+    match load(state, id) {
+        Ok(Some(mut group)) => {
+            group.admitted_children = group.admitted_children.saturating_sub(1);
+            if let Err(e) = create(state, &group) {
+                eprintln!("zirv ctx: failed to roll back admission for work group '{id}': {e}");
+            }
+        }
+        Ok(None) => {
+            eprintln!("zirv ctx: could not roll back admission -- no work group '{id}'");
+        }
+        Err(e) => {
+            eprintln!("zirv ctx: failed to roll back admission for work group '{id}': {e}");
+        }
+    }
+}
+
 /// Issue #155 review finding D2: `deadline_secs` is surfaced as an overdue
 /// marker, never enforced -- nothing here kills a session or a group. `now`
 /// is a parameter, not `state::now_secs()`, for the same testability reason
@@ -474,6 +506,68 @@ mod tests {
             1,
             "a refused admission must not advance the count"
         );
+    }
+
+    /// Re-review (2026-08-27) finding 1: a rollback after a real admission
+    /// restores exactly the slot it undoes, leaving any other admissions on
+    /// the group untouched.
+    #[test]
+    fn rollback_admission_undoes_exactly_one_admitted_child() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        create(&state, &sample_group("wg-1")).expect("create");
+
+        admit_child(&state, "wg-1").expect("first child admitted");
+        admit_child(&state, "wg-1").expect("second child admitted");
+        assert_eq!(
+            load(&state, "wg-1")
+                .expect("load")
+                .expect("present")
+                .admitted_children,
+            2
+        );
+
+        rollback_admission(&state, "wg-1");
+        assert_eq!(
+            load(&state, "wg-1")
+                .expect("load")
+                .expect("present")
+                .admitted_children,
+            1,
+            "rollback must undo exactly one admission"
+        );
+    }
+
+    /// Never underflows: a rollback with nothing to undo (already at zero)
+    /// must saturate rather than wrap `u32::MAX`, since it is called
+    /// best-effort on failure paths that cannot prove an admission actually
+    /// happened moments earlier.
+    #[test]
+    fn rollback_admission_saturates_at_zero() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        create(&state, &sample_group("wg-1")).expect("create"); // admitted_children: 0
+
+        rollback_admission(&state, "wg-1");
+        assert_eq!(
+            load(&state, "wg-1")
+                .expect("load")
+                .expect("present")
+                .admitted_children,
+            0,
+            "must saturate at zero, not underflow"
+        );
+    }
+
+    /// Best-effort: a rollback naming an unknown group must not panic --
+    /// `admit_child`'s own choke points call this from an error path that
+    /// already has a real failure to report, and a second panic/error here
+    /// would only make that worse.
+    #[test]
+    fn rollback_admission_on_an_unknown_group_does_not_panic() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        rollback_admission(&state, "nope");
     }
 
     #[test]

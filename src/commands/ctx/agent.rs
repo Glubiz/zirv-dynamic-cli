@@ -866,7 +866,23 @@ pub fn run_with<W: Write>(
         agent: args.name.clone(),
     });
     let started = std::time::Instant::now();
-    let code = exec::run_with(&exec_args, w, repo, &env)?;
+    // Re-review (2026-08-27) finding 1: `resolve_worker_budget` above already
+    // admitted this delegation into `--group` (if any) before this fallible
+    // spawn is even attempted -- `exec::run_with` can still fail outright
+    // (e.g. `--max-tool-calls` refused up front for an adapter that cannot
+    // enforce it, issue #155 review finding C2), and a failure here must not
+    // permanently burn the group's admission slot for a child that never
+    // ran. `state` is the same handle resolved above for the spawn gate,
+    // unused since; reused here rather than re-resolved.
+    let code = match exec::run_with(&exec_args, w, repo, &env) {
+        Ok(code) => code,
+        Err(e) => {
+            if let Some(id) = &args.group {
+                super::group::rollback_admission(&state, id);
+            }
+            return Err(e);
+        }
+    };
     let wall_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     announcer.emit(&Event::DelegatedFinish {
         agent: args.name.clone(),
@@ -1171,6 +1187,75 @@ mod tests {
                 .admitted_children,
             2,
             "the admission must advance the group's own count"
+        );
+    }
+
+    /// Re-review (2026-08-27) finding 1: a delegation that admits into a
+    /// group and then fails before a child is genuinely launched must not
+    /// permanently burn that admission slot. `--max-tool-calls` with the
+    /// codex adapter is refused by `exec::run_with` itself (issue #155
+    /// review finding C2) strictly AFTER `resolve_worker_budget` has already
+    /// admitted the child into its group -- exactly this finding's failure
+    /// window.
+    #[test]
+    fn a_failed_delegation_after_admission_rolls_back_the_group_slot() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state_path = tmp.path().join("state");
+        let state = crate::commands::ctx::state::StateDir::from_root(state_path.clone());
+        crate::commands::ctx::group::create(&state, &sample_work_group("wg-1", 3, 0))
+            .expect("create group");
+
+        let env = base_env(&state_path);
+        let mut args = args_for("codex", "go");
+        args.group = Some("wg-1".to_string());
+        args.max_tool_calls = Some(5);
+
+        let mut out = Vec::new();
+        let err = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned())
+            .expect_err("codex + --max-tool-calls is refused by exec::run_with");
+        assert!(err.to_string().contains("--max-tool-calls"), "got {err}");
+
+        assert_eq!(
+            crate::commands::ctx::group::load(&state, "wg-1")
+                .expect("load")
+                .expect("present")
+                .admitted_children,
+            0,
+            "the failed delegation must not have permanently burned the group slot"
+        );
+    }
+
+    /// A successful delegation still counts exactly once against its group --
+    /// the rollback added for the failure path above must never also undo a
+    /// genuine admission for a child that actually ran.
+    #[test]
+    fn a_successful_delegation_still_counts_exactly_one_admission() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state_path = tmp.path().join("state");
+        let state = crate::commands::ctx::state::StateDir::from_root(state_path.clone());
+        crate::commands::ctx::group::create(&state, &sample_work_group("wg-1", 3, 0))
+            .expect("create group");
+
+        let env = base_env(&state_path);
+        let mut args = args_for("claude", "go");
+        args.group = Some("wg-1".to_string());
+
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned())
+            .expect("a plain claude delegation with no --max-tool-calls runs cleanly");
+        assert_eq!(code, 0);
+
+        assert_eq!(
+            crate::commands::ctx::group::load(&state, "wg-1")
+                .expect("load")
+                .expect("present")
+                .admitted_children,
+            1,
+            "a successful spawn must still count exactly one admission"
         );
     }
 

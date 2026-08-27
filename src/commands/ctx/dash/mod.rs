@@ -2926,6 +2926,19 @@ fn fulfill_spawn_request(
     {
         return Err(SpawnRefusal::policy(e.to_string()));
     }
+    // Re-review (2026-08-27) finding 1: from here on, `req.work_group_id`
+    // (if any) has genuinely been admitted -- every remaining fallible step
+    // between here and the pane actually spawning must roll that admission
+    // back on its way out, or a post-admission failure (prompt composition,
+    // the interactive pace gate, the pty spawn itself) permanently burns a
+    // `child_limit` slot for a child that never ran. Best-effort, like
+    // `rollback_admission` itself: never shadows the real refusal being
+    // returned.
+    let rollback_admission = || {
+        if let Some(group_id) = &req.work_group_id {
+            super::group::rollback_admission(state, group_id);
+        }
+    };
 
     let session_id = SessionId::new_v4().to_string();
     let registry_short = sessions::short_id(&session_id);
@@ -2940,14 +2953,19 @@ fn fulfill_spawn_request(
         &slug,
     );
 
-    let prompt_args = prompt::injection_args_for_session(
+    let prompt_args = match prompt::injection_args_for_session(
         adapter.as_ref(),
         &[],
         composed.as_ref(),
         state,
         &session_id,
-    )
-    .map_err(|e| SpawnRefusal::policy(e.to_string()))?;
+    ) {
+        Ok(args) => args,
+        Err(e) => {
+            rollback_admission();
+            return Err(SpawnRefusal::policy(e.to_string()));
+        }
+    };
     prompt::log_injection(
         state,
         "dash",
@@ -3080,6 +3098,7 @@ fn fulfill_spawn_request(
                 );
             }
             super::pace::InteractiveGate::Refuse { message } => {
+                rollback_admission();
                 return Err(SpawnRefusal::policy(message));
             }
         }
@@ -3096,7 +3115,7 @@ fn fulfill_spawn_request(
     // stays keyed off the dashboard's own `repo` on purpose: the session/
     // state store is shared across every pane this dashboard hosts,
     // regardless of which worktree a given pane's argv actually runs in.
-    let mut pane = Pane::spawn(
+    let mut pane = match Pane::spawn(
         spec,
         state,
         &spawn_cwd,
@@ -3105,8 +3124,13 @@ fn fulfill_spawn_request(
         &turn_env,
         adapter.capabilities().turn_signal,
         Duration::from_millis(cfg.dash.idle_quiet_ms),
-    )
-    .map_err(|e| SpawnRefusal::channel(e.to_string()))?;
+    ) {
+        Ok(pane) => pane,
+        Err(e) => {
+            rollback_admission();
+            return Err(SpawnRefusal::channel(e.to_string()));
+        }
+    };
     // Issue #115: set eagerly here even for adapter shapes whose fallback
     // channel turned out unsafe (`fallback_is_safe == false` above) -- a
     // worker that received no report-back text at all in its launch prompt
@@ -9856,6 +9880,82 @@ mod tests {
         );
     }
 
+    /// Re-review (2026-08-27) finding 1: an admission granted by `admit_child`
+    /// above must be rolled back when a LATER step in this same call fails
+    /// before a pane is ever actually spawned -- otherwise a group's
+    /// `child_limit` slot is permanently burned for a child that never ran.
+    /// `cfg.pace.spawn_hard_pct` is raised well above the usage set below so
+    /// the EARLIER `spawn_gate` check (before `admit_child`) does not itself
+    /// refuse first; usage above the (default) `max_percent` then trips the
+    /// T10 interactive gate's `Refuse` arm, which runs strictly AFTER
+    /// admission -- exactly this finding's failure window.
+    #[test]
+    fn fulfill_spawn_request_rolls_back_admission_when_a_later_step_refuses() {
+        let repo = std::env::current_dir().expect("cwd");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let group = crate::commands::ctx::group::WorkGroup {
+            work_group_id: "wg-1".to_string(),
+            parent_session_id: String::new(),
+            scope: "test batch".to_string(),
+            child_limit: 3,
+            token_budget: None,
+            deadline_secs: None,
+            completion_contract: String::new(),
+            created_at: 0,
+            closed_at: None,
+            admitted_children: 0,
+        };
+        crate::commands::ctx::group::create(&state, &group).expect("create group");
+
+        let now = crate::commands::ctx::state::now_secs();
+        window::store(
+            &state,
+            &crate::commands::ctx::window::UsageWindows {
+                five_hour: Some(crate::commands::ctx::window::Window {
+                    used_percentage: 99.5,
+                    resets_at: now + 600,
+                    observed_at: now,
+                }),
+                seven_day: None,
+            },
+        )
+        .expect("store collector state above max_percent, below spawn_hard_pct");
+
+        let mut cfg = CtxConfig::default();
+        cfg.pace.spawn_hard_pct = 200.0;
+
+        let mut req = spawn_request("do the work", &repo);
+        req.work_group_id = Some("wg-1".to_string());
+        let mut panes: Vec<Pane> = Vec::new();
+        let mut queues: Vec<VecDeque<String>> = Vec::new();
+        let mut errors = Vec::new();
+        let refusal = fulfill_spawn_request(
+            &req,
+            false,
+            &mut panes,
+            &mut queues,
+            &cfg,
+            &state,
+            &repo,
+            (80, 24),
+            &tmp.path().join("requests"),
+            &mut errors,
+        )
+        .expect_err("the interactive gate refuses once usage is at max_percent");
+        assert!(!refusal.retryable, "not a channel failure -- policy");
+        assert!(panes.is_empty(), "no pane was ever spawned");
+
+        assert_eq!(
+            crate::commands::ctx::group::load(&state, "wg-1")
+                .expect("load")
+                .expect("present")
+                .admitted_children,
+            0,
+            "the admission granted before the later refusal must be rolled back"
+        );
+    }
+
     /// F13: the cap is enforced where a pane is created by something other
     /// than the operator's own launch, so a pane child cannot fork-bomb its
     /// own dashboard. `max_panes = 0` proves the refusal without spawning a
@@ -10462,6 +10562,83 @@ mod tests {
             errors[0].contains("cannot reach argv"),
             "got {:?}",
             errors[0]
+        );
+
+        // Let the trivial `@echo off` child exit on its own rather than
+        // leaving a lingering handle for the test process to outlive.
+        for pane in &mut panes {
+            let _ = pane.shutdown("");
+        }
+    }
+
+    /// Re-review (2026-08-27) finding 1: a successful pane spawn still counts
+    /// exactly once against its group -- the rollback added for the failure
+    /// paths above (see `fulfill_spawn_request_rolls_back_admission_when_a_
+    /// later_step_refuses`) must never also undo a genuine admission for a
+    /// pane that actually launched.
+    #[test]
+    fn fulfill_spawn_request_spawning_a_pane_still_counts_exactly_one_admission() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().to_path_buf();
+
+        let shim = tmp.path().join("codex.cmd");
+        std::fs::write(&shim, "@echo off\r\n").expect("write shim");
+
+        let cfg = CtxConfig {
+            agent_bin: Some(shim.display().to_string()),
+            pace: crate::commands::ctx::config::PaceConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            ..CtxConfig::default()
+        };
+
+        let group = crate::commands::ctx::group::WorkGroup {
+            work_group_id: "wg-1".to_string(),
+            parent_session_id: String::new(),
+            scope: "test batch".to_string(),
+            child_limit: 3,
+            token_budget: None,
+            deadline_secs: None,
+            completion_contract: String::new(),
+            created_at: 0,
+            closed_at: None,
+            admitted_children: 0,
+        };
+        crate::commands::ctx::group::create(&state, &group).expect("create group");
+
+        let mut req = spawn_request("do the work", &repo);
+        req.agent = "codex".to_string();
+        req.work_group_id = Some("wg-1".to_string());
+
+        let mut panes: Vec<Pane> = Vec::new();
+        let mut queues: Vec<VecDeque<String>> = Vec::new();
+        let mut errors = Vec::new();
+        let result = fulfill_spawn_request(
+            &req,
+            false,
+            &mut panes,
+            &mut queues,
+            &cfg,
+            &state,
+            &repo,
+            (80, 24),
+            &tmp.path().join("requests"),
+            &mut errors,
+        );
+
+        assert!(result.is_ok(), "the spawn must succeed: {result:?}");
+        assert_eq!(panes.len(), 1, "the pane was actually created");
+        assert_eq!(
+            crate::commands::ctx::group::load(&state, "wg-1")
+                .expect("load")
+                .expect("present")
+                .admitted_children,
+            1,
+            "a successful spawn must still count exactly one admission"
         );
 
         // Let the trivial `@echo off` child exit on its own rather than
