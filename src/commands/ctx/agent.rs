@@ -24,6 +24,7 @@ use super::config::{CtxConfig, EnvLookup, env_from_process};
 use super::dash::spawnreq;
 use super::event::{SessionId, TranscriptUsage};
 use super::exec::{self, ExecArgs};
+use super::pace;
 
 #[derive(Debug, clap::Args)]
 pub struct AgentArgs {
@@ -68,6 +69,14 @@ pub struct AgentArgs {
     /// Tool-call ceiling for this worker, independent of `--budget-tokens`.
     #[arg(long)]
     pub max_tool_calls: Option<u32>,
+    /// Issue #155, Phase 6(c): spend anyway at or above `pace.spawn_hard_pct`
+    /// (`pace::SpawnGate::Refuse`). The operator's own informed call --
+    /// never a signal that reaches rotation, which this gate never touches
+    /// either way. Travels on the `SpawnRequest` (`SpawnRequest::force`) the
+    /// same way `--role`/`--group` do, so a pane spawn fulfilled by a
+    /// dashboard honours the same override this process already decided on.
+    #[arg(long, default_value_t = false)]
+    pub force: bool,
 }
 
 /// The soft threshold, as a fraction of a budget. At or above it the worker
@@ -167,6 +176,19 @@ pub fn validate_role(role: &Option<String>) -> CtxResult<()> {
             Err(format!("--role must be 'worker' or 'sub-orchestrator'; got '{other}'").into())
         }
     }
+}
+
+/// Issue #155, Phase 6(c): whether this spawn must not start. Only a
+/// `Refuse` blocks, and only without `--force`: a `Warn` is information, not
+/// a gate, and a `Proceed` has nothing to override. `pub(crate)`, not
+/// private: `dash::mod::fulfill_spawn_request` reuses this exact rule
+/// (`SpawnRequest::force` carrying forward whatever this process already
+/// decided) so a pane spawn is held to the identical override, never a
+/// second, independently-drifting copy of it. Deliberately NOT a rot
+/// signal -- see `pace::spawn_gate`'s own doc comment for why quota pressure
+/// must never reach rotation.
+pub(crate) fn spawn_blocked(gate: &pace::SpawnGate, force: bool) -> bool {
+    matches!(gate, pace::SpawnGate::Refuse { .. }) && !force
 }
 
 /// Resolves this delegation's [`WorkerBudget`] from `--budget-tokens`/
@@ -529,6 +551,13 @@ fn try_join_dashboard<W: Write>(
         // from the same `ZIRV_CTX_SESSION` env var today.
         parent_session: super::mail::session_identity(env),
         work_group_id: args.group.clone(),
+        // Issue #155, Phase 6(c): this process's own spawn gate (`run_with`,
+        // above) already evaluated `--force` against the reading it had
+        // before this request was ever written. Carrying it forward lets
+        // `fulfill_spawn_request` honour the identical override rather than
+        // re-litigating it blind and refusing a spawn the requester already
+        // chose to force -- see `SpawnRequest::force`'s own doc comment.
+        force: args.force,
     };
     let path = match spawnreq::write_request(&dir, &req) {
         Ok(path) => path,
@@ -737,6 +766,39 @@ pub fn run_with<W: Write>(
     validate_role(&args.role)?;
     let prompt = resolve_prompt(&args.prompt, &mut std::io::stdin())?;
 
+    // Loaded here rather than after the dashboard-join attempt below (its
+    // former position): the spawn gate needs `cfg.pace` before either fork
+    // of this delegation -- a pane spawn and a headless run -- is chosen,
+    // and `try_join_dashboard` is the fork point between them. `exec::
+    // run_with` still loads its own copy internally on the headless path
+    // (the same pattern `chat.rs` already uses ahead of `wrap::run_with`),
+    // so this remains one extra read of the same layered config rather than
+    // a new code path.
+    let cfg = CtxConfig::load_for_launch(repo, env)?;
+
+    // Issue #155, Phase 6(c): the spawn gate -- quota pressure refuses NEW
+    // delegated work, never rotation of a session already running (see
+    // `pace::spawn_gate`'s own doc comment). `provider_for_agent_name` is
+    // the same static, no-filesystem lookup `zirv ctx usage`/`status` use to
+    // answer this before an adapter is even known to be ready, so a
+    // disabled or misconfigured `--name` still gets an honest usage reading
+    // rather than skipping the gate.
+    let state = super::state::StateDir::resolve(env)?;
+    let provider = adapters::provider_for_agent_name(Some(&args.name));
+    let now = super::state::now_secs();
+    let (collector, estimator) = pace::current_windows(&state, &cfg.pace, now, provider);
+    let gate = pace::spawn_gate(&collector, estimator.as_ref(), now, &cfg.pace);
+    if let Some(note) = pace::describe_spawn_gate(&gate) {
+        eprintln!("zirv ctx agent: {note}");
+    }
+    if spawn_blocked(&gate, args.force) {
+        return Err(
+            "refusing to start new delegated work at this usage level; wait for the window to \
+             reset, or pass --force to spend anyway"
+                .into(),
+        );
+    }
+
     if let Some(result) = try_join_dashboard(
         args,
         &prompt,
@@ -749,11 +811,6 @@ pub fn run_with<W: Write>(
         return result;
     }
 
-    // A second, independent config load just for the announcer: `exec::
-    // run_with` below loads its own copy internally (the same pattern
-    // `chat.rs` already uses ahead of `wrap::run_with`), so this costs one
-    // extra read of the same layered config rather than a new code path.
-    let cfg = CtxConfig::load_for_launch(repo, env)?;
     let announcer = Announcer::new(
         cfg.chrome.events && !args.quiet,
         console::colors_enabled_stderr(),
@@ -896,6 +953,28 @@ mod tests {
             "budget-exhausted"
         );
         assert_eq!(delegation_outcome(1), "failed");
+    }
+
+    /// `--force` is the operator saying they accept the spend. Only a
+    /// Refuse is overridable; a Warn was never blocking, and a Proceed has
+    /// nothing to override.
+    #[test]
+    fn only_a_refusal_is_overridable_and_only_by_force() {
+        let refuse = pace::SpawnGate::Refuse {
+            window: "five_hour",
+            percent: 97.0,
+            source: pace::Source::Collector,
+        };
+        assert!(spawn_blocked(&refuse, false));
+        assert!(!spawn_blocked(&refuse, true), "--force proceeds");
+
+        let warn = pace::SpawnGate::Warn {
+            window: "five_hour",
+            percent: 85.0,
+            source: pace::Source::Collector,
+        };
+        assert!(!spawn_blocked(&warn, false), "a warning never blocks");
+        assert!(!spawn_blocked(&pace::SpawnGate::Proceed, false));
     }
 
     /// Issue #155, Phase 5(d): a budget bounds WORK. At 80% the worker is
@@ -1434,6 +1513,7 @@ mod tests {
             group: None,
             budget_tokens: None,
             max_tool_calls: None,
+            force: false,
         }
     }
 

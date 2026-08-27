@@ -2811,6 +2811,54 @@ fn fulfill_spawn_request(
     let adapter = adapters::select(Some(&req.agent), &[], cfg)
         .map_err(|e| SpawnRefusal::policy(e.to_string()))?;
 
+    // Issue #155, Phase 6(c): the spawn gate -- quota pressure refuses NEW
+    // delegated work, never rotation of a session already running (see
+    // `pace::spawn_gate`'s own doc comment). Placed right after the depth
+    // cap, ahead of the more expensive prompt-composition work below, in the
+    // same cheapest-and-most-hostile-first order this function's own doc
+    // comment promises. Re-applies the SAME check `agent.rs::run_with`
+    // already evaluated against this very request before it was ever
+    // written to disk, so a request that reaches a dashboard other than the
+    // one that check consulted (a live-dashboard fallback, a request that
+    // sat claimed for a while) is held to an equally fresh reading rather
+    // than trusting a decision that may now be stale. `req.force` carries
+    // forward whatever `--force` the requester already decided (see
+    // `SpawnRequest::force`'s own doc comment) -- this re-verifies the usage
+    // reading, it does not re-litigate the operator's own choice to
+    // override it. A `Refuse` becomes `SpawnRefusal::policy`, never
+    // `::channel`: falling back to a headless run would route straight
+    // around the gate (the headless path is gated too, by the identical
+    // check in `agent::run_with`), the same reasoning the pane cap and the
+    // depth cap above already apply. The dashboard has no `--force` of its
+    // own, so the refusal text says so: an operator who wants to override it
+    // here raises `pace.spawn_hard_pct`, or runs `zirv ctx agent --force`
+    // directly instead.
+    let now = super::state::now_secs();
+    let (collector, estimator) =
+        super::pace::current_windows(state, &cfg.pace, now, adapter.provider());
+    let gate = super::pace::spawn_gate(&collector, estimator.as_ref(), now, &cfg.pace);
+    if let Some(note) = super::pace::describe_spawn_gate(&gate) {
+        if super::agent::spawn_blocked(&gate, req.force) {
+            return Err(SpawnRefusal::policy(format!(
+                "{note} -- dashboards have no --force; raise pace.spawn_hard_pct, or run `zirv \
+                 ctx agent --force` directly to override"
+            )));
+        }
+        let overridden = matches!(gate, super::pace::SpawnGate::Refuse { .. }) && req.force;
+        let suffix = if overridden {
+            " (--force: spawning anyway)"
+        } else {
+            ""
+        };
+        push_error(
+            errors,
+            format!(
+                "{} pane for {}: {note}{suffix}",
+                req.agent, req.requested_by
+            ),
+        );
+    }
+
     let session_id = SessionId::new_v4().to_string();
     let registry_short = sessions::short_id(&session_id);
     let slug = super::state::repo_slug(repo);
@@ -5164,6 +5212,17 @@ pub fn run_dashboard(
                                                     role: None,
                                                     parent_session: None,
                                                     work_group_id: None,
+                                                    // The Spawn overlay has no
+                                                    // `--force` of its own (see
+                                                    // `fulfill_spawn_request`'s
+                                                    // own gate comment): an
+                                                    // operator who wants to
+                                                    // override the ceiling from
+                                                    // here raises `pace.
+                                                    // spawn_hard_pct`, or runs
+                                                    // `zirv ctx agent --force`
+                                                    // directly instead.
+                                                    force: false,
                                                 };
                                                 let panes_before_spawn = panes.len();
                                                 // `trusted_interactive: true` --
@@ -8864,6 +8923,7 @@ mod tests {
             role: None,
             parent_session: None,
             work_group_id: None,
+            force: false,
         }
     }
 
@@ -9885,6 +9945,17 @@ mod tests {
     /// `Pane::spawn` is ever reached (no real agent binary needed to prove
     /// it, mirroring `refusal_for`'s own "every assertion is on a refusal
     /// before any spawn" contract).
+    ///
+    /// Issue #155, Phase 6(c) update: at the default config, 99.9% now trips
+    /// `pace::spawn_gate`'s own `spawn_hard_pct` (95%) before this function
+    /// ever reaches the older `pace::interactive_gate` check below (`max_
+    /// percent` 99%) -- the newer, stricter, spawn-specific gate wins, and
+    /// this test now pins ITS wording. The older gate's own `Refuse` arm is
+    /// consequently unreachable through this path at any default config
+    /// (`spawn_hard_pct` < `max_percent`); its `Pause`/advisory arm still
+    /// fires independently for the band below `spawn_hard_pct`, which is a
+    /// deliberate, currently-harmless overlap rather than a regression --
+    /// see the two gates' own doc comments for why they stay distinct knobs.
     #[test]
     fn fulfill_spawn_request_refuses_a_worker_pane_when_usage_is_at_the_ceiling() {
         let repo = std::env::current_dir().expect("cwd");
@@ -9923,7 +9994,7 @@ mod tests {
 
         let refusal = result.expect_err("usage at the ceiling must refuse the spawn");
         assert!(
-            refusal.reason.contains("refusing to launch"),
+            refusal.reason.contains("pace.spawn_hard_pct"),
             "got {}",
             refusal.reason
         );
@@ -9934,6 +10005,112 @@ mod tests {
         );
         assert!(!refusal.retryable, "not a channel failure -- policy");
         assert!(panes.is_empty(), "no pane was ever spawned");
+    }
+
+    /// Issue #155, Phase 6(c): isolates `spawn_gate`'s own `spawn_hard_pct`
+    /// (95%) from the older `pace::interactive_gate`'s `max_percent` (99%)
+    /// -- 96% trips ONLY the new gate (the old one only `Pause`s below its
+    /// own 99% ceiling, which never blocks), proving this gate is what
+    /// actually refuses in the band between the two thresholds, not the
+    /// pre-existing one.
+    #[test]
+    fn fulfill_spawn_request_refuses_a_worker_pane_between_spawn_hard_pct_and_max_percent() {
+        let repo = std::env::current_dir().expect("cwd");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let now = crate::commands::ctx::state::now_secs();
+        window::store(
+            &state,
+            &crate::commands::ctx::window::UsageWindows {
+                five_hour: Some(crate::commands::ctx::window::Window {
+                    used_percentage: 96.0,
+                    resets_at: now + 600,
+                    observed_at: now,
+                }),
+                seven_day: None,
+            },
+        )
+        .expect("store collector state above spawn_hard_pct");
+
+        let cfg = CtxConfig::default();
+        let mut panes: Vec<Pane> = Vec::new();
+        let mut queues: Vec<VecDeque<String>> = Vec::new();
+        let mut errors = Vec::new();
+        let result = fulfill_spawn_request(
+            &spawn_request("do the work", &repo),
+            false,
+            &mut panes,
+            &mut queues,
+            &cfg,
+            &state,
+            &repo,
+            (80, 24),
+            &tmp.path().join("requests"),
+            &mut errors,
+        );
+
+        let refusal = result.expect_err("96% must refuse via spawn_hard_pct alone");
+        assert!(
+            refusal.reason.contains("pace.spawn_hard_pct"),
+            "got {}",
+            refusal.reason
+        );
+        assert!(!refusal.retryable, "not a channel failure -- policy");
+        assert!(panes.is_empty(), "no pane was ever spawned");
+    }
+
+    /// The companion: `req.force` overrides the same 96% reading, proving
+    /// the override actually reaches `fulfill_spawn_request`'s own gate --
+    /// not just `agent.rs`'s copy of the decision -- via the notice this
+    /// gate leaves once it lets a forced request through (`(--force:
+    /// spawning anyway)`), rather than asserting on whatever the real
+    /// pane-spawn machinery further down does with no real agent binary
+    /// configured in this test environment.
+    #[test]
+    fn fulfill_spawn_request_a_forced_request_overrides_the_spawn_gate() {
+        let repo = std::env::current_dir().expect("cwd");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let now = crate::commands::ctx::state::now_secs();
+        window::store(
+            &state,
+            &crate::commands::ctx::window::UsageWindows {
+                five_hour: Some(crate::commands::ctx::window::Window {
+                    used_percentage: 96.0,
+                    resets_at: now + 600,
+                    observed_at: now,
+                }),
+                seven_day: None,
+            },
+        )
+        .expect("store collector state above spawn_hard_pct");
+
+        let cfg = CtxConfig::default();
+        let mut panes: Vec<Pane> = Vec::new();
+        let mut queues: Vec<VecDeque<String>> = Vec::new();
+        let mut errors = Vec::new();
+        let mut req = spawn_request("do the work", &repo);
+        req.force = true;
+        let _ = fulfill_spawn_request(
+            &req,
+            false,
+            &mut panes,
+            &mut queues,
+            &cfg,
+            &state,
+            &repo,
+            (80, 24),
+            &tmp.path().join("requests"),
+            &mut errors,
+        );
+
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("--force: spawning anyway")),
+            "force must let the reading through with a visible override notice, not a silent \
+             pass: {errors:?}"
+        );
     }
 
     /// I, the High-severity regression this round closes: before

@@ -1047,6 +1047,8 @@ checkout:
 | `pace.poll_enabled` | `ZIRV_CTX_PACE_POLL` |
 | `pace.poll_min_interval_secs` | `ZIRV_CTX_PACE_POLL_MIN_INTERVAL_SECS` |
 | `pace.blind_delay_secs` | `ZIRV_CTX_PACE_BLIND_DELAY_SECS` |
+| `pace.spawn_soft_pct` | `ZIRV_CTX_PACE_SPAWN_SOFT_PCT` |
+| `pace.spawn_hard_pct` | `ZIRV_CTX_PACE_SPAWN_HARD_PCT` |
 | `review` (`review.claude`, `review.codex`) | `ZIRV_CTX_REVIEW_MODEL_CLAUDE` / `ZIRV_CTX_REVIEW_MODEL_CODEX` |
 | `worker` (`worker.claude`, `worker.codex`) | `ZIRV_CTX_WORKER_MODEL_CLAUDE` / `ZIRV_CTX_WORKER_MODEL_CODEX` |
 | `handover` (`handover.<agent>.<tier>`) | `ZIRV_CTX_HANDOVER_<AGENT>_<TIER>` (e.g. `ZIRV_CTX_HANDOVER_CLAUDE_DEEP`) |

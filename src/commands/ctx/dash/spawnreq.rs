@@ -102,6 +102,18 @@ pub struct SpawnRequest {
     /// one-off delegation, which is every delegation before 2.35.0.
     #[serde(default)]
     pub work_group_id: Option<String>,
+    /// Issue #155, Phase 6(c): whether the requester already accepted the
+    /// spend at quota pressure (`agent.rs`'s own `--force`). `fulfill_spawn_
+    /// request` applies the SAME `pace::spawn_gate` the requester's own
+    /// `run_with` already evaluated before this request was ever written --
+    /// without this field the dashboard would re-evaluate that gate blind to
+    /// the requester's choice and refuse a spawn `--force` was meant to
+    /// allow, silently defeating the flag for anyone whose worker happens to
+    /// land on a live dashboard. `#[serde(default)]` makes `false` (no
+    /// override) what an older request deserialises to, the same
+    /// fail-closed default `interactive` above already establishes.
+    #[serde(default)]
+    pub force: bool,
 }
 
 /// The role a request actually gets. Unstated or unrecognised is
@@ -392,6 +404,7 @@ mod tests {
             role: None,
             parent_session: None,
             work_group_id: None,
+            force: false,
         }
     }
 
@@ -406,6 +419,10 @@ mod tests {
         assert_eq!(req.role, None);
         assert_eq!(req.parent_session, None);
         assert_eq!(req.work_group_id, None);
+        assert!(
+            !req.force,
+            "an unstated force must never override a quota refusal"
+        );
         assert_eq!(
             role_of(&req),
             PromptRole::Worker,
