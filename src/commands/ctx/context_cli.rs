@@ -169,13 +169,8 @@ pub fn canonical_sha256(common: Option<&str>, harness_specific: Option<&str>) ->
 /// The hash a generated file states it was rendered from, if it states one.
 /// `None` for a file generated before this change, for a native file, or for
 /// a malformed line -- every one of which correctly means "cannot prove
-/// equality", which `compile.rs` reads as "inject as before".
-///
-/// Issue #155, Task 3.1 produces this reader; only its own tests call it
-/// until Task 3.2 wires `compile.rs`'s injection-skip to it, so
-/// `#[allow(dead_code)]` documents the gap as deliberate rather than an
-/// oversight, the same way `announce.rs`'s macOS-only variant is marked.
-#[allow(dead_code)]
+/// equality", which `compile.rs`'s `native_file_already_carries_canonical`
+/// (issue #155, Task 3.2) reads as "inject as before".
 pub fn embedded_canonical_sha256(text: &str) -> Option<String> {
     let line = text
         .lines()
@@ -198,7 +193,11 @@ pub fn embedded_canonical_sha256(text: &str) -> Option<String> {
 /// generated files could ever share content is if the caller passed the same
 /// `harness_specific` text to both, which `run_generate` never does (see
 /// this module's own doc).
-fn render_generated(common: Option<&str>, harness_specific: Option<&str>) -> String {
+///
+/// `pub(super)` rather than private: `compile.rs`'s Task 3.2 dedupe tests
+/// build a fixture native file the same way `run_generate` itself would, so
+/// their fixture and the real writer can never silently drift apart.
+pub(super) fn render_generated(common: Option<&str>, harness_specific: Option<&str>) -> String {
     let mut out = String::new();
     out.push_str(MANAGED_MARKER);
     out.push('\n');

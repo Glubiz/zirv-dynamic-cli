@@ -358,6 +358,24 @@ pub struct ContextConfig {
     /// rationale as `max_common_bytes`/`max_harness_bytes` above -- see
     /// `REPO_FORBIDDEN`.
     pub max_harness_roster_bytes: usize,
+    /// Issue #155, Phase 3: skip injecting the canonical `.zirv/context/`
+    /// layer when the harness's own native instruction file
+    /// (`<repo>/CLAUDE.md` for claude, `<repo>/AGENTS.md` for codex) is a
+    /// zirv-managed render that PROVABLY holds the current canonical bytes
+    /// -- proven by the hash `context_cli::render_generated` stamps into it,
+    /// never assumed. The harness reads that file natively at session
+    /// start, so injecting the same bytes again is pure duplication in the
+    /// single most cacheable layer there is.
+    ///
+    /// Deliberately NOT `REPO_FORBIDDEN`, unlike the byte caps above it: a
+    /// repo layer can only ever set it `false`, and `false` injects MORE
+    /// context, which is narrowing. `CtxConfig::load` folds it with
+    /// `narrow_dedupe_bool` (the mirror of `narrow_pace_bool`, but with
+    /// `false` as the strict value instead of `true` -- this key's safe
+    /// direction is "inject more", the opposite polarity from
+    /// `pace.enabled`'s "gate is on"), so a repo `true` cannot re-enable a
+    /// skip the operator turned off.
+    pub dedupe_native: bool,
 }
 
 impl Default for ContextConfig {
@@ -366,6 +384,7 @@ impl Default for ContextConfig {
             max_common_bytes: 4096,
             max_harness_bytes: 4096,
             max_harness_roster_bytes: 4096,
+            dedupe_native: true,
         }
     }
 }
@@ -1369,6 +1388,18 @@ fn narrow_pace_percent(home: f64, repo: Option<f64>) -> f64 {
     home.min(repo.unwrap_or(f64::INFINITY))
 }
 
+/// Issue #155, Phase 3: the repo-narrowing fold for `context.dedupe_native`
+/// -- the mirror of `narrow_pace_bool` with the opposite polarity. There,
+/// `true` (the gate is on) is strict; here `false` (always inject, never
+/// trust a native file) is strict, because that is this key's safe
+/// direction. `repo` absent contributes nothing (folds in as `true`, the
+/// loose value, so an untouched repo layer never forces the strict `false`
+/// on a home layer that left dedupe on) -- the mirror of `narrow_pace_bool`'s
+/// own `unwrap_or(false)`.
+fn narrow_dedupe_bool(home: bool, repo: Option<bool>) -> bool {
+    home.min(repo.unwrap_or(true))
+}
+
 /// Finding 4 (review): the one comma-separated-list splitter shared by every
 /// caller that needs "trimmed, non-empty entries" -- this module's own
 /// `ZIRV_CTX_SANDBOX_EXTRA_ALLOW`/`_DENY` env values (the same shape
@@ -1893,6 +1924,12 @@ impl CtxConfig {
         let home_pace_enabled = bool_at(take_nested(&mut merged, "pace", "enabled"));
         let home_pace_max_percent = float_at(take_nested(&mut merged, "pace", "max_percent"));
         let home_pace_soft_percent = float_at(take_nested(&mut merged, "pace", "soft_percent"));
+        // Issue #155, Phase 3: `context.dedupe_native` gets the identical
+        // lift-before-merge treatment as `pace.enabled` right above, folded
+        // by `narrow_dedupe_bool` instead of `narrow_pace_bool` -- see that
+        // function's own doc comment for why the polarity is inverted.
+        let home_context_dedupe_native =
+            bool_at(take_nested(&mut merged, "context", "dedupe_native"));
 
         // Read on its own first: the repo layer is the one layer that comes
         // from a checkout rather than from the operator.
@@ -1921,6 +1958,8 @@ impl CtxConfig {
         let repo_pace_enabled = bool_at(take_nested(&mut repo_layer, "pace", "enabled"));
         let repo_pace_max_percent = float_at(take_nested(&mut repo_layer, "pace", "max_percent"));
         let repo_pace_soft_percent = float_at(take_nested(&mut repo_layer, "pace", "soft_percent"));
+        let repo_context_dedupe_native =
+            bool_at(take_nested(&mut repo_layer, "context", "dedupe_native"));
         merge(&mut merged, repo_layer);
 
         // Re-inserted after the merge, before env: env (below) must still be
@@ -1949,6 +1988,15 @@ impl CtxConfig {
             toml::Value::Float(narrow_pace_percent(
                 home_pace_soft_percent.unwrap_or(default_pace.soft_percent),
                 repo_pace_soft_percent,
+            )),
+        );
+        let default_context = ContextConfig::default();
+        insert_path(
+            &mut merged,
+            &["context", "dedupe_native"],
+            toml::Value::Boolean(narrow_dedupe_bool(
+                home_context_dedupe_native.unwrap_or(default_context.dedupe_native),
+                repo_context_dedupe_native,
             )),
         );
 
@@ -2860,6 +2908,70 @@ mod tests {
                 case.home, case.repo
             );
         }
+    }
+
+    /// Issue #155, Phase 3: the fold rule itself, mirroring `the_pace_
+    /// narrowing_fold_rule_favours_the_stricter_layer_either_direction` with
+    /// the opposite polarity -- `false` is strict here, not `true`.
+    #[test]
+    fn the_dedupe_narrowing_fold_rule_favours_always_injecting() {
+        assert!(!narrow_dedupe_bool(false, None));
+        assert!(
+            !narrow_dedupe_bool(false, Some(true)),
+            "repo may not re-enable a skip the operator disabled"
+        );
+        assert!(
+            !narrow_dedupe_bool(true, Some(false)),
+            "repo may disable a skip the operator left on"
+        );
+        assert!(narrow_dedupe_bool(true, None), "both loose: stays loose");
+        assert!(narrow_dedupe_bool(true, Some(true)));
+    }
+
+    /// `context.dedupe_native` is deliberately NOT `REPO_FORBIDDEN`, unlike
+    /// the byte caps beside it: a repo layer can only ever set it `false`,
+    /// which causes MORE context to be injected -- narrowing, the direction
+    /// this trust model allows. A repo layer's `true` must not be able to
+    /// SUPPRESS an operator's own `false`.
+    #[test]
+    fn a_repo_layer_may_disable_native_dedupe_but_never_re_enable_it() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".zirv").join(CTX_CONFIG_FILE),
+            "[context]\ndedupe_native = false\n",
+        )
+        .expect("write home layer");
+
+        let repo = tempfile::tempdir().expect("repo");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv").join(CTX_CONFIG_FILE),
+            "[context]\ndedupe_native = true\n",
+        )
+        .expect("write repo layer");
+
+        let empty: HashMap<String, String> = HashMap::new();
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("loads");
+        assert!(
+            !cfg.context.dedupe_native,
+            "the operator's own false must survive a repo layer's true"
+        );
+    }
+
+    /// The default, and the common case: neither layer mentions the key at
+    /// all, so it must stay at the built-in `true` -- not fold to `false`
+    /// the way an unmodified `narrow_pace_bool` reuse would (its `repo`-
+    /// absent case contributes `false`, the wrong polarity for this key).
+    #[test]
+    fn dedupe_native_defaults_to_true_when_neither_layer_sets_it() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tempfile::tempdir().expect("repo");
+        let empty: HashMap<String, String> = HashMap::new();
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("loads");
+        assert!(cfg.context.dedupe_native);
     }
 
     /// T9: the operator's own env override is still the final word over
@@ -4256,6 +4368,7 @@ mod tests {
         ("context", "max_common_bytes"),
         ("context", "max_harness_bytes"),
         ("context", "max_harness_roster_bytes"),
+        ("context", "dedupe_native"),
         ("mail", "enabled"),
         ("mail", "max_message_bytes"),
         ("mail", "max_delivered_bytes"),
