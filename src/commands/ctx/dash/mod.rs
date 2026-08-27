@@ -2875,41 +2875,40 @@ fn fulfill_spawn_request(
     // written to disk, so a request that reaches a dashboard other than the
     // one that check consulted (a live-dashboard fallback, a request that
     // sat claimed for a while) is held to an equally fresh reading rather
-    // than trusting a decision that may now be stale. `req.force` carries
-    // forward whatever `--force` the requester already decided (see
-    // `SpawnRequest::force`'s own doc comment) -- this re-verifies the usage
-    // reading, it does not re-litigate the operator's own choice to
-    // override it. A `Refuse` becomes `SpawnRefusal::policy`, never
-    // `::channel`: falling back to a headless run would route straight
-    // around the gate (the headless path is gated too, by the identical
-    // check in `agent::run_with`), the same reasoning the pane cap and the
-    // depth cap above already apply. The dashboard has no `--force` of its
-    // own, so the refusal text says so: an operator who wants to override it
-    // here raises `pace.spawn_hard_pct`, or runs `zirv ctx agent --force`
-    // directly instead.
+    // than trusting a decision that may now be stale.
+    //
+    // Security review Finding 2: `req.force` is untrusted JSON any process
+    // that can reach the requests directory can hand-write (the same
+    // premise `parent_role_for`, above, is built on) -- it does NOT carry
+    // the weight `agent.rs::run_with`'s own `args.force` does, which is an
+    // actual operator's own flag, typed at an actual terminal, checked
+    // against this SAME gate before the request was ever written. Treating
+    // the two as equivalent (via `agent::spawn_blocked`, which is correct
+    // for `run_with`'s trusted case) let any pane self-grant the >=
+    // `spawn_hard_pct` hard refusal just by writing `force: true` into its
+    // own request file. So `req.force` is honoured ONLY for the soft band
+    // (`SpawnGate::Warn`, which never blocked a spawn either way) -- the
+    // hard arm (`SpawnGate::Refuse`) is refused here unconditionally,
+    // `req.force` or not. `SpawnRefusal::policy`, never `::channel`: a
+    // headless fallback would route straight around the gate (the headless
+    // path is gated too, by the identical check in `agent::run_with`), the
+    // same reasoning the pane cap and the depth cap above already apply.
     let now = super::state::now_secs();
     let (collector, estimator) =
         super::pace::current_windows(state, &cfg.pace, now, adapter.provider());
     let gate = super::pace::spawn_gate(&collector, estimator.as_ref(), now, &cfg.pace);
     if let Some(note) = super::pace::describe_spawn_gate(&gate) {
-        if super::agent::spawn_blocked(&gate, req.force) {
+        if matches!(gate, super::pace::SpawnGate::Refuse { .. }) {
             return Err(SpawnRefusal::policy(format!(
-                "{note} -- dashboards have no --force; raise pace.spawn_hard_pct, or run `zirv \
-                 ctx agent --force` directly to override"
+                "{note} -- the hard refusal cannot be forced from a pane (a spawn request's own \
+                 `force` is untrusted JSON, not an operator's own choice); an operator who truly \
+                 intends to override it raises pace.spawn_hard_pct in ~/.zirv/ctx.toml, or runs \
+                 `zirv ctx agent --force` directly, outside any dashboard pane"
             )));
         }
-        let overridden = matches!(gate, super::pace::SpawnGate::Refuse { .. }) && req.force;
-        let suffix = if overridden {
-            " (--force: spawning anyway)"
-        } else {
-            ""
-        };
         push_error(
             errors,
-            format!(
-                "{} pane for {}: {note}{suffix}",
-                req.agent, req.requested_by
-            ),
+            format!("{} pane for {}: {note}", req.agent, req.requested_by),
         );
     }
 
@@ -10177,15 +10176,17 @@ mod tests {
         assert!(panes.is_empty(), "no pane was ever spawned");
     }
 
-    /// The companion: `req.force` overrides the same 96% reading, proving
-    /// the override actually reaches `fulfill_spawn_request`'s own gate --
-    /// not just `agent.rs`'s copy of the decision -- via the notice this
-    /// gate leaves once it lets a forced request through (`(--force:
-    /// spawning anyway)`), rather than asserting on whatever the real
-    /// pane-spawn machinery further down does with no real agent binary
-    /// configured in this test environment.
+    /// Security review Finding 2 (test b): `req.force` on a file-dropped
+    /// request must NEVER lift the >= `spawn_hard_pct` hard refusal -- that
+    /// override is `agent.rs::run_with`'s own trusted `--force`, evaluated
+    /// against an actual operator's own typed flag, not a byte any process
+    /// that can reach the requests directory can set for itself. Before this
+    /// fix, this exact request sailed through with only a visible "(--force:
+    /// spawning anyway)" notice -- any pane could self-grant the override
+    /// this refusal exists to withhold from it. Now it must still refuse,
+    /// exactly as an unforced request already does.
     #[test]
-    fn fulfill_spawn_request_a_forced_request_overrides_the_spawn_gate() {
+    fn fulfill_spawn_request_never_lets_a_forced_request_override_the_hard_refusal() {
         let repo = std::env::current_dir().expect("cwd");
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(tmp.path().join("state"));
@@ -10209,7 +10210,81 @@ mod tests {
         let mut errors = Vec::new();
         let mut req = spawn_request("do the work", &repo);
         req.force = true;
-        let _ = fulfill_spawn_request(
+        let refusal = fulfill_spawn_request(
+            &req,
+            false,
+            &mut panes,
+            &mut queues,
+            &cfg,
+            &state,
+            &repo,
+            (80, 24),
+            &tmp.path().join("requests"),
+            &mut errors,
+        )
+        .expect_err("a request's own force must never lift the hard refusal");
+
+        assert!(
+            refusal.reason.contains("pace.spawn_hard_pct"),
+            "got {}",
+            refusal.reason
+        );
+        assert!(
+            refusal.reason.contains("cannot be forced from a pane"),
+            "explains why force did not help: {}",
+            refusal.reason
+        );
+        assert!(!refusal.retryable, "not a channel failure -- policy");
+        assert!(panes.is_empty(), "no pane was ever spawned");
+    }
+
+    /// Security review Finding 2 (test a): the soft band (>= `spawn_soft_pct`,
+    /// below `spawn_hard_pct`) never blocked a spawn either way, forced or
+    /// not -- `req.force` at 90% usage must still let the pane through, the
+    /// same as an unforced request would. Uses the real `.cmd`-shim spawn
+    /// path (see `fulfill_spawn_request_spawns_a_shim_shape_codex_pane_and_
+    /// leaves_mail_unread`, above) so the assertion is on an actual spawn,
+    /// not just on the absence of a gate refusal.
+    #[cfg(windows)]
+    #[test]
+    fn fulfill_spawn_request_a_forced_request_still_spawns_at_soft_pressure() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().to_path_buf();
+
+        let shim = tmp.path().join("codex.cmd");
+        std::fs::write(&shim, "@echo off\r\n").expect("write shim");
+
+        let now = crate::commands::ctx::state::now_secs();
+        window::store_for(
+            &state,
+            crate::commands::ctx::window::CODEX_USAGE_PROVIDER,
+            &crate::commands::ctx::window::UsageWindows {
+                five_hour: Some(crate::commands::ctx::window::Window {
+                    used_percentage: 90.0,
+                    resets_at: now + 600,
+                    observed_at: now,
+                }),
+                seven_day: None,
+            },
+        )
+        .expect("store collector state in the soft band");
+
+        let cfg = CtxConfig {
+            agent_bin: Some(shim.display().to_string()),
+            ..CtxConfig::default()
+        };
+
+        let mut req = spawn_request("do the work", &repo);
+        req.agent = "codex".to_string();
+        req.force = true;
+
+        let mut panes: Vec<Pane> = Vec::new();
+        let mut queues: Vec<VecDeque<String>> = Vec::new();
+        let mut errors = Vec::new();
+        let result = fulfill_spawn_request(
             &req,
             false,
             &mut panes,
@@ -10223,11 +10298,13 @@ mod tests {
         );
 
         assert!(
-            errors
-                .iter()
-                .any(|e| e.contains("--force: spawning anyway")),
-            "force must let the reading through with a visible override notice, not a silent \
-             pass: {errors:?}"
+            result.is_ok(),
+            "the soft band never blocks a spawn, forced or not: {result:?}"
+        );
+        assert_eq!(panes.len(), 1, "the pane was actually created");
+        assert!(
+            errors.iter().any(|e| e.contains("spawn_hard_pct")),
+            "the soft-band notice must still be visible: {errors:?}"
         );
     }
 
