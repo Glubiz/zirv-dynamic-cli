@@ -64,6 +64,11 @@ pub const PROMPT_FILE: &str = "system-prompt.md";
 /// Optional, like the Orchestrator file it mirrors: with no such file a Worker
 /// gets no user layer at all.
 pub const WORKER_PROMPT_FILE: &str = "system-prompt.worker.md";
+/// The user layer's own SubOrchestrator-role file, mirroring
+/// [`WORKER_PROMPT_FILE`] for `PromptRole::SubOrchestrator`. Optional, with
+/// no such file a SubOrchestrator session gets no user layer at all, same as
+/// the other two roles.
+pub const SUB_ORCHESTRATOR_PROMPT_FILE: &str = "system-prompt.sub-orchestrator.md";
 
 /// The floor every zirv-started session gets. Deliberately five rules: enough
 /// to make sessions behave the same way twice, short enough that it never
@@ -193,10 +198,48 @@ pub enum PromptRole {
     /// An interactive session that may coordinate other harnesses. Gets the
     /// harness layer.
     Orchestrator,
+    /// A coordinator handed ONE scope by an Orchestrator. It may split that
+    /// scope and dispatch Workers via `zirv agent`; it may not spawn another
+    /// coordinator. Total delegation depth is capped at 2 (Orchestrator →
+    /// SubOrchestrator → Worker), enforced at spawn time in
+    /// `dash::fulfill_spawn_request` -- prompt text that asks nicely is not a
+    /// cap. Gets neither `HARNESS_PROMPT` nor the roster: which harnesses run
+    /// stays the Orchestrator's decision.
+    // No production caller yet -- issue #155 Task 5.1 (this task) is the
+    // prompt layer only; Task 5.3's `dash::fulfill_spawn_request` is the
+    // first real consumer, for the delegation-depth cap. Same dormancy
+    // pattern as `optimize.rs`'s own `Layer::trust`; this module's own
+    // tests exercise every path in the meantime.
+    #[allow(dead_code)]
+    SubOrchestrator,
     /// A delegated, headless worker. Never gets the harness layer: a worker
     /// is not the one deciding which harnesses run, and teaching it to
     /// delegate invites recursion.
     Worker,
+}
+
+impl PromptRole {
+    /// Whether this role may dispatch delegated Worker sessions via `zirv
+    /// agent`. Only a Worker itself may not: it was already the target of a
+    /// delegation, and letting it delegate onward invites recursion.
+    // No production caller yet, same dormancy as `PromptRole::SubOrchestrator`
+    // above -- Task 5.3 is the first real consumer.
+    #[allow(dead_code)]
+    pub fn may_spawn_workers(self) -> bool {
+        !matches!(self, PromptRole::Worker)
+    }
+
+    /// A short, stable, human-readable name for this role, used in logs and
+    /// diagnostics rather than `Debug`'s type-name casing.
+    // No production caller yet, same dormancy as `may_spawn_workers` above.
+    #[allow(dead_code)]
+    pub fn label(self) -> &'static str {
+        match self {
+            PromptRole::Orchestrator => "orchestrator",
+            PromptRole::SubOrchestrator => "sub-orchestrator",
+            PromptRole::Worker => "worker",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -783,6 +826,7 @@ pub fn compose(
     // operator who had worker instructions in the Orchestrator file.
     let user_file = match role {
         PromptRole::Orchestrator => PROMPT_FILE,
+        PromptRole::SubOrchestrator => SUB_ORCHESTRATOR_PROMPT_FILE,
         PromptRole::Worker => WORKER_PROMPT_FILE,
     };
     let user_path = home.map(|home| home.join(crate::utils::SCRIPT_DIR_NAME).join(user_file));
@@ -1258,6 +1302,7 @@ fn with_adapter_layer(
     let mut composed = composed?;
     let layer = match role {
         PromptRole::Orchestrator => adapter.base_system_prompt(),
+        PromptRole::SubOrchestrator => adapter.sub_orchestrator_system_prompt(),
         PromptRole::Worker => adapter.worker_system_prompt(),
     };
     let Some(layer) = layer.map(str::trim).filter(|layer| !layer.is_empty()) else {
@@ -3197,6 +3242,42 @@ mod tests {
             "a delegated worker does not get the harness layer: {:?}",
             worker.sources
         );
+    }
+
+    /// Issue #155, Phase 5(a): a third role between Orchestrator and Worker.
+    /// It may split a batch and dispatch Workers, so it needs the delegation
+    /// vocabulary a Worker is denied -- but it must NOT learn to spawn
+    /// further coordinators, because an unbounded delegation tree is exactly
+    /// the cost failure this phase exists to bound. The depth cap itself is
+    /// enforced at spawn time (Task 5.3); this is only the vocabulary.
+    #[test]
+    fn a_sub_orchestrator_may_dispatch_workers_but_never_another_coordinator() {
+        assert!(PromptRole::Orchestrator.may_spawn_workers());
+        assert!(PromptRole::SubOrchestrator.may_spawn_workers());
+        assert!(!PromptRole::Worker.may_spawn_workers());
+        assert_eq!(PromptRole::SubOrchestrator.label(), "sub-orchestrator");
+    }
+
+    /// A sub-orchestrator gets NEITHER of the two orchestrator-only layers:
+    /// the full meta-harness teaching, nor the roster of harnesses it could
+    /// open a seat on. It coordinates inside a scope it was handed; it does
+    /// not decide which harnesses run.
+    #[test]
+    fn a_sub_orchestrator_gets_neither_orchestrator_only_layer() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let composed = compose(
+            None,
+            repo.path(),
+            false,
+            &PromptConfig::default(),
+            PromptRole::SubOrchestrator,
+            &["claude -- ready".to_string()],
+            4096,
+        )
+        .expect("composed");
+        assert!(!composed.sources.contains(&PromptSource::Harness));
+        assert!(!composed.sources.contains(&PromptSource::Harnesses));
+        assert!(!composed.text.contains(HARNESS_PROMPT));
     }
 
     #[test]
