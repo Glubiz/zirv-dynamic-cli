@@ -382,6 +382,7 @@ pub(crate) fn run_with_clock<W: Write>(
         &state,
         now_secs(),
         super::adapters::LaunchMode::Headless,
+        true,
     )
     .composed;
     // Known before argv is touched, because it decides how argv is read: the
@@ -1101,6 +1102,7 @@ pub(crate) fn run_with_clock<W: Write>(
                 &state,
                 now_secs(),
                 super::adapters::LaunchMode::Headless,
+                true,
             )
             .composed;
             // C7: `registry_short`, not `short_id(session)` -- `session`
@@ -1776,6 +1778,11 @@ mod tests {
         let state = StateDir::from_root(repo.path().join("state"));
         let mut cfg = CtxConfig::default();
         cfg.memory.core_max_bytes = 40;
+        // Issue #155: the merged memory layer is capped by the SUM of the two
+        // budgets now, not `core_max_bytes` alone -- zero the retrieval half
+        // out so this test's tiny budget still actually bounds what gets
+        // delivered.
+        cfg.memory.retrieval_max_bytes = 0;
         let slug = crate::commands::ctx::state::repo_slug(repo.path());
 
         crate::commands::ctx::memory::remember(
@@ -1808,6 +1815,7 @@ mod tests {
             &state,
             1,
             crate::commands::ctx::adapters::LaunchMode::Headless,
+            false,
         )
         .composed
         .expect("a worker launch still composes a prompt");

@@ -1621,6 +1621,7 @@ pub fn run_with(
         &state_dir,
         super::state::now_secs(),
         launch_mode_from_interactive(interactive_launch),
+        true,
     );
     // The wrapped command's own argv may already carry the adapter's
     // system-prompt flag; merge it in rather than letting `prompt_args` below
@@ -6966,6 +6967,11 @@ mod tests {
         let state = StateDir::from_root(repo.path().join("state"));
         let mut cfg = CtxConfig::default();
         cfg.memory.core_max_bytes = 40;
+        // Issue #155: the merged memory layer is capped by the SUM of the two
+        // budgets now, not `core_max_bytes` alone -- zero the retrieval half
+        // out so this test's tiny budget still actually bounds what gets
+        // delivered.
+        cfg.memory.retrieval_max_bytes = 0;
         let slug = crate::commands::ctx::state::repo_slug(repo.path());
 
         crate::commands::ctx::memory::remember(
@@ -6998,6 +7004,7 @@ mod tests {
             &state,
             1,
             crate::commands::ctx::adapters::LaunchMode::Headless,
+            false,
         )
         .composed
         .expect("a launch still composes a prompt");

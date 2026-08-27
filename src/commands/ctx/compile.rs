@@ -54,6 +54,39 @@ use super::state::StateDir;
 use super::surface::{ContextSurface, Trust};
 use super::{context, memory, retrieval};
 
+/// `log::Decision::action` for a canonical context layer cut by its budget.
+pub const TRUNCATED_ACTION: &str = "context-truncated";
+
+/// The decision-log half of the truncation report. Session-free on purpose:
+/// `compile` runs before most launch paths have minted a session id (see
+/// `run_loop.rs`, which mints one AFTER composing), and the surface path in
+/// `detail` is the identity that actually matters here. `verb` is
+/// `"compile"` for the same reason.
+fn log_truncation_decisions(state: &StateDir, now: u64, provenance: &[ContextProvenance]) {
+    for entry in provenance.iter().filter(|p| p.truncated) {
+        let detail = format!(
+            "{}: {} of {} bytes delivered, {} lost to {}",
+            entry.surface.path().display(),
+            entry.delivered_bytes,
+            entry.raw_bytes,
+            entry.raw_bytes.saturating_sub(entry.delivered_bytes),
+            entry.budget_key,
+        );
+        let _ = super::log::append(
+            state,
+            &super::log::Decision {
+                ts: now,
+                session: "",
+                verb: "compile",
+                verdict: "n/a",
+                score: 0,
+                action: TRUNCATED_ACTION,
+                detail: &detail,
+            },
+        );
+    }
+}
+
 /// One canonical `.zirv/context/*.md` surface actually read and injected --
 /// common, or the harness-specific addition for the adapter this session
 /// launched. Absent (missing file, or empty after trimming) means no entry
@@ -76,6 +109,11 @@ pub struct ContextProvenance {
     /// bytes`) cut this surface short. `delivered_bytes < raw_bytes` exactly
     /// when this is true.
     pub truncated: bool,
+    /// Which configured budget cut this surface -- the exact `ctx.toml` key
+    /// an operator has to raise. Carried as data rather than re-derived from
+    /// the path at each reader, so the decision-log line, the stderr note and
+    /// `zirv context status` can never name three different keys for one cut.
+    pub budget_key: &'static str,
 }
 
 /// The compiled result of one launch-time context assembly: the composed
@@ -153,6 +191,36 @@ fn gather_memory(
     (core, retrieved)
 }
 
+/// The single memory list injected into a composed prompt: the core
+/// selection in its own order, then any retrieval entry not already present.
+///
+/// Deduped on `(shared, key.to_lowercase())`, not on `key` alone: a private
+/// and a shared entry may legitimately carry the same key, and resolving
+/// that conflict is `prompt::select_memory_within_cap`'s job (private
+/// structurally outranks shared there). Case-insensitive because the private
+/// scope never validates or normalizes a key's case, the same reasoning
+/// `select_memory_within_cap`'s own key-conflict suppression already states.
+///
+/// `gather_memory` already filters retrieval against the core keys, so this
+/// is belt-and-braces for that path -- and load-bearing for any future
+/// caller that assembles the two lists differently.
+pub(crate) fn merge_memory_layers(
+    core: &[prompt::MemoryLine],
+    retrieved: &[prompt::MemoryLine],
+) -> Vec<prompt::MemoryLine> {
+    let mut seen: std::collections::HashSet<(bool, String)> = core
+        .iter()
+        .map(|entry| (entry.shared, entry.key.to_lowercase()))
+        .collect();
+    let mut merged = core.to_vec();
+    for entry in retrieved {
+        if seen.insert((entry.shared, entry.key.to_lowercase())) {
+            merged.push(entry.clone());
+        }
+    }
+    merged
+}
+
 fn changed_repo_paths(repo: &Path) -> Vec<String> {
     let mut paths = std::collections::BTreeSet::new();
     for args in [
@@ -218,9 +286,11 @@ permissions.\n\n";
 
 /// Adds the canonical `.zirv/context/{common,claude,codex}.md` layer to a
 /// composed prompt, right after whatever `prompt::compose` itself already
-/// added (its own repo `system-prompt.md` layer, or the memory/user layers
-/// before it if the repo has no `system-prompt.md`) and before whatever the
-/// caller layers on next (mail, report-back, the operator's own command-line
+/// added (its own repo `system-prompt.md` layer, or the user layer before it
+/// if the repo has no `system-prompt.md` -- `compose` no longer builds a
+/// memory layer at all, v8, issue #155) and before whatever `compile.rs`
+/// layers on next: the single merged memory layer, then whatever the caller
+/// adds after that (mail, report-back, the operator's own command-line
 /// instruction). `None` in means `None` out, the same "no composed prompt,
 /// nothing to add" contract every layer in `prompt.rs` follows: a `--simple`
 /// run or a disabled prompt gets no canonical context layer either, however
@@ -244,18 +314,21 @@ fn with_canonical_context_layer(
         return (None, Vec::new());
     };
 
-    let mut candidates: Vec<(context::PrecedenceTier, Layer, PathBuf, usize)> = vec![(
-        context::PrecedenceTier::CanonicalCommon,
-        Layer::ContextCommon,
-        context::common_path(repo),
-        cfg.context.max_common_bytes,
-    )];
+    let mut candidates: Vec<(context::PrecedenceTier, Layer, PathBuf, usize, &'static str)> =
+        vec![(
+            context::PrecedenceTier::CanonicalCommon,
+            Layer::ContextCommon,
+            context::common_path(repo),
+            cfg.context.max_common_bytes,
+            "context.max_common_bytes",
+        )];
     if let Some((layer, path)) = harness_context_layer(adapter_name, repo) {
         candidates.push((
             context::PrecedenceTier::CanonicalHarnessSpecific,
             layer,
             path,
             cfg.context.max_harness_bytes,
+            "context.max_harness_bytes",
         ));
     }
     // `PrecedenceTier`'s derived `Ord` is the single source of truth here
@@ -267,7 +340,7 @@ fn with_canonical_context_layer(
 
     let mut provenance = Vec::new();
     let mut added_any = false;
-    for (_, layer, path, cap) in candidates {
+    for (_, layer, path, cap, budget_key) in candidates {
         let Some((text, raw_bytes, truncated)) = read_context_layer(&path, cap) else {
             continue;
         };
@@ -282,6 +355,7 @@ fn with_canonical_context_layer(
         composed.text.push_str(text.trim_end());
 
         let delivered_bytes = text.len();
+        let display_path = path.display().to_string();
         // `Surface::context_surface` is the existing, already-tested
         // provider/kind/scope-to-`ContextSurface` mapping `optimize.rs`
         // built for exactly this layer (issue #41/#39) -- reused here rather
@@ -294,7 +368,20 @@ fn with_canonical_context_layer(
             raw_bytes,
             delivered_bytes,
             truncated,
+            budget_key,
         });
+        if truncated {
+            // Compose-time, unconditional: this is the operator-visible half
+            // and it costs nothing when nothing was cut. The decision-log
+            // half is gated per call site (`log_truncation`) because a
+            // read-only report compiles too.
+            eprintln!(
+                "zirv: canonical context layer {display_path} was truncated -- \
+                 {delivered_bytes} of {raw_bytes} bytes delivered, {} bytes LOST to \
+                 {budget_key}. Shorten the file or raise the key in ~/.zirv/ctx.toml.",
+                raw_bytes.saturating_sub(delivered_bytes),
+            );
+        }
     }
     if added_any {
         composed.sources.push(PromptSource::Context);
@@ -336,6 +423,7 @@ pub fn compile(
     state: &StateDir,
     now: u64,
     mode: super::adapters::LaunchMode,
+    log_truncation: bool,
 ) -> CompiledContext {
     compile_with_harness_roster(
         home,
@@ -348,6 +436,7 @@ pub fn compile(
         now,
         role == PromptRole::Orchestrator,
         mode,
+        log_truncation,
     )
 }
 
@@ -379,6 +468,7 @@ pub fn compile_with_harness_roster(
     now: u64,
     include_harness_roster: bool,
     mode: super::adapters::LaunchMode,
+    log_truncation: bool,
 ) -> CompiledContext {
     let slug = super::state::repo_slug(repo);
     let (memory_entries, retrieved_memory) = gather_memory(state, repo, &slug, cfg, now);
@@ -397,13 +487,9 @@ pub fn compile_with_harness_roster(
         simple,
         &cfg.prompt,
         role,
-        &memory_entries,
-        cfg.memory.core_max_bytes,
         &harness_lines,
         cfg.context.max_harness_roster_bytes,
     );
-    let composed =
-        prompt::with_memory_layer(composed, &retrieved_memory, cfg.memory.retrieval_max_bytes);
     // Mirrors `compose`'s own gate for `PromptSource::Harnesses` exactly
     // (role == Orchestrator, `cfg.prompt.harnesses`, a non-empty roster) plus
     // the top-level `composed.is_some()` gate every layer in this module
@@ -422,6 +508,21 @@ pub fn compile_with_harness_roster(
     };
     let (composed, provenance) =
         with_canonical_context_layer(composed, adapter.name(), repo, home, cfg);
+    if log_truncation {
+        log_truncation_decisions(state, now, &provenance);
+    }
+    // Issue #155: the one memory layer, injected last of everything zirv
+    // composes deterministically -- mail and the command-line layer are the
+    // only things after it, and both are already per-launch. The cap is the
+    // sum of the two configured budgets, so neither selection can crowd the
+    // other out of the space it was already allotted.
+    let composed = prompt::with_memory_layer(
+        composed,
+        &merge_memory_layers(&memory_entries, &retrieved_memory),
+        cfg.memory
+            .core_max_bytes
+            .saturating_add(cfg.memory.retrieval_max_bytes),
+    );
 
     // Computed from `cfg.policy` alone, never from `composed`'s text: the
     // canonical context layer's prose can steer a session, but it cannot
@@ -474,6 +575,7 @@ mod tests {
             &state,
             now_secs(),
             LaunchMode::Headless,
+            false,
         )
     }
 
@@ -505,6 +607,7 @@ mod tests {
             &state,
             now,
             LaunchMode::Headless,
+            false,
         );
         let second = compile(
             None,
@@ -516,6 +619,7 @@ mod tests {
             &state,
             now,
             LaunchMode::Headless,
+            false,
         );
         assert_eq!(first, second);
     }
@@ -752,6 +856,7 @@ mod tests {
             &state,
             now_secs(),
             LaunchMode::Headless,
+            false,
         );
         assert!(compiled.composed.is_none());
         assert!(compiled.provenance.is_empty());
@@ -849,6 +954,7 @@ mod tests {
             &state,
             now_secs(),
             LaunchMode::Headless,
+            false,
         );
         assert_eq!(compiled.core_memory.selected_entries, 1);
         assert_eq!(compiled.retrieved_memory.selected_entries, 1);
@@ -858,5 +964,309 @@ mod tests {
             text.contains("lib changes require the compatibility check"),
             "got {text}"
         );
+    }
+
+    /// Issue #155, Phase 1(b): this repository's own canonical context must
+    /// fit the budget zirv ships. Pinned as a test rather than fixed once,
+    /// because the file grows with every session that edits it and a silent
+    /// re-truncation is exactly the failure Task 1.1 exists to surface.
+    /// `CARGO_MANIFEST_DIR` is the real repo, the same seam
+    /// `config.rs::the_repo_ctx_toml_parses_and_stays_exhaustive` uses.
+    #[test]
+    fn this_repositorys_canonical_common_context_fits_the_shipped_budget() {
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let path = crate::commands::ctx::context::common_path(repo);
+        let text = std::fs::read_to_string(&path).expect("read .zirv/context/common.md");
+        let cap = CtxConfig::default().context.max_common_bytes;
+        assert!(
+            text.len() <= cap,
+            "{} is {} bytes, over the shipped {cap}-byte context.max_common_bytes budget; \
+             tighten it rather than raising the cap",
+            path.display(),
+            text.len()
+        );
+    }
+
+    /// The harness-specific halves are inside their own independent budget
+    /// too -- they are truncated separately, so a passing common.md says
+    /// nothing about them.
+    #[test]
+    fn this_repositorys_canonical_harness_context_files_fit_the_shipped_budget() {
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let cap = CtxConfig::default().context.max_harness_bytes;
+        for path in [
+            crate::commands::ctx::context::claude_path(repo),
+            crate::commands::ctx::context::codex_path(repo),
+        ] {
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            assert!(
+                text.len() <= cap,
+                "{} is {} bytes, over the shipped {cap}-byte context.max_harness_bytes budget",
+                path.display(),
+                text.len()
+            );
+        }
+    }
+
+    /// Issue #155, Phase 1(a): the single most expensive failure mode of a
+    /// byte budget is one nobody is told about. A cut canonical layer must
+    /// produce BOTH a decision-log entry naming the file and the exact lost
+    /// byte count, AND a stderr note at compose time. Before this, the only
+    /// evidence was `ContextProvenance::truncated`, which nothing but
+    /// `zirv context status` ever reads.
+    #[test]
+    fn a_truncated_canonical_layer_is_logged_with_the_file_and_the_lost_bytes() {
+        let repo = repo_with_context_files(&[("common.md", &"x".repeat(6000))]);
+        let home = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(home.path().join("state"));
+        let mut cfg = CtxConfig::default();
+        cfg.context.max_common_bytes = 4096;
+
+        let compiled = compile(
+            Some(home.path()),
+            repo.path(),
+            false,
+            &cfg,
+            &ClaudeAdapter::new(None),
+            PromptRole::Orchestrator,
+            &state,
+            now_secs(),
+            LaunchMode::Interactive,
+            true,
+        );
+
+        let cut = compiled
+            .provenance
+            .iter()
+            .find(|p| p.truncated)
+            .expect("the 6000-byte common layer must report as truncated");
+        assert_eq!(cut.raw_bytes, 6000);
+        assert_eq!(cut.delivered_bytes, 4096);
+        assert_eq!(cut.budget_key, "context.max_common_bytes");
+
+        let lines = crate::commands::ctx::log::tail(&state, 20).expect("decision log");
+        let entry = lines
+            .iter()
+            .find(|line| line.contains("context-truncated"))
+            .expect("a context-truncated decision must be written");
+        assert!(entry.contains("common.md"), "got {entry}");
+        assert!(entry.contains("1904"), "must name the LOST bytes: {entry}");
+        assert!(entry.contains("context.max_common_bytes"), "got {entry}");
+    }
+
+    /// The other direction: a layer inside its budget writes nothing at all.
+    /// A truncation warning that fires on healthy sessions is noise, and
+    /// noise is how the real one gets ignored.
+    #[test]
+    fn a_layer_inside_its_budget_writes_no_truncation_decision() {
+        let repo = repo_with_context_files(&[("common.md", "short and well within budget\n")]);
+        let home = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(home.path().join("state"));
+
+        let compiled = compile(
+            Some(home.path()),
+            repo.path(),
+            false,
+            &CtxConfig::default(),
+            &ClaudeAdapter::new(None),
+            PromptRole::Orchestrator,
+            &state,
+            now_secs(),
+            LaunchMode::Interactive,
+            true,
+        );
+
+        assert!(compiled.provenance.iter().all(|p| !p.truncated));
+        let lines = crate::commands::ctx::log::tail(&state, 20).unwrap_or_default();
+        assert!(
+            !lines.iter().any(|line| line.contains("context-truncated")),
+            "no decision may be written for an untruncated layer: {lines:?}"
+        );
+    }
+
+    /// `zirv context status` compiles once per registered adapter purely to
+    /// REPORT truncation. It must not also WRITE decisions doing so, or every
+    /// status invocation would spam the log with entries describing a session
+    /// that never launched. That is exactly what the explicit
+    /// `log_truncation` parameter exists to force each call site to answer.
+    #[test]
+    fn a_read_only_report_compile_writes_no_truncation_decision() {
+        let repo = repo_with_context_files(&[("common.md", &"x".repeat(6000))]);
+        let home = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(home.path().join("state"));
+        let mut cfg = CtxConfig::default();
+        cfg.context.max_common_bytes = 4096;
+
+        let compiled = compile(
+            Some(home.path()),
+            repo.path(),
+            false,
+            &cfg,
+            &ClaudeAdapter::new(None),
+            PromptRole::Orchestrator,
+            &state,
+            now_secs(),
+            LaunchMode::Interactive,
+            false,
+        );
+
+        assert!(
+            compiled.provenance.iter().any(|p| p.truncated),
+            "the report still SEES the truncation"
+        );
+        let lines = crate::commands::ctx::log::tail(&state, 20).unwrap_or_default();
+        assert!(
+            !lines.iter().any(|line| line.contains("context-truncated")),
+            "a report must not write decisions: {lines:?}"
+        );
+    }
+
+    /// Issue #155, Phase 1(c)+(d): ONE memory layer, and it sits AFTER the
+    /// canonical context layer.
+    ///
+    /// The retrieval half of memory is selected from live `git diff`/`git
+    /// ls-files` output and is recomputed on every recompose (a nudge
+    /// relaunch, a loop cycle, a dashboard sweep). Everything positioned
+    /// after it therefore falls out of the provider's prompt cache whenever
+    /// the working tree moves. Putting the whole memory layer at the tail --
+    /// as late as it can go while still preceding mail -- keeps the ~8 KiB
+    /// canonical context layer in the cacheable prefix.
+    #[test]
+    fn memory_is_one_layer_and_follows_the_canonical_context_layer() {
+        let repo = repo_with_context_files(&[("common.md", "canonical common instructions\n")]);
+        let home = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(home.path().join("state"));
+        let cfg = CtxConfig::default();
+        let slug = super::super::state::repo_slug(repo.path());
+        memory::upsert_scoped(
+            memory::MemoryScope::Private,
+            repo.path(),
+            &state,
+            &slug,
+            &cfg,
+            &memory::Entry {
+                key: "deploy-cmd".to_string(),
+                written_by: "test".to_string(),
+                written: 100,
+                verified: 100,
+                source: "explicit".to_string(),
+                body: "zirv deploy".to_string(),
+                importance: None,
+                confidence: None,
+                tags: Vec::new(),
+                paths: Vec::new(),
+            },
+        )
+        .expect("remember");
+
+        let compiled = compile(
+            Some(home.path()),
+            repo.path(),
+            false,
+            &cfg,
+            &ClaudeAdapter::new(None),
+            PromptRole::Orchestrator,
+            &state,
+            now_secs(),
+            LaunchMode::Interactive,
+            false,
+        );
+        let composed = compiled.composed.expect("composed");
+
+        let memory_positions: Vec<usize> = composed
+            .sources
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| **s == PromptSource::Memory)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            memory_positions.len(),
+            1,
+            "exactly one memory layer, not two: {:?}",
+            composed.sources
+        );
+        let context_position = composed
+            .sources
+            .iter()
+            .position(|s| *s == PromptSource::Context)
+            .expect("a canonical context layer");
+        assert!(
+            context_position < memory_positions[0],
+            "canonical context must precede memory: {:?}",
+            composed.sources
+        );
+
+        let described = composed.describe();
+        assert!(described.starts_with("v8 "), "got {described}");
+        assert_eq!(
+            described.matches("memory").count(),
+            1,
+            "describe() listed memory twice: {described}"
+        );
+    }
+
+    /// Core and retrieval selections still report SEPARATELY -- `zirv context
+    /// status` shows where an entry came from. Only the injection is unified.
+    #[test]
+    fn the_merged_injection_does_not_collapse_the_two_reported_selections() {
+        let core = vec![prompt::MemoryLine {
+            key: "Deploy-Cmd".to_string(),
+            body: "zirv deploy".to_string(),
+            verified: 100,
+            written: 100,
+            shared: false,
+        }];
+        let retrieved = vec![
+            // Same key, different case: the merge must drop it, because
+            // `gather_memory` already excluded it from retrieval by key and a
+            // second copy in the prompt would say the same thing twice.
+            prompt::MemoryLine {
+                key: "deploy-cmd".to_string(),
+                body: "zirv deploy".to_string(),
+                verified: 90,
+                written: 90,
+                shared: false,
+            },
+            prompt::MemoryLine {
+                key: "lint-cmd".to_string(),
+                body: "cargo clippy".to_string(),
+                verified: 80,
+                written: 80,
+                shared: false,
+            },
+        ];
+
+        let merged = merge_memory_layers(&core, &retrieved);
+        assert_eq!(
+            merged.iter().map(|e| e.key.as_str()).collect::<Vec<_>>(),
+            vec!["Deploy-Cmd", "lint-cmd"],
+            "core order first, retrieval appended, deduped case-insensitively"
+        );
+    }
+
+    /// A shared entry and a private entry may legitimately carry the same
+    /// key: `select_memory_within_cap` resolves that conflict itself, with
+    /// private structurally outranking shared. The merge must not pre-empt
+    /// that by dropping one on key alone -- the dedupe key is (shared, key).
+    #[test]
+    fn merging_keys_on_scope_too_so_the_shared_suppression_rule_still_runs() {
+        let core = vec![prompt::MemoryLine {
+            key: "deploy-cmd".to_string(),
+            body: "private".to_string(),
+            verified: 100,
+            written: 100,
+            shared: false,
+        }];
+        let retrieved = vec![prompt::MemoryLine {
+            key: "deploy-cmd".to_string(),
+            body: "shared".to_string(),
+            verified: 90,
+            written: 90,
+            shared: true,
+        }];
+        assert_eq!(merge_memory_layers(&core, &retrieved).len(), 2);
     }
 }
