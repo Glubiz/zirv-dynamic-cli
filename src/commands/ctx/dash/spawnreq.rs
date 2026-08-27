@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use super::super::CtxResult;
+use super::super::prompt::PromptRole;
 use super::super::state::StateDir;
 
 /// Exported into every pane's own `turn_env`: names the directory a pane's
@@ -82,6 +83,37 @@ pub struct SpawnRequest {
     pub model: Option<String>,
     #[serde(default)]
     pub interactive: bool,
+    /// What the requester is asking this pane to BE (issue #155): absent, or
+    /// unrecognised, means `PromptRole::Worker` -- the least-privileged
+    /// reading, and exactly what every pre-2.35.0 request meant. Never
+    /// trusted as authority on its own: `fulfill_spawn_request` re-derives
+    /// the requesting session's own role and applies the depth cap itself
+    /// (see `role_of`, and `dash::mod::depth_refusal`).
+    #[serde(default)]
+    pub role: Option<String>,
+    /// The session that asked for this spawn, for cost attribution and for
+    /// the depth cap. `requested_by` already carries an address; this is the
+    /// lineage link, and the two are deliberately separate because a
+    /// retryable-refusal fallback can change who runs the work without
+    /// changing who asked for it.
+    #[serde(default)]
+    pub parent_session: Option<String>,
+    /// The `group::WorkGroup` this spawn belongs to, if any. `None` is a
+    /// one-off delegation, which is every delegation before 2.35.0.
+    #[serde(default)]
+    pub work_group_id: Option<String>,
+}
+
+/// The role a request actually gets. Unstated or unrecognised is
+/// `PromptRole::Worker`: a pane must never acquire coordination privileges
+/// from a string nobody validated. Only the two spellings `agent.rs`'s own
+/// `--role` flag accepts (`validate_role`) ever map onto
+/// `PromptRole::SubOrchestrator`.
+pub fn role_of(req: &SpawnRequest) -> PromptRole {
+    match req.role.as_deref() {
+        Some("sub-orchestrator") => PromptRole::SubOrchestrator,
+        _ => PromptRole::Worker,
+    }
 }
 
 /// The dashboard's answer to one [`SpawnRequest`]. `ok: false` always
@@ -357,7 +389,39 @@ mod tests {
             requested_by: "abcd1234".to_string(),
             model: None,
             interactive: false,
+            role: None,
+            parent_session: None,
+            work_group_id: None,
         }
+    }
+
+    /// Issue #155, Phase 5(c): lineage travels with the request. Same-binary
+    /// IPC on one machine, so `#[serde(default)]` is enough -- a request
+    /// written by an older build deserialises to exactly today's behaviour.
+    #[test]
+    fn a_request_written_before_this_change_still_deserialises_to_todays_behaviour() {
+        let old = r#"{"agent":"codex","prompt":"do the thing","cwd":".",
+                      "requested_by":"sess-1"}"#;
+        let req: SpawnRequest = serde_json::from_str(old).expect("older requests still parse");
+        assert_eq!(req.role, None);
+        assert_eq!(req.parent_session, None);
+        assert_eq!(req.work_group_id, None);
+        assert_eq!(
+            role_of(&req),
+            PromptRole::Worker,
+            "an unstated role is a Worker -- the least-privileged reading"
+        );
+    }
+
+    /// An unrecognised role string is a Worker too. A pane must never gain
+    /// coordination privileges from a value nobody validated.
+    #[test]
+    fn an_unknown_role_string_reads_as_a_worker() {
+        let mut req = sample_request();
+        req.role = Some("orchestrator-plus".to_string());
+        assert_eq!(role_of(&req), PromptRole::Worker);
+        req.role = Some("sub-orchestrator".to_string());
+        assert_eq!(role_of(&req), PromptRole::SubOrchestrator);
     }
 
     #[test]
