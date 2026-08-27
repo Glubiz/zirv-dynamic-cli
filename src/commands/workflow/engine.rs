@@ -1993,7 +1993,7 @@ mod tests {
                 output_tokens: 3,
             }
         );
-        assert_eq!(usage.context_total(), 12, "the pre-2.32.0 combined number");
+        assert_eq!(usage.context_total(), 12, "the pre-2.34.0 combined number");
     }
 
     /// The sidechain counterpart of `phase_usage_reads_only_the_appended_

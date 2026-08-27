@@ -111,7 +111,7 @@ pub struct TelemetryEvent {
     pub artifact_count: u32,
     pub worker_count: u32,
     /// Issue #155: the raw cache classes alongside `input_tokens`.
-    /// `input_tokens` keeps its pre-2.32.0 meaning for events produced by the
+    /// `input_tokens` keeps its pre-2.34.0 meaning for events produced by the
     /// workflow engine: the COMBINED context total (raw input plus both cache
     /// classes -- see `engine.rs`'s `usage.context_total()`), not the raw
     /// uncached class alone. These two fields are the ground truth for any
@@ -124,7 +124,7 @@ pub struct TelemetryEvent {
     /// classes. Its own bucket rather than folded into the main numbers: the
     /// main numbers mean "this session's own context", and a subagent's
     /// tokens are not part of it -- but they ARE charged to the account, so
-    /// dropping them (the pre-2.32.0 behaviour) made a phase look cheaper
+    /// dropping them (the pre-2.34.0 behaviour) made a phase look cheaper
     /// than it was.
     #[serde(default)]
     pub sidechain_input_tokens: Option<u64>,

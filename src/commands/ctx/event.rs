@@ -61,7 +61,7 @@ pub struct TranscriptUsage {
 
 impl TranscriptUsage {
     /// The combined "real context size" figure this type carried in
-    /// `input_tokens` before 2.32.0: uncached input plus both cache classes.
+    /// `input_tokens` before 2.34.0: uncached input plus both cache classes.
     /// Every caller that genuinely wants ONE context-size number -- rot's
     /// token gate, status display -- calls this. Saturating, like every other
     /// token arithmetic in this crate.
@@ -194,7 +194,7 @@ mod tests {
         assert_eq!(
             usage.context_total(),
             100_000,
-            "the pre-2.32.0 combined number"
+            "the pre-2.34.0 combined number"
         );
         assert_eq!(TranscriptUsage::default().context_total(), 0);
     }

@@ -1506,7 +1506,7 @@ mod tests {
                 output_tokens: 20,
             }
         );
-        assert_eq!(usage.context_total(), 21, "the pre-2.32.0 combined number");
+        assert_eq!(usage.context_total(), 21, "the pre-2.34.0 combined number");
         assert_eq!(transcript_usage("not json"), None);
     }
 
