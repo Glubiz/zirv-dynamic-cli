@@ -32,11 +32,31 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
 use super::sessions::is_alive;
 use super::state::{self, StateDir};
+
+/// Re-review (2026-08-27) finding 2a: how long an unparseable slot file is
+/// left alone before the dead-owner sweep treats it as crash-orphaned and
+/// removes it. `acquire`'s own claim is `create_new` then `write_all`, two
+/// separate syscalls in a `panic = "abort"` binary, so a kill between them
+/// leaves an empty or partial slot file behind -- and until now `live_
+/// records` skipped such a file forever without ever removing it,
+/// permanently losing that slot index. A few seconds tolerates a write
+/// genuinely still in progress (every write in this module is a few hundred
+/// bytes, effectively instantaneous) without reintroducing finding 2b's
+/// sweep-vs-claim race on a file that is not actually orphaned.
+const UNPARSEABLE_SLOT_GRACE_SECS: u64 = 5;
+
+/// Re-review (2026-08-27) finding 2b: bounded retries for `acquire`'s own
+/// post-claim verification (see `claim_is_verified`'s doc comment). Small --
+/// this only ever loops more than once when a claim is genuinely lost to a
+/// concurrent sweep or clobber, not under ordinary contention (which
+/// `claim_any_slot`'s own `create_new` loop already resolves in one pass).
+const CLAIM_VERIFY_ATTEMPTS: u32 = 3;
 
 /// Substituted-command patterns [`is_heavy`] always checks, regardless of
 /// `SuperviseConfig::heavy_command_patterns` -- see that field's own doc
@@ -183,6 +203,33 @@ impl HeavyPermit {
     }
 }
 
+/// Pure: whether `modified` is more than `grace_secs` older than `now`. Split
+/// out of [`slot_file_is_stale`] so finding 2a's actual age arithmetic is
+/// unit-testable without a real file or the real clock -- the same
+/// discipline `group::is_overdue` already holds for its own age check.
+fn is_stale(modified: SystemTime, now: SystemTime, grace_secs: u64) -> bool {
+    match now.duration_since(modified) {
+        Ok(age) => age.as_secs() > grace_secs,
+        // `modified` is in the future (a clock skew, not a crash-orphaned
+        // file written moments ago) -- never treat that as stale.
+        Err(_) => false,
+    }
+}
+
+/// Whether an unparseable slot file at `path` is old enough to be swept
+/// (finding 2a). Any I/O or clock error resolves to `false` -- not old
+/// enough -- since the safer default here is leaving a file alone, not
+/// deleting it on a filesystem that cannot even report its own age.
+fn slot_file_is_stale(path: &Path, grace_secs: u64) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    let Ok(modified) = meta.modified() else {
+        return false;
+    };
+    is_stale(modified, SystemTime::now(), grace_secs)
+}
+
 /// Every heavy-operation permit currently held, sweeping (and never
 /// including) any entry whose owning pid is no longer alive -- reusing
 /// `sessions::is_alive`, the same liveness probe `sessions::list` sweeps
@@ -210,6 +257,16 @@ pub fn live_records(state: &StateDir) -> Vec<PermitRecord> {
             continue;
         };
         let Ok(record) = serde_json::from_str::<PermitRecord>(&contents) else {
+            // Finding 2a: an unparseable file is either a crash-orphaned
+            // partial write (`acquire`'s own `create_new` then `write_all`
+            // is two syscalls, and this binary is `panic = "abort"`) or a
+            // write genuinely still in progress. Only the former is safe to
+            // remove -- age it by mtime, and free the slot index once it is
+            // older than a short grace window, so a crash-orphaned file does
+            // not lose that slot forever while a fresh write is left alone.
+            if slot_file_is_stale(&path, UNPARSEABLE_SLOT_GRACE_SECS) {
+                let _ = std::fs::remove_file(&path);
+            }
             continue;
         };
         // Finding B5: live if EITHER the parent that acquired the permit or
@@ -270,18 +327,48 @@ pub fn acquire(state: &StateDir, limit: usize, label: &str) -> Option<HeavyPermi
         return None;
     }
 
+    let own_pid = std::process::id();
     let record = PermitRecord {
-        pid: std::process::id(),
+        pid: own_pid,
         child_pid: None,
         label: label.to_string(),
         acquired_at: state::now_secs(),
     };
     let json = serde_json::to_string_pretty(&record).ok()?;
 
+    // Re-review (2026-08-27) finding 2b: a claim that wins `create_new` is
+    // not yet trustworthy on its own. `live_records`'s own dead-owner sweep
+    // (above, and on every other caller running concurrently) reads a slot,
+    // decides its owner is dead, and removes the file with no recheck -- so
+    // a concurrent `acquire` that wins `create_new` on that exact path
+    // between the sweeper's read and its `remove_file` gets its brand-new
+    // permit file deleted out from under it while it believes it holds the
+    // slot. Re-reading and verifying the just-written record closes that:
+    // a lost claim retries the whole scan (a slot the sweeper just freed, or
+    // that another holder just released, may now be claimable) rather than
+    // ever proceeding with a phantom permit.
+    for _ in 0..CLAIM_VERIFY_ATTEMPTS {
+        let path = claim_any_slot(&dir, limit, &json)?;
+        if claim_is_verified(&path, own_pid) {
+            return Some(HeavyPermit { path });
+        }
+        // The file this claim just wrote is gone (swept) or holds a record
+        // this call never wrote (clobbered) -- never proceed with a phantom
+        // permit. Best-effort retry: loop back and scan again.
+    }
+    None
+}
+
+/// One pass over every slot index, returning the path this call manages to
+/// claim via `create_new` -- `None` once every index in `0..limit` is
+/// already taken. Split out of [`acquire`] so finding 2b's verify-then-retry
+/// loop can re-run a full scan on a lost claim, rather than only retrying
+/// the single index that was lost.
+fn claim_any_slot(dir: &Path, limit: usize, json: &str) -> Option<PathBuf> {
     for slot in 0..limit {
-        let path = slot_path(&dir, slot);
-        match create_new_private(&path, &json) {
-            Ok(()) => return Some(HeavyPermit { path }),
+        let path = slot_path(dir, slot);
+        match create_new_private(&path, json) {
+            Ok(()) => return Some(path),
             // Someone else already holds this slot (the expected, common
             // case under contention) -- try the next index.
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -293,6 +380,24 @@ pub fn acquire(state: &StateDir, limit: usize, label: &str) -> Option<HeavyPermi
         }
     }
     None
+}
+
+/// Re-review (2026-08-27) finding 2b: re-reads `path` right after this call
+/// claimed it and confirms the record on disk is still the one this call
+/// itself wrote (by `pid`). `false` means the claim was lost between the
+/// `write_all` inside [`create_new_private`] and this check -- the file is
+/// gone (a concurrent dead-owner sweep won the race) or was overwritten with
+/// someone else's record (not possible under `create_new`'s own atomicity
+/// today, but cheap to rule out here rather than assumed forever) -- either
+/// way, [`acquire`] must not treat this as a held permit.
+fn claim_is_verified(path: &Path, expected_pid: u32) -> bool {
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(record) = serde_json::from_str::<PermitRecord>(&contents) else {
+        return false;
+    };
+    record.pid == expected_pid
 }
 
 #[cfg(test)]
@@ -502,5 +607,175 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].label, "session ab12cd34: cargo nextest run");
         assert_eq!(records[0].pid, std::process::id());
+    }
+
+    /// Pure arithmetic underlying finding 2a's sweep decision, with no file
+    /// or real clock involved: strictly older than `grace_secs` is stale,
+    /// exactly at it is not yet, and a `modified` time in the future (clock
+    /// skew, not a crash-orphaned file) is never stale.
+    #[test]
+    fn is_stale_marks_only_strictly_past_the_grace_window() {
+        let base = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        assert!(
+            !is_stale(base, base + std::time::Duration::from_secs(5), 5),
+            "exactly at the grace window is not yet stale"
+        );
+        assert!(
+            is_stale(base, base + std::time::Duration::from_secs(6), 5),
+            "one second past the grace window is stale"
+        );
+        assert!(
+            !is_stale(base, base - std::time::Duration::from_secs(1), 5),
+            "a modified time in the future must never be treated as stale"
+        );
+    }
+
+    /// Finding 2a: a crash-orphaned slot file (`acquire`'s own `create_new`
+    /// then `write_all` is two syscalls in a `panic = "abort"` binary) older
+    /// than the grace window must be swept, freeing its slot index -- before
+    /// this fix `live_records` skipped an unparseable file forever without
+    /// ever removing it, permanently losing that slot.
+    #[test]
+    fn an_old_unparseable_slot_file_is_swept_and_the_slot_becomes_claimable() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let dir = permits_dir(&state);
+        state::create_private_dir_all(&dir).expect("mkdir");
+        let path = slot_path(&dir, 0);
+        std::fs::write(&path, "").expect("write empty (unparseable) slot file");
+
+        let old =
+            SystemTime::now() - std::time::Duration::from_secs(UNPARSEABLE_SLOT_GRACE_SECS + 5);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("open for mtime")
+            .set_modified(old)
+            .expect("backdate mtime");
+
+        assert_eq!(
+            live_count(&state),
+            0,
+            "an unparseable file must never count as a held permit"
+        );
+        assert!(
+            !path.exists(),
+            "a crash-orphaned slot file older than the grace window must be swept"
+        );
+        assert!(
+            acquire(&state, 1, "cargo build").is_some(),
+            "the swept slot index must become claimable again"
+        );
+    }
+
+    /// The other half of finding 2a: an unparseable file with a fresh mtime
+    /// (just written) must NOT be swept -- it may be a write genuinely still
+    /// in progress, and sweeping it out from under an in-flight `acquire`
+    /// would reintroduce a phantom-permit race of its own.
+    #[test]
+    fn a_fresh_unparseable_slot_file_is_not_swept() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let dir = permits_dir(&state);
+        state::create_private_dir_all(&dir).expect("mkdir");
+        let path = slot_path(&dir, 0);
+        std::fs::write(&path, "").expect("write empty (unparseable) slot file");
+
+        assert_eq!(live_count(&state), 0, "still not a held permit");
+        assert!(
+            path.exists(),
+            "a fresh unparseable file must not be swept -- it may be a write still in progress"
+        );
+    }
+
+    /// Finding 2b: `claim_is_verified` is true only when the record actually
+    /// on disk right now is the one this call itself wrote.
+    #[test]
+    fn claim_is_verified_true_for_a_freshly_written_own_record() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let dir = permits_dir(&state);
+        state::create_private_dir_all(&dir).expect("mkdir");
+        let path = slot_path(&dir, 0);
+        let pid = std::process::id();
+        let json = serde_json::to_string_pretty(&PermitRecord {
+            pid,
+            child_pid: None,
+            label: "cargo build".to_string(),
+            acquired_at: state::now_secs(),
+        })
+        .expect("serialize");
+        create_new_private(&path, &json).expect("write");
+
+        assert!(claim_is_verified(&path, pid));
+    }
+
+    /// Finding 2b: a claim whose file is gone by the time of the verify read
+    /// -- exactly what a concurrent dead-owner sweep winning the race would
+    /// leave behind -- must never verify.
+    #[test]
+    fn claim_is_verified_false_once_the_file_is_gone() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let dir = permits_dir(&state);
+        state::create_private_dir_all(&dir).expect("mkdir");
+        let path = slot_path(&dir, 0); // never written
+
+        assert!(!claim_is_verified(&path, std::process::id()));
+    }
+
+    /// Finding 2b: a claim whose file holds a record this call never wrote
+    /// (a different pid) must never verify either -- "wrong", not only
+    /// "gone".
+    #[test]
+    fn claim_is_verified_false_when_the_record_names_a_different_pid() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let dir = permits_dir(&state);
+        state::create_private_dir_all(&dir).expect("mkdir");
+        let path = slot_path(&dir, 0);
+        let json = serde_json::to_string_pretty(&PermitRecord {
+            pid: std::process::id().wrapping_add(1),
+            child_pid: None,
+            label: "someone else's claim".to_string(),
+            acquired_at: state::now_secs(),
+        })
+        .expect("serialize");
+        create_new_private(&path, &json).expect("write");
+
+        assert!(!claim_is_verified(&path, std::process::id()));
+    }
+
+    /// Finding 2b: exercises `acquire`'s own verify-then-rescan retry at the
+    /// level of its building blocks -- a claim whose file vanishes between
+    /// the write and the verify (simulating the dead-owner sweep race
+    /// `claim_is_verified`'s doc comment describes) must not be trusted, and
+    /// the freed index must be claimable again on the very next scan.
+    #[test]
+    fn a_claim_whose_file_vanishes_before_verification_is_not_trusted_and_the_slot_reclaims() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let dir = permits_dir(&state);
+        state::create_private_dir_all(&dir).expect("mkdir");
+        let own_pid = std::process::id();
+        let json = serde_json::to_string_pretty(&PermitRecord {
+            pid: own_pid,
+            child_pid: None,
+            label: "cargo build".to_string(),
+            acquired_at: state::now_secs(),
+        })
+        .expect("serialize");
+
+        let claimed = claim_any_slot(&dir, 1, &json).expect("the only slot is free");
+        // Simulate a concurrent dead-owner sweep winning the race between
+        // the write inside `claim_any_slot` and this check.
+        std::fs::remove_file(&claimed).expect("simulate the sweep");
+        assert!(
+            !claim_is_verified(&claimed, own_pid),
+            "a vanished claim must never verify"
+        );
+
+        let reclaimed = claim_any_slot(&dir, 1, &json).expect("the freed slot claims again");
+        assert_eq!(reclaimed, claimed, "the same (only) slot index is reused");
     }
 }
