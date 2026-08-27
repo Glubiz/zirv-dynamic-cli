@@ -237,6 +237,36 @@ pub fn parse_events(jsonl: &str) -> Vec<NormalizedEvent> {
     events
 }
 
+/// The most recently observed `message.model` id in `jsonl`, scanned
+/// newest-to-oldest so a live `/model` switch mid-session is reflected
+/// rather than the session's original model. Every assistant row Claude Code
+/// writes carries this field on its own `message` object (the same object
+/// [`usage_categories`] already reads `usage` off of), so this needs no
+/// separate transcript pass beyond the one `parse_events`/`transcript_usage`
+/// already make over the same lines.
+pub fn model_hint(jsonl: &str) -> Option<String> {
+    for line in jsonl.lines().rev() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(row) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if row.get("type").and_then(Value::as_str) != Some("assistant") {
+            continue;
+        }
+        if let Some(model) = row
+            .get("message")
+            .and_then(|m| m.get("model"))
+            .and_then(Value::as_str)
+        {
+            return Some(model.to_string());
+        }
+    }
+    None
+}
+
 /// The shared fold behind [`transcript_usage`] and [`sidechain_transcript_usage`]:
 /// every assistant row whose `isSidechain` flag matches `want_sidechain`,
 /// summed into the four raw classes. One fold, two filters, so the main and
@@ -1335,6 +1365,10 @@ impl AgentAdapter for ClaudeAdapter {
 
     fn structural_context(&self, jsonl: &str, last_n: usize) -> StructuralContext {
         structural_context(jsonl, last_n)
+    }
+
+    fn model_hint(&self, jsonl: &str) -> Option<String> {
+        model_hint(jsonl)
     }
 
     fn transcript_usage(&self, jsonl: &str) -> Option<TranscriptUsage> {
@@ -2859,6 +2893,31 @@ mod tests {
                 .context_window_tokens,
             Some(long)
         );
+    }
+
+    /// Issue #155 D1: `model_hint` reads the same `message.model` field every
+    /// assistant row already carries, and reports the LAST one seen -- a
+    /// live `/model` switch mid-session must be reflected, not the session's
+    /// original model.
+    #[test]
+    fn model_hint_reports_the_most_recent_assistant_model() {
+        let jsonl = format!(
+            "{}\n{}\n{}",
+            r#"{"type":"assistant","message":{"model":"claude-sonnet-5"}}"#,
+            r#"{"type":"user","message":{"content":"hi"}}"#,
+            r#"{"type":"assistant","message":{"model":"claude-opus-5[1m]"}}"#,
+        );
+        assert_eq!(
+            model_hint(&jsonl),
+            Some("claude-opus-5[1m]".to_string()),
+            "the LAST assistant model wins, not the first"
+        );
+    }
+
+    #[test]
+    fn model_hint_is_none_for_a_transcript_with_no_assistant_model_field() {
+        let jsonl = r#"{"type":"user","message":{"content":"hi"}}"#;
+        assert_eq!(model_hint(jsonl), None);
     }
 
     #[test]

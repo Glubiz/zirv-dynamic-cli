@@ -1121,6 +1121,23 @@ pub trait AgentAdapter: std::fmt::Debug {
     fn parse_events(&self, jsonl: &str) -> Vec<NormalizedEvent>;
     fn structural_context(&self, jsonl: &str, last_n: usize) -> StructuralContext;
 
+    /// The most recently observed live model id inside `jsonl`, or `None`
+    /// when this adapter has no per-transcript model signal (the default) or
+    /// the fragment happens to carry none. Must be line-local, exactly like
+    /// [`parse_events`](Self::parse_events): `score.rs` feeds this only the
+    /// bytes appended since the last poll, so a caller keeps the last value
+    /// it resolved across polls rather than treating a fragment with no hit
+    /// as "no model at all".
+    ///
+    /// Issue #155 D1: this is what lets a live scoring path call
+    /// [`capabilities_for_model`](Self::capabilities_for_model) with a real
+    /// model string instead of always falling back to the conservative
+    /// "unstated model" reading -- see that method's own doc comment.
+    fn model_hint(&self, jsonl: &str) -> Option<String> {
+        let _ = jsonl;
+        None
+    }
+
     /// Cumulative input/output usage exposed by this harness's transcript.
     /// This is deliberately separate from rot's latest-context token signal:
     /// workflow telemetry needs phase cost, not current context occupancy.
@@ -1177,10 +1194,13 @@ pub trait AgentAdapter: std::fmt::Debug {
     /// for a KNOWN model. Callers that have a model string to hand use this;
     /// everything else keeps calling `capabilities()`, which carries the
     /// adapter's own conservative default.
-    // Issue #155: no production caller yet -- Phase 6(b)'s rot.rs threshold
-    // work is what calls this with a real model string, the same "accessor
-    // lands ahead of its production caller" pattern `tail_delegations` used.
-    #[allow(dead_code)]
+    ///
+    /// Issue #155 D1: `score.rs`'s live scoring paths (`full_score`,
+    /// `IncrementalScorer::poll`) resolve the model via
+    /// [`model_hint`](Self::model_hint) off the transcript they already have
+    /// in hand and call this instead of `capabilities()`, so a `[1m]` claude
+    /// seat's real 1M window reaches rot's token gates rather than the 200k
+    /// baseline every unstated model gets.
     fn capabilities_for_model(&self, model: Option<&str>) -> Capabilities {
         Capabilities {
             context_window_tokens: self.context_window_tokens(model),
