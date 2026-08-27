@@ -869,10 +869,26 @@ fn upsert_shared(
 
     if !allow_sensitive && let Some(matched) = sensitive_shared_match(entry) {
         return Err(format!(
-            "memory key '{}' looks like it holds a credential ({matched}); the shared bank at .zirv/memory/ is committed to the repository and readable by anyone with checkout access. Store it in the private bank instead (drop --repo), or pass --allow-sensitive to store it in the shared bank anyway.",
+            "memory key '{}' looks like it holds a credential ({matched}); the shared bank at .zirv/memory/ is committed to the repository and readable by anyone with checkout access. Store it in the private bank instead, or pass --allow-sensitive to store it in the shared bank anyway.",
             entry.key
         )
         .into());
+    }
+
+    // Mirror `remember`'s (the private path's) own per-entry body cap: a
+    // shared write is committed to the repository and read by every future
+    // clone, so an oversized body has no more business landing there
+    // unbounded than in the private bank -- checked (and, on the private
+    // path, only checked) against the ORIGINAL body above, then truncated
+    // here for storage, so the credential guard always sees the full text.
+    let mut entry = entry.clone();
+    let cap = cfg.memory.max_entry_bytes;
+    if entry.body.len() > cap {
+        const MARKER: &str = "\n[truncated]";
+        let keep = cap.saturating_sub(MARKER.len());
+        let mut truncated = crate::utils::truncate_bytes(entry.body.clone(), Some(keep));
+        truncated.push_str(MARKER);
+        entry.body = truncated;
     }
 
     super::state::write_shared(&path, &entry.to_markdown())?;
@@ -2325,6 +2341,38 @@ This should not appear in the body.\n";
 
         let path = remember(&state, "-work-repo", &entry, &cfg)
             .expect("remember must not fail on oversize");
+        let stored = parse_markdown(&std::fs::read_to_string(&path).expect("read"));
+        assert!(
+            stored.body.len() <= 50,
+            "body respects the cap: {} bytes",
+            stored.body.len()
+        );
+        assert!(
+            stored.body.ends_with("[truncated]"),
+            "says it was truncated: {}",
+            stored.body
+        );
+    }
+
+    #[test]
+    fn upsert_scoped_shared_truncates_an_oversized_body_to_the_cap_like_the_private_path() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let mut cfg = CtxConfig::default();
+        cfg.memory.max_entry_bytes = 50;
+
+        let mut entry = sample("huge-shared", 1);
+        entry.body = "x".repeat(500);
+
+        let path = upsert_scoped(
+            MemoryScope::Shared,
+            repo.path(),
+            &state,
+            "-irrelevant",
+            &cfg,
+            &entry,
+        )
+        .expect("upsert_scoped must not fail on oversize");
         let stored = parse_markdown(&std::fs::read_to_string(&path).expect("read"));
         assert!(
             stored.body.len() <= 50,
