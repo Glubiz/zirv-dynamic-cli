@@ -1234,6 +1234,10 @@ pub fn evidence_from_transcripts(
             // is the correct "not rotted" answer for this evidence count.
             events: true,
             defer_injection_submit: false,
+            // Not read by `rot::score_events` either (issue #155 is
+            // Phase 6(b)'s job) -- this synthetic evidence pass has no real
+            // adapter/model pairing to ask, so unknown is honest here too.
+            context_window_tokens: None,
         };
         if rot::score_events(&events, caps, cfg).verdict == Verdict::Restart {
             evidence.rot_sessions += 1;

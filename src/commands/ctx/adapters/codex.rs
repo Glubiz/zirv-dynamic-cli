@@ -1320,6 +1320,10 @@ impl AgentAdapter for CodexAdapter {
             // (issue #114) -- a same-burst text+`\r` is read as a paste and
             // the `\r` is folded into the pasted text rather than submitted.
             defer_injection_submit: true,
+            // Issue #155: no capacity is verified for codex, and a guessed
+            // one is worse than falling back to rot's absolute defaults,
+            // which are at least a known quantity. Never fake parity.
+            context_window_tokens: None,
         }
     }
 
@@ -1385,6 +1389,18 @@ mod tests {
     fn codex_has_no_marker_signal() {
         let caps = CodexAdapter::new(None).capabilities();
         assert!(!caps.marker_signal, "the spec gives codex no marker signal");
+    }
+
+    /// Codex reports NO capacity: none is verified for it, and a guessed
+    /// capacity is worse than falling back to the absolute defaults, which
+    /// are at least a known quantity. Never fake parity.
+    #[test]
+    fn codex_reports_no_context_window_because_none_is_verified() {
+        assert_eq!(CodexAdapter::new(None).context_window_tokens(None), None);
+        assert_eq!(
+            CodexAdapter::new(None).capabilities().context_window_tokens,
+            None
+        );
     }
 
     fn fixture(name: &str) -> String {

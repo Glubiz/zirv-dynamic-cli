@@ -263,6 +263,18 @@ pub fn sidechain_transcript_usage(jsonl: &str) -> Option<TranscriptUsage> {
 const FILE_KEYS: &[&str] = &["file_path", "notebook_path", "path"];
 const ERROR_SNIPPET: usize = 200;
 
+/// Conservative context window (issue #155) for a Claude model id this
+/// adapter does not recognise as a long-window seat, and for an unstated
+/// model. Conservative on purpose: an overstated capacity raises the
+/// restart ceiling past what the seat can actually hold, and a session that
+/// overruns its window is a far worse outcome than one rotated slightly
+/// early.
+pub const DEFAULT_CONTEXT_WINDOW_TOKENS: u64 = 200_000;
+
+/// A long-window Claude seat (1M tokens) is spelled with a `[1m]` or `-1m`
+/// marker in the model id in this environment.
+const LONG_CONTEXT_WINDOW_TOKENS: u64 = 1_000_000;
+
 pub fn structural_context(jsonl: &str, last_n: usize) -> StructuralContext {
     let mut out = StructuralContext::default();
 
@@ -1318,6 +1330,20 @@ impl AgentAdapter for ClaudeAdapter {
             // claude's own composer submits a same-burst trailing `\r`
             // correctly -- issue #118 is codex-specific.
             defer_injection_submit: false,
+            context_window_tokens: self.context_window_tokens(None),
+        }
+    }
+
+    /// Claude reports a per-model capacity (issue #155): the long-window
+    /// `[1m]` / `-1m` marker reports `LONG_CONTEXT_WINDOW_TOKENS`, and every
+    /// other id -- including an unstated model -- gets the conservative
+    /// `DEFAULT_CONTEXT_WINDOW_TOKENS`. See that constant's own doc comment
+    /// for why an overstated capacity is the worse failure mode.
+    fn context_window_tokens(&self, model: Option<&str>) -> Option<u64> {
+        let model = model.map(str::to_lowercase);
+        match model.as_deref() {
+            Some(m) if m.contains("[1m]") || m.contains("-1m") => Some(LONG_CONTEXT_WINDOW_TOKENS),
+            _ => Some(DEFAULT_CONTEXT_WINDOW_TOKENS),
         }
     }
 
@@ -2759,6 +2785,51 @@ mod tests {
     #[test]
     fn claude_advertises_the_capability() {
         assert!(ClaudeAdapter::new(None).capabilities().system_prompt);
+    }
+
+    /// Claude reports a per-model capacity, with a CONSERVATIVE default for a
+    /// model id it does not recognise. Conservative on purpose: an
+    /// overstated capacity raises the restart ceiling past what the seat can
+    /// actually hold, and a session that overruns its window is a far worse
+    /// outcome than one rotated slightly early.
+    #[test]
+    fn claude_reports_a_conservative_context_window_for_an_unknown_model() {
+        let adapter = ClaudeAdapter::new(None);
+        assert_eq!(
+            adapter.context_window_tokens(Some("some-model-zirv-has-never-seen")),
+            Some(DEFAULT_CONTEXT_WINDOW_TOKENS)
+        );
+        assert_eq!(
+            adapter.context_window_tokens(None),
+            Some(DEFAULT_CONTEXT_WINDOW_TOKENS),
+            "an unstated model is the same conservative answer"
+        );
+        assert_eq!(
+            adapter.capabilities().context_window_tokens,
+            Some(DEFAULT_CONTEXT_WINDOW_TOKENS),
+            "every existing capabilities() caller gets a capacity with no new plumbing"
+        );
+    }
+
+    /// A recognised long-window model id reports its own capacity, and the
+    /// `[1m]` suffix form is recognised too -- that is how a long-window seat
+    /// is actually spelled in this environment.
+    #[test]
+    fn claude_recognises_a_long_window_model_id() {
+        let adapter = ClaudeAdapter::new(None);
+        let long = adapter
+            .context_window_tokens(Some("claude-opus-5[1m]"))
+            .expect("a capacity");
+        assert!(
+            long > DEFAULT_CONTEXT_WINDOW_TOKENS,
+            "a 1M seat must not be capped at the conservative default"
+        );
+        assert_eq!(
+            adapter
+                .capabilities_for_model(Some("claude-opus-5[1m]"))
+                .context_window_tokens,
+            Some(long)
+        );
     }
 
     #[test]
