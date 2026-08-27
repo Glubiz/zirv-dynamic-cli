@@ -4148,16 +4148,53 @@ pub(crate) fn is_read_only_escape_safe(command: &str, scratchpad_roots: &[String
     })
 }
 
+/// Code review fix (CRITICAL, issue #168 follow-up): the `zirv ctx` verbs
+/// reachable via this carve-out WITHOUT launching an arbitrary subprocess of
+/// their own -- read-only reporting/audit verbs and simple state mutations
+/// against zirv's own mail/memory/group/log stores. Every OTHER `CtxVerb`
+/// spawns a fresh harness process with a caller-controlled prompt/argv/model
+/// (`exec` -- `-- <arbitrary command>`; `wrap`/`chat`/`resume`/`loop` -- an
+/// interactive or headless agent launch; `agent` -- an arbitrary adapter
+/// name plus its own trailing flags; `handover` -- swaps the live session's
+/// harness/model in place) and must NOT qualify here: an unsandboxed retry
+/// of one of those needs the ordinary ask/deny escalation, not a silent
+/// pass just because it happens to start with `zirv ctx`. Deliberately an
+/// ALLOW-list, not a deny-list enumerating the dangerous verbs: a newly
+/// added `CtxVerb` defaults to NOT qualifying until someone adds it here on
+/// purpose, rather than silently inheriting this carve-out.
+const ZIRV_CTX_ESCAPE_SAFE_VERBS: &[&str] = &[
+    "score",
+    "handoff",
+    "hook",
+    "status",
+    "usage",
+    "optimize",
+    "send",
+    "inbox",
+    "remember",
+    "recall",
+    "forget",
+    "nudge",
+    "safety",
+    "permissions",
+    "group",
+];
+
 /// Issue #168, design decision (b): whether EVERY executable segment of
-/// `command` is `zirv ctx <anything>`, or one of the bare `zirv help`/
-/// `zirv version`/`zirv memory`/`zirv context` built-ins (no further
-/// subcommand). `zirv ctx` is what performs the very attestation/safety
-/// checks this module implements -- a broken launch snapshot must not lock
-/// zirv's own supervision commands out from correcting it (see Task 4's
-/// self-heal, which this carve-out complements on the retry path
-/// specifically). Deliberately excludes `zirv agent`, `zirv chat`, and any
-/// other zirv subcommand or script name that launches a subprocess of its
-/// own -- narrower than the blanket `Bash(zirv *)` shipped allow rule.
+/// `command` is `zirv ctx <verb>` for a verb in [`ZIRV_CTX_ESCAPE_SAFE_
+/// VERBS`], or one of the bare `zirv help`/`zirv version`/`zirv memory`/
+/// `zirv context` built-ins (no further subcommand). `zirv ctx` is what
+/// performs the very attestation/safety checks this module implements -- a
+/// broken launch snapshot must not lock zirv's own supervision commands out
+/// from correcting it (see Task 4's self-heal, which this carve-out
+/// complements on the retry path specifically). `usage`'s own `tee`
+/// subcommand is excluded even though `usage` itself qualifies: `zirv ctx
+/// usage tee -- <command>` runs an arbitrary trailing statusline command,
+/// the one escape-safe verb with a subprocess-launching subcommand of its
+/// own. Deliberately excludes `zirv agent`, `zirv chat`, `zirv ctx exec`/
+/// `wrap`/`resume`/`loop`/`handover`, and any other zirv subcommand or
+/// script name that launches a subprocess of its own -- narrower than the
+/// blanket `Bash(zirv *)` shipped allow rule.
 pub(crate) fn is_zirv_ctx_escape_safe(command: &str) -> bool {
     let candidates = normalize_segments(command);
     if candidates.is_empty() {
@@ -4174,7 +4211,15 @@ pub(crate) fn is_zirv_ctx_escape_safe(command: &str) -> bool {
             return false;
         }
         match tokens.get(1).map(String::as_str) {
-            Some("ctx") => true,
+            Some("ctx") => {
+                let Some(verb) = tokens.get(2).map(String::as_str) else {
+                    return false;
+                };
+                if !ZIRV_CTX_ESCAPE_SAFE_VERBS.contains(&verb) {
+                    return false;
+                }
+                !(verb == "usage" && tokens.get(3).map(String::as_str) == Some("tee"))
+            }
             Some("help" | "version" | "memory" | "context") => tokens.len() == 2,
             _ => false,
         }
@@ -5125,11 +5170,33 @@ mod tests {
             "zirv memory",
             "zirv context",
             "zirv ctx status && zirv ctx remember foo",
+            // Code review fix (CRITICAL): every other read-only/state verb
+            // must still qualify -- this must be a precise allow-list, not
+            // an accidental narrowing to just `status`/`remember`/`send`.
+            "zirv ctx recall foo",
+            "zirv ctx inbox",
+            "zirv ctx forget foo",
+            "zirv ctx nudge --session x hi",
+            "zirv ctx safety check -- ls",
+            "zirv ctx permissions audit --agent claude --sessions 5",
+            "zirv ctx group create scope",
+            "zirv ctx handoff",
+            "zirv ctx score",
+            "zirv ctx hook stop",
+            "zirv ctx optimize",
+            "zirv ctx usage",
+            "zirv ctx usage --sessions",
         ] {
             assert!(is_zirv_ctx_escape_safe(command), "{command} should qualify");
         }
     }
 
+    /// Code review fix (CRITICAL, issue #168 follow-up): `is_zirv_ctx_escape_
+    /// safe` used to allow ANY `zirv ctx <verb>` unconditionally, including
+    /// every verb that launches an arbitrary subprocess of its own --
+    /// directly contradicting this function's own doc comment. Every one of
+    /// these must now be rejected, on a `--dangerously-disable-sandbox`
+    /// retry, exactly like any other unlisted command.
     #[test]
     fn zirv_ctx_escape_safe_rejects_agent_chat_and_arbitrary_scripts() {
         for command in [
@@ -5138,6 +5205,21 @@ mod tests {
             "zirv build",
             "zirv ctx status && rm -rf /",
             "zirv",
+            // Every subprocess-launching ctx verb, individually.
+            "zirv ctx exec -- rm -rf /",
+            "zirv ctx agent codex \"do the thing\"",
+            "zirv ctx wrap -- claude",
+            "zirv ctx chat",
+            "zirv ctx resume",
+            "zirv ctx loop --prompt x",
+            "zirv ctx handover --agent codex",
+            // `usage`'s own `tee` subcommand runs an arbitrary trailing
+            // statusline command -- the one escape-safe verb with a
+            // subprocess-launching subcommand of its own.
+            "zirv ctx usage tee -- rm -rf /",
+            // A bare `zirv ctx` (no verb at all) is not itself one of the
+            // explicit safe verbs either.
+            "zirv ctx",
         ] {
             assert!(
                 !is_zirv_ctx_escape_safe(command),
