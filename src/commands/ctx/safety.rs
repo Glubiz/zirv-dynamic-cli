@@ -5406,6 +5406,84 @@ mod tests {
         assert!(text.contains(r#""permissionDecision":"ask""#), "got {text}");
     }
 
+    // -- issue #168, decision (f): find/locate/rg never hard-deny --------
+
+    /// No policy layer -- built-in, and none of this task's new classifiers
+    /// -- ever produces `Deny` for an ordinary read-only `find`/`locate`/
+    /// `rg` invocation, across both launch modes, both permission modes
+    /// hook-mode cares about, and both values of `dangerouslyDisableSandbox`.
+    /// `find -exec`/`-ok` running something unproven still legitimately
+    /// escalates to `Ask` (`is_risky_find_exec`) -- this only pins the
+    /// FLOOR, never `Deny`, for the read-only shapes below.
+    #[test]
+    fn read_only_find_locate_rg_never_hard_deny_via_plain_evaluate() {
+        let policy = SafetyPolicy::default();
+        for command in [
+            "find . -name '*.rs'",
+            "find ./src -iname '*.md' -type f",
+            "find / -name id_rsa",
+            "find ~ -name '*.pem'",
+            "locate id_rsa",
+            "locate -i '*.env'",
+            "rg TODO .",
+            "rg --hidden -i password .",
+            "find . -exec grep -l TODO {} +",
+            "find . -exec sed -n '1p' {} +",
+        ] {
+            for mode in [LaunchMode::Interactive, LaunchMode::Headless] {
+                let outcome = evaluate(&policy, command, mode);
+                assert_ne!(
+                    outcome.verdict,
+                    Verdict::Deny,
+                    "{command} ({mode:?}) must never hard-deny: {outcome:?}"
+                );
+            }
+        }
+    }
+
+    /// `dangerouslyDisableSandbox` is deliberately held at `false` here (no
+    /// unsandboxed retry involved) -- decision (f) is about the BASE
+    /// classifier never hard-denying these read-only shapes (locked in via
+    /// plain `evaluate()` above; this test additionally routes the same
+    /// claim through the full hook pipeline: attestation, the `cd`-prefix
+    /// strip, and the scratchpad-confined-write widening). The SEPARATE
+    /// `--dangerously-disable-sandbox` retry escalation path is untouched by
+    /// this task and, by pre-existing, deliberate SECURITY design, DOES deny
+    /// a root-wide `find` retry headlessly (`a_seeded_find_never_escapes_a_
+    /// root_wide_scan`'s own sibling coverage) and asks/denies a `locate`
+    /// retry too (`locate` was never added to any escape-safe family, by
+    /// this plan or before it) -- neither is a hard-deny bug in the read-
+    /// only classifier itself, and this task must not weaken either to make
+    /// a broader sweep pass.
+    #[test]
+    fn read_only_find_locate_rg_never_hard_deny_through_the_hook_either() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = super::super::testenv::HomeGuard::set(home.path());
+        let empty: HashMap<String, String> = HashMap::new();
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("loads");
+
+        for command in [
+            "find . -name '*.rs'",
+            "find / -name id_rsa",
+            "locate id_rsa",
+            "rg TODO .",
+        ] {
+            for permission_mode in ["default", "dontAsk"] {
+                let stdin = format!(
+                    r#"{{"tool_name":"Bash","tool_input":{{"command":"{command}","dangerouslyDisableSandbox":false}},"permission_mode":"{permission_mode}"}}"#
+                );
+                let mut out = Vec::new();
+                run_check_hook_mode(&cfg, &mut out, &stdin).expect("runs");
+                let text = String::from_utf8(out).expect("utf8");
+                assert!(
+                    !text.contains(r#""permissionDecision":"deny""#),
+                    "{command} (permission_mode={permission_mode}) must never hard-deny: got {text}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn a_policy_fingerprint_is_stable_and_changes_with_every_effective_posture() {
         let original = SafetyPolicy::default();
