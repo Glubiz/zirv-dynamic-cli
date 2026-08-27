@@ -532,16 +532,28 @@ impl ClaudeAdapter {
         let policy_dir = dir.join("policies");
         let policy_path = policy_dir.join(format!("{fingerprint}.json"));
         let path = dir.join(format!("claude-launch-settings-{fingerprint}.json"));
-        // Issue #147: `zirv ctx send` (and any other mail write) must
-        // succeed inside a sandboxed session, so the mailbox tree -- and
-        // ONLY the mailbox tree, never the policy-snapshot/attestation or
-        // log directories right above it -- is allow-listed for write.
-        // Best-effort: a state-dir resolution failure just omits the entry,
-        // it never blocks materializing the rest of this settings layer.
-        let mail_dir =
+        // Issue #147 (mail) extended by issue #168: `zirv ctx send` (and any
+        // other mail write), cross-session memory bank writes, the safety
+        // audit log itself, work-group records, and ctx handover files must
+        // all succeed inside a sandboxed session -- and ONLY those state
+        // dirs, never the policy-snapshot/attestation directory that sits
+        // alongside them under the operator's HOME -- are allow-listed for
+        // write. Best-effort: a state-dir resolution failure just omits the
+        // entries, it never blocks materializing the rest of this settings
+        // layer.
+        let allow_write_dirs: Vec<PathBuf> =
             super::super::state::StateDir::resolve(&super::super::config::env_from_process())
                 .ok()
-                .map(|state| state.mail());
+                .map(|state| {
+                    vec![
+                        state.mail(),
+                        state.memory(),
+                        state.logs(),
+                        state.groups(),
+                        state.handoffs(),
+                    ]
+                })
+                .unwrap_or_default();
         let result = (|| -> std::io::Result<()> {
             super::super::state::create_private_dir_all(&dir)?;
             super::super::state::create_private_dir_all(&policy_dir)?;
@@ -549,7 +561,7 @@ impl ClaudeAdapter {
                 serde_json::to_string_pretty(safety).map_err(std::io::Error::other)?;
             policy_body.push('\n');
             super::super::state::write_private(&policy_path, &policy_body)?;
-            let settings = launch_settings_value(safety, &policy_path, mail_dir.as_deref())
+            let settings = launch_settings_value(safety, &policy_path, &allow_write_dirs)
                 .map_err(std::io::Error::other)?;
             let mut body =
                 serde_json::to_string_pretty(&settings).map_err(std::io::Error::other)?;
@@ -591,7 +603,7 @@ impl ClaudeAdapter {
 fn launch_settings_value(
     safety: &super::super::safety::SafetyPolicy,
     policy_path: &Path,
-    mail_write_dir: Option<&Path>,
+    allow_write_dirs: &[PathBuf],
 ) -> Result<Value, serde_json::Error> {
     let fingerprint = super::super::safety::policy_fingerprint(safety)?;
     #[cfg_attr(windows, allow(unused_mut))]
@@ -645,8 +657,13 @@ fn launch_settings_value(
         // Deliberately narrow: only the mail tree, never the policy-
         // snapshot/attestation or log directories that sit alongside it
         // under the same state root.
-        if let Some(mail_dir) = mail_write_dir {
-            filesystem["allowWrite"] = serde_json::json!([mail_dir.display().to_string()]);
+        if !allow_write_dirs.is_empty() {
+            filesystem["allowWrite"] = serde_json::json!(
+                allow_write_dirs
+                    .iter()
+                    .map(|dir| dir.display().to_string())
+                    .collect::<Vec<_>>()
+            );
         }
         object.insert(
             "sandbox".to_string(),
@@ -1457,7 +1474,7 @@ mod tests {
         launch_settings_value(
             &Default::default(),
             Path::new("zirv-test-safety-policy.json"),
-            None,
+            &[],
         )
         .expect("settings")
     }
@@ -2180,7 +2197,7 @@ mod tests {
     fn launch_settings_bind_the_hook_to_an_immutable_policy_snapshot() {
         let policy = super::super::super::safety::SafetyPolicy::default();
         let policy_path = Path::new("C:/safe/policies/policy.json");
-        let settings = launch_settings_value(&policy, policy_path, None).expect("settings");
+        let settings = launch_settings_value(&policy, policy_path, &[]).expect("settings");
         let expected =
             super::super::super::safety::policy_fingerprint(&policy).expect("fingerprint");
 
@@ -2215,37 +2232,52 @@ mod tests {
         assert!(read_denies.iter().any(|entry| entry == "Read(~/.ssh/**)"));
     }
 
-    /// Issue #147: `zirv ctx send`'s mailbox writes must work inside the
-    /// sandbox, but ONLY the mail tree -- never the policy-snapshot/
-    /// attestation directory that sits right alongside it under the same
-    /// state root.
+    /// Issue #147 (mail) extended by issue #168: every one of zirv's own
+    /// state-dir writes a sandboxed session legitimately needs -- mail,
+    /// memory, logs (the safety audit log itself), groups, and handoffs --
+    /// is allow-listed, but the policy-snapshot/attestation directory
+    /// sitting alongside them (under the operator's HOME, not the state
+    /// root) never is.
     #[cfg(not(windows))]
     #[test]
-    fn launch_settings_allow_write_to_the_mail_dir_but_never_the_policy_snapshot_dir() {
+    fn launch_settings_allow_write_to_every_zirv_state_dir_but_never_the_policy_snapshot_dir() {
         let policy = super::super::super::safety::SafetyPolicy::default();
-        let policy_path = Path::new("/state/logs/policies/abc123.json");
-        let mail_dir = Path::new("/state/mail");
-        let settings =
-            launch_settings_value(&policy, policy_path, Some(mail_dir)).expect("settings");
+        let policy_path = Path::new("/home/op/.zirv/runtime/policies/abc123.json");
+        let dirs = vec![
+            PathBuf::from("/state/mail"),
+            PathBuf::from("/state/memory"),
+            PathBuf::from("/state/logs"),
+            PathBuf::from("/state/groups"),
+            PathBuf::from("/state/handoffs"),
+        ];
+        let settings = launch_settings_value(&policy, policy_path, &dirs).expect("settings");
         let allow_write = settings["sandbox"]["filesystem"]["allowWrite"]
             .as_array()
-            .expect("allowWrite must be present when a mail dir is given");
+            .expect("allowWrite must be present when dirs are given");
+        for expected in [
+            "/state/mail",
+            "/state/memory",
+            "/state/logs",
+            "/state/groups",
+            "/state/handoffs",
+        ] {
+            assert!(
+                allow_write.iter().any(|entry| entry == expected),
+                "{expected} must be allow-listed for write: {settings}"
+            );
+        }
         assert!(
-            allow_write.iter().any(|entry| entry == "/state/mail"),
-            "the mail dir must be allow-listed for write: {settings}"
-        );
-        assert!(
-            !allow_write
-                .iter()
-                .any(|entry| entry.as_str().is_some_and(|s| s.contains("policies"))),
+            !allow_write.iter().any(|entry| entry
+                .as_str()
+                .is_some_and(|s| s.contains("runtime/policies"))),
             "the policy-snapshot/attestation dir must never be allow-listed for write: {settings}"
         );
 
-        // No mail dir resolved (best-effort failure): no allowWrite key at
-        // all, never an empty-but-present one that could mask a future bug.
-        let settings_without_mail =
-            launch_settings_value(&policy, policy_path, None).expect("settings");
-        assert!(settings_without_mail["sandbox"]["filesystem"]["allowWrite"].is_null());
+        // No dirs resolved (best-effort failure): no allowWrite key at all,
+        // never an empty-but-present one that could mask a future bug.
+        let settings_without_dirs =
+            launch_settings_value(&policy, policy_path, &[]).expect("settings");
+        assert!(settings_without_dirs["sandbox"]["filesystem"]["allowWrite"].is_null());
     }
 
     #[test]
@@ -2294,16 +2326,25 @@ mod tests {
             &std::fs::read_to_string(path).expect("read materialized settings"),
         )
         .expect("valid settings JSON");
-        // Mirrors exactly how `launch_settings_path` computes the mail
-        // directory it passes through -- see that method's own doc comment.
-        let mail_dir = super::super::super::state::StateDir::resolve(
+        // Mirrors exactly how `launch_settings_path` computes the allow-write
+        // dirs it passes through -- see that method's own doc comment.
+        let allow_write_dirs: Vec<PathBuf> = super::super::super::state::StateDir::resolve(
             &super::super::super::config::env_from_process(),
         )
         .ok()
-        .map(|state| state.mail());
+        .map(|state| {
+            vec![
+                state.mail(),
+                state.memory(),
+                state.logs(),
+                state.groups(),
+                state.handoffs(),
+            ]
+        })
+        .unwrap_or_default();
         assert_eq!(
             written,
-            launch_settings_value(&policy, &policy_path, mail_dir.as_deref()).expect("settings")
+            launch_settings_value(&policy, &policy_path, &allow_write_dirs).expect("settings")
         );
         let snapshotted: super::super::super::safety::SafetyPolicy = serde_json::from_str(
             &std::fs::read_to_string(policy_path).expect("read policy snapshot"),
