@@ -119,10 +119,11 @@ model = "fable"
 # max_repo_bytes = 4096              # REPO-FORBIDDEN (ZIRV_CTX_PROMPT_MAX_REPO_BYTES): cap on the untrusted repo layer. Default: 4096.
 # harnesses = true                   # REPO-FORBIDDEN (ZIRV_CTX_PROMPT_HARNESSES): whether the derived harness roster is injected. Default: true.
 
-# [context]                          # every key below is REPO-FORBIDDEN -- the canonical .zirv/context/ layer the context compiler (issue #44) injects.
+# [context]                          # every key below is REPO-FORBIDDEN except dedupe_native -- the canonical .zirv/context/ layer the context compiler (issue #44) injects.
 # max_common_bytes = 4096            # REPO-FORBIDDEN (ZIRV_CTX_CONTEXT_MAX_COMMON_BYTES): cap on .zirv/context/common.md. Default: 4096.
 # max_harness_bytes = 4096           # REPO-FORBIDDEN (ZIRV_CTX_CONTEXT_MAX_HARNESS_BYTES): cap on .zirv/context/claude.md or codex.md. Default: 4096.
 # max_harness_roster_bytes = 4096    # REPO-FORBIDDEN (ZIRV_CTX_CONTEXT_MAX_HARNESS_ROSTER_BYTES): budget `zirv context status` measures the derived harness roster against. Default: 4096.
+# dedupe_native = true                # not REPO-FORBIDDEN (repo may only narrow to false, like pace.enabled but inverted): skip re-injecting the canonical layer when CLAUDE.md/AGENTS.md's embedded hash already matches it. Default: true.
 
 # [mail]
 # enabled = true                     # REPO-FORBIDDEN (ZIRV_CTX_MAIL): whether the mailbox is on at all. Default: true.
@@ -193,13 +194,15 @@ model = "fable"
 # may ADD entries to either (narrowing is always safe -- deny and ask are
 # both checked before allow), unioned with the operator's own home-layer
 # entries and the built-in set derived from adapters::SHIPPED_POSTURE_ALLOW/
-# _DENY (always present regardless of configuration). `allow` and `default`
-# ARE REPO-FORBIDDEN (ZIRV_CTX_SAFETY_ALLOW / ZIRV_CTX_SAFETY_DEFAULT):
-# adding an allow entry or changing the unmatched-command default can only
-# ever widen the effective policy, never narrow it.
+# _DENY (always present regardless of configuration). `allow`, `escape_allow`
+# and `default` ARE REPO-FORBIDDEN (ZIRV_CTX_SAFETY_ALLOW /
+# ZIRV_CTX_SAFETY_ESCAPE_ALLOW / ZIRV_CTX_SAFETY_DEFAULT): adding an allow or
+# escape_allow entry or changing the unmatched-command default can only ever
+# widen the effective policy, never narrow it.
 # deny = ["terraform destroy*"]      # additional deny patterns, unioned with the built-in set. Default: [] (built-in set only).
 # ask = ["kubectl delete*"]          # additional ask patterns, unioned with the built-in set. Default: [] (built-in set only).
 # allow = ["just test*"]             # REPO-FORBIDDEN (ZIRV_CTX_SAFETY_ALLOW): additional allow patterns, operator-only. Default: [] (built-in set only).
+# escape_allow = ["just test*"]      # REPO-FORBIDDEN (ZIRV_CTX_SAFETY_ESCAPE_ALLOW): patterns pre-cleared for a --dangerously-disable-sandbox retry specifically, operator-only. Every executable segment of the retry must match. Default: [] (built-in read-only-utility seed only -- see docs).
 # default = "ask"                    # REPO-FORBIDDEN (ZIRV_CTX_SAFETY_DEFAULT): verdict for a command matching no rule. Default: "ask".
 # interactive_default = "allow"      # REPO-FORBIDDEN (ZIRV_CTX_SAFETY_INTERACTIVE_DEFAULT): verdict for a command matching no rule on an INTERACTIVE launch. Default: "allow" -- a command zirv has never seen must not prompt. `default` above still governs headless launches.
 # sql = "on"                         # REPO-FORBIDDEN (ZIRV_CTX_SAFETY_SQL): "on" classifies psql/mysql/mariadb/sqlite3/duckdb/sqlcmd statements (a single provably read-only SELECT/EXPLAIN/SHOW is allowed, everything else asks); "off" disables it. Default: "on".

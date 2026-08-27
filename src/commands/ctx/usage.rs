@@ -15,6 +15,9 @@ use super::{CtxResult, window};
 pub struct UsageArgs {
     #[command(subcommand)]
     pub action: Option<UsageAction>,
+    /// Break the last 24 hours down per session, in raw token classes.
+    #[arg(long, default_value_t = false)]
+    pub sessions: bool,
 }
 
 #[derive(Debug, clap::Subcommand)]
@@ -265,6 +268,51 @@ pub fn report<W: Write>(
     Ok(())
 }
 
+/// Prints a per-session breakdown of the four raw token classes over the
+/// trailing window `spend` was computed for: one line per session with its
+/// raw counts, the cache-hit ratio to one decimal, and the event count. The
+/// cache-hit ratio's denominator is RAW input + cache_creation + cache_read
+/// only -- never the legacy combined `input_tokens` meaning -- so it is a
+/// pure function of the same four categories the line displays. Carries the
+/// same "approximation, token class weighting undocumented" caveat the
+/// estimator section already does. "Nothing to report" is a sentence, not an
+/// empty section.
+pub fn render_sessions<W: Write>(w: &mut W, spend: &[window::SessionSpend]) -> CtxResult<()> {
+    writeln!(w, "\nsessions (last 24h, raw token classes):")?;
+    if spend.is_empty() {
+        writeln!(w, "  no session activity in this window.")?;
+        return Ok(());
+    }
+
+    for s in spend {
+        let denom = s
+            .input_tokens
+            .saturating_add(s.cache_creation_input_tokens)
+            .saturating_add(s.cache_read_input_tokens);
+        let cache_hit_ratio = if denom == 0 {
+            0.0
+        } else {
+            (s.cache_read_input_tokens as f64 / denom as f64) * 100.0
+        };
+        writeln!(
+            w,
+            "  {}: input {} | cache_creation {} | cache_read {} | output {} | cache-hit {:.1}% | events {}",
+            s.session,
+            s.input_tokens,
+            s.cache_creation_input_tokens,
+            s.cache_read_input_tokens,
+            s.output_tokens,
+            cache_hit_ratio,
+            s.events
+        )?;
+    }
+    writeln!(
+        w,
+        "  token class weighting is undocumented, so treat these as an approximation, never ground truth."
+    )?;
+    Ok(())
+}
+
 pub fn run_with<W: Write>(
     args: &UsageArgs,
     w: &mut W,
@@ -367,6 +415,25 @@ pub fn run_with<W: Write>(
             }
             let (collector, estimator) = pace::current_windows(&state, &cfg.pace, now, provider);
             report(w, &collector, estimator.as_ref(), now, &cfg.pace)?;
+
+            if args.sessions {
+                // Best-effort: a failure to resolve the projects root
+                // degrades to the "no session activity" line rather than
+                // turning a working `zirv ctx usage` into an error.
+                let mut spend = window::projects_root()
+                    .map(|root| window::session_spend(&root, now, 86_400))
+                    .unwrap_or_default();
+                spend.sort_by(|a, b| {
+                    let total = |s: &window::SessionSpend| {
+                        s.input_tokens
+                            .saturating_add(s.cache_creation_input_tokens)
+                            .saturating_add(s.cache_read_input_tokens)
+                            .saturating_add(s.output_tokens)
+                    };
+                    total(b).cmp(&total(a))
+                });
+                render_sessions(w, &spend)?;
+            }
 
             if cfg.pace.use_credits.for_provider(provider) {
                 writeln!(
@@ -819,9 +886,15 @@ mod tests {
         .into();
 
         let mut out = Vec::new();
-        let code = run_with(&UsageArgs { action: None }, &mut out, tmp.path(), &|k| {
-            env.get(k).cloned()
-        })
+        let code = run_with(
+            &UsageArgs {
+                action: None,
+                sessions: false,
+            },
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+        )
         .expect("report runs with no state at all");
         assert_eq!(code, 0);
         assert!(String::from_utf8_lossy(&out).contains("not reported"));
@@ -855,9 +928,15 @@ mod tests {
         .into();
 
         let mut out = Vec::new();
-        let code = run_with(&UsageArgs { action: None }, &mut out, repo, &|k| {
-            env.get(k).cloned()
-        })
+        let code = run_with(
+            &UsageArgs {
+                action: None,
+                sessions: false,
+            },
+            &mut out,
+            repo,
+            &|k| env.get(k).cloned(),
+        )
         .expect("runs");
         assert_eq!(code, 0);
         let printed = String::from_utf8(out).expect("utf8");
@@ -913,9 +992,15 @@ mod tests {
         .expect("store");
 
         let mut out = Vec::new();
-        let code = run_with(&UsageArgs { action: None }, &mut out, repo, &|k| {
-            env.get(k).cloned()
-        })
+        let code = run_with(
+            &UsageArgs {
+                action: None,
+                sessions: false,
+            },
+            &mut out,
+            repo,
+            &|k| env.get(k).cloned(),
+        )
         .expect("falls back rather than hard-erroring on the refusal");
         assert_eq!(code, 0);
         let printed = String::from_utf8(out).expect("utf8");
@@ -979,9 +1064,15 @@ mod tests {
         .expect("store");
 
         let mut out = Vec::new();
-        let code = run_with(&UsageArgs { action: None }, &mut out, repo, &|k| {
-            env.get(k).cloned()
-        })
+        let code = run_with(
+            &UsageArgs {
+                action: None,
+                sessions: false,
+            },
+            &mut out,
+            repo,
+            &|k| env.get(k).cloned(),
+        )
         .expect("runs");
         assert_eq!(code, 0);
         let printed = String::from_utf8(out).expect("utf8");
@@ -1013,9 +1104,15 @@ mod tests {
         .into();
 
         let mut out = Vec::new();
-        let code = run_with(&UsageArgs { action: None }, &mut out, repo, &|k| {
-            env.get(k).cloned()
-        })
+        let code = run_with(
+            &UsageArgs {
+                action: None,
+                sessions: false,
+            },
+            &mut out,
+            repo,
+            &|k| env.get(k).cloned(),
+        )
         .expect("runs");
         assert_eq!(code, 0);
         let printed = String::from_utf8(out).expect("utf8");
@@ -1059,12 +1156,49 @@ mod tests {
         .into();
 
         let mut out = Vec::new();
-        let code = run_with(&UsageArgs { action: None }, &mut out, repo, &|k| {
-            env.get(k).cloned()
-        })
+        let code = run_with(
+            &UsageArgs {
+                action: None,
+                sessions: false,
+            },
+            &mut out,
+            repo,
+            &|k| env.get(k).cloned(),
+        )
         .expect("runs");
         assert_eq!(code, 0);
         let printed = String::from_utf8(out).expect("utf8");
         assert_eq!(printed, "openai: no usage source\n");
+    }
+
+    /// The report is honest about being an approximation and never invents a
+    /// percentage: these are raw counts, and the only derived figure is the
+    /// cache-hit ratio, which is a pure function of them.
+    #[test]
+    fn the_sessions_report_shows_raw_counts_and_a_cache_hit_ratio() {
+        let spend = vec![window::SessionSpend {
+            session: "sess-a".to_string(),
+            input_tokens: 1_000,
+            cache_creation_input_tokens: 8_000,
+            cache_read_input_tokens: 91_000,
+            output_tokens: 500,
+            events: 12,
+            newest_at: 1_700_000_000,
+        }];
+        let mut out = Vec::new();
+        render_sessions(&mut out, &spend).expect("render");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(text.contains("sess-a"), "got {text}");
+        assert!(text.contains("91000"), "raw cache-read count: {text}");
+        assert!(text.contains("91.0%"), "cache-hit ratio: {text}");
+    }
+
+    /// Nothing to report is a sentence, not an empty section.
+    #[test]
+    fn the_sessions_report_says_so_when_there_is_nothing_in_the_window() {
+        let mut out = Vec::new();
+        render_sessions(&mut out, &[]).expect("render");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(text.contains("no session activity"), "got {text}");
     }
 }

@@ -313,6 +313,131 @@ pub fn projects_root() -> CtxResult<PathBuf> {
     Ok(crate::utils::home_dir()?.join(".claude").join("projects"))
 }
 
+/// One transcript's spend in the four raw classes, over a trailing window.
+/// `session` is the file stem, `events` counts how many in-window assistant
+/// rows contributed, and `newest_at` is the newest counted row's unix second
+/// -- used to sort the breakdown by recency of activity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionSpend {
+    pub session: String,
+    pub input_tokens: u64,
+    pub cache_creation_input_tokens: u64,
+    pub cache_read_input_tokens: u64,
+    pub output_tokens: u64,
+    pub events: usize,
+    pub newest_at: u64,
+}
+
+/// Folds one transcript's in-window assistant rows into a `SessionSpend` for
+/// it, or `None` when nothing in the file falls inside the window -- a file
+/// contributing no in-window rows produces no entry, never a zeroed one.
+/// Applies the same three guards `sum_file` does: a row counts only when its
+/// `timestamp` parses, is not more than `FUTURE_SKEW_TOLERANCE_SECS` in the
+/// future, and is within `window_secs` of `now`. The four classes come from
+/// `super::adapters::claude::usage_categories`, so this function and
+/// `TranscriptUsage` can never disagree about what a class is.
+fn session_spend_of(
+    session: &str,
+    jsonl: &str,
+    now: u64,
+    window_secs: u64,
+) -> Option<SessionSpend> {
+    let mut spend = SessionSpend {
+        session: session.to_string(),
+        input_tokens: 0,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
+        output_tokens: 0,
+        events: 0,
+        newest_at: 0,
+    };
+
+    for line in jsonl.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(row) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if row.get("type").and_then(Value::as_str) != Some("assistant") {
+            continue;
+        }
+        let Some(at) = row
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .and_then(parse_iso8601_utc)
+        else {
+            continue;
+        };
+        if at > now.saturating_add(FUTURE_SKEW_TOLERANCE_SECS) {
+            continue;
+        }
+        let age = now.saturating_sub(at);
+        if age > window_secs {
+            continue;
+        }
+
+        let Some(usage) = row.get("message").and_then(|m| m.get("usage")) else {
+            continue;
+        };
+        let categories = super::adapters::claude::usage_categories(usage);
+
+        spend.input_tokens = spend.input_tokens.saturating_add(categories.input_tokens);
+        spend.cache_creation_input_tokens = spend
+            .cache_creation_input_tokens
+            .saturating_add(categories.cache_creation_input_tokens);
+        spend.cache_read_input_tokens = spend
+            .cache_read_input_tokens
+            .saturating_add(categories.cache_read_input_tokens);
+        spend.output_tokens = spend.output_tokens.saturating_add(categories.output_tokens);
+        spend.events += 1;
+        if at > spend.newest_at {
+            spend.newest_at = at;
+        }
+    }
+
+    (spend.events > 0).then_some(spend)
+}
+
+/// Per-session spend in the four raw classes, over a trailing window. Reuses
+/// `sum_transcripts`'s directory walk verbatim (including descending into
+/// `subagents/`, for the same reason: those tokens are charged), but folds
+/// per file instead of into one combined total. The session name is the
+/// file stem.
+pub fn session_spend(projects_root: &Path, now: u64, window_secs: u64) -> Vec<SessionSpend> {
+    let mut out = Vec::new();
+    let mut stack = vec![projects_root.to_path_buf()];
+
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let session = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("unknown")
+                .to_string();
+            if let Some(spend) = session_spend_of(&session, &text, now, window_secs) {
+                out.push(spend);
+            }
+        }
+    }
+    out
+}
+
 /// Walks every transcript under the projects root, including the `subagents/`
 /// subdirectories, because subagent turns live in their own files and still
 /// spend the account's budget.
@@ -1918,5 +2043,59 @@ mod tests {
             before, after,
             "store_for must be skipped when the merge is unchanged"
         );
+    }
+
+    /// Issue #155, Phase 2: per-session spend in the four raw classes, over a
+    /// trailing window. `sum_transcripts` already walks every transcript
+    /// including `subagents/`, because those tokens are charged too -- this
+    /// keeps the same walk and stops throwing the file identity away.
+    #[test]
+    fn session_spend_reports_each_transcript_separately_in_raw_classes() {
+        let root = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            root.path().join("sess-a.jsonl"),
+            concat!(
+                r#"{"type":"assistant","timestamp":"2026-08-26T10:00:00Z","message":{"usage":"#,
+                r#"{"input_tokens":10,"cache_creation_input_tokens":100,"#,
+                r#""cache_read_input_tokens":900,"output_tokens":5}}}"#,
+            ),
+        )
+        .expect("write");
+        std::fs::write(
+            root.path().join("sess-b.jsonl"),
+            concat!(
+                r#"{"type":"assistant","timestamp":"2026-08-26T10:00:00Z","message":{"usage":"#,
+                r#"{"input_tokens":7,"output_tokens":1}}}"#,
+            ),
+        )
+        .expect("write");
+
+        let now = parse_iso8601_utc("2026-08-26T11:00:00Z").expect("now");
+        let mut spend = session_spend(root.path(), now, 86_400);
+        spend.sort_by(|a, b| a.session.cmp(&b.session));
+        assert_eq!(spend.len(), 2);
+        assert_eq!(spend[0].session, "sess-a");
+        assert_eq!(spend[0].cache_read_input_tokens, 900);
+        assert_eq!(spend[0].cache_creation_input_tokens, 100);
+        assert_eq!(spend[1].session, "sess-b");
+        assert_eq!(spend[1].cache_read_input_tokens, 0);
+    }
+
+    /// A row older than the window is not counted -- and a session whose rows
+    /// are ALL outside it does not appear at all, rather than appearing as a
+    /// zero.
+    #[test]
+    fn session_spend_drops_a_session_with_nothing_inside_the_window() {
+        let root = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            root.path().join("stale.jsonl"),
+            concat!(
+                r#"{"type":"assistant","timestamp":"2026-08-01T10:00:00Z","message":{"usage":"#,
+                r#"{"input_tokens":10,"output_tokens":5}}}"#,
+            ),
+        )
+        .expect("write");
+        let now = parse_iso8601_utc("2026-08-26T11:00:00Z").expect("now");
+        assert!(session_spend(root.path(), now, 86_400).is_empty());
     }
 }

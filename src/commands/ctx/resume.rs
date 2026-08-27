@@ -121,6 +121,7 @@ fn compose_prompt(
         now,
         false,
         super::adapters::LaunchMode::Interactive,
+        true,
     );
     super::prompt::merge_command_line_prompt(
         adapter,
@@ -704,6 +705,7 @@ mod tests {
             now,
             false,
             crate::commands::ctx::adapters::LaunchMode::Headless,
+            false,
         );
         let (_, expected) = crate::commands::ctx::prompt::merge_command_line_prompt(
             &adapter,

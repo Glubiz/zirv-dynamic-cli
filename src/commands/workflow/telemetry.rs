@@ -15,7 +15,7 @@ use crate::commands::ctx::state::{
     StateDir, create_private_dir_all, now_secs, prune_to_newest, repo_slug, write_private,
 };
 
-const TELEMETRY_SCHEMA_VERSION: u32 = 1;
+const TELEMETRY_SCHEMA_VERSION: u32 = 2;
 const DEFAULT_MAX_EVENTS: usize = 1000;
 const DEFAULT_RETENTION_DAYS: u64 = 30;
 const MAX_CONFIGURED_EVENTS: usize = 100_000;
@@ -110,6 +110,43 @@ pub struct TelemetryEvent {
     pub fix_round: u8,
     pub artifact_count: u32,
     pub worker_count: u32,
+    /// Issue #155: the raw cache classes alongside `input_tokens`.
+    /// `input_tokens` keeps its pre-2.34.0 meaning for events produced by the
+    /// workflow engine: the COMBINED context total (raw input plus both cache
+    /// classes -- see `engine.rs`'s `usage.context_total()`), not the raw
+    /// uncached class alone. `cache_read_input_tokens` is therefore a SUBSET
+    /// of `input_tokens`, not a third figure to add to it: a cache-hit ratio
+    /// is `cache_read_input_tokens / input_tokens` directly (see
+    /// `cache_hit_ratio()` below) -- summing `input_tokens` with the cache
+    /// classes double-counts them.
+    #[serde(default)]
+    pub cache_creation_input_tokens: Option<u64>,
+    #[serde(default)]
+    pub cache_read_input_tokens: Option<u64>,
+    /// Subagent (`isSidechain`) spend for the same phase, in the same four
+    /// classes. Its own bucket rather than folded into the main numbers: the
+    /// main numbers mean "this session's own context", and a subagent's
+    /// tokens are not part of it -- but they ARE charged to the account, so
+    /// dropping them (the pre-2.34.0 behaviour) made a phase look cheaper
+    /// than it was.
+    #[serde(default)]
+    pub sidechain_input_tokens: Option<u64>,
+    #[serde(default)]
+    pub sidechain_cache_creation_input_tokens: Option<u64>,
+    #[serde(default)]
+    pub sidechain_cache_read_input_tokens: Option<u64>,
+    #[serde(default)]
+    pub sidechain_output_tokens: Option<u64>,
+    /// The harness session this event was produced by, its parent (the
+    /// session that delegated the work), and the work group both belong to.
+    /// `role`/`worker_count` said what KIND of thing ran and how many; these
+    /// say WHICH, which is what makes a delegation tree's cost attributable.
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub parent_session_id: Option<String>,
+    #[serde(default)]
+    pub work_group_id: Option<String>,
 }
 
 impl TelemetryEvent {
@@ -139,7 +176,35 @@ impl TelemetryEvent {
             fix_round: 0,
             artifact_count: 0,
             worker_count: 0,
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
+            sidechain_input_tokens: None,
+            sidechain_cache_creation_input_tokens: None,
+            sidechain_cache_read_input_tokens: None,
+            sidechain_output_tokens: None,
+            session_id: None,
+            parent_session_id: None,
+            work_group_id: None,
         }
+    }
+
+    /// The fraction of `input_tokens` (the combined context total) served
+    /// from cache. `cache_read_input_tokens` is a SUBSET of `input_tokens`,
+    /// not a separate figure to add to it -- see the doc comment on that
+    /// field. `None` when either value is missing, or `input_tokens` is `0`
+    /// (no ratio to report, never a manufactured 0%).
+    ///
+    /// No CLI surface reads a `TelemetryEvent`'s ratio back yet (`usage.rs`'s
+    /// own `--sessions` cache-hit line works off `window::SessionSpend`, a
+    /// different type) -- this is the one correct formula for whichever
+    /// future reporting surface needs it, landed now so it is not
+    /// re-derived incorrectly a second time, the same "accessor lands ahead
+    /// of its production caller" pattern `log::tail_delegations` used.
+    #[allow(dead_code)]
+    pub fn cache_hit_ratio(&self) -> Option<f64> {
+        let read = self.cache_read_input_tokens?;
+        let total = self.input_tokens?;
+        (total > 0).then(|| read as f64 / total as f64)
     }
 }
 
@@ -163,6 +228,9 @@ pub fn record(
         &mut event.model,
         &mut event.role,
         &mut event.token_usage_source,
+        &mut event.session_id,
+        &mut event.parent_session_id,
+        &mut event.work_group_id,
     ]
     .into_iter()
     .flatten()
@@ -725,6 +793,70 @@ mod tests {
         assert_eq!(stats.findings_total, 2);
         assert_eq!(stats.findings_meaningful, 1);
         assert_eq!(stats.findings_dismissed, 1);
+    }
+
+    /// Issue #155, Phase 2: an event must carry enough to attribute spend to
+    /// a session, its parent, and its work group -- and to separate the cache
+    /// classes. `role` was a free string and `worker_count` a bare integer;
+    /// neither could say WHICH worker cost what.
+    #[test]
+    fn a_telemetry_event_carries_raw_categories_and_session_lineage() {
+        let mut event = TelemetryEvent::new(TelemetryKind::PhaseCompleted);
+        // `input_tokens` is the COMBINED total (raw input + both cache
+        // classes -- 1_000 + 8_000 + 91_000), not the raw uncached class
+        // alone: `cache_read_input_tokens` is a subset of it.
+        event.input_tokens = Some(100_000);
+        event.cache_creation_input_tokens = Some(8_000);
+        event.cache_read_input_tokens = Some(91_000);
+        event.output_tokens = Some(500);
+        event.sidechain_input_tokens = Some(40);
+        event.sidechain_cache_creation_input_tokens = Some(0);
+        event.sidechain_cache_read_input_tokens = Some(12_000);
+        event.sidechain_output_tokens = Some(90);
+        event.session_id = Some("sess-child".to_string());
+        event.parent_session_id = Some("sess-parent".to_string());
+        event.work_group_id = Some("wg-1".to_string());
+
+        let json = serde_json::to_string(&event).expect("serialize");
+        let back: TelemetryEvent = serde_json::from_str(&json).expect("round-trip");
+        assert_eq!(back, event);
+
+        assert!(
+            (back.cache_hit_ratio().expect("both values present") - 0.91).abs() < 1e-9,
+            "a cache-hit ratio must be computable from ONE event, dividing by the \
+             combined total rather than double-counting the cache classes"
+        );
+    }
+
+    #[test]
+    fn cache_hit_ratio_is_none_without_data_never_a_manufactured_zero() {
+        let mut event = TelemetryEvent::new(TelemetryKind::PhaseCompleted);
+        assert_eq!(event.cache_hit_ratio(), None, "no data at all");
+
+        event.input_tokens = Some(0);
+        event.cache_read_input_tokens = Some(0);
+        assert_eq!(
+            event.cache_hit_ratio(),
+            None,
+            "a zero total has no ratio to report"
+        );
+    }
+
+    /// Back-compatibility: an event written by 2.31.0 has none of these
+    /// fields. Reading it must still work -- the telemetry directory is
+    /// retained for days and an upgrade must not orphan it.
+    #[test]
+    fn an_event_written_before_this_change_still_deserialises() {
+        let old = r#"{"schema_version":1,"id":"e1","timestamp":10,"workflow_id":null,
+            "kind":"phase-completed","phase":null,"intent":null,"complexity":null,
+            "risk":null,"duration_ms":null,"adapter":null,"model":null,"role":null,
+            "input_tokens":7,"output_tokens":3,"succeeded":true,"findings_total":0,
+            "findings_meaningful":0,"findings_dismissed":0,"fix_round":0,
+            "artifact_count":0,"worker_count":0}"#;
+        let event: TelemetryEvent = serde_json::from_str(old).expect("old events still parse");
+        assert_eq!(event.input_tokens, Some(7));
+        assert_eq!(event.cache_read_input_tokens, None);
+        assert_eq!(event.session_id, None);
     }
 
     #[test]

@@ -585,6 +585,40 @@ fn find_rollout(dir: &Path, filename_suffix: &str) -> Option<PathBuf> {
     None
 }
 
+/// `value` rendered as a quoted TOML string, for embedding inside a `-c
+/// key=["..."]`-style config-override argv token (`extra_writable_root_
+/// args`, `approval_suppression_args`'s sibling for path values rather than
+/// bare identifiers). codex's own `-c`/`--config` value parser is TOML, so
+/// this always produces syntax any TOML parser accepts, never a
+/// zirv-invented format.
+///
+/// **Prefers a TOML LITERAL string (`'...'`)** -- no escape processing at
+/// all, so a Windows path's `\` survives untouched -- **over a basic string
+/// (`"..."`), specifically to avoid ever emitting a literal `"`.** A real
+/// bug (2026-08-26, found running this branch's own gates on Windows): the
+/// previous basic-string form escaped `\`/`"` correctly per TOML's own
+/// rules, but `guard_cmd_shim_reparse`'s `CMD_REPARSE_METACHARS` refuses any
+/// argument containing a raw `"` outright on a `cmd.exe`/`powershell` shim
+/// launch (CVE-2024-24576's quote-toggle) -- so the moment `extra_writable_
+/// root_args` was wired in (unconditionally, into every dashboard-spawned
+/// worker pane), a codex pane reached through an npm-installed `.cmd` or a
+/// `.ps1` could never launch at all: its own writable-roots argument tripped
+/// the very guard meant to stop injected content, despite carrying nothing
+/// but zirv-computed paths. A literal string sidesteps this rather than
+/// weakening the guard, which stays a correct, unconditional backstop.
+///
+/// Falls back to an escaped basic string only when `value` itself contains a
+/// literal `'`, which a TOML literal string has no way to represent at all
+/// (pathological for a real filesystem path; that case is not, and was never,
+/// spawnable through a shim launch either way).
+fn toml_quoted_string(value: &str) -> String {
+    if !value.contains('\'') && !value.chars().any(|c| c.is_control() && c != '\t') {
+        return format!("'{value}'");
+    }
+    let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("\"{escaped}\"")
+}
+
 impl AgentAdapter for CodexAdapter {
     fn name(&self) -> &'static str {
         "codex"
@@ -963,19 +997,47 @@ impl AgentAdapter for CodexAdapter {
     /// installed codex-cli's `codex exec --help` no longer documents the
     /// flag, this projects the config-override form instead so the launch
     /// does not fail outright with an unrecognized-argument error.
+    ///
+    /// **`network` (2026-08-26, codex approval-posture round) is folded into
+    /// this method too, not `default_sandbox_args`**: that method's own
+    /// signature (`sandbox`, `safety`, `mode` -- no `policy`) would have to
+    /// change to reach `EffectivePolicy`, which is a trait-wide signature
+    /// change every adapter's `impl` must match, rippling into `claude.rs`
+    /// for a codex-only mapping this round is scoped to leave untouched. This
+    /// method already threads `policy` through, so it is the one place that
+    /// costs nothing extra to reach it from.
+    ///
+    /// `network` defaults to `None` (`EffectivePolicy`'s own `Option<Stance>`
+    /// field, see its doc comment) when no operator layer has ever named it,
+    /// which behaves exactly like `Deny`/`Ask` here -- neither adds any argv
+    /// -- matching what an unwired install has always done: codex's own
+    /// native default under `--sandbox workspace-write` is already
+    /// `network_access: false` with no zirv-added flag at all. Only the
+    /// operator's explicit `Some(Stance::Allow)` adds the
+    /// `-c sandbox_workspace_write.network_access=true` config override --
+    /// verified to work on both the interactive and `exec` command surfaces
+    /// (`approval_suppression_args`'s own doc comment cites the same fact for
+    /// `approval_policy`). Claude's own sandbox network settings are
+    /// untouched by this round.
     fn policy_args(
         &self,
         policy: &crate::commands::ctx::policy::EffectivePolicy,
         mode: super::LaunchMode,
     ) -> Vec<String> {
         use crate::commands::ctx::policy::Stance;
-        if policy.repo_fs_write == Stance::Deny || policy.shell_exec == Stance::Deny {
+        let mut args = if policy.repo_fs_write == Stance::Deny || policy.shell_exec == Stance::Deny
+        {
             let mut args = self.read_only_args();
             args.extend(self.approval_suppression_args(mode, "never"));
             args
         } else {
             Vec::new()
+        };
+        if policy.network == Some(Stance::Allow) {
+            args.push("-c".to_string());
+            args.push("sandbox_workspace_write.network_access=true".to_string());
         }
+        args
     }
 
     /// The codex side of the shipped-default posture, split by launch mode
@@ -1038,6 +1100,50 @@ impl AgentAdapter for CodexAdapter {
             args.push("--approve-for-me".to_string());
         }
         args
+    }
+
+    /// Issue #119 (dash worktree panes) + the mail report-back gap
+    /// (2026-08-26, codex approval-posture round): see the trait method's own
+    /// doc comment for what this closes and why `cwd`/`mail_dir` are not
+    /// threaded through `default_sandbox_args` instead.
+    ///
+    /// One `-c sandbox_workspace_write.writable_roots=[...]` config override
+    /// carries every extra root this launch needs, never several separate
+    /// `-c` occurrences for the same key: codex's own config resolution is
+    /// last-value-wins (the same fact `approval_suppression_args`'s fallback
+    /// relies on for `approval_policy`), so a second `-c ...writable_roots=`
+    /// would silently replace the first rather than add to it. Verified to
+    /// work on both the interactive and `exec` command surfaces, the same
+    /// `-c/--config key=value` fact `approval_suppression_args`'s own doc
+    /// comment cites.
+    ///
+    /// The linked-worktree root is only added when `git_common_dir(cwd)`
+    /// resolves OUTSIDE `cwd` itself -- a main checkout's own `.git` already
+    /// sits inside `cwd`, and so inside `--sandbox workspace-write`'s own
+    /// root, without needing to be named again. `mail_dir` is always added:
+    /// it sits under the state root, always outside `cwd`, regardless of
+    /// worktree shape.
+    fn extra_writable_root_args(&self, cwd: &Path, mail_dir: &Path) -> Vec<String> {
+        let cwd = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+        let mut roots: Vec<PathBuf> = Vec::new();
+        if let Some(git_dir) = super::git_common_dir(&cwd)
+            && !git_dir.starts_with(&cwd)
+        {
+            roots.push(git_dir);
+        }
+        roots.push(mail_dir.to_path_buf());
+
+        let quoted: Vec<String> = roots
+            .iter()
+            .map(|root| toml_quoted_string(&root.display().to_string()))
+            .collect();
+        vec![
+            "-c".to_string(),
+            format!(
+                "sandbox_workspace_write.writable_roots=[{}]",
+                quoted.join(",")
+            ),
+        ]
     }
 
     fn launch_prefix_len(&self) -> usize {
@@ -1166,6 +1272,10 @@ impl AgentAdapter for CodexAdapter {
             {
                 latest = Some(TranscriptUsage {
                     input_tokens: totals.input_tokens,
+                    // `RolloutTokenTotals` has no cache-class fields at all --
+                    // a guessed class would be worse than an honest zero.
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: 0,
                     output_tokens: totals.output_tokens,
                 });
             }
@@ -1596,22 +1706,41 @@ mod tests {
         );
     }
 
+    /// The rollout `TokenCount` fixture both cumulative-snapshot tests below
+    /// share: two snapshots, the second superseding the first.
+    const CODEX_TOKEN_COUNT_FIXTURE: &str = concat!(
+        r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"output_tokens":2}}}}"#,
+        "\n",
+        r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":25,"output_tokens":6}}}}"#,
+    );
+
     #[test]
     fn transcript_usage_uses_the_latest_cumulative_token_snapshot() {
         let adapter = CodexAdapter::new(None);
-        let jsonl = concat!(
-            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"output_tokens":2}}}}"#,
-            "\n",
-            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":25,"output_tokens":6}}}}"#,
-        );
         assert_eq!(
-            adapter.transcript_usage(jsonl),
+            adapter.transcript_usage(CODEX_TOKEN_COUNT_FIXTURE),
             Some(TranscriptUsage {
                 input_tokens: 25,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
                 output_tokens: 6,
             })
         );
         assert!(adapter.transcript_usage_is_cumulative());
+    }
+
+    /// Codex's rollout `TokenCount` totals expose no cache classes at all, so
+    /// its two new fields stay 0 and `context_total()` degrades to exactly
+    /// today's number. Never guess a class an adapter does not report.
+    #[test]
+    fn codex_reports_zero_for_the_cache_classes_it_cannot_see() {
+        let adapter = CodexAdapter::new(None);
+        let usage = adapter
+            .transcript_usage(CODEX_TOKEN_COUNT_FIXTURE)
+            .expect("usage");
+        assert_eq!(usage.cache_creation_input_tokens, 0);
+        assert_eq!(usage.cache_read_input_tokens, 0);
+        assert_eq!(usage.context_total(), usage.input_tokens);
     }
 
     /// B: `--sandbox read-only` (verified against `codex exec --help` on
@@ -1703,6 +1832,41 @@ mod tests {
                     super::super::LaunchMode::Headless
                 )
                 .is_empty()
+        );
+    }
+
+    /// `network` (2026-08-26, codex approval-posture round): `None`
+    /// (including `EffectivePolicy::default()`'s own unconfigured value),
+    /// `Deny` and `Ask` all add nothing here -- codex's own native default
+    /// under `--sandbox workspace-write` is already closed, matching what an
+    /// unwired install has always done. Only the operator's explicit
+    /// `Some(Stance::Allow)` adds the config override, and as one `-c`
+    /// occurrence -- never a bare `network_access` substring split across two
+    /// tokens some other way.
+    #[test]
+    fn policy_args_adds_the_network_override_only_when_policy_explicitly_allows_it() {
+        use crate::commands::ctx::policy::{EffectivePolicy, Stance};
+        let adapter = CodexAdapter::new(None);
+
+        let denied = adapter.policy_args(
+            &EffectivePolicy::default(),
+            super::super::LaunchMode::Headless,
+        );
+        assert!(
+            !denied.iter().any(|a| a.contains("network_access")),
+            "network must stay closed under the default policy: {denied:?}"
+        );
+
+        let allowed_policy = EffectivePolicy {
+            network: Some(Stance::Allow),
+            ..EffectivePolicy::default()
+        };
+        let allowed = adapter.policy_args(&allowed_policy, super::super::LaunchMode::Headless);
+        assert!(
+            allowed
+                .windows(2)
+                .any(|w| w == ["-c", "sandbox_workspace_write.network_access=true"]),
+            "got {allowed:?}"
         );
     }
 
@@ -2119,6 +2283,184 @@ mod tests {
                 .iter()
                 .any(|a| a.contains("dangerously-bypass-approvals-and-sandbox")),
             "must never widen: {args:?}"
+        );
+    }
+
+    /// Issue #119 + the mail report-back gap (2026-08-26): a launch inside a
+    /// PLAIN checkout (not a linked worktree) must still get the mail
+    /// subtree as a writable root -- `zirv ctx send` report-back always
+    /// needs it -- but must never name the state root itself: only the
+    /// invariant is asserted (some writable-root arg naming the mail dir),
+    /// never exact argv, since the config-override string this builds is an
+    /// internal choice a test must not lock in more tightly than the
+    /// mechanism itself is verified.
+    ///
+    /// A real bug found running this branch's own gates on Windows
+    /// (2026-08-26): `toml_quoted_string`'s basic-string form embeds a
+    /// literal `"` in every writable-root argv token it builds, and
+    /// `guard_cmd_shim_reparse`'s `CMD_REPARSE_METACHARS` refuses `"`
+    /// outright on any `cmd.exe`/`powershell` shim launch (an npm-installed
+    /// `.cmd`, or a `.ps1`) -- so a codex pane spawned through a shim could
+    /// never launch at all once `extra_writable_root_args` was wired in,
+    /// unconditionally, into every dashboard-spawned worker pane. See
+    /// `no_extra_writable_root_arg_ever_trips_the_cmd_shim_reparse_guard`
+    /// below for the direct regression test.
+    #[test]
+    fn extra_writable_root_args_always_includes_the_mail_dir_but_never_the_bare_state_root() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::process::Command::new("git")
+            .arg("init")
+            .arg("-q")
+            .arg(repo.path())
+            .status()
+            .expect("git init");
+        let state_root = tempfile::tempdir().expect("tempdir");
+        let mail_dir = state_root.path().join("mail");
+
+        let adapter = CodexAdapter::new(None);
+        let args = adapter.extra_writable_root_args(repo.path(), &mail_dir);
+
+        let joined = args.join(" ");
+        // Checked as a QUOTED, closed TOML string element (`"<path>"`), not a
+        // bare substring: `mail_dir` is itself `<state_root>/mail`, so a
+        // plain substring check for the state root's own path would also
+        // match inside the (correct) mail entry. Quoting-and-closing is what
+        // actually distinguishes "the state root named as its own array
+        // element" from "the mail subtree, which happens to start with the
+        // state root's path".
+        //
+        // Built through the same `toml_quoted_string` the implementation
+        // uses, not a bare `"<path>"` wrap: `toml_quoted_string` quotes with
+        // `'...'` (a TOML literal string) whenever it can, not `"..."`, so a
+        // naive double-quote wrap never matches the real argv (found
+        // 2026-08-26, Windows dev machine).
+        let quoted_mail = toml_quoted_string(&mail_dir.display().to_string());
+        let quoted_state_root = toml_quoted_string(&state_root.path().display().to_string());
+        assert!(
+            joined.contains(&quoted_mail),
+            "must name the mail subtree: {args:?}"
+        );
+        assert!(
+            !joined.contains(&quoted_state_root),
+            "must never name the bare state root as its own writable-root entry: {args:?}"
+        );
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "-c"
+                    && w[1].starts_with("sandbox_workspace_write.writable_roots=[")),
+            "got {args:?}"
+        );
+    }
+
+    /// The other half of issue #119: a launch whose `cwd` is a linked `git
+    /// worktree add` sibling must ALSO get the shared `.git` common dir as a
+    /// writable root, since it sits outside `cwd` (and so outside `--sandbox
+    /// workspace-write`'s own root) -- every git object/ref write from that
+    /// worktree lands there. A real linked worktree, not a guessed path: the
+    /// mechanism this pins is `git rev-parse --git-common-dir` itself, via
+    /// the moved-and-shared `adapters::git_common_dir`.
+    #[test]
+    fn extra_writable_root_args_adds_the_shared_git_dir_for_a_linked_worktree() {
+        let main_repo = tempfile::tempdir().expect("tempdir");
+        let run_git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(main_repo.path())
+                .status()
+                .expect("git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        run_git(&["init", "-q"]);
+        run_git(&["config", "user.email", "test@example.com"]);
+        run_git(&["config", "user.name", "test"]);
+        std::fs::write(main_repo.path().join("f.txt"), "x").expect("write");
+        run_git(&["add", "."]);
+        run_git(&["commit", "-q", "-m", "init"]);
+
+        let linked = tempfile::tempdir().expect("tempdir");
+        let linked_path = linked.path().join("worktree");
+        run_git(&["worktree", "add", linked_path.to_str().expect("utf8 path")]);
+
+        let expected_git_dir =
+            super::super::git_common_dir(main_repo.path()).expect("main repo has a git common dir");
+
+        let state_root = tempfile::tempdir().expect("tempdir");
+        let mail_dir = state_root.path().join("mail");
+        let adapter = CodexAdapter::new(None);
+        let args = adapter.extra_writable_root_args(&linked_path, &mail_dir);
+
+        let joined = args.join(" ");
+        // Same fix as `extra_writable_root_args_always_includes_the_mail_
+        // dir_but_never_the_bare_state_root` above: compare against
+        // `toml_quoted_string`'s own quoted form (a TOML literal string,
+        // `'...'`), not a bare `.display()` substring check, which never
+        // matches once the value is quoted.
+        assert!(
+            joined.contains(&toml_quoted_string(&expected_git_dir.display().to_string())),
+            "must name the shared git common dir for a linked worktree: {args:?}"
+        );
+        assert!(
+            joined.contains(&toml_quoted_string(&mail_dir.display().to_string())),
+            "must still name the mail subtree too: {args:?}"
+        );
+    }
+
+    /// The regression this round fixes, exercised end to end through the
+    /// real guard rather than only inspecting `toml_quoted_string`'s output
+    /// (2026-08-26): `extra_writable_root_args`'s own argv, appended after a
+    /// `cmd.exe /c <shim>` prefix exactly as a real npm-installed codex shim
+    /// launch would carry it, must never trip `guard_cmd_shim_reparse`. This
+    /// is not a hypothetical -- `dash::worker_pane_extra_args` calls
+    /// `extra_writable_root_args` unconditionally for every dashboard-spawned
+    /// worker pane (see that function's own doc comment), so before this fix
+    /// a codex pane reached through a `.cmd` shim could never launch at all.
+    #[test]
+    fn no_extra_writable_root_arg_ever_trips_the_cmd_shim_reparse_guard() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::process::Command::new("git")
+            .arg("init")
+            .arg("-q")
+            .arg(repo.path())
+            .status()
+            .expect("git init");
+        let state_root = tempfile::tempdir().expect("tempdir");
+        let mail_dir = state_root.path().join("mail");
+
+        let adapter = CodexAdapter::new(None);
+        let extra = adapter.extra_writable_root_args(repo.path(), &mail_dir);
+        assert!(!extra.is_empty(), "the mail root alone must still add args");
+
+        let mut shim_args = vec!["/c".to_string(), "codex.cmd".to_string()];
+        shim_args.extend(extra);
+        crate::commands::ctx::adapters::guard_cmd_shim_reparse("cmd.exe", &shim_args)
+            .expect("extra_writable_root_args must never trip the cmd-shim reparse guard");
+    }
+
+    /// Issue "codex approval hell" (2026-08-26): an operator's own `-c
+    /// approval_policy=on-request` config override must pin the launch
+    /// exactly the way a bare `--ask-for-approval on-request` flag already
+    /// does -- `flags_pin_policy` now recognises the split `-c key=value`
+    /// form (see its own doc comment in `adapters/mod.rs`), so
+    /// `policy_launch_args` must append nothing at all after it, on any
+    /// installed codex-cli regardless of what its own `--help` probes
+    /// report.
+    #[test]
+    fn policy_launch_args_appends_nothing_after_an_operator_config_override_of_approval_policy() {
+        let cfg = CtxConfig::default();
+        let adapter = CodexAdapter::new(None)
+            .with_on_request_approval_forced(true)
+            .with_exec_ask_for_approval_forced(false);
+        let flags = vec!["-c".to_string(), "approval_policy=on-request".to_string()];
+        let out = crate::commands::ctx::adapters::policy_launch_args(
+            &cfg,
+            &adapter,
+            &flags,
+            super::super::LaunchMode::Headless,
+        );
+        assert!(
+            out.is_empty(),
+            "zirv must not append anything after the operator's own -c approval_policy=... \
+             override: {out:?}"
         );
     }
 

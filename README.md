@@ -1050,6 +1050,7 @@ checkout:
 | `worker` (`worker.claude`, `worker.codex`) | `ZIRV_CTX_WORKER_MODEL_CLAUDE` / `ZIRV_CTX_WORKER_MODEL_CODEX` |
 | `handover` (`handover.<agent>.<tier>`) | `ZIRV_CTX_HANDOVER_<AGENT>_<TIER>` (e.g. `ZIRV_CTX_HANDOVER_CLAUDE_DEEP`) |
 | `safety.allow` | `ZIRV_CTX_SAFETY_ALLOW` |
+| `safety.escape_allow` | `ZIRV_CTX_SAFETY_ESCAPE_ALLOW` |
 | `safety.default` | `ZIRV_CTX_SAFETY_DEFAULT` |
 | `safety.interactive_default` | `ZIRV_CTX_SAFETY_INTERACTIVE_DEFAULT` |
 | `safety.sql` | `ZIRV_CTX_SAFETY_SQL` |

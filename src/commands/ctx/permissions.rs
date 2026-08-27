@@ -24,15 +24,17 @@
 
 use std::collections::HashMap;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::ValueEnum;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::CtxResult;
+use super::log::{self, SafetyDecisionRecord};
 use super::safety::{
-    collapse_whitespace, pipeline_stages, sql_program_name, strip_program_dir, unwrap_env_prefix,
+    collapse_whitespace, command_fails_escape_screen, command_pattern_from_bash_rule, glob_match,
+    pipeline_stages, sha256_hex, sql_program_name, strip_program_dir, unwrap_env_prefix,
     unwrap_shell_wrapper,
 };
 
@@ -71,6 +73,19 @@ pub struct PermissionRequest {
     /// one-off (a long literal payload) or a downstream-only capability (a
     /// pipe into `jq`/`grep`/`awk`/`sed` whose own argument is what varies).
     pub reusable: bool,
+    /// Issue #147: the claude permission mode active at request time
+    /// (`"default"`/`"plan"`/`"acceptEdits"`/`"dontAsk"`/`"auto"`/
+    /// `"bypassPermissions"`), read from the transcript's own
+    /// `type: "permission-mode"` event line (or a `permissionMode` field
+    /// carried directly on the surrounding entry). Empty when the
+    /// transcript predates that field, or for a codex request (no analogue).
+    pub permission_mode: String,
+    /// Issue #147: whether this request happened inside a claude sidechain
+    /// (`isSidechain: true` -- a sub-agent/Task-tool-spawned transcript
+    /// branch) rather than the main conversation. `false` for codex (no
+    /// sidechain concept) and for a claude transcript entry that omits the
+    /// field.
+    pub is_sidechain: bool,
 }
 
 /// One command family's aggregated requests, ready to render or recommend
@@ -103,6 +118,11 @@ pub struct AuditReport {
     pub sessions_scanned: usize,
     pub total_requests: usize,
     pub groups: Vec<FamilyGroup>,
+    /// Issue #147: the ungrouped requests `groups` above was folded from --
+    /// `run_compile`'s `--escape` eligibility pass needs each request's own
+    /// `cause`/`result` (an interactive sandbox-escape ask vs. an ordinary
+    /// denial), which a `FamilyGroup` does not carry.
+    pub requests: Vec<PermissionRequest>,
 }
 
 /// Above this many total requests, `optimize`'s friction pass surfaces the
@@ -464,6 +484,82 @@ pub(crate) fn is_protected_family(family: &str, sample: &str) -> bool {
         || is_arbitrary_package_exec_family
 }
 
+// ---------------------------------------------------------------------
+// Issue #147, design decision 7: native claude permission conflicts
+// ---------------------------------------------------------------------
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct NativeClaudeSettings {
+    #[serde(default)]
+    permissions: NativeClaudePermissions,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct NativeClaudePermissions {
+    #[serde(default)]
+    deny: Vec<String>,
+    #[serde(default)]
+    ask: Vec<String>,
+}
+
+/// Best-effort read of the operator's own native claude permission rules --
+/// NEVER written to, only read, so a recommended/compiled zirv family is
+/// never silently presented as "fixed" while the operator's own
+/// `~/.claude/settings.json` (and, trivially, a project `.claude/
+/// settings.json` under `repo`, when given) still blocks or prompts on it.
+/// A read/parse failure for either file simply contributes nothing -- the
+/// conflict check then finds no conflict, degrading to pre-#147 behavior
+/// rather than failing the audit/compile outright. Returns `(pattern,
+/// "deny"|"ask")` pairs with the `Bash(...)` wrapper already stripped
+/// (`safety::command_pattern_from_bash_rule`), the identical shape zirv's
+/// own `[safety]` rules use.
+fn read_native_claude_rules(home: &Path, repo: Option<&Path>) -> Vec<(String, &'static str)> {
+    let mut out = Vec::new();
+    let candidates = [
+        Some(home.join(".claude").join("settings.json")),
+        repo.map(|r| r.join(".claude").join("settings.json")),
+    ];
+    for path in candidates.into_iter().flatten() {
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(settings) = serde_json::from_str::<NativeClaudeSettings>(&text) else {
+            continue;
+        };
+        out.extend(
+            settings
+                .permissions
+                .deny
+                .iter()
+                .filter_map(|r| command_pattern_from_bash_rule(r))
+                .map(|p| (p, "deny")),
+        );
+        out.extend(
+            settings
+                .permissions
+                .ask
+                .iter()
+                .filter_map(|r| command_pattern_from_bash_rule(r))
+                .map(|p| (p, "ask")),
+        );
+    }
+    out
+}
+
+/// Whether `sample` -- a family's representative command -- would still be
+/// blocked (`deny`) or re-prompted (`ask`) by one of the operator's own
+/// native claude permission rules, matched with the identical glob matcher
+/// (`safety::glob_match`) claude's own `Bash(<pattern>)` rules use. Returns
+/// a human-readable name for the first conflicting rule found, for a
+/// warning message -- never used to suppress a recommendation/write, only
+/// to correct how it is presented (design decision 7's own wording).
+fn native_conflict(native_rules: &[(String, &'static str)], sample: &str) -> Option<String> {
+    native_rules
+        .iter()
+        .find(|(pattern, _)| glob_match(pattern, sample))
+        .map(|(pattern, kind)| format!("Bash({pattern}) [{kind}]"))
+}
+
 fn recommendation_for(family: &str, protected: bool, reusable: bool) -> String {
     if protected {
         return format!(
@@ -569,6 +665,8 @@ pub fn extract_codex_requests(text: &str, session: &str) -> Vec<PermissionReques
             cause: "sandbox_permissions: require_escalated".to_string(),
             result: "escalated".to_string(),
             reusable,
+            permission_mode: String::new(),
+            is_sidechain: false,
         });
     }
     out
@@ -582,6 +680,19 @@ pub fn extract_codex_requests(text: &str, session: &str) -> Vec<PermissionReques
 struct ClaudeToolUse {
     name: String,
     command: Option<String>,
+    /// Whether `input.dangerouslyDisableSandbox` was set -- the exact
+    /// signal `safety::run_check_hook_mode_with_env` keys its own escalation
+    /// branch on (issue #147).
+    dangerously_disable_sandbox: bool,
+    /// The claude permission mode in force when this tool_use was recorded
+    /// (issue #147) -- see `PermissionRequest::permission_mode`'s own doc
+    /// comment for where it comes from.
+    permission_mode: String,
+    is_sidechain: bool,
+    /// Unix seconds, parsed from the entry's own `timestamp` field
+    /// (`window::parse_iso8601_utc`). `None` when absent/unparseable, in
+    /// which case log correlation matches on session+hash alone.
+    timestamp: Option<u64>,
 }
 
 fn tool_result_text(entry: &Value) -> String {
@@ -596,12 +707,67 @@ fn tool_result_text(entry: &Value) -> String {
     }
 }
 
-/// Extracts every headless `dontAsk` permission denial from one claude
-/// transcript JSONL file (see this module's own doc comment for the shape,
-/// grounded in real session files on this machine).
-pub fn extract_claude_requests(text: &str, session: &str) -> Vec<PermissionRequest> {
+/// A safety-decision log correlation must land within this many seconds of
+/// the transcript's own tool_use timestamp to count as the SAME invocation
+/// (issue #147) -- generous enough to absorb clock/serialization skew
+/// between the hook process and the transcript writer, tight enough that a
+/// much later re-run of the identical command text is never mismatched to
+/// an earlier decision.
+const CORRELATION_WINDOW_SECS: u64 = 300;
+
+/// Issue #147, design decision 5: correlates one transcript command against
+/// zirv's own safety-decision log (`log::read_safety_decisions`) -- the
+/// actual hook verdict for THIS invocation, not a guess from the
+/// transcript's own denial text alone. Join key: same session id and the
+/// identical `command_sha256` the hook itself computed
+/// (`safety::audit_hook_decision`: `sha256_hex(command.trim())`); when more
+/// than one log entry matches (the same command run more than once in the
+/// session), the closest by timestamp wins, and only within
+/// `CORRELATION_WINDOW_SECS` -- a match outside the window is treated as no
+/// match at all rather than risking a wrong-invocation correlation.
+fn correlate_safety_decision<'a>(
+    records: &'a [SafetyDecisionRecord],
+    session: &str,
+    command: &str,
+    at: Option<u64>,
+) -> Option<&'a SafetyDecisionRecord> {
+    let hash = sha256_hex(command.trim().as_bytes());
+    let mut candidates: Vec<&SafetyDecisionRecord> = records
+        .iter()
+        .filter(|r| r.session == session && r.command_sha256 == hash)
+        .collect();
+    let Some(at) = at else {
+        return candidates.pop();
+    };
+    candidates.sort_by_key(|r| r.ts.abs_diff(at));
+    candidates
+        .into_iter()
+        .find(|r| r.ts.abs_diff(at) <= CORRELATION_WINDOW_SECS)
+}
+
+/// Extracts every claude permission request worth an operator's attention
+/// from one transcript JSONL file (see this module's own doc comment for
+/// the transcript shapes, grounded in real session files on this machine):
+/// a headless `dontAsk` denial (as before this issue), now classified via
+/// `log_records` rather than a single hardcoded cause string, PLUS every
+/// interactive `--dangerously-disable-sandbox` retry the safety-decision
+/// log shows was answered with `ask` (issue #147, design decision 5) --
+/// invisible to the pre-#147 extractor entirely, since a subsequently
+/// ACCEPTED ask never produces an errored tool_result for the old code path
+/// to notice. `log_records` is `log::read_safety_decisions`'s own output for
+/// this machine's state dir, passed in (rather than read here) so this
+/// function stays a pure fold over its two inputs -- `audit_report` reads
+/// the log exactly once per call, not once per transcript file.
+pub fn extract_claude_requests(
+    text: &str,
+    session: &str,
+    log_records: &[SafetyDecisionRecord],
+) -> Vec<PermissionRequest> {
     let mut uses: HashMap<String, ClaudeToolUse> = HashMap::new();
+    // tool_use_id -> whether its own tool_result was an error, once seen.
+    let mut results: HashMap<String, bool> = HashMap::new();
     let mut out = Vec::new();
+    let mut current_permission_mode = String::new();
 
     for line in text.lines() {
         let line = line.trim();
@@ -611,6 +777,33 @@ pub fn extract_claude_requests(text: &str, session: &str) -> Vec<PermissionReque
         let Ok(v) = serde_json::from_str::<Value>(line) else {
             continue;
         };
+        // A dedicated `{"type":"permission-mode","permissionMode":"..."}`
+        // event line (verified against a real transcript,
+        // tests/fixtures/claude-real-session.jsonl) is claude's own record
+        // of a mode change -- tracked as running state so every later
+        // tool_use is stamped with the mode actually in force at that
+        // point, not a fixed value guessed once for the whole file.
+        if v.get("type").and_then(Value::as_str) == Some("permission-mode") {
+            if let Some(mode) = v.get("permissionMode").and_then(Value::as_str) {
+                current_permission_mode = mode.to_string();
+            }
+            continue;
+        }
+        // Some entries also carry `permissionMode` directly (a `user` line
+        // in the real fixture does); as good a signal as the dedicated
+        // event line, so it updates the same running value.
+        if let Some(mode) = v.get("permissionMode").and_then(Value::as_str) {
+            current_permission_mode = mode.to_string();
+        }
+        let is_sidechain = v
+            .get("isSidechain")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let timestamp = v
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .and_then(super::window::parse_iso8601_utc);
+
         let Some(content) = v.pointer("/message/content").and_then(Value::as_array) else {
             continue;
         };
@@ -635,42 +828,147 @@ pub fn extract_claude_requests(text: &str, session: &str) -> Vec<PermissionReque
                                 .and_then(Value::as_str)
                                 .map(str::to_string)
                         });
-                    uses.insert(id.to_string(), ClaudeToolUse { name, command });
+                    let dangerously_disable_sandbox = entry
+                        .pointer("/input/dangerouslyDisableSandbox")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    uses.insert(
+                        id.to_string(),
+                        ClaudeToolUse {
+                            name,
+                            command,
+                            dangerously_disable_sandbox,
+                            permission_mode: current_permission_mode.clone(),
+                            is_sidechain,
+                            timestamp,
+                        },
+                    );
                 }
                 Some("tool_result") => {
-                    if entry.get("is_error").and_then(Value::as_bool) != Some(true) {
+                    let Some(tool_use_id) = entry.get("tool_use_id").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    let is_error = entry.get("is_error").and_then(Value::as_bool) == Some(true);
+                    results.insert(tool_use_id.to_string(), is_error);
+                    if !is_error {
                         continue;
                     }
                     let text_val = tool_result_text(entry);
                     if !text_val.contains("Permission to use") {
                         continue;
                     }
-                    let Some(tool_use_id) = entry.get("tool_use_id").and_then(Value::as_str) else {
-                        continue;
-                    };
                     let Some(used) = uses.get(tool_use_id) else {
                         continue;
                     };
                     let raw = used.command.clone().unwrap_or_else(|| used.name.clone());
-                    let is_bash = used.name.eq_ignore_ascii_case("Bash");
+                    // The safety hook is registered for Bash/PowerShell
+                    // only (`claude::launch_settings_value`'s own
+                    // `"matcher": "Bash|PowerShell"`) -- any other tool's
+                    // denial can never have zirv's hook as its cause.
+                    let is_bash = used.name.eq_ignore_ascii_case("Bash")
+                        || used.name.eq_ignore_ascii_case("PowerShell");
                     let family = if is_bash {
                         family_of(&raw)
                     } else {
                         used.name.clone()
                     };
+                    let cause = if !is_bash {
+                        "native denial (tool outside zirv's safety-hook scope: Bash/PowerShell \
+                         only)"
+                            .to_string()
+                    } else {
+                        match correlate_safety_decision(log_records, session, &raw, used.timestamp)
+                        {
+                            Some(record) if record.verdict == "deny" => {
+                                match record.matched_pattern.as_deref() {
+                                    Some("<sandbox: unsandboxed retry>") => {
+                                        "headless dontAsk denial (sandbox-escape retry not \
+                                         escape_allow-cleared)"
+                                            .to_string()
+                                    }
+                                    Some(pattern) => {
+                                        format!(
+                                            "headless dontAsk denial (zirv safety hook: {pattern})"
+                                        )
+                                    }
+                                    None => {
+                                        "headless dontAsk denial (zirv safety hook)".to_string()
+                                    }
+                                }
+                            }
+                            // A correlation exists but was not itself a
+                            // `deny` -- the log and the transcript disagree
+                            // (a config change mid-session, or a coarser
+                            // time-window collision); report the mismatch
+                            // rather than asserting a cause the evidence
+                            // does not support.
+                            Some(_) => "headless dontAsk denial (safety-decision log \
+                                         correlated but its own verdict was not `deny` -- see \
+                                         the raw log)"
+                                .to_string(),
+                            // No log evidence at all (older run, pruned
+                            // log, missing state dir): the pre-#147
+                            // fallback wording, unchanged.
+                            None => "permission-mode dontAsk denial".to_string(),
+                        }
+                    };
                     out.push(PermissionRequest {
                         session: session.to_string(),
                         raw,
                         family,
-                        cause: "permission-mode dontAsk denial".to_string(),
+                        cause,
                         result: "denied".to_string(),
                         reusable: !is_bash
                             || is_reusable(&used.command.clone().unwrap_or_default()),
+                        permission_mode: used.permission_mode.clone(),
+                        is_sidechain: used.is_sidechain,
                     });
                 }
                 _ => {}
             }
         }
+    }
+
+    // Second pass (issue #147, design decision 5): every Bash/PowerShell
+    // sandbox-escape retry, regardless of whether it ever produced an
+    // errored tool_result -- an ask that was ACCEPTED never does, which is
+    // exactly what made this whole class invisible before. Iterated over
+    // `uses` directly (not the transcript a second time) since every
+    // tool_use this session ever recorded is already collected there.
+    for (id, used) in &uses {
+        if !used.dangerously_disable_sandbox {
+            continue;
+        }
+        let Some(raw) = &used.command else { continue };
+        let Some(record) = correlate_safety_decision(log_records, session, raw, used.timestamp)
+        else {
+            continue;
+        };
+        // `deny` is already reported above (it always produces the errored
+        // "Permission to use" tool_result); a silent `allow` (the gh
+        // carve-out or an `escape_allow` match) generated no friction at
+        // all and is not itself a request needing attention. Only `ask` is
+        // new territory here.
+        if record.verdict != "ask"
+            || record.matched_pattern.as_deref() != Some("<sandbox: unsandboxed retry>")
+        {
+            continue;
+        }
+        let result = match results.get(id) {
+            Some(false) => "escalated-accepted",
+            Some(true) => "escalated-denied",
+            None => "escalated-pending",
+        };
+        out.push(PermissionRequest {
+            session: session.to_string(),
+            raw: raw.clone(),
+            family: family_of(raw),
+            cause: "interactive sandbox-escape ask".to_string(),
+            result: result.to_string(),
+            reusable: is_reusable(raw),
+            permission_mode: used.permission_mode.clone(),
+            is_sidechain: used.is_sidechain,
+        });
     }
     out
 }
@@ -720,6 +1018,22 @@ pub(crate) fn group_requests(requests: &[PermissionRequest]) -> Vec<FamilyGroup>
 /// Runs the extractor for `agent` over every transcript file in `files`,
 /// tagging each request with its file stem as the session id.
 pub fn audit_report(agent: AuditAgent, files: &[PathBuf]) -> AuditReport {
+    // Issue #147: read once per call, not once per transcript file --
+    // `extract_claude_requests` takes the slice rather than reading it
+    // itself, keeping that function a pure fold over its two inputs. A
+    // resolution failure (no state dir, e.g. `ZIRV_CTX_STATE_DIR` unset on
+    // a machine with no platform state dir) degrades to an empty slice:
+    // every claude request then falls back to its pre-#147 cause wording,
+    // exactly the graceful-degradation contract `correlate_safety_decision`
+    // callers already rely on.
+    let log_records: Vec<SafetyDecisionRecord> = if matches!(agent, AuditAgent::Claude) {
+        super::state::StateDir::resolve(&super::config::env_from_process())
+            .map(|state| log::read_safety_decisions(&state))
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
     let mut requests = Vec::new();
     let mut scanned = 0usize;
     for path in files {
@@ -734,7 +1048,7 @@ pub fn audit_report(agent: AuditAgent, files: &[PathBuf]) -> AuditReport {
             .to_string();
         let mut found = match agent {
             AuditAgent::Codex => extract_codex_requests(&text, &session),
-            AuditAgent::Claude => extract_claude_requests(&text, &session),
+            AuditAgent::Claude => extract_claude_requests(&text, &session, &log_records),
         };
         requests.append(&mut found);
     }
@@ -743,10 +1057,15 @@ pub fn audit_report(agent: AuditAgent, files: &[PathBuf]) -> AuditReport {
         sessions_scanned: scanned,
         total_requests: requests.len(),
         groups: group_requests(&requests),
+        requests,
     }
 }
 
-pub fn render_report(report: &AuditReport) -> String {
+/// `native_rules` is issue #147, design decision 7's conflict source
+/// (`read_native_claude_rules`) -- empty for codex (no native-settings
+/// analogue) and for every pre-#147 call site, so passing `&[]` reproduces
+/// the exact old output byte for byte.
+pub fn render_report(report: &AuditReport, native_rules: &[(String, &'static str)]) -> String {
     let mut out = String::new();
     out.push_str(&format!(
         "# Permission audit -- {} ({} sessions scanned, {} requests)\n\n",
@@ -769,7 +1088,14 @@ pub fn render_report(report: &AuditReport) -> String {
         ));
         out.push_str(&format!("- cause: {}\n", group.cause));
         out.push_str(&format!("- sample: `{}`\n", group.sample));
-        out.push_str(&format!("- recommendation: {}\n\n", group.recommendation));
+        out.push_str(&format!("- recommendation: {}\n", group.recommendation));
+        if let Some(conflict) = native_conflict(native_rules, &group.sample) {
+            out.push_str(&format!(
+                "- WARNING: your own native claude rule {conflict} would still block or \
+                 prompt on this family -- the recommendation above alone does not fix it\n"
+            ));
+        }
+        out.push('\n');
     }
     out
 }
@@ -822,6 +1148,15 @@ pub struct CompileArgs {
     /// `~/.zirv/ctx.toml`.
     #[arg(long, default_value_t = false)]
     pub dry_run: bool,
+    /// Issue #147, `--agent claude` only: without this flag, repeated
+    /// eligible sandbox-escape-ask families are PRINTED as a recommendation
+    /// only. With it, they are additionally written to `[safety]
+    /// escape_allow` in `~/.zirv/ctx.toml` -- the operator-only home layer,
+    /// exactly like the ordinary `[safety] allow` compile above it. No
+    /// effect for `--agent codex`, which has no sandbox-escape-retry
+    /// concept.
+    #[arg(long, default_value_t = false)]
+    pub escape: bool,
 }
 
 fn transcripts_root(agent: AuditAgent) -> Option<PathBuf> {
@@ -832,6 +1167,24 @@ fn transcripts_root(agent: AuditAgent) -> Option<PathBuf> {
         AuditAgent::Claude => super::window::projects_root().ok(),
     }
 }
+
+/// Codex has no per-command permission-hook contract zirv can pin the way
+/// claude's `PreToolUse` hook is (`safety.rs`'s own doc comment): a codex
+/// launch never consults `[safety]` at all (`CodexAdapter::default_sandbox_
+/// args`'s own `let _ = (sandbox, safety);`, and `policy_args` reads only
+/// `[policy]`, never `[safety]`). So while `permissions compile` still
+/// writes real `[safety] allow` entries for a codex audit -- they are the
+/// honest record of what a codex session actually asked for, and claude
+/// reads them -- those entries change nothing about how *codex itself*
+/// launches. Printed on every codex `audit`/`compile` run (including the
+/// default `--agent codex`, `AuditArgs`/`CompileArgs`'s own `default_value`)
+/// so an operator does not read "compiled" as "codex now enforces this".
+/// Upstream `exec_permission_approvals`/`request_permissions_tool` (a
+/// per-command hook codex itself would consult) are still in development,
+/// not yet something this codebase can pin against.
+const CODEX_SAFETY_NO_OP_CAVEAT: &str = "caveat: compiled [safety] allow entries do not change codex's own launch posture -- \
+     codex has no per-command approval hook zirv can pin (upstream exec_permission_approvals \
+     / request_permissions_tool are still in development)";
 
 pub fn run_audit<W: Write>(args: &AuditArgs, w: &mut W) -> CtxResult<i32> {
     let files = transcripts_root(args.agent)
@@ -845,7 +1198,21 @@ pub fn run_audit<W: Write>(args: &AuditArgs, w: &mut W) -> CtxResult<i32> {
             serde_json::to_string_pretty(&report).unwrap_or_default()
         )?;
     } else {
-        write!(w, "{}", render_report(&report))?;
+        if args.agent == AuditAgent::Codex {
+            writeln!(w, "{CODEX_SAFETY_NO_OP_CAVEAT}")?;
+        }
+        // Issue #147, design decision 7: claude only -- codex has no native
+        // settings.json permission-rule analogue for this to conflict with.
+        let native_rules = if matches!(args.agent, AuditAgent::Claude) {
+            crate::utils::home_dir()
+                .map(|home| {
+                    read_native_claude_rules(&home, std::env::current_dir().ok().as_deref())
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        write!(w, "{}", render_report(&report, &native_rules))?;
     }
     Ok(0)
 }
@@ -905,6 +1272,77 @@ fn compile_eligibility(groups: &[FamilyGroup]) -> (Vec<String>, Vec<String>, Vec
     (eligible_patterns, skipped_protected, skipped_too_generic)
 }
 
+/// Issue #147, design decision 6: the `--escape` eligibility fold, over the
+/// AUDIT'S OWN `requests` (not `groups` -- a `FamilyGroup` folds away which
+/// members were the sandbox-escape-ask ones at all, which is exactly the
+/// filter this needs first). Eligibility: (1) the family has at least two
+/// tokens ([`is_family_too_generic`], reused unchanged); (2) the family is
+/// not protected ([`is_protected_family`]/`group.protected`, reused
+/// unchanged -- git/publish/credential/install gating); (3) EVERY observed
+/// command in the family clears `safety::command_fails_escape_screen`
+/// (credential paths, `.env` access, an unbounded root-wide `find`, and
+/// every ordinary built-in/operator `deny` verdict -- rm -rf included) --
+/// reusing that one combinator rather than re-declaring any of those
+/// patterns here. `codex` has no sandbox-escape-retry concept, so a codex
+/// report's `requests` carries no `"interactive sandbox-escape ask"` cause
+/// and this always returns three empty lists for it.
+/// The sandbox-escape-ask subset of `requests`, grouped -- shared by
+/// `escape_eligibility` (which family earns compiling) and `run_compile`
+/// (which needs each eligible family's own `.sample` for the design
+/// decision 7 native-conflict check), so "which requests count as a
+/// sandbox-escape ask" is declared exactly once.
+fn escape_ask_groups(requests: &[PermissionRequest]) -> Vec<FamilyGroup> {
+    let escape_requests: Vec<PermissionRequest> = requests
+        .iter()
+        .filter(|r| r.cause == "interactive sandbox-escape ask")
+        .cloned()
+        .collect();
+    group_requests(&escape_requests)
+}
+
+fn escape_eligibility(requests: &[PermissionRequest]) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let escape_requests: Vec<&PermissionRequest> = requests
+        .iter()
+        .filter(|r| r.cause == "interactive sandbox-escape ask")
+        .collect();
+    let groups = escape_ask_groups(requests);
+
+    let mut eligible_patterns: Vec<String> = Vec::new();
+    let mut skipped_protected: Vec<String> = Vec::new();
+    let mut skipped_too_generic: Vec<String> = Vec::new();
+    for group in &groups {
+        if is_family_too_generic(&group.family) {
+            skipped_too_generic.push(group.family.clone());
+            continue;
+        }
+        if group.protected || is_protected_family(&group.family, &group.sample) {
+            skipped_protected.push(group.family.clone());
+            continue;
+        }
+        let fails_screen = escape_requests
+            .iter()
+            .filter(|r| r.family == group.family)
+            .any(|r| command_fails_escape_screen(&r.raw));
+        if fails_screen {
+            skipped_protected.push(format!(
+                "{} (an observed invocation fails the credential/root-scan/deny screen)",
+                group.family
+            ));
+            continue;
+        }
+        eligible_patterns.push(format!("{} *", group.family));
+    }
+    (eligible_patterns, skipped_protected, skipped_too_generic)
+}
+
+/// The family a compiled pattern (`"<family> *"`) was derived from -- the
+/// inverse of `compile_eligibility`/`escape_eligibility`'s own
+/// `format!("{family} *")`, used only to look a pattern's sample command
+/// back up for the design decision 7 native-conflict check.
+fn family_of_pattern(pattern: &str) -> &str {
+    pattern.strip_suffix(" *").unwrap_or(pattern)
+}
+
 /// Issue #132's residual: "compile operator-owned managed policy into
 /// reusable approvals". Runs the identical audit pipeline `run_audit` does,
 /// then writes every ELIGIBLE family (`compile_eligibility`: not too
@@ -936,6 +1374,10 @@ pub fn run_compile<W: Write>(args: &CompileArgs, w: &mut W) -> CtxResult<i32> {
     let (eligible_patterns, skipped_protected, skipped_too_generic) =
         compile_eligibility(&report.groups);
 
+    if args.agent == AuditAgent::Codex {
+        writeln!(w, "{CODEX_SAFETY_NO_OP_CAVEAT}")?;
+    }
+
     let home = crate::utils::home_dir()?;
     let existing = crate::commands::setup::read_home_safety_allow(&home).unwrap_or_default();
     let (added, duplicates) =
@@ -950,53 +1392,134 @@ pub fn run_compile<W: Write>(args: &CompileArgs, w: &mut W) -> CtxResult<i32> {
         )?;
     }
 
+    // Issue #147, design decision 7: claude only -- codex has no native
+    // settings.json permission-rule analogue for this to conflict with.
+    let native_rules = if matches!(args.agent, AuditAgent::Claude) {
+        read_native_claude_rules(&home, std::env::current_dir().ok().as_deref())
+    } else {
+        Vec::new()
+    };
+    let sample_of: HashMap<String, String> = report
+        .groups
+        .iter()
+        .map(|g| (g.family.clone(), g.sample.clone()))
+        .collect();
+
     write_compile_summary(
         w,
-        args.dry_run,
-        &added,
-        &skipped_protected,
-        &skipped_too_generic,
-        &duplicates,
+        &CompileSummary {
+            dry_run: args.dry_run,
+            added: &added,
+            skipped_protected: &skipped_protected,
+            skipped_too_generic: &skipped_too_generic,
+            duplicates: &duplicates,
+            native_rules: &native_rules,
+            sample_of: &sample_of,
+        },
     )?;
+
+    // Issue #147, design decision 6: claude only -- codex has no
+    // sandbox-escape-retry concept, so `escape_eligibility` always returns
+    // three empty lists for it and this section would be a no-op anyway;
+    // skipped outright rather than printing an empty section every time.
+    if matches!(args.agent, AuditAgent::Claude) {
+        let (escape_eligible, escape_skipped_protected, escape_skipped_too_generic) =
+            escape_eligibility(&report.requests);
+        let escape_existing =
+            crate::commands::setup::read_home_safety_escape_allow(&home).unwrap_or_default();
+        let (escape_added, escape_duplicates) =
+            crate::commands::setup::union_allow_patterns(&escape_existing, &escape_eligible);
+
+        if args.escape && !args.dry_run && !escape_added.is_empty() {
+            crate::commands::setup::union_home_safety_escape_allow(&home, &escape_eligible)?;
+            writeln!(
+                w,
+                "note: rewriting ~/.zirv/ctx.toml loses any comments currently in the file \
+                 (existing values are preserved); the pre-write file was copied to ctx.toml.bak"
+            )?;
+        }
+
+        let escape_sample_of: HashMap<String, String> = escape_ask_groups(&report.requests)
+            .iter()
+            .map(|g| (g.family.clone(), g.sample.clone()))
+            .collect();
+
+        write_escape_compile_summary(
+            w,
+            args.escape,
+            &CompileSummary {
+                dry_run: args.dry_run,
+                added: &escape_added,
+                skipped_protected: &escape_skipped_protected,
+                skipped_too_generic: &escape_skipped_too_generic,
+                duplicates: &escape_duplicates,
+                native_rules: &native_rules,
+                sample_of: &escape_sample_of,
+            },
+        )?;
+    }
     Ok(0)
 }
 
-fn write_compile_summary<W: Write>(
-    w: &mut W,
+/// Issue #147, design decision 7's addition to both compile-summary
+/// writers below: `native_rules`/`sample_of` let an `added`/`duplicates`
+/// pattern be checked against the operator's own native claude rules and
+/// annotated rather than silently presented as fixed (`sample_of` maps a
+/// family -- not the full `"<family> *"` pattern -- to its representative
+/// command). Bundled into one struct purely to keep both functions under
+/// clippy's argument-count lint; both `native_rules`/`sample_of` are empty
+/// for codex (and for every pre-#147 caller), reproducing old output
+/// exactly.
+struct CompileSummary<'a> {
     dry_run: bool,
-    added: &[String],
-    skipped_protected: &[String],
-    skipped_too_generic: &[String],
-    duplicates: &[String],
-) -> CtxResult<()> {
+    added: &'a [String],
+    skipped_protected: &'a [String],
+    skipped_too_generic: &'a [String],
+    duplicates: &'a [String],
+    native_rules: &'a [(String, &'static str)],
+    sample_of: &'a HashMap<String, String>,
+}
+
+fn write_compile_summary<W: Write>(w: &mut W, summary: &CompileSummary<'_>) -> CtxResult<()> {
     writeln!(
         w,
         "# Permission compile{}\n",
-        if dry_run { " (dry run)" } else { "" }
+        if summary.dry_run { " (dry run)" } else { "" }
     )?;
-    if added.is_empty() {
+    if summary.added.is_empty() {
         writeln!(w, "added: (none)")?;
     } else {
         writeln!(w, "added:")?;
-        for pattern in added {
+        for pattern in summary.added {
             writeln!(w, "  - {pattern}")?;
+            let sample = summary
+                .sample_of
+                .get(family_of_pattern(pattern))
+                .map(String::as_str);
+            if let Some(conflict) = sample.and_then(|s| native_conflict(summary.native_rules, s)) {
+                writeln!(
+                    w,
+                    "    WARNING: your own native claude rule {conflict} would still block or \
+                     prompt on this family -- not actually fixed by this addition alone"
+                )?;
+            }
         }
     }
-    if !skipped_protected.is_empty() {
+    if !summary.skipped_protected.is_empty() {
         writeln!(w, "skipped (protected):")?;
-        for family in skipped_protected {
+        for family in summary.skipped_protected {
             writeln!(w, "  - {family}")?;
         }
     }
-    if !skipped_too_generic.is_empty() {
+    if !summary.skipped_too_generic.is_empty() {
         writeln!(w, "skipped (too generic):")?;
-        for family in skipped_too_generic {
+        for family in summary.skipped_too_generic {
             writeln!(w, "  - {family} -- {TOO_GENERIC_REASON}")?;
         }
     }
-    if !duplicates.is_empty() {
+    if !summary.duplicates.is_empty() {
         writeln!(w, "skipped (duplicate, already in [safety] allow):")?;
-        for pattern in duplicates {
+        for pattern in summary.duplicates {
             writeln!(w, "  - {pattern}")?;
         }
     }
@@ -1005,6 +1528,72 @@ fn write_compile_summary<W: Write>(
         "\ntakes effect for new sessions; running sessions will show 'policy snapshot stale' \
          in `zirv ctx status` until relaunched"
     )?;
+    Ok(())
+}
+
+/// Issue #147, design decision 6: the `--escape` section, printed
+/// additionally (never instead of `write_compile_summary` above) whenever
+/// `--agent claude` is compiled. Without `--escape`, `summary.added` is
+/// always empty (nothing was written) and every eligible pattern still
+/// appears under `would_add`, so the operator sees exactly what `--escape`
+/// would do before opting in.
+fn write_escape_compile_summary<W: Write>(
+    w: &mut W,
+    escape: bool,
+    summary: &CompileSummary<'_>,
+) -> CtxResult<()> {
+    writeln!(
+        w,
+        "\n# Sandbox-escape compile{}\n",
+        if !escape {
+            " (preview only -- pass --escape to write to [safety] escape_allow)"
+        } else if summary.dry_run {
+            " (dry run)"
+        } else {
+            ""
+        }
+    )?;
+    let heading = if escape { "added" } else { "would_add" };
+    if summary.added.is_empty() {
+        writeln!(w, "{heading}: (none)")?;
+    } else {
+        writeln!(w, "{heading}:")?;
+        for pattern in summary.added {
+            writeln!(w, "  - {pattern}")?;
+            let sample = summary
+                .sample_of
+                .get(family_of_pattern(pattern))
+                .map(String::as_str);
+            if let Some(conflict) = sample.and_then(|s| native_conflict(summary.native_rules, s)) {
+                writeln!(
+                    w,
+                    "    WARNING: your own native claude rule {conflict} would still block or \
+                     prompt on this family -- not actually fixed by this addition alone"
+                )?;
+            }
+        }
+    }
+    if !summary.skipped_protected.is_empty() {
+        writeln!(
+            w,
+            "skipped (protected or fails the deny/credential/root-scan screen):"
+        )?;
+        for family in summary.skipped_protected {
+            writeln!(w, "  - {family}")?;
+        }
+    }
+    if !summary.skipped_too_generic.is_empty() {
+        writeln!(w, "skipped (too generic):")?;
+        for family in summary.skipped_too_generic {
+            writeln!(w, "  - {family} -- {TOO_GENERIC_REASON}")?;
+        }
+    }
+    if !summary.duplicates.is_empty() {
+        writeln!(w, "skipped (duplicate, already in [safety] escape_allow):")?;
+        for pattern in summary.duplicates {
+            writeln!(w, "  - {pattern}")?;
+        }
+    }
     Ok(())
 }
 
@@ -1216,7 +1805,7 @@ mod tests {
     #[test]
     fn claude_correlates_a_denial_with_its_tool_use_by_id() {
         let text = claude_denial_pair("toolu_1", "Bash", Some("zirv ctx status"));
-        let requests = extract_claude_requests(&text, "session-b");
+        let requests = extract_claude_requests(&text, "session-b", &[]);
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].family, "zirv ctx status");
         assert_eq!(requests[0].result, "denied");
@@ -1233,7 +1822,7 @@ mod tests {
         })
         .to_string();
         let text = format!("{use_line}\n{ok_result}");
-        assert!(extract_claude_requests(&text, "s").is_empty());
+        assert!(extract_claude_requests(&text, "s", &[]).is_empty());
     }
 
     #[test]
@@ -1245,19 +1834,261 @@ mod tests {
             "message": {"content": [{"type": "tool_result", "tool_use_id": "t1", "is_error": true, "content": [{"type": "text", "text": "command exited 1"}]}]}
         }).to_string();
         let text = format!("{use_line}\n{err_result}");
-        assert!(extract_claude_requests(&text, "s").is_empty());
+        assert!(extract_claude_requests(&text, "s", &[]).is_empty());
     }
 
     #[test]
     fn claude_non_bash_tools_report_the_tool_name_as_family() {
         let text = claude_denial_pair("toolu_2", "Read", None);
-        let requests = extract_claude_requests(&text, "s");
+        let requests = extract_claude_requests(&text, "s", &[]);
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].family, "Read");
         // Non-Bash denials have no command-shaped payload to judge for
         // reusability, so they default to reusable (the whole TOOL, not one
         // invocation of it, is what a policy change would grant).
         assert!(requests[0].reusable);
+    }
+
+    // -------------------------------------------------------------
+    // Issue #147, design decision 5: safety-decision log correlation
+    // -------------------------------------------------------------
+
+    fn safety_decision_record(
+        session: &str,
+        command: &str,
+        verdict: &str,
+        matched_pattern: Option<&str>,
+        ts: u64,
+    ) -> SafetyDecisionRecord {
+        SafetyDecisionRecord {
+            ts,
+            session: session.to_string(),
+            mode: "interactive".to_string(),
+            verdict: verdict.to_string(),
+            command_sha256: sha256_hex(command.trim().as_bytes()),
+            matched_pattern: matched_pattern.map(str::to_string),
+        }
+    }
+
+    /// A dangerously-disable-sandbox retry with a timestamp, so
+    /// `correlate_safety_decision` has something to join against.
+    fn sandbox_escape_tool_use(
+        id: &str,
+        command: &str,
+        timestamp: &str,
+        permission_mode: Option<&str>,
+        is_sidechain: bool,
+    ) -> String {
+        serde_json::json!({
+            "type": "assistant",
+            "timestamp": timestamp,
+            "isSidechain": is_sidechain,
+            "permissionMode": permission_mode,
+            "message": {
+                "content": [{
+                    "type": "tool_use",
+                    "id": id,
+                    "name": "Bash",
+                    "input": {"command": command, "dangerouslyDisableSandbox": true}
+                }]
+            }
+        })
+        .to_string()
+    }
+
+    fn tool_result_line(id: &str, is_error: bool, text: &str) -> String {
+        let mut content = serde_json::json!({"tool_use_id": id, "type": "tool_result"});
+        if is_error {
+            content["is_error"] = serde_json::json!(true);
+        }
+        content["content"] = serde_json::json!([{"type": "text", "text": text}]);
+        serde_json::json!({"message": {"content": [content]}}).to_string()
+    }
+
+    /// Correlated headless deny: the errored "Permission to use" tool_result
+    /// still gets reported (unchanged), but the cause now names the actual
+    /// hook reason instead of the generic pre-#147 wording.
+    #[test]
+    fn a_headless_sandbox_escape_denial_correlates_to_the_hooks_own_matched_pattern() {
+        let command = "some-unknown-tool --flag";
+        let use_line = sandbox_escape_tool_use(
+            "t1",
+            command,
+            "2026-08-26T10:00:00.000Z",
+            Some("dontAsk"),
+            false,
+        );
+        let result_line = tool_result_line(
+            "t1",
+            true,
+            "Permission to use Bash has been denied because Claude Code is running in don't ask mode.",
+        );
+        let text = format!("{use_line}\n{result_line}");
+        let records = vec![safety_decision_record(
+            "s",
+            command,
+            "deny",
+            Some("<sandbox: unsandboxed retry>"),
+            1_787_738_400, // 2026-08-26T10:00:00Z in unix seconds
+        )];
+        let requests = extract_claude_requests(&text, "s", &records);
+        assert_eq!(requests.len(), 1, "{requests:#?}");
+        assert!(
+            requests[0]
+                .cause
+                .contains("sandbox-escape retry not escape_allow-cleared"),
+            "{:?}",
+            requests[0]
+        );
+        assert_eq!(requests[0].permission_mode, "dontAsk");
+    }
+
+    /// Design decision 5's headline gap: an interactive ask that was
+    /// ACCEPTED never produces an errored tool_result, so the pre-#147
+    /// extractor missed it entirely. The successful tool_result plus the
+    /// log's own `ask` verdict is what makes it visible now.
+    #[test]
+    fn an_accepted_interactive_sandbox_escape_ask_is_now_reported() {
+        let command = "grep -r TODO /some/dir";
+        let use_line = sandbox_escape_tool_use(
+            "t1",
+            command,
+            "2026-08-26T10:00:00.000Z",
+            Some("default"),
+            false,
+        );
+        let ok_result = tool_result_line("t1", false, "TODO: fix this");
+        let text = format!("{use_line}\n{ok_result}");
+        let records = vec![safety_decision_record(
+            "s",
+            command,
+            "ask",
+            Some("<sandbox: unsandboxed retry>"),
+            1_787_738_400,
+        )];
+        let requests = extract_claude_requests(&text, "s", &records);
+        assert_eq!(requests.len(), 1, "{requests:#?}");
+        assert_eq!(requests[0].cause, "interactive sandbox-escape ask");
+        assert_eq!(requests[0].result, "escalated-accepted");
+        assert_eq!(requests[0].permission_mode, "default");
+    }
+
+    /// The same ask, but the session ended (or the model moved on) before
+    /// any tool_result ever arrived for it -- reported as pending, not
+    /// silently dropped.
+    #[test]
+    fn a_pending_interactive_sandbox_escape_ask_with_no_tool_result_is_reported() {
+        let command = "cat /some/log";
+        let use_line = sandbox_escape_tool_use(
+            "t1",
+            command,
+            "2026-08-26T10:00:00.000Z",
+            Some("default"),
+            false,
+        );
+        let records = vec![safety_decision_record(
+            "s",
+            command,
+            "ask",
+            Some("<sandbox: unsandboxed retry>"),
+            1_787_738_400,
+        )];
+        let requests = extract_claude_requests(&use_line, "s", &records);
+        assert_eq!(requests.len(), 1, "{requests:#?}");
+        assert_eq!(requests[0].result, "escalated-pending");
+    }
+
+    /// A silent escape allow (built-in or `[safety] escape_allow`) is not
+    /// friction an operator needs to see -- it must never surface as a
+    /// request at all.
+    #[test]
+    fn a_silently_allowed_sandbox_escape_produces_no_request() {
+        let command = "grep -r TODO /some/dir";
+        let use_line = sandbox_escape_tool_use(
+            "t1",
+            command,
+            "2026-08-26T10:00:00.000Z",
+            Some("default"),
+            false,
+        );
+        let ok_result = tool_result_line("t1", false, "TODO: fix this");
+        let text = format!("{use_line}\n{ok_result}");
+        let records = vec![safety_decision_record(
+            "s",
+            command,
+            "allow",
+            Some("<sandbox: escape_allow>"),
+            1_787_738_400,
+        )];
+        assert!(extract_claude_requests(&text, "s", &records).is_empty());
+    }
+
+    /// Outside `CORRELATION_WINDOW_SECS`, a same-hash log entry must be
+    /// treated as no match at all -- the pre-#147 fallback wording, not a
+    /// wrong-invocation correlation.
+    #[test]
+    fn a_correlation_outside_the_time_window_falls_back_to_the_generic_cause() {
+        let command = "some-unknown-tool --flag";
+        let use_line = sandbox_escape_tool_use(
+            "t1",
+            command,
+            "2026-08-26T10:00:00.000Z",
+            Some("dontAsk"),
+            false,
+        );
+        let result_line = tool_result_line(
+            "t1",
+            true,
+            "Permission to use Bash has been denied because Claude Code is running in don't ask mode.",
+        );
+        let text = format!("{use_line}\n{result_line}");
+        let records = vec![safety_decision_record(
+            "s",
+            command,
+            "deny",
+            Some("<sandbox: unsandboxed retry>"),
+            1_787_738_400 - 10_000, // far outside the window
+        )];
+        let requests = extract_claude_requests(&text, "s", &records);
+        assert_eq!(requests.len(), 1, "{requests:#?}");
+        assert_eq!(requests[0].cause, "permission-mode dontAsk denial");
+    }
+
+    /// `isSidechain`/`permission-mode` event lines are real, verified
+    /// transcript shapes (tests/fixtures/claude-real-session.jsonl) --
+    /// this pins that both are threaded onto the reported request.
+    #[test]
+    fn permission_mode_and_sidechain_are_read_from_the_transcript() {
+        let mode_line = serde_json::json!({
+            "type": "permission-mode",
+            "permissionMode": "dontAsk",
+            "sessionId": "s"
+        })
+        .to_string();
+        let use_line = serde_json::json!({
+            "type": "assistant",
+            "isSidechain": true,
+            "message": {
+                "content": [{"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "zirv ctx status"}}]
+            }
+        })
+        .to_string();
+        let result_line = serde_json::json!({
+            "message": {
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "t1",
+                    "is_error": true,
+                    "content": [{"type": "text", "text": "Permission to use Bash has been denied because Claude Code is running in don't ask mode."}]
+                }]
+            }
+        })
+        .to_string();
+        let text = format!("{mode_line}\n{use_line}\n{result_line}");
+        let requests = extract_claude_requests(&text, "s", &[]);
+        assert_eq!(requests.len(), 1, "{requests:#?}");
+        assert_eq!(requests[0].permission_mode, "dontAsk");
+        assert!(requests[0].is_sidechain);
     }
 
     // -------------------------------------------------------------
@@ -1274,6 +2105,8 @@ mod tests {
                 cause: "c".into(),
                 result: "escalated".into(),
                 reusable: true,
+                permission_mode: String::new(),
+                is_sidechain: false,
             },
             PermissionRequest {
                 session: "s".into(),
@@ -1282,6 +2115,8 @@ mod tests {
                 cause: "c".into(),
                 result: "escalated".into(),
                 reusable: true,
+                permission_mode: String::new(),
+                is_sidechain: false,
             },
             PermissionRequest {
                 session: "s".into(),
@@ -1290,6 +2125,8 @@ mod tests {
                 cause: "c".into(),
                 result: "escalated".into(),
                 reusable: false,
+                permission_mode: String::new(),
+                is_sidechain: false,
             },
         ];
         let groups = group_requests(&requests);
@@ -1316,8 +2153,9 @@ mod tests {
                 recommendation: "Grant 'gh issue' a standing allow".into(),
                 protected: false,
             }],
+            requests: Vec::new(),
         };
-        let text = render_report(&report);
+        let text = render_report(&report, &[]);
         assert!(text.contains("gh issue"));
         assert!(text.contains("reusable"));
         assert!(text.contains("Grant 'gh issue'"));
@@ -1330,8 +2168,9 @@ mod tests {
             sessions_scanned: 3,
             total_requests: 0,
             groups: vec![],
+            requests: Vec::new(),
         };
-        assert!(render_report(&report).contains("No escalated or denied"));
+        assert!(render_report(&report, &[]).contains("No escalated or denied"));
     }
 
     #[test]
@@ -1460,7 +2299,7 @@ mod tests {
 
     #[test]
     fn claude_fixture_covers_bash_and_non_bash_denials() {
-        let requests = extract_claude_requests(CLAUDE_FIXTURE, "fixture-session");
+        let requests = extract_claude_requests(CLAUDE_FIXTURE, "fixture-session", &[]);
         // 4 permission denials in the fixture: zirv ctx status, the long-body
         // gh issue create, the Read denial, and the force-push. The
         // successful nextest run and the ordinary (non-permission) failure
@@ -1484,7 +2323,7 @@ mod tests {
     /// would otherwise pass unnoticed.
     #[test]
     fn claude_fixture_force_push_stays_protected_despite_being_reusable() {
-        let requests = extract_claude_requests(CLAUDE_FIXTURE, "fixture-session");
+        let requests = extract_claude_requests(CLAUDE_FIXTURE, "fixture-session", &[]);
         let groups = group_requests(&requests);
         let git_push = groups
             .iter()
@@ -1941,6 +2780,69 @@ mod tests {
         .expect("write fixture");
     }
 
+    /// Issue "codex approval hell" (2026-08-26): compiled `[safety] allow`
+    /// entries never change codex's own launch posture (codex has no
+    /// per-command hook zirv can pin), so both audit verbs must say so for a
+    /// codex run -- including via the default agent -- and must not print
+    /// the same caveat for a claude run, where the compiled entries DO
+    /// change what the `PreToolUse` hook allows.
+    #[test]
+    fn run_audit_prints_the_codex_safety_no_op_caveat_only_for_codex() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        write_codex_rollout_fixture(home.path(), "gh issue create --title x");
+
+        let codex_args = AuditArgs {
+            agent: AuditAgent::Codex,
+            sessions: 5,
+            json: false,
+        };
+        let mut out = Vec::new();
+        run_audit(&codex_args, &mut out).expect("run_audit");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            text.contains(CODEX_SAFETY_NO_OP_CAVEAT),
+            "codex audit must print the no-op caveat: {text}"
+        );
+
+        let claude_args = AuditArgs {
+            agent: AuditAgent::Claude,
+            sessions: 5,
+            json: false,
+        };
+        let mut out = Vec::new();
+        run_audit(&claude_args, &mut out).expect("run_audit");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            !text.contains(CODEX_SAFETY_NO_OP_CAVEAT),
+            "claude audit must not print codex's no-op caveat: {text}"
+        );
+    }
+
+    /// The default `--agent` value is codex (`AuditArgs`/`CompileArgs`'s own
+    /// `default_value = "codex"`), so a caller who never passes `--agent` at
+    /// all must still see the caveat.
+    #[test]
+    fn run_compile_prints_the_codex_safety_no_op_caveat_by_default() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        write_codex_rollout_fixture(home.path(), "gh issue create --title x");
+
+        let args = CompileArgs {
+            agent: AuditAgent::Codex,
+            sessions: 5,
+            dry_run: true,
+            escape: false,
+        };
+        let mut out = Vec::new();
+        run_compile(&args, &mut out).expect("run_compile");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            text.contains(CODEX_SAFETY_NO_OP_CAVEAT),
+            "compile with the default (codex) agent must print the no-op caveat: {text}"
+        );
+    }
+
     #[test]
     fn run_compile_dry_run_writes_nothing_end_to_end() {
         let home = tempfile::tempdir().expect("home");
@@ -1954,6 +2856,7 @@ mod tests {
             agent: AuditAgent::Codex,
             sessions: 5,
             dry_run: true,
+            escape: false,
         };
         let mut out = Vec::new();
         let code = run_compile(&args, &mut out).expect("run_compile");
@@ -1987,6 +2890,7 @@ mod tests {
             agent: AuditAgent::Codex,
             sessions: 5,
             dry_run: false,
+            escape: false,
         };
         let mut out = Vec::new();
         let code = run_compile(&args, &mut out).expect("run_compile");
@@ -2066,6 +2970,7 @@ mod tests {
             sessions_scanned: 1,
             total_requests: requests.len(),
             groups: group_requests(&requests),
+            requests: requests.clone(),
         };
         let (eligible, skipped_protected, _) = compile_eligibility(&report.groups);
         let existing = crate::commands::setup::read_home_safety_allow(home.path()).expect("read");
@@ -2083,5 +2988,375 @@ mod tests {
             vec!["gh issue *".to_string(), "cargo nextest *".to_string()],
             "the seeded entry survives; the new one is appended; git push is never written"
         );
+    }
+
+    // -------------------------------------------------------------
+    // Issue #147, design decision 6: `--escape` compile
+    // -------------------------------------------------------------
+
+    /// Writes a claude transcript recording an accepted sandbox-escape ask
+    /// for `command`/`session`, and the correlating safety-decision log
+    /// entry, under `home` -- the fixture shape
+    /// `run_compile --agent claude --escape` audits end to end.
+    fn write_claude_escape_ask_fixture(session: &str, command: &str, ts: u64) {
+        // Reads whatever `ZIRV_CTX_STATE_DIR` the caller has already set via
+        // `VarGuard` -- must be called after that guard is in scope, so the
+        // log lands exactly where `audit_report`'s own real-env read will
+        // look for it.
+        let state_dir =
+            super::super::state::StateDir::resolve(&super::super::config::env_from_process())
+                .expect("resolve test state dir");
+        log::append_safety(
+            &state_dir,
+            &log::SafetyDecision {
+                ts,
+                session,
+                mode: "interactive",
+                verdict: "ask",
+                command_sha256: &sha256_hex(command.trim().as_bytes()),
+                policy_sha256: "p",
+                launch_policy_sha256: None,
+                attestation: "not-present",
+                matched_pattern: Some("<sandbox: unsandboxed retry>"),
+                origin: Some("built-in"),
+                platform: "linux",
+            },
+        )
+        .expect("append safety decision");
+
+        let home = crate::utils::home_dir().expect("home dir");
+        let projects_dir = home.join(".claude").join("projects").join("repo");
+        std::fs::create_dir_all(&projects_dir).expect("mkdir");
+        let use_line = sandbox_escape_tool_use(
+            "t1",
+            command,
+            "2026-08-26T10:00:00.000Z",
+            Some("default"),
+            false,
+        );
+        let ok_result = tool_result_line("t1", false, "ok");
+        std::fs::write(
+            projects_dir.join(format!("{session}.jsonl")),
+            format!("{use_line}\n{ok_result}\n"),
+        )
+        .expect("write transcript");
+    }
+
+    /// End to end: an accepted, recurring sandbox-escape ask for a
+    /// non-generic, non-protected, screen-clean family is printed as a
+    /// recommendation WITHOUT `--escape`, and actually written to `[safety]
+    /// escape_allow` WITH it.
+    #[test]
+    fn run_compile_escape_previews_without_the_flag_and_writes_with_it() {
+        let command = "zirv ctx status";
+        let session = "escape-session";
+
+        // Preview (--dry-run, no --escape): recommendation printed under
+        // `would_add`, nothing written at all -- isolates the `--escape`
+        // wording/gating from the ordinary `[safety] allow` compile, which
+        // writes independently of `--escape` and would otherwise also pick
+        // up this same reusable, unprotected family.
+        {
+            let home = tempfile::tempdir().expect("home");
+            let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+            let _state_env = crate::commands::ctx::testenv::VarGuard::set(&[(
+                super::super::state::STATE_ENV,
+                Some(home.path().join("state").to_str().expect("utf8 state")),
+            )]);
+            write_claude_escape_ask_fixture(session, command, 1_787_738_400);
+
+            let args = CompileArgs {
+                agent: AuditAgent::Claude,
+                sessions: 5,
+                dry_run: true,
+                escape: false,
+            };
+            let mut out = Vec::new();
+            let code = run_compile(&args, &mut out).expect("run_compile");
+            assert_eq!(code, 0);
+            let text = String::from_utf8(out).expect("utf8");
+            assert!(text.contains("Sandbox-escape compile"), "got {text}");
+            assert!(text.contains("preview only"), "got {text}");
+            assert!(text.contains("would_add"), "got {text}");
+            assert!(text.contains("zirv ctx status *"), "got {text}");
+            assert!(
+                !home.path().join(".zirv/ctx.toml").exists(),
+                "a dry run must not write anything: {text}"
+            );
+        }
+
+        // Real write (--escape): the pattern lands in [safety] escape_allow.
+        {
+            let home = tempfile::tempdir().expect("home");
+            let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+            let _state_env = crate::commands::ctx::testenv::VarGuard::set(&[(
+                super::super::state::STATE_ENV,
+                Some(home.path().join("state").to_str().expect("utf8 state")),
+            )]);
+            write_claude_escape_ask_fixture(session, command, 1_787_738_400);
+
+            let args = CompileArgs {
+                agent: AuditAgent::Claude,
+                sessions: 5,
+                dry_run: false,
+                escape: true,
+            };
+            let mut out = Vec::new();
+            let code = run_compile(&args, &mut out).expect("run_compile");
+            assert_eq!(code, 0);
+            let text = String::from_utf8(out).expect("utf8");
+            assert!(text.contains("added:"), "got {text}");
+            assert!(text.contains("zirv ctx status *"), "got {text}");
+
+            let escape_allow =
+                crate::commands::setup::read_home_safety_escape_allow(home.path()).expect("read");
+            assert_eq!(escape_allow, vec!["zirv ctx status *".to_string()]);
+            // The ordinary `[safety] allow` compile runs independently of
+            // `--escape` (unaffected by it either way) and picks up this
+            // same reusable, unprotected family on its own -- both keys end
+            // up populated, from two separate write paths.
+            let allow = crate::commands::setup::read_home_safety_allow(home.path()).expect("read");
+            assert_eq!(allow, vec!["zirv ctx status *".to_string()]);
+        }
+    }
+
+    /// Design decision 6's eligibility gate: a single-token family (no
+    /// subcommand) is refused as too generic, even for an otherwise
+    /// screen-clean, accepted sandbox-escape ask.
+    #[test]
+    fn escape_eligibility_refuses_a_too_generic_family() {
+        let requests = vec![PermissionRequest {
+            session: "s".into(),
+            raw: "echo hi".into(),
+            family: "echo".into(),
+            cause: "interactive sandbox-escape ask".into(),
+            result: "escalated-accepted".into(),
+            reusable: true,
+            permission_mode: "default".into(),
+            is_sidechain: false,
+        }];
+        let (eligible, _protected, too_generic) = escape_eligibility(&requests);
+        assert!(eligible.is_empty(), "{eligible:?}");
+        assert_eq!(too_generic, vec!["echo".to_string()]);
+    }
+
+    /// A protected family (e.g. a destructive/global-write shape) must
+    /// never be compiled into `escape_allow`, matching the ordinary
+    /// `compile_eligibility`'s own guarantee.
+    #[test]
+    fn escape_eligibility_refuses_a_protected_family() {
+        let requests = vec![PermissionRequest {
+            session: "s".into(),
+            raw: "git push --force origin main".into(),
+            family: "git push".into(),
+            cause: "interactive sandbox-escape ask".into(),
+            result: "escalated-accepted".into(),
+            reusable: true,
+            permission_mode: "default".into(),
+            is_sidechain: false,
+        }];
+        let (eligible, protected, _too_generic) = escape_eligibility(&requests);
+        assert!(eligible.is_empty(), "{eligible:?}");
+        assert_eq!(protected, vec!["git push".to_string()]);
+    }
+
+    /// Design decision 6's own security requirement: a family with ANY
+    /// observed invocation touching a credential path, `.env`, or a
+    /// root-wide `find` must never be compiled, even though the family
+    /// itself (`cat`/`find`) is otherwise an ordinary read-only utility.
+    #[test]
+    fn escape_eligibility_refuses_a_family_with_a_credential_touching_member() {
+        let requests = vec![
+            PermissionRequest {
+                session: "s".into(),
+                raw: "cat /var/log/app.log".into(),
+                family: "cat".into(),
+                cause: "interactive sandbox-escape ask".into(),
+                result: "escalated-accepted".into(),
+                reusable: true,
+                permission_mode: "default".into(),
+                is_sidechain: false,
+            },
+            PermissionRequest {
+                session: "s".into(),
+                raw: "cat ~/.ssh/id_rsa".into(),
+                family: "cat".into(),
+                cause: "interactive sandbox-escape ask".into(),
+                result: "escalated-accepted".into(),
+                reusable: true,
+                permission_mode: "default".into(),
+                is_sidechain: false,
+            },
+        ];
+        // `cat` alone is too generic (single token) regardless, so use a
+        // synthetic two-token family to isolate the screen check.
+        let requests: Vec<PermissionRequest> = requests
+            .into_iter()
+            .map(|mut r| {
+                r.family = "cat log".to_string();
+                r
+            })
+            .collect();
+        let (eligible, skipped, _too_generic) = escape_eligibility(&requests);
+        assert!(eligible.is_empty(), "{eligible:?}");
+        assert!(
+            skipped
+                .iter()
+                .any(|s| s.starts_with("cat log") && s.contains("screen")),
+            "{skipped:?}"
+        );
+    }
+
+    /// SECURITY (review round 1, 2026-08-27, Critical amendment): the same
+    /// screen must refuse a family with any observed member that redirects
+    /// output/input via an unquoted `>`/`>>`/`<` -- `command_fails_escape_
+    /// screen` delegates straight to `safety::escape_denied_by_screen`, so
+    /// this is a regression test for that shared function, exercised
+    /// through the compile-eligibility seam rather than a duplicate of the
+    /// hook-level test in `safety.rs`.
+    #[test]
+    fn escape_eligibility_refuses_a_family_with_a_redirecting_member() {
+        let requests = vec![PermissionRequest {
+            session: "s".into(),
+            raw: "echo pwned > log/out.txt".into(),
+            family: "echo log".into(),
+            cause: "interactive sandbox-escape ask".into(),
+            result: "escalated-accepted".into(),
+            reusable: true,
+            permission_mode: "default".into(),
+            is_sidechain: false,
+        }];
+        let (eligible, skipped, _too_generic) = escape_eligibility(&requests);
+        assert!(eligible.is_empty(), "{eligible:?}");
+        assert!(
+            skipped
+                .iter()
+                .any(|s| s.starts_with("echo log") && s.contains("screen")),
+            "{skipped:?}"
+        );
+    }
+
+    /// The clean, eligible case: a two-token, unprotected, screen-clean
+    /// family compiles to the expected `"<family> *"` pattern.
+    #[test]
+    fn escape_eligibility_accepts_a_clean_family() {
+        let requests = vec![PermissionRequest {
+            session: "s".into(),
+            raw: "zirv ctx status".into(),
+            family: "zirv ctx status".into(),
+            cause: "interactive sandbox-escape ask".into(),
+            result: "escalated-accepted".into(),
+            reusable: true,
+            permission_mode: "default".into(),
+            is_sidechain: false,
+        }];
+        let (eligible, protected, too_generic) = escape_eligibility(&requests);
+        assert_eq!(eligible, vec!["zirv ctx status *".to_string()]);
+        assert!(protected.is_empty(), "{protected:?}");
+        assert!(too_generic.is_empty(), "{too_generic:?}");
+    }
+
+    // -------------------------------------------------------------
+    // Issue #147, design decision 7: native claude permission conflicts
+    // -------------------------------------------------------------
+
+    #[test]
+    fn read_native_claude_rules_extracts_bash_deny_and_ask_patterns_and_skips_non_bash() {
+        let home = tempfile::tempdir().expect("home");
+        std::fs::create_dir_all(home.path().join(".claude")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".claude/settings.json"),
+            serde_json::json!({
+                "permissions": {
+                    "deny": ["Bash(rm -rf *)", "Read(~/.ssh/**)"],
+                    "ask": ["Bash(*find /*)"]
+                }
+            })
+            .to_string(),
+        )
+        .expect("write settings");
+
+        let rules = read_native_claude_rules(home.path(), None);
+        assert!(
+            rules.contains(&("rm -rf *".to_string(), "deny")),
+            "{rules:?}"
+        );
+        assert!(
+            rules.contains(&("*find /*".to_string(), "ask")),
+            "{rules:?}"
+        );
+        assert_eq!(
+            rules.len(),
+            2,
+            "the non-Bash Read() rule must be skipped: {rules:?}"
+        );
+    }
+
+    #[test]
+    fn read_native_claude_rules_is_empty_when_the_file_is_absent_or_unparseable() {
+        let home = tempfile::tempdir().expect("home");
+        assert!(read_native_claude_rules(home.path(), None).is_empty());
+
+        std::fs::create_dir_all(home.path().join(".claude")).expect("mkdir");
+        std::fs::write(home.path().join(".claude/settings.json"), "not json").expect("write");
+        assert!(read_native_claude_rules(home.path(), None).is_empty());
+    }
+
+    #[test]
+    fn native_conflict_finds_the_first_matching_rule_and_names_it() {
+        let rules = vec![("*find /*".to_string(), "ask")];
+        assert_eq!(
+            native_conflict(&rules, "find / -name x"),
+            Some("Bash(*find /*) [ask]".to_string())
+        );
+        assert_eq!(native_conflict(&rules, "grep -r TODO ."), None);
+    }
+
+    /// A family a recommendation would otherwise present as fixable is
+    /// instead annotated with a warning naming the specific native rule
+    /// that still blocks/prompts it -- `read_native_claude_rules` never
+    /// writes to `~/.claude/settings.json`, only reads it.
+    #[test]
+    fn render_report_warns_when_a_native_claude_rule_still_conflicts() {
+        let home = tempfile::tempdir().expect("home");
+        std::fs::create_dir_all(home.path().join(".claude")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".claude/settings.json"),
+            serde_json::json!({"permissions": {"ask": ["Bash(cargo nextest *)"]}}).to_string(),
+        )
+        .expect("write settings");
+
+        let report = AuditReport {
+            agent: "claude",
+            sessions_scanned: 1,
+            total_requests: 1,
+            groups: vec![FamilyGroup {
+                family: "cargo nextest".into(),
+                count: 1,
+                reusable: true,
+                sample: "cargo nextest run --no-fail-fast".into(),
+                cause: "permission-mode dontAsk denial".into(),
+                recommendation: "Grant 'cargo nextest' a standing allow".into(),
+                protected: false,
+            }],
+            requests: Vec::new(),
+        };
+        let native_rules = read_native_claude_rules(home.path(), None);
+        let text = render_report(&report, &native_rules);
+        assert!(
+            text.contains("WARNING") && text.contains("Bash(cargo nextest *) [ask]"),
+            "got {text}"
+        );
+
+        // A family the native rules say nothing about gets no warning.
+        let clean = AuditReport {
+            groups: vec![FamilyGroup {
+                family: "grep".into(),
+                sample: "grep -r TODO .".into(),
+                ..report.groups[0].clone()
+            }],
+            ..report
+        };
+        assert!(!render_report(&clean, &native_rules).contains("WARNING"));
     }
 }

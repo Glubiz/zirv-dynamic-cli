@@ -419,13 +419,16 @@ const MAX_SERVER_STDERR_BYTES: usize = 4096;
 /// its lifetime -- the failure `Stdio::null()` never had.
 fn spawn_stderr_drain(
     stderr: Option<std::process::ChildStderr>,
-) -> std::sync::Arc<std::sync::Mutex<Vec<u8>>> {
+) -> (
+    std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    std::thread::JoinHandle<()>,
+) {
     let tail = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let Some(mut stderr) = stderr else {
-        return tail;
+        return (tail, std::thread::spawn(|| {}));
     };
     let sink = std::sync::Arc::clone(&tail);
-    std::thread::spawn(move || {
+    let handle = std::thread::spawn(move || {
         use std::io::Read;
         let mut chunk = [0u8; 4096];
         while let Ok(count) = stderr.read(&mut chunk) {
@@ -440,7 +443,7 @@ fn spawn_stderr_drain(
             }
         }
     });
-    tail
+    (tail, handle)
 }
 
 fn stderr_note(tail: &std::sync::Mutex<Vec<u8>>) -> String {
@@ -452,6 +455,31 @@ fn stderr_note(tail: &std::sync::Mutex<Vec<u8>>) -> String {
         return String::new();
     }
     format!(": {text}")
+}
+
+/// How long a failure path waits for [`spawn_stderr_drain`]'s reader thread
+/// to catch up before [`stderr_note`] reads its tail. Every call site sits
+/// downstream of the child already being dead (an immediate exit) or just
+/// killed (a readiness timeout), so `try_wait`/termination observing the
+/// OS-level exit races the reader thread actually being scheduled to drain
+/// the pipe -- the exact mechanism `supervise::FINAL_DRAIN_BUDGET` bounds
+/// for the analogous `OutputTap` race. A child that wrote its last line and
+/// exited in the same instant used to lose that line here: `try_wait`
+/// noticed the exit before the reader thread had drained it.
+const STDERR_DRAIN_BUDGET: Duration = Duration::from_millis(500);
+
+/// Waits (bounded by `budget`) for `handle` to finish. Never blocks past the
+/// budget even if the thread is somehow wedged -- this is a diagnostic best
+/// effort, not a correctness requirement, so a slow drain must not turn into
+/// a slow failure report.
+fn wait_for_stderr_drain(handle: &std::thread::JoinHandle<()>, budget: Duration) {
+    let deadline = Instant::now() + budget;
+    while !handle.is_finished() {
+        if Instant::now() >= deadline {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
 }
 
 fn run_interactive(args: &PresentArgs, repo: &Path) -> CtxResult<()> {
@@ -473,7 +501,7 @@ fn run_interactive_with(args: &PresentArgs, repo: &Path, ready_timeout: Duration
         .stderr(Stdio::piped())
         .spawn()?;
     let mut job = crate::commands::ctx::supervise::JobGuard::adopt(child.id());
-    let stderr = spawn_stderr_drain(child.stderr.take());
+    let (stderr, stderr_thread) = spawn_stderr_drain(child.stderr.take());
     // The clock starts at spawn, not after the blocking browser open: an
     // opener that sits waiting for a user used to extend the "hard" lifetime
     // by however long that took.
@@ -486,6 +514,7 @@ fn run_interactive_with(args: &PresentArgs, repo: &Path, ready_timeout: Duration
     loop {
         if let Some(status) = child.try_wait()? {
             job.close();
+            wait_for_stderr_drain(&stderr_thread, STDERR_DRAIN_BUDGET);
             return Err(format!(
                 "server command exited before serving ({status}){}",
                 stderr_note(&stderr)
@@ -501,6 +530,7 @@ fn run_interactive_with(args: &PresentArgs, repo: &Path, ready_timeout: Duration
             // has been called a failure.
             super::terminate_process_tree(&mut child)?;
             job.close();
+            wait_for_stderr_drain(&stderr_thread, STDERR_DRAIN_BUDGET);
             return Err(format!(
                 "server did not accept a connection on {target} within {}s{}",
                 ready_timeout.as_secs(),

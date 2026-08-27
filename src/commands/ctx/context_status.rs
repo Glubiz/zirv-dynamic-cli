@@ -493,8 +493,19 @@ fn render_per_harness_section<W: Write>(
             writeln!(w, "    canonical context (.zirv/context/): none found")?;
         }
         for provenance in &compiled.provenance {
+            // Issue #155, Phase 3: a deduped surface (skipped because the
+            // adapter's native file already provably carries it -- see
+            // `compile::native_file_already_carries_canonical`) reports
+            // `delivered_bytes: 0, truncated: false`. Checked AFTER
+            // `truncated` so a genuinely truncated-to-zero layer (an
+            // operator-configured `max_*_bytes = 0`) still reads as
+            // `[TRUNCATED]`, never `[DEDUPED]` -- deduped is specifically
+            // "zero delivered and NOT because the budget cut it", which an
+            // operator would otherwise have no way to tell apart from a bug.
             let flag = if provenance.truncated {
                 " [TRUNCATED]"
+            } else if provenance.delivered_bytes == 0 {
+                " [DEDUPED]"
             } else {
                 ""
             };
@@ -664,6 +675,7 @@ pub fn run_with<W: Write>(
                 &state,
                 now,
                 super::adapters::LaunchMode::Interactive,
+                false,
             );
             (adapter.name(), compiled)
         })
@@ -1085,6 +1097,36 @@ mod tests {
         assert!(
             !out.to_lowercase().contains("not yet enforced"),
             "the budget is real now, so the report must not disclaim it as unenforced: {out}"
+        );
+    }
+
+    /// MAJOR (review finding on 90523d3): a deduped surface reports
+    /// `raw_bytes > 0, delivered_bytes: 0, truncated: false` -- and before
+    /// this fix, the marker logic only ever explained `[TRUNCATED]`, so an
+    /// operator saw "31B raw, 0B delivered" with no indication whether that
+    /// was deliberate (dedupe) or a bug. `[DEDUPED]` names it, and must
+    /// never be confused with `[TRUNCATED]`.
+    #[test]
+    fn a_deduped_canonical_surface_is_flagged_deduped_not_truncated() {
+        let fixture = Fixture::new();
+        fixture.write_canonical("common.md", "canonical common instructions\n");
+        std::fs::write(
+            fixture.repo.join("CLAUDE.md"),
+            crate::commands::ctx::context_cli::render_generated(
+                Some("canonical common instructions\n"),
+                None,
+            ),
+        )
+        .expect("write native CLAUDE.md");
+
+        let (_, out) = fixture.run(&default_args());
+        assert!(
+            out.contains("[DEDUPED]"),
+            "a deduped surface (0B delivered, not truncated) must be flagged, not silent: {out}"
+        );
+        assert!(
+            !out.contains("[TRUNCATED]"),
+            "a dedupe skip is not a truncation: {out}"
         );
     }
 
