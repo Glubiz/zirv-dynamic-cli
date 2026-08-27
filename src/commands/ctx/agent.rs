@@ -176,34 +176,6 @@ fn delegation_outcome(code: i32) -> &'static str {
     }
 }
 
-/// The model token following a `--model`/`-m` flag (any form `adapters::
-/// classify_model_flag` recognises) in an already-built launch argv, or
-/// `None` when none is present. `command` here is the *effective* argv
-/// `worker_launch_flags` produced -- the configured/default worker model
-/// prepend, or the operator's own passthrough -- so this reads back
-/// whichever one actually won, rather than guessing.
-fn launched_model(command: &[String]) -> Option<&str> {
-    let mut found = None;
-    let mut i = 0;
-    while i < command.len() {
-        match adapters::classify_model_flag(&command[i]) {
-            Some(adapters::ModelFlagForm::Separated) => {
-                if let Some(value) = command.get(i + 1) {
-                    found = Some(value.as_str());
-                }
-                i += 2;
-                continue;
-            }
-            Some(adapters::ModelFlagForm::Joined(value)) => {
-                found = Some(value);
-            }
-            None => {}
-        }
-        i += 1;
-    }
-    found
-}
-
 /// How long a delegated run waits for the dashboard's own answer before
 /// giving up and running headless instead. Generous enough for a live
 /// dashboard's own event loop (50ms poll, plus a once-per-tick request
@@ -624,7 +596,7 @@ pub fn run_with<W: Write>(
     // Read back out of the effective argv rather than re-deriving it: this
     // is whichever of the operator's own `--model`/`-m` passthrough or the
     // configured/default worker-model prepend actually won.
-    let model = launched_model(&command).map(str::to_string);
+    let model = adapters::last_model_flag(&command).map(str::to_string);
     let worker_session = SessionId::new_v4().to_string();
 
     let exec_args = ExecArgs {
@@ -1463,6 +1435,12 @@ mod tests {
         );
         let record: serde_json::Value = serde_json::from_str(&delegations[0]).expect("json");
         assert_eq!(record["agent"], "claude");
+        // Pins the argv -> model field wiring end-to-end: no `--model` was
+        // passed, so `worker_launch_flags` prepends claude's own configured-
+        // or-default worker model (`ClaudeAdapter::default_worker_model`,
+        // "sonnet" with nothing configured), and `adapters::last_model_flag`
+        // must read that exact value back out of the effective argv.
+        assert_eq!(record["model"], "sonnet");
         assert_eq!(record["exit_code"], 0);
         assert_eq!(record["outcome"], "ok");
         assert!(
