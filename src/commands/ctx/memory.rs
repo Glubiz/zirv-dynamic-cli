@@ -780,25 +780,57 @@ fn sensitive_shared_term(haystack: &str) -> Option<&'static str> {
         .find(|term| lower.contains(term))
 }
 
+/// Runs both halves of the shared-scope credential check
+/// (`sensitive_shared_term`'s deny-list and `review::detect_token_shape`'s
+/// regex families -- OpenAI/GitHub/Slack/AWS-style keys, a PEM private-key
+/// block, a JWT, reused rather than duplicated since the `regex` crate and
+/// these exact families are already a workspace dependency) against one
+/// field, named `label` in the returned message for `sensitive_shared_match`
+/// below. `None` means nothing matched in this field.
+fn sensitive_shared_field(label: &str, value: &str) -> Option<String> {
+    if let Some(term) = sensitive_shared_term(value) {
+        return Some(format!("the term '{term}' in its {label}"));
+    }
+    crate::commands::workflow::review::detect_token_shape(value)
+        .map(|family| format!("a {family} in its {label}"))
+}
+
 /// Whether `entry` looks credential-shaped rather than a durable,
-/// safe-to-commit repository fact: a deny-list term in the key or body
-/// (`sensitive_shared_term`), or a known token shape in the body
-/// (`review::detect_token_shape` -- OpenAI/GitHub/Slack/AWS-style keys, a PEM
-/// private-key block, a JWT -- reused rather than duplicated, since the
-/// `regex` crate and these exact families are already a workspace
-/// dependency). `None` means nothing matched. Pure (no I/O), so both
+/// safe-to-commit repository fact: checks every field an attacker or a
+/// careless human can populate -- `key`, `body`, and every `tags`/`paths`
+/// entry -- with the same deny-list-plus-token-shape rule
+/// (`sensitive_shared_field`), not body-only. A credential-shaped `key` is
+/// reachable in practice despite `validate_shared_key`'s lowercase-kebab-case
+/// charset: `sk-` (OpenAI) and `xox[baprs]-` (Slack) are both expressible in
+/// pure lowercase/digits/hyphens, so a key like `sk-<20+ chars>` still trips
+/// the same regex the body does. `tags` is reachable today via `zirv memory
+/// remember --shared --tag ...`; `paths` has no `--path` writer yet (see
+/// `Entry::paths`'s own doc comment -- issue #44 wires one up later), so
+/// that arm is currently unreachable from any CLI surface but is checked
+/// anyway, cheaply, so the guard does not have to be revisited the day a
+/// `--path` flag exists: a path is attacker-influenced the same way a tag
+/// is. `None` means nothing matched anywhere. Pure (no I/O), so both
 /// `upsert_shared` (a hard refusal) and `write_durable`'s harvest loop (a
 /// skip-and-log, never an abort) can call it without either owning its own
 /// copy of the rule.
 fn sensitive_shared_match(entry: &Entry) -> Option<String> {
-    if let Some(term) = sensitive_shared_term(&entry.key) {
-        return Some(format!("the term '{term}' in its key"));
+    if let Some(m) = sensitive_shared_field("key", &entry.key) {
+        return Some(m);
     }
-    if let Some(term) = sensitive_shared_term(&entry.body) {
-        return Some(format!("the term '{term}' in its body"));
+    if let Some(m) = sensitive_shared_field("body", &entry.body) {
+        return Some(m);
     }
-    crate::commands::workflow::review::detect_token_shape(&entry.body)
-        .map(|family| format!("a {family} in its body"))
+    for tag in &entry.tags {
+        if let Some(m) = sensitive_shared_field("one of its tags", tag) {
+            return Some(m);
+        }
+    }
+    for path in &entry.paths {
+        if let Some(m) = sensitive_shared_field("one of its paths", path) {
+            return Some(m);
+        }
+    }
+    None
 }
 
 fn upsert_shared(
@@ -4804,6 +4836,62 @@ This should not appear in the body.\n";
         )
         .expect_err("a GitHub-shaped token must be refused");
         assert!(err.to_string().contains("credential"), "got {err}");
+    }
+
+    #[test]
+    fn upsert_scoped_shared_refuses_a_tag_that_looks_credential_shaped() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let cfg = CtxConfig::default();
+        let mut entry = sample("deploy-notes", 1);
+        entry.tags = vec!["password:hunter2".to_string()];
+
+        let err = upsert_scoped(
+            MemoryScope::Shared,
+            repo.path(),
+            &state,
+            "-irrelevant",
+            &cfg,
+            &entry,
+        )
+        .expect_err("a tag containing 'password' must be refused");
+        assert!(err.to_string().contains("credential"), "got {err}");
+        assert!(
+            !repo.path().join(".zirv/memory/deploy-notes.md").exists(),
+            "nothing must be written when the guard refuses"
+        );
+
+        let path = upsert_shared_allow_sensitive(repo.path(), &state, "-irrelevant", &cfg, &entry)
+            .expect("--allow-sensitive must permit a flagged tag through too");
+        assert!(path.is_file());
+    }
+
+    #[test]
+    fn upsert_scoped_shared_refuses_a_key_that_is_itself_a_token_shape() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let cfg = CtxConfig::default();
+        // `sk-...` is valid lowercase-kebab-case (issue #172 cross-review
+        // finding 7): the deny-list alone never sees this, only
+        // `review::detect_token_shape`'s regex does, and only once the guard
+        // runs it over the key field too, not just the body.
+        let mut entry = sample("sk-abcdefghijklmnopqrstuv", 1);
+        entry.body = "an ordinary, unremarkable fact.".to_string();
+
+        let err = upsert_scoped(
+            MemoryScope::Shared,
+            repo.path(),
+            &state,
+            "-irrelevant",
+            &cfg,
+            &entry,
+        )
+        .expect_err("a key shaped like an OpenAI-style secret must be refused");
+        assert!(err.to_string().contains("credential"), "got {err}");
+
+        let path = upsert_shared_allow_sensitive(repo.path(), &state, "-irrelevant", &cfg, &entry)
+            .expect("--allow-sensitive must permit a flagged key through too");
+        assert!(path.is_file());
     }
 
     #[test]
