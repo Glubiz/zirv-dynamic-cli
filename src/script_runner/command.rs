@@ -200,16 +200,52 @@ async fn heavy_permit_for(
     // already put in a script -- failing `zirv test` outright because a
     // background build is running would be worse than waiting for it. Polls
     // on a bounded interval up to a generous cap, then proceeds without a
-    // permit rather than blocking a script forever.
+    // permit rather than blocking a script forever -- see `wait_for_permit`'s
+    // own doc comment for why that escape hatch stays loud rather than
+    // simply vanishing back to the pre-#155 ungoverned behavior.
     const POLL_INTERVAL: Duration = Duration::from_millis(500);
     const MAX_WAIT: Duration = Duration::from_secs(600);
+    wait_for_permit(&state, limit, &label, command, POLL_INTERVAL, MAX_WAIT).await
+}
+
+/// The actual wait loop `heavy_permit_for` drives with its own real
+/// `POLL_INTERVAL`/`MAX_WAIT` -- split out so a test can drive it with
+/// millisecond-scale durations instead of actually waiting out a 10-minute
+/// cap.
+///
+/// Finding B2: this loop's liveness escape hatch (proceeding WITHOUT a
+/// permit once `max_wait` elapses) is deliberately kept -- removing it could
+/// deadlock a script behind a build that never finishes, and this codebase's
+/// philosophy (`wrap.rs`'s own doc comment) is that supervision failure
+/// degrades to passthrough rather than blocking forever. But a command that
+/// proceeds ungoverned is exactly the failure mode the whole budget exists
+/// to prevent, so it must never be silent: unlike the one-time "waiting"
+/// notice below, the timeout itself always gets its own loud warning line,
+/// naming both how long this command waited and that it is now running
+/// without the budget's protection.
+async fn wait_for_permit(
+    state: &crate::commands::ctx::state::StateDir,
+    limit: usize,
+    label: &str,
+    command: &str,
+    poll_interval: Duration,
+    max_wait: Duration,
+) -> Option<crate::commands::ctx::permit::HeavyPermit> {
+    use crate::commands::ctx::permit;
+
     let mut waited = Duration::ZERO;
     let mut announced = false;
     loop {
-        if let Some(permit) = permit::acquire(&state, limit, &label) {
+        if let Some(permit) = permit::acquire(state, limit, label) {
             return Some(permit);
         }
-        if waited >= MAX_WAIT {
+        if waited >= max_wait {
+            eprintln!(
+                "zirv: WARNING: waited {}s for a heavy-operation slot ({limit} in use) before \
+                 running `{command}` -- proceeding WITHOUT a permit. This heavy operation is now \
+                 running UNGOVERNED alongside whatever else is holding the budget.",
+                max_wait.as_secs()
+            );
             return None;
         }
         if !announced {
@@ -220,7 +256,7 @@ async fn heavy_permit_for(
             // `permit::live_records`, the exact same source `zirv ctx
             // status`'s own occupancy line reads, so the two can never
             // disagree about who is holding a slot.
-            let holders: Vec<String> = permit::live_records(&state)
+            let holders: Vec<String> = permit::live_records(state)
                 .into_iter()
                 .map(|record| record.label)
                 .collect();
@@ -230,8 +266,8 @@ async fn heavy_permit_for(
             );
             announced = true;
         }
-        sleep(POLL_INTERVAL).await;
-        waited += POLL_INTERVAL;
+        sleep(poll_interval).await;
+        waited += poll_interval;
     }
 }
 
@@ -461,5 +497,34 @@ mod tests {
     fn permit_label_falls_back_to_the_bare_command_when_unsupervised() {
         let env = |_: &str| None;
         assert_eq!(permit_label(&env, "cargo build"), "cargo build");
+    }
+
+    /// Finding B2: once the wait exceeds its cap, the loop must still
+    /// proceed WITHOUT a permit (the liveness escape hatch stays -- removing
+    /// it could deadlock a script behind a build that never finishes) but
+    /// must not do so silently. Drives the real loop with millisecond-scale
+    /// durations instead of the real 600s `MAX_WAIT`, so this stays fast and
+    /// deterministic: the only live permit is held for the whole test, so
+    /// every poll fails until `max_wait` elapses.
+    #[tokio::test]
+    async fn wait_for_permit_proceeds_ungoverned_once_the_wait_times_out() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = crate::commands::ctx::state::StateDir::from_root(tmp.path().to_path_buf());
+        let _held = crate::commands::ctx::permit::acquire(&state, 1, "cargo build")
+            .expect("the only slot is held for the whole test");
+
+        let result = wait_for_permit(
+            &state,
+            1,
+            "cargo test",
+            "cargo test",
+            Duration::from_millis(5),
+            Duration::from_millis(30),
+        )
+        .await;
+        assert!(
+            result.is_none(),
+            "the wait must give up and proceed without a permit once max_wait elapses"
+        );
     }
 }
