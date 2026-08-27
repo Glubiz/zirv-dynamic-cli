@@ -1854,8 +1854,14 @@ pub struct RememberArgs {
     /// the private, machine-local one (issue #172). Committed with the
     /// repository, so it follows whichever branch it was written on until
     /// that branch merges -- see `zirv ctx recall`'s `[local]`/`[repo]`
-    /// labels. Gated the same way `zirv memory remember --shared` already
-    /// is: `cfg.memory.enabled && cfg.memory.shared_enabled`.
+    /// labels. Storing new text is gated the same way `zirv memory remember
+    /// --shared` already is: `cfg.memory.enabled && cfg.memory.
+    /// shared_enabled` (`upsert_shared`). `--verify` alone is NOT gated on
+    /// `shared_enabled` -- it routes through `verify_scoped`, which
+    /// deliberately never consults the shared gate (the same
+    /// must-not-trap-data rule `forget_scoped` follows: disabling a scope
+    /// can refuse new writes but must never block reading back or
+    /// refreshing what is already there).
     #[arg(long, default_value_t = false)]
     pub repo: bool,
     /// Store into the shared bank even though its key or body looks
