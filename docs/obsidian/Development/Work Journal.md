@@ -20,6 +20,11 @@ last-verified: 2026-08-28
 
 ## Entries
 
+### 2026-08-28: AI-native SDLC flows — design spec complete (`docs/187-ai-native-sdlc-spec`, issue #187, PR #188)
+**What:** Wrote and posted the full design spec for issue #187, aligning `zirv workflow` with the AI-native SDLC playbook (Plan→Design→Build→Test→Deploy→Maintain) by extending the existing workflow engine in place rather than adding a second one or store.
+**Key changes:** `docs/superpowers/specs/2026-08-28-ai-native-sdlc-design.md` (new, committed); the full spec was also posted as a comment on issue #187. Docs-only session — no code changed; `Cargo.toml` bumped to 2.35.1 for the PR.
+**Follow-up:** Implementation phased into 5 PR-sized sub-issues; phase 1 (artifact chain + `WorkflowPhase::Intent` + adaptive pipeline + `brainstorm` skill) is next. See [[Active Work]] and the 2026-08-28 [[Decision Log]] entry.
+
 ### 2026-08-28: Reliable messaging — completed and review-hardened (`release/2.35.0`, issue #177, draft PR #185)
 **What:** Added a compiling, additive delivery-sidecar implementation around the legacy Markdown mailbox: UUID/thread/reply metadata, per-recipient receipts, TTL/dead-letter state, explicit claim-once, role fan-out, sender status, automatic post-write wake markers, a cross-harness information-not-instruction envelope, and status metrics.
 **Verification at handoff (`68be11a` WIP checkpoint):** `cargo check`, rustfmt, and `git diff --check` passed; the 56 pre-existing `mail::tests` passed before six new focused tests were appended, unexecuted at that point.
