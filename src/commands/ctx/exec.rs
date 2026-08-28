@@ -4517,12 +4517,16 @@ mod tests {
 
         let state_for_writer = state_dir.clone();
         let repo_for_writer = tmp.path().to_path_buf();
+        let modes_for_writer = modes.clone();
         let writer = std::thread::spawn(move || {
             // 20s, not the old 5s: honest against this test's own 30s exec
             // timeout, and a give-up now panics instead of silently never
             // nudging -- see `wait_for_live_session_or_panic`'s own doc
             // comment.
             wait_for_live_session_or_panic(&state_for_writer, Duration::from_secs(20));
+            // Registration precedes the fixture consuming its mode. Wait for
+            // that observable transition so the nudge cannot steal `hang`.
+            wait_for_first_line_or_panic(&modes_for_writer, "limit", Duration::from_secs(20));
             nudge_live_session(
                 &state_for_writer,
                 &repo_for_writer,
@@ -5145,6 +5149,23 @@ mod tests {
             "no live session appeared within {budget:?} -- the hang-mode agent likely never \
              started, or this machine is starved badly enough that it could not be observed in \
              time (check for CPU contention before assuming a real regression)"
+        );
+    }
+
+    fn wait_for_first_line_or_panic(path: &std::path::Path, expected: &str, budget: Duration) {
+        let deadline = std::time::Instant::now() + budget;
+        while std::time::Instant::now() < deadline {
+            if std::fs::read_to_string(path)
+                .ok()
+                .is_some_and(|text| text.lines().next() == Some(expected))
+            {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!(
+            "{} never advanced to mode {expected:?} within {budget:?}",
+            path.display()
         );
     }
 
