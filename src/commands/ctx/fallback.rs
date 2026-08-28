@@ -107,10 +107,8 @@ fn candidate_headroom(
         );
     }
     let pct = cfg.fallback.unknown_headroom_pct;
-    (pct > 0.0 && pct >= cfg.fallback.min_candidate_headroom_pct).then_some(CandidateHeadroom {
-        pct,
-        assumed: true,
-    })
+    (pct > 0.0 && pct >= cfg.fallback.min_candidate_headroom_pct)
+        .then_some(CandidateHeadroom { pct, assumed: true })
 }
 
 fn requested_headroom(state: &StateDir, cfg: &CtxConfig, name: &str, now: u64) -> Option<f64> {
@@ -139,7 +137,10 @@ fn best_alternate(
 ) -> Option<(String, String, CandidateHeadroom)> {
     let mut best: Option<(usize, String, String, CandidateHeadroom)> = None;
     for (order_index, name) in cfg.fallback.order.iter().enumerate() {
-        if name == requested || excluded.iter().any(|seen| seen == name) || !cfg.agents.is_enabled(name) {
+        if name == requested
+            || excluded.iter().any(|seen| seen == name)
+            || !cfg.agents.is_enabled(name)
+        {
             continue;
         }
         if !candidate_allowed_by_capacity(cfg, name, bounds) {
@@ -157,13 +158,9 @@ fn best_alternate(
         let Some(headroom) = candidate_headroom(state, cfg, name, now) else {
             continue;
         };
-        let Some(model) = handover::equivalent_model(
-            requested,
-            source_model,
-            source_model_explicit,
-            name,
-            cfg,
-        ) else {
+        let Some(model) =
+            handover::equivalent_model(requested, source_model, source_model_explicit, name, cfg)
+        else {
             continue;
         };
         let replace = match &best {
@@ -202,14 +199,11 @@ pub fn route_new_delegation(
     let provider = adapters::provider_for_agent_name(Some(requested));
     let (collector, estimator) = pace::current_windows(state, &cfg.pace, now, provider);
     let gate = pace::spawn_gate(&collector, estimator.as_ref(), now, &cfg.pace);
-    let source_headroom =
-        pace::spawn_headroom(&collector, estimator.as_ref(), now, &cfg.pace)
-            .map(|reading| reading.headroom_pct);
+    let source_headroom = pace::spawn_headroom(&collector, estimator.as_ref(), now, &cfg.pace)
+        .map(|reading| reading.headroom_pct);
     let reason = match gate {
         SpawnGate::Refuse { .. } => RouteReason::Exhausted,
-        _ if source_headroom
-            .is_some_and(|pct| pct <= cfg.fallback.predictive_headroom_pct) =>
-        {
+        _ if source_headroom.is_some_and(|pct| pct <= cfg.fallback.predictive_headroom_pct) => {
             RouteReason::Predictive
         }
         _ => return None,
@@ -282,26 +276,34 @@ mod tests {
         let mut cfg = CtxConfig::default();
         cfg.fallback.small_task_max_tokens = 10_000;
         cfg.fallback.small_task_max_tool_calls = 10;
-        assert!(TaskBounds {
-            tokens: Some(1_000),
-            tool_calls: None,
-        }
-        .is_small(&cfg));
-        assert!(TaskBounds {
-            tokens: None,
-            tool_calls: Some(3),
-        }
-        .is_small(&cfg));
-        assert!(!TaskBounds {
-            tokens: Some(20_000),
-            tool_calls: Some(30),
-        }
-        .is_small(&cfg));
-        assert!(!TaskBounds {
-            tokens: None,
-            tool_calls: None,
-        }
-        .is_small(&cfg));
+        assert!(
+            TaskBounds {
+                tokens: Some(1_000),
+                tool_calls: None,
+            }
+            .is_small(&cfg)
+        );
+        assert!(
+            TaskBounds {
+                tokens: None,
+                tool_calls: Some(3),
+            }
+            .is_small(&cfg)
+        );
+        assert!(
+            !TaskBounds {
+                tokens: Some(20_000),
+                tool_calls: Some(30),
+            }
+            .is_small(&cfg)
+        );
+        assert!(
+            !TaskBounds {
+                tokens: None,
+                tool_calls: None,
+            }
+            .is_small(&cfg)
+        );
     }
 
     #[test]
