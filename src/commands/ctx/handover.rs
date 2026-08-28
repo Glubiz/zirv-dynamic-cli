@@ -103,6 +103,45 @@ pub fn resolve_model(agent: &str, requested: &str, cfg: &CtxConfig) -> CtxResult
     Ok(requested.trim().to_string())
 }
 
+
+/// Classifies a concrete model id against this harness's configured generic
+/// ladder. This is intentionally exact (case-insensitive) rather than fuzzy:
+/// issue #186 promises not to sacrifice quality during cross-harness routing,
+/// so an operator-pinned model we cannot place on a verified tier is a reason
+/// to decline automatic fallback rather than guess.
+pub fn tier_for_model(agent: &str, model: &str, cfg: &CtxConfig) -> Option<&'static str> {
+    TIERS.into_iter().find(|tier| {
+        resolve_model(agent, tier, cfg)
+            .ok()
+            .is_some_and(|resolved| resolved.eq_ignore_ascii_case(model.trim()))
+    })
+}
+
+/// Resolves the equivalent generic tier on another harness. When the source
+/// model came from zirv's own worker default and is absent, `standard` is the
+/// conservative background-work baseline. An explicit source model that does
+/// not match a verified tier returns `None`, preserving the operator's quality
+/// choice instead of translating a vendor-specific literal by guesswork.
+pub fn equivalent_model(
+    source_agent: &str,
+    source_model: Option<&str>,
+    source_model_explicit: bool,
+    target_agent: &str,
+    cfg: &CtxConfig,
+) -> Option<String> {
+    let tier = match source_model {
+        Some(model) => tier_for_model(source_agent, model, cfg),
+        None if !source_model_explicit => Some("standard"),
+        None => None,
+    };
+    let tier = match tier {
+        Some(tier) => tier,
+        None if source_model_explicit => return None,
+        None => "standard",
+    };
+    resolve_model(target_agent, tier, cfg).ok()
+}
+
 #[derive(Debug, clap::Args)]
 pub struct HandoverArgs {
     /// Target model: a literal model id, or a generic tier (cheap/standard/deep)
