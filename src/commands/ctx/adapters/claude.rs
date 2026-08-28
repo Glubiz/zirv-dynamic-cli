@@ -538,6 +538,21 @@ impl ClaudeAdapter {
         // log directories right above it -- is allow-listed for write.
         // Best-effort: a state-dir resolution failure just omits the entry,
         // it never blocks materializing the rest of this settings layer.
+        //
+        // Code review revert (issue #168 follow-up): a prior round widened
+        // this to also allow-list memory/logs/groups/handoffs, reasoning
+        // that `zirv ctx remember`/`recall`/`forget`/`nudge`/`group`/...
+        // needed the same OS-sandbox write access `zirv ctx send` does.
+        // With `is_zirv_ctx_escape_safe`'s own fix (above), every one of
+        // those `zirv ctx <state-verb>` invocations already rides the
+        // ALWAYS-ALLOWED unsandboxed retry, so no prompt is ever paid for
+        // those writes regardless of what this OS-sandbox allowlist says.
+        // Reverting to mail-only keeps the safety audit trail (`logs/`),
+        // the cross-session memory bank, group budgets, and handoffs
+        // UNWRITABLE from inside the sandbox on any OTHER path (an
+        // unlisted/unmatched command that is not `zirv ctx` at all) -- real
+        // defense-in-depth the widened list gave up for no operator-facing
+        // benefit.
         let mail_dir =
             super::super::state::StateDir::resolve(&super::super::config::env_from_process())
                 .ok()
@@ -2219,6 +2234,18 @@ mod tests {
     /// sandbox, but ONLY the mail tree -- never the policy-snapshot/
     /// attestation directory that sits right alongside it under the same
     /// state root.
+    ///
+    /// Code review revert (issue #168 follow-up): Task 7 had widened this to
+    /// also allow-list memory/logs/groups/handoffs. With the `is_zirv_ctx_
+    /// escape_safe` fix above, every `zirv ctx <state-verb>` (`remember`/
+    /// `recall`/`forget`/`nudge`/`group`/...) already rides the ALWAYS-
+    /// ALLOWED unsandboxed retry, so no prompt is ever paid for those writes
+    /// regardless of what the OS sandbox's own `allowWrite` says. Reverting
+    /// to mail-only keeps the safety audit trail (`logs/`), the cross-
+    /// session memory bank, group budgets, and handoffs UNWRITABLE from
+    /// inside the sandbox on any OTHER path (an unlisted/unmatched command
+    /// that is not `zirv ctx` at all), which is a real defense-in-depth
+    /// layer the widened list gave up for no operator-facing benefit.
     #[cfg(not(windows))]
     #[test]
     fn launch_settings_allow_write_to_the_mail_dir_but_never_the_policy_snapshot_dir() {
