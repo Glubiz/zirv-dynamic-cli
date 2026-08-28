@@ -5487,6 +5487,102 @@ mod tests {
     /// silent" rule `reject_untrusted_keys` follows, applied to a section
     /// where a silent default is a permission grant.
     #[test]
+    fn fallback_defaults_are_conservative_and_enabled() {
+        let cfg = FallbackConfig::default();
+        assert!(cfg.enabled);
+        assert_eq!(cfg.order, vec!["claude", "codex"]);
+        assert_eq!(cfg.predictive_headroom_pct, 20.0);
+        assert_eq!(cfg.min_candidate_headroom_pct, 10.0);
+        assert_eq!(cfg.unknown_headroom_pct, 25.0);
+        assert_eq!(cfg.small_task_max_tokens, 40_000);
+        assert_eq!(cfg.small_task_max_tool_calls, 24);
+    }
+
+    #[test]
+    fn a_repo_fallback_table_can_only_narrow_the_operator_policy() {
+        let home = tempfile::tempdir().expect("home");
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".zirv/ctx.toml"),
+            "[fallback]\nenabled = true\norder = [\"claude\", \"codex\"]\npredictive_headroom_pct = 15.0\nmin_candidate_headroom_pct = 20.0\nunknown_headroom_pct = 20.0\nsmall_task_max_tokens = 30000\nsmall_task_max_tool_calls = 20\n",
+        )
+        .expect("write home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let repo = tempfile::tempdir().expect("repo");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        // Every value below except order attempts to make fallback MORE eager.
+        // Order also tries to reorder and add a candidate outside the home
+        // preference. None of those widenings may survive the trust fold.
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[fallback]\nenabled = true\norder = [\"codex\", \"claude\"]\npredictive_headroom_pct = 80.0\nmin_candidate_headroom_pct = 1.0\nunknown_headroom_pct = 90.0\nsmall_task_max_tokens = 90000\nsmall_task_max_tool_calls = 90\n",
+        )
+        .expect("write repo");
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert!(cfg.fallback.enabled);
+        assert_eq!(cfg.fallback.order, vec!["claude", "codex"]);
+        assert_eq!(cfg.fallback.predictive_headroom_pct, 15.0);
+        assert_eq!(cfg.fallback.min_candidate_headroom_pct, 20.0);
+        assert_eq!(cfg.fallback.unknown_headroom_pct, 20.0);
+        assert_eq!(cfg.fallback.small_task_max_tokens, 30_000);
+        assert_eq!(cfg.fallback.small_task_max_tool_calls, 20);
+    }
+
+    #[test]
+    fn a_repo_may_disable_filter_and_tighten_fallback() {
+        let home = tempfile::tempdir().expect("home");
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".zirv/ctx.toml"),
+            "[fallback]\norder = [\"claude\", \"codex\"]\npredictive_headroom_pct = 20.0\nmin_candidate_headroom_pct = 10.0\nunknown_headroom_pct = 25.0\nsmall_task_max_tokens = 40000\nsmall_task_max_tool_calls = 24\n",
+        )
+        .expect("write home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let repo = tempfile::tempdir().expect("repo");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[fallback]\nenabled = false\norder = [\"codex\"]\npredictive_headroom_pct = 10.0\nmin_candidate_headroom_pct = 30.0\nunknown_headroom_pct = 5.0\nsmall_task_max_tokens = 8000\nsmall_task_max_tool_calls = 6\n",
+        )
+        .expect("write repo");
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert!(!cfg.fallback.enabled);
+        assert_eq!(cfg.fallback.order, vec!["codex"]);
+        assert_eq!(cfg.fallback.predictive_headroom_pct, 10.0);
+        assert_eq!(cfg.fallback.min_candidate_headroom_pct, 30.0);
+        assert_eq!(cfg.fallback.unknown_headroom_pct, 5.0);
+        assert_eq!(cfg.fallback.small_task_max_tokens, 8_000);
+        assert_eq!(cfg.fallback.small_task_max_tool_calls, 6);
+    }
+
+    #[test]
+    fn fallback_env_is_the_operator_override_above_repo_narrowing() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tempfile::tempdir().expect("repo");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[fallback]\nenabled = false\norder = []\nunknown_headroom_pct = 0.0\n",
+        )
+        .expect("write repo");
+
+        let env = env_map(&[
+            ("ZIRV_CTX_FALLBACK", "true"),
+            ("ZIRV_CTX_FALLBACK_ORDER", "codex,claude"),
+            ("ZIRV_CTX_FALLBACK_UNKNOWN_HEADROOM_PCT", "35"),
+        ]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert!(cfg.fallback.enabled);
+        assert_eq!(cfg.fallback.order, vec!["codex", "claude"]);
+        assert_eq!(cfg.fallback.unknown_headroom_pct, 35.0);
+    }
+
+    #[test]
     fn a_malformed_repo_policy_table_fails_the_load() {
         let home = tempfile::tempdir().expect("tempdir");
         let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
