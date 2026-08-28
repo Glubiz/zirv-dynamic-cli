@@ -12,6 +12,8 @@ use super::handover;
 use super::pace::{self, SpawnGate};
 use super::state::StateDir;
 
+pub const VISITED_ENV: &str = "ZIRV_CTX_FALLBACK_VISITED";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RouteReason {
     Exhausted,
@@ -134,10 +136,11 @@ fn best_alternate(
     source_model_explicit: bool,
     bounds: TaskBounds,
     now: u64,
+    excluded: &[String],
 ) -> Option<(String, String, CandidateHeadroom)> {
     let mut best: Option<(usize, String, String, CandidateHeadroom)> = None;
     for (order_index, name) in cfg.fallback.order.iter().enumerate() {
-        if name == requested || !cfg.agents.is_enabled(name) {
+        if name == requested || excluded.iter().any(|seen| seen == name) || !cfg.agents.is_enabled(name) {
             continue;
         }
         if !candidate_allowed_by_capacity(cfg, name, bounds) {
@@ -218,6 +221,7 @@ pub fn route_new_delegation(
         source_model_explicit,
         bounds,
         now,
+        &[],
     )?;
     Some(Route {
         requested: requested.to_string(),
@@ -241,6 +245,7 @@ pub fn route_blocked_session(
     source_model_explicit: bool,
     bounds: TaskBounds,
     now: u64,
+    excluded: &[String],
 ) -> Option<Route> {
     if !cfg.fallback.enabled {
         return None;
@@ -253,6 +258,7 @@ pub fn route_blocked_session(
         source_model_explicit,
         bounds,
         now,
+        excluded,
     )?;
     Some(Route {
         requested: requested.to_string(),
