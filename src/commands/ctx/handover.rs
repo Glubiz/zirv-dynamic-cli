@@ -103,7 +103,6 @@ pub fn resolve_model(agent: &str, requested: &str, cfg: &CtxConfig) -> CtxResult
     Ok(requested.trim().to_string())
 }
 
-
 /// Classifies a concrete model id against this harness's configured generic
 /// ladder. This is intentionally exact (case-insensitive) rather than fuzzy:
 /// issue #186 promises not to sacrifice quality during cross-harness routing,
@@ -627,15 +626,12 @@ mod tests {
         let mut cfg = CtxConfig::default();
         cfg.handover.claude.standard = Some("sonnet-custom".to_string());
         cfg.handover.codex.standard = Some("terra-custom".to_string());
-        assert_eq!(tier_for_model("claude", "SONNET-CUSTOM", &cfg), Some("standard"));
         assert_eq!(
-            equivalent_model(
-                "claude",
-                Some("sonnet-custom"),
-                true,
-                "codex",
-                &cfg
-            ),
+            tier_for_model("claude", "SONNET-CUSTOM", &cfg),
+            Some("standard")
+        );
+        assert_eq!(
+            equivalent_model("claude", Some("sonnet-custom"), true, "codex", &cfg),
             Some("terra-custom".to_string())
         );
     }
@@ -644,13 +640,7 @@ mod tests {
     fn unclassified_operator_worker_default_also_never_guesses_a_quality_tier() {
         let cfg = CtxConfig::default();
         assert_eq!(
-            equivalent_model(
-                "claude",
-                Some("custom-worker-model"),
-                false,
-                "codex",
-                &cfg
-            ),
+            equivalent_model("claude", Some("custom-worker-model"), false, "codex", &cfg),
             None
         );
     }
@@ -658,15 +648,12 @@ mod tests {
     #[test]
     fn explicit_unclassified_model_never_guesses_a_cross_harness_equivalent() {
         let cfg = CtxConfig::default();
-        assert_eq!(tier_for_model("claude", "claude-experimental-x", &cfg), None);
         assert_eq!(
-            equivalent_model(
-                "claude",
-                Some("claude-experimental-x"),
-                true,
-                "codex",
-                &cfg
-            ),
+            tier_for_model("claude", "claude-experimental-x", &cfg),
+            None
+        );
+        assert_eq!(
+            equivalent_model("claude", Some("claude-experimental-x"), true, "codex", &cfg),
             None
         );
     }
