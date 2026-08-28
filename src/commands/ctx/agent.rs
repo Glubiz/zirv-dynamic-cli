@@ -374,7 +374,6 @@ fn flags_pin_model(flags: &[String]) -> bool {
         .any(|f| adapters::classify_model_flag(f).is_some())
 }
 
-
 /// Cross-harness fallback cannot forward arbitrary vendor CLI flags: a claude
 /// flag may mean something different (or be invalid) on codex and vice versa.
 /// Empty passthrough is safe, and a model-only passthrough can be replaced by
