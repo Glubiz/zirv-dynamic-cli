@@ -57,6 +57,13 @@ use super::{AgentAdapter, ResolvedProgram, TurnSignalSetup};
 /// operator switch is applied, not here -- this constant is unconditional
 /// content, the same way `claude::ORCHESTRATOR_PROMPT` has no switch of its
 /// own.
+///
+/// Issue #175: carries the same delegation-sizing rule as claude's layer,
+/// extended with this file's own native-subagents-first framing -- native
+/// codex subagent threads stay the default for any bounded task, and `zirv
+/// ctx agent --role sub-orchestrator` is reserved for work that genuinely
+/// decomposes into multiple coherently-scoped areas or must run under
+/// zirv's own supervision independently of this seat.
 pub const ORCHESTRATOR_PROMPT: &str = "\
 zirv orchestrator conventions (codex)
 
@@ -77,6 +84,11 @@ instead of a cheaper tier.
 work (handing a task to a different harness, such as claude) and the fallback whenever native \
 subagents are unavailable or turned off (`[agents] enabled = false`); name an explicit --model \
 there too, for the same reason.
+- Size delegation to the job: native codex subagent threads (cheaper-tier pinned per the rule \
+above) are the default for every bounded task, however substantial. Reserve a sub-orchestrator \
+(`zirv ctx agent --role sub-orchestrator --scope \"<area>\"`) for work that splits into multiple \
+coherent areas each needing its own coordination, or that must run under zirv's own supervision \
+independently of this seat -- never for a single bounded task a worker could finish.
 - Bundle before you dispatch: never spawn a worker for one tiny task. Group small related tasks \
 (same file or area, or a natural sequence) into a single checklist brief per worker, with a \
 per-item output format. A small or trivial change -- a one-line fix, a single obvious edit -- \
@@ -1801,7 +1813,7 @@ mod tests {
     #[test]
     fn the_codex_orchestrator_layer_names_its_own_delegation_route_and_tiers() {
         assert!(
-            ORCHESTRATOR_PROMPT.len() < 3_000,
+            ORCHESTRATOR_PROMPT.len() < 3_600,
             "this ships on every codex session: {} bytes",
             ORCHESTRATOR_PROMPT.len()
         );
@@ -1860,6 +1872,49 @@ mod tests {
             !ORCHESTRATOR_PROMPT.contains("haiku") && !ORCHESTRATOR_PROMPT.contains("sonnet"),
             "codex has no fixed model vocabulary to name: {ORCHESTRATOR_PROMPT}"
         );
+    }
+
+    /// Issue #175: extends this layer with the same delegation-sizing rule
+    /// as claude's own -- native codex subagent threads default this seat's
+    /// delegation for any bounded task, however substantial, and a
+    /// sub-orchestrator is reserved for work that genuinely splits into
+    /// multiple coherently-scoped areas or must run under zirv's own
+    /// supervision independently of this seat.
+    #[test]
+    fn the_orchestrator_prompt_sizes_delegation_between_subagents_and_sub_orchestrators() {
+        assert!(
+            ORCHESTRATOR_PROMPT.contains("native codex subagent threads"),
+            "got:\n{ORCHESTRATOR_PROMPT}"
+        );
+        assert!(
+            ORCHESTRATOR_PROMPT
+                .contains("are the default for every bounded task, however substantial"),
+            "native subagent threads must be the sizing default: {ORCHESTRATOR_PROMPT}"
+        );
+        assert!(
+            ORCHESTRATOR_PROMPT.contains("zirv ctx agent --role sub-orchestrator --scope"),
+            "got:\n{ORCHESTRATOR_PROMPT}"
+        );
+        assert!(
+            ORCHESTRATOR_PROMPT.contains("multiple coherent areas"),
+            "sub-orchestrators are reserved for multi-area work: {ORCHESTRATOR_PROMPT}"
+        );
+        assert!(
+            ORCHESTRATOR_PROMPT.contains("never for a single bounded task a worker could finish"),
+            "got:\n{ORCHESTRATOR_PROMPT}"
+        );
+    }
+
+    /// The sizing rule is orchestrator-only vocabulary. Codex contributes no
+    /// worker layer and falls back to `worker_system_prompt` (`None`) for a
+    /// sub-orchestrator role too (see `codex_contributes_no_worker_layer_of_
+    /// its_own`), so neither delegated role has any text to gain this bullet
+    /// in the first place.
+    #[test]
+    fn the_codex_worker_and_sub_orchestrator_roles_carry_no_layer_to_gain_the_sizing_rule() {
+        let adapter = CodexAdapter::new(None);
+        assert_eq!(adapter.worker_system_prompt(), None);
+        assert_eq!(adapter.sub_orchestrator_system_prompt(), None);
     }
 
     /// The codex ladder, top to bottom: `gpt-5.6-sol` (the default when no
