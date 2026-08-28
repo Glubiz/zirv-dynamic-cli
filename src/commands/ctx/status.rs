@@ -52,7 +52,7 @@ fn policy_snapshot_is_stale(record: &sessions::Record, env: EnvLookup<'_>) -> bo
 }
 
 /// N7: one line per registry record (`<short> <agent> <verb> pid <pid> <age>
-/// live|unreachable|stale <repo_slug>`), plus one line for any `s/*.sock` file that has
+/// live|unreachable|dead <repo_slug>`), plus one line for any `s/*.sock` file that has
 /// no matching registry record -- an older zirv binary that predates the
 /// registry still wrote sockets, and a mixed-version machine must not make
 /// those supervisors disappear from `status` entirely, just less detailed.
@@ -91,10 +91,14 @@ fn sessions_lines(
                 // live: the process is running, but it bound no turn-signal
                 // socket, so it can never notice a `zirv ctx nudge`. Showing
                 // it as plain `live` invited an operator to nudge something
-                // that would silently ignore them. A stale record still
-                // reports stale -- being gone outranks being unreachable.
+                // that would silently ignore them. A record whose pid no
+                // longer exists (`Liveness::Stale`; swept from disk as a
+                // side effect of this very listing, see `sessions::list`'s
+                // own doc comment) still reports `dead`, unambiguously --
+                // issue #166 -- rather than `stale`, which read as one more
+                // shade of live: being gone outranks being unreachable.
                 match (liveness, record.reachable) {
-                    (Liveness::Stale, _) => "stale",
+                    (Liveness::Stale, _) => "dead",
                     (Liveness::Live, true) => "live",
                     (Liveness::Live, false) => "unreachable",
                 },
@@ -1749,8 +1753,12 @@ mod tests {
         pid
     }
 
+    /// Issue #166: an operator reading `status` must see this unambiguously
+    /// as `dead`, not `live` -- and not the old `stale` wording either, which
+    /// read as merely one more shade of live rather than "this process is
+    /// gone."
     #[test]
-    fn status_marks_a_session_whose_process_is_gone_as_stale() {
+    fn status_marks_a_session_whose_process_is_gone_as_dead() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(tmp.path().join("state"));
         state.ensure().expect("ensure");
@@ -1775,7 +1783,7 @@ mod tests {
         let text = String::from_utf8(out).expect("utf8");
 
         let line = text.lines().find(|l| l.contains(&short)).unwrap_or("");
-        assert!(line.contains("stale"), "got {line}");
+        assert!(line.contains("dead"), "got {line}");
         assert!(!line.contains("live"), "got {line}");
     }
 

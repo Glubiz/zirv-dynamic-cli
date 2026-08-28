@@ -932,21 +932,23 @@ pub fn delivery_filter<'a>(latched: Option<&'a str>, current: &'a str) -> Option
     Some(latched.unwrap_or(current))
 }
 
-/// How much of a short id `zirv ctx nudge` insists on. `resolve_prefix`
-/// accepts any *unique* prefix, which is the right rule for a read-only
-/// lookup but the wrong one for a write: a single mistyped character can
-/// still be unique, and the nudge then wakes -- and can restart -- a session
+/// How much of a short id a write against a resolved session (`zirv ctx
+/// nudge`, `zirv ctx kill`) insists on. `resolve_prefix` accepts any *unique*
+/// prefix, which is the right rule for a read-only lookup but the wrong one
+/// for a write: a single mistyped character can still be unique, and the
+/// action then lands on -- wakes, restarts, or outright kills -- a session
 /// the operator never meant to touch. Four characters is 16 bits of the
 /// eight-hex-character short id, enough that a typo lands on "no session
 /// matches" rather than on a neighbour.
-pub const MIN_NUDGE_PREFIX: usize = 4;
+pub const MIN_TARGET_PREFIX: usize = 4;
 
-/// The refusal for a too-short nudge target, or `None` when the prefix is
-/// long enough to act on. Pure, so the rule is testable without a registry
-/// on disk. A prefix that *equals* a live session's whole short id always
-/// passes, however short that short id happens to be.
-pub fn nudge_prefix_too_short(prefix: &str, live_shorts: &[String]) -> Option<String> {
-    if prefix.chars().count() >= MIN_NUDGE_PREFIX {
+/// The refusal for a too-short target prefix, or `None` when it is long
+/// enough to act on. Pure, so the rule is testable without a registry on
+/// disk. A prefix that *equals* a live session's whole short id always
+/// passes, however short that short id happens to be. `verb` names the
+/// action in the refusal text (`"nudge"`, `"kill"`).
+pub fn prefix_too_short(verb: &str, prefix: &str, live_shorts: &[String]) -> Option<String> {
+    if prefix.chars().count() >= MIN_TARGET_PREFIX {
         return None;
     }
     if live_shorts.iter().any(|short| short == prefix) {
@@ -958,7 +960,7 @@ pub fn nudge_prefix_too_short(prefix: &str, live_shorts: &[String]) -> Option<St
         live_shorts.join(", ")
     };
     Some(format!(
-        "prefix too short (a nudge needs at least {MIN_NUDGE_PREFIX} characters, \
+        "prefix too short (a {verb} needs at least {MIN_TARGET_PREFIX} characters, \
          or a session's whole short id); sessions: {listed}"
     ))
 }
@@ -1026,7 +1028,7 @@ pub fn run_nudge_with<W: Write>(
     // prefix is very often *unique* on a machine running a single session, so
     // resolution would happily succeed and nudge (and potentially restart) a
     // session the operator only half-typed.
-    if let Some(refusal) = nudge_prefix_too_short(&args.prefix, &live_shorts(&state)) {
+    if let Some(refusal) = prefix_too_short("nudge", &args.prefix, &live_shorts(&state)) {
         return Err(format!("zirv ctx nudge: {refusal}").into());
     }
     // Only a live session is a valid nudge target: `resolve_prefix` already
@@ -1127,6 +1129,79 @@ pub fn run_nudge<W: Write>(args: &NudgeArgs, w: &mut W) -> CtxResult<i32> {
     let repo = std::env::current_dir()?;
     let env = env_from_process();
     run_nudge_with(args, w, &repo, &env, &mut std::io::stdin())
+}
+
+// Issue #166: `zirv ctx kill <prefix>`. A worker that has exhausted its
+// token budget, or is simply wedged, cannot notice a `nudge` -- that path
+// depends on the target reading its own mail and waking itself. `kill` needs
+// none of that: it is a plain OS-level SIGTERM/SIGKILL against the
+// registered pid, which works whether or not the process on the other end
+// can still act on anything.
+
+/// How long `kill` waits after SIGTERM before escalating to SIGKILL --
+/// `supervise::terminate`'s own grace window for an owned `Child`.
+const KILL_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+#[derive(Debug, clap::Args)]
+pub struct KillArgs {
+    /// Short id (or a unique prefix of one, at least four characters) of the
+    /// session to terminate.
+    pub prefix: String,
+}
+
+/// Terminates a registered session's process outright -- SIGTERM, escalating
+/// to SIGKILL after `KILL_GRACE` -- and deregisters it. Unlike `nudge`, this
+/// never depends on the target being able to notice or act on anything: it
+/// is a plain process signal, not mail. Freeing whatever machine-wide
+/// heavy-operation permit the session's pid held (`permit::live_records`) is
+/// a direct consequence of the pid actually dying, not a separate step here.
+///
+/// Only a live session is a valid kill target: `resolve_prefix` already
+/// filters to live records (a stale one was already swept from disk, and
+/// deregistered, by the time a caller could act on it -- see `list`'s own
+/// doc comment), so an unknown *or* already-dead session both surface as the
+/// same `NotFound`, the identical contract `run_nudge_with` already has for
+/// this exact case -- there is nothing left to kill, and nothing left to
+/// deregister either, since the sweep already did that.
+pub fn run_kill_with<W: Write>(args: &KillArgs, w: &mut W, env: EnvLookup<'_>) -> CtxResult<i32> {
+    let state = StateDir::resolve(env)?;
+    if let Some(refusal) = prefix_too_short("kill", &args.prefix, &live_shorts(&state)) {
+        return Err(format!("zirv ctx kill: {refusal}").into());
+    }
+    let record = resolve_prefix(&state, &args.prefix).map_err(|e| {
+        format!(
+            "zirv ctx kill: {}",
+            resolve_error_with_diagnostics(&e, &state, env)
+        )
+    })?;
+
+    let confirmed_dead = super::supervise::terminate_pid(record.pid, KILL_GRACE);
+    // Best-effort, matching every other piece of state-dir housekeeping in
+    // this module: whether or not the process could be confirmed dead, there
+    // is no reason left to keep the record around -- `kill` is the operator
+    // saying this session is done, not asking to retry.
+    let _ = std::fs::remove_file(record_path(&state, &record.short));
+
+    if confirmed_dead {
+        writeln!(
+            w,
+            "zirv ctx kill: terminated {} ({}, {}, pid {}) and deregistered it",
+            record.short, record.agent, record.verb, record.pid
+        )?;
+    } else {
+        writeln!(
+            w,
+            "zirv ctx kill: sent SIGTERM/SIGKILL to {} ({}, {}, pid {}) but could not confirm \
+             it exited; deregistered it from the session registry regardless",
+            record.short, record.agent, record.verb, record.pid
+        )?;
+    }
+    Ok(0)
+}
+
+pub fn run_kill<W: Write>(args: &KillArgs, w: &mut W) -> CtxResult<i32> {
+    let env = env_from_process();
+    run_kill_with(args, w, &env)
 }
 
 #[cfg(test)]
@@ -2009,10 +2084,10 @@ mod tests {
         // than the minimum is still addressable by that whole id, and only by
         // it.
         let shorts = vec!["ab".to_string()];
-        assert_eq!(nudge_prefix_too_short("ab", &shorts), None);
-        assert!(nudge_prefix_too_short("a", &shorts).is_some());
-        assert_eq!(nudge_prefix_too_short("abcd", &[]), None);
-        let refusal = nudge_prefix_too_short("x", &[]).expect("refused");
+        assert_eq!(prefix_too_short("nudge", "ab", &shorts), None);
+        assert!(prefix_too_short("nudge", "a", &shorts).is_some());
+        assert_eq!(prefix_too_short("nudge", "abcd", &[]), None);
+        let refusal = prefix_too_short("nudge", "x", &[]).expect("refused");
         assert!(refusal.contains("none registered"), "got {refusal}");
     }
 
@@ -2696,5 +2771,134 @@ mod tests {
         let err = run_nudge_with(&args, &mut out, &repo, &|k| env.get(k).cloned(), &mut stdin)
             .expect_err("the only match is dead");
         assert!(err.to_string().contains("no session"), "got {err}");
+    }
+
+    fn sh(script: &str) -> std::process::Command {
+        let mut cmd = std::process::Command::new("sh");
+        cmd.arg("-c").arg(script);
+        cmd
+    }
+
+    /// Issue #166: `zirv ctx kill` must work against a session that has no
+    /// way to notice anything -- unlike `nudge`, this never depends on the
+    /// target reading mail or waking itself. Ends the real process by pid and
+    /// deregisters the record, both without a `SessionGuard` of its own: a
+    /// separate `kill` invocation only ever has the registry record, never
+    /// the original guard.
+    #[test]
+    fn kill_terminates_a_live_sessions_process_and_deregisters_it() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let state_dir = tmp.path().join("state");
+        let state = state_in(&state_dir);
+        let repo = tmp.path().join("repo");
+
+        let mut child = sh("sleep 30")
+            .spawn()
+            .expect("spawn a real process to kill");
+        let pid = child.id();
+        // `run_kill_with`'s own liveness check is `is_alive` (`kill(pid,
+        // 0)`), not `Child::try_wait` -- this test is the process's real
+        // parent, so it must reap concurrently or the killed process would
+        // sit as a zombie (still visible to `kill(pid, 0)`) until this test's
+        // own `wait()` ran. See `supervise::terminate_pid`'s own tests for
+        // the same reasoning.
+        let reaper = std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+
+        let mut record = record_for("eeeeeeee-2222-4333-8444-555555555555", &repo, Verb::Exec);
+        record.pid = pid;
+        let short = record.short.clone();
+        let path = record_path(&state, &short);
+        write_record(&state, &record);
+
+        let env = env_map(&[(
+            super::super::state::STATE_ENV,
+            state_dir.to_str().expect("utf8"),
+        )]);
+        let args = KillArgs {
+            prefix: short.clone(),
+        };
+        let mut out = Vec::new();
+        let code =
+            run_kill_with(&args, &mut out, &|k| env.get(k).cloned()).expect("kill must succeed");
+        assert_eq!(code, 0);
+        reaper.join().expect("reaper thread");
+
+        assert!(!path.exists(), "the record is deregistered");
+        assert!(
+            list(&state).is_empty(),
+            "nothing left to resolve a future nudge or kill against"
+        );
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(text.contains(&short), "names what it killed: {text}");
+    }
+
+    /// `resolve_prefix`'s own contract, reused verbatim by `kill`: an unknown
+    /// prefix and a prefix whose only match already died (and was therefore
+    /// already swept and deregistered by `list`) surface identically -- there
+    /// is nothing left to kill or deregister either way.
+    #[test]
+    fn killing_an_unknown_or_dead_session_is_an_error_that_says_so() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let state_dir = tmp.path().join("state");
+        let repo = tmp.path().join("repo");
+        let env = env_map(&[(
+            super::super::state::STATE_ENV,
+            state_dir.to_str().expect("utf8"),
+        )]);
+
+        let args = KillArgs {
+            prefix: "zzzz".to_string(),
+        };
+        let mut out = Vec::new();
+        let err = run_kill_with(&args, &mut out, &|k| env.get(k).cloned())
+            .expect_err("no session is registered at all");
+        assert!(err.to_string().contains("no session"), "got {err}");
+
+        let state = state_in(&state_dir);
+        let mut dead = record_for("dddddddd-2222-4333-8444-555555555555", &repo, Verb::Loop);
+        dead.pid = dead_pid();
+        write_record(&state, &dead);
+
+        let args = KillArgs {
+            prefix: "dddd".to_string(),
+        };
+        let mut out = Vec::new();
+        let err = run_kill_with(&args, &mut out, &|k| env.get(k).cloned())
+            .expect_err("the only match is already dead");
+        assert!(err.to_string().contains("no session"), "got {err}");
+    }
+
+    /// Same guard `nudge` already has, on the same shared rule: a kill is at
+    /// least as destructive as a nudge (it ends the process outright), so a
+    /// mistyped one- or two-character prefix must not resolve just because it
+    /// happens to be unique on this machine.
+    #[test]
+    fn a_kill_prefix_shorter_than_four_characters_is_refused() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let state_dir = tmp.path().join("state");
+        let state = state_in(&state_dir);
+        let repo = tmp.path().join("repo");
+        let record = record_for("abcdef12-3456-4789-8abc-def012345678", &repo, Verb::Chat);
+        let _guard = SessionGuard::register(&state, record);
+
+        let env = env_map(&[(
+            super::super::state::STATE_ENV,
+            state_dir.to_str().expect("utf8"),
+        )]);
+        let args = KillArgs {
+            prefix: "abc".to_string(),
+        };
+        let mut out = Vec::new();
+        let err = run_kill_with(&args, &mut out, &|k| env.get(k).cloned())
+            .expect_err("three characters is not enough to kill on");
+        assert!(err.to_string().contains("prefix too short"), "got {err}");
     }
 }
