@@ -1117,6 +1117,14 @@ fn write_nudge_marker(state: &StateDir, short: &str, from: &str) {
     let _ = std::fs::write(nudge_marker_path(state, short), from.as_bytes());
 }
 
+/// Best-effort low-latency notification used after durable mail storage.
+/// The marker carries no authority and may be lost without losing mail; live
+/// supervisors consume it through the same turn-boundary path as an explicit
+/// `zirv ctx nudge`.
+pub(crate) fn notify_mail(state: &StateDir, short: &str, from: &str) {
+    write_nudge_marker(state, short, from);
+}
+
 /// Atomically claims the wake-up marker for `short`, returning who sent it.
 ///
 /// `std::fs::remove_file` is the atomic claim, the same idiom `mail::

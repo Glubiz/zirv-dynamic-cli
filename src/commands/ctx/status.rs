@@ -114,6 +114,11 @@ fn sessions_lines(
                     "  policy snapshot stale (current policy is wider); relaunch to adopt",
                 );
             }
+            let delivery = mail::session_delivery_metrics(state, &record.short, now);
+            line.push_str(&format!(
+                "  mail queue {} unread {} recent in:{} out:{}",
+                delivery.queued, delivery.unread, delivery.recent_in, delivery.recent_out
+            ));
             line
         })
         .collect();
@@ -500,6 +505,13 @@ pub fn run_with<W: Write>(
         )?,
         Ok(messages) => writeln!(w, "mail: {} unread", messages.len())?,
         Err(_) => writeln!(w, "mail: (unreadable)")?,
+    }
+    let recent_mail = mail::recent_flow_lines(&state, crate::commands::ctx::state::now_secs(), 5);
+    if !recent_mail.is_empty() {
+        writeln!(w, "mail flow (last hour):")?;
+        for line in recent_mail {
+            writeln!(w, "  {line}")?;
+        }
     }
 
     let session_records = sessions::list(&state);

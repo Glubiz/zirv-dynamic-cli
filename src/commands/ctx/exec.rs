@@ -550,8 +550,10 @@ pub(crate) fn run_with_clock<W: Write>(
     // own `task_prompt_with_mail_fallback` call (which intentionally reuses
     // whatever this holds rather than re-listing) sees the most recent
     // listing, not permanently the launch-time one.
-    let mut mail_messages: Vec<super::mail::Message> =
-        mail_entries.iter().map(|(_, msg)| msg.clone()).collect();
+    let mut mail_messages: Vec<super::mail::Message> = mail_entries
+        .iter()
+        .map(|(path, msg)| super::mail::message_with_delivery_envelope(&state, path, msg))
+        .collect();
     if !mail_messages.is_empty() {
         announcer.emit(&super::announce::Event::MailDelivered {
             count: mail_messages.len(),

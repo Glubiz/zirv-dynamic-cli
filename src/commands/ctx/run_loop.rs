@@ -236,8 +236,10 @@ pub(crate) fn run_with_clock<W: Write>(
         } else {
             Vec::new()
         };
-        let mail_messages: Vec<super::mail::Message> =
-            mail_entries.iter().map(|(_, msg)| msg.clone()).collect();
+        let mail_messages: Vec<super::mail::Message> = mail_entries
+            .iter()
+            .map(|(path, msg)| super::mail::message_with_delivery_envelope(&state, path, msg))
+            .collect();
         if !mail_messages.is_empty() {
             announcer.emit(&super::announce::Event::MailDelivered {
                 count: mail_messages.len(),
