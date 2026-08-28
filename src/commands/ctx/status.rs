@@ -474,7 +474,11 @@ pub fn run_with<W: Write>(
             writeln!(
                 w,
                 "fallback: {} | order {} | steer below {:.0}% headroom | candidate min {:.0}% | unknown assumes {:.0}%",
-                if cfg.fallback.enabled { "enabled" } else { "disabled" },
+                if cfg.fallback.enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                },
                 if cfg.fallback.order.is_empty() {
                     "(none)".to_string()
                 } else {
