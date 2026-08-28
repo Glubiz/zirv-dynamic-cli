@@ -792,6 +792,15 @@ pub struct Pane {
     /// directory could not be created), which can then only ever be the
     /// requester of nothing.
     intake_dir: Option<PathBuf>,
+    /// Security review Finding 2 (2026-08-28): the `group::WorkGroup` this
+    /// pane was spawned into (`spawnreq::SpawnRequest::work_group_id`), if
+    /// any. A dashboard-spawned coordinator claims it at spawn and the
+    /// dashboard closes it when this pane's own child exits -- the pane-side
+    /// mirror of `agent::run_with`'s claim/close pair, without which a
+    /// dash-spawned coordinator's group stayed open and unclaimed forever.
+    /// Also what `dash::mod::on_quit` persists into the restore roster, so a
+    /// restored pane comes back inside the same group.
+    work_group_id: Option<String>,
     /// Whether `report_back_reminder_sweep`'s one-shot completion reminder
     /// has already been injected into this pane. Set the moment that
     /// injection succeeds and never cleared again -- unlike
@@ -986,6 +995,7 @@ impl Pane {
             done: false,
             report_to: None,
             intake_dir: None,
+            work_group_id: None,
             report_reminder_sent: false,
             pending_submit: None,
         })
@@ -1414,6 +1424,19 @@ impl Pane {
     /// This pane's own spawn-request intake directory, if it was given one.
     pub fn intake_dir(&self) -> Option<&Path> {
         self.intake_dir.as_deref()
+    }
+
+    /// Security review Finding 2: records the work group this pane was
+    /// spawned into. Called right after `Pane::spawn` by the caller that
+    /// already admitted the spawn into that group -- see
+    /// [`Pane::work_group_id`]'s own field comment.
+    pub fn set_work_group_id(&mut self, id: Option<String>) {
+        self.work_group_id = id;
+    }
+
+    /// The work group this pane belongs to, if any.
+    pub fn work_group_id(&self) -> Option<&str> {
+        self.work_group_id.as_deref()
     }
 
     /// Whether `report_back_reminder_sweep`'s one-shot reminder has already

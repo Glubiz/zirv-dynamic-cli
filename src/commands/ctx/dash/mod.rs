@@ -1088,6 +1088,7 @@ fn reap_ended_panes(
     panes: &mut Vec<Pane>,
     queues: &mut Vec<VecDeque<String>>,
     cfg: &CtxConfig,
+    state: &StateDir,
     focused: &mut usize,
     selected: &mut usize,
     errors: &mut Vec<String>,
@@ -1107,6 +1108,7 @@ fn reap_ended_panes(
             push_error(errors, format!("reap {}: {e}", panes[index].short()));
         }
         let pane = panes.remove(index);
+        close_claimed_group(&pane, state);
         if index < queues.len() {
             queues.remove(index);
         }
@@ -1129,6 +1131,40 @@ fn reap_ended_panes(
         // Deliberately no `index += 1`: the next pane has shifted into this
         // slot and has not been looked at yet.
     }
+}
+
+/// Security review Finding 2 (2026-08-28): a coordinator pane's scope is
+/// done the moment its own child exits -- successfully or not -- exactly as
+/// `agent::run_with`'s completion path already treats a headless
+/// coordinator's, and with the same two guards: only a `SubOrchestrator`
+/// pane, and only for a group THIS pane actually claimed
+/// (`group::claim_sub_orchestrator` is first-claim-wins, so a group some
+/// other session owns must never be closed out from under it). Totals
+/// survive: `group::close` only stamps `closed_at`, leaving
+/// `admitted_children` and the terms a reviewer reads with `zirv ctx group
+/// status` exactly as they were.
+///
+/// Best-effort throughout: a pane is being reaped either way, and a group
+/// record that cannot be read or written is not a reason to fail that.
+/// Deliberately NOT called from `on_quit`: a dashboard quitting kills its
+/// panes mid-work rather than watching them finish, and such a group is
+/// genuinely still open -- `group::is_abandoned` (claimed, unclosed, claimant
+/// gone) is what surfaces it then, which is what the claim at spawn now makes
+/// possible for a dash-spawned coordinator at all.
+fn close_claimed_group(pane: &Pane, state: &StateDir) {
+    if !matches!(pane.role(), prompt::PromptRole::SubOrchestrator) {
+        return;
+    }
+    let Some(group_id) = pane.work_group_id() else {
+        return;
+    };
+    let Ok(Some(group)) = super::group::load(state, group_id) else {
+        return;
+    };
+    if group.sub_orchestrator_session.as_deref() != Some(pane.short()) {
+        return;
+    }
+    let _ = super::group::close(state, group_id, super::state::now_secs());
 }
 
 /// Called on every quit path, before any pane is torn down (shutdown --
@@ -3258,7 +3294,22 @@ fn fulfill_spawn_request(
     // still benefits from the reminder pointing it at the right command.
     pane.set_report_to(report_to_for(req, cfg));
     pane.set_intake_dir(pane_channel);
+    pane.set_work_group_id(req.work_group_id.clone());
     let short = pane.short().to_string();
+    // Security review Finding 2: the dash-side half of issue #170's
+    // claim/close pair. `agent::run_with` claims a group for the coordinator
+    // it launches headlessly, but the dashboard fork of the very same
+    // delegation claimed nothing -- so a dash-spawned coordinator's group sat
+    // open and unclaimed forever, and `group::is_abandoned` (which needs a
+    // claim to have anything to say) could never flag it when that pane died.
+    // First-claim-wins, and best-effort for the same reason `run_with`'s own
+    // claim is: a group swept between admission and here must not fail a
+    // spawn that has already happened.
+    if matches!(requested_role, prompt::PromptRole::SubOrchestrator)
+        && let Some(group_id) = &req.work_group_id
+    {
+        let _ = super::group::claim_sub_orchestrator(state, group_id, &short);
+    }
     panes.push(pane);
     nudge_queues.push(VecDeque::new());
 
@@ -5252,6 +5303,7 @@ pub fn run_dashboard(
             &mut panes,
             &mut nudge_queues,
             cfg,
+            state,
             &mut focused,
             &mut selected,
             &mut errors,
@@ -8461,6 +8513,7 @@ mod tests {
                 &mut panes,
                 &mut queues,
                 &cfg,
+                &state,
                 &mut focused,
                 &mut selected,
                 &mut errors,
@@ -12707,6 +12760,7 @@ mod tests {
                 &mut panes,
                 &mut queues,
                 &cfg,
+                &state,
                 &mut focused,
                 &mut selected,
                 &mut errors,
@@ -13537,6 +13591,148 @@ mod tests {
         assert_eq!(
             group.sub_orchestrator_session, None,
             "and must not claim the group either"
+        );
+
+        for pane in &mut panes {
+            let _ = pane.shutdown("");
+        }
+    }
+
+    /// SECURITY/lifecycle (review round 2, Finding 2, 2026-08-28): the
+    /// dashboard fork of a coordinator delegation used to claim nothing and
+    /// close nothing -- only `agent::run_with`'s headless fork did -- so a
+    /// dash-spawned sub-orchestrator left its group open and unclaimed
+    /// forever, which `group::is_abandoned` cannot flag (no claim, nothing to
+    /// be responsible for). End to end here: the spawn claims the group, the
+    /// pane's own exit closes it, and the totals a reviewer reads survive
+    /// that close.
+    #[cfg(unix)]
+    #[test]
+    fn a_dash_spawned_coordinator_claims_its_group_and_closes_it_when_the_pane_exits() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().to_path_buf();
+        let requests_dir = tmp
+            .path()
+            .join("dash")
+            .join("aaaa1111-token")
+            .join("requests");
+        let (mut panes, mut queues, orch_channel, _worker_channel) =
+            two_paned_dash(&state, &repo, &requests_dir);
+
+        let cfg = CtxConfig {
+            // Exits immediately, so the reap loop below has something real to
+            // reap -- and never a real agent binary, the ABSOLUTE rule every
+            // pty test in this module follows.
+            agent_bin: Some("true".to_string()),
+            pace: crate::commands::ctx::config::PaceConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            ..CtxConfig::default()
+        };
+
+        let group_id = super::super::group::run_create(
+            &state,
+            &mut Vec::new(),
+            &super::super::group::CreateArgs {
+                scope: "the batch".to_string(),
+                child_limit: 4,
+                token_budget: None,
+                deadline_secs: None,
+                completion_contract: "every child reports back".to_string(),
+                parent_session: None,
+            },
+            1_000,
+        )
+        .expect("create group");
+
+        let orch_short = sessions::short_id("aaaaaaaa-1111-4222-8333-444444444444");
+        let mut req = spawn_request("own this scope", &repo);
+        req.parent_session = Some(orch_short.clone());
+        req.role = Some("sub-orchestrator".to_string());
+        req.work_group_id = Some(group_id.clone());
+        spawnreq::write_request(&orch_channel, &req).expect("write");
+
+        let mut errors = Vec::new();
+        handle_spawn_requests(
+            &requests_dir,
+            &mut panes,
+            &mut queues,
+            &cfg,
+            &state,
+            &repo,
+            (80, 24),
+            &mut errors,
+        );
+        assert_eq!(panes.len(), 3, "the coordinator pane spawned: {errors:?}");
+        let coordinator_short = panes[2].short().to_string();
+
+        let claimed = super::super::group::load(&state, &group_id)
+            .expect("load")
+            .expect("group");
+        assert_eq!(
+            claimed.sub_orchestrator_session.as_deref(),
+            Some(coordinator_short.as_str()),
+            "the dashboard claims the group for the pane it just spawned"
+        );
+        assert_eq!(
+            claimed.admitted_children, 1,
+            "and the pane spawn was admitted against the child limit"
+        );
+        assert!(
+            !super::super::group::is_abandoned(&claimed, true),
+            "a claimed group whose coordinator is still alive is not abandoned"
+        );
+        assert!(
+            super::super::group::is_abandoned(&claimed, false),
+            "and the claim is what finally lets a dash-spawned coordinator's death be flagged"
+        );
+
+        // The coordinator's child exits, and the reap seam closes its group.
+        // (The two setup panes are trivial, immediately-exiting children too,
+        // so the loop watches for the coordinator's own short id rather than
+        // counting panes.)
+        let coordinator_live =
+            |panes: &[Pane]| panes.iter().any(|p| p.short() == coordinator_short);
+        let (mut focused, mut selected) = (0usize, 0usize);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline && coordinator_live(&panes) {
+            for pane in panes.iter_mut() {
+                pane.drain();
+            }
+            reap_ended_panes(
+                &mut panes,
+                &mut queues,
+                &cfg,
+                &state,
+                &mut focused,
+                &mut selected,
+                &mut errors,
+                &mut Vec::new(),
+                &mut HashSet::new(),
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(!coordinator_live(&panes), "the coordinator pane was reaped");
+
+        let closed = super::super::group::load(&state, &group_id)
+            .expect("load")
+            .expect("group");
+        assert!(
+            closed.closed_at.is_some(),
+            "the coordinator's exit closes the group it claimed"
+        );
+        assert_eq!(
+            closed.admitted_children, 1,
+            "and the totals a reviewer reads survive the close"
+        );
+        assert_eq!(closed.completion_contract, "every child reports back");
+        assert!(
+            !super::super::group::is_abandoned(&closed, false),
+            "a closed group is finished, not abandoned"
         );
 
         for pane in &mut panes {
