@@ -3608,6 +3608,68 @@ mod tests {
     }
 
     #[test]
+    fn a_limit_hit_hands_over_to_an_enabled_alternate_before_parking() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let state_dir = tmp.path().join("state");
+        let argv_log = tmp.path().join("argv.log");
+        let mut env = base_env(&state_dir);
+        // A confirmed vendor limit is stronger evidence than proactive pacing,
+        // so fallback remains useful even when the operator disabled the pace
+        // gate itself.
+        env.insert("ZIRV_CTX_PACE".to_string(), "false".to_string());
+        env.insert(
+            "ZIRV_CTX_AGENT_BIN".to_string(),
+            format!("sh {}", fixture("fake-codex-agent.sh").display()),
+        );
+
+        // The first (codex) child reports a hard limit. The same fixture then
+        // stands in for the selected claude continuation and exits cleanly.
+        let modes = tmp.path().join("modes.txt");
+        std::fs::write(&modes, "limit\nhealthy\n").expect("write modes");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let _fake_agent = crate::commands::ctx::testenv::VarGuard::set(&[
+            ("FAKE_AGENT_MODE_FILE", modes.to_str()),
+            ("FAKE_AGENT_ARGV_LOG", argv_log.to_str()),
+        ]);
+
+        let args = ExecArgs {
+            agent: Some("codex".to_string()),
+            session_id: None,
+            transcript: None,
+            prompt: Some("finish the requested work".to_string()),
+            max_restarts: Some(0),
+            budget_tokens: None,
+            max_tool_calls: None,
+            timeout_secs: Some(30),
+            simple: false,
+            command: Vec::new(),
+        };
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        assert_eq!(code.expect("runs"), 0);
+
+        let log = std::fs::read_to_string(state_dir.join("logs/decisions.jsonl")).expect("log");
+        assert!(
+            log.contains("\"action\":\"harness-handover\""),
+            "the confirmed limit should cross harnesses: {log}"
+        );
+        assert!(
+            log.contains("codex -> claude"),
+            "the selected route should be transparent: {log}"
+        );
+        assert!(
+            !log.contains("\"action\":\"limit-park\""),
+            "an admissible alternate should be used before the legacy park path: {log}"
+        );
+        let argv = std::fs::read_to_string(&argv_log).unwrap_or_default();
+        assert!(
+            argv.contains("finish the requested work"),
+            "the logical task must survive the handoff: {argv}"
+        );
+    }
+
+    #[test]
     fn a_limit_hit_parks_and_relaunches_without_spending_the_restart_budget() {
         let tmp = crate::commands::ctx::testenv::repo();
         let home = tmp.path().join("home");
