@@ -1369,6 +1369,152 @@ pub(crate) fn run_with_clock<W: Write>(
         }
 
         if limit_hit {
+            // Issue #186: a vendor-confirmed block is the only point where a
+            // running session may move harnesses. The child is already stopped,
+            // so this never interrupts an in-flight response. Only launches
+            // zirv itself built from prompt data are portable across vendors;
+            // an operator-owned explicit command keeps today's park behavior.
+            let visited: Vec<String> = env(super::fallback::VISITED_ENV)
+                .map(|raw| super::config::split_csv_list(&raw))
+                .unwrap_or_default();
+            let source_model = adapters::last_model_flag(&args.command);
+            let route = (adapter_builds_launch && prompt.is_some()).then(|| {
+                super::fallback::route_blocked_session(
+                    &state,
+                    &cfg,
+                    adapter.name(),
+                    source_model,
+                    source_model.is_some(),
+                    super::fallback::TaskBounds {
+                        tokens: worker_budget.tokens,
+                        tool_calls: worker_budget.tool_calls,
+                    },
+                    now_fn(),
+                    &visited,
+                )
+            }).flatten();
+
+            if let Some(route) = route {
+                let jsonl = std::fs::read_to_string(&transcript).unwrap_or_default();
+                let ctx = adapter.structural_context(&jsonl, cfg.handoff.tail_items);
+                let (note, source) = handoff::distill_or_structural(
+                    adapter.as_ref(),
+                    &distiller_model,
+                    &ctx,
+                    Duration::from_secs(cfg.handoff.timeout_secs),
+                    cfg.chrome.events,
+                );
+                let stored = handoff::store(&state, repo, session.as_str(), &note)?;
+
+                // Preserve the delegation's original budget across the vendor
+                // boundary. This harvest includes the just-stopped child plus
+                // every prior restart already accumulated in these counters.
+                if has_budget {
+                    harvest_spend(
+                        adapter.as_ref(),
+                        &transcript,
+                        &mut prior_usage,
+                        &mut prior_tool_calls,
+                    );
+                }
+                let spent_tokens = prior_usage
+                    .context_total()
+                    .saturating_add(prior_usage.output_tokens);
+                let remaining_tokens =
+                    worker_budget.tokens.map(|limit| limit.saturating_sub(spent_tokens));
+                let remaining_tool_calls = worker_budget
+                    .tool_calls
+                    .map(|limit| limit.saturating_sub(prior_tool_calls));
+                if worker_budget.tokens.is_some_and(|_| remaining_tokens == Some(0))
+                    || worker_budget
+                        .tool_calls
+                        .is_some_and(|_| remaining_tool_calls == Some(0))
+                {
+                    let _ = log::append(
+                        &state,
+                        &log::Decision {
+                            ts: now_secs(),
+                            session: session.as_str(),
+                            verb: "exec",
+                            verdict: "budget",
+                            score: 0,
+                            action: "fallback-budget-exhausted",
+                            detail: "usage limit coincided with the delegation budget ceiling",
+                        },
+                    );
+                    session_guard.release();
+                    return Ok(EXIT_BUDGET_EXHAUSTED);
+                }
+
+                let detail = format!(
+                    "{}; {} handoff at {}",
+                    route.detail(),
+                    source,
+                    stored.display()
+                );
+                let _ = log::append(
+                    &state,
+                    &log::Decision {
+                        ts: now_secs(),
+                        session: session.as_str(),
+                        verb: "exec",
+                        verdict: "limit",
+                        score: 100,
+                        action: "harness-handover",
+                        detail: &detail,
+                    },
+                );
+                writeln!(
+                    w,
+                    "zirv ctx exec: usage limit hit; continuing on another harness ({detail})"
+                )?;
+
+                let prompt_text = prompt.clone().expect("route requires a known prompt");
+                let continuation = format!(
+                    "{prompt_text}\n\nThe previous harness exhausted its usage window. Continue from this handoff without redoing completed work:\n\n{}",
+                    note.to_markdown()
+                );
+                let target = adapters::select(Some(&route.selected), &[], &cfg)?;
+                let nested_args = ExecArgs {
+                    agent: Some(route.selected.clone()),
+                    session_id: None,
+                    transcript: None,
+                    prompt: Some(continuation),
+                    max_restarts: args.max_restarts,
+                    timeout_secs: args.timeout_secs,
+                    budget_tokens: remaining_tokens,
+                    max_tool_calls: remaining_tool_calls,
+                    command: target.model_args(&route.model),
+                    simple: args.simple,
+                };
+
+                let mut next_visited = visited;
+                if !next_visited.iter().any(|name| name == adapter.name()) {
+                    next_visited.push(adapter.name().to_string());
+                }
+                let visited_csv = next_visited.join(",");
+                let nested_env = |key: &str| {
+                    if key == super::fallback::VISITED_ENV {
+                        Some(visited_csv.clone())
+                    } else {
+                        env(key)
+                    }
+                };
+
+                // The old session has ended and its handoff is durable before
+                // the continuation is registered. Releasing first prevents two
+                // live registry entries from claiming one logical worker.
+                session_guard.release();
+                return run_with_clock(
+                    &nested_args,
+                    w,
+                    repo,
+                    &nested_env,
+                    now_fn,
+                    sleep_fn,
+                );
+            }
+
             let _ = log::append(
                 &state,
                 &log::Decision {
