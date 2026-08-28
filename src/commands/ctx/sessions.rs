@@ -570,11 +570,26 @@ impl SessionGuard {
     /// here, best-effort: `short` and the record's path do not move (see
     /// `refresh_session`), so a failed write costs a stale pid, never an
     /// address.
+    ///
+    /// Review round 2 finding 1 (issue #152): `start_time` MUST move with
+    /// `pid`, not just `pid` alone. `record_is_alive`'s `EPERM` branch
+    /// compares whoever currently holds `record.pid` against `record.
+    /// start_time` -- leaving the old value in place after repointing `pid`
+    /// at a fresh child would compare the CHILD's real start time against
+    /// the SUPERVISOR's, which is a guaranteed mismatch (the child always
+    /// starts meaningfully after the supervisor that goes on to spawn it).
+    /// That is not a hypothetical: it is exactly the everyday sandboxed
+    /// case issue #146 was written for -- a live child, probed with `EPERM`
+    /// -- and would have `list` delete a perfectly live pane's record.
+    /// Re-reading via `process_start_secs(pid)` keeps the two in lockstep;
+    /// `None` (no usable `ps`) degrades `start_time` to `None` too, which
+    /// is `record_is_alive`'s own "cannot tell" case, never a false mismatch.
     pub fn adopt_child_pid(&mut self, pid: u32) {
         if self.released || self.record.pid == pid {
             return;
         }
         self.record.pid = pid;
+        self.record.start_time = process_start_secs(pid);
         self.path = write_record(&self.state, &self.record);
     }
 
@@ -705,16 +720,43 @@ pub(crate) fn is_alive(_pid: u32) -> bool {
 
 /// How far apart a record's stamped `start_time` and a freshly read one may
 /// be before they are considered two different processes rather than the
-/// same one read twice. Named after `RECYCLED_PID_TOLERANCE_SECS` (`kill`'s
-/// own recycled-pid guard, above) since it absorbs the exact same sources of
-/// slack: a coarse `ps -o etime=` reading and a clock that stepped between
-/// the two reads it is compared against.
+/// same one read twice.
+///
+/// Review round 2 finding 2 (issue #152): 10s was too tight. This
+/// disambiguator's whole job is to catch a pid the OS recycled to an
+/// unrelated process well AFTER the original session died -- in practice
+/// hours or days later, since a pid only frees once the original process is
+/// long gone and the kernel's pid counter wraps back around to it. It has no
+/// business firing on ordinary clock noise: an NTP correction or a manual
+/// clock change between registration and a later check can plausibly move
+/// either `now_secs()` reading by more than a few seconds without any
+/// process having changed at all, and `record_is_alive`'s `EPERM` branch is
+/// exactly the sandboxed-probe path issue #146 exists for -- a genuinely
+/// live, unrelated-uid session, not a recycled one. 300s (5 minutes) absorbs
+/// realistic NTP steps, `ps -o etime=` rounding, and this reader's own
+/// now-minus-age derivation slack, while still being a small fraction of the
+/// "hours or days" gap the actual recycled-pid failure mode produces. Never
+/// sweep a live record on a difference the clock environment alone could
+/// plausibly explain.
+///
+/// Compare `RECYCLED_PID_TOLERANCE_SECS` (`kill`'s own recycled-pid guard,
+/// above): both absorb clock/reading slack, but they answer different
+/// questions at different magnitudes and must not be unified. `kill`'s guard
+/// compares a target's own freshly-read age against `registered_at` -- a
+/// ONE-SIDED "is this process younger than its own record" heuristic, where
+/// even a few seconds of slack (5s) is enough margin because a genuine
+/// session's process always predates its record by a wide, predictable
+/// margin (registration happens moments after the process starts). This
+/// disambiguator instead compares two INDEPENDENT start-time readings of the
+/// same claimed process, taken at different times, against each other --
+/// exactly the kind of comparison a clock step disturbs, and with no
+/// registration-order assumption to lean on, hence the much wider 300s.
 ///
 /// Only `record_is_alive`'s `#[cfg(unix)]` branch reads this outside of
 /// tests -- see its own `#[cfg_attr]`, matching `parse_etime`'s identical
 /// non-unix dead-code allowance below.
 #[cfg_attr(not(unix), allow(dead_code))]
-const START_TIME_TOLERANCE_SECS: u64 = 10;
+const START_TIME_TOLERANCE_SECS: u64 = 300;
 
 /// Pure: whether a mismatch between a record's stamped `start_time` and a
 /// freshly read one is large enough to mean "a different process now holds
@@ -747,7 +789,14 @@ fn start_time_disambiguates_dead(recorded: Option<u64>, current: Option<u64>) ->
 /// exactly issue #152's own scope note -- Windows liveness stays on its
 /// existing `OpenProcess`/`GetExitCodeProcess` mechanism, unaffected, since
 /// `record_is_alive` never calls this off unix.
-fn process_start_secs(pid: u32) -> Option<u64> {
+///
+/// `pub(crate)`: every place `Record::pid` is ever repointed at a different
+/// process after `Record::new` -- `SessionGuard::adopt_child_pid` here, and
+/// `dash::pane::Pane::spawn`'s own `record.pid = child_pid` -- must re-derive
+/// `start_time` for the NEW pid in the same breath, or `record_is_alive`
+/// compares the new process against the old one's start time and reads a
+/// guaranteed, false mismatch (review round 2 finding 1, issue #152).
+pub(crate) fn process_start_secs(pid: u32) -> Option<u64> {
     let age = process_age_secs(pid)?;
     Some(super::state::now_secs().saturating_sub(age))
 }
@@ -1335,6 +1384,19 @@ pub struct KillArgs {
 /// session's process always predates the record that describes it, so any
 /// positive slack is pure margin -- against a coarse `ps` reading, a clock
 /// that stepped between the two, and second-boundary rounding.
+///
+/// Compare `START_TIME_TOLERANCE_SECS` (`record_is_alive`'s own
+/// disambiguator, issue #152): both absorb the same kinds of measurement
+/// slack, but at deliberately different magnitudes because they answer
+/// different questions. This constant backs a ONE-SIDED "is the process
+/// younger than its own record" heuristic (`pid_looks_recycled`), where a
+/// genuine session's process predates its record by a wide, predictable
+/// margin, so a few seconds (5s) of slack is already generous margin.
+/// `START_TIME_TOLERANCE_SECS` instead backs a comparison of two
+/// INDEPENDENT start-time readings of the same claimed process taken at
+/// different times -- exactly what an NTP correction or manual clock change
+/// between the two readings can disturb -- with no registration-order
+/// assumption to lean on, hence its much wider 300s. Do not unify these.
 const RECYCLED_PID_TOLERANCE_SECS: u64 = 5;
 
 /// Pure: whether the process currently holding a session's pid started
@@ -1647,6 +1709,56 @@ mod tests {
             on_disk.owner_pid,
             Some(std::process::id()),
             "owner_pid still answers 'which process filed this', untouched"
+        );
+    }
+
+    /// Review round 2 finding 1 (issue #152): `adopt_child_pid` must re-stamp
+    /// `start_time` for the NEW pid in the same breath it repoints `pid`
+    /// itself, or the very next `EPERM` liveness probe against a perfectly
+    /// live pane compares the CHILD's real start time against whatever the
+    /// record's `start_time` was left at (the supervisor's own, from
+    /// `Record::new`) and reads a guaranteed, false mismatch -- deleting a
+    /// live session's record. Pid 1 stands in for "a real process this
+    /// caller cannot signal", the same real-`EPERM` source the other pid-1
+    /// tests in this module use, since forcing an `EPERM` against a pid this
+    /// test owns outright is not possible.
+    #[cfg(unix)]
+    #[test]
+    fn adopt_child_pid_re_stamps_start_time_so_the_new_pid_reads_live() {
+        // SAFETY: `geteuid` takes no arguments and only reads process state.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipping: running as root, kill(1, 0) succeeds outright");
+            return;
+        }
+        // SAFETY: signal 0 sends nothing; it only probes existence and
+        // permission -- see finding 5's own note on why `geteuid` alone is
+        // not a sufficient guard (a rootless/namespaced sandbox can still
+        // let this uid signal pid 1 outright).
+        if unsafe { libc::kill(1, 0) } == 0 {
+            eprintln!("skipping: kill(1, 0) succeeds outright in this sandbox");
+            return;
+        }
+        if process_start_secs(1).is_none() {
+            eprintln!("skipping: no usable `ps` in this environment, so no start time to check");
+            return;
+        }
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = state_in(tmp.path());
+        let repo = tmp.path().join("repo");
+        let record = record_for("77777777-2222-4333-8444-555555555555", &repo, Verb::Wrap);
+        let mut guard = SessionGuard::register(&state, record);
+
+        guard.adopt_child_pid(1);
+
+        assert_eq!(
+            guard.record().start_time,
+            process_start_secs(1),
+            "start_time must move with pid, not stay pinned to the supervisor's own"
+        );
+        assert!(
+            record_is_alive(guard.record()),
+            "the repointed record must read live, not falsely dead from a stale start_time"
         );
     }
 
@@ -3235,9 +3347,20 @@ mod tests {
     }
 
     /// `process_start_secs` smoke test: this test process's own start time
-    /// is readable, and reading it twice gives the same answer -- it is not
-    /// approximated freshly relative to "now" in a way that would drift
-    /// between two calls a moment apart.
+    /// is readable, and reading it twice gives (very close to) the same
+    /// answer -- it is not approximated freshly relative to "now" in a way
+    /// that would drift materially between two calls a moment apart.
+    ///
+    /// Review round 2 finding 4: exact equality was too strict. Each read is
+    /// an independent `now_secs() - ps_etime_derived_age` derivation, and
+    /// `ps`'s own `etime` field is whole-second/whole-minute granularity
+    /// (rounding differently depending on exactly when within that window
+    /// each `ps` invocation lands), so two reads a moment apart can
+    /// legitimately land a second or two either side of each other without
+    /// anything about the process's real start time having changed. `2`
+    /// comfortably covers that rounding while still catching a reader that
+    /// is actually broken (drifting with "now" rather than anchored to the
+    /// process).
     #[cfg(unix)]
     #[test]
     fn process_start_secs_of_this_process_is_stable_across_two_reads() {
@@ -3245,11 +3368,14 @@ mod tests {
             eprintln!("skipping: no usable `ps` in this environment, so no start time to read");
             return;
         };
-        let second = process_start_secs(std::process::id());
-        assert_eq!(
-            Some(first),
-            second,
-            "the same process read twice must report the same start time"
+        let Some(second) = process_start_secs(std::process::id()) else {
+            eprintln!("skipping: `ps` became unusable between the two reads");
+            return;
+        };
+        assert!(
+            first.abs_diff(second) <= 2,
+            "the same process read twice must report nearly the same start time: {first} vs \
+             {second}"
         );
     }
 
@@ -3269,6 +3395,20 @@ mod tests {
         // SAFETY: `geteuid` takes no arguments and only reads process state.
         if unsafe { libc::geteuid() } == 0 {
             eprintln!("skipping: running as root, kill(1, 0) succeeds outright");
+            return;
+        }
+        // Review round 2 finding 5: `geteuid() == 0` alone is not a reliable
+        // enough guard. Under `docker run --user <uid>`, or any other setup
+        // where this test's own uid happens to already own pid 1 (a
+        // namespaced/rootless container's pid 1 is not always root's), a
+        // non-root euid can still get `kill(1, 0) == 0` -- `CanSignal`, not
+        // `EPERM` -- which would make this test's `!record_is_alive`
+        // assertion below deterministically false regardless of start_time.
+        // Ask the same question `probe_signal` itself would, directly.
+        // SAFETY: signal 0 sends nothing; it only probes existence and
+        // permission.
+        if unsafe { libc::kill(1, 0) } == 0 {
+            eprintln!("skipping: kill(1, 0) succeeds outright in this sandbox");
             return;
         }
         let Some(pid1_start) = process_start_secs(1) else {
