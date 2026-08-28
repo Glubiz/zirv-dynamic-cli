@@ -1231,11 +1231,7 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         &["pace", "use_credits", "codex"],
         EnvKind::Bool,
     ),
-    (
-        "ZIRV_CTX_FALLBACK",
-        &["fallback", "enabled"],
-        EnvKind::Bool,
-    ),
+    ("ZIRV_CTX_FALLBACK", &["fallback", "enabled"], EnvKind::Bool),
     (
         "ZIRV_CTX_FALLBACK_PREDICTIVE_HEADROOM_PCT",
         &["fallback", "predictive_headroom_pct"],
@@ -1555,9 +1551,10 @@ fn narrow_fallback_order(home: Vec<String>, repo: Option<Vec<String>>) -> Vec<St
     let Some(repo) = repo else {
         return home;
     };
-    home.into_iter().filter(|name| repo.contains(name)).collect()
+    home.into_iter()
+        .filter(|name| repo.contains(name))
+        .collect()
 }
-
 
 /// A `toml::Value::Float` or `Value::Integer` (from `take_nested`) as
 /// `Option<f64>` -- TOML happily writes `max_percent = 90` with no decimal
@@ -2219,16 +2216,28 @@ impl CtxConfig {
         // re-insertion below for each field's strict direction.
         let home_fallback_enabled = bool_at(take_nested(&mut merged, "fallback", "enabled"));
         let home_fallback_order = string_array_at(take_nested(&mut merged, "fallback", "order"));
-        let home_fallback_predictive =
-            float_at(take_nested(&mut merged, "fallback", "predictive_headroom_pct"));
-        let home_fallback_min_candidate =
-            float_at(take_nested(&mut merged, "fallback", "min_candidate_headroom_pct"));
+        let home_fallback_predictive = float_at(take_nested(
+            &mut merged,
+            "fallback",
+            "predictive_headroom_pct",
+        ));
+        let home_fallback_min_candidate = float_at(take_nested(
+            &mut merged,
+            "fallback",
+            "min_candidate_headroom_pct",
+        ));
         let home_fallback_unknown =
             float_at(take_nested(&mut merged, "fallback", "unknown_headroom_pct"));
-        let home_fallback_small_tokens =
-            integer_at(take_nested(&mut merged, "fallback", "small_task_max_tokens"));
-        let home_fallback_small_tools =
-            integer_at(take_nested(&mut merged, "fallback", "small_task_max_tool_calls"));
+        let home_fallback_small_tokens = integer_at(take_nested(
+            &mut merged,
+            "fallback",
+            "small_task_max_tokens",
+        ));
+        let home_fallback_small_tools = integer_at(take_nested(
+            &mut merged,
+            "fallback",
+            "small_task_max_tool_calls",
+        ));
 
         // Read on its own first: the repo layer is the one layer that comes
         // from a checkout rather than from the operator.
@@ -2265,17 +2274,33 @@ impl CtxConfig {
             "heavy_command_patterns",
         ));
         let repo_fallback_enabled = bool_at(take_nested(&mut repo_layer, "fallback", "enabled"));
-        let repo_fallback_order = string_array_at(take_nested(&mut repo_layer, "fallback", "order"));
-        let repo_fallback_predictive =
-            float_at(take_nested(&mut repo_layer, "fallback", "predictive_headroom_pct"));
-        let repo_fallback_min_candidate =
-            float_at(take_nested(&mut repo_layer, "fallback", "min_candidate_headroom_pct"));
-        let repo_fallback_unknown =
-            float_at(take_nested(&mut repo_layer, "fallback", "unknown_headroom_pct"));
-        let repo_fallback_small_tokens =
-            integer_at(take_nested(&mut repo_layer, "fallback", "small_task_max_tokens"));
-        let repo_fallback_small_tools =
-            integer_at(take_nested(&mut repo_layer, "fallback", "small_task_max_tool_calls"));
+        let repo_fallback_order =
+            string_array_at(take_nested(&mut repo_layer, "fallback", "order"));
+        let repo_fallback_predictive = float_at(take_nested(
+            &mut repo_layer,
+            "fallback",
+            "predictive_headroom_pct",
+        ));
+        let repo_fallback_min_candidate = float_at(take_nested(
+            &mut repo_layer,
+            "fallback",
+            "min_candidate_headroom_pct",
+        ));
+        let repo_fallback_unknown = float_at(take_nested(
+            &mut repo_layer,
+            "fallback",
+            "unknown_headroom_pct",
+        ));
+        let repo_fallback_small_tokens = integer_at(take_nested(
+            &mut repo_layer,
+            "fallback",
+            "small_task_max_tokens",
+        ));
+        let repo_fallback_small_tools = integer_at(take_nested(
+            &mut repo_layer,
+            "fallback",
+            "small_task_max_tool_calls",
+        ));
         merge(&mut merged, repo_layer);
 
         // Re-inserted after the merge, before env: env (below) must still be
@@ -2421,12 +2446,18 @@ impl CtxConfig {
             cfg.fallback.order = split_csv_list(&raw);
         }
         for (key, value) in [
-            ("fallback.predictive_headroom_pct", cfg.fallback.predictive_headroom_pct),
+            (
+                "fallback.predictive_headroom_pct",
+                cfg.fallback.predictive_headroom_pct,
+            ),
             (
                 "fallback.min_candidate_headroom_pct",
                 cfg.fallback.min_candidate_headroom_pct,
             ),
-            ("fallback.unknown_headroom_pct", cfg.fallback.unknown_headroom_pct),
+            (
+                "fallback.unknown_headroom_pct",
+                cfg.fallback.unknown_headroom_pct,
+            ),
         ] {
             if !(0.0..=100.0).contains(&value) {
                 return Err(format!("{key} must be between 0 and 100, got {value}").into());
@@ -2434,7 +2465,10 @@ impl CtxConfig {
         }
         let mut seen = std::collections::HashSet::new();
         for name in &cfg.fallback.order {
-            if !super::adapters::ADAPTERS.iter().any(|(known, _)| known == name) {
+            if !super::adapters::ADAPTERS
+                .iter()
+                .any(|(known, _)| known == name)
+            {
                 return Err(format!(
                     "fallback.order contains unknown agent '{name}'; known adapters: {}",
                     super::adapters::ADAPTERS
