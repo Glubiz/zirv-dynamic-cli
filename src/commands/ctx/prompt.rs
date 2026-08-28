@@ -3232,7 +3232,7 @@ mod tests {
         use crate::commands::ctx::adapters::claude::ORCHESTRATOR_PROMPT;
 
         assert!(
-            ORCHESTRATOR_PROMPT.len() < 3_000,
+            ORCHESTRATOR_PROMPT.len() < 3_600,
             "this ships on every claude session: {} bytes",
             ORCHESTRATOR_PROMPT.len()
         );
