@@ -4014,6 +4014,63 @@ fn partition_restore_selection(
     (to_spawn, deferred)
 }
 
+/// Builds the `turn_env` a restored dashboard pane spawns with -- everything
+/// `spawn_restored_pane` pushes ahead of `Pane::spawn`: the base env `build_
+/// turn_env` produces, a fresh spawn-request channel of its own (Security
+/// review Finding 1), the roster's group binding when the candidate carried
+/// one (Security review Finding 6), and the durable interactive-launch pin
+/// (issue #160 finding 1). Factored out of `spawn_restored_pane` so the exact
+/// fields it adds are pinned directly, independent of a real pty spawn's
+/// behavior -- the same reasoning `spawn_launch_mode_pin`'s own doc comment
+/// gives for testing that pin as a pure function rather than reading a real
+/// spawned child's own environment back.
+///
+/// Returns the built `turn_env` alongside the freshly minted pane channel
+/// path: `spawn_restored_pane` needs both, the env to spawn with and the
+/// path to hand the spawned `Pane` via `set_intake_dir`.
+fn restored_pane_turn_env(
+    cfg: &CtxConfig,
+    state: &StateDir,
+    repo: &Path,
+    candidate: &roster::RosterPane,
+    requests_dir: &Path,
+    errors: &mut Vec<String>,
+) -> (Vec<(String, String)>, PathBuf) {
+    let (mut turn_env, turn_env_err) =
+        build_turn_env(cfg, state, repo, &candidate.agent, &candidate.session_id);
+    if let Some(e) = turn_env_err {
+        push_error(errors, e);
+    }
+    // Security review Finding 1: a restored pane is a pane like any other and
+    // gets its own channel -- a fresh token, since the one it carried before
+    // the quit died with that dashboard's token directory.
+    let pane_channel = mint_pane_channel(requests_dir, errors);
+    turn_env.push((
+        spawnreq::DASH_REQUESTS_ENV.to_string(),
+        pane_channel.display().to_string(),
+    ));
+    // Security review Finding 6: and the group binding travels back with it,
+    // the same pair `fulfill_spawn_request` pushes for a fresh spawn -- a
+    // restore that dropped it left the pane's own further delegations
+    // ungrouped, outside the child limit and the token ceiling its batch was
+    // launched under.
+    if let Some(group_id) = &candidate.work_group_id {
+        turn_env.push((super::agent::WORK_GROUP_ENV.to_string(), group_id.clone()));
+    }
+    // Issue #160 finding 1: a restored pane is a pane the operator is
+    // watching in the dashboard, exactly like the dashboard's own first
+    // (orchestrator) pane -- see `run_dashboard`'s identical push for that
+    // pane's own rationale -- so it gets the same unconditional durable
+    // interactive-launch pin, never conditioned on a request that does not
+    // exist for this pane. Without this a restored pane came back
+    // classified headless and fell back to the fail-closed approval posture
+    // on every dashboard restart.
+    if let Some((key, value)) = adapters::launch_mode_pin_env(adapters::LaunchMode::Interactive) {
+        turn_env.push((key, value));
+    }
+    (turn_env, pane_channel)
+}
+
 /// Spawns one roster candidate back as a fresh pane: resolves its
 /// adapter (re-checked against the live gate, same "data, never authority"
 /// discipline `fulfill_spawn_request` already holds a spawn request to --
@@ -4068,27 +4125,8 @@ fn spawn_restored_pane(
         title: candidate.title.clone(),
     };
 
-    let (mut turn_env, turn_env_err) =
-        build_turn_env(cfg, state, repo, &candidate.agent, &candidate.session_id);
-    if let Some(e) = turn_env_err {
-        push_error(errors, e);
-    }
-    // Security review Finding 1: a restored pane is a pane like any other and
-    // gets its own channel -- a fresh token, since the one it carried before
-    // the quit died with that dashboard's token directory.
-    let pane_channel = mint_pane_channel(requests_dir, errors);
-    turn_env.push((
-        spawnreq::DASH_REQUESTS_ENV.to_string(),
-        pane_channel.display().to_string(),
-    ));
-    // Security review Finding 6: and the group binding travels back with it,
-    // the same pair `fulfill_spawn_request` pushes for a fresh spawn -- a
-    // restore that dropped it left the pane's own further delegations
-    // ungrouped, outside the child limit and the token ceiling its batch was
-    // launched under.
-    if let Some(group_id) = &candidate.work_group_id {
-        turn_env.push((super::agent::WORK_GROUP_ENV.to_string(), group_id.clone()));
-    }
+    let (turn_env, pane_channel) =
+        restored_pane_turn_env(cfg, state, repo, candidate, requests_dir, errors);
 
     match Pane::spawn(
         spec,
@@ -14044,6 +14082,41 @@ mod tests {
             written.panes,
             vec![live_one],
             "a held-back candidate is offered again next launch, not destroyed"
+        );
+    }
+
+    /// Issue #160 finding 1: a restored dashboard pane is a pane the operator
+    /// is watching, exactly like the dashboard's own first (orchestrator)
+    /// pane -- which `run_dashboard` unconditionally pins to `LaunchMode::
+    /// Interactive` (see that push's own doc comment). Before this fix
+    /// `spawn_restored_pane` built its `turn_env` from `build_turn_env` plus
+    /// the fresh spawn-request channel and group binding, but never pushed
+    /// the durable interactive-launch pin, so a restored pane a human was
+    /// looking at right there in the dashboard classified as headless and
+    /// fell back to the fail-closed approval posture on every restart.
+    #[test]
+    fn restored_pane_turn_env_carries_the_interactive_launch_mode_pin() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let requests_dir = state.dash().join("aaaa1111-token").join("requests");
+        std::fs::create_dir_all(&requests_dir).expect("mkdir requests");
+
+        let candidate = restore_pane("cccc3333", "33333333-2222-4333-8444-555555555555");
+        let cfg = CtxConfig::default();
+        let mut errors = Vec::new();
+
+        let (turn_env, _pane_channel) =
+            restored_pane_turn_env(&cfg, &state, &repo, &candidate, &requests_dir, &mut errors);
+
+        assert!(
+            turn_env.contains(&(
+                super::super::adapters::LAUNCH_MODE_ENV.to_string(),
+                super::super::adapters::LAUNCH_MODE_INTERACTIVE_VALUE.to_string()
+            )),
+            "a restored pane must carry the durable interactive-launch pin, same as the \
+             dashboard's own first pane: {turn_env:?}"
         );
     }
 
