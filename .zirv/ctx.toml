@@ -124,6 +124,7 @@ model = "fable"
 # repo_layer = true                  # REPO-FORBIDDEN (ZIRV_CTX_PROMPT_REPO): whether <repo>/.zirv/system-prompt.md is read. Default: true.
 # max_repo_bytes = 4096              # REPO-FORBIDDEN (ZIRV_CTX_PROMPT_MAX_REPO_BYTES): cap on the untrusted repo layer. Default: 4096.
 # harnesses = true                   # REPO-FORBIDDEN (ZIRV_CTX_PROMPT_HARNESSES): whether the derived harness roster is injected. Default: true.
+# codex_orchestrator = true          # REPO-FORBIDDEN (ZIRV_CTX_PROMPT_CODEX_ORCHESTRATOR): whether a codex Orchestrator session gets codex's own orchestrator-conventions layer. Default: true.
 
 # [context]                          # every key below is REPO-FORBIDDEN except dedupe_native -- the canonical .zirv/context/ layer the context compiler (issue #44) injects.
 # max_common_bytes = 4096            # REPO-FORBIDDEN (ZIRV_CTX_CONTEXT_MAX_COMMON_BYTES): cap on .zirv/context/common.md. Default: 4096.

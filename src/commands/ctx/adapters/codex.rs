@@ -12,6 +12,89 @@ use super::super::event::{
 use super::super::window::{self, RolloutRecord};
 use super::{AgentAdapter, ResolvedProgram, TurnSignalSetup};
 
+/// Codex's own base layer (see `AgentAdapter::base_system_prompt`), the codex
+/// analogue of `claude::ORCHESTRATOR_PROMPT` (issue #167). Revised 2026-08-28:
+/// the original text assumed no native subagent/task facility was verifiable
+/// for codex; `learn.chatgpt.com/docs/agent-configuration/subagents` (checked
+/// against this adapter's own `capabilities()` and `docs/superpowers/notes/
+/// 2026-07-31-codex-cli-facts.md`) confirms codex DOES have one: custom
+/// agents are TOML files in `~/.codex/agents/` (personal) or `.codex/agents/`
+/// (project) with required `name`/`description`/`developer_instructions` and
+/// optional `model`/`model_reasoning_effort`, plus built-in `default`/
+/// `worker`/`explorer` agents, all gated by the `[agents]` block in `~/
+/// .codex/config.toml` (`enabled`, `max_concurrent_threads_per_session`,
+/// `default_subagent_model`, `default_subagent_reasoning_effort`). This layer
+/// now teaches native subagent threads as the primary in-repo delegation
+/// path, with `zirv agent` -- the same cross-harness mechanism `HARNESS_
+/// PROMPT` already documents in full (dashboard pane behavior, `zirv ctx
+/// send`/`nudge`, mail report-back) -- reserved for cross-harness delegation
+/// and as the fallback when native subagents are unavailable or turned off
+/// (`[agents] enabled = false`). This layer still does not repeat `HARNESS_
+/// PROMPT`'s own mechanism, only the orchestrator mandate and model-tier
+/// discipline on top of it.
+///
+/// Tiers are framed by role first ("smallest, fastest tier", "mid tier",
+/// "this seat's own top tier") so the guidance survives a model rename, the
+/// same discipline `harness_prompt_never_names_vendor_specific_models`
+/// enforces for `HARNESS_PROMPT` -- but each role now also carries a
+/// "currently `gpt-5.6-luna`"/"currently `gpt-5.6-terra`" example (matching
+/// this adapter's own ladder, see `review_model_below_walks_the_codex_
+/// ladder`), since a concrete example is worth naming even though a codex
+/// account's own model names are operator-chosen strings.
+///
+/// The "never omit a model" rule is tighter here than `HARNESS_PROMPT`'s own
+/// generic "...or omit it to use the operator's own default worker tier"
+/// allowance: `CodexAdapter::default_worker_model` is verified `None` (no
+/// zirv-managed cheap default for a `zirv agent codex ...` worker, unlike
+/// claude's hard `"sonnet"` fallback -- see `codex_has_no_default_worker_
+/// model`), and the same gap applies to a native subagent spawn with no
+/// model named -- it resolves through the parent's own model unless `[agents]
+/// default_subagent_model` is set. Naming a tier explicitly, subagent or
+/// `zirv agent` alike, is the only way to actually avoid that inheritance.
+///
+/// Gated by `PromptConfig::codex_orchestrator` (issue #167, `REPO_FORBIDDEN`
+/// like `prompt.harnesses`): `prompt::with_adapter_layer` is where that
+/// operator switch is applied, not here -- this constant is unconditional
+/// content, the same way `claude::ORCHESTRATOR_PROMPT` has no switch of its
+/// own.
+pub const ORCHESTRATOR_PROMPT: &str = "\
+zirv orchestrator conventions (codex)
+
+You are an orchestrator. Coordination and judgment are the job, implementation is not: this \
+seat's own model is reserved for orchestration, hard debugging, and design, so delegate every \
+substantive piece of work (codebase exploration, implementation, testing, review) and keep your \
+own replies brief and decision-focused.
+
+- Native codex subagent threads (worker/explorer roles) are the primary delegation path for work \
+inside this repo: spawn one per substantive piece of work, pinning each to the cheapest fitting \
+tier -- the smallest, fastest tier for mechanical and bulk work (currently gpt-5.6-luna), a mid \
+tier for ordinary exploration, implementation and test writing (currently gpt-5.6-terra), and \
+this seat's own top tier reserved for orchestration, hard debugging and design decisions. Never \
+spawn a subagent without an explicit cheaper model, unless the operator's own `[agents] default_\
+subagent_model` already names one -- an omitted model otherwise inherits this seat's own model \
+instead of a cheaper tier.
+- `zirv agent <name> \"<prompt>\" -- --model <m>` remains the delegation route for cross-harness \
+work (handing a task to a different harness, such as claude) and the fallback whenever native \
+subagents are unavailable or turned off (`[agents] enabled = false`); name an explicit --model \
+there too, for the same reason.
+- Bundle before you dispatch: never spawn a worker for one tiny task. Group small related tasks \
+(same file or area, or a natural sequence) into a single checklist brief per worker, with a \
+per-item output format. A small or trivial change -- a one-line fix, a single obvious edit -- \
+stays on this seat; delegate only substantive, independent work.
+- Write self-contained briefs: state the goal, constraints, relevant file paths and exact output \
+format, and nothing else -- a delegated worker shares none of your context. Every brief must \
+itself tell the worker not to delegate further and to reply briefly with compact structured \
+findings, never raw file dumps.
+- Decide rather than let a worker loop: choices between valid designs, architecture changes, and \
+anything a worker has failed at twice come back to you. Do not read large files or write code \
+yourself unless the change is trivial.
+- Hold implementers to this repository's standards: follow the patterns already there, look for \
+reusable code before adding new code, write a failing test first, keep diffs minimal, and run the \
+project's format, lint and test commands before reporting back.
+- Verify in batches: one independent reviewer gate per batch of related changes, not one per \
+micro-task. You own the final integration, so resolve conflicts between worker outputs and report \
+outcomes, including failures, plainly.";
+
 /// Verified facts backing this adapter live in
 /// `docs/superpowers/notes/2026-07-31-codex-cli-facts.md`. Current Codex
 /// releases expose both lifecycle hooks and the external `notify` program;
@@ -709,12 +792,14 @@ impl AgentAdapter for CodexAdapter {
         vec!["-c".to_string(), format!("developer_instructions={value}")]
     }
 
-    /// Spelled out rather than left to the trait default: the only base layer zirv has is written
-    /// around Claude Code's tools (the Agent tool, `.claude/agents`, the
-    /// `/code-review` skill), none of which codex has. Instructions about
-    /// tools an agent does not have are worse than no instructions.
+    /// Issue #167: codex now has its own base layer (`ORCHESTRATOR_PROMPT`,
+    /// this module), written around what is actually verified about codex
+    /// rather than claude's Agent-tool-specific text -- see that constant's
+    /// own doc comment for why the two layers read so differently. The
+    /// operator-facing on/off switch (`PromptConfig::codex_orchestrator`)
+    /// lives in `prompt::with_adapter_layer`, not here.
     fn base_system_prompt(&self) -> Option<&'static str> {
-        None
+        Some(ORCHESTRATOR_PROMPT)
     }
 
     /// Verified via `codex exec --help` (quoted verbatim in the notes file):
@@ -1684,13 +1769,97 @@ mod tests {
         assert_eq!(CodexAdapter::new(None).default_worker_model(), None);
     }
 
-    /// Same "nothing verified to guess" answer for the role layers: codex
-    /// contributes neither an orchestrator nor a worker layer of its own, so
-    /// `prompt::with_adapter_layer` splices nothing in for either role rather
-    /// than handing codex text written for claude's tools.
+    /// Unlike the orchestrator layer (issue #167, `ORCHESTRATOR_PROMPT`),
+    /// codex still contributes no **worker** layer of its own: a delegated
+    /// worker session (`PromptRole::Worker`) must never be taught to
+    /// delegate onward, and there is nothing else codex-specific worth
+    /// saying to it yet, so `prompt::with_adapter_layer` splices nothing in
+    /// for that role.
     #[test]
     fn codex_contributes_no_worker_layer_of_its_own() {
         assert_eq!(CodexAdapter::new(None).worker_system_prompt(), None);
+    }
+
+    /// Issue #167: codex's own base layer is no longer `None` -- an
+    /// orchestrator seat on codex gets its own delegation mandate, the same
+    /// way claude's does via `ORCHESTRATOR_PROMPT`.
+    #[test]
+    fn codex_contributes_its_own_orchestrator_layer() {
+        assert_eq!(
+            CodexAdapter::new(None).base_system_prompt(),
+            Some(ORCHESTRATOR_PROMPT)
+        );
+    }
+
+    /// Mirrors claude's `the_orchestrator_layer_is_short_enough_to_ship_on_
+    /// every_session` and its neighboring content assertions: this ships on
+    /// every codex Orchestrator session, so it stays short, names native
+    /// subagent threads as the primary delegation path with `zirv agent` as
+    /// the cross-harness/fallback route, keeps the model-tier discipline
+    /// issue #167 asks for, and never leaks claude-only vocabulary (the
+    /// Agent tool, `.claude/agents`) codex does not have.
+    #[test]
+    fn the_codex_orchestrator_layer_names_its_own_delegation_route_and_tiers() {
+        assert!(
+            ORCHESTRATOR_PROMPT.len() < 3_000,
+            "this ships on every codex session: {} bytes",
+            ORCHESTRATOR_PROMPT.len()
+        );
+        assert!(!ORCHESTRATOR_PROMPT.contains('\u{2014}'), "no em dashes");
+        assert!(
+            ORCHESTRATOR_PROMPT.contains("You are an orchestrator"),
+            "got:\n{ORCHESTRATOR_PROMPT}"
+        );
+        assert!(
+            ORCHESTRATOR_PROMPT.contains("subagent"),
+            "native codex subagent threads must be the primary in-repo delegation path: \
+             {ORCHESTRATOR_PROMPT}"
+        );
+        assert!(
+            ORCHESTRATOR_PROMPT.contains("zirv agent"),
+            "zirv agent must remain the cross-harness and fallback delegation route: \
+             {ORCHESTRATOR_PROMPT}"
+        );
+        assert!(
+            ORCHESTRATOR_PROMPT.contains("cross-harness")
+                && ORCHESTRATOR_PROMPT.contains("[agents] enabled = false"),
+            "zirv agent's role must be scoped to cross-harness work and the disabled-subagents \
+             fallback, not the default in-repo path: {ORCHESTRATOR_PROMPT}"
+        );
+        assert!(
+            !ORCHESTRATOR_PROMPT.contains("Agent tool")
+                && !ORCHESTRATOR_PROMPT.contains(".claude/agents"),
+            "claude-only vocabulary must not leak into codex's own layer: {ORCHESTRATOR_PROMPT}"
+        );
+        for tier in ["mechanical", "mid tier", "hard debugging", "design"] {
+            assert!(
+                ORCHESTRATOR_PROMPT.contains(tier),
+                "missing tier guidance '{tier}': {ORCHESTRATOR_PROMPT}"
+            );
+        }
+        for example in ["currently gpt-5.6-luna", "currently gpt-5.6-terra"] {
+            assert!(
+                ORCHESTRATOR_PROMPT.contains(example),
+                "tier roles must carry a durable '{example}' example so the guidance survives a \
+                 model rename: {ORCHESTRATOR_PROMPT}"
+            );
+        }
+        assert!(
+            ORCHESTRATOR_PROMPT
+                .contains("Never spawn a subagent without an explicit cheaper model")
+                && ORCHESTRATOR_PROMPT.contains("default_subagent_model"),
+            "must forbid silently inheriting the seat model on a subagent spawn, with the \
+             operator's own [agents] default_subagent_model as the one named exception: \
+             {ORCHESTRATOR_PROMPT}"
+        );
+        assert!(
+            ORCHESTRATOR_PROMPT.contains("small or trivial change"),
+            "small/trivial tasks must be exempt from forced delegation: {ORCHESTRATOR_PROMPT}"
+        );
+        assert!(
+            !ORCHESTRATOR_PROMPT.contains("haiku") && !ORCHESTRATOR_PROMPT.contains("sonnet"),
+            "codex has no fixed model vocabulary to name: {ORCHESTRATOR_PROMPT}"
+        );
     }
 
     /// The codex ladder, top to bottom: `gpt-5.6-sol` (the default when no

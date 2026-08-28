@@ -380,6 +380,18 @@ pub struct PromptConfig {
     /// repo checkout must not be able to suppress a layer the operator
     /// relies on to see what this session may delegate to.
     pub harnesses: bool,
+    /// Whether a codex Orchestrator session's composed prompt gets codex's
+    /// own `AgentAdapter::base_system_prompt` layer (issue #167,
+    /// `adapters::codex::ORCHESTRATOR_PROMPT`) -- the codex analogue of
+    /// claude's `ORCHESTRATOR_PROMPT`, spliced in by `prompt::with_adapter_
+    /// layer`. On by default; an operator who finds it redundant with their
+    /// own AGENTS.md conventions turns it off here. `REPO_FORBIDDEN`, same
+    /// trust asymmetry as `harnesses` right above: a repo checkout must not
+    /// be able to force this layer back on for an operator who turned it
+    /// off. Claude's own orchestrator layer has no such switch -- it is not
+    /// operator-toggleable independent of `prompt.enabled` -- so this key
+    /// only ever gates the codex adapter.
+    pub codex_orchestrator: bool,
 }
 
 impl Default for PromptConfig {
@@ -389,6 +401,7 @@ impl Default for PromptConfig {
             repo_layer: true,
             max_repo_bytes: 4096,
             harnesses: true,
+            codex_orchestrator: true,
         }
     }
 }
@@ -1201,6 +1214,11 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         EnvKind::Bool,
     ),
     (
+        "ZIRV_CTX_PROMPT_CODEX_ORCHESTRATOR",
+        &["prompt", "codex_orchestrator"],
+        EnvKind::Bool,
+    ),
+    (
         "ZIRV_CTX_CONTEXT_MAX_COMMON_BYTES",
         &["context", "max_common_bytes"],
         EnvKind::Int,
@@ -1594,6 +1612,15 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     // who turned it off, the same trust asymmetry as `prompt.enabled` and
     // `prompt.repo_layer` right above.
     (&["prompt", "harnesses"], "ZIRV_CTX_PROMPT_HARNESSES"),
+    // Issue #167: codex's own orchestrator-conventions layer
+    // (`adapters::codex::ORCHESTRATOR_PROMPT`) is the codex analogue of
+    // claude's `ORCHESTRATOR_PROMPT` -- a repo checkout must not be able to
+    // force it back on for an operator who turned it off, the same trust
+    // asymmetry as `prompt.harnesses` right above.
+    (
+        &["prompt", "codex_orchestrator"],
+        "ZIRV_CTX_PROMPT_CODEX_ORCHESTRATOR",
+    ),
     // The canonical `.zirv/context/{common,claude,codex}.md` layer (issue
     // #44's compiler) is repo-owned, untrusted content injected into the
     // composed prompt the same way the repo `system-prompt.md` layer is --
@@ -3557,6 +3584,7 @@ mod tests {
         assert!(prompt.repo_layer);
         assert_eq!(prompt.max_repo_bytes, 4096);
         assert!(prompt.harnesses);
+        assert!(prompt.codex_orchestrator);
     }
 
     #[test]
@@ -3566,11 +3594,14 @@ mod tests {
         // A repo that could raise max_repo_bytes would make the cap decorative.
         // `harnesses` is here for the same reason: a repo must not be able to
         // force the derived roster back on for an operator who turned it off.
+        // `codex_orchestrator` (issue #167): same asymmetry, for codex's own
+        // orchestrator-conventions layer.
         for (key, value) in [
             ("enabled", "true"),
             ("repo_layer", "true"),
             ("max_repo_bytes", "1000000"),
             ("harnesses", "false"),
+            ("codex_orchestrator", "false"),
         ] {
             let repo = tempfile::tempdir().expect("tempdir");
             std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
@@ -3618,6 +3649,18 @@ mod tests {
         let cfg = CtxConfig::load(home_only.path(), &|k| env.get(k).cloned()).expect("load");
         assert!(
             !cfg.prompt.harnesses,
+            "the environment is the operator, not the checkout"
+        );
+    }
+
+    /// Issue #167: the codex orchestrator layer's own operator switch.
+    #[test]
+    fn the_operator_may_still_toggle_the_codex_orchestrator_layer() {
+        let home_only = tempfile::tempdir().expect("tempdir");
+        let env = env_map(&[("ZIRV_CTX_PROMPT_CODEX_ORCHESTRATOR", "false")]);
+        let cfg = CtxConfig::load(home_only.path(), &|k| env.get(k).cloned()).expect("load");
+        assert!(
+            !cfg.prompt.codex_orchestrator,
             "the environment is the operator, not the checkout"
         );
     }
@@ -4816,6 +4859,7 @@ mod tests {
         ("prompt", "repo_layer"),
         ("prompt", "max_repo_bytes"),
         ("prompt", "harnesses"),
+        ("prompt", "codex_orchestrator"),
         ("context", "max_common_bytes"),
         ("context", "max_harness_bytes"),
         ("context", "max_harness_roster_bytes"),
