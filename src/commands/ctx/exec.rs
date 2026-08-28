@@ -20,7 +20,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use super::config::{CtxConfig, EnvLookup, env_from_process};
-use super::event::{NormalizedEvent, SessionId, SessionRef};
+use super::event::{NormalizedEvent, SessionId, SessionRef, TranscriptUsage};
 use super::pace;
 use super::rot::Verdict;
 use super::signal::{self, TurnSignal};
@@ -709,18 +709,26 @@ pub(crate) fn run_with_clock<W: Write>(
     let timeout = Duration::from_secs(args.timeout_secs.unwrap_or(cfg.supervise.max_cycle_secs));
     let poll = Duration::from_millis(cfg.supervise.poll_ms);
     // Issue #155, Phase 5(d): the CEILING is fixed for the whole run, same as
-    // `max_restarts`/`timeout` above. Known scope limit: SPEND is measured
-    // against the current child's own transcript only (`supervise_run`'s
-    // budget check reads `transcript` directly), so a rot/timeout/nudge
-    // restart -- which mints a fresh transcript, same as every restart
-    // already does -- starts that count over rather than carrying prior
-    // children's spend forward. Bounding one continuous, unrestarted run is
-    // the common case this closes; bounding a run across its own restarts is
-    // follow-up work.
+    // `max_restarts`/`timeout` above. Issue #169.2: SPEND is now accumulated
+    // across every restart this run mints, not just measured against
+    // whichever child happens to be running -- see `prior_usage`/`prior_
+    // tool_calls` below, harvested from each outgoing transcript at every
+    // restart/nudge/park site before a fresh one is minted. Before this fix
+    // a rot/timeout/nudge restart or a usage-limit park -- all of which mint
+    // a fresh transcript -- silently reset the meter, so N restarts allowed
+    // N times the configured ceiling.
     let worker_budget = agent::WorkerBudget {
         tokens: args.budget_tokens,
         tool_calls: args.max_tool_calls,
     };
+    // Issue #169.2: the running total of every PRIOR child's own spend this
+    // invocation has already superseded (a rot/timeout/nudge restart, or a
+    // usage-limit park). Folded into every budget check alongside the
+    // current child's own transcript (`evaluate_worker_budget`), so the
+    // budget bounds the whole supervised run, not just its latest incarnation.
+    let mut prior_usage = TranscriptUsage::default();
+    let mut prior_tool_calls: u32 = 0;
+    let has_budget = worker_budget.tokens.is_some() || worker_budget.tool_calls.is_some();
 
     let socket_path = state.socket_for(session.as_str());
     let server = match signal::SignalServer::bind(&socket_path) {
@@ -915,7 +923,13 @@ pub(crate) fn run_with_clock<W: Write>(
             repo,
             super::sessions::Verb::Exec,
         )
-        .with_safety_policy_sha256(safety_policy_sha256),
+        .with_safety_policy_sha256(safety_policy_sha256)
+        // Issue #169: `exec::run_with` has no `PromptRole` parameter to get
+        // wrong (see `agent.rs`'s own module doc comment: a delegated run is
+        // always a worker session), so this is always `Worker` -- an
+        // accurate reflection of what every headless delegation actually
+        // runs as today.
+        .with_role(super::prompt::PromptRole::Worker.label()),
     );
 
     // Item 10: owned across every cycle of the loop below (the pre-flight
@@ -1008,6 +1022,8 @@ pub(crate) fn run_with_clock<W: Write>(
             can_restart,
             &transcript,
             worker_budget,
+            &prior_usage,
+            prior_tool_calls,
             &mut budget_soft_warned,
             &mut budget_exhausted,
         )?;
@@ -1113,6 +1129,17 @@ pub(crate) fn run_with_clock<W: Write>(
             );
             let stored = handoff::store(&state, repo, session.as_str(), &note)?;
 
+            // Issue #169.2: harvest the outgoing child's own spend before its
+            // transcript is superseded, so a nudge restart never resets the
+            // budget meter.
+            if has_budget {
+                harvest_spend(
+                    adapter.as_ref(),
+                    &transcript,
+                    &mut prior_usage,
+                    &mut prior_tool_calls,
+                );
+            }
             session = SessionId::new_v4();
             session_guard.refresh_session(session.as_str());
             transcript = derive_transcript(&session);
@@ -1374,7 +1401,20 @@ pub(crate) fn run_with_clock<W: Write>(
                 return Ok(EXIT_ROT_EXHAUSTED);
             };
 
-            // A park is not a restart: the budget is for rot, not for waiting.
+            // A park is not a restart: the restart budget (`max_restarts`)
+            // is for rot, not for waiting. The token/tool-call budget is a
+            // different ceiling, for the whole run regardless of why it
+            // relaunched -- a park mints a fresh transcript exactly like a
+            // restart does, so its outgoing child's spend is harvested here
+            // too (issue #169.2).
+            if has_budget {
+                harvest_spend(
+                    adapter.as_ref(),
+                    &transcript,
+                    &mut prior_usage,
+                    &mut prior_tool_calls,
+                );
+            }
             session = SessionId::new_v4();
             session_guard.refresh_session(session.as_str());
             transcript = derive_transcript(&session);
@@ -1548,6 +1588,17 @@ pub(crate) fn run_with_clock<W: Write>(
             "zirv ctx exec: {reason} detected, restarting ({restarts}/{max_restarts}) with a {source} handoff"
         )?;
 
+        // Issue #169.2: harvest the outgoing child's own spend before its
+        // transcript is superseded, so a rot/timeout restart never resets
+        // the budget meter.
+        if has_budget {
+            harvest_spend(
+                adapter.as_ref(),
+                &transcript,
+                &mut prior_usage,
+                &mut prior_tool_calls,
+            );
+        }
         session = SessionId::new_v4();
         session_guard.refresh_session(session.as_str());
         // The new session writes somewhere new, so the next iteration's watcher
@@ -1610,11 +1661,71 @@ pub(crate) fn run_with_clock<W: Write>(
     }
 }
 
-/// Reads `transcript` fresh and evaluates `budget` against it, counting tool
-/// calls via `adapter.parse_events`. `None` when neither ceiling is
-/// configured (the common case, and every delegation before 2.35.0) or the
-/// transcript cannot be read yet -- a read failure here must never be fatal,
-/// since it can just mean the child has not flushed its first line.
+/// Reads `transcript` fresh and returns its own usage and tool-call count
+/// (via `adapter.parse_events`), or `None` if it cannot be read yet -- a read
+/// failure here must never be fatal, since it can just mean the child has not
+/// flushed its first line. Shared by [`evaluate_worker_budget`] and
+/// [`harvest_spend`] (issue #169.2), so the two can never drift on how one
+/// transcript's own spend is computed.
+fn read_transcript_spend(
+    adapter: &dyn adapters::AgentAdapter,
+    transcript: &Path,
+) -> Option<(TranscriptUsage, u32)> {
+    let body = std::fs::read_to_string(transcript).ok()?;
+    let usage = adapter.transcript_usage(&body).unwrap_or_default();
+    let tool_calls = adapter
+        .parse_events(&body)
+        .iter()
+        .filter(|event| matches!(event, NormalizedEvent::ToolCall { .. }))
+        .count();
+    Some((usage, u32::try_from(tool_calls).unwrap_or(u32::MAX)))
+}
+
+/// Field-wise saturating sum of two [`TranscriptUsage`]s -- how a restart's
+/// outgoing child's spend is folded into the running total, and how that
+/// total is folded into the current child's own reading before a budget
+/// check.
+fn add_usage(a: &TranscriptUsage, b: &TranscriptUsage) -> TranscriptUsage {
+    TranscriptUsage {
+        input_tokens: a.input_tokens.saturating_add(b.input_tokens),
+        cache_creation_input_tokens: a
+            .cache_creation_input_tokens
+            .saturating_add(b.cache_creation_input_tokens),
+        cache_read_input_tokens: a
+            .cache_read_input_tokens
+            .saturating_add(b.cache_read_input_tokens),
+        output_tokens: a.output_tokens.saturating_add(b.output_tokens),
+    }
+}
+
+/// Issue #169.2: folds `transcript`'s own usage and tool-call count into the
+/// running `prior_usage`/`prior_tool_calls` accumulators. Called once, on the
+/// OUTGOING transcript, at every restart/nudge/park site in `run_with` --
+/// before a fresh session (and therefore a fresh transcript) is minted for
+/// the next child. A transcript that cannot be read yet contributes nothing
+/// rather than failing the restart it is called from (best-effort, matching
+/// `evaluate_worker_budget`'s own tolerance).
+fn harvest_spend(
+    adapter: &dyn adapters::AgentAdapter,
+    transcript: &Path,
+    prior_usage: &mut TranscriptUsage,
+    prior_tool_calls: &mut u32,
+) {
+    if let Some((usage, tool_calls)) = read_transcript_spend(adapter, transcript) {
+        *prior_usage = add_usage(prior_usage, &usage);
+        *prior_tool_calls = prior_tool_calls.saturating_add(tool_calls);
+    }
+}
+
+/// Reads `transcript` fresh and evaluates `budget` against it PLUS every
+/// prior child's own already-harvested spend (`prior_usage`/`prior_tool_
+/// calls`, issue #169.2) -- so the ceiling bounds the whole supervised run
+/// across every restart, not just whichever child happens to be running
+/// right now. `None` when neither ceiling is configured (the common case,
+/// and every delegation before 2.35.0) or the CURRENT transcript cannot be
+/// read yet -- a read failure here must never be fatal, since it can just
+/// mean the child has not flushed its first line; the next tick that can
+/// read it still sees the full cumulative total, prior spend included.
 ///
 /// Shared by `supervise_run`'s own tick (checked on every poll while the
 /// child is alive) and its post-exit check just below (issue #155 review
@@ -1624,19 +1735,20 @@ fn evaluate_worker_budget(
     adapter: &dyn adapters::AgentAdapter,
     budget: agent::WorkerBudget,
     transcript: &Path,
+    prior_usage: &TranscriptUsage,
+    prior_tool_calls: u32,
 ) -> Option<agent::BudgetState> {
     if budget.tokens.is_none() && budget.tool_calls.is_none() {
         return None;
     }
-    let body = std::fs::read_to_string(transcript).ok()?;
-    let usage = adapter.transcript_usage(&body).unwrap_or_default();
-    let tool_calls = adapter
-        .parse_events(&body)
-        .iter()
-        .filter(|event| matches!(event, NormalizedEvent::ToolCall { .. }))
-        .count();
-    let tool_calls = u32::try_from(tool_calls).unwrap_or(u32::MAX);
-    Some(agent::budget_state(&budget, &usage, tool_calls))
+    let (usage, tool_calls) = read_transcript_spend(adapter, transcript)?;
+    let combined_usage = add_usage(prior_usage, &usage);
+    let combined_tool_calls = prior_tool_calls.saturating_add(tool_calls);
+    Some(agent::budget_state(
+        &budget,
+        &combined_usage,
+        combined_tool_calls,
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1672,6 +1784,11 @@ fn supervise_run(
     // retain once the window has moved past them.
     transcript: &Path,
     budget: agent::WorkerBudget,
+    // Issue #169.2: every prior child's own already-harvested spend this
+    // invocation has superseded, folded into every check below alongside
+    // `transcript`'s own current reading (`evaluate_worker_budget`).
+    prior_usage: &TranscriptUsage,
+    prior_tool_calls: u32,
     soft_warned: &mut bool,
     budget_exhausted: &mut bool,
 ) -> CtxResult<Outcome> {
@@ -1739,7 +1856,7 @@ fn supervise_run(
         // transcript read entirely when no ceiling is configured (every
         // delegation before 2.35.0, and the common case even after), so a
         // run that never asked to be bounded pays nothing extra here.
-        match evaluate_worker_budget(adapter, budget, transcript) {
+        match evaluate_worker_budget(adapter, budget, transcript, prior_usage, prior_tool_calls) {
             Some(agent::BudgetState::HardStop { used, limit }) => {
                 eprintln!(
                     "zirv ctx exec: token/tool-call budget exhausted ({used}/{limit}); \
@@ -1782,7 +1899,7 @@ fn supervise_run(
     if !*budget_exhausted
         && matches!(outcome, Outcome::Exited(0))
         && let Some(agent::BudgetState::HardStop { used, limit }) =
-            evaluate_worker_budget(adapter, budget, transcript)
+            evaluate_worker_budget(adapter, budget, transcript, prior_usage, prior_tool_calls)
     {
         eprintln!(
             "zirv ctx exec: token/tool-call budget exhausted ({used}/{limit}) in the child's \
@@ -5252,6 +5369,86 @@ mod tests {
         assert!(
             nudge_restart_line.contains("handoff at"),
             "names the handoff the same way an ordinary restart does: {nudge_restart_line}"
+        );
+    }
+
+    /// Issue #169.2: a restart must never reset the token budget meter. Two
+    /// children, each well under `--budget-tokens` on its own transcript
+    /// alone, whose COMBINED spend exceeds it -- before this fix, a fresh
+    /// transcript per restart meant the second child's own (still-under-
+    /// budget) reading was all `evaluate_worker_budget` ever saw, so the run
+    /// finished with exit `0` instead of `EXIT_BUDGET_EXHAUSTED`.
+    ///
+    /// `FAKE_AGENT_TURNS=1` shrinks one child's own transcript to a known,
+    /// small total (2 assistant events x 20_000 cache-read tokens = 40_004
+    /// with the fixture's own `input_tokens: 2` per event) so both runs can
+    /// sit comfortably under a budget individually while landing over it
+    /// together. The restart itself is a real nudge (`nudge_live_session`),
+    /// the same deterministic trigger `a_nudge_restart_does_not_spend_the_
+    /// rot_restart_budget` already uses -- not rot or a timeout -- because a
+    /// nudge relaunch mints a fresh transcript exactly the same way, and
+    /// does not depend on the rot scorer's own heuristics to fire on cue.
+    #[test]
+    fn a_restart_accumulates_spend_instead_of_resetting_the_budget_meter() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let state_dir = tmp.path().join("state");
+        let session_log = tmp.path().join("session.log");
+        let session = "40404040-2222-4333-8444-555555555555";
+        let mut env = base_env(&state_dir);
+        env.insert("ZIRV_CTX_PACE".to_string(), "false".to_string());
+        env.insert("ZIRV_CTX_POLL_MS".to_string(), "50".to_string());
+
+        let modes = tmp.path().join("modes.txt");
+        std::fs::write(&modes, "hang\nhealthy\n").expect("write modes");
+
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        // C10: a guard, not a bare set/remove pair -- see the identical
+        // comment on the nudge tests above this one.
+        let _fake_agent = crate::commands::ctx::testenv::VarGuard::set(&[
+            ("FAKE_AGENT_MODE_FILE", modes.to_str()),
+            ("FAKE_AGENT_SESSION_ENV_LOG", session_log.to_str()),
+            ("FAKE_AGENT_TURNS", Some("1")),
+        ]);
+
+        let state_for_writer = state_dir.clone();
+        let repo_for_writer = tmp.path().to_path_buf();
+        let session_log_for_writer = session_log.clone();
+        let writer = std::thread::spawn(move || {
+            wait_for_lines_or_panic(&session_log_for_writer, 1, Duration::from_secs(20));
+            nudge_live_session(&state_for_writer, &repo_for_writer, "keep going");
+        });
+
+        let args = ExecArgs {
+            agent: Some("claude".to_string()),
+            session_id: Some(session.to_string()),
+            transcript: Some(transcript_for(&home, tmp.path(), session)),
+            prompt: Some("do the work".to_string()),
+            max_restarts: Some(0),
+            // Above one child's own ~40_004-token transcript, below two
+            // combined (~80_008): neither child trips the budget on its own
+            // reading, only the accumulated total does.
+            budget_tokens: Some(60_000),
+            max_tool_calls: None,
+            timeout_secs: Some(30),
+            simple: false,
+            command: fake_agent_command(session),
+        };
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        writer.join().expect("writer thread");
+
+        assert_eq!(
+            code.expect("runs"),
+            EXIT_BUDGET_EXHAUSTED,
+            "the second child's own transcript alone is under budget -- only the accumulated \
+             total exceeds it"
+        );
+        let log = std::fs::read_to_string(state_dir.join("logs/decisions.jsonl")).expect("log");
+        assert!(log.contains("\"verdict\":\"budget\""), "got {log}");
+        assert!(
+            log.contains("\"action\":\"nudge-restart\""),
+            "the restart that must not reset the meter actually happened: {log}"
         );
     }
 
