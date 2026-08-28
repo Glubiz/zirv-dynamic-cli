@@ -10633,7 +10633,17 @@ mod tests {
         let state = StateDir::from_root(tmp.path().join("state"));
         let repo = tmp.path().join("repo");
         std::fs::create_dir_all(&repo).expect("mkdir repo");
-        let cfg = CtxConfig::default();
+        let cfg = CtxConfig {
+            // Keep the end-to-end spawn proof without consulting PATH for a
+            // developer-installed agent binary, matching the module's other
+            // real-pty-spawn tests.
+            agent_bin: Some("sleep 3".to_string()),
+            pace: crate::commands::ctx::config::PaceConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            ..CtxConfig::default()
+        };
 
         let orch_session = "44444444-5555-4666-8777-888888888888";
         let spec = PaneSpec {
@@ -10716,7 +10726,17 @@ mod tests {
         let state = StateDir::from_root(tmp.path().join("state"));
         let repo = tmp.path().join("repo");
         std::fs::create_dir_all(&repo).expect("mkdir repo");
-        let cfg = CtxConfig::default();
+        let cfg = CtxConfig {
+            // Keep the end-to-end role propagation proof without consulting
+            // PATH for a developer-installed agent binary, matching the
+            // module's other real-pty-spawn tests.
+            agent_bin: Some("sleep 3".to_string()),
+            pace: crate::commands::ctx::config::PaceConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            ..CtxConfig::default()
+        };
 
         let orch_session = "55555555-6666-4777-8888-999999999999";
         let spec = PaneSpec {
