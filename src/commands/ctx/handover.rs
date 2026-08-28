@@ -600,6 +600,58 @@ mod tests {
     }
 
     #[test]
+    fn equivalent_model_preserves_the_verified_quality_tier_across_harnesses() {
+        let cfg = CtxConfig::default();
+        assert_eq!(tier_for_model("claude", "sonnet", &cfg), Some("standard"));
+        assert_eq!(
+            equivalent_model("claude", Some("sonnet"), false, "codex", &cfg),
+            Some("gpt-5.6-terra".to_string())
+        );
+        assert_eq!(
+            equivalent_model("claude", Some("opus"), true, "codex", &cfg),
+            Some("gpt-5.6-sol".to_string())
+        );
+        assert_eq!(
+            equivalent_model("codex", Some("gpt-5.4-mini"), true, "claude", &cfg),
+            Some("haiku".to_string())
+        );
+    }
+
+    #[test]
+    fn equivalent_model_honors_operator_tier_overrides_on_both_harnesses() {
+        let mut cfg = CtxConfig::default();
+        cfg.handover.claude.standard = Some("sonnet-custom".to_string());
+        cfg.handover.codex.standard = Some("terra-custom".to_string());
+        assert_eq!(tier_for_model("claude", "SONNET-CUSTOM", &cfg), Some("standard"));
+        assert_eq!(
+            equivalent_model(
+                "claude",
+                Some("sonnet-custom"),
+                true,
+                "codex",
+                &cfg
+            ),
+            Some("terra-custom".to_string())
+        );
+    }
+
+    #[test]
+    fn explicit_unclassified_model_never_guesses_a_cross_harness_equivalent() {
+        let cfg = CtxConfig::default();
+        assert_eq!(tier_for_model("claude", "claude-experimental-x", &cfg), None);
+        assert_eq!(
+            equivalent_model(
+                "claude",
+                Some("claude-experimental-x"),
+                true,
+                "codex",
+                &cfg
+            ),
+            None
+        );
+    }
+
+    #[test]
     fn resolve_model_passes_a_literal_model_id_through_unresolved() {
         let cfg = CtxConfig::default();
         assert_eq!(
