@@ -52,7 +52,7 @@ fn policy_snapshot_is_stale(record: &sessions::Record, env: EnvLookup<'_>) -> bo
 }
 
 /// N7: one line per registry record (`<short> <agent> <verb> pid <pid> <age>
-/// live|unreachable|stale <repo_slug>`), plus one line for any `s/*.sock` file that has
+/// live|unreachable|dead <repo_slug>`), plus one line for any `s/*.sock` file that has
 /// no matching registry record -- an older zirv binary that predates the
 /// registry still wrote sockets, and a mixed-version machine must not make
 /// those supervisors disappear from `status` entirely, just less detailed.
@@ -91,10 +91,14 @@ fn sessions_lines(
                 // live: the process is running, but it bound no turn-signal
                 // socket, so it can never notice a `zirv ctx nudge`. Showing
                 // it as plain `live` invited an operator to nudge something
-                // that would silently ignore them. A stale record still
-                // reports stale -- being gone outranks being unreachable.
+                // that would silently ignore them. A record whose pid no
+                // longer exists (`Liveness::Stale`; swept from disk as a
+                // side effect of this very listing, see `sessions::list`'s
+                // own doc comment) still reports `dead`, unambiguously --
+                // issue #166 -- rather than `stale`, which read as one more
+                // shade of live: being gone outranks being unreachable.
                 match (liveness, record.reachable) {
-                    (Liveness::Stale, _) => "stale",
+                    (Liveness::Stale, _) => "dead",
                     (Liveness::Live, true) => "live",
                     (Liveness::Live, false) => "unreachable",
                 },
@@ -142,7 +146,20 @@ fn sessions_lines(
 /// when `group` is a record this listing actually loaded (`group::list`), or
 /// just the bare `fallback_id` when it is not -- a delegation naming an
 /// unknown or never-written group id must still be shown, not dropped.
-fn group_header(group: Option<&group::WorkGroup>, fallback_id: &str) -> String {
+///
+/// Issue #170: `live_shorts` -- built by `group_tree_lines` from its own
+/// `records` parameter, keyed by SHORT id (`sessions::Record::short`), the
+/// same address `WorkGroup::sub_orchestrator_session` is stored as -- is
+/// reused here to answer the liveness question `group::is_abandoned` needs,
+/// so `group_header` stays as pure as `group_tree_lines` itself (no
+/// fs/clock/env of its own). Deliberately NOT `group_tree_lines`' own
+/// `live_sessions` set, which is keyed by the FULL session id
+/// `DelegationRow::session` carries instead.
+fn group_header(
+    group: Option<&group::WorkGroup>,
+    fallback_id: &str,
+    live_shorts: &std::collections::BTreeSet<&str>,
+) -> String {
     let Some(wg) = group else {
         return format!("  {fallback_id}");
     };
@@ -160,6 +177,16 @@ fn group_header(group: Option<&group::WorkGroup>, fallback_id: &str) -> String {
     }
     if let Some(deadline) = wg.deadline_secs {
         header.push_str(&format!(" deadline={deadline}s"));
+    }
+    if let Some(sub) = &wg.sub_orchestrator_session {
+        header.push_str(&format!(" sub-orchestrator={sub}"));
+    }
+    let claimant_alive = wg
+        .sub_orchestrator_session
+        .as_deref()
+        .is_some_and(|s| live_shorts.contains(s));
+    if group::is_abandoned(wg, claimant_alive) {
+        header.push_str(" ABANDONED");
     }
     header
 }
@@ -243,6 +270,17 @@ pub fn group_tree_lines(
         .filter(|(_, liveness)| *liveness == Liveness::Live)
         .map(|(record, _)| record.session.as_str())
         .collect();
+    // Issue #170: `WorkGroup::sub_orchestrator_session` is a SHORT id (the
+    // same address `parent_session`/`SpawnRequest::parent_session` already
+    // use throughout this codebase), unlike `live_sessions` above which is
+    // keyed by the FULL session id `DelegationRow::session` carries -- a
+    // second set, keyed the other way, so `group_header`'s abandoned check
+    // asks the right question of the right key space.
+    let live_shorts: std::collections::BTreeSet<&str> = records
+        .iter()
+        .filter(|(_, liveness)| *liveness == Liveness::Live)
+        .map(|(record, _)| record.short.as_str())
+        .collect();
 
     let mut lines = Vec::new();
     let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
@@ -258,7 +296,7 @@ pub fn group_tree_lines(
         seen.insert(wg.work_group_id.as_str());
         push_group_block(
             &mut lines,
-            group_header(Some(wg), ""),
+            group_header(Some(wg), "", &live_shorts),
             &children,
             &live_sessions,
         );
@@ -278,7 +316,7 @@ pub fn group_tree_lines(
             .collect();
         push_group_block(
             &mut lines,
-            group_header(None, id),
+            group_header(None, id, &live_shorts),
             &children,
             &live_sessions,
         );
@@ -291,7 +329,7 @@ pub fn group_tree_lines(
     if !ungrouped.is_empty() {
         push_group_block(
             &mut lines,
-            group_header(None, "ungrouped"),
+            group_header(None, "ungrouped", &live_shorts),
             &ungrouped,
             &live_sessions,
         );
@@ -1749,8 +1787,12 @@ mod tests {
         pid
     }
 
+    /// Issue #166: an operator reading `status` must see this unambiguously
+    /// as `dead`, not `live` -- and not the old `stale` wording either, which
+    /// read as merely one more shade of live rather than "this process is
+    /// gone."
     #[test]
-    fn status_marks_a_session_whose_process_is_gone_as_stale() {
+    fn status_marks_a_session_whose_process_is_gone_as_dead() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(tmp.path().join("state"));
         state.ensure().expect("ensure");
@@ -1775,7 +1817,7 @@ mod tests {
         let text = String::from_utf8(out).expect("utf8");
 
         let line = text.lines().find(|l| l.contains(&short)).unwrap_or("");
-        assert!(line.contains("stale"), "got {line}");
+        assert!(line.contains("dead"), "got {line}");
         assert!(!line.contains("live"), "got {line}");
     }
 
@@ -1910,6 +1952,7 @@ mod tests {
             created_at: 1_700_000_000,
             closed_at: None,
             admitted_children: 0,
+            sub_orchestrator_session: None,
         }
     }
 
@@ -2018,6 +2061,40 @@ mod tests {
             !text.contains("failed"),
             "must not show the stale outcome: {text}"
         );
+    }
+
+    /// Issue #170: the tree names an ABANDONED group -- claimed by a
+    /// SubOrchestrator whose own session is no longer live, still open. The
+    /// SAME group with its claimant still alive must not carry the marker.
+    #[test]
+    fn the_group_tree_marks_a_group_whose_claimed_coordinator_died() {
+        let mut group = sample_group("wg-1", "phase 5 implementation");
+        group.sub_orchestrator_session = Some("deadbeef".to_string());
+        let row = delegation_row("wg-1", "sess-a", "codex", 100, 200, 50);
+
+        // `sessions::short_id` takes the first 8 ASCII-alphanumeric
+        // characters, so this session id derives to exactly "deadbeef" --
+        // matching `group.sub_orchestrator_session` above.
+        let record = sessions::Record::new(
+            "deadbeef-2222-4333-8444-555555555555",
+            "claude",
+            std::path::Path::new("/repo"),
+            sessions::Verb::Exec,
+        );
+        assert_eq!(record.short, "deadbeef");
+
+        // Dead: no matching live record at all.
+        let dead_text = group_tree_lines(
+            std::slice::from_ref(&group),
+            std::slice::from_ref(&row),
+            &[],
+        )
+        .join("\n");
+        assert!(dead_text.contains("ABANDONED"), "got {dead_text}");
+
+        // Alive: the exact same group, with its claimant now live.
+        let alive_text = group_tree_lines(&[group], &[row], &[(record, Liveness::Live)]).join("\n");
+        assert!(!alive_text.contains("ABANDONED"), "got {alive_text}");
     }
 
     /// End-to-end: no `delegations.jsonl` at all (the common case -- `zirv

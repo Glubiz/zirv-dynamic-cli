@@ -528,6 +528,7 @@ pub(crate) fn dash_orchestrator_pane(
         compiled.composed,
         None,
         launch.role,
+        &cfg.prompt,
     );
     let prompt_args = super::prompt::injection_args_for_session(
         adapter,

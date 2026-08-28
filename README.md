@@ -1008,7 +1008,7 @@ A repository config is part of a checkout, so cloning a repository must not be
 enough to change what zirv executes. `<repo>/.zirv/ctx.toml` may not set
 `agent`, `agent_bin`, `supervise.on_failure`, `handoff.model`,
 `optimize.model`, `sandbox.enabled`, `prompt.enabled`, `prompt.repo_layer`,
-`prompt.max_repo_bytes`, `prompt.harnesses`, `mail.enabled`,
+`prompt.max_repo_bytes`, `prompt.harnesses`, `prompt.codex_orchestrator`, `mail.enabled`,
 `mail.max_delivered_bytes`, `chrome.events`, any `memory.*` key, any
 `dash.*` key, any `pace.*` key, `review`, `worker`, `handover`, or any of the
 five keys that feed the token gate (`score.token_floor`,
@@ -1031,6 +1031,7 @@ checkout:
 | `prompt.repo_layer` | `ZIRV_CTX_PROMPT_REPO` |
 | `prompt.max_repo_bytes` | `ZIRV_CTX_PROMPT_MAX_REPO_BYTES` |
 | `prompt.harnesses` | `ZIRV_CTX_PROMPT_HARNESSES` |
+| `prompt.codex_orchestrator` | `ZIRV_CTX_PROMPT_CODEX_ORCHESTRATOR` |
 | `context.max_common_bytes` | `ZIRV_CTX_CONTEXT_MAX_COMMON_BYTES` |
 | `context.max_harness_bytes` | `ZIRV_CTX_CONTEXT_MAX_HARNESS_BYTES` |
 | `context.max_harness_roster_bytes` | `ZIRV_CTX_CONTEXT_MAX_HARNESS_ROSTER_BYTES` |
@@ -1088,6 +1089,9 @@ silencing the announcement channel would hide its own degradation notices
 from anyone running zirv there. `prompt.harnesses` closes the same loop for
 the derived per-adapter harness-roster layer: a repo checkout must not be
 able to force that layer back on for an operator who turned it off.
+`prompt.codex_orchestrator` closes the same loop once more for codex's own
+orchestrator-conventions layer (issue #167): a repo checkout must not be
+able to re-enable it for an operator who turned it off.
 `memory.*` closes the same hole again for the memory bank's *configuration*
 (not its content -- see below): a repo checkout must not be able to switch
 either scope's gate on or off for itself, raise its own caps, or switch

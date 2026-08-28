@@ -1632,6 +1632,7 @@ pub fn run_with(
         compiled.composed,
         None,
         role,
+        &cfg.prompt,
     );
     let prompt_args = super::prompt::injection_args_for_session(
         adapter.as_ref(),
@@ -1771,7 +1772,8 @@ pub fn run_with(
     // since both are computed from the identical `cfg.safety` value.
     let safety_policy_sha256 = super::safety::policy_fingerprint(&cfg.safety).ok();
     let record = super::sessions::Record::new(session.as_str(), adapter.name(), repo, verb)
-        .with_safety_policy_sha256(safety_policy_sha256);
+        .with_safety_policy_sha256(safety_policy_sha256)
+        .with_role(role.label());
     let record = if server.is_some() {
         record
     } else {

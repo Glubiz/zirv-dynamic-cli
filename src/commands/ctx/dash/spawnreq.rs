@@ -165,6 +165,38 @@ pub fn request_dir_for(state: &StateDir, dash_short: &str, token: &str) -> PathB
         .join("requests")
 }
 
+/// `<state>/dash/<dash_short>-<token>/p-<pane_token>`: ONE pane's own intake
+/// directory, a sibling of the dashboard's shared `requests` leaf rather than
+/// a child of it, so `owner_pid_path` below (and every other reader that walks
+/// to `requests_dir.parent()`) resolves the same token dir for a pane channel
+/// as for the shared one, and `dash::mod::remove_request_dir`'s single
+/// `remove_dir_all` of that parent still takes every pane channel with it.
+///
+/// Security review Finding 1 (2026-08-28): every pane used to inherit the one
+/// shared `requests` directory, so a request's requester was whatever
+/// `SpawnRequest::parent_session` claimed -- a `zirv ctx status`-visible short
+/// id, which any pane can read. A pane could therefore name its own
+/// orchestrator as its parent and be classified with that pane's role. A pane
+/// now gets its own directory, named with a fresh `dash::mod::spawn_token`
+/// (16 hex characters, minted per pane, never derived from anything public),
+/// and the dashboard drains each one separately: which directory a request
+/// arrived in IS the requester, derived server-side and never read out of the
+/// request.
+///
+/// Trust boundary (issue #179): the token authenticates the HONEST path -- a
+/// pane's own `zirv ctx agent`, which only ever learns this path via the env
+/// var it inherited -- not the channel itself. It does not isolate same-uid
+/// panes from each other: a pane agent can `readdir` the parent directory,
+/// discover a sibling's `p-<pane_token>` name, and write a forged request
+/// straight into it, being attributed that pane's role. Accepted for this
+/// release; socket-peer-credential hardening is tracked in issue #179.
+pub fn pane_request_dir_for(dash_requests_dir: &Path, pane_token: &str) -> PathBuf {
+    dash_requests_dir
+        .parent()
+        .unwrap_or(dash_requests_dir)
+        .join(format!("p-{pane_token}"))
+}
+
 /// The owner-pid file for a dashboard's spawn-request channel: the token
 /// directory's own `owner.pid`, i.e. the PARENT of `requests_dir` joined with
 /// `owner.pid` (`<state>/dash/<dash_short>-<token>/owner.pid`). It holds the
@@ -452,6 +484,37 @@ mod tests {
                 .join("dash")
                 .join("aaaa1111-0123456789abcdef")
                 .join("owner.pid")
+        );
+    }
+
+    /// Security review Finding 1: a pane channel sits BESIDE the shared
+    /// `requests` leaf, not inside it, so the token dir stays the parent of
+    /// both -- `owner_pid_path` (which a pane's own `agent::live_join_target`
+    /// liveness check goes through) must resolve the same `owner.pid` either
+    /// way, or a pane could never confirm its own dashboard is alive.
+    #[test]
+    fn a_pane_channel_is_a_sibling_of_requests_under_the_same_token_dir() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let requests = request_dir_for(&state, "aaaa1111", "0123456789abcdef");
+        let pane = pane_request_dir_for(&requests, "fedcba9876543210");
+
+        assert_eq!(
+            pane,
+            tmp.path()
+                .join("dash")
+                .join("aaaa1111-0123456789abcdef")
+                .join("p-fedcba9876543210")
+        );
+        assert_eq!(
+            owner_pid_path(&pane),
+            owner_pid_path(&requests),
+            "both channels answer to the same dashboard's owner.pid"
+        );
+        assert_ne!(
+            pane_request_dir_for(&requests, "1111111111111111"),
+            pane,
+            "each pane's channel is its own directory"
         );
     }
 

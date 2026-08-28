@@ -28,6 +28,13 @@ use super::{AgentAdapter, ResolvedProgram, TurnSignalSetup};
 /// only way to make "set the model parameter explicitly" concrete enough to
 /// follow. It still never asks for `--model`: that flag picks *this seat's*
 /// model, which stays the operator's choice, untouched by this text.
+///
+/// Issue #175: carries an explicit delegation-sizing rule so a seat does not
+/// default to minting a sub-orchestrator for ordinary work -- native
+/// Agent-tool subagents stay the default for any bounded task, and `zirv ctx
+/// agent --role sub-orchestrator` is reserved for work that genuinely
+/// decomposes into multiple coherently-scoped areas or must run under zirv's
+/// own supervision independently of this seat.
 pub const ORCHESTRATOR_PROMPT: &str = "\
 zirv orchestrator conventions (claude)
 
@@ -36,6 +43,11 @@ orchestrator model is reserved for this seat, so delegate every substantive piec
 (codebase exploration, implementation, testing, review) to subagents via the Agent tool and keep \
 your own replies brief and decision-focused.
 
+- Size delegation to the job: native Agent-tool subagents (cheaper-model tier per the rule \
+above) are the default for every bounded task, however substantial. Reserve a sub-orchestrator \
+(`zirv ctx agent --role sub-orchestrator --scope \"<area>\"`) for work that splits into multiple \
+coherent areas each needing its own coordination, or that must run under zirv's own supervision \
+independently of this seat -- never for a single bounded task a worker could finish.
 - Bundle before you dispatch: never spawn an agent for one tiny task. Group small related tasks \
 (same file or area, or a natural sequence) into a single checklist brief per agent, with a \
 per-item output format. Split across agents only when tasks are independent and substantial, \
@@ -100,20 +112,31 @@ raw file contents into it.";
 /// unbounded delegation tree is exactly the cost failure this role exists to
 /// bound. It also does not carry the Orchestrator layer's own review-round
 /// rules -- the Orchestrator owns review gates.
+///
+/// Issue #170: extended with the scope contract a work group actually
+/// enforces (`group::WorkGroup`) -- own one area end to end, dispatch at the
+/// cheapest fitting tier per child, only ever Workers, and report ONE
+/// integrated result against the group's completion contract rather than
+/// each child's own outcome individually. `--group` itself is never named
+/// here as something to type: `agent::resolve_group_binding`'s env fallback
+/// (`WORK_GROUP_ENV`) already binds every child this session spawns to the
+/// same group without it needing to remember to pass one.
 pub const SUB_ORCHESTRATOR_PROMPT: &str = "\
 zirv sub-orchestrator conventions (claude)
 
-You are a sub-orchestrator: you coordinate ONE scope handed to you by an orchestrator, you do not \
-decide which harnesses run.
+You are a sub-orchestrator: you own ONE scope end to end, handed to you by an orchestrator as a \
+work group with its own budget and completion contract. You do not decide which harnesses run.
 
-- Split your scope and dispatch delegated workers with `zirv agent <name> \"<prompt>\" -- --model \
-<m>`, always naming the cheapest model that can do the task.
-- Do not spawn another sub-orchestrator or a dashboard coordinator: delegation stops at one level \
-below you.
+- Split your scope into worker briefs and dispatch each with `zirv agent <name> \"<prompt>\" -- \
+--model <m>`, naming the cheapest tier that can do that one brief -- not uniformly the same model \
+for every child.
+- Spawn only Workers. Do not spawn another sub-orchestrator or a dashboard coordinator: delegation \
+stops at one level below you, and every child you dispatch inherits your own work group \
+automatically, with no `--group` of its own to remember.
 - Keep your own replies to decisions and outcomes, not implementation: do not read large files or \
 write code yourself unless the change is trivial.
-- When every child you dispatched is done, report your scope's result back plainly, including any \
-failures.";
+- When every child you dispatched is done, report ONE integrated result against your work group's \
+completion contract -- not each child's own outcome individually -- including any failures.";
 
 fn text_of(message: &Value) -> String {
     message
@@ -3403,6 +3426,51 @@ mod tests {
             ),
             "got:\n{ORCHESTRATOR_PROMPT}"
         );
+    }
+
+    /// Issue #175: the orchestrator layer must default this seat to native
+    /// Agent-tool subagents for any bounded task, however substantial, and
+    /// reserve a sub-orchestrator for work that genuinely splits into
+    /// multiple coherently-scoped areas or must run under zirv's own
+    /// supervision independently of this seat -- so a seat stops minting
+    /// sub-orchestrators for ordinary tasks a worker could finish.
+    #[test]
+    fn the_orchestrator_prompt_sizes_delegation_between_subagents_and_sub_orchestrators() {
+        assert!(
+            ORCHESTRATOR_PROMPT.contains("native Agent-tool subagents"),
+            "got:\n{ORCHESTRATOR_PROMPT}"
+        );
+        assert!(
+            ORCHESTRATOR_PROMPT
+                .contains("are the default for every bounded task, however substantial"),
+            "native subagents must be the sizing default: {ORCHESTRATOR_PROMPT}"
+        );
+        assert!(
+            ORCHESTRATOR_PROMPT.contains("zirv ctx agent --role sub-orchestrator --scope"),
+            "got:\n{ORCHESTRATOR_PROMPT}"
+        );
+        assert!(
+            ORCHESTRATOR_PROMPT.contains("multiple coherent areas"),
+            "sub-orchestrators are reserved for multi-area work: {ORCHESTRATOR_PROMPT}"
+        );
+        assert!(
+            ORCHESTRATOR_PROMPT.contains("never for a single bounded task a worker could finish"),
+            "got:\n{ORCHESTRATOR_PROMPT}"
+        );
+    }
+
+    /// The sizing rule is orchestrator-only vocabulary: a Worker never
+    /// decides delegation shape at all, and a sub-orchestrator's own
+    /// delegation is already capped to Workers by `SUB_ORCHESTRATOR_PROMPT`
+    /// itself, so neither layer needs or gets this bullet.
+    #[test]
+    fn the_worker_and_sub_orchestrator_layers_do_not_gain_the_sizing_rule() {
+        for layer in [WORKER_PROMPT, SUB_ORCHESTRATOR_PROMPT] {
+            assert!(
+                !layer.contains("Size delegation to the job"),
+                "only the orchestrator layer decides delegation shape: {layer}"
+            );
+        }
     }
 
     /// `exec` strips this many leading tokens off the argv the operator

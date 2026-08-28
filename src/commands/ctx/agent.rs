@@ -26,7 +26,7 @@ use super::event::{SessionId, TranscriptUsage};
 use super::exec::{self, ExecArgs};
 use super::pace;
 
-#[derive(Debug, clap::Args)]
+#[derive(Debug, Clone, clap::Args)]
 pub struct AgentArgs {
     /// Adapter name to delegate to.
     pub name: String,
@@ -57,9 +57,22 @@ pub struct AgentArgs {
     pub role: Option<String>,
     /// The work group (`zirv ctx group create`) this delegation belongs to.
     /// Its own token budget, when set, is a ceiling `--budget-tokens` may
-    /// only tighten, never raise (`resolve_budget_tokens`).
+    /// only tighten, never raise (`resolve_budget_tokens`). Unstated falls
+    /// back to `WORK_GROUP_ENV` (`resolve_group_binding`, issue #170) --
+    /// the group a SubOrchestrator was itself launched under, so every
+    /// worker it spawns lands in that group by lineage rather than by typing
+    /// `--group` on every call.
     #[arg(long)]
     pub group: Option<String>,
+    /// Issue #170: what this group of delegated work is for. Meaningful only
+    /// alongside `--role sub-orchestrator` and with no `--group` already
+    /// resolved (explicitly or via `WORK_GROUP_ENV`): mints a fresh work
+    /// group scoped to this text (`group::create`'s own defaults for
+    /// everything else, `--budget-tokens` as its token ceiling) and binds
+    /// this delegation to it, rather than requiring the operator to run
+    /// `zirv ctx group create` as a separate step first.
+    #[arg(long)]
+    pub scope: Option<String>,
     /// Token ceiling for this worker (issue #155, Phase 5(d)). Checkpoints
     /// at `BUDGET_SOFT_FRACTION` of the ceiling and stops at the ceiling
     /// itself -- never a signal to change models. `None` (the default) is
@@ -175,6 +188,101 @@ pub fn validate_role(role: &Option<String>) -> CtxResult<()> {
         Some(other) => {
             Err(format!("--role must be 'worker' or 'sub-orchestrator'; got '{other}'").into())
         }
+    }
+}
+
+/// Issue #170: exported into a SubOrchestrator delegation's own env
+/// (`resolve_group_binding`'s caller, once the child actually launches) so
+/// every `zirv agent` call ITS OWN harness makes -- with no `--group` of its
+/// own -- lands in the same work group by lineage rather than by the
+/// harness remembering to type `--group` every time.
+pub const WORK_GROUP_ENV: &str = "ZIRV_CTX_WORK_GROUP";
+
+/// Issue #170: resolves what `--group` this delegation actually binds to,
+/// mutating `args.group` in place -- called once, at the very top of
+/// [`run_with`], before the dashboard-join fork so BOTH forks of this
+/// delegation (a live pane, or the headless fallback) see the same answer.
+///
+/// Three cases, in order:
+/// 1. `args.group` already named -- unchanged. An operator's own explicit
+///    choice always wins.
+/// 2. Unstated, but [`WORK_GROUP_ENV`] is set -- inherited. This is the
+///    "lineage rather than convention" binding itself: a SubOrchestrator's
+///    own further `zirv agent` calls, run from inside its own harness with
+///    no `--group` of their own, pick up the same group its OWN launch was
+///    bound to.
+/// 3. Unstated, no inherited env, but `args.scope` names one and `args.role`
+///    is `sub-orchestrator` -- mints a fresh group scoped to it
+///    (`group::create`, `--budget-tokens` as its ceiling) so a coordinator
+///    can be launched in one command rather than requiring `zirv ctx group
+///    create` as a separate step first.
+///
+/// Neither case touches an existing group's own terms: case 2 only ever
+/// reads an id, and case 3 only ever creates a brand new one.
+///
+/// Returns the id it MINTED (case 3), if any -- `None` for an explicit or
+/// inherited binding, which this delegation does not own and must never
+/// unwind. Security review round 2 (Finding 4): the caller rolls a minted
+/// group back (`group::discard_if_unused`) on every path that ends without
+/// the delegation actually starting, and this call now happens only after
+/// that caller's own spawn gate has already passed.
+fn resolve_group_binding(
+    args: &mut AgentArgs,
+    state: &super::state::StateDir,
+    env: EnvLookup<'_>,
+) -> CtxResult<Option<String>> {
+    if args.group.is_some() {
+        return Ok(None);
+    }
+    if let Some(inherited) = env(WORK_GROUP_ENV).filter(|s| !s.is_empty()) {
+        args.group = Some(inherited);
+        return Ok(None);
+    }
+    if let Some(scope) = &args.scope
+        && args.role.as_deref() == Some("sub-orchestrator")
+    {
+        let id = super::group::run_create(
+            state,
+            &mut std::io::sink(),
+            &super::group::CreateArgs {
+                scope: scope.clone(),
+                child_limit: super::group::DEFAULT_CHILD_LIMIT,
+                token_budget: args.budget_tokens,
+                deadline_secs: None,
+                completion_contract: super::group::DEFAULT_COMPLETION_CONTRACT.to_string(),
+                parent_session: super::mail::session_identity(env),
+            },
+            super::state::now_secs(),
+        )?;
+        args.group = Some(id.clone());
+        return Ok(Some(id));
+    }
+    Ok(None)
+}
+
+/// Security review round 2 (Finding 3): folds the group this delegation
+/// actually resolved ([`resolve_group_binding`]) into the env lookup its
+/// headless launch runs under, exactly as `chat::quiet_env` folds `--quiet`
+/// -- `exec::run_with`'s own `turn_env_for`/`apply_session_env` exports
+/// [`WORK_GROUP_ENV`] from it into the child, so a headless coordinator's
+/// children inherit the binding by lineage the same way a dashboard-spawned
+/// coordinator's already did (`dash::fulfill_spawn_request` pushes the same
+/// pair into its pane's `turn_env`). Reusing the env lookup, rather than
+/// adding a parallel parameter or an `ExecArgs` field, is the same trade-off
+/// `quiet_env`'s own doc comment spells out: one lookup already threaded
+/// through every downstream signature, carrying exactly the fact the child
+/// needs to read back.
+///
+/// `None` leaves the lookup untouched, so an inherited `WORK_GROUP_ENV` (a
+/// coordinator's own child calling `zirv agent` with no `--group`) still
+/// reaches the child unchanged.
+fn group_env<'a>(
+    env: EnvLookup<'a>,
+    group: Option<String>,
+) -> impl Fn(&str) -> Option<String> + 'a {
+    move |key: &str| match &group {
+        Some(id) if key == WORK_GROUP_ENV => Some(id.clone()),
+        _ => env(key),
     }
 }
 
@@ -809,6 +917,28 @@ pub fn run_with<W: Write>(
         );
     }
 
+    // Issue #170: resolved once, here, before the dashboard-join fork below,
+    // so a pane spawn and the headless fallback both see the identical
+    // answer -- an inherited `WORK_GROUP_ENV` binding, or a freshly minted
+    // scope-bound group. Shadows the caller's own `&AgentArgs` with an owned
+    // copy; every read of `args` below (including inside `try_join_
+    // dashboard`) is unaffected by this rebinding.
+    //
+    // Security review round 2 (Finding 4): deliberately AFTER the spawn gate
+    // above, which refuses without ever reaching a launch -- a `--scope`
+    // group minted ahead of it was left open, unclaimed and childless on disk
+    // for every such refusal. `minted_group` is what this invocation created
+    // itself (never an inherited or explicitly named one), and every path
+    // below that ends without the delegation starting unwinds it.
+    let mut args = args.clone();
+    let minted_group = resolve_group_binding(&mut args, &state, env)?;
+    let args = &args;
+    let discard_minted_group = || {
+        if let Some(id) = &minted_group {
+            super::group::discard_if_unused(&state, id);
+        }
+    };
+
     if let Some(result) = try_join_dashboard(
         args,
         &prompt,
@@ -818,6 +948,25 @@ pub fn run_with<W: Write>(
         DASH_ACK_TIMEOUT,
         DASH_CLAIM_EXTENSION,
     ) {
+        // Finding 4: the dashboard answered definitively, and only `Ok(0)`
+        // (`answer_for_ack`'s spawned-a-pane arm) means work actually
+        // started. A refusal spawned nothing, so a group minted for it
+        // moments ago holds nothing -- and `discard_if_unused` still checks
+        // that for itself, so the genuinely ambiguous "claimed but never
+        // confirmed" answer cannot delete a group a pane really did claim.
+        //
+        // Bounded race on `Ok(EXIT_DASH_UNCONFIRMED)`: the dashboard has
+        // already taken the request (so it will not be retried) but a slow
+        // dashboard may not yet have reached `admit_child` on this group when
+        // the discard below runs. If it lands in that window the still-
+        // pristine group is deleted out from under the in-flight admission,
+        // which then finds no group and refuses ("no work group") instead of
+        // spawning. Accepted: a clean refusal here is preferable to leaving
+        // group cleanup dependent on winning a race with a dashboard that may
+        // be arbitrarily slow or may never answer at all.
+        if !matches!(result, Ok(0)) {
+            discard_minted_group();
+        }
         return result;
     }
 
@@ -825,7 +974,10 @@ pub fn run_with<W: Write>(
         cfg.chrome.events && !args.quiet,
         console::colors_enabled_stderr(),
     );
-    let env = quiet_env(env, args.quiet);
+    // Finding 3: the launch below runs under an env lookup that carries this
+    // delegation's own group, so `exec::run_with` can export it to the child.
+    let quieted = quiet_env(env, args.quiet);
+    let env = group_env(&quieted, args.group.clone());
 
     // Resolved here, ahead of `exec::run_with`'s own (identical) selection
     // further down, purely to compute the default worker model this spawn
@@ -839,10 +991,35 @@ pub fn run_with<W: Write>(
     // configured/default worker-model prepend actually won.
     let model = adapters::last_model_flag(&command).map(str::to_string);
     let worker_session = SessionId::new_v4().to_string();
+    // Issue #170: this delegation binds `args.group` (if any) to the child
+    // about to run headlessly as its SubOrchestrator -- first-claim-wins, so
+    // a group shared by an operator across several `--group` invocations is
+    // only ever auto-closed by whichever one actually claimed it (below).
+    // Best-effort: a claim failure (a group swept between `resolve_group_
+    // binding` and here) must not fail an otherwise-runnable delegation --
+    // `resolve_worker_budget`, right after this, is what actually enforces
+    // that the named group still exists at all.
+    if args.role.as_deref() == Some("sub-orchestrator")
+        && let Some(id) = &args.group
+    {
+        let _ = super::group::claim_sub_orchestrator(
+            &state,
+            id,
+            &super::sessions::short_id(&worker_session),
+        );
+    }
     // Issue #155, Phase 5(d): resolved before the launch, not inside
     // `exec::run_with` -- an unknown or closed `--group` must fail this
     // delegation outright rather than silently running it unbounded.
-    let worker_budget = resolve_worker_budget(&env, args)?;
+    let worker_budget = match resolve_worker_budget(&env, args) {
+        Ok(budget) => budget,
+        Err(e) => {
+            // Finding 4: nothing ran, so a group minted moments ago for this
+            // delegation must not outlive it.
+            discard_minted_group();
+            return Err(e);
+        }
+    };
 
     let exec_args = ExecArgs {
         agent: Some(args.name.clone()),
@@ -880,9 +1057,30 @@ pub fn run_with<W: Write>(
             if let Some(id) = &args.group {
                 super::group::rollback_admission(&state, id);
             }
+            // Finding 4: with the admission rolled back the group is pristine
+            // again, so a group this invocation minted for a launch that
+            // never happened is removed rather than left open forever.
+            discard_minted_group();
             return Err(e);
         }
     };
+    // Issue #170: this delegation's scope is done -- successfully or not --
+    // the moment its supervised run exits (completion contract and spend are
+    // both left for a reviewer to check against `zirv ctx group status`,
+    // never machine-verified -- see `WorkGroup::completion_contract`'s own
+    // doc comment). Closes the group only when THIS session is the one that
+    // actually claimed it above, never a group some other, concurrent
+    // claimant owns -- an operator's own shared `--group` across several
+    // unrelated invocations must not be closed out from under whichever of
+    // them still has work left.
+    if args.role.as_deref() == Some("sub-orchestrator")
+        && let Some(id) = &args.group
+        && let Ok(Some(group)) = super::group::load(&state, id)
+        && group.sub_orchestrator_session.as_deref()
+            == Some(super::sessions::short_id(&worker_session).as_str())
+    {
+        let _ = super::group::close(&state, id, super::state::now_secs());
+    }
     let wall_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     announcer.emit(&Event::DelegatedFinish {
         agent: args.name.clone(),
@@ -1135,6 +1333,7 @@ mod tests {
             created_at: 0,
             closed_at: None,
             admitted_children: admitted,
+            sub_orchestrator_session: None,
         }
     }
 
@@ -1270,6 +1469,85 @@ mod tests {
         let err = validate_role(&Some("orchestrator".to_string()))
             .expect_err("orchestrator is not a spawnable role");
         assert!(err.to_string().contains("--role"), "got {err}");
+    }
+
+    /// Issue #170: an operator's own explicit `--group` always wins, over
+    /// both the inherited env binding and a `--scope` that would otherwise
+    /// mint a fresh one.
+    #[test]
+    fn resolve_group_binding_prefers_an_explicit_group_over_everything_else() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = super::super::state::StateDir::from_root(tmp.path().to_path_buf());
+        let env: HashMap<String, String> =
+            [(WORK_GROUP_ENV.to_string(), "wg-inherited".to_string())].into();
+
+        let mut args = args_for("claude", "do the work");
+        args.group = Some("wg-explicit".to_string());
+        args.scope = Some("some scope".to_string());
+        args.role = Some("sub-orchestrator".to_string());
+        resolve_group_binding(&mut args, &state, &|k| env.get(k).cloned()).expect("resolves");
+        assert_eq!(args.group.as_deref(), Some("wg-explicit"));
+    }
+
+    /// The "lineage rather than convention" binding itself: no `--group` of
+    /// its own, but `WORK_GROUP_ENV` was inherited (the same real process env
+    /// a SubOrchestrator's own launch was seeded with) -- picked up with no
+    /// operator action required.
+    #[test]
+    fn resolve_group_binding_falls_back_to_the_inherited_env_var() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = super::super::state::StateDir::from_root(tmp.path().to_path_buf());
+        let env: HashMap<String, String> =
+            [(WORK_GROUP_ENV.to_string(), "wg-inherited".to_string())].into();
+
+        let mut args = args_for("claude", "do the work");
+        resolve_group_binding(&mut args, &state, &|k| env.get(k).cloned()).expect("resolves");
+        assert_eq!(args.group.as_deref(), Some("wg-inherited"));
+    }
+
+    /// Issue #170: `--scope` alongside `--role sub-orchestrator`, with no
+    /// `--group` resolved any other way, mints a fresh group scoped to it --
+    /// one command instead of a separate `zirv ctx group create` step first.
+    #[test]
+    fn resolve_group_binding_mints_a_scope_bound_group_for_a_sub_orchestrator() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = super::super::state::StateDir::from_root(tmp.path().to_path_buf());
+        let env: HashMap<String, String> = HashMap::new();
+
+        let mut args = args_for("claude", "do the work");
+        args.role = Some("sub-orchestrator".to_string());
+        args.scope = Some("own the frontend rewrite".to_string());
+        args.budget_tokens = Some(250_000);
+        let minted =
+            resolve_group_binding(&mut args, &state, &|k| env.get(k).cloned()).expect("resolves");
+
+        let id = args.group.clone().expect("a group was minted");
+        assert_eq!(
+            minted.as_deref(),
+            Some(id.as_str()),
+            "a minted group is reported back, so its caller can unwind it (Finding 4)"
+        );
+        let group = super::super::group::load(&state, &id)
+            .expect("load")
+            .expect("present");
+        assert_eq!(group.scope, "own the frontend rewrite");
+        assert_eq!(group.token_budget, Some(250_000));
+        assert_eq!(group.child_limit, super::super::group::DEFAULT_CHILD_LIMIT);
+    }
+
+    /// A plain worker request (no `--role sub-orchestrator`) must never mint
+    /// a group just because `--scope` happened to be set -- only a
+    /// coordinator owns a scope.
+    #[test]
+    fn resolve_group_binding_does_not_mint_for_a_plain_worker() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = super::super::state::StateDir::from_root(tmp.path().to_path_buf());
+        let env: HashMap<String, String> = HashMap::new();
+
+        let mut args = args_for("claude", "do the work");
+        args.scope = Some("own the frontend rewrite".to_string());
+        resolve_group_binding(&mut args, &state, &|k| env.get(k).cloned()).expect("resolves");
+        assert_eq!(args.group, None);
     }
 
     // `worker_launch_flags`/`flags_pin_model`: pure, so these are testable
@@ -1683,6 +1961,7 @@ mod tests {
             quiet: false,
             role: None,
             group: None,
+            scope: None,
             budget_tokens: None,
             max_tool_calls: None,
             force: false,
@@ -2077,6 +2356,216 @@ mod tests {
         );
     }
 
+    /// Issue #170: a SubOrchestrator's group closes automatically once its
+    /// own supervised run ends -- "when a sub-orchestrator finishes its
+    /// scope, its group closes" -- with no separate `zirv ctx group close`
+    /// step required.
+    #[test]
+    fn a_completed_sub_orchestrator_delegation_closes_its_own_claimed_group() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state_dir = tmp.path().join("state");
+        let mut env = base_env(&state_dir);
+        env.insert("ZIRV_CTX_PACE".to_string(), "false".to_string());
+        let state = crate::commands::ctx::state::StateDir::from_root(state_dir.clone());
+        let group_id = crate::commands::ctx::group::run_create(
+            &state,
+            &mut Vec::new(),
+            &crate::commands::ctx::group::CreateArgs {
+                scope: "own the frontend rewrite".to_string(),
+                child_limit: 3,
+                token_budget: None,
+                deadline_secs: None,
+                completion_contract: "report by mail".to_string(),
+                parent_session: None,
+            },
+            1_700_000_000,
+        )
+        .expect("group create");
+
+        unsafe {
+            std::env::set_var("FAKE_AGENT_MODE", "healthy");
+        }
+        let mut args = args_for("claude", "do the work");
+        args.role = Some("sub-orchestrator".to_string());
+        args.group = Some(group_id.clone());
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE");
+        }
+        assert_eq!(code.expect("runs"), 0);
+
+        let group = crate::commands::ctx::group::load(&state, &group_id)
+            .expect("load")
+            .expect("present");
+        assert!(
+            group.closed_at.is_some(),
+            "the sub-orchestrator's own scope finished; the group must close itself"
+        );
+        assert!(
+            group.sub_orchestrator_session.is_some(),
+            "the group must name who claimed and closed it"
+        );
+    }
+
+    /// Security review round 2 (Finding 3): the headless fork of a
+    /// coordinator delegation resolved (and here mints) a group, but exported
+    /// nothing -- only the dashboard fork pushed `WORK_GROUP_ENV` into its
+    /// pane's environment. So a headless sub-orchestrator's own children
+    /// resolved `group = None`: no admission, no child limit, no token
+    /// ceiling, "ungrouped" in the status tree. The child's real environment
+    /// is what proves the fix, read back through the fixture's own env log.
+    #[test]
+    fn a_headless_coordinators_child_inherits_the_group_it_was_bound_to() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state_dir = tmp.path().join("state");
+        let mut env = base_env(&state_dir);
+        env.insert("ZIRV_CTX_PACE".to_string(), "false".to_string());
+        let state = crate::commands::ctx::state::StateDir::from_root(state_dir.clone());
+        let group_env_log = tmp.path().join("group-env.log");
+
+        unsafe {
+            std::env::set_var("FAKE_AGENT_MODE", "healthy");
+            std::env::set_var("FAKE_AGENT_GROUP_ENV_LOG", &group_env_log);
+        }
+        let mut args = args_for("claude", "own this scope");
+        args.role = Some("sub-orchestrator".to_string());
+        args.scope = Some("the frontend rewrite".to_string());
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE");
+            std::env::remove_var("FAKE_AGENT_GROUP_ENV_LOG");
+        }
+        assert_eq!(code.expect("runs"), 0);
+
+        let groups = crate::commands::ctx::group::list(&state);
+        assert_eq!(groups.len(), 1, "the scope minted exactly one group");
+        let inherited = std::fs::read_to_string(&group_env_log).expect("the child logged its env");
+        assert_eq!(
+            inherited.trim(),
+            groups[0].work_group_id,
+            "the coordinator's own child must carry the group it was bound to"
+        );
+    }
+
+    /// The other half of Finding 3, end to end: a child that inherits that
+    /// exact environment -- a `zirv ctx agent` call with no `--group` of its
+    /// own, run from inside a coordinator's harness -- resolves the SAME
+    /// group and is admitted against its child limit, which is what the
+    /// missing export cost.
+    #[test]
+    fn a_child_that_inherits_the_group_env_is_admitted_into_that_same_group() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state_dir = tmp.path().join("state");
+        let mut env = base_env(&state_dir);
+        env.insert("ZIRV_CTX_PACE".to_string(), "false".to_string());
+        let state = crate::commands::ctx::state::StateDir::from_root(state_dir.clone());
+        let group_id = crate::commands::ctx::group::run_create(
+            &state,
+            &mut Vec::new(),
+            &crate::commands::ctx::group::CreateArgs {
+                scope: "the frontend rewrite".to_string(),
+                child_limit: 3,
+                token_budget: None,
+                deadline_secs: None,
+                completion_contract: "report by mail".to_string(),
+                parent_session: None,
+            },
+            1_700_000_000,
+        )
+        .expect("group create");
+        // Exactly what the coordinator's child process inherits, per the test
+        // above: the binding in the environment, and no `--group` typed.
+        env.insert(WORK_GROUP_ENV.to_string(), group_id.clone());
+
+        unsafe {
+            std::env::set_var("FAKE_AGENT_MODE", "healthy");
+        }
+        let args = args_for("claude", "do a slice of it");
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE");
+        }
+        assert_eq!(code.expect("runs"), 0);
+
+        let group = crate::commands::ctx::group::load(&state, &group_id)
+            .expect("load")
+            .expect("present");
+        assert_eq!(
+            group.admitted_children, 1,
+            "the inherited binding is what makes `admit_child` fire at all"
+        );
+        assert!(
+            group.closed_at.is_none(),
+            "a plain worker child never closes its coordinator's group"
+        );
+        let delegations = crate::commands::ctx::log::tail_delegations(&state, 10).expect("tail");
+        let record: serde_json::Value = serde_json::from_str(&delegations[0]).expect("json");
+        assert_eq!(
+            record["work_group_id"].as_str(),
+            Some(group_id.as_str()),
+            "and the delegation is recorded inside that group, not as ungrouped: {record}"
+        );
+    }
+
+    /// The other half: a plain WORKER delegation into the same group must
+    /// never close it -- only the coordinator that owns a group's scope may
+    /// finish it. Otherwise the very first worker to complete would close a
+    /// batch its siblings are still working through.
+    #[test]
+    fn a_completed_plain_worker_delegation_never_closes_its_group() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state_dir = tmp.path().join("state");
+        let mut env = base_env(&state_dir);
+        env.insert("ZIRV_CTX_PACE".to_string(), "false".to_string());
+        let state = crate::commands::ctx::state::StateDir::from_root(state_dir.clone());
+        let group_id = crate::commands::ctx::group::run_create(
+            &state,
+            &mut Vec::new(),
+            &crate::commands::ctx::group::CreateArgs {
+                scope: "own the frontend rewrite".to_string(),
+                child_limit: 3,
+                token_budget: None,
+                deadline_secs: None,
+                completion_contract: "report by mail".to_string(),
+                parent_session: None,
+            },
+            1_700_000_000,
+        )
+        .expect("group create");
+
+        unsafe {
+            std::env::set_var("FAKE_AGENT_MODE", "healthy");
+        }
+        let mut args = args_for("claude", "do the work");
+        args.group = Some(group_id.clone());
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE");
+        }
+        assert_eq!(code.expect("runs"), 0);
+
+        let group = crate::commands::ctx::group::load(&state, &group_id)
+            .expect("load")
+            .expect("present");
+        assert!(
+            group.closed_at.is_none(),
+            "a plain worker completing must never close the group it ran in"
+        );
+        assert!(group.sub_orchestrator_session.is_none());
+    }
+
     // Task 11: joining a running dashboard instead of spawning headless.
 
     /// Polls `dir` for a `req-*.json` file and hands its file stem to
@@ -2277,6 +2766,51 @@ mod tests {
         assert_eq!(code, 1);
         let output = String::from_utf8_lossy(&out);
         assert!(output.contains("disabled"), "got {output}");
+    }
+
+    /// Security review round 2 (Finding 4): `--scope` mints a group, and a
+    /// dashboard that then refuses the spawn means the delegation never
+    /// starts -- so the group must not be left open, unclaimed and childless
+    /// on disk. (The refusal here is the same non-retryable shape the
+    /// dashboard's own lineage and depth gates produce.)
+    #[test]
+    fn a_refused_scope_spawn_leaves_no_work_group_behind() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let (requests_dir, env) = live_dashboard_dir(tmp.path());
+        let state = crate::commands::ctx::state::StateDir::from_root(tmp.path().join("state"));
+
+        let responder = std::thread::spawn({
+            let dir = requests_dir.clone();
+            move || {
+                respond_to_next_request(
+                    dir,
+                    r#"{"ok":false,"short":null,"reason":"a worker may not delegate onward"}"#,
+                )
+            }
+        });
+
+        let mut args = joinable_args("claude", "own this scope");
+        args.role = Some("sub-orchestrator".to_string());
+        args.scope = Some("the frontend rewrite".to_string());
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned())
+            .expect("dashboard join runs");
+        let request_body = responder.join().expect("responder thread");
+
+        assert_eq!(code, 1, "a policy refusal ends the delegation");
+        let req: spawnreq::SpawnRequest =
+            serde_json::from_str(&request_body).expect("the request parses");
+        assert!(
+            req.work_group_id.is_some(),
+            "the minted group still travels in the request: {request_body}"
+        );
+        assert!(
+            crate::commands::ctx::group::list(&state).is_empty(),
+            "a refused spawn must leave no group behind: {:?}",
+            crate::commands::ctx::group::list(&state)
+        );
     }
 
     /// A live requests directory, and the `AgentArgs`/env pair that reaches

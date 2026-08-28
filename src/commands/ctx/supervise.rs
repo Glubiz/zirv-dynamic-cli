@@ -5,6 +5,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use super::CtxResult;
+use super::sessions::is_alive;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tick {
@@ -106,6 +107,57 @@ pub fn terminate(child: &mut Child, grace: Duration) -> CtxResult<()> {
     let _ = child.kill();
     let _ = child.wait();
     Ok(())
+}
+
+/// SIGTERM, then SIGKILL after `grace`, against a bare pid this process does
+/// not own as a `Child` -- `zirv ctx kill` resolves a session's pid from the
+/// on-disk registry in an entirely different process, so unlike `terminate`
+/// above there is no `Child` handle to call, only the pid itself. Mirrors
+/// `terminate`'s own escalation exactly; the two differ only in what they
+/// have a handle to. Returns whether the pid was confirmed dead by the end of
+/// the grace period plus a brief settle window after the final signal --
+/// best-effort, like every other piece of state-dir housekeeping in this
+/// codebase, since a pid that ignores even `SIGKILL` (a zombie stuck on an
+/// uninterruptible syscall) is not something any caller here can fix.
+#[cfg(unix)]
+pub(crate) fn terminate_pid(pid: u32, grace: Duration) -> bool {
+    if !is_alive(pid) {
+        return true;
+    }
+    // SAFETY: `kill` with a pid and a valid signal number.
+    unsafe {
+        libc::kill(pid as libc::pid_t, libc::SIGTERM);
+    }
+    let deadline = Instant::now() + grace;
+    while Instant::now() < deadline {
+        if !is_alive(pid) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    // SAFETY: same as above.
+    unsafe {
+        libc::kill(pid as libc::pid_t, libc::SIGKILL);
+    }
+    let settle = Instant::now() + Duration::from_millis(250);
+    while Instant::now() < settle {
+        if !is_alive(pid) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    !is_alive(pid)
+}
+
+/// The non-unix counterpart: there is no SIGTERM to escalate from, so this
+/// goes straight to the same tree-kill `terminate`'s own non-unix branch
+/// uses.
+#[cfg(not(unix))]
+pub(crate) fn terminate_pid(pid: u32, _grace: Duration) -> bool {
+    if !is_alive(pid) {
+        return true;
+    }
+    kill_tree(pid) || !is_alive(pid)
 }
 
 /// The `taskkill` invocation that terminates the whole process tree rooted at
@@ -932,6 +984,44 @@ mod tests {
         let mut child = spawn(sh("exit 0")).expect("spawn");
         let _ = child.wait();
         terminate(&mut child, Duration::from_millis(50)).expect("terminate must be idempotent");
+    }
+
+    /// `terminate_pid` is `terminate`'s bare-pid counterpart -- `zirv ctx
+    /// kill` only ever has a pid it read back from the session registry,
+    /// never a `Child` it spawned itself. Same escalation, same fixture as
+    /// `terminate_stops_a_child_that_ignores_sigterm` above.
+    ///
+    /// `terminate_pid`'s own liveness check is `is_alive` (`kill(pid, 0)`),
+    /// not `Child::try_wait`, so unlike that sibling test this one must reap
+    /// the child concurrently, in another thread: a killed process a test
+    /// still holds a `Child` for but has not `wait()`-ed on sits as a zombie
+    /// -- still visible to `kill(pid, 0)` -- until reaped, which would make
+    /// `is_alive` report it alive right through the whole grace and settle
+    /// window. Production never hits this: `zirv ctx kill` runs in an
+    /// unrelated process, so whatever the killed pid's real parent is reaps
+    /// it on its own schedule, same as this thread does here.
+    #[test]
+    fn terminate_pid_stops_a_process_that_ignores_sigterm() {
+        let mut child = spawn(sh("trap '' TERM; sleep 30")).expect("spawn");
+        let pid = child.id();
+        let reaper = std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+        let started = Instant::now();
+        assert!(terminate_pid(pid, Duration::from_millis(150)));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        reaper.join().expect("reaper thread");
+    }
+
+    #[test]
+    fn terminate_pid_is_safe_on_an_already_dead_pid() {
+        let mut child = spawn(sh("exit 0")).expect("spawn");
+        let pid = child.id();
+        let _ = child.wait();
+        assert!(
+            terminate_pid(pid, Duration::from_millis(50)),
+            "an already-dead pid reads as confirmed dead, not an error"
+        );
     }
 
     /// Force the mtime forward explicitly rather than relying on real time to

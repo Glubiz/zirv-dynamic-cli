@@ -25,7 +25,7 @@
 #![allow(dead_code)]
 
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
@@ -61,10 +61,12 @@ pub struct PaneSpec {
     pub argv: Vec<String>,
     /// Shapes the composed prompt and argv the caller builds *before*
     /// constructing this spec (the same `prompt::compose` role every other
-    /// supervisor already threads through) -- accepted here for interface
-    /// completeness with the rest of the launch pipeline, but a pane itself
-    /// has no per-role behavior once its argv is fixed, so `Pane::spawn`
-    /// reads and discards it rather than storing a field nothing reads.
+    /// supervisor already threads through). Issue #169: also the role this
+    /// pane's own `Pane`/`sessions::Record` is stamped with at spawn time --
+    /// the caller (`dash::mod::fulfill_spawn_request`) has already run this
+    /// value through the depth cap before ever constructing a `PaneSpec`, so
+    /// `Pane::spawn` records it as fact rather than re-deriving or
+    /// re-validating it.
     pub role: PromptRole,
     pub verb: Verb,
     /// uuid, minted by the caller: the pane's registry short id and
@@ -699,6 +701,12 @@ pub struct Pane {
     /// pane is never body-injected, only a worker pane is (the trust split
     /// the spec calls for; `dash::mod::is_delivery_eligible`).
     verb: Verb,
+    /// Issue #169: the role this pane was ACTUALLY spawned with
+    /// (`PaneSpec::role`), server-side and forgery-proof -- a pane's own
+    /// child cannot widen it after the fact, since nothing here ever reads
+    /// it back from anything the child says. `dash::mod::parent_role_for`
+    /// reads this instead of assuming every live pane is a `Worker`.
+    role: PromptRole,
     session_id: String,
     parser: vt100::Parser,
     master: Box<dyn portable_pty::MasterPty + Send>,
@@ -773,6 +781,26 @@ pub struct Pane {
     /// addressability for the report-back layer and is the only place that
     /// answer exists.
     report_to: Option<String>,
+    /// Security review Finding 1 (2026-08-28): this pane's OWN spawn-request
+    /// intake directory (`spawnreq::pane_request_dir_for`), the one path this
+    /// pane's child tree was told about through `DASH_REQUESTS_ENV`. The
+    /// dashboard drains it separately from every other pane's, so a request
+    /// found here is, server-side, a request from THIS pane -- the identity
+    /// `dash::mod::fulfill_spawn_request` classifies lineage by, instead of
+    /// believing whatever `SpawnRequest::parent_session` claims. `None` for a
+    /// pane with no channel of its own (every test pane, and a spawn whose
+    /// directory could not be created), which can then only ever be the
+    /// requester of nothing.
+    intake_dir: Option<PathBuf>,
+    /// Security review Finding 2 (2026-08-28): the `group::WorkGroup` this
+    /// pane was spawned into (`spawnreq::SpawnRequest::work_group_id`), if
+    /// any. A dashboard-spawned coordinator claims it at spawn and the
+    /// dashboard closes it when this pane's own child exits -- the pane-side
+    /// mirror of `agent::run_with`'s claim/close pair, without which a
+    /// dash-spawned coordinator's group stayed open and unclaimed forever.
+    /// Also what `dash::mod::on_quit` persists into the restore roster, so a
+    /// restored pane comes back inside the same group.
+    work_group_id: Option<String>,
     /// Whether `report_back_reminder_sweep`'s one-shot completion reminder
     /// has already been injected into this pane. Set the moment that
     /// injection succeeds and never cleared again -- unlike
@@ -845,9 +873,6 @@ impl Pane {
             session_id,
             title,
         } = spec;
-        // See the field's own doc comment: nothing inside a pane reads the
-        // role once its argv is fixed.
-        let _ = role;
 
         let (cols, rows) = size;
         let pair = native_pty_system().openpty(PtySize {
@@ -923,7 +948,7 @@ impl Pane {
             wrap::publish_socket_path(state, &session_id, server.path());
         }
 
-        let mut record = Record::new(&session_id, &agent_name, repo, verb);
+        let mut record = Record::new(&session_id, &agent_name, repo, verb).with_role(role.label());
         // `Record::new` stamps `std::process::id()` -- the dashboard's own pid,
         // identical for every pane, so liveness could not tell one pane's child
         // from another's. Stamp the child's real pid instead. `process_id`
@@ -948,6 +973,7 @@ impl Pane {
             title,
             agent_name,
             verb,
+            role,
             session_id,
             parser: vt100::Parser::new(rows, cols, SCROLLBACK_ROWS),
             master,
@@ -968,6 +994,8 @@ impl Pane {
             exit_code: None,
             done: false,
             report_to: None,
+            intake_dir: None,
+            work_group_id: None,
             report_reminder_sent: false,
             pending_submit: None,
         })
@@ -1383,6 +1411,34 @@ impl Pane {
         self.report_to.as_deref()
     }
 
+    /// Security review Finding 1: records the spawn-request directory this
+    /// pane's own child tree was handed (`DASH_REQUESTS_ENV`). Called right
+    /// after `Pane::spawn` by the caller that minted the directory and put it
+    /// in this pane's `turn_env` -- the two must always name the same path,
+    /// which is what makes "a request arrived in this directory" mean "this
+    /// pane asked for it". See [`Pane::intake_dir`]'s own field comment.
+    pub fn set_intake_dir(&mut self, dir: PathBuf) {
+        self.intake_dir = Some(dir);
+    }
+
+    /// This pane's own spawn-request intake directory, if it was given one.
+    pub fn intake_dir(&self) -> Option<&Path> {
+        self.intake_dir.as_deref()
+    }
+
+    /// Security review Finding 2: records the work group this pane was
+    /// spawned into. Called right after `Pane::spawn` by the caller that
+    /// already admitted the spawn into that group -- see
+    /// [`Pane::work_group_id`]'s own field comment.
+    pub fn set_work_group_id(&mut self, id: Option<String>) {
+        self.work_group_id = id;
+    }
+
+    /// The work group this pane belongs to, if any.
+    pub fn work_group_id(&self) -> Option<&str> {
+        self.work_group_id.as_deref()
+    }
+
     /// Whether `report_back_reminder_sweep`'s one-shot reminder has already
     /// been injected into this pane.
     pub fn report_reminder_sent(&self) -> bool {
@@ -1410,6 +1466,14 @@ impl Pane {
     /// `Verb::Dash` for a worker pane) -- see the field's own doc comment.
     pub fn verb(&self) -> Verb {
         self.verb
+    }
+
+    /// The role this pane was ACTUALLY spawned with (issue #169) -- what
+    /// `dash::mod::parent_role_for` reads instead of assuming every live
+    /// pane is a `Worker`. Set once, at `Pane::spawn`, from `PaneSpec::role`;
+    /// nothing here ever revises it from anything the pane's own child says.
+    pub fn role(&self) -> PromptRole {
+        self.role
     }
 
     /// The sidebar's one-line preview: the bottom-most non-blank row of this

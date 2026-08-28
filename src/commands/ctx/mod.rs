@@ -385,6 +385,13 @@ pub enum CtxVerb {
     Forget(memory::ForgetArgs),
     /// Interrupt a live session with a message: durable mail plus a wake-up.
     Nudge(sessions::NudgeArgs),
+    /// Terminate a registered session's process outright: SIGTERM, escalating
+    /// to SIGKILL, then deregister it -- unlike `nudge`, this never depends
+    /// on the target being able to notice or act on anything. On unix a pid
+    /// the OS has recycled since the session registered is deregistered
+    /// without being signalled; where that start-time check cannot run
+    /// (Windows, or no `ps`) the registered pid is signalled as-is.
+    Kill(sessions::KillArgs),
     /// Evaluate, list or explain zirv's harness-neutral command safety policy.
     Safety(safety::SafetyArgs),
     /// Swap the orchestrator seat's model or harness in place, same session id.
@@ -478,6 +485,7 @@ pub fn dispatch(args: &[String]) -> i32 {
         CtxVerb::Recall(a) => memory::run_recall(a, &mut out),
         CtxVerb::Forget(a) => memory::run_forget(a, &mut out),
         CtxVerb::Nudge(a) => sessions::run_nudge(a, &mut out),
+        CtxVerb::Kill(a) => sessions::run_kill(a, &mut out),
         CtxVerb::Safety(a) => safety::run(a, &mut out),
         CtxVerb::Handover(a) => handover::run(a, &mut out),
         CtxVerb::Permissions(a) => permissions::run(a, &mut out),

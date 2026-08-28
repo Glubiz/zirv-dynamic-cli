@@ -262,6 +262,7 @@ pub(crate) fn run_with_clock<W: Write>(
             composed,
             None,
             super::prompt::PromptRole::Worker,
+            &cfg.prompt,
         );
 
         match session_guard.as_mut() {
