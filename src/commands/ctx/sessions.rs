@@ -1186,8 +1186,82 @@ const KILL_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 #[derive(Debug, clap::Args)]
 pub struct KillArgs {
     /// Short id (or a unique prefix of one, at least four characters) of the
-    /// session to terminate.
+    /// session to terminate. On unix a target whose pid the OS has since
+    /// recycled to an unrelated process is deregistered without being
+    /// signalled; where the check cannot run (Windows, or no `ps` on PATH)
+    /// the registered pid is signalled as-is.
     pub prefix: String,
+}
+
+/// How much later than its own registration the process holding a session's
+/// pid may have started before this reads as a recycled pid. A genuine
+/// session's process always predates the record that describes it, so any
+/// positive slack is pure margin -- against a coarse `ps` reading, a clock
+/// that stepped between the two, and second-boundary rounding.
+const RECYCLED_PID_TOLERANCE_SECS: u64 = 5;
+
+/// Pure: whether the process currently holding a session's pid started
+/// AFTER that session was registered -- i.e. the original process died and
+/// the OS handed its pid to something unrelated.
+///
+/// Security review round 2 (Finding 7): `resolve_prefix` reports such a
+/// session as live (`is_alive` is a signal-0 probe with no way to tell one
+/// process from another at the same pid -- see its own doc comment), so
+/// `kill` would SIGTERM/SIGKILL a stranger's process. `age_secs` is the
+/// target's own elapsed running time, `registered_at` the record's
+/// `started_at`, both in seconds.
+fn pid_looks_recycled(registered_at: u64, age_secs: u64, now: u64) -> bool {
+    now.saturating_sub(age_secs) > registered_at.saturating_add(RECYCLED_PID_TOLERANCE_SECS)
+}
+
+/// Pure: POSIX `ps -o etime=` output (`[[dd-]hh:]mm:ss`) as seconds. `None`
+/// for anything that does not parse, which every caller reads as "cannot
+/// tell" rather than as any particular age.
+fn parse_etime(raw: &str) -> Option<u64> {
+    let (days, clock) = match raw.trim().split_once('-') {
+        Some((days, clock)) => (days.trim().parse::<u64>().ok()?, clock),
+        None => (0, raw.trim()),
+    };
+    let mut fields = clock.split(':').rev();
+    let seconds = fields.next()?.trim().parse::<u64>().ok()?;
+    let minutes = fields.next()?.trim().parse::<u64>().ok()?;
+    let hours = match fields.next() {
+        Some(hours) => hours.trim().parse::<u64>().ok()?,
+        None => 0,
+    };
+    if fields.next().is_some() {
+        return None;
+    }
+    Some(days * 86_400 + hours * 3_600 + minutes * 60 + seconds)
+}
+
+/// How long the process holding `pid` has been running, in seconds.
+///
+/// POSIX `ps -o etime=`, deliberately rather than a platform-specific
+/// interface (`/proc/<pid>/stat` plus `btime`, `sysctl KERN_PROC_PID`): this
+/// answers one question, on one code path, and a platform-abstraction layer
+/// for it would be more machinery than the question is worth. `None` --
+/// `ps` missing, refused (a sandbox), or output this cannot parse -- means
+/// "cannot tell", and every caller then behaves exactly as it did before this
+/// check existed rather than refusing to act.
+#[cfg(unix)]
+fn process_age_secs(pid: u32) -> Option<u64> {
+    let output = std::process::Command::new("ps")
+        .args(["-o", "etime=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_etime(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// No portable start-time probe on this platform, so a recycled pid is
+/// indistinguishable from the session's own -- see [`run_kill_with`]'s doc
+/// comment for the residual this leaves.
+#[cfg(not(unix))]
+fn process_age_secs(_pid: u32) -> Option<u64> {
+    None
 }
 
 /// Terminates a registered session's process outright -- SIGTERM, escalating
@@ -1204,6 +1278,22 @@ pub struct KillArgs {
 /// same `NotFound`, the identical contract `run_nudge_with` already has for
 /// this exact case -- there is nothing left to kill, and nothing left to
 /// deregister either, since the sweep already did that.
+///
+/// Security review round 2 (Finding 7): "live" there is a signal-0 probe of
+/// a pid, and a pid the OS recycled before any sweep noticed answers it just
+/// as a live session would -- so this used to SIGTERM/SIGKILL an unrelated
+/// process that merely inherited the number. The target's own start time is
+/// checked against the record's `started_at` first ([`process_age_secs`],
+/// [`pid_looks_recycled`]): a process younger than the session that claims it
+/// is a recycled pid, and is deregistered without ever being signalled.
+///
+/// Residual, deliberately not closed here: the check needs a start time, and
+/// on Windows (and anywhere `ps` is missing or refused) there is none to be
+/// had without a platform-abstraction layer this one code path does not
+/// justify. There the registered pid is signalled as before, and a recycled
+/// pid is still reachable -- narrow, since it also requires the original
+/// process to have died and the pid counter to have wrapped before any
+/// `sessions::list` swept the record.
 pub fn run_kill_with<W: Write>(args: &KillArgs, w: &mut W, env: EnvLookup<'_>) -> CtxResult<i32> {
     let state = StateDir::resolve(env)?;
     if let Some(refusal) = prefix_too_short("kill", &args.prefix, &live_shorts(&state)) {
@@ -1215,6 +1305,22 @@ pub fn run_kill_with<W: Write>(args: &KillArgs, w: &mut W, env: EnvLookup<'_>) -
             resolve_error_with_diagnostics(&e, &state, env)
         )
     })?;
+
+    // Finding 7: the pid may no longer be this session's. Deregister it --
+    // the session it described is gone either way -- but signal nothing.
+    if process_age_secs(record.pid)
+        .is_some_and(|age| pid_looks_recycled(record.started_at, age, super::state::now_secs()))
+    {
+        let _ = std::fs::remove_file(record_path(&state, &record.short));
+        writeln!(
+            w,
+            "zirv ctx kill: {} ({}, {}) is gone -- pid {} now belongs to a process that started \
+             after the session registered, so nothing was signalled; deregistered it from the \
+             session registry",
+            record.short, record.agent, record.verb, record.pid
+        )?;
+        return Ok(0);
+    }
 
     let confirmed_dead = super::supervise::terminate_pid(record.pid, KILL_GRACE);
     // Best-effort, matching every other piece of state-dir housekeeping in
@@ -2875,6 +2981,102 @@ mod tests {
         );
         let text = String::from_utf8(out).expect("utf8");
         assert!(text.contains(&short), "names what it killed: {text}");
+    }
+
+    /// Security review round 2 (Finding 7): the POSIX `ps -o etime=` shapes,
+    /// and nothing else read as an age.
+    #[test]
+    fn parse_etime_reads_the_posix_elapsed_time_format() {
+        assert_eq!(parse_etime("00:07"), Some(7));
+        assert_eq!(parse_etime("       01:30"), Some(90));
+        assert_eq!(parse_etime("02:03:04"), Some(7_384));
+        assert_eq!(parse_etime("3-04:05:06\n"), Some(273_906));
+        assert_eq!(parse_etime(""), None);
+        assert_eq!(parse_etime("7"), None, "a bare number is not an etime");
+        assert_eq!(parse_etime("a:bc"), None);
+        assert_eq!(parse_etime("1:2:3:4"), None);
+    }
+
+    /// The pure half of the recycled-pid guard: only a process that started
+    /// AFTER the session that claims its pid is a stranger. A process older
+    /// than its own record is the ordinary case (a supervisor registers
+    /// itself moments after it starts, and a dashboard registers a pane's
+    /// record long after the dashboard process itself began), and must never
+    /// be mistaken for a recycled one.
+    #[test]
+    fn pid_looks_recycled_only_flags_a_process_younger_than_its_own_record() {
+        let now = 1_700_000_000;
+        assert!(
+            !pid_looks_recycled(now - 60, 3_600, now),
+            "a process much older than its record is the ordinary case"
+        );
+        assert!(
+            !pid_looks_recycled(now, 0, now),
+            "and one that started in the same instant is not a stranger either"
+        );
+        assert!(
+            !pid_looks_recycled(now - RECYCLED_PID_TOLERANCE_SECS, 0, now),
+            "the tolerance absorbs a coarse reading and a stepped clock"
+        );
+        assert!(
+            pid_looks_recycled(now - 3_600, 5, now),
+            "a process seconds old under an hour-old record is a recycled pid"
+        );
+    }
+
+    /// The whole point of the guard, end to end on a real process: `kill`
+    /// must not SIGTERM a stranger that merely inherited a dead session's
+    /// pid. Simulated the only way a test can without waiting for the OS to
+    /// wrap its pid counter -- a genuinely fresh process, under a record
+    /// that claims to predate it by an hour.
+    #[cfg(unix)]
+    #[test]
+    fn kill_deregisters_a_recycled_pid_without_signalling_it() {
+        if process_age_secs(std::process::id()).is_none() {
+            eprintln!("skipping: no usable `ps` in this environment, so no start time to check");
+            return;
+        }
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let state_dir = tmp.path().join("state");
+        let state = state_in(&state_dir);
+        let repo = tmp.path().join("repo");
+
+        let mut child = sh("sleep 30").spawn().expect("spawn a stand-in process");
+        let pid = child.id();
+
+        let mut record = record_for("cccccccc-2222-4333-8444-555555555555", &repo, Verb::Exec);
+        record.pid = pid;
+        record.started_at = super::super::state::now_secs() - 3_600;
+        let short = record.short.clone();
+        let path = record_path(&state, &short);
+        write_record(&state, &record);
+
+        let env = env_map(&[(
+            super::super::state::STATE_ENV,
+            state_dir.to_str().expect("utf8"),
+        )]);
+        let args = KillArgs {
+            prefix: short.clone(),
+        };
+        let mut out = Vec::new();
+        let code = run_kill_with(&args, &mut out, &|k| env.get(k).cloned()).expect("kill runs");
+
+        assert_eq!(code, 0);
+        assert!(!path.exists(), "the dead session is still deregistered");
+        assert!(
+            is_alive(pid),
+            "but the unrelated process holding its pid must be left alone"
+        );
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            text.contains("nothing was signalled"),
+            "and the operator is told why: {text}"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     /// `resolve_prefix`'s own contract, reused verbatim by `kill`: an unknown

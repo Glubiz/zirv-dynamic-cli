@@ -387,7 +387,10 @@ pub enum CtxVerb {
     Nudge(sessions::NudgeArgs),
     /// Terminate a registered session's process outright: SIGTERM, escalating
     /// to SIGKILL, then deregister it -- unlike `nudge`, this never depends
-    /// on the target being able to notice or act on anything.
+    /// on the target being able to notice or act on anything. On unix a pid
+    /// the OS has recycled since the session registered is deregistered
+    /// without being signalled; where that start-time check cannot run
+    /// (Windows, or no `ps`) the registered pid is signalled as-is.
     Kill(sessions::KillArgs),
     /// Evaluate, list or explain zirv's harness-neutral command safety policy.
     Safety(safety::SafetyArgs),
