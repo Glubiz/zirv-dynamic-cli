@@ -351,6 +351,20 @@ pub struct Record {
     /// deserializes as `None` rather than failing to parse.
     #[serde(default)]
     pub safety_policy_sha256: Option<String>,
+    /// Issue #169: the `prompt::PromptRole` label (`"orchestrator"`,
+    /// `"sub-orchestrator"` or `"worker"`) this session was ACTUALLY spawned
+    /// with, stamped once by the server that spawned it (`Pane::spawn`,
+    /// `wrap::run_with`) -- never by anything the session itself later
+    /// claims. Plain `String`, not the `prompt::PromptRole` type itself: this
+    /// module has no reason to depend on `prompt.rs`, and every other
+    /// plain-vocabulary field here (`agent`, `roster::RosterPane::role`)
+    /// already follows the same "label string, not an enum" convention.
+    /// `None` for a record written by an older build, or any session type
+    /// this was never threaded through to -- `status.rs`'s group tree reads
+    /// it as "worker" (the least-privileged, and most common, reading) in
+    /// that case.
+    #[serde(default)]
+    pub role: Option<String>,
 }
 
 fn reachable_default() -> bool {
@@ -384,6 +398,9 @@ impl Record {
             // launch-time policy snapshot (and its fingerprint) has
             // anything to record -- see `with_safety_policy_sha256`.
             safety_policy_sha256: None,
+            // Left unset here too: only a caller that actually knows the
+            // role it spawned (`with_role`) has anything to record.
+            role: None,
         }
     }
 
@@ -403,6 +420,17 @@ impl Record {
     /// disabled, or fingerprinting failed) does not need its own branch.
     pub fn with_safety_policy_sha256(mut self, fingerprint: Option<String>) -> Self {
         self.safety_policy_sha256 = fingerprint;
+        self
+    }
+
+    /// Issue #169: stamps the role (a `prompt::PromptRole::label()` string)
+    /// this session was actually spawned with, chained onto `new` at the
+    /// call site that resolved one. Forgery-proof by construction: the
+    /// caller is the server that decided what to spawn (`Pane::spawn`'s own
+    /// `PaneSpec::role`, `wrap::run_with`'s own `role` parameter), never
+    /// anything read back from the session's own request.
+    pub fn with_role(mut self, role: &str) -> Self {
+        self.role = Some(role.to_string());
         self
     }
 }

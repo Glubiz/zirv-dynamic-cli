@@ -61,10 +61,12 @@ pub struct PaneSpec {
     pub argv: Vec<String>,
     /// Shapes the composed prompt and argv the caller builds *before*
     /// constructing this spec (the same `prompt::compose` role every other
-    /// supervisor already threads through) -- accepted here for interface
-    /// completeness with the rest of the launch pipeline, but a pane itself
-    /// has no per-role behavior once its argv is fixed, so `Pane::spawn`
-    /// reads and discards it rather than storing a field nothing reads.
+    /// supervisor already threads through). Issue #169: also the role this
+    /// pane's own `Pane`/`sessions::Record` is stamped with at spawn time --
+    /// the caller (`dash::mod::fulfill_spawn_request`) has already run this
+    /// value through the depth cap before ever constructing a `PaneSpec`, so
+    /// `Pane::spawn` records it as fact rather than re-deriving or
+    /// re-validating it.
     pub role: PromptRole,
     pub verb: Verb,
     /// uuid, minted by the caller: the pane's registry short id and
@@ -699,6 +701,12 @@ pub struct Pane {
     /// pane is never body-injected, only a worker pane is (the trust split
     /// the spec calls for; `dash::mod::is_delivery_eligible`).
     verb: Verb,
+    /// Issue #169: the role this pane was ACTUALLY spawned with
+    /// (`PaneSpec::role`), server-side and forgery-proof -- a pane's own
+    /// child cannot widen it after the fact, since nothing here ever reads
+    /// it back from anything the child says. `dash::mod::parent_role_for`
+    /// reads this instead of assuming every live pane is a `Worker`.
+    role: PromptRole,
     session_id: String,
     parser: vt100::Parser,
     master: Box<dyn portable_pty::MasterPty + Send>,
@@ -845,9 +853,6 @@ impl Pane {
             session_id,
             title,
         } = spec;
-        // See the field's own doc comment: nothing inside a pane reads the
-        // role once its argv is fixed.
-        let _ = role;
 
         let (cols, rows) = size;
         let pair = native_pty_system().openpty(PtySize {
@@ -923,7 +928,7 @@ impl Pane {
             wrap::publish_socket_path(state, &session_id, server.path());
         }
 
-        let mut record = Record::new(&session_id, &agent_name, repo, verb);
+        let mut record = Record::new(&session_id, &agent_name, repo, verb).with_role(role.label());
         // `Record::new` stamps `std::process::id()` -- the dashboard's own pid,
         // identical for every pane, so liveness could not tell one pane's child
         // from another's. Stamp the child's real pid instead. `process_id`
@@ -948,6 +953,7 @@ impl Pane {
             title,
             agent_name,
             verb,
+            role,
             session_id,
             parser: vt100::Parser::new(rows, cols, SCROLLBACK_ROWS),
             master,
@@ -1410,6 +1416,14 @@ impl Pane {
     /// `Verb::Dash` for a worker pane) -- see the field's own doc comment.
     pub fn verb(&self) -> Verb {
         self.verb
+    }
+
+    /// The role this pane was ACTUALLY spawned with (issue #169) -- what
+    /// `dash::mod::parent_role_for` reads instead of assuming every live
+    /// pane is a `Worker`. Set once, at `Pane::spawn`, from `PaneSpec::role`;
+    /// nothing here ever revises it from anything the pane's own child says.
+    pub fn role(&self) -> PromptRole {
+        self.role
     }
 
     /// The sidebar's one-line preview: the bottom-most non-blank row of this
