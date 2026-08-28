@@ -2,8 +2,10 @@
 //!
 //! Distinct from `ctx.toml`, which tunes ctx supervisor *behavior*: if the
 //! question is "yes/no, may zirv use this thing", it belongs here; anything
-//! else belongs in `ctx.toml`. The first (and so far only) section is
-//! `[agents]`, one per-adapter `enabled` flag.
+//! else belongs in `ctx.toml`. `[agents]` holds per-adapter switches;
+//! operator-owned `[github]` may hold the fallback token used by `zirv
+//! report`. Repository `[github]` values are parsed for forward-compatible
+//! settings loading but are never read by the reporting command.
 //!
 //! Layering mirrors `ctx.toml`'s (`~/.zirv/.settings.toml`, then
 //! `<repo>/.zirv/.settings.toml`, then `ZIRV_AGENT_<NAME>_ENABLED`), but the
@@ -56,6 +58,16 @@ pub type EnvLookup<'a> = &'a dyn Fn(&str) -> Option<String>;
 #[serde(default)]
 pub struct SettingsFile {
     pub agents: HashMap<String, AgentSettings>,
+    pub github: GithubSettings,
+}
+
+/// Operator-owned GitHub credentials for built-in GitHub operations. Kept
+/// deliberately narrow: the token is read only from `~/.zirv/.settings.toml`
+/// and is never accepted from a repository layer.
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct GithubSettings {
+    pub token: Option<String>,
 }
 
 /// `enabled = None` means this layer is silent on the agent -- distinct from
@@ -159,7 +171,7 @@ fn read_layer(path: &Path, known: &[&str]) -> CtxResult<Option<SettingsFile>> {
     let raw: toml::Table = toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
 
     for key in raw.keys() {
-        if key != "agents" {
+        if !matches!(key.as_str(), "agents" | "github") {
             crate::output::warn(format!(
                 "{}: unknown section `[{key}]`; ignoring",
                 path.display()
@@ -202,6 +214,24 @@ fn operator_settings_path() -> Option<PathBuf> {
     crate::utils::home_dir()
         .ok()
         .map(|home| home.join(crate::utils::SCRIPT_DIR_NAME).join(SETTINGS_FILE))
+}
+
+/// Reads the optional GitHub token from the operator's settings layer only.
+/// A repository checkout is never passed to this function, so it cannot
+/// choose or replace credentials used by `zirv report`.
+pub fn operator_github_token(home: &Path) -> CtxResult<Option<String>> {
+    let path = home.join(crate::utils::SCRIPT_DIR_NAME).join(SETTINGS_FILE);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let settings: SettingsFile =
+        toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(settings
+        .github
+        .token
+        .map(|token| token.trim().to_string())
+        .filter(|token| !token.is_empty()))
 }
 
 /// Writes `[agents.<name>] enabled = <bool>` into `<home>/.zirv/.settings.toml`,
@@ -528,6 +558,31 @@ mod tests {
     fn write_settings(dir: &Path, contents: &str) {
         std::fs::create_dir_all(dir.join(".zirv")).expect("mkdir");
         std::fs::write(dir.join(".zirv").join(SETTINGS_FILE), contents).expect("write");
+    }
+
+    #[test]
+    fn operator_github_token_reads_and_trims_only_the_given_home_file() {
+        let home = tempfile::tempdir().expect("tempdir");
+        write_settings(home.path(), "[github]\ntoken = \"  operator-token  \"\n");
+
+        assert_eq!(
+            operator_github_token(home.path()).expect("token"),
+            Some("operator-token".to_string())
+        );
+
+        let other_home = tempfile::tempdir().expect("tempdir");
+        assert_eq!(
+            operator_github_token(other_home.path()).expect("missing token"),
+            None
+        );
+    }
+
+    #[test]
+    fn operator_github_token_ignores_an_empty_token() {
+        let home = tempfile::tempdir().expect("tempdir");
+        write_settings(home.path(), "[github]\ntoken = \"  \"\n");
+
+        assert_eq!(operator_github_token(home.path()).expect("token"), None);
     }
 
     // -- set_operator_agent_enabled (the first-run wizard's settings writer) --

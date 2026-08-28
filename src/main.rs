@@ -9,6 +9,7 @@ use commands::{
     create::{CreateOptions, create_script},
     help::show_help,
     init::init_zirv,
+    report,
     version::get_version,
 };
 
@@ -68,6 +69,14 @@ fn is_top_level_memory(argv: &[String]) -> bool {
 fn is_top_level_setup(argv: &[String]) -> bool {
     argv.get(1)
         .is_some_and(|name| name.eq_ignore_ascii_case("setup"))
+}
+
+/// `zirv report` owns its own clap tree and must be intercepted before a
+/// repository script can resolve under the same reserved name. The
+/// case-insensitive match mirrors every other raw-argv built-in.
+fn is_top_level_report(argv: &[String]) -> bool {
+    argv.get(1)
+        .is_some_and(|name| name.eq_ignore_ascii_case("report"))
 }
 
 /// True when argv[1] names the `context` built-in (issue #45, "Context
@@ -243,6 +252,10 @@ async fn main() {
 
     if is_top_level_setup(&argv) {
         std::process::exit(setup::dispatch(&argv[1..]));
+    }
+
+    if is_top_level_report(&argv) {
+        std::process::exit(report::dispatch(&argv[1..]));
     }
 
     if let Some(verb) = top_level_ctx_alias(&argv) {
@@ -447,6 +460,14 @@ mod tests {
         assert!(is_top_level_setup(&argv(&["zirv", "setup"])));
         assert!(is_top_level_setup(&argv(&["zirv", "SETUP", "status"])));
         assert!(!is_top_level_setup(&argv(&["zirv", "setups"])));
+
+        assert!(is_top_level_report(&argv(&[
+            "zirv", "report", "bug", "title"
+        ])));
+        assert!(is_top_level_report(&argv(&[
+            "zirv", "REPORT", "feature", "title"
+        ])));
+        assert!(!is_top_level_report(&argv(&["zirv", "reports"])));
     }
 
     /// FINDING 2: every reserved command name -- whatever its casing -- is
@@ -456,7 +477,7 @@ mod tests {
     #[test]
     fn mis_cased_reserved_command_names_are_recognised_by_the_guard() {
         for name in [
-            "Help", "HELP", "Version", "CREATE", "Init", "Ctx", "Chat", "Agent", "Setup",
+            "Help", "HELP", "Version", "CREATE", "Init", "Ctx", "Chat", "Agent", "Setup", "Report",
         ] {
             assert!(
                 utils::is_reserved_command(name),

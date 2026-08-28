@@ -102,6 +102,10 @@ fn write_builtins<W: Write>(writer: &mut W) -> Result<(), Box<dyn std::error::Er
     writeln!(writer, "  create, c      Create a new script")?;
     writeln!(
         writer,
+        "  report         File a Zirv bug or feature request on GitHub"
+    )?;
+    writeln!(
+        writer,
         "  setup          Configure AI context, memory, hooks, migration, and safe resets"
     )?;
     writeln!(
@@ -241,6 +245,7 @@ mod tests {
             "create",
             "version",
             "init",
+            "report",
             "ctx",
             "--dry-run",
             "--name",
