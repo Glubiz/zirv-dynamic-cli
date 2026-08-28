@@ -360,6 +360,30 @@ pub struct AdapterStats {
     pub failures: usize,
 }
 
+/// Per-`workflow_id` breakdown (issue #155's "each shipped item showing its
+/// measured reduction" acceptance hook): how many independent `ReviewRun`
+/// rounds a workflow went through, its findings totals -- `findings_total`
+/// is every finding *reported* by a reviewer, `findings_meaningful` is the
+/// subset that is Major/Critical and not dismissed, i.e. *confirmed* -- and
+/// the token totals attributed to it. Findings come from the same
+/// latest-snapshot-per-workflow logic `aggregate`'s overall counters already
+/// used, so this never double-counts across phases the way summing every
+/// event's findings fields would.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct WorkflowStats {
+    pub review_runs: usize,
+    pub findings_total: u32,
+    pub findings_meaningful: u32,
+    pub findings_dismissed: u32,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub token_events: usize,
+    /// Confirmed (`findings_meaningful`) findings per `ReviewRun` round --
+    /// this workflow's own defect-rate accounting hook. `None` when this
+    /// workflow has recorded no `ReviewRun` event, never a manufactured 0.
+    pub confirmed_findings_per_review: Option<f64>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct StatsReport {
     pub events: usize,
@@ -379,6 +403,16 @@ pub struct StatsReport {
     pub frontend_render_failures: usize,
     pub frontend_visual_reviews: usize,
     pub frontend_visual_review_failures: usize,
+    /// Every workflow id seen in this repository's telemetry, keyed to its
+    /// own `WorkflowStats` -- the per-workflow / per-`ReviewRun` breakdown
+    /// `docs/benchmarks/token-cost.md` §1.3 previously had no CLI for.
+    pub workflows: BTreeMap<String, WorkflowStats>,
+    pub review_runs: usize,
+    /// Confirmed findings per review round, across every workflow combined
+    /// (`findings_meaningful` / `review_runs`). `None` when no `ReviewRun`
+    /// event has been recorded at all -- the "no regression in
+    /// review-confirmed defect rates" accounting hook issue #155 asks for.
+    pub review_defect_rate: Option<f64>,
 }
 
 pub fn aggregate(events: &[TelemetryEvent]) -> StatsReport {
@@ -394,6 +428,8 @@ pub fn aggregate(events: &[TelemetryEvent]) -> StatsReport {
     let mut frontend_visual_reviews = 0usize;
     let mut frontend_visual_review_failures = 0usize;
     let mut finding_snapshots: BTreeMap<String, (u64, String, u32, u32, u32)> = BTreeMap::new();
+    let mut workflows: BTreeMap<String, WorkflowStats> = BTreeMap::new();
+    let mut review_runs = 0usize;
     for event in events {
         if let Some(phase) = event.phase {
             let entry = phases.entry(phase.to_string()).or_default();
@@ -440,6 +476,24 @@ pub fn aggregate(events: &[TelemetryEvent]) -> StatsReport {
             verification_runs += 1;
             if event.succeeded == Some(false) {
                 verification_failures += 1;
+            }
+        }
+        if event.kind == TelemetryKind::ReviewRun {
+            review_runs += 1;
+        }
+        if let Some(workflow_id) = &event.workflow_id {
+            let entry = workflows.entry(workflow_id.clone()).or_default();
+            if event.kind == TelemetryKind::ReviewRun {
+                entry.review_runs += 1;
+            }
+            entry.input_tokens = entry
+                .input_tokens
+                .saturating_add(event.input_tokens.unwrap_or(0));
+            entry.output_tokens = entry
+                .output_tokens
+                .saturating_add(event.output_tokens.unwrap_or(0));
+            if event.input_tokens.is_some() || event.output_tokens.is_some() {
+                entry.token_events += 1;
             }
         }
         match event.kind {
@@ -500,6 +554,18 @@ pub fn aggregate(events: &[TelemetryEvent]) -> StatsReport {
         .values()
         .map(|snapshot| u64::from(snapshot.4))
         .sum();
+    for (workflow_id, snapshot) in &finding_snapshots {
+        let entry = workflows.entry(workflow_id.clone()).or_default();
+        entry.findings_total = snapshot.2;
+        entry.findings_meaningful = snapshot.3;
+        entry.findings_dismissed = snapshot.4;
+    }
+    for stats in workflows.values_mut() {
+        stats.confirmed_findings_per_review = (stats.review_runs > 0)
+            .then(|| f64::from(stats.findings_meaningful) / stats.review_runs as f64);
+    }
+    let review_defect_rate =
+        (review_runs > 0).then(|| findings_meaningful as f64 / review_runs as f64);
     let slowest_phase = phases
         .iter()
         .max_by_key(|(_, stats)| stats.duration_ms)
@@ -527,6 +593,9 @@ pub fn aggregate(events: &[TelemetryEvent]) -> StatsReport {
         frontend_render_failures,
         frontend_visual_reviews,
         frontend_visual_review_failures,
+        workflows,
+        review_runs,
+        review_defect_rate,
     }
 }
 
@@ -637,6 +706,37 @@ pub fn run_stats(args: &StatsArgs, writer: &mut impl Write) -> CtxResult<i32> {
             "findings: {} total, {} meaningful, {} dismissed",
             report.findings_total, report.findings_meaningful, report.findings_dismissed
         )?;
+        writeln!(
+            writer,
+            "review-confirmed defect rate: {}",
+            report
+                .review_defect_rate
+                .map(|rate| format!(
+                    "{rate:.2} confirmed findings/review round ({} review runs)",
+                    report.review_runs
+                ))
+                .unwrap_or_else(|| "no ReviewRun events recorded yet".to_string())
+        )?;
+        if !report.workflows.is_empty() {
+            writeln!(writer, "workflows:")?;
+            for (workflow_id, stats) in &report.workflows {
+                writeln!(
+                    writer,
+                    "  {workflow_id}: {} review runs, findings {} total/{} confirmed/{} dismissed, \
+                     {} tokens ({} measured events), {}",
+                    stats.review_runs,
+                    stats.findings_total,
+                    stats.findings_meaningful,
+                    stats.findings_dismissed,
+                    stats.input_tokens.saturating_add(stats.output_tokens),
+                    stats.token_events,
+                    stats
+                        .confirmed_findings_per_review
+                        .map(|rate| format!("{rate:.2} confirmed/review"))
+                        .unwrap_or_else(|| "no review runs".to_string())
+                )?;
+            }
+        }
         writeln!(
             writer,
             "frontend: detector {} runs/{} failures, render {} runs/{} failures, visual review {} runs/{} failures",
@@ -857,6 +957,87 @@ mod tests {
         assert_eq!(event.input_tokens, Some(7));
         assert_eq!(event.cache_read_input_tokens, None);
         assert_eq!(event.session_id, None);
+    }
+
+    /// Issue #155 measurement closeout: `zirv workflow stats` previously had
+    /// no per-workflow / per-`ReviewRun` breakdown at all (§1.3 of
+    /// `docs/benchmarks/token-cost.md` called this out by name). Two
+    /// workflows, each with tokens and review rounds, must stay separated
+    /// rather than folded into the flat phase/adapter totals.
+    #[test]
+    fn aggregate_breaks_down_tokens_and_review_runs_per_workflow() {
+        // Explicit, ordered timestamps/ids on every event: `PhaseCompleted`
+        // events participate in the same latest-snapshot-per-workflow finding
+        // logic `ReviewRun` events do (both are in `aggregate`'s snapshot
+        // match arm), so leaving `phase_a`/`phase_b` on `TelemetryEvent::new`'s
+        // real-wall-clock default timestamp would make them look newer than
+        // every deliberately-small `review_a1`/`review_a2` timestamp below and
+        // silently win the "latest" comparison.
+        let mut phase_a = TelemetryEvent::new(TelemetryKind::PhaseCompleted);
+        phase_a.workflow_id = Some("wf-a".into());
+        phase_a.phase = Some(WorkflowPhase::Implement);
+        phase_a.input_tokens = Some(1_000);
+        phase_a.output_tokens = Some(200);
+        phase_a.timestamp = 0;
+        phase_a.id = "p-a".into();
+
+        let mut review_a1 = TelemetryEvent::new(TelemetryKind::ReviewRun);
+        review_a1.workflow_id = Some("wf-a".into());
+        review_a1.timestamp = 1;
+        review_a1.id = "a1".into();
+        review_a1.findings_total = 3;
+        review_a1.findings_meaningful = 2;
+        review_a1.findings_dismissed = 1;
+
+        let mut review_a2 = TelemetryEvent::new(TelemetryKind::ReviewRun);
+        review_a2.workflow_id = Some("wf-a".into());
+        review_a2.timestamp = 2;
+        review_a2.id = "a2".into();
+        review_a2.findings_total = 1;
+        review_a2.findings_meaningful = 0;
+        review_a2.findings_dismissed = 1;
+
+        let mut phase_b = TelemetryEvent::new(TelemetryKind::PhaseCompleted);
+        phase_b.workflow_id = Some("wf-b".into());
+        phase_b.phase = Some(WorkflowPhase::Implement);
+        phase_b.input_tokens = Some(50);
+        phase_b.output_tokens = Some(10);
+        phase_b.timestamp = 0;
+        phase_b.id = "p-b".into();
+
+        let stats = aggregate(&[phase_a, review_a1, review_a2, phase_b]);
+
+        assert_eq!(stats.review_runs, 2);
+        assert_eq!(stats.workflows.len(), 2);
+
+        let wf_a = &stats.workflows["wf-a"];
+        assert_eq!(wf_a.review_runs, 2);
+        assert_eq!(wf_a.input_tokens, 1_000);
+        assert_eq!(wf_a.output_tokens, 200);
+        assert_eq!(wf_a.token_events, 1);
+        // Latest snapshot by (timestamp, id) wins, same rule as the overall
+        // finding counters -- review_a2 (timestamp 2) is newest.
+        assert_eq!(wf_a.findings_total, 1);
+        assert_eq!(wf_a.findings_meaningful, 0);
+        assert_eq!(wf_a.findings_dismissed, 1);
+        assert_eq!(wf_a.confirmed_findings_per_review, Some(0.0));
+
+        let wf_b = &stats.workflows["wf-b"];
+        assert_eq!(wf_b.review_runs, 0);
+        assert_eq!(wf_b.input_tokens, 50);
+        assert_eq!(wf_b.confirmed_findings_per_review, None);
+
+        // Combined across both workflows: 0 confirmed findings / 2 review runs.
+        assert_eq!(stats.review_defect_rate, Some(0.0));
+    }
+
+    #[test]
+    fn review_defect_rate_is_none_without_any_review_run() {
+        let mut phase = TelemetryEvent::new(TelemetryKind::PhaseCompleted);
+        phase.workflow_id = Some("wf-a".into());
+        let stats = aggregate(&[phase]);
+        assert_eq!(stats.review_runs, 0);
+        assert_eq!(stats.review_defect_rate, None);
     }
 
     #[test]

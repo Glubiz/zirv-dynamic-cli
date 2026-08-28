@@ -3,21 +3,22 @@ name: CD Pipeline
 permissions:
   contents: write
 
+# CD triggers directly on the merge push to main. CI is not re-run after
+# the merge: it already gated the PR, so the merge commit's push goes
+# straight to release.
 on:
-  workflow_run:
-    workflows: ["CI Pipeline"]
-    types:
-      - completed
+  push:
+    branches: [ main ]
   workflow_dispatch:
 
 jobs:
   build:
     name: Build Binaries
-    # Only release from main: the workflow_run trigger fires for CI runs on
-    # every branch (PRs included) but checks out the default branch, so an
-    # ungated run rebuilds and re-publishes whatever version main already
-    # has — failing at the release/Chocolatey step on the duplicate.
-    if: ${{ (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'main') || github.event_name == 'workflow_dispatch' }}
+    # Only release from main: workflow_dispatch can be invoked from any
+    # ref, and an off-main run would rebuild and re-publish whatever
+    # version that ref carries — failing at the release/Chocolatey step
+    # on the duplicate.
+    if: ${{ github.ref == 'refs/heads/main' }}
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:

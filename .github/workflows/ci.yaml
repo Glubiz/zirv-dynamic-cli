@@ -1,8 +1,11 @@
 name: CI Pipeline
 
+# CI is a merge gate only: it runs on PRs targeting main (and on demand).
+# It deliberately does NOT run on pushes to main — a commit can only reach
+# main through a PR that already passed these exact checks, and the CD
+# pipeline triggers directly on the merge push instead of chaining off a
+# post-merge CI run.
 on:
-  push:
-    branches: [ main ]
   pull_request:
     branches: [ main ]
   workflow_dispatch:

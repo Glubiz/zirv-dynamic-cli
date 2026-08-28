@@ -232,12 +232,23 @@ fn slot_file_is_stale(path: &Path, grace_secs: u64) -> bool {
 
 /// Every heavy-operation permit currently held, sweeping (and never
 /// including) any entry whose owning pid is no longer alive -- reusing
-/// `sessions::is_alive`, the same liveness probe `sessions::list` sweeps
-/// dead session records with, rather than a second, independently-drifting
-/// copy -- so a permit left behind by a killed or crashed holder never
-/// wedges the budget forever. A directory that does not exist yet, or a
-/// file that fails to read or parse, both read as "not held": nothing on a
-/// fresh machine, and one malformed file must never fail the whole listing.
+/// `sessions::is_alive`, the bare-pid signal-0 probe, rather than a second,
+/// independently-drifting copy -- so a permit left behind by a killed or
+/// crashed holder never wedges the budget forever. A directory that does not
+/// exist yet, or a file that fails to read or parse, both read as "not
+/// held": nothing on a fresh machine, and one malformed file must never fail
+/// the whole listing.
+///
+/// Issue #152: `sessions::list`'s own sweep moved on to `sessions::
+/// record_is_alive`, which disambiguates an `EPERM`-read pid by comparing a
+/// `Record`'s stamped `start_time` against a freshly read one. `PermitRecord`
+/// carries no `start_time` and deliberately is not getting one in that same
+/// change -- a permit slot's failure mode is different from a session
+/// record's: it is not offered for restore or addressed by a human-typed
+/// prefix, so a wedged slot merely outlives its holder briefly and then
+/// frees the moment that pid genuinely frees (or `is_alive`'s own `EPERM`
+/// residual applies, same as before). Extending `PermitRecord` to carry a
+/// start time too is a deliberate non-goal of this fix, not an oversight.
 ///
 /// Exposed as records, not just a count (issue #162): `status.rs`'s
 /// occupancy line and `script_runner`'s wait message both need to name WHO

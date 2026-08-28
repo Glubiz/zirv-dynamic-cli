@@ -816,6 +816,17 @@ pub struct Pane {
     /// [`INJECTION_SUBMIT_DELAY`]'s own doc comment for why this replaced an
     /// inline sleep.
     pending_submit: Option<Instant>,
+    /// Issue #160 finding 1, review round (2026-08-28): the `LaunchMode`
+    /// this pane was ACTUALLY spawned with, derived from `turn_env` itself
+    /// (whether it carried the durable interactive-launch pin,
+    /// `adapters::LAUNCH_MODE_ENV`/`LAUNCH_MODE_INTERACTIVE_VALUE`) rather
+    /// than trusted as a separate parameter that could drift out of sync
+    /// with what the child actually inherited. `dash::mod::on_quit` reads
+    /// this back (`launch_mode()`) to roster `RosterPane::interactive`, so a
+    /// restore can relaunch the pane on the same terms it originally had --
+    /// see `restored_pane_turn_env`'s own doc comment for why an
+    /// unconditional restore-as-Interactive was wrong.
+    launch_mode: super::super::adapters::LaunchMode,
 }
 
 impl Pane {
@@ -897,6 +908,20 @@ impl Pane {
         command.cwd(cwd);
 
         sessions::scrub_supervision_env(&mut command);
+        // Issue #160 finding 1, review round (2026-08-28): derived from
+        // `turn_env`'s own content rather than a separate parameter -- the
+        // single source of truth for what this pane's child actually
+        // inherits is the same `turn_env` slice `command.env` is fed from
+        // below, so there is no second copy that could ever say something
+        // different. See `Pane::launch_mode`'s own doc comment.
+        let launch_mode = if turn_env.iter().any(|(k, v)| {
+            k == super::super::adapters::LAUNCH_MODE_ENV
+                && v == super::super::adapters::LAUNCH_MODE_INTERACTIVE_VALUE
+        }) {
+            super::super::adapters::LaunchMode::Interactive
+        } else {
+            super::super::adapters::LaunchMode::Headless
+        };
         for (key, value) in turn_env {
             command.env(key, value);
         }
@@ -954,8 +979,17 @@ impl Pane {
         // from another's. Stamp the child's real pid instead. `process_id`
         // returns `None` on a platform that cannot report it; there we leave
         // the dashboard's pid rather than a bogus one.
+        //
+        // Review round 2 finding 1 (issue #152): `start_time` must move with
+        // `pid` in the same breath, via the same `sessions::process_start_secs`
+        // reader `Record::new` itself used -- see `SessionGuard::
+        // adopt_child_pid`'s doc comment for why leaving the dashboard's own
+        // start time in place here is a guaranteed false "dead" the moment
+        // this pane's very first liveness probe hits `EPERM` (the everyday
+        // sandboxed case issue #146 exists for).
         if let Some(child_pid) = child.process_id() {
             record.pid = child_pid;
+            record.start_time = sessions::process_start_secs(child_pid);
         }
         // `owner_pid` is left unset here: `SessionGuard::register` below
         // stamps it with this process's own pid -- the dashboard's -- for
@@ -998,6 +1032,7 @@ impl Pane {
             work_group_id: None,
             report_reminder_sent: false,
             pending_submit: None,
+            launch_mode,
         })
     }
 
@@ -1476,6 +1511,16 @@ impl Pane {
         self.role
     }
 
+    /// The `LaunchMode` this pane was ACTUALLY spawned with (issue #160
+    /// finding 1) -- derived once, at `Pane::spawn`, from whether `turn_env`
+    /// carried the durable interactive-launch pin. `dash::mod::on_quit`
+    /// reads this back to roster `RosterPane::interactive`, so a restore
+    /// can relaunch this pane on the same terms it originally had, rather
+    /// than unconditionally as `Interactive`.
+    pub fn launch_mode(&self) -> super::super::adapters::LaunchMode {
+        self.launch_mode
+    }
+
     /// The sidebar's one-line preview: the bottom-most non-blank row of this
     /// pane's current screen.
     pub fn last_line(&self) -> String {
@@ -1697,6 +1742,16 @@ impl Pane {
                 .chain(command.get_args().map(|a| a.to_string_lossy().to_string()))
                 .collect()
         };
+        // NON-GOAL residual (2026-08-28, filed rather than silently
+        // omitted): `handover::build_turn_env` does not push the durable
+        // interactive-launch pin, so `self.launch_mode` still reads this
+        // pane's ORIGINAL spawn mode after a handover even though the
+        // successor child below never actually receives the pin either
+        // way. Out of scope for issue #160's fix round, which named exactly
+        // three call sites (`fulfill_spawn_request`, `run_dashboard`'s
+        // first pane, `restored_pane_turn_env`), all in `dash::mod`, not
+        // this one -- a pane that both underwent a handover AND survives a
+        // later dashboard restore is the only case this residual reaches.
         let turn_env = super::super::handover::build_turn_env(
             new_adapter.as_ref(),
             self.server.as_ref(),
