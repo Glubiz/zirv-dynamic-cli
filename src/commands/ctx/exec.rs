@@ -4629,6 +4629,10 @@ mod tests {
         let argv_log = tmp.path().join("argv.log");
         let mut env = base_env(&state_dir);
         env.insert("ZIRV_CTX_PACE".to_string(), "false".to_string());
+        // This regression specifically isolates the same-harness park/relaunch
+        // mail path. #186 enables fallback by default, which would correctly
+        // continue the already-stopped codex child on claude instead.
+        env.insert("ZIRV_CTX_FALLBACK".to_string(), "false".to_string());
         env.insert("ZIRV_CTX_POLL_MS".to_string(), "50".to_string());
         env.insert(
             "ZIRV_CTX_AGENT_BIN".to_string(),
