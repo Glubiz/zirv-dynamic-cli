@@ -359,10 +359,15 @@ pub struct Record {
     /// module has no reason to depend on `prompt.rs`, and every other
     /// plain-vocabulary field here (`agent`, `roster::RosterPane::role`)
     /// already follows the same "label string, not an enum" convention.
-    /// `None` for a record written by an older build, or any session type
-    /// this was never threaded through to -- `status.rs`'s group tree reads
-    /// it as "worker" (the least-privileged, and most common, reading) in
-    /// that case.
+    ///
+    /// Read by `dash::mod::parent_role_for` (via [`load_record`]) for a
+    /// requesting session this dashboard hosts no pane for -- an operator's
+    /// own terminal, or a headless coordinator -- which is the only place a
+    /// role can be recovered for such a session at all. `None` for a record
+    /// written by an older build, or any session type this was never threaded
+    /// through to; that reader then falls back to the verb (`Verb::Chat` is
+    /// an orchestrator seat, anything else a worker), never to a wider role
+    /// than the session could already have had.
     #[serde(default)]
     pub role: Option<String>,
 }
@@ -659,10 +664,18 @@ pub(crate) fn is_alive(_pid: u32) -> bool {
 /// not a cleanup. A missing, unreadable or malformed record answers `false`
 /// -- nothing to collide with, so the restore may proceed.
 pub fn short_is_live(state: &StateDir, short: &str) -> bool {
+    load_record(state, short).is_some_and(|record| is_alive(record.pid))
+}
+
+/// One registry record, read straight off disk by its short id -- a question,
+/// never a cleanup: unlike [`list`], nothing is swept and no liveness is
+/// judged here, so a caller that only wants what was RECORDED about a session
+/// (`Record::role`, issue #169) does not have to walk, and mutate, the whole
+/// registry to find it. `None` for a missing, unreadable or malformed record.
+pub fn load_record(state: &StateDir, short: &str) -> Option<Record> {
     std::fs::read_to_string(record_path(state, short))
         .ok()
         .and_then(|contents| serde_json::from_str::<Record>(&contents).ok())
-        .is_some_and(|record| is_alive(record.pid))
 }
 
 /// Every record currently on disk, alongside whether its own process is

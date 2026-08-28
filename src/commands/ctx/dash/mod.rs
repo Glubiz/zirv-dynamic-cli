@@ -2481,20 +2481,54 @@ pub(crate) fn depth_refusal(
 /// SubOrchestrator. The claimed value now only ever reaches this function
 /// when the channel proves nothing about who wrote it, and it is refused
 /// outright whenever it names a live pane (see `fulfill_spawn_request`).
+///
+/// III, security review round 2 (Finding 5): a parent this dashboard hosts no
+/// pane for is looked up in the session REGISTRY before the `Orchestrator`
+/// default is reached -- `sessions::Record::role` is stamped server-side by
+/// whichever supervisor spawned that session (`Pane::spawn`, `wrap::run_
+/// with`) and is exactly the answer this function was otherwise guessing.
+/// That covers the two real cases the pane list cannot: a headless
+/// coordinator delegating from its own terminal (its record says
+/// `sub-orchestrator`, so its worker spawns are allowed) and a headless
+/// WORKER trying to delegate onward (its record says `worker`, so the depth
+/// cap now bites there too, instead of reading as an unrestricted
+/// orchestrator). Only a parent the registry has never heard of -- an
+/// operator's own raw terminal, which registers nothing until it launches
+/// something -- keeps the `Orchestrator` default.
 fn parent_role_for(
     requester: Option<&str>,
     req: &spawnreq::SpawnRequest,
     panes: &[Pane],
+    state: &StateDir,
 ) -> prompt::PromptRole {
-    requester
-        .or(req.parent_session.as_deref())
-        .and_then(|parent| {
-            panes
-                .iter()
-                .find(|pane| sessions::short_id(pane.session_id()) == parent)
-        })
-        .map(|pane| pane.role())
+    let Some(parent) = requester.or(req.parent_session.as_deref()) else {
+        return prompt::PromptRole::Orchestrator;
+    };
+    if let Some(pane) = panes
+        .iter()
+        .find(|pane| sessions::short_id(pane.session_id()) == parent)
+    {
+        return pane.role();
+    }
+    sessions::load_record(state, parent)
+        .map(|record| recorded_role(&record))
         .unwrap_or(prompt::PromptRole::Orchestrator)
+}
+
+/// The role one registry record was spawned with (issue #169's own
+/// `sessions::Record::role`), with the pre-#169 fallback for a record written
+/// before that field existed: `Verb::Chat` is an operator's own orchestrator
+/// seat, and every other verb is a delegated worker -- the least-privileged
+/// reading of a record that never said.
+fn recorded_role(record: &sessions::Record) -> prompt::PromptRole {
+    record
+        .role
+        .as_deref()
+        .and_then(prompt::PromptRole::from_label)
+        .unwrap_or(match record.verb {
+            sessions::Verb::Chat => prompt::PromptRole::Orchestrator,
+            _ => prompt::PromptRole::Worker,
+        })
 }
 
 /// Whether the task-prompt fallback (`worker_task_prompt`, below) has
@@ -2896,7 +2930,7 @@ fn fulfill_spawn_request(
     // never trusts `req` for its own lineage (see its own doc comment); a
     // refusal here is policy, the same reasoning the pane cap and the agent
     // gate right below already apply.
-    let parent_role = parent_role_for(requester, req, panes);
+    let parent_role = parent_role_for(requester, req, panes, state);
     let requested_role = spawnreq::role_of(req);
     // Security review Finding 1: `parent_role_for`'s `Orchestrator` answer
     // is never a VERIFIED one (see its own doc comment) -- it is what BOTH
@@ -10212,21 +10246,104 @@ mod tests {
     /// `sub-orchestrator`).
     #[test]
     fn parent_role_for_never_trusts_the_requests_own_claimed_lineage() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
         let panes: Vec<Pane> = Vec::new();
 
         let mut req = spawn_request("do the work", Path::new("/repo"));
         req.parent_session = None;
         assert_eq!(
-            parent_role_for(None, &req, &panes),
+            parent_role_for(None, &req, &panes, &state),
             prompt::PromptRole::Orchestrator
         );
 
-        // A forged id naming no pane this dashboard tracks: same answer as
-        // no lineage at all, never more privileged.
+        // A forged id naming neither a pane this dashboard tracks nor a
+        // session the registry has ever heard of: same answer as no lineage
+        // at all, never more privileged.
         req.parent_session = Some("deadbeef".to_string());
         assert_eq!(
-            parent_role_for(None, &req, &panes),
+            parent_role_for(None, &req, &panes, &state),
             prompt::PromptRole::Orchestrator
+        );
+    }
+
+    /// Security review round 2 (Finding 5): a parent this dashboard hosts no
+    /// pane for is no longer guessed at -- `sessions::Record::role`, stamped
+    /// server-side by whichever supervisor spawned that session, is read back
+    /// from the registry. A headless coordinator therefore keeps its
+    /// `SubOrchestrator` reading (and may still spawn workers here), while a
+    /// headless WORKER is finally caught by the depth cap instead of passing
+    /// as an unrestricted orchestrator. A record written before that field
+    /// existed falls back to its verb, and a session the registry has never
+    /// heard of keeps the `Orchestrator` default.
+    #[test]
+    fn parent_role_for_reads_a_recorded_role_for_a_session_this_dash_hosts_no_pane_for() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        let panes: Vec<Pane> = Vec::new();
+
+        let register = |session: &str, verb: sessions::Verb, role: Option<&str>| {
+            let record = sessions::Record::new(session, "claude", &repo, verb);
+            let record = match role {
+                Some(role) => record.with_role(role),
+                None => record,
+            };
+            sessions::SessionGuard::register(&state, record)
+        };
+        // Held for the whole test: `SessionGuard` removes its own record when
+        // it drops, and these records have to still be on disk to be read.
+        let _coordinator = register(
+            "cccccccc-1111-4222-8333-444444444444",
+            sessions::Verb::Exec,
+            Some(prompt::PromptRole::SubOrchestrator.label()),
+        );
+        let _worker = register(
+            "dddddddd-1111-4222-8333-444444444444",
+            sessions::Verb::Exec,
+            Some(prompt::PromptRole::Worker.label()),
+        );
+        let _old_chat = register(
+            "eeeeeeee-1111-4222-8333-444444444444",
+            sessions::Verb::Chat,
+            None,
+        );
+        let _old_exec = register(
+            "ffffffff-1111-4222-8333-444444444444",
+            sessions::Verb::Exec,
+            None,
+        );
+
+        let role_of = |session: &str| {
+            let mut req = spawn_request("do the work", &repo);
+            req.parent_session = Some(sessions::short_id(session));
+            parent_role_for(None, &req, &panes, &state)
+        };
+
+        assert_eq!(
+            role_of("cccccccc-1111-4222-8333-444444444444"),
+            prompt::PromptRole::SubOrchestrator,
+            "a headless coordinator's own recorded role is what the depth cap must see"
+        );
+        assert_eq!(
+            role_of("dddddddd-1111-4222-8333-444444444444"),
+            prompt::PromptRole::Worker,
+            "and a headless worker may not delegate onward either"
+        );
+        assert_eq!(
+            role_of("eeeeeeee-1111-4222-8333-444444444444"),
+            prompt::PromptRole::Orchestrator,
+            "a record written before `role` existed falls back to its verb: chat is a seat"
+        );
+        assert_eq!(
+            role_of("ffffffff-1111-4222-8333-444444444444"),
+            prompt::PromptRole::Worker,
+            "...and every other verb is a worker, the least-privileged reading"
+        );
+        assert_eq!(
+            role_of("99999999-1111-4222-8333-444444444444"),
+            prompt::PromptRole::Orchestrator,
+            "a session the registry never heard of is an operator's own terminal"
         );
     }
 
@@ -10270,15 +10387,15 @@ mod tests {
         let mut req = spawn_request("do the work", &repo);
         req.parent_session = Some(worker_short.clone());
         assert_eq!(
-            parent_role_for(Some(&worker_short), &req, &panes),
+            parent_role_for(Some(&worker_short), &req, &panes, &state),
             prompt::PromptRole::Worker
         );
 
-        // A DIFFERENT id, not in `panes` at all, still reads as unrestricted
-        // -- the presence of an unrelated live pane must not change that.
+        // A DIFFERENT id, in neither `panes` nor the registry, still reads as
+        // unrestricted -- an unrelated live pane must not change that.
         req.parent_session = Some("ffffffff".to_string());
         assert_eq!(
-            parent_role_for(None, &req, &panes),
+            parent_role_for(None, &req, &panes, &state),
             prompt::PromptRole::Orchestrator
         );
 
@@ -10287,7 +10404,7 @@ mod tests {
         // wrote about its own lineage.
         req.parent_session = Some("ffffffff".to_string());
         assert_eq!(
-            parent_role_for(Some(&worker_short), &req, &panes),
+            parent_role_for(Some(&worker_short), &req, &panes, &state),
             prompt::PromptRole::Worker
         );
     }
@@ -10571,7 +10688,7 @@ mod tests {
         let mut worker_req = spawn_request("split off a worker brief", &repo);
         worker_req.parent_session = Some(sub_short.clone());
         assert_eq!(
-            parent_role_for(Some(&sub_short), &worker_req, &panes),
+            parent_role_for(Some(&sub_short), &worker_req, &panes, &state),
             prompt::PromptRole::SubOrchestrator,
             "the freshly spawned pane's own role must be readable back, not hardcoded Worker"
         );

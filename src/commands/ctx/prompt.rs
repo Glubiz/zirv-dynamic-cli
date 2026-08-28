@@ -240,6 +240,20 @@ impl PromptRole {
             PromptRole::Worker => "worker",
         }
     }
+
+    /// [`PromptRole::label`] read back: the inverse of the one spelling this
+    /// codebase persists a role in (`sessions::Record::role`, `dash::roster::
+    /// RosterPane::role`). `None` for anything else -- a label written by a
+    /// future build, or a corrupted one -- so every caller has to decide its
+    /// own fallback rather than silently receiving a role nobody wrote.
+    pub fn from_label(label: &str) -> Option<PromptRole> {
+        match label {
+            "orchestrator" => Some(PromptRole::Orchestrator),
+            "sub-orchestrator" => Some(PromptRole::SubOrchestrator),
+            "worker" => Some(PromptRole::Worker),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
