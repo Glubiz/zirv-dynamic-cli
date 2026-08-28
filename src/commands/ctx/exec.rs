@@ -1378,21 +1378,23 @@ pub(crate) fn run_with_clock<W: Write>(
                 .map(|raw| super::config::split_csv_list(&raw))
                 .unwrap_or_default();
             let source_model = adapters::last_model_flag(&args.command);
-            let route = (adapter_builds_launch && prompt.is_some()).then(|| {
-                super::fallback::route_blocked_session(
-                    &state,
-                    &cfg,
-                    adapter.name(),
-                    source_model,
-                    source_model.is_some(),
-                    super::fallback::TaskBounds {
-                        tokens: worker_budget.tokens,
-                        tool_calls: worker_budget.tool_calls,
-                    },
-                    now_fn(),
-                    &visited,
-                )
-            }).flatten();
+            let route = (adapter_builds_launch && prompt.is_some())
+                .then(|| {
+                    super::fallback::route_blocked_session(
+                        &state,
+                        &cfg,
+                        adapter.name(),
+                        source_model,
+                        source_model.is_some(),
+                        super::fallback::TaskBounds {
+                            tokens: worker_budget.tokens,
+                            tool_calls: worker_budget.tool_calls,
+                        },
+                        now_fn(),
+                        &visited,
+                    )
+                })
+                .flatten();
 
             if let Some(route) = route {
                 let jsonl = std::fs::read_to_string(&transcript).unwrap_or_default();
@@ -1420,12 +1422,15 @@ pub(crate) fn run_with_clock<W: Write>(
                 let spent_tokens = prior_usage
                     .context_total()
                     .saturating_add(prior_usage.output_tokens);
-                let remaining_tokens =
-                    worker_budget.tokens.map(|limit| limit.saturating_sub(spent_tokens));
+                let remaining_tokens = worker_budget
+                    .tokens
+                    .map(|limit| limit.saturating_sub(spent_tokens));
                 let remaining_tool_calls = worker_budget
                     .tool_calls
                     .map(|limit| limit.saturating_sub(prior_tool_calls));
-                if worker_budget.tokens.is_some_and(|_| remaining_tokens == Some(0))
+                if worker_budget
+                    .tokens
+                    .is_some_and(|_| remaining_tokens == Some(0))
                     || worker_budget
                         .tool_calls
                         .is_some_and(|_| remaining_tool_calls == Some(0))
@@ -1505,14 +1510,7 @@ pub(crate) fn run_with_clock<W: Write>(
                 // the continuation is registered. Releasing first prevents two
                 // live registry entries from claiming one logical worker.
                 session_guard.release();
-                return run_with_clock(
-                    &nested_args,
-                    w,
-                    repo,
-                    &nested_env,
-                    now_fn,
-                    sleep_fn,
-                );
+                return run_with_clock(&nested_args, w, repo, &nested_env, now_fn, sleep_fn);
             }
 
             let _ = log::append(
