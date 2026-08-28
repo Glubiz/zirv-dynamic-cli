@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-23
+last-verified: 2026-08-27
 ---
 
 # Rot Engine
@@ -65,6 +65,14 @@ pub enum Verdict { Healthy, Advise, Compact, Restart }
 - At or above `token_ceiling`, the verdict is **at least** `Compact` even if the weighted score alone wouldn't reach it — and a score that had already reached `compact_at` is escalated all the way to `Restart`.
 
 Net effect: token growth is a gate, not a fifth weighted vote. Behavioral signals decide *how bad* a session looks; token count decides *whether that badness is allowed to matter yet* and can force an outcome behavior alone wouldn't reach.
+
+### Capacity-aware gates (issue #155, Phase 6, 2026-08-27)
+
+`token_floor`/`token_ceiling` used to be flat absolute numbers (100_000/160_000) regardless of the actual seat's context window — the epic's own motivating bug was a 1M-context claude session (`[1m]`) restarting at roughly 16% of its real capacity because the gate had no way to know the seat was ten times bigger than the default assumption. Both are now `Option<u64>` **explicit overrides**; three new keys derive the gate from the model's real capacity instead: `token_floor_ratio` (default 0.5), `token_ceiling_ratio` (default 0.8), and `model_context_tokens` (an operator override of the resolved capacity — "they know their seat; the adapter's default is a guess about it"). All five keys are `REPO_FORBIDDEN` (see [[Untrusted Configuration]]).
+
+`rot::token_gates(cfg, caps) -> (u64, u64)` is the new pure resolver `verdict_for`/`score_from` both take a `Capabilities` parameter to call: an explicit `token_floor`/`token_ceiling` wins outright per field; otherwise the corresponding ratio is applied to the resolved capacity (`cfg.model_context_tokens`, else `caps.context_window_tokens`, i.e. the adapter's own per-model report); with no capacity available from anywhere (codex today, or any adapter that cannot honestly state one), `FALLBACK_TOKEN_FLOOR`/`FALLBACK_TOKEN_CEILING` (100_000/160_000, the pre-#155 absolutes) apply unchanged. The result is always ordered and non-zero: if a *derived* ceiling would land at or below the floor, only the derived side moves (a fully operator-pinned inverted pair stands as written — a number the operator typed is never silently rewritten) so `verdict_for`'s two-stage gate never becomes meaningless. Still fully pure — capacity arrives inside `Capabilities`, already a parameter of `score_events`/`RotState::score`, so no fs/clock/env/net access is added to `rot.rs`.
+
+**The live model has to actually reach this gate, which needed a second fix (2026-08-27 review round, finding D1).** `Capabilities::context_window_tokens` was only ever reachable through `AgentAdapter::capabilities_for_model`, which had no production caller — every live scoring path called plain `capabilities()` with `model: None`, so a 1M claude seat's real window never reached the gate above and the epic's motivating bug stayed unfixed even after `token_gates` itself shipped. `AgentAdapter::model_hint(jsonl)` (default `None`; claude reads the last assistant `message.model` field, newest wins — see [[Ctx Adapters]]) is now wired through `score.rs`'s live scoring paths: `full_score` resolves it off the whole transcript in hand and calls `capabilities_for_model` instead of `capabilities()`; `IncrementalScorer` carries the resolved model across polls in its own `model: Option<String>` field, since a poll only ever sees the bytes appended since the last one and a chunk that happens not to mention a model (a lone tool-result line) must not read as "no model at all." The Stop hook's on-disk checkpoint gained the same `model` field, and `CHECKPOINT_VERSION` bumped **1 → 2** so an older checkpoint (written before the field existed) is rejected and rebuilt cleanly on the next poll rather than silently resuming with `model: None` until a lucky assistant line happens to repeat it. `RotState::feed_all`'s own fold never reads capabilities at all, so `fingerprint()` (the checkpoint-invalidation key) deliberately keeps calling plain `capabilities()`: a model switch mid-session must not force a full incremental rebuild, only the next poll's gate computation needs the new model.
 
 ```mermaid
 flowchart LR

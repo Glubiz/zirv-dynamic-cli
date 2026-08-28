@@ -71,6 +71,44 @@ pub struct Delegation<'a> {
     pub outcome: &'a str,
 }
 
+/// The owned, deserializable counterpart of [`Delegation`] (which borrows
+/// and is serialize-only) -- what [`read_delegations`] parses one logged
+/// line back into for `status::group_tree_lines` to render. Field names and
+/// shape mirror `Delegation` exactly, the same borrowed-for-writing/owned-
+/// for-reading split `SafetyDecision`/`SafetyDecisionRecord` already uses.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DelegationRow {
+    /// Kept for parity with every field `Delegation` writes -- not read by
+    /// `status::group_tree_lines` today (which orders by `group::list`'s own
+    /// creation order, not by delegation time), the same
+    /// kept-for-parity-not-yet-read pattern `SafetyDecisionRecord::mode`
+    /// already uses.
+    #[allow(dead_code)]
+    pub ts: u64,
+    pub session: String,
+    /// Kept for parity with `Delegation`; no caller has needed a delegation's
+    /// parent yet -- `status::group_tree_lines` already knows which group
+    /// (and thus which parent) a row belongs to via `work_group_id`.
+    #[allow(dead_code)]
+    pub parent_session: String,
+    #[serde(default)]
+    pub work_group_id: Option<String>,
+    pub agent: String,
+    #[serde(default)]
+    pub model: Option<String>,
+    pub input_tokens: u64,
+    pub cache_creation_input_tokens: u64,
+    pub cache_read_input_tokens: u64,
+    pub output_tokens: u64,
+    pub wall_ms: u64,
+    /// Kept for parity with `Delegation`; `status::group_tree_lines` renders
+    /// `outcome` (already a human string derived from this code), not the
+    /// raw code itself.
+    #[allow(dead_code)]
+    pub exit_code: i32,
+    pub outcome: String,
+}
+
 pub fn append(state: &StateDir, decision: &Decision<'_>) -> CtxResult<()> {
     let dir = state.logs();
     super::state::create_private_dir_all(&dir)?;
@@ -168,12 +206,10 @@ pub fn read_safety_decisions(state: &StateDir) -> Vec<SafetyDecisionRecord> {
     out
 }
 
-/// Issue #155: no CLI surface reads `delegations.jsonl` back yet -- that is
-/// Phase 5's reporting work, once `work_group_id` gives it something to
-/// group by. This reader lands now so `append_delegation`'s own round-trip
-/// is testable today, the same "accessor lands ahead of its production
-/// caller" pattern `LaunchMode::label`/`is_interactive` used.
-#[allow(dead_code)]
+/// Tails `delegations.jsonl`'s newest `count` raw JSON lines, same contract
+/// `tail` gives the main decision log. [`read_delegations`] is the reader
+/// that parses these back into [`DelegationRow`]s for `status::
+/// group_tree_lines` (issue #155, Phase 5(f)).
 pub fn tail_delegations(state: &StateDir, count: usize) -> CtxResult<Vec<String>> {
     let path = state.logs().join(DELEGATION_FILE);
     if !path.exists() {
@@ -183,6 +219,21 @@ pub fn tail_delegations(state: &StateDir, count: usize) -> CtxResult<Vec<String>
     let lines: Vec<String> = text.lines().map(str::to_string).collect();
     let from = lines.len().saturating_sub(count);
     Ok(lines[from..].to_vec())
+}
+
+/// Parses [`tail_delegations`]'s newest `count` lines back into
+/// [`DelegationRow`]s for `status::group_tree_lines`. A line that fails to
+/// parse (a truncated write, a stray corrupt line) is skipped, not fatal --
+/// the same tolerance `group::list` and `read_safety_decisions` already give
+/// their own on-disk, best-effort state. Degrades to an empty `Vec` on any
+/// read failure at all (missing file, unreadable file), exactly like
+/// `tail_delegations` itself already does for a missing file.
+pub fn read_delegations(state: &StateDir, count: usize) -> Vec<DelegationRow> {
+    tail_delegations(state, count)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect()
 }
 
 #[cfg(test)]
@@ -391,6 +442,97 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(tmp.path().to_path_buf());
         assert!(tail_delegations(&state, 10).expect("tail").is_empty());
+    }
+
+    /// Issue #155, Phase 5(f): `read_delegations` is what `status::
+    /// group_tree_lines` reads its input from -- round-trips a real
+    /// `Delegation` back into an owned `DelegationRow`, and a corrupt line
+    /// landing in the middle of a concurrent write is skipped, not fatal,
+    /// the same tolerance `group::list` and `read_safety_decisions` already
+    /// give their own on-disk, best-effort state.
+    #[test]
+    fn read_delegations_round_trips_and_skips_a_corrupt_line() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        append_delegation(
+            &state,
+            &Delegation {
+                ts: 1_700_000_000,
+                session: "sess-child",
+                parent_session: "sess-parent",
+                work_group_id: Some("wg-1"),
+                agent: "codex",
+                model: Some("gpt-5-codex"),
+                input_tokens: 1_000,
+                cache_creation_input_tokens: 8_000,
+                cache_read_input_tokens: 91_000,
+                output_tokens: 500,
+                wall_ms: 42_000,
+                exit_code: 0,
+                outcome: "ok",
+            },
+        )
+        .expect("append");
+
+        {
+            let mut file =
+                super::super::state::open_private_append(&state.logs().join(DELEGATION_FILE))
+                    .expect("open");
+            writeln!(file, "not json").expect("write corrupt line");
+        }
+
+        append_delegation(
+            &state,
+            &Delegation {
+                ts: 1_700_000_100,
+                session: "sess-child-2",
+                parent_session: "sess-parent",
+                work_group_id: None,
+                agent: "claude",
+                model: None,
+                input_tokens: 10,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+                output_tokens: 5,
+                wall_ms: 1_000,
+                exit_code: 1,
+                outcome: "failed",
+            },
+        )
+        .expect("append");
+
+        let rows = read_delegations(&state, 10);
+        assert_eq!(
+            rows.len(),
+            2,
+            "the corrupt line is skipped, not fatal: {rows:?}"
+        );
+        assert_eq!(rows[0].session, "sess-child");
+        assert_eq!(rows[0].work_group_id.as_deref(), Some("wg-1"));
+        assert_eq!(rows[0].model.as_deref(), Some("gpt-5-codex"));
+        assert_eq!(rows[1].session, "sess-child-2");
+        assert_eq!(rows[1].work_group_id, None);
+        assert_eq!(rows[1].outcome, "failed");
+    }
+
+    /// No file at all is an empty list, not an error -- `zirv ctx agent`
+    /// has never successfully delegated on this machine yet.
+    #[test]
+    fn read_delegations_before_any_exist_is_empty_not_an_error() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        assert!(read_delegations(&state, 10).is_empty());
+    }
+
+    /// A present-but-empty file (the directory was created but nothing was
+    /// ever appended) is also an empty list, not an error.
+    #[test]
+    fn read_delegations_from_an_empty_file_is_empty_not_an_error() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        super::super::state::create_private_dir_all(&state.logs()).expect("mkdir");
+        std::fs::write(state.logs().join(DELEGATION_FILE), "").expect("write empty file");
+        assert!(read_delegations(&state, 10).is_empty());
     }
 
     #[test]

@@ -909,8 +909,17 @@ including `score`, `handoff` and `status`, works on all three platforms.
 
 Four signals over the trailing window (default 10 turns):
 
-1. **Context size** (a gate, not a vote). Below 100000 tokens the verdict is always
-   `healthy`; at or above 160000 it is at least `compact`.
+1. **Context size** (a gate, not a vote). The floor and ceiling scale with the
+   model's real context window (issue #155): by default the floor sits at 50%
+   of capacity and the ceiling at 80% (`score.token_floor_ratio`/
+   `token_ceiling_ratio`), so a 200k-token seat still gates at 100000/160000,
+   the pre-ratio absolutes, and a 1M-token seat gates at 500000/800000
+   instead of restarting at the same 160000 tokens with 840k of headroom
+   left. When no capacity is known (codex today), the absolute
+   100000/160000 fallbacks apply unchanged. `score.token_floor`/
+   `token_ceiling` still pin an exact number outright, overriding the ratio.
+   Below the floor the verdict is always `healthy`; at or above the ceiling
+   it is at least `compact`.
 2. **Tool-failure rate** (weight 40).
 3. **Repetition loops**, three or more identical tool calls with identical input
    (weight 30).
@@ -1001,7 +1010,10 @@ enough to change what zirv executes. `<repo>/.zirv/ctx.toml` may not set
 `optimize.model`, `sandbox.enabled`, `prompt.enabled`, `prompt.repo_layer`,
 `prompt.max_repo_bytes`, `prompt.harnesses`, `mail.enabled`,
 `mail.max_delivered_bytes`, `chrome.events`, any `memory.*` key, any
-`dash.*` key, any `pace.*` key, `review`, `worker`, or `handover`; doing so is an error
+`dash.*` key, any `pace.*` key, `review`, `worker`, `handover`, or any of the
+five keys that feed the token gate (`score.token_floor`,
+`score.token_ceiling`, `score.token_floor_ratio`, `score.token_ceiling_ratio`,
+`score.model_context_tokens`); doing so is an error
 that names the key. Set those in `~/.zirv/ctx.toml`, or with the matching
 `ZIRV_CTX_*` variable below, which comes from the operator rather than the
 checkout:
@@ -1041,11 +1053,14 @@ checkout:
 | `dash.roster_max_age_secs` | `ZIRV_CTX_DASH_ROSTER_MAX_AGE_SECS` |
 | `dash.max_panes` | `ZIRV_CTX_DASH_MAX_PANES` |
 | `dash.mouse` | `ZIRV_CTX_DASH_MOUSE` |
-| `supervise.max_heavy_workers` | `ZIRV_CTX_SUPERVISE_MAX_HEAVY_WORKERS` |
+| `supervise.max_heavy_workers` | `ZIRV_CTX_SUPERVISE_MAX_HEAVY_WORKERS` (deprecated alias for `max_heavy_operations`) |
+| `supervise.max_heavy_operations` | `ZIRV_CTX_SUPERVISE_MAX_HEAVY_OPERATIONS` |
 | `pace.use_credits` | `ZIRV_CTX_PACE_USE_CREDITS_CLAUDE` (the table-node match also blocks `pace.use_credits.codex` alone) |
 | `pace.poll_enabled` | `ZIRV_CTX_PACE_POLL` |
 | `pace.poll_min_interval_secs` | `ZIRV_CTX_PACE_POLL_MIN_INTERVAL_SECS` |
 | `pace.blind_delay_secs` | `ZIRV_CTX_PACE_BLIND_DELAY_SECS` |
+| `pace.spawn_soft_pct` | `ZIRV_CTX_PACE_SPAWN_SOFT_PCT` |
+| `pace.spawn_hard_pct` | `ZIRV_CTX_PACE_SPAWN_HARD_PCT` |
 | `review` (`review.claude`, `review.codex`) | `ZIRV_CTX_REVIEW_MODEL_CLAUDE` / `ZIRV_CTX_REVIEW_MODEL_CODEX` |
 | `worker` (`worker.claude`, `worker.codex`) | `ZIRV_CTX_WORKER_MODEL_CLAUDE` / `ZIRV_CTX_WORKER_MODEL_CODEX` |
 | `handover` (`handover.<agent>.<tier>`) | `ZIRV_CTX_HANDOVER_<AGENT>_<TIER>` (e.g. `ZIRV_CTX_HANDOVER_CLAUDE_DEEP`) |
@@ -1054,6 +1069,11 @@ checkout:
 | `safety.default` | `ZIRV_CTX_SAFETY_DEFAULT` |
 | `safety.interactive_default` | `ZIRV_CTX_SAFETY_INTERACTIVE_DEFAULT` |
 | `safety.sql` | `ZIRV_CTX_SAFETY_SQL` |
+| `score.token_floor` | `ZIRV_CTX_TOKEN_FLOOR` |
+| `score.token_ceiling` | `ZIRV_CTX_TOKEN_CEILING` |
+| `score.token_floor_ratio` | `ZIRV_CTX_SCORE_TOKEN_FLOOR_RATIO` |
+| `score.token_ceiling_ratio` | `ZIRV_CTX_SCORE_TOKEN_CEILING_RATIO` |
+| `score.model_context_tokens` | `ZIRV_CTX_SCORE_MODEL_CONTEXT_TOKENS` |
 | `workflow.repo_checks_enabled` | `ZIRV_CTX_WORKFLOW_REPO_CHECKS` |
 | `workflow.repo_skills_enabled` | `ZIRV_CTX_WORKFLOW_REPO_SKILLS` |
 | `workflow.telemetry_enabled` | `ZIRV_CTX_WORKFLOW_TELEMETRY` |

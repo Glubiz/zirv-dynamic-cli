@@ -52,8 +52,11 @@ model = "fable"
 # [score]
 # window = 10                        # trailing turns the rolling rot score looks over
 # min_turns = 10                     # turns required before the score is trusted at all
-# token_floor = 100_000              # tokens below which token pressure contributes nothing
-# token_ceiling = 160_000            # tokens at which token pressure is maxed out
+# token_floor = 100_000              # REPO-FORBIDDEN (ZIRV_CTX_TOKEN_FLOOR): explicit absolute floor override, wins over token_floor_ratio below. Default: unset.
+# token_ceiling = 160_000            # REPO-FORBIDDEN (ZIRV_CTX_TOKEN_CEILING): explicit absolute ceiling override, wins over token_ceiling_ratio below. Default: unset.
+# token_floor_ratio = 0.5            # REPO-FORBIDDEN (ZIRV_CTX_SCORE_TOKEN_FLOOR_RATIO): fraction of the resolved context-window capacity below which token pressure contributes nothing (issue #155).
+# token_ceiling_ratio = 0.8          # REPO-FORBIDDEN (ZIRV_CTX_SCORE_TOKEN_CEILING_RATIO): fraction of the resolved context-window capacity at which token pressure is maxed out.
+# model_context_tokens = 200_000     # REPO-FORBIDDEN (ZIRV_CTX_SCORE_MODEL_CONTEXT_TOKENS): operator-pinned capacity, overriding the adapter's own reported context window. Default: unset (adapter-reported; falls back to the 100_000/160_000 absolutes above when no capacity is known at all).
 # weight_tool_failure = 40.0         # score weight for repeated tool failures (weights sum to 100)
 # weight_repetition = 30.0           # score weight for repeated actions
 # weight_marker = 30.0               # score weight for the rot marker appearing in output
@@ -76,7 +79,8 @@ model = "fable"
 # backoff_base_secs = 60             # base backoff between restart attempts
 # on_failure = "notify-send done"    # REPO-FORBIDDEN (ZIRV_CTX_ON_FAILURE): shell command run on failure. Default: unset.
 # max_nudges = 3                     # consecutive nudge-driven restarts tolerated before nudges are ignored
-# max_heavy_workers = 1              # REPO-FORBIDDEN (ZIRV_CTX_SUPERVISE_MAX_HEAVY_WORKERS): machine-wide cap on live unattended workers (issue #133)
+# max_heavy_operations = 1           # REPO-FORBIDDEN (ZIRV_CTX_SUPERVISE_MAX_HEAVY_OPERATIONS): machine-wide cap on concurrent heavy commands (issue #155, replacing #133's max_heavy_workers)
+# max_heavy_workers = 1              # DEPRECATED alias for max_heavy_operations. REPO-FORBIDDEN (ZIRV_CTX_SUPERVISE_MAX_HEAVY_WORKERS)
 
 # [handoff]
 # model = "haiku"                    # REPO-FORBIDDEN (ZIRV_CTX_MODEL): distiller/judgment model override. Default: unset (adapter decides).
@@ -99,6 +103,8 @@ model = "fable"
 # poll_enabled = true                # REPO-FORBIDDEN (ZIRV_CTX_PACE_POLL): active API-poll fallback when the collector is stale. Default: true.
 # poll_min_interval_secs = 60        # REPO-FORBIDDEN (ZIRV_CTX_PACE_POLL_MIN_INTERVAL_SECS): floor between poll attempts. Default: 60.
 # blind_delay_secs = 60              # REPO-FORBIDDEN (ZIRV_CTX_PACE_BLIND_DELAY_SECS): fail-SAFE per-cycle delay applied when the gate has no usable data at all (no binding collector reading, no configured estimator) instead of proceeding unthrottled. Default: 60.
+# spawn_soft_pct = 80.0               # REPO-FORBIDDEN (ZIRV_CTX_PACE_SPAWN_SOFT_PCT): usage percentage at or above which a NEW delegated spawn (zirv ctx agent, a dashboard pane) warns but still proceeds. Never gates rotation of an already-running session. Default: 80.0.
+# spawn_hard_pct = 95.0               # REPO-FORBIDDEN (ZIRV_CTX_PACE_SPAWN_HARD_PCT): usage percentage at or above which a NEW delegated spawn is refused unless overridden with --force. Never gates rotation of an already-running session. Default: 95.0.
 
 # [pace.use_credits]                 # REPO-FORBIDDEN (ZIRV_CTX_PACE_USE_CREDITS_CLAUDE / _CODEX): skip pace gating for a harness whose vendor plan covers overage.
 # claude = false                     # Default: false.

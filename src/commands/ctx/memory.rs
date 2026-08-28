@@ -285,6 +285,19 @@ pub enum MemoryScope {
 }
 
 impl MemoryScope {
+    /// Maps a scope-selecting CLI boolean to the scope it selects: `zirv ctx
+    /// remember`/`recall`/`forget`'s `--repo` and `zirv memory`'s `--shared`
+    /// both boil down to exactly this mapping (issue #172 cross-review
+    /// finding 6) -- centralized here, once, rather than each CLI surface
+    /// keeping its own identical `if flag { Shared } else { Private }`.
+    pub fn of(flag: bool) -> MemoryScope {
+        if flag {
+            MemoryScope::Shared
+        } else {
+            MemoryScope::Private
+        }
+    }
+
     /// Whether this scope may be used at all. `cfg.memory.enabled` is a
     /// MASTER switch: `false` disables both scopes outright, so an operator
     /// who turned memory off before the shared scope existed does not
@@ -328,6 +341,24 @@ impl MemoryScope {
             MemoryScope::Shared => safe_shared_dir(repo),
         }
     }
+}
+
+/// One entry plus the scope it was actually read from, for a scope-merging
+/// JSON surface (`zirv ctx recall --json`, `zirv memory list`/`recall
+/// --json`). `scope` must always be derived from which bank the caller read
+/// the entry from, never from the entry's own header fields -- a shared
+/// entry's `Source`/`Written-By` are themselves attacker-supplied repository
+/// content (see `MemoryScope::Shared`'s own doc comment above). Shared
+/// between both CLI surfaces (issue #172 cross-review finding 6) rather than
+/// each keeping its own identical copy; the two surfaces still use different
+/// label vocabularies at the call site (`"local"`/`"repo"` for `zirv ctx`,
+/// `"private"`/`"shared"` for `zirv memory`), so `scope` is filled in by the
+/// caller, not derived here.
+#[derive(Serialize)]
+pub(crate) struct ScopedEntry<'a> {
+    #[serde(flatten)]
+    pub(crate) entry: &'a Entry,
+    pub(crate) scope: &'static str,
 }
 
 /// `<repo>/.zirv/memory/`, refused (returned as `None`) if either it or
@@ -749,12 +780,97 @@ fn is_regular_file(path: &Path) -> bool {
 /// never observes a partial file, and two concurrent upserts of the same key
 /// each write in full before either `rename` lands -- the result is always
 /// one of the two complete entries, never a mix of both.
+/// Case-insensitive substrings whose presence in a shared-scope key or body
+/// mark the entry as probably holding a live credential rather than a
+/// durable, safe-to-commit repository fact (issue #172). Deliberately blunt,
+/// the same style `workflow::review::is_sensitive_name`'s own
+/// `name.contains("credential")`/`name.contains("secret")` already use for a
+/// sibling problem (screening an untracked file before a review package): a
+/// false positive costs the writer a private `remember` or an explicit
+/// `--allow-sensitive` retry; a false negative commits a secret to every
+/// future clone of the repository.
+const SENSITIVE_SHARED_TERMS: &[&str] = &[
+    "password",
+    "passwd",
+    "secret",
+    "token",
+    "api-key",
+    "api_key",
+    "apikey",
+    "credential",
+    "creds",
+    "private-key",
+    "private_key",
+];
+
+fn sensitive_shared_term(haystack: &str) -> Option<&'static str> {
+    let lower = haystack.to_ascii_lowercase();
+    SENSITIVE_SHARED_TERMS
+        .iter()
+        .copied()
+        .find(|term| lower.contains(term))
+}
+
+/// Runs both halves of the shared-scope credential check
+/// (`sensitive_shared_term`'s deny-list and `review::detect_token_shape`'s
+/// regex families -- OpenAI/GitHub/Slack/AWS-style keys, a PEM private-key
+/// block, a JWT, reused rather than duplicated since the `regex` crate and
+/// these exact families are already a workspace dependency) against one
+/// field, named `label` in the returned message for `sensitive_shared_match`
+/// below. `None` means nothing matched in this field.
+fn sensitive_shared_field(label: &str, value: &str) -> Option<String> {
+    if let Some(term) = sensitive_shared_term(value) {
+        return Some(format!("the term '{term}' in its {label}"));
+    }
+    crate::commands::workflow::review::detect_token_shape(value)
+        .map(|family| format!("a {family} in its {label}"))
+}
+
+/// Whether `entry` looks credential-shaped rather than a durable,
+/// safe-to-commit repository fact: checks every field an attacker or a
+/// careless human can populate -- `key`, `body`, and every `tags`/`paths`
+/// entry -- with the same deny-list-plus-token-shape rule
+/// (`sensitive_shared_field`), not body-only. A credential-shaped `key` is
+/// reachable in practice despite `validate_shared_key`'s lowercase-kebab-case
+/// charset: `sk-` (OpenAI) and `xox[baprs]-` (Slack) are both expressible in
+/// pure lowercase/digits/hyphens, so a key like `sk-<20+ chars>` still trips
+/// the same regex the body does. `tags` is reachable today via `zirv memory
+/// remember --shared --tag ...`; `paths` has no `--path` writer yet (see
+/// `Entry::paths`'s own doc comment -- issue #44 wires one up later), so
+/// that arm is currently unreachable from any CLI surface but is checked
+/// anyway, cheaply, so the guard does not have to be revisited the day a
+/// `--path` flag exists: a path is attacker-influenced the same way a tag
+/// is. `None` means nothing matched anywhere. Pure (no I/O), so both
+/// `upsert_shared` (a hard refusal) and `write_durable`'s harvest loop (a
+/// skip-and-log, never an abort) can call it without either owning its own
+/// copy of the rule.
+fn sensitive_shared_match(entry: &Entry) -> Option<String> {
+    if let Some(m) = sensitive_shared_field("key", &entry.key) {
+        return Some(m);
+    }
+    if let Some(m) = sensitive_shared_field("body", &entry.body) {
+        return Some(m);
+    }
+    for tag in &entry.tags {
+        if let Some(m) = sensitive_shared_field("one of its tags", tag) {
+            return Some(m);
+        }
+    }
+    for path in &entry.paths {
+        if let Some(m) = sensitive_shared_field("one of its paths", path) {
+            return Some(m);
+        }
+    }
+    None
+}
+
 fn upsert_shared(
     repo: &Path,
     state: &StateDir,
     slug: &str,
     cfg: &CtxConfig,
     entry: &Entry,
+    allow_sensitive: bool,
 ) -> CtxResult<PathBuf> {
     if !MemoryScope::Shared.enabled(cfg) {
         let reason = MemoryScope::Shared.disabled_reason(cfg);
@@ -782,8 +898,52 @@ fn upsert_shared(
         }
     }
 
+    if !allow_sensitive && let Some(matched) = sensitive_shared_match(entry) {
+        return Err(format!(
+            "memory key '{}' looks like it holds a credential ({matched}); the shared bank at .zirv/memory/ is committed to the repository and readable by anyone with checkout access. Store it in the private bank instead, or pass --allow-sensitive to store it in the shared bank anyway.",
+            entry.key
+        )
+        .into());
+    }
+
+    // Mirror `remember`'s (the private path's) own per-entry body cap: a
+    // shared write is committed to the repository and read by every future
+    // clone, so an oversized body has no more business landing there
+    // unbounded than in the private bank -- checked (and, on the private
+    // path, only checked) against the ORIGINAL body above, then truncated
+    // here for storage, so the credential guard always sees the full text.
+    let mut entry = entry.clone();
+    let cap = cfg.memory.max_entry_bytes;
+    if entry.body.len() > cap {
+        const MARKER: &str = "\n[truncated]";
+        let keep = cap.saturating_sub(MARKER.len());
+        let mut truncated = crate::utils::truncate_bytes(entry.body.clone(), Some(keep));
+        truncated.push_str(MARKER);
+        entry.body = truncated;
+    }
+
     super::state::write_shared(&path, &entry.to_markdown())?;
     Ok(path)
+}
+
+/// Explicit escape hatch for a human who has deliberately decided a shared
+/// entry should be committed despite looking credential-shaped (`zirv ctx
+/// remember --repo --allow-sensitive`, issue #172). Every other shared-scope
+/// writer -- `upsert_scoped` (and so every automatic path through it:
+/// `zirv memory remember --shared`, `zirv memory optimize --apply`'s
+/// consolidation) -- always calls `upsert_shared` with `allow_sensitive =
+/// false`, and `write_durable`'s harvest loop skips a flagged candidate
+/// before ever reaching `upsert_scoped` for it (see below) -- so this bypass
+/// exists on exactly one, explicitly-named, human-invoked path and nowhere
+/// else.
+pub fn upsert_shared_allow_sensitive(
+    repo: &Path,
+    state: &StateDir,
+    slug: &str,
+    cfg: &CtxConfig,
+    entry: &Entry,
+) -> CtxResult<PathBuf> {
+    upsert_shared(repo, state, slug, cfg, entry, true)
 }
 
 /// Scope-aware upsert: `Private` delegates unchanged to `remember` above;
@@ -812,7 +972,7 @@ pub fn upsert_scoped(
 ) -> CtxResult<PathBuf> {
     match scope {
         MemoryScope::Private => remember(state, slug, entry, cfg),
-        MemoryScope::Shared => upsert_shared(repo, state, slug, cfg, entry),
+        MemoryScope::Shared => upsert_shared(repo, state, slug, cfg, entry, false),
     }
 }
 
@@ -1471,6 +1631,28 @@ pub(super) fn is_temporary_or_generic(body: &str) -> bool {
         .any(|pattern| lower.contains(pattern))
 }
 
+/// Whether a raw harvest candidate `(key, body)` -- BEFORE any truncation --
+/// looks credential-shaped, reusing the shared-scope guard's own rule
+/// (`sensitive_shared_match`) rather than a second copy of it. Built as a
+/// minimal probe `Entry` (harvest candidates carry no tags/paths yet, so
+/// those are left empty; only `key`/`body` are ever populated by a harvest
+/// answer). Pure, like `filter_durable_candidates` itself.
+fn harvest_candidate_credential_match(key: &str, body: &str) -> Option<String> {
+    let probe = Entry {
+        key: key.to_string(),
+        written_by: String::new(),
+        written: 0,
+        verified: 0,
+        source: String::new(),
+        body: body.to_string(),
+        importance: None,
+        confidence: None,
+        tags: Vec::new(),
+        paths: Vec::new(),
+    };
+    sensitive_shared_match(&probe)
+}
+
 /// The durability filter (issue #37): a PURE, deterministic function over
 /// already-parsed `(key, body)` candidates -- no model, no filesystem, no
 /// clock -- so it is directly testable against every reject-list category
@@ -1480,11 +1662,19 @@ pub(super) fn is_temporary_or_generic(body: &str) -> bool {
 /// Applied in order, each check independent of the others: a malformed key
 /// (`validate_shared_key` -- not lowercase kebab-case, too long, all-hyphen,
 /// or a reserved Windows device name) is dropped; a body matching
-/// `is_temporary_or_generic` is dropped; the body is then truncated to
-/// `cfg.memory.max_entry_bytes` (the same per-entry cap every other entry in
-/// this store gets) and dropped entirely if truncation leaves nothing but
-/// whitespace. Only survivors count against the two NEW per-session caps
-/// issue #37 asks for: `cfg.memory.harvest_max_entries` (stops accepting
+/// `is_temporary_or_generic` is dropped; a body that looks credential-shaped
+/// (`harvest_candidate_credential_match`, checked against the RAW body here,
+/// BEFORE truncation) is dropped -- issue #172 cross-review: this filter
+/// used to truncate first and let `write_durable`'s own credential check run
+/// only on the ALREADY-truncated body, so a long credential straddling the
+/// truncation boundary could be sheared down to a tail too short for
+/// `review::detect_token_shape`'s length gates and land, partially, in the
+/// repo-committed bank -- the check now runs where `upsert_shared` itself
+/// already gets the order right: guard first, truncate second; the body is
+/// then truncated to `cfg.memory.max_entry_bytes` (the same per-entry cap
+/// every other entry in this store gets) and dropped entirely if truncation
+/// leaves nothing but whitespace. Only survivors count against the two NEW
+/// per-session caps issue #37 asks for: `cfg.memory.harvest_max_entries` (stops accepting
 /// once reached, keeping the model's own answer order as a priority order)
 /// and `cfg.memory.harvest_max_bytes` (a cumulative budget over
 /// every accepted body; a single candidate that alone would blow the
@@ -1501,6 +1691,9 @@ pub fn filter_durable_candidates(
             continue;
         }
         if is_temporary_or_generic(body) {
+            continue;
+        }
+        if harvest_candidate_credential_match(key, body).is_some() {
             continue;
         }
         let body = crate::utils::truncate_bytes(body.clone(), Some(cfg.memory.max_entry_bytes));
@@ -1593,6 +1786,23 @@ fn write_durable(
             tags: Vec::new(),
             paths: Vec::new(),
         };
+        if let Some(matched) = sensitive_shared_match(&entry) {
+            let _ = super::log::append(
+                state,
+                &super::log::Decision {
+                    ts: now,
+                    session: "n/a",
+                    verb: "memory",
+                    verdict: "n/a",
+                    score: 0,
+                    action: "harvest-skipped",
+                    detail: &format!(
+                        "'{key}' looks credential-shaped ({matched}); refusing to harvest it into the shared bank"
+                    ),
+                },
+            );
+            continue;
+        }
         upsert_scoped(MemoryScope::Shared, repo, state, slug, cfg, &entry)?;
         written += 1;
     }
@@ -1629,6 +1839,32 @@ pub fn harvest_durable(
     let answer =
         super::handoff::run_model(adapter, model, &durable_harvest_prompt(handoff), timeout)?;
     let candidates = parse_harvest(&answer);
+    // Logged here, against the RAW candidates, rather than inside the pure
+    // `filter_durable_candidates` (which drops a credential-shaped candidate
+    // silently, the same as its other reject categories): this is the one
+    // place in the harvest pipeline with both `state` (to log) and the
+    // model's un-truncated answer still in hand, so the skip is observable
+    // (`harvest-skipped`, the same idiom `write_durable`'s own credential
+    // check and already-explicit-key skip already use) rather than a silent
+    // drop the operator has no way to notice.
+    for (key, body) in &candidates {
+        if let Some(matched) = harvest_candidate_credential_match(key, body) {
+            let _ = super::log::append(
+                state,
+                &super::log::Decision {
+                    ts: now_secs(),
+                    session: "n/a",
+                    verb: "memory",
+                    verdict: "n/a",
+                    score: 0,
+                    action: "harvest-skipped",
+                    detail: &format!(
+                        "'{key}' looks credential-shaped ({matched}); refusing to harvest it into the shared bank"
+                    ),
+                },
+            );
+        }
+    }
     let accepted = filter_durable_candidates(&candidates, cfg);
     let written = write_durable(repo, state, slug, &accepted, cfg, now_secs())?;
     // Issue #87: a one-line summary on the `zirv ▸` channel every time a
@@ -1703,6 +1939,27 @@ pub struct RememberArgs {
     /// stamp rather than requiring new text.
     #[arg(long, default_value_t = false)]
     pub verify: bool,
+    /// Write (or, with `--verify`, refresh) this fact in the shared,
+    /// repository-owned bank at `<repo>/.zirv/memory/<key>.md` instead of
+    /// the private, machine-local one (issue #172). Committed with the
+    /// repository, so it follows whichever branch it was written on until
+    /// that branch merges -- see `zirv ctx recall`'s `[local]`/`[repo]`
+    /// labels. Storing new text is gated the same way `zirv memory remember
+    /// --shared` already is: `cfg.memory.enabled && cfg.memory.
+    /// shared_enabled` (`upsert_shared`). `--verify` alone is NOT gated on
+    /// `shared_enabled` -- it routes through `verify_scoped`, which
+    /// deliberately never consults the shared gate (the same
+    /// must-not-trap-data rule `forget_scoped` follows: disabling a scope
+    /// can refuse new writes but must never block reading back or
+    /// refreshing what is already there).
+    #[arg(long, default_value_t = false)]
+    pub repo: bool,
+    /// Store into the shared bank even though its key or body looks
+    /// credential-shaped (`memory::sensitive_shared_match`). Has no effect
+    /// without `--repo`, and no effect on the private bank, which the guard
+    /// never inspects at all.
+    #[arg(long, default_value_t = false)]
+    pub allow_sensitive: bool,
     /// NOT a CLI flag on `zirv ctx remember` -- `#[arg(skip)]` always
     /// leaves this at its default (`None`) here. `zirv memory remember`'s
     /// private arm (`memory_cli.rs`, the only surface with `--importance`)
@@ -1739,6 +1996,12 @@ pub struct ForgetArgs {
     /// Remove every entry in this repository's memory bank.
     #[arg(long, default_value_t = false)]
     pub all: bool,
+    /// Forget from the shared, repository-owned bank (`<repo>/.zirv/memory/`)
+    /// instead of the private, machine-local one (issue #172). Not
+    /// supported together with `--all`, since `forget_all` only ever clears
+    /// the private bank.
+    #[arg(long, default_value_t = false)]
+    pub repo: bool,
 }
 
 /// `env(key)`, treating a missing or blank value as `"unknown"` -- the same
@@ -1789,14 +2052,24 @@ pub fn run_remember_with<W: Write>(
 
     let state = StateDir::resolve(env)?;
     let slug = repo_slug(repo);
+    let scope = MemoryScope::of(args.repo);
+    let bank_label = ctx_scope_label(scope);
 
     match resolve_remember(args, stdin)? {
         RememberIntent::VerifyOnly => {
-            if verify(&state, &slug, &args.key)? {
-                writeln!(w, "zirv ctx remember: verified '{}'", args.key)?;
+            if verify_scoped(scope, repo, &state, &slug, &args.key)? {
+                writeln!(
+                    w,
+                    "zirv ctx remember: verified '{}' in the {bank_label} bank",
+                    args.key
+                )?;
                 Ok(0)
             } else {
-                Err(format!("zirv ctx remember: no entry for key '{}'", args.key).into())
+                Err(format!(
+                    "zirv ctx remember: no entry for key '{}' in the {bank_label} bank",
+                    args.key
+                )
+                .into())
             }
         }
         RememberIntent::Store(body) => {
@@ -1823,10 +2096,15 @@ pub fn run_remember_with<W: Write>(
                 // exists to set it yet.
                 paths: Vec::new(),
             };
-            let path = remember(&state, &slug, &entry, &cfg)?;
+            let path = if scope == MemoryScope::Shared && args.allow_sensitive {
+                upsert_shared_allow_sensitive(repo, &state, &slug, &cfg, &entry)
+            } else {
+                upsert_scoped(scope, repo, &state, &slug, &cfg, &entry)
+            }
+            .map_err(|e| format!("zirv ctx remember: {e}"))?;
             writeln!(
                 w,
-                "zirv ctx remember: stored '{}' at {}",
+                "zirv ctx remember: stored '{}' in the {bank_label} bank at {}",
                 args.key,
                 path.display()
             )?;
@@ -1839,6 +2117,31 @@ pub fn run_remember<W: Write>(args: &RememberArgs, w: &mut W) -> CtxResult<i32> 
     let repo = std::env::current_dir()?;
     let env = env_from_process();
     run_remember_with(args, w, &repo, &env, &mut std::io::stdin())
+}
+
+/// Provenance label `zirv ctx remember`/`recall`/`forget` show for a scope
+/// -- `"local"`/`"repo"`, since those verbs name the flag `--repo`. A
+/// different vocabulary from `zirv memory`'s own `"private"`/`"shared"`
+/// (`memory_cli.rs`'s own `scope_label`, which names its flag `--shared`
+/// instead) -- centralizing `MemoryScope::of` (issue #172 cross-review
+/// finding 6) does not force the two surfaces to share wording, only the
+/// bool-to-scope mapping underneath it.
+fn ctx_scope_label(scope: MemoryScope) -> &'static str {
+    match scope {
+        MemoryScope::Private => "local",
+        MemoryScope::Shared => "repo",
+    }
+}
+
+/// The extra clause `zirv ctx recall` appends to a shared entry's
+/// human-readable line, warning that it is repository-owned, untrusted
+/// content rather than something this operator verified -- never shown for
+/// a private entry, which by definition never left this machine.
+fn ctx_scope_trust_note(scope: MemoryScope) -> &'static str {
+    match scope {
+        MemoryScope::Shared => " -- repo: repository-owned content, not operator-verified",
+        MemoryScope::Private => "",
+    }
 }
 
 pub fn run_recall_with<W: Write>(
@@ -1856,10 +2159,19 @@ pub fn run_recall_with<W: Write>(
 
     let state = StateDir::resolve(env)?;
     let slug = repo_slug(repo);
-    let mut entries: Vec<Entry> = list(&state, &slug)?.into_iter().map(|(_, e)| e).collect();
+    let mut entries: Vec<(Entry, MemoryScope)> =
+        list_scoped(MemoryScope::Private, repo, &state, &slug, &cfg)?
+            .into_iter()
+            .map(|(_, e)| (e, MemoryScope::Private))
+            .collect();
+    entries.extend(
+        list_scoped(MemoryScope::Shared, repo, &state, &slug, &cfg)?
+            .into_iter()
+            .map(|(_, e)| (e, MemoryScope::Shared)),
+    );
 
     if let Some(key) = &args.key {
-        entries.retain(|entry| &entry.key == key);
+        entries.retain(|(entry, _)| &entry.key == key);
     }
     if let Some(days) = args.stale {
         // Saturating, not plain multiplication: `--stale` is an operator-typed
@@ -1867,20 +2179,26 @@ pub fn run_recall_with<W: Write>(
         // a debug build, a wrapped (tiny) threshold in a release one, which
         // silently reported every entry as fresh.
         let threshold = now_secs().saturating_sub(days.saturating_mul(86_400));
-        entries.retain(|entry| entry.verified < threshold);
+        entries.retain(|(entry, _)| entry.verified < threshold);
     }
 
-    for entry in &entries {
+    for (entry, scope) in &entries {
+        let label = ctx_scope_label(*scope);
         if args.json {
-            writeln!(w, "{}", serde_json::to_string(entry)?)?;
+            let scoped = ScopedEntry {
+                entry,
+                scope: label,
+            };
+            writeln!(w, "{}", serde_json::to_string(&scoped)?)?;
         } else {
             let now = now_secs();
             let written_days = now.saturating_sub(entry.written) / 86_400;
             let verified_days = now.saturating_sub(entry.verified) / 86_400;
+            let trust_note = ctx_scope_trust_note(*scope);
             writeln!(
                 w,
-                "{} (written {}d ago, verified {}d ago)\n{}\n",
-                entry.key, written_days, verified_days, entry.body
+                "{} [{label}{trust_note}] (written {written_days}d ago, verified {verified_days}d ago)\n{}\n",
+                entry.key, entry.body
             )?;
         }
     }
@@ -1906,6 +2224,12 @@ pub fn run_forget_with<W: Write>(
     let slug = repo_slug(repo);
 
     if args.all {
+        if args.repo {
+            return Err(
+                "zirv ctx forget: --all clears only the local bank; pass a --key with --repo to remove one shared entry instead"
+                    .into(),
+            );
+        }
         forget_all(&state, &slug)?;
         writeln!(w, "zirv ctx forget: cleared the memory bank")?;
         return Ok(0);
@@ -1913,10 +2237,18 @@ pub fn run_forget_with<W: Write>(
     let Some(key) = &args.key else {
         return Err("zirv ctx forget: pass a key, or --all".into());
     };
-    if forget(&state, &slug, key)? {
-        writeln!(w, "zirv ctx forget: removed '{key}'")?;
+    let scope = MemoryScope::of(args.repo);
+    let bank_label = ctx_scope_label(scope);
+    if forget_scoped(scope, repo, &state, &slug, key)? {
+        writeln!(
+            w,
+            "zirv ctx forget: removed '{key}' from the {bank_label} bank"
+        )?;
     } else {
-        writeln!(w, "zirv ctx forget: no entry for '{key}'")?;
+        writeln!(
+            w,
+            "zirv ctx forget: no entry for '{key}' in the {bank_label} bank"
+        )?;
     }
     Ok(0)
 }
@@ -2012,7 +2344,7 @@ mod tests {
             written,
             verified: written,
             source: "explicit".to_string(),
-            body: "the staging DB creds live in 1Password.".to_string(),
+            body: "the build must pass locally before every release.".to_string(),
             importance: None,
             confidence: None,
             tags: Vec::new(),
@@ -2102,6 +2434,38 @@ This should not appear in the body.\n";
 
         let path = remember(&state, "-work-repo", &entry, &cfg)
             .expect("remember must not fail on oversize");
+        let stored = parse_markdown(&std::fs::read_to_string(&path).expect("read"));
+        assert!(
+            stored.body.len() <= 50,
+            "body respects the cap: {} bytes",
+            stored.body.len()
+        );
+        assert!(
+            stored.body.ends_with("[truncated]"),
+            "says it was truncated: {}",
+            stored.body
+        );
+    }
+
+    #[test]
+    fn upsert_scoped_shared_truncates_an_oversized_body_to_the_cap_like_the_private_path() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let mut cfg = CtxConfig::default();
+        cfg.memory.max_entry_bytes = 50;
+
+        let mut entry = sample("huge-shared", 1);
+        entry.body = "x".repeat(500);
+
+        let path = upsert_scoped(
+            MemoryScope::Shared,
+            repo.path(),
+            &state,
+            "-irrelevant",
+            &cfg,
+            &entry,
+        )
+        .expect("upsert_scoped must not fail on oversize");
         let stored = parse_markdown(&std::fs::read_to_string(&path).expect("read"));
         assert!(
             stored.body.len() <= 50,
@@ -2660,6 +3024,118 @@ This should not appear in the body.\n";
     }
 
     #[test]
+    fn ctx_recall_merges_both_banks_and_labels_each_entrys_provenance() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state_dir = repo.path().join("state");
+        let state = StateDir::from_root(state_dir.clone());
+        let cfg = CtxConfig::default();
+        let slug = repo_slug(repo.path());
+
+        let mut local = sample("local-fact", 1);
+        local.body = "only ever lives on this machine".to_string();
+        remember(&state, &slug, &local, &cfg).expect("remember private");
+
+        let mut shared = sample("repo-fact", 2);
+        shared.body = "travels with the branch".to_string();
+        upsert_scoped(
+            MemoryScope::Shared,
+            repo.path(),
+            &state,
+            &slug,
+            &cfg,
+            &shared,
+        )
+        .expect("upsert shared");
+
+        let env = env_map(&[(state::STATE_ENV, state_dir.to_str().expect("utf8"))]);
+        let args = RecallArgs {
+            key: None,
+            stale: None,
+            json: false,
+        };
+        let mut out = Vec::new();
+        run_recall_with(&args, &mut out, repo.path(), &|k| env.get(k).cloned()).expect("recall");
+        let text = String::from_utf8(out).expect("utf8");
+
+        let local_at = text.find("local-fact").expect("local entry present");
+        let repo_at = text.find("repo-fact").expect("repo entry present");
+        assert!(
+            local_at < repo_at,
+            "local entries are listed before repo ones: {text}"
+        );
+        assert!(text.contains("[local]"), "got {text}");
+        assert!(text.contains("[repo --"), "got {text}");
+    }
+
+    #[test]
+    fn ctx_recall_json_includes_a_scope_field_for_each_entry() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state_dir = repo.path().join("state");
+        let state = StateDir::from_root(state_dir.clone());
+        let cfg = CtxConfig::default();
+        let slug = repo_slug(repo.path());
+
+        upsert_scoped(
+            MemoryScope::Shared,
+            repo.path(),
+            &state,
+            &slug,
+            &cfg,
+            &sample("repo-fact", 1),
+        )
+        .expect("upsert shared");
+
+        let env = env_map(&[(state::STATE_ENV, state_dir.to_str().expect("utf8"))]);
+        let args = RecallArgs {
+            key: None,
+            stale: None,
+            json: true,
+        };
+        let mut out = Vec::new();
+        run_recall_with(&args, &mut out, repo.path(), &|k| env.get(k).cloned()).expect("recall");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(text.contains("\"scope\":\"repo\""), "got {text}");
+    }
+
+    #[test]
+    fn ctx_recall_with_key_shows_the_local_entry_before_the_repo_entry_for_the_same_key() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state_dir = repo.path().join("state");
+        let state = StateDir::from_root(state_dir.clone());
+        let cfg = CtxConfig::default();
+        let slug = repo_slug(repo.path());
+
+        let mut local = sample("shared-key-name", 1);
+        local.body = "local version of the fact".to_string();
+        remember(&state, &slug, &local, &cfg).expect("remember private");
+
+        let mut shared = sample("shared-key-name", 2);
+        shared.body = "repo version of the fact".to_string();
+        upsert_scoped(
+            MemoryScope::Shared,
+            repo.path(),
+            &state,
+            &slug,
+            &cfg,
+            &shared,
+        )
+        .expect("upsert shared");
+
+        let env = env_map(&[(state::STATE_ENV, state_dir.to_str().expect("utf8"))]);
+        let args = RecallArgs {
+            key: Some("shared-key-name".to_string()),
+            stale: None,
+            json: false,
+        };
+        let mut out = Vec::new();
+        run_recall_with(&args, &mut out, repo.path(), &|k| env.get(k).cloned()).expect("recall");
+        let text = String::from_utf8(out).expect("utf8");
+        let local_at = text.find("local version").expect("local entry present");
+        let repo_at = text.find("repo version").expect("repo entry present");
+        assert!(local_at < repo_at, "local first: {text}");
+    }
+
+    #[test]
     fn remember_records_the_writing_agent_from_the_environment() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let home = tempfile::tempdir().expect("tempdir");
@@ -2674,6 +3150,8 @@ This should not appear in the body.\n";
             text: Some("cargo build --release".to_string()),
             text_file: None,
             verify: false,
+            repo: false,
+            allow_sensitive: false,
             importance: None,
             confidence: None,
             tags: Vec::new(),
@@ -2700,6 +3178,137 @@ This should not appear in the body.\n";
     }
 
     #[test]
+    fn ctx_remember_repo_writes_to_dot_zirv_memory_and_recall_shows_it_labeled_repo() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let state_dir = repo.path().join("state");
+        let env = env_map(&[(state::STATE_ENV, state_dir.to_str().expect("utf8"))]);
+        let mut stdin = std::io::Cursor::new(Vec::<u8>::new());
+
+        let args = RememberArgs {
+            key: "onboarding-doc".to_string(),
+            text: Some("see CONTRIBUTING.md for setup".to_string()),
+            text_file: None,
+            verify: false,
+            repo: true,
+            allow_sensitive: false,
+            importance: None,
+            confidence: None,
+            tags: Vec::new(),
+        };
+        let mut out = Vec::new();
+        run_remember_with(
+            &args,
+            &mut out,
+            repo.path(),
+            &|k| env.get(k).cloned(),
+            &mut stdin,
+        )
+        .expect("remember --repo");
+
+        let path = repo.path().join(".zirv/memory/onboarding-doc.md");
+        assert!(path.is_file(), "expected {}", path.display());
+        assert!(
+            std::fs::read_to_string(&path)
+                .expect("read")
+                .contains("see CONTRIBUTING.md for setup")
+        );
+    }
+
+    #[test]
+    fn ctx_remember_repo_refuses_when_shared_enabled_is_false() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let state_dir = repo.path().join("state");
+        let env = env_map(&[
+            (state::STATE_ENV, state_dir.to_str().expect("utf8")),
+            ("ZIRV_CTX_MEMORY_SHARED", "false"),
+        ]);
+        let mut stdin = std::io::Cursor::new(Vec::<u8>::new());
+        let args = RememberArgs {
+            key: "onboarding-doc".to_string(),
+            text: Some("see CONTRIBUTING.md for setup".to_string()),
+            text_file: None,
+            verify: false,
+            repo: true,
+            allow_sensitive: false,
+            importance: None,
+            confidence: None,
+            tags: Vec::new(),
+        };
+        let mut out = Vec::new();
+        let err = run_remember_with(
+            &args,
+            &mut out,
+            repo.path(),
+            &|k| env.get(k).cloned(),
+            &mut stdin,
+        )
+        .expect_err("shared_enabled = false must refuse the write");
+        assert!(err.to_string().contains("shared_enabled"), "got {err}");
+    }
+
+    #[test]
+    fn ctx_remember_verify_repo_refreshes_the_shared_entrys_stamp() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let state_dir = repo.path().join("state");
+        let state = StateDir::from_root(state_dir.clone());
+        let cfg = CtxConfig::default();
+        let slug = repo_slug(repo.path());
+
+        let mut entry = sample("onboarding-doc", 1_700_000_000);
+        entry.verified = 1_700_000_000;
+        upsert_scoped(
+            MemoryScope::Shared,
+            repo.path(),
+            &state,
+            &slug,
+            &cfg,
+            &entry,
+        )
+        .expect("seed shared");
+
+        let env = env_map(&[(state::STATE_ENV, state_dir.to_str().expect("utf8"))]);
+        let args = RememberArgs {
+            key: "onboarding-doc".to_string(),
+            text: None,
+            text_file: None,
+            verify: true,
+            repo: true,
+            allow_sensitive: false,
+            importance: None,
+            confidence: None,
+            tags: Vec::new(),
+        };
+        let mut out = Vec::new();
+        let mut stdin = std::io::Cursor::new(Vec::<u8>::new());
+        run_remember_with(
+            &args,
+            &mut out,
+            repo.path(),
+            &|k| env.get(k).cloned(),
+            &mut stdin,
+        )
+        .expect("verify-only remember --repo");
+
+        let refreshed = get_scoped(
+            MemoryScope::Shared,
+            repo.path(),
+            &state,
+            &slug,
+            &cfg,
+            "onboarding-doc",
+        )
+        .expect("get")
+        .expect("present");
+        assert!(refreshed.verified > 1_700_000_000, "verified was refreshed");
+    }
+
+    #[test]
     fn remember_with_verify_and_no_text_only_refreshes_the_stamp() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let home = tempfile::tempdir().expect("tempdir");
@@ -2718,6 +3327,8 @@ This should not appear in the body.\n";
             text: None,
             text_file: None,
             verify: true,
+            repo: false,
+            allow_sensitive: false,
             importance: None,
             confidence: None,
             tags: Vec::new(),
@@ -2765,6 +3376,8 @@ This should not appear in the body.\n";
             text: Some("should not be stored".to_string()),
             text_file: None,
             verify: false,
+            repo: false,
+            allow_sensitive: false,
             importance: None,
             confidence: None,
             tags: Vec::new(),
@@ -2800,6 +3413,7 @@ This should not appear in the body.\n";
         let forget_args = ForgetArgs {
             key: Some("build-cmd".to_string()),
             all: false,
+            repo: false,
         };
         let mut forget_out = Vec::new();
         run_forget_with(&forget_args, &mut forget_out, tmp.path(), &|k| {
@@ -2820,11 +3434,66 @@ This should not appear in the body.\n";
         let args = ForgetArgs {
             key: None,
             all: false,
+            repo: false,
         };
         let mut out = Vec::new();
         let err = run_forget_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned())
             .expect_err("neither a key nor --all was given");
         assert!(err.to_string().contains("--all"), "got {err}");
+    }
+
+    #[test]
+    fn ctx_forget_repo_removes_a_shared_entry_without_touching_the_local_one() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state_dir = repo.path().join("state");
+        let state = StateDir::from_root(state_dir.clone());
+        let cfg = CtxConfig::default();
+        let slug = repo_slug(repo.path());
+
+        remember(&state, &slug, &sample("build-cmd", 1), &cfg).expect("remember private");
+        upsert_scoped(
+            MemoryScope::Shared,
+            repo.path(),
+            &state,
+            &slug,
+            &cfg,
+            &sample("build-cmd", 1),
+        )
+        .expect("upsert shared");
+
+        let env = env_map(&[(state::STATE_ENV, state_dir.to_str().expect("utf8"))]);
+        let args = ForgetArgs {
+            key: Some("build-cmd".to_string()),
+            all: false,
+            repo: true,
+        };
+        let mut out = Vec::new();
+        run_forget_with(&args, &mut out, repo.path(), &|k| env.get(k).cloned()).expect("forget");
+
+        assert!(
+            !repo.path().join(".zirv/memory/build-cmd.md").exists(),
+            "the shared entry must be removed"
+        );
+        assert!(
+            get(&state, &slug, "build-cmd").expect("get").is_some(),
+            "the local entry must be untouched"
+        );
+    }
+
+    #[test]
+    fn ctx_forget_all_with_repo_is_refused() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state_dir = repo.path().join("state");
+        let env = env_map(&[(state::STATE_ENV, state_dir.to_str().expect("utf8"))]);
+        let args = ForgetArgs {
+            key: None,
+            all: true,
+            repo: true,
+        };
+        let mut out = Vec::new();
+        let err = run_forget_with(&args, &mut out, repo.path(), &|k| env.get(k).cloned())
+            .expect_err("--all --repo is not supported");
+        assert!(err.to_string().contains("--repo"), "got {err}");
     }
 
     // N5/issue #34: the memory prompt layer's own source, `render_for_prompt`
@@ -3167,13 +3836,66 @@ This should not appear in the body.\n";
 
     #[test]
     fn filter_accepts_a_genuinely_durable_fact() {
+        // Key and body are deliberately guard-safe (issue #172 cross-review:
+        // filter_durable_candidates now also runs the shared-scope
+        // credential guard, so a key/body that merely SOUNDS like it might
+        // hold a secret -- without this fixture ever intending to test that
+        // -- would otherwise make this "accepts a fine fact" test fail for
+        // an unrelated reason; the guard itself has its own dedicated tests
+        // below).
         let cfg = CtxConfig::default();
         let candidates = vec![(
-            "staging-db-creds".to_string(),
-            "The staging DB creds live in 1Password under staging-db.".to_string(),
+            "release-runbook".to_string(),
+            "The release runbook lives in the internal wiki under docs.".to_string(),
         )];
         let accepted = filter_durable_candidates(&candidates, &cfg);
         assert_eq!(accepted.len(), 1, "a real fact must survive: {accepted:?}");
+    }
+
+    #[test]
+    fn filter_drops_a_credential_that_truncation_would_otherwise_shear_below_the_token_shape_gate()
+    {
+        // Issue #172 cross-review: a real bypass. `filter_durable_candidates`
+        // used to truncate every body to `max_entry_bytes` BEFORE anything
+        // downstream (`write_durable`'s own credential check) ever looked at
+        // it, so a long credential straddling the truncation boundary got
+        // sheared down to a tail too short for `review::detect_token_shape`'s
+        // length gates (`sk-[A-Za-z0-9_-]{20,}`) to fire, and the truncated
+        // remnant landed in the repo-committed shared bank anyway. This is
+        // the exact scenario the reviewer proved it with: a 533-byte body of
+        // 500 filler bytes followed by a 33-byte `sk-`-shaped secret, with
+        // `max_entry_bytes = 512` -- truncating first leaves only `sk-` plus
+        // 9 of the secret's 30 characters, well under the 20-character
+        // minimum the regex requires, so the old code accepted it.
+        let mut cfg = CtxConfig::default();
+        cfg.memory.max_entry_bytes = 512;
+        let secret = format!("sk-{}", "B".repeat(30));
+        assert_eq!(
+            secret.len(),
+            33,
+            "sanity: the secret alone is unambiguously token-shaped"
+        );
+        // The token-shape regex is deliberately anchored (see
+        // `review::TOKEN_SHAPE_RE`'s own doc comment) so it cannot fire in
+        // the middle of an ordinary word: the character immediately before
+        // `sk-` must not itself be alphanumeric. The filler therefore ends
+        // in a space, not another letter, so the FULL (untruncated) body is
+        // unambiguously token-shaped -- the point under test is truncation
+        // order, not the anchor rule itself.
+        let filler = format!("{} ", "a".repeat(499));
+        let body = format!("{filler}{secret}");
+        assert_eq!(
+            body.len(),
+            533,
+            "sanity: matches the reviewer's boundary-shear scenario"
+        );
+
+        let candidates = vec![("infra-notes".to_string(), body)];
+        let accepted = filter_durable_candidates(&candidates, &cfg);
+        assert!(
+            accepted.is_empty(),
+            "a credential-shaped candidate must never survive truncation into the accepted list: {accepted:?}"
+        );
     }
 
     #[test]
@@ -3453,12 +4175,12 @@ This should not appear in the body.\n";
         let cfg = CtxConfig::default();
 
         let explicit = Entry {
-            key: "staging-db-creds".to_string(),
+            key: "release-runbook".to_string(),
             written_by: "claude".to_string(),
             written: 1_000,
             verified: 1_000,
             source: "explicit".to_string(),
-            body: "the staging DB creds live in 1Password.".to_string(),
+            body: "the release runbook lives in the internal wiki.".to_string(),
             importance: None,
             confidence: None,
             tags: Vec::new(),
@@ -3490,8 +4212,8 @@ This should not appear in the body.\n";
 
         let accepted = vec![
             (
-                "staging-db-creds".to_string(),
-                "creds moved to Vault under staging-db (inferred)".to_string(),
+                "release-runbook".to_string(),
+                "runbook moved to the new wiki space (inferred)".to_string(),
             ),
             ("build-cmd".to_string(), "cargo build --release".to_string()),
         ];
@@ -3505,7 +4227,7 @@ This should not appear in the body.\n";
             &state,
             "-work-repo",
             &cfg,
-            "staging-db-creds",
+            "release-runbook",
         )
         .expect("read")
         .expect("still there");
@@ -3687,6 +4409,90 @@ This should not appear in the body.\n";
         assert_ne!(
             build_cmd[0].1.body, "cargo build",
             "the body was refreshed too"
+        );
+    }
+
+    /// e2e (issue #172 cross-review finding 5): the skip-and-log path in
+    /// `write_durable` was, until this test, only exercised against
+    /// hand-built `Vec`s in `write_durable_skips_a_credential_shaped_
+    /// candidate_but_still_writes_the_rest`. This drives the same guard
+    /// through a real model call instead -- `fake-model.sh`'s
+    /// `harvest_with_credential` mode answers with a credential-shaped line
+    /// mixed in among two well-formed ones, the same shape a real model
+    /// could plausibly propose on its own -- so the harvest boundary itself,
+    /// not just the unit-level helper, is proven to skip it.
+    #[cfg(unix)]
+    #[test]
+    fn a_harvest_skips_a_credential_shaped_line_from_the_model_but_still_writes_the_rest() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let mut cfg = CtxConfig::default();
+        cfg.memory.harvest = true;
+        let adapter = fake_model_adapter();
+
+        let _mode = crate::commands::ctx::testenv::VarGuard::set(&[(
+            "FAKE_MODEL_MODE",
+            Some("harvest_with_credential"),
+        )]);
+        let count = harvest_durable(
+            &adapter,
+            "haiku",
+            &sample_handoff(),
+            repo.path(),
+            &state,
+            "-work-repo",
+            &cfg,
+        )
+        .expect("harvests");
+
+        assert_eq!(count, 2, "the credential-shaped line is skipped: {count}");
+        assert!(
+            get_scoped(
+                MemoryScope::Shared,
+                repo.path(),
+                &state,
+                "-work-repo",
+                &cfg,
+                "build-cmd"
+            )
+            .expect("get")
+            .is_some(),
+            "the well-formed fact before the credential line still lands"
+        );
+        assert!(
+            get_scoped(
+                MemoryScope::Shared,
+                repo.path(),
+                &state,
+                "-work-repo",
+                &cfg,
+                "release-runbook"
+            )
+            .expect("get")
+            .is_some(),
+            "the well-formed fact after the credential line still lands"
+        );
+        assert!(
+            get_scoped(
+                MemoryScope::Shared,
+                repo.path(),
+                &state,
+                "-work-repo",
+                &cfg,
+                "staging-db-creds"
+            )
+            .expect("get")
+            .is_none(),
+            "the credential-shaped candidate must never be written"
+        );
+
+        let log = std::fs::read_to_string(state.logs().join("decisions.jsonl")).expect("log");
+        assert!(
+            log.contains("harvest-skipped")
+                && log.contains("staging-db-creds")
+                && log.contains("credential"),
+            "the skip must be visible in the decision log: {log}"
         );
     }
 
@@ -4200,12 +5006,322 @@ This should not appear in the body.\n";
             &state,
             "-irrelevant",
             &cfg,
-            &sample("staging-db-creds", 2),
+            &sample("deploy-notes", 2),
         )
         .expect("upsert b");
 
         assert!(dir.join("build-cmd.md").exists());
-        assert!(dir.join("staging-db-creds.md").exists());
+        assert!(dir.join("deploy-notes.md").exists());
+    }
+
+    #[test]
+    fn upsert_scoped_shared_refuses_a_key_that_looks_credential_shaped() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let cfg = CtxConfig::default();
+        let mut entry = sample("staging-db-creds", 1);
+        entry.body = "see the ops runbook for details.".to_string();
+
+        let err = upsert_scoped(
+            MemoryScope::Shared,
+            repo.path(),
+            &state,
+            "-irrelevant",
+            &cfg,
+            &entry,
+        )
+        .expect_err("a key containing 'creds' must be refused");
+        assert!(err.to_string().contains("credential"), "got {err}");
+        assert!(
+            !repo
+                .path()
+                .join(".zirv/memory/staging-db-creds.md")
+                .exists(),
+            "nothing must be written when the guard refuses"
+        );
+    }
+
+    #[test]
+    fn upsert_scoped_shared_refuses_a_body_containing_a_denylisted_term() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let cfg = CtxConfig::default();
+        let mut entry = sample("deploy-notes", 1);
+        entry.body = "the deploy token is rotated weekly.".to_string();
+
+        let err = upsert_scoped(
+            MemoryScope::Shared,
+            repo.path(),
+            &state,
+            "-irrelevant",
+            &cfg,
+            &entry,
+        )
+        .expect_err("a body containing 'token' must be refused");
+        assert!(err.to_string().contains("credential"), "got {err}");
+    }
+
+    #[test]
+    fn upsert_scoped_shared_refuses_a_body_containing_a_pem_private_key_block() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let cfg = CtxConfig::default();
+        let mut entry = sample("deploy-key-notes", 1);
+        entry.body =
+            "-----BEGIN RSA PRIVATE KEY-----\nMIIBOgIBAAJBAK\n-----END RSA PRIVATE KEY-----"
+                .to_string();
+
+        let err = upsert_scoped(
+            MemoryScope::Shared,
+            repo.path(),
+            &state,
+            "-irrelevant",
+            &cfg,
+            &entry,
+        )
+        .expect_err("a PEM private-key block must be refused");
+        assert!(err.to_string().contains("credential"), "got {err}");
+    }
+
+    #[test]
+    fn upsert_scoped_shared_refuses_a_body_containing_an_aws_or_github_token_shape() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let cfg = CtxConfig::default();
+
+        let mut aws_entry = sample("infra-notes", 1);
+        aws_entry.body = "rotate AKIAABCDEFGHIJKLMNOP if it leaks.".to_string();
+        let err = upsert_scoped(
+            MemoryScope::Shared,
+            repo.path(),
+            &state,
+            "-irrelevant",
+            &cfg,
+            &aws_entry,
+        )
+        .expect_err("an AWS-shaped access key id must be refused");
+        assert!(err.to_string().contains("credential"), "got {err}");
+
+        let mut gh_entry = sample("ci-notes", 2);
+        gh_entry.body = "old value was ghp_abcdefghijklmnopqrstuvwxyz0123456789.".to_string();
+        let err = upsert_scoped(
+            MemoryScope::Shared,
+            repo.path(),
+            &state,
+            "-irrelevant",
+            &cfg,
+            &gh_entry,
+        )
+        .expect_err("a GitHub-shaped token must be refused");
+        assert!(err.to_string().contains("credential"), "got {err}");
+    }
+
+    #[test]
+    fn upsert_scoped_shared_refuses_a_tag_that_looks_credential_shaped() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let cfg = CtxConfig::default();
+        let mut entry = sample("deploy-notes", 1);
+        entry.tags = vec!["password:hunter2".to_string()];
+
+        let err = upsert_scoped(
+            MemoryScope::Shared,
+            repo.path(),
+            &state,
+            "-irrelevant",
+            &cfg,
+            &entry,
+        )
+        .expect_err("a tag containing 'password' must be refused");
+        assert!(err.to_string().contains("credential"), "got {err}");
+        assert!(
+            !repo.path().join(".zirv/memory/deploy-notes.md").exists(),
+            "nothing must be written when the guard refuses"
+        );
+
+        let path = upsert_shared_allow_sensitive(repo.path(), &state, "-irrelevant", &cfg, &entry)
+            .expect("--allow-sensitive must permit a flagged tag through too");
+        assert!(path.is_file());
+    }
+
+    #[test]
+    fn upsert_scoped_shared_refuses_a_key_that_is_itself_a_token_shape() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let cfg = CtxConfig::default();
+        // `sk-...` is valid lowercase-kebab-case (issue #172 cross-review
+        // finding 7): the deny-list alone never sees this, only
+        // `review::detect_token_shape`'s regex does, and only once the guard
+        // runs it over the key field too, not just the body.
+        let mut entry = sample("sk-abcdefghijklmnopqrstuv", 1);
+        entry.body = "an ordinary, unremarkable fact.".to_string();
+
+        let err = upsert_scoped(
+            MemoryScope::Shared,
+            repo.path(),
+            &state,
+            "-irrelevant",
+            &cfg,
+            &entry,
+        )
+        .expect_err("a key shaped like an OpenAI-style secret must be refused");
+        assert!(err.to_string().contains("credential"), "got {err}");
+
+        let path = upsert_shared_allow_sensitive(repo.path(), &state, "-irrelevant", &cfg, &entry)
+            .expect("--allow-sensitive must permit a flagged key through too");
+        assert!(path.is_file());
+    }
+
+    #[test]
+    fn upsert_shared_allow_sensitive_bypasses_the_credential_guard() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let cfg = CtxConfig::default();
+        let mut entry = sample("staging-db-creds", 1);
+        entry.body = "see the ops runbook for details.".to_string();
+
+        let path = upsert_shared_allow_sensitive(repo.path(), &state, "-irrelevant", &cfg, &entry)
+            .expect("an explicit override must be allowed to write it anyway");
+        assert!(path.is_file());
+        assert!(
+            path.ends_with("staging-db-creds.md"),
+            "got {}",
+            path.display()
+        );
+    }
+
+    #[test]
+    fn upsert_scoped_private_never_consults_the_shared_credential_guard() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let cfg = CtxConfig::default();
+        let mut entry = sample("staging-db-creds", 1);
+        entry.body = "the token rotates weekly.".to_string();
+
+        let path = upsert_scoped(
+            MemoryScope::Private,
+            repo.path(),
+            &state,
+            "-irrelevant",
+            &cfg,
+            &entry,
+        )
+        .expect("the private scope never runs the shared-only credential guard");
+        assert!(path.is_file());
+    }
+
+    #[test]
+    fn write_durable_skips_a_credential_shaped_candidate_but_still_writes_the_rest() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let cfg = CtxConfig::default();
+
+        let accepted = vec![
+            ("build-cmd".to_string(), "cargo build --release".to_string()),
+            (
+                "staging-db-creds".to_string(),
+                "the staging DB creds live in 1Password.".to_string(),
+            ),
+            (
+                "deploy-notes".to_string(),
+                "deploy with zirv ctx exec".to_string(),
+            ),
+        ];
+        let written = write_durable(repo.path(), &state, "-work-repo", &accepted, &cfg, 1_000)
+            .expect("write_durable must not abort the whole batch");
+        assert_eq!(
+            written, 2,
+            "the credential-shaped candidate is skipped, the other two land"
+        );
+
+        assert!(
+            get_scoped(
+                MemoryScope::Shared,
+                repo.path(),
+                &state,
+                "-work-repo",
+                &cfg,
+                "build-cmd"
+            )
+            .expect("get")
+            .is_some()
+        );
+        assert!(
+            get_scoped(
+                MemoryScope::Shared,
+                repo.path(),
+                &state,
+                "-work-repo",
+                &cfg,
+                "deploy-notes"
+            )
+            .expect("get")
+            .is_some()
+        );
+        assert!(
+            get_scoped(
+                MemoryScope::Shared,
+                repo.path(),
+                &state,
+                "-work-repo",
+                &cfg,
+                "staging-db-creds"
+            )
+            .expect("get")
+            .is_none(),
+            "the flagged candidate must never be written"
+        );
+    }
+
+    #[test]
+    fn ctx_remember_repo_refuses_a_credential_shaped_key_unless_allow_sensitive_is_set() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let state_dir = repo.path().join("state");
+        let env = env_map(&[(state::STATE_ENV, state_dir.to_str().expect("utf8"))]);
+        let mut stdin = std::io::Cursor::new(Vec::<u8>::new());
+
+        let args = RememberArgs {
+            key: "staging-db-creds".to_string(),
+            text: Some("see the ops runbook for details.".to_string()),
+            text_file: None,
+            verify: false,
+            repo: true,
+            allow_sensitive: false,
+            importance: None,
+            confidence: None,
+            tags: Vec::new(),
+        };
+        let mut out = Vec::new();
+        let err = run_remember_with(
+            &args,
+            &mut out,
+            repo.path(),
+            &|k| env.get(k).cloned(),
+            &mut stdin,
+        )
+        .expect_err("a credential-shaped key must be refused without --allow-sensitive");
+        assert!(err.to_string().contains("credential"), "got {err}");
+
+        let allowed = RememberArgs {
+            allow_sensitive: true,
+            ..args
+        };
+        let mut out2 = Vec::new();
+        run_remember_with(
+            &allowed,
+            &mut out2,
+            repo.path(),
+            &|k| env.get(k).cloned(),
+            &mut stdin,
+        )
+        .expect("--allow-sensitive must permit the write");
+        assert!(
+            repo.path()
+                .join(".zirv/memory/staging-db-creds.md")
+                .is_file()
+        );
     }
 
     /// Acceptance criterion: updating a key updates its stable file rather

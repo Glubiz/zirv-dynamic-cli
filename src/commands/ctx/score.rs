@@ -48,11 +48,13 @@ fn full_score(
     }
     let jsonl = std::fs::read_to_string(transcript)
         .map_err(|e| format!("{}: {e}", transcript.display()))?;
-    Ok(rot::score_events(
-        &adapter.parse_events(&jsonl),
-        adapter.capabilities(),
-        cfg,
-    ))
+    // Issue #155 D1: the whole transcript is in hand here, so the live model
+    // -- if this adapter can state one at all -- is resolved from it and fed
+    // into `capabilities_for_model` rather than the conservative "unstated
+    // model" default `capabilities()` always carries. A `[1m]` claude seat's
+    // real 1M window now reaches rot's token gates on every full parse.
+    let caps = adapter.capabilities_for_model(adapter.model_hint(&jsonl).as_deref());
+    Ok(rot::score_events(&adapter.parse_events(&jsonl), caps, cfg))
 }
 
 /// One-shot scoring, used by the `score` verb itself: no state is kept, so the
@@ -77,6 +79,12 @@ pub struct IncrementalScorer {
     transcript: PathBuf,
     watcher: Watcher,
     state: Option<RotState>,
+    /// Issue #155 D1: the last live model this adapter reported via
+    /// `AgentAdapter::model_hint`, carried across polls. A poll only ever
+    /// sees the bytes appended since the last one, so a chunk that happens
+    /// not to mention a model (e.g. a lone tool-result line) must not read
+    /// as "no model at all" -- it keeps whatever was last resolved.
+    model: Option<String>,
 }
 
 impl IncrementalScorer {
@@ -85,15 +93,23 @@ impl IncrementalScorer {
             watcher: Watcher::new(transcript.clone()),
             transcript,
             state: None,
+            model: None,
         }
     }
 
     /// Resumes from a checkpoint a previous process wrote.
-    fn resuming(transcript: PathBuf, offset: u64, consumed: u64, state: RotState) -> Self {
+    fn resuming(
+        transcript: PathBuf,
+        offset: u64,
+        consumed: u64,
+        state: RotState,
+        model: Option<String>,
+    ) -> Self {
         Self {
             watcher: Watcher::resuming(transcript.clone(), offset, consumed),
             transcript,
             state: Some(state),
+            model,
         }
     }
 
@@ -103,6 +119,10 @@ impl IncrementalScorer {
 
     fn state(&self) -> Option<&RotState> {
         self.state.as_ref()
+    }
+
+    fn model(&self) -> Option<&str> {
+        self.model.as_deref()
     }
 
     /// `None` when the transcript has not changed since the last poll, which
@@ -128,7 +148,20 @@ impl IncrementalScorer {
         };
         if appended.restarted || self.state.as_ref().is_none_or(|s| !s.built_for(cfg)) {
             self.state = RotState::new(cfg);
+            // A restarted (truncated/rewritten) transcript may belong to a
+            // different session entirely -- issue #155 D1 -- so a model
+            // resolved off the old one must not linger past the rebuild.
+            self.model = None;
         }
+        // Issue #155 D1: resolved off the committed lines every poll, newest
+        // wins, kept across polls (see the `model` field's own doc comment).
+        // Read out into a local (rather than calling `self.model()` below)
+        // so this does not hold an immutable borrow of `self` across the
+        // mutable borrow of `self.state` just below it.
+        if let Some(model) = adapter.model_hint(&appended.lines) {
+            self.model = Some(model);
+        }
+        let model = self.model.clone();
         let Some(state) = self.state.as_mut() else {
             // An unbounded window has no bounded state to fold into.
             return full_score(adapter, &self.transcript, cfg).map(Some);
@@ -139,17 +172,27 @@ impl IncrementalScorer {
         // -- a full parse would see it too -- but is never committed to the
         // state, because the next poll reads it again, complete.
         if appended.partial.is_empty() {
-            return Ok(state.score(adapter.capabilities(), cfg));
+            let caps = adapter.capabilities_for_model(model.as_deref());
+            return Ok(state.score(caps, cfg));
         }
         let mut with_partial = state.clone();
         with_partial.feed_all(&adapter.parse_events(&appended.partial));
-        Ok(with_partial.score(adapter.capabilities(), cfg))
+        // The partial line might be the only place a fresh model switch shows
+        // up so far; it is never committed to `self.model` (mirroring
+        // `state`/`with_partial` above), only used for this one score.
+        let partial_model = adapter.model_hint(&appended.partial).or(model);
+        let caps = adapter.capabilities_for_model(partial_model.as_deref());
+        Ok(with_partial.score(caps, cfg))
     }
 }
 
 /// Bumped whenever the checkpoint or `RotState` changes shape, so an older
-/// file is ignored and rebuilt instead of misread.
-const CHECKPOINT_VERSION: u32 = 1;
+/// file is ignored and rebuilt instead of misread. Issue #155 D1: bumped to
+/// 2 for the new `model` field -- a checkpoint written before that field
+/// existed would otherwise resume with `model: None` until the next poll
+/// happens to carry a fresh assistant line, which is usually immediate but
+/// not guaranteed; the version bump forces one clean rebuild instead.
+const CHECKPOINT_VERSION: u32 = 2;
 
 /// What a fresh process needs to carry on folding where the last one stopped.
 #[derive(Debug, Serialize, Deserialize)]
@@ -163,11 +206,27 @@ struct Checkpoint {
     offset: u64,
     consumed: u64,
     state: RotState,
+    /// Issue #155 D1: the live model `IncrementalScorer::model` had last
+    /// resolved, carried across the Stop hook's fresh-process-per-turn
+    /// restarts so a resumed poll never regresses to the "unstated model"
+    /// default just because the freshly appended bytes happen not to repeat
+    /// it. `#[serde(default)]` only matters for a same-version file that
+    /// somehow lacks it; a genuinely older checkpoint is rejected outright by
+    /// the version bump above.
+    #[serde(default)]
+    model: Option<String>,
 }
 
 /// Everything outside the transcript that decides what the same bytes score
 /// to. Any change to it rebuilds rather than reusing state folded under rules
 /// that no longer apply.
+///
+/// Deliberately `capabilities()`, not `capabilities_for_model` (issue #155
+/// D1): `RotState::feed_all`'s fold never reads `Capabilities` at all, only
+/// the live model resolved at score-read time does (see `IncrementalScorer::
+/// poll`), so an operator switching models mid-session must not force a full
+/// incremental-state rebuild -- only the next poll's gate computation needs
+/// to see the new model, not the whole fold redone.
 fn fingerprint(adapter: &dyn AgentAdapter, cfg: &ScoreConfig) -> u64 {
     input_hash(&format!(
         "{CHECKPOINT_VERSION}|{}|{:?}|{cfg:?}",
@@ -217,6 +276,7 @@ fn save_checkpoint(path: &Path, transcript: &Path, fingerprint: u64, scorer: &In
         offset,
         consumed,
         state: state.clone(),
+        model: scorer.model().map(str::to_string),
     }) else {
         return;
     };
@@ -270,6 +330,7 @@ fn score_with_checkpoint(
             checkpoint.offset,
             checkpoint.consumed,
             checkpoint.state,
+            checkpoint.model,
         ),
         None => IncrementalScorer::new(transcript.to_path_buf()),
     };
@@ -705,6 +766,118 @@ mod tests {
         let err = score_with_checkpoint(&state, &transcript, &adapter, &ScoreConfig::default())
             .expect_err("no verified event parsing");
         assert!(err.to_string().contains("eventless"), "got {err}");
+    }
+
+    /// Issue #155 D1 end-to-end: `score_transcript`'s live scoring path --
+    /// not only `ClaudeAdapter::capabilities_for_model`'s own adapter-level
+    /// unit test -- must resolve a `[1m]` model's real 1M window rather than
+    /// silently keeping the 200k baseline every unstated model gets (the
+    /// epic's motivating bug). `tokens` sits ABOVE the 200k-model ceiling
+    /// (0.8 * 200_000 = 160_000) but BELOW the 1M-model floor (0.5 *
+    /// 1_000_000 = 500_000), so a resolved vs. unresolved model disagree on
+    /// `Verdict` outright, not merely on an internal number nothing else
+    /// observes.
+    #[test]
+    fn score_transcript_resolves_a_1m_claude_seats_real_window() {
+        let tokens = 170_000u64;
+        let body = |model: &str| -> String {
+            format!(
+                "{{\"type\":\"user\",\"message\":{{\"content\":\"go\"}}}}\n{{\"type\":\"assistant\",\"message\":{{\"model\":\"{model}\",\"content\":[{{\"type\":\"text\",\"text\":\"[zirv] done\"}}],\"usage\":{{\"input_tokens\":{tokens}}}}}}}\n"
+            )
+        };
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let transcript = dir.path().join("t.jsonl");
+        std::fs::write(&transcript, body("claude-opus-5[1m]")).expect("write transcript");
+        let long_window =
+            score_transcript(&transcript, None, dir.path(), &|_| None).expect("full score runs");
+        assert_eq!(
+            long_window.verdict,
+            rot::Verdict::Healthy,
+            "a 1M seat keeps {tokens} tokens below its own floor: {long_window:?}"
+        );
+
+        let baseline_dir = tempfile::tempdir().expect("tempdir");
+        let baseline_transcript = baseline_dir.path().join("t.jsonl");
+        std::fs::write(&baseline_transcript, body("claude-opus-5")).expect("write transcript");
+        let baseline = score_transcript(&baseline_transcript, None, baseline_dir.path(), &|_| None)
+            .expect("full score runs");
+        assert_ne!(
+            baseline.verdict,
+            rot::Verdict::Healthy,
+            "the same token count must escalate at the 200k default ceiling: {baseline:?}"
+        );
+    }
+
+    /// Issue #155 D1: `exec`/`loop`'s own rot-restart gate polls through
+    /// `IncrementalScorer` directly, and most turns never restate a model --
+    /// so a live model, once resolved, must not regress to the conservative
+    /// default just because a LATER poll's appended bytes happen not to
+    /// mention one.
+    #[test]
+    fn incremental_scorer_keeps_the_last_resolved_model_across_polls() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let transcript = dir.path().join("t.jsonl");
+        let adapter = super::adapters::claude::ClaudeAdapter::new(None);
+        let cfg = ScoreConfig::default();
+
+        let first_turn = "{\"type\":\"assistant\",\"message\":{\"model\":\"claude-opus-5[1m]\",\"content\":[{\"type\":\"text\",\"text\":\"[zirv] one\"}],\"usage\":{\"input_tokens\":1}}}\n";
+        std::fs::write(&transcript, first_turn).expect("write transcript");
+        let mut scorer = IncrementalScorer::new(transcript.clone());
+        scorer.poll(&adapter, &cfg).expect("no error");
+
+        let tokens = 170_000u64;
+        let second_turn = format!(
+            "{{\"type\":\"assistant\",\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"[zirv] two\"}}],\"usage\":{{\"input_tokens\":{tokens}}}}}}}\n"
+        );
+        std::fs::write(&transcript, format!("{first_turn}{second_turn}")).expect("append");
+
+        let score = scorer
+            .poll(&adapter, &cfg)
+            .expect("no error")
+            .expect("a score");
+        assert_eq!(
+            score.verdict,
+            rot::Verdict::Healthy,
+            "the remembered 1M model must still gate {tokens} tokens as healthy: {score:?}"
+        );
+    }
+
+    /// Issue #155 D1: the Stop hook is a fresh process on every turn (see
+    /// `score_transcript_cached`'s own doc comment), so the live model has to
+    /// survive in the checkpoint FILE, not merely in one long-lived
+    /// `IncrementalScorer` -- covered separately by
+    /// `incremental_scorer_keeps_the_last_resolved_model_across_polls` just
+    /// above. Two separate `score_transcript_cached` calls simulate that:
+    /// each one re-resolves everything from disk, exactly like two real hook
+    /// processes would.
+    #[test]
+    fn score_transcript_cached_remembers_the_model_across_a_fresh_process_checkpoint_resume() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = state_env(dir.path());
+        let lookup = |k: &str| env.get(k).cloned();
+        let transcript = dir.path().join("session.jsonl");
+
+        let first_turn = "{\"type\":\"assistant\",\"message\":{\"model\":\"claude-opus-5[1m]\",\"content\":[{\"type\":\"text\",\"text\":\"[zirv] one\"}],\"usage\":{\"input_tokens\":1}}}\n";
+        std::fs::write(&transcript, first_turn).expect("write transcript");
+        score_transcript_cached(&transcript, None, dir.path(), &lookup).expect("first pass scores");
+
+        let tokens = 170_000u64;
+        let second_turn = format!(
+            "{{\"type\":\"assistant\",\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"[zirv] two\"}}],\"usage\":{{\"input_tokens\":{tokens}}}}}}}\n"
+        );
+        std::fs::write(&transcript, format!("{first_turn}{second_turn}")).expect("append");
+
+        // A brand-new `IncrementalScorer` inside this call, resuming purely
+        // from the checkpoint file the pass above wrote -- no in-memory
+        // state survives between these two calls.
+        let score = score_transcript_cached(&transcript, None, dir.path(), &lookup)
+            .expect("second pass scores");
+        assert_eq!(
+            score.verdict,
+            rot::Verdict::Healthy,
+            "the checkpointed 1M model must still gate {tokens} tokens as healthy: {score:?}"
+        );
     }
 
     /// Grows `transcript` towards `body` in `chunks` appends cut at line
@@ -1270,15 +1443,22 @@ mod tests {
         assert_eq!(parsed["signals"]["marker_miss_rate"], 0.0);
     }
 
+    /// `score.token_floor`/`token_ceiling` are `REPO_FORBIDDEN` (issue #155,
+    /// Phase 6b): a repo checkout can no longer move them, only the
+    /// operator's own home layer can -- see `config.rs`'s
+    /// `a_repo_ctx_toml_cannot_move_any_of_the_five_token_gate_keys`. This is
+    /// that same trust boundary exercised through `score`'s own entry point.
     #[test]
-    fn repo_config_changes_the_verdict() {
+    fn operator_config_changes_the_verdict() {
         let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::create_dir_all(dir.path().join(".zirv")).expect("mkdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
         std::fs::write(
-            dir.path().join(".zirv/ctx.toml"),
+            home.path().join(".zirv/ctx.toml"),
             "[score]\ntoken_floor = 500000\ntoken_ceiling = 900000\n",
         )
         .expect("write");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
         let transcript = write_transcript(dir.path(), 12, false, 170_000);
         let args = ScoreArgs {
             transcript,

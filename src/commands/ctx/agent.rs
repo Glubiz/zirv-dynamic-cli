@@ -22,8 +22,9 @@ use super::announce::{Announcer, Event};
 use super::chat::quiet_env;
 use super::config::{CtxConfig, EnvLookup, env_from_process};
 use super::dash::spawnreq;
-use super::event::SessionId;
+use super::event::{SessionId, TranscriptUsage};
 use super::exec::{self, ExecArgs};
+use super::pace;
 
 #[derive(Debug, clap::Args)]
 pub struct AgentArgs {
@@ -47,6 +48,184 @@ pub struct AgentArgs {
     /// Errors and warnings are never suppressed.
     #[arg(long, default_value_t = false)]
     pub quiet: bool,
+    /// What this delegated worker should present as: `worker` (the default,
+    /// unstated) or `sub-orchestrator` (issue #155, Phase 5). Travels on the
+    /// `SpawnRequest` (`spawnreq::role_of`) when a dashboard pane fulfils
+    /// this delegation, and is re-validated there against the depth cap
+    /// (`dash::mod::depth_refusal`) -- this flag is a request, not a grant.
+    #[arg(long)]
+    pub role: Option<String>,
+    /// The work group (`zirv ctx group create`) this delegation belongs to.
+    /// Its own token budget, when set, is a ceiling `--budget-tokens` may
+    /// only tighten, never raise (`resolve_budget_tokens`).
+    #[arg(long)]
+    pub group: Option<String>,
+    /// Token ceiling for this worker (issue #155, Phase 5(d)). Checkpoints
+    /// at `BUDGET_SOFT_FRACTION` of the ceiling and stops at the ceiling
+    /// itself -- never a signal to change models. `None` (the default) is
+    /// unbounded, exactly today's behaviour.
+    #[arg(long)]
+    pub budget_tokens: Option<u64>,
+    /// Tool-call ceiling for this worker, independent of `--budget-tokens`.
+    #[arg(long)]
+    pub max_tool_calls: Option<u32>,
+    /// Issue #155, Phase 6(c): spend anyway at or above `pace.spawn_hard_pct`
+    /// (`pace::SpawnGate::Refuse`). The operator's own informed call --
+    /// never a signal that reaches rotation, which this gate never touches
+    /// either way. Travels on the `SpawnRequest` (`SpawnRequest::force`) the
+    /// same way `--role`/`--group` do, so a pane spawn fulfilled by a
+    /// dashboard honours the same override this process already decided on.
+    #[arg(long, default_value_t = false)]
+    pub force: bool,
+}
+
+/// The soft threshold, as a fraction of a budget. At or above it the worker
+/// is nudged to wrap up and checkpoint while it still has room to write a
+/// usable result; at the budget itself it is stopped.
+pub const BUDGET_SOFT_FRACTION: f64 = 0.8;
+
+/// What a delegated worker is allowed to spend. `None` on a field means no
+/// ceiling for it -- which is every delegation before 2.35.0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WorkerBudget {
+    pub tokens: Option<u64>,
+    pub tool_calls: Option<u32>,
+}
+
+/// A budget's state against what a worker has spent so far. Never a
+/// downgrade signal: see `budget_state`'s own doc comment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BudgetState {
+    Ok,
+    SoftWarn { used: u64, limit: u64 },
+    HardStop { used: u64, limit: u64 },
+}
+
+/// HardStop > SoftWarn > Ok, so the worst ceiling wins when both are set.
+fn rank(state: BudgetState) -> u8 {
+    match state {
+        BudgetState::Ok => 0,
+        BudgetState::SoftWarn { .. } => 1,
+        BudgetState::HardStop { .. } => 2,
+    }
+}
+
+/// Pure: no clock, no filesystem. The worst state across both ceilings wins
+/// (HardStop > SoftWarn > Ok), the same "most restrictive answer" fold
+/// `safety::evaluate_candidates` uses.
+///
+/// Spend is `usage.context_total() + usage.output_tokens`, not
+/// `usage.input_tokens`: uncached input is near zero in a cached session, so
+/// budgeting on it alone would mean the budget effectively never fires.
+///
+/// A budget CHECKPOINTS, it never downgrades the model: this function only
+/// ever reports `Ok`/`SoftWarn`/`HardStop`, never anything that could be read
+/// as "switch to a cheaper model" -- that path does not exist, on purpose
+/// (issue #155's own architect ruling: a cheaper answer to the wrong
+/// question is not a saving, and an automatic downshift is out of scope).
+pub fn budget_state(
+    budget: &WorkerBudget,
+    usage: &TranscriptUsage,
+    tool_calls: u32,
+) -> BudgetState {
+    let spent = usage.context_total().saturating_add(usage.output_tokens);
+    let mut worst = BudgetState::Ok;
+    let mut consider = |used: u64, limit: u64| {
+        if limit == 0 {
+            return;
+        }
+        let soft = (limit as f64 * BUDGET_SOFT_FRACTION) as u64;
+        let state = if used >= limit {
+            BudgetState::HardStop { used, limit }
+        } else if used >= soft {
+            BudgetState::SoftWarn { used, limit }
+        } else {
+            BudgetState::Ok
+        };
+        if rank(state) > rank(worst) {
+            worst = state;
+        }
+    };
+    if let Some(limit) = budget.tokens {
+        consider(spent, limit);
+    }
+    if let Some(limit) = budget.tool_calls {
+        consider(u64::from(tool_calls), u64::from(limit));
+    }
+    worst
+}
+
+/// A group's own token budget is a ceiling its children may only TIGHTEN. An
+/// explicit `--budget-tokens` larger than the group's own is clamped, never
+/// honoured: a child must not be able to raise the batch's own limit.
+pub fn resolve_budget_tokens(group: Option<u64>, explicit: Option<u64>) -> Option<u64> {
+    match (group, explicit) {
+        (Some(group), Some(explicit)) => Some(group.min(explicit)),
+        (Some(group), None) => Some(group),
+        (None, explicit) => explicit,
+    }
+}
+
+/// `--role` accepts exactly two spellings; anything else is refused before
+/// this delegation ever launches, the same discipline `validate_flags`
+/// applies to `flags`.
+pub fn validate_role(role: &Option<String>) -> CtxResult<()> {
+    match role.as_deref() {
+        None | Some("worker") | Some("sub-orchestrator") => Ok(()),
+        Some(other) => {
+            Err(format!("--role must be 'worker' or 'sub-orchestrator'; got '{other}'").into())
+        }
+    }
+}
+
+/// Issue #155, Phase 6(c): whether this spawn must not start. Only a
+/// `Refuse` blocks, and only without `--force`: a `Warn` is information, not
+/// a gate, and a `Proceed` has nothing to override. `pub(crate)`, not
+/// private: `dash::mod::fulfill_spawn_request` reuses this exact rule
+/// (`SpawnRequest::force` carrying forward whatever this process already
+/// decided) so a pane spawn is held to the identical override, never a
+/// second, independently-drifting copy of it. Deliberately NOT a rot
+/// signal -- see `pace::spawn_gate`'s own doc comment for why quota pressure
+/// must never reach rotation.
+pub(crate) fn spawn_blocked(gate: &pace::SpawnGate, force: bool) -> bool {
+    matches!(gate, pace::SpawnGate::Refuse { .. }) && !force
+}
+
+/// Resolves this delegation's [`WorkerBudget`] from `--budget-tokens`/
+/// `--max-tool-calls` and, when `--group` names one, that group's own token
+/// ceiling -- which `--budget-tokens` may only tighten (`resolve_budget_
+/// tokens`). An unknown or closed group is a hard error: silently ignoring
+/// it would let a mistyped `--group` run unbounded work a batch's own budget
+/// was meant to cap. `--max-tool-calls` has no group-level counterpart
+/// (`group::WorkGroup` carries no such field) and so is never clamped.
+///
+/// Issue #155 review finding D2: this is also the headless admission choke
+/// point for `child_limit` -- `group::admit_child` is called here, once,
+/// only on the path that actually runs the delegation headlessly. The
+/// dashboard-pane fork of the same request (`agent::try_join_dashboard`,
+/// tried BEFORE this function is ever reached -- see `run_with`) never
+/// admits here; `dash::fulfill_spawn_request` admits on that side instead,
+/// so a single `zirv ctx agent --group` invocation is counted exactly once
+/// regardless of which fork actually spawns.
+fn resolve_worker_budget(env: EnvLookup<'_>, args: &AgentArgs) -> CtxResult<WorkerBudget> {
+    let group_token_budget = match &args.group {
+        Some(id) => {
+            let state = super::state::StateDir::resolve(env)?;
+            let group = super::group::load(&state, id)?.ok_or_else(|| {
+                format!("zirv ctx agent: no work group '{id}' -- create one with `zirv ctx group create`")
+            })?;
+            if group.closed_at.is_some() {
+                return Err(format!("zirv ctx agent: work group '{id}' is closed").into());
+            }
+            super::group::admit_child(&state, id).map_err(|e| format!("zirv ctx agent: {e}"))?;
+            group.token_budget
+        }
+        None => None,
+    };
+    Ok(WorkerBudget {
+        tokens: resolve_budget_tokens(group_token_budget, args.budget_tokens),
+        tool_calls: args.max_tool_calls,
+    })
 }
 
 /// Everything wrong with `flags` that can be seen without running anything.
@@ -161,17 +340,23 @@ pub fn resolve_prompt(raw: &str, stdin: &mut dyn Read) -> CtxResult<String> {
 /// human-readable line; every other exit code -- including a plain success --
 /// gets none, since that is either self-explanatory or the agent's own doing.
 pub fn exit_note(code: i32) -> Option<String> {
-    matches!(code, exec::EXIT_ROT_EXHAUSTED | exec::EXIT_TIMEOUT).then(|| exec::describe_exit(code))
+    matches!(
+        code,
+        exec::EXIT_ROT_EXHAUSTED | exec::EXIT_TIMEOUT | exec::EXIT_BUDGET_EXHAUSTED
+    )
+    .then(|| exec::describe_exit(code))
 }
 
 /// Which of the supervisor's outcomes this exit code represents. Mirrors
-/// `exit_note`'s own two special cases: those are zirv giving up, not the
+/// `exit_note`'s own special cases: those are zirv giving up (or, for
+/// `EXIT_BUDGET_EXHAUSTED`, zirv stopping the run on purpose), not the
 /// worker failing, and they cost very differently.
 fn delegation_outcome(code: i32) -> &'static str {
     match code {
         0 => "ok",
         exec::EXIT_ROT_EXHAUSTED => "rot-exhausted",
         exec::EXIT_TIMEOUT => "timeout",
+        exec::EXIT_BUDGET_EXHAUSTED => "budget-exhausted",
         _ => "failed",
     }
 }
@@ -284,10 +469,12 @@ const EXIT_DASH_UNCONFIRMED: i32 = 1;
 /// directory absent or its owner dead, AND issue #145's own fallback scan of
 /// every other `<state>/dash/*` token directory (`live_join_target`) also
 /// found nothing live (notice printed, naming every candidate considered);
-/// options a pane cannot honour (`--max-restarts`/`--timeout-secs`/`--
-/// flags` other than a lone `--model` pin, notice printed); a prompt that
-/// would be misread as a flag (notice printed); a request that could not
-/// even be written (notice printed); an unclaimed ack timeout (notice
+/// options a pane cannot honour (`--max-restarts`/`--timeout-secs`/
+/// `--budget-tokens`/`--max-tool-calls`/`--flags` other than a lone
+/// `--model` pin, notice printed -- `--role`/`--group` are NOT in this list:
+/// both travel on the `SpawnRequest` itself, see its own fields); a prompt
+/// that would be misread as a flag (notice printed); a request that could
+/// not even be written (notice printed); an unclaimed ack timeout (notice
 /// printed, since that is a live channel that simply did not respond); and a
 /// `retryable` refusal, where the dashboard has answered that it spawned
 /// nothing for a reason that says nothing about whether the task may run
@@ -319,13 +506,24 @@ fn try_join_dashboard<W: Write>(
     // declines: honouring some of what the operator typed and dropping the
     // rest would be worse than not using the dashboard at all.
     let pinned_model = super::adapters::model_only_flags(&args.flags);
+    // Issue #155, Phase 5(d): `--budget-tokens`/`--max-tool-calls` join the
+    // same decline list as `--max-restarts`/`--timeout-secs`, for the same
+    // reason -- a pane is not a supervised headless run and `SpawnRequest`
+    // carries neither ceiling, so silently dropping one would be worse than
+    // not using the dashboard at all. `--role`/`--group` deliberately do
+    // NOT join this list: both ride in the request itself (`spawnreq::
+    // SpawnRequest::role`/`work_group_id`, below) and the dashboard's own
+    // `fulfill_spawn_request` re-validates both at the authority side, the
+    // same as every other field a pane can honour.
     if args.max_restarts.is_some()
         || args.timeout_secs.is_some()
+        || args.budget_tokens.is_some()
+        || args.max_tool_calls.is_some()
         || (!args.flags.is_empty() && pinned_model.is_none())
     {
         eprintln!(
-            "zirv ctx agent: dashboard panes don't support --max-restarts/--timeout-secs/-- flags \
-             other than a --model pin; running headless"
+            "zirv ctx agent: dashboard panes don't support --max-restarts/--timeout-secs/\
+             --budget-tokens/--max-tool-calls/-- flags other than a --model pin; running headless"
         );
         return None;
     }
@@ -356,6 +554,20 @@ fn try_join_dashboard<W: Write>(
         // picks it up next -- this call site cannot vouch that a human is
         // watching that dashboard, so it does not claim `interactive`.
         interactive: false,
+        role: args.role.clone(),
+        // `session_identity`, not `requested_by` above: the two are
+        // deliberately separate (see `SpawnRequest::parent_session`'s own
+        // doc comment) even though this call site happens to derive both
+        // from the same `ZIRV_CTX_SESSION` env var today.
+        parent_session: super::mail::session_identity(env),
+        work_group_id: args.group.clone(),
+        // Issue #155, Phase 6(c): this process's own spawn gate (`run_with`,
+        // above) already evaluated `--force` against the reading it had
+        // before this request was ever written. Carrying it forward lets
+        // `fulfill_spawn_request` honour the identical override rather than
+        // re-litigating it blind and refusing a spawn the requester already
+        // chose to force -- see `SpawnRequest::force`'s own doc comment.
+        force: args.force,
     };
     let path = match spawnreq::write_request(&dir, &req) {
         Ok(path) => path,
@@ -561,7 +773,41 @@ pub fn run_with<W: Write>(
     env: EnvLookup<'_>,
 ) -> CtxResult<i32> {
     validate_flags(&args.flags)?;
+    validate_role(&args.role)?;
     let prompt = resolve_prompt(&args.prompt, &mut std::io::stdin())?;
+
+    // Loaded here rather than after the dashboard-join attempt below (its
+    // former position): the spawn gate needs `cfg.pace` before either fork
+    // of this delegation -- a pane spawn and a headless run -- is chosen,
+    // and `try_join_dashboard` is the fork point between them. `exec::
+    // run_with` still loads its own copy internally on the headless path
+    // (the same pattern `chat.rs` already uses ahead of `wrap::run_with`),
+    // so this remains one extra read of the same layered config rather than
+    // a new code path.
+    let cfg = CtxConfig::load_for_launch(repo, env)?;
+
+    // Issue #155, Phase 6(c): the spawn gate -- quota pressure refuses NEW
+    // delegated work, never rotation of a session already running (see
+    // `pace::spawn_gate`'s own doc comment). `provider_for_agent_name` is
+    // the same static, no-filesystem lookup `zirv ctx usage`/`status` use to
+    // answer this before an adapter is even known to be ready, so a
+    // disabled or misconfigured `--name` still gets an honest usage reading
+    // rather than skipping the gate.
+    let state = super::state::StateDir::resolve(env)?;
+    let provider = adapters::provider_for_agent_name(Some(&args.name));
+    let now = super::state::now_secs();
+    let (collector, estimator) = pace::current_windows(&state, &cfg.pace, now, provider);
+    let gate = pace::spawn_gate(&collector, estimator.as_ref(), now, &cfg.pace);
+    if let Some(note) = pace::describe_spawn_gate(&gate) {
+        eprintln!("zirv ctx agent: {note}");
+    }
+    if spawn_blocked(&gate, args.force) {
+        return Err(
+            "refusing to start new delegated work at this usage level; wait for the window to \
+             reset, or pass --force to spend anyway"
+                .into(),
+        );
+    }
 
     if let Some(result) = try_join_dashboard(
         args,
@@ -575,11 +821,6 @@ pub fn run_with<W: Write>(
         return result;
     }
 
-    // A second, independent config load just for the announcer: `exec::
-    // run_with` below loads its own copy internally (the same pattern
-    // `chat.rs` already uses ahead of `wrap::run_with`), so this costs one
-    // extra read of the same layered config rather than a new code path.
-    let cfg = CtxConfig::load_for_launch(repo, env)?;
     let announcer = Announcer::new(
         cfg.chrome.events && !args.quiet,
         console::colors_enabled_stderr(),
@@ -598,6 +839,10 @@ pub fn run_with<W: Write>(
     // configured/default worker-model prepend actually won.
     let model = adapters::last_model_flag(&command).map(str::to_string);
     let worker_session = SessionId::new_v4().to_string();
+    // Issue #155, Phase 5(d): resolved before the launch, not inside
+    // `exec::run_with` -- an unknown or closed `--group` must fail this
+    // delegation outright rather than silently running it unbounded.
+    let worker_budget = resolve_worker_budget(&env, args)?;
 
     let exec_args = ExecArgs {
         agent: Some(args.name.clone()),
@@ -611,6 +856,8 @@ pub fn run_with<W: Write>(
         prompt: Some(prompt),
         max_restarts: args.max_restarts,
         timeout_secs: args.timeout_secs,
+        budget_tokens: worker_budget.tokens,
+        max_tool_calls: worker_budget.tool_calls,
         command,
         simple: false,
     };
@@ -619,7 +866,23 @@ pub fn run_with<W: Write>(
         agent: args.name.clone(),
     });
     let started = std::time::Instant::now();
-    let code = exec::run_with(&exec_args, w, repo, &env)?;
+    // Re-review (2026-08-27) finding 1: `resolve_worker_budget` above already
+    // admitted this delegation into `--group` (if any) before this fallible
+    // spawn is even attempted -- `exec::run_with` can still fail outright
+    // (e.g. `--max-tool-calls` refused up front for an adapter that cannot
+    // enforce it, issue #155 review finding C2), and a failure here must not
+    // permanently burn the group's admission slot for a child that never
+    // ran. `state` is the same handle resolved above for the spawn gate,
+    // unused since; reused here rather than re-resolved.
+    let code = match exec::run_with(&exec_args, w, repo, &env) {
+        Ok(code) => code,
+        Err(e) => {
+            if let Some(id) = &args.group {
+                super::group::rollback_admission(&state, id);
+            }
+            return Err(e);
+        }
+    };
     let wall_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     announcer.emit(&Event::DelegatedFinish {
         agent: args.name.clone(),
@@ -658,7 +921,13 @@ pub fn run_with<W: Write>(
                 ts: super::state::now_secs(),
                 session: &worker_session,
                 parent_session: &parent_session,
-                work_group_id: None,
+                // Issue #155 review finding D2: this used to be hardcoded
+                // `None`, so a completed headless delegation never recorded
+                // the group it actually ran under -- `zirv ctx status`'s
+                // group tree (`status::group_tree_lines`) renders every such
+                // delegation as ungrouped even though `--group` traveled all
+                // the way through `resolve_worker_budget` above.
+                work_group_id: args.group.as_deref(),
                 agent: &args.name,
                 model: model.as_deref(),
                 input_tokens: usage.input_tokens,
@@ -711,7 +980,296 @@ mod tests {
             "rot-exhausted"
         );
         assert_eq!(delegation_outcome(exec::EXIT_TIMEOUT), "timeout");
+        assert_eq!(
+            delegation_outcome(exec::EXIT_BUDGET_EXHAUSTED),
+            "budget-exhausted"
+        );
         assert_eq!(delegation_outcome(1), "failed");
+    }
+
+    /// `--force` is the operator saying they accept the spend. Only a
+    /// Refuse is overridable; a Warn was never blocking, and a Proceed has
+    /// nothing to override.
+    #[test]
+    fn only_a_refusal_is_overridable_and_only_by_force() {
+        let refuse = pace::SpawnGate::Refuse {
+            window: "five_hour",
+            percent: 97.0,
+            source: pace::Source::Collector,
+        };
+        assert!(spawn_blocked(&refuse, false));
+        assert!(!spawn_blocked(&refuse, true), "--force proceeds");
+
+        let warn = pace::SpawnGate::Warn {
+            window: "five_hour",
+            percent: 85.0,
+            source: pace::Source::Collector,
+        };
+        assert!(!spawn_blocked(&warn, false), "a warning never blocks");
+        assert!(!spawn_blocked(&pace::SpawnGate::Proceed, false));
+    }
+
+    /// Issue #155, Phase 5(d): a budget bounds WORK. At 80% the worker is
+    /// nudged to wrap up and checkpoint; at 100% it is checkpointed and
+    /// stopped with a structured result demand. It is NEVER a signal to
+    /// switch models -- a cheaper answer to the wrong question is not a
+    /// saving, and automatic downshift is explicitly out of scope.
+    #[test]
+    fn a_token_budget_warns_at_eighty_percent_and_stops_at_the_limit() {
+        let budget = WorkerBudget {
+            tokens: Some(100_000),
+            tool_calls: None,
+        };
+        let at = |context: u64| TranscriptUsage {
+            input_tokens: context,
+            ..Default::default()
+        };
+
+        assert_eq!(budget_state(&budget, &at(79_999), 0), BudgetState::Ok);
+        assert!(matches!(
+            budget_state(&budget, &at(80_000), 0),
+            BudgetState::SoftWarn { limit: 100_000, .. }
+        ));
+        assert!(matches!(
+            budget_state(&budget, &at(100_000), 0),
+            BudgetState::HardStop { .. }
+        ));
+        assert!(matches!(
+            budget_state(&budget, &at(1_000_000), 0),
+            BudgetState::HardStop { .. }
+        ));
+    }
+
+    /// The budget counts what the run actually spends -- every input class
+    /// plus output -- not just uncached input, which is near zero in a cached
+    /// session and would make the budget never fire.
+    #[test]
+    fn a_token_budget_counts_every_class_the_run_spends() {
+        let budget = WorkerBudget {
+            tokens: Some(100_000),
+            tool_calls: None,
+        };
+        let cached = TranscriptUsage {
+            input_tokens: 1_000,
+            cache_creation_input_tokens: 9_000,
+            cache_read_input_tokens: 89_000,
+            output_tokens: 1_000,
+        };
+        assert!(
+            matches!(
+                budget_state(&budget, &cached, 0),
+                BudgetState::HardStop { .. }
+            ),
+            "100k spent across four classes is 100k spent"
+        );
+    }
+
+    /// Tool calls are their own ceiling: a worker can burn a budget in cheap
+    /// calls without moving the token count much, and a runaway loop is
+    /// exactly what the rot engine's repetition signal already watches for.
+    #[test]
+    fn a_tool_call_ceiling_is_independent_of_the_token_ceiling() {
+        let budget = WorkerBudget {
+            tokens: None,
+            tool_calls: Some(50),
+        };
+        let none = TranscriptUsage::default();
+        assert_eq!(budget_state(&budget, &none, 39), BudgetState::Ok);
+        assert!(matches!(
+            budget_state(&budget, &none, 40),
+            BudgetState::SoftWarn { .. }
+        ));
+        assert!(matches!(
+            budget_state(&budget, &none, 50),
+            BudgetState::HardStop { .. }
+        ));
+    }
+
+    /// No budget is no change: every delegation before 2.35.0 ran unbounded
+    /// and must continue to.
+    #[test]
+    fn no_budget_never_warns_and_never_stops() {
+        let budget = WorkerBudget {
+            tokens: None,
+            tool_calls: None,
+        };
+        let huge = TranscriptUsage {
+            input_tokens: u64::MAX,
+            ..Default::default()
+        };
+        assert_eq!(budget_state(&budget, &huge, u32::MAX), BudgetState::Ok);
+    }
+
+    /// A `--group` supplies defaults the flags may only TIGHTEN. A worker
+    /// must not be able to talk its way past the group's own ceiling by
+    /// passing a larger `--budget-tokens`.
+    #[test]
+    fn an_explicit_budget_may_only_tighten_the_groups_own() {
+        let group_budget = Some(100_000);
+        assert_eq!(
+            resolve_budget_tokens(group_budget, Some(50_000)),
+            Some(50_000)
+        );
+        assert_eq!(
+            resolve_budget_tokens(group_budget, Some(500_000)),
+            Some(100_000)
+        );
+        assert_eq!(resolve_budget_tokens(group_budget, None), Some(100_000));
+        assert_eq!(resolve_budget_tokens(None, Some(50_000)), Some(50_000));
+        assert_eq!(resolve_budget_tokens(None, None), None);
+    }
+
+    fn sample_work_group(
+        id: &str,
+        child_limit: u32,
+        admitted: u32,
+    ) -> crate::commands::ctx::group::WorkGroup {
+        crate::commands::ctx::group::WorkGroup {
+            work_group_id: id.to_string(),
+            parent_session_id: String::new(),
+            scope: "test batch".to_string(),
+            child_limit,
+            token_budget: None,
+            deadline_secs: None,
+            completion_contract: String::new(),
+            created_at: 0,
+            closed_at: None,
+            admitted_children: admitted,
+        }
+    }
+
+    /// Issue #155 review finding D2: `resolve_worker_budget` is the headless
+    /// admission choke point for `child_limit` -- a `--group` naming a group
+    /// already at its limit must be refused outright, the same "hard error,
+    /// not silent ignore" contract this function's own doc comment already
+    /// applies to an unknown or closed group.
+    #[test]
+    fn resolve_worker_budget_refuses_a_group_already_at_its_child_limit() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = crate::commands::ctx::state::StateDir::from_root(tmp.path().to_path_buf());
+        crate::commands::ctx::group::create(&state, &sample_work_group("wg-1", 1, 1))
+            .expect("create");
+        let mut env = HashMap::new();
+        env.insert(
+            crate::commands::ctx::state::STATE_ENV.to_string(),
+            tmp.path().display().to_string(),
+        );
+
+        let mut args = args_for("claude", "go");
+        args.group = Some("wg-1".to_string());
+        let err =
+            resolve_worker_budget(&|k| env.get(k).cloned(), &args).expect_err("group is full");
+        assert!(err.to_string().contains("wg-1"), "got {err}");
+    }
+
+    /// The same choke point admits a delegation cleanly under the limit, and
+    /// advances the group's own `admitted_children` count by exactly one.
+    #[test]
+    fn resolve_worker_budget_admits_a_delegation_under_the_child_limit() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = crate::commands::ctx::state::StateDir::from_root(tmp.path().to_path_buf());
+        crate::commands::ctx::group::create(&state, &sample_work_group("wg-1", 3, 1))
+            .expect("create");
+        let mut env = HashMap::new();
+        env.insert(
+            crate::commands::ctx::state::STATE_ENV.to_string(),
+            tmp.path().display().to_string(),
+        );
+
+        let mut args = args_for("claude", "go");
+        args.group = Some("wg-1".to_string());
+        resolve_worker_budget(&|k| env.get(k).cloned(), &args).expect("admitted under the limit");
+
+        assert_eq!(
+            crate::commands::ctx::group::load(&state, "wg-1")
+                .expect("load")
+                .expect("present")
+                .admitted_children,
+            2,
+            "the admission must advance the group's own count"
+        );
+    }
+
+    /// Re-review (2026-08-27) finding 1: a delegation that admits into a
+    /// group and then fails before a child is genuinely launched must not
+    /// permanently burn that admission slot. `--max-tool-calls` with the
+    /// codex adapter is refused by `exec::run_with` itself (issue #155
+    /// review finding C2) strictly AFTER `resolve_worker_budget` has already
+    /// admitted the child into its group -- exactly this finding's failure
+    /// window.
+    #[test]
+    fn a_failed_delegation_after_admission_rolls_back_the_group_slot() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state_path = tmp.path().join("state");
+        let state = crate::commands::ctx::state::StateDir::from_root(state_path.clone());
+        crate::commands::ctx::group::create(&state, &sample_work_group("wg-1", 3, 0))
+            .expect("create group");
+
+        let env = base_env(&state_path);
+        let mut args = args_for("codex", "go");
+        args.group = Some("wg-1".to_string());
+        args.max_tool_calls = Some(5);
+
+        let mut out = Vec::new();
+        let err = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned())
+            .expect_err("codex + --max-tool-calls is refused by exec::run_with");
+        assert!(err.to_string().contains("--max-tool-calls"), "got {err}");
+
+        assert_eq!(
+            crate::commands::ctx::group::load(&state, "wg-1")
+                .expect("load")
+                .expect("present")
+                .admitted_children,
+            0,
+            "the failed delegation must not have permanently burned the group slot"
+        );
+    }
+
+    /// A successful delegation still counts exactly once against its group --
+    /// the rollback added for the failure path above must never also undo a
+    /// genuine admission for a child that actually ran.
+    #[test]
+    fn a_successful_delegation_still_counts_exactly_one_admission() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state_path = tmp.path().join("state");
+        let state = crate::commands::ctx::state::StateDir::from_root(state_path.clone());
+        crate::commands::ctx::group::create(&state, &sample_work_group("wg-1", 3, 0))
+            .expect("create group");
+
+        let env = base_env(&state_path);
+        let mut args = args_for("claude", "go");
+        args.group = Some("wg-1".to_string());
+
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned())
+            .expect("a plain claude delegation with no --max-tool-calls runs cleanly");
+        assert_eq!(code, 0);
+
+        assert_eq!(
+            crate::commands::ctx::group::load(&state, "wg-1")
+                .expect("load")
+                .expect("present")
+                .admitted_children,
+            1,
+            "a successful spawn must still count exactly one admission"
+        );
+    }
+
+    /// `--role` accepts exactly the two spellings the depth cap and
+    /// `spawnreq::role_of` understand; anything else must be refused before
+    /// launch, not silently read as a Worker three call frames later.
+    #[test]
+    fn validate_role_accepts_only_the_two_known_spellings() {
+        assert!(validate_role(&None).is_ok());
+        assert!(validate_role(&Some("worker".to_string())).is_ok());
+        assert!(validate_role(&Some("sub-orchestrator".to_string())).is_ok());
+        let err = validate_role(&Some("orchestrator".to_string()))
+            .expect_err("orchestrator is not a spawnable role");
+        assert!(err.to_string().contains("--role"), "got {err}");
     }
 
     // `worker_launch_flags`/`flags_pin_model`: pure, so these are testable
@@ -1123,6 +1681,11 @@ mod tests {
             max_restarts: Some(0),
             timeout_secs: Some(30),
             quiet: false,
+            role: None,
+            group: None,
+            budget_tokens: None,
+            max_tool_calls: None,
+            force: false,
         }
     }
 
@@ -1463,6 +2026,57 @@ mod tests {
         );
     }
 
+    /// Issue #155 review finding D2: a completed headless delegation must
+    /// record the group it actually ran under -- before this fix `agent.rs`
+    /// hardcoded `work_group_id: None` on every completion log record, so
+    /// `zirv ctx status`'s group tree rendered every delegation as
+    /// ungrouped no matter what `--group` was passed.
+    #[test]
+    fn a_completed_delegation_records_its_own_work_group_id() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state_dir = tmp.path().join("state");
+        let mut env = base_env(&state_dir);
+        env.insert("ZIRV_CTX_PACE".to_string(), "false".to_string());
+        let state = crate::commands::ctx::state::StateDir::from_root(state_dir.clone());
+        let group_id = crate::commands::ctx::group::run_create(
+            &state,
+            &mut Vec::new(),
+            &crate::commands::ctx::group::CreateArgs {
+                scope: "test batch".to_string(),
+                child_limit: 3,
+                token_budget: None,
+                deadline_secs: None,
+                completion_contract: "report by mail".to_string(),
+                parent_session: None,
+            },
+            1_700_000_000,
+        )
+        .expect("group create");
+
+        unsafe {
+            std::env::set_var("FAKE_AGENT_MODE", "healthy");
+        }
+        let mut args = args_for("claude", "do the work");
+        args.group = Some(group_id.clone());
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE");
+        }
+        assert_eq!(code.expect("runs"), 0);
+
+        let delegations = crate::commands::ctx::log::tail_delegations(&state, 10).expect("tail");
+        assert_eq!(delegations.len(), 1);
+        let record: serde_json::Value = serde_json::from_str(&delegations[0]).expect("json");
+        assert_eq!(
+            record["work_group_id"].as_str(),
+            Some(group_id.as_str()),
+            "the completion record must name the real group: {record}"
+        );
+    }
+
     // Task 11: joining a running dashboard instead of spawning headless.
 
     /// Polls `dir` for a `req-*.json` file and hands its file stem to
@@ -1591,6 +2205,48 @@ mod tests {
         );
     }
 
+    /// Issue #155, Phase 5(c): unlike `--budget-tokens`/`--max-tool-calls`
+    /// (which decline the dashboard join, see `options_a_pane_cannot_honour_
+    /// decline_the_dashboard_join`), `--role`/`--group` DO travel -- they
+    /// ride on the `SpawnRequest` itself, for `fulfill_spawn_request`'s own
+    /// depth cap and budget resolution to read on the fulfilment side.
+    #[test]
+    fn role_and_group_join_the_dashboard_and_travel_in_the_request() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let (requests_dir, mut env) = live_dashboard_dir(tmp.path());
+        // This request's own lineage: the calling process's own session id,
+        // which `parent_session` is derived from (`mail::session_identity`).
+        env.insert(
+            crate::commands::ctx::adapters::SESSION_ENV.to_string(),
+            "eeee5555".to_string(),
+        );
+
+        let responder = std::thread::spawn({
+            let dir = requests_dir.clone();
+            move || respond_to_next_request(dir, r#"{"ok":true,"short":"abcd1234","reason":null}"#)
+        });
+
+        let mut args = joinable_args("claude", "go");
+        args.role = Some("sub-orchestrator".to_string());
+        args.group = Some("wg-1".to_string());
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned())
+            .expect("dashboard join runs");
+        let request_body = responder.join().expect("responder thread");
+
+        assert_eq!(code, 0, "must NOT decline for --role/--group");
+        let req: spawnreq::SpawnRequest =
+            serde_json::from_str(&request_body).expect("the request parses");
+        assert_eq!(req.role.as_deref(), Some("sub-orchestrator"));
+        assert_eq!(req.work_group_id.as_deref(), Some("wg-1"));
+        assert!(
+            req.parent_session.is_some(),
+            "this process's own session id must be the lineage link: {request_body}"
+        );
+    }
+
     /// A refusal ack (the dashboard's own `cfg.agents.refusal` gate, or an
     /// unknown/unready adapter) prints the reason and returns `Ok(1)` --
     /// still short-circuiting the headless path, since the dashboard already
@@ -1714,6 +2370,10 @@ mod tests {
                     "--verbose".to_string(),
                 ]
             },
+            // Issue #155, Phase 5(d): a pane cannot honour either budget
+            // ceiling, same reasoning as `max_restarts`/`timeout_secs` above.
+            |a: &mut AgentArgs| a.budget_tokens = Some(100_000),
+            |a: &mut AgentArgs| a.max_tool_calls = Some(50),
         ] {
             let mut args = joinable_args("claude", "go");
             mutate(&mut args);

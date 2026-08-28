@@ -1287,6 +1287,17 @@ impl AgentAdapter for CodexAdapter {
         true
     }
 
+    /// Issue #155 review finding C2: `parse_events` above never emits
+    /// `NormalizedEvent::ToolCall` -- deliberately, per its own doc comment,
+    /// since no verified rollout shape exists for a tool call at all -- so a
+    /// `--max-tool-calls` ceiling checked against this adapter's events
+    /// would never see a count above zero. `exec::run_with_clock` reads
+    /// this to refuse the flag outright rather than accept it and silently
+    /// never enforce it.
+    fn counts_tool_calls(&self) -> bool {
+        false
+    }
+
     fn compact_command(&self) -> Option<&'static str> {
         None
     }
@@ -1320,6 +1331,10 @@ impl AgentAdapter for CodexAdapter {
             // (issue #114) -- a same-burst text+`\r` is read as a paste and
             // the `\r` is folded into the pasted text rather than submitted.
             defer_injection_submit: true,
+            // Issue #155: no capacity is verified for codex, and a guessed
+            // one is worse than falling back to rot's absolute defaults,
+            // which are at least a known quantity. Never fake parity.
+            context_window_tokens: None,
         }
     }
 
@@ -1387,6 +1402,18 @@ mod tests {
         assert!(!caps.marker_signal, "the spec gives codex no marker signal");
     }
 
+    /// Codex reports NO capacity: none is verified for it, and a guessed
+    /// capacity is worse than falling back to the absolute defaults, which
+    /// are at least a known quantity. Never fake parity.
+    #[test]
+    fn codex_reports_no_context_window_because_none_is_verified() {
+        assert_eq!(CodexAdapter::new(None).context_window_tokens(None), None);
+        assert_eq!(
+            CodexAdapter::new(None).capabilities().context_window_tokens,
+            None
+        );
+    }
+
     fn fixture(name: &str) -> String {
         std::fs::read_to_string(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1402,6 +1429,34 @@ mod tests {
     #[test]
     fn codex_now_reports_verified_event_parsing() {
         assert!(CodexAdapter::new(None).capabilities().events);
+    }
+
+    /// Issue #155 review finding C2: `events` above is true (codex derives
+    /// real `TurnStart`/`AssistantFinal` data), but `ToolCall` specifically
+    /// is never one of them -- see `parse_events`'s own doc comment. This
+    /// adapter must say so honestly through the narrower
+    /// `counts_tool_calls` capability rather than let `events: true` be
+    /// mistaken for "the whole normalized vocabulary is covered".
+    #[test]
+    fn codex_reports_it_cannot_count_tool_calls() {
+        assert!(!CodexAdapter::new(None).counts_tool_calls());
+    }
+
+    /// The other half of C2: no rollout line, healthy or otherwise, should
+    /// ever produce a `ToolCall` event -- the fixture below covers a normal
+    /// two-turn session, so this is the direct behavioral proof behind the
+    /// capability flag above, not just a label.
+    #[test]
+    fn parse_events_never_emits_a_tool_call_for_codex() {
+        let jsonl = fixture("codex-rollout-turn-events.jsonl");
+        let adapter = CodexAdapter::new(None);
+        let events = adapter.parse_events(&jsonl);
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, NormalizedEvent::ToolCall { .. })),
+            "got {events:?}"
+        );
     }
 
     /// Issue #86: the exact normalized event sequence a recorded two-turn

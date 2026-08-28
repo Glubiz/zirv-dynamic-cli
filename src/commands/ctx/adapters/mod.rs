@@ -1023,6 +1023,17 @@ pub trait AgentAdapter: std::fmt::Debug {
         None
     }
 
+    /// This agent's own layer for a `PromptRole::SubOrchestrator` session --
+    /// a coordinator handed one scope, which may dispatch Workers but not
+    /// spawn another coordinator (see `PromptRole::SubOrchestrator`).
+    ///
+    /// Defaults to the Worker layer: an adapter with nothing coordinator-
+    /// specific to say should say the safer thing, not the more permissive
+    /// one.
+    fn sub_orchestrator_system_prompt(&self) -> Option<&'static str> {
+        self.worker_system_prompt()
+    }
+
     /// The user-facing flag name `system_prompt_args` emits, when the agent has
     /// one. Lets a caller find and merge a user's own use of the flag instead
     /// of silently overriding it with a second occurrence. `None` when the
@@ -1110,6 +1121,23 @@ pub trait AgentAdapter: std::fmt::Debug {
     fn parse_events(&self, jsonl: &str) -> Vec<NormalizedEvent>;
     fn structural_context(&self, jsonl: &str, last_n: usize) -> StructuralContext;
 
+    /// The most recently observed live model id inside `jsonl`, or `None`
+    /// when this adapter has no per-transcript model signal (the default) or
+    /// the fragment happens to carry none. Must be line-local, exactly like
+    /// [`parse_events`](Self::parse_events): `score.rs` feeds this only the
+    /// bytes appended since the last poll, so a caller keeps the last value
+    /// it resolved across polls rather than treating a fragment with no hit
+    /// as "no model at all".
+    ///
+    /// Issue #155 D1: this is what lets a live scoring path call
+    /// [`capabilities_for_model`](Self::capabilities_for_model) with a real
+    /// model string instead of always falling back to the conservative
+    /// "unstated model" reading -- see that method's own doc comment.
+    fn model_hint(&self, jsonl: &str) -> Option<String> {
+        let _ = jsonl;
+        None
+    }
+
     /// Cumulative input/output usage exposed by this harness's transcript.
     /// This is deliberately separate from rot's latest-context token signal:
     /// workflow telemetry needs phase cost, not current context occupancy.
@@ -1125,9 +1153,60 @@ pub trait AgentAdapter: std::fmt::Debug {
         false
     }
 
+    /// Whether [`parse_events`](Self::parse_events) can ever emit
+    /// [`NormalizedEvent::ToolCall`] for this agent -- i.e., whether
+    /// `--max-tool-calls` (issue #155, Phase 5(d)) has any real signal to
+    /// count against. `true` by default, since most adapters' `parse_events`
+    /// are built directly off verified tool-call records in their own
+    /// transcript.
+    ///
+    /// Issue #155 review finding C2: `CodexAdapter` overrides this to
+    /// `false` -- its own `parse_events` doc comment explains there is no
+    /// verified rollout shape for a tool call at all, so it deliberately
+    /// never emits one. Left silently `true` here, `--max-tool-calls` would
+    /// accept the flag for a codex worker and then never advance toward it,
+    /// which reads as "budget respected" forever rather than "budget not
+    /// enforceable". `exec::run_with_clock` checks this once, at
+    /// argument-validation time, and refuses the flag outright rather than
+    /// let it fail silently on every poll after that.
+    ///
+    /// Deliberately outside [`Capabilities`]: nothing in `rot.rs` or
+    /// anything scored reads this, so it does not belong in the struct that
+    /// exists to feed those signals.
+    fn counts_tool_calls(&self) -> bool {
+        true
+    }
+
     fn compact_command(&self) -> Option<&'static str>;
     fn quit_sequence(&self) -> &'static str;
     fn capabilities(&self) -> Capabilities;
+
+    /// This adapter's usable context window for `model`, when it can state
+    /// one. `None` -- the default -- means no verified capacity, which
+    /// leaves rotation on its absolute thresholds. Never guess: an
+    /// overstated capacity raises the restart ceiling past what the seat
+    /// holds, and overrunning a window is worse than rotating early.
+    fn context_window_tokens(&self, _model: Option<&str>) -> Option<u64> {
+        None
+    }
+
+    /// [`capabilities`](Self::capabilities) with the context window resolved
+    /// for a KNOWN model. Callers that have a model string to hand use this;
+    /// everything else keeps calling `capabilities()`, which carries the
+    /// adapter's own conservative default.
+    ///
+    /// Issue #155 D1: `score.rs`'s live scoring paths (`full_score`,
+    /// `IncrementalScorer::poll`) resolve the model via
+    /// [`model_hint`](Self::model_hint) off the transcript they already have
+    /// in hand and call this instead of `capabilities()`, so a `[1m]` claude
+    /// seat's real 1M window reaches rot's token gates rather than the 200k
+    /// baseline every unstated model gets.
+    fn capabilities_for_model(&self, model: Option<&str>) -> Capabilities {
+        Capabilities {
+            context_window_tokens: self.context_window_tokens(model),
+            ..self.capabilities()
+        }
+    }
 
     /// A verified harness-owned way to present a local artifact directly in
     /// that harness's UI, without launching a browser or development server.
@@ -2853,6 +2932,7 @@ mod tests {
             system_prompt: true,
             events: true,
             defer_injection_submit: true,
+            context_window_tokens: None,
         };
         assert!(missing_capability_labels(all_true).is_empty());
 

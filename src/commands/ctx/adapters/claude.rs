@@ -64,8 +64,9 @@ outcomes, including failures, plainly.
 - Before reporting development work done, run this harness's own /code-review over the full diff \
 at a single-reviewer effort level (low or medium), routed to the review model named in the \
 harness roster, never this seat's own model, and never a high-or-above fan-out, which forks \
-agents that inherit the seat's expensive model. A session that also carries the zirv meta-harness \
-layer follows that layer's cross-harness review round on top.";
+agents that inherit the seat's expensive model. If a `zirv workflow` review gate is active for \
+this change, that gate is the single source of truth and this native review does not run at all: \
+`zirv workflow review run` is the round.";
 
 /// Claude's own layer for a delegated **Worker** session (see
 /// `AgentAdapter::worker_system_prompt`), spliced in place of
@@ -89,6 +90,30 @@ fork-type subagents, which inherit this session's model and ignore overrides.
 spawned you owns review rounds.
 - Your final message is your report: lead with the outcome, keep it self-contained, and never dump \
 raw file contents into it.";
+
+/// Claude's own layer for a `PromptRole::SubOrchestrator` session (see
+/// `AgentAdapter::sub_orchestrator_system_prompt`), spliced in place of
+/// [`ORCHESTRATOR_PROMPT`] and [`WORKER_PROMPT`] for that role. Unlike a
+/// Worker, a sub-orchestrator may split its own scope and dispatch Workers
+/// via `zirv agent` -- so it gets that delegation vocabulary -- but unlike
+/// the Orchestrator it must never learn to spawn another coordinator: an
+/// unbounded delegation tree is exactly the cost failure this role exists to
+/// bound. It also does not carry the Orchestrator layer's own review-round
+/// rules -- the Orchestrator owns review gates.
+pub const SUB_ORCHESTRATOR_PROMPT: &str = "\
+zirv sub-orchestrator conventions (claude)
+
+You are a sub-orchestrator: you coordinate ONE scope handed to you by an orchestrator, you do not \
+decide which harnesses run.
+
+- Split your scope and dispatch delegated workers with `zirv agent <name> \"<prompt>\" -- --model \
+<m>`, always naming the cheapest model that can do the task.
+- Do not spawn another sub-orchestrator or a dashboard coordinator: delegation stops at one level \
+below you.
+- Keep your own replies to decisions and outcomes, not implementation: do not read large files or \
+write code yourself unless the change is trivial.
+- When every child you dispatched is done, report your scope's result back plainly, including any \
+failures.";
 
 fn text_of(message: &Value) -> String {
     message
@@ -212,6 +237,36 @@ pub fn parse_events(jsonl: &str) -> Vec<NormalizedEvent> {
     events
 }
 
+/// The most recently observed `message.model` id in `jsonl`, scanned
+/// newest-to-oldest so a live `/model` switch mid-session is reflected
+/// rather than the session's original model. Every assistant row Claude Code
+/// writes carries this field on its own `message` object (the same object
+/// [`usage_categories`] already reads `usage` off of), so this needs no
+/// separate transcript pass beyond the one `parse_events`/`transcript_usage`
+/// already make over the same lines.
+pub fn model_hint(jsonl: &str) -> Option<String> {
+    for line in jsonl.lines().rev() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(row) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if row.get("type").and_then(Value::as_str) != Some("assistant") {
+            continue;
+        }
+        if let Some(model) = row
+            .get("message")
+            .and_then(|m| m.get("model"))
+            .and_then(Value::as_str)
+        {
+            return Some(model.to_string());
+        }
+    }
+    None
+}
+
 /// The shared fold behind [`transcript_usage`] and [`sidechain_transcript_usage`]:
 /// every assistant row whose `isSidechain` flag matches `want_sidechain`,
 /// summed into the four raw classes. One fold, two filters, so the main and
@@ -262,6 +317,18 @@ pub fn sidechain_transcript_usage(jsonl: &str) -> Option<TranscriptUsage> {
 
 const FILE_KEYS: &[&str] = &["file_path", "notebook_path", "path"];
 const ERROR_SNIPPET: usize = 200;
+
+/// Conservative context window (issue #155) for a Claude model id this
+/// adapter does not recognise as a long-window seat, and for an unstated
+/// model. Conservative on purpose: an overstated capacity raises the
+/// restart ceiling past what the seat can actually hold, and a session that
+/// overruns its window is a far worse outcome than one rotated slightly
+/// early.
+pub const DEFAULT_CONTEXT_WINDOW_TOKENS: u64 = 200_000;
+
+/// A long-window Claude seat (1M tokens) is spelled with a `[1m]` or `-1m`
+/// marker in the model id in this environment.
+const LONG_CONTEXT_WINDOW_TOKENS: u64 = 1_000_000;
 
 pub fn structural_context(jsonl: &str, last_n: usize) -> StructuralContext {
     let mut out = StructuralContext::default();
@@ -471,6 +538,21 @@ impl ClaudeAdapter {
         // log directories right above it -- is allow-listed for write.
         // Best-effort: a state-dir resolution failure just omits the entry,
         // it never blocks materializing the rest of this settings layer.
+        //
+        // Code review revert (issue #168 follow-up): a prior round widened
+        // this to also allow-list memory/logs/groups/handoffs, reasoning
+        // that `zirv ctx remember`/`recall`/`forget`/`nudge`/`group`/...
+        // needed the same OS-sandbox write access `zirv ctx send` does.
+        // With `is_zirv_ctx_escape_safe`'s own fix (above), every one of
+        // those `zirv ctx <state-verb>` invocations already rides the
+        // ALWAYS-ALLOWED unsandboxed retry, so no prompt is ever paid for
+        // those writes regardless of what this OS-sandbox allowlist says.
+        // Reverting to mail-only keeps the safety audit trail (`logs/`),
+        // the cross-session memory bank, group budgets, and handoffs
+        // UNWRITABLE from inside the sandbox on any OTHER path (an
+        // unlisted/unmatched command that is not `zirv ctx` at all) -- real
+        // defense-in-depth the widened list gave up for no operator-facing
+        // benefit.
         let mail_dir =
             super::super::state::StateDir::resolve(&super::super::config::env_from_process())
                 .ok()
@@ -816,6 +898,10 @@ impl AgentAdapter for ClaudeAdapter {
 
     fn worker_system_prompt(&self) -> Option<&'static str> {
         Some(WORKER_PROMPT)
+    }
+
+    fn sub_orchestrator_system_prompt(&self) -> Option<&'static str> {
+        Some(SUB_ORCHESTRATOR_PROMPT)
     }
 
     /// Counted over the argv the operator wrote, not over the argv `base()`
@@ -1296,6 +1382,10 @@ impl AgentAdapter for ClaudeAdapter {
         structural_context(jsonl, last_n)
     }
 
+    fn model_hint(&self, jsonl: &str) -> Option<String> {
+        model_hint(jsonl)
+    }
+
     fn transcript_usage(&self, jsonl: &str) -> Option<TranscriptUsage> {
         transcript_usage(jsonl)
     }
@@ -1318,6 +1408,20 @@ impl AgentAdapter for ClaudeAdapter {
             // claude's own composer submits a same-burst trailing `\r`
             // correctly -- issue #118 is codex-specific.
             defer_injection_submit: false,
+            context_window_tokens: self.context_window_tokens(None),
+        }
+    }
+
+    /// Claude reports a per-model capacity (issue #155): the long-window
+    /// `[1m]` / `-1m` marker reports `LONG_CONTEXT_WINDOW_TOKENS`, and every
+    /// other id -- including an unstated model -- gets the conservative
+    /// `DEFAULT_CONTEXT_WINDOW_TOKENS`. See that constant's own doc comment
+    /// for why an overstated capacity is the worse failure mode.
+    fn context_window_tokens(&self, model: Option<&str>) -> Option<u64> {
+        let model = model.map(str::to_lowercase);
+        match model.as_deref() {
+            Some(m) if m.contains("[1m]") || m.contains("-1m") => Some(LONG_CONTEXT_WINDOW_TOKENS),
+            _ => Some(DEFAULT_CONTEXT_WINDOW_TOKENS),
         }
     }
 
@@ -2130,6 +2234,18 @@ mod tests {
     /// sandbox, but ONLY the mail tree -- never the policy-snapshot/
     /// attestation directory that sits right alongside it under the same
     /// state root.
+    ///
+    /// Code review revert (issue #168 follow-up): Task 7 had widened this to
+    /// also allow-list memory/logs/groups/handoffs. With the `is_zirv_ctx_
+    /// escape_safe` fix above, every `zirv ctx <state-verb>` (`remember`/
+    /// `recall`/`forget`/`nudge`/`group`/...) already rides the ALWAYS-
+    /// ALLOWED unsandboxed retry, so no prompt is ever paid for those writes
+    /// regardless of what the OS sandbox's own `allowWrite` says. Reverting
+    /// to mail-only keeps the safety audit trail (`logs/`), the cross-
+    /// session memory bank, group budgets, and handoffs UNWRITABLE from
+    /// inside the sandbox on any OTHER path (an unlisted/unmatched command
+    /// that is not `zirv ctx` at all), which is a real defense-in-depth
+    /// layer the widened list gave up for no operator-facing benefit.
     #[cfg(not(windows))]
     #[test]
     fn launch_settings_allow_write_to_the_mail_dir_but_never_the_policy_snapshot_dir() {
@@ -2761,6 +2877,76 @@ mod tests {
         assert!(ClaudeAdapter::new(None).capabilities().system_prompt);
     }
 
+    /// Claude reports a per-model capacity, with a CONSERVATIVE default for a
+    /// model id it does not recognise. Conservative on purpose: an
+    /// overstated capacity raises the restart ceiling past what the seat can
+    /// actually hold, and a session that overruns its window is a far worse
+    /// outcome than one rotated slightly early.
+    #[test]
+    fn claude_reports_a_conservative_context_window_for_an_unknown_model() {
+        let adapter = ClaudeAdapter::new(None);
+        assert_eq!(
+            adapter.context_window_tokens(Some("some-model-zirv-has-never-seen")),
+            Some(DEFAULT_CONTEXT_WINDOW_TOKENS)
+        );
+        assert_eq!(
+            adapter.context_window_tokens(None),
+            Some(DEFAULT_CONTEXT_WINDOW_TOKENS),
+            "an unstated model is the same conservative answer"
+        );
+        assert_eq!(
+            adapter.capabilities().context_window_tokens,
+            Some(DEFAULT_CONTEXT_WINDOW_TOKENS),
+            "every existing capabilities() caller gets a capacity with no new plumbing"
+        );
+    }
+
+    /// A recognised long-window model id reports its own capacity, and the
+    /// `[1m]` suffix form is recognised too -- that is how a long-window seat
+    /// is actually spelled in this environment.
+    #[test]
+    fn claude_recognises_a_long_window_model_id() {
+        let adapter = ClaudeAdapter::new(None);
+        let long = adapter
+            .context_window_tokens(Some("claude-opus-5[1m]"))
+            .expect("a capacity");
+        assert!(
+            long > DEFAULT_CONTEXT_WINDOW_TOKENS,
+            "a 1M seat must not be capped at the conservative default"
+        );
+        assert_eq!(
+            adapter
+                .capabilities_for_model(Some("claude-opus-5[1m]"))
+                .context_window_tokens,
+            Some(long)
+        );
+    }
+
+    /// Issue #155 D1: `model_hint` reads the same `message.model` field every
+    /// assistant row already carries, and reports the LAST one seen -- a
+    /// live `/model` switch mid-session must be reflected, not the session's
+    /// original model.
+    #[test]
+    fn model_hint_reports_the_most_recent_assistant_model() {
+        let jsonl = format!(
+            "{}\n{}\n{}",
+            r#"{"type":"assistant","message":{"model":"claude-sonnet-5"}}"#,
+            r#"{"type":"user","message":{"content":"hi"}}"#,
+            r#"{"type":"assistant","message":{"model":"claude-opus-5[1m]"}}"#,
+        );
+        assert_eq!(
+            model_hint(&jsonl),
+            Some("claude-opus-5[1m]".to_string()),
+            "the LAST assistant model wins, not the first"
+        );
+    }
+
+    #[test]
+    fn model_hint_is_none_for_a_transcript_with_no_assistant_model_field() {
+        let jsonl = r#"{"type":"user","message":{"content":"hi"}}"#;
+        assert_eq!(model_hint(jsonl), None);
+    }
+
     #[test]
     fn model_args_uses_the_verified_flag() {
         let adapter = ClaudeAdapter::new(None);
@@ -2811,6 +2997,34 @@ mod tests {
                 "the worker layer must say '{claim}': {layer}"
             );
         }
+    }
+
+    /// The trimmed coordination layer is real text, materially shorter than
+    /// the orchestrator layer -- the whole point is that a coordinator seat
+    /// costs less than the seat that spawned it -- and it must never coach
+    /// onward coordinator spawning.
+    #[test]
+    fn the_sub_orchestrator_layer_is_short_and_forbids_spawning_coordinators() {
+        assert!(SUB_ORCHESTRATOR_PROMPT.len() < ORCHESTRATOR_PROMPT.len());
+        assert!(SUB_ORCHESTRATOR_PROMPT.contains("zirv agent"));
+        assert!(
+            SUB_ORCHESTRATOR_PROMPT.contains("sub-orchestrator"),
+            "must name what it must not spawn"
+        );
+    }
+
+    /// Claude actually wires `SUB_ORCHESTRATOR_PROMPT` into the adapter
+    /// trait rather than leaving the const unused and falling back to the
+    /// default (`worker_system_prompt`) -- the three role layers must all be
+    /// distinct texts.
+    #[test]
+    fn claude_has_its_own_sub_orchestrator_layer_distinct_from_the_other_two() {
+        let layer = ClaudeAdapter::new(None)
+            .sub_orchestrator_system_prompt()
+            .expect("claude has a sub-orchestrator layer");
+        assert_eq!(layer, SUB_ORCHESTRATOR_PROMPT);
+        assert_ne!(layer, WORKER_PROMPT);
+        assert_ne!(layer, ORCHESTRATOR_PROMPT);
     }
 
     /// The claude ladder, top to bottom: fable/mythos, opus, sonnet, haiku.
@@ -3131,6 +3345,22 @@ mod tests {
             ),
             "the model-routing bullet's pin clause must carve out the review-model exception: \
              {ORCHESTRATOR_PROMPT}"
+        );
+    }
+
+    /// The specific sentence being corrected: the orchestrator layer used to
+    /// say a session carrying the zirv meta-harness layer follows that
+    /// layer's cross-harness review round "on top" of its own /code-review.
+    /// That instruction is what turned one change into three review rounds.
+    #[test]
+    fn the_orchestrator_layer_no_longer_stacks_a_review_round_on_top() {
+        assert!(
+            !ORCHESTRATOR_PROMPT.contains("on top"),
+            "the stacking instruction must be gone"
+        );
+        assert!(
+            ORCHESTRATOR_PROMPT.contains("zirv workflow"),
+            "and must instead defer to the workflow gate when one is active"
         );
     }
 

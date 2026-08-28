@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-25
+last-verified: 2026-08-27
 ---
 
 # _system-context
@@ -68,6 +68,7 @@ Every row's "vault page" is also the page whose "If changed" line names its own 
 | `safety` | `check`/`list`/`explain` against zirv's harness-neutral command safety policy; `check` is also Claude's launch-attested `PreToolUse` hook. |
 | `permissions audit` | Transcript-backed audit of recent escalated/denied command-permission requests, grouped by normalized command family (issue #132). |
 | `handover` | Swap the orchestrator seat's model or harness in place, same registry short id (issue #84). |
+| `group` | `create`/`status`/`close` a work group: persisted scope/child-limit/token-budget/deadline/contract for a batch of delegated work (issue #155). |
 
 ## Key Flows
 

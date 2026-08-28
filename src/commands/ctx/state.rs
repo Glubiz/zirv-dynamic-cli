@@ -402,6 +402,14 @@ impl StateDir {
         self.0.join("sessions")
     }
 
+    /// `<state>/groups` -- one JSON file per work group (issue #155). A
+    /// sibling of `sessions()`, and deliberately NOT inside it: a session is
+    /// a live process, a group outlives every process in it and is the
+    /// record of what a batch of delegated work was launched under.
+    pub fn groups(&self) -> PathBuf {
+        self.0.join("groups")
+    }
+
     /// First 8 hex characters of the session id keep the socket path short.
     pub fn socket_for(&self, session: &str) -> PathBuf {
         let short: String = session

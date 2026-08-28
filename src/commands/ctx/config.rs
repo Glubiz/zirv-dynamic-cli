@@ -27,8 +27,25 @@ pub fn env_from_process() -> impl Fn(&str) -> Option<String> {
 pub struct ScoreConfig {
     pub window: usize,
     pub min_turns: usize,
-    pub token_floor: u64,
-    pub token_ceiling: u64,
+    /// Explicit absolute override for the token-pressure floor. Wins outright
+    /// over `token_floor_ratio` when set -- an operator who pins a number
+    /// gets that number, capacity or not. `None` (the default) means "derive
+    /// it from the ratio and the resolved capacity instead"; see
+    /// `rot::token_gates`.
+    pub token_floor: Option<u64>,
+    /// Same as `token_floor`, for the ceiling.
+    pub token_ceiling: Option<u64>,
+    /// Fraction of the resolved capacity the floor sits at when no explicit
+    /// `token_floor` is set (issue #155, Phase 6b). Default `0.5`.
+    pub token_floor_ratio: f64,
+    /// Fraction of the resolved capacity the ceiling sits at when no
+    /// explicit `token_ceiling` is set. Default `0.8`.
+    pub token_ceiling_ratio: f64,
+    /// Operator-pinned context-window capacity, overriding whatever the
+    /// adapter itself reports (`Capabilities::context_window_tokens`): the
+    /// operator knows their own seat, and the adapter's default is a guess
+    /// about it. `None` (the default) defers to the adapter.
+    pub model_context_tokens: Option<u64>,
     pub weight_tool_failure: f64,
     pub weight_repetition: f64,
     pub weight_marker: f64,
@@ -44,8 +61,11 @@ impl Default for ScoreConfig {
         Self {
             window: 10,
             min_turns: 10,
-            token_floor: 100_000,
-            token_ceiling: 160_000,
+            token_floor: None,
+            token_ceiling: None,
+            token_floor_ratio: 0.5,
+            token_ceiling_ratio: 0.8,
+            model_context_tokens: None,
             weight_tool_failure: 40.0,
             weight_repetition: 30.0,
             weight_marker: 30.0,
@@ -93,32 +113,50 @@ pub struct SuperviseConfig {
     /// this names no binary, shell command, or model choice, only how many
     /// times a session tolerates being interrupted.
     pub max_nudges: u32,
-    /// Issue #133: the machine-wide cap on live "heavy" workers --
-    /// unattended supervised sessions that can run real build/test-class
-    /// load with nobody watching (`Verb::Exec`, including `zirv agent`'s
-    /// headless fallback which delegates straight into `exec::run_with`, and
-    /// `Verb::Dash` dashboard worker panes -- see
-    /// `sessions::count_heavy_workers`'s own doc comment for exactly which
-    /// verbs count and why). Refuse-not-queue: a spawn that would exceed
-    /// this is rejected outright at `exec.rs`'s registration point and
-    /// `dash::fulfill_spawn_request`, not queued, because a BSOD-triggering
-    /// incident (four kernel bugchecks in 12 minutes, issue #133's own
-    /// evidence) was two concurrent cold `cargo build` + full-nextest
-    /// workloads run under zirv supervision with no governance at all.
-    /// Defaults to 1: the two-parallel-worktree reproduction in #133 needed
-    /// only two to blue-screen the host, so the safe default is a single
-    /// heavy worker at a time -- an operator who has verified their own
-    /// machine can take more raises this explicitly.
+    /// Issue #155, Phase 5(e): how many HEAVY OPERATIONS may run
+    /// concurrently on this machine -- classified commands (`cargo build`/
+    /// `test`/`nextest`/`clippy`/`package`/`publish`, plus
+    /// `heavy_command_patterns`), each holding a permit for the duration of
+    /// the child process (`permit::acquire`/`permit::HeavyPermit`), checked
+    /// at `script_runner::Command::invoke`, the single seam where a zirv
+    /// script runs a shell command. Replaces `max_heavy_workers`, which
+    /// counted live `Verb::Exec | Verb::Dash` session records and so was
+    /// blind to what those sessions were actually doing: an idle worker
+    /// consumed the whole budget while a busy orchestrator running a full
+    /// nextest sweep consumed none of it.
     ///
-    /// `REPO_FORBIDDEN`, the same trust asymmetry as `dash.max_panes`: a
-    /// checked-out repo raising its own concurrency budget is exactly the
-    /// case the cap exists for, so only `~/.zirv/ctx.toml` or
-    /// `ZIRV_CTX_SUPERVISE_MAX_HEAVY_WORKERS` may set it. Deliberately
-    /// **not** under `[agents]` -- that table is reserved for the distinct,
-    /// per-agent `<repo>/.zirv/.settings.toml` gate (see
+    /// `max_heavy_workers` is still accepted as a DEPRECATED ALIAS,
+    /// rewritten onto this key before deserialisation: these structs are
+    /// `deny_unknown_fields`, so an operator's existing `~/.zirv/ctx.toml`
+    /// (or `ZIRV_CTX_SUPERVISE_MAX_HEAVY_WORKERS`) would otherwise hard-fail
+    /// on upgrade. The new key wins when both are present.
+    ///
+    /// Defaults to 1, unchanged from issue #133: the two-parallel-worktree
+    /// reproduction there needed only two concurrent cold `cargo build` +
+    /// full-nextest workloads to blue-screen the host four times in twelve
+    /// minutes, so the safe default is a single heavy operation at a time --
+    /// an operator who has verified their own machine can take more raises
+    /// this explicitly.
+    ///
+    /// `REPO_FORBIDDEN` under BOTH spellings, unchanged from #133: a
+    /// checked-out repo raising the machine-wide concurrency budget is
+    /// exactly the case the cap exists for, so only `~/.zirv/ctx.toml` or
+    /// the matching `ZIRV_CTX_SUPERVISE_MAX_HEAVY_*` env var may set it.
+    /// Deliberately **not** under `[agents]` -- that table is reserved for
+    /// the distinct, per-agent `<repo>/.zirv/.settings.toml` gate (see
     /// `agents_in_ctx_toml_is_rejected_so_the_two_files_stay_distinct`) --
     /// this is a `[supervise]` key like every other cap in this struct.
-    pub max_heavy_workers: usize,
+    pub max_heavy_operations: usize,
+    /// Extra command patterns an operator classifies as heavy on their own
+    /// machine, ADDED to the built-in set (`permit::BUILTIN_HEAVY_PATTERNS`),
+    /// never replacing it -- `permit::is_heavy` always checks the built-ins
+    /// regardless of what this holds. A repo layer may add entries (adding
+    /// is narrowing), but the built-ins can never be removed by any layer.
+    /// Not `REPO_FORBIDDEN`: unlike `max_heavy_operations` itself, adding a
+    /// pattern can only make MORE commands wait for a permit, never fewer,
+    /// so a repo checkout widening this list cannot reproduce issue #133's
+    /// ungoverned-concurrency incident.
+    pub heavy_command_patterns: Vec<String>,
 }
 
 impl Default for SuperviseConfig {
@@ -132,7 +170,8 @@ impl Default for SuperviseConfig {
             backoff_base_secs: 60,
             on_failure: None,
             max_nudges: 3,
-            max_heavy_workers: 1,
+            max_heavy_operations: 1,
+            heavy_command_patterns: Vec::new(),
         }
     }
 }
@@ -221,6 +260,27 @@ pub struct PaceConfig {
     /// cycles that would otherwise spend against the account with nobody
     /// watching. See [[Usage and Pacing]]/[[Known Issues]].
     pub blind_delay_secs: u64,
+    /// Issue #155, Phase 6(c): the soft/hard band for `pace::spawn_gate`,
+    /// which gates whether a NEW delegated worker may be spawned at all
+    /// (`agent::run_with`, `dash::fulfill_spawn_request`) -- never whether an
+    /// already-running session gets restarted. Restarting a session because
+    /// it is expensive would discard a warm cache and re-read the whole
+    /// context, the single most expensive possible reaction to a cost
+    /// signal, so `rot.rs`/`score.rs` never read these (or any other
+    /// `pace`/`window` field) at all. Deliberately distinct from `max_
+    /// percent`/`soft_percent` above, which tune an already-running
+    /// supervised loop's own cadence: a spawn is new spend the operator has
+    /// not yet committed to, so it earns a stricter, earlier ceiling than
+    /// pacing an existing one. `REPO_FORBIDDEN`: a repo checkout must not be
+    /// able to change when the operator's account stops accepting new work,
+    /// in either direction.
+    pub spawn_soft_pct: f64,
+    /// See `spawn_soft_pct` just above. At or above this, `agent::run_with`/
+    /// `dash::fulfill_spawn_request` refuse the spawn outright unless
+    /// overridden (`agent::run_with`'s own `--force`, or `dash::SpawnRequest
+    /// ::force` carrying that same choice into a pane spawn).
+    /// `REPO_FORBIDDEN`, same reasoning as `spawn_soft_pct`.
+    pub spawn_hard_pct: f64,
 }
 
 impl Default for PaceConfig {
@@ -242,6 +302,8 @@ impl Default for PaceConfig {
             poll_min_interval_secs: 60,
             use_credits: UseCreditsConfig::default(),
             blind_delay_secs: 60,
+            spawn_soft_pct: 80.0,
+            spawn_hard_pct: 95.0,
         }
     }
 }
@@ -961,6 +1023,21 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         &["score", "token_ceiling"],
         EnvKind::Int,
     ),
+    (
+        "ZIRV_CTX_SCORE_TOKEN_FLOOR_RATIO",
+        &["score", "token_floor_ratio"],
+        EnvKind::Float,
+    ),
+    (
+        "ZIRV_CTX_SCORE_TOKEN_CEILING_RATIO",
+        &["score", "token_ceiling_ratio"],
+        EnvKind::Float,
+    ),
+    (
+        "ZIRV_CTX_SCORE_MODEL_CONTEXT_TOKENS",
+        &["score", "model_context_tokens"],
+        EnvKind::Int,
+    ),
     ("ZIRV_CTX_MARKER", &["score", "marker"], EnvKind::Str),
     (
         "ZIRV_CTX_DEBOUNCE_MS",
@@ -1006,6 +1083,11 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
     (
         "ZIRV_CTX_SUPERVISE_MAX_HEAVY_WORKERS",
         &["supervise", "max_heavy_workers"],
+        EnvKind::Int,
+    ),
+    (
+        "ZIRV_CTX_SUPERVISE_MAX_HEAVY_OPERATIONS",
+        &["supervise", "max_heavy_operations"],
         EnvKind::Int,
     ),
     ("ZIRV_CTX_MODEL", &["handoff", "model"], EnvKind::Str),
@@ -1069,6 +1151,16 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         "ZIRV_CTX_PACE_BLIND_DELAY_SECS",
         &["pace", "blind_delay_secs"],
         EnvKind::Int,
+    ),
+    (
+        "ZIRV_CTX_PACE_SPAWN_SOFT_PCT",
+        &["pace", "spawn_soft_pct"],
+        EnvKind::Float,
+    ),
+    (
+        "ZIRV_CTX_PACE_SPAWN_HARD_PCT",
+        &["pace", "spawn_hard_pct"],
+        EnvKind::Float,
     ),
     (
         "ZIRV_CTX_PACE_USE_CREDITS_CLAUDE",
@@ -1642,12 +1734,20 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     (&["dash", "max_panes"], "ZIRV_CTX_DASH_MAX_PANES"),
     // Issue #133: same trust asymmetry as `dash.max_panes` right above, one
     // level up -- a repo checkout must not be able to raise the machine-wide
-    // heavy-worker budget any more than it can raise the one dashboard's own
-    // pane cap. See `SuperviseConfig::max_heavy_workers`'s own doc comment
-    // for the BSOD incident this defends against.
+    // heavy-operation budget any more than it can raise the one dashboard's
+    // own pane cap. See `SuperviseConfig::max_heavy_operations`'s own doc
+    // comment for the BSOD incident this defends against.
     (
         &["supervise", "max_heavy_workers"],
         "ZIRV_CTX_SUPERVISE_MAX_HEAVY_WORKERS",
+    ),
+    // Issue #155, Phase 5(e): `max_heavy_operations` is the renamed key --
+    // same trust posture as `max_heavy_workers` right above, which stays
+    // forbidden too as a deprecated alias (see `CtxConfig::load`'s pre-
+    // deserialise rewrite).
+    (
+        &["supervise", "max_heavy_operations"],
+        "ZIRV_CTX_SUPERVISE_MAX_HEAVY_OPERATIONS",
     ),
     // Mouse capture takes over the terminal's own text selection, so which
     // way that trade goes is the operator's call about their own terminal,
@@ -1676,6 +1776,19 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
         &["pace", "blind_delay_secs"],
         "ZIRV_CTX_PACE_BLIND_DELAY_SECS",
     ),
+    // Issue #155, Phase 6(c): `pace::spawn_gate`'s own soft/hard band --
+    // whether a NEW delegated worker may be spawned at all, never whether an
+    // already-running session gets restarted (see `SpawnGate`'s own doc
+    // comment for why the two must stay independent). A repo checkout must
+    // not be able to change when the operator's account stops accepting new
+    // work, in EITHER direction: raising either percentage would let a
+    // checkout spend past a ceiling the operator set, and lowering one would
+    // let a checkout throttle delegation for an operator who did not ask for
+    // it -- the same "the checkout is not the operator" trust asymmetry
+    // every other entry in this list enforces, applied to a refusal
+    // threshold instead of a byte cap or a switch.
+    (&["pace", "spawn_soft_pct"], "ZIRV_CTX_PACE_SPAWN_SOFT_PCT"),
+    (&["pace", "spawn_hard_pct"], "ZIRV_CTX_PACE_SPAWN_HARD_PCT"),
     // `chat.model` is deliberately ABSENT from this list. See `ChatConfig`'s
     // own doc comment and the spec's "Orchestrator model" section
     // (docs/superpowers/specs/2026-08-13-zirv-dashboard-design.md): unlike
@@ -1754,6 +1867,30 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     // otherwise impose on a write statement reaching a broad allow rule or
     // the permissive interactive default -- loosening only.
     (&["safety", "sql"], "ZIRV_CTX_SAFETY_SQL"),
+    // Issue #155, Phase 6b: a repo checkout must not be able to move when the
+    // operator's own sessions rotate -- raising the ceiling (or the ratio
+    // that derives it) hides rot from the operator for longer; lowering the
+    // floor fires restarts, and the compaction/handoff they trigger, more
+    // often than the operator chose. Both directions are the checkout
+    // choosing spend/safety behavior for its own operator, the same trust
+    // asymmetry every other entry in this list enforces. All five keys that
+    // feed `rot::token_gates` are forbidden together, absolutes and ratios
+    // alike, so a checkout cannot route around the absolute-override block by
+    // tuning the ratio instead (or vice versa).
+    (&["score", "token_floor"], "ZIRV_CTX_TOKEN_FLOOR"),
+    (&["score", "token_ceiling"], "ZIRV_CTX_TOKEN_CEILING"),
+    (
+        &["score", "token_floor_ratio"],
+        "ZIRV_CTX_SCORE_TOKEN_FLOOR_RATIO",
+    ),
+    (
+        &["score", "token_ceiling_ratio"],
+        "ZIRV_CTX_SCORE_TOKEN_CEILING_RATIO",
+    ),
+    (
+        &["score", "model_context_tokens"],
+        "ZIRV_CTX_SCORE_MODEL_CONTEXT_TOKENS",
+    ),
 ];
 
 fn value_at<'a>(table: &'a toml::Table, path: &[&str]) -> Option<&'a toml::Value> {
@@ -1935,6 +2072,19 @@ impl CtxConfig {
         // function's own doc comment for why the polarity is inverted.
         let home_context_dedupe_native =
             bool_at(take_nested(&mut merged, "context", "dedupe_native"));
+        // `supervise.heavy_command_patterns` gets the identical treatment as
+        // `sandbox.extra_deny` above, for the identical reason: the field's
+        // own doc comment promises a repo layer may only ADD patterns, never
+        // replace the operator's own list, but the ordinary `merge()` below
+        // would let a repo `heavy_command_patterns = []` (or any other
+        // array) silently clobber the home layer's entries instead of
+        // adding to them. Lifted out and unioned once both layers are in
+        // hand, same as `extra_deny`.
+        let home_heavy_patterns = string_array(take_nested(
+            &mut merged,
+            "supervise",
+            "heavy_command_patterns",
+        ));
 
         // Read on its own first: the repo layer is the one layer that comes
         // from a checkout rather than from the operator.
@@ -1965,6 +2115,11 @@ impl CtxConfig {
         let repo_pace_soft_percent = float_at(take_nested(&mut repo_layer, "pace", "soft_percent"));
         let repo_context_dedupe_native =
             bool_at(take_nested(&mut repo_layer, "context", "dedupe_native"));
+        let repo_heavy_patterns = string_array(take_nested(
+            &mut repo_layer,
+            "supervise",
+            "heavy_command_patterns",
+        ));
         merge(&mut merged, repo_layer);
 
         // Re-inserted after the merge, before env: env (below) must still be
@@ -2012,6 +2167,25 @@ impl CtxConfig {
             }
         }
 
+        // Issue #155, Phase 5(e): `supervise.max_heavy_workers` is a
+        // deprecated alias for `max_heavy_operations`, rewritten here --
+        // after every layer, including the `ENV_MAP` loop just above, has
+        // already contributed -- because `SuperviseConfig` is
+        // `deny_unknown_fields` and an old key surviving to `try_into()`
+        // below would hard-fail the load rather than degrade gracefully.
+        // Positioned after `ENV_MAP` rather than alongside the `pace`/
+        // `context` re-insertions above so the deprecated
+        // `ZIRV_CTX_SUPERVISE_MAX_HEAVY_WORKERS` env var (still in
+        // `ENV_MAP`, unchanged) gets the identical rewrite a deprecated TOML
+        // key gets, instead of leaving its own stray `max_heavy_workers`
+        // entry behind. The new key wins whenever both spellings ended up
+        // set, regardless of which layer or env var supplied either one.
+        if let Some(old) = take_nested(&mut merged, "supervise", "max_heavy_workers")
+            && value_at(&merged, &["supervise", "max_heavy_operations"]).is_none()
+        {
+            insert_path(&mut merged, &["supervise", "max_heavy_operations"], old);
+        }
+
         let mut cfg: Self = toml::Value::Table(merged)
             .try_into()
             .map_err(|e| format!("invalid ctx config: {e}"))?;
@@ -2035,6 +2209,16 @@ impl CtxConfig {
         if let Some(raw) = env("ZIRV_CTX_SANDBOX_EXTRA_ALLOW") {
             cfg.sandbox.extra_allow = split_csv_list(&raw);
         }
+
+        // Same union as `extra_deny` above, for `heavy_command_patterns`: the
+        // operator's own home-layer patterns plus whatever the repo adds,
+        // never fewer than either -- a repo layer may only add a pattern
+        // (narrowing), never remove or replace the operator's own list. No
+        // env override exists for this key today, unlike `extra_deny`/
+        // `extra_allow`.
+        let mut heavy_patterns = home_heavy_patterns;
+        heavy_patterns.extend(repo_heavy_patterns);
+        cfg.supervise.heavy_command_patterns = heavy_patterns;
 
         // SECURITY (command-injection defense): `chat.model` is one of the few
         // keys a repo `ctx.toml` may set (see `REPO_FORBIDDEN`'s `chat.model`
@@ -2280,8 +2464,14 @@ mod tests {
         let cfg = ScoreConfig::default();
         assert_eq!(cfg.window, 10);
         assert_eq!(cfg.min_turns, 10);
-        assert_eq!(cfg.token_floor, 100_000);
-        assert_eq!(cfg.token_ceiling, 160_000);
+        assert_eq!(
+            cfg.token_floor, None,
+            "absolute overrides are unset by default -- see rot::token_gates"
+        );
+        assert_eq!(cfg.token_ceiling, None);
+        assert_eq!(cfg.token_floor_ratio, 0.5);
+        assert_eq!(cfg.token_ceiling_ratio, 0.8);
+        assert_eq!(cfg.model_context_tokens, None);
         assert_eq!(cfg.advise_at, 40);
         assert_eq!(cfg.compact_at, 60);
         assert_eq!(cfg.restart_at, 80);
@@ -2296,9 +2486,14 @@ mod tests {
         assert_eq!(SuperviseConfig::default().max_restarts, 2);
         assert_eq!(SuperviseConfig::default().max_nudges, 3);
         assert_eq!(
-            SuperviseConfig::default().max_heavy_workers,
+            SuperviseConfig::default().max_heavy_operations,
             1,
-            "issue #133: a single heavy worker at a time is the safe default"
+            "issue #133: a single heavy operation at a time is the safe default"
+        );
+        assert_eq!(
+            SuperviseConfig::default().heavy_command_patterns,
+            Vec::<String>::new(),
+            "the built-in set is baked into permit::is_heavy, not duplicated here"
         );
         assert_eq!(
             HandoffConfig::default().model,
@@ -2315,17 +2510,16 @@ mod tests {
         std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
         std::fs::write(
             repo.path().join(".zirv/ctx.toml"),
-            "[score]\nwindow = 4\ntoken_floor = 50000\nmarker = \"[repo]\"\n",
+            "[score]\nwindow = 4\nmarker = \"[repo]\"\n",
         )
         .expect("write");
 
         let empty = env_map(&[]);
         let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
         assert_eq!(cfg.score.window, 4);
-        assert_eq!(cfg.score.token_floor, 50_000);
         assert_eq!(cfg.score.marker, "[repo]");
         assert_eq!(
-            cfg.score.token_ceiling, 160_000,
+            cfg.score.token_ceiling_ratio, 0.8,
             "untouched keys keep defaults"
         );
 
@@ -2333,7 +2527,58 @@ mod tests {
         let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
         assert_eq!(cfg.score.window, 7);
         assert_eq!(cfg.score.marker, "[env]");
-        assert_eq!(cfg.score.token_floor, 50_000, "repo layer still applies");
+    }
+
+    /// Companion to the test above, for the token gate's own five keys
+    /// specifically: none of them may be set from a repo checkout at all
+    /// (issue #155, Phase 6b) -- see `REPO_FORBIDDEN`'s own comment on the
+    /// `score.token_floor` entry for why both the absolutes and the ratios
+    /// are blocked together.
+    #[test]
+    fn a_repo_ctx_toml_cannot_move_any_of_the_five_token_gate_keys() {
+        for repo_toml in [
+            "[score]\ntoken_floor = 50000\n",
+            "[score]\ntoken_ceiling = 900000\n",
+            "[score]\ntoken_floor_ratio = 0.9\n",
+            "[score]\ntoken_ceiling_ratio = 0.1\n",
+            "[score]\nmodel_context_tokens = 1000000\n",
+        ] {
+            let repo = tempfile::tempdir().expect("repo");
+            let home = tempfile::tempdir().expect("home");
+            let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+            std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+            std::fs::write(repo.path().join(".zirv/ctx.toml"), repo_toml).expect("write");
+            let empty: HashMap<String, String> = HashMap::new();
+            let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+                .expect_err(&format!("a repo may not set: {repo_toml}"));
+            assert!(
+                is_repo_forbidden(err.as_ref()),
+                "must be a security refusal for {repo_toml}: {err}"
+            );
+        }
+    }
+
+    /// The operator's own home layer -- unlike the repo layer above -- may
+    /// still set `token_floor`/`token_ceiling` as plain integers, and they
+    /// still parse: the type moved from `u64` to `Option<u64>`, but a
+    /// present value still deserializes to `Some`, so no existing operator
+    /// config breaks.
+    #[test]
+    fn an_operator_layer_still_parses_plain_integer_token_thresholds() {
+        let home = tempfile::tempdir().expect("home");
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".zirv/ctx.toml"),
+            "[score]\ntoken_floor = 50000\ntoken_ceiling = 900000\n",
+        )
+        .expect("write");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let repo = tempfile::tempdir().expect("repo");
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert_eq!(cfg.score.token_floor, Some(50_000));
+        assert_eq!(cfg.score.token_ceiling, Some(900_000));
     }
 
     #[test]
@@ -2703,6 +2948,18 @@ mod tests {
     }
 
     #[test]
+    fn spawn_gate_thresholds_are_settable_from_the_operators_own_env() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let env = env_map(&[
+            ("ZIRV_CTX_PACE_SPAWN_SOFT_PCT", "70"),
+            ("ZIRV_CTX_PACE_SPAWN_HARD_PCT", "90"),
+        ]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert_eq!(cfg.pace.spawn_soft_pct, 70.0);
+        assert_eq!(cfg.pace.spawn_hard_pct, 90.0);
+    }
+
+    #[test]
     fn a_non_numeric_percent_is_rejected_with_the_variable_named() {
         let repo = tempfile::tempdir().expect("tempdir");
         let env = env_map(&[("ZIRV_CTX_PACE_MAX_PERCENT", "loads")]);
@@ -2727,6 +2984,47 @@ mod tests {
         assert_eq!(cfg.poll_min_interval_secs, 60);
         assert!(!cfg.use_credits.claude);
         assert!(!cfg.use_credits.codex);
+    }
+
+    #[test]
+    fn pace_gains_spawn_soft_and_hard_pct_defaults() {
+        let cfg = PaceConfig::default();
+        assert_eq!(cfg.spawn_soft_pct, 80.0);
+        assert_eq!(cfg.spawn_hard_pct, 95.0);
+    }
+
+    /// Issue #155, Phase 6(c): unlike `pace.enabled`/`max_percent`/
+    /// `soft_percent` (which a repo may repo-narrow -- see `a_repo_layer_
+    /// may_only_narrow_pace_enabled_max_percent_and_soft_percent` below),
+    /// `spawn_soft_pct`/`spawn_hard_pct` are `REPO_FORBIDDEN` outright: a
+    /// checkout may not move either threshold in EITHER direction, not even
+    /// to tighten it. Raising either would let a checkout spend past a
+    /// ceiling the operator set; a repo-narrowing fold (the `pace.max_
+    /// percent` shape) would let a checkout throttle delegation for an
+    /// operator who never asked for that either -- a spawn gate has no safe
+    /// direction for an untrusted layer to move it, so both are blocked
+    /// outright instead.
+    #[test]
+    fn a_repo_ctx_toml_cannot_move_the_spawn_gate_thresholds_in_either_direction() {
+        for repo_toml in [
+            "[pace]\nspawn_soft_pct = 10.0\n",
+            "[pace]\nspawn_soft_pct = 99.0\n",
+            "[pace]\nspawn_hard_pct = 10.0\n",
+            "[pace]\nspawn_hard_pct = 99.9\n",
+        ] {
+            let repo = tempfile::tempdir().expect("repo");
+            let home = tempfile::tempdir().expect("home");
+            let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+            std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+            std::fs::write(repo.path().join(".zirv/ctx.toml"), repo_toml).expect("write");
+            let empty: HashMap<String, String> = HashMap::new();
+            let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+                .expect_err(&format!("a repo may not set: {repo_toml}"));
+            assert!(
+                is_repo_forbidden(err.as_ref()),
+                "must be a security refusal for {repo_toml}: {err}"
+            );
+        }
     }
 
     #[test]
@@ -3719,33 +4017,149 @@ mod tests {
         assert_eq!(cfg.supervise.max_nudges, 5);
     }
 
-    /// Issue #133: `supervise.max_heavy_workers` reads from its own env var
-    /// like every other `supervise.*` key.
+    /// Issue #155, Phase 5(e): the deprecated `ZIRV_CTX_SUPERVISE_MAX_HEAVY_
+    /// WORKERS` env var still sets the renamed `max_heavy_operations` key --
+    /// the same alias treatment the deprecated TOML key gets, so an
+    /// operator's existing shell profile keeps working across the upgrade.
     #[test]
-    fn max_heavy_workers_env_override_sets_the_key() {
+    fn max_heavy_workers_env_override_sets_the_new_key() {
         let repo = tempfile::tempdir().expect("tempdir");
         let env = env_map(&[("ZIRV_CTX_SUPERVISE_MAX_HEAVY_WORKERS", "4")]);
         let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
-        assert_eq!(cfg.supervise.max_heavy_workers, 4);
+        assert_eq!(cfg.supervise.max_heavy_operations, 4);
     }
 
-    /// Issue #133: `max_heavy_workers` is `REPO_FORBIDDEN`, the same trust
-    /// asymmetry as `dash.max_panes` -- a checked-out repo raising its own
-    /// concurrency budget is exactly the case the cap exists for.
+    /// The renamed key reads from its own env var like every other
+    /// `supervise.*` key.
     #[test]
-    fn a_repository_config_may_not_set_max_heavy_workers() {
+    fn max_heavy_operations_env_override_sets_the_key() {
         let repo = tempfile::tempdir().expect("tempdir");
-        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        let env = env_map(&[("ZIRV_CTX_SUPERVISE_MAX_HEAVY_OPERATIONS", "4")]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert_eq!(cfg.supervise.max_heavy_operations, 4);
+    }
+
+    /// Issue #155, Phase 5(e): `supervise.max_heavy_workers` is renamed to
+    /// `max_heavy_operations`. The old spelling must still PARSE, not merely
+    /// be documented: `CtxConfig`'s structs are `deny_unknown_fields`, an
+    /// installed older binary hard-errors on an unknown key, and an
+    /// operator's existing `~/.zirv/ctx.toml` has to keep working across the
+    /// upgrade in both directions.
+    #[test]
+    fn the_deprecated_max_heavy_workers_alias_still_sets_the_new_key() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
         std::fs::write(
-            repo.path().join(".zirv/ctx.toml"),
-            "[supervise]\nmax_heavy_workers = 99\n",
+            home.path().join(".zirv").join(CTX_CONFIG_FILE),
+            "[supervise]\nmax_heavy_workers = 2\n",
         )
         .expect("write");
 
-        let empty = env_map(&[]);
-        let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
-            .expect_err("max_heavy_workers must be REPO_FORBIDDEN");
-        assert!(err.to_string().contains("max_heavy_workers"), "got {err}");
+        let repo = tempfile::tempdir().expect("repo");
+        let empty: HashMap<String, String> = HashMap::new();
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("loads");
+        assert_eq!(cfg.supervise.max_heavy_operations, 2);
+    }
+
+    /// The new spelling wins when both are present -- an operator mid-
+    /// migration must not get the old value silently.
+    #[test]
+    fn the_new_key_wins_over_the_deprecated_alias() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".zirv").join(CTX_CONFIG_FILE),
+            "[supervise]\nmax_heavy_workers = 2\nmax_heavy_operations = 4\n",
+        )
+        .expect("write");
+
+        let repo = tempfile::tempdir().expect("repo");
+        let empty: HashMap<String, String> = HashMap::new();
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("loads");
+        assert_eq!(cfg.supervise.max_heavy_operations, 4);
+    }
+
+    /// Both spellings stay `REPO_FORBIDDEN`: a checked-out repo raising the
+    /// machine-wide concurrency budget is the exact case issue #133's BSOD
+    /// incident created it for, and a renamed key must not become a hole.
+    #[test]
+    fn neither_spelling_may_come_from_a_repo_layer() {
+        for key in ["max_heavy_operations", "max_heavy_workers"] {
+            let repo = tempfile::tempdir().expect("repo");
+            std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+            std::fs::write(
+                repo.path().join(".zirv").join(CTX_CONFIG_FILE),
+                format!("[supervise]\n{key} = 8\n"),
+            )
+            .expect("write");
+            let empty: HashMap<String, String> = HashMap::new();
+            let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+                .expect_err("a repo layer must be rejected");
+            assert!(err.to_string().contains(key), "got {err}");
+        }
+    }
+
+    /// Unlike `max_heavy_operations`, `heavy_command_patterns` is not
+    /// `REPO_FORBIDDEN`: a repo may ADD a pattern (only ever narrowing, per
+    /// the field's own doc comment), but a plain deep merge would let a
+    /// repo's array -- including an empty one -- silently REPLACE the
+    /// operator's home-layer list instead of adding to it. Proves the union,
+    /// end to end through `CtxConfig::load`, the same way
+    /// `sandbox_extra_deny_unions_the_operators_and_the_repos_own_entries`
+    /// proves it for `extra_deny`.
+    #[test]
+    fn repo_heavy_command_patterns_are_added_not_replaced() {
+        let home = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".zirv").join(CTX_CONFIG_FILE),
+            "[supervise]\nheavy_command_patterns = [\"npm run build*\"]\n",
+        )
+        .expect("write");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv").join(CTX_CONFIG_FILE),
+            "[supervise]\nheavy_command_patterns = []\n",
+        )
+        .expect("write");
+
+        let empty: HashMap<String, String> = HashMap::new();
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert!(
+            cfg.supervise
+                .heavy_command_patterns
+                .contains(&"npm run build*".to_string()),
+            "an empty repo array must not erase the operator's own pattern: {:?}",
+            cfg.supervise.heavy_command_patterns
+        );
+
+        let repo2 = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo2.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo2.path().join(".zirv").join(CTX_CONFIG_FILE),
+            "[supervise]\nheavy_command_patterns = [\"yarn build*\"]\n",
+        )
+        .expect("write");
+        let cfg2 = CtxConfig::load(repo2.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert!(
+            cfg2.supervise
+                .heavy_command_patterns
+                .contains(&"npm run build*".to_string()),
+            "the operator's own pattern must survive: {:?}",
+            cfg2.supervise.heavy_command_patterns
+        );
+        assert!(
+            cfg2.supervise
+                .heavy_command_patterns
+                .contains(&"yarn build*".to_string()),
+            "the repo's own addition must land too: {:?}",
+            cfg2.supervise.heavy_command_patterns
+        );
     }
 
     /// S1-class boundary, same rationale as `prompt.max_repo_bytes` and
@@ -4346,6 +4760,9 @@ mod tests {
         ("score", "min_turns"),
         ("score", "token_floor"),
         ("score", "token_ceiling"),
+        ("score", "token_floor_ratio"),
+        ("score", "token_ceiling_ratio"),
+        ("score", "model_context_tokens"),
         ("score", "weight_tool_failure"),
         ("score", "weight_repetition"),
         ("score", "weight_marker"),
@@ -4364,6 +4781,7 @@ mod tests {
         ("supervise", "backoff_base_secs"),
         ("supervise", "on_failure"),
         ("supervise", "max_nudges"),
+        ("supervise", "max_heavy_operations"),
         ("supervise", "max_heavy_workers"),
         ("handoff", "model"),
         ("handoff", "tail_items"),
@@ -4383,6 +4801,8 @@ mod tests {
         ("pace", "poll_enabled"),
         ("pace", "poll_min_interval_secs"),
         ("pace", "blind_delay_secs"),
+        ("pace", "spawn_soft_pct"),
+        ("pace", "spawn_hard_pct"),
         ("pace.use_credits", "claude"),
         ("pace.use_credits", "codex"),
         ("optimize", "enabled"),
