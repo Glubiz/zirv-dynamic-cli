@@ -136,6 +136,11 @@ pub fn equivalent_model(
     };
     let tier = match tier {
         Some(tier) => tier,
+        // A concrete source model that is not on the verified ladder is not
+        // automatically "standard", regardless of whether it came from an
+        // explicit CLI flag or the operator's worker default. Guessing here
+        // would violate issue #186's no-quality-downgrade contract.
+        None if source_model.is_some() => return None,
         None if source_model_explicit => return None,
         None => "standard",
     };
@@ -632,6 +637,21 @@ mod tests {
                 &cfg
             ),
             Some("terra-custom".to_string())
+        );
+    }
+
+    #[test]
+    fn unclassified_operator_worker_default_also_never_guesses_a_quality_tier() {
+        let cfg = CtxConfig::default();
+        assert_eq!(
+            equivalent_model(
+                "claude",
+                Some("custom-worker-model"),
+                false,
+                "codex",
+                &cfg
+            ),
+            None
         );
     }
 
