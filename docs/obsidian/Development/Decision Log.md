@@ -24,6 +24,14 @@ last-verified: 2026-08-28
 
 ## Decisions
 
+### 2026-08-28 — Cross-harness fallback moves only new work or an already-stopped limit-blocked child, and only at a verified equivalent tier (issue #186, v2.36.0)
+**Context:** Pacing and agent enablement knew independently when a vendor seat was exhausted and which alternate harnesses existed, but the delegation/supervisor paths never connected those facts. Blindly swapping a live response or translating an arbitrary concrete model/CLI argv would risk duplicated work, incompatible flags, or a quality downgrade.
+**Decision:** `fallback.rs` selects only enabled/ready/capacity-compatible harnesses with admissible measured or conservatively-assumed headroom. New work may be predictively rerouted; existing work may cross harnesses only after `exec` has observed a recognized vendor limit and the child has stopped, using a durable handoff and remaining budget. Concrete models cross only when they map exactly onto the configured `cheap|standard|deep` ladder; arbitrary vendor flags are not translated.
+**Rejected:** Interrupting a live child as its passive usage reading approaches a threshold — the reading can be stale and there is no safe response-boundary proof. Treating every unknown model as `standard` — could silently downgrade an operator-selected model. Forwarding arbitrary passthrough flags across CLIs — vendor flag semantics are not portable.
+**Consequences:** Unknown usage can still participate only through the operator's explicit conservative assumption (0 opts out); visited-harness tracking prevents ping-pong after consecutive vendor limits. If no alternate is safe, existing refusal/park-until-reset behavior remains in control.
+**Spec / link:** `src/commands/ctx/fallback.rs`, `agent.rs`, `exec.rs`, `handover.rs`; [[Usage and Pacing]]; [[Ctx Supervisors]]; [[Untrusted Configuration]]; issue #186.
+
+
 ### 2026-08-28 — `permissions propose` is disabled by default and structurally unable to be enabled by a repository (issue #178, v2.35.0)
 **Context:** `zirv ctx permissions propose` auto-files public GitHub issues from transcript evidence. Reusing `ctx.toml`'s `REPO_FORBIDDEN` table would only reject a repo-set key, not prevent the key from being read at all — a weaker boundary than the "never even consulted" property `[github].token` (issue #176) already established for the adjacent GitHub-credential surface.
 **Decision:** `PermissionsSettings.propose_enabled` lives in `.settings.toml`'s `[permissions]` table, defaults `false`, and is read only by `settings::operator_propose_enabled(home)` — a function mirroring `operator_github_token` exactly, called only with the operator's own home directory. `run_propose` gates on it before any capture/classify/escalate work runs.
