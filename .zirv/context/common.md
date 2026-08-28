@@ -22,7 +22,7 @@ Nextest's process-per-test isolation prevents `env::set_var` races. `--no-fail-f
 
 - Rust edition 2024. Options use `#[serde(default)]` or `Option<T>`; optional params use `?` (`"branch?"`). Scripts live in `.zirv/` or `~/.zirv/`.
 - Case-insensitive reserved built-ins: ctx, chat, agent, skill, workflow, test, verify, artifact, memory, context, setup, report, help, version, init, create, frontend. They cannot be shadowed. `<repo>/.zirv/{ctx.toml,.settings.toml,verify.toml,.shortcuts.yaml}` are config, not scripts.
-- If Zirv itself malfunctions or lacks a needed capability, file it with `zirv report bug|feature <title> [--body <text>|--body-file <path>]`; never put credentials or other secrets in a report.
+- Report zirv bugs/feature gaps: `zirv report bug|feature <title> [--body <text>|--body-file <path>]`; never include secrets.
 - `rot.rs` is pure (no fs/clock/env/net): identical events give identical verdicts; I/O belongs in `score.rs`.
 - `wrap` must never worsen sessions: no hot-path `unwrap`/`expect`; restore raw mode explicitly (`panic = "abort"`); supervision failure becomes pure passthrough.
 - Repo-owned surfaces are UNTRUSTED and may only NARROW: `<repo>/.zirv/{ctx.toml,system-prompt.md,context/*.md,memory/}` and repo skills/checks. Repo-layer `REPO_FORBIDDEN` keys hard-error; only `~/.zirv/ctx.toml`, `ZIRV_CTX_*`, or flags may set them.
