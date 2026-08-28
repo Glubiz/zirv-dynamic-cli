@@ -59,6 +59,7 @@ pub type EnvLookup<'a> = &'a dyn Fn(&str) -> Option<String>;
 pub struct SettingsFile {
     pub agents: HashMap<String, AgentSettings>,
     pub github: GithubSettings,
+    pub permissions: PermissionsSettings,
 }
 
 /// Operator-owned GitHub credentials for built-in GitHub operations. Kept
@@ -68,6 +69,26 @@ pub struct SettingsFile {
 #[serde(default, deny_unknown_fields)]
 pub struct GithubSettings {
     pub token: Option<String>,
+}
+
+/// Operator-owned switch for issue #178's approved-prompt review / safe-list
+/// proposal loop (`zirv ctx permissions propose`). Kept in `.settings.toml`
+/// rather than `ctx.toml`'s `REPO_FORBIDDEN` mechanism, mirroring
+/// `GithubSettings`/`operator_github_token` exactly: the feature is read via
+/// [`operator_propose_enabled`], which is only ever handed the operator's own
+/// home directory, never a repository's -- so a repository `.settings.toml`
+/// cannot enable this even by accident (it is not merely rejected, it is
+/// never consulted for this key at all, the same "structurally unable"
+/// property `operator_github_token` already gives GitHub credentials).
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PermissionsSettings {
+    /// OFF unless the operator explicitly turns it on: this feature reads
+    /// operator-approved permission prompts and auto-files public GitHub
+    /// issues proposing they be marked safe, so opt-in is the only
+    /// conservative default (issue #178, design ruling: "the feature is
+    /// DISABLED by default").
+    pub propose_enabled: bool,
 }
 
 /// `enabled = None` means this layer is silent on the agent -- distinct from
@@ -171,7 +192,7 @@ fn read_layer(path: &Path, known: &[&str]) -> CtxResult<Option<SettingsFile>> {
     let raw: toml::Table = toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
 
     for key in raw.keys() {
-        if !matches!(key.as_str(), "agents" | "github") {
+        if !matches!(key.as_str(), "agents" | "github" | "permissions") {
             crate::output::warn(format!(
                 "{}: unknown section `[{key}]`; ignoring",
                 path.display()
@@ -232,6 +253,22 @@ pub fn operator_github_token(home: &Path) -> CtxResult<Option<String>> {
         .token
         .map(|token| token.trim().to_string())
         .filter(|token| !token.is_empty()))
+}
+
+/// Reads the `zirv ctx permissions propose` enable switch from the
+/// operator's settings layer only -- mirrors `operator_github_token` exactly
+/// (a repository checkout is never passed to this function, so it cannot
+/// enable the feature for itself). A missing file, like a missing token,
+/// simply means the feature is off: the safe, opt-in default.
+pub fn operator_propose_enabled(home: &Path) -> CtxResult<bool> {
+    let path = home.join(crate::utils::SCRIPT_DIR_NAME).join(SETTINGS_FILE);
+    if !path.is_file() {
+        return Ok(false);
+    }
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let settings: SettingsFile =
+        toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(settings.permissions.propose_enabled)
 }
 
 /// Writes `[agents.<name>] enabled = <bool>` into `<home>/.zirv/.settings.toml`,
@@ -583,6 +620,49 @@ mod tests {
         write_settings(home.path(), "[github]\ntoken = \"  \"\n");
 
         assert_eq!(operator_github_token(home.path()).expect("token"), None);
+    }
+
+    // -- operator_propose_enabled (issue #178) --------------------------
+
+    #[test]
+    fn propose_is_disabled_by_default_with_no_settings_file() {
+        let home = tempfile::tempdir().expect("tempdir");
+        assert!(!operator_propose_enabled(home.path()).expect("enabled"));
+    }
+
+    #[test]
+    fn propose_is_disabled_when_the_settings_file_is_silent_on_it() {
+        let home = tempfile::tempdir().expect("tempdir");
+        write_settings(home.path(), "[github]\ntoken = \"x\"\n");
+        assert!(!operator_propose_enabled(home.path()).expect("enabled"));
+    }
+
+    #[test]
+    fn the_operator_home_file_can_enable_propose() {
+        let home = tempfile::tempdir().expect("tempdir");
+        write_settings(home.path(), "[permissions]\npropose_enabled = true\n");
+        assert!(operator_propose_enabled(home.path()).expect("enabled"));
+    }
+
+    /// The structural guarantee issue #178 requires: a repository's own
+    /// `.settings.toml` is never even passed to this function, so it cannot
+    /// enable the feature for itself no matter what it contains -- this test
+    /// pins that by pointing `operator_propose_enabled` at a directory that
+    /// plays the "repo" role and asserting the repo-authored `true` never
+    /// takes effect for a caller reading the real operator home instead.
+    #[test]
+    fn a_repository_settings_file_cannot_enable_propose() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        write_settings(repo.path(), "[permissions]\npropose_enabled = true\n");
+        let home = tempfile::tempdir().expect("tempdir");
+
+        // The repo layer, read on its own, does say `true` -- proving the
+        // fixture is meaningful.
+        assert!(operator_propose_enabled(repo.path()).expect("enabled"));
+        // But a caller resolving the OPERATOR's own switch (the only call
+        // this feature is wired to make) reads the home directory, which
+        // never saw that repo file at all.
+        assert!(!operator_propose_enabled(home.path()).expect("enabled"));
     }
 
     // -- set_operator_agent_enabled (the first-run wizard's settings writer) --

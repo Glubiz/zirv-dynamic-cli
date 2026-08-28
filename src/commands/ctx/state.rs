@@ -410,6 +410,18 @@ impl StateDir {
         self.0.join("groups")
     }
 
+    /// Issue #178: captured operator-approved permission prompts, ready for
+    /// `permissions::propose`'s safe-list classifier -- `<state>/approvals/
+    /// *.jsonl`, one file per day (see `log::append_safety`'s own doc
+    /// comment for why day-bucketing: a hard time boundary without a
+    /// cross-process truncate race between concurrent writers). A sibling of
+    /// `logs()`, not inside it: these are the operator's own approval
+    /// decisions distilled from transcripts, not a hook's own rotation
+    /// verdicts.
+    pub fn approvals(&self) -> PathBuf {
+        self.0.join("approvals")
+    }
+
     /// First 8 hex characters of the session id keep the socket path short.
     pub fn socket_for(&self, session: &str) -> PathBuf {
         let short: String = session
