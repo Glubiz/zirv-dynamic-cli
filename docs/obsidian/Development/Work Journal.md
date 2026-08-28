@@ -20,6 +20,12 @@ last-verified: 2026-08-28
 
 ## Entries
 
+### 2026-08-28: cross-harness token fallback (issue #186, v2.36.0, PR #189)
+**What:** Connected usage windows, the enabled/capacity roster, model-tier mapping, delegation routing, and `exec` handoffs so exhausted/low-headroom new work can land on another harness and a vendor-limit-blocked supervised prompt can resume there instead of idling.
+**Key changes:** new `commands/ctx/fallback.rs`; trusted repo-narrow-only `[fallback]` config; `pace::spawn_headroom`; exact cross-vendor tier mapping; `agent` predictive/exhausted rerouting; `exec` handoff + remaining-budget continuation + visited-harness loop guard; `ctx status` policy/headroom disclosure; decision-log actions `harness-reroute`/`harness-handover`; v2.36.0 bump and regression tests for trust/model/bounded-capacity rules.
+**Follow-up:** Finish CI (build/tests/fmt/clippy/Windows target) and move draft PR #189 to review-ready once all gates are green.
+
+
 ### 2026-08-28: Reliable messaging — completed and review-hardened (`release/2.35.0`, issue #177, draft PR #185)
 **What:** Added a compiling, additive delivery-sidecar implementation around the legacy Markdown mailbox: UUID/thread/reply metadata, per-recipient receipts, TTL/dead-letter state, explicit claim-once, role fan-out, sender status, automatic post-write wake markers, a cross-harness information-not-instruction envelope, and status metrics.
 **Verification at handoff (`68be11a` WIP checkpoint):** `cargo check`, rustfmt, and `git diff --check` passed; the 56 pre-existing `mail::tests` passed before six new focused tests were appended, unexecuted at that point.
