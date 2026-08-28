@@ -20,6 +20,11 @@ last-verified: 2026-08-28
 
 ## Entries
 
+### 2026-08-28: Reliable messaging WIP handoff (`release/2.35.0`, issue #177, draft PR #185)
+**What:** Added a compiling, additive delivery-sidecar implementation around the legacy Markdown mailbox: UUID/thread/reply metadata, per-recipient receipts, TTL/dead-letter state, explicit claim-once, role fan-out, sender status, automatic post-write wake markers, a cross-harness information-not-instruction envelope, and status metrics.
+**Verification at handoff:** `cargo check`, rustfmt, and `git diff --check` pass. The 56 pre-existing `mail::tests` passed before six new focused tests were appended; those six have not been executed. This is intentionally a WIP checkpoint, not a completed #177 implementation.
+**Next:** Run the focused mail suite, fix and review the WIP (especially concurrent receipt updates, claim races, TTL moves, and prompt rendering), document it, then finish #177 before starting #178.
+
 ### 2026-08-28: CLI-native Zirv issue reporting (`release/2.35.0`, issue #176, draft PR #185)
 **What:** Added `zirv report bug|feature <title> [--body|--body-file]`, posting to the fixed Zirv repository with the matching label, a bounded environment footer, and only the created issue URL on stdout. Session context includes harness/model but never a session id.
 **Key changes:** new `commands/report.rs`; raw-argv dispatch, reserved-name and built-in help wiring; operator-only `[github].token` parsing in `settings.rs`; canonical instructions plus [[Built-in Commands]]/[[Untrusted Configuration]]. Credential order is GitHub CLI, `GH_TOKEN`, `GITHUB_TOKEN`, then home settings; repository settings never supply credentials. HTTP and auth are injected in tests, which remain network- and real-token-free.
