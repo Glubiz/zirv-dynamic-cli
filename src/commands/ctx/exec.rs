@@ -762,7 +762,7 @@ pub(crate) fn run_with_clock<W: Write>(
     // harness rather than re-resolving from scratch, whether or not turn
     // signals are available.
     let turn_env_for = |session: &SessionId| {
-        let mut env: Vec<(String, String)> = server
+        let mut turn_env: Vec<(String, String)> = server
             .as_ref()
             .map(|server| {
                 adapter
@@ -776,8 +776,22 @@ pub(crate) fn run_with_clock<W: Write>(
                     .env
             })
             .unwrap_or_default();
-        env.push((adapters::AGENT_ENV.to_string(), adapter.name().to_string()));
-        env
+        turn_env.push((adapters::AGENT_ENV.to_string(), adapter.name().to_string()));
+        // Security review round 2 (Finding 3): the work-group binding travels
+        // by lineage. `dash::fulfill_spawn_request` already pushed this exact
+        // pair into a pane's own `turn_env`; the headless launch pushed
+        // nothing, so a headless sub-orchestrator's children resolved
+        // `group = None` (`agent::resolve_group_binding`'s env fallback found
+        // nothing) -- no `admit_child`, no `child_limit`, no token ceiling,
+        // and every such delegation rendered "ungrouped" in `zirv ctx
+        // status`'s group tree. Read from this run's own env lookup, which
+        // `agent::run_with` folds its resolved `--group` into (`group_env`,
+        // the same shape `chat::quiet_env` established), so an inherited
+        // binding and a freshly resolved one reach the child identically.
+        if let Some(group) = env(super::agent::WORK_GROUP_ENV).filter(|id| !id.is_empty()) {
+            turn_env.push((super::agent::WORK_GROUP_ENV.to_string(), group));
+        }
+        turn_env
     };
 
     // F3: the one place a launch's session identity is applied, so the scrub

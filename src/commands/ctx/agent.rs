@@ -252,6 +252,32 @@ fn resolve_group_binding(
     Ok(())
 }
 
+/// Security review round 2 (Finding 3): folds the group this delegation
+/// actually resolved ([`resolve_group_binding`]) into the env lookup its
+/// headless launch runs under, exactly as `chat::quiet_env` folds `--quiet`
+/// -- `exec::run_with`'s own `turn_env_for`/`apply_session_env` exports
+/// [`WORK_GROUP_ENV`] from it into the child, so a headless coordinator's
+/// children inherit the binding by lineage the same way a dashboard-spawned
+/// coordinator's already did (`dash::fulfill_spawn_request` pushes the same
+/// pair into its pane's `turn_env`). Reusing the env lookup, rather than
+/// adding a parallel parameter or an `ExecArgs` field, is the same trade-off
+/// `quiet_env`'s own doc comment spells out: one lookup already threaded
+/// through every downstream signature, carrying exactly the fact the child
+/// needs to read back.
+///
+/// `None` leaves the lookup untouched, so an inherited `WORK_GROUP_ENV` (a
+/// coordinator's own child calling `zirv agent` with no `--group`) still
+/// reaches the child unchanged.
+fn group_env<'a>(
+    env: EnvLookup<'a>,
+    group: Option<String>,
+) -> impl Fn(&str) -> Option<String> + 'a {
+    move |key: &str| match &group {
+        Some(id) if key == WORK_GROUP_ENV => Some(id.clone()),
+        _ => env(key),
+    }
+}
+
 /// Issue #155, Phase 6(c): whether this spawn must not start. Only a
 /// `Refuse` blocks, and only without `--force`: a `Warn` is information, not
 /// a gate, and a `Proceed` has nothing to override. `pub(crate)`, not
@@ -908,7 +934,10 @@ pub fn run_with<W: Write>(
         cfg.chrome.events && !args.quiet,
         console::colors_enabled_stderr(),
     );
-    let env = quiet_env(env, args.quiet);
+    // Finding 3: the launch below runs under an env lookup that carries this
+    // delegation's own group, so `exec::run_with` can export it to the child.
+    let quieted = quiet_env(env, args.quiet);
+    let env = group_env(&quieted, args.group.clone());
 
     // Resolved here, ahead of `exec::run_with`'s own (identical) selection
     // further down, purely to compute the default worker model this spawn
@@ -2320,6 +2349,112 @@ mod tests {
         assert!(
             group.sub_orchestrator_session.is_some(),
             "the group must name who claimed and closed it"
+        );
+    }
+
+    /// Security review round 2 (Finding 3): the headless fork of a
+    /// coordinator delegation resolved (and here mints) a group, but exported
+    /// nothing -- only the dashboard fork pushed `WORK_GROUP_ENV` into its
+    /// pane's environment. So a headless sub-orchestrator's own children
+    /// resolved `group = None`: no admission, no child limit, no token
+    /// ceiling, "ungrouped" in the status tree. The child's real environment
+    /// is what proves the fix, read back through the fixture's own env log.
+    #[test]
+    fn a_headless_coordinators_child_inherits_the_group_it_was_bound_to() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state_dir = tmp.path().join("state");
+        let mut env = base_env(&state_dir);
+        env.insert("ZIRV_CTX_PACE".to_string(), "false".to_string());
+        let state = crate::commands::ctx::state::StateDir::from_root(state_dir.clone());
+        let group_env_log = tmp.path().join("group-env.log");
+
+        unsafe {
+            std::env::set_var("FAKE_AGENT_MODE", "healthy");
+            std::env::set_var("FAKE_AGENT_GROUP_ENV_LOG", &group_env_log);
+        }
+        let mut args = args_for("claude", "own this scope");
+        args.role = Some("sub-orchestrator".to_string());
+        args.scope = Some("the frontend rewrite".to_string());
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE");
+            std::env::remove_var("FAKE_AGENT_GROUP_ENV_LOG");
+        }
+        assert_eq!(code.expect("runs"), 0);
+
+        let groups = crate::commands::ctx::group::list(&state);
+        assert_eq!(groups.len(), 1, "the scope minted exactly one group");
+        let inherited = std::fs::read_to_string(&group_env_log).expect("the child logged its env");
+        assert_eq!(
+            inherited.trim(),
+            groups[0].work_group_id,
+            "the coordinator's own child must carry the group it was bound to"
+        );
+    }
+
+    /// The other half of Finding 3, end to end: a child that inherits that
+    /// exact environment -- a `zirv ctx agent` call with no `--group` of its
+    /// own, run from inside a coordinator's harness -- resolves the SAME
+    /// group and is admitted against its child limit, which is what the
+    /// missing export cost.
+    #[test]
+    fn a_child_that_inherits_the_group_env_is_admitted_into_that_same_group() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state_dir = tmp.path().join("state");
+        let mut env = base_env(&state_dir);
+        env.insert("ZIRV_CTX_PACE".to_string(), "false".to_string());
+        let state = crate::commands::ctx::state::StateDir::from_root(state_dir.clone());
+        let group_id = crate::commands::ctx::group::run_create(
+            &state,
+            &mut Vec::new(),
+            &crate::commands::ctx::group::CreateArgs {
+                scope: "the frontend rewrite".to_string(),
+                child_limit: 3,
+                token_budget: None,
+                deadline_secs: None,
+                completion_contract: "report by mail".to_string(),
+                parent_session: None,
+            },
+            1_700_000_000,
+        )
+        .expect("group create");
+        // Exactly what the coordinator's child process inherits, per the test
+        // above: the binding in the environment, and no `--group` typed.
+        env.insert(WORK_GROUP_ENV.to_string(), group_id.clone());
+
+        unsafe {
+            std::env::set_var("FAKE_AGENT_MODE", "healthy");
+        }
+        let args = args_for("claude", "do a slice of it");
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE");
+        }
+        assert_eq!(code.expect("runs"), 0);
+
+        let group = crate::commands::ctx::group::load(&state, &group_id)
+            .expect("load")
+            .expect("present");
+        assert_eq!(
+            group.admitted_children, 1,
+            "the inherited binding is what makes `admit_child` fire at all"
+        );
+        assert!(
+            group.closed_at.is_none(),
+            "a plain worker child never closes its coordinator's group"
+        );
+        let delegations = crate::commands::ctx::log::tail_delegations(&state, 10).expect("tail");
+        let record: serde_json::Value = serde_json::from_str(&delegations[0]).expect("json");
+        assert_eq!(
+            record["work_group_id"].as_str(),
+            Some(group_id.as_str()),
+            "and the delegation is recorded inside that group, not as ungrouped: {record}"
         );
     }
 

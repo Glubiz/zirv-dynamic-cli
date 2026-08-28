@@ -14,6 +14,9 @@
 #   FAKE_AGENT_SESSION_ENV_LOG=<path>       append $ZIRV_CTX_SESSION per run,
 #                                           so a test can see what each child
 #                                           was told to report signals as
+#   FAKE_AGENT_GROUP_ENV_LOG=<path>         append $ZIRV_CTX_WORK_GROUP per
+#                                           run, so a test can see the work
+#                                           group the child inherited
 #   FAKE_AGENT_ARGV_LOG=<path>              append the full argv of each run,
 #                                           so a test can assert on injected
 #                                           flags such as --append-system-prompt
@@ -65,6 +68,9 @@ if [ -n "${FAKE_AGENT_MODE_FILE:-}" ] && [ -s "${FAKE_AGENT_MODE_FILE}" ]; then
 fi
 if [ -n "${FAKE_AGENT_SESSION_ENV_LOG:-}" ]; then
   printf '%s\n' "${ZIRV_CTX_SESSION:-}" >> "$FAKE_AGENT_SESSION_ENV_LOG"
+fi
+if [ -n "${FAKE_AGENT_GROUP_ENV_LOG:-}" ]; then
+  printf '%s\n' "${ZIRV_CTX_WORK_GROUP:-}" >> "$FAKE_AGENT_GROUP_ENV_LOG"
 fi
 turns="${FAKE_AGENT_TURNS:-12}"
 
