@@ -16,8 +16,12 @@ use std::time::Duration;
 use clap::{Args, Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 
-type ReportResult<T> = Result<T, Box<dyn std::error::Error>>;
-type EnvLookup<'a> = &'a dyn Fn(&str) -> Option<String>;
+/// `pub(crate)`, not private: issue #178's `permissions::propose` reuses this
+/// alias in its own dedup/comment helper signatures (`find_open_issue_by_title`,
+/// `add_issue_comment`) rather than re-declaring the identical shape. Left
+/// unexported beyond the crate -- external callers have no reason to name it.
+pub(crate) type ReportResult<T> = Result<T, Box<dyn std::error::Error>>;
+pub(crate) type EnvLookup<'a> = &'a dyn Fn(&str) -> Option<String>;
 
 const GITHUB_API_URL: &str = "https://api.github.com/repos/Glubiz/zirv-dynamic-cli/issues";
 const GITHUB_REPOSITORY: &str = "Glubiz/zirv-dynamic-cli";
@@ -55,16 +59,31 @@ pub struct ReportArgs {
     body_file: Option<PathBuf>,
 }
 
+/// `pub(crate)`: issue #178's `permissions::propose` builds these directly to
+/// reuse `create_issue` rather than re-declaring an equivalent request shape.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-struct IssueRequest {
-    title: String,
-    body: String,
-    labels: Vec<String>,
+pub(crate) struct IssueRequest {
+    pub(crate) title: String,
+    pub(crate) body: String,
+    pub(crate) labels: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct IssueResponse {
     html_url: String,
+}
+
+/// One row of a `GET .../issues?labels=...` listing -- only the two fields
+/// [`find_open_issue_by_title`] needs.
+#[derive(Debug, Deserialize)]
+struct IssueListItem {
+    number: u64,
+    title: String,
+}
+
+#[derive(Debug, Serialize)]
+struct IssueCommentRequest<'a> {
+    body: &'a str,
 }
 
 static HTTP_AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
@@ -79,7 +98,7 @@ fn http_agent() -> &'static ureq::Agent {
     })
 }
 
-fn create_issue(token: &str, request: &IssueRequest) -> ReportResult<String> {
+pub(crate) fn create_issue(token: &str, request: &IssueRequest) -> ReportResult<String> {
     let payload = serde_json::to_string(request)?;
     let mut response = http_agent()
         .post(GITHUB_API_URL)
@@ -102,10 +121,66 @@ fn create_issue(token: &str, request: &IssueRequest) -> ReportResult<String> {
     Ok(created.html_url)
 }
 
+/// Issue #178's dedup lookup: the open issue number (if any) among those
+/// carrying `label` whose title is EXACTLY `title` -- an exact match, not a
+/// substring/search-index match, so a family name that happens to be a
+/// prefix of another family's title (`"gh pr"` vs `"gh pr edit"`, if that
+/// ever became two distinct proposal titles) can never cross-match. Reads
+/// only OPEN issues: a closed/rejected proposal must not silently absorb new
+/// evidence as though it were still live.
+pub(crate) fn find_open_issue_by_title(
+    token: &str,
+    label: &str,
+    title: &str,
+) -> ReportResult<Option<u64>> {
+    let mut response = http_agent()
+        .get(GITHUB_API_URL)
+        .query("labels", label)
+        .query("state", "open")
+        .query("per_page", "100")
+        .header("Accept", "application/vnd.github+json")
+        .header("Authorization", &format!("Bearer {token}"))
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .header("User-Agent", &format!("zirv/{}", env!("CARGO_PKG_VERSION")))
+        .call()
+        .map_err(|error| format!("GitHub rejected the issue search: {error}"))?;
+    let body = response
+        .body_mut()
+        .read_to_string()
+        .map_err(|error| format!("GitHub returned an unreadable issue list: {error}"))?;
+    let items: Vec<IssueListItem> = serde_json::from_str(&body)
+        .map_err(|error| format!("GitHub returned an unreadable issue list: {error}"))?;
+    Ok(items
+        .into_iter()
+        .find(|item| item.title == title)
+        .map(|item| item.number))
+}
+
+/// Issue #178's dedup write: appends `body` as a new comment on an existing
+/// proposal issue rather than filing a duplicate. The response body is
+/// intentionally unread beyond draining it -- callers need only know the
+/// call succeeded (`create_issue` needs the created URL back; a comment has
+/// nothing equivalent worth surfacing).
+pub(crate) fn add_issue_comment(token: &str, issue_number: u64, body: &str) -> ReportResult<()> {
+    let url = format!("{GITHUB_API_URL}/{issue_number}/comments");
+    let payload = serde_json::to_string(&IssueCommentRequest { body })?;
+    let mut response = http_agent()
+        .post(&url)
+        .header("Accept", "application/vnd.github+json")
+        .header("Content-Type", "application/json")
+        .header("Authorization", &format!("Bearer {token}"))
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .header("User-Agent", &format!("zirv/{}", env!("CARGO_PKG_VERSION")))
+        .send(payload)
+        .map_err(|error| format!("GitHub rejected the issue comment: {error}"))?;
+    let _ = response.body_mut().read_to_string();
+    Ok(())
+}
+
 /// Reads the token GitHub CLI has selected for github.com. The command and
 /// every argument are fixed; no shell parses them and no repository value
 /// can alter the invocation.
-fn gh_auth_token() -> Option<String> {
+pub(crate) fn gh_auth_token() -> Option<String> {
     let output = Command::new("gh")
         .args(["auth", "token", "--hostname", "github.com"])
         .output()
@@ -125,7 +200,7 @@ fn clean_token(token: Option<String>) -> Option<String> {
         .filter(|token| !token.is_empty())
 }
 
-fn resolve_token(
+pub(crate) fn resolve_token(
     home: Option<&Path>,
     env: EnvLookup<'_>,
     cli_token: &dyn Fn() -> Option<String>,
