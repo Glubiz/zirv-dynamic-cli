@@ -374,6 +374,32 @@ fn flags_pin_model(flags: &[String]) -> bool {
         .any(|f| adapters::classify_model_flag(f).is_some())
 }
 
+
+/// Cross-harness fallback cannot forward arbitrary vendor CLI flags: a claude
+/// flag may mean something different (or be invalid) on codex and vice versa.
+/// Empty passthrough is safe, and a model-only passthrough can be replaced by
+/// the verified equivalent tier. Anything else declines automatic routing.
+fn translated_route_flags(
+    flags: &[String],
+    target: &dyn AgentAdapter,
+    target_model: &str,
+) -> Option<Vec<String>> {
+    let mut i = 0;
+    while i < flags.len() {
+        match adapters::classify_model_flag(&flags[i]) {
+            Some(adapters::ModelFlagForm::Separated) => {
+                if i + 1 >= flags.len() {
+                    return None;
+                }
+                i += 2;
+            }
+            Some(adapters::ModelFlagForm::Joined(_)) => i += 1,
+            None => return None,
+        }
+    }
+    Some(target.model_args(target_model))
+}
+
 /// The effective trailing flags a delegated headless spawn launches with.
 ///
 /// Unchanged when the operator's own `flags` already pin `--model`
@@ -894,27 +920,81 @@ pub fn run_with<W: Write>(
     // a new code path.
     let cfg = CtxConfig::load_for_launch(repo, env)?;
 
-    // Issue #155, Phase 6(c): the spawn gate -- quota pressure refuses NEW
-    // delegated work, never rotation of a session already running (see
-    // `pace::spawn_gate`'s own doc comment). `provider_for_agent_name` is
-    // the same static, no-filesystem lookup `zirv ctx usage`/`status` use to
-    // answer this before an adapter is even known to be ready, so a
-    // disabled or misconfigured `--name` still gets an honest usage reading
-    // rather than skipping the gate.
+    // Issue #186: resolve the requested worker model before the spawn gate so
+    // an exhausted/low-headroom seat can be translated to an equivalent tier
+    // on another enabled harness. This does not launch anything.
     let state = super::state::StateDir::resolve(env)?;
-    let provider = adapters::provider_for_agent_name(Some(&args.name));
     let now = super::state::now_secs();
+    let requested_adapter = adapters::select(Some(&args.name), &[], &cfg)?;
+    let requested_command =
+        worker_launch_flags(&cfg, &args.name, requested_adapter.as_ref(), &args.flags);
+    let requested_model = adapters::last_model_flag(&requested_command);
+    let source_model_explicit = flags_pin_model(&args.flags);
+    let bounds = super::fallback::TaskBounds {
+        tokens: args.budget_tokens,
+        tool_calls: args.max_tool_calls,
+    };
+
+    let route = super::fallback::route_new_delegation(
+        &state,
+        &cfg,
+        &args.name,
+        requested_model,
+        source_model_explicit,
+        bounds,
+        now,
+        args.force,
+    );
+    let mut routed_args = args.clone();
+    let mut route_applied = None;
+    if let Some(route) = route {
+        if let Ok(target_adapter) = adapters::select(Some(&route.selected), &[], &cfg)
+            && let Some(flags) =
+                translated_route_flags(&args.flags, target_adapter.as_ref(), &route.model)
+        {
+            routed_args.name = route.selected.clone();
+            routed_args.flags = flags;
+            let parent_session =
+                super::mail::session_identity(env).unwrap_or_else(|| "delegation".to_string());
+            let detail = route.detail();
+            let _ = super::log::append(
+                &state,
+                &super::log::Decision {
+                    ts: now,
+                    session: &parent_session,
+                    verb: "agent",
+                    verdict: "reroute",
+                    score: 0,
+                    action: "harness-reroute",
+                    detail: &detail,
+                },
+            );
+            eprintln!("zirv ctx agent: automatically routed {detail}");
+            route_applied = Some(route);
+        }
+    }
+
+    // The ordinary spawn gate still owns the final decision for whichever
+    // harness will actually launch. If cross-harness translation was unsafe
+    // (for example vendor-specific passthrough flags), this is the requested
+    // harness and today's refusal behavior remains intact.
+    let provider = adapters::provider_for_agent_name(Some(&routed_args.name));
     let (collector, estimator) = pace::current_windows(&state, &cfg.pace, now, provider);
     let gate = pace::spawn_gate(&collector, estimator.as_ref(), now, &cfg.pace);
     if let Some(note) = pace::describe_spawn_gate(&gate) {
         eprintln!("zirv ctx agent: {note}");
     }
     if spawn_blocked(&gate, args.force) {
-        return Err(
+        let fallback_note = if route_applied.is_none() && cfg.fallback.enabled {
+            " No admissible fallback harness had enough trusted/assumed headroom."
+        } else {
+            ""
+        };
+        return Err(format!(
             "refusing to start new delegated work at this usage level; wait for the window to \
-             reset, or pass --force to spend anyway"
-                .into(),
-        );
+             reset, or pass --force to spend anyway.{fallback_note}"
+        )
+        .into());
     }
 
     // Issue #170: resolved once, here, before the dashboard-join fork below,
@@ -930,7 +1010,7 @@ pub fn run_with<W: Write>(
     // for every such refusal. `minted_group` is what this invocation created
     // itself (never an inherited or explicitly named one), and every path
     // below that ends without the delegation starting unwinds it.
-    let mut args = args.clone();
+    let mut args = routed_args;
     let minted_group = resolve_group_binding(&mut args, &state, env)?;
     let args = &args;
     let discard_minted_group = || {
