@@ -70,12 +70,11 @@ pub struct TaskBounds {
 
 impl TaskBounds {
     pub fn is_small(self, cfg: &CtxConfig) -> bool {
-        matches!(
-            (self.tokens, self.tool_calls),
-            (Some(tokens), Some(tools))
-                if tokens <= cfg.fallback.small_task_max_tokens
-                    && tools <= cfg.fallback.small_task_max_tool_calls
-        )
+        self.tokens
+            .is_some_and(|tokens| tokens <= cfg.fallback.small_task_max_tokens)
+            || self
+                .tool_calls
+                .is_some_and(|tools| tools <= cfg.fallback.small_task_max_tool_calls)
     }
 }
 
@@ -149,7 +148,10 @@ fn best_alternate(
         // Selection is the canonical readiness + agent_bin compatibility gate.
         // A broken/absent alternate is skipped, never allowed to turn fallback
         // itself into a failed launch.
-        if adapters::select(Some(name), &[], cfg).is_err() {
+        let Ok(candidate_adapter) = adapters::select(Some(name), &[], cfg) else {
+            continue;
+        };
+        if bounds.tool_calls.is_some() && !candidate_adapter.counts_tool_calls() {
             continue;
         }
         let Some(headroom) = candidate_headroom(state, cfg, name, now) else {
@@ -276,23 +278,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn small_capacity_requires_both_explicit_bounds() {
+    fn small_capacity_requires_an_explicit_bounded_dimension() {
         let mut cfg = CtxConfig::default();
         cfg.fallback.small_task_max_tokens = 10_000;
         cfg.fallback.small_task_max_tool_calls = 10;
-        assert!(!TaskBounds {
+        assert!(TaskBounds {
             tokens: Some(1_000),
             tool_calls: None,
         }
         .is_small(&cfg));
         assert!(TaskBounds {
-            tokens: Some(1_000),
+            tokens: None,
             tool_calls: Some(3),
         }
         .is_small(&cfg));
         assert!(!TaskBounds {
             tokens: Some(20_000),
-            tool_calls: Some(3),
+            tool_calls: Some(30),
+        }
+        .is_small(&cfg));
+        assert!(!TaskBounds {
+            tokens: None,
+            tool_calls: None,
         }
         .is_small(&cfg));
     }
