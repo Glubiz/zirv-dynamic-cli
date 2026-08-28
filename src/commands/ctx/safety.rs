@@ -7641,6 +7641,50 @@ mod tests {
         );
     }
 
+    /// Issue #160 finding 3: a commit message body containing path-like
+    /// text (`~/`, `/../`) and a redirection-looking character (`>`) must
+    /// not be denied just because it superficially resembles a home-relative
+    /// path, a directory-traversal segment, or an output redirection --
+    /// `redact_opaque_message` replaces the ENTIRE message body with
+    /// `OPAQUE_MESSAGE_PLACEHOLDER` before any other classifier (root-wide
+    /// path checks, `contains_unquoted_redirection`, etc.) ever sees it, so
+    /// none of those text shapes inside the message prose can escalate the
+    /// verdict. The fix already existed (`redact_opaque_message`, applied at
+    /// both `push_executable_candidate` and `normalize_segments`'s own raw
+    /// candidate); this pins it against the specific acceptance criteria the
+    /// issue named.
+    #[test]
+    fn a_commit_message_containing_path_like_text_and_a_redirection_character_is_allowed() {
+        let policy = SafetyPolicy::default();
+        let command = "git commit -m \"backup notes: see ~/.config and /../etc, redirect with >\"";
+        let outcome = evaluate(&policy, command, LaunchMode::Interactive);
+        assert_eq!(
+            outcome.verdict,
+            Verdict::Allow,
+            "path-like text and a redirection character inside commit message prose is \
+             documentation, not code: {outcome:?}"
+        );
+    }
+
+    /// The same acceptance criteria, but the message arrives through a
+    /// single-quoted heredoc (`$(cat <<'EOF' ...prose... EOF)`) -- the
+    /// same POSIX-literal shape `a_heredoc_built_commit_message_naming_
+    /// denied_primitives_is_allowed` above already pins for denied
+    /// primitives, here carrying the path-like/redirection text instead.
+    #[test]
+    fn a_heredoc_built_commit_message_containing_path_like_text_and_a_redirection_character_is_allowed()
+     {
+        let policy = SafetyPolicy::default();
+        let command = "git commit -m \"$(cat <<'EOF'\nbackup notes: see ~/.config and /../etc, redirect with >\nEOF\n)\"";
+        let outcome = evaluate(&policy, command, LaunchMode::Interactive);
+        assert_eq!(
+            outcome.verdict,
+            Verdict::Allow,
+            "a heredoc-built message with path-like/redirection text is still documentation, \
+             not code: {outcome:?}"
+        );
+    }
+
     /// The same carve-out for every other message-bearing invocation and
     /// argument spelling this scanner recognizes: `--message=`, the attached
     /// `-m<value>` short form, `git tag -m`, `git notes -m`, and `hg commit
