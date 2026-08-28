@@ -5427,18 +5427,30 @@ mod tests {
             ("FAKE_AGENT_TURNS", Some("1")),
         ]);
 
+        let first_transcript = transcript_for(&home, tmp.path(), session);
         let state_for_writer = state_dir.clone();
         let repo_for_writer = tmp.path().to_path_buf();
         let session_log_for_writer = session_log.clone();
+        let transcript_for_writer = first_transcript.clone();
         let writer = std::thread::spawn(move || {
             wait_for_lines_or_panic(&session_log_for_writer, 1, Duration::from_secs(20));
+            // The session-env line only says the child STARTED: the fixture
+            // appends it before it has even created its transcript, let alone
+            // written a turn into it. Nudging on that line alone raced the
+            // restart ahead of the outgoing child's own spend, so
+            // `harvest_spend` folded in a transcript that did not exist yet
+            // (0 tokens) and the incoming child's own under-budget reading was
+            // all the meter ever saw -- exit `0` instead of the accumulated
+            // `EXIT_BUDGET_EXHAUSTED` this test is about. Wait for the whole
+            // `FAKE_AGENT_TURNS=1` turn (4 lines) that harvest has to see.
+            wait_for_lines_or_panic(&transcript_for_writer, 4, Duration::from_secs(20));
             nudge_live_session(&state_for_writer, &repo_for_writer, "keep going");
         });
 
         let args = ExecArgs {
             agent: Some("claude".to_string()),
             session_id: Some(session.to_string()),
-            transcript: Some(transcript_for(&home, tmp.path(), session)),
+            transcript: Some(first_transcript),
             prompt: Some("do the work".to_string()),
             max_restarts: Some(0),
             // Above one child's own ~40_004-token transcript, below two
