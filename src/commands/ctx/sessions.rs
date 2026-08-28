@@ -1217,6 +1217,10 @@ fn pid_looks_recycled(registered_at: u64, age_secs: u64, now: u64) -> bool {
 /// Pure: POSIX `ps -o etime=` output (`[[dd-]hh:]mm:ss`) as seconds. `None`
 /// for anything that does not parse, which every caller reads as "cannot
 /// tell" rather than as any particular age.
+///
+/// Only called from the `#[cfg(unix)]` `process_age_secs` and from tests; the
+/// non-unix `process_age_secs` never reaches it.
+#[cfg_attr(not(unix), allow(dead_code))]
 fn parse_etime(raw: &str) -> Option<u64> {
     let (days, clock) = match raw.trim().split_once('-') {
         Some((days, clock)) => (days.trim().parse::<u64>().ok()?, clock),

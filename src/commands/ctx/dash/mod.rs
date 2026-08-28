@@ -2948,6 +2948,15 @@ fn fulfill_spawn_request(
     // quit) nothing can be proven about the writer, so naming a live pane
     // there is refused for the same reason: a short id is public
     // (`zirv ctx status` prints it) and can never be an authentication.
+    //
+    // Trust boundary (issue #179): `requester` proves which directory a
+    // request arrived in, and this gate stops a request from CLAIMING a
+    // foreign parent -- it does not prove which process wrote the file. A
+    // same-uid pane can `readdir` a sibling's private channel directory
+    // (`spawnreq::pane_request_dir_for`) and write a forged request straight
+    // into it; that request is indistinguishable here from a genuine one and
+    // is attributed the sibling's identity. Accepted for this release;
+    // socket-peer-credential hardening is tracked in issue #179.
     if let Some(claimed) = req.parent_session.as_deref() {
         let mismatched = match requester {
             Some(requester) => claimed != requester,
@@ -11189,6 +11198,7 @@ mod tests {
             created_at: 0,
             closed_at: None,
             admitted_children: 0,
+            sub_orchestrator_session: None,
         };
         crate::commands::ctx::group::create(&state, &group).expect("create group");
 
