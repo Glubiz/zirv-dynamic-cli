@@ -70,6 +70,24 @@ pub struct RosterPane {
     /// same reasoning as `report_to`.
     #[serde(default)]
     pub work_group_id: Option<String>,
+    /// Issue #160 finding 1, review round (2026-08-28): whether this pane
+    /// carried the durable interactive-launch pin (`adapters::LAUNCH_MODE_
+    /// ENV`/`LaunchMode::Interactive`) at quit time -- `dash::mod::on_quit`
+    /// reads it off `Pane::launch_mode()`. A restore must relaunch a pane
+    /// "on the same terms as a freshly spawned one" (issue #160): a worker
+    /// pane spawned through the untrusted file-dropped request channel is
+    /// ALWAYS launched `Headless` (`FILE_DROP_TRUSTED_INTERACTIVE`), so
+    /// restoring it as `Interactive` regardless would hand it a posture it
+    /// was explicitly refused at spawn time. `#[serde(default)]`, same
+    /// reasoning as `report_to`/`work_group_id` above -- but note the
+    /// direction: a roster entry written by an OLDER build, before this
+    /// field existed, has no way to say what its pane's launch mode
+    /// actually was, so absence must default to the FAIL-CLOSED reading
+    /// (`false`, no pin) rather than the permissive one. That is also
+    /// exactly today's pre-this-round behavior for such an entry, so an
+    /// old roster restores no worse than it already did.
+    #[serde(default)]
+    pub interactive: bool,
 }
 
 /// A full dashboard's worth of panes, stamped with the time it was written
@@ -218,6 +236,7 @@ mod tests {
                     report_to: None,
                     report_reminder_sent: false,
                     work_group_id: None,
+                    interactive: true,
                 },
                 RosterPane {
                     agent: "codex".to_string(),
@@ -228,6 +247,7 @@ mod tests {
                     report_to: Some("aaaa1111".to_string()),
                     report_reminder_sent: true,
                     work_group_id: Some("wg-1".to_string()),
+                    interactive: false,
                 },
             ],
         }
@@ -260,6 +280,14 @@ mod tests {
     /// absence read as `None`/`false` rather than a hard parse failure that
     /// would silently drop the whole roster (`take_roster`'s own `.ok()?`
     /// chain turns any parse error into "nothing to restore").
+    ///
+    /// Issue #160 finding 1, review round (2026-08-28): the identical
+    /// back-compat requirement now also covers `interactive` -- a build that
+    /// predates it wrote no such key either, and `#[serde(default)]` must
+    /// read that absence as `false` (no pin, the FAIL-CLOSED side), not
+    /// `true`. Defaulting to `true` here would have handed every pane
+    /// restored from a pre-upgrade roster the permissive interactive
+    /// posture with no record it was ever actually spawned that way.
     #[test]
     fn an_old_style_roster_entry_with_no_report_back_fields_loads_with_none_and_false() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -285,6 +313,11 @@ mod tests {
         assert_eq!(got.panes.len(), 1);
         assert_eq!(got.panes[0].report_to, None);
         assert!(!got.panes[0].report_reminder_sent);
+        assert!(
+            !got.panes[0].interactive,
+            "an old-format entry with no `interactive` key must default to fail-closed \
+             (no pin), not the permissive side"
+        );
     }
 
     #[test]
