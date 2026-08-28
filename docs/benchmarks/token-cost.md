@@ -239,7 +239,12 @@ controlled single-phase A/B run.
 transcript under this machine's zirv-related project directories, bucketed
 by each transcript's latest timestamp into pre-epoch (before
 2026-08-27T00:00:00Z, before any phase shipped) and post-epoch (on or
-after — all 6 phases in effect, v2.31.0 through the current v2.33.x). One
+after). The post-epoch bucket is coarser than the release timeline: the
+v2.31.0 release merge landed at 2026-08-27T07:42Z, so post-epoch sessions
+from the first ~7.7 hours of 2026-08-27 predate every shipped phase, and
+the full 6-phase stack (v2.31.0 through the current v2.33.x) is only
+guaranteed in effect for sessions after that merge; this slice is not
+separated out and its size is unquantified. One
 transcript file = one "session" (including `subagents/*.jsonl` files,
 matching `window::session_spend`'s own definition — see §4.1). Produced by
 `docs/benchmarks/token_cost_analysis.py`; raw output committed at
