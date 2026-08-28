@@ -2403,14 +2403,18 @@ pub(crate) fn depth_refusal(
 /// an assertion of role by itself.
 ///
 /// `req.parent_session` naming one of this dashboard's own live panes reads
-/// as `PromptRole::Worker`: every pane `fulfill_spawn_request` has ever
-/// spawned is one in every way this process can currently observe
-/// (`PaneSpec::role` is read and discarded by `Pane::spawn`, so there is no
-/// in-process record of a live pane ever being anything else -- see that
-/// field's own doc comment in `pane.rs`). This is also the fail-closed
-/// answer: a genuine SubOrchestrator pane's own further delegation is
-/// refused by this along with a genuine Worker's, rather than risk crediting
-/// a forged id with more privilege than this dashboard can actually verify.
+/// as THAT PANE'S OWN role (`Pane::role`, issue #169) -- the role it was
+/// actually spawned with, stamped server-side at `Pane::spawn` from
+/// `PaneSpec::role` and never revised by anything the pane's own child says
+/// afterward. Before issue #169 this returned a hardcoded `Worker` for any
+/// match at all (`PaneSpec::role` was read and discarded by `Pane::spawn`),
+/// which misclassified the dashboard's own interactive orchestrator pane
+/// (`Verb::Chat`, always spawned with `role: Orchestrator`) as a `Worker`
+/// the moment it tried to delegate from within a live dash -- see the
+/// regression test `an_interactive_orchestrator_pane_may_delegate_from_
+/// within_its_own_dash` below. The same fix lets a legitimately-spawned
+/// SubOrchestrator pane's own further delegation read as `SubOrchestrator`
+/// rather than being fail-closed to `Worker`.
 ///
 /// A `parent_session` naming no pane this dashboard tracks -- absent, or a
 /// value matching nothing live -- still reads as `PromptRole::Orchestrator`:
@@ -2424,13 +2428,10 @@ pub(crate) fn depth_refusal(
 /// only, never widening.
 ///
 /// I, security review (Finding 1): despite the name, this `Orchestrator`
-/// answer is never a VERIFIED one -- there is no live pane this process can
-/// ever observe as anything other than `Worker` (see above), so every
-/// `Orchestrator` this function ever returns means "unverified", not "known
-/// to be the operator's own top-level seat". Trusting it for a coordinator
-/// role (`sub-orchestrator`) would let exactly the attack this phase exists
-/// to close: a live Worker pane that simply omits or forges its own
-/// `parent_session` reads identically to a genuine rejoin, and could
+/// answer for an UNMATCHED parent is never a VERIFIED one. Trusting it for a
+/// coordinator role (`sub-orchestrator`) would let exactly the attack this
+/// phase exists to close: a live Worker pane that simply omits or forges its
+/// own `parent_session` reads identically to a genuine rejoin, and could
 /// otherwise claim a sub-orchestrator spawn no real Worker may ever request.
 /// `fulfill_spawn_request` (the sole caller) therefore refuses a coordinator
 /// role outright the moment lineage is unverified, BEFORE `depth_refusal`
@@ -2438,13 +2439,19 @@ pub(crate) fn depth_refusal(
 /// below, which both this function and that check share. A worker-role
 /// request rides the unverified `Orchestrator` reading unaffected: a forged
 /// or absent parent gets it no more than a genuine rejoin already could, and
-/// `depth_refusal(Orchestrator, Worker)` was always `None`.
+/// `depth_refusal(Orchestrator, Worker)` was always `None`. A MATCHED parent
+/// is, by construction, verified (it names a pane this exact process
+/// spawned and still tracks), so its real role is always safe to trust here.
 fn parent_role_for(req: &spawnreq::SpawnRequest, panes: &[Pane]) -> prompt::PromptRole {
-    if parent_lineage_verified(req, panes) {
-        prompt::PromptRole::Worker
-    } else {
-        prompt::PromptRole::Orchestrator
-    }
+    req.parent_session
+        .as_deref()
+        .and_then(|parent| {
+            panes
+                .iter()
+                .find(|pane| sessions::short_id(pane.session_id()) == parent)
+        })
+        .map(|pane| pane.role())
+        .unwrap_or(prompt::PromptRole::Orchestrator)
 }
 
 /// Whether `req.parent_session` names one of this dashboard's own currently
@@ -3046,7 +3053,13 @@ fn fulfill_spawn_request(
     let spec = PaneSpec {
         agent_name: req.agent.clone(),
         argv,
-        role: prompt::PromptRole::Worker,
+        // Issue #169: the role this request was actually granted, already
+        // checked against the depth cap above -- not a hardcoded `Worker`.
+        // Before this fix a legitimately-approved SubOrchestrator spawn
+        // still landed on a pane whose `Pane::role()` read back as `Worker`,
+        // so its own further delegation was refused by the depth cap one
+        // hop too early.
+        role: requested_role,
         verb: sessions::Verb::Dash,
         session_id: session_id.clone(),
         title: format!("wrk {}", req.agent),
@@ -3060,6 +3073,16 @@ fn fulfill_spawn_request(
         spawnreq::DASH_REQUESTS_ENV.to_string(),
         requests_dir.display().to_string(),
     ));
+    // Issue #170: a work-group binding travels by lineage, not convention --
+    // this pane's own child inherits `agent::WORK_GROUP_ENV` in its real
+    // process environment, so any further `zirv agent` call it makes with no
+    // `--group` of its own (`agent::resolve_group_binding`'s env fallback)
+    // lands in the SAME group automatically, and every process THAT spawns
+    // inherits it in turn via ordinary environment inheritance -- no
+    // additional plumbing needed past this one seam.
+    if let Some(group_id) = &req.work_group_id {
+        turn_env.push((super::agent::WORK_GROUP_ENV.to_string(), group_id.clone()));
+    }
     // Issue #147 amendment, review round 1 (2026-08-27) correction: routed
     // through `spawn_launch_mode_pin`, which is `trusted_interactive`-only
     // and never reads `req.interactive` -- see both that function's and
@@ -7396,6 +7419,7 @@ mod tests {
             reachable: true,
             owner_pid,
             safety_policy_sha256: None,
+            role: None,
         }
     }
 
@@ -9842,6 +9866,7 @@ mod tests {
             created_at: 0,
             closed_at: None,
             admitted_children: 1,
+            sub_orchestrator_session: None,
         };
         crate::commands::ctx::group::create(&state, &group).expect("create group");
 
@@ -9905,6 +9930,7 @@ mod tests {
             created_at: 0,
             closed_at: None,
             admitted_children: 0,
+            sub_orchestrator_session: None,
         };
         crate::commands::ctx::group::create(&state, &group).expect("create group");
 
@@ -10223,6 +10249,191 @@ mod tests {
             "a worker request with unverified lineage must reach the pane cap, not be refused \
              for its lineage: {reason}"
         );
+    }
+
+    /// Issue #169 regression: PRODUCTION BUG (2026-08-28) -- an interactive
+    /// chat pane (the operator's own orchestrator seat, `Verb::Chat`, always
+    /// spawned with `role: Orchestrator` -- see `chat.rs`) running inside a
+    /// live dashboard ran `zirv agent codex ...` and was refused with "a
+    /// worker may not delegate onward (delegation depth cap: 2)". Before this
+    /// fix, `parent_role_for` returned a hardcoded `Worker` for ANY live pane
+    /// match -- including the dashboard's own orchestrator pane -- so a
+    /// request naming that pane as its parent always hit
+    /// `depth_refusal(Worker, _)`. Reproduced here exactly: an Orchestrator
+    /// pane live in `panes`, a request naming it as `parent_session`, must be
+    /// allowed to spawn both a Worker and a SubOrchestrator.
+    #[cfg(unix)]
+    #[test]
+    fn an_interactive_orchestrator_pane_may_delegate_from_within_its_own_dash() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let cfg = CtxConfig::default();
+
+        let orch_session = "44444444-5555-4666-8777-888888888888";
+        let spec = PaneSpec {
+            agent_name: "test-agent".to_string(),
+            argv: trivial_argv(),
+            role: prompt::PromptRole::Orchestrator,
+            verb: sessions::Verb::Chat,
+            session_id: orch_session.to_string(),
+            title: "orch".to_string(),
+        };
+        let mut panes = vec![
+            Pane::spawn(
+                spec,
+                &state,
+                &repo,
+                &repo,
+                (80, 24),
+                &[],
+                true,
+                pane::DEFAULT_IDLE_QUIET,
+            )
+            .expect("spawn"),
+        ];
+        let mut queues: Vec<VecDeque<String>> = vec![VecDeque::new()];
+
+        // A plain worker request from the orchestrator's own pane.
+        let mut worker_req = spawn_request("do the work", &repo);
+        worker_req.parent_session = Some(sessions::short_id(orch_session));
+        let mut errors = Vec::new();
+        fulfill_spawn_request(
+            &worker_req,
+            false,
+            &mut panes,
+            &mut queues,
+            &cfg,
+            &state,
+            &repo,
+            (80, 24),
+            &tmp.path().join("requests"),
+            &mut errors,
+        )
+        .expect("the operator's own orchestrator pane may spawn a worker");
+
+        // A sub-orchestrator request from the same pane.
+        let mut sub_req = spawn_request("own this scope", &repo);
+        sub_req.parent_session = Some(sessions::short_id(orch_session));
+        sub_req.role = Some("sub-orchestrator".to_string());
+        fulfill_spawn_request(
+            &sub_req,
+            false,
+            &mut panes,
+            &mut queues,
+            &cfg,
+            &state,
+            &repo,
+            (80, 24),
+            &tmp.path().join("requests"),
+            &mut errors,
+        )
+        .expect("the operator's own orchestrator pane may spawn a sub-orchestrator");
+    }
+
+    /// Issue #169: the other half of the fix -- a legitimately-spawned
+    /// SubOrchestrator pane's own further delegation must read as
+    /// `SubOrchestrator`, not the pre-fix hardcoded `Worker`, so it may spawn
+    /// a Worker of its own (end to end, through two real `fulfill_spawn_
+    /// request` calls) while still being refused another SubOrchestrator --
+    /// the existing depth-cap unit tests already pin the latter in isolation;
+    /// this proves the pane that a real spawn actually produces carries the
+    /// role the cap needs to see.
+    #[cfg(unix)]
+    #[test]
+    fn a_spawned_sub_orchestrator_pane_may_spawn_a_worker_but_not_another_sub_orchestrator() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let cfg = CtxConfig::default();
+
+        let orch_session = "55555555-6666-4777-8888-999999999999";
+        let spec = PaneSpec {
+            agent_name: "test-agent".to_string(),
+            argv: trivial_argv(),
+            role: prompt::PromptRole::Orchestrator,
+            verb: sessions::Verb::Chat,
+            session_id: orch_session.to_string(),
+            title: "orch".to_string(),
+        };
+        let mut panes = vec![
+            Pane::spawn(
+                spec,
+                &state,
+                &repo,
+                &repo,
+                (80, 24),
+                &[],
+                true,
+                pane::DEFAULT_IDLE_QUIET,
+            )
+            .expect("spawn"),
+        ];
+        let mut queues: Vec<VecDeque<String>> = vec![VecDeque::new()];
+        let mut errors = Vec::new();
+
+        let mut sub_req = spawn_request("own this scope", &repo);
+        sub_req.parent_session = Some(sessions::short_id(orch_session));
+        sub_req.role = Some("sub-orchestrator".to_string());
+        let sub_short = fulfill_spawn_request(
+            &sub_req,
+            false,
+            &mut panes,
+            &mut queues,
+            &cfg,
+            &state,
+            &repo,
+            (80, 24),
+            &tmp.path().join("requests"),
+            &mut errors,
+        )
+        .expect("the orchestrator may spawn a sub-orchestrator");
+
+        // The sub-orchestrator pane spawns a plain worker of its own.
+        // `sub_short` -- the newly spawned pane's own registry short id,
+        // exactly the form `parent_session` names elsewhere -- is reused
+        // directly rather than re-derived.
+        let mut worker_req = spawn_request("split off a worker brief", &repo);
+        worker_req.parent_session = Some(sub_short.clone());
+        assert_eq!(
+            parent_role_for(&worker_req, &panes),
+            prompt::PromptRole::SubOrchestrator,
+            "the freshly spawned pane's own role must be readable back, not hardcoded Worker"
+        );
+        fulfill_spawn_request(
+            &worker_req,
+            false,
+            &mut panes,
+            &mut queues,
+            &cfg,
+            &state,
+            &repo,
+            (80, 24),
+            &tmp.path().join("requests"),
+            &mut errors,
+        )
+        .expect("a sub-orchestrator may spawn a worker");
+
+        // The same sub-orchestrator pane may NOT spawn another coordinator.
+        let mut second_sub_req = spawn_request("own another scope", &repo);
+        second_sub_req.parent_session = Some(sub_short.clone());
+        second_sub_req.role = Some("sub-orchestrator".to_string());
+        let refusal = fulfill_spawn_request(
+            &second_sub_req,
+            false,
+            &mut panes,
+            &mut queues,
+            &cfg,
+            &state,
+            &repo,
+            (80, 24),
+            &tmp.path().join("requests"),
+            &mut errors,
+        )
+        .expect_err("a sub-orchestrator may not spawn another");
+        assert!(refusal.reason.contains("depth"), "got {}", refusal.reason);
     }
 
     /// T10: the coverage gap this closes -- a worker pane spawn request

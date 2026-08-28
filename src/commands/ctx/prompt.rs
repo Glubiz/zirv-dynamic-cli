@@ -230,9 +230,9 @@ impl PromptRole {
     }
 
     /// A short, stable, human-readable name for this role, used in logs and
-    /// diagnostics rather than `Debug`'s type-name casing.
-    // No production caller yet, same dormancy as `may_spawn_workers` above.
-    #[allow(dead_code)]
+    /// diagnostics rather than `Debug`'s type-name casing. Also what
+    /// `sessions::Record::with_role` persists (issue #169) -- `Pane::spawn`
+    /// and `wrap::run_with` both stamp a session's record with this label.
     pub fn label(self) -> &'static str {
         match self {
             PromptRole::Orchestrator => "orchestrator",
