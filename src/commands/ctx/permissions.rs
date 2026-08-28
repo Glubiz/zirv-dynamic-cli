@@ -154,7 +154,18 @@ fn family_depth(program: &str) -> usize {
         // managers/CLIs so `uv run <script>` normalizes to the two-token
         // family `"uv run"` -- distinct from `uv sync`/`uv add`/`uv pip`,
         // which are not arbitrary-code executors and stay compileable.
-        "git" | "gh" | "cargo" | "npm" | "docker" | "kubectl" | "npx" | "pnpm" | "yarn" | "uv" => 2,
+        //
+        // Review round 2 (2026-08-28, issue #178): `glab` joins `gh` here --
+        // both are subcommand-based CLIs with the identical stable two-token
+        // shape (`gh pr create` / `glab mr create`). Without this, `glab`
+        // fell to the `_ => 1` default, collapsing EVERY glab invocation to
+        // the single-token family `"glab"` -- which made
+        // `is_family_too_generic` wrongly flag every `glab mr`/`glab issue`
+        // collaboration command as "too generic" in `permissions::propose`'s
+        // classifier, even though `collaboration_triple` already establishes
+        // exact `(program, resource, verb)` specificity independently.
+        "git" | "gh" | "glab" | "cargo" | "npm" | "docker" | "kubectl" | "npx" | "pnpm"
+        | "yarn" | "uv" => 2,
         _ => 1,
     }
 }
@@ -1682,6 +1693,20 @@ pub struct ApprovalRecord {
     /// is kept only for `zirv ctx status`-style visibility into how noisy
     /// the operator's approvals have been, never proposed.
     pub irrelevant: bool,
+    /// Review round 2 (2026-08-28), the release plan's own global
+    /// constraint: "when no safe general pattern can express an operation,
+    /// surface guidance toward a non-escalating alternative, not a one-off
+    /// allow entry, and never silently drop it." `Some(label)` (one of
+    /// [`ExclusionReason::label`]'s values, e.g. `"protected"`) whenever
+    /// `irrelevant` is `false` AND the command was in `propose`'s documented
+    /// scope (a `gh`/`glab` invocation) but excluded for a specific, nameable
+    /// reason; `None` when `irrelevant` is `true` (nothing to explain) or the
+    /// command was outside scope entirely (an unrelated command this module
+    /// never claimed to cover -- no guidance is owed for it). Portable by
+    /// construction, same as every other field here: a reason label, never
+    /// raw command text.
+    #[serde(default)]
+    pub exclusion_reason: Option<String>,
 }
 
 /// One in-memory, not-yet-classified approved ask, captured post-hoc from a
@@ -1818,35 +1843,149 @@ fn has_shell_composition_or_redirect(raw: &str) -> bool {
     false
 }
 
-/// The conservative classifier itself: `true` only for a command that is (1)
-/// a documented safe `gh`/`glab` collaboration verb ([`is_safe_collaboration_verb`]),
-/// (2) free of shell composition/redirection ([`has_shell_composition_or_redirect`]),
-/// (3) not independently protected ([`is_protected_family`] -- also catches a
+/// Review round 2 (2026-08-28): the release plan's own global constraint
+/// requires more than a yes/no answer -- when an approved command was
+/// excluded, the operator is owed a REASON and a nudge toward a
+/// non-escalating alternative, not silence. Each variant names one gate
+/// [`classify_approval`] found the command failing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum ExclusionReason {
+    /// A protected/lifecycle action (merge, close/reopen, delete, release,
+    /// auth, a mutating/arbitrary API call, or a credential-bearing
+    /// argument) -- `is_protected_family`/`command_fails_escape_screen`, or
+    /// simply not on [`SAFE_COLLABORATION_VERBS`] at all despite being a
+    /// recognized `gh`/`glab` invocation.
+    Protected,
+    /// [`is_family_too_generic`]: the normalized family collapses to a
+    /// single token, too coarse to safely generalize.
+    TooGeneric,
+    /// [`is_reusable`] says no: a long literal payload or a filter-pipe
+    /// target, the signature of a one-off spelling that will not recur.
+    OneOffSpelling,
+    /// [`has_shell_composition_or_redirect`]: chained, piped, or redirected
+    /// with another command.
+    ShellComposition,
+}
+
+impl ExclusionReason {
+    /// Short, stable, portable label -- what actually reaches
+    /// [`ApprovalRecord::exclusion_reason`] (never the enum itself, so the
+    /// persisted JSON stays a plain string like every other classification
+    /// field on that type).
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            ExclusionReason::Protected => "protected",
+            ExclusionReason::TooGeneric => "too-generic",
+            ExclusionReason::OneOffSpelling => "one-off-spelling",
+            ExclusionReason::ShellComposition => "shell-composition",
+        }
+    }
+
+    /// The non-escalating alternative `run_propose`'s output points the
+    /// operator toward -- concise and general, never a machine-specific
+    /// detail (there is none to give: the record this is rendered from
+    /// carries no raw command text at all).
+    pub(crate) fn guidance(self) -> &'static str {
+        match self {
+            ExclusionReason::Protected => {
+                "a protected or lifecycle action (merge, close/reopen, delete, release, auth, \
+                 or an arbitrary/credential-bearing API call) -- it stays operator-approved \
+                 each time and is never proposed for a standing allow."
+            }
+            ExclusionReason::TooGeneric => {
+                "too generic to safely generalize -- invoke it with a more specific \
+                 subcommand/verb so a narrower, safer pattern can be evaluated instead."
+            }
+            ExclusionReason::OneOffSpelling => {
+                "shaped like a one-off command spelling (a long literal payload) rather than a \
+                 reusable capability -- prefer routing it through an existing safe verb where \
+                 one already exists instead of a literal one-off."
+            }
+            ExclusionReason::ShellComposition => {
+                "chained, piped, or redirected with another command -- run each step as its \
+                 own plain invocation so it can be evaluated on its own merits."
+            }
+        }
+    }
+}
+
+/// The classifier's full verdict, not just a bool -- [`is_irrelevant_approval`]
+/// collapses this to `Eligible` vs. everything else, but `record_from_capture`
+/// needs the finer distinction to persist [`ApprovalRecord::exclusion_reason`]
+/// (guidance-worthy) separately from `OutOfScope` (not this module's concern
+/// at all, no guidance owed).
+pub(crate) enum ApprovalClassification {
+    /// Clearly safe/idempotent -- eligible for a safe-list proposal.
+    Eligible,
+    /// A `gh`/`glab` invocation that looked like it might qualify but was
+    /// excluded for a specific, nameable reason.
+    Excluded(ExclusionReason),
+    /// Not a `gh`/`glab` command at all -- entirely outside `propose`'s
+    /// documented scope (issue #178 acceptance criterion 6). No guidance is
+    /// owed for a command this module never claimed to cover.
+    OutOfScope,
+}
+
+/// The conservative classifier itself, checked in this order: (1) still in
+/// scope at all (a `gh`/`glab` invocation, by leading program name alone --
+/// otherwise `OutOfScope`, no further gate matters); (2) free of shell
+/// composition/redirection ([`has_shell_composition_or_redirect`]); (3) the
+/// family is not too generic ([`is_family_too_generic`]); (4) not
+/// independently protected ([`is_protected_family`] -- also catches a
 /// credential-bearing argument via its own `has("token")`/`has("keychain")`/
-/// `has("keyring")` checks), and (4) clear of `safety.rs`'s own
-/// credential/`.env`/root-scan/deny screen (`command_fails_escape_screen`).
-/// Every one of these must pass; any single failure means "warranted" (keep
-/// prompting), never "irrelevant" -- issue #178's own conservatism
-/// requirement ("only clearly read-only or idempotent commands qualify").
-pub(crate) fn is_irrelevant_approval(raw: &str) -> bool {
+/// `has("keyring")` checks) and clear of `safety.rs`'s own
+/// credential/`.env`/root-scan/deny screen (`command_fails_escape_screen`);
+/// (5) reusable, not a one-off literal/filter-pipe spelling
+/// ([`is_reusable`]); (6) finally, a documented safe `gh`/`glab`
+/// collaboration verb ([`is_safe_collaboration_verb`]) -- anything still in
+/// scope but not on that exact list (`gh pr merge`, `gh issue delete`, ...)
+/// is `Excluded(Protected)` too, a recognized lifecycle verb this module
+/// deliberately never safelists. Every gate must pass for `Eligible`; any
+/// single failure means "warranted" (keep prompting), never "irrelevant" --
+/// issue #178's own conservatism requirement ("only clearly read-only or
+/// idempotent commands qualify").
+pub(crate) fn classify_approval(raw: &str) -> ApprovalClassification {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
-        return false;
+        return ApprovalClassification::OutOfScope;
+    }
+    let first_stage = pipeline_stages(trimmed)
+        .into_iter()
+        .next()
+        .unwrap_or_default();
+    let unwrapped = unwrap_wrappers(&first_stage);
+    let collapsed = collapse_whitespace(&strip_program_dir(&unwrapped));
+    let program = sql_program_name(collapsed.split(' ').next().unwrap_or_default());
+    if !matches!(program.as_str(), "gh" | "glab") {
+        return ApprovalClassification::OutOfScope;
     }
     if has_shell_composition_or_redirect(trimmed) {
-        return false;
-    }
-    if !is_safe_collaboration_verb(trimmed) {
-        return false;
+        return ApprovalClassification::Excluded(ExclusionReason::ShellComposition);
     }
     let family = family_of(trimmed);
-    if is_protected_family(&family, trimmed) {
-        return false;
+    if is_family_too_generic(&family) {
+        return ApprovalClassification::Excluded(ExclusionReason::TooGeneric);
     }
-    if command_fails_escape_screen(trimmed) {
-        return false;
+    if is_protected_family(&family, trimmed) || command_fails_escape_screen(trimmed) {
+        return ApprovalClassification::Excluded(ExclusionReason::Protected);
     }
-    true
+    if !is_reusable(trimmed) {
+        return ApprovalClassification::Excluded(ExclusionReason::OneOffSpelling);
+    }
+    if !is_safe_collaboration_verb(trimmed) {
+        return ApprovalClassification::Excluded(ExclusionReason::Protected);
+    }
+    ApprovalClassification::Eligible
+}
+
+/// A thin boolean view of [`classify_approval`], `#[cfg(test)]`: production
+/// code (`record_from_capture`) needs the finer `ExclusionReason` detail
+/// `classify_approval` itself returns, so it calls that directly rather than
+/// this wrapper -- this is a test-readability convenience only, not a second
+/// classification path.
+#[cfg(test)]
+pub(crate) fn is_irrelevant_approval(raw: &str) -> bool {
+    matches!(classify_approval(raw), ApprovalClassification::Eligible)
 }
 
 /// Coarse, non-identifying classification of a transcript entry's own `cwd`
@@ -2062,13 +2201,19 @@ fn extract_codex_approvals(text: &str, session: &str) -> Vec<CapturedApproval> {
     out
 }
 
-/// Classifies `capture` (`is_irrelevant_approval`) while its raw command
-/// text is still available, then discards it -- the point at which "capture"
-/// becomes "the only thing that ever reaches disk".
+/// Classifies `capture` (`classify_approval`) while its raw command text is
+/// still available, then discards it -- the point at which "capture"
+/// becomes "the only thing that ever reaches disk". `exclusion_reason` is
+/// computed from the SAME classification call as `irrelevant`, never a
+/// second independent check, so the two fields can never disagree.
 fn record_from_capture(capture: &CapturedApproval) -> ApprovalRecord {
     let family = family_of(&capture.raw);
     let verb = collaboration_triple(&capture.raw).map(|(p, r, v)| format!("{p} {r} {v}"));
-    let irrelevant = is_irrelevant_approval(&capture.raw);
+    let (irrelevant, exclusion_reason) = match classify_approval(&capture.raw) {
+        ApprovalClassification::Eligible => (true, None),
+        ApprovalClassification::Excluded(reason) => (false, Some(reason.label().to_string())),
+        ApprovalClassification::OutOfScope => (false, None),
+    };
     ApprovalRecord {
         ts: super::state::now_secs(),
         session: capture.session.clone(),
@@ -2077,6 +2222,7 @@ fn record_from_capture(capture: &CapturedApproval) -> ApprovalRecord {
         verb,
         cwd_scope: capture.cwd_scope.clone(),
         irrelevant,
+        exclusion_reason,
     }
 }
 
@@ -2168,6 +2314,62 @@ pub(crate) fn group_proposal_evidence(records: &[ApprovalRecord]) -> Vec<Proposa
         .collect()
 }
 
+/// Review round 2 (2026-08-28), fix 1: what was already reported for one
+/// family, as of the last successful `create`/`comment` call -- persisted
+/// beside the approvals themselves (`<state>/approvals/reported.json`) so a
+/// second `propose` run can tell "nothing changed" from "there is new
+/// evidence" without re-deriving it from scratch or guessing. Mirrors
+/// [`ProposalEvidence`]'s shape minus `family` (the map key it is stored
+/// under) -- see [`read_reported_evidence`]/[`write_reported_evidence`].
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+struct ReportedEvidence {
+    approvals: usize,
+    sessions: usize,
+    verbs: Vec<String>,
+    agents: Vec<String>,
+}
+
+impl ReportedEvidence {
+    fn from_evidence(evidence: &ProposalEvidence) -> Self {
+        Self {
+            approvals: evidence.approvals,
+            sessions: evidence.sessions,
+            verbs: evidence.verbs.clone(),
+            agents: evidence.agents.clone(),
+        }
+    }
+}
+
+/// A sibling FILE (not another day-bucketed `*.jsonl`) inside the same
+/// `<state>/approvals/` directory [`read_approvals`] already scans --
+/// deliberately named without a `.jsonl` extension so that scan's own
+/// extension filter never picks it up as an approval record.
+fn reported_evidence_path(state: &super::state::StateDir) -> PathBuf {
+    state.approvals().join("reported.json")
+}
+
+/// Best-effort read, matching every other state-dir reader in this module:
+/// a missing or corrupt file just means "nothing reported yet", never a hard
+/// error -- the first `propose` run after this feature shipped, or a
+/// hand-cleared state dir, must not be treated as a load failure.
+fn read_reported_evidence(state: &super::state::StateDir) -> HashMap<String, ReportedEvidence> {
+    let Ok(text) = std::fs::read_to_string(reported_evidence_path(state)) else {
+        return HashMap::new();
+    };
+    serde_json::from_str(&text).unwrap_or_default()
+}
+
+fn write_reported_evidence(
+    state: &super::state::StateDir,
+    reported: &HashMap<String, ReportedEvidence>,
+) -> CtxResult<()> {
+    let dir = state.approvals();
+    super::state::create_private_dir_all(&dir)?;
+    let json = serde_json::to_string_pretty(reported)?;
+    super::state::write_private(&reported_evidence_path(state), &json)?;
+    Ok(())
+}
+
 fn proposal_title(family: &str) -> String {
     format!("Safe-list proposal: `{family}`")
 }
@@ -2175,22 +2377,18 @@ fn proposal_title(family: &str) -> String {
 /// Renders one proposal issue/comment body. Every field comes from
 /// [`ProposalEvidence`], which is already portable by construction -- see
 /// its own doc comment -- so nothing here can leak a path, an environment
-/// value, or a one-off command spelling.
-fn proposal_body(evidence: &ProposalEvidence) -> String {
-    format!(
+/// value, or a one-off command spelling. `previous`, when `Some` (a repeat
+/// report against an already-open issue, review round 2 fix 1), adds an
+/// explicit delta section rather than silently repeating identical totals --
+/// what changed since the LAST report, not just the running total.
+fn proposal_body(evidence: &ProposalEvidence, previous: Option<&ReportedEvidence>) -> String {
+    let mut body = format!(
         "Automated safe-list proposal from `zirv ctx permissions propose` (issue #178).\n\n\
          - family: `{family}`\n\
          - observed verb(s): {verbs}\n\
          - approved occurrences: {approvals}\n\
          - distinct sessions: {sessions}\n\
-         - harness(es): {agents}\n\n\
-         Every observed invocation in this family was a documented, non-mutating gh/glab \
-         collaboration verb (create, edit/update, or comment) -- never a merge, close/reopen, \
-         delete, release, auth action, arbitrary API call, redirect, or shell-composed command. \
-         The evidence above is portable by construction: no path, environment value, or literal \
-         command text from any specific machine is recorded anywhere in zirv's own approval \
-         store.\n\n\
-         Consider marking `{family} *` safe by default.",
+         - harness(es): {agents}\n",
         family = evidence.family,
         verbs = if evidence.verbs.is_empty() {
             "(none captured)".to_string()
@@ -2200,7 +2398,109 @@ fn proposal_body(evidence: &ProposalEvidence) -> String {
         approvals = evidence.approvals,
         sessions = evidence.sessions,
         agents = evidence.agents.join(", "),
-    )
+    );
+    if let Some(previous) = previous {
+        let new_approvals = evidence.approvals.saturating_sub(previous.approvals);
+        let new_sessions = evidence.sessions.saturating_sub(previous.sessions);
+        let new_verbs: Vec<&str> = evidence
+            .verbs
+            .iter()
+            .filter(|v| !previous.verbs.contains(v))
+            .map(String::as_str)
+            .collect();
+        body.push_str(&format!(
+            "\nUpdate since the last report on this issue: {new_approvals} new approved \
+             occurrence(s) across {new_sessions} new distinct session(s)",
+        ));
+        if new_verbs.is_empty() {
+            body.push_str(".\n");
+        } else {
+            body.push_str(&format!(
+                ", newly observed verb(s): {}.\n",
+                new_verbs.join(", ")
+            ));
+        }
+    }
+    body.push_str(&format!(
+        "\nEvery observed invocation in this family was a documented, non-mutating gh/glab \
+         collaboration verb (create, edit/update, or comment) -- never a merge, close/reopen, \
+         delete, release, auth action, arbitrary API call, redirect, or shell-composed command. \
+         The evidence above is portable by construction: no path, environment value, or literal \
+         command text from any specific machine is recorded anywhere in zirv's own approval \
+         store.\n\n\
+         Consider marking `{family} *` safe by default.",
+        family = evidence.family,
+    ));
+    body
+}
+
+/// One family's captured-but-excluded approvals, folded by reason -- review
+/// round 2 (2026-08-28) fix 2: the release plan's own global constraint
+/// ("when no safe general pattern can express an operation, surface
+/// guidance toward a non-escalating alternative, never silently drop it").
+struct ExcludedGroup {
+    family: String,
+    reason: ExclusionReason,
+    approvals: usize,
+}
+
+/// Folds every WARRANTED (non-eligible) record that still carries an
+/// `exclusion_reason` -- i.e. every record `classify_approval` put in scope
+/// (a `gh`/`glab` invocation) but excluded for a specific reason. A record
+/// with `exclusion_reason: None` (either eligible, or entirely out of
+/// `propose`'s documented scope) contributes nothing here -- there is
+/// nothing to guide an operator toward for a command this module never
+/// claimed to cover.
+fn group_excluded_evidence(records: &[ApprovalRecord]) -> Vec<ExcludedGroup> {
+    fn reason_from_label(label: &str) -> Option<ExclusionReason> {
+        match label {
+            "protected" => Some(ExclusionReason::Protected),
+            "too-generic" => Some(ExclusionReason::TooGeneric),
+            "one-off-spelling" => Some(ExclusionReason::OneOffSpelling),
+            "shell-composition" => Some(ExclusionReason::ShellComposition),
+            _ => None, // an unrecognized/forward-incompatible label: skip, don't guess.
+        }
+    }
+    let mut by_key: std::collections::BTreeMap<(String, ExclusionReason), usize> =
+        std::collections::BTreeMap::new();
+    for record in records {
+        if record.irrelevant {
+            continue;
+        }
+        let Some(reason) = record
+            .exclusion_reason
+            .as_deref()
+            .and_then(reason_from_label)
+        else {
+            continue;
+        };
+        *by_key.entry((record.family.clone(), reason)).or_insert(0) += 1;
+    }
+    by_key
+        .into_iter()
+        .map(|((family, reason), approvals)| ExcludedGroup {
+            family,
+            reason,
+            approvals,
+        })
+        .collect()
+}
+
+/// Prints one guidance line per excluded family -- always, regardless of
+/// whether any OTHER family also has real proposal evidence this run, so an
+/// operator whose every captured approval landed here still sees why,
+/// rather than a bare "nothing to propose."
+fn render_excluded_guidance<W: Write>(w: &mut W, groups: &[ExcludedGroup]) -> CtxResult<()> {
+    for group in groups {
+        writeln!(
+            w,
+            "excluded: '{}' ({} approved occurrence(s)) -- {}",
+            group.family,
+            group.approvals,
+            group.reason.guidance()
+        )?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, clap::Args)]
@@ -2326,8 +2626,16 @@ fn run_propose_with<W: Write>(
 
     let mut all_records = existing;
     all_records.extend(newly_recorded);
-    let evidence = group_proposal_evidence(&all_records);
 
+    // Review round 2 (2026-08-28) fix 2: guidance for every captured-but-
+    // excluded family, printed unconditionally -- even a run that ends up
+    // proposing nothing new still tells the operator WHY, and toward what,
+    // rather than a bare "nothing to propose." Never gated on `--dry-run`:
+    // it names no machine-specific detail to preview away.
+    let excluded = group_excluded_evidence(&all_records);
+    render_excluded_guidance(w, &excluded)?;
+
+    let evidence = group_proposal_evidence(&all_records);
     if evidence.is_empty() {
         writeln!(
             w,
@@ -2336,18 +2644,63 @@ fn run_propose_with<W: Write>(
         return Ok(0);
     }
 
-    let token =
-        crate::commands::report::resolve_token(Some(home), io.env.as_ref(), io.cli_token.as_ref())?;
+    // Review round 2 (2026-08-28) fix 1: a family whose evidence is BYTE-
+    // FOR-BYTE identical to what was already reported (the persisted
+    // watermark) needs no new comment -- re-running `propose` over an
+    // overlapping transcript window must never re-comment identical
+    // evidence onto a public issue. Only a family with new/changed evidence
+    // is "actionable"; `previous` (when `Some`) is what makes the follow-up
+    // comment body delta-marked rather than a silent repeat of the running
+    // total.
+    let already_reported = read_reported_evidence(state);
+    let mut newly_reported = already_reported.clone();
+    let mut actionable: Vec<(&ProposalEvidence, Option<ReportedEvidence>)> = Vec::new();
+    let mut unchanged_families: Vec<&str> = Vec::new();
     for item in &evidence {
+        let current = ReportedEvidence::from_evidence(item);
+        match already_reported.get(&item.family) {
+            Some(previous) if *previous == current => {
+                unchanged_families.push(&item.family);
+            }
+            previous => {
+                actionable.push((item, previous.cloned()));
+            }
+        }
+    }
+
+    if actionable.is_empty() {
+        writeln!(
+            w,
+            "no new evidence since the last report -- nothing to propose ({} family/families \
+             unchanged: {}).",
+            unchanged_families.len(),
+            unchanged_families.join(", ")
+        )?;
+        return Ok(0);
+    }
+
+    let token = if args.dry_run {
+        None
+    } else {
+        Some(crate::commands::report::resolve_token(
+            Some(home),
+            io.env.as_ref(),
+            io.cli_token.as_ref(),
+        )?)
+    };
+    for (item, previous) in &actionable {
         let title = proposal_title(&item.family);
         if args.dry_run {
             writeln!(w, "[dry run] would propose: {title}")?;
             continue;
         }
-        let body = proposal_body(item);
-        match (io.find_issue)(&token, SAFE_LIST_PROPOSAL_LABEL, &title)? {
+        let token = token
+            .as_deref()
+            .expect("resolved above whenever not --dry-run");
+        let body = proposal_body(item, previous.as_ref());
+        match (io.find_issue)(token, SAFE_LIST_PROPOSAL_LABEL, &title)? {
             Some(number) => {
-                (io.comment_issue)(&token, number, &body)?;
+                (io.comment_issue)(token, number, &body)?;
                 writeln!(w, "commented on existing proposal issue #{number}: {title}")?;
             }
             None => {
@@ -2356,10 +2709,22 @@ fn run_propose_with<W: Write>(
                     body,
                     labels: vec![SAFE_LIST_PROPOSAL_LABEL.to_string()],
                 };
-                let url = (io.create_issue)(&token, &request)?;
+                let url = (io.create_issue)(token, &request)?;
                 writeln!(w, "filed new proposal issue: {url}")?;
             }
         }
+        newly_reported.insert(item.family.clone(), ReportedEvidence::from_evidence(item));
+        // Persisted after each success (not batched at the end) so a later
+        // item's failure never loses an earlier item's already-reported
+        // watermark.
+        write_reported_evidence(state, &newly_reported)?;
+    }
+    if !unchanged_families.is_empty() {
+        writeln!(
+            w,
+            "unchanged since last report (skipped, no comment posted): {}",
+            unchanged_families.join(", ")
+        )?;
     }
     Ok(0)
 }
@@ -4428,6 +4793,7 @@ mod tests {
                 verb: Some("gh pr create".into()),
                 cwd_scope: "repo".into(),
                 irrelevant: true,
+                exclusion_reason: None,
             },
             ApprovalRecord {
                 ts: 2,
@@ -4437,6 +4803,7 @@ mod tests {
                 verb: Some("gh pr comment".into()),
                 cwd_scope: "unknown".into(),
                 irrelevant: true,
+                exclusion_reason: None,
             },
             ApprovalRecord {
                 ts: 3,
@@ -4446,6 +4813,7 @@ mod tests {
                 verb: Some("gh pr merge".into()),
                 cwd_scope: "repo".into(),
                 irrelevant: false,
+                exclusion_reason: Some("protected".into()),
             },
         ];
         let evidence = group_proposal_evidence(&records);
@@ -4470,6 +4838,7 @@ mod tests {
             verb: Some("gh pr merge".into()),
             cwd_scope: "repo".into(),
             irrelevant: false,
+            exclusion_reason: Some("protected".into()),
         }];
         assert!(group_proposal_evidence(&records).is_empty());
     }
@@ -4757,6 +5126,328 @@ mod tests {
             stored.len(),
             1,
             "the second run must not duplicate the same session+family"
+        );
+    }
+
+    // ===============================================================
+    // Review round 2 (2026-08-28): fix 1 -- no re-commenting unchanged
+    // evidence; fix 2 -- non-escalating-alternative guidance
+    // ===============================================================
+
+    // -- fix 1: reported-evidence watermark ----------------------------
+
+    #[test]
+    fn an_unchanged_family_makes_no_http_call_on_a_second_run() {
+        let home = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".zirv/.settings.toml"),
+            "[permissions]\npropose_enabled = true\n",
+        )
+        .expect("settings");
+        let state_root = tempfile::tempdir().expect("tempdir");
+        let state = super::super::state::StateDir::from_root(state_root.path().to_path_buf());
+        let transcripts = tempfile::tempdir().expect("tempdir");
+        let command = "gh pr create --title x --body y";
+        let file = write_claude_transcript(transcripts.path(), "s1", command, "/some/repo");
+        let log_records = vec![safety_record("s1", command, "ask")];
+        let args = ProposeArgs {
+            agent: AuditAgent::Claude,
+            sessions: 5,
+            dry_run: false,
+        };
+
+        // First run: no open issue yet -> files one.
+        let found1 = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let created1 = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let commented1 = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let io1 = propose_io_recording(found1.clone(), created1.clone(), commented1.clone());
+        let mut out1 = Vec::new();
+        run_propose_with(
+            &args,
+            &mut out1,
+            home.path(),
+            &state,
+            std::slice::from_ref(&file),
+            &log_records,
+            &io1,
+        )
+        .expect("run 1");
+        assert_eq!(created1.borrow().len(), 1, "first run files the proposal");
+
+        // Second run over the SAME transcript: nothing new captured, and
+        // the evidence is byte-for-byte what was already reported -- must
+        // be a no-op with ZERO HTTP calls of any kind (the bug: it used to
+        // re-comment identical evidence every run).
+        let found2 = std::rc::Rc::new(std::cell::RefCell::new(Some(42u64)));
+        let created2 = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let commented2 = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let io2 = propose_io_recording(found2.clone(), created2.clone(), commented2.clone());
+        let mut out2 = Vec::new();
+        run_propose_with(
+            &args,
+            &mut out2,
+            home.path(),
+            &state,
+            std::slice::from_ref(&file),
+            &log_records,
+            &io2,
+        )
+        .expect("run 2");
+
+        assert!(
+            created2.borrow().is_empty(),
+            "no new issue on an unchanged run"
+        );
+        assert!(
+            commented2.borrow().is_empty(),
+            "no comment on an unchanged run -- this is the fix"
+        );
+        let text2 = String::from_utf8(out2).expect("utf8");
+        assert!(
+            text2.contains("no new evidence"),
+            "must say why it did nothing: {text2}"
+        );
+    }
+
+    #[test]
+    fn new_approval_after_a_report_produces_exactly_one_delta_marked_comment() {
+        let home = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".zirv/.settings.toml"),
+            "[permissions]\npropose_enabled = true\n",
+        )
+        .expect("settings");
+        let state_root = tempfile::tempdir().expect("tempdir");
+        let state = super::super::state::StateDir::from_root(state_root.path().to_path_buf());
+        let transcripts = tempfile::tempdir().expect("tempdir");
+        let command1 = "gh pr create --title x --body y";
+        let file1 = write_claude_transcript(transcripts.path(), "s1", command1, "/some/repo");
+        let log_records1 = vec![safety_record("s1", command1, "ask")];
+        let args = ProposeArgs {
+            agent: AuditAgent::Claude,
+            sessions: 5,
+            dry_run: false,
+        };
+
+        let found1 = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let created1 = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let commented1 = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let io1 = propose_io_recording(found1.clone(), created1.clone(), commented1.clone());
+        let mut out1 = Vec::new();
+        run_propose_with(
+            &args,
+            &mut out1,
+            home.path(),
+            &state,
+            std::slice::from_ref(&file1),
+            &log_records1,
+            &io1,
+        )
+        .expect("run 1");
+        assert_eq!(created1.borrow().len(), 1);
+
+        // A second, DIFFERENT session approves an equivalent command in the
+        // same family -- genuinely new evidence.
+        let command2 = "gh pr create --title y --body z";
+        let file2 = write_claude_transcript(transcripts.path(), "s2", command2, "/some/repo");
+        let log_records2 = vec![safety_record("s2", command2, "ask")];
+
+        let found2 = std::rc::Rc::new(std::cell::RefCell::new(Some(99u64)));
+        let created2 = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let commented2 = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let io2 = propose_io_recording(found2.clone(), created2.clone(), commented2.clone());
+        let mut out2 = Vec::new();
+        run_propose_with(
+            &args,
+            &mut out2,
+            home.path(),
+            &state,
+            std::slice::from_ref(&file2),
+            &log_records2,
+            &io2,
+        )
+        .expect("run 2");
+
+        assert!(
+            created2.borrow().is_empty(),
+            "an already-open issue must be commented, never duplicated"
+        );
+        assert_eq!(commented2.borrow().len(), 1, "exactly one comment");
+        let (number, body) = &commented2.borrow()[0];
+        assert_eq!(*number, 99);
+        assert!(
+            body.contains("Update since the last report"),
+            "must be clearly delta-marked: {body}"
+        );
+        assert!(
+            body.contains("1 new approved occurrence"),
+            "must name what is new: {body}"
+        );
+    }
+
+    // -- fix 2: non-escalating-alternative guidance --------------------
+
+    #[test]
+    fn classify_approval_categorizes_each_exclusion_reason() {
+        assert!(matches!(
+            classify_approval("gh pr merge 12"),
+            ApprovalClassification::Excluded(ExclusionReason::Protected)
+        ));
+        assert!(matches!(
+            classify_approval("gh"),
+            ApprovalClassification::Excluded(ExclusionReason::TooGeneric)
+        ));
+        let one_off = format!("gh pr comment 12 --body \"{}\"", "x".repeat(200));
+        assert!(matches!(
+            classify_approval(&one_off),
+            ApprovalClassification::Excluded(ExclusionReason::OneOffSpelling)
+        ));
+        assert!(matches!(
+            classify_approval("gh pr create --title x && rm -rf /"),
+            ApprovalClassification::Excluded(ExclusionReason::ShellComposition)
+        ));
+        assert!(matches!(
+            classify_approval("cargo build"),
+            ApprovalClassification::OutOfScope
+        ));
+        assert!(matches!(
+            classify_approval("gh pr create --title x --body y"),
+            ApprovalClassification::Eligible
+        ));
+    }
+
+    #[test]
+    fn out_of_scope_commands_produce_no_exclusion_guidance() {
+        let capture = CapturedApproval {
+            session: "s1".to_string(),
+            agent: "claude",
+            raw: "cargo build".to_string(),
+            cwd_scope: "repo".to_string(),
+        };
+        let record = record_from_capture(&capture);
+        assert!(!record.irrelevant);
+        assert_eq!(record.exclusion_reason, None);
+        assert!(group_excluded_evidence(std::slice::from_ref(&record)).is_empty());
+    }
+
+    #[test]
+    fn an_excluded_family_gets_guidance_and_files_no_proposal() {
+        let home = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".zirv/.settings.toml"),
+            "[permissions]\npropose_enabled = true\n",
+        )
+        .expect("settings");
+        let state_root = tempfile::tempdir().expect("tempdir");
+        let state = super::super::state::StateDir::from_root(state_root.path().to_path_buf());
+        let transcripts = tempfile::tempdir().expect("tempdir");
+        let command = "gh pr merge 12";
+        let file = write_claude_transcript(transcripts.path(), "s1", command, "/some/repo");
+        let log_records = vec![safety_record("s1", command, "ask")];
+        let args = ProposeArgs {
+            agent: AuditAgent::Claude,
+            sessions: 5,
+            dry_run: false,
+        };
+        let found = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let created = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let commented = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let io = propose_io_recording(found.clone(), created.clone(), commented.clone());
+        let mut out = Vec::new();
+
+        run_propose_with(
+            &args,
+            &mut out,
+            home.path(),
+            &state,
+            std::slice::from_ref(&file),
+            &log_records,
+            &io,
+        )
+        .expect("run");
+
+        assert!(
+            created.borrow().is_empty(),
+            "a protected verb is never proposed"
+        );
+        assert!(commented.borrow().is_empty());
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            text.contains("excluded: 'gh pr'"),
+            "must name the excluded family: {text}"
+        );
+        assert!(
+            text.contains("protected or lifecycle action"),
+            "must give the non-escalating guidance: {text}"
+        );
+    }
+
+    #[test]
+    fn excluded_guidance_still_prints_alongside_a_real_eligible_proposal() {
+        // Two different families in the same run: one eligible (creates a
+        // proposal), one excluded (protected) -- the excluded one must
+        // still get its guidance line, not be silently swallowed just
+        // because the run also had something real to propose.
+        let home = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".zirv/.settings.toml"),
+            "[permissions]\npropose_enabled = true\n",
+        )
+        .expect("settings");
+        let state_root = tempfile::tempdir().expect("tempdir");
+        let state = super::super::state::StateDir::from_root(state_root.path().to_path_buf());
+        let transcripts = tempfile::tempdir().expect("tempdir");
+        let eligible_command = "gh pr create --title x --body y";
+        let excluded_command = "gh issue delete 5";
+        let text = format!(
+            "{}\n{}\n{}\n{}",
+            claude_ask_line("id1", eligible_command, "/some/repo"),
+            claude_result_line("id1", false),
+            claude_ask_line("id2", excluded_command, "/some/repo"),
+            claude_result_line("id2", false),
+        );
+        let path = transcripts.path().join("s1.jsonl");
+        std::fs::write(&path, text).expect("write transcript");
+        let log_records = vec![
+            safety_record("s1", eligible_command, "ask"),
+            safety_record("s1", excluded_command, "ask"),
+        ];
+        let args = ProposeArgs {
+            agent: AuditAgent::Claude,
+            sessions: 5,
+            dry_run: false,
+        };
+        let found = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let created = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let commented = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let io = propose_io_recording(found.clone(), created.clone(), commented.clone());
+        let mut out = Vec::new();
+
+        run_propose_with(
+            &args,
+            &mut out,
+            home.path(),
+            &state,
+            std::slice::from_ref(&path),
+            &log_records,
+            &io,
+        )
+        .expect("run");
+
+        assert_eq!(
+            created.borrow().len(),
+            1,
+            "the eligible family is still proposed"
+        );
+        assert_eq!(created.borrow()[0].0, "Safe-list proposal: `gh pr`");
+        let rendered = String::from_utf8(out).expect("utf8");
+        assert!(
+            rendered.contains("excluded: 'gh issue'"),
+            "the excluded family's guidance must still appear: {rendered}"
         );
     }
 }
