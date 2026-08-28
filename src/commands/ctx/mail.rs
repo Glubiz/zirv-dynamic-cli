@@ -1295,7 +1295,7 @@ impl Default for SendArgs {
     }
 }
 
-#[derive(Debug, clap::Args)]
+#[derive(Debug, Default, clap::Args)]
 pub struct InboxArgs {
     /// Read without consuming: leaves every printed message in place instead
     /// of moving it to `read/`. This is the old default behavior of a plain
@@ -1316,17 +1316,6 @@ pub struct InboxArgs {
     /// is accepted and resolves to its thread id).
     #[arg(long, value_name = "MESSAGE_OR_THREAD_ID")]
     pub thread: Option<String>,
-}
-
-impl Default for InboxArgs {
-    fn default() -> Self {
-        Self {
-            peek: false,
-            consume: false,
-            json: false,
-            thread: None,
-        }
-    }
 }
 
 /// `env(key)`, treating a missing or blank value as `"unknown"` rather than
@@ -4190,5 +4179,176 @@ This should not appear in the body.\n";
         ] {
             assert!(text.contains(expected), "missing {expected:?}: {text}");
         }
+    }
+
+    /// #177 concurrency review: `claim_once` is the only thing standing
+    /// between "exactly one session claims this" and two sessions both
+    /// acting on the same undirected message. The single-threaded tests
+    /// above (`implicit_undirected_send_is_rejected_and_explicit_claim_once_is_trackable`)
+    /// exercise the happy path but never put two claimants in the race
+    /// window at once. This spawns a real thread per claimant, releases them
+    /// together with a `Barrier` so they all reach `OpenOptions::create_new`
+    /// as close to simultaneously as the OS scheduler allows, and asserts
+    /// that -- no matter how the race resolves -- exactly one of them wins.
+    /// A non-atomic implementation (e.g. an `.exists()` check followed by a
+    /// separate write) would let more than one thread observe "not yet
+    /// claimed" and both report success; `create_new`'s open-is-the-claim
+    /// design (the same pattern `claim_and_write` uses for message paths,
+    /// see item 4 above) is what rules that out.
+    #[test]
+    fn claim_once_is_atomic_under_concurrent_claimants() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = std::sync::Arc::new(StateDir::from_root(tmp.path().join("state")));
+        let envelope = std::sync::Arc::new(DeliveryEnvelope {
+            schema_version: DELIVERY_SCHEMA_VERSION,
+            id: "concurrent-claim-test".to_string(),
+            thread_id: "concurrent-claim-test".to_string(),
+            reply_to: None,
+            topic: None,
+            intent: None,
+            from: DeliveryParty {
+                session: "sender".to_string(),
+                harness: "claude".to_string(),
+                model: None,
+                role: None,
+                repo_slug: "repo".to_string(),
+            },
+            to: DeliverySelector {
+                kind: "claim_once".to_string(),
+                value: None,
+            },
+            payload: PayloadSize {
+                original_bytes: 0,
+                stored_bytes: 0,
+            },
+            created_at: now_secs(),
+            expires_at: now_secs() + 60,
+            claim_once: true,
+            targets: Vec::new(),
+        });
+        write_envelope(&state, &envelope).expect("write envelope");
+
+        const CLAIMANTS: usize = 8;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(CLAIMANTS));
+        let handles: Vec<_> = (0..CLAIMANTS)
+            .map(|i| {
+                let state = state.clone();
+                let envelope = envelope.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    claim_once(&state, &envelope, &format!("reader{i}")).expect("claim attempt")
+                })
+            })
+            .collect();
+        let results: Vec<bool> = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("thread join"))
+            .collect();
+
+        assert_eq!(
+            results.iter().filter(|won| **won).count(),
+            1,
+            "exactly one concurrent claimant must win the race: {results:?}"
+        );
+        let winner = claimed_by(&state, &envelope.id).expect("a claimant recorded itself");
+        assert!(
+            (0..CLAIMANTS)
+                .map(|i| format!("reader{i}"))
+                .any(|name| name == winner),
+            "the recorded claimant must be one of the racers, not a corrupted mix: {winner}"
+        );
+    }
+
+    /// #177 concurrency review: a role/fan-out send produces one shared
+    /// `DeliveryEnvelope` but a separate receipt file per recipient
+    /// (`receipt_path` is keyed by `envelope.id` + `session`). This confirms
+    /// the two receipt files really are independent on disk: one recipient
+    /// consuming its own copy through the normal inbox path must update only
+    /// that recipient's receipt, leaving every other targeted recipient's
+    /// receipt exactly as it was queued.
+    #[test]
+    fn per_recipient_receipts_do_not_clobber_each_other() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state_dir = tmp.path().join("state");
+        let state = StateDir::from_root(state_dir.clone());
+        let repo = tmp.path().join("repo");
+        let first_id = "review01-1111-4111-8111-111111111111";
+        let second_id = "review02-2222-4222-8222-222222222222";
+        let first = sessions::Record::new(first_id, "claude", &repo, sessions::Verb::Dash)
+            .with_role("reviewer");
+        let second = sessions::Record::new(second_id, "codex", &repo, sessions::Verb::Exec)
+            .with_role("reviewer");
+        let first_short = first.short.clone();
+        let second_short = second.short.clone();
+        let _first = sessions::SessionGuard::register(&state, first);
+        let _second = sessions::SessionGuard::register(&state, second);
+
+        let sender_env = env_map(&[(
+            super::super::state::STATE_ENV,
+            state_dir.to_str().expect("utf8"),
+        )]);
+        let args = SendArgs {
+            to_role: Some("reviewer".to_string()),
+            message: Some("review this".to_string()),
+            ..SendArgs::default()
+        };
+        let mut output = Vec::new();
+        run_send_with(
+            &args,
+            &mut output,
+            &repo,
+            &|key| sender_env.get(key).cloned(),
+            &mut std::io::Cursor::new(Vec::<u8>::new()),
+        )
+        .expect("role send");
+        let envelope = resolve_envelope(&state, &created_id(&output)).expect("envelope");
+
+        let before = read_receipts(&state, &envelope.id);
+        assert!(
+            before
+                .iter()
+                .all(|receipt| receipt.state == ReceiptState::Queued),
+            "both receipts start out queued: {before:?}"
+        );
+
+        // Only the first recipient reads its own copy.
+        let first_reader_env = env_map(&[
+            (
+                super::super::state::STATE_ENV,
+                state_dir.to_str().expect("utf8"),
+            ),
+            (SESSION_ENV, first_id),
+            (AGENT_ENV, "claude"),
+        ]);
+        run_inbox_with(&InboxArgs::default(), &mut Vec::new(), &repo, &|key| {
+            first_reader_env.get(key).cloned()
+        })
+        .expect("first recipient reads");
+
+        let after = read_receipts(&state, &envelope.id);
+        let first_receipt = after
+            .iter()
+            .find(|receipt| receipt.session == first_short)
+            .expect("first recipient's receipt");
+        let second_receipt = after
+            .iter()
+            .find(|receipt| receipt.session == second_short)
+            .expect("second recipient's receipt");
+        assert_eq!(
+            first_receipt.state,
+            ReceiptState::Read,
+            "the reading recipient's own receipt updates"
+        );
+        assert!(first_receipt.read_at.is_some());
+        assert_eq!(
+            second_receipt.state,
+            ReceiptState::Queued,
+            "an uninvolved recipient's receipt must not be clobbered by another's read"
+        );
+        assert!(
+            second_receipt.read_at.is_none(),
+            "an uninvolved recipient's receipt must not gain a read timestamp"
+        );
     }
 }
