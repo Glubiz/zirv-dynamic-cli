@@ -25,7 +25,7 @@
 #![allow(dead_code)]
 
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
@@ -781,6 +781,17 @@ pub struct Pane {
     /// addressability for the report-back layer and is the only place that
     /// answer exists.
     report_to: Option<String>,
+    /// Security review Finding 1 (2026-08-28): this pane's OWN spawn-request
+    /// intake directory (`spawnreq::pane_request_dir_for`), the one path this
+    /// pane's child tree was told about through `DASH_REQUESTS_ENV`. The
+    /// dashboard drains it separately from every other pane's, so a request
+    /// found here is, server-side, a request from THIS pane -- the identity
+    /// `dash::mod::fulfill_spawn_request` classifies lineage by, instead of
+    /// believing whatever `SpawnRequest::parent_session` claims. `None` for a
+    /// pane with no channel of its own (every test pane, and a spawn whose
+    /// directory could not be created), which can then only ever be the
+    /// requester of nothing.
+    intake_dir: Option<PathBuf>,
     /// Whether `report_back_reminder_sweep`'s one-shot completion reminder
     /// has already been injected into this pane. Set the moment that
     /// injection succeeds and never cleared again -- unlike
@@ -974,6 +985,7 @@ impl Pane {
             exit_code: None,
             done: false,
             report_to: None,
+            intake_dir: None,
             report_reminder_sent: false,
             pending_submit: None,
         })
@@ -1387,6 +1399,21 @@ impl Pane {
     /// its outcome back to, if any.
     pub fn report_to(&self) -> Option<&str> {
         self.report_to.as_deref()
+    }
+
+    /// Security review Finding 1: records the spawn-request directory this
+    /// pane's own child tree was handed (`DASH_REQUESTS_ENV`). Called right
+    /// after `Pane::spawn` by the caller that minted the directory and put it
+    /// in this pane's `turn_env` -- the two must always name the same path,
+    /// which is what makes "a request arrived in this directory" mean "this
+    /// pane asked for it". See [`Pane::intake_dir`]'s own field comment.
+    pub fn set_intake_dir(&mut self, dir: PathBuf) {
+        self.intake_dir = Some(dir);
+    }
+
+    /// This pane's own spawn-request intake directory, if it was given one.
+    pub fn intake_dir(&self) -> Option<&Path> {
+        self.intake_dir.as_deref()
     }
 
     /// Whether `report_back_reminder_sweep`'s one-shot reminder has already

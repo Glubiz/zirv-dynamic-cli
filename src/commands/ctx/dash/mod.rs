@@ -1979,6 +1979,36 @@ fn spawn_token() -> String {
     uuid::Uuid::new_v4().simple().to_string()[..16].to_string()
 }
 
+/// Security review Finding 1 (2026-08-28): one freshly minted intake
+/// directory for a pane that is about to spawn -- its own capability token,
+/// its own channel, nobody else's. The dashboard drains each pane's channel
+/// separately, so "this request was in that directory" is what identifies the
+/// requesting session; nothing about the requester is ever read out of the
+/// request itself (see `fulfill_spawn_request`'s own lineage gate).
+///
+/// Created eagerly rather than left to `spawnreq::write_request`'s own lazy
+/// `create_private_dir_all`: a pane's `agent::live_join_target` refuses a
+/// `DASH_REQUESTS_ENV` directory that does not exist yet, and would then scan
+/// for another live dashboard instead. A creation failure is therefore
+/// narrated, not fatal -- the pane simply falls back to that scan (finding
+/// this dashboard's own shared channel, where it can still ask for a plain
+/// worker), which is the never-make-it-worse degradation this module holds
+/// everywhere else.
+fn mint_pane_channel(requests_dir: &Path, errors: &mut Vec<String>) -> PathBuf {
+    let dir = spawnreq::pane_request_dir_for(requests_dir, &spawn_token());
+    if let Err(e) = super::state::create_private_dir_all(&dir) {
+        push_error(
+            errors,
+            format!(
+                "dashboard: could not create the spawn-request channel {}: {e}; this pane can \
+                 only ask for plain worker panes",
+                dir.display()
+            ),
+        );
+    }
+    dir
+}
+
 /// CROSS-CUTTING (shared with the supervisor): removes every
 /// `<state>/dash/<short>-<token>` token directory whose `owner.pid` names a
 /// process no longer alive -- a leak from a dashboard that exited abnormally
@@ -2435,16 +2465,29 @@ pub(crate) fn depth_refusal(
 /// otherwise claim a sub-orchestrator spawn no real Worker may ever request.
 /// `fulfill_spawn_request` (the sole caller) therefore refuses a coordinator
 /// role outright the moment lineage is unverified, BEFORE `depth_refusal`
-/// ever sees this function's answer -- see `parent_lineage_verified`, right
-/// below, which both this function and that check share. A worker-role
-/// request rides the unverified `Orchestrator` reading unaffected: a forged
-/// or absent parent gets it no more than a genuine rejoin already could, and
-/// `depth_refusal(Orchestrator, Worker)` was always `None`. A MATCHED parent
-/// is, by construction, verified (it names a pane this exact process
-/// spawned and still tracks), so its real role is always safe to trust here.
-fn parent_role_for(req: &spawnreq::SpawnRequest, panes: &[Pane]) -> prompt::PromptRole {
-    req.parent_session
-        .as_deref()
+/// ever sees this function's answer. A worker-role request rides the
+/// unverified `Orchestrator` reading unaffected: a forged or absent parent
+/// gets it no more than a genuine rejoin already could, and
+/// `depth_refusal(Orchestrator, Worker)` was always `None`.
+///
+/// II, security review round 2 (Finding 1, 2026-08-28): `requester` -- the
+/// identity the dashboard derived from the intake channel this request
+/// actually arrived on (`handle_spawn_requests`) -- WINS over anything
+/// `req` says, and is the only lineage that is ever verified. Matching
+/// `req.parent_session` against the live pane list was never a binding
+/// between the requester and the parent it named: a Worker pane knows its
+/// own orchestrator's short id (`zirv ctx status` prints it), so naming that
+/// pane was enough to be classified with that pane's role and mint a real
+/// SubOrchestrator. The claimed value now only ever reaches this function
+/// when the channel proves nothing about who wrote it, and it is refused
+/// outright whenever it names a live pane (see `fulfill_spawn_request`).
+fn parent_role_for(
+    requester: Option<&str>,
+    req: &spawnreq::SpawnRequest,
+    panes: &[Pane],
+) -> prompt::PromptRole {
+    requester
+        .or(req.parent_session.as_deref())
         .and_then(|parent| {
             panes
                 .iter()
@@ -2452,22 +2495,6 @@ fn parent_role_for(req: &spawnreq::SpawnRequest, panes: &[Pane]) -> prompt::Prom
         })
         .map(|pane| pane.role())
         .unwrap_or(prompt::PromptRole::Orchestrator)
-}
-
-/// Whether `req.parent_session` names one of this dashboard's own currently
-/// live panes -- the only lineage [`parent_role_for`] (and the coordinator
-/// refusal in `fulfill_spawn_request`, right where it calls both of these)
-/// ever trusts. `req.parent_session` is used only as a KEY into this
-/// dashboard's own live pane list, never as an assertion of role by itself
-/// -- mirrors `spawn_launch_mode_pin`'s own discipline (see its doc
-/// comment): a spawn request is untrusted JSON any process that can reach
-/// the requests directory can hand-write.
-fn parent_lineage_verified(req: &spawnreq::SpawnRequest, panes: &[Pane]) -> bool {
-    req.parent_session.as_deref().is_some_and(|parent| {
-        panes
-            .iter()
-            .any(|pane| sessions::short_id(pane.session_id()) == parent)
-    })
 }
 
 /// Whether the task-prompt fallback (`worker_task_prompt`, below) has
@@ -2783,6 +2810,7 @@ fn worker_task_prompt(
 fn fulfill_spawn_request(
     req: &spawnreq::SpawnRequest,
     trusted_interactive: bool,
+    requester: Option<&str>,
     panes: &mut Vec<Pane>,
     nudge_queues: &mut Vec<VecDeque<String>>,
     cfg: &CtxConfig,
@@ -2834,11 +2862,41 @@ fn fulfill_spawn_request(
     // now gates the actual heavy COMMAND a pane's agent runs, at
     // `script_runner::Command::invoke` (`permit::acquire`), so an idle pane
     // holds nothing and never counts against it.
+    // Security review round 2 (Finding 1): the requester is whoever's intake
+    // channel this request arrived on, and a request may not speak for
+    // anybody else. `requester` is `Some` only for a pane's own private
+    // directory (`spawnreq::pane_request_dir_for`, handed to that pane's
+    // child tree and nothing else), so a `parent_session` that disagrees with
+    // it is a pane claiming another session's lineage -- refused outright
+    // rather than quietly ignored, so the forgery is visible in the ack and
+    // in the dashboard's own notice channel. On the SHARED channel (an
+    // operator's own terminal, or a pane rejoining after its own dashboard
+    // quit) nothing can be proven about the writer, so naming a live pane
+    // there is refused for the same reason: a short id is public
+    // (`zirv ctx status` prints it) and can never be an authentication.
+    if let Some(claimed) = req.parent_session.as_deref() {
+        let mismatched = match requester {
+            Some(requester) => claimed != requester,
+            None => panes
+                .iter()
+                .any(|pane| sessions::short_id(pane.session_id()) == claimed),
+        };
+        if mismatched {
+            return Err(SpawnRefusal::policy(format!(
+                "a spawn request may only name the session it was sent from as its parent; this \
+                 one arrived on {} and claimed '{claimed}'",
+                match requester {
+                    Some(requester) => format!("session {requester}'s own channel"),
+                    None => "a channel that proves no session identity".to_string(),
+                }
+            )));
+        }
+    }
     // Issue #155, Phase 5(c): the delegation depth cap. `parent_role_for`
     // never trusts `req` for its own lineage (see its own doc comment); a
     // refusal here is policy, the same reasoning the pane cap and the agent
     // gate right below already apply.
-    let parent_role = parent_role_for(req, panes);
+    let parent_role = parent_role_for(requester, req, panes);
     let requested_role = spawnreq::role_of(req);
     // Security review Finding 1: `parent_role_for`'s `Orchestrator` answer
     // is never a VERIFIED one (see its own doc comment) -- it is what BOTH
@@ -2853,11 +2911,14 @@ fn fulfill_spawn_request(
     // one allowance the rejoin case still needs, and a bounded single worker
     // pane is no more than the pane cap, agent gate and spawn quota below
     // already allow any unverified requester to obtain.
-    if !parent_lineage_verified(req, panes)
-        && matches!(requested_role, prompt::PromptRole::SubOrchestrator)
-    {
+    //
+    // Round 2 (Finding 1): "verified" is now a property of the CHANNEL, not
+    // of a value the request supplied -- only a request that arrived on some
+    // pane's own private intake directory has a lineage this dashboard
+    // established itself.
+    if requester.is_none() && matches!(requested_role, prompt::PromptRole::SubOrchestrator) {
         return Err(SpawnRefusal::policy(
-            "a request naming no live pane this dashboard tracks may not claim the \
+            "a request arriving on a channel that proves no session identity may not claim the \
              sub-orchestrator role -- an operator who wants a coordinator seat runs `zirv ctx \
              agent --role sub-orchestrator` directly, outside any dashboard pane"
                 .to_string(),
@@ -3069,9 +3130,12 @@ fn fulfill_spawn_request(
     if let Some(e) = turn_env_err {
         push_error(errors, e);
     }
+    // Security review Finding 1: this pane's OWN channel, not the shared one
+    // -- what makes the next request it writes attributable to it.
+    let pane_channel = mint_pane_channel(requests_dir, errors);
     turn_env.push((
         spawnreq::DASH_REQUESTS_ENV.to_string(),
-        requests_dir.display().to_string(),
+        pane_channel.display().to_string(),
     ));
     // Issue #170: a work-group binding travels by lineage, not convention --
     // this pane's own child inherits `agent::WORK_GROUP_ENV` in its real
@@ -3159,6 +3223,7 @@ fn fulfill_spawn_request(
     // worker that received no report-back text at all in its launch prompt
     // still benefits from the reminder pointing it at the right command.
     pane.set_report_to(report_to_for(req, cfg));
+    pane.set_intake_dir(pane_channel);
     let short = pane.short().to_string();
     panes.push(pane);
     nudge_queues.push(VecDeque::new());
@@ -3205,10 +3270,30 @@ fn claim_batch(
         .collect()
 }
 
-/// Drains every request currently queued in `requests_dir` and answers each
-/// one, in order. Called once per tick, alongside `mail_sweep`/
-/// `deliver_queued_nudges`: a request is data sitting on disk, not something
-/// that needs sub-tick latency.
+/// Every intake channel this dashboard drains on a tick, paired with the
+/// session identity a request arriving there proves: this dashboard's own
+/// shared `requests` directory first (`None` -- any process that discovered
+/// this dashboard can write there, so it proves nothing), then one channel
+/// per live pane (`Some(short)` -- that directory's path was handed to that
+/// pane's child tree and to nothing else).
+///
+/// Security review Finding 1: snapshotted BEFORE any fulfilment, because
+/// fulfilling appends panes and a pane spawned on this tick cannot yet have
+/// queued anything -- and because `fulfill_spawn_request` needs `panes`
+/// mutably while this list is being walked.
+fn intake_channels(requests_dir: &Path, panes: &[Pane]) -> Vec<(PathBuf, Option<String>)> {
+    let mut channels = vec![(requests_dir.to_path_buf(), None)];
+    channels.extend(panes.iter().filter_map(|pane| {
+        pane.intake_dir()
+            .map(|dir| (dir.to_path_buf(), Some(pane.short().to_string())))
+    }));
+    channels
+}
+
+/// Drains every request currently queued on every intake channel
+/// ([`intake_channels`]) and answers each one, in order. Called once per
+/// tick, alongside `mail_sweep`/`deliver_queued_nudges`: a request is data
+/// sitting on disk, not something that needs sub-tick latency.
 #[allow(clippy::too_many_arguments)]
 fn handle_spawn_requests(
     requests_dir: &Path,
@@ -3220,7 +3305,42 @@ fn handle_spawn_requests(
     size: (u16, u16),
     errors: &mut Vec<String>,
 ) {
-    let batch = claim_batch(spawnreq::take_requests(requests_dir));
+    for (dir, requester) in intake_channels(requests_dir, panes) {
+        drain_one_channel(
+            &dir,
+            requester.as_deref(),
+            requests_dir,
+            panes,
+            nudge_queues,
+            cfg,
+            state,
+            repo,
+            size,
+            errors,
+        );
+    }
+}
+
+/// One intake channel's own queue: every request in `dir`, each answered with
+/// an ack written back into that same `dir` so a requester only ever polls
+/// the channel it wrote to. `requester` is the identity that channel proves
+/// (see [`intake_channels`]); `requests_dir` stays the DASHBOARD's shared
+/// directory throughout, because that is what `fulfill_spawn_request` derives
+/// a freshly spawned pane's own channel from.
+#[allow(clippy::too_many_arguments)]
+fn drain_one_channel(
+    dir: &Path,
+    requester: Option<&str>,
+    requests_dir: &Path,
+    panes: &mut Vec<Pane>,
+    nudge_queues: &mut Vec<VecDeque<String>>,
+    cfg: &CtxConfig,
+    state: &StateDir,
+    repo: &Path,
+    size: (u16, u16),
+    errors: &mut Vec<String>,
+) {
+    let batch = claim_batch(spawnreq::take_requests(dir));
     for (stem, req) in batch {
         // `FILE_DROP_TRUSTED_INTERACTIVE` (never a bare `false`, on purpose
         // -- a named constant is harder to accidentally swap for
@@ -3234,6 +3354,7 @@ fn handle_spawn_requests(
         let ack = match fulfill_spawn_request(
             &req,
             FILE_DROP_TRUSTED_INTERACTIVE,
+            requester,
             panes,
             nudge_queues,
             cfg,
@@ -3257,7 +3378,7 @@ fn handle_spawn_requests(
                 // Withdrawn only on an outright failure: when the spawn
                 // succeeded and only `write_ack` below failed, a pane really
                 // is running and the claim is exactly right.
-                spawnreq::remove_claim(requests_dir, &stem);
+                spawnreq::remove_claim(dir, &stem);
                 spawnreq::SpawnAck {
                     ok: false,
                     short: None,
@@ -3266,7 +3387,7 @@ fn handle_spawn_requests(
                 }
             }
         };
-        if let Err(e) = spawnreq::write_ack(requests_dir, &stem, &ack) {
+        if let Err(e) = spawnreq::write_ack(dir, &stem, &ack) {
             push_error(errors, format!("spawn ack: {e}"));
         }
     }
@@ -3848,9 +3969,13 @@ fn spawn_restored_pane(
     if let Some(e) = turn_env_err {
         push_error(errors, e);
     }
+    // Security review Finding 1: a restored pane is a pane like any other and
+    // gets its own channel -- a fresh token, since the one it carried before
+    // the quit died with that dashboard's token directory.
+    let pane_channel = mint_pane_channel(requests_dir, errors);
     turn_env.push((
         spawnreq::DASH_REQUESTS_ENV.to_string(),
-        requests_dir.display().to_string(),
+        pane_channel.display().to_string(),
     ));
 
     match Pane::spawn(
@@ -3877,6 +4002,7 @@ fn spawn_restored_pane(
             if candidate.report_reminder_sent {
                 pane.mark_report_reminder_sent();
             }
+            pane.set_intake_dir(pane_channel);
             panes.push(pane);
             nudge_queues.push(VecDeque::new());
         }
@@ -4721,9 +4847,15 @@ pub fn run_dashboard(
             format!("dashboard: could not create the spawn-request directory: {e}"),
         );
     }
+    // Security review Finding 1: the orchestrator pane gets its own channel
+    // too -- the operator's own seat is exactly the identity a worker pane
+    // most wants to speak as, so it must be the one identity a worker pane
+    // cannot borrow. Its requests then arrive already attributed to it, which
+    // is what lets it legitimately mint sub-orchestrators.
+    let first_pane_channel = mint_pane_channel(&requests_dir, &mut errors);
     turn_env.push((
         spawnreq::DASH_REQUESTS_ENV.to_string(),
-        requests_dir.display().to_string(),
+        first_pane_channel.display().to_string(),
     ));
     // CROSS-CUTTING: the owner-pid file. `nested_session_evidence` reads it to
     // tell a live dashboard from a token dir a crashed one leaked; without it,
@@ -4793,7 +4925,10 @@ pub fn run_dashboard(
         turn_signal_capable_for(cfg, &agent_name),
         Duration::from_millis(cfg.dash.idle_quiet_ms),
     ) {
-        Ok(pane) => pane,
+        Ok(mut pane) => {
+            pane.set_intake_dir(first_pane_channel);
+            pane
+        }
         Err(e) => {
             remove_request_dir(&requests_dir);
             return Err(e);
@@ -5351,6 +5486,15 @@ pub fn run_dashboard(
                                                 let fulfilled = fulfill_spawn_request(
                                                     &req,
                                                     true,
+                                                    // The operator's own
+                                                    // keypress, not a
+                                                    // session speaking: this
+                                                    // spawn IS the delegation
+                                                    // root, so there is no
+                                                    // requesting session to
+                                                    // derive (and `req`
+                                                    // claims no parent).
+                                                    None,
                                                     &mut panes,
                                                     &mut nudge_queues,
                                                     cfg,
@@ -9286,6 +9430,7 @@ mod tests {
         fulfill_spawn_request(
             req,
             false,
+            None,
             &mut panes,
             &mut queues,
             cfg,
@@ -9879,6 +10024,7 @@ mod tests {
         let err = fulfill_spawn_request(
             &req,
             false,
+            None,
             &mut panes,
             &mut queues,
             &cfg,
@@ -9959,6 +10105,7 @@ mod tests {
         let refusal = fulfill_spawn_request(
             &req,
             false,
+            None,
             &mut panes,
             &mut queues,
             &cfg,
@@ -10070,7 +10217,7 @@ mod tests {
         let mut req = spawn_request("do the work", Path::new("/repo"));
         req.parent_session = None;
         assert_eq!(
-            parent_role_for(&req, &panes),
+            parent_role_for(None, &req, &panes),
             prompt::PromptRole::Orchestrator
         );
 
@@ -10078,16 +10225,17 @@ mod tests {
         // no lineage at all, never more privileged.
         req.parent_session = Some("deadbeef".to_string());
         assert_eq!(
-            parent_role_for(&req, &panes),
+            parent_role_for(None, &req, &panes),
             prompt::PromptRole::Orchestrator
         );
     }
 
-    /// The other half of the same property: a `parent_session` that DOES
-    /// name one of this dashboard's own live panes reads as `Worker` --
-    /// every pane this process has ever spawned is one, in every way this
-    /// process can currently observe -- which is what actually makes the
+    /// The other half of the same property: a requester the dashboard
+    /// DERIVED from the intake channel, naming one of its own live panes,
+    /// reads as that pane's own role -- which is what actually makes the
     /// depth cap bite for a real delegation chain, not just for a forged one.
+    /// Round 2 (Finding 1): the identity comes from the channel, so a
+    /// `parent_session` the request wrote for itself no longer decides this.
     #[cfg(unix)]
     #[test]
     fn parent_role_for_reads_a_live_pane_of_this_dashboard_as_a_worker() {
@@ -10118,16 +10266,29 @@ mod tests {
             .expect("spawn"),
         ];
 
+        let worker_short = sessions::short_id("22222222-3333-4444-8555-666666666666");
         let mut req = spawn_request("do the work", &repo);
-        req.parent_session = Some(sessions::short_id("22222222-3333-4444-8555-666666666666"));
-        assert_eq!(parent_role_for(&req, &panes), prompt::PromptRole::Worker);
+        req.parent_session = Some(worker_short.clone());
+        assert_eq!(
+            parent_role_for(Some(&worker_short), &req, &panes),
+            prompt::PromptRole::Worker
+        );
 
         // A DIFFERENT id, not in `panes` at all, still reads as unrestricted
         // -- the presence of an unrelated live pane must not change that.
         req.parent_session = Some("ffffffff".to_string());
         assert_eq!(
-            parent_role_for(&req, &panes),
+            parent_role_for(None, &req, &panes),
             prompt::PromptRole::Orchestrator
+        );
+
+        // And the derived identity outranks the claimed one: a request that
+        // arrived on the worker's own channel is that worker's, whatever it
+        // wrote about its own lineage.
+        req.parent_session = Some("ffffffff".to_string());
+        assert_eq!(
+            parent_role_for(Some(&worker_short), &req, &panes),
+            prompt::PromptRole::Worker
         );
     }
 
@@ -10169,13 +10330,18 @@ mod tests {
         let mut queues: Vec<VecDeque<String>> = vec![VecDeque::new()];
         let mut errors = Vec::new();
 
+        let worker_short = sessions::short_id("33333333-4444-5555-8666-777777777777");
         let mut req = spawn_request("do the work", &repo);
         req.role = Some("sub-orchestrator".to_string());
-        req.parent_session = Some(sessions::short_id("33333333-4444-5555-8666-777777777777"));
+        req.parent_session = Some(worker_short.clone());
 
+        // Round 2 (Finding 1): the request arrives on the worker pane's own
+        // channel, so its lineage is honest AND server-derived -- exactly the
+        // case the depth cap is for.
         let refusal = fulfill_spawn_request(
             &req,
             false,
+            Some(&worker_short),
             &mut panes,
             &mut queues,
             &cfg,
@@ -10295,13 +10461,17 @@ mod tests {
         ];
         let mut queues: Vec<VecDeque<String>> = vec![VecDeque::new()];
 
-        // A plain worker request from the orchestrator's own pane.
+        // A plain worker request from the orchestrator's own pane -- arriving
+        // on that pane's own intake channel, which is what the dashboard
+        // derives its identity from (round 2, Finding 1).
+        let orch_short = sessions::short_id(orch_session);
         let mut worker_req = spawn_request("do the work", &repo);
-        worker_req.parent_session = Some(sessions::short_id(orch_session));
+        worker_req.parent_session = Some(orch_short.clone());
         let mut errors = Vec::new();
         fulfill_spawn_request(
             &worker_req,
             false,
+            Some(&orch_short),
             &mut panes,
             &mut queues,
             &cfg,
@@ -10315,11 +10485,12 @@ mod tests {
 
         // A sub-orchestrator request from the same pane.
         let mut sub_req = spawn_request("own this scope", &repo);
-        sub_req.parent_session = Some(sessions::short_id(orch_session));
+        sub_req.parent_session = Some(orch_short.clone());
         sub_req.role = Some("sub-orchestrator".to_string());
         fulfill_spawn_request(
             &sub_req,
             false,
+            Some(&orch_short),
             &mut panes,
             &mut queues,
             &cfg,
@@ -10374,12 +10545,14 @@ mod tests {
         let mut queues: Vec<VecDeque<String>> = vec![VecDeque::new()];
         let mut errors = Vec::new();
 
+        let orch_short = sessions::short_id(orch_session);
         let mut sub_req = spawn_request("own this scope", &repo);
-        sub_req.parent_session = Some(sessions::short_id(orch_session));
+        sub_req.parent_session = Some(orch_short.clone());
         sub_req.role = Some("sub-orchestrator".to_string());
         let sub_short = fulfill_spawn_request(
             &sub_req,
             false,
+            Some(&orch_short),
             &mut panes,
             &mut queues,
             &cfg,
@@ -10398,13 +10571,14 @@ mod tests {
         let mut worker_req = spawn_request("split off a worker brief", &repo);
         worker_req.parent_session = Some(sub_short.clone());
         assert_eq!(
-            parent_role_for(&worker_req, &panes),
+            parent_role_for(Some(&sub_short), &worker_req, &panes),
             prompt::PromptRole::SubOrchestrator,
             "the freshly spawned pane's own role must be readable back, not hardcoded Worker"
         );
         fulfill_spawn_request(
             &worker_req,
             false,
+            Some(&sub_short),
             &mut panes,
             &mut queues,
             &cfg,
@@ -10423,6 +10597,7 @@ mod tests {
         let refusal = fulfill_spawn_request(
             &second_sub_req,
             false,
+            Some(&sub_short),
             &mut panes,
             &mut queues,
             &cfg,
@@ -10483,6 +10658,7 @@ mod tests {
         let result = fulfill_spawn_request(
             &spawn_request("do the work", &repo),
             false,
+            None,
             &mut panes,
             &mut queues,
             &cfg,
@@ -10540,6 +10716,7 @@ mod tests {
         let result = fulfill_spawn_request(
             &spawn_request("do the work", &repo),
             false,
+            None,
             &mut panes,
             &mut queues,
             &cfg,
@@ -10597,6 +10774,7 @@ mod tests {
         let refusal = fulfill_spawn_request(
             &req,
             false,
+            None,
             &mut panes,
             &mut queues,
             &cfg,
@@ -10671,6 +10849,7 @@ mod tests {
         let result = fulfill_spawn_request(
             &req,
             false,
+            None,
             &mut panes,
             &mut queues,
             &cfg,
@@ -10741,6 +10920,7 @@ mod tests {
         let result = fulfill_spawn_request(
             &req,
             false,
+            None,
             &mut panes,
             &mut queues,
             &cfg,
@@ -10833,6 +11013,7 @@ mod tests {
         let result = fulfill_spawn_request(
             &req,
             false,
+            None,
             &mut panes,
             &mut queues,
             &cfg,
@@ -11031,6 +11212,7 @@ mod tests {
         let result = fulfill_spawn_request(
             &req,
             false,
+            None,
             &mut panes,
             &mut queues,
             &cfg,
@@ -13096,6 +13278,235 @@ mod tests {
             1,
             "the forged request still spawns a pane -- forging is about the pin, not the spawn \
              itself: {errors:?}"
+        );
+
+        for pane in &mut panes {
+            let _ = pane.shutdown("");
+        }
+    }
+
+    /// Two live panes with a channel each: an orchestrator seat and a worker
+    /// under it, the shape every lineage question in this module is really
+    /// about. Returns `(panes, queues, shared requests dir, orchestrator
+    /// channel, worker channel)`.
+    #[cfg(unix)]
+    fn two_paned_dash(
+        state: &StateDir,
+        repo: &Path,
+        requests_dir: &Path,
+    ) -> (Vec<Pane>, Vec<VecDeque<String>>, PathBuf, PathBuf) {
+        let mut errors = Vec::new();
+        let mut panes = Vec::new();
+        let mut channels = Vec::new();
+        for (session_id, role, verb, title) in [
+            (
+                "aaaaaaaa-1111-4222-8333-444444444444",
+                prompt::PromptRole::Orchestrator,
+                sessions::Verb::Chat,
+                "orch",
+            ),
+            (
+                "bbbbbbbb-1111-4222-8333-444444444444",
+                prompt::PromptRole::Worker,
+                sessions::Verb::Dash,
+                "wrk test",
+            ),
+        ] {
+            let mut pane = Pane::spawn(
+                PaneSpec {
+                    agent_name: "test-agent".to_string(),
+                    argv: trivial_argv(),
+                    role,
+                    verb,
+                    session_id: session_id.to_string(),
+                    title: title.to_string(),
+                },
+                state,
+                repo,
+                repo,
+                (80, 24),
+                &[],
+                true,
+                pane::DEFAULT_IDLE_QUIET,
+            )
+            .expect("spawn");
+            let channel = mint_pane_channel(requests_dir, &mut errors);
+            pane.set_intake_dir(channel.clone());
+            channels.push(channel);
+            panes.push(pane);
+        }
+        let queues = vec![VecDeque::new(); panes.len()];
+        let worker_channel = channels.pop().expect("worker channel");
+        let orch_channel = channels.pop().expect("orchestrator channel");
+        (panes, queues, orch_channel, worker_channel)
+    }
+
+    /// SECURITY (review round 2, Finding 1, 2026-08-28): the whole point.
+    /// A worker pane knows its own orchestrator's short id -- `zirv ctx
+    /// status` prints it, and `report_to` hands it over outright -- so
+    /// classifying lineage from `SpawnRequest::parent_session` let that
+    /// worker submit a request naming the orchestrator, be read as an
+    /// Orchestrator, and mint a real SubOrchestrator the depth cap exists to
+    /// refuse it. The requester is now derived from WHICH channel the
+    /// request arrived on, so the forgery is refused outright: no pane, and
+    /// no group side effect either (the refusal lands before `admit_child`).
+    #[cfg(unix)]
+    #[test]
+    fn a_request_on_a_workers_channel_may_not_name_another_session_as_its_parent() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let requests_dir = tmp
+            .path()
+            .join("dash")
+            .join("aaaa1111-token")
+            .join("requests");
+        let (mut panes, mut queues, _orch_channel, worker_channel) =
+            two_paned_dash(&state, &repo, &requests_dir);
+
+        let group_id = super::super::group::run_create(
+            &state,
+            &mut Vec::new(),
+            &super::super::group::CreateArgs {
+                scope: "the forged batch".to_string(),
+                child_limit: 4,
+                token_budget: None,
+                deadline_secs: None,
+                completion_contract: "n/a".to_string(),
+                parent_session: None,
+            },
+            1_000,
+        )
+        .expect("create group");
+
+        // The forgery: written into the WORKER's own channel, but claiming
+        // the orchestrator pane as its parent and asking to be a coordinator.
+        let mut req = spawn_request("own this scope", &repo);
+        req.parent_session = Some(sessions::short_id("aaaaaaaa-1111-4222-8333-444444444444"));
+        req.role = Some("sub-orchestrator".to_string());
+        req.work_group_id = Some(group_id.clone());
+        let path = spawnreq::write_request(&worker_channel, &req).expect("write");
+        let stem = spawnreq::request_stem(&path).expect("stem");
+
+        let mut errors = Vec::new();
+        handle_spawn_requests(
+            &requests_dir,
+            &mut panes,
+            &mut queues,
+            &CtxConfig::default(),
+            &state,
+            &repo,
+            (80, 24),
+            &mut errors,
+        );
+
+        assert_eq!(panes.len(), 2, "no pane was spawned for the forgery");
+        let ack = spawnreq::wait_for_ack(&worker_channel, &stem, Duration::from_millis(50))
+            .expect("the forgery is acked on the channel it arrived on");
+        assert!(!ack.ok);
+        let reason = ack.reason.unwrap_or_default();
+        assert!(
+            reason.contains("may only name the session it was sent from"),
+            "the refusal names the actual problem: {reason}"
+        );
+        let group = super::super::group::load(&state, &group_id)
+            .expect("load")
+            .expect("group still exists");
+        assert_eq!(
+            group.admitted_children, 0,
+            "a refused forgery must not spend the group's child limit"
+        );
+        assert_eq!(
+            group.sub_orchestrator_session, None,
+            "and must not claim the group either"
+        );
+
+        for pane in &mut panes {
+            let _ = pane.shutdown("");
+        }
+    }
+
+    /// The other half: an honest request on a pane's own channel is
+    /// attributed to THAT pane, whose real role then decides the depth cap.
+    /// Same worker channel, same dashboard, no forged parent -- and the
+    /// worker is refused for what it actually is, while the orchestrator's
+    /// own channel still carries a coordinator request through.
+    #[cfg(unix)]
+    #[test]
+    fn an_honest_request_is_attributed_to_the_channel_it_arrived_on() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().to_path_buf();
+        let requests_dir = tmp
+            .path()
+            .join("dash")
+            .join("aaaa1111-token")
+            .join("requests");
+        let (mut panes, mut queues, orch_channel, worker_channel) =
+            two_paned_dash(&state, &repo, &requests_dir);
+
+        let cfg = CtxConfig {
+            // The same ABSOLUTE rule every other real-pty-spawn test here
+            // follows: never a real agent binary.
+            agent_bin: Some("sleep 3".to_string()),
+            pace: crate::commands::ctx::config::PaceConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            ..CtxConfig::default()
+        };
+
+        // The worker asks -- truthfully -- to delegate onward. Refused for
+        // its own role, which is what attribution is for.
+        let mut worker_req = spawn_request("split this off", &repo);
+        worker_req.parent_session =
+            Some(sessions::short_id("bbbbbbbb-1111-4222-8333-444444444444"));
+        let worker_path = spawnreq::write_request(&worker_channel, &worker_req).expect("write");
+        let worker_stem = spawnreq::request_stem(&worker_path).expect("stem");
+
+        // The orchestrator asks for a coordinator on its own channel.
+        let mut orch_req = spawn_request("own this scope", &repo);
+        orch_req.parent_session = Some(sessions::short_id("aaaaaaaa-1111-4222-8333-444444444444"));
+        orch_req.role = Some("sub-orchestrator".to_string());
+        let orch_path = spawnreq::write_request(&orch_channel, &orch_req).expect("write");
+        let orch_stem = spawnreq::request_stem(&orch_path).expect("stem");
+
+        let mut errors = Vec::new();
+        handle_spawn_requests(
+            &requests_dir,
+            &mut panes,
+            &mut queues,
+            &cfg,
+            &state,
+            &repo,
+            (80, 24),
+            &mut errors,
+        );
+
+        let worker_ack =
+            spawnreq::wait_for_ack(&worker_channel, &worker_stem, Duration::from_millis(50))
+                .expect("the worker's own request is acked");
+        assert!(!worker_ack.ok);
+        assert!(
+            worker_ack.reason.unwrap_or_default().contains("depth"),
+            "a worker's honest request is refused by the depth cap, not the lineage gate"
+        );
+
+        let orch_ack = spawnreq::wait_for_ack(&orch_channel, &orch_stem, Duration::from_millis(50))
+            .expect("the orchestrator's own request is acked");
+        assert!(
+            orch_ack.ok,
+            "the operator's own seat may still mint a coordinator: {:?}",
+            orch_ack.reason
+        );
+        assert_eq!(panes.len(), 3, "exactly one new pane: {errors:?}");
+        assert_eq!(
+            panes[2].role(),
+            prompt::PromptRole::SubOrchestrator,
+            "and it really is a coordinator"
         );
 
         for pane in &mut panes {
