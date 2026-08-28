@@ -44,6 +44,18 @@ pub struct WorkGroup {
     /// [`admit_child`], the sole place any admission is granted.
     #[serde(default)]
     pub admitted_children: u32,
+    /// Issue #170: the session id of the SubOrchestrator this group is bound
+    /// to -- first-claim-wins (`claim_sub_orchestrator`), so a group either
+    /// belongs to no coordinator yet or to exactly one for its whole life.
+    /// Drives two things: the group closes automatically once that session's
+    /// own supervised run ends (`agent::run_with`'s completion path), and
+    /// `is_abandoned` can tell "still open because the work continues" apart
+    /// from "still open because its coordinator died before it could close
+    /// this itself." `None` for a group with no coordinator claim yet -- a
+    /// plain one-off batch of workers reporting straight to an Orchestrator,
+    /// or a group written by an older build.
+    #[serde(default)]
+    pub sub_orchestrator_session: Option<String>,
 }
 
 fn record_path(state: &StateDir, id: &str) -> PathBuf {
@@ -190,6 +202,39 @@ pub fn is_overdue(group: &WorkGroup, now: u64) -> bool {
             .is_some_and(|deadline| now > group.created_at.saturating_add(deadline))
 }
 
+/// Issue #170: binds `group` to `session` as its SubOrchestrator, first-
+/// claim-wins. A no-op (`Ok`, unchanged) when the group is already claimed --
+/// by `session` itself (idempotent: a coordinator that resolves its own
+/// already-bound group again must not error) or by a different one (the
+/// group already belongs to whichever session claimed it first; a second
+/// claimant simply never becomes the one `agent::run_with` auto-closes it
+/// for). Load-modify-write, like every other mutation in this file.
+pub fn claim_sub_orchestrator(state: &StateDir, id: &str, session: &str) -> CtxResult<()> {
+    let Some(mut group) = load(state, id)? else {
+        return Err(format!("no work group '{id}'").into());
+    };
+    if group.sub_orchestrator_session.is_none() {
+        group.sub_orchestrator_session = Some(session.to_string());
+        create(state, &group)?;
+    }
+    Ok(())
+}
+
+/// Issue #170: an open group whose claimed SubOrchestrator (`sub_
+/// orchestrator_session`) is no longer alive -- its own session ended
+/// (crashed, was killed, or the process otherwise vanished) without ever
+/// reaching `agent::run_with`'s own completion path, which is what closes a
+/// group it claimed under ordinary circumstances. `alive` is supplied by the
+/// caller (`sessions::list`'s own liveness, the same the registry already
+/// computes) rather than resolved here, mirroring `is_overdue`'s own
+/// "caller supplies `now`" testability shape -- this module has no reason to
+/// depend on `sessions.rs` for a process-liveness check. A group with no
+/// claim yet is never abandoned: nothing has failed to close it, because
+/// nothing has claimed responsibility for closing it.
+pub fn is_abandoned(group: &WorkGroup, claimant_alive: bool) -> bool {
+    group.closed_at.is_none() && group.sub_orchestrator_session.is_some() && !claimant_alive
+}
+
 #[derive(Debug, clap::Args)]
 pub struct GroupArgs {
     #[command(subcommand)]
@@ -207,20 +252,26 @@ pub enum GroupVerb {
     Close(CloseArgs),
 }
 
+/// `CreateArgs::child_limit`'s own default -- also what `agent::
+/// resolve_group_binding` mints a scope-bound group with (issue #170), so
+/// the two never drift on what "unstated" means.
+pub const DEFAULT_CHILD_LIMIT: u32 = 3;
+/// `CreateArgs::completion_contract`'s own default, shared with `agent::
+/// resolve_group_binding` for the same reason as [`DEFAULT_CHILD_LIMIT`].
+pub const DEFAULT_COMPLETION_CONTRACT: &str =
+    "report a compact structured result by mail to the requesting session";
+
 #[derive(Debug, clap::Args)]
 pub struct CreateArgs {
     /// What this group of delegated work is for.
     pub scope: String,
-    #[arg(long, default_value_t = 3)]
+    #[arg(long, default_value_t = DEFAULT_CHILD_LIMIT)]
     pub child_limit: u32,
     #[arg(long)]
     pub token_budget: Option<u64>,
     #[arg(long)]
     pub deadline_secs: Option<u64>,
-    #[arg(
-        long,
-        default_value = "report a compact structured result by mail to the requesting session"
-    )]
+    #[arg(long, default_value = DEFAULT_COMPLETION_CONTRACT)]
     pub completion_contract: String,
     #[arg(long)]
     pub parent_session: Option<String>,
@@ -259,6 +310,7 @@ pub fn run_create<W: Write>(
         created_at: now,
         closed_at: None,
         admitted_children: 0,
+        sub_orchestrator_session: None,
     };
     create(state, &group)?;
     writeln!(w, "work group {id} created (scope: {})", group.scope)?;
@@ -268,7 +320,25 @@ pub fn run_create<W: Write>(
 /// `now` is a parameter (not resolved here) so a caller can render a
 /// deterministic overdue marker in a test -- the same seam `run_create`/
 /// `run_close` already take one for.
-fn print_group<W: Write>(w: &mut W, group: &WorkGroup, now: u64) -> CtxResult<()> {
+/// Issue #170: whether the session named by `short` (`sessions::Record::
+/// short`) is currently live, per the same registry `zirv ctx status`
+/// already reads. A short id with no matching record at all (its own file
+/// swept, or never written) reads as not-alive -- there is nothing left to
+/// call live.
+fn short_id_is_alive(state: &StateDir, short: &str) -> bool {
+    super::sessions::list(state)
+        .into_iter()
+        .any(|(record, liveness)| {
+            record.short == short && liveness == super::sessions::Liveness::Live
+        })
+}
+
+fn print_group<W: Write>(
+    w: &mut W,
+    group: &WorkGroup,
+    now: u64,
+    state: &StateDir,
+) -> CtxResult<()> {
     let status = if group.closed_at.is_some() {
         "closed"
     } else {
@@ -283,10 +353,22 @@ fn print_group<W: Write>(w: &mut W, group: &WorkGroup, now: u64) -> CtxResult<()
         group.admitted_children,
         group.parent_session_id
     )?;
+    if let Some(sub) = &group.sub_orchestrator_session {
+        write!(w, " sub-orchestrator={sub}")?;
+    }
     // Issue #155 review finding D2: display-only -- see `is_overdue`'s own
     // doc comment. Nothing here kills or restarts anything on account of it.
     if is_overdue(group, now) {
         write!(w, " OVERDUE")?;
+    }
+    // Issue #170: same display-only spirit -- an abandoned group is not
+    // acted on here, only named, so an operator scanning `zirv ctx status`
+    // can tell "still open because the work continues" apart from "still
+    // open because its coordinator died before it could close this itself".
+    if let Some(sub) = &group.sub_orchestrator_session
+        && is_abandoned(group, short_id_is_alive(state, sub))
+    {
+        write!(w, " ABANDONED")?;
     }
     writeln!(w)?;
     Ok(())
@@ -301,7 +383,7 @@ pub fn run_status<W: Write>(
     match &args.work_group_id {
         Some(id) => match load(state, id)? {
             Some(group) => {
-                print_group(w, &group, now)?;
+                print_group(w, &group, now, state)?;
                 Ok(0)
             }
             None => {
@@ -316,7 +398,7 @@ pub fn run_status<W: Write>(
                 return Ok(0);
             }
             for group in &groups {
-                print_group(w, group, now)?;
+                print_group(w, group, now, state)?;
             }
             Ok(0)
         }
@@ -364,6 +446,7 @@ mod tests {
             created_at: 1_700_000_000,
             closed_at: None,
             admitted_children: 0,
+            sub_orchestrator_session: None,
         }
     }
 
@@ -387,6 +470,7 @@ mod tests {
             created_at: 1_700_000_000,
             closed_at: None,
             admitted_children: 0,
+            sub_orchestrator_session: None,
         };
         create(&state, &group).expect("create");
 
@@ -645,5 +729,120 @@ mod tests {
             String::from_utf8(after).expect("utf8").contains("OVERDUE"),
             "well past the deadline"
         );
+    }
+
+    /// Issue #170: first-claim-wins. A second claim on an already-bound group
+    /// is a no-op, not an error and not a hijack -- the group belongs to
+    /// whichever SubOrchestrator claimed it first for its whole life.
+    #[test]
+    fn claim_sub_orchestrator_binds_the_first_claimant_and_ignores_a_second() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        create(&state, &sample_group("wg-1")).expect("create");
+
+        claim_sub_orchestrator(&state, "wg-1", "sess-a").expect("first claim");
+        assert_eq!(
+            load(&state, "wg-1")
+                .expect("load")
+                .expect("present")
+                .sub_orchestrator_session,
+            Some("sess-a".to_string())
+        );
+
+        claim_sub_orchestrator(&state, "wg-1", "sess-b")
+            .expect("a second claim on an already-bound group is not an error");
+        assert_eq!(
+            load(&state, "wg-1")
+                .expect("load")
+                .expect("present")
+                .sub_orchestrator_session,
+            Some("sess-a".to_string()),
+            "the first claimant still owns the group"
+        );
+    }
+
+    #[test]
+    fn claim_sub_orchestrator_errors_on_an_unknown_group() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let err = claim_sub_orchestrator(&state, "nope", "sess-a").expect_err("no such group");
+        assert!(err.to_string().contains("nope"), "got {err}");
+    }
+
+    /// Issue #170: abandoned means exactly one thing -- claimed, still open,
+    /// and the claimant is gone. An unclaimed group is never abandoned (no
+    /// one has failed to close it), a claimed-and-alive one is not abandoned
+    /// either, and a closed group is never abandoned no matter what.
+    #[test]
+    fn is_abandoned_is_true_only_for_an_open_group_with_a_dead_claimed_coordinator() {
+        let mut group = sample_group("wg-1");
+        assert!(
+            !is_abandoned(&group, false),
+            "no claim yet -- nothing to abandon"
+        );
+
+        group.sub_orchestrator_session = Some("sess-a".to_string());
+        assert!(!is_abandoned(&group, true), "claimed and alive");
+        assert!(is_abandoned(&group, false), "claimed and dead");
+
+        group.closed_at = Some(1_700_000_500);
+        assert!(
+            !is_abandoned(&group, false),
+            "a closed group is never abandoned"
+        );
+    }
+
+    /// End to end: `zirv ctx group status` names an ABANDONED group only
+    /// once it has been claimed by a coordinator whose own session has since
+    /// died -- an unclaimed open group never gets the marker.
+    #[test]
+    fn group_status_prints_abandoned_for_an_open_group_whose_claimed_coordinator_died() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        create(&state, &sample_group("wg-1")).expect("create");
+
+        let mut before = Vec::new();
+        run_status(
+            &state,
+            &mut before,
+            &StatusArgs {
+                work_group_id: Some("wg-1".to_string()),
+            },
+            1_700_000_100,
+        )
+        .expect("status runs");
+        assert!(
+            !String::from_utf8(before)
+                .expect("utf8")
+                .contains("ABANDONED"),
+            "unclaimed, never abandoned"
+        );
+
+        // A session whose pid is provably dead claims the group.
+        let mut record = super::super::sessions::Record::new(
+            "deadbeef-2222-4333-8444-555555555555",
+            "claude",
+            &repo,
+            super::super::sessions::Verb::Exec,
+        );
+        record.pid = super::super::testenv::dead_pid();
+        let _guard = super::super::sessions::SessionGuard::register(&state, record);
+        claim_sub_orchestrator(&state, "wg-1", "deadbeef").expect("claim");
+
+        let mut after = Vec::new();
+        run_status(
+            &state,
+            &mut after,
+            &StatusArgs {
+                work_group_id: Some("wg-1".to_string()),
+            },
+            1_700_000_100,
+        )
+        .expect("status runs");
+        let text = String::from_utf8(after).expect("utf8");
+        assert!(text.contains("sub-orchestrator=deadbeef"), "got {text}");
+        assert!(text.contains("ABANDONED"), "got {text}");
     }
 }
