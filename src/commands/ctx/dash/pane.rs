@@ -979,8 +979,17 @@ impl Pane {
         // from another's. Stamp the child's real pid instead. `process_id`
         // returns `None` on a platform that cannot report it; there we leave
         // the dashboard's pid rather than a bogus one.
+        //
+        // Review round 2 finding 1 (issue #152): `start_time` must move with
+        // `pid` in the same breath, via the same `sessions::process_start_secs`
+        // reader `Record::new` itself used -- see `SessionGuard::
+        // adopt_child_pid`'s doc comment for why leaving the dashboard's own
+        // start time in place here is a guaranteed false "dead" the moment
+        // this pane's very first liveness probe hits `EPERM` (the everyday
+        // sandboxed case issue #146 exists for).
         if let Some(child_pid) = child.process_id() {
             record.pid = child_pid;
+            record.start_time = sessions::process_start_secs(child_pid);
         }
         // `owner_pid` is left unset here: `SessionGuard::register` below
         // stamps it with this process's own pid -- the dashboard's -- for

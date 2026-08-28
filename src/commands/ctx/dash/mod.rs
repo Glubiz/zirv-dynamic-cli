@@ -7779,6 +7779,7 @@ mod tests {
             owner_pid,
             safety_policy_sha256: None,
             role: None,
+            start_time: None,
         }
     }
 
