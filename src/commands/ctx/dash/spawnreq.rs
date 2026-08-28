@@ -182,6 +182,14 @@ pub fn request_dir_for(state: &StateDir, dash_short: &str, token: &str) -> PathB
 /// and the dashboard drains each one separately: which directory a request
 /// arrived in IS the requester, derived server-side and never read out of the
 /// request.
+///
+/// Trust boundary (issue #179): the token authenticates the HONEST path -- a
+/// pane's own `zirv ctx agent`, which only ever learns this path via the env
+/// var it inherited -- not the channel itself. It does not isolate same-uid
+/// panes from each other: a pane agent can `readdir` the parent directory,
+/// discover a sibling's `p-<pane_token>` name, and write a forged request
+/// straight into it, being attributed that pane's role. Accepted for this
+/// release; socket-peer-credential hardening is tracked in issue #179.
 pub fn pane_request_dir_for(dash_requests_dir: &Path, pane_token: &str) -> PathBuf {
     dash_requests_dir
         .parent()

@@ -954,6 +954,16 @@ pub fn run_with<W: Write>(
         // moments ago holds nothing -- and `discard_if_unused` still checks
         // that for itself, so the genuinely ambiguous "claimed but never
         // confirmed" answer cannot delete a group a pane really did claim.
+        //
+        // Bounded race on `Ok(EXIT_DASH_UNCONFIRMED)`: the dashboard has
+        // already taken the request (so it will not be retried) but a slow
+        // dashboard may not yet have reached `admit_child` on this group when
+        // the discard below runs. If it lands in that window the still-
+        // pristine group is deleted out from under the in-flight admission,
+        // which then finds no group and refuses ("no work group") instead of
+        // spawning. Accepted: a clean refusal here is preferable to leaving
+        // group cleanup dependent on winning a race with a dashboard that may
+        // be arbitrarily slow or may never answer at all.
         if !matches!(result, Ok(0)) {
             discard_minted_group();
         }
