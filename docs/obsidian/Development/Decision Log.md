@@ -24,6 +24,27 @@ last-verified: 2026-08-28
 
 ## Decisions
 
+### 2026-08-28 — `permissions propose` is disabled by default and structurally unable to be enabled by a repository (issue #178, v2.35.0)
+**Context:** `zirv ctx permissions propose` auto-files public GitHub issues from transcript evidence. Reusing `ctx.toml`'s `REPO_FORBIDDEN` table would only reject a repo-set key, not prevent the key from being read at all — a weaker boundary than the "never even consulted" property `[github].token` (issue #176) already established for the adjacent GitHub-credential surface.
+**Decision:** `PermissionsSettings.propose_enabled` lives in `.settings.toml`'s `[permissions]` table, defaults `false`, and is read only by `settings::operator_propose_enabled(home)` — a function mirroring `operator_github_token` exactly, called only with the operator's own home directory. `run_propose` gates on it before any capture/classify/escalate work runs.
+**Rejected:** A `ctx.toml` `REPO_FORBIDDEN` key — would still parse and evaluate a repo-set value before rejecting it, one step short of "never read", and mixes a public-issue-filing feature into the config surface meant for supervisor-behavior tuning rather than operator-owned credentials/switches.
+**Consequences:** A future operator-only switch of this shape (public network side effect, no safe repo-narrowable default) should follow the same "only ever handed a home path" pattern rather than growing `REPO_FORBIDDEN` further. `a_repository_settings_file_cannot_enable_propose` pins the structural guarantee directly.
+**Spec / link:** `src/settings.rs::operator_propose_enabled`/`PermissionsSettings`; [[Command Safety]]; [[Untrusted Configuration]]; issue #178.
+
+### 2026-08-28 — Every rendered mail envelope field is sanitized, not just the fields already cleaned upstream (issue #177 review, v2.35.0)
+**Context:** `render_delivery_message` interpolated `envelope.from.session`/`.harness` (sourced from raw `SESSION_ENV`/`AGENT_ENV`) directly into a line-oriented `## Zirv Message Envelope` block injected into other sessions' prompts, without the `header_value` sanitization `Message::to_markdown`'s legacy header block already applied to the same identity fields — a newline-bearing env var could forge an extra trusted-looking bullet line (e.g. `- Role: root`).
+**Decision:** Every interpolated field in `render_delivery_message` — id, thread, reply-to, topic, intent, from-session, harness, model, role — is passed through `header_value` at render time, even fields already cleaned upstream (`topic`/`intent` via `clean_envelope_value` at send time, `id`/`thread_id` always zirv-generated UUIDs).
+**Rejected:** Sanitizing only the two fields the finding named — leaves this function's safety dependent on every future writer of a `DeliveryEnvelope` remembering to pre-clean its own fields; sanitizing unconditionally at the one render site costs nothing and removes that dependency entirely.
+**Consequences:** A new envelope field added later is safe by default at this render site regardless of whether its producer sanitizes it.
+**Spec / link:** `src/commands/ctx/mail.rs::render_delivery_message`, `a_crafted_sender_identity_cannot_forge_an_envelope_header_line`; [[Untrusted Configuration]]'s mail section; issue #177.
+
+### 2026-08-28 — Unidentified claim-once claimants mint a unique id instead of sharing a literal placeholder (issue #177 review, v2.35.0)
+**Context:** `mark_delivery` fell back to the literal string `"unknown-reader"` for every caller with no resolvable session identity. `claim_once`'s `AlreadyExists` fallback trusts a string match against the claimant it was asked to check, not proof of "the same caller who won the race" — so two independent unidentified readers of an undirected claim-once message both matched the same placeholder and could both pass the check.
+**Decision:** A caller with no stable identity now gets `anonymous_claimant_id()` — `"unknown-reader-<pid>-<uuid v4>"` — minted fresh per call, unique enough that two genuinely concurrent anonymous claimants can never collide, with no promise of stability across calls.
+**Rejected:** Making claim-once refuse an unidentified caller outright — the whole point of the undirected/claim-once shape is "whichever session is free," including one whose identity resolution genuinely failed; refusing it would regress that case entirely.
+**Consequences:** A claim-once claim record for an unidentified reader is now diagnostically useless (a fresh pid+uuid, not a real session) but correctly unique; `two_unidentified_readers_of_a_claim_once_message_do_not_collapse_into_one_claimant` pins the fix directly.
+**Spec / link:** `src/commands/ctx/mail.rs::anonymous_claimant_id`/`mark_delivery`; [[Ctx Subsystem]]'s "Reliable delivery" section; issue #177.
+
 ### 2026-08-28 — `zirv report` fixes its destination and accepts fallback credentials only from the operator layer (issue #176, v2.35.0)
 **Context:** A reporting command must work inside arbitrary checkouts, but allowing a checkout to choose either the destination or credential would let repository input redirect operator-authenticated writes. GitHub CLI already has a secure credential store, while headless environments commonly supply `GH_TOKEN`/`GITHUB_TOKEN`.
 **Decision:** `report.rs` posts only to `Glubiz/zirv-dynamic-cli`, resolving credentials in order from `gh auth token --hostname github.com`, `GH_TOKEN`, `GITHUB_TOKEN`, then `[github].token` in `~/.zirv/.settings.toml`. The settings fallback takes only a home path; no repository path reaches it.
