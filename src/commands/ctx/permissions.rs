@@ -370,13 +370,20 @@ const INLINE_CODE_FLAGS: &[&str] = &["-c", "-e", "-command", "--eval"];
 /// out via `family_program` (the family's own first token) below.
 const ARBITRARY_PACKAGE_EXEC_PROGRAMS: &[&str] = &["npx", "bunx", "uvx"];
 
-/// Issue #141: `gh api`'s method/body flags -- a bare `gh api <path>` sends
-/// a GET and is read-only, but `-X`/`--method <verb>` naming anything other
-/// than GET, or a request-body flag (`-f`/`--field`/`--input`) implying one
-/// is about to be sent, both mean the call mutates whatever the endpoint
-/// controls. `tokens` is already lowercased, so `verb` comparisons below are
-/// case-insensitive for free.
-fn gh_api_call_is_mutating(tokens: &[String]) -> bool {
+/// Issue #141 (`gh api`), widened to `glab api` (review round 3, 2026-08-28):
+/// a bare `<tool> api <path>` sends a GET and is read-only, but `-X`/
+/// `--method <verb>` naming anything other than GET, or a request-body flag
+/// (`-f`/`--field`/`--input`) implying one is about to be sent, both mean
+/// the call mutates whatever the endpoint controls. `glab api` was
+/// deliberately built to mirror `gh api`'s own interface (GitLab's own CLI
+/// documents it as such), and shares the identical flag spellings this
+/// function already checks, so one shared check covers both tools rather
+/// than a second copy of the same logic -- when in doubt this direction
+/// (treating an unfamiliar flag shape as mutating) is the safe one, since
+/// `Ord`/`protected` never widens what a standing allow would cover. `tokens`
+/// is already lowercased, so `verb` comparisons below are case-insensitive
+/// for free.
+fn api_call_is_mutating(tokens: &[String]) -> bool {
     let method_is_non_get = tokens.iter().enumerate().any(|(i, t)| {
         if let Some(value) = t.strip_prefix("--method=") {
             return value != "get";
@@ -486,9 +493,18 @@ pub(crate) fn is_protected_family(family: &str, sample: &str) -> bool {
         "yarn run" | "yarn dlx" => true,
         "uv run" => true,
         // Issue #141: `gh api` is protected only when it actually mutates --
-        // see `gh_api_call_is_mutating`'s own doc comment. A bare read
+        // see `api_call_is_mutating`'s own doc comment. A bare read
         // (`gh api repos/x/y`, an implicit GET) stays compileable.
-        "gh api" => gh_api_call_is_mutating(&tokens),
+        //
+        // Review round 3 (2026-08-28): `glab api` joins it here. Without
+        // this arm, `family_depth("glab") == 2` (added in review round 2 to
+        // fix `glab mr`/`glab issue` families) made `"glab api"` a
+        // REACHABLE two-token family with no protection arm at all -- a
+        // mutating `glab api -X DELETE ...`/`glab api -X POST -f ...` would
+        // fall through to `_ => false` and could be auto-written into
+        // `[safety] allow` by `zirv ctx permissions compile`, directly
+        // contradicting "arbitrary API calls stay gated."
+        "gh api" | "glab api" => api_call_is_mutating(&tokens),
         _ => false,
     };
 
@@ -3717,6 +3733,42 @@ mod tests {
         ));
     }
 
+    /// Review round 3 (2026-08-28): `glab api` must be gated exactly like
+    /// `gh api` -- `family_depth("glab") == 2` (review round 2) makes
+    /// `"glab api"` a reachable two-token family, and without this arm a
+    /// mutating call would fall through `is_protected_family`'s `_ => false`
+    /// default and could be auto-written into `[safety] allow` by
+    /// `zirv ctx permissions compile`.
+    #[test]
+    fn is_protected_family_protects_glab_api_only_when_it_mutates() {
+        assert!(
+            !is_protected_family("glab api", "glab api projects/foo%2Fbar"),
+            "a bare glab api call is an implicit GET and must stay unprotected"
+        );
+        for mutating_sample in [
+            "glab api -X POST projects/foo%2Fbar/issues",
+            "glab api --method POST projects/foo%2Fbar/issues",
+            "glab api --method=DELETE projects/foo%2Fbar/issues/1",
+            "glab api -f title=foo projects/foo%2Fbar/issues",
+            "glab api --field title=foo projects/foo%2Fbar/issues",
+            "glab api --input body.json projects/foo%2Fbar/issues",
+        ] {
+            assert!(
+                is_protected_family("glab api", mutating_sample),
+                "must be protected: {mutating_sample}"
+            );
+        }
+        // Explicit GET, spelled either way, stays unprotected.
+        assert!(!is_protected_family(
+            "glab api",
+            "glab api -X GET projects/foo%2Fbar"
+        ));
+        assert!(!is_protected_family(
+            "glab api",
+            "glab api --method=GET projects/foo%2Fbar"
+        ));
+    }
+
     /// The narrow read-only siblings named in issue #141 must remain
     /// unprotected -- the fix must not have widened the net past the actual
     /// arbitrary-code-execution subcommands.
@@ -3727,6 +3779,7 @@ mod tests {
             ("kubectl get", "kubectl get pods"),
             ("cargo build", "cargo build --release"),
             ("gh api", "gh api repos/foo/bar"),
+            ("glab api", "glab api projects/foo%2Fbar"),
         ] {
             assert!(
                 !is_protected_family(family, sample),
@@ -3775,6 +3828,16 @@ mod tests {
             family_group("uvx", "uvx black .", true, false),
             family_group("uv run", "uv run script.py", true, false),
             family_group("gh api", "gh api -X POST repos/foo/bar/issues", true, false),
+            // Review round 3 (2026-08-28): the specific end-to-end gap the
+            // coordinator flagged -- without the `"glab api"` protected arm,
+            // this mutating call would have compiled straight into
+            // `[safety] allow`.
+            family_group(
+                "glab api",
+                "glab api -X POST projects/foo%2Fbar/issues",
+                true,
+                false,
+            ),
         ];
         let (eligible, skipped_protected, skipped_too_generic) =
             compile_eligibility(&protected_groups);
