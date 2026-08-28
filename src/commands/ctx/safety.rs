@@ -4382,6 +4382,22 @@ fn resolve_lexical_path_components(path: &str) -> Vec<&str> {
 /// this classifier cannot know whether the launch's own working directory
 /// is itself at or above a sensitive root, the same non-goal
 /// `generated_path` already documents for the identical reason.
+///
+/// Issue #160 finding 2, option (a) (2026-08-28): this is a DELIBERATE
+/// ruling, recorded here rather than left implicit. A relative starting
+/// point (`find ..`, `find .`, `find some/subdir`) is out of scope for the
+/// root-wide-scan rule on purpose -- resolving it against the real cwd
+/// would need filesystem/process state this text-only classifier
+/// deliberately never touches (`evaluate`'s own doc comment: "Pure: no
+/// clock, filesystem or environment access"). The alternative considered
+/// and rejected was escalating every relative `find` to `Ask`, which would
+/// have turned the overwhelmingly common bounded case (`find . -name
+/// '*.rs'`, `find ./src -name '*.rs'`) into constant unprompted friction for
+/// no proven safety gain -- a relative token can, of course, still walk
+/// above the cwd (`find ..`), but this classifier has no way to know
+/// whether that lands it at or above a sensitive root either. See
+/// `find_dot_dot_relative_scan_is_deliberately_out_of_the_root_wide_rules_
+/// scope` for the pinning regression test.
 fn is_root_wide_or_whole_home_path(token: &str) -> bool {
     if let Some(rest) = token.strip_prefix('~') {
         return match rest.split_once('/') {
@@ -4419,6 +4435,11 @@ fn is_root_wide_or_whole_home_path(token: &str) -> bool {
 /// see that function's own doc comment for why `//`, `/.`, `/./`, `/..`,
 /// `/../`, and a bare `~user` all had to close in one pass rather than as
 /// individually enumerated literals.
+///
+/// Issue #160 finding 2, option (a): a relative starting point (`find ..
+/// -iname id_rsa`, `find . -iname id_rsa`) is deliberately never treated as
+/// root-wide here -- see [`is_root_wide_or_whole_home_path`]'s own doc
+/// comment for the recorded ruling and its rationale.
 fn is_root_wide_find_scan(command: &str) -> bool {
     let Some(tokens) = sql_tokens(&collapse_whitespace(command)) else {
         return false;
@@ -8988,6 +9009,33 @@ mod tests {
         assert!(
             text.contains(r#""permissionDecision":"allow""#),
             "a genuinely bounded absolute subtree must still escape silently: got {text}"
+        );
+    }
+
+    /// Issue #160 finding 2, option (a) (2026-08-28): PINS the deliberate
+    /// ruling recorded on `is_root_wide_or_whole_home_path`/`is_root_wide_
+    /// find_scan`'s own doc comments -- a relative starting-point (no
+    /// leading `/` or `~`) is left OUT of the root-wide-scan rule's scope on
+    /// purpose, because this text-only classifier cannot know whether the
+    /// launch's own working directory is itself at or above a sensitive
+    /// root (the same non-goal `generated_path` documents for the identical
+    /// reason). `find .. -iname id_rsa` therefore is NOT escalated by the
+    /// root-wide-scan rule; it rides the seeded `find *` family straight to
+    /// `Allow` on the interactive default, exactly like the pre-existing
+    /// `find ./src -name '*.rs'` relative case the sibling test above
+    /// already pins for the absolute-subtree side. This is a decision
+    /// record, not a bug report: a future change that starts resolving `..`
+    /// against the real cwd would need to update this pin deliberately, not
+    /// discover the behavior by accident.
+    #[test]
+    fn find_dot_dot_relative_scan_is_deliberately_out_of_the_root_wide_rules_scope() {
+        let policy = SafetyPolicy::default();
+        let outcome = evaluate(&policy, "find .. -iname id_rsa", LaunchMode::Interactive);
+        assert_eq!(
+            outcome.verdict,
+            Verdict::Allow,
+            "a relative `..` starting point is deliberately out of scope for the root-wide-scan \
+             rule (issue #160 finding 2, option a): got {outcome:?}"
         );
     }
 
