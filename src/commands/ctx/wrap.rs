@@ -1632,6 +1632,7 @@ pub fn run_with(
         compiled.composed,
         None,
         role,
+        &cfg.prompt,
     );
     let prompt_args = super::prompt::injection_args_for_session(
         adapter.as_ref(),

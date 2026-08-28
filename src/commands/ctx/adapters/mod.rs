@@ -3849,14 +3849,26 @@ mod tests {
     /// The trait default: an agent zirv has verified nothing about receives
     /// no base layer, rather than another agent's instructions.
     #[test]
-    fn only_the_agent_a_base_layer_was_written_for_receives_it() {
+    fn an_unverified_agent_receives_no_base_layer_by_default() {
+        assert_eq!(NoOverrideAdapter(String::new()).base_system_prompt(), None);
+    }
+
+    /// Issue #167: both real adapters now have their own base layer, and
+    /// each is genuinely its own text -- neither ever hands the other
+    /// agent's tool-specific instructions.
+    #[test]
+    fn each_real_adapter_receives_its_own_distinct_base_layer() {
+        let claude_layer = claude::ClaudeAdapter::new(None)
+            .base_system_prompt()
+            .expect("claude has one of its own");
+        let codex_layer = codex::CodexAdapter::new(None)
+            .base_system_prompt()
+            .expect("codex has one of its own, issue #167");
+        assert_ne!(claude_layer, codex_layer);
         assert!(
-            claude::ClaudeAdapter::new(None)
-                .base_system_prompt()
-                .is_some(),
-            "claude has one of its own"
+            !codex_layer.contains("Agent tool") && !codex_layer.contains(".claude/agents"),
+            "claude-only vocabulary must not reach codex's own layer"
         );
-        assert_eq!(codex::CodexAdapter::new(None).base_system_prompt(), None);
     }
 
     #[test]

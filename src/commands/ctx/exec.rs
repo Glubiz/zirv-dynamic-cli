@@ -589,6 +589,7 @@ pub(crate) fn run_with_clock<W: Write>(
         composed,
         prompt_value_at,
         super::prompt::PromptRole::Worker,
+        &cfg.prompt,
     );
 
     // The user's own flags from the original `--` command (anything beyond
@@ -1233,6 +1234,7 @@ pub(crate) fn run_with_clock<W: Write>(
                 fresh,
                 operator_prompt_text.as_deref(),
                 super::prompt::PromptRole::Worker,
+                &cfg.prompt,
             );
             composed = fresh;
             prompt_args = super::prompt::injection_args_for_session(

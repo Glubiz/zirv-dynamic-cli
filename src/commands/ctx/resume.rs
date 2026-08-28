@@ -129,6 +129,7 @@ fn compose_prompt(
         compiled.composed,
         None,
         super::prompt::PromptRole::Orchestrator,
+        &cfg.prompt,
     )
 }
 
@@ -713,6 +714,7 @@ mod tests {
             compiled.composed,
             None,
             crate::commands::ctx::prompt::PromptRole::Orchestrator,
+            &cfg.prompt,
         );
         let expected = expected.expect("composed");
 
