@@ -189,6 +189,33 @@ pub fn rollback_admission(state: &StateDir, id: &str) {
     }
 }
 
+/// Security review round 2 (Finding 4): removes a group record that was
+/// minted for a delegation which then never started. `agent::resolve_group_
+/// binding` mints a `--scope` group before the refusal gates downstream of it
+/// have all been passed (a dashboard that refuses the spawn, a budget that
+/// cannot be resolved, a launch that fails outright), and each such refusal
+/// used to leave an open, unclaimed, childless group on disk forever.
+///
+/// Only a PRISTINE group is ever removed -- no admitted child, no coordinator
+/// claim, not already closed -- so anything that did in fact start under it
+/// keeps its record: a dashboard that spawned the pane admits and claims
+/// before this side's ack can time out, which is exactly the ambiguous case
+/// this guard exists for. Returns whether the record was removed, and is
+/// best-effort otherwise: the delegation being unwound is the caller's real
+/// news, never this.
+pub fn discard_if_unused(state: &StateDir, id: &str) -> bool {
+    let Ok(Some(group)) = load(state, id) else {
+        return false;
+    };
+    if group.admitted_children > 0
+        || group.sub_orchestrator_session.is_some()
+        || group.closed_at.is_some()
+    {
+        return false;
+    }
+    std::fs::remove_file(record_path(state, id)).is_ok()
+}
+
 /// Issue #155 review finding D2: `deadline_secs` is surfaced as an overdue
 /// marker, never enforced -- nothing here kills a session or a group. `now`
 /// is a parameter, not `state::now_secs()`, for the same testability reason
@@ -758,6 +785,47 @@ mod tests {
                 .sub_orchestrator_session,
             Some("sess-a".to_string()),
             "the first claimant still owns the group"
+        );
+    }
+
+    /// Security review round 2 (Finding 4): a group minted for a delegation
+    /// that never started is removed -- but only while it is genuinely
+    /// pristine. Anything that did start under it (an admitted child, a
+    /// coordinator's claim) or has already finished keeps its record, which
+    /// is what makes the unwind safe on the one ambiguous path that reaches
+    /// it (a dashboard that claimed the request and never confirmed).
+    #[test]
+    fn discard_if_unused_removes_only_a_pristine_group() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+
+        create(&state, &sample_group("wg-admitted")).expect("create");
+        admit_child(&state, "wg-admitted").expect("admit");
+        assert!(!discard_if_unused(&state, "wg-admitted"));
+        assert!(load(&state, "wg-admitted").expect("load").is_some());
+
+        let mut claimed = sample_group("wg-claimed");
+        claimed.sub_orchestrator_session = Some("sess-a".to_string());
+        create(&state, &claimed).expect("create");
+        assert!(!discard_if_unused(&state, "wg-claimed"));
+        assert!(load(&state, "wg-claimed").expect("load").is_some());
+
+        let mut closed = sample_group("wg-closed");
+        closed.closed_at = Some(1_700_000_500);
+        create(&state, &closed).expect("create");
+        assert!(!discard_if_unused(&state, "wg-closed"));
+        assert!(load(&state, "wg-closed").expect("load").is_some());
+
+        create(&state, &sample_group("wg-pristine")).expect("create");
+        assert!(discard_if_unused(&state, "wg-pristine"));
+        assert!(
+            load(&state, "wg-pristine").expect("load").is_none(),
+            "a group nothing ever ran under leaves no record behind"
+        );
+
+        assert!(
+            !discard_if_unused(&state, "wg-never-existed"),
+            "and an unknown group is not an error, just nothing to remove"
         );
     }
 

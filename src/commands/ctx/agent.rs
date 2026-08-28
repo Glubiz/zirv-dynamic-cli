@@ -219,17 +219,24 @@ pub const WORK_GROUP_ENV: &str = "ZIRV_CTX_WORK_GROUP";
 ///
 /// Neither case touches an existing group's own terms: case 2 only ever
 /// reads an id, and case 3 only ever creates a brand new one.
+///
+/// Returns the id it MINTED (case 3), if any -- `None` for an explicit or
+/// inherited binding, which this delegation does not own and must never
+/// unwind. Security review round 2 (Finding 4): the caller rolls a minted
+/// group back (`group::discard_if_unused`) on every path that ends without
+/// the delegation actually starting, and this call now happens only after
+/// that caller's own spawn gate has already passed.
 fn resolve_group_binding(
     args: &mut AgentArgs,
     state: &super::state::StateDir,
     env: EnvLookup<'_>,
-) -> CtxResult<()> {
+) -> CtxResult<Option<String>> {
     if args.group.is_some() {
-        return Ok(());
+        return Ok(None);
     }
     if let Some(inherited) = env(WORK_GROUP_ENV).filter(|s| !s.is_empty()) {
         args.group = Some(inherited);
-        return Ok(());
+        return Ok(None);
     }
     if let Some(scope) = &args.scope
         && args.role.as_deref() == Some("sub-orchestrator")
@@ -247,9 +254,10 @@ fn resolve_group_binding(
             },
             super::state::now_secs(),
         )?;
-        args.group = Some(id);
+        args.group = Some(id.clone());
+        return Ok(Some(id));
     }
-    Ok(())
+    Ok(None)
 }
 
 /// Security review round 2 (Finding 3): folds the group this delegation
@@ -894,15 +902,6 @@ pub fn run_with<W: Write>(
     // disabled or misconfigured `--name` still gets an honest usage reading
     // rather than skipping the gate.
     let state = super::state::StateDir::resolve(env)?;
-    // Issue #170: resolved once, here, before the dashboard-join fork below,
-    // so a pane spawn and the headless fallback both see the identical
-    // answer -- an inherited `WORK_GROUP_ENV` binding, or a freshly minted
-    // scope-bound group. Shadows the caller's own `&AgentArgs` with an owned
-    // copy; every read of `args` below (including inside `try_join_
-    // dashboard`) is unaffected by this rebinding.
-    let mut args = args.clone();
-    resolve_group_binding(&mut args, &state, env)?;
-    let args = &args;
     let provider = adapters::provider_for_agent_name(Some(&args.name));
     let now = super::state::now_secs();
     let (collector, estimator) = pace::current_windows(&state, &cfg.pace, now, provider);
@@ -918,6 +917,28 @@ pub fn run_with<W: Write>(
         );
     }
 
+    // Issue #170: resolved once, here, before the dashboard-join fork below,
+    // so a pane spawn and the headless fallback both see the identical
+    // answer -- an inherited `WORK_GROUP_ENV` binding, or a freshly minted
+    // scope-bound group. Shadows the caller's own `&AgentArgs` with an owned
+    // copy; every read of `args` below (including inside `try_join_
+    // dashboard`) is unaffected by this rebinding.
+    //
+    // Security review round 2 (Finding 4): deliberately AFTER the spawn gate
+    // above, which refuses without ever reaching a launch -- a `--scope`
+    // group minted ahead of it was left open, unclaimed and childless on disk
+    // for every such refusal. `minted_group` is what this invocation created
+    // itself (never an inherited or explicitly named one), and every path
+    // below that ends without the delegation starting unwinds it.
+    let mut args = args.clone();
+    let minted_group = resolve_group_binding(&mut args, &state, env)?;
+    let args = &args;
+    let discard_minted_group = || {
+        if let Some(id) = &minted_group {
+            super::group::discard_if_unused(&state, id);
+        }
+    };
+
     if let Some(result) = try_join_dashboard(
         args,
         &prompt,
@@ -927,6 +948,15 @@ pub fn run_with<W: Write>(
         DASH_ACK_TIMEOUT,
         DASH_CLAIM_EXTENSION,
     ) {
+        // Finding 4: the dashboard answered definitively, and only `Ok(0)`
+        // (`answer_for_ack`'s spawned-a-pane arm) means work actually
+        // started. A refusal spawned nothing, so a group minted for it
+        // moments ago holds nothing -- and `discard_if_unused` still checks
+        // that for itself, so the genuinely ambiguous "claimed but never
+        // confirmed" answer cannot delete a group a pane really did claim.
+        if !matches!(result, Ok(0)) {
+            discard_minted_group();
+        }
         return result;
     }
 
@@ -971,7 +1001,15 @@ pub fn run_with<W: Write>(
     // Issue #155, Phase 5(d): resolved before the launch, not inside
     // `exec::run_with` -- an unknown or closed `--group` must fail this
     // delegation outright rather than silently running it unbounded.
-    let worker_budget = resolve_worker_budget(&env, args)?;
+    let worker_budget = match resolve_worker_budget(&env, args) {
+        Ok(budget) => budget,
+        Err(e) => {
+            // Finding 4: nothing ran, so a group minted moments ago for this
+            // delegation must not outlive it.
+            discard_minted_group();
+            return Err(e);
+        }
+    };
 
     let exec_args = ExecArgs {
         agent: Some(args.name.clone()),
@@ -1009,6 +1047,10 @@ pub fn run_with<W: Write>(
             if let Some(id) = &args.group {
                 super::group::rollback_admission(&state, id);
             }
+            // Finding 4: with the admission rolled back the group is pristine
+            // again, so a group this invocation minted for a launch that
+            // never happened is removed rather than left open forever.
+            discard_minted_group();
             return Err(e);
         }
     };
@@ -1466,9 +1508,15 @@ mod tests {
         args.role = Some("sub-orchestrator".to_string());
         args.scope = Some("own the frontend rewrite".to_string());
         args.budget_tokens = Some(250_000);
-        resolve_group_binding(&mut args, &state, &|k| env.get(k).cloned()).expect("resolves");
+        let minted =
+            resolve_group_binding(&mut args, &state, &|k| env.get(k).cloned()).expect("resolves");
 
         let id = args.group.clone().expect("a group was minted");
+        assert_eq!(
+            minted.as_deref(),
+            Some(id.as_str()),
+            "a minted group is reported back, so its caller can unwind it (Finding 4)"
+        );
         let group = super::super::group::load(&state, &id)
             .expect("load")
             .expect("present");
@@ -2708,6 +2756,51 @@ mod tests {
         assert_eq!(code, 1);
         let output = String::from_utf8_lossy(&out);
         assert!(output.contains("disabled"), "got {output}");
+    }
+
+    /// Security review round 2 (Finding 4): `--scope` mints a group, and a
+    /// dashboard that then refuses the spawn means the delegation never
+    /// starts -- so the group must not be left open, unclaimed and childless
+    /// on disk. (The refusal here is the same non-retryable shape the
+    /// dashboard's own lineage and depth gates produce.)
+    #[test]
+    fn a_refused_scope_spawn_leaves_no_work_group_behind() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let (requests_dir, env) = live_dashboard_dir(tmp.path());
+        let state = crate::commands::ctx::state::StateDir::from_root(tmp.path().join("state"));
+
+        let responder = std::thread::spawn({
+            let dir = requests_dir.clone();
+            move || {
+                respond_to_next_request(
+                    dir,
+                    r#"{"ok":false,"short":null,"reason":"a worker may not delegate onward"}"#,
+                )
+            }
+        });
+
+        let mut args = joinable_args("claude", "own this scope");
+        args.role = Some("sub-orchestrator".to_string());
+        args.scope = Some("the frontend rewrite".to_string());
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned())
+            .expect("dashboard join runs");
+        let request_body = responder.join().expect("responder thread");
+
+        assert_eq!(code, 1, "a policy refusal ends the delegation");
+        let req: spawnreq::SpawnRequest =
+            serde_json::from_str(&request_body).expect("the request parses");
+        assert!(
+            req.work_group_id.is_some(),
+            "the minted group still travels in the request: {request_body}"
+        );
+        assert!(
+            crate::commands::ctx::group::list(&state).is_empty(),
+            "a refused spawn must leave no group behind: {:?}",
+            crate::commands::ctx::group::list(&state)
+        );
     }
 
     /// A live requests directory, and the `AgentArgs`/env pair that reaches
