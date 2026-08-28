@@ -13,34 +13,44 @@ use super::super::window::{self, RolloutRecord};
 use super::{AgentAdapter, ResolvedProgram, TurnSignalSetup};
 
 /// Codex's own base layer (see `AgentAdapter::base_system_prompt`), the codex
-/// analogue of `claude::ORCHESTRATOR_PROMPT` (issue #167). Written around
-/// what this adapter has actually verified about codex rather than borrowed
-/// from claude's: no native subagent/task facility is verified anywhere in
-/// this codebase (see `docs/superpowers/notes/2026-07-31-codex-cli-facts.md`
-/// and this adapter's own `capabilities()`), so the one delegation path this
-/// text teaches is `zirv agent`, the same cross-harness mechanism `HARNESS_
+/// analogue of `claude::ORCHESTRATOR_PROMPT` (issue #167). Revised 2026-08-28:
+/// the original text assumed no native subagent/task facility was verifiable
+/// for codex; `learn.chatgpt.com/docs/agent-configuration/subagents` (checked
+/// against this adapter's own `capabilities()` and `docs/superpowers/notes/
+/// 2026-07-31-codex-cli-facts.md`) confirms codex DOES have one: custom
+/// agents are TOML files in `~/.codex/agents/` (personal) or `.codex/agents/`
+/// (project) with required `name`/`description`/`developer_instructions` and
+/// optional `model`/`model_reasoning_effort`, plus built-in `default`/
+/// `worker`/`explorer` agents, all gated by the `[agents]` block in `~/
+/// .codex/config.toml` (`enabled`, `max_concurrent_threads_per_session`,
+/// `default_subagent_model`, `default_subagent_reasoning_effort`). This layer
+/// now teaches native subagent threads as the primary in-repo delegation
+/// path, with `zirv agent` -- the same cross-harness mechanism `HARNESS_
 /// PROMPT` already documents in full (dashboard pane behavior, `zirv ctx
-/// send`/`nudge`, mail report-back) -- this layer does not repeat that
-/// mechanism, only the orchestrator mandate and model-tier discipline on top
-/// of it.
+/// send`/`nudge`, mail report-back) -- reserved for cross-harness delegation
+/// and as the fallback when native subagents are unavailable or turned off
+/// (`[agents] enabled = false`). This layer still does not repeat `HARNESS_
+/// PROMPT`'s own mechanism, only the orchestrator mandate and model-tier
+/// discipline on top of it.
 ///
-/// Deliberately vendor-neutral on model names, unlike claude's own layer:
-/// claude's Agent tool has a fixed `haiku`/`sonnet`/`opus` vocabulary this
-/// codebase can name directly, but a codex account's own model names are
-/// operator-chosen strings (the issue's own example seat is `gpt-5.6-sol`),
-/// so tiers are described by role instead -- see `harness_prompt_never_
-/// names_vendor_specific_models` for the same discipline `HARNESS_PROMPT`
-/// already follows.
+/// Tiers are framed by role first ("smallest, fastest tier", "mid tier",
+/// "this seat's own top tier") so the guidance survives a model rename, the
+/// same discipline `harness_prompt_never_names_vendor_specific_models`
+/// enforces for `HARNESS_PROMPT` -- but each role now also carries a
+/// "currently `gpt-5.6-luna`"/"currently `gpt-5.6-terra`" example (matching
+/// this adapter's own ladder, see `review_model_below_walks_the_codex_
+/// ladder`), since a concrete example is worth naming even though a codex
+/// account's own model names are operator-chosen strings.
 ///
-/// The "never omit `--model`" rule is tighter here than `HARNESS_PROMPT`'s
-/// own generic "...or omit it to use the operator's own default worker tier"
+/// The "never omit a model" rule is tighter here than `HARNESS_PROMPT`'s own
+/// generic "...or omit it to use the operator's own default worker tier"
 /// allowance: `CodexAdapter::default_worker_model` is verified `None` (no
-/// zirv-managed cheap default for a codex worker, unlike claude's hard
-/// `"sonnet"` fallback -- see `codex_has_no_default_worker_model`), so a
-/// `zirv agent codex ...` dispatch with no `--model` runs on whatever
-/// `~/.codex/config.toml` names by default, which may be this very seat's
-/// own model. Naming a tier explicitly is the only way to actually avoid
-/// that inheritance for a codex worker.
+/// zirv-managed cheap default for a `zirv agent codex ...` worker, unlike
+/// claude's hard `"sonnet"` fallback -- see `codex_has_no_default_worker_
+/// model`), and the same gap applies to a native subagent spawn with no
+/// model named -- it resolves through the parent's own model unless `[agents]
+/// default_subagent_model` is set. Naming a tier explicitly, subagent or
+/// `zirv agent` alike, is the only way to actually avoid that inheritance.
 ///
 /// Gated by `PromptConfig::codex_orchestrator` (issue #167, `REPO_FORBIDDEN`
 /// like `prompt.harnesses`): `prompt::with_adapter_layer` is where that
@@ -55,13 +65,18 @@ seat's own model is reserved for orchestration, hard debugging, and design, so d
 substantive piece of work (codebase exploration, implementation, testing, review) and keep your \
 own replies brief and decision-focused.
 
-- Codex has no native subagent facility zirv can verify, so delegate through `zirv agent <name> \
-\"<prompt>\" -- --model <m>` rather than trying to spawn one yourself.
-- Every `zirv agent` dispatch MUST name an explicit --model: the smallest, cheapest tier for \
-mechanical and bulk work, a mid tier for ordinary exploration, implementation and test writing, \
-and this seat's own top tier only for hard debugging and design exploration. Never omit it -- \
-codex has no managed cheap default for a delegated worker, so an omitted flag can silently land \
-the worker on this seat's own model instead of a cheaper one.
+- Native codex subagent threads (worker/explorer roles) are the primary delegation path for work \
+inside this repo: spawn one per substantive piece of work, pinning each to the cheapest fitting \
+tier -- the smallest, fastest tier for mechanical and bulk work (currently gpt-5.6-luna), a mid \
+tier for ordinary exploration, implementation and test writing (currently gpt-5.6-terra), and \
+this seat's own top tier reserved for orchestration, hard debugging and design decisions. Never \
+spawn a subagent without an explicit cheaper model, unless the operator's own `[agents] default_\
+subagent_model` already names one -- an omitted model otherwise inherits this seat's own model \
+instead of a cheaper tier.
+- `zirv agent <name> \"<prompt>\" -- --model <m>` remains the delegation route for cross-harness \
+work (handing a task to a different harness, such as claude) and the fallback whenever native \
+subagents are unavailable or turned off (`[agents] enabled = false`); name an explicit --model \
+there too, for the same reason.
 - Bundle before you dispatch: never spawn a worker for one tiny task. Group small related tasks \
 (same file or area, or a natural sequence) into a single checklist brief per worker, with a \
 per-item output format. A small or trivial change -- a one-line fix, a single obvious edit -- \
@@ -1778,10 +1793,11 @@ mod tests {
 
     /// Mirrors claude's `the_orchestrator_layer_is_short_enough_to_ship_on_
     /// every_session` and its neighboring content assertions: this ships on
-    /// every codex Orchestrator session, so it stays short, names the
-    /// delegation route and model-tier discipline issue #167 asks for, and
-    /// never leaks claude-only vocabulary (the Agent tool, `.claude/agents`)
-    /// codex does not have.
+    /// every codex Orchestrator session, so it stays short, names native
+    /// subagent threads as the primary delegation path with `zirv agent` as
+    /// the cross-harness/fallback route, keeps the model-tier discipline
+    /// issue #167 asks for, and never leaks claude-only vocabulary (the
+    /// Agent tool, `.claude/agents`) codex does not have.
     #[test]
     fn the_codex_orchestrator_layer_names_its_own_delegation_route_and_tiers() {
         assert!(
@@ -1795,9 +1811,20 @@ mod tests {
             "got:\n{ORCHESTRATOR_PROMPT}"
         );
         assert!(
-            ORCHESTRATOR_PROMPT.contains("zirv agent"),
-            "codex has no native subagent facility, so delegation must route through zirv agent: \
+            ORCHESTRATOR_PROMPT.contains("subagent"),
+            "native codex subagent threads must be the primary in-repo delegation path: \
              {ORCHESTRATOR_PROMPT}"
+        );
+        assert!(
+            ORCHESTRATOR_PROMPT.contains("zirv agent"),
+            "zirv agent must remain the cross-harness and fallback delegation route: \
+             {ORCHESTRATOR_PROMPT}"
+        );
+        assert!(
+            ORCHESTRATOR_PROMPT.contains("cross-harness")
+                && ORCHESTRATOR_PROMPT.contains("[agents] enabled = false"),
+            "zirv agent's role must be scoped to cross-harness work and the disabled-subagents \
+             fallback, not the default in-repo path: {ORCHESTRATOR_PROMPT}"
         );
         assert!(
             !ORCHESTRATOR_PROMPT.contains("Agent tool")
@@ -1810,9 +1837,20 @@ mod tests {
                 "missing tier guidance '{tier}': {ORCHESTRATOR_PROMPT}"
             );
         }
+        for example in ["currently gpt-5.6-luna", "currently gpt-5.6-terra"] {
+            assert!(
+                ORCHESTRATOR_PROMPT.contains(example),
+                "tier roles must carry a durable '{example}' example so the guidance survives a \
+                 model rename: {ORCHESTRATOR_PROMPT}"
+            );
+        }
         assert!(
-            ORCHESTRATOR_PROMPT.contains("Never omit it"),
-            "must forbid silently inheriting the seat model: {ORCHESTRATOR_PROMPT}"
+            ORCHESTRATOR_PROMPT
+                .contains("Never spawn a subagent without an explicit cheaper model")
+                && ORCHESTRATOR_PROMPT.contains("default_subagent_model"),
+            "must forbid silently inheriting the seat model on a subagent spawn, with the \
+             operator's own [agents] default_subagent_model as the one named exception: \
+             {ORCHESTRATOR_PROMPT}"
         );
         assert!(
             ORCHESTRATOR_PROMPT.contains("small or trivial change"),
