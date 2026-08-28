@@ -14,14 +14,15 @@ Nextest's process-per-test isolation prevents `env::set_var` races. `--no-fail-f
 
 ## Module map
 
-- `src/main.rs`, `src/input.rs`: raw-argv built-ins, clap, script lookup; `src/commands/`: create, init, help, version, setup.
+- `src/main.rs`, `src/input.rs`: raw-argv built-ins, clap, script lookup; `src/commands/`: create, init, help, version, setup, report.
 - `src/commands/workflow/`: skill/capability, engine/classify, verification/review, artifact/telemetry; `src/script_runner/`: script.rs, command.rs (`${var}`), command_types.rs, options.rs, mod.rs; `src/utils.rs`: parsing/shortcuts/reserved names; `src/settings.rs`: `<repo>/.zirv/.settings.toml` agent gate.
 - `src/commands/ctx/`: mod/config/state/log; event+rot; adapters/{claude,codex}; score handoff resume hook status handover; run_loop exec wrap (supervisors); signal supervise term; pace usage window poll; optimize prompt compile context memory memory_cli mail sessions policy safety chat agent announce chrome; dash/ (mod pane ui spawnreq roster).
 
 ## Conventions
 
 - Rust edition 2024. Options use `#[serde(default)]` or `Option<T>`; optional params use `?` (`"branch?"`). Scripts live in `.zirv/` or `~/.zirv/`.
-- Case-insensitive reserved built-ins: ctx, chat, agent, skill, workflow, test, verify, artifact, memory, context, setup, help, version, init, create, frontend. They cannot be shadowed. `<repo>/.zirv/{ctx.toml,.settings.toml,verify.toml,.shortcuts.yaml}` are config, not scripts.
+- Case-insensitive reserved built-ins: ctx, chat, agent, skill, workflow, test, verify, artifact, memory, context, setup, report, help, version, init, create, frontend. They cannot be shadowed. `<repo>/.zirv/{ctx.toml,.settings.toml,verify.toml,.shortcuts.yaml}` are config, not scripts.
+- If Zirv itself malfunctions or lacks a needed capability, file it with `zirv report bug|feature <title> [--body <text>|--body-file <path>]`; never put credentials or other secrets in a report.
 - `rot.rs` is pure (no fs/clock/env/net): identical events give identical verdicts; I/O belongs in `score.rs`.
 - `wrap` must never worsen sessions: no hot-path `unwrap`/`expect`; restore raw mode explicitly (`panic = "abort"`); supervision failure becomes pure passthrough.
 - Repo-owned surfaces are UNTRUSTED and may only NARROW: `<repo>/.zirv/{ctx.toml,system-prompt.md,context/*.md,memory/}` and repo skills/checks. Repo-layer `REPO_FORBIDDEN` keys hard-error; only `~/.zirv/ctx.toml`, `ZIRV_CTX_*`, or flags may set them.

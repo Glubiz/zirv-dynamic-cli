@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-27
+last-verified: 2026-08-28
 ---
 
 # Decision Log
@@ -23,6 +23,13 @@ last-verified: 2026-08-27
 - If the entry is longer than the cap, the "why" is a spec, not an ADR — write it under `docs/superpowers/specs/` and link to it.
 
 ## Decisions
+
+### 2026-08-28 — `zirv report` fixes its destination and accepts fallback credentials only from the operator layer (issue #176, v2.35.0)
+**Context:** A reporting command must work inside arbitrary checkouts, but allowing a checkout to choose either the destination or credential would let repository input redirect operator-authenticated writes. GitHub CLI already has a secure credential store, while headless environments commonly supply `GH_TOKEN`/`GITHUB_TOKEN`.
+**Decision:** `report.rs` posts only to `Glubiz/zirv-dynamic-cli`, resolving credentials in order from `gh auth token --hostname github.com`, `GH_TOKEN`, `GITHUB_TOKEN`, then `[github].token` in `~/.zirv/.settings.toml`. The settings fallback takes only a home path; no repository path reaches it.
+**Rejected:** Reading `<repo>/.zirv/.settings.toml` for a token or repository override — a checkout is untrusted and must not select where an operator credential writes. Requiring `gh` outright — would make headless/token-based use fail despite already-supported GitHub authentication mechanisms.
+**Consequences:** Tests inject credential lookup and HTTP transport and never touch a real token or network. Adding another report destination or auth source requires a new explicit trust decision rather than a config key in a checkout.
+**Spec / link:** `src/commands/report.rs`; `src/settings.rs::operator_github_token`; [[Built-in Commands]]; [[Untrusted Configuration]]; issue #176.
 
 ### 2026-08-27 — Unverified spawn-request lineage may never claim a coordinator role (issue #155 review, PR #171, v2.32.0)
 **Context:** `SpawnRequest.parent_session` names the requester's own live pane so `depth_refusal` can enforce the `Orchestrator -> SubOrchestrator -> Worker` chain, but `parent_role_for`'s reading of it was never a verified identity — a missing or forged value falls back to `Orchestrator`, the same answer a genuine top-level rejoin gets. A live Worker pane could forge or omit its own `parent_session` and sail a `depth_refusal(Orchestrator, SubOrchestrator)` check that was always `None`, granting itself a coordinator seat it should never reach.
