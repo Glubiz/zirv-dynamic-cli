@@ -327,9 +327,8 @@ pub fn spawn_headroom(
         Some(found) => (Source::Collector, Some(found)),
         None if cfg.estimator => (
             Source::Estimator,
-            estimator.and_then(|windows| {
-                worst(windows.five_hour.as_ref(), windows.seven_day.as_ref())
-            }),
+            estimator
+                .and_then(|windows| worst(windows.five_hour.as_ref(), windows.seven_day.as_ref())),
         ),
         None => (Source::None, None),
     };
