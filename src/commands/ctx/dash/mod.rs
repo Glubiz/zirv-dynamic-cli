@@ -1236,6 +1236,12 @@ fn on_quit(
             // Finding 6: and the group it belongs to, so the restore can put
             // it back inside the same one.
             work_group_id: pane.work_group_id().map(str::to_string),
+            // Issue #160 finding 1, review round (2026-08-28): the launch
+            // mode this pane was ACTUALLY spawned with (`Pane::launch_mode`),
+            // so a restore can relaunch it on the same terms rather than
+            // unconditionally pinning `Interactive` -- see `restored_pane_
+            // turn_env`'s own doc comment.
+            interactive: pane.launch_mode() == adapters::LaunchMode::Interactive,
         })
         .collect();
     let panes_for_roster = merge_unoffered(live, unoffered);
@@ -1956,13 +1962,29 @@ fn turn_signal_capable_for(cfg: &CtxConfig, agent_name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Builds a fresh pane's `turn_env`: the adapter's own turn-signal
+/// registration (or its resolution-failure fallback), the pane's session
+/// identity, and -- security review round (2026-08-28), review of issue
+/// #160's own fix -- the durable interactive-launch pin, ALWAYS pushed here
+/// rather than left to each of the three call sites to remember on their
+/// own. Before this, `fulfill_spawn_request`, `run_dashboard`'s first pane,
+/// and `spawn_restored_pane` each pushed `adapters::launch_mode_pin_env`
+/// separately after calling this function -- three independent chances to
+/// forget the pin, and issue #160 finding 1 was exactly that: the third
+/// occurrence of the forgotten-pin bug class. `mode` is now a MANDATORY
+/// parameter so a call site that forgets to decide it is a compile error,
+/// not a silently-headless pane; `LaunchMode::Headless` already reads as
+/// "no pin" through `launch_mode_pin_env`, so no separate `Option` is
+/// needed to make "no pin" explicit -- the enum already has that variant.
 fn build_turn_env(
     cfg: &CtxConfig,
     state: &StateDir,
     repo: &Path,
     agent_name: &str,
     session_id: &str,
+    mode: adapters::LaunchMode,
 ) -> (Vec<(String, String)>, Option<String>) {
+    let pin = adapters::launch_mode_pin_env(mode);
     match adapters::select(Some(agent_name), &[], cfg) {
         Ok(adapter) => {
             let socket = state.socket_for(session_id);
@@ -1991,14 +2013,23 @@ fn build_turn_env(
             if !env.iter().any(|(k, _)| k == adapters::SESSION_ENV) {
                 env.push((adapters::SESSION_ENV.to_string(), session_id.to_string()));
             }
+            if let Some(pair) = pin {
+                env.push(pair);
+            }
             (env, None)
         }
-        Err(e) => (
-            vec![(adapters::AGENT_ENV.to_string(), agent_name.to_string())],
-            Some(format!(
-                "dashboard: could not resolve adapter '{agent_name}' for turn signals: {e}"
-            )),
-        ),
+        Err(e) => {
+            let mut env = vec![(adapters::AGENT_ENV.to_string(), agent_name.to_string())];
+            if let Some(pair) = pin {
+                env.push(pair);
+            }
+            (
+                env,
+                Some(format!(
+                    "dashboard: could not resolve adapter '{agent_name}' for turn signals: {e}"
+                )),
+            )
+        }
     }
 }
 
@@ -2335,10 +2366,10 @@ fn worker_pane_extra_args(
     extra
 }
 
-/// The env pair, if any, [`fulfill_spawn_request`] pushes into a fresh
-/// worker pane's `turn_env` for the durable interactive-launch pin
-/// (`adapters::LAUNCH_MODE_ENV`, issue #147 amendment). `trusted_interactive`
-/// is the ONLY input -- deliberately not `SpawnRequest.interactive`, which is
+/// The `LaunchMode` [`fulfill_spawn_request`] feeds to `build_turn_env` for
+/// a fresh worker pane's durable interactive-launch pin (`adapters::
+/// LAUNCH_MODE_ENV`, issue #147 amendment). `trusted_interactive` is the
+/// ONLY input -- deliberately not `SpawnRequest.interactive`, which is
 /// untrusted JSON any process able to write into the requests directory can
 /// forge (review round 1, 2026-08-27, Important). Pure and directly testable
 /// so the security property ("a forged request can never produce the pin")
@@ -2346,12 +2377,18 @@ fn worker_pane_extra_args(
 /// behavior; see `fulfill_spawn_request`'s own doc comment for which callers
 /// pass `true` (only the dashboard's own in-process Spawn overlay) versus
 /// `false` (everything else, including every file-dropped request).
-fn spawn_launch_mode_pin(trusted_interactive: bool) -> Option<(String, String)> {
-    adapters::launch_mode_pin_env(if trusted_interactive {
+///
+/// Security review round (2026-08-28), issue #160 finding 2: used to push
+/// the env pair itself (`Option<(String, String)>`); now just resolves the
+/// `LaunchMode` and leaves the actual pin-pushing to `build_turn_env`,
+/// which every call site now routes through -- see that function's own doc
+/// comment for why the push moved there.
+fn trusted_launch_mode(trusted_interactive: bool) -> adapters::LaunchMode {
+    if trusted_interactive {
         adapters::LaunchMode::Interactive
     } else {
         adapters::LaunchMode::Headless
-    })
+    }
 }
 
 /// The `trusted_interactive` [`handle_spawn_requests`] always passes to
@@ -2466,7 +2503,7 @@ pub(crate) fn depth_refusal(
 
 /// The PARENT session's role for [`depth_refusal`], resolved from data this
 /// dashboard already trusts -- never from anything `req` itself claims about
-/// its own lineage. Mirrors `spawn_launch_mode_pin`'s own discipline (see its
+/// its own lineage. Mirrors `trusted_launch_mode`'s own discipline (see its
 /// doc comment): a spawn request is untrusted JSON any process that can reach
 /// the requests directory can hand-write, so `req.parent_session` is used
 /// only as a KEY into this dashboard's own live pane list, never trusted as
@@ -3209,7 +3246,22 @@ fn fulfill_spawn_request(
         title: format!("wrk {}", req.agent),
     };
 
-    let (mut turn_env, turn_env_err) = build_turn_env(cfg, state, repo, &req.agent, &session_id);
+    // Issue #147 amendment, review round 1 (2026-08-27) correction, and
+    // issue #160 finding 2 (2026-08-28): the durable interactive-launch pin
+    // is decided by `trusted_launch_mode`, which is `trusted_interactive`-
+    // only and never reads `req.interactive` (see both that function's and
+    // this one's own doc comments for the full security reasoning), and
+    // pushed by `build_turn_env` itself -- this call site no longer pushes
+    // it separately, closing off the "forgot the pin" bug class at this
+    // call site for good.
+    let (mut turn_env, turn_env_err) = build_turn_env(
+        cfg,
+        state,
+        repo,
+        &req.agent,
+        &session_id,
+        trusted_launch_mode(trusted_interactive),
+    );
     if let Some(e) = turn_env_err {
         push_error(errors, e);
     }
@@ -3223,19 +3275,12 @@ fn fulfill_spawn_request(
     // Issue #170: a work-group binding travels by lineage, not convention --
     // this pane's own child inherits `agent::WORK_GROUP_ENV` in its real
     // process environment, so any further `zirv agent` call it makes with no
-    // `--group` of its own (`agent::resolve_group_binding`'s env fallback)
-    // lands in the SAME group automatically, and every process THAT spawns
-    // inherits it in turn via ordinary environment inheritance -- no
-    // additional plumbing needed past this one seam.
+    // `--group` of its own (`agent::resolve_group_binding`'s own env
+    // fallback) lands in the SAME group automatically, and every process
+    // THAT spawns inherits it in turn via ordinary environment inheritance
+    // -- no additional plumbing needed past this one seam.
     if let Some(group_id) = &req.work_group_id {
         turn_env.push((super::agent::WORK_GROUP_ENV.to_string(), group_id.clone()));
-    }
-    // Issue #147 amendment, review round 1 (2026-08-27) correction: routed
-    // through `spawn_launch_mode_pin`, which is `trusted_interactive`-only
-    // and never reads `req.interactive` -- see both that function's and
-    // this one's own doc comments for the full security reasoning.
-    if let Some((key, value)) = spawn_launch_mode_pin(trusted_interactive) {
-        turn_env.push((key, value));
     }
 
     // T10: the same launch-time pacing gate `wrap::run_with`/this dashboard's
@@ -4014,6 +4059,76 @@ fn partition_restore_selection(
     (to_spawn, deferred)
 }
 
+/// Builds the `turn_env` a restored dashboard pane spawns with -- everything
+/// `spawn_restored_pane` pushes ahead of `Pane::spawn`: the base env `build_
+/// turn_env` produces (including the durable interactive-launch pin, when
+/// `candidate` carried one), a fresh spawn-request channel of its own
+/// (Security review Finding 1), and the roster's group binding when the
+/// candidate carried one (Security review Finding 6). Factored out of
+/// `spawn_restored_pane` so the exact fields it adds are pinned directly,
+/// independent of a real pty spawn's behavior -- the same reasoning
+/// `trusted_launch_mode`'s own doc comment gives for testing a launch-mode
+/// decision as a pure function rather than reading a real spawned child's
+/// own environment back.
+///
+/// Issue #160 finding 1, review round (2026-08-28): a restore used to
+/// unconditionally pin `LaunchMode::Interactive`, which handed every worker
+/// pane that survived a dashboard quit+restore cycle an interactive posture
+/// it may have been explicitly REFUSED at spawn time (a file-dropped spawn
+/// request is untrusted and always launches `Headless` --
+/// `FILE_DROP_TRUSTED_INTERACTIVE`). The correct rule (issue #160: "on the
+/// same terms as a freshly spawned one") is to restore whatever launch mode
+/// the pane ORIGINALLY had, recorded on the roster entry at quit time
+/// (`RosterPane::interactive`, `#[serde(default)]` so an old-format roster
+/// entry with the field absent restores fail-closed -- no pin, today's
+/// pre-fix-round behavior -- rather than defaulting to the permissive side).
+///
+/// Returns the built `turn_env` alongside the freshly minted pane channel
+/// path: `spawn_restored_pane` needs both, the env to spawn with and the
+/// path to hand the spawned `Pane` via `set_intake_dir`.
+fn restored_pane_turn_env(
+    cfg: &CtxConfig,
+    state: &StateDir,
+    repo: &Path,
+    candidate: &roster::RosterPane,
+    requests_dir: &Path,
+    errors: &mut Vec<String>,
+) -> (Vec<(String, String)>, PathBuf) {
+    let mode = if candidate.interactive {
+        adapters::LaunchMode::Interactive
+    } else {
+        adapters::LaunchMode::Headless
+    };
+    let (mut turn_env, turn_env_err) = build_turn_env(
+        cfg,
+        state,
+        repo,
+        &candidate.agent,
+        &candidate.session_id,
+        mode,
+    );
+    if let Some(e) = turn_env_err {
+        push_error(errors, e);
+    }
+    // Security review Finding 1: a restored pane is a pane like any other and
+    // gets its own channel -- a fresh token, since the one it carried before
+    // the quit died with that dashboard's token directory.
+    let pane_channel = mint_pane_channel(requests_dir, errors);
+    turn_env.push((
+        spawnreq::DASH_REQUESTS_ENV.to_string(),
+        pane_channel.display().to_string(),
+    ));
+    // Security review Finding 6: and the group binding travels back with it,
+    // the same pair `fulfill_spawn_request` pushes for a fresh spawn -- a
+    // restore that dropped it left the pane's own further delegations
+    // ungrouped, outside the child limit and the token ceiling its batch was
+    // launched under.
+    if let Some(group_id) = &candidate.work_group_id {
+        turn_env.push((super::agent::WORK_GROUP_ENV.to_string(), group_id.clone()));
+    }
+    (turn_env, pane_channel)
+}
+
 /// Spawns one roster candidate back as a fresh pane: resolves its
 /// adapter (re-checked against the live gate, same "data, never authority"
 /// discipline `fulfill_spawn_request` already holds a spawn request to --
@@ -4068,27 +4183,8 @@ fn spawn_restored_pane(
         title: candidate.title.clone(),
     };
 
-    let (mut turn_env, turn_env_err) =
-        build_turn_env(cfg, state, repo, &candidate.agent, &candidate.session_id);
-    if let Some(e) = turn_env_err {
-        push_error(errors, e);
-    }
-    // Security review Finding 1: a restored pane is a pane like any other and
-    // gets its own channel -- a fresh token, since the one it carried before
-    // the quit died with that dashboard's token directory.
-    let pane_channel = mint_pane_channel(requests_dir, errors);
-    turn_env.push((
-        spawnreq::DASH_REQUESTS_ENV.to_string(),
-        pane_channel.display().to_string(),
-    ));
-    // Security review Finding 6: and the group binding travels back with it,
-    // the same pair `fulfill_spawn_request` pushes for a fresh spawn -- a
-    // restore that dropped it left the pane's own further delegations
-    // ungrouped, outside the child limit and the token ceiling its batch was
-    // launched under.
-    if let Some(group_id) = &candidate.work_group_id {
-        turn_env.push((super::agent::WORK_GROUP_ENV.to_string(), group_id.clone()));
-    }
+    let (turn_env, pane_channel) =
+        restored_pane_turn_env(cfg, state, repo, candidate, requests_dir, errors);
 
     match Pane::spawn(
         spec,
@@ -4914,20 +5010,25 @@ pub fn run_dashboard(
         None => agent_name.clone(),
     };
     let session_id = first.session_id.clone();
-    let (mut turn_env, turn_env_err) = build_turn_env(cfg, state, repo, &agent_name, &session_id);
-    if let Some(e) = turn_env_err {
-        push_error(&mut errors, e);
-    }
     // Issue #147 amendment: the dashboard's own first (orchestrator) pane is
     // unconditionally the human-attended session the operator is looking
     // at -- the same fact `dash_orchestrator_pane`'s hardcoded `LaunchMode::
     // Interactive` already encodes for this pane's own `policy_launch_args`
     // call -- so the durable interactive-launch pin is always set here,
     // never conditioned on a request that does not exist for this pane.
-    if let Some((key, value)) =
-        super::adapters::launch_mode_pin_env(super::adapters::LaunchMode::Interactive)
-    {
-        turn_env.push((key, value));
+    // Issue #160 finding 2 (2026-08-28): `build_turn_env` itself now pushes
+    // the pin from the `LaunchMode` passed in, so this call site no longer
+    // pushes it separately.
+    let (mut turn_env, turn_env_err) = build_turn_env(
+        cfg,
+        state,
+        repo,
+        &agent_name,
+        &session_id,
+        super::adapters::LaunchMode::Interactive,
+    );
+    if let Some(e) = turn_env_err {
+        push_error(&mut errors, e);
     }
     // The seat this pane sits in, for the `zirv ctx hook pretool` guard
     // running inside it. This `turn_env` belongs to the first pane and only
@@ -9374,7 +9475,14 @@ mod tests {
         let cfg = CtxConfig::default();
         let session_id = "11112222-3333-4444-8555-666677778888";
 
-        let (env, err) = build_turn_env(&cfg, &state, &repo, "codex", session_id);
+        let (env, err) = build_turn_env(
+            &cfg,
+            &state,
+            &repo,
+            "codex",
+            session_id,
+            adapters::LaunchMode::Headless,
+        );
 
         assert!(err.is_none(), "codex resolves fine, so no error: {err:?}");
         assert!(
@@ -9398,7 +9506,14 @@ mod tests {
         let cfg = CtxConfig::default();
         let session_id = "22223333-4444-5555-8666-777788889999";
 
-        let (env, err) = build_turn_env(&cfg, &state, &repo, "claude", session_id);
+        let (env, err) = build_turn_env(
+            &cfg,
+            &state,
+            &repo,
+            "claude",
+            session_id,
+            adapters::LaunchMode::Headless,
+        );
 
         assert!(err.is_none());
         let matches: Vec<_> = env
@@ -9409,6 +9524,53 @@ mod tests {
             matches.len(),
             1,
             "exactly one SESSION_ENV entry, not duplicated: {env:?}"
+        );
+    }
+
+    /// Issue #160 finding 2 (2026-08-28): `build_turn_env` now pushes the
+    /// durable interactive-launch pin itself, from the mandatory `mode`
+    /// parameter, rather than leaving it to each of its three call sites --
+    /// this pins that push at its actual source, independent of any one
+    /// call site remembering to add it separately.
+    #[test]
+    fn build_turn_env_pushes_the_interactive_launch_mode_pin_only_when_asked() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().to_path_buf();
+        let cfg = CtxConfig::default();
+        let session_id = "33334444-5555-6666-8777-888899990000";
+
+        let (interactive_env, _) = build_turn_env(
+            &cfg,
+            &state,
+            &repo,
+            "claude",
+            session_id,
+            adapters::LaunchMode::Interactive,
+        );
+        assert!(
+            interactive_env.contains(&(
+                adapters::LAUNCH_MODE_ENV.to_string(),
+                adapters::LAUNCH_MODE_INTERACTIVE_VALUE.to_string()
+            )),
+            "LaunchMode::Interactive must push the pin: {interactive_env:?}"
+        );
+
+        let (headless_env, _) = build_turn_env(
+            &cfg,
+            &state,
+            &repo,
+            "claude",
+            session_id,
+            adapters::LaunchMode::Headless,
+        );
+        assert!(
+            !headless_env
+                .iter()
+                .any(|(k, _)| k == adapters::LAUNCH_MODE_ENV),
+            "LaunchMode::Headless must never push the pin: {headless_env:?}"
         );
     }
 
@@ -13407,34 +13569,39 @@ mod tests {
     /// JSON -- any process able to reach the requests directory
     /// (capability-protected by a token in its path, not authenticated) can
     /// write a `req-*.json` claiming `"interactive": true` regardless of
-    /// whether a human is actually watching any dashboard. `spawn_launch_
-    /// mode_pin` (what `fulfill_spawn_request` actually keys the durable
-    /// interactive-launch pin on) takes `trusted_interactive` as its ONLY
-    /// input, so a forged `req.interactive: true` can never produce the pin
-    /// through `handle_spawn_requests` (the file-drop consumer, which always
-    /// passes `false`) -- only the dashboard's own in-process Spawn overlay,
-    /// which passes `true`, can. Deliberately a pure decision-function test,
-    /// not a real-process env capture: this codebase's own established
-    /// pattern for exactly this class of question (see `worker_pane_extra_
-    /// args_fails_closed_to_headless_for_a_non_interactive_request`,
-    /// `wrap::tests::launch_mode_from_interactive_maps_the_boolean_to_the_
-    /// right_mode`) -- deterministic regardless of host PTY/console
-    /// behavior, unlike reading a real spawned child's own environment back.
+    /// whether a human is actually watching any dashboard. `trusted_launch_
+    /// mode` (what `fulfill_spawn_request` actually keys the durable
+    /// interactive-launch pin on, via `build_turn_env`) takes
+    /// `trusted_interactive` as its ONLY input, so a forged `req.interactive:
+    /// true` can never produce the pin through `handle_spawn_requests` (the
+    /// file-drop consumer, which always passes `false`) -- only the
+    /// dashboard's own in-process Spawn overlay, which passes `true`, can.
+    /// Deliberately a pure decision-function test, not a real-process env
+    /// capture: this codebase's own established pattern for exactly this
+    /// class of question (see `worker_pane_extra_args_fails_closed_to_
+    /// headless_for_a_non_interactive_request`, `wrap::tests::launch_mode_
+    /// from_interactive_maps_the_boolean_to_the_right_mode`) -- deterministic
+    /// regardless of host PTY/console behavior, unlike reading a real
+    /// spawned child's own environment back.
+    ///
+    /// Issue #160 finding 2 (2026-08-28): this used to assert the pushed env
+    /// PAIR directly (`Option<(String, String)>`); now `trusted_launch_mode`
+    /// only resolves the `LaunchMode` and `build_turn_env` does the actual
+    /// pushing (see that function's own doc comment), so this asserts the
+    /// mode instead -- the security property under test (forged `req.
+    /// interactive` never wins) is unchanged.
     #[test]
-    fn spawn_launch_mode_pin_ignores_req_interactive_and_only_trusts_the_caller() {
+    fn trusted_launch_mode_ignores_req_interactive_and_only_trusts_the_caller() {
         assert_eq!(
-            spawn_launch_mode_pin(false),
-            None,
+            trusted_launch_mode(false),
+            super::super::adapters::LaunchMode::Headless,
             "an untrusted spawn -- every file-dropped request, `handle_spawn_requests`'s own \
              call site -- must never receive the pin, regardless of what a forged \
              `SpawnRequest.interactive` claims"
         );
         assert_eq!(
-            spawn_launch_mode_pin(true),
-            Some((
-                super::super::adapters::LAUNCH_MODE_ENV.to_string(),
-                super::super::adapters::LAUNCH_MODE_INTERACTIVE_VALUE.to_string()
-            )),
+            trusted_launch_mode(true),
+            super::super::adapters::LaunchMode::Interactive,
             "only the dashboard's own in-process Spawn overlay, which passes `true`, may pin \
              Interactive"
         );
@@ -14044,6 +14211,105 @@ mod tests {
             written.panes,
             vec![live_one],
             "a held-back candidate is offered again next launch, not destroyed"
+        );
+    }
+
+    /// Issue #160 finding 1, review round (2026-08-28): a restore must
+    /// relaunch a pane "on the same terms as a freshly spawned one" -- a
+    /// worker pane that WAS interactive-pinned at its original spawn
+    /// (`RosterPane::interactive == true`, recorded from `Pane::launch_mode`
+    /// at quit time) gets the pin back on restore. Also FINDING 3: asserts
+    /// all three env pairs `restored_pane_turn_env`'s own doc comment claims
+    /// are pinned directly -- `DASH_REQUESTS_ENV` and `WORK_GROUP_ENV` had
+    /// zero coverage before this round even though the doc comment claimed
+    /// otherwise.
+    #[test]
+    fn restored_pane_turn_env_pins_interactive_when_the_original_pane_was_interactive() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let requests_dir = state.dash().join("aaaa1111-token").join("requests");
+        std::fs::create_dir_all(&requests_dir).expect("mkdir requests");
+
+        let mut candidate = restore_pane("cccc3333", "33333333-2222-4333-8444-555555555555");
+        candidate.interactive = true;
+        candidate.work_group_id = Some("wg-42".to_string());
+        let cfg = CtxConfig::default();
+        let mut errors = Vec::new();
+
+        let (turn_env, pane_channel) =
+            restored_pane_turn_env(&cfg, &state, &repo, &candidate, &requests_dir, &mut errors);
+
+        assert!(
+            turn_env.contains(&(
+                super::super::adapters::LAUNCH_MODE_ENV.to_string(),
+                super::super::adapters::LAUNCH_MODE_INTERACTIVE_VALUE.to_string()
+            )),
+            "a restored pane that was originally interactive-pinned must carry the durable \
+             interactive-launch pin again: {turn_env:?}"
+        );
+        assert!(
+            turn_env.contains(&(
+                spawnreq::DASH_REQUESTS_ENV.to_string(),
+                pane_channel.display().to_string()
+            )),
+            "a restored pane gets its own fresh spawn-request channel: {turn_env:?}"
+        );
+        assert!(
+            turn_env.contains(&(
+                super::super::agent::WORK_GROUP_ENV.to_string(),
+                "wg-42".to_string()
+            )),
+            "the roster's group binding must travel back with the restored pane: {turn_env:?}"
+        );
+    }
+
+    /// The other half of issue #160 finding 1: a worker pane that was
+    /// spawned `Headless` (every file-dropped spawn request --
+    /// `FILE_DROP_TRUSTED_INTERACTIVE` -- is always `Headless`, regardless
+    /// of what a forged `SpawnRequest.interactive` claims) must NOT gain the
+    /// interactive pin just by surviving a dashboard quit+restore cycle.
+    /// Before this fix `spawn_restored_pane` unconditionally pinned
+    /// `LaunchMode::Interactive`, which would have handed every ordinary
+    /// delegated worker an interactive posture it was explicitly refused at
+    /// spawn time.
+    #[test]
+    fn restored_pane_turn_env_restores_without_the_pin_for_a_non_interactive_worker_pane() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let requests_dir = state.dash().join("aaaa1111-token").join("requests");
+        std::fs::create_dir_all(&requests_dir).expect("mkdir requests");
+
+        // `restore_pane` leaves `interactive` at its `Default` (`false`) --
+        // an ordinary delegated worker pane, never trusted-interactive.
+        let candidate = restore_pane("dddd4444", "44444444-2222-4333-8444-555555555555");
+        assert!(
+            !candidate.interactive,
+            "sanity: the fixture is non-interactive"
+        );
+        let cfg = CtxConfig::default();
+        let mut errors = Vec::new();
+
+        let (turn_env, pane_channel) =
+            restored_pane_turn_env(&cfg, &state, &repo, &candidate, &requests_dir, &mut errors);
+
+        assert!(
+            !turn_env
+                .iter()
+                .any(|(k, _)| k == super::super::adapters::LAUNCH_MODE_ENV),
+            "a worker pane that was never interactive-pinned must not gain the pin on \
+             restore: {turn_env:?}"
+        );
+        assert!(
+            turn_env.contains(&(
+                spawnreq::DASH_REQUESTS_ENV.to_string(),
+                pane_channel.display().to_string()
+            )),
+            "the fresh spawn-request channel is still pushed regardless of launch mode: \
+             {turn_env:?}"
         );
     }
 
