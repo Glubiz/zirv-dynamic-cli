@@ -462,7 +462,7 @@ const TOKEN_SHAPE_FAMILIES: &[(&str, &str)] = &[
     ("jwt", "JSON Web Token"),
 ];
 
-fn detect_token_shape(text: &str) -> Option<&'static str> {
+pub(crate) fn detect_token_shape(text: &str) -> Option<&'static str> {
     let caps = TOKEN_SHAPE_RE.captures(text)?;
     TOKEN_SHAPE_FAMILIES
         .iter()

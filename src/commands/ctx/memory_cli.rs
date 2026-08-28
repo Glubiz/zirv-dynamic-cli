@@ -168,6 +168,14 @@ pub struct RememberArgs {
     /// Repeatable: pass `--tag` more than once for more than one.
     #[arg(long = "tag")]
     pub tags: Vec<String>,
+    /// Store into the shared bank even though its key, body, or a tag looks
+    /// credential-shaped (`memory::sensitive_shared_match`). Has no effect
+    /// without `--shared`, and no effect on the private bank, which the
+    /// guard never inspects at all (issue #172's escape hatch, the same
+    /// flag name and meaning `zirv ctx remember --repo --allow-sensitive`
+    /// uses).
+    #[arg(long, default_value_t = false)]
+    pub allow_sensitive: bool,
 }
 
 /// The only values `--importance`/`--confidence` accept -- the same two
@@ -231,12 +239,12 @@ pub struct OptimizeArgs {
     #[arg(long)]
     pub agent: Option<String>,
 }
+/// Thin, surface-local name for `MemoryScope::of` (issue #172 cross-review
+/// finding 6): the bool-to-scope mapping itself is centralized there rather
+/// than duplicated here, but every call site in this file reads more
+/// naturally as `scope_of(args.shared)` than `MemoryScope::of(args.shared)`.
 fn scope_of(shared: bool) -> MemoryScope {
-    if shared {
-        MemoryScope::Shared
-    } else {
-        MemoryScope::Private
-    }
+    MemoryScope::of(shared)
 }
 
 fn scope_label(scope: MemoryScope) -> &'static str {
@@ -349,24 +357,13 @@ pub fn run_init<W: Write>(args: &InitArgs, w: &mut W) -> CtxResult<i32> {
     run_init_with(args, w, &std::env::current_dir()?)
 }
 
-/// An `Entry` plus the scope it was read from, for JSON output. `scope` is
-/// derived from which directory the CLI actually read, never from the
-/// entry's own header fields -- a shared entry's `Source`/`Written-By` are
-/// attacker-supplied repository content (see `MemoryScope::Shared`'s own doc
-/// comment) and must never be the thing that tells a reader which bank an
-/// entry came from.
-#[derive(Serialize)]
-struct ScopedEntry<'a> {
-    #[serde(flatten)]
-    entry: &'a Entry,
-    scope: &'static str,
-}
-
 /// Renders entries already selected from one scope. Never trusts an entry's
-/// own header for its scope label (see `ScopedEntry`); a shared entry's
-/// human-readable line additionally carries an explicit untrusted-content
-/// note so a repo-committed `Source: explicit` can never read as if it were
-/// operator-verified.
+/// own header for its scope label (see `memory::ScopedEntry`, shared with
+/// `zirv ctx recall`'s own JSON output rather than each surface keeping its
+/// own identical copy -- issue #172 cross-review finding 6); a shared
+/// entry's human-readable line additionally carries an explicit
+/// untrusted-content note so a repo-committed `Source: explicit` can never
+/// read as if it were operator-verified.
 fn render_entries<W: Write>(
     w: &mut W,
     entries: &[Entry],
@@ -377,7 +374,7 @@ fn render_entries<W: Write>(
     let label = scope_label(scope);
     for entry in entries {
         if json {
-            let scoped = ScopedEntry {
+            let scoped = memory::ScopedEntry {
                 entry,
                 scope: label,
             };
@@ -401,8 +398,8 @@ fn render_entries<W: Write>(
 
 /// A ranked `Entry` plus its scope, score, and selection reasons -- the
 /// JSON shape `zirv memory recall --json` emits (issue #35). `scope`
-/// follows `ScopedEntry`'s own rule: derived from which directory was
-/// read, never from the entry's own header.
+/// follows `memory::ScopedEntry`'s own rule: derived from which directory
+/// was read, never from the entry's own header.
 #[derive(Serialize)]
 struct RankedEntry<'a> {
     #[serde(flatten)]
@@ -412,10 +409,10 @@ struct RankedEntry<'a> {
     reasons: &'a [String],
 }
 
-/// Renders a ranking's selected entries. Reuses `ScopedEntry`'s scope-
-/// labeling and the shared-scope trust note from `render_entries`, adding
-/// `score`/`reasons` -- the selection diagnostics issue #35 asks for -- to
-/// both the JSON and human-readable forms.
+/// Renders a ranking's selected entries. Reuses `memory::ScopedEntry`'s
+/// scope-labeling and the shared-scope trust note from `render_entries`,
+/// adding `score`/`reasons` -- the selection diagnostics issue #35 asks for
+/// -- to both the JSON and human-readable forms.
 fn render_ranked<W: Write>(
     w: &mut W,
     ranked: &[Ranked<'_>],
@@ -556,6 +553,8 @@ pub fn run_remember_with<W: Write>(
             text: Some(args.text.clone()),
             text_file: None,
             verify: false,
+            repo: false,
+            allow_sensitive: false,
             importance,
             confidence,
             tags: args.tags.clone(),
@@ -590,7 +589,11 @@ pub fn run_remember_with<W: Write>(
         // yet.
         paths: Vec::new(),
     };
-    let path = memory::upsert_scoped(MemoryScope::Shared, repo, &state, &slug, &cfg, &entry)?;
+    let path = if args.allow_sensitive {
+        memory::upsert_shared_allow_sensitive(repo, &state, &slug, &cfg, &entry)?
+    } else {
+        memory::upsert_scoped(MemoryScope::Shared, repo, &state, &slug, &cfg, &entry)?
+    };
     writeln!(
         w,
         "zirv memory remember: stored '{}' in the shared bank at {}",
@@ -955,6 +958,7 @@ mod tests {
                 importance: None,
                 confidence: None,
                 tags: Vec::new(),
+                allow_sensitive: false,
             },
             &mut Vec::new(),
             repo.path(),
@@ -970,6 +974,7 @@ mod tests {
                 importance: None,
                 confidence: None,
                 tags: Vec::new(),
+                allow_sensitive: false,
             },
             &mut Vec::new(),
             repo.path(),
@@ -1047,6 +1052,7 @@ mod tests {
             importance: None,
             confidence: None,
             tags: Vec::new(),
+            allow_sensitive: false,
         };
         let mut stdin = std::io::Cursor::new(Vec::<u8>::new());
         run_remember_with(
@@ -1065,6 +1071,7 @@ mod tests {
             importance: None,
             confidence: None,
             tags: Vec::new(),
+            allow_sensitive: false,
         };
         run_remember_with(
             &shared_args,
@@ -1168,6 +1175,7 @@ mod tests {
                 importance: None,
                 confidence: None,
                 tags: Vec::new(),
+                allow_sensitive: false,
             },
             &mut Vec::new(),
             repo.path(),
@@ -1183,6 +1191,7 @@ mod tests {
                 importance: None,
                 confidence: None,
                 tags: Vec::new(),
+                allow_sensitive: false,
             },
             &mut Vec::new(),
             repo.path(),
@@ -1313,6 +1322,7 @@ mod tests {
                 importance: None,
                 confidence: None,
                 tags: Vec::new(),
+                allow_sensitive: false,
             },
             &mut Vec::new(),
             repo.path(),
@@ -1328,6 +1338,7 @@ mod tests {
                 importance: None,
                 confidence: None,
                 tags: Vec::new(),
+                allow_sensitive: false,
             },
             &mut Vec::new(),
             repo.path(),
@@ -1380,6 +1391,7 @@ mod tests {
                     importance: None,
                     confidence: None,
                     tags: Vec::new(),
+                    allow_sensitive: false,
                 },
                 &mut Vec::new(),
                 repo.path(),
@@ -1432,6 +1444,7 @@ mod tests {
                     importance: None,
                     confidence: None,
                     tags: Vec::new(),
+                    allow_sensitive: false,
                 },
                 &mut Vec::new(),
                 repo.path(),
@@ -1479,6 +1492,7 @@ mod tests {
                 importance: None,
                 confidence: None,
                 tags: Vec::new(),
+                allow_sensitive: false,
             },
             &mut Vec::new(),
             repo.path(),
@@ -1525,6 +1539,7 @@ mod tests {
                 importance: None,
                 confidence: None,
                 tags: Vec::new(),
+                allow_sensitive: false,
             },
             &mut out,
             repo.path(),
@@ -1552,6 +1567,7 @@ mod tests {
                 importance: None,
                 confidence: None,
                 tags: Vec::new(),
+                allow_sensitive: false,
             },
             &mut Vec::new(),
             repo.path(),
@@ -1560,6 +1576,64 @@ mod tests {
         )
         .expect_err("shared_enabled = false must refuse the write");
         assert!(err.to_string().contains("shared_enabled"), "got {err}");
+    }
+
+    #[test]
+    fn remember_shared_refuses_a_credential_shaped_key_unless_allow_sensitive_is_set() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = HomeGuard::set(home.path());
+        let state_dir = repo.path().join("state");
+        let env = env_map(&[(state::STATE_ENV, state_dir.to_str().expect("utf8"))]);
+        let mut stdin = std::io::Cursor::new(Vec::<u8>::new());
+
+        let err = run_remember_with(
+            &RememberArgs {
+                key: "staging-db-creds".to_string(),
+                text: "see the ops runbook for details.".to_string(),
+                shared: true,
+                importance: None,
+                confidence: None,
+                tags: Vec::new(),
+                allow_sensitive: false,
+            },
+            &mut Vec::new(),
+            repo.path(),
+            &|k| env.get(k).cloned(),
+            &mut stdin,
+        )
+        .expect_err("a credential-shaped key must be refused without --allow-sensitive");
+        assert!(err.to_string().contains("credential"), "got {err}");
+        assert!(
+            !repo
+                .path()
+                .join(".zirv/memory/staging-db-creds.md")
+                .exists(),
+            "nothing must be written when the guard refuses"
+        );
+
+        let mut out = Vec::new();
+        run_remember_with(
+            &RememberArgs {
+                key: "staging-db-creds".to_string(),
+                text: "see the ops runbook for details.".to_string(),
+                shared: true,
+                importance: None,
+                confidence: None,
+                tags: Vec::new(),
+                allow_sensitive: true,
+            },
+            &mut out,
+            repo.path(),
+            &|k| env.get(k).cloned(),
+            &mut stdin,
+        )
+        .expect("--allow-sensitive must permit the write");
+        assert!(
+            repo.path()
+                .join(".zirv/memory/staging-db-creds.md")
+                .is_file()
+        );
     }
 
     #[test]
@@ -1583,6 +1657,7 @@ mod tests {
                 importance: None,
                 confidence: None,
                 tags: Vec::new(),
+                allow_sensitive: false,
             },
             &mut Vec::new(),
             repo.path(),
@@ -1614,6 +1689,7 @@ mod tests {
                 importance: Some("high".to_string()),
                 confidence: Some("high".to_string()),
                 tags: vec!["release".to_string(), "deploy".to_string()],
+                allow_sensitive: false,
             },
             &mut Vec::new(),
             repo.path(),
@@ -1629,6 +1705,7 @@ mod tests {
                 importance: Some("low".to_string()),
                 confidence: None,
                 tags: Vec::new(),
+                allow_sensitive: false,
             },
             &mut Vec::new(),
             repo.path(),
@@ -1695,6 +1772,7 @@ mod tests {
                 importance: Some("urgent".to_string()),
                 confidence: None,
                 tags: Vec::new(),
+                allow_sensitive: false,
             },
             &mut Vec::new(),
             repo.path(),
@@ -1732,6 +1810,7 @@ mod tests {
                 importance: None,
                 confidence: None,
                 tags: Vec::new(),
+                allow_sensitive: false,
             },
             &mut Vec::new(),
             repo.path(),
@@ -1747,6 +1826,7 @@ mod tests {
                 importance: None,
                 confidence: None,
                 tags: Vec::new(),
+                allow_sensitive: false,
             },
             &mut Vec::new(),
             repo.path(),
@@ -1884,6 +1964,7 @@ mod tests {
                 importance: None,
                 confidence: None,
                 tags: Vec::new(),
+                allow_sensitive: false,
             },
             &mut Vec::new(),
             repo,
