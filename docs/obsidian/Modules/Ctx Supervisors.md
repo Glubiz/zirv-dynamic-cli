@@ -238,6 +238,14 @@ Each pane's rot score is now wired up, closing the gap the header's `score` fiel
 
 A wrapped codex session specifically has no statusline tee of its own, so without help its usage segment would stay a permanent placeholder for its entire life — unlike the sessions that already gate on pacing. `wrap`'s `redraw_bar_if_due` now runs `window::refresh_codex_usage` itself immediately before its existing `load_for` read, gated on `bar.provider == window::CODEX_USAGE_PROVIDER` and floored to once per `CODEX_BAR_SCAN_SECS` (60s — independent of `BAR_THROTTLE`'s 1s redraw cadence, since a rollout scan is a real filesystem walk, not a single stat call). File-scanning only: `HttpPoller`/`maybe_poll` never appear on this path, per `wrap`'s "must never make a session worse" invariant — a network call on the redraw path could stall the whole session. See [[Usage and Pacing]] for the scan's own home-directory resolution (`crate::utils::home_dir()`, not `refresh_codex_usage`'s internal Windows-unsafe fallback) and [[Decision Log]] for why the 2026-08-15 removal no longer applies. Both the header and every sidebar row's score are still polled on the existing ~1s facts throttle, never per frame.
 
+## Cross-harness continuation (issue #186, v2.36.0)
+
+`zirv ctx agent` consults `fallback::route_new_delegation` before its existing spawn gate. An exhausted seat, or a measured-low-headroom seat for new background work, can route to another enabled/ready harness with more admissible headroom. Only verified generic model-tier equivalents cross vendors; a concrete model that cannot be classified is left on its requested harness rather than guessed. Vendor-specific passthrough argv is likewise never translated.
+
+`exec` handles the mid-task case only at the existing safe limit-detection seam: after the child has stopped on a recognized vendor limit, it distills and stores a handoff, preserves the remaining enforceable token/tool-call budget, and launches a continuation on an admissible alternate. `ZIRV_CTX_FALLBACK_VISITED` prevents stale readings from bouncing a continuation back to an already-exhausted harness. With no admissible alternate, the pre-existing `wait_for_window` park/relaunch path runs unchanged.
+
+Automatic new-work reroutes log `harness-reroute`; blocked-session moves log `harness-handover`. `zirv ctx status` shows fallback policy plus measured/assumed headroom and its existing recent-decision section explains the route. Dashboard workers are spawned under the effective harness, so the sidebar/focused-pane label and per-harness usage reflect where work actually landed.
+
 ## Cross-links
 
 - [[Ctx Subsystem]] — the hub page for `zirv ctx`; verb dispatch, config layering, and how these three verbs fit alongside `status`, `hook`, `handoff`, `resume`, and the dashboard.
