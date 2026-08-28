@@ -1175,7 +1175,7 @@ fn close_claimed_group(pane: &Pane, state: &StateDir) {
 ///
 /// 1. Writes this repo's own restore roster (`roster::write_roster`) from
 ///    every pane still alive, orchestrator included -- `RosterPane::role`
-///    records which is which (`roster::ROLE_ORCHESTRATOR`/`ROLE_WORKER`), so
+///    records which is which (`Pane::role`'s own `label()`), so
 ///    a later startup restore can filter the orchestrator back out itself
 ///    rather than this write having to guess which pane index is safe to
 ///    keep. A pane whose child has already exited is left out entirely: there
@@ -1217,12 +1217,13 @@ fn on_quit(
         .map(|pane| roster::RosterPane {
             agent: pane.agent().to_string(),
             session_id: pane.session_id().to_string(),
-            role: if pane.verb() == sessions::Verb::Chat {
-                roster::ROLE_ORCHESTRATOR
-            } else {
-                roster::ROLE_WORKER
-            }
-            .to_string(),
+            // Security review Finding 6: the role this pane was actually
+            // spawned with (`Pane::role`, issue #169), not a guess re-derived
+            // from its verb. The verb form collapsed every non-chat pane to
+            // `roster::ROLE_WORKER`, so a coordinator pane came back from a restore
+            // demoted -- refused its own onward delegation by the depth cap,
+            // and unable to close the group it still owned.
+            role: pane.role().label().to_string(),
             short: pane.short().to_string(),
             title: pane.title().to_string(),
             // F3 (review, PR #116): persisted so a restore
@@ -1232,6 +1233,9 @@ fn on_quit(
             // `report_back_reminder_sweep` could never remind it again.
             report_to: pane.report_to().map(str::to_string),
             report_reminder_sent: pane.report_reminder_sent(),
+            // Finding 6: and the group it belongs to, so the restore can put
+            // it back inside the same one.
+            work_group_id: pane.work_group_id().map(str::to_string),
         })
         .collect();
     let panes_for_roster = merge_unoffered(live, unoffered);
@@ -4001,7 +4005,7 @@ fn partition_restore_selection(
     (to_spawn, deferred)
 }
 
-/// Spawns one roster candidate back as a fresh worker pane: resolves its
+/// Spawns one roster candidate back as a fresh pane: resolves its
 /// adapter (re-checked against the live gate, same "data, never authority"
 /// discipline `fulfill_spawn_request` already holds a spawn request to --
 /// an agent an operator disabled since the last quit must not come back just
@@ -4043,7 +4047,13 @@ fn spawn_restored_pane(
     let spec = PaneSpec {
         agent_name: candidate.agent.clone(),
         argv,
-        role: prompt::PromptRole::Worker,
+        // Security review Finding 6: the role the roster recorded, not a
+        // hardcoded `Worker`. A restored coordinator used to come back
+        // demoted -- refused its own onward delegation by the depth cap, and
+        // no longer able to close the group it still owned. An unrecognised
+        // label (a roster written by a future build) falls back to `Worker`,
+        // the least-privileged reading, exactly as `spawnreq::role_of` does.
+        role: prompt::PromptRole::from_label(&candidate.role).unwrap_or(prompt::PromptRole::Worker),
         verb: sessions::Verb::Dash,
         session_id: candidate.session_id.clone(),
         title: candidate.title.clone(),
@@ -4062,6 +4072,14 @@ fn spawn_restored_pane(
         spawnreq::DASH_REQUESTS_ENV.to_string(),
         pane_channel.display().to_string(),
     ));
+    // Security review Finding 6: and the group binding travels back with it,
+    // the same pair `fulfill_spawn_request` pushes for a fresh spawn -- a
+    // restore that dropped it left the pane's own further delegations
+    // ungrouped, outside the child limit and the token ceiling its batch was
+    // launched under.
+    if let Some(group_id) = &candidate.work_group_id {
+        turn_env.push((super::agent::WORK_GROUP_ENV.to_string(), group_id.clone()));
+    }
 
     match Pane::spawn(
         spec,
@@ -4088,6 +4106,7 @@ fn spawn_restored_pane(
                 pane.mark_report_reminder_sent();
             }
             pane.set_intake_dir(pane_channel);
+            pane.set_work_group_id(candidate.work_group_id.clone());
             panes.push(pane);
             nudge_queues.push(VecDeque::new());
         }
@@ -11705,7 +11724,7 @@ mod tests {
         let candidates = vec![roster::RosterPane {
             agent: "claude".to_string(),
             session_id: "sess-1".to_string(),
-            role: roster::ROLE_WORKER.to_string(),
+            role: prompt::PromptRole::Worker.label().to_string(),
             short: "aaaa1111".to_string(),
             title: "wrk claude".to_string(),
             ..Default::default()
@@ -11787,7 +11806,7 @@ mod tests {
         assert_eq!(written.panes.len(), 1);
         assert_eq!(written.panes[0].agent, "test-agent");
         assert_eq!(written.panes[0].short, panes[0].short());
-        assert_eq!(written.panes[0].role, roster::ROLE_WORKER);
+        assert_eq!(written.panes[0].role, prompt::PromptRole::Worker.label());
 
         for pane in panes.iter_mut() {
             let _ = pane.shutdown("");
@@ -12596,7 +12615,7 @@ mod tests {
         let worker = roster::RosterPane {
             agent: "codex".to_string(),
             session_id: "22222222-2222-4333-8444-555555555555".to_string(),
-            role: roster::ROLE_WORKER.to_string(),
+            role: prompt::PromptRole::Worker.label().to_string(),
             short: "bbbb2222".to_string(),
             title: "wrk codex".to_string(),
             ..Default::default()
@@ -12628,7 +12647,7 @@ mod tests {
         let live = roster::RosterPane {
             agent: "claude".to_string(),
             session_id: "11111111-2222-4333-8444-555555555555".to_string(),
-            role: roster::ROLE_WORKER.to_string(),
+            role: prompt::PromptRole::Worker.label().to_string(),
             short: "aaaa1111".to_string(),
             title: "wrk claude".to_string(),
             ..Default::default()
@@ -12636,7 +12655,7 @@ mod tests {
         let unoffered = roster::RosterPane {
             agent: "codex".to_string(),
             session_id: "22222222-2222-4333-8444-555555555555".to_string(),
-            role: roster::ROLE_WORKER.to_string(),
+            role: prompt::PromptRole::Worker.label().to_string(),
             short: "bbbb2222".to_string(),
             title: "wrk codex".to_string(),
             ..Default::default()
@@ -12670,7 +12689,7 @@ mod tests {
         let candidate = roster::RosterPane {
             agent: "codex".to_string(),
             session_id: "22222222-2222-4333-8444-555555555555".to_string(),
-            role: roster::ROLE_WORKER.to_string(),
+            role: prompt::PromptRole::Worker.label().to_string(),
             short: "bbbb2222".to_string(),
             title: "wrk codex".to_string(),
             ..Default::default()
@@ -13862,7 +13881,7 @@ mod tests {
         roster::RosterPane {
             agent: "claude".to_string(),
             session_id: session_id.to_string(),
-            role: roster::ROLE_WORKER.to_string(),
+            role: prompt::PromptRole::Worker.label().to_string(),
             short: short.to_string(),
             title: format!("wrk {short}"),
             ..Default::default()
@@ -14131,6 +14150,105 @@ mod tests {
         );
 
         panes[0].finish_shutdown().expect("shutdown");
+    }
+
+    /// Security review Finding 6 (2026-08-28): a restore used to hardcode
+    /// `role: Worker` and push no group binding at all, so a coordinator pane
+    /// came back from a dashboard restart demoted (refused its own onward
+    /// delegation by the depth cap, and no longer able to close the group it
+    /// still owned) and outside the batch it was launched under. Round trip
+    /// here: quit snapshot -> roster -> restore.
+    #[cfg(unix)]
+    #[test]
+    fn a_coordinator_pane_survives_a_snapshot_and_restore_as_a_coordinator() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let requests_dir = state.dash().join("aaaa1111-token").join("requests");
+        std::fs::create_dir_all(&requests_dir).expect("mkdir requests");
+
+        let session_id = "77777777-2222-4333-8444-555555555555";
+        let mut pane = Pane::spawn(
+            PaneSpec {
+                // A real adapter NAME (the restore path resolves it again),
+                // never a real agent binary -- `cfg.agent_bin` below is what
+                // the restored pane actually launches.
+                agent_name: "claude".to_string(),
+                argv: trivial_argv(),
+                role: prompt::PromptRole::SubOrchestrator,
+                verb: sessions::Verb::Dash,
+                session_id: session_id.to_string(),
+                title: "sub codex".to_string(),
+            },
+            &state,
+            &repo,
+            &repo,
+            (80, 24),
+            &[],
+            true,
+            pane::DEFAULT_IDLE_QUIET,
+        )
+        .expect("spawn");
+        pane.set_work_group_id(Some("wg-1".to_string()));
+        let panes = vec![pane];
+
+        on_quit(&panes, &[], &[], &requests_dir, &state, &repo);
+        let slug = super::super::state::repo_slug(&repo);
+        let written = roster::take_roster(&state, &slug, super::super::state::now_secs(), 999_999)
+            .expect("a roster is written");
+        assert_eq!(written.panes.len(), 1);
+        assert_eq!(
+            written.panes[0].role,
+            prompt::PromptRole::SubOrchestrator.label(),
+            "the quit snapshot records the role the pane was spawned with"
+        );
+        assert_eq!(
+            written.panes[0].work_group_id.as_deref(),
+            Some("wg-1"),
+            "and the group it belongs to"
+        );
+        assert!(
+            !restorable_candidates(written.clone()).is_empty(),
+            "a coordinator is still offered for restore -- only the orchestrator seat is filtered"
+        );
+
+        let cfg = CtxConfig {
+            agent_bin: Some("sleep 3".to_string()),
+            ..Default::default()
+        };
+        let mut restored = Vec::new();
+        let mut nudge_queues = Vec::new();
+        let mut errors = Vec::new();
+        let mut deferred_restore = Vec::new();
+        spawn_restored_pane(
+            &written.panes[0],
+            &mut restored,
+            &mut nudge_queues,
+            &cfg,
+            &state,
+            &repo,
+            (80, 24),
+            &requests_dir,
+            &mut errors,
+            &mut deferred_restore,
+        );
+
+        assert_eq!(restored.len(), 1, "the candidate restored: {errors:?}");
+        assert_eq!(
+            restored[0].role(),
+            prompt::PromptRole::SubOrchestrator,
+            "a restored coordinator is still a coordinator"
+        );
+        assert_eq!(
+            restored[0].work_group_id(),
+            Some("wg-1"),
+            "and is still bound to its own group"
+        );
+
+        for pane in &mut restored {
+            let _ = pane.finish_shutdown();
+        }
     }
 
     // R8: the loop has to be able to give up on a dead input stream.

@@ -17,8 +17,11 @@ use super::super::CtxResult;
 use super::super::adapters::AgentAdapter;
 use super::super::state::StateDir;
 
-/// The role label `dash::mod::on_quit` stamps on the orchestrator pane
-/// (`Verb::Chat`). A roster entry carrying this role is never offered for
+/// The role label `dash::mod::on_quit` stamps on the orchestrator pane --
+/// `prompt::PromptRole::Orchestrator`'s own `label()`, which is the
+/// vocabulary every `RosterPane::role` is written in (issue #169), so a
+/// coordinator pane records `"sub-orchestrator"` and is restored as one
+/// (`dash::mod::spawn_restored_pane`). A roster entry carrying this role is never offered for
 /// restore -- see this module's own `restore` doc section and `dash::mod`'s
 /// startup filter: the `first` `PaneSpec` a fresh dashboard launch already
 /// builds *is* the orchestrator, so spawning a second one from the roster
@@ -26,8 +29,6 @@ use super::super::state::StateDir;
 /// roster file is read by a struct with no other typed vocabulary to lean
 /// on, matching `sessions::Record`'s own plain-string `agent` field.
 pub const ROLE_ORCHESTRATOR: &str = "orchestrator";
-/// The role label for every other pane (`Verb::Dash`).
-pub const ROLE_WORKER: &str = "worker";
 
 /// One pane's own snapshot at quit time: enough to relaunch it (`agent`,
 /// `session_id` -- fed to `resume_args`) and enough to label it in the
@@ -59,6 +60,16 @@ pub struct RosterPane {
     /// again. `#[serde(default)]`, same reasoning as `report_to`.
     #[serde(default)]
     pub report_reminder_sent: bool,
+    /// Security review Finding 6 (2026-08-28): the `group::WorkGroup` this
+    /// pane was spawned into, so a restore puts it back inside the same
+    /// group -- `dash::mod::spawn_restored_pane` re-exports it as
+    /// `agent::WORK_GROUP_ENV`, which is what keeps the restored pane's own
+    /// further delegations bound by lineage, and what lets a restored
+    /// coordinator still close the group it claimed. Before this, a restore
+    /// silently dropped the binding along with the role. `#[serde(default)]`,
+    /// same reasoning as `report_to`.
+    #[serde(default)]
+    pub work_group_id: Option<String>,
 }
 
 /// A full dashboard's worth of panes, stamped with the time it was written
@@ -192,6 +203,7 @@ mod tests {
     use super::*;
     use crate::commands::ctx::adapters::claude::ClaudeAdapter;
     use crate::commands::ctx::adapters::codex::CodexAdapter;
+    use crate::commands::ctx::prompt::PromptRole;
 
     fn sample_roster() -> Roster {
         Roster {
@@ -200,20 +212,22 @@ mod tests {
                 RosterPane {
                     agent: "claude".to_string(),
                     session_id: "11111111-2222-4333-8444-555555555555".to_string(),
-                    role: ROLE_ORCHESTRATOR.to_string(),
+                    role: PromptRole::Orchestrator.label().to_string(),
                     short: "aaaa1111".to_string(),
                     title: "orch".to_string(),
                     report_to: None,
                     report_reminder_sent: false,
+                    work_group_id: None,
                 },
                 RosterPane {
                     agent: "codex".to_string(),
                     session_id: "22222222-2222-4333-8444-555555555555".to_string(),
-                    role: ROLE_WORKER.to_string(),
+                    role: PromptRole::Worker.label().to_string(),
                     short: "bbbb2222".to_string(),
                     title: "wrk codex".to_string(),
                     report_to: Some("aaaa1111".to_string()),
                     report_reminder_sent: true,
+                    work_group_id: Some("wg-1".to_string()),
                 },
             ],
         }
@@ -392,7 +406,7 @@ mod tests {
         let pane = RosterPane {
             agent: "claude".to_string(),
             session_id: "11111111-2222-4333-8444-555555555555".to_string(),
-            role: ROLE_WORKER.to_string(),
+            role: PromptRole::Worker.label().to_string(),
             short: "aaaa1111".to_string(),
             title: "wrk claude".to_string(),
             ..Default::default()
@@ -419,7 +433,7 @@ mod tests {
         let pane = RosterPane {
             agent: "claude".to_string(),
             session_id: "11111111-2222-4333-8444-555555555555".to_string(),
-            role: ROLE_WORKER.to_string(),
+            role: PromptRole::Worker.label().to_string(),
             short: "aaaa1111".to_string(),
             title: "wrk claude".to_string(),
             ..Default::default()
@@ -445,7 +459,7 @@ mod tests {
         let pane = RosterPane {
             agent: "codex".to_string(),
             session_id: "22222222-2222-4333-8444-555555555555".to_string(),
-            role: ROLE_WORKER.to_string(),
+            role: PromptRole::Worker.label().to_string(),
             short: "bbbb2222".to_string(),
             title: "wrk codex".to_string(),
             ..Default::default()
