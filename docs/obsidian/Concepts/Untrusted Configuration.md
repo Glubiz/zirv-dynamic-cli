@@ -1,10 +1,11 @@
 ---
-last-verified: 2026-08-28
+last-verified: 2026-08-29
 ---
 
 # Untrusted Configuration
 
 > [!tip] Quick Reference
+> - Repository agents under `.zirv/agents/` are another untrusted methodology surface. They are disabled by default through operator-only `workflow.repo_agents_enabled`; when enabled, repository manifests may only add new ids and can never replace built-in/operator seats. Required capabilities are re-evaluated against effective policy at dispatch, and `read_only: true` is an adapter-enforced floor rather than prose.
 > - Repository skills under `.zirv/skills/` are untrusted methodology. They may request logical capabilities but cannot grant permissions or widen an operator policy, and they may only **add** skill ids — a repo id colliding with a built-in or operator-global one is ignored with a warning naming the collision (2026-08-21). Symlinked manifests/parents, path escapes, oversized manifests/resolved stacks, unknown schema, and dependency cycles fail safely. `zirv skill list/show --built-in-only` disables custom layers for inspection, `zirv workflow start --built-in-only` persists the same choice for execution and resume, and the operator-only `workflow.repo_skills_enabled` turns the repository layer off entirely.
 > - A sixth surface, and the sharpest: repository-authored **shell commands**. `.zirv/verify.toml` and `package.json` scripts reach `sh -c` through `zirv test`/`zirv verify`, gated by the operator-only `workflow.repo_checks_enabled`, with hard timeout/count caps and a per-check source label in every report — see [[Workflows]].
 > - A repo checkout is not a trusted operator: `.zirv/ctx.toml`'s repo layer, `.zirv/.settings.toml`'s repo layer, and `<repo>/.zirv/system-prompt.md`'s repo layer are all untrusted input, and `zirv ctx optimize` reads (never writes) the repo's own CLAUDE.md text.
