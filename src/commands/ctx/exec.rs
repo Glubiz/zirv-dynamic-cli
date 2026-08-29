@@ -1451,27 +1451,59 @@ fn run_with_clock_inner<W: Write>(
                 .map(|raw| super::config::split_csv_list(&raw))
                 .unwrap_or_default();
             let source_model = adapters::last_model_flag(&args.command);
+            let route_request = super::fallback::RouteRequest {
+                requested: adapter.name(),
+                source_model,
+                source_model_explicit: source_model.is_some(),
+                bounds: super::fallback::TaskBounds {
+                    tokens: worker_budget.tokens,
+                    tool_calls: worker_budget.tool_calls,
+                },
+                now: now_fn(),
+            };
             let route = (adapter_builds_launch && prompt.is_some())
                 .then(|| {
                     super::fallback::route_blocked_session(
                         &state,
                         &cfg,
-                        super::fallback::RouteRequest {
-                            requested: adapter.name(),
-                            source_model,
-                            source_model_explicit: source_model.is_some(),
-                            bounds: super::fallback::TaskBounds {
-                                tokens: worker_budget.tokens,
-                                tool_calls: worker_budget.tool_calls,
-                            },
-                            now: now_fn(),
-                        },
+                        route_request,
                         &visited,
                     )
                 })
                 .flatten();
+            let deferred_reset = (route.is_none() && adapter_builds_launch && prompt.is_some())
+                .then(|| {
+                    super::fallback::earliest_reset_choice(
+                        &state,
+                        &cfg,
+                        route_request,
+                        &visited,
+                    )
+                })
+                .flatten();
+            let alternate = route
+                .as_ref()
+                .map(|route| {
+                    (
+                        route.selected.clone(),
+                        route.model.clone(),
+                        route.detail(),
+                    )
+                })
+                .or_else(|| {
+                    deferred_reset.as_ref().and_then(|choice| {
+                        if !choice.is_cross_harness() {
+                            return None;
+                        }
+                        Some((
+                            choice.selected.clone(),
+                            choice.model.clone()?,
+                            choice.detail(),
+                        ))
+                    })
+                });
 
-            if let Some(route) = route {
+            if let Some((selected_agent, selected_model, selection_detail)) = alternate {
                 let jsonl = std::fs::read_to_string(&transcript).unwrap_or_default();
                 let ctx = adapter.structural_context(&jsonl, cfg.handoff.tail_items);
                 let (note, source) = handoff::distill_or_structural(
@@ -1541,7 +1573,7 @@ fn run_with_clock_inner<W: Write>(
 
                 let detail = format!(
                     "{}; {} handoff at {}",
-                    route.detail(),
+                    selection_detail,
                     source,
                     stored.display()
                 );
@@ -1567,9 +1599,9 @@ fn run_with_clock_inner<W: Write>(
                     "{prompt_text}\n\nThe previous harness exhausted its usage window. Continue from this handoff without redoing completed work:\n\n{}",
                     note.to_markdown()
                 );
-                let target = adapters::select(Some(&route.selected), &[], &cfg)?;
+                let target = adapters::select(Some(&selected_agent), &[], &cfg)?;
                 let nested_args = ExecArgs {
-                    agent: Some(route.selected.clone()),
+                    agent: Some(selected_agent.clone()),
                     session_id: None,
                     transcript: None,
                     prompt: Some(continuation),
@@ -1577,7 +1609,7 @@ fn run_with_clock_inner<W: Write>(
                     timeout_secs: args.timeout_secs,
                     budget_tokens: remaining_tokens,
                     max_tool_calls: remaining_tool_calls,
-                    command: target.model_args(&route.model),
+                    command: target.model_args(&selected_model),
                     simple: args.simple,
                 };
 
@@ -1610,6 +1642,13 @@ fn run_with_clock_inner<W: Write>(
                 );
             }
 
+            let wait_detail = deferred_reset
+                .as_ref()
+                .map(super::fallback::ResetChoice::detail)
+                .unwrap_or_else(|| {
+                    "agent reported a usage limit; parking until the current window resets"
+                        .to_string()
+                });
             let _ = log::append(
                 &state,
                 &log::Decision {
@@ -1619,13 +1658,10 @@ fn run_with_clock_inner<W: Write>(
                     verdict: "limit",
                     score: 100,
                     action: "limit-park",
-                    detail: "agent reported a usage limit; parking until the window resets",
+                    detail: &wait_detail,
                 },
             );
-            writeln!(
-                w,
-                "zirv ctx exec: the agent reported a usage limit, parking until the window resets"
-            )?;
+            writeln!(w, "zirv ctx exec: {wait_detail}")?;
 
             pace::wait_for_window(
                 w,
