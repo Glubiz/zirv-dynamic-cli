@@ -1464,15 +1464,15 @@ pub fn approve(state_dir: &StateDir, mut state: WorkflowState) -> CtxResult<Work
         // Accepted predecessor artifacts must still be the exact bytes that
         // were reviewed. The current stage itself is intentionally excluded
         // until pin_current_artifact replaces its acceptance record.
-        if let Some(drifted) = artifact_drift(&state)? {
-            if drifted != stage {
-                reopen_artifact_gate(&mut state, drifted)?;
-                save(state_dir, &state, true)?;
-                return Err(format!(
-                    "accepted {drifted} artifact changed after approval; re-approve it before {stage}"
-                )
-                .into());
-            }
+        if let Some(drifted) = artifact_drift(&state)?
+            && drifted != stage
+        {
+            reopen_artifact_gate(&mut state, drifted)?;
+            save(state_dir, &state, true)?;
+            return Err(format!(
+                "accepted {drifted} artifact changed after approval; re-approve it before {stage}"
+            )
+            .into());
         }
         let completed = state.current().expect("artifact step exists").clone();
         let accepted = pin_current_artifact(&mut state)?;
