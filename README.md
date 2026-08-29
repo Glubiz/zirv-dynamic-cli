@@ -1077,6 +1077,7 @@ checkout:
 | `score.model_context_tokens` | `ZIRV_CTX_SCORE_MODEL_CONTEXT_TOKENS` |
 | `workflow.repo_checks_enabled` | `ZIRV_CTX_WORKFLOW_REPO_CHECKS` |
 | `workflow.repo_skills_enabled` | `ZIRV_CTX_WORKFLOW_REPO_SKILLS` |
+| `workflow.repo_agents_enabled` | `ZIRV_CTX_WORKFLOW_REPO_AGENTS` |
 | `workflow.telemetry_enabled` | `ZIRV_CTX_WORKFLOW_TELEMETRY` |
 | `workflow.telemetry_max_events` | `ZIRV_CTX_WORKFLOW_TELEMETRY_MAX_EVENTS` |
 | `workflow.telemetry_retention_days` | `ZIRV_CTX_WORKFLOW_TELEMETRY_RETENTION_DAYS` |
