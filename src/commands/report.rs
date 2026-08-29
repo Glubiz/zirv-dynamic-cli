@@ -23,7 +23,6 @@ use serde::{Deserialize, Serialize};
 pub(crate) type ReportResult<T> = Result<T, Box<dyn std::error::Error>>;
 pub(crate) type EnvLookup<'a> = &'a dyn Fn(&str) -> Option<String>;
 
-const GITHUB_API_URL: &str = "https://api.github.com/repos/Glubiz/zirv-dynamic-cli/issues";
 const GITHUB_REPOSITORY: &str = "Glubiz/zirv-dynamic-cli";
 const HTTP_TIMEOUT_SECS: u64 = 15;
 const HTTP_CONNECT_TIMEOUT_SECS: u64 = 5;
@@ -98,10 +97,45 @@ fn http_agent() -> &'static ureq::Agent {
     })
 }
 
-pub(crate) fn create_issue(token: &str, request: &IssueRequest) -> ReportResult<String> {
+fn validate_repository(repository: &str) -> ReportResult<String> {
+    let repository = repository.trim();
+    let mut parts = repository.split('/');
+    let owner = parts.next().unwrap_or_default();
+    let repo = parts.next().unwrap_or_default();
+    if owner.is_empty()
+        || repo.is_empty()
+        || parts.next().is_some()
+        || !owner
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        || !repo
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    {
+        return Err(format!(
+            "invalid GitHub repository '{repository}'; expected owner/repository"
+        )
+        .into());
+    }
+    Ok(format!("{owner}/{repo}"))
+}
+
+fn issues_url(repository: &str) -> ReportResult<String> {
+    Ok(format!(
+        "https://api.github.com/repos/{}/issues",
+        validate_repository(repository)?
+    ))
+}
+
+pub(crate) fn create_issue_in(
+    repository: &str,
+    token: &str,
+    request: &IssueRequest,
+) -> ReportResult<String> {
     let payload = serde_json::to_string(request)?;
+    let url = issues_url(repository)?;
     let mut response = http_agent()
-        .post(GITHUB_API_URL)
+        .post(&url)
         .header("Accept", "application/vnd.github+json")
         .header("Content-Type", "application/json")
         .header("Authorization", &format!("Bearer {token}"))
@@ -121,6 +155,10 @@ pub(crate) fn create_issue(token: &str, request: &IssueRequest) -> ReportResult<
     Ok(created.html_url)
 }
 
+pub(crate) fn create_issue(token: &str, request: &IssueRequest) -> ReportResult<String> {
+    create_issue_in(GITHUB_REPOSITORY, token, request)
+}
+
 /// Issue #178's dedup lookup: the open issue number (if any) among those
 /// carrying `label` whose title is EXACTLY `title` -- an exact match, not a
 /// substring/search-index match, so a family name that happens to be a
@@ -128,13 +166,15 @@ pub(crate) fn create_issue(token: &str, request: &IssueRequest) -> ReportResult<
 /// ever became two distinct proposal titles) can never cross-match. Reads
 /// only OPEN issues: a closed/rejected proposal must not silently absorb new
 /// evidence as though it were still live.
-pub(crate) fn find_open_issue_by_title(
+pub(crate) fn find_open_issue_by_title_in(
+    repository: &str,
     token: &str,
     label: &str,
     title: &str,
 ) -> ReportResult<Option<u64>> {
+    let url = issues_url(repository)?;
     let mut response = http_agent()
-        .get(GITHUB_API_URL)
+        .get(&url)
         .query("labels", label)
         .query("state", "open")
         .query("per_page", "100")
@@ -156,13 +196,26 @@ pub(crate) fn find_open_issue_by_title(
         .map(|item| item.number))
 }
 
+pub(crate) fn find_open_issue_by_title(
+    token: &str,
+    label: &str,
+    title: &str,
+) -> ReportResult<Option<u64>> {
+    find_open_issue_by_title_in(GITHUB_REPOSITORY, token, label, title)
+}
+
 /// Issue #178's dedup write: appends `body` as a new comment on an existing
 /// proposal issue rather than filing a duplicate. The response body is
 /// intentionally unread beyond draining it -- callers need only know the
 /// call succeeded (`create_issue` needs the created URL back; a comment has
 /// nothing equivalent worth surfacing).
-pub(crate) fn add_issue_comment(token: &str, issue_number: u64, body: &str) -> ReportResult<()> {
-    let url = format!("{GITHUB_API_URL}/{issue_number}/comments");
+pub(crate) fn add_issue_comment_in(
+    repository: &str,
+    token: &str,
+    issue_number: u64,
+    body: &str,
+) -> ReportResult<()> {
+    let url = format!("{}/{issue_number}/comments", issues_url(repository)?);
     let payload = serde_json::to_string(&IssueCommentRequest { body })?;
     let mut response = http_agent()
         .post(&url)
@@ -175,6 +228,10 @@ pub(crate) fn add_issue_comment(token: &str, issue_number: u64, body: &str) -> R
         .map_err(|error| format!("GitHub rejected the issue comment: {error}"))?;
     let _ = response.body_mut().read_to_string();
     Ok(())
+}
+
+pub(crate) fn add_issue_comment(token: &str, issue_number: u64, body: &str) -> ReportResult<()> {
+    add_issue_comment_in(GITHUB_REPOSITORY, token, issue_number, body)
 }
 
 /// Reads the token GitHub CLI has selected for github.com. The command and
@@ -519,8 +576,13 @@ mod tests {
     fn fixed_destination_is_the_zirv_repository() {
         assert_eq!(GITHUB_REPOSITORY, "Glubiz/zirv-dynamic-cli");
         assert_eq!(
-            GITHUB_API_URL,
+            issues_url(GITHUB_REPOSITORY).unwrap(),
             "https://api.github.com/repos/Glubiz/zirv-dynamic-cli/issues"
+        );
+        assert!(validate_repository("../owner/repo").is_err());
+        assert_eq!(
+            validate_repository("owner/repo").unwrap(),
+            "owner/repo"
         );
     }
 }
