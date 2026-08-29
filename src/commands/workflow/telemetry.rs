@@ -837,12 +837,7 @@ mod tests {
         let mut maintenance_breach = TelemetryEvent::new(TelemetryKind::MaintenanceScan);
         maintenance_breach.succeeded = Some(false);
 
-        let report = aggregate(&[
-            accepted,
-            dispatched,
-            deploy_failed,
-            maintenance_breach,
-        ]);
+        let report = aggregate(&[accepted, dispatched, deploy_failed, maintenance_breach]);
         assert_eq!(report.artifact_acceptances, 1);
         assert_eq!(report.agent_dispatches, 1);
         assert_eq!(report.deploy_gate_evaluations, 1);
