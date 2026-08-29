@@ -385,12 +385,13 @@ fn process_breach(
 }
 
 fn scan(args: &ScanArgs, writer: &mut impl Write) -> CtxResult<i32> {
-    let repo = args
-        .repo
-        .clone()
-        .unwrap_or(std::env::current_dir()?)
+    let raw_repo = match &args.repo {
+        Some(repo) => repo.clone(),
+        None => std::env::current_dir()?,
+    };
+    let repo = raw_repo
         .canonicalize()
-        .unwrap_or_else(|_| args.repo.clone().unwrap_or_else(|| PathBuf::from(".")));
+        .unwrap_or(raw_repo);
     let cfg = CtxConfig::load(&repo, &|key| std::env::var(key).ok())?;
     let state_dir = StateDir::resolve(&|key| std::env::var(key).ok())?;
     let mut results = Vec::new();
