@@ -614,12 +614,14 @@ fn initial_artifact_records(
         let Some(stage) = step.artifact else {
             continue;
         };
-        records.entry(stage.key().to_string()).or_insert_with(|| WorkflowArtifactRecord {
-            stage,
-            rel_path: format!(".zirv/work/{workflow_id}/{}", stage.file_name()),
-            accepted_hash: None,
-            accepted_at: None,
-        });
+        records
+            .entry(stage.key().to_string())
+            .or_insert_with(|| WorkflowArtifactRecord {
+                stage,
+                rel_path: format!(".zirv/work/{workflow_id}/{}", stage.file_name()),
+                accepted_hash: None,
+                accepted_at: None,
+            });
     }
     records
 }
@@ -629,14 +631,15 @@ fn sync_artifact_records(state: &mut WorkflowState) {
         let Some(stage) = step.artifact else {
             continue;
         };
-        state.artifacts.entry(stage.key().to_string()).or_insert_with(|| {
-            WorkflowArtifactRecord {
+        state
+            .artifacts
+            .entry(stage.key().to_string())
+            .or_insert_with(|| WorkflowArtifactRecord {
                 stage,
                 rel_path: format!(".zirv/work/{}/{}", state.id, stage.file_name()),
                 accepted_hash: None,
                 accepted_at: None,
-            }
-        });
+            });
     }
 }
 
@@ -664,7 +667,9 @@ fn ensure_current_artifact_template(state: &WorkflowState) -> CtxResult<()> {
     if path.exists() {
         return Ok(());
     }
-    let parent = path.parent().ok_or("workflow artifact has no parent directory")?;
+    let parent = path
+        .parent()
+        .ok_or("workflow artifact has no parent directory")?;
     std::fs::create_dir_all(parent)?;
     std::fs::write(path, stage.template())?;
     Ok(())
@@ -693,8 +698,7 @@ fn rfc3339_now() -> String {
     let z = days + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 }.div_euclid(146_097);
     let doe = z - era * 146_097;
-    let yoe = (doe - doe.div_euclid(1_460) + doe.div_euclid(36_524)
-        - doe.div_euclid(146_096))
+    let yoe = (doe - doe.div_euclid(1_460) + doe.div_euclid(36_524) - doe.div_euclid(146_096))
         .div_euclid(365);
     let mut year = yoe + era * 400;
     let doy = doe - (365 * yoe + yoe.div_euclid(4) - yoe.div_euclid(100));
@@ -734,7 +738,11 @@ fn pin_current_artifact(state: &mut WorkflowState) -> CtxResult<ArtifactStage> {
 }
 
 fn artifact_drift(state: &WorkflowState) -> CtxResult<Option<ArtifactStage>> {
-    for stage in [ArtifactStage::Intent, ArtifactStage::Spec, ArtifactStage::Plan] {
+    for stage in [
+        ArtifactStage::Intent,
+        ArtifactStage::Spec,
+        ArtifactStage::Plan,
+    ] {
         let Some(record) = state.artifacts.get(stage.key()) else {
             continue;
         };
@@ -754,7 +762,9 @@ fn reopen_artifact_gate(state: &mut WorkflowState, stage: ArtifactStage) -> CtxR
         .steps
         .iter()
         .position(|step| step.artifact == Some(stage))
-        .ok_or_else(|| format!("accepted {stage} artifact no longer has an owning workflow step"))?;
+        .ok_or_else(|| {
+            format!("accepted {stage} artifact no longer has an owning workflow step")
+        })?;
     let invalid: Vec<String> = state.steps[index..]
         .iter()
         .map(|step| step.id.clone())
@@ -774,7 +784,11 @@ fn reopen_artifact_gate(state: &mut WorkflowState, stage: ArtifactStage) -> CtxR
 
 fn append_accepted_artifacts(state: &WorkflowState, rendered: &mut String) -> CtxResult<()> {
     let mut remaining = MAX_WORK_ARTIFACT_CONTEXT_BYTES;
-    for stage in [ArtifactStage::Intent, ArtifactStage::Spec, ArtifactStage::Plan] {
+    for stage in [
+        ArtifactStage::Intent,
+        ArtifactStage::Spec,
+        ArtifactStage::Plan,
+    ] {
         let Some(record) = state.artifacts.get(stage.key()) else {
             continue;
         };
@@ -1762,7 +1776,11 @@ struct WorkflowArtifactStatus {
 
 fn workflow_artifact_statuses(state: &WorkflowState) -> CtxResult<Vec<WorkflowArtifactStatus>> {
     let mut statuses = Vec::new();
-    for stage in [ArtifactStage::Intent, ArtifactStage::Spec, ArtifactStage::Plan] {
+    for stage in [
+        ArtifactStage::Intent,
+        ArtifactStage::Spec,
+        ArtifactStage::Plan,
+    ] {
         let Some(record) = state.artifacts.get(stage.key()) else {
             continue;
         };
@@ -2185,7 +2203,15 @@ mod tests {
                 .iter()
                 .map(|step| step.id.as_str())
                 .collect::<Vec<_>>(),
-            ["intent", "spec", "plan", "implement", "test", "review", "verify"]
+            [
+                "intent",
+                "spec",
+                "plan",
+                "implement",
+                "test",
+                "review",
+                "verify"
+            ]
         );
         assert!(steps[1].approval);
         assert_eq!(steps[1].artifact, Some(ArtifactStage::Spec));
@@ -2209,7 +2235,10 @@ mod tests {
 
         assert_eq!(state.profile, WorkflowProfile::Frontend);
         assert_eq!(state.current().unwrap().skill, "brainstorm");
-        assert_eq!(state.current().unwrap().artifact, Some(ArtifactStage::Intent));
+        assert_eq!(
+            state.current().unwrap().artifact,
+            Some(ArtifactStage::Intent)
+        );
         assert!(
             state
                 .steps
@@ -2244,7 +2273,10 @@ mod tests {
             .find(|step| step.phase == WorkflowPhase::Design)
             .expect("substantial frontend has spec/design");
         assert_eq!(design.skill, "frontend-design");
-        assert!(design.approval, "spec acceptance remains a hard artifact gate");
+        assert!(
+            design.approval,
+            "spec acceptance remains a hard artifact gate"
+        );
         assert!(
             state
                 .steps
