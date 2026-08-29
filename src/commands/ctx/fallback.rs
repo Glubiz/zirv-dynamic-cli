@@ -62,6 +62,30 @@ impl Route {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResetChoice {
+    pub requested: String,
+    pub selected: String,
+    /// None only when waiting on the originally requested harness, where no
+    /// cross-vendor model translation is needed.
+    pub model: Option<String>,
+    pub reset_at: u64,
+    pub window: &'static str,
+}
+
+impl ResetChoice {
+    pub fn is_cross_harness(&self) -> bool {
+        self.selected != self.requested
+    }
+
+    pub fn detail(&self) -> String {
+        format!(
+            "{} -> {} (all admissible seats exhausted; earliest {} reset at {})",
+            self.requested, self.selected, self.window, self.reset_at
+        )
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TaskBounds {
     pub tokens: Option<u64>,
@@ -264,6 +288,81 @@ pub fn route_new_delegation(
     })
 }
 
+/// When no admissible harness can run now, chooses the seat whose hard spawn
+/// gate clears first. The requested harness remains a candidate even when its
+/// model is unknown, because waiting on the same vendor requires no quality
+/// translation. Alternate harnesses use the same roster, readiness, capacity,
+/// tool-enforcement, and verified-tier checks as immediate fallback.
+pub fn earliest_reset_choice(
+    state: &StateDir,
+    cfg: &CtxConfig,
+    request: RouteRequest<'_>,
+    excluded: &[String],
+) -> Option<ResetChoice> {
+    if !cfg.fallback.enabled {
+        return None;
+    }
+
+    let requested_provider = adapters::provider_for_agent_name(Some(request.requested));
+    let (collector, estimator) =
+        pace::current_windows(state, &cfg.pace, request.now, requested_provider);
+    let requested_reset = pace::spawn_reset(&collector, estimator.as_ref(), request.now, &cfg.pace)?;
+
+    let mut best = ResetChoice {
+        requested: request.requested.to_string(),
+        selected: request.requested.to_string(),
+        model: request.source_model.map(str::to_string),
+        reset_at: requested_reset.reset_at,
+        window: requested_reset.window,
+    };
+    let mut best_order = usize::MAX;
+
+    for (order_index, name) in cfg.fallback.order.iter().enumerate() {
+        if name == request.requested
+            || excluded.iter().any(|seen| seen == name)
+            || !cfg.agents.is_enabled(name)
+            || !candidate_allowed_by_capacity(cfg, name, request.bounds)
+        {
+            continue;
+        }
+        let Ok(candidate_adapter) = adapters::select(Some(name), &[], cfg) else {
+            continue;
+        };
+        if request.bounds.tool_calls.is_some() && !candidate_adapter.counts_tool_calls() {
+            continue;
+        }
+        let Some(model) = handover::equivalent_model(
+            request.requested,
+            request.source_model,
+            request.source_model_explicit,
+            name,
+            cfg,
+        ) else {
+            continue;
+        };
+        let provider = candidate_adapter.provider();
+        let (collector, estimator) = pace::current_windows(state, &cfg.pace, request.now, provider);
+        let Some(reset) = pace::spawn_reset(&collector, estimator.as_ref(), request.now, &cfg.pace)
+        else {
+            continue;
+        };
+        if reset.reset_at < best.reset_at
+            || (reset.reset_at == best.reset_at && order_index < best_order)
+        {
+            best = ResetChoice {
+                requested: request.requested.to_string(),
+                selected: name.clone(),
+                model: Some(model),
+                reset_at: reset.reset_at,
+                window: reset.window,
+            };
+            best_order = order_index;
+        }
+    }
+
+    Some(best)
+}
+
 /// Selection after a vendor-confirmed block. Unlike predictive routing this
 /// does not need the source usage collector to agree: the child's own limit
 /// message is stronger evidence than a stale/missing passive reading.
@@ -346,6 +445,21 @@ mod tests {
         };
         assert_eq!(bounds.required_headroom_pct(&cfg, "five_hour"), Some(25.0));
         assert_eq!(bounds.required_headroom_pct(&cfg, "seven_day"), Some(2.5));
+    }
+
+    #[test]
+    fn reset_choice_detail_names_the_earliest_seat_and_reset() {
+        let choice = ResetChoice {
+            requested: "claude".into(),
+            selected: "codex".into(),
+            model: Some("gpt-5.6-terra".into()),
+            reset_at: 1_700_000_600,
+            window: "five_hour",
+        };
+        assert!(choice.is_cross_harness());
+        let detail = choice.detail();
+        assert!(detail.contains("claude -> codex"));
+        assert!(detail.contains("1700000600"));
     }
 
     #[test]
