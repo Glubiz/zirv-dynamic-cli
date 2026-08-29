@@ -16,9 +16,7 @@ use sha2::{Digest, Sha256};
 use super::classify::{ClassificationInput, Complexity, Intent, RiskBand};
 use super::engine::{self, WorkflowKind, WorkflowState, WorkflowStatus};
 use crate::commands::ctx::CtxResult;
-use crate::commands::ctx::config::{
-    CtxConfig, MaintainDetectorConfig, MaintainDetectorMode,
-};
+use crate::commands::ctx::config::{CtxConfig, MaintainDetectorConfig, MaintainDetectorMode};
 use crate::commands::ctx::state::{
     StateDir, create_private_dir_all, now_secs, repo_slug, write_private, write_shared,
 };
@@ -98,7 +96,9 @@ fn validate_detector(id: &str, detector: &MaintainDetectorConfig) -> CtxResult<(
         .into());
     }
     if detector.mode == MaintainDetectorMode::LineCount && detector.threshold == 0 {
-        return Err(format!("maintain detector '{id}' line-count threshold must be at least 1").into());
+        return Err(
+            format!("maintain detector '{id}' line-count threshold must be at least 1").into(),
+        );
     }
     Ok(())
 }
@@ -161,12 +161,18 @@ fn run_detector(
         .stderr(Stdio::piped());
     let mut child = command.spawn()?;
     let mut job = crate::commands::ctx::supervise::JobGuard::adopt(child.id());
-    let stdout = child.stdout.take().ok_or("maintain detector stdout was not captured")?;
-    let stderr = child.stderr.take().ok_or("maintain detector stderr was not captured")?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or("maintain detector stdout was not captured")?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or("maintain detector stderr was not captured")?;
     let stdout_thread = std::thread::spawn(move || count_stream(stdout));
     let stderr_thread = std::thread::spawn(move || count_stream(stderr));
-    let deadline = Instant::now()
-        + Duration::from_secs(timeout_secs.clamp(1, MAX_DETECTOR_TIMEOUT_SECS));
+    let deadline =
+        Instant::now() + Duration::from_secs(timeout_secs.clamp(1, MAX_DETECTOR_TIMEOUT_SECS));
     let (exit_code, timed_out) = loop {
         if let Some(status) = child.try_wait()? {
             super::terminate_process_tree(&mut child)?;
@@ -184,8 +190,7 @@ fn run_detector(
     let (_stderr_lines, stderr_bytes) = stderr_thread.join().unwrap_or((0, 0));
     let breach = timed_out
         || exit_code.is_none_or(|code| code != 0)
-        || (detector.mode == MaintainDetectorMode::LineCount
-            && stdout_lines >= detector.threshold);
+        || (detector.mode == MaintainDetectorMode::LineCount && stdout_lines >= detector.threshold);
     Ok(DetectorResult {
         id: id.to_string(),
         mode: detector.mode,
@@ -252,7 +257,10 @@ fn clear_marker(state_dir: &StateDir, repo: &Path, key: &str) -> CtxResult<()> {
 }
 
 fn incident_title(repo: &Path, detector_id: &str) -> String {
-    format!("[zirv-maintain:{}] detector breach", incident_key(repo, detector_id))
+    format!(
+        "[zirv-maintain:{}] detector breach",
+        incident_key(repo, detector_id)
+    )
 }
 
 fn incident_intent(detector: &DetectorResult) -> String {
@@ -318,12 +326,9 @@ fn file_incident(
         &|key| std::env::var(key).ok(),
         &crate::commands::report::gh_auth_token,
     )?;
-    if let Some(number) = crate::commands::report::find_open_issue_by_title_in(
-        repository,
-        &token,
-        "",
-        &title,
-    )? {
+    if let Some(number) =
+        crate::commands::report::find_open_issue_by_title_in(repository, &token, "", &title)?
+    {
         return Ok(format!("https://github.com/{repository}/issues/{number}"));
     }
     crate::commands::report::create_issue_in(
@@ -394,9 +399,7 @@ fn scan(args: &ScanArgs, writer: &mut impl Write) -> CtxResult<i32> {
         Some(repo) => repo.clone(),
         None => std::env::current_dir()?,
     };
-    let repo = raw_repo
-        .canonicalize()
-        .unwrap_or(raw_repo);
+    let repo = raw_repo.canonicalize().unwrap_or(raw_repo);
     let cfg = CtxConfig::load(&repo, &|key| std::env::var(key).ok())?;
     let state_dir = StateDir::resolve(&|key| std::env::var(key).ok())?;
     let mut results = Vec::new();
@@ -468,15 +471,17 @@ fn scan(args: &ScanArgs, writer: &mut impl Write) -> CtxResult<i32> {
             }
         }
     }
-    Ok(if report
-        .results
-        .iter()
-        .any(|result| result.report_error.is_some())
-    {
-        2
-    } else {
-        0
-    })
+    Ok(
+        if report
+            .results
+            .iter()
+            .any(|result| result.report_error.is_some())
+        {
+            2
+        } else {
+            0
+        },
+    )
 }
 
 pub fn run(args: &MaintainArgs, writer: &mut impl Write) -> CtxResult<i32> {
@@ -525,16 +530,28 @@ mod tests {
     fn exit_detector_breaches_only_on_failure_or_timeout() {
         let repo = tempdir().unwrap();
         let success = MaintainDetectorConfig {
-            command: if cfg!(windows) { "exit /B 0".into() } else { "true".into() },
+            command: if cfg!(windows) {
+                "exit /B 0".into()
+            } else {
+                "true".into()
+            },
             mode: MaintainDetectorMode::ExitNonzero,
             threshold: 1,
         };
         let failure = MaintainDetectorConfig {
-            command: if cfg!(windows) { "exit /B 7".into() } else { "exit 7".into() },
+            command: if cfg!(windows) {
+                "exit /B 7".into()
+            } else {
+                "exit 7".into()
+            },
             ..success.clone()
         };
         assert!(!run_detector(repo.path(), "ok", &success, 5).unwrap().breach);
-        assert!(run_detector(repo.path(), "bad", &failure, 5).unwrap().breach);
+        assert!(
+            run_detector(repo.path(), "bad", &failure, 5)
+                .unwrap()
+                .breach
+        );
     }
 
     #[test]
@@ -589,7 +606,11 @@ mod tests {
 
         let key = incident_key(repo.path(), "audit");
         clear_marker(&state_dir, repo.path(), &key).unwrap();
-        assert!(load_marker(&state_dir, repo.path(), &key).unwrap().is_none());
+        assert!(
+            load_marker(&state_dir, repo.path(), &key)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
