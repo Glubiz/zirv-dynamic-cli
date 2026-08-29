@@ -1570,6 +1570,67 @@ fn float_at(value: Option<toml::Value>) -> Option<f64> {
     })
 }
 
+/// Issue #186 hardening: fallback values are lifted out of their source
+/// layers before the ordinary serde pass, so malformed values must be
+/// rejected here rather than converted to None and silently replaced by
+/// defaults. Each helper names the exact operator-facing key in its error.
+fn fallback_bool_at(value: Option<toml::Value>, key: &str) -> CtxResult<Option<bool>> {
+    match value {
+        None => Ok(None),
+        Some(toml::Value::Boolean(v)) => Ok(Some(v)),
+        Some(_) => Err(format!("fallback.{key}: expected a boolean").into()),
+    }
+}
+
+fn fallback_float_at(value: Option<toml::Value>, key: &str) -> CtxResult<Option<f64>> {
+    match value {
+        None => Ok(None),
+        Some(toml::Value::Float(v)) => Ok(Some(v)),
+        Some(toml::Value::Integer(v)) => Ok(Some(v as f64)),
+        Some(_) => Err(format!("fallback.{key}: expected a number").into()),
+    }
+}
+
+fn fallback_string_array_at(
+    value: Option<toml::Value>,
+    key: &str,
+) -> CtxResult<Option<Vec<String>>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let toml::Value::Array(values) = value else {
+        return Err(format!("fallback.{key}: expected an array of strings").into());
+    };
+    let mut out = Vec::with_capacity(values.len());
+    for value in values {
+        let toml::Value::String(value) = value else {
+            return Err(format!("fallback.{key}: expected an array of strings").into());
+        };
+        out.push(value);
+    }
+    Ok(Some(out))
+}
+
+fn fallback_u64_at(value: Option<toml::Value>, key: &str) -> CtxResult<Option<u64>> {
+    match value {
+        None => Ok(None),
+        Some(toml::Value::Integer(v)) => u64::try_from(v)
+            .map(Some)
+            .map_err(|_| format!("fallback.{key}: expected a non-negative integer").into()),
+        Some(_) => Err(format!("fallback.{key}: expected a non-negative integer").into()),
+    }
+}
+
+fn fallback_u32_at(value: Option<toml::Value>, key: &str) -> CtxResult<Option<u32>> {
+    match value {
+        None => Ok(None),
+        Some(toml::Value::Integer(v)) => u32::try_from(v)
+            .map(Some)
+            .map_err(|_| format!("fallback.{key}: expected an integer from 0 to {}", u32::MAX).into()),
+        Some(_) => Err(format!("fallback.{key}: expected an integer from 0 to {}", u32::MAX).into()),
+    }
+}
+
 /// T9: the repo-narrowing fold for `pace.enabled`, mirroring `policy::
 /// EffectivePolicy::narrowed_by`'s own `Stance::max` -- `true` (the gate is
 /// on) is the stricter value, so it wins regardless of which layer set it.
@@ -2214,30 +2275,30 @@ impl CtxConfig {
         // Issue #186: every fallback field is lifted before the repo merge.
         // The repo may only narrow automatic vendor steering; see the
         // re-insertion below for each field's strict direction.
-        let home_fallback_enabled = bool_at(take_nested(&mut merged, "fallback", "enabled"));
-        let home_fallback_order = string_array_at(take_nested(&mut merged, "fallback", "order"));
-        let home_fallback_predictive = float_at(take_nested(
-            &mut merged,
-            "fallback",
+        let home_fallback_enabled =
+            fallback_bool_at(take_nested(&mut merged, "fallback", "enabled"), "enabled")?;
+        let home_fallback_order =
+            fallback_string_array_at(take_nested(&mut merged, "fallback", "order"), "order")?;
+        let home_fallback_predictive = fallback_float_at(
+            take_nested(&mut merged, "fallback", "predictive_headroom_pct"),
             "predictive_headroom_pct",
-        ));
-        let home_fallback_min_candidate = float_at(take_nested(
-            &mut merged,
-            "fallback",
+        )?;
+        let home_fallback_min_candidate = fallback_float_at(
+            take_nested(&mut merged, "fallback", "min_candidate_headroom_pct"),
             "min_candidate_headroom_pct",
-        ));
-        let home_fallback_unknown =
-            float_at(take_nested(&mut merged, "fallback", "unknown_headroom_pct"));
-        let home_fallback_small_tokens = integer_at(take_nested(
-            &mut merged,
-            "fallback",
+        )?;
+        let home_fallback_unknown = fallback_float_at(
+            take_nested(&mut merged, "fallback", "unknown_headroom_pct"),
+            "unknown_headroom_pct",
+        )?;
+        let home_fallback_small_tokens = fallback_u64_at(
+            take_nested(&mut merged, "fallback", "small_task_max_tokens"),
             "small_task_max_tokens",
-        ));
-        let home_fallback_small_tools = integer_at(take_nested(
-            &mut merged,
-            "fallback",
+        )?;
+        let home_fallback_small_tools = fallback_u32_at(
+            take_nested(&mut merged, "fallback", "small_task_max_tool_calls"),
             "small_task_max_tool_calls",
-        ));
+        )?;
 
         // Read on its own first: the repo layer is the one layer that comes
         // from a checkout rather than from the operator.
@@ -2273,34 +2334,32 @@ impl CtxConfig {
             "supervise",
             "heavy_command_patterns",
         ));
-        let repo_fallback_enabled = bool_at(take_nested(&mut repo_layer, "fallback", "enabled"));
-        let repo_fallback_order =
-            string_array_at(take_nested(&mut repo_layer, "fallback", "order"));
-        let repo_fallback_predictive = float_at(take_nested(
-            &mut repo_layer,
-            "fallback",
+        let repo_fallback_enabled =
+            fallback_bool_at(take_nested(&mut repo_layer, "fallback", "enabled"), "enabled")?;
+        let repo_fallback_order = fallback_string_array_at(
+            take_nested(&mut repo_layer, "fallback", "order"),
+            "order",
+        )?;
+        let repo_fallback_predictive = fallback_float_at(
+            take_nested(&mut repo_layer, "fallback", "predictive_headroom_pct"),
             "predictive_headroom_pct",
-        ));
-        let repo_fallback_min_candidate = float_at(take_nested(
-            &mut repo_layer,
-            "fallback",
+        )?;
+        let repo_fallback_min_candidate = fallback_float_at(
+            take_nested(&mut repo_layer, "fallback", "min_candidate_headroom_pct"),
             "min_candidate_headroom_pct",
-        ));
-        let repo_fallback_unknown = float_at(take_nested(
-            &mut repo_layer,
-            "fallback",
+        )?;
+        let repo_fallback_unknown = fallback_float_at(
+            take_nested(&mut repo_layer, "fallback", "unknown_headroom_pct"),
             "unknown_headroom_pct",
-        ));
-        let repo_fallback_small_tokens = integer_at(take_nested(
-            &mut repo_layer,
-            "fallback",
+        )?;
+        let repo_fallback_small_tokens = fallback_u64_at(
+            take_nested(&mut repo_layer, "fallback", "small_task_max_tokens"),
             "small_task_max_tokens",
-        ));
-        let repo_fallback_small_tools = integer_at(take_nested(
-            &mut repo_layer,
-            "fallback",
+        )?;
+        let repo_fallback_small_tools = fallback_u32_at(
+            take_nested(&mut repo_layer, "fallback", "small_task_max_tool_calls"),
             "small_task_max_tool_calls",
-        ));
+        )?;
         merge(&mut merged, repo_layer);
 
         // Re-inserted after the merge, before env: env (below) must still be
@@ -2386,10 +2445,9 @@ impl CtxConfig {
                     .min(repo_fallback_unknown.unwrap_or(f64::INFINITY)),
             ),
         );
-        let home_small_tokens = home_fallback_small_tokens
-            .and_then(|v| u64::try_from(v).ok())
-            .unwrap_or(default_fallback.small_task_max_tokens);
-        let repo_small_tokens = repo_fallback_small_tokens.and_then(|v| u64::try_from(v).ok());
+        let home_small_tokens =
+            home_fallback_small_tokens.unwrap_or(default_fallback.small_task_max_tokens);
+        let repo_small_tokens = repo_fallback_small_tokens;
         insert_path(
             &mut merged,
             &["fallback", "small_task_max_tokens"],
@@ -2400,10 +2458,9 @@ impl CtxConfig {
                     .unwrap_or(i64::MAX),
             ),
         );
-        let home_small_tools = home_fallback_small_tools
-            .and_then(|v| u32::try_from(v).ok())
-            .unwrap_or(default_fallback.small_task_max_tool_calls);
-        let repo_small_tools = repo_fallback_small_tools.and_then(|v| u32::try_from(v).ok());
+        let home_small_tools =
+            home_fallback_small_tools.unwrap_or(default_fallback.small_task_max_tool_calls);
+        let repo_small_tools = repo_fallback_small_tools;
         insert_path(
             &mut merged,
             &["fallback", "small_task_max_tool_calls"],
