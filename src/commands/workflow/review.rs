@@ -78,6 +78,11 @@ pub fn required_independent_reviews(risk: RiskBand) -> usize {
 
 pub fn required_independent_reviews_for(state: &WorkflowState) -> usize {
     let baseline = required_independent_reviews(state.classification.risk);
+    let baseline = if state.deploy_tier == super::deploy::DeployTier::Production {
+        baseline.max(1)
+    } else {
+        baseline
+    };
     if baseline > 0 && has_repeated_meaningful_finding(&state.review_findings) {
         baseline.max(2)
     } else {
@@ -203,6 +208,14 @@ impl VerificationEvidence {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct PullRequestReference {
+    pub repository: String,
+    pub number: u64,
+    pub title: String,
+    pub url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct ReviewPackage {
     pub schema_version: u32,
     #[serde(skip)]
@@ -211,6 +224,8 @@ pub struct ReviewPackage {
     pub include_custom_agents: bool,
     pub workflow_id: String,
     pub task: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pull_request: Option<PullRequestReference>,
     pub classification: super::classify::Classification,
     pub review_depth: ReviewDepth,
     pub required_independent_reviews: usize,
@@ -721,6 +736,7 @@ pub fn package(
         include_custom_agents: state.include_custom_skills,
         workflow_id: state.id.clone(),
         task: state.task.clone(),
+        pull_request: None,
         classification: state.classification.clone(),
         review_depth: if required_reviews >= 2 {
             ReviewDepth::StrongIndependentReview
@@ -758,6 +774,8 @@ pub enum ReviewCommand {
     Package(PackageArgs),
     /// Launch one isolated reviewer through Zirv supervision.
     Run(RunReviewArgs),
+    /// Import GitHub PR review comments as open workflow findings.
+    IngestPrComments(IngestPrCommentsArgs),
     /// Record a concrete review finding.
     Add(AddFindingArgs),
     /// Update a finding's final disposition.
@@ -781,6 +799,12 @@ pub struct PackageArgs {
     pub state: ReviewStateArgs,
     #[arg(long)]
     pub base: Option<String>,
+    /// Package an incoming GitHub pull request instead of the local working tree.
+    #[arg(long)]
+    pub pr: Option<u64>,
+    /// Explicit GitHub owner/repository; otherwise inferred from origin.
+    #[arg(long)]
+    pub github_repo: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -791,6 +815,22 @@ pub struct RunReviewArgs {
     pub agent: String,
     #[arg(long)]
     pub base: Option<String>,
+    /// Review an incoming GitHub pull request without treating it as local
+    /// workflow completion evidence.
+    #[arg(long)]
+    pub pr: Option<u64>,
+    #[arg(long)]
+    pub github_repo: Option<String>,
+    #[arg(long)]
+    pub repo: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub struct IngestPrCommentsArgs {
+    pub workflow_id: String,
+    pub pr: u64,
+    #[arg(long)]
+    pub github_repo: Option<String>,
     #[arg(long)]
     pub repo: Option<PathBuf>,
 }
