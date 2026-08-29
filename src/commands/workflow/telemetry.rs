@@ -244,6 +244,9 @@ pub fn record(
         &mut event.session_id,
         &mut event.parent_session_id,
         &mut event.work_group_id,
+        &mut event.artifact_stage,
+        &mut event.deploy_tier,
+        &mut event.agent_id,
     ]
     .into_iter()
     .flatten()
