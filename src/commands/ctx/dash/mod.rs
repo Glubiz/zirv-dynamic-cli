@@ -10383,6 +10383,104 @@ mod tests {
         );
     }
 
+    #[test]
+    fn dashboard_spawn_reroutes_an_exhausted_requested_harness_before_admission() {
+        let repo = std::env::current_dir().expect("cwd");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let now = crate::commands::ctx::state::now_secs();
+
+        crate::commands::ctx::window::store_for(
+            &state,
+            "anthropic",
+            &crate::commands::ctx::window::UsageWindows {
+                five_hour: Some(crate::commands::ctx::window::Window {
+                    used_percentage: 100.0,
+                    resets_at: now + 3_600,
+                    observed_at: now,
+                }),
+                seven_day: None,
+            },
+        )
+        .expect("store claude usage");
+        crate::commands::ctx::window::store_for(
+            &state,
+            "openai",
+            &crate::commands::ctx::window::UsageWindows {
+                five_hour: Some(crate::commands::ctx::window::Window {
+                    used_percentage: 10.0,
+                    resets_at: now + 3_600,
+                    observed_at: now,
+                }),
+                seven_day: None,
+            },
+        )
+        .expect("store codex usage");
+
+        let group = crate::commands::ctx::group::WorkGroup {
+            work_group_id: "wg-routing-stop".to_string(),
+            parent_session_id: String::new(),
+            scope: "test batch".to_string(),
+            child_limit: 0,
+            token_budget: None,
+            deadline_secs: None,
+            completion_contract: String::new(),
+            created_at: 0,
+            closed_at: None,
+            admitted_children: 0,
+            sub_orchestrator_session: None,
+        };
+        crate::commands::ctx::group::create(&state, &group).expect("create group");
+
+        let mut cfg = CtxConfig::default();
+        cfg.agent_bin = Some(
+            std::env::current_exe()
+                .expect("current test executable")
+                .display()
+                .to_string(),
+        );
+        cfg.pace.estimator = false;
+
+        let mut req = spawn_request("do the work", &repo);
+        req.agent = "claude".to_string();
+        req.work_group_id = Some("wg-routing-stop".to_string());
+        let mut panes: Vec<Pane> = Vec::new();
+        let mut queues: Vec<VecDeque<String>> = Vec::new();
+        let mut errors = Vec::new();
+
+        let refusal = fulfill_spawn_request(
+            &req,
+            true,
+            None,
+            &mut panes,
+            &mut queues,
+            &cfg,
+            &state,
+            &repo,
+            (80, 24),
+            &tmp.path().join("requests"),
+            &mut errors,
+        )
+        .expect_err("the full group stops the request after routing");
+
+        assert!(refusal.reason.contains("wg-routing-stop"), "got {}", refusal.reason);
+        assert!(
+            errors
+                .iter()
+                .any(|line| line.contains("dashboard spawn automatically routed claude -> codex")),
+            "the dashboard must expose its fallback decision: {errors:?}"
+        );
+        assert!(panes.is_empty(), "the post-routing admission stop spawned nothing");
+        let decisions = crate::commands::ctx::log::tail(&state, 20).expect("decisions");
+        assert!(
+            decisions
+                .iter()
+                .any(|line| line.contains("\"action\":\"harness-reroute\"")
+                    && line.contains("claude -> codex")),
+            "the reroute must be persisted too: {decisions:?}"
+        );
+    }
+
     /// Re-review (2026-08-27) finding 1: an admission granted by `admit_child`
     /// above must be rolled back when a LATER step in this same call fails
     /// before a pane is ever actually spawned -- otherwise a group's
