@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-28
+last-verified: 2026-08-29
 ---
 
 # Decision Log
@@ -23,6 +23,13 @@ last-verified: 2026-08-28
 - If the entry is longer than the cap, the "why" is a spec, not an ADR — write it under `docs/superpowers/specs/` and link to it.
 
 ## Decisions
+
+### 2026-08-29 — ModelTier stays a routing hint; adapters never guess concrete model ids (PR #200 review)
+**Context:** The SDLC spec's Dispatch section said `Fast|Standard|Deep` map to concrete vendor models (haiku/sonnet/opus-class). The implementation deliberately passes the tier through as a hint and lets each adapter/operator config pick real models; the conformance review flagged the mismatch.
+**Decision:** Keep the implemented behavior and amend the spec. The provider-neutral layer never hardcodes vendor model names; a tier is advisory routing metadata.
+**Rejected:** Implementing the mapping as specced — vendor model names rot on every release cycle, and codex has no haiku/sonnet/opus ladder, so a hardcoded map would break the layer's own claude/codex neutrality invariant (test-enforced: no provider strings in seat bodies).
+**Consequences:** Tier-based cost routing lives in adapter/operator config, not the registry. Anyone re-reading the original spec must use the amended Dispatch section (marked 2026-08-29).
+**Spec / link:** `docs/superpowers/specs/2026-08-28-ai-native-sdlc-design.md` (Dispatch amendment); `src/commands/ctx/adapters/mod.rs` `dispatch_agent`.
 
 ### 2026-08-28 — Committed workflow artifacts are an untrusted work-product surface, not a config surface (issue #187 design)
 **Context:** The AI-native SDLC design commits `intent.md`/`spec.md`/`plan.md` into `.zirv/work/<workflow-id>/` so reviewers can inspect normal PR diffs, while repository-owned text remains untrusted.

@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-28
+last-verified: 2026-08-29
 ---
 
 # Work Journal
@@ -20,7 +20,10 @@ last-verified: 2026-08-28
 
 ## Entries
 
-### 2026-08-28: AI-native SDLC flows — design spec complete (`docs/187-ai-native-sdlc-spec`, issue #187, PR #188)
+### 2026-08-29: PR #200 five-leg review round and fix wave (`release/187-ai-native-sdlc`)
+**What:** Full review of the SDLC release PR: spec conformance (20/22 implemented), superpowers parity/token analysis (~10–16x cheaper per cycle, enforcement is code not prose), Windows gates + CLI smoke, Docker/Linux wrap verification, and a correctness pass; then one fix wave.
+**Key changes:** `handover.rs` implicit-model quality assumption restored; `exec.rs` segment accounting (no-prompt exit records once, exhausted budget records at all); `fallback.rs` reset-tie keeps the requested harness; `engine.rs` symlink defense on `.zirv/work`, unknown-workflow domain error, gitignore warning; cross-adapter `dispatch_agent` conformance test; `common.md` trimmed under budget; spec Dispatch amendment (see [[Decision Log]]).
+**Follow-up:** issue #203 (pre-existing over-budget exit-code clobber flake, see [[Known Issues]]); loop-session cross-harness handover stays parked per `82567c2`'s own framing.
 **What:** Wrote the full design for extending `zirv workflow` across Intent → Design → Plan → Implement/Test/Review/Verify → Deploy, plus maintain-cycle re-entry, without a second engine.
 **Key changes:** New `docs/superpowers/specs/2026-08-28-ai-native-sdlc-design.md`; committed-work-product hash gates, adaptive skill stages, provider-neutral agents, deploy tiers, maintain scan, and telemetry/docs are phased into #190–#194. The design branch was reconciled onto current main before implementation validation.
 **Follow-up:** Implement and validate the five stacked phases.
