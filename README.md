@@ -1078,6 +1078,9 @@ checkout:
 | `workflow.repo_checks_enabled` | `ZIRV_CTX_WORKFLOW_REPO_CHECKS` |
 | `workflow.repo_skills_enabled` | `ZIRV_CTX_WORKFLOW_REPO_SKILLS` |
 | `workflow.repo_agents_enabled` | `ZIRV_CTX_WORKFLOW_REPO_AGENTS` |
+| `workflow.deploy.tier` | `ZIRV_CTX_WORKFLOW_DEPLOY_TIER` |
+| `workflow.maintain` | `~/.zirv/ctx.toml only` |
+| `report.repository` | `ZIRV_CTX_REPORT_REPOSITORY` |
 | `workflow.telemetry_enabled` | `ZIRV_CTX_WORKFLOW_TELEMETRY` |
 | `workflow.telemetry_max_events` | `ZIRV_CTX_WORKFLOW_TELEMETRY_MAX_EVENTS` |
 | `workflow.telemetry_retention_days` | `ZIRV_CTX_WORKFLOW_TELEMETRY_RETENTION_DAYS` |
