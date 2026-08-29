@@ -77,6 +77,7 @@ pub enum TelemetryKind {
     ArtifactProduced,
     ArtifactAccepted,
     AgentDispatched,
+    DeployGateEvaluated,
     WorkflowCompleted,
     FindingUpdated,
     FrontendDetectorRun,
