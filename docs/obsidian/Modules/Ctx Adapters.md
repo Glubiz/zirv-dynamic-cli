@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-27
+last-verified: 2026-08-29
 ---
 
 # Ctx Adapters
@@ -30,6 +30,7 @@ Defined in `mod.rs`, with `Debug` as a supertrait (so `Box<dyn AgentAdapter>` ca
 - `policy_support(capability, stance, mode)` / `default_sandbox_args(sandbox, safety, mode)` — report and project the canonical policy for an explicit `LaunchMode`; the mode is supplied by each real-launch seam rather than inferred.
 - `distiller_cmd(model)` — builds the command for the small judgment/summarization model child used by handoff distillation and `optimize`.
 - `read_only_args()` — the flags that keep this agent from writing files or running shell commands (claude `--disallowedTools=Write,Edit,Bash,NotebookEdit`, codex `--sandbox read-only`, plus `--ignore-rules --ignore-user-config` when the installed codex-cli's own `--help` documents them — issue #89, see "The distiller/reviewer sandbox residual" below). `distiller_cmd` applies them, and so does any other child whose prompt embeds untrusted repository text — the workflow reviewer, handed a repository diff (see [[Workflows]]). No trait default: a new adapter has to answer deliberately rather than inherit "no restriction" by omission.
+- `dispatch_agent(manifest, task)` — provider-neutral workflow-seat dispatch. The default implementation reloads effective `CtxConfig`, verifies every required logical capability against canonical policy, projects the adapter's normal headless sandbox/policy arguments, adds only an explicitly operator/caller-pinned model id, injects the manifest instruction layer, and appends `read_only_args()` last for read-only seats. Manifests describe methodology and requirements; they never grant permissions.
 - `sandbox_residual_note()` (2026-08-23, issue #89) — names a known, recorded gap in this adapter's own `read_only_args()` pin for the operator's currently-resolved binary, or `None` when there is nothing to disclose. Default `None` (claude's own answer: `--disallowedTools` is the whole restriction claude needs). Consulted by `adapters::announce_sandbox_residual_once` whenever this adapter is resolved as the distiller or the workflow reviewer.
 - `system_prompt_args(prompt)` — argv that appends `prompt` to the agent's system prompt for one run; empty when the adapter has no verified mechanism.
 - `transcript_path(session)` — where this agent's own transcript file lives on disk.
