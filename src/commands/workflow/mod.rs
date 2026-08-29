@@ -20,6 +20,7 @@ pub mod engine;
 pub mod frontend;
 pub mod frontend_detector;
 pub mod frontend_render;
+pub mod maintain;
 pub mod review;
 pub mod skill;
 pub mod telemetry;
