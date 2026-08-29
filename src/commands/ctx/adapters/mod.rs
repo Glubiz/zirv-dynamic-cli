@@ -946,7 +946,12 @@ pub trait AgentAdapter: std::fmt::Debug {
             }
         }
 
-        let mut extra = policy_launch_args(&cfg, self, &[], LaunchMode::Headless);
+        let mut extra = if cfg.sandbox.enabled {
+            self.default_sandbox_args(&cfg.sandbox, &cfg.safety, LaunchMode::Headless)
+        } else {
+            Vec::new()
+        };
+        extra.extend(self.policy_args(&cfg.policy, LaunchMode::Headless));
         if let Some(model) = task.model.as_deref() {
             extra.extend(self.model_args(model));
         }
