@@ -3053,6 +3053,57 @@ fn fulfill_spawn_request(
     if let Some(reason) = cfg.agents.refusal(&req.agent) {
         return Err(SpawnRefusal::policy(reason));
     }
+    let requested_adapter = adapters::select(Some(&req.agent), &[], cfg)
+        .map_err(|e| SpawnRefusal::policy(e.to_string()))?;
+
+    // Issue #186 hardening: the dashboard's own Spawn overlay reaches this
+    // authority-side path directly, without passing through agent::run_with.
+    // Reuse the same fallback selector here so a root dashboard delegation
+    // does not hard-refuse an exhausted requested seat while another enabled
+    // harness has safe equivalent capacity.
+    let source_model = req.model.clone().or_else(|| {
+        let model_args = adapters::worker_model_args(cfg, &req.agent, requested_adapter.as_ref());
+        adapters::last_model_flag(&model_args).map(str::to_string)
+    });
+    let now = super::state::now_secs();
+    let route = super::fallback::route_new_delegation(
+        state,
+        cfg,
+        super::fallback::RouteRequest {
+            requested: &req.agent,
+            source_model: source_model.as_deref(),
+            source_model_explicit: req.model.is_some(),
+            bounds: super::fallback::TaskBounds {
+                tokens: None,
+                tool_calls: None,
+            },
+            now,
+        },
+        req.force,
+    );
+    let mut effective_req = req.clone();
+    if let Some(route) = route {
+        effective_req.agent = route.selected.clone();
+        effective_req.model = Some(route.model.clone());
+        let detail = route.detail();
+        let _ = super::log::append(
+            state,
+            &super::log::Decision {
+                ts: now,
+                session: &req.requested_by,
+                verb: "dash",
+                verdict: "reroute",
+                score: 0,
+                action: "harness-reroute",
+                detail: &detail,
+            },
+        );
+        push_error(errors, format!("dashboard spawn automatically routed {detail}"));
+    }
+    let req = &effective_req;
+    if let Some(reason) = cfg.agents.refusal(&req.agent) {
+        return Err(SpawnRefusal::policy(reason));
+    }
     let adapter = adapters::select(Some(&req.agent), &[], cfg)
         .map_err(|e| SpawnRefusal::policy(e.to_string()))?;
 
@@ -3084,7 +3135,6 @@ fn fulfill_spawn_request(
     // headless fallback would route straight around the gate (the headless
     // path is gated too, by the identical check in `agent::run_with`), the
     // same reasoning the pane cap and the depth cap above already apply.
-    let now = super::state::now_secs();
     let (collector, estimator) =
         super::pace::current_windows(state, &cfg.pace, now, adapter.provider());
     let gate = super::pace::spawn_gate(&collector, estimator.as_ref(), now, &cfg.pace);
@@ -10330,6 +10380,104 @@ mod tests {
                 .admitted_children,
             1,
             "a refused admission must not advance the count"
+        );
+    }
+
+    #[test]
+    fn dashboard_spawn_reroutes_an_exhausted_requested_harness_before_admission() {
+        let repo = std::env::current_dir().expect("cwd");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let now = crate::commands::ctx::state::now_secs();
+
+        crate::commands::ctx::window::store_for(
+            &state,
+            "anthropic",
+            &crate::commands::ctx::window::UsageWindows {
+                five_hour: Some(crate::commands::ctx::window::Window {
+                    used_percentage: 100.0,
+                    resets_at: now + 3_600,
+                    observed_at: now,
+                }),
+                seven_day: None,
+            },
+        )
+        .expect("store claude usage");
+        crate::commands::ctx::window::store_for(
+            &state,
+            "openai",
+            &crate::commands::ctx::window::UsageWindows {
+                five_hour: Some(crate::commands::ctx::window::Window {
+                    used_percentage: 10.0,
+                    resets_at: now + 3_600,
+                    observed_at: now,
+                }),
+                seven_day: None,
+            },
+        )
+        .expect("store codex usage");
+
+        let group = crate::commands::ctx::group::WorkGroup {
+            work_group_id: "wg-routing-stop".to_string(),
+            parent_session_id: String::new(),
+            scope: "test batch".to_string(),
+            child_limit: 0,
+            token_budget: None,
+            deadline_secs: None,
+            completion_contract: String::new(),
+            created_at: 0,
+            closed_at: None,
+            admitted_children: 0,
+            sub_orchestrator_session: None,
+        };
+        crate::commands::ctx::group::create(&state, &group).expect("create group");
+
+        let mut cfg = CtxConfig::default();
+        cfg.agent_bin = Some(
+            std::env::current_exe()
+                .expect("current test executable")
+                .display()
+                .to_string(),
+        );
+        cfg.pace.estimator = false;
+
+        let mut req = spawn_request("do the work", &repo);
+        req.agent = "claude".to_string();
+        req.work_group_id = Some("wg-routing-stop".to_string());
+        let mut panes: Vec<Pane> = Vec::new();
+        let mut queues: Vec<VecDeque<String>> = Vec::new();
+        let mut errors = Vec::new();
+
+        let refusal = fulfill_spawn_request(
+            &req,
+            true,
+            None,
+            &mut panes,
+            &mut queues,
+            &cfg,
+            &state,
+            &repo,
+            (80, 24),
+            &tmp.path().join("requests"),
+            &mut errors,
+        )
+        .expect_err("the full group stops the request after routing");
+
+        assert!(refusal.reason.contains("wg-routing-stop"), "got {}", refusal.reason);
+        assert!(
+            errors
+                .iter()
+                .any(|line| line.contains("dashboard spawn automatically routed claude -> codex")),
+            "the dashboard must expose its fallback decision: {errors:?}"
+        );
+        assert!(panes.is_empty(), "the post-routing admission stop spawned nothing");
+        let decisions = crate::commands::ctx::log::tail(&state, 20).expect("decisions");
+        assert!(
+            decisions
+                .iter()
+                .any(|line| line.contains("\"action\":\"harness-reroute\"")
+                    && line.contains("claude -> codex")),
+            "the reroute must be persisted too: {decisions:?}"
         );
     }
 
