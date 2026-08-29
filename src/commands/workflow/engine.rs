@@ -1630,6 +1630,8 @@ pub enum WorkflowSubcommand {
     Resume(StateIdArgs),
     /// Print only the current step's resolved skill context.
     Context(StatusArgs),
+    /// Inspect committed workflow work-product artifacts and acceptance state.
+    Artifacts(ArtifactsArgs),
     /// Approve the current gated step.
     Approve(StateIdArgs),
     /// Record a step result and transition the state machine.
@@ -1699,6 +1701,50 @@ pub struct StateIdArgs {
 }
 
 #[derive(Debug, Args)]
+pub struct ArtifactsArgs {
+    pub id: String,
+    #[arg(long)]
+    pub repo: Option<PathBuf>,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct WorkflowArtifactStatus {
+    stage: ArtifactStage,
+    rel_path: String,
+    exists: bool,
+    accepted: bool,
+    drifted: bool,
+    accepted_at: Option<String>,
+}
+
+fn workflow_artifact_statuses(state: &WorkflowState) -> CtxResult<Vec<WorkflowArtifactStatus>> {
+    let mut statuses = Vec::new();
+    for stage in [ArtifactStage::Intent, ArtifactStage::Spec, ArtifactStage::Plan] {
+        let Some(record) = state.artifacts.get(stage.key()) else {
+            continue;
+        };
+        let path = workflow_artifact_path(state, stage)?;
+        let exists = path.exists();
+        let accepted = record.accepted_hash.is_some();
+        let drifted = match record.accepted_hash.as_deref() {
+            Some(hash) => !exists || artifact_hash(&path)? != hash,
+            None => false,
+        };
+        statuses.push(WorkflowArtifactStatus {
+            stage,
+            rel_path: record.rel_path.clone(),
+            exists,
+            accepted,
+            drifted,
+            accepted_at: record.accepted_at.clone(),
+        });
+    }
+    Ok(statuses)
+}
+
+#[derive(Debug, Args)]
 pub struct AdvanceArgs {
     pub id: String,
     #[arg(long, value_enum)]
@@ -1759,8 +1805,13 @@ fn write_state(writer: &mut impl Write, state: &WorkflowState, json: bool) -> Ct
         if let Some(step) = state.current() {
             writeln!(
                 writer,
-                "current: {} ({}, skill {})",
-                step.id, step.phase, step.skill
+                "current: {} ({}, skill {}{})",
+                step.id,
+                step.phase,
+                step.skill,
+                step.artifact
+                    .map(|stage| format!(", artifact {stage}"))
+                    .unwrap_or_default()
             )?;
         } else {
             writeln!(writer, "current: none")?;
@@ -1803,8 +1854,15 @@ pub fn run(args: &WorkflowArgs, writer: &mut impl Write) -> CtxResult<i32> {
                 for step in definition.steps {
                     writeln!(
                         writer,
-                        "  {}\t{}\tskill={}\twhen={:?}\tapproval={}",
-                        step.id, step.phase, step.skill, step.condition, step.approval
+                        "  {}\t{}\tskill={}\tartifact={}\twhen={:?}\tapproval={}",
+                        step.id,
+                        step.phase,
+                        step.skill,
+                        step.artifact
+                            .map(|stage| stage.to_string())
+                            .unwrap_or_else(|| "-".into()),
+                        step.condition,
+                        step.approval
                     )?;
                 }
             }
@@ -1873,6 +1931,7 @@ pub fn run(args: &WorkflowArgs, writer: &mut impl Write) -> CtxResult<i32> {
                 classification,
             );
             state.usage_checkpoint = usage_checkpoint(&state.repo);
+            ensure_current_artifact_template(&state)?;
             save(&state_dir, &state, true)?;
             let mut event = super::telemetry::TelemetryEvent::new(
                 super::telemetry::TelemetryKind::WorkflowStarted,
@@ -1909,6 +1968,7 @@ pub fn run(args: &WorkflowArgs, writer: &mut impl Write) -> CtxResult<i32> {
             ) {
                 return Err(format!("cannot resume workflow in {:?} state", state.status).into());
             }
+            ensure_current_artifact_template(&state)?;
             save(&state_dir, &state, true)?;
             write_state(writer, &state, false)?;
         }
@@ -1922,6 +1982,43 @@ pub fn run(args: &WorkflowArgs, writer: &mut impl Write) -> CtxResult<i32> {
             match render_current_context(&state, &repo, dirs::home_dir().as_deref())? {
                 Some(context) => write!(writer, "{context}")?,
                 None => writeln!(writer, "workflow has no active step context")?,
+            }
+        }
+        WorkflowSubcommand::Artifacts(args) => {
+            let repo = resolve_repo(args.repo.as_deref())?;
+            let state_dir = resolve_state()?;
+            let state = load(&state_dir, &repo, &args.id)?;
+            let statuses = workflow_artifact_statuses(&state)?;
+            if args.json {
+                serde_json::to_writer_pretty(&mut *writer, &statuses)?;
+                writeln!(writer)?;
+            } else if statuses.is_empty() {
+                writeln!(writer, "workflow has no committed work-product artifacts")?;
+            } else {
+                writeln!(writer, "STAGE\tPATH\tSTATE")?;
+                for status in statuses {
+                    let state = if status.drifted {
+                        "drifted"
+                    } else if status.accepted {
+                        "accepted"
+                    } else if status.exists {
+                        "pending"
+                    } else {
+                        "missing"
+                    };
+                    writeln!(
+                        writer,
+                        "{}\t{}\t{}{}",
+                        status.stage,
+                        status.rel_path,
+                        state,
+                        status
+                            .accepted_at
+                            .as_deref()
+                            .map(|at| format!(" ({at})"))
+                            .unwrap_or_default()
+                    )?;
+                }
             }
         }
         WorkflowSubcommand::Approve(args) => {
