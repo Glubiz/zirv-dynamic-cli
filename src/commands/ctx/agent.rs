@@ -953,24 +953,24 @@ pub fn run_with<W: Write>(
         && let Some(flags) =
             translated_route_flags(&args.flags, target_adapter.as_ref(), &route.model)
     {
-            routed_args.name = route.selected.clone();
-            routed_args.flags = flags;
-            let parent_session =
-                super::mail::session_identity(env).unwrap_or_else(|| "delegation".to_string());
-            let detail = route.detail();
-            let _ = super::log::append(
-                &state,
-                &super::log::Decision {
-                    ts: now,
-                    session: &parent_session,
-                    verb: "agent",
-                    verdict: "reroute",
-                    score: 0,
-                    action: "harness-reroute",
-                    detail: &detail,
-                },
-            );
-            eprintln!("zirv ctx agent: automatically routed {detail}");
+        routed_args.name = route.selected.clone();
+        routed_args.flags = flags;
+        let parent_session =
+            super::mail::session_identity(env).unwrap_or_else(|| "delegation".to_string());
+        let detail = route.detail();
+        let _ = super::log::append(
+            &state,
+            &super::log::Decision {
+                ts: now,
+                session: &parent_session,
+                verb: "agent",
+                verdict: "reroute",
+                score: 0,
+                action: "harness-reroute",
+                detail: &detail,
+            },
+        );
+        eprintln!("zirv ctx agent: automatically routed {detail}");
         route_applied = Some(route);
     }
 
