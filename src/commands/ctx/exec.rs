@@ -1383,14 +1383,16 @@ pub(crate) fn run_with_clock<W: Write>(
                     super::fallback::route_blocked_session(
                         &state,
                         &cfg,
-                        adapter.name(),
-                        source_model,
-                        source_model.is_some(),
-                        super::fallback::TaskBounds {
-                            tokens: worker_budget.tokens,
-                            tool_calls: worker_budget.tool_calls,
+                        super::fallback::RouteRequest {
+                            requested: adapter.name(),
+                            source_model,
+                            source_model_explicit: source_model.is_some(),
+                            bounds: super::fallback::TaskBounds {
+                                tokens: worker_budget.tokens,
+                                tool_calls: worker_budget.tool_calls,
+                            },
+                            now: now_fn(),
                         },
-                        now_fn(),
                         &visited,
                     )
                 })
