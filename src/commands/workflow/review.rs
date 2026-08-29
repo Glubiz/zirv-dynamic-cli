@@ -391,7 +391,6 @@ fn git_diff_capped(repo: &Path, base_sha: &str) -> CtxResult<(String, bool)> {
     Ok((String::from_utf8_lossy(&stdout).into_owned(), truncated))
 }
 
-
 fn validate_github_repo_slug(raw: &str) -> CtxResult<String> {
     let raw = raw.trim().trim_end_matches(".git");
     let mut parts = raw.split('/');
@@ -407,10 +406,7 @@ fn validate_github_repo_slug(raw: &str) -> CtxResult<String> {
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
     {
-        return Err(format!(
-            "invalid GitHub repository '{raw}'; expected owner/repository"
-        )
-        .into());
+        return Err(format!("invalid GitHub repository '{raw}'; expected owner/repository").into());
     }
     Ok(format!("{owner}/{repo}"))
 }
@@ -459,11 +455,7 @@ fn gh_output(repo_slug: &str, args: &[String]) -> CtxResult<String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-fn gh_output_capped(
-    repo_slug: &str,
-    args: &[String],
-    cap: usize,
-) -> CtxResult<(String, bool)> {
+fn gh_output_capped(repo_slug: &str, args: &[String], cap: usize) -> CtxResult<(String, bool)> {
     let mut child = Command::new("gh")
         .args(args)
         .args(["--repo", repo_slug])
@@ -518,9 +510,10 @@ fn load_pull_request(repo_slug: &str, number: u64) -> CtxResult<GhPullRequestVie
 }
 
 fn pr_fingerprint(head_sha: &str) -> CtxResult<u64> {
-    let prefix = head_sha.get(..16).ok_or("GitHub PR head sha is too short")?;
-    u64::from_str_radix(prefix, 16)
-        .map_err(|_| "GitHub PR head sha is not hexadecimal".into())
+    let prefix = head_sha
+        .get(..16)
+        .ok_or("GitHub PR head sha is too short")?;
+    u64::from_str_radix(prefix, 16).map_err(|_| "GitHub PR head sha is not hexadecimal".into())
 }
 
 fn package_pull_request(
@@ -531,8 +524,7 @@ fn package_pull_request(
     let repository = github_repo_slug(&state.repo, explicit_repo)?;
     let view = load_pull_request(&repository, pr)?;
     let args = vec!["pr".to_string(), "diff".to_string(), pr.to_string()];
-    let (diff, diff_truncated) =
-        gh_output_capped(&repository, &args, MAX_REVIEW_DIFF_BYTES)?;
+    let (diff, diff_truncated) = gh_output_capped(&repository, &args, MAX_REVIEW_DIFF_BYTES)?;
     let change_fingerprint = pr_fingerprint(&view.head_ref_oid)?;
     let required_reviews = required_independent_reviews_for(state);
     Ok(ReviewPackage {
@@ -562,7 +554,11 @@ fn package_pull_request(
         diff_base_sha: view.base_ref_oid,
         diff_is_delta: false,
         change_fingerprint,
-        changed_paths: view.files.into_iter().map(|file| PathBuf::from(file.path)).collect(),
+        changed_paths: view
+            .files
+            .into_iter()
+            .map(|file| PathBuf::from(file.path))
+            .collect(),
         diff,
         diff_truncated,
         verification: None,
@@ -658,12 +654,7 @@ fn severity_from_github_comment(body: &str) -> FindingSeverity {
     }
 }
 
-fn github_summary(
-    pr: u64,
-    author: Option<&GhUser>,
-    body: &str,
-    url: Option<&str>,
-) -> String {
+fn github_summary(pr: u64, author: Option<&GhUser>, body: &str, url: Option<&str>) -> String {
     let author = author.map(|user| user.login.as_str()).unwrap_or("unknown");
     let body = body
         .replace(['\r', '\n'], " ")
@@ -691,8 +682,11 @@ fn ingest_pull_request_comments(
     let inline: Vec<GhInlineComment> = github_api_pages(&repository, &inline_endpoint)?;
     let reviews: Vec<GhReviewComment> = github_api_pages(&repository, &review_endpoint)?;
 
-    let existing: BTreeSet<String> =
-        state.review_findings.iter().map(|finding| finding.id.clone()).collect();
+    let existing: BTreeSet<String> = state
+        .review_findings
+        .iter()
+        .map(|finding| finding.id.clone())
+        .collect();
     let mut incoming = Vec::new();
 
     for comment in inline {
@@ -732,12 +726,7 @@ fn ingest_pull_request_comments(
         incoming.push(ReviewFinding {
             id,
             severity: severity_from_github_comment(&body),
-            summary: github_summary(
-                pr,
-                review.user.as_ref(),
-                &body,
-                review.html_url.as_deref(),
-            ),
+            summary: github_summary(pr, review.user.as_ref(), &body, review.html_url.as_deref()),
             path: None,
             line: None,
             disposition: FindingDisposition::Open,
@@ -1488,11 +1477,7 @@ fn records_evidence(run: &ReviewerRun, fingerprint_unchanged: bool) -> bool {
 }
 
 fn launch_reviewer(agent: &str, package: &ReviewPackage) -> CtxResult<ReviewerRun> {
-    let argv = reviewer_argv(
-        agent,
-        &package.repo_root,
-        package.include_custom_agents,
-    )?;
+    let argv = reviewer_argv(agent, &package.repo_root, package.include_custom_agents)?;
     // A delta package must never read as a whole change: a reviewer told
     // "this is the whole diff" when it is only what changed since the last
     // reviewed commit will report false findings about code it cannot see.
@@ -1624,8 +1609,7 @@ fn run_independent_review(
         event.complexity = Some(state.classification.complexity);
         event.risk = Some(state.classification.risk);
         event.work_domain = Some(state.classification.work_domain.domain);
-        event.duration_ms =
-            Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
+        event.duration_ms = Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
         event.adapter = Some(args.agent.clone());
         event.succeeded = Some(recorded);
         event.worker_count = 1;
@@ -1823,8 +1807,7 @@ pub fn run(args: &ReviewArgs, writer: &mut impl Write) -> CtxResult<i32> {
             return run_independent_review(args, writer, &launch_reviewer);
         }
         ReviewCommand::IngestPrComments(args) => {
-            let (state_dir, mut state) =
-                state_and_repo(args.repo.as_deref(), &args.workflow_id)?;
+            let (state_dir, mut state) = state_and_repo(args.repo.as_deref(), &args.workflow_id)?;
             let count = ingest_pull_request_comments(
                 &state_dir,
                 &mut state,
@@ -2220,7 +2203,9 @@ mod tests {
             "the reviewer seat's hard read-only floor must be appended last"
         );
         assert!(
-            claude.iter().any(|arg| arg.contains("workflow agent seat: reviewer@1")),
+            claude
+                .iter()
+                .any(|arg| arg.contains("workflow agent seat: reviewer@1")),
             "the provider-neutral reviewer manifest must reach the harness system prompt"
         );
 
@@ -2240,7 +2225,10 @@ mod tests {
         let error = reviewer_argv("nope", repo.path(), false)
             .unwrap_err()
             .to_string();
-        assert!(error.contains("unknown") || error.contains("unsupported"), "{error}");
+        assert!(
+            error.contains("unknown") || error.contains("unsupported"),
+            "{error}"
+        );
         assert!(
             reviewer_argv("Claude", repo.path(), false).is_err(),
             "the adapter name is validated too"
@@ -2304,8 +2292,7 @@ mod tests {
         struct Row {
             id: u64,
         }
-        let rows: Vec<Row> =
-            parse_paginated(r#"[[{"id":1},{"id":2}],[{"id":3}]]"#).unwrap();
+        let rows: Vec<Row> = parse_paginated(r#"[[{"id":1},{"id":2}],[{"id":3}]]"#).unwrap();
         assert_eq!(rows, [Row { id: 1 }, Row { id: 2 }, Row { id: 3 }]);
     }
 
