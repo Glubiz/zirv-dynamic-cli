@@ -1221,42 +1221,22 @@ pub fn run_with<W: Write>(
     if let Ok(state_dir) = super::state::StateDir::resolve(&env) {
         let parent_session = super::mail::session_identity(&env).unwrap_or_default();
         let outcome = delegation_outcome(code);
-        let mut total = TranscriptUsage::default();
-        let mut route = Vec::new();
-
-        for segment in &execution_report.segments {
-            total.input_tokens = total.input_tokens.saturating_add(segment.usage.input_tokens);
-            total.cache_creation_input_tokens = total
-                .cache_creation_input_tokens
-                .saturating_add(segment.usage.cache_creation_input_tokens);
-            total.cache_read_input_tokens = total
-                .cache_read_input_tokens
-                .saturating_add(segment.usage.cache_read_input_tokens);
-            total.output_tokens = total.output_tokens.saturating_add(segment.usage.output_tokens);
-            route.push(match segment.model.as_deref() {
+        let total = append_execution_segments(
+            &state_dir,
+            &execution_report,
+            &parent_session,
+            args.group.as_deref(),
+            code,
+            outcome,
+        );
+        let route: Vec<String> = execution_report
+            .segments
+            .iter()
+            .map(|segment| match segment.model.as_deref() {
                 Some(model) => format!("{} ({model})", segment.agent),
                 None => format!("{} (default model)", segment.agent),
-            });
-
-            let _ = super::log::append_delegation(
-                &state_dir,
-                &super::log::Delegation {
-                    ts: super::state::now_secs(),
-                    session: &segment.session,
-                    parent_session: &parent_session,
-                    work_group_id: args.group.as_deref(),
-                    agent: &segment.agent,
-                    model: segment.model.as_deref(),
-                    input_tokens: segment.usage.input_tokens,
-                    cache_creation_input_tokens: segment.usage.cache_creation_input_tokens,
-                    cache_read_input_tokens: segment.usage.cache_read_input_tokens,
-                    output_tokens: segment.usage.output_tokens,
-                    wall_ms: segment.wall_ms,
-                    exit_code: code,
-                    outcome,
-                },
-            );
-        }
+            })
+            .collect();
 
         let route = if route.is_empty() {
             format!(
@@ -1291,6 +1271,46 @@ pub fn run_with<W: Write>(
     }
 
     Ok(code)
+}
+
+fn append_execution_segments(
+    state: &super::state::StateDir,
+    report: &exec::ExecutionReport,
+    parent_session: &str,
+    work_group_id: Option<&str>,
+    exit_code: i32,
+    outcome: &'static str,
+) -> TranscriptUsage {
+    let mut total = TranscriptUsage::default();
+    for segment in &report.segments {
+        total.input_tokens = total.input_tokens.saturating_add(segment.usage.input_tokens);
+        total.cache_creation_input_tokens = total
+            .cache_creation_input_tokens
+            .saturating_add(segment.usage.cache_creation_input_tokens);
+        total.cache_read_input_tokens = total
+            .cache_read_input_tokens
+            .saturating_add(segment.usage.cache_read_input_tokens);
+        total.output_tokens = total.output_tokens.saturating_add(segment.usage.output_tokens);
+        let _ = super::log::append_delegation(
+            state,
+            &super::log::Delegation {
+                ts: super::state::now_secs(),
+                session: &segment.session,
+                parent_session,
+                work_group_id,
+                agent: &segment.agent,
+                model: segment.model.as_deref(),
+                input_tokens: segment.usage.input_tokens,
+                cache_creation_input_tokens: segment.usage.cache_creation_input_tokens,
+                cache_read_input_tokens: segment.usage.cache_read_input_tokens,
+                output_tokens: segment.usage.output_tokens,
+                wall_ms: segment.wall_ms,
+                exit_code,
+                outcome,
+            },
+        );
+    }
+    total
 }
 
 pub fn run<W: Write>(args: &AgentArgs, w: &mut W) -> CtxResult<i32> {
@@ -2377,6 +2397,52 @@ mod tests {
             0,
             "--quiet must not change the outcome"
         );
+    }
+
+    #[test]
+    fn cross_harness_execution_segments_are_both_persisted_and_summed() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = crate::commands::ctx::state::StateDir::from_root(tmp.path().join("state"));
+        let report = exec::ExecutionReport {
+            segments: vec![
+                exec::ExecutionSegment {
+                    session: "aaaaaaaa-1111-4111-8111-111111111111".to_string(),
+                    agent: "claude".to_string(),
+                    model: Some("sonnet".to_string()),
+                    usage: TranscriptUsage {
+                        input_tokens: 10,
+                        cache_creation_input_tokens: 20,
+                        cache_read_input_tokens: 30,
+                        output_tokens: 40,
+                    },
+                    wall_ms: 100,
+                },
+                exec::ExecutionSegment {
+                    session: "bbbbbbbb-2222-4222-8222-222222222222".to_string(),
+                    agent: "codex".to_string(),
+                    model: Some("gpt-5.6-terra".to_string()),
+                    usage: TranscriptUsage {
+                        input_tokens: 1,
+                        cache_creation_input_tokens: 2,
+                        cache_read_input_tokens: 3,
+                        output_tokens: 4,
+                    },
+                    wall_ms: 200,
+                },
+            ],
+        };
+
+        let total = append_execution_segments(&state, &report, "parent", Some("wg-1"), 0, "ok");
+        assert_eq!(total.input_tokens, 11);
+        assert_eq!(total.cache_creation_input_tokens, 22);
+        assert_eq!(total.cache_read_input_tokens, 33);
+        assert_eq!(total.output_tokens, 44);
+
+        let rows = crate::commands::ctx::log::tail_delegations(&state, 10).expect("rows");
+        assert_eq!(rows.len(), 2, "both vendor segments must be visible");
+        assert!(rows.iter().any(|row| row.contains("\"agent\":\"claude\"")));
+        assert!(rows.iter().any(|row| row.contains("\"agent\":\"codex\"")));
+        assert!(rows.iter().any(|row| row.contains("gpt-5.6-terra")));
     }
 
     /// Issue #155, Phase 2: the end-to-end write, against a real
