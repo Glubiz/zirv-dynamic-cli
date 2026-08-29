@@ -5,6 +5,7 @@ last-verified: 2026-08-29
 # Untrusted Configuration
 
 > [!tip] Quick Reference
+> - Deploy tier is asymmetric by construction: `workflow.deploy.tier` is operator-only and repo-forbidden, while a checkout may set only `workflow.deploy.minimum_tier`. That minimum is folded with `max` over `development < staging < production`, so repository configuration can require stricter gates but cannot lower them. `ZIRV_CTX_WORKFLOW_DEPLOY_TIER` is the operator's final override; an already-running workflow itself only ratchets stricter.
 > - Repository agents under `.zirv/agents/` are another untrusted methodology surface. They are disabled by default through operator-only `workflow.repo_agents_enabled`; when enabled, repository manifests may only add new ids and can never replace built-in/operator seats. Required capabilities are re-evaluated against effective policy at dispatch, and `read_only: true` is an adapter-enforced floor rather than prose.
 > - Repository skills under `.zirv/skills/` are untrusted methodology. They may request logical capabilities but cannot grant permissions or widen an operator policy, and they may only **add** skill ids — a repo id colliding with a built-in or operator-global one is ignored with a warning naming the collision (2026-08-21). Symlinked manifests/parents, path escapes, oversized manifests/resolved stacks, unknown schema, and dependency cycles fail safely. `zirv skill list/show --built-in-only` disables custom layers for inspection, `zirv workflow start --built-in-only` persists the same choice for execution and resume, and the operator-only `workflow.repo_skills_enabled` turns the repository layer off entirely.
 > - A sixth surface, and the sharpest: repository-authored **shell commands**. `.zirv/verify.toml` and `package.json` scripts reach `sh -c` through `zirv test`/`zirv verify`, gated by the operator-only `workflow.repo_checks_enabled`, with hard timeout/count caps and a per-check source label in every report — see [[Workflows]].
@@ -51,6 +52,7 @@ Plus a third, read-only case: `zirv ctx optimize` reads the repo's own CLAUDE.md
 | `prompt.max_repo_bytes` | `ZIRV_CTX_PROMPT_MAX_REPO_BYTES` |
 | `prompt.harnesses` | `ZIRV_CTX_PROMPT_HARNESSES` |
 | `prompt.codex_orchestrator` | `ZIRV_CTX_PROMPT_CODEX_ORCHESTRATOR` |
+| `workflow.deploy.tier` | `ZIRV_CTX_WORKFLOW_DEPLOY_TIER` |
 | `mail.enabled` | `ZIRV_CTX_MAIL` |
 | `mail.max_delivered_bytes` | `ZIRV_CTX_MAIL_MAX_DELIVERED_BYTES` |
 | `chrome.events` | `ZIRV_CTX_QUIET` (inverted meaning — see `config.rs`'s `EnvKind::NegatedBool`) |
