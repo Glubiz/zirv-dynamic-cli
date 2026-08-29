@@ -2080,16 +2080,32 @@ mod tests {
         }
     }
 
+    fn skip_leading_artifact_steps(mut state: WorkflowState) -> WorkflowState {
+        while state.current().is_some_and(|step| step.artifact.is_some()) {
+            let id = state.current().unwrap().id.clone();
+            state.completed_steps.push(id);
+            state.current_step += 1;
+        }
+        state.status = if state.current().is_some() {
+            WorkflowStatus::Running
+        } else {
+            WorkflowStatus::Completed
+        };
+        state
+    }
+
     #[test]
-    fn low_risk_feature_uses_fast_path_without_design_or_review() {
+    fn low_risk_feature_uses_intent_fast_path_without_spec_plan_or_review() {
         let steps = definition(WorkflowKind::Feature).materialize(&low_classification());
         assert_eq!(
             steps
                 .iter()
                 .map(|step| step.id.as_str())
                 .collect::<Vec<_>>(),
-            ["implement", "test", "verify"]
+            ["intent", "implement", "test", "verify"]
         );
+        assert_eq!(steps[0].artifact, Some(ArtifactStage::Intent));
+        assert!(steps[0].approval);
     }
 
     #[test]
@@ -2108,11 +2124,15 @@ mod tests {
         classification.complexity = Complexity::Bounded;
         classification.risk = RiskBand::High;
         let steps = definition(WorkflowKind::Feature).materialize(&classification);
-        assert!(
+        assert_eq!(
             steps
-                .first()
-                .is_some_and(|step| step.id == "design" && step.approval)
+                .iter()
+                .map(|step| step.id.as_str())
+                .collect::<Vec<_>>(),
+            ["intent", "spec", "plan", "implement", "test", "review", "verify"]
         );
+        assert!(steps[1].approval);
+        assert_eq!(steps[1].artifact, Some(ArtifactStage::Spec));
     }
 
     #[test]
@@ -2132,7 +2152,15 @@ mod tests {
         );
 
         assert_eq!(state.profile, WorkflowProfile::Frontend);
-        assert_eq!(state.current().unwrap().skill, "frontend-implement");
+        assert_eq!(state.current().unwrap().skill, "brainstorm");
+        assert_eq!(state.current().unwrap().artifact, Some(ArtifactStage::Intent));
+        assert!(
+            state
+                .steps
+                .iter()
+                .find(|step| step.phase == WorkflowPhase::Implement)
+                .is_some_and(|step| step.skill == "frontend-implement")
+        );
     }
 
     #[test]
@@ -2152,9 +2180,15 @@ mod tests {
             classification,
         );
 
-        assert_eq!(state.status, WorkflowStatus::Running);
-        assert_eq!(state.steps[0].skill, "frontend-design");
-        assert!(!state.steps[0].approval);
+        assert_eq!(state.status, WorkflowStatus::AwaitingApproval);
+        assert_eq!(state.steps[0].skill, "brainstorm");
+        let design = state
+            .steps
+            .iter()
+            .find(|step| step.phase == WorkflowPhase::Design)
+            .expect("substantial frontend has spec/design");
+        assert_eq!(design.skill, "frontend-design");
+        assert!(design.approval, "spec acceptance remains a hard artifact gate");
         assert!(
             state
                 .steps
@@ -2190,6 +2224,7 @@ mod tests {
             .iter()
             .position(|step| step.phase == WorkflowPhase::Test)
             .unwrap();
+        state.status = WorkflowStatus::Running;
 
         let error = advance_with_evidence(&state_dir, state, StepOutcome::Success, None)
             .unwrap_err()
@@ -2298,12 +2333,30 @@ mod tests {
             classification,
         );
         assert_eq!(state.status, WorkflowStatus::AwaitingApproval);
+        ensure_current_artifact_template(&state).unwrap();
         assert!(
             advance_with_evidence(&state_dir, state.clone(), StepOutcome::Success, None).is_err()
         );
+        assert!(
+            approve(&state_dir, state.clone()).is_err(),
+            "an untouched template cannot be accepted"
+        );
+        let intent = workflow_artifact_path(&state, ArtifactStage::Intent).unwrap();
+        std::fs::write(
+            intent,
+            "# Intent\n\n## Problem\nConcrete problem\n\n## Desired outcome\nConcrete result\n",
+        )
+        .unwrap();
         let approved = approve(&state_dir, state).unwrap();
-        assert_eq!(approved.status, WorkflowStatus::Running);
-        assert_eq!(approved.current().unwrap().id, "design");
+        assert_eq!(approved.current().unwrap().id, "spec");
+        assert_eq!(approved.status, WorkflowStatus::AwaitingApproval);
+        assert!(
+            approved
+                .artifacts
+                .get("intent")
+                .and_then(|record| record.accepted_hash.as_ref())
+                .is_some()
+        );
     }
 
     #[test]
@@ -2311,18 +2364,18 @@ mod tests {
         let repo = tempdir().unwrap();
         let root = tempdir().unwrap();
         let state_dir = StateDir::from_root(root.path().to_path_buf());
-        let mut state = WorkflowState::start(
+        let mut state = skip_leading_artifact_steps(WorkflowState::start(
             repo.path().to_path_buf(),
             "small feature".into(),
             WorkflowKind::Feature,
             None,
             true,
             low_classification(),
-        );
+        ));
         save(&state_dir, &state, true).unwrap();
         state = advance_with_evidence(&state_dir, state, StepOutcome::Success, None).unwrap();
         let resumed = load(&state_dir, repo.path(), &state.id).unwrap();
-        assert_eq!(resumed.completed_steps, vec!["implement"]);
+        assert_eq!(resumed.completed_steps, vec!["intent", "implement"]);
         assert_eq!(resumed.current().unwrap().id, "test");
     }
 
@@ -2331,14 +2384,14 @@ mod tests {
         let repo = tempdir().unwrap();
         let root = tempdir().unwrap();
         let state_dir = StateDir::from_root(root.path().to_path_buf());
-        let mut state = WorkflowState::start(
+        let mut state = skip_leading_artifact_steps(WorkflowState::start(
             repo.path().to_path_buf(),
             "small feature".into(),
             WorkflowKind::Feature,
             None,
             true,
             low_classification(),
-        );
+        ));
         save(&state_dir, &state, true).unwrap();
         for _ in 0..MAX_STEP_ATTEMPTS {
             state = advance_with_evidence(&state_dir, state, StepOutcome::Failure, None).unwrap();
@@ -2672,14 +2725,14 @@ mod tests {
     #[test]
     fn switching_steps_replaces_ephemeral_skill_context() {
         let repo = tempdir().unwrap();
-        let mut state = WorkflowState::start(
+        let mut state = skip_leading_artifact_steps(WorkflowState::start(
             repo.path().to_path_buf(),
             "small feature".into(),
             WorkflowKind::Feature,
             None,
             true,
             low_classification(),
-        );
+        ));
         let implement = render_current_context(&state, repo.path(), None)
             .unwrap()
             .unwrap();
@@ -2704,14 +2757,14 @@ mod tests {
             "schema_version: 1\nid: implement\nversion: 2\nname: Override\ndescription: untrusted override\ncontext_budget_bytes: 64\nphases: [implement]\ninstructions: repository override\n",
         )
         .unwrap();
-        let state = WorkflowState::start(
+        let state = skip_leading_artifact_steps(WorkflowState::start(
             repo.path().to_path_buf(),
             "small feature".into(),
             WorkflowKind::Feature,
             None,
             false,
             low_classification(),
-        );
+        ));
         let context = render_current_context(&state, repo.path(), None)
             .unwrap()
             .unwrap();
