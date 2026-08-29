@@ -100,14 +100,14 @@ fn candidate_headroom(
     now: u64,
 ) -> Option<CandidateHeadroom> {
     let provider = adapters::provider_for_agent_name(Some(name));
-    let (collector, estimator) = pace::current_windows(state, &cfg.pace, request.now, provider);
+    let (collector, estimator) = pace::current_windows(state, &cfg.pace, now, provider);
     if matches!(
-        pace::spawn_gate(&collector, estimator.as_ref(), request.now, &cfg.pace),
+        pace::spawn_gate(&collector, estimator.as_ref(), now, &cfg.pace),
         SpawnGate::Refuse { .. }
     ) {
         return None;
     }
-    if let Some(reading) = pace::spawn_headroom(&collector, estimator.as_ref(), request.now, &cfg.pace) {
+    if let Some(reading) = pace::spawn_headroom(&collector, estimator.as_ref(), now, &cfg.pace) {
         return (reading.headroom_pct >= cfg.fallback.min_candidate_headroom_pct).then_some(
             CandidateHeadroom {
                 pct: reading.headroom_pct,
@@ -122,8 +122,8 @@ fn candidate_headroom(
 
 fn requested_headroom(state: &StateDir, cfg: &CtxConfig, name: &str, now: u64) -> Option<f64> {
     let provider = adapters::provider_for_agent_name(Some(name));
-    let (collector, estimator) = pace::current_windows(state, &cfg.pace, request.now, provider);
-    pace::spawn_headroom(&collector, estimator.as_ref(), request.now, &cfg.pace)
+    let (collector, estimator) = pace::current_windows(state, &cfg.pace, now, provider);
+    pace::spawn_headroom(&collector, estimator.as_ref(), now, &cfg.pace)
         .map(|reading| reading.headroom_pct)
 }
 
