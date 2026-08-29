@@ -163,15 +163,13 @@ fn best_alternate(
         let Some(headroom) = candidate_headroom(state, cfg, name, request.now) else {
             continue;
         };
-        let Some(model) =
-            handover::equivalent_model(
-                request.requested,
-                request.source_model,
-                request.source_model_explicit,
-                name,
-                cfg,
-            )
-        else {
+        let Some(model) = handover::equivalent_model(
+            request.requested,
+            request.source_model,
+            request.source_model_explicit,
+            name,
+            cfg,
+        ) else {
             continue;
         };
         let replace = match &best {
@@ -206,8 +204,9 @@ pub fn route_new_delegation(
     let provider = adapters::provider_for_agent_name(Some(request.requested));
     let (collector, estimator) = pace::current_windows(state, &cfg.pace, request.now, provider);
     let gate = pace::spawn_gate(&collector, estimator.as_ref(), request.now, &cfg.pace);
-    let source_headroom = pace::spawn_headroom(&collector, estimator.as_ref(), request.now, &cfg.pace)
-        .map(|reading| reading.headroom_pct);
+    let source_headroom =
+        pace::spawn_headroom(&collector, estimator.as_ref(), request.now, &cfg.pace)
+            .map(|reading| reading.headroom_pct);
     let reason = match gate {
         SpawnGate::Refuse { .. } => RouteReason::Exhausted,
         _ if source_headroom.is_some_and(|pct| pct <= cfg.fallback.predictive_headroom_pct) => {
