@@ -2331,7 +2331,8 @@ mod tests {
                 "implement",
                 "test",
                 "review",
-                "verify"
+                "verify",
+                "deploy"
             ]
         );
         assert!(steps[1].approval);
@@ -2514,11 +2515,16 @@ mod tests {
             true,
             classification,
         );
-        state.current_step = state
+        let test_index = state
             .steps
             .iter()
             .position(|step| step.phase == WorkflowPhase::Test)
             .unwrap();
+        state.completed_steps = state.steps[..test_index]
+            .iter()
+            .map(|step| step.id.clone())
+            .collect();
+        state.current_step = test_index;
         state.status = WorkflowStatus::Running;
 
         let error = advance_with_evidence(&state_dir, state, StepOutcome::Success, None)
