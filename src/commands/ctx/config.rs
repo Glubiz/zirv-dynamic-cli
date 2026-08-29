@@ -492,13 +492,29 @@ impl Default for MailConfig {
     }
 }
 
-/// Operator-only switches over the workflow subsystem
-/// (`src/commands/workflow/`). Every key here is `REPO_FORBIDDEN`: each one
-/// decides whether repository-authored content -- shell commands in
-/// `.zirv/verify.toml`, `npm run` scripts named by `package.json`, skill
-/// methodology in `.zirv/skills/` -- gets executed or injected at all, or how
-/// long local telemetry is kept, and a checkout must never be able to answer
-/// that for the operator.
+/// Deploy policy embedded under `[workflow.deploy]`. `tier` is operator-only;
+/// `minimum_tier` is the single repository-controlled workflow key and may
+/// only ratchet strictness upward during layered config resolution.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WorkflowDeployConfig {
+    pub tier: crate::commands::workflow::deploy::DeployTier,
+    pub minimum_tier: Option<crate::commands::workflow::deploy::DeployTier>,
+}
+
+impl Default for WorkflowDeployConfig {
+    fn default() -> Self {
+        Self {
+            tier: crate::commands::workflow::deploy::DeployTier::Development,
+            minimum_tier: None,
+        }
+    }
+}
+
+/// Operator-controlled switches over the workflow subsystem
+/// (`src/commands/workflow/`). Every field is repo-forbidden except the
+/// explicitly folded `workflow.deploy.minimum_tier`, which can only make the
+/// effective deploy tier stricter.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct WorkflowConfig {
@@ -515,6 +531,7 @@ pub struct WorkflowConfig {
     /// the operator explicitly enables this layer, and may never replace a
     /// trusted built-in/operator id.
     pub repo_agents_enabled: bool,
+    pub deploy: WorkflowDeployConfig,
     /// Local workflow telemetry. Previously read straight from the process
     /// environment, which a repository script could set for itself.
     pub telemetry_enabled: bool,
@@ -528,6 +545,7 @@ impl Default for WorkflowConfig {
             repo_checks_enabled: true,
             repo_skills_enabled: true,
             repo_agents_enabled: false,
+            deploy: WorkflowDeployConfig::default(),
             telemetry_enabled: true,
             telemetry_max_events: 1000,
             telemetry_retention_days: 30,
@@ -1339,6 +1357,11 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         EnvKind::Bool,
     ),
     (
+        "ZIRV_CTX_WORKFLOW_DEPLOY_TIER",
+        &["workflow", "deploy", "tier"],
+        EnvKind::Str,
+    ),
+    (
         "ZIRV_CTX_WORKFLOW_TELEMETRY",
         &["workflow", "telemetry_enabled"],
         EnvKind::Bool,
@@ -1516,6 +1539,33 @@ fn merge(base: &mut toml::Table, over: toml::Table) {
 /// for `merge()` to clobber the operator's with in the first place.
 fn take_nested(table: &mut toml::Table, section: &str, key: &str) -> Option<toml::Value> {
     table.get_mut(section)?.as_table_mut()?.remove(key)
+}
+
+fn take_nested3(
+    table: &mut toml::Table,
+    section: &str,
+    subsection: &str,
+    key: &str,
+) -> Option<toml::Value> {
+    table
+        .get_mut(section)?
+        .as_table_mut()?
+        .get_mut(subsection)?
+        .as_table_mut()?
+        .remove(key)
+}
+
+fn deploy_tier_at(
+    value: Option<toml::Value>,
+    key: &str,
+) -> CtxResult<Option<crate::commands::workflow::deploy::DeployTier>> {
+    value
+        .map(|value| {
+            value
+                .try_into()
+                .map_err(|error| format!("invalid {key}: {error}").into())
+        })
+        .transpose()
 }
 
 /// A `toml::Value::Array` of strings (from `take_nested`) as owned
@@ -1789,6 +1839,10 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     (
         &["workflow", "repo_agents_enabled"],
         "ZIRV_CTX_WORKFLOW_REPO_AGENTS",
+    ),
+    (
+        &["workflow", "deploy", "tier"],
+        "ZIRV_CTX_WORKFLOW_DEPLOY_TIER",
     ),
     (
         &["workflow", "telemetry_enabled"],
@@ -2253,6 +2307,14 @@ impl CtxConfig {
             "fallback",
             "small_task_max_tool_calls",
         ));
+        let home_deploy_tier = deploy_tier_at(
+            take_nested3(&mut merged, "workflow", "deploy", "tier"),
+            "workflow.deploy.tier",
+        )?;
+        let home_deploy_minimum = deploy_tier_at(
+            take_nested3(&mut merged, "workflow", "deploy", "minimum_tier"),
+            "workflow.deploy.minimum_tier",
+        )?;
 
         // Read on its own first: the repo layer is the one layer that comes
         // from a checkout rather than from the operator.
@@ -2316,7 +2378,34 @@ impl CtxConfig {
             "fallback",
             "small_task_max_tool_calls",
         ));
+        let repo_deploy_minimum = deploy_tier_at(
+            take_nested3(
+                &mut repo_layer,
+                "workflow",
+                "deploy",
+                "minimum_tier",
+            ),
+            "workflow.deploy.minimum_tier",
+        )?;
         merge(&mut merged, repo_layer);
+
+        let default_deploy = WorkflowDeployConfig::default();
+        let declared_minimum = home_deploy_minimum.max(repo_deploy_minimum);
+        let effective_deploy = home_deploy_tier
+            .unwrap_or(default_deploy.tier)
+            .max(declared_minimum.unwrap_or(default_deploy.tier));
+        insert_path(
+            &mut merged,
+            &["workflow", "deploy", "tier"],
+            toml::Value::String(effective_deploy.to_string()),
+        );
+        if let Some(minimum) = declared_minimum {
+            insert_path(
+                &mut merged,
+                &["workflow", "deploy", "minimum_tier"],
+                toml::Value::String(minimum.to_string()),
+            );
+        }
 
         // Re-inserted after the merge, before env: env (below) must still be
         // able to overwrite this outright, the same final-word precedence
