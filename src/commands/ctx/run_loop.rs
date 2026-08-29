@@ -8,7 +8,7 @@ use super::pace;
 use super::rot::Verdict;
 use super::state::{StateDir, now_secs};
 use super::supervise::{self, Outcome, Tick};
-use super::{CtxResult, adapters, log, score};
+use super::{CtxResult, adapters, handoff, log, score};
 
 /// Repeated cycle failures, escalated to the caller.
 pub const EXIT_FAILED: i32 = 75;
@@ -118,11 +118,13 @@ pub(crate) fn run_with_clock<W: Write>(
         return Err("--cycles must be at least 1".into());
     }
 
-    let prompt = resolve_prompt(args)?;
+    let mut task_prompt = resolve_prompt(args)?;
     let cfg = CtxConfig::load_for_launch(repo, env)?;
     let announcer =
         super::announce::Announcer::new(cfg.chrome.events, console::colors_enabled_stderr());
-    let adapter = adapters::select(args.agent.as_deref().or(cfg.agent.as_deref()), &[], &cfg)?;
+    let mut adapter = adapters::select(args.agent.as_deref().or(cfg.agent.as_deref()), &[], &cfg)?;
+    let mut extra = args.extra.clone();
+    let mut visited: Vec<String> = Vec::new();
     let state = StateDir::resolve(env)?;
 
     let interval = Duration::from_secs(args.interval_secs.unwrap_or(cfg.supervise.interval_secs));
@@ -260,7 +262,7 @@ pub(crate) fn run_with_clock<W: Write>(
         };
         let (user_extra, composed) = super::prompt::merge_command_line_prompt(
             adapter.as_ref(),
-            &args.extra,
+            &extra,
             composed,
             None,
             super::prompt::PromptRole::Worker,
@@ -268,7 +270,7 @@ pub(crate) fn run_with_clock<W: Write>(
         );
 
         match session_guard.as_mut() {
-            Some(guard) => guard.refresh_session(session.as_str()),
+            Some(guard) => guard.refresh_session_agent(session.as_str(), adapter.name()),
             None => {
                 registry_short = Some(session_short.clone());
                 // Issue #139: see `wrap.rs::run_with`'s identical comment.
@@ -348,8 +350,8 @@ pub(crate) fn run_with_clock<W: Write>(
 
         // When argv injection is unsafe, the complete compiled context moves
         // to the task-prompt channel ahead of mail.
-        let prompt = super::prompt::task_prompt_with_composed_fallback(
-            &prompt,
+        let cycle_prompt = super::prompt::task_prompt_with_composed_fallback(
+            &task_prompt,
             system_prompt_supported,
             composed.as_ref(),
         );
@@ -360,8 +362,8 @@ pub(crate) fn run_with_clock<W: Write>(
         // an adapter with no system-prompt mechanism: the task prompt text
         // itself. A capable adapter (claude) gets the unchanged `prompt`
         // back, since its mail already rode the `composed` fold above.
-        let prompt = super::prompt::task_prompt_with_mail_fallback(
-            &prompt,
+        let cycle_prompt = super::prompt::task_prompt_with_mail_fallback(
+            &cycle_prompt,
             (system_prompt_supported && composed.is_some()) || mail_in_composed,
             &mail_messages,
             cfg.mail.max_delivered_bytes,
@@ -382,11 +384,11 @@ pub(crate) fn run_with_clock<W: Write>(
         let (mut command, stdin_prompt) =
             if prompt_delivery_via_stdin(adapter.as_ref(), &session, &extra) {
                 match adapter.headless_cmd_stdin(&session, &extra) {
-                    Some(command) => (command, Some(prompt.clone())),
-                    None => (adapter.headless_cmd(&prompt, &session, &extra), None),
+                    Some(command) => (command, Some(cycle_prompt.clone())),
+                    None => (adapter.headless_cmd(&cycle_prompt, &session, &extra), None),
                 }
             } else {
-                (adapter.headless_cmd(&prompt, &session, &extra), None)
+                (adapter.headless_cmd(&cycle_prompt, &session, &extra), None)
             };
         command.current_dir(repo);
         // F3: `loop` binds no turn-signal socket of its own, so it has no
@@ -488,6 +490,112 @@ pub(crate) fn run_with_clock<W: Write>(
                 "loop",
                 &mut std::io::stderr(),
             );
+        }
+
+        if limit_hit {
+            let source_model = adapters::last_model_flag(&extra);
+            let route_request = super::fallback::RouteRequest {
+                requested: adapter.name(),
+                source_model,
+                source_model_explicit: source_model.is_some(),
+                bounds: super::fallback::TaskBounds {
+                    tokens: None,
+                    tool_calls: None,
+                },
+                now: now_fn(),
+            };
+            let route =
+                super::fallback::route_blocked_session(&state, &cfg, route_request, &visited);
+            let deferred_reset = route
+                .is_none()
+                .then(|| {
+                    super::fallback::earliest_reset_choice(
+                        &state,
+                        &cfg,
+                        route_request,
+                        &visited,
+                    )
+                })
+                .flatten();
+            let alternate = route
+                .as_ref()
+                .map(|route| {
+                    (
+                        route.selected.clone(),
+                        route.model.clone(),
+                        route.detail(),
+                    )
+                })
+                .or_else(|| {
+                    deferred_reset.as_ref().and_then(|choice| {
+                        if !choice.is_cross_harness() {
+                            return None;
+                        }
+                        Some((
+                            choice.selected.clone(),
+                            choice.model.clone()?,
+                            choice.detail(),
+                        ))
+                    })
+                });
+
+            if let Some((selected_agent, selected_model, selection_detail)) = alternate
+                && let Ok(target) = adapters::select(Some(&selected_agent), &[], &cfg)
+                && let Some(translated) =
+                    super::agent::translated_route_flags(&extra, target.as_ref(), &selected_model)
+            {
+                let jsonl = std::fs::read_to_string(&transcript).unwrap_or_default();
+                let ctx = adapter.structural_context(&jsonl, cfg.handoff.tail_items);
+                let distiller_model =
+                    handoff::resolve_distiller_model(cfg.handoff.model.as_deref(), adapter.as_ref());
+                let (note, source) = handoff::distill_or_structural(
+                    adapter.as_ref(),
+                    &distiller_model,
+                    &ctx,
+                    Duration::from_secs(cfg.handoff.timeout_secs),
+                    cfg.chrome.events,
+                );
+                let stored = handoff::store(&state, repo, session.as_str(), &note)?;
+                let detail = format!(
+                    "{}; {} handoff at {}",
+                    selection_detail,
+                    source,
+                    stored.display()
+                );
+                let _ = log::append(
+                    &state,
+                    &log::Decision {
+                        ts: now_secs(),
+                        session: session.as_str(),
+                        verb: "loop",
+                        verdict: "limit",
+                        score: 100,
+                        action: "harness-handover",
+                        detail: &detail,
+                    },
+                );
+                writeln!(
+                    w,
+                    "zirv ctx loop: usage limit hit; continuing on another harness ({detail})"
+                )?;
+
+                if !visited.iter().any(|name| name == adapter.name()) {
+                    visited.push(adapter.name().to_string());
+                }
+                task_prompt = format!(
+                    "{}\n\nThe previous harness exhausted its usage window. Continue from this handoff without redoing completed work:\n\n{}",
+                    task_prompt,
+                    note.to_markdown()
+                );
+                extra = translated;
+                adapter = target;
+                pace_flags = pace::PaceGateFlags::default();
+                if let Some(guard) = session_guard.as_mut() {
+                    guard.refresh_session_agent(session.as_str(), adapter.name());
+                }
+                failures = 0;
+                continue;
+            }
         }
 
         let (action, failed) = match outcome {
