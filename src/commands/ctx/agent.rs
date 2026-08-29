@@ -937,20 +937,22 @@ pub fn run_with<W: Write>(
     let route = super::fallback::route_new_delegation(
         &state,
         &cfg,
-        &args.name,
-        requested_model,
-        source_model_explicit,
-        bounds,
-        now,
+        super::fallback::RouteRequest {
+            requested: &args.name,
+            source_model: requested_model,
+            source_model_explicit,
+            bounds,
+            now,
+        },
         args.force,
     );
     let mut routed_args = args.clone();
     let mut route_applied = None;
-    if let Some(route) = route {
-        if let Ok(target_adapter) = adapters::select(Some(&route.selected), &[], &cfg)
-            && let Some(flags) =
-                translated_route_flags(&args.flags, target_adapter.as_ref(), &route.model)
-        {
+    if let Some(route) = route
+        && let Ok(target_adapter) = adapters::select(Some(&route.selected), &[], &cfg)
+        && let Some(flags) =
+            translated_route_flags(&args.flags, target_adapter.as_ref(), &route.model)
+    {
             routed_args.name = route.selected.clone();
             routed_args.flags = flags;
             let parent_session =
@@ -969,8 +971,7 @@ pub fn run_with<W: Write>(
                 },
             );
             eprintln!("zirv ctx agent: automatically routed {detail}");
-            route_applied = Some(route);
-        }
+        route_applied = Some(route);
     }
 
     // The ordinary spawn gate still owns the final decision for whichever
