@@ -1958,6 +1958,7 @@ fn write_state(writer: &mut impl Write, state: &WorkflowState, json: bool) -> Ct
         writeln!(writer, "workflow: {}", state.id)?;
         writeln!(writer, "kind: {}", state.kind.as_str())?;
         writeln!(writer, "profile: {:?}", state.profile)?;
+        writeln!(writer, "deploy tier: {}", state.deploy_tier)?;
         writeln!(writer, "status: {:?}", state.status)?;
         writeln!(
             writer,
@@ -2083,6 +2084,7 @@ pub fn run(args: &WorkflowArgs, writer: &mut impl Write) -> CtxResult<i32> {
             }
             let definition = definition(args.kind);
             let profile = WorkflowProfile::for_classification(&classification);
+            let deploy_tier = super::deploy::effective_tier(&repo)?;
             if let Some(agent) = &selected_agent {
                 let registry = SkillRegistry::load_for_repo(
                     &repo,
@@ -2095,7 +2097,12 @@ pub fn run(args: &WorkflowArgs, writer: &mut impl Write) -> CtxResult<i32> {
                     !args.built_in_only,
                 )?;
                 let report = super::capability::CapabilityReport::for_repo(agent, &repo)?;
-                for step in materialize(definition.kind, &classification, profile) {
+                for step in materialize(
+                    definition.kind,
+                    &classification,
+                    profile,
+                    deploy_tier,
+                ) {
                     for skill in step_skill_ids(&step, &classification) {
                         registry.ensure_supported(&skill, &report)?;
                     }
@@ -2112,6 +2119,7 @@ pub fn run(args: &WorkflowArgs, writer: &mut impl Write) -> CtxResult<i32> {
                 !args.built_in_only,
                 classification,
             );
+            apply_effective_deploy_tier(&mut state, deploy_tier);
             state.usage_checkpoint = usage_checkpoint(&state.repo);
             ensure_current_artifact_template(&state)?;
             save(&state_dir, &state, true)?;
@@ -2123,6 +2131,7 @@ pub fn run(args: &WorkflowArgs, writer: &mut impl Write) -> CtxResult<i32> {
             event.complexity = Some(state.classification.complexity);
             event.risk = Some(state.classification.risk);
             event.work_domain = Some(state.classification.work_domain.domain);
+            event.deploy_tier = Some(state.deploy_tier.to_string());
             let _ = super::telemetry::record(
                 &state_dir,
                 &state.repo,
@@ -2143,7 +2152,8 @@ pub fn run(args: &WorkflowArgs, writer: &mut impl Write) -> CtxResult<i32> {
         WorkflowSubcommand::Resume(args) => {
             let repo = resolve_repo(args.repo.as_deref())?;
             let state_dir = resolve_state()?;
-            let state = load(&state_dir, &repo, &args.id)?;
+            let mut state = load(&state_dir, &repo, &args.id)?;
+            refresh_deploy_tier(&mut state)?;
             if !matches!(
                 state.status,
                 WorkflowStatus::Running | WorkflowStatus::AwaitingApproval
