@@ -2297,7 +2297,7 @@ mod tests {
                 .iter()
                 .map(|step| step.id.as_str())
                 .collect::<Vec<_>>(),
-            ["intent", "implement", "test", "verify"]
+            ["intent", "implement", "test", "verify", "deploy"]
         );
         assert_eq!(steps[0].artifact, Some(ArtifactStage::Intent));
         assert!(steps[0].approval);
@@ -2336,6 +2336,92 @@ mod tests {
         );
         assert!(steps[1].approval);
         assert_eq!(steps[1].artifact, Some(ArtifactStage::Spec));
+    }
+
+    #[test]
+    fn deploy_tier_matrix_adds_structural_gates() {
+        let classification = low_classification();
+        let profile = WorkflowProfile::Standard;
+
+        let development = materialize(
+            WorkflowKind::Feature,
+            &classification,
+            profile,
+            DeployTier::Development,
+        );
+        let development_deploy = development
+            .iter()
+            .find(|step| step.phase == WorkflowPhase::Deploy)
+            .unwrap();
+        assert!(!development_deploy.approval);
+        assert!(!development.iter().any(|step| step.phase == WorkflowPhase::Review));
+
+        let staging = materialize(
+            WorkflowKind::Feature,
+            &classification,
+            profile,
+            DeployTier::Staging,
+        );
+        assert!(
+            staging
+                .iter()
+                .find(|step| step.phase == WorkflowPhase::Deploy)
+                .unwrap()
+                .approval
+        );
+        assert!(!staging.iter().any(|step| step.phase == WorkflowPhase::Review));
+
+        let production = materialize(
+            WorkflowKind::Feature,
+            &classification,
+            profile,
+            DeployTier::Production,
+        );
+        let review = production
+            .iter()
+            .position(|step| step.phase == WorkflowPhase::Review)
+            .unwrap();
+        let verify = production
+            .iter()
+            .position(|step| step.phase == WorkflowPhase::Verify)
+            .unwrap();
+        let deploy = production
+            .iter()
+            .position(|step| step.phase == WorkflowPhase::Deploy)
+            .unwrap();
+        assert!(review < verify && verify < deploy);
+        assert!(production[review].agent.as_deref() == Some("reviewer"));
+        assert!(production[deploy].approval);
+    }
+
+    #[test]
+    fn tightening_to_production_rewinds_later_completed_evidence() {
+        let mut state = WorkflowState::start(
+            PathBuf::from("repo"),
+            "small feature".into(),
+            WorkflowKind::Feature,
+            None,
+            true,
+            low_classification(),
+        );
+        state.completed_steps =
+            vec!["intent", "implement", "test", "verify"].into_iter().map(str::to_string).collect();
+        state.current_step = state
+            .steps
+            .iter()
+            .position(|step| step.phase == WorkflowPhase::Deploy)
+            .unwrap();
+        state.status = WorkflowStatus::Running;
+
+        apply_effective_deploy_tier(&mut state, DeployTier::Production);
+
+        assert_eq!(state.deploy_tier, DeployTier::Production);
+        assert_eq!(state.current().unwrap().phase, WorkflowPhase::Review);
+        assert_eq!(
+            state.completed_steps,
+            ["intent", "implement", "test"],
+            "verify evidence after the inserted production review must be replayed"
+        );
     }
 
     #[test]
