@@ -1105,7 +1105,7 @@ pub fn package(
     let required_reviews = required_independent_reviews_for(state);
     let escalated = required_reviews > required_independent_reviews(state.classification.risk);
     Ok(ReviewPackage {
-        schema_version: 1,
+        schema_version: 2,
         repo_root: state.repo.clone(),
         include_custom_agents: state.include_custom_skills,
         workflow_id: state.id.clone(),
