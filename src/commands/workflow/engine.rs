@@ -10,13 +10,14 @@ use sha2::{Digest, Sha256};
 
 use super::agents::AgentRegistry;
 use super::classify::{self, Classification, Complexity, Intent, RiskBand, WorkDomain};
+use super::deploy::DeployTier;
 use super::skill::{SkillRegistry, WorkflowPhase};
 use crate::commands::ctx::CtxResult;
 use crate::commands::ctx::state::{
     StateDir, create_private_dir_all, now_secs, repo_slug, write_private,
 };
 
-pub const WORKFLOW_SCHEMA_VERSION: u32 = 3;
+pub const WORKFLOW_SCHEMA_VERSION: u32 = 4;
 const MAX_STEP_ATTEMPTS: u8 = 3;
 const MAX_WORK_ARTIFACT_CONTEXT_BYTES: usize = 24 * 1024;
 
@@ -320,6 +321,7 @@ pub fn definitions() -> Vec<WorkflowDefinition> {
                     false,
                 ),
                 step("verify", Phase::Verify, "verify", When::Always, false),
+                step("deploy", Phase::Deploy, "finish-branch", When::Always, false),
             ],
         },
         WorkflowDefinition {
@@ -358,6 +360,7 @@ pub fn definitions() -> Vec<WorkflowDefinition> {
                     false,
                 ),
                 step("verify", Phase::Verify, "verify", When::Always, false),
+                step("deploy", Phase::Deploy, "finish-branch", When::Always, false),
             ],
         },
         WorkflowDefinition {
@@ -395,6 +398,7 @@ pub fn definitions() -> Vec<WorkflowDefinition> {
                     false,
                 ),
                 step("verify", Phase::Verify, "verify", When::Always, false),
+                step("deploy", Phase::Deploy, "finish-branch", When::Always, false),
             ],
         },
         WorkflowDefinition {
@@ -491,13 +495,40 @@ fn apply_profile(profile: WorkflowProfile, steps: &mut [WorkflowStep]) {
     }
 }
 
+fn apply_deploy_tier(tier: DeployTier, steps: &mut Vec<WorkflowStep>) {
+    if tier == DeployTier::Production
+        && !steps.iter().any(|step| step.phase == WorkflowPhase::Review)
+        && let Some(verify_index) = steps
+            .iter()
+            .position(|step| step.phase == WorkflowPhase::Verify)
+    {
+        steps.insert(
+            verify_index,
+            step(
+                "review",
+                WorkflowPhase::Review,
+                "review",
+                StepCondition::Always,
+                false,
+            ),
+        );
+    }
+    for step in steps {
+        if step.phase == WorkflowPhase::Deploy {
+            step.approval = tier >= DeployTier::Staging;
+        }
+    }
+}
+
 fn materialize(
     kind: WorkflowKind,
     classification: &Classification,
     profile: WorkflowProfile,
+    deploy_tier: DeployTier,
 ) -> Vec<WorkflowStep> {
     let mut steps = definition(kind).materialize(classification);
     apply_profile(profile, &mut steps);
+    apply_deploy_tier(deploy_tier, &mut steps);
     steps
 }
 
@@ -535,6 +566,8 @@ pub struct WorkflowState {
     #[serde(default = "default_true")]
     pub include_custom_skills: bool,
     pub classification: Classification,
+    #[serde(default)]
+    pub deploy_tier: DeployTier,
     pub steps: Vec<WorkflowStep>,
     pub current_step: usize,
     pub completed_steps: Vec<String>,
@@ -570,7 +603,8 @@ impl WorkflowState {
         classification: Classification,
     ) -> Self {
         let profile = WorkflowProfile::for_classification(&classification);
-        let steps = materialize(kind, &classification, profile);
+        let deploy_tier = DeployTier::Development;
+        let steps = materialize(kind, &classification, profile, deploy_tier);
         let status = if steps.first().is_some_and(|step| step.approval) {
             WorkflowStatus::AwaitingApproval
         } else {
@@ -589,6 +623,7 @@ impl WorkflowState {
             adapter,
             include_custom_skills,
             classification,
+            deploy_tier,
             steps,
             current_step: 0,
             completed_steps: Vec::new(),
@@ -1228,7 +1263,12 @@ fn reclassify_at_gate(state: &mut WorkflowState) {
 /// re-classification above and by the fail-safe escalation applied when Git
 /// measurement is unavailable at a gate.
 fn rematerialize_after_risk_increase(state: &mut WorkflowState) {
-    let desired = materialize(state.kind, &state.classification, state.profile);
+    let desired = materialize(
+        state.kind,
+        &state.classification,
+        state.profile,
+        state.deploy_tier,
+    );
     let known: Vec<String> = state.steps.iter().map(|step| step.id.clone()).collect();
     let earliest_new = desired.iter().position(|step| {
         !known.contains(&step.id)
@@ -1259,12 +1299,60 @@ fn rematerialize_after_risk_increase(state: &mut WorkflowState) {
         .unwrap_or(state.steps.len());
 }
 
+
+fn apply_effective_deploy_tier(state: &mut WorkflowState, effective: DeployTier) {
+    let target = state.deploy_tier.max(effective);
+    let desired = materialize(
+        state.kind,
+        &state.classification,
+        state.profile,
+        target,
+    );
+
+    let known: Vec<String> = state.steps.iter().map(|step| step.id.clone()).collect();
+    let earliest_new = desired
+        .iter()
+        .position(|step| !known.contains(&step.id));
+
+    if target > state.deploy_tier
+        && let Some(cutoff) = earliest_new
+    {
+        let safe_ids: Vec<String> = desired[..cutoff]
+            .iter()
+            .map(|step| step.id.clone())
+            .collect();
+        state
+            .completed_steps
+            .retain(|completed| safe_ids.contains(completed));
+    }
+
+    state.deploy_tier = target;
+    state.steps = desired;
+    sync_artifact_records(state);
+    state.current_step = state
+        .steps
+        .iter()
+        .position(|step| !state.completed_steps.contains(&step.id))
+        .unwrap_or(state.steps.len());
+    state.status = match state.current() {
+        None => WorkflowStatus::Completed,
+        Some(step) if step.approval => WorkflowStatus::AwaitingApproval,
+        Some(_) => WorkflowStatus::Running,
+    };
+}
+
+fn refresh_deploy_tier(state: &mut WorkflowState) -> CtxResult<()> {
+    let effective = super::deploy::effective_tier(&state.repo)?;
+    apply_effective_deploy_tier(state, effective);
+    Ok(())
+}
 pub fn advance_with_evidence(
     state_dir: &StateDir,
     mut state: WorkflowState,
     outcome: StepOutcome,
     evidence: Option<&TransitionEvidence>,
 ) -> CtxResult<WorkflowState> {
+    refresh_deploy_tier(&mut state)?;
     if let Some(stage) = artifact_drift(&state)? {
         reopen_artifact_gate(&mut state, stage)?;
         state.updated_at = now_secs();
@@ -1345,6 +1433,27 @@ pub fn advance_with_evidence(
                     )
                     .into());
                 }
+            }
+            if current.phase == WorkflowPhase::Deploy {
+                let gate = super::deploy::production_gate_satisfied(state_dir, &state);
+                let mut event = super::telemetry::TelemetryEvent::new(
+                    super::telemetry::TelemetryKind::DeployGateEvaluated,
+                );
+                event.workflow_id = Some(state.id.clone());
+                event.phase = Some(current.phase);
+                event.intent = Some(state.classification.intent);
+                event.complexity = Some(state.classification.complexity);
+                event.risk = Some(state.classification.risk);
+                event.work_domain = Some(state.classification.work_domain.domain);
+                event.deploy_tier = Some(state.deploy_tier.to_string());
+                event.succeeded = Some(gate.is_ok());
+                let _ = super::telemetry::record(
+                    state_dir,
+                    &state.repo,
+                    &event,
+                    &super::telemetry::TelemetryConfig::for_repo(&state.repo),
+                );
+                gate?;
             }
             if current.phase == WorkflowPhase::Review {
                 if state
@@ -1472,6 +1581,7 @@ pub fn advance_with_evidence(
         completed.complexity = Some(state.classification.complexity);
         completed.risk = Some(state.classification.risk);
         completed.work_domain = Some(state.classification.work_domain.domain);
+        completed.deploy_tier = Some(state.deploy_tier.to_string());
         completed.succeeded = Some(true);
         completed.findings_total = findings_total;
         completed.findings_meaningful = findings_meaningful;
@@ -1487,6 +1597,7 @@ pub fn advance_with_evidence(
 }
 
 pub fn approve(state_dir: &StateDir, mut state: WorkflowState) -> CtxResult<WorkflowState> {
+    refresh_deploy_tier(&mut state)?;
     if state.status != WorkflowStatus::AwaitingApproval {
         return Err("workflow is not awaiting approval".into());
     }
