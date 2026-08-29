@@ -15,7 +15,7 @@ Nextest's process-per-test isolation prevents `env::set_var` races. `--no-fail-f
 ## Module map
 
 - `src/main.rs`, `src/input.rs`: raw-argv built-ins, clap, script lookup; `src/commands/`: create, init, help, version, setup, report.
-- `src/commands/workflow/`: skill/capability/agents, engine/classify/deploy, verification/review, artifact/telemetry; `src/script_runner/`: script.rs, command.rs (`${var}`), command_types.rs, options.rs, mod.rs; `src/utils.rs`: parsing/shortcuts/reserved names; `src/settings.rs`: `<repo>/.zirv/.settings.toml` agent gate.
+- `src/commands/workflow/`: skill/capability/agents, engine/classify/deploy/maintain, verification/review, artifact/telemetry; `src/script_runner/`: script.rs, command.rs (`${var}`), command_types.rs, options.rs, mod.rs; `src/utils.rs`: parsing/shortcuts/reserved names; `src/settings.rs`: `<repo>/.zirv/.settings.toml` agent gate.
 - `src/commands/ctx/`: mod/config/state/log; event+rot; adapters/{claude,codex}; score handoff resume hook status handover; run_loop exec wrap (supervisors); signal supervise term; pace usage window poll; optimize prompt compile context memory memory_cli mail sessions policy safety chat agent announce chrome; dash/ (mod pane ui spawnreq roster).
 
 ## Conventions
