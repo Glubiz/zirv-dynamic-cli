@@ -79,6 +79,15 @@ impl TaskBounds {
 }
 
 #[derive(Debug, Clone, Copy)]
+pub struct RouteRequest<'a> {
+    pub requested: &'a str,
+    pub source_model: Option<&'a str>,
+    pub source_model_explicit: bool,
+    pub bounds: TaskBounds,
+    pub now: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
 struct CandidateHeadroom {
     pct: f64,
     assumed: bool,
@@ -91,14 +100,14 @@ fn candidate_headroom(
     now: u64,
 ) -> Option<CandidateHeadroom> {
     let provider = adapters::provider_for_agent_name(Some(name));
-    let (collector, estimator) = pace::current_windows(state, &cfg.pace, now, provider);
+    let (collector, estimator) = pace::current_windows(state, &cfg.pace, request.now, provider);
     if matches!(
-        pace::spawn_gate(&collector, estimator.as_ref(), now, &cfg.pace),
+        pace::spawn_gate(&collector, estimator.as_ref(), request.now, &cfg.pace),
         SpawnGate::Refuse { .. }
     ) {
         return None;
     }
-    if let Some(reading) = pace::spawn_headroom(&collector, estimator.as_ref(), now, &cfg.pace) {
+    if let Some(reading) = pace::spawn_headroom(&collector, estimator.as_ref(), request.now, &cfg.pace) {
         return (reading.headroom_pct >= cfg.fallback.min_candidate_headroom_pct).then_some(
             CandidateHeadroom {
                 pct: reading.headroom_pct,
@@ -113,8 +122,8 @@ fn candidate_headroom(
 
 fn requested_headroom(state: &StateDir, cfg: &CtxConfig, name: &str, now: u64) -> Option<f64> {
     let provider = adapters::provider_for_agent_name(Some(name));
-    let (collector, estimator) = pace::current_windows(state, &cfg.pace, now, provider);
-    pace::spawn_headroom(&collector, estimator.as_ref(), now, &cfg.pace)
+    let (collector, estimator) = pace::current_windows(state, &cfg.pace, request.now, provider);
+    pace::spawn_headroom(&collector, estimator.as_ref(), request.now, &cfg.pace)
         .map(|reading| reading.headroom_pct)
 }
 
@@ -128,22 +137,18 @@ pub fn candidate_allowed_by_capacity(cfg: &CtxConfig, name: &str, bounds: TaskBo
 fn best_alternate(
     state: &StateDir,
     cfg: &CtxConfig,
-    requested: &str,
-    source_model: Option<&str>,
-    source_model_explicit: bool,
-    bounds: TaskBounds,
-    now: u64,
+    request: RouteRequest<'_>,
     excluded: &[String],
 ) -> Option<(String, String, CandidateHeadroom)> {
     let mut best: Option<(usize, String, String, CandidateHeadroom)> = None;
     for (order_index, name) in cfg.fallback.order.iter().enumerate() {
-        if name == requested
+        if name == request.requested
             || excluded.iter().any(|seen| seen == name)
             || !cfg.agents.is_enabled(name)
         {
             continue;
         }
-        if !candidate_allowed_by_capacity(cfg, name, bounds) {
+        if !candidate_allowed_by_capacity(cfg, name, request.bounds) {
             continue;
         }
         // Selection is the canonical readiness + agent_bin compatibility gate.
@@ -152,14 +157,20 @@ fn best_alternate(
         let Ok(candidate_adapter) = adapters::select(Some(name), &[], cfg) else {
             continue;
         };
-        if bounds.tool_calls.is_some() && !candidate_adapter.counts_tool_calls() {
+        if request.bounds.tool_calls.is_some() && !candidate_adapter.counts_tool_calls() {
             continue;
         }
-        let Some(headroom) = candidate_headroom(state, cfg, name, now) else {
+        let Some(headroom) = candidate_headroom(state, cfg, name, request.now) else {
             continue;
         };
         let Some(model) =
-            handover::equivalent_model(requested, source_model, source_model_explicit, name, cfg)
+            handover::equivalent_model(
+                request.requested,
+                request.source_model,
+                request.source_model_explicit,
+                name,
+                cfg,
+            )
         else {
             continue;
         };
@@ -185,21 +196,17 @@ fn best_alternate(
 pub fn route_new_delegation(
     state: &StateDir,
     cfg: &CtxConfig,
-    requested: &str,
-    source_model: Option<&str>,
-    source_model_explicit: bool,
-    bounds: TaskBounds,
-    now: u64,
+    request: RouteRequest<'_>,
     force: bool,
 ) -> Option<Route> {
     if !cfg.fallback.enabled || force {
         return None;
     }
 
-    let provider = adapters::provider_for_agent_name(Some(requested));
-    let (collector, estimator) = pace::current_windows(state, &cfg.pace, now, provider);
-    let gate = pace::spawn_gate(&collector, estimator.as_ref(), now, &cfg.pace);
-    let source_headroom = pace::spawn_headroom(&collector, estimator.as_ref(), now, &cfg.pace)
+    let provider = adapters::provider_for_agent_name(Some(request.requested));
+    let (collector, estimator) = pace::current_windows(state, &cfg.pace, request.now, provider);
+    let gate = pace::spawn_gate(&collector, estimator.as_ref(), request.now, &cfg.pace);
+    let source_headroom = pace::spawn_headroom(&collector, estimator.as_ref(), request.now, &cfg.pace)
         .map(|reading| reading.headroom_pct);
     let reason = match gate {
         SpawnGate::Refuse { .. } => RouteReason::Exhausted,
@@ -209,18 +216,9 @@ pub fn route_new_delegation(
         _ => return None,
     };
 
-    let (selected, model, headroom) = best_alternate(
-        state,
-        cfg,
-        requested,
-        source_model,
-        source_model_explicit,
-        bounds,
-        now,
-        &[],
-    )?;
+    let (selected, model, headroom) = best_alternate(state, cfg, request, &[])?;
     Some(Route {
-        requested: requested.to_string(),
+        requested: request.requested.to_string(),
         selected,
         model,
         reason,
@@ -236,32 +234,19 @@ pub fn route_new_delegation(
 pub fn route_blocked_session(
     state: &StateDir,
     cfg: &CtxConfig,
-    requested: &str,
-    source_model: Option<&str>,
-    source_model_explicit: bool,
-    bounds: TaskBounds,
-    now: u64,
+    request: RouteRequest<'_>,
     excluded: &[String],
 ) -> Option<Route> {
     if !cfg.fallback.enabled {
         return None;
     }
-    let (selected, model, headroom) = best_alternate(
-        state,
-        cfg,
-        requested,
-        source_model,
-        source_model_explicit,
-        bounds,
-        now,
-        excluded,
-    )?;
+    let (selected, model, headroom) = best_alternate(state, cfg, request, excluded)?;
     Some(Route {
-        requested: requested.to_string(),
+        requested: request.requested.to_string(),
         selected,
         model,
         reason: RouteReason::Exhausted,
-        requested_headroom_pct: requested_headroom(state, cfg, requested, now),
+        requested_headroom_pct: requested_headroom(state, cfg, request.requested, request.now),
         selected_headroom_pct: headroom.pct,
         selected_headroom_assumed: headroom.assumed,
     })
