@@ -15,17 +15,7 @@ use crate::commands::ctx::CtxResult;
 use crate::commands::ctx::state::StateDir;
 
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    Default,
-    PartialEq,
-    Eq,
-    PartialOrd,
-    Ord,
-    Serialize,
-    Deserialize,
-    ValueEnum,
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, ValueEnum,
 )]
 #[serde(rename_all = "kebab-case")]
 pub enum DeployTier {
@@ -46,10 +36,7 @@ impl std::fmt::Display for DeployTier {
 }
 
 pub fn effective_tier(repo: &Path) -> CtxResult<DeployTier> {
-    let cfg = crate::commands::ctx::config::CtxConfig::load(
-        repo,
-        &|key| std::env::var(key).ok(),
-    )?;
+    let cfg = crate::commands::ctx::config::CtxConfig::load(repo, &|key| std::env::var(key).ok())?;
     Ok(cfg.workflow.deploy.tier)
 }
 
@@ -62,10 +49,7 @@ pub fn fresh_independent_reviews(state: &WorkflowState) -> CtxResult<usize> {
         .count())
 }
 
-pub fn production_gate_satisfied(
-    state_dir: &StateDir,
-    state: &WorkflowState,
-) -> CtxResult<()> {
+pub fn production_gate_satisfied(state_dir: &StateDir, state: &WorkflowState) -> CtxResult<()> {
     if state.deploy_tier != DeployTier::Production {
         return Ok(());
     }
@@ -75,9 +59,7 @@ pub fn production_gate_satisfied(
         .iter()
         .any(|finding| finding.disposition == super::review::FindingDisposition::Open)
     {
-        return Err(
-            "production deploy is blocked while review findings remain open".into(),
-        );
+        return Err("production deploy is blocked while review findings remain open".into());
     }
 
     let reviews = fresh_independent_reviews(state)?;
@@ -87,14 +69,9 @@ pub fn production_gate_satisfied(
         );
     }
 
-    if !super::verification::latest_is_fresh_and_passing(
-        state_dir,
-        &state.repo,
-        true,
-    )? {
+    if !super::verification::latest_is_fresh_and_passing(state_dir, &state.repo, true)? {
         return Err(
-            "production deploy requires fresh passing final verification; run `zirv verify`"
-                .into(),
+            "production deploy requires fresh passing final verification; run `zirv verify`".into(),
         );
     }
 
