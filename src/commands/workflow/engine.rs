@@ -2360,6 +2360,89 @@ mod tests {
     }
 
     #[test]
+    fn artifact_drift_reopens_the_owning_gate_and_invalidates_later_work() {
+        let repo = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+        let mut classification = low_classification();
+        classification.complexity = Complexity::Substantial;
+        classification.risk = RiskBand::High;
+        let state = WorkflowState::start(
+            repo.path().to_path_buf(),
+            "substantial feature".into(),
+            WorkflowKind::Feature,
+            None,
+            true,
+            classification,
+        );
+        ensure_current_artifact_template(&state).unwrap();
+        let intent = workflow_artifact_path(&state, ArtifactStage::Intent).unwrap();
+        std::fs::write(
+            &intent,
+            "# Intent\n\n## Problem\nA\n\n## Desired outcome\nB\n",
+        )
+        .unwrap();
+        let state = approve(&state_dir, state).unwrap();
+        assert_eq!(state.current().unwrap().id, "spec");
+
+        std::fs::write(
+            &intent,
+            "# Intent\n\n## Problem\nChanged after acceptance\n\n## Desired outcome\nB\n",
+        )
+        .unwrap();
+        let error =
+            advance_with_evidence(&state_dir, state, StepOutcome::Success, None).unwrap_err();
+        assert!(error.to_string().contains("intent artifact changed"));
+
+        let reopened = load_active(&state_dir, repo.path()).unwrap().unwrap();
+        assert_eq!(reopened.current().unwrap().id, "intent");
+        assert_eq!(reopened.status, WorkflowStatus::AwaitingApproval);
+        assert!(
+            reopened
+                .artifacts
+                .get("intent")
+                .unwrap()
+                .accepted_hash
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn workflow_artifact_status_reports_pending_accepted_and_drifted() {
+        let repo = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+        let state = WorkflowState::start(
+            repo.path().to_path_buf(),
+            "small feature".into(),
+            WorkflowKind::Feature,
+            None,
+            true,
+            low_classification(),
+        );
+        ensure_current_artifact_template(&state).unwrap();
+        let pending = workflow_artifact_statuses(&state).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(pending[0].exists);
+        assert!(!pending[0].accepted);
+
+        let intent = workflow_artifact_path(&state, ArtifactStage::Intent).unwrap();
+        std::fs::write(
+            &intent,
+            "# Intent\n\n## Problem\nA\n\n## Desired outcome\nB\n",
+        )
+        .unwrap();
+        let accepted = approve(&state_dir, state).unwrap();
+        let statuses = workflow_artifact_statuses(&accepted).unwrap();
+        assert!(statuses[0].accepted);
+        assert!(!statuses[0].drifted);
+
+        std::fs::write(&intent, "# Intent\nchanged\n").unwrap();
+        let statuses = workflow_artifact_statuses(&accepted).unwrap();
+        assert!(statuses[0].drifted);
+    }
+
+    #[test]
     fn resume_does_not_redispatch_completed_steps() {
         let repo = tempdir().unwrap();
         let root = tempdir().unwrap();
