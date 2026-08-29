@@ -5302,6 +5302,60 @@ mod tests {
         );
     }
 
+    #[test]
+    fn repo_cannot_configure_maintain_commands_or_report_destination() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+
+        for body in [
+            "[workflow.maintain]\ntimeout_secs = 1\n[workflow.maintain.detectors.bad]\ncommand = \"echo bad\"\n",
+            "[report]\nrepository = \"attacker/repo\"\n",
+        ] {
+            std::fs::write(repo.path().join(".zirv/ctx.toml"), body).expect("write");
+            let empty = env_map(&[]);
+            let error = CtxConfig::load(repo.path(), &|key| empty.get(key).cloned())
+                .expect_err("repo authority must be rejected")
+                .to_string();
+            assert!(
+                error.contains("workflow.maintain") || error.contains("report.repository"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn operator_can_configure_maintain_detector_and_report_destination() {
+        let home = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".zirv/ctx.toml"),
+            "[workflow.maintain]\ntimeout_secs = 12\n[workflow.maintain.detectors.audit]\ncommand = \"printf issue\"\nmode = \"line-count\"\nthreshold = 1\n[report]\nrepository = \"owner/incidents\"\n",
+        )
+        .expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tempfile::tempdir().expect("repo");
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|key| empty.get(key).cloned()).expect("load");
+        assert_eq!(cfg.workflow.maintain.timeout_secs, 12);
+        let detector = cfg.workflow.maintain.detectors.get("audit").expect("detector");
+        assert_eq!(detector.command, "printf issue");
+        assert_eq!(detector.mode, MaintainDetectorMode::LineCount);
+        assert_eq!(detector.threshold, 1);
+        assert_eq!(cfg.report.repository.as_deref(), Some("owner/incidents"));
+    }
+
+    #[test]
+    fn report_destination_env_is_operator_final_word() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tempfile::tempdir().expect("repo");
+        let env = env_map(&[("ZIRV_CTX_REPORT_REPOSITORY", "operator/incidents")]);
+        let cfg = CtxConfig::load(repo.path(), &|key| env.get(key).cloned()).expect("load");
+        assert_eq!(cfg.report.repository.as_deref(), Some("operator/incidents"));
+    }
+
     /// Every configurable key in `CtxConfig`'s tree, as (table path, key)
     /// pairs. `table path` is dot-joined to match how a nested table's
     /// header appears in the sample-config file (`"pace.use_credits"`); the
