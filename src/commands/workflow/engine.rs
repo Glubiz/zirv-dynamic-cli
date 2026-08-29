@@ -1299,20 +1299,12 @@ fn rematerialize_after_risk_increase(state: &mut WorkflowState) {
         .unwrap_or(state.steps.len());
 }
 
-
 fn apply_effective_deploy_tier(state: &mut WorkflowState, effective: DeployTier) {
     let target = state.deploy_tier.max(effective);
-    let desired = materialize(
-        state.kind,
-        &state.classification,
-        state.profile,
-        target,
-    );
+    let desired = materialize(state.kind, &state.classification, state.profile, target);
 
     let known: Vec<String> = state.steps.iter().map(|step| step.id.clone()).collect();
-    let earliest_new = desired
-        .iter()
-        .position(|step| !known.contains(&step.id));
+    let earliest_new = desired.iter().position(|step| !known.contains(&step.id));
 
     if target > state.deploy_tier
         && let Some(cutoff) = earliest_new
@@ -2099,12 +2091,7 @@ pub fn run(args: &WorkflowArgs, writer: &mut impl Write) -> CtxResult<i32> {
                     !args.built_in_only,
                 )?;
                 let report = super::capability::CapabilityReport::for_repo(agent, &repo)?;
-                for step in materialize(
-                    definition.kind,
-                    &classification,
-                    profile,
-                    deploy_tier,
-                ) {
+                for step in materialize(definition.kind, &classification, profile, deploy_tier) {
                     for skill in step_skill_ids(&step, &classification) {
                         registry.ensure_supported(&skill, &report)?;
                     }
@@ -2360,7 +2347,11 @@ mod tests {
             .find(|step| step.phase == WorkflowPhase::Deploy)
             .unwrap();
         assert!(!development_deploy.approval);
-        assert!(!development.iter().any(|step| step.phase == WorkflowPhase::Review));
+        assert!(
+            !development
+                .iter()
+                .any(|step| step.phase == WorkflowPhase::Review)
+        );
 
         let staging = materialize(
             WorkflowKind::Feature,
@@ -2375,7 +2366,11 @@ mod tests {
                 .unwrap()
                 .approval
         );
-        assert!(!staging.iter().any(|step| step.phase == WorkflowPhase::Review));
+        assert!(
+            !staging
+                .iter()
+                .any(|step| step.phase == WorkflowPhase::Review)
+        );
 
         let production = materialize(
             WorkflowKind::Feature,
@@ -2410,8 +2405,10 @@ mod tests {
             true,
             low_classification(),
         );
-        state.completed_steps =
-            vec!["intent", "implement", "test", "verify"].into_iter().map(str::to_string).collect();
+        state.completed_steps = vec!["intent", "implement", "test", "verify"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
         state.current_step = state
             .steps
             .iter()
