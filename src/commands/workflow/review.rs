@@ -391,6 +391,372 @@ fn git_diff_capped(repo: &Path, base_sha: &str) -> CtxResult<(String, bool)> {
     Ok((String::from_utf8_lossy(&stdout).into_owned(), truncated))
 }
 
+
+fn validate_github_repo_slug(raw: &str) -> CtxResult<String> {
+    let raw = raw.trim().trim_end_matches(".git");
+    let mut parts = raw.split('/');
+    let owner = parts.next().unwrap_or_default();
+    let repo = parts.next().unwrap_or_default();
+    if owner.is_empty()
+        || repo.is_empty()
+        || parts.next().is_some()
+        || !owner
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        || !repo
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    {
+        return Err(format!(
+            "invalid GitHub repository '{raw}'; expected owner/repository"
+        )
+        .into());
+    }
+    Ok(format!("{owner}/{repo}"))
+}
+
+fn github_repo_from_origin(repo: &Path) -> CtxResult<String> {
+    let origin = git(repo, &["remote", "get-url", "origin"])?;
+    let raw = origin.trim();
+    let slug = if let Some(rest) = raw.strip_prefix("https://github.com/") {
+        rest
+    } else if let Some(rest) = raw.strip_prefix("http://github.com/") {
+        rest
+    } else if let Some(rest) = raw.strip_prefix("git@github.com:") {
+        rest
+    } else if let Some(rest) = raw.strip_prefix("ssh://git@github.com/") {
+        rest
+    } else {
+        return Err(format!(
+            "origin '{raw}' is not a supported github.com remote; pass --github-repo owner/repository"
+        )
+        .into());
+    };
+    validate_github_repo_slug(slug)
+}
+
+fn github_repo_slug(repo: &Path, explicit: Option<&str>) -> CtxResult<String> {
+    match explicit {
+        Some(raw) => validate_github_repo_slug(raw),
+        None => github_repo_from_origin(repo),
+    }
+}
+
+fn gh_output(repo_slug: &str, args: &[String]) -> CtxResult<String> {
+    let output = Command::new("gh")
+        .args(args)
+        .args(["--repo", repo_slug])
+        .output()
+        .map_err(|error| format!("could not launch GitHub CLI: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "gh {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn gh_output_capped(
+    repo_slug: &str,
+    args: &[String],
+    cap: usize,
+) -> CtxResult<(String, bool)> {
+    let mut child = Command::new("gh")
+        .args(args)
+        .args(["--repo", repo_slug])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("could not launch GitHub CLI: {error}"))?;
+    let stdout = child.stdout.take().ok_or("gh stdout was not captured")?;
+    let stderr = child.stderr.take().ok_or("gh stderr was not captured")?;
+    let stderr_thread = std::thread::spawn(move || read_capped_head(stderr, 16 * 1024).0);
+    let (stdout, truncated) = read_capped_head(stdout, cap);
+    let status = child.wait()?;
+    let stderr = stderr_thread.join().unwrap_or_default();
+    if !status.success() {
+        return Err(format!(
+            "gh {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&stderr).trim()
+        )
+        .into());
+    }
+    Ok((String::from_utf8_lossy(&stdout).into_owned(), truncated))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GhPullRequestView {
+    base_ref_oid: String,
+    head_ref_oid: String,
+    title: String,
+    url: Option<String>,
+    #[serde(default)]
+    files: Vec<GhPullRequestFile>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GhPullRequestFile {
+    path: String,
+}
+
+fn load_pull_request(repo_slug: &str, number: u64) -> CtxResult<GhPullRequestView> {
+    let args = vec![
+        "pr".to_string(),
+        "view".to_string(),
+        number.to_string(),
+        "--json".to_string(),
+        "baseRefOid,headRefOid,title,url,files".to_string(),
+    ];
+    let raw = gh_output(repo_slug, &args)?;
+    serde_json::from_str(&raw)
+        .map_err(|error| format!("GitHub CLI returned invalid PR metadata: {error}").into())
+}
+
+fn pr_fingerprint(head_sha: &str) -> CtxResult<u64> {
+    let prefix = head_sha.get(..16).ok_or("GitHub PR head sha is too short")?;
+    u64::from_str_radix(prefix, 16)
+        .map_err(|_| "GitHub PR head sha is not hexadecimal".into())
+}
+
+fn package_pull_request(
+    state: &WorkflowState,
+    pr: u64,
+    explicit_repo: Option<&str>,
+) -> CtxResult<ReviewPackage> {
+    let repository = github_repo_slug(&state.repo, explicit_repo)?;
+    let view = load_pull_request(&repository, pr)?;
+    let args = vec!["pr".to_string(), "diff".to_string(), pr.to_string()];
+    let (diff, diff_truncated) =
+        gh_output_capped(&repository, &args, MAX_REVIEW_DIFF_BYTES)?;
+    let change_fingerprint = pr_fingerprint(&view.head_ref_oid)?;
+    let required_reviews = required_independent_reviews_for(state);
+    Ok(ReviewPackage {
+        schema_version: 2,
+        repo_root: state.repo.clone(),
+        include_custom_agents: state.include_custom_skills,
+        workflow_id: state.id.clone(),
+        task: state.task.clone(),
+        pull_request: Some(PullRequestReference {
+            repository,
+            number: pr,
+            title: crate::utils::truncate_bytes(view.title, Some(512)),
+            url: view.url,
+        }),
+        classification: state.classification.clone(),
+        review_depth: if required_reviews >= 2 {
+            ReviewDepth::StrongIndependentReview
+        } else if required_reviews == 1 {
+            ReviewDepth::OneIndependentReviewer
+        } else {
+            ReviewDepth::SelfVerification
+        },
+        required_independent_reviews: required_reviews,
+        escalation_reason: None,
+        base_sha: view.base_ref_oid.clone(),
+        head_sha: view.head_ref_oid.clone(),
+        diff_base_sha: view.base_ref_oid,
+        diff_is_delta: false,
+        change_fingerprint,
+        changed_paths: view.files.into_iter().map(|file| PathBuf::from(file.path)).collect(),
+        diff,
+        diff_truncated,
+        verification: None,
+        existing_findings: state.review_findings.clone(),
+        review_round: 1,
+        max_review_rounds: MAX_FIX_REVIEW_ROUNDS,
+    })
+}
+
+#[derive(Debug, Deserialize)]
+struct GhUser {
+    login: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GhInlineComment {
+    id: u64,
+    body: String,
+    path: Option<String>,
+    line: Option<u32>,
+    original_line: Option<u32>,
+    html_url: Option<String>,
+    user: Option<GhUser>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GhReviewComment {
+    id: u64,
+    body: Option<String>,
+    html_url: Option<String>,
+    user: Option<GhUser>,
+}
+
+fn parse_paginated<T: for<'de> Deserialize<'de>>(raw: &str) -> CtxResult<Vec<T>> {
+    let value: serde_json::Value = serde_json::from_str(raw)
+        .map_err(|error| format!("GitHub CLI returned invalid JSON: {error}"))?;
+    let Some(items) = value.as_array() else {
+        return Err("GitHub CLI returned a non-array paginated response".into());
+    };
+    let flat: Vec<serde_json::Value> = if items.first().is_some_and(|value| value.is_array()) {
+        items
+            .iter()
+            .flat_map(|page| page.as_array().into_iter().flatten().cloned())
+            .collect()
+    } else {
+        items.clone()
+    };
+    flat.into_iter()
+        .map(|value| {
+            serde_json::from_value(value)
+                .map_err(|error| format!("GitHub CLI returned an invalid comment: {error}").into())
+        })
+        .collect()
+}
+
+fn github_api_pages<T: for<'de> Deserialize<'de>>(
+    repo_slug: &str,
+    endpoint: &str,
+) -> CtxResult<Vec<T>> {
+    let args = vec![
+        "api".to_string(),
+        "--paginate".to_string(),
+        "--slurp".to_string(),
+        endpoint.to_string(),
+    ];
+    parse_paginated(&gh_output(repo_slug, &args)?)
+}
+
+fn severity_from_github_comment(body: &str) -> FindingSeverity {
+    let normalized = body.trim_start().to_ascii_lowercase();
+    if normalized.starts_with("[critical]")
+        || normalized.starts_with("critical:")
+        || normalized.starts_with("blocker:")
+    {
+        FindingSeverity::Critical
+    } else if normalized.starts_with("[minor]")
+        || normalized.starts_with("minor:")
+        || normalized.starts_with("nit:")
+    {
+        FindingSeverity::Minor
+    } else if normalized.starts_with("[note]") || normalized.starts_with("note:") {
+        FindingSeverity::Note
+    } else {
+        FindingSeverity::Major
+    }
+}
+
+fn github_summary(
+    pr: u64,
+    author: Option<&GhUser>,
+    body: &str,
+    url: Option<&str>,
+) -> String {
+    let author = author.map(|user| user.login.as_str()).unwrap_or("unknown");
+    let body = body
+        .replace(['\r', '\n'], " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut summary = format!("GitHub PR #{pr} review by {author}: {body}");
+    if let Some(url) = url {
+        summary.push_str(" (");
+        summary.push_str(url);
+        summary.push(')');
+    }
+    crate::utils::truncate_bytes(summary, Some(MAX_FINDING_SUMMARY_BYTES))
+}
+
+fn ingest_pull_request_comments(
+    state_dir: &StateDir,
+    state: &mut WorkflowState,
+    pr: u64,
+    explicit_repo: Option<&str>,
+) -> CtxResult<usize> {
+    let repository = github_repo_slug(&state.repo, explicit_repo)?;
+    let inline_endpoint = format!("repos/{repository}/pulls/{pr}/comments");
+    let review_endpoint = format!("repos/{repository}/pulls/{pr}/reviews");
+    let inline: Vec<GhInlineComment> = github_api_pages(&repository, &inline_endpoint)?;
+    let reviews: Vec<GhReviewComment> = github_api_pages(&repository, &review_endpoint)?;
+
+    let existing: BTreeSet<String> =
+        state.review_findings.iter().map(|finding| finding.id.clone()).collect();
+    let mut incoming = Vec::new();
+
+    for comment in inline {
+        let id = format!("github-pr-{pr}-comment-{}", comment.id);
+        if existing.contains(&id) || comment.body.trim().is_empty() {
+            continue;
+        }
+        let path = comment.path.and_then(|path| {
+            (path.len() <= MAX_FINDING_PATH_BYTES && !Path::new(&path).is_absolute())
+                .then(|| PathBuf::from(path))
+        });
+        incoming.push(ReviewFinding {
+            id,
+            severity: severity_from_github_comment(&comment.body),
+            summary: github_summary(
+                pr,
+                comment.user.as_ref(),
+                &comment.body,
+                comment.html_url.as_deref(),
+            ),
+            path,
+            line: comment.line.or(comment.original_line),
+            disposition: FindingDisposition::Open,
+            recommended_disposition: Some(FindingDisposition::Fixed),
+            created_at: now_secs(),
+        });
+    }
+
+    for review in reviews {
+        let Some(body) = review.body.filter(|body| !body.trim().is_empty()) else {
+            continue;
+        };
+        let id = format!("github-pr-{pr}-review-{}", review.id);
+        if existing.contains(&id) {
+            continue;
+        }
+        incoming.push(ReviewFinding {
+            id,
+            severity: severity_from_github_comment(&body),
+            summary: github_summary(
+                pr,
+                review.user.as_ref(),
+                &body,
+                review.html_url.as_deref(),
+            ),
+            path: None,
+            line: None,
+            disposition: FindingDisposition::Open,
+            recommended_disposition: Some(FindingDisposition::Fixed),
+            created_at: now_secs(),
+        });
+    }
+
+    let remaining = MAX_REVIEW_FINDINGS.saturating_sub(state.review_findings.len());
+    if incoming.len() > remaining {
+        return Err(format!(
+            "GitHub PR has {} new review comments but workflow has room for only {remaining}",
+            incoming.len()
+        )
+        .into());
+    }
+
+    let count = incoming.len();
+    if count > 0 {
+        state.review_findings.extend(incoming);
+        state.updated_at = now_secs();
+        save_state(state_dir, state)?;
+        record_finding_update(state_dir, state);
+    }
+    Ok(count)
+}
+
 fn append_capped(target: &mut String, text: &str, cap: usize, truncated: &mut bool) {
     let remaining = cap.saturating_sub(target.len());
     if text.len() <= remaining {
