@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-27
+last-verified: 2026-08-28
 ---
 
 # Usage and Pacing
@@ -165,6 +165,12 @@ flowchart TD
         SLEEP -->|window healthy now| GO
     end
 ```
+
+## Cross-harness headroom and fallback (issue #186, v2.36.0)
+
+`pace::spawn_headroom` exposes the binding five-hour/seven-day reading as remaining percentage headroom without changing `spawn_gate` itself. The new `fallback.rs` selector consumes that signal for **new delegations** and for a supervisor only **after** a vendor-confirmed usage-limit stop. Predictive steering fires only from a measured source reading at or below `fallback.predictive_headroom_pct`; an absent/stale source never causes speculative steering.
+
+Candidate harnesses are filtered through the normal enabled/readiness gate, `.settings.toml` capacity markers, the ordinary spawn gate, enforceable task budgets, and equivalent model-tier resolution. A candidate with no usable usage reading receives only the operator-configured conservative `fallback.unknown_headroom_pct` assumption (default 25%; 0 opts unknown seats out). Known-refused candidates are never selected. If no candidate qualifies, the existing refusal/park-and-wait behavior remains authoritative.
 
 ## See Also
 

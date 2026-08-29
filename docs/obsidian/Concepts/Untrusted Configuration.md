@@ -247,6 +247,12 @@ The same two habits apply, adapted to what memory actually is:
 
 Issue #37 tightens automatic harvesting further: clean exits and distilled rot handoffs share one `memory::harvest_durable` path, and harvesting requires `memory.enabled`, `memory.harvest`, and `memory.shared_enabled` before a model is started. Candidates are filtered deterministically for durable repository facts, capped by `harvest_max_entries` and `harvest_max_bytes`, written only to the git-reviewable shared bank, and never overwrite an entry whose `Source` is `explicit`. Issue #38's `zirv memory optimize` remains report-only unless `--apply` is explicit; even then it only consolidates safe duplicate groups and never deletes entries or invokes git.
 
+## Fallback routing is operator-owned, repository-narrowable (issue #186)
+
+`[fallback]` is not an all-or-nothing `REPO_FORBIDDEN` table because a checkout has safe ways to become **less** eager to spend another vendor seat. `CtxConfig::load` lifts its fields before the normal repository merge and folds them asymmetrically: a repo may disable fallback, filter candidates from the operator's order, lower the predictive threshold, raise required candidate headroom, lower unknown-seat assumed headroom, and lower the "small task" budget ceilings. It cannot enable a home-disabled policy, add/reorder candidates, or make a threshold more permissive. `ZIRV_CTX_FALLBACK*` environment variables remain the operator's final override.
+
+This is separate from `.zirv/.settings.toml`'s roster/capacity gate. Fallback never bypasses it: disabled harnesses are ineligible, and a `capacity = "small"` harness only receives an explicitly bounded small brief.
+
 ## The underlying convention
 
 Repo-provided text is treated the same way regardless of which surface it arrives through: capped where it can grow unbounded, labeled where it's concatenated into something authoritative-looking, and denied any lever — a config key, a tool — that would let it grant itself more than that.
