@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-27
+last-verified: 2026-08-29
 ---
 
 # Workflows
@@ -8,14 +8,14 @@ last-verified: 2026-08-27
 
 - **Files:** `src/commands/workflow/{mod,skill,capability,classify,engine,verification,review,artifact,telemetry,frontend,frontend_detector,frontend_render}.rs`
 - **Commands:** `zirv skill`, `zirv workflow`, `zirv test`, `zirv verify`, `zirv artifact`, `zirv frontend`
-- **State:** private platform state under `workflows/`, `verification/`, `artifacts/`, `workflow-telemetry/`, and `frontend/`, each repository-scoped by the existing deterministic repo slug
+- **State:** private platform state under `workflows/`, `verification/`, `artifacts/`, `workflow-telemetry/`, and `frontend/`, each repository-scoped by the existing deterministic repo slug; accepted SDLC work products live in git under `.zirv/work/<workflow-id>/`
 - **Repository inputs:** `.zirv/skills/*.yaml|yml|toml` and optional `.zirv/verify.toml` — both untrusted, and both gated by an operator-only `[workflow]` config key
 - **Operator config:** `[workflow]` in `ctx.toml` — `repo_checks_enabled`, `repo_skills_enabled`, `telemetry_enabled`, `telemetry_max_events`, `telemetry_retention_days`, every one `REPO_FORBIDDEN`
 - **If changed:** [[Built-in Commands]], [[Architecture Overview]], [[Utilities]] when prompt-layer behavior changes, and [[Untrusted Configuration]] when trust/capability rules change
 
 ## Purpose
 
-The workflow subsystem makes Zirv own the development lifecycle instead of asking every model to reconstruct a methodology in conversation. Skills describe concise judgment. Zirv owns deterministic mechanics, phase state, risk selection, verification, review limits, artifacts, and telemetry.
+The workflow subsystem makes Zirv own the development lifecycle instead of asking every model to reconstruct a methodology in conversation. Skills describe concise judgment. Zirv owns deterministic mechanics, phase state, risk selection, verification, review limits, artifacts, and telemetry. The AI-native SDLC chain is a version-controlled work-product surface: adaptive workflows create `intent.md`, `spec.md`, and `plan.md` only when classification requires them, while private workflow state retains the acceptance authority.
 
 Workflow state and skill context are deliberately different:
 
@@ -51,10 +51,15 @@ zirv workflow classify --task "..."
 zirv workflow start feature --task "..." [--agent claude] [--built-in-only]
 zirv workflow status [id]
 zirv workflow context [id]
+zirv workflow artifacts <id> [--json]
 zirv workflow approve <id>
 zirv workflow advance <id> --outcome success|failure
 zirv workflow resume <id>
 ```
+
+The committed artifact chain is structural rather than advisory. Artifact steps create fixed templates under `.zirv/work/<workflow-id>/`; `workflow approve` refuses an untouched template, pins the accepted SHA-256 digest and timestamp in private state, then advances the artifact step. Later steps fold only accepted, hash-matching artifacts into prompt context, under a shared byte cap and explicitly labeled as untrusted repository text. Missing or edited accepted files reopen the owning acceptance gate and invalidate later completed steps, so implementation cannot silently proceed against a plan that changed after approval. `workflow artifacts` exposes pending/accepted/drifted state without making repository text authoritative.
+
+Adaptive defaults keep ceremony proportional: features always capture intent, add a plan for bounded work and a spec for substantial/high-risk work; trivial bugfixes retain the debug spine with no artifact ceremony, while larger bugfix/refactor work gains intent/plan gates; spikes capture intent; review-only workflows do not create planning artifacts. `WorkflowPhase::Intent` uses the provider-neutral `brainstorm` skill.
 
 Classification separates intent, work domain (`general` or `frontend`), complexity (`trivial`, `bounded`, `substantial`, `architectural`), and risk (`low`, `medium`, `high`, `critical`). Frontend selection is automatic from task language and changed frontend paths; there is no `--frontend` or init flag. Identical path/line/task inputs produce the same score and sorted reasons. Both tracked and untracked change surfaces contribute paths and size signals, measured against the same merge-base diff base `review` uses (`origin/main`, then `main`, then `HEAD^`), so classification and review agree on what "the change" is. Sensitive auth/security or database/schema surfaces raise a High floor; an explicit `--risk` below that floor is refused outright, and every other input can only ever be *raised* toward it:
 
