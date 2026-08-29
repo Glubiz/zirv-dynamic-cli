@@ -678,6 +678,51 @@ fn sync_artifact_records(state: &mut WorkflowState) {
     }
 }
 
+/// Refuses a repo-owned workflow artifact path routed through a symlinked
+/// `.zirv/work` directory, workflow directory, or artifact file itself --
+/// the same defense `agents::load_dir` and `artifact::register` apply to
+/// their own repo-owned surfaces. Checked once at the single choke point
+/// every reader/writer/hasher of a workflow artifact goes through
+/// (`workflow_artifact_path`), before any create/read/hash touches disk.
+///
+/// A missing component is not a symlink, so `symlink_metadata` erroring with
+/// `NotFound` is treated as "nothing to refuse yet" -- `ensure_current_
+/// artifact_template` still needs to be able to create these paths fresh.
+fn refuse_symlinked_artifact_path(repo: &Path, workflow_id: &str, path: &Path) -> CtxResult<()> {
+    let work_root = repo.join(".zirv").join("work");
+    let workflow_dir = work_root.join(workflow_id);
+    for candidate in [work_root.as_path(), workflow_dir.as_path(), path] {
+        if let Ok(metadata) = std::fs::symlink_metadata(candidate)
+            && metadata.file_type().is_symlink()
+        {
+            return Err(format!(
+                "refusing symlinked workflow artifact path '{}'",
+                candidate.display()
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+/// Design spec risk-section commitment: a repo that `.gitignore`s `.zirv/`
+/// (or `.zirv/work/` specifically) silently loses every work-product
+/// artifact a workflow produces -- nothing else in this crate would notice.
+/// Best-effort only, mirroring `classify::git_change_input`'s own plain
+/// `git -C <repo> ...` shell-out: a missing `git`, a non-repository `repo`,
+/// or any other probe failure reads as "not ignored" rather than blocking
+/// `workflow start` on an environment problem this warning is not
+/// authoritative about anyway.
+fn work_dir_is_gitignored(repo: &Path) -> bool {
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["check-ignore", "--quiet", ".zirv/work"])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
 fn workflow_artifact_path(state: &WorkflowState, stage: ArtifactStage) -> CtxResult<PathBuf> {
     let record = state
         .artifacts
@@ -691,7 +736,9 @@ fn workflow_artifact_path(state: &WorkflowState, stage: ArtifactStage) -> CtxRes
         )
         .into());
     }
-    Ok(state.repo.join(&record.rel_path))
+    let path = state.repo.join(&record.rel_path);
+    refuse_symlinked_artifact_path(&state.repo, &state.id, &path)?;
+    Ok(path)
 }
 
 fn ensure_current_artifact_template(state: &WorkflowState) -> CtxResult<()> {
@@ -897,6 +944,14 @@ pub(crate) fn save(state_dir: &StateDir, state: &WorkflowState, active: bool) ->
 
 pub fn load(state: &StateDir, repo: &Path, id: &str) -> CtxResult<WorkflowState> {
     let path = state_path(state, repo, id)?;
+    // Every verb that resolves a workflow by id (`status`, `resume`,
+    // `context`, `artifacts`, `approve`, `advance`, ...) goes through this
+    // one function, so checking here once is enough to keep a bogus id from
+    // leaking a raw OS error ("The system cannot find the path specified.
+    // (os error 3)") instead of a domain-shaped message.
+    if !path.exists() {
+        return Err(format!("unknown workflow '{id}'").into());
+    }
     let value: WorkflowState = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
     if value.schema_version != WORKFLOW_SCHEMA_VERSION {
         return Err(format!(
@@ -2111,6 +2166,12 @@ pub fn run(args: &WorkflowArgs, writer: &mut impl Write) -> CtxResult<i32> {
             apply_effective_deploy_tier(&mut state, deploy_tier);
             state.usage_checkpoint = usage_checkpoint(&state.repo);
             ensure_current_artifact_template(&state)?;
+            if work_dir_is_gitignored(&state.repo) {
+                writeln!(
+                    writer,
+                    "warning: .zirv/work is ignored by this repository's .gitignore -- workflow artifacts will not be tracked by git"
+                )?;
+            }
             save(&state_dir, &state, true)?;
             let mut event = super::telemetry::TelemetryEvent::new(
                 super::telemetry::TelemetryKind::WorkflowStarted,
@@ -2662,6 +2723,115 @@ mod tests {
         );
     }
 
+    /// Mirrors `skill::symlinked_manifests_are_refused` / `agents::load_dir`'s
+    /// own symlink defense: a symlinked `.zirv/work/<id>` workflow directory
+    /// must be refused before `ensure_current_artifact_template` ever creates
+    /// or writes through it. `#[cfg(unix)]` for the same reason those two
+    /// tests are: creating a real symlink needs elevated privileges on
+    /// Windows, so this is verified on Linux/Docker instead (see the crate's
+    /// own working instructions on cross-platform symlink tests).
+    #[cfg(unix)]
+    #[test]
+    fn ensure_current_artifact_template_refuses_a_symlinked_workflow_directory() {
+        use std::os::unix::fs::symlink;
+        let repo = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join(".zirv/work")).unwrap();
+        let state = WorkflowState::start(
+            repo.path().to_path_buf(),
+            "small feature".into(),
+            WorkflowKind::Feature,
+            None,
+            true,
+            low_classification(),
+        );
+        let workflow_dir = repo.path().join(".zirv/work").join(&state.id);
+        symlink(outside.path(), &workflow_dir).unwrap();
+
+        let error = ensure_current_artifact_template(&state)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("symlinked"), "{error}");
+        assert!(
+            !outside
+                .path()
+                .join(ArtifactStage::Intent.file_name())
+                .exists(),
+            "must refuse before ever writing through the symlink"
+        );
+    }
+
+    /// Same defense, but the `.zirv/work` root itself is symlinked rather
+    /// than the per-workflow directory beneath it.
+    #[cfg(unix)]
+    #[test]
+    fn ensure_current_artifact_template_refuses_a_symlinked_work_root() {
+        use std::os::unix::fs::symlink;
+        let repo = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join(".zirv")).unwrap();
+        symlink(outside.path(), repo.path().join(".zirv/work")).unwrap();
+        let state = WorkflowState::start(
+            repo.path().to_path_buf(),
+            "small feature".into(),
+            WorkflowKind::Feature,
+            None,
+            true,
+            low_classification(),
+        );
+
+        let error = ensure_current_artifact_template(&state)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("symlinked"), "{error}");
+    }
+
+    /// Design spec risk-section commitment: `workflow start` warns (does not
+    /// block) when `.zirv/work` would be gitignored, since a repo that
+    /// ignores it silently loses every work-product artifact a workflow
+    /// produces. Uses a real `git` shell-out, same as the frontend tests
+    /// above (`git` is on PATH in this crate's own test environment).
+    #[test]
+    fn work_dir_is_gitignored_detects_a_zirv_work_gitignore_rule() {
+        let repo = tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.email=t@example.com",
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(repo.path())
+                .status()
+                .unwrap();
+            assert!(status.success());
+        };
+        git(&["init", "-q"]);
+        assert!(
+            !work_dir_is_gitignored(repo.path()),
+            "no .gitignore rule yet"
+        );
+
+        std::fs::write(repo.path().join(".gitignore"), ".zirv/\n").unwrap();
+        assert!(
+            work_dir_is_gitignored(repo.path()),
+            "a .zirv/ gitignore rule covers .zirv/work"
+        );
+    }
+
+    /// The probe is best-effort, never authoritative: a path with no git
+    /// repository at all must read as "not ignored" rather than erroring
+    /// `workflow start` on an environment `git` cannot make sense of.
+    #[test]
+    fn work_dir_is_gitignored_fails_open_outside_a_git_repository() {
+        let not_a_repo = tempdir().unwrap();
+        assert!(!work_dir_is_gitignored(not_a_repo.path()));
+    }
+
     #[test]
     fn artifact_drift_reopens_the_owning_gate_and_invalidates_later_work() {
         let repo = tempdir().unwrap();
@@ -2743,6 +2913,29 @@ mod tests {
         std::fs::write(&intent, "# Intent\nchanged\n").unwrap();
         let statuses = workflow_artifact_statuses(&accepted).unwrap();
         assert!(statuses[0].drifted);
+    }
+
+    /// `load` is the single choke point every id-resolving verb (`status`,
+    /// `resume`, `context`, `artifacts`, `approve`, `advance`) goes through --
+    /// pinned here so a bogus id gets the domain-shaped "unknown workflow"
+    /// message rather than `std::fs::read_to_string`'s raw OS error ("The
+    /// system cannot find the path specified. (os error 3)" on Windows).
+    #[test]
+    fn load_reports_a_domain_error_for_an_unknown_workflow_id() {
+        let repo = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+
+        let error = load(&state_dir, repo.path(), "does-not-exist")
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("unknown workflow"), "{error}");
+        assert!(error.contains("does-not-exist"), "{error}");
+        assert!(
+            !error.to_ascii_lowercase().contains("os error"),
+            "must not leak a raw OS error: {error}"
+        );
     }
 
     #[test]

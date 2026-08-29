@@ -259,10 +259,21 @@ fn dispatch_agent(&self, manifest: &AgentManifest, task: &AgentTask) -> Result<C
 ```
 
 - claude: headless invocation with the manifest instructions as the worker system-prompt
-  layer, model mapped from `ModelTier` (Fast→haiku-class, Standard→sonnet-class,
-  Deep→opus-class) unless the operator pins otherwise.
-- codex: worker argv with the equivalent flags; tier maps to the operator's configured
-  codex model tiers.
+  layer.
+- codex: worker argv with the equivalent flags.
+
+**Amendment, reviewed design decision (2026-08-29):** the implementation deliberately does
+not map `ModelTier` to a concrete model id in either adapter. `model_tier` is passed through
+as a routing hint only — each adapter (and, through it, the operator's own config) decides
+what concrete model that hint resolves to, unless an operator/caller explicitly supplies a
+model id, in which case the explicit pin always wins. This section originally described
+`dispatch_agent` guessing a provider-specific model per tier (Fast→haiku-class,
+Standard→sonnet-class, Deep→opus-class for claude; an equivalent codex mapping); that was
+never built, on purpose. Hardcoding vendor model names in this provider-neutral layer would
+rot the moment a vendor renames or retires a model class, and — worse — codex has no
+haiku/sonnet/opus ladder to map onto at all, so the same hardcoded table could never hold
+for both adapters without silently favoring one of them. See `AgentAdapter::dispatch_agent`'s
+own doc comment (`src/commands/ctx/adapters/mod.rs`) for the implemented contract.
 
 `WorkflowStep` gains `agent: Option<String>` (manifest id). The review machinery's
 independent-reviewer seat becomes `agent: Some("reviewer")` instead of ad-hoc argv — same
