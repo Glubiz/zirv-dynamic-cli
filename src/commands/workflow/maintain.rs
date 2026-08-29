@@ -542,6 +542,51 @@ mod tests {
     }
 
     #[test]
+    fn persistent_breach_reuses_one_parked_workflow_until_recovery() {
+        let repo = tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join(".zirv")).unwrap();
+        let root = tempdir().unwrap();
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+        let mut first = DetectorResult {
+            id: "audit".into(),
+            mode: MaintainDetectorMode::ExitNonzero,
+            threshold: 1,
+            exit_code: Some(1),
+            timed_out: false,
+            output_lines: 0,
+            output_bytes: 0,
+            breach: true,
+            workflow_id: None,
+            issue_url: None,
+            report_error: None,
+        };
+        process_breach(&state_dir, repo.path(), None, &mut first).unwrap();
+        let workflow = first.workflow_id.clone().expect("workflow");
+        assert!(
+            repo.path()
+                .join(".zirv/work")
+                .join(&workflow)
+                .join("intent.md")
+                .exists()
+        );
+        let stored = engine::load(&state_dir, repo.path(), &workflow).unwrap();
+        assert_eq!(stored.status, WorkflowStatus::AwaitingApproval);
+        assert_eq!(
+            stored.current().and_then(|step| step.artifact),
+            Some(engine::ArtifactStage::Intent)
+        );
+
+        let mut second = first.clone();
+        second.workflow_id = None;
+        process_breach(&state_dir, repo.path(), None, &mut second).unwrap();
+        assert_eq!(second.workflow_id.as_deref(), Some(workflow.as_str()));
+
+        let key = incident_key(repo.path(), "audit");
+        clear_marker(&state_dir, repo.path(), &key).unwrap();
+        assert!(load_marker(&state_dir, repo.path(), &key).unwrap().is_none());
+    }
+
+    #[test]
     fn incident_intent_never_embeds_detector_command_or_output() {
         let detector = DetectorResult {
             id: "audit".into(),
