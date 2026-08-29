@@ -35,6 +35,14 @@ Registry precedence is deterministic and asymmetric: an operator-global manifest
 
 A repository manifest that will not load takes the workflow prompt layer with it — composition still succeeds, and the loss is announced once on the `zirv ▸` channel (`Event::WorkflowLayerSkipped`) instead of disappearing silently.
 
+## Agent registry
+
+Workflow seats are provider-neutral data, not harness plugins. `AgentManifest` schema version 1 carries a stable id/version, role label, model-tier hint, read-only floor, capability requirements, bounded instruction body, and context budget. Built-ins are `implementer`, `reviewer`, `doc-keeper`, `security-scanner`, and `explorer`; `.claude/agents/vault-keeper.md` has been migrated to `.zirv/agents/vault-keeper.yaml`.
+
+Layering intentionally mirrors skills but is stricter by default. Operator-global `~/.zirv/agents/*.{yaml,yml,toml}` may replace built-ins. Repository `.zirv/agents/*` is disabled unless the operator enables `workflow.repo_agents_enabled`, and when enabled may only add non-colliding ids; collisions with trusted ids are ignored with warnings. A repository seat therefore cannot rewrite `reviewer`, remove its read-only floor, or acquire authority from its manifest text.
+
+`WorkflowStep.agent` addresses a seat by id. Implement/debug steps use `implementer`; independent review uses `reviewer`. `zirv workflow agents list|show` exposes the resolved registry and provenance. Capability preflight runs the seat through the same canonical effective policy as skills. Adapter dispatch adds provider-specific launch mechanics only after policy resolution, and a read-only seat appends the adapter's hard read-only arguments last. `model_tier` is a routing hint; Zirv does not invent provider model ids from it.
+
 Repository skills are untrusted methodology. A manifest can request `repo.write`, `shell.exec`, or another logical capability, but it cannot grant one. `CapabilityReport::for_repo` loads the same effective canonical policy as an AI launch, maps logical workflow prerequisites onto it, and only narrows adapter support; it never promotes an unsupported operation. `zirv workflow start --agent <name>` and inherited supervised-session adapters resolve every selected step's required capabilities before persisting the workflow. `zirv skill show --agent` and `zirv frontend capabilities --agent --repo` expose the same policy-aware diagnostics.
 
 ## Capability vocabulary
