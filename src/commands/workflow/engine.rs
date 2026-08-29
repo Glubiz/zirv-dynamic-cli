@@ -1804,6 +1804,8 @@ pub enum WorkflowSubcommand {
     Advance(AdvanceArgs),
     /// Build compact review packages and persist finding dispositions.
     Review(super::review::ReviewArgs),
+    /// Run deterministic operator-configured maintenance detectors.
+    Maintain(super::maintain::MaintainArgs),
     /// Aggregate privacy-conscious local workflow telemetry.
     Stats(super::telemetry::StatsArgs),
 }
@@ -2247,6 +2249,9 @@ pub fn run(args: &WorkflowArgs, writer: &mut impl Write) -> CtxResult<i32> {
         }
         WorkflowSubcommand::Review(args) => {
             return super::review::run(args, writer);
+        }
+        WorkflowSubcommand::Maintain(args) => {
+            return super::maintain::run(args, writer);
         }
         WorkflowSubcommand::Stats(args) => {
             return super::telemetry::run_stats(args, writer);
