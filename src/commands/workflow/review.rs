@@ -1772,16 +1772,30 @@ pub fn run(args: &ReviewArgs, writer: &mut impl Write) -> CtxResult<i32> {
     match &args.command {
         ReviewCommand::Package(args) => {
             let (state_dir, state) = state_and_repo(args.state.repo.as_deref(), &args.state.id)?;
-            let package = package(&state_dir, &state, args.base.as_deref())?;
+            if args.pr.is_none() && args.github_repo.is_some() {
+                return Err("--github-repo requires --pr".into());
+            }
+            let package = match args.pr {
+                Some(pr) => package_pull_request(&state, pr, args.github_repo.as_deref())?,
+                None => package(&state_dir, &state, args.base.as_deref())?,
+            };
             if args.state.json {
                 serde_json::to_writer_pretty(&mut *writer, &package)?;
                 writeln!(writer)?;
             } else {
-                writeln!(
-                    writer,
-                    "review package {}..{}",
-                    package.base_sha, package.head_sha
-                )?;
+                if let Some(pr) = &package.pull_request {
+                    writeln!(
+                        writer,
+                        "review package PR {}#{} {}..{}",
+                        pr.repository, pr.number, package.base_sha, package.head_sha
+                    )?;
+                } else {
+                    writeln!(
+                        writer,
+                        "review package {}..{}",
+                        package.base_sha, package.head_sha
+                    )?;
+                }
                 writeln!(writer, "depth: {:?}", package.review_depth)?;
                 writeln!(writer, "changed paths: {}", package.changed_paths.len())?;
                 writeln!(
@@ -1807,6 +1821,21 @@ pub fn run(args: &ReviewArgs, writer: &mut impl Write) -> CtxResult<i32> {
         }
         ReviewCommand::Run(args) => {
             return run_independent_review(args, writer, &launch_reviewer);
+        }
+        ReviewCommand::IngestPrComments(args) => {
+            let (state_dir, mut state) =
+                state_and_repo(args.repo.as_deref(), &args.workflow_id)?;
+            let count = ingest_pull_request_comments(
+                &state_dir,
+                &mut state,
+                args.pr,
+                args.github_repo.as_deref(),
+            )?;
+            writeln!(
+                writer,
+                "ingested {count} new GitHub PR review comment{}",
+                if count == 1 { "" } else { "s" }
+            )?;
         }
         ReviewCommand::Add(args) => {
             let (state_dir, mut state) = state_and_repo(args.repo.as_deref(), &args.workflow_id)?;
