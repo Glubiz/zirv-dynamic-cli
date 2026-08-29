@@ -609,7 +609,7 @@ mod tests {
         };
         let text = incident_intent(&detector);
         assert!(text.contains("audit"));
-        assert!(text.contains("Output lines"));
+        assert!(text.contains("Observed output lines"));
         assert!(!text.contains("cargo audit"));
     }
 }
