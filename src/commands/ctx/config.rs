@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use super::CtxResult;
 
@@ -511,7 +511,7 @@ impl Default for WorkflowDeployConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum MaintainDetectorMode {
     #[default]
