@@ -785,7 +785,6 @@ fn run_with_clock_inner<W: Write>(
     // budget bounds the whole supervised run, not just its latest incarnation.
     let mut prior_usage = TranscriptUsage::default();
     let mut prior_tool_calls: u32 = 0;
-    let has_budget = worker_budget.tokens.is_some() || worker_budget.tool_calls.is_some();
 
     let socket_path = state.socket_for(session.as_str());
     let server = match signal::SignalServer::bind(&socket_path) {
@@ -1219,17 +1218,15 @@ fn run_with_clock_inner<W: Write>(
             );
             let stored = handoff::store(&state, repo, session.as_str(), &note)?;
 
-            // Issue #169.2: harvest the outgoing child's own spend before its
-            // transcript is superseded, so a nudge restart never resets the
-            // budget meter.
-            if has_budget {
-                harvest_spend(
-                    adapter.as_ref(),
-                    &transcript,
-                    &mut prior_usage,
-                    &mut prior_tool_calls,
-                );
-            }
+            // Harvest every outgoing child even for an unbounded run: the same
+            // accumulator now feeds both budget enforcement and delegation
+            // accounting, so skipping it would hide pre-handoff/restart spend.
+            harvest_spend(
+                adapter.as_ref(),
+                &transcript,
+                &mut prior_usage,
+                &mut prior_tool_calls,
+            );
             session = SessionId::new_v4();
             session_guard.refresh_session(session.as_str());
             transcript = derive_transcript(&session);
@@ -1528,17 +1525,15 @@ fn run_with_clock_inner<W: Write>(
                     execution_started,
                 );
 
-                // Preserve the delegation's original budget across the vendor
-                // boundary. This harvest includes the just-stopped child plus
-                // every prior restart already accumulated in these counters.
-                if has_budget {
-                    harvest_spend(
-                        adapter.as_ref(),
-                        &transcript,
-                        &mut prior_usage,
-                        &mut prior_tool_calls,
-                    );
-                }
+                // Preserve both accounting and any configured delegation budget
+                // across the vendor boundary. This includes the just-stopped
+                // child plus every prior restart already accumulated here.
+                harvest_spend(
+                    adapter.as_ref(),
+                    &transcript,
+                    &mut prior_usage,
+                    &mut prior_tool_calls,
+                );
                 let spent_tokens = prior_usage
                     .context_total()
                     .saturating_add(prior_usage.output_tokens);
@@ -1705,20 +1700,15 @@ fn run_with_clock_inner<W: Write>(
                 return Ok(EXIT_ROT_EXHAUSTED);
             };
 
-            // A park is not a restart: the restart budget (`max_restarts`)
-            // is for rot, not for waiting. The token/tool-call budget is a
-            // different ceiling, for the whole run regardless of why it
-            // relaunched -- a park mints a fresh transcript exactly like a
-            // restart does, so its outgoing child's spend is harvested here
-            // too (issue #169.2).
-            if has_budget {
-                harvest_spend(
-                    adapter.as_ref(),
-                    &transcript,
-                    &mut prior_usage,
-                    &mut prior_tool_calls,
-                );
-            }
+            // A park mints a fresh transcript exactly like a restart, so the
+            // outgoing child's spend must be harvested for both whole-run
+            // accounting and any configured token/tool-call ceiling.
+            harvest_spend(
+                adapter.as_ref(),
+                &transcript,
+                &mut prior_usage,
+                &mut prior_tool_calls,
+            );
             session = SessionId::new_v4();
             session_guard.refresh_session(session.as_str());
             transcript = derive_transcript(&session);
@@ -1910,17 +1900,14 @@ fn run_with_clock_inner<W: Write>(
             "zirv ctx exec: {reason} detected, restarting ({restarts}/{max_restarts}) with a {source} handoff"
         )?;
 
-        // Issue #169.2: harvest the outgoing child's own spend before its
-        // transcript is superseded, so a rot/timeout restart never resets
-        // the budget meter.
-        if has_budget {
-            harvest_spend(
-                adapter.as_ref(),
-                &transcript,
-                &mut prior_usage,
-                &mut prior_tool_calls,
-            );
-        }
+        // Harvest before superseding the transcript so both accounting and
+        // any configured whole-run budget include this rot/timeout child.
+        harvest_spend(
+            adapter.as_ref(),
+            &transcript,
+            &mut prior_usage,
+            &mut prior_tool_calls,
+        );
         session = SessionId::new_v4();
         session_guard.refresh_session(session.as_str());
         // The new session writes somewhere new, so the next iteration's watcher
