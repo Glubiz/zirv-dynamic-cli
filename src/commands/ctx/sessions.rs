@@ -561,6 +561,20 @@ impl SessionGuard {
         self.path = write_record(&self.state, &self.record);
     }
 
+    /// Same stable-address refresh as [refresh_session], while also changing
+    /// the harness that currently owns this logical supervisor. Used by
+    /// cross-harness loop continuation, where status must follow the new
+    /// vendor without minting a new delivery address.
+    pub fn refresh_session_agent(&mut self, new_session: &str, agent: &str) {
+        if self.released {
+            return;
+        }
+        self.record.session = new_session.to_string();
+        self.record.agent = agent.to_string();
+        self.record.started_at = super::state::now_secs();
+        self.path = write_record(&self.state, &self.record);
+    }
+
     /// Points this run's record at the pid of the agent child the supervisor
     /// actually spawned, rather than at the supervisor's own pid.
     ///
