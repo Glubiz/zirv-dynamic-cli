@@ -5578,6 +5578,71 @@ mod tests {
     /// silent" rule `reject_untrusted_keys` follows, applied to a section
     /// where a silent default is a permission grant.
     #[test]
+    fn malformed_home_fallback_enabled_fails_instead_of_becoming_true() {
+        let home = tempfile::tempdir().expect("home");
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".zirv/ctx.toml"),
+            "[fallback]\nenabled = \"false\"\n",
+        )
+        .expect("write home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tempfile::tempdir().expect("repo");
+        let empty = env_map(&[]);
+
+        let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+            .expect_err("a string must never silently become fallback.enabled = true");
+        assert!(err.to_string().contains("fallback.enabled"), "got {err}");
+        assert!(err.to_string().contains("boolean"), "got {err}");
+    }
+
+    #[test]
+    fn malformed_repo_fallback_value_fails_instead_of_becoming_a_default() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tempfile::tempdir().expect("repo");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[fallback]\nunknown_headroom_pct = \"0\"\n",
+        )
+        .expect("write repo");
+        let empty = env_map(&[]);
+
+        let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+            .expect_err("a string zero must not become the permissive default assumption");
+        assert!(
+            err.to_string().contains("fallback.unknown_headroom_pct"),
+            "got {err}"
+        );
+        assert!(err.to_string().contains("number"), "got {err}");
+    }
+
+    #[test]
+    fn strict_fallback_extractors_reject_partial_arrays_and_negative_limits() {
+        assert!(
+            fallback_string_array_at(
+                Some(toml::Value::Array(vec![
+                    toml::Value::String("claude".into()),
+                    toml::Value::Integer(7),
+                ])),
+                "order",
+            )
+            .is_err()
+        );
+        assert!(
+            fallback_u64_at(Some(toml::Value::Integer(-1)), "small_task_max_tokens").is_err()
+        );
+        assert!(
+            fallback_u32_at(
+                Some(toml::Value::Integer(-1)),
+                "small_task_max_tool_calls",
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn fallback_defaults_are_conservative_and_enabled() {
         let cfg = FallbackConfig::default();
         assert!(cfg.enabled);
