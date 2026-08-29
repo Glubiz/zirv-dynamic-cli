@@ -1,6 +1,6 @@
 //! Versioned workflow definitions and durable execution state.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
@@ -464,7 +464,7 @@ fn apply_profile(profile: WorkflowProfile, steps: &mut [WorkflowStep]) {
             WorkflowPhase::Test => "frontend-test",
             WorkflowPhase::Review => "frontend-review",
             WorkflowPhase::Verify => "frontend-verify",
-            WorkflowPhase::Delegate | WorkflowPhase::Present => continue,
+            WorkflowPhase::Deploy | WorkflowPhase::Delegate | WorkflowPhase::Present => continue,
         }
         .into();
         // The agent owns routine visual decisions. The workflow still
@@ -483,6 +483,21 @@ fn materialize(
     let mut steps = definition(kind).materialize(classification);
     apply_profile(profile, &mut steps);
     steps
+}
+
+/// Skill ids that compose one materialized step. The primary step skill stays
+/// stable for state/back-compat; substantial implementation additionally
+/// receives the resume-safe accepted-plan executor, whose own dependency stack
+/// includes worktree isolation and the general implementation discipline.
+fn step_skill_ids(step: &WorkflowStep, classification: &Classification) -> Vec<String> {
+    let mut ids = Vec::new();
+    if step.phase == WorkflowPhase::Implement
+        && classification.complexity >= Complexity::Substantial
+    {
+        ids.push("execute-plan".to_string());
+    }
+    ids.push(step.skill.clone());
+    ids
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1526,7 +1541,6 @@ pub fn render_current_context(
         return Ok(None);
     }
     let registry = SkillRegistry::load_for_repo(repo, home, state.include_custom_skills)?;
-    let stack = registry.resolve_stack(&step.skill)?;
     let task = state
         .task
         .chars()
@@ -1567,14 +1581,20 @@ pub fn render_current_context(
         rendered.push_str(&super::frontend::render_profile(&profile));
         rendered.push('\n');
     }
-    for skill in stack {
-        rendered.push_str(&format!(
-            "\n[skill {}@{}; source={}]\n{}\n",
-            skill.manifest.id,
-            skill.manifest.version,
-            skill.source,
-            skill.manifest.instructions.trim()
-        ));
+    let mut rendered_skill_ids = BTreeSet::new();
+    for selected in step_skill_ids(step, &state.classification) {
+        for skill in registry.resolve_stack(&selected)? {
+            if !rendered_skill_ids.insert(skill.manifest.id.clone()) {
+                continue;
+            }
+            rendered.push_str(&format!(
+                "\n[skill {}@{}; source={}]\n{}\n",
+                skill.manifest.id,
+                skill.manifest.version,
+                skill.source,
+                skill.manifest.instructions.trim()
+            ));
+        }
     }
     Ok(Some(rendered))
 }
@@ -1919,7 +1939,9 @@ pub fn run(args: &WorkflowArgs, writer: &mut impl Write) -> CtxResult<i32> {
                 )?;
                 let report = super::capability::CapabilityReport::for_repo(agent, &repo)?;
                 for step in materialize(definition.kind, &classification, profile) {
-                    registry.ensure_supported(&step.skill, &report)?;
+                    for skill in step_skill_ids(&step, &classification) {
+                        registry.ensure_supported(&skill, &report)?;
+                    }
                 }
             }
             let mut state = WorkflowState::start(
@@ -2828,6 +2850,46 @@ mod tests {
         assert!(implement.contains("[skill implement@1"));
         assert!(!testing.contains("[skill implement@1"));
         assert!(testing.contains("[skill testing@1"));
+    }
+
+    #[test]
+    fn substantial_implementation_composes_execute_plan_and_worktree() {
+        let repo = tempdir().unwrap();
+        let mut classification = low_classification();
+        classification.complexity = Complexity::Substantial;
+        let state = skip_leading_artifact_steps(WorkflowState::start(
+            repo.path().to_path_buf(),
+            "substantial feature".into(),
+            WorkflowKind::Feature,
+            None,
+            true,
+            classification,
+        ));
+        let context = render_current_context(&state, repo.path(), None)
+            .unwrap()
+            .unwrap();
+        assert!(context.contains("[skill worktree@1"));
+        assert!(context.contains("[skill implement@1"));
+        assert!(context.contains("[skill execute-plan@1"));
+    }
+
+    #[test]
+    fn trivial_implementation_does_not_pay_execute_plan_or_worktree_context() {
+        let repo = tempdir().unwrap();
+        let state = skip_leading_artifact_steps(WorkflowState::start(
+            repo.path().to_path_buf(),
+            "small feature".into(),
+            WorkflowKind::Feature,
+            None,
+            true,
+            low_classification(),
+        ));
+        let context = render_current_context(&state, repo.path(), None)
+            .unwrap()
+            .unwrap();
+        assert!(context.contains("[skill implement@1"));
+        assert!(!context.contains("[skill execute-plan@1"));
+        assert!(!context.contains("[skill worktree@1"));
     }
 
     #[test]
