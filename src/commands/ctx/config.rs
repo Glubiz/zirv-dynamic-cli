@@ -511,6 +511,57 @@ impl Default for WorkflowDeployConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MaintainDetectorMode {
+    #[default]
+    ExitNonzero,
+    LineCount,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MaintainDetectorConfig {
+    pub command: String,
+    pub mode: MaintainDetectorMode,
+    pub threshold: u64,
+}
+
+impl Default for MaintainDetectorConfig {
+    fn default() -> Self {
+        Self {
+            command: String::new(),
+            mode: MaintainDetectorMode::ExitNonzero,
+            threshold: 1,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WorkflowMaintainConfig {
+    pub timeout_secs: u64,
+    pub detectors: std::collections::BTreeMap<String, MaintainDetectorConfig>,
+}
+
+impl Default for WorkflowMaintainConfig {
+    fn default() -> Self {
+        Self {
+            timeout_secs: 60,
+            detectors: std::collections::BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ReportConfig {
+    /// GitHub owner/repository used by workflow maintenance incident filing.
+    /// The ordinary `zirv report` command intentionally keeps its product
+    /// default and does not consume this destination.
+    pub repository: Option<String>,
+}
+
 /// Operator-controlled switches over the workflow subsystem
 /// (`src/commands/workflow/`). Every field is repo-forbidden except the
 /// explicitly folded `workflow.deploy.minimum_tier`, which can only make the
@@ -532,6 +583,7 @@ pub struct WorkflowConfig {
     /// trusted built-in/operator id.
     pub repo_agents_enabled: bool,
     pub deploy: WorkflowDeployConfig,
+    pub maintain: WorkflowMaintainConfig,
     /// Local workflow telemetry. Previously read straight from the process
     /// environment, which a repository script could set for itself.
     pub telemetry_enabled: bool,
@@ -546,6 +598,7 @@ impl Default for WorkflowConfig {
             repo_skills_enabled: true,
             repo_agents_enabled: false,
             deploy: WorkflowDeployConfig::default(),
+            maintain: WorkflowMaintainConfig::default(),
             telemetry_enabled: true,
             telemetry_max_events: 1000,
             telemetry_retention_days: 30,
@@ -1010,6 +1063,7 @@ pub struct CtxConfig {
     pub context: ContextConfig,
     pub mail: MailConfig,
     pub workflow: WorkflowConfig,
+    pub report: ReportConfig,
     pub memory: MemoryConfig,
     pub setup: SetupConfig,
     pub chrome: ChromeConfig,
@@ -1359,6 +1413,11 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
     (
         "ZIRV_CTX_WORKFLOW_DEPLOY_TIER",
         &["workflow", "deploy", "tier"],
+        EnvKind::Str,
+    ),
+    (
+        "ZIRV_CTX_REPORT_REPOSITORY",
+        &["report", "repository"],
         EnvKind::Str,
     ),
     (
@@ -1843,6 +1902,14 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     (
         &["workflow", "deploy", "tier"],
         "ZIRV_CTX_WORKFLOW_DEPLOY_TIER",
+    ),
+    (
+        &["workflow", "maintain"],
+        "~/.zirv/ctx.toml only",
+    ),
+    (
+        &["report", "repository"],
+        "ZIRV_CTX_REPORT_REPOSITORY",
     ),
     (
         &["workflow", "telemetry_enabled"],
@@ -5357,6 +5424,8 @@ mod tests {
         ("workflow", "repo_agents_enabled"),
         ("workflow.deploy", "tier"),
         ("workflow.deploy", "minimum_tier"),
+        ("workflow.maintain", "timeout_secs"),
+        ("report", "repository"),
         ("workflow", "telemetry_enabled"),
         ("workflow", "telemetry_max_events"),
         ("workflow", "telemetry_retention_days"),
