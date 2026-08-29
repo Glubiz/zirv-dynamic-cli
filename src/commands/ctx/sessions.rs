@@ -460,6 +460,17 @@ impl Record {
         self.role = Some(role.to_string());
         self
     }
+
+    /// Issue #186 hardening: preserves a supervisor's already-established
+    /// delivery address while the underlying vendor session changes. This is
+    /// only used by Zirv's own cross-harness continuation path; callers must
+    /// supply the short id of the logical supervisor that is being continued.
+    pub fn with_stable_short(mut self, short: &str) -> Self {
+        if !short.is_empty() {
+            self.short = short.to_string();
+        }
+        self
+    }
 }
 
 fn record_path(state: &StateDir, short: &str) -> PathBuf {
