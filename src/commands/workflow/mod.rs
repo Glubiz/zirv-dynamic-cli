@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use super::ctx::CtxResult;
 
+pub mod agents;
 pub mod artifact;
 pub mod capability;
 pub mod classify;
@@ -30,13 +31,13 @@ pub const TOP_LEVEL_COMMANDS: &[&str] = &[
     "skill", "workflow", "test", "verify", "artifact", "frontend",
 ];
 
-/// The two operator gates over repository-provided workflow input:
-/// `workflow.repo_checks_enabled` (may `.zirv/verify.toml` and `package.json`
-/// script commands run at all) and `workflow.repo_skills_enabled` (is
-/// `.zirv/skills/` loaded at all).
+/// Operator gates over repository-provided workflow input. Each is resolved
+/// from operator-controlled config and fails closed when that config cannot be
+/// trusted.
 pub(crate) struct RepoGates {
     pub checks: bool,
     pub skills: bool,
+    pub agents: bool,
 }
 
 /// Resolves both gates, failing **closed** when the configuration cannot be
@@ -57,12 +58,14 @@ pub(crate) fn repo_gates(repo: &std::path::Path) -> RepoGates {
         Ok(cfg) => RepoGates {
             checks: cfg.workflow.repo_checks_enabled,
             skills: cfg.workflow.repo_skills_enabled,
+            agents: cfg.workflow.repo_agents_enabled,
         },
         Err(error) => {
             announce_unreadable_config(&error.to_string());
             RepoGates {
                 checks: false,
                 skills: false,
+                agents: false,
             }
         }
     }
