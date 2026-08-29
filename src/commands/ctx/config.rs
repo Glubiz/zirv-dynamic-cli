@@ -5145,6 +5145,96 @@ mod tests {
         assert!(cfg.agents.is_enabled("claude"));
     }
 
+    #[test]
+    fn repo_deploy_minimum_can_only_raise_operator_tier() {
+        use crate::commands::workflow::deploy::DeployTier;
+
+        let home = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".zirv/ctx.toml"),
+            "[workflow.deploy]\ntier = \"staging\"\nminimum_tier = \"development\"\n",
+        )
+        .expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[workflow.deploy]\nminimum_tier = \"production\"\n",
+        )
+        .expect("repo");
+
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|key| empty.get(key).cloned()).expect("load");
+        assert_eq!(cfg.workflow.deploy.tier, DeployTier::Production);
+        assert_eq!(
+            cfg.workflow.deploy.minimum_tier,
+            Some(DeployTier::Production)
+        );
+    }
+
+    #[test]
+    fn repo_deploy_minimum_cannot_lower_operator_tier() {
+        use crate::commands::workflow::deploy::DeployTier;
+
+        let home = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".zirv/ctx.toml"),
+            "[workflow.deploy]\ntier = \"production\"\n",
+        )
+        .expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[workflow.deploy]\nminimum_tier = \"development\"\n",
+        )
+        .expect("repo");
+
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|key| empty.get(key).cloned()).expect("load");
+        assert_eq!(cfg.workflow.deploy.tier, DeployTier::Production);
+    }
+
+    #[test]
+    fn repo_cannot_choose_deploy_tier_but_operator_env_can_override_the_fold() {
+        use crate::commands::workflow::deploy::DeployTier;
+
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[workflow.deploy]\ntier = \"development\"\n",
+        )
+        .expect("repo");
+        let empty = env_map(&[]);
+        let error = CtxConfig::load(repo.path(), &|key| empty.get(key).cloned())
+            .expect_err("repo tier must be forbidden")
+            .to_string();
+        assert!(error.contains("workflow.deploy.tier"), "{error}");
+
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[workflow.deploy]\nminimum_tier = \"production\"\n",
+        )
+        .expect("repo");
+        let env = env_map(&[("ZIRV_CTX_WORKFLOW_DEPLOY_TIER", "development")]);
+        let cfg = CtxConfig::load(repo.path(), &|key| env.get(key).cloned()).expect("env");
+        assert_eq!(cfg.workflow.deploy.tier, DeployTier::Development);
+        assert_eq!(
+            cfg.workflow.deploy.minimum_tier,
+            Some(DeployTier::Production),
+            "the declared repo minimum remains inspectable even when operator env overrides it"
+        );
+    }
+
     /// Every configurable key in `CtxConfig`'s tree, as (table path, key)
     /// pairs. `table path` is dot-joined to match how a nested table's
     /// header appears in the sample-config file (`"pace.use_credits"`); the
@@ -5264,6 +5354,9 @@ mod tests {
         ("dash", "idle_quiet_ms"),
         ("workflow", "repo_checks_enabled"),
         ("workflow", "repo_skills_enabled"),
+        ("workflow", "repo_agents_enabled"),
+        ("workflow.deploy", "tier"),
+        ("workflow.deploy", "minimum_tier"),
         ("workflow", "telemetry_enabled"),
         ("workflow", "telemetry_max_events"),
         ("workflow", "telemetry_retention_days"),
