@@ -1602,6 +1602,45 @@ mod tests {
     use super::super::testenv::dead_pid;
 
     #[test]
+    fn cross_harness_refresh_keeps_the_logical_address_and_registry_path() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = state_in(&tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        let record = Record::new(
+            "aaaaaaaa-1111-4111-8111-111111111111",
+            "claude",
+            &repo,
+            Verb::Exec,
+        )
+        .with_stable_short("stable01");
+        let mut guard = SessionGuard::register(&state, record);
+        let original_path = guard.path.clone();
+
+        guard.refresh_session_agent(
+            "bbbbbbbb-2222-4222-8222-222222222222",
+            "codex",
+        );
+
+        assert_eq!(guard.record.short, "stable01");
+        assert_eq!(guard.record.agent, "codex");
+        assert_eq!(
+            guard.record.session,
+            "bbbbbbbb-2222-4222-8222-222222222222"
+        );
+        assert_eq!(
+            guard.path, original_path,
+            "changing the underlying vendor session must not mint a new address"
+        );
+
+        let stored: Record = serde_json::from_str(
+            &std::fs::read_to_string(&guard.path).expect("stored record"),
+        )
+        .expect("deserialize record");
+        assert_eq!(stored.short, "stable01");
+        assert_eq!(stored.agent, "codex");
+    }
+
+    #[test]
     fn a_record_without_owner_pid_deserializes_as_unowned() {
         // A record written by a build that predates `owner_pid` has no such
         // key in its JSON at all -- not `null`, simply absent -- which is
