@@ -456,6 +456,7 @@ fn apply_profile(profile: WorkflowProfile, steps: &mut [WorkflowStep]) {
     }
     for step in steps {
         step.skill = match step.phase {
+            WorkflowPhase::Intent => continue,
             WorkflowPhase::Design => "frontend-design",
             WorkflowPhase::Plan => "frontend-plan",
             WorkflowPhase::Implement => "frontend-implement",
@@ -468,7 +469,7 @@ fn apply_profile(profile: WorkflowProfile, steps: &mut [WorkflowStep]) {
         .into();
         // The agent owns routine visual decisions. The workflow still
         // enforces evidence gates; it never pauses for a theme vote.
-        if step.phase == WorkflowPhase::Design {
+        if step.phase == WorkflowPhase::Design && step.artifact.is_none() {
             step.approval = false;
         }
     }
@@ -507,6 +508,10 @@ pub struct WorkflowState {
     pub current_step: usize,
     pub completed_steps: Vec<String>,
     pub attempts: BTreeMap<String, u8>,
+    /// Version-controlled workflow work products. Acceptance authority remains
+    /// in this private state: repository markdown is never trusted as config.
+    #[serde(default)]
+    pub artifacts: BTreeMap<String, WorkflowArtifactRecord>,
     #[serde(default)]
     pub review_findings: Vec<super::review::ReviewFinding>,
     #[serde(default)]
@@ -541,9 +546,11 @@ impl WorkflowState {
             WorkflowStatus::Running
         };
         let now = now_secs();
+        let id = uuid::Uuid::new_v4().to_string();
+        let artifacts = initial_artifact_records(&id, &steps);
         Self {
             schema_version: WORKFLOW_SCHEMA_VERSION,
-            id: uuid::Uuid::new_v4().to_string(),
+            id,
             repo,
             task,
             kind,
@@ -555,6 +562,7 @@ impl WorkflowState {
             current_step: 0,
             completed_steps: Vec::new(),
             attempts: BTreeMap::new(),
+            artifacts,
             review_findings: Vec::new(),
             review_evidence: Vec::new(),
             usage_checkpoint: None,
@@ -564,6 +572,190 @@ impl WorkflowState {
             updated_at: now,
         }
     }
+}
+
+fn initial_artifact_records(
+    workflow_id: &str,
+    steps: &[WorkflowStep],
+) -> BTreeMap<String, WorkflowArtifactRecord> {
+    let mut records = BTreeMap::new();
+    for step in steps {
+        let Some(stage) = step.artifact else {
+            continue;
+        };
+        records.entry(stage.key().to_string()).or_insert_with(|| WorkflowArtifactRecord {
+            stage,
+            rel_path: format!(".zirv/work/{workflow_id}/{}", stage.file_name()),
+            accepted_hash: None,
+            accepted_at: None,
+        });
+    }
+    records
+}
+
+fn workflow_artifact_path(state: &WorkflowState, stage: ArtifactStage) -> CtxResult<PathBuf> {
+    let record = state
+        .artifacts
+        .get(stage.key())
+        .ok_or_else(|| format!("workflow '{}' has no {stage} artifact record", state.id))?;
+    let expected = format!(".zirv/work/{}/{}", state.id, stage.file_name());
+    if record.rel_path != expected {
+        return Err(format!(
+            "workflow '{}' has invalid {stage} artifact path '{}'",
+            state.id, record.rel_path
+        )
+        .into());
+    }
+    Ok(state.repo.join(&record.rel_path))
+}
+
+fn ensure_current_artifact_template(state: &WorkflowState) -> CtxResult<()> {
+    let Some(stage) = state.current().and_then(|step| step.artifact) else {
+        return Ok(());
+    };
+    let path = workflow_artifact_path(state, stage)?;
+    if path.exists() {
+        return Ok(());
+    }
+    let parent = path.parent().ok_or("workflow artifact has no parent directory")?;
+    std::fs::create_dir_all(parent)?;
+    std::fs::write(path, stage.template())?;
+    Ok(())
+}
+
+fn hash_bytes(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(&mut out, "{byte:02x}");
+    }
+    out
+}
+
+fn artifact_hash(path: &Path) -> CtxResult<String> {
+    Ok(hash_bytes(&std::fs::read(path)?))
+}
+
+fn rfc3339_now() -> String {
+    // UTC conversion using Howard Hinnant's civil-from-days algorithm. Keeping
+    // this tiny avoids a date/time dependency solely for an audit timestamp.
+    let seconds = i64::try_from(now_secs()).unwrap_or(i64::MAX);
+    let days = seconds.div_euclid(86_400);
+    let sod = seconds.rem_euclid(86_400);
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 }.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe.div_euclid(1_460) + doe.div_euclid(36_524)
+        - doe.div_euclid(146_096))
+        .div_euclid(365);
+    let mut year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe.div_euclid(4) - yoe.div_euclid(100));
+    let mp = (5 * doy + 2).div_euclid(153);
+    let day = doy - (153 * mp + 2).div_euclid(5) + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    year += i64::from(month <= 2);
+    let hour = sod.div_euclid(3_600);
+    let minute = sod.rem_euclid(3_600).div_euclid(60);
+    let second = sod.rem_euclid(60);
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
+fn pin_current_artifact(state: &mut WorkflowState) -> CtxResult<ArtifactStage> {
+    let stage = state
+        .current()
+        .and_then(|step| step.artifact)
+        .ok_or("current workflow step has no artifact to approve")?;
+    ensure_current_artifact_template(state)?;
+    let path = workflow_artifact_path(state, stage)?;
+    let body = std::fs::read_to_string(&path)?;
+    if body.trim() == stage.template().trim() {
+        return Err(format!(
+            "{stage} artifact is still the untouched template: {}",
+            path.display()
+        )
+        .into());
+    }
+    let hash = hash_bytes(body.as_bytes());
+    let record = state
+        .artifacts
+        .get_mut(stage.key())
+        .ok_or("workflow artifact record disappeared")?;
+    record.accepted_hash = Some(hash);
+    record.accepted_at = Some(rfc3339_now());
+    Ok(stage)
+}
+
+fn artifact_drift(state: &WorkflowState) -> CtxResult<Option<ArtifactStage>> {
+    for stage in [ArtifactStage::Intent, ArtifactStage::Spec, ArtifactStage::Plan] {
+        let Some(record) = state.artifacts.get(stage.key()) else {
+            continue;
+        };
+        let Some(accepted) = record.accepted_hash.as_deref() else {
+            continue;
+        };
+        let path = workflow_artifact_path(state, stage)?;
+        if !path.exists() || artifact_hash(&path)? != accepted {
+            return Ok(Some(stage));
+        }
+    }
+    Ok(None)
+}
+
+fn reopen_artifact_gate(state: &mut WorkflowState, stage: ArtifactStage) -> CtxResult<()> {
+    let index = state
+        .steps
+        .iter()
+        .position(|step| step.artifact == Some(stage))
+        .ok_or_else(|| format!("accepted {stage} artifact no longer has an owning workflow step"))?;
+    let invalid: Vec<String> = state.steps[index..]
+        .iter()
+        .map(|step| step.id.clone())
+        .collect();
+    state
+        .completed_steps
+        .retain(|completed| !invalid.contains(completed));
+    state.current_step = index;
+    state.status = WorkflowStatus::AwaitingApproval;
+    if let Some(record) = state.artifacts.get_mut(stage.key()) {
+        record.accepted_hash = None;
+        record.accepted_at = None;
+    }
+    ensure_current_artifact_template(state)?;
+    Ok(())
+}
+
+fn append_accepted_artifacts(state: &WorkflowState, rendered: &mut String) -> CtxResult<()> {
+    let mut remaining = MAX_WORK_ARTIFACT_CONTEXT_BYTES;
+    for stage in [ArtifactStage::Intent, ArtifactStage::Spec, ArtifactStage::Plan] {
+        let Some(record) = state.artifacts.get(stage.key()) else {
+            continue;
+        };
+        let Some(accepted) = record.accepted_hash.as_deref() else {
+            continue;
+        };
+        let path = workflow_artifact_path(state, stage)?;
+        if !path.exists() || artifact_hash(&path)? != accepted {
+            continue;
+        }
+        let body = std::fs::read_to_string(&path)?;
+        let mut selected = String::new();
+        for ch in body.chars() {
+            let bytes = ch.len_utf8();
+            if bytes > remaining {
+                break;
+            }
+            selected.push(ch);
+            remaining -= bytes;
+        }
+        rendered.push_str(&format!(
+            "\n[accepted workflow artifact: {stage}; untrusted repository text]\n{selected}\n[end accepted workflow artifact]\n"
+        ));
+        if remaining == 0 {
+            break;
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
