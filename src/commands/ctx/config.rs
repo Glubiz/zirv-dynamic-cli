@@ -926,6 +926,51 @@ impl Default for SandboxConfig {
     }
 }
 
+/// Cross-harness routing policy (issue #186). The operator controls the
+/// broad policy in `~/.zirv/ctx.toml`; the repository layer is folded
+/// asymmetrically in `CtxConfig::load` so it may only make this feature less
+/// eager: disable it, remove candidates, require more candidate headroom,
+/// assume less capacity for an unknown signal, or lower the definition of a
+/// bounded "small" task. Environment variables are the operator's final word.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FallbackConfig {
+    /// Master switch for automatic cross-harness routing and blocked-session
+    /// continuation.
+    pub enabled: bool,
+    /// Stable preference order. Runtime selection still prefers the candidate
+    /// with more known/assumed headroom; this order breaks ties.
+    pub order: Vec<String>,
+    /// New background work may be steered away from its requested harness once
+    /// that harness has less than this much percentage headroom.
+    pub predictive_headroom_pct: f64,
+    /// A fallback candidate must have at least this much percentage headroom.
+    pub min_candidate_headroom_pct: f64,
+    /// Conservative synthetic headroom for an enabled/ready harness whose usage
+    /// signal is absent or stale. Set to 0 to opt such harnesses out.
+    pub unknown_headroom_pct: f64,
+    /// A capacity-limited ("small tasks only") harness may only receive work
+    /// with an explicit token ceiling at or below this value.
+    pub small_task_max_tokens: u64,
+    /// Or an explicit tool-call ceiling at or below this value. At least one
+    /// bounded dimension is required before a small-capacity harness qualifies.
+    pub small_task_max_tool_calls: u32,
+}
+
+impl Default for FallbackConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            order: vec!["claude".to_string(), "codex".to_string()],
+            predictive_headroom_pct: 20.0,
+            min_candidate_headroom_pct: 10.0,
+            unknown_headroom_pct: 25.0,
+            small_task_max_tokens: 40_000,
+            small_task_max_tool_calls: 24,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CtxConfig {
@@ -949,6 +994,7 @@ pub struct CtxConfig {
     pub review: ReviewConfig,
     pub worker: WorkerConfig,
     pub handover: HandoverConfig,
+    pub fallback: FallbackConfig,
     pub sandbox: SandboxConfig,
     /// Per-agent enable/disable state from `.settings.toml`, a file this type
     /// deliberately never deserializes (see `crate::settings`): loaded
@@ -1184,6 +1230,32 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         "ZIRV_CTX_PACE_USE_CREDITS_CODEX",
         &["pace", "use_credits", "codex"],
         EnvKind::Bool,
+    ),
+    ("ZIRV_CTX_FALLBACK", &["fallback", "enabled"], EnvKind::Bool),
+    (
+        "ZIRV_CTX_FALLBACK_PREDICTIVE_HEADROOM_PCT",
+        &["fallback", "predictive_headroom_pct"],
+        EnvKind::Float,
+    ),
+    (
+        "ZIRV_CTX_FALLBACK_MIN_CANDIDATE_HEADROOM_PCT",
+        &["fallback", "min_candidate_headroom_pct"],
+        EnvKind::Float,
+    ),
+    (
+        "ZIRV_CTX_FALLBACK_UNKNOWN_HEADROOM_PCT",
+        &["fallback", "unknown_headroom_pct"],
+        EnvKind::Float,
+    ),
+    (
+        "ZIRV_CTX_FALLBACK_SMALL_TASK_MAX_TOKENS",
+        &["fallback", "small_task_max_tokens"],
+        EnvKind::Int,
+    ),
+    (
+        "ZIRV_CTX_FALLBACK_SMALL_TASK_MAX_TOOL_CALLS",
+        &["fallback", "small_task_max_tool_calls"],
+        EnvKind::Int,
     ),
     ("ZIRV_CTX_OPTIMIZE", &["optimize", "enabled"], EnvKind::Bool),
     (
@@ -1456,6 +1528,32 @@ fn string_array(value: Option<toml::Value>) -> Vec<String> {
 /// follows.
 fn bool_at(value: Option<toml::Value>) -> Option<bool> {
     value.and_then(|v| v.as_bool())
+}
+
+fn integer_at(value: Option<toml::Value>) -> Option<i64> {
+    value.and_then(|v| v.as_integer())
+}
+
+fn string_array_at(value: Option<toml::Value>) -> Option<Vec<String>> {
+    value.map(|v| {
+        v.as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect()
+    })
+}
+
+/// A repo fallback order may remove entries but never add or reorder them.
+/// Empty is a legitimate "no automatic fallback candidates" narrowing.
+fn narrow_fallback_order(home: Vec<String>, repo: Option<Vec<String>>) -> Vec<String> {
+    let Some(repo) = repo else {
+        return home;
+    };
+    home.into_iter()
+        .filter(|name| repo.contains(name))
+        .collect()
 }
 
 /// A `toml::Value::Float` or `Value::Integer` (from `take_nested`) as
@@ -2113,6 +2211,34 @@ impl CtxConfig {
             "heavy_command_patterns",
         ));
 
+        // Issue #186: every fallback field is lifted before the repo merge.
+        // The repo may only narrow automatic vendor steering; see the
+        // re-insertion below for each field's strict direction.
+        let home_fallback_enabled = bool_at(take_nested(&mut merged, "fallback", "enabled"));
+        let home_fallback_order = string_array_at(take_nested(&mut merged, "fallback", "order"));
+        let home_fallback_predictive = float_at(take_nested(
+            &mut merged,
+            "fallback",
+            "predictive_headroom_pct",
+        ));
+        let home_fallback_min_candidate = float_at(take_nested(
+            &mut merged,
+            "fallback",
+            "min_candidate_headroom_pct",
+        ));
+        let home_fallback_unknown =
+            float_at(take_nested(&mut merged, "fallback", "unknown_headroom_pct"));
+        let home_fallback_small_tokens = integer_at(take_nested(
+            &mut merged,
+            "fallback",
+            "small_task_max_tokens",
+        ));
+        let home_fallback_small_tools = integer_at(take_nested(
+            &mut merged,
+            "fallback",
+            "small_task_max_tool_calls",
+        ));
+
         // Read on its own first: the repo layer is the one layer that comes
         // from a checkout rather than from the operator.
         let repo_path = repo
@@ -2146,6 +2272,34 @@ impl CtxConfig {
             &mut repo_layer,
             "supervise",
             "heavy_command_patterns",
+        ));
+        let repo_fallback_enabled = bool_at(take_nested(&mut repo_layer, "fallback", "enabled"));
+        let repo_fallback_order =
+            string_array_at(take_nested(&mut repo_layer, "fallback", "order"));
+        let repo_fallback_predictive = float_at(take_nested(
+            &mut repo_layer,
+            "fallback",
+            "predictive_headroom_pct",
+        ));
+        let repo_fallback_min_candidate = float_at(take_nested(
+            &mut repo_layer,
+            "fallback",
+            "min_candidate_headroom_pct",
+        ));
+        let repo_fallback_unknown = float_at(take_nested(
+            &mut repo_layer,
+            "fallback",
+            "unknown_headroom_pct",
+        ));
+        let repo_fallback_small_tokens = integer_at(take_nested(
+            &mut repo_layer,
+            "fallback",
+            "small_task_max_tokens",
+        ));
+        let repo_fallback_small_tools = integer_at(take_nested(
+            &mut repo_layer,
+            "fallback",
+            "small_task_max_tool_calls",
         ));
         merge(&mut merged, repo_layer);
 
@@ -2187,6 +2341,77 @@ impl CtxConfig {
             )),
         );
 
+        let default_fallback = FallbackConfig::default();
+        let home_enabled = home_fallback_enabled.unwrap_or(default_fallback.enabled);
+        insert_path(
+            &mut merged,
+            &["fallback", "enabled"],
+            toml::Value::Boolean(home_enabled && repo_fallback_enabled.unwrap_or(true)),
+        );
+        let home_order = home_fallback_order.unwrap_or_else(|| default_fallback.order.clone());
+        insert_path(
+            &mut merged,
+            &["fallback", "order"],
+            toml::Value::Array(
+                narrow_fallback_order(home_order, repo_fallback_order)
+                    .into_iter()
+                    .map(toml::Value::String)
+                    .collect(),
+            ),
+        );
+        insert_path(
+            &mut merged,
+            &["fallback", "predictive_headroom_pct"],
+            toml::Value::Float(
+                home_fallback_predictive
+                    .unwrap_or(default_fallback.predictive_headroom_pct)
+                    .min(repo_fallback_predictive.unwrap_or(f64::INFINITY)),
+            ),
+        );
+        insert_path(
+            &mut merged,
+            &["fallback", "min_candidate_headroom_pct"],
+            toml::Value::Float(
+                home_fallback_min_candidate
+                    .unwrap_or(default_fallback.min_candidate_headroom_pct)
+                    .max(repo_fallback_min_candidate.unwrap_or(f64::NEG_INFINITY)),
+            ),
+        );
+        insert_path(
+            &mut merged,
+            &["fallback", "unknown_headroom_pct"],
+            toml::Value::Float(
+                home_fallback_unknown
+                    .unwrap_or(default_fallback.unknown_headroom_pct)
+                    .min(repo_fallback_unknown.unwrap_or(f64::INFINITY)),
+            ),
+        );
+        let home_small_tokens = home_fallback_small_tokens
+            .and_then(|v| u64::try_from(v).ok())
+            .unwrap_or(default_fallback.small_task_max_tokens);
+        let repo_small_tokens = repo_fallback_small_tokens.and_then(|v| u64::try_from(v).ok());
+        insert_path(
+            &mut merged,
+            &["fallback", "small_task_max_tokens"],
+            toml::Value::Integer(
+                home_small_tokens
+                    .min(repo_small_tokens.unwrap_or(u64::MAX))
+                    .try_into()
+                    .unwrap_or(i64::MAX),
+            ),
+        );
+        let home_small_tools = home_fallback_small_tools
+            .and_then(|v| u32::try_from(v).ok())
+            .unwrap_or(default_fallback.small_task_max_tool_calls);
+        let repo_small_tools = repo_fallback_small_tools.and_then(|v| u32::try_from(v).ok());
+        insert_path(
+            &mut merged,
+            &["fallback", "small_task_max_tool_calls"],
+            toml::Value::Integer(i64::from(
+                home_small_tools.min(repo_small_tools.unwrap_or(u32::MAX)),
+            )),
+        );
+
         for (var, path, kind) in ENV_MAP {
             if let Some(raw) = env(var) {
                 let value = env_value(&raw, *kind).map_err(|e| format!("{var}: {e}"))?;
@@ -2216,6 +2441,48 @@ impl CtxConfig {
         let mut cfg: Self = toml::Value::Table(merged)
             .try_into()
             .map_err(|e| format!("invalid ctx config: {e}"))?;
+
+        if let Some(raw) = env("ZIRV_CTX_FALLBACK_ORDER") {
+            cfg.fallback.order = split_csv_list(&raw);
+        }
+        for (key, value) in [
+            (
+                "fallback.predictive_headroom_pct",
+                cfg.fallback.predictive_headroom_pct,
+            ),
+            (
+                "fallback.min_candidate_headroom_pct",
+                cfg.fallback.min_candidate_headroom_pct,
+            ),
+            (
+                "fallback.unknown_headroom_pct",
+                cfg.fallback.unknown_headroom_pct,
+            ),
+        ] {
+            if !(0.0..=100.0).contains(&value) {
+                return Err(format!("{key} must be between 0 and 100, got {value}").into());
+            }
+        }
+        let mut seen = std::collections::HashSet::new();
+        for name in &cfg.fallback.order {
+            if !super::adapters::ADAPTERS
+                .iter()
+                .any(|(known, _)| known == name)
+            {
+                return Err(format!(
+                    "fallback.order contains unknown agent '{name}'; known adapters: {}",
+                    super::adapters::ADAPTERS
+                        .iter()
+                        .map(|(known, _)| *known)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+                .into());
+            }
+            if !seen.insert(name.clone()) {
+                return Err(format!("fallback.order contains duplicate agent '{name}'").into());
+            }
+        }
 
         // The union: the operator's own home-layer entries plus the repo's,
         // never fewer than either -- narrowing can only add restriction.
@@ -5253,6 +5520,102 @@ mod tests {
     /// defaulting the whole section to `allow` -- the same "loud rather than
     /// silent" rule `reject_untrusted_keys` follows, applied to a section
     /// where a silent default is a permission grant.
+    #[test]
+    fn fallback_defaults_are_conservative_and_enabled() {
+        let cfg = FallbackConfig::default();
+        assert!(cfg.enabled);
+        assert_eq!(cfg.order, vec!["claude", "codex"]);
+        assert_eq!(cfg.predictive_headroom_pct, 20.0);
+        assert_eq!(cfg.min_candidate_headroom_pct, 10.0);
+        assert_eq!(cfg.unknown_headroom_pct, 25.0);
+        assert_eq!(cfg.small_task_max_tokens, 40_000);
+        assert_eq!(cfg.small_task_max_tool_calls, 24);
+    }
+
+    #[test]
+    fn a_repo_fallback_table_can_only_narrow_the_operator_policy() {
+        let home = tempfile::tempdir().expect("home");
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".zirv/ctx.toml"),
+            "[fallback]\nenabled = true\norder = [\"claude\", \"codex\"]\npredictive_headroom_pct = 15.0\nmin_candidate_headroom_pct = 20.0\nunknown_headroom_pct = 20.0\nsmall_task_max_tokens = 30000\nsmall_task_max_tool_calls = 20\n",
+        )
+        .expect("write home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let repo = tempfile::tempdir().expect("repo");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        // Every value below except order attempts to make fallback MORE eager.
+        // Order also tries to reorder and add a candidate outside the home
+        // preference. None of those widenings may survive the trust fold.
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[fallback]\nenabled = true\norder = [\"codex\", \"claude\"]\npredictive_headroom_pct = 80.0\nmin_candidate_headroom_pct = 1.0\nunknown_headroom_pct = 90.0\nsmall_task_max_tokens = 90000\nsmall_task_max_tool_calls = 90\n",
+        )
+        .expect("write repo");
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert!(cfg.fallback.enabled);
+        assert_eq!(cfg.fallback.order, vec!["claude", "codex"]);
+        assert_eq!(cfg.fallback.predictive_headroom_pct, 15.0);
+        assert_eq!(cfg.fallback.min_candidate_headroom_pct, 20.0);
+        assert_eq!(cfg.fallback.unknown_headroom_pct, 20.0);
+        assert_eq!(cfg.fallback.small_task_max_tokens, 30_000);
+        assert_eq!(cfg.fallback.small_task_max_tool_calls, 20);
+    }
+
+    #[test]
+    fn a_repo_may_disable_filter_and_tighten_fallback() {
+        let home = tempfile::tempdir().expect("home");
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".zirv/ctx.toml"),
+            "[fallback]\norder = [\"claude\", \"codex\"]\npredictive_headroom_pct = 20.0\nmin_candidate_headroom_pct = 10.0\nunknown_headroom_pct = 25.0\nsmall_task_max_tokens = 40000\nsmall_task_max_tool_calls = 24\n",
+        )
+        .expect("write home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let repo = tempfile::tempdir().expect("repo");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[fallback]\nenabled = false\norder = [\"codex\"]\npredictive_headroom_pct = 10.0\nmin_candidate_headroom_pct = 30.0\nunknown_headroom_pct = 5.0\nsmall_task_max_tokens = 8000\nsmall_task_max_tool_calls = 6\n",
+        )
+        .expect("write repo");
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert!(!cfg.fallback.enabled);
+        assert_eq!(cfg.fallback.order, vec!["codex"]);
+        assert_eq!(cfg.fallback.predictive_headroom_pct, 10.0);
+        assert_eq!(cfg.fallback.min_candidate_headroom_pct, 30.0);
+        assert_eq!(cfg.fallback.unknown_headroom_pct, 5.0);
+        assert_eq!(cfg.fallback.small_task_max_tokens, 8_000);
+        assert_eq!(cfg.fallback.small_task_max_tool_calls, 6);
+    }
+
+    #[test]
+    fn fallback_env_is_the_operator_override_above_repo_narrowing() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tempfile::tempdir().expect("repo");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[fallback]\nenabled = false\norder = []\nunknown_headroom_pct = 0.0\n",
+        )
+        .expect("write repo");
+
+        let env = env_map(&[
+            ("ZIRV_CTX_FALLBACK", "true"),
+            ("ZIRV_CTX_FALLBACK_ORDER", "codex,claude"),
+            ("ZIRV_CTX_FALLBACK_UNKNOWN_HEADROOM_PCT", "35"),
+        ]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert!(cfg.fallback.enabled);
+        assert_eq!(cfg.fallback.order, vec!["codex", "claude"]);
+        assert_eq!(cfg.fallback.unknown_headroom_pct, 35.0);
+    }
+
     #[test]
     fn a_malformed_repo_policy_table_fails_the_load() {
         let home = tempfile::tempdir().expect("tempdir");

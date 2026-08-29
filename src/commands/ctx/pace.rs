@@ -298,6 +298,48 @@ pub enum SpawnGate {
 /// refusal, the same reasoning `decide`'s own `Unknown` arm and T8's
 /// `blind_delay_secs` already apply, see `no_usage_reading_proceeds_rather_
 /// than_refusing` below.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SpawnHeadroom {
+    pub window: &'static str,
+    pub percent: f64,
+    pub headroom_pct: f64,
+    pub source: Source,
+}
+
+/// Issue #186: exposes the same binding usage reading as `spawn_gate` as
+/// remaining percentage headroom. `None` is deliberately honest uncertainty;
+/// cross-harness fallback applies its configured conservative assumption rather
+/// than pretending an absent signal is either empty or exhausted.
+pub fn spawn_headroom(
+    collector: &UsageWindows,
+    estimator: Option<&UsageWindows>,
+    now: u64,
+    cfg: &PaceConfig,
+) -> Option<SpawnHeadroom> {
+    if !cfg.enabled {
+        return None;
+    }
+    let collector_worst = worst(
+        binding(&collector.five_hour, now, cfg),
+        binding(&collector.seven_day, now, cfg),
+    );
+    let (source, picked) = match collector_worst {
+        Some(found) => (Source::Collector, Some(found)),
+        None if cfg.estimator => (
+            Source::Estimator,
+            estimator
+                .and_then(|windows| worst(windows.five_hour.as_ref(), windows.seven_day.as_ref())),
+        ),
+        None => (Source::None, None),
+    };
+    picked.map(|(window, reading)| SpawnHeadroom {
+        window,
+        percent: reading.used_percentage,
+        headroom_pct: (100.0 - reading.used_percentage).clamp(0.0, 100.0),
+        source,
+    })
+}
+
 pub fn spawn_gate(
     collector: &UsageWindows,
     estimator: Option<&UsageWindows>,

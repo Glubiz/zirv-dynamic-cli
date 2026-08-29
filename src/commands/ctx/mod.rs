@@ -14,6 +14,7 @@ pub mod dash;
 pub mod drift;
 pub mod event;
 pub mod exec;
+pub mod fallback;
 pub mod group;
 pub mod handoff;
 pub mod handover;
