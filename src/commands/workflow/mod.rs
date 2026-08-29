@@ -15,6 +15,7 @@ pub mod agents;
 pub mod artifact;
 pub mod capability;
 pub mod classify;
+pub mod deploy;
 pub mod engine;
 pub mod frontend;
 pub mod frontend_detector;
