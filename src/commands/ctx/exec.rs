@@ -340,8 +340,14 @@ pub fn run_with<W: Write>(
     repo: &Path,
     env: EnvLookup<'_>,
 ) -> CtxResult<i32> {
-    let (code, _) = run_with_report(args, w, repo, env)?;
-    Ok(code)
+    run_with_clock(
+        args,
+        w,
+        repo,
+        env,
+        &super::state::now_secs,
+        &|d: Duration| std::thread::sleep(d),
+    )
 }
 
 /// Same supervised execution as [run_with], plus the per-harness accounting
@@ -378,16 +384,7 @@ pub(crate) fn run_with_clock<W: Write>(
     sleep_fn: &dyn Fn(Duration),
 ) -> CtxResult<i32> {
     let mut report = ExecutionReport::default();
-    run_with_clock_inner(
-        args,
-        w,
-        repo,
-        env,
-        now_fn,
-        sleep_fn,
-        None,
-        &mut report,
-    )
+    run_with_clock_inner(args, w, repo, env, now_fn, sleep_fn, None, &mut report)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1460,33 +1457,17 @@ fn run_with_clock_inner<W: Write>(
             };
             let route = (adapter_builds_launch && prompt.is_some())
                 .then(|| {
-                    super::fallback::route_blocked_session(
-                        &state,
-                        &cfg,
-                        route_request,
-                        &visited,
-                    )
+                    super::fallback::route_blocked_session(&state, &cfg, route_request, &visited)
                 })
                 .flatten();
             let deferred_reset = (route.is_none() && adapter_builds_launch && prompt.is_some())
                 .then(|| {
-                    super::fallback::earliest_reset_choice(
-                        &state,
-                        &cfg,
-                        route_request,
-                        &visited,
-                    )
+                    super::fallback::earliest_reset_choice(&state, &cfg, route_request, &visited)
                 })
                 .flatten();
             let alternate = route
                 .as_ref()
-                .map(|route| {
-                    (
-                        route.selected.clone(),
-                        route.model.clone(),
-                        route.detail(),
-                    )
-                })
+                .map(|route| (route.selected.clone(), route.model.clone(), route.detail()))
                 .or_else(|| {
                     deferred_reset.as_ref().and_then(|choice| {
                         if !choice.is_cross_harness() {
@@ -1817,15 +1798,6 @@ fn run_with_clock_inner<W: Write>(
                 execution_model.as_deref(),
                 execution_started,
             );
-            record_execution_segment(
-                report,
-                adapter.as_ref(),
-                &session,
-                &transcript,
-                &prior_usage,
-                execution_model.as_deref(),
-                execution_started,
-            );
             session_guard.release();
             return Ok(exhausted_code);
         };
@@ -1847,6 +1819,15 @@ fn run_with_clock_inner<W: Write>(
                 w,
                 "zirv ctx exec: {reason} after {restarts} restarts, giving up with exit {exhausted_code}"
             )?;
+            record_execution_segment(
+                report,
+                adapter.as_ref(),
+                &session,
+                &transcript,
+                &prior_usage,
+                execution_model.as_deref(),
+                execution_started,
+            );
             session_guard.release();
             return Ok(exhausted_code);
         }
@@ -3020,6 +3001,52 @@ mod tests {
         );
     }
 
+    /// The "restarts >= max_restarts" give-up exit used to return without
+    /// ever calling `record_execution_segment`, silently dropping the
+    /// harvested spend for the child that just rotted from `ExecutionReport`.
+    /// `max_restarts: 0` means give-up fires on the very first rot, so
+    /// exactly one child ran and exactly one segment must be recorded for it.
+    #[test]
+    fn an_exhausted_restart_budget_still_records_its_final_segment() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let session = "33333333-3333-4333-8444-555555555555";
+        let env = base_env(&tmp.path().join("state"));
+
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        unsafe {
+            std::env::set_var("FAKE_AGENT_MODE", "rot");
+            std::env::set_var("FAKE_AGENT_SLEEP", "30");
+        }
+        let args = ExecArgs {
+            agent: Some("claude".to_string()),
+            session_id: Some(session.to_string()),
+            transcript: Some(transcript_for(&home, tmp.path(), session)),
+            prompt: Some("do the work".to_string()),
+            max_restarts: Some(0),
+            budget_tokens: None,
+            max_tool_calls: None,
+            timeout_secs: Some(60),
+            simple: false,
+            command: fake_agent_command(session),
+        };
+        let mut out = Vec::new();
+        let result = run_with_report(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE");
+            std::env::remove_var("FAKE_AGENT_SLEEP");
+        }
+
+        let (code, report) = result.expect("runs");
+        assert_eq!(code, EXIT_ROT_EXHAUSTED);
+        assert_eq!(
+            report.segments.len(),
+            1,
+            "the rotted child's spend must still be recorded before giving up: {:?}",
+            report.segments
+        );
+    }
+
     fn walk_md(dir: &std::path::Path) -> Vec<PathBuf> {
         let mut found = Vec::new();
         let Ok(entries) = std::fs::read_dir(dir) else {
@@ -3157,6 +3184,57 @@ mod tests {
         assert!(
             text.contains("cannot restart"),
             "say why supervision stood down: {text}"
+        );
+    }
+
+    /// Same "no prompt to restart with" exit as
+    /// `a_run_with_no_discoverable_prompt_refuses_to_restart`, but through
+    /// `run_with_report`: exactly one child ever ran, so the accounting
+    /// caller (`agent.rs`'s `append_execution_segments`) must see exactly one
+    /// segment. Two identical `record_execution_segment` calls on this exit
+    /// path used to double it, double-summing cost and writing the
+    /// delegation log entry twice.
+    #[test]
+    fn the_no_prompt_exit_records_exactly_one_execution_segment() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let session = "44444444-3333-4333-8444-555555555555";
+        let env = base_env(&tmp.path().join("state"));
+
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        unsafe {
+            std::env::set_var("FAKE_AGENT_MODE", "rot");
+            // Keep the child alive past the first scoring tick so rot is seen.
+            std::env::set_var("FAKE_AGENT_SLEEP", "30");
+        }
+        let mut command = fake_agent_command(session);
+        command.retain(|a| a != "-p" && a != "do the work");
+        let args = ExecArgs {
+            agent: Some("claude".to_string()),
+            session_id: Some(session.to_string()),
+            transcript: Some(transcript_for(&home, tmp.path(), session)),
+            prompt: None,
+            max_restarts: Some(2),
+            budget_tokens: None,
+            max_tool_calls: None,
+            timeout_secs: Some(60),
+            simple: false,
+            command,
+        };
+        let mut out = Vec::new();
+        let result = run_with_report(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE");
+            std::env::remove_var("FAKE_AGENT_SLEEP");
+        }
+
+        let (code, report) = result.expect("runs");
+        assert_eq!(code, EXIT_ROT_EXHAUSTED);
+        assert_eq!(
+            report.segments.len(),
+            1,
+            "exactly one child ran, so exactly one segment must be recorded: {:?}",
+            report.segments
         );
     }
 

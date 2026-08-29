@@ -211,8 +211,7 @@ fn best_alternate(
         if request.bounds.tool_calls.is_some() && !candidate_adapter.counts_tool_calls() {
             continue;
         }
-        let Some(headroom) =
-            candidate_headroom(state, cfg, name, request.bounds, request.now)
+        let Some(headroom) = candidate_headroom(state, cfg, name, request.bounds, request.now)
         else {
             continue;
         };
@@ -306,7 +305,8 @@ pub fn earliest_reset_choice(
     let requested_provider = adapters::provider_for_agent_name(Some(request.requested));
     let (collector, estimator) =
         pace::current_windows(state, &cfg.pace, request.now, requested_provider);
-    let requested_reset = pace::spawn_reset(&collector, estimator.as_ref(), request.now, &cfg.pace)?;
+    let requested_reset =
+        pace::spawn_reset(&collector, estimator.as_ref(), request.now, &cfg.pace)?;
 
     let mut best = ResetChoice {
         requested: request.requested.to_string(),
@@ -346,8 +346,14 @@ pub fn earliest_reset_choice(
         else {
             continue;
         };
+        // `best_order` stays `usize::MAX` while `best` is still the requested
+        // harness, so a tie only hands the seat to an alternate once another
+        // alternate is already ahead of it; an exact tie against the
+        // requested harness itself must not dislodge it.
         if reset.reset_at < best.reset_at
-            || (reset.reset_at == best.reset_at && order_index < best_order)
+            || (reset.reset_at == best.reset_at
+                && best_order != usize::MAX
+                && order_index < best_order)
         {
             best = ResetChoice {
                 requested: request.requested.to_string(),
@@ -448,24 +454,20 @@ mod tests {
     }
 
     fn test_cfg_with_ready_adapters() -> CtxConfig {
-        let mut cfg = CtxConfig::default();
-        cfg.agent_bin = Some(
-            std::env::current_exe()
-                .expect("current test executable")
-                .display()
-                .to_string(),
-        );
+        let mut cfg = CtxConfig {
+            agent_bin: Some(
+                std::env::current_exe()
+                    .expect("current test executable")
+                    .display()
+                    .to_string(),
+            ),
+            ..CtxConfig::default()
+        };
         cfg.pace.estimator = false;
         cfg
     }
 
-    fn store_usage(
-        state: &StateDir,
-        provider: &str,
-        percent: f64,
-        reset_at: u64,
-        now: u64,
-    ) {
+    fn store_usage(state: &StateDir, provider: &str, percent: f64, reset_at: u64, now: u64) {
         crate::commands::ctx::window::store_for(
             state,
             provider,
@@ -544,6 +546,42 @@ mod tests {
 
         assert_eq!(route.reason, RouteReason::Predictive);
         assert_eq!(route.selected, "codex");
+    }
+
+    #[test]
+    fn tied_reset_prefers_the_requested_harness_over_an_alternate() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = test_cfg_with_ready_adapters();
+        let now = 1_700_000_000;
+        // Both seats reset at exactly the same instant. Staying on the
+        // requested harness requires no quality translation, so the tie
+        // must not hand the seat to an alternate.
+        store_usage(&state, "anthropic", 100.0, now + 3_600, now);
+        store_usage(&state, "openai", 100.0, now + 3_600, now);
+
+        let choice = earliest_reset_choice(
+            &state,
+            &cfg,
+            RouteRequest {
+                requested: "claude",
+                source_model: Some("sonnet"),
+                source_model_explicit: false,
+                bounds: TaskBounds {
+                    tokens: None,
+                    tool_calls: None,
+                },
+                now,
+            },
+            &[],
+        )
+        .expect("both seats are hard blocked");
+
+        assert_eq!(
+            choice.selected, "claude",
+            "an exact tie should keep the requested harness"
+        );
+        assert_eq!(choice.reset_at, now + 3_600);
     }
 
     #[test]

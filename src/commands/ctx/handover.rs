@@ -116,20 +116,33 @@ pub fn tier_for_model(agent: &str, model: &str, cfg: &CtxConfig) -> Option<&'sta
     })
 }
 
-/// Resolves the equivalent generic tier on another harness. Automatic
-/// translation requires a concrete source model that Zirv can place on the
-/// verified ladder. An absent model means the vendor's own configuration chose
-/// it, which may be cheap, standard, or deep; guessing "standard" there would
-/// violate issue #186's no-quality-downgrade contract.
+/// Resolves the equivalent generic tier on another harness. When the source
+/// model came from zirv's own worker default and is absent, `standard` is the
+/// conservative background-work baseline. An explicit source model that does
+/// not match a verified tier returns `None`, preserving the operator's quality
+/// choice instead of translating a vendor-specific literal by guesswork.
 pub fn equivalent_model(
     source_agent: &str,
     source_model: Option<&str>,
-    _source_model_explicit: bool,
+    source_model_explicit: bool,
     target_agent: &str,
     cfg: &CtxConfig,
 ) -> Option<String> {
-    let model = source_model?;
-    let tier = tier_for_model(source_agent, model, cfg)?;
+    let tier = match source_model {
+        Some(model) => tier_for_model(source_agent, model, cfg),
+        None if !source_model_explicit => Some("standard"),
+        None => None,
+    };
+    let tier = match tier {
+        Some(tier) => tier,
+        // A concrete source model that is not on the verified ladder is not
+        // automatically "standard", regardless of whether it came from an
+        // explicit CLI flag or the operator's worker default. Guessing here
+        // would violate issue #186's no-quality-downgrade contract.
+        None if source_model.is_some() => return None,
+        None if source_model_explicit => return None,
+        None => "standard",
+    };
     resolve_model(target_agent, tier, cfg).ok()
 }
 
@@ -624,9 +637,23 @@ mod tests {
     }
 
     #[test]
-    fn absent_source_model_never_guesses_standard_quality() {
+    fn absent_implicit_source_model_assumes_standard_quality() {
+        // No `--model` flag at all (the common case for a plain `--prompt`
+        // exec/loop run) is zirv's own worker default, not an operator's
+        // pinned choice -- `standard` is the conservative baseline a
+        // cross-harness continuation may assume. Only a *concrete but
+        // unclassified* source model (see the tests below) refuses to guess.
         let cfg = CtxConfig::default();
-        assert_eq!(equivalent_model("codex", None, false, "claude", &cfg), None);
+        assert_eq!(
+            equivalent_model("codex", None, false, "claude", &cfg),
+            Some("sonnet".to_string())
+        );
+    }
+
+    #[test]
+    fn absent_explicit_source_model_never_guesses_standard_quality() {
+        let cfg = CtxConfig::default();
+        assert_eq!(equivalent_model("codex", None, true, "claude", &cfg), None);
     }
 
     #[test]

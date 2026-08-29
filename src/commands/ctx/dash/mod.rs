@@ -3098,7 +3098,10 @@ fn fulfill_spawn_request(
                 detail: &detail,
             },
         );
-        push_error(errors, format!("dashboard spawn automatically routed {detail}"));
+        push_error(
+            errors,
+            format!("dashboard spawn automatically routed {detail}"),
+        );
     }
     let req = &effective_req;
     if let Some(reason) = cfg.agents.refusal(&req.agent) {
@@ -10432,13 +10435,15 @@ mod tests {
         };
         crate::commands::ctx::group::create(&state, &group).expect("create group");
 
-        let mut cfg = CtxConfig::default();
-        cfg.agent_bin = Some(
-            std::env::current_exe()
-                .expect("current test executable")
-                .display()
-                .to_string(),
-        );
+        let mut cfg = CtxConfig {
+            agent_bin: Some(
+                std::env::current_exe()
+                    .expect("current test executable")
+                    .display()
+                    .to_string(),
+            ),
+            ..CtxConfig::default()
+        };
         cfg.pace.estimator = false;
 
         let mut req = spawn_request("do the work", &repo);
@@ -10463,14 +10468,21 @@ mod tests {
         )
         .expect_err("the full group stops the request after routing");
 
-        assert!(refusal.reason.contains("wg-routing-stop"), "got {}", refusal.reason);
+        assert!(
+            refusal.reason.contains("wg-routing-stop"),
+            "got {}",
+            refusal.reason
+        );
         assert!(
             errors
                 .iter()
                 .any(|line| line.contains("dashboard spawn automatically routed claude -> codex")),
             "the dashboard must expose its fallback decision: {errors:?}"
         );
-        assert!(panes.is_empty(), "the post-routing admission stop spawned nothing");
+        assert!(
+            panes.is_empty(),
+            "the post-routing admission stop spawned nothing"
+        );
         let decisions = crate::commands::ctx::log::tail(&state, 20).expect("decisions");
         assert!(
             decisions
@@ -10526,6 +10538,13 @@ mod tests {
 
         let mut cfg = CtxConfig::default();
         cfg.pace.spawn_hard_pct = 200.0;
+        // This pins the OLDER T10 interactive-gate refusal in isolation; the
+        // newer predictive cross-harness reroute (`route_new_delegation`,
+        // issue #186) would otherwise steer this low-headroom request to
+        // codex before that gate is ever reached, on any machine where the
+        // codex adapter resolves (`CodexAdapter::ready` fails open even when
+        // codex is not installed -- see its own doc comment).
+        cfg.fallback.enabled = false;
 
         let mut req = spawn_request("do the work", &repo);
         req.work_group_id = Some("wg-1".to_string());
@@ -11184,7 +11203,12 @@ mod tests {
         )
         .expect("store collector state at the ceiling");
 
-        let cfg = CtxConfig::default();
+        let mut cfg = CtxConfig::default();
+        // Isolate the `spawn_hard_pct` refusal from the predictive
+        // cross-harness reroute (`route_new_delegation`, issue #186), which
+        // would otherwise steer this low-headroom request to codex first --
+        // see the sibling test above for the full explanation.
+        cfg.fallback.enabled = false;
         let mut panes: Vec<Pane> = Vec::new();
         let mut queues: Vec<VecDeque<String>> = Vec::new();
         let mut errors = Vec::new();
@@ -11242,7 +11266,12 @@ mod tests {
         )
         .expect("store collector state above spawn_hard_pct");
 
-        let cfg = CtxConfig::default();
+        let mut cfg = CtxConfig::default();
+        // Isolate `spawn_hard_pct` from the predictive cross-harness reroute
+        // (`route_new_delegation`, issue #186) -- see the doc comment above
+        // this test for why 96% headroom would otherwise be steered to codex
+        // before this gate is ever reached.
+        cfg.fallback.enabled = false;
         let mut panes: Vec<Pane> = Vec::new();
         let mut queues: Vec<VecDeque<String>> = Vec::new();
         let mut errors = Vec::new();

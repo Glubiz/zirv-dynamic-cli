@@ -941,8 +941,7 @@ pub fn run_with<W: Write>(
         bounds,
         now,
     };
-    let route =
-        super::fallback::route_new_delegation(&state, &cfg, route_request, args.force);
+    let route = super::fallback::route_new_delegation(&state, &cfg, route_request, args.force);
     let mut routed_args = args.clone();
     let mut route_applied = None;
     if let Some(route) = route
@@ -983,8 +982,7 @@ pub fn run_with<W: Write>(
     {
         if choice.is_cross_harness() {
             if let Some(model) = choice.model.as_deref()
-                && let Ok(target_adapter) =
-                    adapters::select(Some(&choice.selected), &[], &cfg)
+                && let Ok(target_adapter) = adapters::select(Some(&choice.selected), &[], &cfg)
                 && let Some(flags) =
                     translated_route_flags(&args.flags, target_adapter.as_ref(), model)
             {
@@ -1283,14 +1281,18 @@ fn append_execution_segments(
 ) -> TranscriptUsage {
     let mut total = TranscriptUsage::default();
     for segment in &report.segments {
-        total.input_tokens = total.input_tokens.saturating_add(segment.usage.input_tokens);
+        total.input_tokens = total
+            .input_tokens
+            .saturating_add(segment.usage.input_tokens);
         total.cache_creation_input_tokens = total
             .cache_creation_input_tokens
             .saturating_add(segment.usage.cache_creation_input_tokens);
         total.cache_read_input_tokens = total
             .cache_read_input_tokens
             .saturating_add(segment.usage.cache_read_input_tokens);
-        total.output_tokens = total.output_tokens.saturating_add(segment.usage.output_tokens);
+        total.output_tokens = total
+            .output_tokens
+            .saturating_add(segment.usage.output_tokens);
         let _ = super::log::append_delegation(
             state,
             &super::log::Delegation {

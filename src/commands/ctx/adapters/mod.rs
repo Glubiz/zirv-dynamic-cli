@@ -2968,6 +2968,142 @@ mod tests {
         }
     }
 
+    /// Byte offset of `needle` as a contiguous run inside `haystack`, or
+    /// `None` if it never occurs (or is empty). Used to locate one building
+    /// block's argv inside the assembled command without hardcoding any
+    /// vendor-specific flag spelling.
+    fn find_subsequence(haystack: &[String], needle: &[String]) -> Option<usize> {
+        if needle.is_empty() || needle.len() > haystack.len() {
+            return None;
+        }
+        haystack.windows(needle.len()).position(|w| w == needle)
+    }
+
+    /// Spec Risks section (issue #187, `2026-08-28-ai-native-sdlc-design.md`)
+    /// calls for a cross-adapter conformance test on `AgentAdapter::
+    /// dispatch_agent`'s own documented contract, so a future third adapter
+    /// -- or a change to either existing one -- cannot silently drop an
+    /// invariant for just one harness. Composed entirely from each adapter's
+    /// own methods (`policy_args`, `default_sandbox_args`, `read_only_args`),
+    /// never a hardcoded vendor flag, so this holds regardless of which real
+    /// binaries happen to be installed on the machine running it.
+    #[test]
+    fn dispatch_agent_invariants_hold_for_claude_and_codex() {
+        use crate::commands::workflow::agents::{
+            AGENT_SCHEMA_VERSION, AgentManifest, AgentTask, ModelTier,
+        };
+        use crate::commands::workflow::capability::CapabilityId;
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        // Repo-layer narrowing (deny is always a permitted narrowing, never
+        // `REPO_FORBIDDEN`): forces `policy_args` to be non-empty for both
+        // adapters, so "the narrowing fold is applied" is not a vacuous
+        // check against the shipped all-`Allow` default, where `policy_args`
+        // returns empty for every adapter (see its own doc comment).
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[policy]\nrepo_fs_write = \"deny\"\n",
+        )
+        .expect("write ctx.toml");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let resolved_cfg =
+            CtxConfig::load(repo.path(), &|k| std::env::var(k).ok()).expect("load resolved cfg");
+        assert_eq!(
+            resolved_cfg.policy.repo_fs_write,
+            crate::commands::ctx::policy::Stance::Deny,
+            "the repo-layer narrowing must actually be in effect"
+        );
+
+        let manifest = AgentManifest {
+            schema_version: AGENT_SCHEMA_VERSION,
+            id: "conformance-probe".to_string(),
+            version: 1,
+            name: "Conformance Probe".to_string(),
+            description: "cross-adapter dispatch_agent invariants".to_string(),
+            role: "worker".to_string(),
+            model_tier: ModelTier::Standard,
+            read_only: true,
+            required_capabilities: vec![CapabilityId::RepoRead],
+            optional_capabilities: Vec::new(),
+            context_budget_bytes: 4096,
+            instructions: "Do the thing.".to_string(),
+        };
+        let task = AgentTask {
+            prompt: "do the thing".to_string(),
+            repo: repo.path().to_path_buf(),
+            model: None,
+        };
+
+        for name in ["claude", "codex"] {
+            let adapter = select(Some(name), &[], &permissive_cfg())
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+
+            // Invariant 1: the capability check happens for every adapter,
+            // not just one. Network access is `Stance::Deny` by default with
+            // no config at all (see `EffectivePolicy`'s own doc comment), so
+            // this needs no extra setup to be a real refusal.
+            let mut denied = manifest.clone();
+            denied.required_capabilities = vec![CapabilityId::NetworkAccess];
+            let error = adapter
+                .dispatch_agent(&denied, &task)
+                .expect_err(&format!("{name}: a denied capability must refuse"));
+            assert!(
+                error.to_string().contains("network.access"),
+                "{name}: {error}"
+            );
+
+            // Invariant 2: a satisfied seat dispatches, carrying the same
+            // building blocks `dispatch_agent`'s own doc comment promises,
+            // in order -- sandbox args, then the policy narrowing fold, and
+            // the read-only floor appended LAST, after everything else.
+            let command = adapter
+                .dispatch_agent(&manifest, &task)
+                .unwrap_or_else(|e| panic!("{name}: a satisfied capability must dispatch: {e}"));
+            let argv = flatten_command(command);
+
+            let read_only_args = adapter.read_only_args();
+            assert!(
+                !read_only_args.is_empty(),
+                "{name}: a read-only seat's floor must not be empty, or this invariant is vacuous"
+            );
+            assert!(
+                argv.ends_with(read_only_args.as_slice()),
+                "{name}: the read-only floor must be appended LAST -- got {argv:?}"
+            );
+            let before_floor = &argv[..argv.len() - read_only_args.len()];
+
+            let policy_args = adapter.policy_args(&resolved_cfg.policy, LaunchMode::Headless);
+            assert!(
+                !policy_args.is_empty(),
+                "{name}: the forced repo_fs_write=deny narrowing must actually produce args"
+            );
+            let policy_pos = find_subsequence(before_floor, &policy_args).unwrap_or_else(|| {
+                panic!("{name}: the narrowing fold (policy_args) is missing from {argv:?}")
+            });
+
+            if resolved_cfg.sandbox.enabled {
+                let sandbox_args = adapter.default_sandbox_args(
+                    &resolved_cfg.sandbox,
+                    &resolved_cfg.safety,
+                    LaunchMode::Headless,
+                );
+                if !sandbox_args.is_empty() {
+                    let sandbox_pos =
+                        find_subsequence(before_floor, &sandbox_args).unwrap_or_else(|| {
+                            panic!("{name}: sandbox args are missing from {argv:?}")
+                        });
+                    assert!(
+                        sandbox_pos <= policy_pos,
+                        "{name}: sandbox args must precede the narrowing fold -- got {argv:?}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn join_with_or_reads_like_plain_english() {
         assert_eq!(join_with_or(&[]), "");

@@ -561,20 +561,6 @@ impl SessionGuard {
         self.path = write_record(&self.state, &self.record);
     }
 
-    /// Same stable-address refresh as [refresh_session], while also changing
-    /// the harness that currently owns this logical supervisor. Used by
-    /// cross-harness loop continuation, where status must follow the new
-    /// vendor without minting a new delivery address.
-    pub fn refresh_session_agent(&mut self, new_session: &str, agent: &str) {
-        if self.released {
-            return;
-        }
-        self.record.session = new_session.to_string();
-        self.record.agent = agent.to_string();
-        self.record.started_at = super::state::now_secs();
-        self.path = write_record(&self.state, &self.record);
-    }
-
     /// Points this run's record at the pid of the agent child the supervisor
     /// actually spawned, rather than at the supervisor's own pid.
     ///
@@ -1600,45 +1586,6 @@ mod tests {
     }
 
     use super::super::testenv::dead_pid;
-
-    #[test]
-    fn cross_harness_refresh_keeps_the_logical_address_and_registry_path() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let state = state_in(&tmp.path().join("state"));
-        let repo = tmp.path().join("repo");
-        let record = Record::new(
-            "aaaaaaaa-1111-4111-8111-111111111111",
-            "claude",
-            &repo,
-            Verb::Exec,
-        )
-        .with_stable_short("stable01");
-        let mut guard = SessionGuard::register(&state, record);
-        let original_path = guard.path.clone();
-
-        guard.refresh_session_agent(
-            "bbbbbbbb-2222-4222-8222-222222222222",
-            "codex",
-        );
-
-        assert_eq!(guard.record.short, "stable01");
-        assert_eq!(guard.record.agent, "codex");
-        assert_eq!(
-            guard.record.session,
-            "bbbbbbbb-2222-4222-8222-222222222222"
-        );
-        assert_eq!(
-            guard.path, original_path,
-            "changing the underlying vendor session must not mint a new address"
-        );
-
-        let stored: Record = serde_json::from_str(
-            &std::fs::read_to_string(&guard.path).expect("stored record"),
-        )
-        .expect("deserialize record");
-        assert_eq!(stored.short, "stable01");
-        assert_eq!(stored.agent, "codex");
-    }
 
     #[test]
     fn a_record_without_owner_pid_deserializes_as_unowned() {
