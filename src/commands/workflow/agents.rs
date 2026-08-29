@@ -90,8 +90,7 @@ impl AgentManifest {
             )
             .into());
         }
-        if self.context_budget_bytes == 0
-            || self.context_budget_bytes > MAX_AGENT_INSTRUCTION_BYTES
+        if self.context_budget_bytes == 0 || self.context_budget_bytes > MAX_AGENT_INSTRUCTION_BYTES
         {
             return Err(format!(
                 "agent '{}': context_budget_bytes must be in 1..={MAX_AGENT_INSTRUCTION_BYTES}",
@@ -112,10 +111,12 @@ impl AgentManifest {
             .into());
         }
         if self.read_only
-            && self
-                .required_capabilities
-                .iter()
-                .any(|capability| matches!(capability, CapabilityId::RepoWrite | CapabilityId::GitWorktree))
+            && self.required_capabilities.iter().any(|capability| {
+                matches!(
+                    capability,
+                    CapabilityId::RepoWrite | CapabilityId::GitWorktree
+                )
+            })
         {
             return Err(format!(
                 "agent '{}': read-only seats cannot require a write capability",
@@ -294,9 +295,12 @@ fn load_dir(
     if root_metadata.file_type().is_symlink() {
         return Err(format!("refusing symlinked agent directory '{}'", root.display()).into());
     }
-    let canonical_root = root
-        .canonicalize()
-        .map_err(|error| format!("cannot resolve agent directory '{}': {error}", root.display()))?;
+    let canonical_root = root.canonicalize().map_err(|error| {
+        format!(
+            "cannot resolve agent directory '{}': {error}",
+            root.display()
+        )
+    })?;
     let canonical_allowed = allowed_root.canonicalize().map_err(|error| {
         format!(
             "cannot resolve agent trust root '{}': {error}",
@@ -560,7 +564,11 @@ pub fn run(args: &AgentArgs, writer: &mut impl Write) -> CtxResult<i32> {
                         agent.manifest.version,
                         agent.manifest.role,
                         agent.manifest.model_tier,
-                        if agent.manifest.read_only { "read-only" } else { "writable" },
+                        if agent.manifest.read_only {
+                            "read-only"
+                        } else {
+                            "writable"
+                        },
                         agent.source
                     )?;
                 }
@@ -598,7 +606,11 @@ pub fn run(args: &AgentArgs, writer: &mut impl Write) -> CtxResult<i32> {
                 writeln!(
                     writer,
                     "mode: {}",
-                    if agent.manifest.read_only { "read-only" } else { "writable" }
+                    if agent.manifest.read_only {
+                        "read-only"
+                    } else {
+                        "writable"
+                    }
                 )?;
                 if let Some(path) = &agent.source_path {
                     writeln!(writer, "path: {}", path.display())?;
@@ -636,7 +648,11 @@ mod tests {
         assert_eq!(agents.len(), 5);
         for agent in agents {
             for forbidden in ["Claude", "Codex", "Bash tool", "Agent tool"] {
-                assert!(!agent.instructions.contains(forbidden), "{} leaked {forbidden}", agent.id);
+                assert!(
+                    !agent.instructions.contains(forbidden),
+                    "{} leaked {forbidden}",
+                    agent.id
+                );
             }
             agent.validate().unwrap();
         }
@@ -659,8 +675,14 @@ mod tests {
         );
 
         let registry = AgentRegistry::load(repo.path(), Some(home.path()), true, true).unwrap();
-        assert_eq!(registry.get("reviewer").unwrap().source, AgentSource::OperatorGlobal);
-        assert_eq!(registry.get("specialist").unwrap().source, AgentSource::Repository);
+        assert_eq!(
+            registry.get("reviewer").unwrap().source,
+            AgentSource::OperatorGlobal
+        );
+        assert_eq!(
+            registry.get("specialist").unwrap().source,
+            AgentSource::Repository
+        );
         assert_eq!(registry.warnings().len(), 1);
         assert!(registry.warnings()[0].contains("reviewer"));
     }
