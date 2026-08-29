@@ -112,10 +112,9 @@ fn validate_repository(repository: &str) -> ReportResult<String> {
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
     {
-        return Err(format!(
-            "invalid GitHub repository '{repository}'; expected owner/repository"
-        )
-        .into());
+        return Err(
+            format!("invalid GitHub repository '{repository}'; expected owner/repository").into(),
+        );
     }
     Ok(format!("{owner}/{repo}"))
 }
@@ -583,9 +582,6 @@ mod tests {
             "https://api.github.com/repos/Glubiz/zirv-dynamic-cli/issues"
         );
         assert!(validate_repository("../owner/repo").is_err());
-        assert_eq!(
-            validate_repository("owner/repo").unwrap(),
-            "owner/repo"
-        );
+        assert_eq!(validate_repository("owner/repo").unwrap(), "owner/repo");
     }
 }
