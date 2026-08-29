@@ -447,6 +447,105 @@ mod tests {
         assert_eq!(bounds.required_headroom_pct(&cfg, "seven_day"), Some(2.5));
     }
 
+    fn test_cfg_with_ready_adapters() -> CtxConfig {
+        let mut cfg = CtxConfig::default();
+        cfg.agent_bin = Some(
+            std::env::current_exe()
+                .expect("current test executable")
+                .display()
+                .to_string(),
+        );
+        cfg.pace.estimator = false;
+        cfg
+    }
+
+    fn store_usage(
+        state: &StateDir,
+        provider: &str,
+        percent: f64,
+        reset_at: u64,
+        now: u64,
+    ) {
+        crate::commands::ctx::window::store_for(
+            state,
+            provider,
+            &crate::commands::ctx::window::UsageWindows {
+                five_hour: Some(crate::commands::ctx::window::Window {
+                    used_percentage: percent,
+                    resets_at: reset_at,
+                    observed_at: now,
+                }),
+                seven_day: None,
+            },
+        )
+        .expect("store provider usage");
+    }
+
+    #[test]
+    fn all_exhausted_selects_the_admissible_harness_with_the_earliest_reset() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = test_cfg_with_ready_adapters();
+        let now = 1_700_000_000;
+        store_usage(&state, "anthropic", 100.0, now + 3_600, now);
+        store_usage(&state, "openai", 100.0, now + 600, now);
+
+        let choice = earliest_reset_choice(
+            &state,
+            &cfg,
+            RouteRequest {
+                requested: "claude",
+                source_model: Some("sonnet"),
+                source_model_explicit: false,
+                bounds: TaskBounds {
+                    tokens: None,
+                    tool_calls: None,
+                },
+                now,
+            },
+            &[],
+        )
+        .expect("both seats are hard blocked");
+
+        assert_eq!(choice.selected, "codex");
+        assert_eq!(choice.model.as_deref(), Some("gpt-5.6-terra"));
+        assert_eq!(choice.reset_at, now + 600);
+    }
+
+    #[test]
+    fn predictive_routing_uses_the_task_budget_when_the_source_cannot_fit_it() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let mut cfg = test_cfg_with_ready_adapters();
+        cfg.pace.five_hour_budget_tokens = 100_000;
+        cfg.fallback.predictive_headroom_pct = 20.0;
+        let now = 1_700_000_000;
+        // 25% headroom is above the static 20% threshold, but a 30% task
+        // budget cannot fit. The target has ample room.
+        store_usage(&state, "anthropic", 75.0, now + 3_600, now);
+        store_usage(&state, "openai", 20.0, now + 3_600, now);
+
+        let route = route_new_delegation(
+            &state,
+            &cfg,
+            RouteRequest {
+                requested: "claude",
+                source_model: Some("sonnet"),
+                source_model_explicit: false,
+                bounds: TaskBounds {
+                    tokens: Some(30_000),
+                    tool_calls: None,
+                },
+                now,
+            },
+            false,
+        )
+        .expect("the bounded task does not fit the requested seat");
+
+        assert_eq!(route.reason, RouteReason::Predictive);
+        assert_eq!(route.selected, "codex");
+    }
+
     #[test]
     fn reset_choice_detail_names_the_earliest_seat_and_reset() {
         let choice = ResetChoice {
