@@ -15,7 +15,7 @@ use crate::commands::ctx::state::{
     StateDir, create_private_dir_all, now_secs, prune_to_newest, repo_slug, write_private,
 };
 
-const TELEMETRY_SCHEMA_VERSION: u32 = 2;
+const TELEMETRY_SCHEMA_VERSION: u32 = 3;
 const DEFAULT_MAX_EVENTS: usize = 1000;
 const DEFAULT_RETENTION_DAYS: u64 = 30;
 const MAX_CONFIGURED_EVENTS: usize = 100_000;
@@ -75,6 +75,7 @@ pub enum TelemetryKind {
     VerificationRun,
     ReviewRun,
     ArtifactProduced,
+    ArtifactAccepted,
     WorkflowCompleted,
     FindingUpdated,
     FrontendDetectorRun,
@@ -147,6 +148,15 @@ pub struct TelemetryEvent {
     pub parent_session_id: Option<String>,
     #[serde(default)]
     pub work_group_id: Option<String>,
+    /// Accepted workflow work-product stage (intent/spec/plan), when relevant.
+    #[serde(default)]
+    pub artifact_stage: Option<String>,
+    /// Effective deploy tier, populated by deploy-gate events in phase 4.
+    #[serde(default)]
+    pub deploy_tier: Option<String>,
+    /// Provider-neutral agent manifest id, populated by agent dispatch in phase 3.
+    #[serde(default)]
+    pub agent_id: Option<String>,
 }
 
 impl TelemetryEvent {
@@ -185,6 +195,9 @@ impl TelemetryEvent {
             session_id: None,
             parent_session_id: None,
             work_group_id: None,
+            artifact_stage: None,
+            deploy_tier: None,
+            agent_id: None,
         }
     }
 
