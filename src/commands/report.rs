@@ -173,11 +173,14 @@ pub(crate) fn find_open_issue_by_title_in(
     title: &str,
 ) -> ReportResult<Option<u64>> {
     let url = issues_url(repository)?;
-    let mut response = http_agent()
+    let mut request = http_agent()
         .get(&url)
-        .query("labels", label)
         .query("state", "open")
-        .query("per_page", "100")
+        .query("per_page", "100");
+    if !label.trim().is_empty() {
+        request = request.query("labels", label);
+    }
+    let mut response = request
         .header("Accept", "application/vnd.github+json")
         .header("Authorization", &format!("Bearer {token}"))
         .header("X-GitHub-Api-Version", "2022-11-28")
