@@ -2049,6 +2049,8 @@ mod tests {
             id: state.id.clone(),
             agent: "claude".into(),
             base: None,
+            pr: None,
+            github_repo: None,
             repo: Some(repo.path().to_path_buf()),
         };
         let mut out = Vec::new();
@@ -2087,6 +2089,8 @@ mod tests {
             id: state.id.clone(),
             agent: "claude".into(),
             base: None,
+            pr: None,
+            github_repo: None,
             repo: Some(repo.path().to_path_buf()),
         };
         let mut out = Vec::new();
@@ -2261,6 +2265,48 @@ mod tests {
         assert!(lines[1].ends_with(" second line"));
         assert_eq!(lines[2], "third line");
         assert_eq!(lines[3], "no trailing newline");
+    }
+
+    #[test]
+    fn github_repository_slug_validation_is_strict_and_normalizes_git_suffix() {
+        assert_eq!(
+            validate_github_repo_slug("Glubiz/zirv-dynamic-cli.git").unwrap(),
+            "Glubiz/zirv-dynamic-cli"
+        );
+        for bad in ["", "repo", "a/b/c", "../owner/repo", "owner/re po"] {
+            assert!(validate_github_repo_slug(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn github_review_severity_mapping_is_deterministic() {
+        assert_eq!(
+            severity_from_github_comment("[critical] auth bypass"),
+            FindingSeverity::Critical
+        );
+        assert_eq!(
+            severity_from_github_comment("nit: rename this"),
+            FindingSeverity::Minor
+        );
+        assert_eq!(
+            severity_from_github_comment("note: optional"),
+            FindingSeverity::Note
+        );
+        assert_eq!(
+            severity_from_github_comment("This changes semantics"),
+            FindingSeverity::Major
+        );
+    }
+
+    #[test]
+    fn paginated_github_api_slurp_is_flattened() {
+        #[derive(Debug, Deserialize, PartialEq, Eq)]
+        struct Row {
+            id: u64,
+        }
+        let rows: Vec<Row> =
+            parse_paginated(r#"[[{"id":1},{"id":2}],[{"id":3}]]"#).unwrap();
+        assert_eq!(rows, [Row { id: 1 }, Row { id: 2 }, Row { id: 3 }]);
     }
 
     #[test]
@@ -2639,6 +2685,8 @@ checksum = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f80"
             id: state.id.clone(),
             agent: "claude".into(),
             base: None,
+            pr: None,
+            github_repo: None,
             repo: Some(repo.path().to_path_buf()),
         };
         let mut out = Vec::new();
