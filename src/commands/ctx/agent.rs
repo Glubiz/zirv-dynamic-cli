@@ -378,7 +378,7 @@ fn flags_pin_model(flags: &[String]) -> bool {
 /// flag may mean something different (or be invalid) on codex and vice versa.
 /// Empty passthrough is safe, and a model-only passthrough can be replaced by
 /// the verified equivalent tier. Anything else declines automatic routing.
-fn translated_route_flags(
+pub(crate) fn translated_route_flags(
     flags: &[String],
     target: &dyn AgentAdapter,
     target_model: &str,
@@ -934,18 +934,15 @@ pub fn run_with<W: Write>(
         tool_calls: args.max_tool_calls,
     };
 
-    let route = super::fallback::route_new_delegation(
-        &state,
-        &cfg,
-        super::fallback::RouteRequest {
-            requested: &args.name,
-            source_model: requested_model,
-            source_model_explicit,
-            bounds,
-            now,
-        },
-        args.force,
-    );
+    let route_request = super::fallback::RouteRequest {
+        requested: &args.name,
+        source_model: requested_model,
+        source_model_explicit,
+        bounds,
+        now,
+    };
+    let route =
+        super::fallback::route_new_delegation(&state, &cfg, route_request, args.force);
     let mut routed_args = args.clone();
     let mut route_applied = None;
     if let Some(route) = route
@@ -974,17 +971,43 @@ pub fn run_with<W: Write>(
         route_applied = Some(route);
     }
 
+    // If no harness can run immediately, select the admissible seat whose
+    // hard gate clears first. A deferred cross-harness choice still obeys the
+    // same argv portability rule as an immediate reroute; if vendor-specific
+    // flags cannot be translated, waiting stays on the requested harness.
+    let mut deferred_reset = None;
+    if route_applied.is_none()
+        && !args.force
+        && let Some(choice) =
+            super::fallback::earliest_reset_choice(&state, &cfg, route_request, &[])
+    {
+        if choice.is_cross_harness() {
+            if let Some(model) = choice.model.as_deref()
+                && let Ok(target_adapter) =
+                    adapters::select(Some(&choice.selected), &[], &cfg)
+                && let Some(flags) =
+                    translated_route_flags(&args.flags, target_adapter.as_ref(), model)
+            {
+                routed_args.name = choice.selected.clone();
+                routed_args.flags = flags;
+                deferred_reset = Some(choice);
+            }
+        } else {
+            deferred_reset = Some(choice);
+        }
+    }
+
     // The ordinary spawn gate still owns the final decision for whichever
-    // harness will actually launch. If cross-harness translation was unsafe
-    // (for example vendor-specific passthrough flags), this is the requested
-    // harness and today's refusal behavior remains intact.
+    // harness will actually launch. A deferred reset is the one exception:
+    // the headless exec pacing gate below will wait until that exact seat is
+    // usable rather than treating the hard gate as a permanent refusal.
     let provider = adapters::provider_for_agent_name(Some(&routed_args.name));
     let (collector, estimator) = pace::current_windows(&state, &cfg.pace, now, provider);
     let gate = pace::spawn_gate(&collector, estimator.as_ref(), now, &cfg.pace);
     if let Some(note) = pace::describe_spawn_gate(&gate) {
         eprintln!("zirv ctx agent: {note}");
     }
-    if spawn_blocked(&gate, args.force) {
+    if spawn_blocked(&gate, args.force) && deferred_reset.is_none() {
         let fallback_note = if route_applied.is_none() && cfg.fallback.enabled {
             " No admissible fallback harness had enough trusted/assumed headroom."
         } else {
@@ -995,6 +1018,24 @@ pub fn run_with<W: Write>(
              reset, or pass --force to spend anyway.{fallback_note}"
         )
         .into());
+    }
+    if let Some(choice) = deferred_reset.as_ref() {
+        let detail = choice.detail();
+        let parent_session =
+            super::mail::session_identity(env).unwrap_or_else(|| "delegation".to_string());
+        let _ = super::log::append(
+            &state,
+            &super::log::Decision {
+                ts: now,
+                session: &parent_session,
+                verb: "agent",
+                verdict: "wait",
+                score: 0,
+                action: "harness-reset-wait",
+                detail: &detail,
+            },
+        );
+        eprintln!("zirv ctx agent: {detail}; pacing until that seat is available");
     }
 
     // Issue #170: resolved once, here, before the dashboard-join fork below,
@@ -1019,15 +1060,17 @@ pub fn run_with<W: Write>(
         }
     };
 
-    if let Some(result) = try_join_dashboard(
-        args,
-        &prompt,
-        w,
-        repo,
-        env,
-        DASH_ACK_TIMEOUT,
-        DASH_CLAIM_EXTENSION,
-    ) {
+    if deferred_reset.is_none()
+        && let Some(result) = try_join_dashboard(
+            args,
+            &prompt,
+            w,
+            repo,
+            env,
+            DASH_ACK_TIMEOUT,
+            DASH_CLAIM_EXTENSION,
+        )
+    {
         // Finding 4: the dashboard answered definitively, and only `Ok(0)`
         // (`answer_for_ack`'s spawned-a-pane arm) means work actually
         // started. A refusal spawned nothing, so a group minted for it
