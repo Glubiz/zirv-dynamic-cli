@@ -510,6 +510,11 @@ pub struct WorkflowConfig {
     /// skills can only ever *add* ids (see `skill::load_dir`); this turns the
     /// whole layer off.
     pub repo_skills_enabled: bool,
+    /// Whether untrusted repository-provided `.zirv/agents/` manifests are
+    /// loaded. Off by default: a checkout may propose a new role only after
+    /// the operator explicitly enables this layer, and may never replace a
+    /// trusted built-in/operator id.
+    pub repo_agents_enabled: bool,
     /// Local workflow telemetry. Previously read straight from the process
     /// environment, which a repository script could set for itself.
     pub telemetry_enabled: bool,
@@ -522,6 +527,7 @@ impl Default for WorkflowConfig {
         Self {
             repo_checks_enabled: true,
             repo_skills_enabled: true,
+            repo_agents_enabled: false,
             telemetry_enabled: true,
             telemetry_max_events: 1000,
             telemetry_retention_days: 30,
@@ -1328,6 +1334,11 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         EnvKind::Bool,
     ),
     (
+        "ZIRV_CTX_WORKFLOW_REPO_AGENTS",
+        &["workflow", "repo_agents_enabled"],
+        EnvKind::Bool,
+    ),
+    (
         "ZIRV_CTX_WORKFLOW_TELEMETRY",
         &["workflow", "telemetry_enabled"],
         EnvKind::Bool,
@@ -1774,6 +1785,10 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     (
         &["workflow", "repo_skills_enabled"],
         "ZIRV_CTX_WORKFLOW_REPO_SKILLS",
+    ),
+    (
+        &["workflow", "repo_agents_enabled"],
+        "ZIRV_CTX_WORKFLOW_REPO_AGENTS",
     ),
     (
         &["workflow", "telemetry_enabled"],
