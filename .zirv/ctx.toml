@@ -181,6 +181,17 @@ model = "fable"
 # tier = "development"               # REPO-FORBIDDEN (ZIRV_CTX_WORKFLOW_DEPLOY_TIER): development < staging < production. Operator env overrides all layers. Default: "development".
 # minimum_tier = "development"       # repo MAY set this key because it folds with max(home, repo): it can only make deploy gates stricter, never looser. Omit by default.
 
+# [workflow.maintain]                # REPO-FORBIDDEN as a whole: detector commands execute with operator authority and must live only in ~/.zirv/ctx.toml.
+# timeout_secs = 60                  # timeout applied to each deterministic detector. Default: 60, hard-capped by the maintain runner.
+#
+# [workflow.maintain.detectors.example]
+# command = "cargo audit --quiet"     # operator-authored shell command; repository layers may never set it.
+# mode = "exit-nonzero"              # "exit-nonzero" or "line-count".
+# threshold = 1                      # line-count breaches at >= threshold; exit-nonzero ignores this value.
+
+# [report]
+# repository = "owner/repository"    # REPO-FORBIDDEN (ZIRV_CTX_REPORT_REPOSITORY): destination for workflow-maintain incidents only. The ordinary report command keeps its fixed Zirv repository default.
+
 # [policy]                           # zirv's own canonical permissions policy (src/commands/ctx/policy.rs).
 # Not REPO-FORBIDDEN, and the ONE table here that does NOT deep-merge:
 # `[policy]` is lifted out of every layer and folded by `policy::resolve` as
