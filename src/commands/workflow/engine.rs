@@ -8,6 +8,7 @@ use clap::{Args, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use super::agents::AgentRegistry;
 use super::classify::{self, Classification, Complexity, Intent, RiskBand, WorkDomain};
 use super::skill::{SkillRegistry, WorkflowPhase};
 use crate::commands::ctx::CtxResult;
@@ -15,7 +16,7 @@ use crate::commands::ctx::state::{
     StateDir, create_private_dir_all, now_secs, repo_slug, write_private,
 };
 
-pub const WORKFLOW_SCHEMA_VERSION: u32 = 2;
+pub const WORKFLOW_SCHEMA_VERSION: u32 = 3;
 const MAX_STEP_ATTEMPTS: u8 = 3;
 const MAX_WORK_ARTIFACT_CONTEXT_BYTES: usize = 24 * 1024;
 
@@ -187,6 +188,11 @@ pub struct WorkflowStep {
     pub id: String,
     pub phase: WorkflowPhase,
     pub skill: String,
+    /// Provider-neutral workflow seat. This is an address, not authority:
+    /// dispatch still resolves the seat through the trusted agent registry and
+    /// narrows it through the effective policy.
+    #[serde(default)]
+    pub agent: Option<String>,
     #[serde(default)]
     pub artifact: Option<ArtifactStage>,
     pub condition: StepCondition,
@@ -225,6 +231,14 @@ impl WorkflowDefinition {
     }
 }
 
+fn seat_for_phase(phase: WorkflowPhase) -> Option<String> {
+    match phase {
+        WorkflowPhase::Implement | WorkflowPhase::Debug => Some("implementer".into()),
+        WorkflowPhase::Review => Some("reviewer".into()),
+        _ => None,
+    }
+}
+
 fn step(
     id: &str,
     phase: WorkflowPhase,
@@ -236,6 +250,7 @@ fn step(
         id: id.to_string(),
         phase,
         skill: skill.to_string(),
+        agent: seat_for_phase(phase),
         artifact: None,
         condition,
         approval,
@@ -254,6 +269,7 @@ fn artifact_step(
         id: id.to_string(),
         phase,
         skill: skill.to_string(),
+        agent: None,
         artifact: Some(stage),
         condition,
         approval: true,
@@ -1562,6 +1578,9 @@ pub fn render_current_context(
         step.phase,
         state.status
     );
+    if let Some(agent) = step.agent.as_deref() {
+        rendered.push_str(&format!("agent-seat: {agent}\n"));
+    }
     if let Some(stage) = step.artifact {
         ensure_current_artifact_template(state)?;
         let record = state
@@ -1652,6 +1671,8 @@ pub enum WorkflowSubcommand {
     Context(StatusArgs),
     /// Inspect committed workflow work-product artifacts and acceptance state.
     Artifacts(ArtifactsArgs),
+    /// Inspect provider-neutral workflow seats and their trust provenance.
+    Agents(super::agents::AgentArgs),
     /// Approve the current gated step.
     Approve(StateIdArgs),
     /// Record a step result and transition the state machine.
@@ -1682,10 +1703,10 @@ pub struct StartArgs {
     pub kind: WorkflowKind,
     #[arg(long)]
     pub task: String,
-    /// Validate every selected skill against this adapter before starting.
+    /// Harness adapter used for capability preflight (for example claude/codex).
     #[arg(long)]
     pub agent: Option<String>,
-    /// Ignore operator-global and repository-provided skill overrides.
+    /// Ignore operator-global and repository-provided skill/agent overrides.
     #[arg(long)]
     pub built_in_only: bool,
     #[arg(long)]
@@ -1825,10 +1846,11 @@ fn write_state(writer: &mut impl Write, state: &WorkflowState, json: bool) -> Ct
         if let Some(step) = state.current() {
             writeln!(
                 writer,
-                "current: {} ({}, skill {}{})",
+                "current: {} ({}, skill {}, agent {}{})",
                 step.id,
                 step.phase,
                 step.skill,
+                step.agent.as_deref().unwrap_or("-"),
                 step.artifact
                     .map(|stage| format!(", artifact {stage}"))
                     .unwrap_or_default()
@@ -1874,10 +1896,11 @@ pub fn run(args: &WorkflowArgs, writer: &mut impl Write) -> CtxResult<i32> {
                 for step in definition.steps {
                     writeln!(
                         writer,
-                        "  {}\t{}\tskill={}\tartifact={}\twhen={:?}\tapproval={}",
+                        "  {}\t{}\tskill={}\tagent={}\tartifact={}\twhen={:?}\tapproval={}",
                         step.id,
                         step.phase,
                         step.skill,
+                        step.agent.as_deref().unwrap_or("-"),
                         step.artifact
                             .map(|stage| stage.to_string())
                             .unwrap_or_else(|| "-".into()),
@@ -1937,10 +1960,18 @@ pub fn run(args: &WorkflowArgs, writer: &mut impl Write) -> CtxResult<i32> {
                     dirs::home_dir().as_deref(),
                     !args.built_in_only,
                 )?;
+                let agent_registry = AgentRegistry::load_for_repo(
+                    &repo,
+                    dirs::home_dir().as_deref(),
+                    !args.built_in_only,
+                )?;
                 let report = super::capability::CapabilityReport::for_repo(agent, &repo)?;
                 for step in materialize(definition.kind, &classification, profile) {
                     for skill in step_skill_ids(&step, &classification) {
                         registry.ensure_supported(&skill, &report)?;
+                    }
+                    if let Some(seat) = step.agent.as_deref() {
+                        agent_registry.ensure_supported(seat, &report)?;
                     }
                 }
             }
@@ -2005,6 +2036,9 @@ pub fn run(args: &WorkflowArgs, writer: &mut impl Write) -> CtxResult<i32> {
                 Some(context) => write!(writer, "{context}")?,
                 None => writeln!(writer, "workflow has no active step context")?,
             }
+        }
+        WorkflowSubcommand::Agents(args) => {
+            return super::agents::run(args, writer);
         }
         WorkflowSubcommand::Artifacts(args) => {
             let repo = resolve_repo(args.repo.as_deref())?;
