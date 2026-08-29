@@ -1903,14 +1903,8 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
         &["workflow", "deploy", "tier"],
         "ZIRV_CTX_WORKFLOW_DEPLOY_TIER",
     ),
-    (
-        &["workflow", "maintain"],
-        "~/.zirv/ctx.toml only",
-    ),
-    (
-        &["report", "repository"],
-        "ZIRV_CTX_REPORT_REPOSITORY",
-    ),
+    (&["workflow", "maintain"], "~/.zirv/ctx.toml only"),
+    (&["report", "repository"], "ZIRV_CTX_REPORT_REPOSITORY"),
     (
         &["workflow", "telemetry_enabled"],
         "ZIRV_CTX_WORKFLOW_TELEMETRY",
@@ -2446,12 +2440,7 @@ impl CtxConfig {
             "small_task_max_tool_calls",
         ));
         let repo_deploy_minimum = deploy_tier_at(
-            take_nested3(
-                &mut repo_layer,
-                "workflow",
-                "deploy",
-                "minimum_tier",
-            ),
+            take_nested3(&mut repo_layer, "workflow", "deploy", "minimum_tier"),
             "workflow.deploy.minimum_tier",
         )?;
         merge(&mut merged, repo_layer);
@@ -5339,7 +5328,12 @@ mod tests {
         let empty = env_map(&[]);
         let cfg = CtxConfig::load(repo.path(), &|key| empty.get(key).cloned()).expect("load");
         assert_eq!(cfg.workflow.maintain.timeout_secs, 12);
-        let detector = cfg.workflow.maintain.detectors.get("audit").expect("detector");
+        let detector = cfg
+            .workflow
+            .maintain
+            .detectors
+            .get("audit")
+            .expect("detector");
         assert_eq!(detector.command, "printf issue");
         assert_eq!(detector.mode, MaintainDetectorMode::LineCount);
         assert_eq!(detector.threshold, 1);
