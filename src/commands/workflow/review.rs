@@ -619,16 +619,24 @@ fn parse_paginated<T: for<'de> Deserialize<'de>>(raw: &str) -> CtxResult<Vec<T>>
 }
 
 fn github_api_pages<T: for<'de> Deserialize<'de>>(
-    repo_slug: &str,
+    _repo_slug: &str,
     endpoint: &str,
 ) -> CtxResult<Vec<T>> {
-    let args = vec![
-        "api".to_string(),
-        "--paginate".to_string(),
-        "--slurp".to_string(),
-        endpoint.to_string(),
-    ];
-    parse_paginated(&gh_output(repo_slug, &args)?)
+    // The endpoint already carries repos/{owner}/{repo}; unlike `gh pr`,
+    // `gh api` has no --repo flag. Keep this as a direct argv launch with
+    // no shell and let the endpoint be the complete repository authority.
+    let output = Command::new("gh")
+        .args(["api", "--paginate", "--slurp", endpoint])
+        .output()
+        .map_err(|error| format!("could not launch GitHub CLI: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "gh api failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into());
+    }
+    parse_paginated(&String::from_utf8_lossy(&output.stdout))
 }
 
 fn severity_from_github_comment(body: &str) -> FindingSeverity {
@@ -1553,9 +1561,10 @@ fn run_independent_review(
     launch: &dyn Fn(&str, &ReviewPackage) -> CtxResult<ReviewerRun>,
 ) -> CtxResult<i32> {
     let (state_dir, state) = state_and_repo(args.repo.as_deref(), &args.id)?;
-    if depth_for_risk(state.classification.risk) == ReviewDepth::SelfVerification {
+    if required_independent_reviews_for(&state) == 0 {
         return Err(
-            "risk policy selects self-verification; an independent reviewer is not required".into(),
+            "workflow policy selects self-verification; an independent reviewer is not required"
+                .into(),
         );
     }
     if state.status != WorkflowStatus::Running
@@ -1563,7 +1572,13 @@ fn run_independent_review(
     {
         return Err("independent review can only run during an active review step".into());
     }
-    let package = package(&state_dir, &state, args.base.as_deref())?;
+    if args.pr.is_none() && args.github_repo.is_some() {
+        return Err("--github-repo requires --pr".into());
+    }
+    let package = match args.pr {
+        Some(pr) => package_pull_request(&state, pr, args.github_repo.as_deref())?,
+        None => package(&state_dir, &state, args.base.as_deref())?,
+    };
     let started = std::time::Instant::now();
     let mut dispatch_event =
         super::telemetry::TelemetryEvent::new(super::telemetry::TelemetryKind::AgentDispatched);
@@ -1582,6 +1597,71 @@ fn run_independent_review(
     );
     let run = launch(&args.agent, &package)?;
     let code = run.code;
+
+    // Incoming PR review is deliberately inspection-only. Re-read its head
+    // after the reviewer exits and validate structured output, but never
+    // append this remote fingerprint to the local workflow's review evidence.
+    // Otherwise reviewing an unrelated PR could satisfy a production deploy.
+    if let Some(pr) = args.pr {
+        let repository = github_repo_slug(&state.repo, args.github_repo.as_deref())?;
+        let current = load_pull_request(&repository, pr)?;
+        let unchanged = current.head_ref_oid == package.head_sha;
+        let recorded = records_evidence(&run, unchanged);
+        let findings = if recorded {
+            run.output
+                .as_deref()
+                .map(parse_reviewer_output)
+                .transpose()?
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let mut event =
+            super::telemetry::TelemetryEvent::new(super::telemetry::TelemetryKind::ReviewRun);
+        event.workflow_id = Some(state.id.clone());
+        event.phase = Some(super::skill::WorkflowPhase::Review);
+        event.intent = Some(state.classification.intent);
+        event.complexity = Some(state.classification.complexity);
+        event.risk = Some(state.classification.risk);
+        event.work_domain = Some(state.classification.work_domain.domain);
+        event.duration_ms =
+            Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
+        event.adapter = Some(args.agent.clone());
+        event.succeeded = Some(recorded);
+        event.worker_count = 1;
+        let _ = super::telemetry::record(
+            &state_dir,
+            &state.repo,
+            &event,
+            &super::telemetry::TelemetryConfig::for_repo(&state.repo),
+        );
+
+        if run.dashboard_spawn {
+            writeln!(
+                writer,
+                "the PR review was spawned as a dashboard pane; no completed result is available yet"
+            )?;
+            return Ok(code);
+        }
+        if code == 0 && !unchanged {
+            return Err(
+                "the pull request head changed during review; discard this review and rerun it"
+                    .into(),
+            );
+        }
+        if recorded {
+            writeln!(
+                writer,
+                "reviewed GitHub PR {}#{} at {}: {} finding(s); remote PR review does not count as local workflow completion evidence",
+                repository,
+                pr,
+                package.head_sha,
+                findings.len()
+            )?;
+        }
+        return Ok(code);
+    }
+
     let fingerprint_unchanged =
         verification::change_fingerprint(&state.repo)? == package.change_fingerprint;
     // The reviewer runs `zirv workflow review add` against the same state file
