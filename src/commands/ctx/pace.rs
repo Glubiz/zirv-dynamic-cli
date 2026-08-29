@@ -340,6 +340,64 @@ pub fn spawn_headroom(
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SpawnReset {
+    pub reset_at: u64,
+    pub window: &'static str,
+    pub source: Source,
+}
+
+/// When a new-work gate is hard-refused, returns when that provider can next
+/// be considered usable. If more than one authoritative window is at the hard
+/// ceiling, all of them must clear, so this returns the latest reset among the
+/// blocking windows. The source layering is identical to [spawn_gate]:
+/// binding collector data wins as a layer; the estimator is considered only
+/// when no collector window is binding.
+pub fn spawn_reset(
+    collector: &UsageWindows,
+    estimator: Option<&UsageWindows>,
+    now: u64,
+    cfg: &PaceConfig,
+) -> Option<SpawnReset> {
+    if !cfg.enabled {
+        return None;
+    }
+
+    let collector_five = binding(&collector.five_hour, now, cfg);
+    let collector_seven = binding(&collector.seven_day, now, cfg);
+    let collector_has_binding = collector_five.is_some() || collector_seven.is_some();
+    let (source, five, seven) = if collector_has_binding {
+        (Source::Collector, collector_five, collector_seven)
+    } else if cfg.estimator {
+        (
+            Source::Estimator,
+            estimator.and_then(|windows| windows.five_hour.as_ref()),
+            estimator.and_then(|windows| windows.seven_day.as_ref()),
+        )
+    } else {
+        (Source::None, None, None)
+    };
+
+    [("five_hour", five), ("seven_day", seven)]
+        .into_iter()
+        .filter_map(|(window, reading)| {
+            let reading = reading?;
+            (reading.used_percentage >= cfg.spawn_hard_pct).then(|| {
+                let reset_at = if reading.resets_at > now {
+                    reading.resets_at
+                } else {
+                    now.saturating_add(cfg.fallback_delay_secs)
+                };
+                SpawnReset {
+                    reset_at,
+                    window,
+                    source,
+                }
+            })
+        })
+        .max_by_key(|reset| reset.reset_at)
+}
+
 pub fn spawn_gate(
     collector: &UsageWindows,
     estimator: Option<&UsageWindows>,
@@ -1224,6 +1282,51 @@ pub fn wait_for_window<W: Write>(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn spawn_reset_waits_for_every_hard_blocking_window() {
+        let now = 1_700_000_000;
+        let cfg = super::PaceConfig {
+            spawn_hard_pct: 95.0,
+            ..Default::default()
+        };
+        let collector = super::UsageWindows {
+            five_hour: Some(super::Window {
+                used_percentage: 99.0,
+                resets_at: now + 600,
+                observed_at: now,
+            }),
+            seven_day: Some(super::Window {
+                used_percentage: 96.0,
+                resets_at: now + 3_600,
+                observed_at: now,
+            }),
+        };
+        let reset = super::spawn_reset(&collector, None, now, &cfg).expect("hard refused");
+        assert_eq!(reset.reset_at, now + 3_600);
+        assert_eq!(reset.window, "seven_day");
+        assert_eq!(reset.source, super::Source::Collector);
+    }
+
+    #[test]
+    fn spawn_reset_uses_the_configured_fallback_delay_when_reset_is_unknown() {
+        let now = 1_700_000_000;
+        let cfg = super::PaceConfig {
+            spawn_hard_pct: 95.0,
+            fallback_delay_secs: 777,
+            ..Default::default()
+        };
+        let collector = super::UsageWindows {
+            five_hour: Some(super::Window {
+                used_percentage: 100.0,
+                resets_at: 0,
+                observed_at: now,
+            }),
+            seven_day: None,
+        };
+        let reset = super::spawn_reset(&collector, None, now, &cfg).expect("hard refused");
+        assert_eq!(reset.reset_at, now + 777);
+    }
+
     use super::*;
     use crate::commands::ctx::config::PaceConfig;
     use crate::commands::ctx::state::StateDir;
