@@ -1369,6 +1369,152 @@ pub(crate) fn run_with_clock<W: Write>(
         }
 
         if limit_hit {
+            // Issue #186: a vendor-confirmed block is the only point where a
+            // running session may move harnesses. The child is already stopped,
+            // so this never interrupts an in-flight response. Only launches
+            // zirv itself built from prompt data are portable across vendors;
+            // an operator-owned explicit command keeps today's park behavior.
+            let visited: Vec<String> = env(super::fallback::VISITED_ENV)
+                .map(|raw| super::config::split_csv_list(&raw))
+                .unwrap_or_default();
+            let source_model = adapters::last_model_flag(&args.command);
+            let route = (adapter_builds_launch && prompt.is_some())
+                .then(|| {
+                    super::fallback::route_blocked_session(
+                        &state,
+                        &cfg,
+                        super::fallback::RouteRequest {
+                            requested: adapter.name(),
+                            source_model,
+                            source_model_explicit: source_model.is_some(),
+                            bounds: super::fallback::TaskBounds {
+                                tokens: worker_budget.tokens,
+                                tool_calls: worker_budget.tool_calls,
+                            },
+                            now: now_fn(),
+                        },
+                        &visited,
+                    )
+                })
+                .flatten();
+
+            if let Some(route) = route {
+                let jsonl = std::fs::read_to_string(&transcript).unwrap_or_default();
+                let ctx = adapter.structural_context(&jsonl, cfg.handoff.tail_items);
+                let (note, source) = handoff::distill_or_structural(
+                    adapter.as_ref(),
+                    &distiller_model,
+                    &ctx,
+                    Duration::from_secs(cfg.handoff.timeout_secs),
+                    cfg.chrome.events,
+                );
+                let stored = handoff::store(&state, repo, session.as_str(), &note)?;
+
+                // Preserve the delegation's original budget across the vendor
+                // boundary. This harvest includes the just-stopped child plus
+                // every prior restart already accumulated in these counters.
+                if has_budget {
+                    harvest_spend(
+                        adapter.as_ref(),
+                        &transcript,
+                        &mut prior_usage,
+                        &mut prior_tool_calls,
+                    );
+                }
+                let spent_tokens = prior_usage
+                    .context_total()
+                    .saturating_add(prior_usage.output_tokens);
+                let remaining_tokens = worker_budget
+                    .tokens
+                    .map(|limit| limit.saturating_sub(spent_tokens));
+                let remaining_tool_calls = worker_budget
+                    .tool_calls
+                    .map(|limit| limit.saturating_sub(prior_tool_calls));
+                if worker_budget
+                    .tokens
+                    .is_some_and(|_| remaining_tokens == Some(0))
+                    || worker_budget
+                        .tool_calls
+                        .is_some_and(|_| remaining_tool_calls == Some(0))
+                {
+                    let _ = log::append(
+                        &state,
+                        &log::Decision {
+                            ts: now_secs(),
+                            session: session.as_str(),
+                            verb: "exec",
+                            verdict: "budget",
+                            score: 0,
+                            action: "fallback-budget-exhausted",
+                            detail: "usage limit coincided with the delegation budget ceiling",
+                        },
+                    );
+                    session_guard.release();
+                    return Ok(EXIT_BUDGET_EXHAUSTED);
+                }
+
+                let detail = format!(
+                    "{}; {} handoff at {}",
+                    route.detail(),
+                    source,
+                    stored.display()
+                );
+                let _ = log::append(
+                    &state,
+                    &log::Decision {
+                        ts: now_secs(),
+                        session: session.as_str(),
+                        verb: "exec",
+                        verdict: "limit",
+                        score: 100,
+                        action: "harness-handover",
+                        detail: &detail,
+                    },
+                );
+                writeln!(
+                    w,
+                    "zirv ctx exec: usage limit hit; continuing on another harness ({detail})"
+                )?;
+
+                let prompt_text = prompt.clone().expect("route requires a known prompt");
+                let continuation = format!(
+                    "{prompt_text}\n\nThe previous harness exhausted its usage window. Continue from this handoff without redoing completed work:\n\n{}",
+                    note.to_markdown()
+                );
+                let target = adapters::select(Some(&route.selected), &[], &cfg)?;
+                let nested_args = ExecArgs {
+                    agent: Some(route.selected.clone()),
+                    session_id: None,
+                    transcript: None,
+                    prompt: Some(continuation),
+                    max_restarts: args.max_restarts,
+                    timeout_secs: args.timeout_secs,
+                    budget_tokens: remaining_tokens,
+                    max_tool_calls: remaining_tool_calls,
+                    command: target.model_args(&route.model),
+                    simple: args.simple,
+                };
+
+                let mut next_visited = visited;
+                if !next_visited.iter().any(|name| name == adapter.name()) {
+                    next_visited.push(adapter.name().to_string());
+                }
+                let visited_csv = next_visited.join(",");
+                let nested_env = |key: &str| {
+                    if key == super::fallback::VISITED_ENV {
+                        Some(visited_csv.clone())
+                    } else {
+                        env(key)
+                    }
+                };
+
+                // The old session has ended and its handoff is durable before
+                // the continuation is registered. Releasing first prevents two
+                // live registry entries from claiming one logical worker.
+                session_guard.release();
+                return run_with_clock(&nested_args, w, repo, &nested_env, now_fn, sleep_fn);
+            }
+
             let _ = log::append(
                 &state,
                 &log::Decision {
@@ -3462,6 +3608,68 @@ mod tests {
     }
 
     #[test]
+    fn a_limit_hit_hands_over_to_an_enabled_alternate_before_parking() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let state_dir = tmp.path().join("state");
+        let argv_log = tmp.path().join("argv.log");
+        let mut env = base_env(&state_dir);
+        // A confirmed vendor limit is stronger evidence than proactive pacing,
+        // so fallback remains useful even when the operator disabled the pace
+        // gate itself.
+        env.insert("ZIRV_CTX_PACE".to_string(), "false".to_string());
+        env.insert(
+            "ZIRV_CTX_AGENT_BIN".to_string(),
+            format!("sh {}", fixture("fake-codex-agent.sh").display()),
+        );
+
+        // The first (codex) child reports a hard limit. The same fixture then
+        // stands in for the selected claude continuation and exits cleanly.
+        let modes = tmp.path().join("modes.txt");
+        std::fs::write(&modes, "limit\nhealthy\n").expect("write modes");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let _fake_agent = crate::commands::ctx::testenv::VarGuard::set(&[
+            ("FAKE_AGENT_MODE_FILE", modes.to_str()),
+            ("FAKE_AGENT_ARGV_LOG", argv_log.to_str()),
+        ]);
+
+        let args = ExecArgs {
+            agent: Some("codex".to_string()),
+            session_id: None,
+            transcript: None,
+            prompt: Some("finish the requested work".to_string()),
+            max_restarts: Some(0),
+            budget_tokens: None,
+            max_tool_calls: None,
+            timeout_secs: Some(30),
+            simple: false,
+            command: Vec::new(),
+        };
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        assert_eq!(code.expect("runs"), 0);
+
+        let log = std::fs::read_to_string(state_dir.join("logs/decisions.jsonl")).expect("log");
+        assert!(
+            log.contains("\"action\":\"harness-handover\""),
+            "the confirmed limit should cross harnesses: {log}"
+        );
+        assert!(
+            log.contains("codex -> claude"),
+            "the selected route should be transparent: {log}"
+        );
+        assert!(
+            !log.contains("\"action\":\"limit-park\""),
+            "an admissible alternate should be used before the legacy park path: {log}"
+        );
+        let argv = std::fs::read_to_string(&argv_log).unwrap_or_default();
+        assert!(
+            argv.contains("finish the requested work"),
+            "the logical task must survive the handoff: {argv}"
+        );
+    }
+
+    #[test]
     fn a_limit_hit_parks_and_relaunches_without_spending_the_restart_budget() {
         let tmp = crate::commands::ctx::testenv::repo();
         let home = tmp.path().join("home");
@@ -4483,6 +4691,10 @@ mod tests {
         let argv_log = tmp.path().join("argv.log");
         let mut env = base_env(&state_dir);
         env.insert("ZIRV_CTX_PACE".to_string(), "false".to_string());
+        // This regression specifically isolates the same-harness park/relaunch
+        // mail path. #186 enables fallback by default, which would correctly
+        // continue the already-stopped codex child on claude instead.
+        env.insert("ZIRV_CTX_FALLBACK".to_string(), "false".to_string());
         env.insert("ZIRV_CTX_POLL_MS".to_string(), "50".to_string());
         env.insert(
             "ZIRV_CTX_AGENT_BIN".to_string(),

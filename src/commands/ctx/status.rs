@@ -471,6 +471,55 @@ pub fn run_with<W: Write>(
             if let Some(line) = describe_injection_fallback(cfg) {
                 writeln!(w, "{line}")?;
             }
+            writeln!(
+                w,
+                "fallback: {} | order {} | steer below {:.0}% headroom | candidate min {:.0}% | unknown assumes {:.0}%",
+                if cfg.fallback.enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                },
+                if cfg.fallback.order.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    cfg.fallback.order.join(" -> ")
+                },
+                cfg.fallback.predictive_headroom_pct,
+                cfg.fallback.min_candidate_headroom_pct,
+                cfg.fallback.unknown_headroom_pct,
+            )?;
+            if cfg.fallback.enabled {
+                let now = crate::commands::ctx::state::now_secs();
+                for name in &cfg.fallback.order {
+                    let provider = adapters::provider_for_agent_name(Some(name));
+                    let (collector, estimator) =
+                        super::pace::current_windows(&state, &cfg.pace, now, provider);
+                    let headroom =
+                        super::pace::spawn_headroom(&collector, estimator.as_ref(), now, &cfg.pace)
+                            .map(|reading| format!("{:.0}% measured", reading.headroom_pct))
+                            .unwrap_or_else(|| {
+                                if cfg.fallback.unknown_headroom_pct > 0.0 {
+                                    format!("{:.0}% assumed", cfg.fallback.unknown_headroom_pct)
+                                } else {
+                                    "unknown / opted out".to_string()
+                                }
+                            });
+                    let capacity = if cfg.agents.is_capacity_small(name) {
+                        "small-only"
+                    } else {
+                        "full"
+                    };
+                    writeln!(
+                        w,
+                        "  fallback {name}: {} / {capacity} / {headroom}",
+                        if cfg.agents.is_enabled(name) {
+                            "enabled"
+                        } else {
+                            "disabled"
+                        }
+                    )?;
+                }
+            }
         }
         Err(e) if repo_forbidden => writeln!(w, "\nCONFIG REJECTED: {e}")?,
         Err(e) => writeln!(w, "\nchat: unavailable (configuration error: {e})")?,
