@@ -148,6 +148,14 @@ Feature, bugfix, and refactor workflows end in `Deploy/finish-branch`. Productio
 
 The review engine also accepts incoming GitHub PRs: `workflow review package <id> --pr <n> [--github-repo owner/repo]` and `review run ... --pr <n>` read PR metadata/diff through fixed `gh` argv, cap the diff to the normal review budget, and re-check the PR head after review. Remote PR review is inspection-only and never becomes local workflow completion evidence. `workflow review ingest-pr-comments <workflow-id> --pr <n>` imports inline/review bodies as deterministic-id open `ReviewFinding` obligations, making repeated ingestion idempotent.
 
+## Maintain loop
+
+`zirv workflow maintain scan [--repo <path>] [--json]` is an invoked scanner, not a daemon. It reads detectors only from operator-owned `~/.zirv/ctx.toml` under `[workflow.maintain.detectors.<id>]`; repository config is forbidden from defining detector commands. Each detector is deterministic: either a non-zero/timeout breach or a stdout line-count threshold. Commands are bounded, run with process-tree cleanup, and the scanner retains only exit code, timeout state, line/byte counts, never detector command/output bodies in committed artifacts, telemetry, or GitHub issues.
+
+A breach creates one bounded incident cycle parked at the Intent acceptance gate. Zirv commits `.zirv/work/<workflow-id>/intent.md` with detector metadata, stores a private active-incident marker keyed by canonical repository + detector, and reuses that workflow while the breach persists. A clean scan clears the marker, so a later recurrence becomes a new incident. If operator-only `[report] repository = "owner/repo"` is configured, the scanner files an exact-title-deduplicated GitHub issue; a fresh machine also reuses an already-open issue by title. Issue filing failure does not discard the parked workflow and is retried on the next scan.
+
+The ordinary `zirv report` command keeps its fixed Zirv repository destination; the generalized report transport is used only when an explicit operator-selected destination is supplied by maintenance. `MaintenanceScan` telemetry records pass/breach without source/output payloads, and `workflow stats` aggregates maintenance breaches alongside artifact acceptance, agent dispatch and deploy-gate outcomes.
+
 ## Review
 
 `zirv workflow review package <id>` builds a reproducible package from task/classification, base/head SHAs, tracked and untracked changed paths, a streaming/capped relevant diff, summarized verification (including whether it is fresh), existing findings, and review round. It never includes the controller conversation or plan history. `review run --agent <name>` pipes that package to a fresh `zirv agent` worker; the worker does not share the controller conversation.
