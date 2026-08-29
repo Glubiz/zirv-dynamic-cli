@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 use clap::{Args, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use super::classify::{self, Classification, Complexity, Intent, RiskBand, WorkDomain};
 use super::skill::{SkillRegistry, WorkflowPhase};
@@ -14,8 +15,74 @@ use crate::commands::ctx::state::{
     StateDir, create_private_dir_all, now_secs, repo_slug, write_private,
 };
 
-pub const WORKFLOW_SCHEMA_VERSION: u32 = 1;
+pub const WORKFLOW_SCHEMA_VERSION: u32 = 2;
 const MAX_STEP_ATTEMPTS: u8 = 3;
+const MAX_WORK_ARTIFACT_CONTEXT_BYTES: usize = 24 * 1024;
+
+const INTENT_TEMPLATE: &str = r#"# Intent
+
+## Problem
+
+<!-- What problem are we solving, for whom, and why now? -->
+
+## Desired outcome
+
+<!-- Describe the observable end state. -->
+
+## Constraints
+
+<!-- Technical, product, policy, compatibility, time, or scope constraints. -->
+
+## Open questions
+
+<!-- Keep only questions that materially affect correctness. Use "None" when resolved. -->
+
+## Acceptance criteria
+
+- [ ] <!-- Observable outcome -->
+"#;
+
+const SPEC_TEMPLATE: &str = r#"# Specification
+
+## Context
+
+<!-- Existing behavior, architecture, and evidence that constrain the design. -->
+
+## Goals
+
+- <!-- Goal -->
+
+## Non-goals
+
+- <!-- Explicitly out of scope -->
+
+## Design
+
+<!-- Chosen approach, affected boundaries, data/control flow, compatibility, and tradeoffs. -->
+
+## Testing strategy
+
+<!-- Deterministic checks and evidence required before completion. -->
+
+## Risks
+
+<!-- Material risks and mitigations. -->
+"#;
+
+const PLAN_TEMPLATE: &str = r#"# Implementation plan
+
+## Ordered tasks
+
+- [ ] T1: <!-- concrete task -->
+  - Files: <!-- exact paths or bounded areas -->
+  - Verify: <!-- exact command/check -->
+
+## Execution ledger
+
+| Task | Started | Finished | Evidence |
+| --- | --- | --- | --- |
+| T1 |  |  |  |
+"#;
 const MAX_PHASE_TRANSCRIPT_BYTES: u64 = 16 * 1024 * 1024;
 const USAGE_SNAPSHOT_TAIL_BYTES: u64 = 256 * 1024;
 
@@ -55,6 +122,54 @@ impl WorkflowKind {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ArtifactStage {
+    Intent,
+    Spec,
+    Plan,
+}
+
+impl ArtifactStage {
+    fn key(self) -> &'static str {
+        match self {
+            Self::Intent => "intent",
+            Self::Spec => "spec",
+            Self::Plan => "plan",
+        }
+    }
+
+    fn file_name(self) -> &'static str {
+        match self {
+            Self::Intent => "intent.md",
+            Self::Spec => "spec.md",
+            Self::Plan => "plan.md",
+        }
+    }
+
+    fn template(self) -> &'static str {
+        match self {
+            Self::Intent => INTENT_TEMPLATE,
+            Self::Spec => SPEC_TEMPLATE,
+            Self::Plan => PLAN_TEMPLATE,
+        }
+    }
+}
+
+impl std::fmt::Display for ArtifactStage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.key())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowArtifactRecord {
+    pub stage: ArtifactStage,
+    pub rel_path: String,
+    pub accepted_hash: Option<String>,
+    pub accepted_at: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum StepCondition {
@@ -72,6 +187,8 @@ pub struct WorkflowStep {
     pub id: String,
     pub phase: WorkflowPhase,
     pub skill: String,
+    #[serde(default)]
+    pub artifact: Option<ArtifactStage>,
     pub condition: StepCondition,
     pub approval: bool,
     pub max_attempts: u8,
@@ -119,13 +236,33 @@ fn step(
         id: id.to_string(),
         phase,
         skill: skill.to_string(),
+        artifact: None,
         condition,
         approval,
         max_attempts: MAX_STEP_ATTEMPTS,
     }
 }
 
+fn artifact_step(
+    id: &str,
+    phase: WorkflowPhase,
+    skill: &str,
+    stage: ArtifactStage,
+    condition: StepCondition,
+) -> WorkflowStep {
+    WorkflowStep {
+        id: id.to_string(),
+        phase,
+        skill: skill.to_string(),
+        artifact: Some(stage),
+        condition,
+        approval: true,
+        max_attempts: MAX_STEP_ATTEMPTS,
+    }
+}
+
 pub fn definitions() -> Vec<WorkflowDefinition> {
+    use ArtifactStage as Artifact;
     use Complexity as C;
     use RiskBand as R;
     use StepCondition as When;
@@ -134,32 +271,30 @@ pub fn definitions() -> Vec<WorkflowDefinition> {
         WorkflowDefinition {
             schema_version: WORKFLOW_SCHEMA_VERSION,
             kind: WorkflowKind::Feature,
-            description: "Design, implement, test and proportionally review a feature.".into(),
+            description: "Capture intent, design and plan proportionally, then implement, test and review.".into(),
             steps: vec![
-                step(
-                    "design",
+                artifact_step("intent", Phase::Intent, "brainstorm", Artifact::Intent, When::Always),
+                artifact_step(
+                    "spec",
                     Phase::Design,
                     "design",
+                    Artifact::Spec,
                     When::ComplexityOrRisk {
                         complexity: C::Substantial,
                         risk: R::High,
                     },
-                    true,
                 ),
-                step(
+                artifact_step(
                     "plan",
                     Phase::Plan,
                     "plan",
-                    When::ComplexityAtLeast(C::Substantial),
-                    false,
+                    Artifact::Plan,
+                    When::ComplexityOrRisk {
+                        complexity: C::Bounded,
+                        risk: R::High,
+                    },
                 ),
-                step(
-                    "implement",
-                    Phase::Implement,
-                    "implement",
-                    When::Always,
-                    false,
-                ),
+                step("implement", Phase::Implement, "implement", When::Always, false),
                 step("test", Phase::Test, "testing", When::Always, false),
                 step(
                     "review",
@@ -174,22 +309,30 @@ pub fn definitions() -> Vec<WorkflowDefinition> {
         WorkflowDefinition {
             schema_version: WORKFLOW_SCHEMA_VERSION,
             kind: WorkflowKind::Bugfix,
-            description: "Reproduce, fix, test and verify a defect.".into(),
+            description: "Capture intent when warranted, reproduce, plan larger fixes, test and verify.".into(),
             steps: vec![
-                step(
-                    "debug",
-                    Phase::Debug,
-                    "systematic-debugging",
-                    When::Always,
-                    false,
+                artifact_step(
+                    "intent",
+                    Phase::Intent,
+                    "brainstorm",
+                    Artifact::Intent,
+                    When::ComplexityOrRisk {
+                        complexity: C::Bounded,
+                        risk: R::Medium,
+                    },
                 ),
-                step(
-                    "implement",
-                    Phase::Implement,
-                    "implement",
-                    When::Always,
-                    false,
+                step("debug", Phase::Debug, "systematic-debugging", When::Always, false),
+                artifact_step(
+                    "plan",
+                    Phase::Plan,
+                    "plan",
+                    Artifact::Plan,
+                    When::ComplexityOrRisk {
+                        complexity: C::Substantial,
+                        risk: R::High,
+                    },
                 ),
+                step("implement", Phase::Implement, "implement", When::Always, false),
                 step("test", Phase::Test, "testing", When::Always, false),
                 step(
                     "review",
@@ -204,25 +347,29 @@ pub fn definitions() -> Vec<WorkflowDefinition> {
         WorkflowDefinition {
             schema_version: WORKFLOW_SCHEMA_VERSION,
             kind: WorkflowKind::Refactor,
-            description: "Refactor with behavior-preserving tests and proportional review.".into(),
+            description: "Plan proportional behavior-preserving changes with intent capture for substantial or high-risk work.".into(),
             steps: vec![
-                step(
-                    "design",
-                    Phase::Design,
-                    "design",
+                artifact_step(
+                    "intent",
+                    Phase::Intent,
+                    "brainstorm",
+                    Artifact::Intent,
                     When::ComplexityOrRisk {
                         complexity: C::Substantial,
                         risk: R::High,
                     },
-                    true,
                 ),
-                step(
-                    "implement",
-                    Phase::Implement,
-                    "implement",
-                    When::Always,
-                    false,
+                artifact_step(
+                    "plan",
+                    Phase::Plan,
+                    "plan",
+                    Artifact::Plan,
+                    When::ComplexityOrRisk {
+                        complexity: C::Bounded,
+                        risk: R::Medium,
+                    },
                 ),
+                step("implement", Phase::Implement, "implement", When::Always, false),
                 step("test", Phase::Test, "testing", When::Always, false),
                 step(
                     "review",
@@ -237,16 +384,11 @@ pub fn definitions() -> Vec<WorkflowDefinition> {
         WorkflowDefinition {
             schema_version: WORKFLOW_SCHEMA_VERSION,
             kind: WorkflowKind::Spike,
-            description: "Time-bounded exploration with explicit findings.".into(),
+            description: "Capture intent, run time-bounded exploration and record explicit findings.".into(),
             steps: vec![
+                artifact_step("intent", Phase::Intent, "brainstorm", Artifact::Intent, When::Always),
                 step("design", Phase::Design, "design", When::Always, false),
-                step(
-                    "implement",
-                    Phase::Implement,
-                    "implement",
-                    When::Always,
-                    false,
-                ),
+                step("implement", Phase::Implement, "implement", When::Always, false),
                 step(
                     "verify",
                     Phase::Verify,
