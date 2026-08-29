@@ -124,10 +124,7 @@ fn count_stream(mut reader: impl Read) -> (u64, u64) {
     let mut saw_any = false;
     let mut ended_with_newline = true;
     let mut chunk = [0u8; 8192];
-    loop {
-        let Ok(count) = reader.read(&mut chunk) else {
-            break;
-        };
+    while let Ok(count) = reader.read(&mut chunk) {
         if count == 0 {
             break;
         }
