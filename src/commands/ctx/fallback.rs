@@ -70,11 +70,32 @@ pub struct TaskBounds {
 
 impl TaskBounds {
     pub fn is_small(self, cfg: &CtxConfig) -> bool {
+        // A tool-call cap alone does not bound total work: a three-tool-call
+        // brief can still spend an unbounded number of model tokens. Require
+        // the total-token ceiling, and reject any additionally supplied tool
+        // ceiling that is itself larger than the small-task policy.
         self.tokens
             .is_some_and(|tokens| tokens <= cfg.fallback.small_task_max_tokens)
-            || self
+            && self
                 .tool_calls
-                .is_some_and(|tools| tools <= cfg.fallback.small_task_max_tool_calls)
+                .is_none_or(|tools| tools <= cfg.fallback.small_task_max_tool_calls)
+    }
+
+    fn required_headroom_pct(self, cfg: &CtxConfig, window: &str) -> Option<f64> {
+        let tokens = self.tokens?;
+        let budget = match window {
+            "five_hour" => cfg.pace.five_hour_budget_tokens,
+            "seven_day" => cfg.pace.seven_day_budget_tokens,
+            _ => 0,
+        };
+        (budget > 0).then(|| (tokens as f64 / budget as f64) * 100.0)
+    }
+
+    fn required_unknown_headroom_pct(self, cfg: &CtxConfig) -> f64 {
+        ["five_hour", "seven_day"]
+            .into_iter()
+            .filter_map(|window| self.required_headroom_pct(cfg, window))
+            .fold(0.0, f64::max)
     }
 }
 
@@ -97,6 +118,7 @@ fn candidate_headroom(
     state: &StateDir,
     cfg: &CtxConfig,
     name: &str,
+    bounds: TaskBounds,
     now: u64,
 ) -> Option<CandidateHeadroom> {
     let provider = adapters::provider_for_agent_name(Some(name));
@@ -108,16 +130,21 @@ fn candidate_headroom(
         return None;
     }
     if let Some(reading) = pace::spawn_headroom(&collector, estimator.as_ref(), now, &cfg.pace) {
-        return (reading.headroom_pct >= cfg.fallback.min_candidate_headroom_pct).then_some(
-            CandidateHeadroom {
-                pct: reading.headroom_pct,
-                assumed: false,
-            },
-        );
+        let required = bounds
+            .required_headroom_pct(cfg, reading.window)
+            .unwrap_or(0.0);
+        let floor = cfg.fallback.min_candidate_headroom_pct.max(required);
+        return (reading.headroom_pct >= floor).then_some(CandidateHeadroom {
+            pct: reading.headroom_pct,
+            assumed: false,
+        });
     }
     let pct = cfg.fallback.unknown_headroom_pct;
-    (pct > 0.0 && pct >= cfg.fallback.min_candidate_headroom_pct)
-        .then_some(CandidateHeadroom { pct, assumed: true })
+    let floor = cfg
+        .fallback
+        .min_candidate_headroom_pct
+        .max(bounds.required_unknown_headroom_pct(cfg));
+    (pct > 0.0 && pct >= floor).then_some(CandidateHeadroom { pct, assumed: true })
 }
 
 fn requested_headroom(state: &StateDir, cfg: &CtxConfig, name: &str, now: u64) -> Option<f64> {
@@ -160,7 +187,9 @@ fn best_alternate(
         if request.bounds.tool_calls.is_some() && !candidate_adapter.counts_tool_calls() {
             continue;
         }
-        let Some(headroom) = candidate_headroom(state, cfg, name, request.now) else {
+        let Some(headroom) =
+            candidate_headroom(state, cfg, name, request.bounds, request.now)
+        else {
             continue;
         };
         let Some(model) = handover::equivalent_model(
@@ -204,12 +233,20 @@ pub fn route_new_delegation(
     let provider = adapters::provider_for_agent_name(Some(request.requested));
     let (collector, estimator) = pace::current_windows(state, &cfg.pace, request.now, provider);
     let gate = pace::spawn_gate(&collector, estimator.as_ref(), request.now, &cfg.pace);
-    let source_headroom =
-        pace::spawn_headroom(&collector, estimator.as_ref(), request.now, &cfg.pace)
-            .map(|reading| reading.headroom_pct);
+    let source_reading =
+        pace::spawn_headroom(&collector, estimator.as_ref(), request.now, &cfg.pace);
+    let source_headroom = source_reading.map(|reading| reading.headroom_pct);
+    let task_will_not_fit = source_reading.is_some_and(|reading| {
+        request
+            .bounds
+            .required_headroom_pct(cfg, reading.window)
+            .is_some_and(|required| reading.headroom_pct < required)
+    });
     let reason = match gate {
         SpawnGate::Refuse { .. } => RouteReason::Exhausted,
-        _ if source_headroom.is_some_and(|pct| pct <= cfg.fallback.predictive_headroom_pct) => {
+        _ if task_will_not_fit
+            || source_headroom.is_some_and(|pct| pct <= cfg.fallback.predictive_headroom_pct) =>
+        {
             RouteReason::Predictive
         }
         _ => return None,
@@ -256,7 +293,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn small_capacity_requires_an_explicit_bounded_dimension() {
+    fn small_capacity_requires_a_bounded_small_token_budget() {
         let mut cfg = CtxConfig::default();
         cfg.fallback.small_task_max_tokens = 10_000;
         cfg.fallback.small_task_max_tool_calls = 10;
@@ -269,25 +306,46 @@ mod tests {
         );
         assert!(
             TaskBounds {
-                tokens: None,
+                tokens: Some(1_000),
                 tool_calls: Some(3),
             }
             .is_small(&cfg)
         );
         assert!(
             !TaskBounds {
-                tokens: Some(20_000),
+                tokens: None,
+                tool_calls: Some(3),
+            }
+            .is_small(&cfg),
+            "a tool-call cap alone leaves model-token spend unbounded"
+        );
+        assert!(
+            !TaskBounds {
+                tokens: Some(1_000),
                 tool_calls: Some(30),
             }
             .is_small(&cfg)
         );
         assert!(
             !TaskBounds {
-                tokens: None,
-                tool_calls: None,
+                tokens: Some(20_000),
+                tool_calls: Some(3),
             }
             .is_small(&cfg)
         );
+    }
+
+    #[test]
+    fn token_budget_converts_to_required_window_headroom_when_capacity_is_known() {
+        let mut cfg = CtxConfig::default();
+        cfg.pace.five_hour_budget_tokens = 100_000;
+        cfg.pace.seven_day_budget_tokens = 1_000_000;
+        let bounds = TaskBounds {
+            tokens: Some(25_000),
+            tool_calls: None,
+        };
+        assert_eq!(bounds.required_headroom_pct(&cfg, "five_hour"), Some(25.0));
+        assert_eq!(bounds.required_headroom_pct(&cfg, "seven_day"), Some(2.5));
     }
 
     #[test]
