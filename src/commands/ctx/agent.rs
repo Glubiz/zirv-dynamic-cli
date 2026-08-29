@@ -1131,8 +1131,8 @@ pub fn run_with<W: Write>(
     // permanently burn the group's admission slot for a child that never
     // ran. `state` is the same handle resolved above for the spawn gate,
     // unused since; reused here rather than re-resolved.
-    let code = match exec::run_with(&exec_args, w, repo, &env) {
-        Ok(code) => code,
+    let (code, execution_report) = match exec::run_with_report(&exec_args, w, repo, &env) {
+        Ok(result) => result,
         Err(e) => {
             if let Some(id) = &args.group {
                 super::group::rollback_admission(&state, id);
@@ -1171,51 +1171,67 @@ pub fn run_with<W: Write>(
     }
 
     // Best effort throughout: a delegation that ran must never fail because
-    // its accounting could not be written (issue #155, Phase 2).
+    // its accounting could not be written (issue #155, Phase 2). Issue #186
+    // hardening: exec now reports every vendor-backed segment of one logical
+    // delegation, so a cross-harness continuation is neither charged to the
+    // wrong agent nor omitted from the cost tree.
     if let Ok(state_dir) = super::state::StateDir::resolve(&env) {
-        let usage = std::fs::read_to_string(adapter.transcript_path(&super::event::SessionRef {
-            id: SessionId::parse(&worker_session),
-            cwd: repo.to_path_buf(),
-        }))
-        .ok()
-        .and_then(|body| adapter.transcript_usage(&body))
-        .unwrap_or_default();
         let parent_session = super::mail::session_identity(&env).unwrap_or_default();
         let outcome = delegation_outcome(code);
+        let mut total = TranscriptUsage::default();
+        let mut route = Vec::new();
+
+        for segment in &execution_report.segments {
+            total.input_tokens = total.input_tokens.saturating_add(segment.usage.input_tokens);
+            total.cache_creation_input_tokens = total
+                .cache_creation_input_tokens
+                .saturating_add(segment.usage.cache_creation_input_tokens);
+            total.cache_read_input_tokens = total
+                .cache_read_input_tokens
+                .saturating_add(segment.usage.cache_read_input_tokens);
+            total.output_tokens = total.output_tokens.saturating_add(segment.usage.output_tokens);
+            route.push(match segment.model.as_deref() {
+                Some(model) => format!("{} ({model})", segment.agent),
+                None => format!("{} (default model)", segment.agent),
+            });
+
+            let _ = super::log::append_delegation(
+                &state_dir,
+                &super::log::Delegation {
+                    ts: super::state::now_secs(),
+                    session: &segment.session,
+                    parent_session: &parent_session,
+                    work_group_id: args.group.as_deref(),
+                    agent: &segment.agent,
+                    model: segment.model.as_deref(),
+                    input_tokens: segment.usage.input_tokens,
+                    cache_creation_input_tokens: segment.usage.cache_creation_input_tokens,
+                    cache_read_input_tokens: segment.usage.cache_read_input_tokens,
+                    output_tokens: segment.usage.output_tokens,
+                    wall_ms: segment.wall_ms,
+                    exit_code: code,
+                    outcome,
+                },
+            );
+        }
+
+        let route = if route.is_empty() {
+            format!(
+                "{} ({})",
+                args.name,
+                model.as_deref().unwrap_or("default worker model")
+            )
+        } else {
+            route.join(" -> ")
+        };
         let detail = format!(
-            "{} ({}): {} in / {} cache-creation / {} cache-read / {} out in {}ms -- {}",
-            args.name,
-            model.as_deref().unwrap_or("default worker model"),
-            usage.input_tokens,
-            usage.cache_creation_input_tokens,
-            usage.cache_read_input_tokens,
-            usage.output_tokens,
+            "{route}: {} in / {} cache-creation / {} cache-read / {} out in {}ms -- {}",
+            total.input_tokens,
+            total.cache_creation_input_tokens,
+            total.cache_read_input_tokens,
+            total.output_tokens,
             wall_ms,
             outcome,
-        );
-        let _ = super::log::append_delegation(
-            &state_dir,
-            &super::log::Delegation {
-                ts: super::state::now_secs(),
-                session: &worker_session,
-                parent_session: &parent_session,
-                // Issue #155 review finding D2: this used to be hardcoded
-                // `None`, so a completed headless delegation never recorded
-                // the group it actually ran under -- `zirv ctx status`'s
-                // group tree (`status::group_tree_lines`) renders every such
-                // delegation as ungrouped even though `--group` traveled all
-                // the way through `resolve_worker_budget` above.
-                work_group_id: args.group.as_deref(),
-                agent: &args.name,
-                model: model.as_deref(),
-                input_tokens: usage.input_tokens,
-                cache_creation_input_tokens: usage.cache_creation_input_tokens,
-                cache_read_input_tokens: usage.cache_read_input_tokens,
-                output_tokens: usage.output_tokens,
-                wall_ms,
-                exit_code: code,
-                outcome,
-            },
         );
         let _ = super::log::append(
             &state_dir,
