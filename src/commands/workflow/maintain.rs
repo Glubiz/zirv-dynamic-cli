@@ -205,8 +205,13 @@ fn incident_key(repo: &Path, detector_id: &str) -> String {
     let canonical = repo.canonicalize().unwrap_or_else(|_| repo.to_path_buf());
     let mut hasher = Sha256::new();
     hasher.update(canonical.to_string_lossy().as_bytes());
-    let digest = format!("{:x}", hasher.finalize());
-    format!("{detector_id}-{}", &digest[..12])
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(&mut hex, "{byte:02x}");
+    }
+    format!("{detector_id}-{}", &hex[..12])
 }
 
 fn marker_path(state_dir: &StateDir, repo: &Path, key: &str) -> PathBuf {
