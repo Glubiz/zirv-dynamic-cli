@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-27
+last-verified: 2026-08-29
 ---
 
 # Workflows
@@ -8,14 +8,14 @@ last-verified: 2026-08-27
 
 - **Files:** `src/commands/workflow/{mod,skill,capability,classify,engine,verification,review,artifact,telemetry,frontend,frontend_detector,frontend_render}.rs`
 - **Commands:** `zirv skill`, `zirv workflow`, `zirv test`, `zirv verify`, `zirv artifact`, `zirv frontend`
-- **State:** private platform state under `workflows/`, `verification/`, `artifacts/`, `workflow-telemetry/`, and `frontend/`, each repository-scoped by the existing deterministic repo slug
+- **State:** private platform state under `workflows/`, `verification/`, `artifacts/`, `workflow-telemetry/`, and `frontend/`, each repository-scoped by the existing deterministic repo slug; accepted SDLC work products live in git under `.zirv/work/<workflow-id>/`
 - **Repository inputs:** `.zirv/skills/*.yaml|yml|toml` and optional `.zirv/verify.toml` — both untrusted, and both gated by an operator-only `[workflow]` config key
 - **Operator config:** `[workflow]` in `ctx.toml` — `repo_checks_enabled`, `repo_skills_enabled`, `telemetry_enabled`, `telemetry_max_events`, `telemetry_retention_days`, every one `REPO_FORBIDDEN`
 - **If changed:** [[Built-in Commands]], [[Architecture Overview]], [[Utilities]] when prompt-layer behavior changes, and [[Untrusted Configuration]] when trust/capability rules change
 
 ## Purpose
 
-The workflow subsystem makes Zirv own the development lifecycle instead of asking every model to reconstruct a methodology in conversation. Skills describe concise judgment. Zirv owns deterministic mechanics, phase state, risk selection, verification, review limits, artifacts, and telemetry.
+The workflow subsystem makes Zirv own the development lifecycle instead of asking every model to reconstruct a methodology in conversation. Skills describe concise judgment. Zirv owns deterministic mechanics, phase state, risk selection, verification, review limits, artifacts, and telemetry. The AI-native SDLC chain is a version-controlled work-product surface: adaptive workflows create `intent.md`, `spec.md`, and `plan.md` only when classification requires them, while private workflow state retains the acceptance authority.
 
 Workflow state and skill context are deliberately different:
 
@@ -27,11 +27,21 @@ The shared Context Compiler consumes `engine::active_skill_context`/`render_curr
 
 ## Skills
 
-`SkillManifest` schema version 1 includes a stable id/version, triggers, applicable phases, required/optional logical capabilities, context budget, dependencies, and an instruction body. General built-ins are embedded in the binary: `design`, `plan`, `implement`, `systematic-debugging`, `testing`, `tdd`, `review`, `verify`, `delegate`, and `parallelize`. Frontend work adds the built-in, repository-non-overridable `frontend-craft` floor and phase skills `frontend-{design,plan,implement,debug,test,review,verify}`. Every phase stack resolves the craft floor and its corresponding general engineering skill before the phase-specific frontend instructions.
+`SkillManifest` schema version 1 includes a stable id/version, triggers, applicable phases, required/optional logical capabilities, context budget, dependencies, and an instruction body. General built-ins are embedded in the binary: `brainstorm`, `design`, `write-plan`, `plan`, `worktree`, `implement`, `execute-plan`, `systematic-debugging`, `testing`, `tdd`, `review`, `verify`, `delegate`, `parallelize`, and `finish-branch`. Frontend work adds the built-in, repository-non-overridable `frontend-craft` floor and phase skills `frontend-{design,plan,implement,debug,test,review,verify}`. Every phase stack resolves the craft floor and its corresponding general engineering skill before the phase-specific frontend instructions.
+
+The process-parity layer stays adapter-neutral. `write-plan` owns the durable plan format; the existing `plan` skill depends on it. Substantial implementation steps compose `execute-plan`, whose dependency stack adds `worktree` isolation plus the normal implementation discipline; trivial work does not pay that context or capability cost. `execute-plan` treats the plan ledger as resume state and verifies before ticking tasks. `finish-branch` is the Deploy-phase methodology behind structural deploy-tier gates. Development auto-advances the deploy step once evidence passes; Staging requires explicit deploy approval; Production requires approval plus at least one fresh independent `reviewer`-seat run and fresh final `zirv verify` evidence. Existing TDD/debug/delegate/parallelize/review/verify guidance was tightened around falsifiable evidence, independent review, worker result validation, and no completion claims from stale evidence.
 
 Registry precedence is deterministic and asymmetric: an operator-global manifest (`~/.zirv/skills`) may replace a built-in, because the operator is trusted; a repository manifest (`.zirv/skills`) may only **add** an id it does not already occupy. A repository id that collides with a built-in or operator-global skill is ignored, and the collision is reported as a warning naming both sides (`SkillRegistry::warnings`, printed by `zirv skill list/show`) rather than silently replacing trusted methodology text. `zirv skill list/show --built-in-only` disables both custom layers; `zirv workflow start --built-in-only` persists that trust choice in the workflow state, so resume and prompt rendering cannot silently re-enable an override; and the operator-only `workflow.repo_skills_enabled` (`REPO_FORBIDDEN`, see [[Untrusted Configuration]]) drops the repository layer entirely. Both gates (`workflow::repo_gates`) fail **closed** on a genuine config load failure — an unreadable file, or a `REPO_FORBIDDEN` key a repo file tried to set, which still fails `CtxConfig::load` outright — disabling repo-provided skills *and* repo-provided checks and saying so on the `zirv ▸` channel. Since `repo_checks_enabled`/`repo_skills_enabled` are themselves `REPO_FORBIDDEN`, a repo layer could never set either one to begin with; a repo `ctx.toml` that merely fails to *parse* (a stray keystroke, not a forbidden key) no longer collapses the whole load into an error either, so it neither widens nor narrows these two gates — see [[Untrusted Configuration]] for the parse-vs-reject distinction. Files, directory entry counts, individual instructions, and dependency-resolved stacks are bounded; unknown schema fields/versions fail; symlinked manifests or parent directories and path escapes are refused; dependency cycles/missing dependencies fail before resolution.
 
 A repository manifest that will not load takes the workflow prompt layer with it — composition still succeeds, and the loss is announced once on the `zirv ▸` channel (`Event::WorkflowLayerSkipped`) instead of disappearing silently.
+
+## Agent registry
+
+Workflow seats are provider-neutral data, not harness plugins. `AgentManifest` schema version 1 carries a stable id/version, role label, model-tier hint, read-only floor, capability requirements, bounded instruction body, and context budget. Built-ins are `implementer`, `reviewer`, `doc-keeper`, `security-scanner`, and `explorer`; `.claude/agents/vault-keeper.md` has been migrated to `.zirv/agents/vault-keeper.yaml`.
+
+Layering intentionally mirrors skills but is stricter by default. Operator-global `~/.zirv/agents/*.{yaml,yml,toml}` may replace built-ins. Repository `.zirv/agents/*` is disabled unless the operator enables `workflow.repo_agents_enabled`, and when enabled may only add non-colliding ids; collisions with trusted ids are ignored with warnings. A repository seat therefore cannot rewrite `reviewer`, remove its read-only floor, or acquire authority from its manifest text.
+
+`WorkflowStep.agent` addresses a seat by id. Implement/debug steps use `implementer`; independent review uses `reviewer`. `zirv workflow agents list|show` exposes the resolved registry and provenance. Capability preflight runs the seat through the same canonical effective policy as skills. Adapter dispatch adds provider-specific launch mechanics only after policy resolution, and a read-only seat appends the adapter's hard read-only arguments last. `model_tier` is a routing hint; Zirv does not invent provider model ids from it.
 
 Repository skills are untrusted methodology. A manifest can request `repo.write`, `shell.exec`, or another logical capability, but it cannot grant one. `CapabilityReport::for_repo` loads the same effective canonical policy as an AI launch, maps logical workflow prerequisites onto it, and only narrows adapter support; it never promotes an unsupported operation. `zirv workflow start --agent <name>` and inherited supervised-session adapters resolve every selected step's required capabilities before persisting the workflow. `zirv skill show --agent` and `zirv frontend capabilities --agent --repo` expose the same policy-aware diagnostics.
 
@@ -51,10 +61,15 @@ zirv workflow classify --task "..."
 zirv workflow start feature --task "..." [--agent claude] [--built-in-only]
 zirv workflow status [id]
 zirv workflow context [id]
+zirv workflow artifacts <id> [--json]
 zirv workflow approve <id>
 zirv workflow advance <id> --outcome success|failure
 zirv workflow resume <id>
 ```
+
+The committed artifact chain is structural rather than advisory. Artifact steps create fixed templates under `.zirv/work/<workflow-id>/`; `workflow approve` refuses an untouched template, pins the accepted SHA-256 digest and timestamp in private state, then advances the artifact step. Later steps fold only accepted, hash-matching artifacts into prompt context, under a shared byte cap and explicitly labeled as untrusted repository text. Missing or edited accepted files reopen the owning acceptance gate and invalidate later completed steps, so implementation cannot silently proceed against a plan that changed after approval. `workflow artifacts` exposes pending/accepted/drifted state without making repository text authoritative.
+
+Adaptive defaults keep ceremony proportional: features always capture intent, add a plan for bounded work and a spec for substantial/high-risk work; trivial bugfixes retain the debug spine with no artifact ceremony, while larger bugfix/refactor work gains intent/plan gates; spikes capture intent; review-only workflows do not create planning artifacts. `WorkflowPhase::Intent` uses the provider-neutral `brainstorm` skill.
 
 Classification separates intent, work domain (`general` or `frontend`), complexity (`trivial`, `bounded`, `substantial`, `architectural`), and risk (`low`, `medium`, `high`, `critical`). Frontend selection is automatic from task language and changed frontend paths; there is no `--frontend` or init flag. Identical path/line/task inputs produce the same score and sorted reasons. Both tracked and untracked change surfaces contribute paths and size signals, measured against the same merge-base diff base `review` uses (`origin/main`, then `main`, then `HEAD^`), so classification and review agree on what "the change" is. Sensitive auth/security or database/schema surfaces raise a High floor; an explicit `--risk` below that floor is refused outright, and every other input can only ever be *raised* toward it:
 
@@ -124,6 +139,22 @@ Checks run in the repository through a bounded shell child with stdout/stderr dr
 Reports are named with a leading zero-padded `finished_at` timestamp and pruned on every write via the same `telemetry::prune_expired_except` helper `workflow-telemetry/` uses (one shared pruner, not two): a report older than the resolved retention window is removed, except the file the `latest` pointer currently names, which always survives even if it is itself older than the window. Retention is resolved from `[workflow] telemetry_retention_days` — verification has no retention key of its own yet; see the Decision Log entry and the Known Issues residual for why.
 
 Report files carry their own schema version (2), separate from `.zirv/verify.toml`'s (1), so an older build's report is rejected rather than reinterpreted. Reports include a change fingerprint over `HEAD`, raw change metadata, and content hashes for the tracked/untracked paths in the change set, plus compact per-check status. The fingerprint is taken **before** the checks run, so edits made during a long suite are not recorded as tested, and every Git call runs at the worktree root with `core.quotePath=false`, so root-relative paths and non-ASCII filenames both resolve (a `--repo <subdir>` run used to mix two path bases and see no content edits at all). A `--check`-narrowed run records what it was narrowed to and can never satisfy a step gate — a format-only run is evidence about formatting. Results are printed before they are persisted: a state-directory failure is a warning, not a lost run, and a closed pipe (`zirv verify | head`) costs the output but not the stored report. Every repository-controlled string a report prints — a check's `command` included, not just its captured output — is scrubbed of control characters, so an escape sequence in `verify.toml` cannot repaint the terminal into a forged summary. Test/verify workflow steps cannot advance on stale, narrowed, or failed evidence; report schema versions are checked when evidence is reloaded.
+
+## Deploy tiers and PR lifecycle
+
+`[workflow.deploy] tier = "development" | "staging" | "production"` is operator authority and `workflow.deploy.tier` is repo-forbidden. A repository may set only `workflow.deploy.minimum_tier`; config resolution folds the strictest home/repo minimum with the operator tier, while `ZIRV_CTX_WORKFLOW_DEPLOY_TIER` remains the operator's final override. Running workflows ratchet their persisted tier upward only, so tightening policy mid-run cannot be undone by later config drift.
+
+Feature, bugfix, and refactor workflows end in `Deploy/finish-branch`. Production materialization inserts an independent Review step before Verify when risk classification would otherwise omit review, and tightening to Production rewinds completion after the newly inserted gate. The Deploy step records `DeployGateEvaluated` telemetry and production cannot pass with open findings, stale/missing reviewer evidence, or stale/missing final verification.
+
+The review engine also accepts incoming GitHub PRs: `workflow review package <id> --pr <n> [--github-repo owner/repo]` and `review run ... --pr <n>` read PR metadata/diff through fixed `gh` argv, cap the diff to the normal review budget, and re-check the PR head after review. Remote PR review is inspection-only and never becomes local workflow completion evidence. `workflow review ingest-pr-comments <workflow-id> --pr <n>` imports inline/review bodies as deterministic-id open `ReviewFinding` obligations, making repeated ingestion idempotent.
+
+## Maintain loop
+
+`zirv workflow maintain scan [--repo <path>] [--json]` is an invoked scanner, not a daemon. It reads detectors only from operator-owned `~/.zirv/ctx.toml` under `[workflow.maintain.detectors.<id>]`; repository config is forbidden from defining detector commands. Each detector is deterministic: either a non-zero/timeout breach or a stdout line-count threshold. Commands are bounded, run with process-tree cleanup, and the scanner retains only exit code, timeout state, line/byte counts, never detector command/output bodies in committed artifacts, telemetry, or GitHub issues.
+
+A breach creates one bounded incident cycle parked at the Intent acceptance gate. Zirv commits `.zirv/work/<workflow-id>/intent.md` with detector metadata, stores a private active-incident marker keyed by canonical repository + detector, and reuses that workflow while the breach persists. A clean scan clears the marker, so a later recurrence becomes a new incident. If operator-only `[report] repository = "owner/repo"` is configured, the scanner files an exact-title-deduplicated GitHub issue; a fresh machine also reuses an already-open issue by title. Issue filing failure does not discard the parked workflow and is retried on the next scan.
+
+The ordinary `zirv report` command keeps its fixed Zirv repository destination; the generalized report transport is used only when an explicit operator-selected destination is supplied by maintenance. `MaintenanceScan` telemetry records pass/breach without source/output payloads, and `workflow stats` aggregates maintenance breaches alongside artifact acceptance, agent dispatch and deploy-gate outcomes.
 
 ## Review
 

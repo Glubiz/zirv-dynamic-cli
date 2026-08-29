@@ -20,6 +20,11 @@ last-verified: 2026-08-28
 
 ## Entries
 
+### 2026-08-28: AI-native SDLC flows — design spec complete (`docs/187-ai-native-sdlc-spec`, issue #187, PR #188)
+**What:** Wrote the full design for extending `zirv workflow` across Intent → Design → Plan → Implement/Test/Review/Verify → Deploy, plus maintain-cycle re-entry, without a second engine.
+**Key changes:** New `docs/superpowers/specs/2026-08-28-ai-native-sdlc-design.md`; committed-work-product hash gates, adaptive skill stages, provider-neutral agents, deploy tiers, maintain scan, and telemetry/docs are phased into #190–#194. The design branch was reconciled onto current main before implementation validation.
+**Follow-up:** Implement and validate the five stacked phases.
+
 ### 2026-08-28: cross-harness token fallback (issue #186, v2.36.0, PR #189)
 **What:** Connected usage windows, the enabled/capacity roster, model-tier mapping, delegation routing, and `exec` handoffs so exhausted/low-headroom new work can land on another harness and a vendor-limit-blocked supervised prompt can resume there instead of idling.
 **Key changes:** new `commands/ctx/fallback.rs`; trusted repo-narrow-only `[fallback]` config; `pace::spawn_headroom`; exact cross-vendor tier mapping; `agent` predictive/exhausted rerouting; `exec` handoff + remaining-budget continuation + visited-harness loop guard; `ctx status` policy/headroom disclosure; decision-log actions `harness-reroute`/`harness-handover`; v2.36.0 bump and regression tests for trust/model/bounded-capacity rules.

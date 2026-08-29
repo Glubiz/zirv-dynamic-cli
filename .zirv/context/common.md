@@ -15,7 +15,7 @@ Nextest's process-per-test isolation prevents `env::set_var` races. `--no-fail-f
 ## Module map
 
 - `src/main.rs`, `src/input.rs`: raw-argv built-ins, clap, script lookup; `src/commands/`: create, init, help, version, setup, report.
-- `src/commands/workflow/`: skill/capability, engine/classify, verification/review, artifact/telemetry; `src/script_runner/`: script.rs, command.rs (`${var}`), command_types.rs, options.rs, mod.rs; `src/utils.rs`: parsing/shortcuts/reserved names; `src/settings.rs`: `<repo>/.zirv/.settings.toml` agent gate.
+- `src/commands/workflow/`: skill/capability/agents, engine/classify/deploy/maintain, verification/review, artifact/telemetry; `src/script_runner/`: script.rs, command.rs (`${var}`), command_types.rs, options.rs, mod.rs; `src/utils.rs`: parsing/shortcuts/reserved names; `src/settings.rs`: `<repo>/.zirv/.settings.toml` agent gate.
 - `src/commands/ctx/`: mod/config/state/log; event+rot; adapters/{claude,codex}; score handoff resume hook status handover; run_loop exec wrap (supervisors); signal supervise term; pace usage window poll; optimize prompt compile context memory memory_cli mail sessions policy safety chat agent announce chrome; dash/ (mod pane ui spawnreq roster).
 
 ## Conventions
@@ -25,7 +25,7 @@ Nextest's process-per-test isolation prevents `env::set_var` races. `--no-fail-f
 - Report zirv bugs/feature gaps: `zirv report bug|feature <title> [--body <text>|--body-file <path>]`; never include secrets.
 - `rot.rs` is pure (no fs/clock/env/net): identical events give identical verdicts; I/O belongs in `score.rs`.
 - `wrap` must never worsen sessions: no hot-path `unwrap`/`expect`; restore raw mode explicitly (`panic = "abort"`); supervision failure becomes pure passthrough.
-- Repo-owned surfaces are UNTRUSTED and may only NARROW: `<repo>/.zirv/{ctx.toml,system-prompt.md,context/*.md,memory/}` and repo skills/checks. Repo-layer `REPO_FORBIDDEN` keys hard-error; only `~/.zirv/ctx.toml`, `ZIRV_CTX_*`, or flags may set them.
+- Repo-owned surfaces are UNTRUSTED and may only NARROW: `<repo>/.zirv/{ctx.toml,system-prompt.md,context/*.md,memory/}` and repo skills/agents/checks. Repo-layer `REPO_FORBIDDEN` keys hard-error; only `~/.zirv/ctx.toml`, `ZIRV_CTX_*`, or flags may set them.
 - Tests stay inline in `#[cfg(test)] mod tests`; `tests/fixtures/` is data only.
 
 ## After completing work -- mandatory

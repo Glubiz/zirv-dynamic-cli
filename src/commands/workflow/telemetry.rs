@@ -15,7 +15,7 @@ use crate::commands::ctx::state::{
     StateDir, create_private_dir_all, now_secs, prune_to_newest, repo_slug, write_private,
 };
 
-const TELEMETRY_SCHEMA_VERSION: u32 = 2;
+const TELEMETRY_SCHEMA_VERSION: u32 = 3;
 const DEFAULT_MAX_EVENTS: usize = 1000;
 const DEFAULT_RETENTION_DAYS: u64 = 30;
 const MAX_CONFIGURED_EVENTS: usize = 100_000;
@@ -75,6 +75,10 @@ pub enum TelemetryKind {
     VerificationRun,
     ReviewRun,
     ArtifactProduced,
+    ArtifactAccepted,
+    AgentDispatched,
+    DeployGateEvaluated,
+    MaintenanceScan,
     WorkflowCompleted,
     FindingUpdated,
     FrontendDetectorRun,
@@ -147,6 +151,15 @@ pub struct TelemetryEvent {
     pub parent_session_id: Option<String>,
     #[serde(default)]
     pub work_group_id: Option<String>,
+    /// Accepted workflow work-product stage (intent/spec/plan), when relevant.
+    #[serde(default)]
+    pub artifact_stage: Option<String>,
+    /// Effective deploy tier, populated by deploy-gate events in phase 4.
+    #[serde(default)]
+    pub deploy_tier: Option<String>,
+    /// Provider-neutral agent manifest id, populated by agent dispatch in phase 3.
+    #[serde(default)]
+    pub agent_id: Option<String>,
 }
 
 impl TelemetryEvent {
@@ -185,6 +198,9 @@ impl TelemetryEvent {
             session_id: None,
             parent_session_id: None,
             work_group_id: None,
+            artifact_stage: None,
+            deploy_tier: None,
+            agent_id: None,
         }
     }
 
@@ -231,6 +247,9 @@ pub fn record(
         &mut event.session_id,
         &mut event.parent_session_id,
         &mut event.work_group_id,
+        &mut event.artifact_stage,
+        &mut event.deploy_tier,
+        &mut event.agent_id,
     ]
     .into_iter()
     .flatten()
@@ -403,6 +422,12 @@ pub struct StatsReport {
     pub frontend_render_failures: usize,
     pub frontend_visual_reviews: usize,
     pub frontend_visual_review_failures: usize,
+    pub artifact_acceptances: usize,
+    pub agent_dispatches: usize,
+    pub deploy_gate_evaluations: usize,
+    pub deploy_gate_failures: usize,
+    pub maintenance_scans: usize,
+    pub maintenance_breaches: usize,
     /// Every workflow id seen in this repository's telemetry, keyed to its
     /// own `WorkflowStats` -- the per-workflow / per-`ReviewRun` breakdown
     /// `docs/benchmarks/token-cost.md` §1.3 previously had no CLI for.
@@ -427,6 +452,12 @@ pub fn aggregate(events: &[TelemetryEvent]) -> StatsReport {
     let mut frontend_render_failures = 0usize;
     let mut frontend_visual_reviews = 0usize;
     let mut frontend_visual_review_failures = 0usize;
+    let mut artifact_acceptances = 0usize;
+    let mut agent_dispatches = 0usize;
+    let mut deploy_gate_evaluations = 0usize;
+    let mut deploy_gate_failures = 0usize;
+    let mut maintenance_scans = 0usize;
+    let mut maintenance_breaches = 0usize;
     let mut finding_snapshots: BTreeMap<String, (u64, String, u32, u32, u32)> = BTreeMap::new();
     let mut workflows: BTreeMap<String, WorkflowStats> = BTreeMap::new();
     let mut review_runs = 0usize;
@@ -515,6 +546,20 @@ pub fn aggregate(events: &[TelemetryEvent]) -> StatsReport {
                     frontend_visual_review_failures += 1;
                 }
             }
+            TelemetryKind::ArtifactAccepted => artifact_acceptances += 1,
+            TelemetryKind::AgentDispatched => agent_dispatches += 1,
+            TelemetryKind::DeployGateEvaluated => {
+                deploy_gate_evaluations += 1;
+                if event.succeeded == Some(false) {
+                    deploy_gate_failures += 1;
+                }
+            }
+            TelemetryKind::MaintenanceScan => {
+                maintenance_scans += 1;
+                if event.succeeded == Some(false) {
+                    maintenance_breaches += 1;
+                }
+            }
             _ => {}
         }
         if let Some(workflow_id) = &event.workflow_id
@@ -593,6 +638,12 @@ pub fn aggregate(events: &[TelemetryEvent]) -> StatsReport {
         frontend_render_failures,
         frontend_visual_reviews,
         frontend_visual_review_failures,
+        artifact_acceptances,
+        agent_dispatches,
+        deploy_gate_evaluations,
+        deploy_gate_failures,
+        maintenance_scans,
+        maintenance_breaches,
         workflows,
         review_runs,
         review_defect_rate,
@@ -747,6 +798,16 @@ pub fn run_stats(args: &StatsArgs, writer: &mut impl Write) -> CtxResult<i32> {
             report.frontend_visual_reviews,
             report.frontend_visual_review_failures
         )?;
+        writeln!(
+            writer,
+            "sdlc lifecycle: {} artifact acceptances, {} agent dispatches, deploy gates {} evaluations/{} failures, maintenance {} scans/{} breaches",
+            report.artifact_acceptances,
+            report.agent_dispatches,
+            report.deploy_gate_evaluations,
+            report.deploy_gate_failures,
+            report.maintenance_scans,
+            report.maintenance_breaches
+        )?;
     }
     Ok(0)
 }
@@ -764,6 +825,30 @@ mod tests {
         for forbidden in ["prompt", "source_code", "response", "diff", "output"] {
             assert!(!object.contains_key(forbidden));
         }
+    }
+
+    #[test]
+    fn sdlc_lifecycle_events_are_aggregated_without_payload_content() {
+        let mut accepted = TelemetryEvent::new(TelemetryKind::ArtifactAccepted);
+        accepted.succeeded = Some(true);
+        let dispatched = TelemetryEvent::new(TelemetryKind::AgentDispatched);
+        let mut deploy_failed = TelemetryEvent::new(TelemetryKind::DeployGateEvaluated);
+        deploy_failed.succeeded = Some(false);
+        let mut maintenance_breach = TelemetryEvent::new(TelemetryKind::MaintenanceScan);
+        maintenance_breach.succeeded = Some(false);
+
+        let report = aggregate(&[
+            accepted,
+            dispatched,
+            deploy_failed,
+            maintenance_breach,
+        ]);
+        assert_eq!(report.artifact_acceptances, 1);
+        assert_eq!(report.agent_dispatches, 1);
+        assert_eq!(report.deploy_gate_evaluations, 1);
+        assert_eq!(report.deploy_gate_failures, 1);
+        assert_eq!(report.maintenance_scans, 1);
+        assert_eq!(report.maintenance_breaches, 1);
     }
 
     #[test]

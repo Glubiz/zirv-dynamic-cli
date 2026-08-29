@@ -1,21 +1,90 @@
 //! Versioned workflow definitions and durable execution state.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use clap::{Args, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
+use super::agents::AgentRegistry;
 use super::classify::{self, Classification, Complexity, Intent, RiskBand, WorkDomain};
+use super::deploy::DeployTier;
 use super::skill::{SkillRegistry, WorkflowPhase};
 use crate::commands::ctx::CtxResult;
 use crate::commands::ctx::state::{
     StateDir, create_private_dir_all, now_secs, repo_slug, write_private,
 };
 
-pub const WORKFLOW_SCHEMA_VERSION: u32 = 1;
+pub const WORKFLOW_SCHEMA_VERSION: u32 = 4;
 const MAX_STEP_ATTEMPTS: u8 = 3;
+const MAX_WORK_ARTIFACT_CONTEXT_BYTES: usize = 24 * 1024;
+
+const INTENT_TEMPLATE: &str = r#"# Intent
+
+## Problem
+
+<!-- What problem are we solving, for whom, and why now? -->
+
+## Desired outcome
+
+<!-- Describe the observable end state. -->
+
+## Constraints
+
+<!-- Technical, product, policy, compatibility, time, or scope constraints. -->
+
+## Open questions
+
+<!-- Keep only questions that materially affect correctness. Use "None" when resolved. -->
+
+## Acceptance criteria
+
+- [ ] <!-- Observable outcome -->
+"#;
+
+const SPEC_TEMPLATE: &str = r#"# Specification
+
+## Context
+
+<!-- Existing behavior, architecture, and evidence that constrain the design. -->
+
+## Goals
+
+- <!-- Goal -->
+
+## Non-goals
+
+- <!-- Explicitly out of scope -->
+
+## Design
+
+<!-- Chosen approach, affected boundaries, data/control flow, compatibility, and tradeoffs. -->
+
+## Testing strategy
+
+<!-- Deterministic checks and evidence required before completion. -->
+
+## Risks
+
+<!-- Material risks and mitigations. -->
+"#;
+
+const PLAN_TEMPLATE: &str = r#"# Implementation plan
+
+## Ordered tasks
+
+- [ ] T1: <!-- concrete task -->
+  - Files: <!-- exact paths or bounded areas -->
+  - Verify: <!-- exact command/check -->
+
+## Execution ledger
+
+| Task | Started | Finished | Evidence |
+| --- | --- | --- | --- |
+| T1 |  |  |  |
+"#;
 const MAX_PHASE_TRANSCRIPT_BYTES: u64 = 16 * 1024 * 1024;
 const USAGE_SNAPSHOT_TAIL_BYTES: u64 = 256 * 1024;
 
@@ -55,6 +124,54 @@ impl WorkflowKind {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ArtifactStage {
+    Intent,
+    Spec,
+    Plan,
+}
+
+impl ArtifactStage {
+    fn key(self) -> &'static str {
+        match self {
+            Self::Intent => "intent",
+            Self::Spec => "spec",
+            Self::Plan => "plan",
+        }
+    }
+
+    fn file_name(self) -> &'static str {
+        match self {
+            Self::Intent => "intent.md",
+            Self::Spec => "spec.md",
+            Self::Plan => "plan.md",
+        }
+    }
+
+    fn template(self) -> &'static str {
+        match self {
+            Self::Intent => INTENT_TEMPLATE,
+            Self::Spec => SPEC_TEMPLATE,
+            Self::Plan => PLAN_TEMPLATE,
+        }
+    }
+}
+
+impl std::fmt::Display for ArtifactStage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.key())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowArtifactRecord {
+    pub stage: ArtifactStage,
+    pub rel_path: String,
+    pub accepted_hash: Option<String>,
+    pub accepted_at: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum StepCondition {
@@ -72,6 +189,13 @@ pub struct WorkflowStep {
     pub id: String,
     pub phase: WorkflowPhase,
     pub skill: String,
+    /// Provider-neutral workflow seat. This is an address, not authority:
+    /// dispatch still resolves the seat through the trusted agent registry and
+    /// narrows it through the effective policy.
+    #[serde(default)]
+    pub agent: Option<String>,
+    #[serde(default)]
+    pub artifact: Option<ArtifactStage>,
     pub condition: StepCondition,
     pub approval: bool,
     pub max_attempts: u8,
@@ -108,6 +232,14 @@ impl WorkflowDefinition {
     }
 }
 
+fn seat_for_phase(phase: WorkflowPhase) -> Option<String> {
+    match phase {
+        WorkflowPhase::Implement | WorkflowPhase::Debug => Some("implementer".into()),
+        WorkflowPhase::Review => Some("reviewer".into()),
+        _ => None,
+    }
+}
+
 fn step(
     id: &str,
     phase: WorkflowPhase,
@@ -119,13 +251,35 @@ fn step(
         id: id.to_string(),
         phase,
         skill: skill.to_string(),
+        agent: seat_for_phase(phase),
+        artifact: None,
         condition,
         approval,
         max_attempts: MAX_STEP_ATTEMPTS,
     }
 }
 
+fn artifact_step(
+    id: &str,
+    phase: WorkflowPhase,
+    skill: &str,
+    stage: ArtifactStage,
+    condition: StepCondition,
+) -> WorkflowStep {
+    WorkflowStep {
+        id: id.to_string(),
+        phase,
+        skill: skill.to_string(),
+        agent: None,
+        artifact: Some(stage),
+        condition,
+        approval: true,
+        max_attempts: MAX_STEP_ATTEMPTS,
+    }
+}
+
 pub fn definitions() -> Vec<WorkflowDefinition> {
+    use ArtifactStage as Artifact;
     use Complexity as C;
     use RiskBand as R;
     use StepCondition as When;
@@ -134,32 +288,30 @@ pub fn definitions() -> Vec<WorkflowDefinition> {
         WorkflowDefinition {
             schema_version: WORKFLOW_SCHEMA_VERSION,
             kind: WorkflowKind::Feature,
-            description: "Design, implement, test and proportionally review a feature.".into(),
+            description: "Capture intent, design and plan proportionally, then implement, test and review.".into(),
             steps: vec![
-                step(
-                    "design",
+                artifact_step("intent", Phase::Intent, "brainstorm", Artifact::Intent, When::Always),
+                artifact_step(
+                    "spec",
                     Phase::Design,
                     "design",
+                    Artifact::Spec,
                     When::ComplexityOrRisk {
                         complexity: C::Substantial,
                         risk: R::High,
                     },
-                    true,
                 ),
-                step(
+                artifact_step(
                     "plan",
                     Phase::Plan,
                     "plan",
-                    When::ComplexityAtLeast(C::Substantial),
-                    false,
+                    Artifact::Plan,
+                    When::ComplexityOrRisk {
+                        complexity: C::Bounded,
+                        risk: R::High,
+                    },
                 ),
-                step(
-                    "implement",
-                    Phase::Implement,
-                    "implement",
-                    When::Always,
-                    false,
-                ),
+                step("implement", Phase::Implement, "implement", When::Always, false),
                 step("test", Phase::Test, "testing", When::Always, false),
                 step(
                     "review",
@@ -169,27 +321,36 @@ pub fn definitions() -> Vec<WorkflowDefinition> {
                     false,
                 ),
                 step("verify", Phase::Verify, "verify", When::Always, false),
+                step("deploy", Phase::Deploy, "finish-branch", When::Always, false),
             ],
         },
         WorkflowDefinition {
             schema_version: WORKFLOW_SCHEMA_VERSION,
             kind: WorkflowKind::Bugfix,
-            description: "Reproduce, fix, test and verify a defect.".into(),
+            description: "Capture intent when warranted, reproduce, plan larger fixes, test and verify.".into(),
             steps: vec![
-                step(
-                    "debug",
-                    Phase::Debug,
-                    "systematic-debugging",
-                    When::Always,
-                    false,
+                artifact_step(
+                    "intent",
+                    Phase::Intent,
+                    "brainstorm",
+                    Artifact::Intent,
+                    When::ComplexityOrRisk {
+                        complexity: C::Bounded,
+                        risk: R::Medium,
+                    },
                 ),
-                step(
-                    "implement",
-                    Phase::Implement,
-                    "implement",
-                    When::Always,
-                    false,
+                step("debug", Phase::Debug, "systematic-debugging", When::Always, false),
+                artifact_step(
+                    "plan",
+                    Phase::Plan,
+                    "plan",
+                    Artifact::Plan,
+                    When::ComplexityOrRisk {
+                        complexity: C::Substantial,
+                        risk: R::High,
+                    },
                 ),
+                step("implement", Phase::Implement, "implement", When::Always, false),
                 step("test", Phase::Test, "testing", When::Always, false),
                 step(
                     "review",
@@ -199,30 +360,35 @@ pub fn definitions() -> Vec<WorkflowDefinition> {
                     false,
                 ),
                 step("verify", Phase::Verify, "verify", When::Always, false),
+                step("deploy", Phase::Deploy, "finish-branch", When::Always, false),
             ],
         },
         WorkflowDefinition {
             schema_version: WORKFLOW_SCHEMA_VERSION,
             kind: WorkflowKind::Refactor,
-            description: "Refactor with behavior-preserving tests and proportional review.".into(),
+            description: "Plan proportional behavior-preserving changes with intent capture for substantial or high-risk work.".into(),
             steps: vec![
-                step(
-                    "design",
-                    Phase::Design,
-                    "design",
+                artifact_step(
+                    "intent",
+                    Phase::Intent,
+                    "brainstorm",
+                    Artifact::Intent,
                     When::ComplexityOrRisk {
                         complexity: C::Substantial,
                         risk: R::High,
                     },
-                    true,
                 ),
-                step(
-                    "implement",
-                    Phase::Implement,
-                    "implement",
-                    When::Always,
-                    false,
+                artifact_step(
+                    "plan",
+                    Phase::Plan,
+                    "plan",
+                    Artifact::Plan,
+                    When::ComplexityOrRisk {
+                        complexity: C::Bounded,
+                        risk: R::Medium,
+                    },
                 ),
+                step("implement", Phase::Implement, "implement", When::Always, false),
                 step("test", Phase::Test, "testing", When::Always, false),
                 step(
                     "review",
@@ -232,21 +398,17 @@ pub fn definitions() -> Vec<WorkflowDefinition> {
                     false,
                 ),
                 step("verify", Phase::Verify, "verify", When::Always, false),
+                step("deploy", Phase::Deploy, "finish-branch", When::Always, false),
             ],
         },
         WorkflowDefinition {
             schema_version: WORKFLOW_SCHEMA_VERSION,
             kind: WorkflowKind::Spike,
-            description: "Time-bounded exploration with explicit findings.".into(),
+            description: "Capture intent, run time-bounded exploration and record explicit findings.".into(),
             steps: vec![
+                artifact_step("intent", Phase::Intent, "brainstorm", Artifact::Intent, When::Always),
                 step("design", Phase::Design, "design", When::Always, false),
-                step(
-                    "implement",
-                    Phase::Implement,
-                    "implement",
-                    When::Always,
-                    false,
-                ),
+                step("implement", Phase::Implement, "implement", When::Always, false),
                 step(
                     "verify",
                     Phase::Verify,
@@ -314,6 +476,7 @@ fn apply_profile(profile: WorkflowProfile, steps: &mut [WorkflowStep]) {
     }
     for step in steps {
         step.skill = match step.phase {
+            WorkflowPhase::Intent => continue,
             WorkflowPhase::Design => "frontend-design",
             WorkflowPhase::Plan => "frontend-plan",
             WorkflowPhase::Implement => "frontend-implement",
@@ -321,13 +484,38 @@ fn apply_profile(profile: WorkflowProfile, steps: &mut [WorkflowStep]) {
             WorkflowPhase::Test => "frontend-test",
             WorkflowPhase::Review => "frontend-review",
             WorkflowPhase::Verify => "frontend-verify",
-            WorkflowPhase::Delegate | WorkflowPhase::Present => continue,
+            WorkflowPhase::Deploy | WorkflowPhase::Delegate | WorkflowPhase::Present => continue,
         }
         .into();
         // The agent owns routine visual decisions. The workflow still
         // enforces evidence gates; it never pauses for a theme vote.
-        if step.phase == WorkflowPhase::Design {
+        if step.phase == WorkflowPhase::Design && step.artifact.is_none() {
             step.approval = false;
+        }
+    }
+}
+
+fn apply_deploy_tier(tier: DeployTier, steps: &mut Vec<WorkflowStep>) {
+    if tier == DeployTier::Production
+        && !steps.iter().any(|step| step.phase == WorkflowPhase::Review)
+        && let Some(verify_index) = steps
+            .iter()
+            .position(|step| step.phase == WorkflowPhase::Verify)
+    {
+        steps.insert(
+            verify_index,
+            step(
+                "review",
+                WorkflowPhase::Review,
+                "review",
+                StepCondition::Always,
+                false,
+            ),
+        );
+    }
+    for step in steps {
+        if step.phase == WorkflowPhase::Deploy {
+            step.approval = tier >= DeployTier::Staging;
         }
     }
 }
@@ -336,10 +524,27 @@ fn materialize(
     kind: WorkflowKind,
     classification: &Classification,
     profile: WorkflowProfile,
+    deploy_tier: DeployTier,
 ) -> Vec<WorkflowStep> {
     let mut steps = definition(kind).materialize(classification);
     apply_profile(profile, &mut steps);
+    apply_deploy_tier(deploy_tier, &mut steps);
     steps
+}
+
+/// Skill ids that compose one materialized step. The primary step skill stays
+/// stable for state/back-compat; substantial implementation additionally
+/// receives the resume-safe accepted-plan executor, whose own dependency stack
+/// includes worktree isolation and the general implementation discipline.
+fn step_skill_ids(step: &WorkflowStep, classification: &Classification) -> Vec<String> {
+    let mut ids = Vec::new();
+    if step.phase == WorkflowPhase::Implement
+        && classification.complexity >= Complexity::Substantial
+    {
+        ids.push("execute-plan".to_string());
+    }
+    ids.push(step.skill.clone());
+    ids
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -361,10 +566,16 @@ pub struct WorkflowState {
     #[serde(default = "default_true")]
     pub include_custom_skills: bool,
     pub classification: Classification,
+    #[serde(default)]
+    pub deploy_tier: DeployTier,
     pub steps: Vec<WorkflowStep>,
     pub current_step: usize,
     pub completed_steps: Vec<String>,
     pub attempts: BTreeMap<String, u8>,
+    /// Version-controlled workflow work products. Acceptance authority remains
+    /// in this private state: repository markdown is never trusted as config.
+    #[serde(default)]
+    pub artifacts: BTreeMap<String, WorkflowArtifactRecord>,
     #[serde(default)]
     pub review_findings: Vec<super::review::ReviewFinding>,
     #[serde(default)]
@@ -392,16 +603,19 @@ impl WorkflowState {
         classification: Classification,
     ) -> Self {
         let profile = WorkflowProfile::for_classification(&classification);
-        let steps = materialize(kind, &classification, profile);
+        let deploy_tier = DeployTier::Development;
+        let steps = materialize(kind, &classification, profile, deploy_tier);
         let status = if steps.first().is_some_and(|step| step.approval) {
             WorkflowStatus::AwaitingApproval
         } else {
             WorkflowStatus::Running
         };
         let now = now_secs();
+        let id = uuid::Uuid::new_v4().to_string();
+        let artifacts = initial_artifact_records(&id, &steps);
         Self {
             schema_version: WORKFLOW_SCHEMA_VERSION,
-            id: uuid::Uuid::new_v4().to_string(),
+            id,
             repo,
             task,
             kind,
@@ -409,10 +623,12 @@ impl WorkflowState {
             adapter,
             include_custom_skills,
             classification,
+            deploy_tier,
             steps,
             current_step: 0,
             completed_steps: Vec::new(),
             attempts: BTreeMap::new(),
+            artifacts,
             review_findings: Vec::new(),
             review_evidence: Vec::new(),
             usage_checkpoint: None,
@@ -422,6 +638,220 @@ impl WorkflowState {
             updated_at: now,
         }
     }
+}
+
+fn initial_artifact_records(
+    workflow_id: &str,
+    steps: &[WorkflowStep],
+) -> BTreeMap<String, WorkflowArtifactRecord> {
+    let mut records = BTreeMap::new();
+    for step in steps {
+        let Some(stage) = step.artifact else {
+            continue;
+        };
+        records
+            .entry(stage.key().to_string())
+            .or_insert_with(|| WorkflowArtifactRecord {
+                stage,
+                rel_path: format!(".zirv/work/{workflow_id}/{}", stage.file_name()),
+                accepted_hash: None,
+                accepted_at: None,
+            });
+    }
+    records
+}
+
+fn sync_artifact_records(state: &mut WorkflowState) {
+    for step in &state.steps {
+        let Some(stage) = step.artifact else {
+            continue;
+        };
+        state
+            .artifacts
+            .entry(stage.key().to_string())
+            .or_insert_with(|| WorkflowArtifactRecord {
+                stage,
+                rel_path: format!(".zirv/work/{}/{}", state.id, stage.file_name()),
+                accepted_hash: None,
+                accepted_at: None,
+            });
+    }
+}
+
+fn workflow_artifact_path(state: &WorkflowState, stage: ArtifactStage) -> CtxResult<PathBuf> {
+    let record = state
+        .artifacts
+        .get(stage.key())
+        .ok_or_else(|| format!("workflow '{}' has no {stage} artifact record", state.id))?;
+    let expected = format!(".zirv/work/{}/{}", state.id, stage.file_name());
+    if record.rel_path != expected {
+        return Err(format!(
+            "workflow '{}' has invalid {stage} artifact path '{}'",
+            state.id, record.rel_path
+        )
+        .into());
+    }
+    Ok(state.repo.join(&record.rel_path))
+}
+
+fn ensure_current_artifact_template(state: &WorkflowState) -> CtxResult<()> {
+    let Some(stage) = state.current().and_then(|step| step.artifact) else {
+        return Ok(());
+    };
+    let path = workflow_artifact_path(state, stage)?;
+    if path.exists() {
+        return Ok(());
+    }
+    let parent = path
+        .parent()
+        .ok_or("workflow artifact has no parent directory")?;
+    std::fs::create_dir_all(parent)?;
+    std::fs::write(path, stage.template())?;
+    Ok(())
+}
+
+fn hash_bytes(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(&mut out, "{byte:02x}");
+    }
+    out
+}
+
+fn artifact_hash(path: &Path) -> CtxResult<String> {
+    Ok(hash_bytes(&std::fs::read(path)?))
+}
+
+fn rfc3339_now() -> String {
+    // UTC conversion using Howard Hinnant's civil-from-days algorithm. Keeping
+    // this tiny avoids a date/time dependency solely for an audit timestamp.
+    let seconds = i64::try_from(now_secs()).unwrap_or(i64::MAX);
+    let days = seconds.div_euclid(86_400);
+    let sod = seconds.rem_euclid(86_400);
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 }.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe.div_euclid(1_460) + doe.div_euclid(36_524) - doe.div_euclid(146_096))
+        .div_euclid(365);
+    let mut year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe.div_euclid(4) - yoe.div_euclid(100));
+    let mp = (5 * doy + 2).div_euclid(153);
+    let day = doy - (153 * mp + 2).div_euclid(5) + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    year += if month <= 2 { 1 } else { 0 };
+    let hour = sod.div_euclid(3_600);
+    let minute = sod.rem_euclid(3_600).div_euclid(60);
+    let second = sod.rem_euclid(60);
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
+fn pin_current_artifact(state: &mut WorkflowState) -> CtxResult<ArtifactStage> {
+    let stage = state
+        .current()
+        .and_then(|step| step.artifact)
+        .ok_or("current workflow step has no artifact to approve")?;
+    ensure_current_artifact_template(state)?;
+    let path = workflow_artifact_path(state, stage)?;
+    let body = std::fs::read_to_string(&path)?;
+    if body.trim() == stage.template().trim() {
+        return Err(format!(
+            "{stage} artifact is still the untouched template: {}",
+            path.display()
+        )
+        .into());
+    }
+    let hash = hash_bytes(body.as_bytes());
+    let record = state
+        .artifacts
+        .get_mut(stage.key())
+        .ok_or("workflow artifact record disappeared")?;
+    record.accepted_hash = Some(hash);
+    record.accepted_at = Some(rfc3339_now());
+    Ok(stage)
+}
+
+fn artifact_drift(state: &WorkflowState) -> CtxResult<Option<ArtifactStage>> {
+    for stage in [
+        ArtifactStage::Intent,
+        ArtifactStage::Spec,
+        ArtifactStage::Plan,
+    ] {
+        let Some(record) = state.artifacts.get(stage.key()) else {
+            continue;
+        };
+        let Some(accepted) = record.accepted_hash.as_deref() else {
+            continue;
+        };
+        let path = workflow_artifact_path(state, stage)?;
+        if !path.exists() || artifact_hash(&path)? != accepted {
+            return Ok(Some(stage));
+        }
+    }
+    Ok(None)
+}
+
+fn reopen_artifact_gate(state: &mut WorkflowState, stage: ArtifactStage) -> CtxResult<()> {
+    let index = state
+        .steps
+        .iter()
+        .position(|step| step.artifact == Some(stage))
+        .ok_or_else(|| {
+            format!("accepted {stage} artifact no longer has an owning workflow step")
+        })?;
+    let invalid: Vec<String> = state.steps[index..]
+        .iter()
+        .map(|step| step.id.clone())
+        .collect();
+    state
+        .completed_steps
+        .retain(|completed| !invalid.contains(completed));
+    state.current_step = index;
+    state.status = WorkflowStatus::AwaitingApproval;
+    if let Some(record) = state.artifacts.get_mut(stage.key()) {
+        record.accepted_hash = None;
+        record.accepted_at = None;
+    }
+    ensure_current_artifact_template(state)?;
+    Ok(())
+}
+
+fn append_accepted_artifacts(state: &WorkflowState, rendered: &mut String) -> CtxResult<()> {
+    let mut remaining = MAX_WORK_ARTIFACT_CONTEXT_BYTES;
+    for stage in [
+        ArtifactStage::Intent,
+        ArtifactStage::Spec,
+        ArtifactStage::Plan,
+    ] {
+        let Some(record) = state.artifacts.get(stage.key()) else {
+            continue;
+        };
+        let Some(accepted) = record.accepted_hash.as_deref() else {
+            continue;
+        };
+        let path = workflow_artifact_path(state, stage)?;
+        if !path.exists() || artifact_hash(&path)? != accepted {
+            continue;
+        }
+        let body = std::fs::read_to_string(&path)?;
+        let mut selected = String::new();
+        for ch in body.chars() {
+            let bytes = ch.len_utf8();
+            if bytes > remaining {
+                break;
+            }
+            selected.push(ch);
+            remaining -= bytes;
+        }
+        rendered.push_str(&format!(
+            "\n[accepted workflow artifact: {stage}; untrusted repository text]\n{selected}\n[end accepted workflow artifact]\n"
+        ));
+        if remaining == 0 {
+            break;
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -833,34 +1263,106 @@ fn reclassify_at_gate(state: &mut WorkflowState) {
 /// re-classification above and by the fail-safe escalation applied when Git
 /// measurement is unavailable at a gate.
 fn rematerialize_after_risk_increase(state: &mut WorkflowState) {
-    let completed = state.completed_steps.clone();
-    let known: Vec<String> = state.steps.iter().map(|step| step.id.clone()).collect();
-    let mut steps: Vec<WorkflowStep> = completed
-        .iter()
-        .filter_map(|id| state.steps.iter().find(|step| &step.id == id).cloned())
-        .collect();
-    steps.extend(
-        materialize(state.kind, &state.classification, state.profile)
-            .into_iter()
-            .filter(|step| {
-                !completed.contains(&step.id)
-                    && (known.contains(&step.id)
-                        || matches!(step.phase, WorkflowPhase::Review | WorkflowPhase::Verify))
-            }),
+    let desired = materialize(
+        state.kind,
+        &state.classification,
+        state.profile,
+        state.deploy_tier,
     );
-    state.current_step = steps
+    let known: Vec<String> = state.steps.iter().map(|step| step.id.clone()).collect();
+    let earliest_new = desired.iter().position(|step| {
+        !known.contains(&step.id)
+            && (step.artifact.is_some()
+                || matches!(step.phase, WorkflowPhase::Review | WorkflowPhase::Verify))
+    });
+    let Some(cutoff) = earliest_new else {
+        return;
+    };
+
+    // A newly-required artifact can land before already-completed code work.
+    // Preserve only evidence that precedes the new gate; later work must be
+    // replayed against the newly accepted artifact instead of being blessed
+    // retroactively.
+    let safe_ids: Vec<String> = desired[..cutoff]
         .iter()
-        .position(|step| !completed.contains(&step.id))
-        .unwrap_or(steps.len());
-    state.steps = steps;
+        .map(|step| step.id.clone())
+        .collect();
+    state
+        .completed_steps
+        .retain(|completed| safe_ids.contains(completed));
+    state.steps = desired;
+    sync_artifact_records(state);
+    state.current_step = state
+        .steps
+        .iter()
+        .position(|step| !state.completed_steps.contains(&step.id))
+        .unwrap_or(state.steps.len());
 }
 
+
+fn apply_effective_deploy_tier(state: &mut WorkflowState, effective: DeployTier) {
+    let target = state.deploy_tier.max(effective);
+    let desired = materialize(
+        state.kind,
+        &state.classification,
+        state.profile,
+        target,
+    );
+
+    let known: Vec<String> = state.steps.iter().map(|step| step.id.clone()).collect();
+    let earliest_new = desired
+        .iter()
+        .position(|step| !known.contains(&step.id));
+
+    if target > state.deploy_tier
+        && let Some(cutoff) = earliest_new
+    {
+        let safe_ids: Vec<String> = desired[..cutoff]
+            .iter()
+            .map(|step| step.id.clone())
+            .collect();
+        state
+            .completed_steps
+            .retain(|completed| safe_ids.contains(completed));
+    }
+
+    state.deploy_tier = target;
+    state.steps = desired;
+    sync_artifact_records(state);
+    state.current_step = state
+        .steps
+        .iter()
+        .position(|step| !state.completed_steps.contains(&step.id))
+        .unwrap_or(state.steps.len());
+    state.status = match state.current() {
+        None => WorkflowStatus::Completed,
+        Some(step) if step.approval => WorkflowStatus::AwaitingApproval,
+        Some(_) => WorkflowStatus::Running,
+    };
+}
+
+fn refresh_deploy_tier(state: &mut WorkflowState) -> CtxResult<()> {
+    let effective = super::deploy::effective_tier(&state.repo)?;
+    apply_effective_deploy_tier(state, effective);
+    Ok(())
+}
 pub fn advance_with_evidence(
     state_dir: &StateDir,
     mut state: WorkflowState,
     outcome: StepOutcome,
     evidence: Option<&TransitionEvidence>,
 ) -> CtxResult<WorkflowState> {
+    refresh_deploy_tier(&mut state)?;
+    if let Some(stage) = artifact_drift(&state)? {
+        reopen_artifact_gate(&mut state, stage)?;
+        state.updated_at = now_secs();
+        save(state_dir, &state, true)?;
+        return Err(format!(
+            "accepted {stage} artifact changed after approval; review and run `zirv workflow approve {}` again",
+            state.id
+        )
+        .into());
+    }
     if state.status == WorkflowStatus::AwaitingApproval {
         return Err("current workflow step is awaiting approval".into());
     }
@@ -932,6 +1434,27 @@ pub fn advance_with_evidence(
                     .into());
                 }
             }
+            if current.phase == WorkflowPhase::Deploy {
+                let gate = super::deploy::production_gate_satisfied(state_dir, &state);
+                let mut event = super::telemetry::TelemetryEvent::new(
+                    super::telemetry::TelemetryKind::DeployGateEvaluated,
+                );
+                event.workflow_id = Some(state.id.clone());
+                event.phase = Some(current.phase);
+                event.intent = Some(state.classification.intent);
+                event.complexity = Some(state.classification.complexity);
+                event.risk = Some(state.classification.risk);
+                event.work_domain = Some(state.classification.work_domain.domain);
+                event.deploy_tier = Some(state.deploy_tier.to_string());
+                event.succeeded = Some(gate.is_ok());
+                let _ = super::telemetry::record(
+                    state_dir,
+                    &state.repo,
+                    &event,
+                    &super::telemetry::TelemetryConfig::for_repo(&state.repo),
+                );
+                gate?;
+            }
             if current.phase == WorkflowPhase::Review {
                 if state
                     .review_findings
@@ -987,6 +1510,8 @@ pub fn advance_with_evidence(
             state.completed_steps.push(current.id.clone());
             state.current_step += 1;
             reclassify_at_gate(&mut state);
+            sync_artifact_records(&mut state);
+            ensure_current_artifact_template(&state)?;
             state.status = match state.current() {
                 None => WorkflowStatus::Completed,
                 Some(step) if step.approval => WorkflowStatus::AwaitingApproval,
@@ -1056,6 +1581,7 @@ pub fn advance_with_evidence(
         completed.complexity = Some(state.classification.complexity);
         completed.risk = Some(state.classification.risk);
         completed.work_domain = Some(state.classification.work_domain.domain);
+        completed.deploy_tier = Some(state.deploy_tier.to_string());
         completed.succeeded = Some(true);
         completed.findings_total = findings_total;
         completed.findings_meaningful = findings_meaningful;
@@ -1071,9 +1597,67 @@ pub fn advance_with_evidence(
 }
 
 pub fn approve(state_dir: &StateDir, mut state: WorkflowState) -> CtxResult<WorkflowState> {
+    refresh_deploy_tier(&mut state)?;
     if state.status != WorkflowStatus::AwaitingApproval {
         return Err("workflow is not awaiting approval".into());
     }
+
+    if let Some(stage) = state.current().and_then(|step| step.artifact) {
+        // Accepted predecessor artifacts must still be the exact bytes that
+        // were reviewed. The current stage itself is intentionally excluded
+        // until pin_current_artifact replaces its acceptance record.
+        if let Some(drifted) = artifact_drift(&state)?
+            && drifted != stage
+        {
+            reopen_artifact_gate(&mut state, drifted)?;
+            save(state_dir, &state, true)?;
+            return Err(format!(
+                "accepted {drifted} artifact changed after approval; re-approve it before {stage}"
+            )
+            .into());
+        }
+        let completed = state.current().expect("artifact step exists").clone();
+        let accepted = pin_current_artifact(&mut state)?;
+        if !state.completed_steps.contains(&completed.id) {
+            state.completed_steps.push(completed.id);
+        }
+        state.current_step += 1;
+        reclassify_at_gate(&mut state);
+        sync_artifact_records(&mut state);
+        ensure_current_artifact_template(&state)?;
+        state.status = match state.current() {
+            None => WorkflowStatus::Completed,
+            Some(step) if step.approval => WorkflowStatus::AwaitingApproval,
+            Some(_) => WorkflowStatus::Running,
+        };
+        state.updated_at = now_secs();
+        state.phase_started_at = state.updated_at;
+        let active = matches!(
+            state.status,
+            WorkflowStatus::Running | WorkflowStatus::AwaitingApproval
+        );
+        save(state_dir, &state, active)?;
+
+        let mut event = super::telemetry::TelemetryEvent::new(
+            super::telemetry::TelemetryKind::ArtifactAccepted,
+        );
+        event.workflow_id = Some(state.id.clone());
+        event.phase = Some(completed.phase);
+        event.intent = Some(state.classification.intent);
+        event.complexity = Some(state.classification.complexity);
+        event.risk = Some(state.classification.risk);
+        event.work_domain = Some(state.classification.work_domain.domain);
+        event.succeeded = Some(true);
+        event.artifact_stage = Some(accepted.to_string());
+        let _ = super::telemetry::record(
+            state_dir,
+            &state.repo,
+            &event,
+            &super::telemetry::TelemetryConfig::for_repo(&state.repo),
+        );
+        return Ok(state);
+    }
+
     state.status = WorkflowStatus::Running;
     state.updated_at = now_secs();
     save(state_dir, &state, true)?;
@@ -1098,7 +1682,6 @@ pub fn render_current_context(
         return Ok(None);
     }
     let registry = SkillRegistry::load_for_repo(repo, home, state.include_custom_skills)?;
-    let stack = registry.resolve_stack(&step.skill)?;
     let task = state
         .task
         .chars()
@@ -1120,6 +1703,21 @@ pub fn render_current_context(
         step.phase,
         state.status
     );
+    if let Some(agent) = step.agent.as_deref() {
+        rendered.push_str(&format!("agent-seat: {agent}\n"));
+    }
+    if let Some(stage) = step.artifact {
+        ensure_current_artifact_template(state)?;
+        let record = state
+            .artifacts
+            .get(stage.key())
+            .ok_or("current workflow artifact record is missing")?;
+        rendered.push_str(&format!(
+            "artifact: {} ({stage}; fill this committed work product, then wait for acceptance)\n",
+            record.rel_path
+        ));
+    }
+    append_accepted_artifacts(state, &mut rendered)?;
     if state.profile == WorkflowProfile::Frontend {
         let state_dir = StateDir::resolve(&|key| std::env::var(key).ok())?;
         let profile = super::frontend::ensure_profile(&state_dir, repo)?;
@@ -1127,14 +1725,20 @@ pub fn render_current_context(
         rendered.push_str(&super::frontend::render_profile(&profile));
         rendered.push('\n');
     }
-    for skill in stack {
-        rendered.push_str(&format!(
-            "\n[skill {}@{}; source={}]\n{}\n",
-            skill.manifest.id,
-            skill.manifest.version,
-            skill.source,
-            skill.manifest.instructions.trim()
-        ));
+    let mut rendered_skill_ids = BTreeSet::new();
+    for selected in step_skill_ids(step, &state.classification) {
+        for skill in registry.resolve_stack(&selected)? {
+            if !rendered_skill_ids.insert(skill.manifest.id.clone()) {
+                continue;
+            }
+            rendered.push_str(&format!(
+                "\n[skill {}@{}; source={}]\n{}\n",
+                skill.manifest.id,
+                skill.manifest.version,
+                skill.source,
+                skill.manifest.instructions.trim()
+            ));
+        }
     }
     Ok(Some(rendered))
 }
@@ -1190,12 +1794,18 @@ pub enum WorkflowSubcommand {
     Resume(StateIdArgs),
     /// Print only the current step's resolved skill context.
     Context(StatusArgs),
+    /// Inspect committed workflow work-product artifacts and acceptance state.
+    Artifacts(ArtifactsArgs),
+    /// Inspect provider-neutral workflow seats and their trust provenance.
+    Agents(super::agents::AgentArgs),
     /// Approve the current gated step.
     Approve(StateIdArgs),
     /// Record a step result and transition the state machine.
     Advance(AdvanceArgs),
     /// Build compact review packages and persist finding dispositions.
     Review(super::review::ReviewArgs),
+    /// Run deterministic operator-configured maintenance detectors.
+    Maintain(super::maintain::MaintainArgs),
     /// Aggregate privacy-conscious local workflow telemetry.
     Stats(super::telemetry::StatsArgs),
 }
@@ -1220,10 +1830,10 @@ pub struct StartArgs {
     pub kind: WorkflowKind,
     #[arg(long)]
     pub task: String,
-    /// Validate every selected skill against this adapter before starting.
+    /// Harness adapter used for capability preflight (for example claude/codex).
     #[arg(long)]
     pub agent: Option<String>,
-    /// Ignore operator-global and repository-provided skill overrides.
+    /// Ignore operator-global and repository-provided skill/agent overrides.
     #[arg(long)]
     pub built_in_only: bool,
     #[arg(long)]
@@ -1256,6 +1866,54 @@ pub struct StateIdArgs {
     pub id: String,
     #[arg(long)]
     pub repo: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub struct ArtifactsArgs {
+    pub id: String,
+    #[arg(long)]
+    pub repo: Option<PathBuf>,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct WorkflowArtifactStatus {
+    stage: ArtifactStage,
+    rel_path: String,
+    exists: bool,
+    accepted: bool,
+    drifted: bool,
+    accepted_at: Option<String>,
+}
+
+fn workflow_artifact_statuses(state: &WorkflowState) -> CtxResult<Vec<WorkflowArtifactStatus>> {
+    let mut statuses = Vec::new();
+    for stage in [
+        ArtifactStage::Intent,
+        ArtifactStage::Spec,
+        ArtifactStage::Plan,
+    ] {
+        let Some(record) = state.artifacts.get(stage.key()) else {
+            continue;
+        };
+        let path = workflow_artifact_path(state, stage)?;
+        let exists = path.exists();
+        let accepted = record.accepted_hash.is_some();
+        let drifted = match record.accepted_hash.as_deref() {
+            Some(hash) => !exists || artifact_hash(&path)? != hash,
+            None => false,
+        };
+        statuses.push(WorkflowArtifactStatus {
+            stage,
+            rel_path: record.rel_path.clone(),
+            exists,
+            accepted,
+            drifted,
+            accepted_at: record.accepted_at.clone(),
+        });
+    }
+    Ok(statuses)
 }
 
 #[derive(Debug, Args)]
@@ -1302,6 +1960,7 @@ fn write_state(writer: &mut impl Write, state: &WorkflowState, json: bool) -> Ct
         writeln!(writer, "workflow: {}", state.id)?;
         writeln!(writer, "kind: {}", state.kind.as_str())?;
         writeln!(writer, "profile: {:?}", state.profile)?;
+        writeln!(writer, "deploy tier: {}", state.deploy_tier)?;
         writeln!(writer, "status: {:?}", state.status)?;
         writeln!(
             writer,
@@ -1319,8 +1978,14 @@ fn write_state(writer: &mut impl Write, state: &WorkflowState, json: bool) -> Ct
         if let Some(step) = state.current() {
             writeln!(
                 writer,
-                "current: {} ({}, skill {})",
-                step.id, step.phase, step.skill
+                "current: {} ({}, skill {}, agent {}{})",
+                step.id,
+                step.phase,
+                step.skill,
+                step.agent.as_deref().unwrap_or("-"),
+                step.artifact
+                    .map(|stage| format!(", artifact {stage}"))
+                    .unwrap_or_default()
             )?;
         } else {
             writeln!(writer, "current: none")?;
@@ -1363,8 +2028,16 @@ pub fn run(args: &WorkflowArgs, writer: &mut impl Write) -> CtxResult<i32> {
                 for step in definition.steps {
                     writeln!(
                         writer,
-                        "  {}\t{}\tskill={}\twhen={:?}\tapproval={}",
-                        step.id, step.phase, step.skill, step.condition, step.approval
+                        "  {}\t{}\tskill={}\tagent={}\tartifact={}\twhen={:?}\tapproval={}",
+                        step.id,
+                        step.phase,
+                        step.skill,
+                        step.agent.as_deref().unwrap_or("-"),
+                        step.artifact
+                            .map(|stage| stage.to_string())
+                            .unwrap_or_else(|| "-".into()),
+                        step.condition,
+                        step.approval
                     )?;
                 }
             }
@@ -1413,15 +2086,31 @@ pub fn run(args: &WorkflowArgs, writer: &mut impl Write) -> CtxResult<i32> {
             }
             let definition = definition(args.kind);
             let profile = WorkflowProfile::for_classification(&classification);
+            let deploy_tier = super::deploy::effective_tier(&repo)?;
             if let Some(agent) = &selected_agent {
                 let registry = SkillRegistry::load_for_repo(
                     &repo,
                     dirs::home_dir().as_deref(),
                     !args.built_in_only,
                 )?;
+                let agent_registry = AgentRegistry::load_for_repo(
+                    &repo,
+                    dirs::home_dir().as_deref(),
+                    !args.built_in_only,
+                )?;
                 let report = super::capability::CapabilityReport::for_repo(agent, &repo)?;
-                for step in materialize(definition.kind, &classification, profile) {
-                    registry.ensure_supported(&step.skill, &report)?;
+                for step in materialize(
+                    definition.kind,
+                    &classification,
+                    profile,
+                    deploy_tier,
+                ) {
+                    for skill in step_skill_ids(&step, &classification) {
+                        registry.ensure_supported(&skill, &report)?;
+                    }
+                    if let Some(seat) = step.agent.as_deref() {
+                        agent_registry.ensure_supported(seat, &report)?;
+                    }
                 }
             }
             let mut state = WorkflowState::start(
@@ -1432,7 +2121,9 @@ pub fn run(args: &WorkflowArgs, writer: &mut impl Write) -> CtxResult<i32> {
                 !args.built_in_only,
                 classification,
             );
+            apply_effective_deploy_tier(&mut state, deploy_tier);
             state.usage_checkpoint = usage_checkpoint(&state.repo);
+            ensure_current_artifact_template(&state)?;
             save(&state_dir, &state, true)?;
             let mut event = super::telemetry::TelemetryEvent::new(
                 super::telemetry::TelemetryKind::WorkflowStarted,
@@ -1442,6 +2133,7 @@ pub fn run(args: &WorkflowArgs, writer: &mut impl Write) -> CtxResult<i32> {
             event.complexity = Some(state.classification.complexity);
             event.risk = Some(state.classification.risk);
             event.work_domain = Some(state.classification.work_domain.domain);
+            event.deploy_tier = Some(state.deploy_tier.to_string());
             let _ = super::telemetry::record(
                 &state_dir,
                 &state.repo,
@@ -1462,13 +2154,15 @@ pub fn run(args: &WorkflowArgs, writer: &mut impl Write) -> CtxResult<i32> {
         WorkflowSubcommand::Resume(args) => {
             let repo = resolve_repo(args.repo.as_deref())?;
             let state_dir = resolve_state()?;
-            let state = load(&state_dir, &repo, &args.id)?;
+            let mut state = load(&state_dir, &repo, &args.id)?;
+            refresh_deploy_tier(&mut state)?;
             if !matches!(
                 state.status,
                 WorkflowStatus::Running | WorkflowStatus::AwaitingApproval
             ) {
                 return Err(format!("cannot resume workflow in {:?} state", state.status).into());
             }
+            ensure_current_artifact_template(&state)?;
             save(&state_dir, &state, true)?;
             write_state(writer, &state, false)?;
         }
@@ -1482,6 +2176,46 @@ pub fn run(args: &WorkflowArgs, writer: &mut impl Write) -> CtxResult<i32> {
             match render_current_context(&state, &repo, dirs::home_dir().as_deref())? {
                 Some(context) => write!(writer, "{context}")?,
                 None => writeln!(writer, "workflow has no active step context")?,
+            }
+        }
+        WorkflowSubcommand::Agents(args) => {
+            return super::agents::run(args, writer);
+        }
+        WorkflowSubcommand::Artifacts(args) => {
+            let repo = resolve_repo(args.repo.as_deref())?;
+            let state_dir = resolve_state()?;
+            let state = load(&state_dir, &repo, &args.id)?;
+            let statuses = workflow_artifact_statuses(&state)?;
+            if args.json {
+                serde_json::to_writer_pretty(&mut *writer, &statuses)?;
+                writeln!(writer)?;
+            } else if statuses.is_empty() {
+                writeln!(writer, "workflow has no committed work-product artifacts")?;
+            } else {
+                writeln!(writer, "STAGE\tPATH\tSTATE")?;
+                for status in statuses {
+                    let state = if status.drifted {
+                        "drifted"
+                    } else if status.accepted {
+                        "accepted"
+                    } else if status.exists {
+                        "pending"
+                    } else {
+                        "missing"
+                    };
+                    writeln!(
+                        writer,
+                        "{}\t{}\t{}{}",
+                        status.stage,
+                        status.rel_path,
+                        state,
+                        status
+                            .accepted_at
+                            .as_deref()
+                            .map(|at| format!(" ({at})"))
+                            .unwrap_or_default()
+                    )?;
+                }
             }
         }
         WorkflowSubcommand::Approve(args) => {
@@ -1516,6 +2250,9 @@ pub fn run(args: &WorkflowArgs, writer: &mut impl Write) -> CtxResult<i32> {
         WorkflowSubcommand::Review(args) => {
             return super::review::run(args, writer);
         }
+        WorkflowSubcommand::Maintain(args) => {
+            return super::maintain::run(args, writer);
+        }
         WorkflowSubcommand::Stats(args) => {
             return super::telemetry::run_stats(args, writer);
         }
@@ -1543,16 +2280,32 @@ mod tests {
         }
     }
 
+    fn skip_leading_artifact_steps(mut state: WorkflowState) -> WorkflowState {
+        while state.current().is_some_and(|step| step.artifact.is_some()) {
+            let id = state.current().unwrap().id.clone();
+            state.completed_steps.push(id);
+            state.current_step += 1;
+        }
+        state.status = if state.current().is_some() {
+            WorkflowStatus::Running
+        } else {
+            WorkflowStatus::Completed
+        };
+        state
+    }
+
     #[test]
-    fn low_risk_feature_uses_fast_path_without_design_or_review() {
+    fn low_risk_feature_uses_intent_fast_path_without_spec_plan_or_review() {
         let steps = definition(WorkflowKind::Feature).materialize(&low_classification());
         assert_eq!(
             steps
                 .iter()
                 .map(|step| step.id.as_str())
                 .collect::<Vec<_>>(),
-            ["implement", "test", "verify"]
+            ["intent", "implement", "test", "verify", "deploy"]
         );
+        assert_eq!(steps[0].artifact, Some(ArtifactStage::Intent));
+        assert!(steps[0].approval);
     }
 
     #[test]
@@ -1571,10 +2324,109 @@ mod tests {
         classification.complexity = Complexity::Bounded;
         classification.risk = RiskBand::High;
         let steps = definition(WorkflowKind::Feature).materialize(&classification);
-        assert!(
+        assert_eq!(
             steps
-                .first()
-                .is_some_and(|step| step.id == "design" && step.approval)
+                .iter()
+                .map(|step| step.id.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "intent",
+                "spec",
+                "plan",
+                "implement",
+                "test",
+                "review",
+                "verify",
+                "deploy"
+            ]
+        );
+        assert!(steps[1].approval);
+        assert_eq!(steps[1].artifact, Some(ArtifactStage::Spec));
+    }
+
+    #[test]
+    fn deploy_tier_matrix_adds_structural_gates() {
+        let classification = low_classification();
+        let profile = WorkflowProfile::Standard;
+
+        let development = materialize(
+            WorkflowKind::Feature,
+            &classification,
+            profile,
+            DeployTier::Development,
+        );
+        let development_deploy = development
+            .iter()
+            .find(|step| step.phase == WorkflowPhase::Deploy)
+            .unwrap();
+        assert!(!development_deploy.approval);
+        assert!(!development.iter().any(|step| step.phase == WorkflowPhase::Review));
+
+        let staging = materialize(
+            WorkflowKind::Feature,
+            &classification,
+            profile,
+            DeployTier::Staging,
+        );
+        assert!(
+            staging
+                .iter()
+                .find(|step| step.phase == WorkflowPhase::Deploy)
+                .unwrap()
+                .approval
+        );
+        assert!(!staging.iter().any(|step| step.phase == WorkflowPhase::Review));
+
+        let production = materialize(
+            WorkflowKind::Feature,
+            &classification,
+            profile,
+            DeployTier::Production,
+        );
+        let review = production
+            .iter()
+            .position(|step| step.phase == WorkflowPhase::Review)
+            .unwrap();
+        let verify = production
+            .iter()
+            .position(|step| step.phase == WorkflowPhase::Verify)
+            .unwrap();
+        let deploy = production
+            .iter()
+            .position(|step| step.phase == WorkflowPhase::Deploy)
+            .unwrap();
+        assert!(review < verify && verify < deploy);
+        assert!(production[review].agent.as_deref() == Some("reviewer"));
+        assert!(production[deploy].approval);
+    }
+
+    #[test]
+    fn tightening_to_production_rewinds_later_completed_evidence() {
+        let mut state = WorkflowState::start(
+            PathBuf::from("repo"),
+            "small feature".into(),
+            WorkflowKind::Feature,
+            None,
+            true,
+            low_classification(),
+        );
+        state.completed_steps =
+            vec!["intent", "implement", "test", "verify"].into_iter().map(str::to_string).collect();
+        state.current_step = state
+            .steps
+            .iter()
+            .position(|step| step.phase == WorkflowPhase::Deploy)
+            .unwrap();
+        state.status = WorkflowStatus::Running;
+
+        apply_effective_deploy_tier(&mut state, DeployTier::Production);
+
+        assert_eq!(state.deploy_tier, DeployTier::Production);
+        assert_eq!(state.current().unwrap().phase, WorkflowPhase::Review);
+        assert_eq!(
+            state.completed_steps,
+            ["intent", "implement", "test"],
+            "verify evidence after the inserted production review must be replayed"
         );
     }
 
@@ -1595,7 +2447,18 @@ mod tests {
         );
 
         assert_eq!(state.profile, WorkflowProfile::Frontend);
-        assert_eq!(state.current().unwrap().skill, "frontend-implement");
+        assert_eq!(state.current().unwrap().skill, "brainstorm");
+        assert_eq!(
+            state.current().unwrap().artifact,
+            Some(ArtifactStage::Intent)
+        );
+        assert!(
+            state
+                .steps
+                .iter()
+                .find(|step| step.phase == WorkflowPhase::Implement)
+                .is_some_and(|step| step.skill == "frontend-implement")
+        );
     }
 
     #[test]
@@ -1615,9 +2478,18 @@ mod tests {
             classification,
         );
 
-        assert_eq!(state.status, WorkflowStatus::Running);
-        assert_eq!(state.steps[0].skill, "frontend-design");
-        assert!(!state.steps[0].approval);
+        assert_eq!(state.status, WorkflowStatus::AwaitingApproval);
+        assert_eq!(state.steps[0].skill, "brainstorm");
+        let design = state
+            .steps
+            .iter()
+            .find(|step| step.phase == WorkflowPhase::Design)
+            .expect("substantial frontend has spec/design");
+        assert_eq!(design.skill, "frontend-design");
+        assert!(
+            design.approval,
+            "spec acceptance remains a hard artifact gate"
+        );
         assert!(
             state
                 .steps
@@ -1648,11 +2520,17 @@ mod tests {
             true,
             classification,
         );
-        state.current_step = state
+        let test_index = state
             .steps
             .iter()
             .position(|step| step.phase == WorkflowPhase::Test)
             .unwrap();
+        state.completed_steps = state.steps[..test_index]
+            .iter()
+            .map(|step| step.id.clone())
+            .collect();
+        state.current_step = test_index;
+        state.status = WorkflowStatus::Running;
 
         let error = advance_with_evidence(&state_dir, state, StepOutcome::Success, None)
             .unwrap_err()
@@ -1761,20 +2639,86 @@ mod tests {
             classification,
         );
         assert_eq!(state.status, WorkflowStatus::AwaitingApproval);
+        ensure_current_artifact_template(&state).unwrap();
         assert!(
             advance_with_evidence(&state_dir, state.clone(), StepOutcome::Success, None).is_err()
         );
+        assert!(
+            approve(&state_dir, state.clone()).is_err(),
+            "an untouched template cannot be accepted"
+        );
+        let intent = workflow_artifact_path(&state, ArtifactStage::Intent).unwrap();
+        std::fs::write(
+            intent,
+            "# Intent\n\n## Problem\nConcrete problem\n\n## Desired outcome\nConcrete result\n",
+        )
+        .unwrap();
         let approved = approve(&state_dir, state).unwrap();
-        assert_eq!(approved.status, WorkflowStatus::Running);
-        assert_eq!(approved.current().unwrap().id, "design");
+        assert_eq!(approved.current().unwrap().id, "spec");
+        assert_eq!(approved.status, WorkflowStatus::AwaitingApproval);
+        assert!(
+            approved
+                .artifacts
+                .get("intent")
+                .and_then(|record| record.accepted_hash.as_ref())
+                .is_some()
+        );
     }
 
     #[test]
-    fn resume_does_not_redispatch_completed_steps() {
+    fn artifact_drift_reopens_the_owning_gate_and_invalidates_later_work() {
         let repo = tempdir().unwrap();
         let root = tempdir().unwrap();
         let state_dir = StateDir::from_root(root.path().to_path_buf());
-        let mut state = WorkflowState::start(
+        let mut classification = low_classification();
+        classification.complexity = Complexity::Substantial;
+        classification.risk = RiskBand::High;
+        let state = WorkflowState::start(
+            repo.path().to_path_buf(),
+            "substantial feature".into(),
+            WorkflowKind::Feature,
+            None,
+            true,
+            classification,
+        );
+        ensure_current_artifact_template(&state).unwrap();
+        let intent = workflow_artifact_path(&state, ArtifactStage::Intent).unwrap();
+        std::fs::write(
+            &intent,
+            "# Intent\n\n## Problem\nA\n\n## Desired outcome\nB\n",
+        )
+        .unwrap();
+        let state = approve(&state_dir, state).unwrap();
+        assert_eq!(state.current().unwrap().id, "spec");
+
+        std::fs::write(
+            &intent,
+            "# Intent\n\n## Problem\nChanged after acceptance\n\n## Desired outcome\nB\n",
+        )
+        .unwrap();
+        let error =
+            advance_with_evidence(&state_dir, state, StepOutcome::Success, None).unwrap_err();
+        assert!(error.to_string().contains("intent artifact changed"));
+
+        let reopened = load_active(&state_dir, repo.path()).unwrap().unwrap();
+        assert_eq!(reopened.current().unwrap().id, "intent");
+        assert_eq!(reopened.status, WorkflowStatus::AwaitingApproval);
+        assert!(
+            reopened
+                .artifacts
+                .get("intent")
+                .unwrap()
+                .accepted_hash
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn workflow_artifact_status_reports_pending_accepted_and_drifted() {
+        let repo = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+        let state = WorkflowState::start(
             repo.path().to_path_buf(),
             "small feature".into(),
             WorkflowKind::Feature,
@@ -1782,10 +2726,45 @@ mod tests {
             true,
             low_classification(),
         );
+        ensure_current_artifact_template(&state).unwrap();
+        let pending = workflow_artifact_statuses(&state).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(pending[0].exists);
+        assert!(!pending[0].accepted);
+
+        let intent = workflow_artifact_path(&state, ArtifactStage::Intent).unwrap();
+        std::fs::write(
+            &intent,
+            "# Intent\n\n## Problem\nA\n\n## Desired outcome\nB\n",
+        )
+        .unwrap();
+        let accepted = approve(&state_dir, state).unwrap();
+        let statuses = workflow_artifact_statuses(&accepted).unwrap();
+        assert!(statuses[0].accepted);
+        assert!(!statuses[0].drifted);
+
+        std::fs::write(&intent, "# Intent\nchanged\n").unwrap();
+        let statuses = workflow_artifact_statuses(&accepted).unwrap();
+        assert!(statuses[0].drifted);
+    }
+
+    #[test]
+    fn resume_does_not_redispatch_completed_steps() {
+        let repo = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+        let mut state = skip_leading_artifact_steps(WorkflowState::start(
+            repo.path().to_path_buf(),
+            "small feature".into(),
+            WorkflowKind::Feature,
+            None,
+            true,
+            low_classification(),
+        ));
         save(&state_dir, &state, true).unwrap();
         state = advance_with_evidence(&state_dir, state, StepOutcome::Success, None).unwrap();
         let resumed = load(&state_dir, repo.path(), &state.id).unwrap();
-        assert_eq!(resumed.completed_steps, vec!["implement"]);
+        assert_eq!(resumed.completed_steps, vec!["intent", "implement"]);
         assert_eq!(resumed.current().unwrap().id, "test");
     }
 
@@ -1794,14 +2773,14 @@ mod tests {
         let repo = tempdir().unwrap();
         let root = tempdir().unwrap();
         let state_dir = StateDir::from_root(root.path().to_path_buf());
-        let mut state = WorkflowState::start(
+        let mut state = skip_leading_artifact_steps(WorkflowState::start(
             repo.path().to_path_buf(),
             "small feature".into(),
             WorkflowKind::Feature,
             None,
             true,
             low_classification(),
-        );
+        ));
         save(&state_dir, &state, true).unwrap();
         for _ in 0..MAX_STEP_ATTEMPTS {
             state = advance_with_evidence(&state_dir, state, StepOutcome::Failure, None).unwrap();
@@ -2135,14 +3114,14 @@ mod tests {
     #[test]
     fn switching_steps_replaces_ephemeral_skill_context() {
         let repo = tempdir().unwrap();
-        let mut state = WorkflowState::start(
+        let mut state = skip_leading_artifact_steps(WorkflowState::start(
             repo.path().to_path_buf(),
             "small feature".into(),
             WorkflowKind::Feature,
             None,
             true,
             low_classification(),
-        );
+        ));
         let implement = render_current_context(&state, repo.path(), None)
             .unwrap()
             .unwrap();
@@ -2158,6 +3137,46 @@ mod tests {
     }
 
     #[test]
+    fn substantial_implementation_composes_execute_plan_and_worktree() {
+        let repo = tempdir().unwrap();
+        let mut classification = low_classification();
+        classification.complexity = Complexity::Substantial;
+        let state = skip_leading_artifact_steps(WorkflowState::start(
+            repo.path().to_path_buf(),
+            "substantial feature".into(),
+            WorkflowKind::Feature,
+            None,
+            true,
+            classification,
+        ));
+        let context = render_current_context(&state, repo.path(), None)
+            .unwrap()
+            .unwrap();
+        assert!(context.contains("[skill worktree@1"));
+        assert!(context.contains("[skill implement@1"));
+        assert!(context.contains("[skill execute-plan@1"));
+    }
+
+    #[test]
+    fn trivial_implementation_does_not_pay_execute_plan_or_worktree_context() {
+        let repo = tempdir().unwrap();
+        let state = skip_leading_artifact_steps(WorkflowState::start(
+            repo.path().to_path_buf(),
+            "small feature".into(),
+            WorkflowKind::Feature,
+            None,
+            true,
+            low_classification(),
+        ));
+        let context = render_current_context(&state, repo.path(), None)
+            .unwrap()
+            .unwrap();
+        assert!(context.contains("[skill implement@1"));
+        assert!(!context.contains("[skill execute-plan@1"));
+        assert!(!context.contains("[skill worktree@1"));
+    }
+
+    #[test]
     fn built_in_only_state_survives_prompt_rendering() {
         let repo = tempdir().unwrap();
         let skills = repo.path().join(".zirv/skills");
@@ -2167,14 +3186,14 @@ mod tests {
             "schema_version: 1\nid: implement\nversion: 2\nname: Override\ndescription: untrusted override\ncontext_budget_bytes: 64\nphases: [implement]\ninstructions: repository override\n",
         )
         .unwrap();
-        let state = WorkflowState::start(
+        let state = skip_leading_artifact_steps(WorkflowState::start(
             repo.path().to_path_buf(),
             "small feature".into(),
             WorkflowKind::Feature,
             None,
             false,
             low_classification(),
-        );
+        ));
         let context = render_current_context(&state, repo.path(), None)
             .unwrap()
             .unwrap();

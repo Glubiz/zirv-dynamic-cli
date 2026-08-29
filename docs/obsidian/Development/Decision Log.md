@@ -24,6 +24,13 @@ last-verified: 2026-08-28
 
 ## Decisions
 
+### 2026-08-28 — Committed workflow artifacts are an untrusted work-product surface, not a config surface (issue #187 design)
+**Context:** The AI-native SDLC design commits `intent.md`/`spec.md`/`plan.md` into `.zirv/work/<workflow-id>/` so reviewers can inspect normal PR diffs, while repository-owned text remains untrusted.
+**Decision:** Artifact bytes are work products only. Private workflow state pins acceptance hashes and timestamps; prompt folding is capped and explicitly labels the text untrusted. A hash mismatch reopens the owning gate.
+**Rejected:** Repo frontmatter as approval state, or a `--no-artifacts` bypass. Either would let repository text or an ad-hoc flag route around structural ceremony.
+**Consequences:** Private JSON remains the authority for progression; committed files are auditable evidence. Classification is the only mechanism that skips artifact stages.
+**Spec / link:** `docs/superpowers/specs/2026-08-28-ai-native-sdlc-design.md`; [[Untrusted Configuration]]; issue #187.
+
 ### 2026-08-28 — Cross-harness fallback moves only new work or an already-stopped limit-blocked child, and only at a verified equivalent tier (issue #186, v2.36.0)
 **Context:** Pacing and agent enablement knew independently when a vendor seat was exhausted and which alternate harnesses existed, but the delegation/supervisor paths never connected those facts. Blindly swapping a live response or translating an arbitrary concrete model/CLI argv would risk duplicated work, incompatible flags, or a quality downgrade.
 **Decision:** `fallback.rs` selects only enabled/ready/capacity-compatible harnesses with admissible measured or conservatively-assumed headroom. New work may be predictively rerouted; existing work may cross harnesses only after `exec` has observed a recognized vendor limit and the child has stopped, using a durable handoff and remaining budget. Concrete models cross only when they map exactly onto the configured `cheap|standard|deep` ladder; arbitrary vendor flags are not translated.
