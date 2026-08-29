@@ -593,6 +593,22 @@ fn initial_artifact_records(
     records
 }
 
+fn sync_artifact_records(state: &mut WorkflowState) {
+    for step in &state.steps {
+        let Some(stage) = step.artifact else {
+            continue;
+        };
+        state.artifacts.entry(stage.key().to_string()).or_insert_with(|| {
+            WorkflowArtifactRecord {
+                stage,
+                rel_path: format!(".zirv/work/{}/{}", state.id, stage.file_name()),
+                accepted_hash: None,
+                accepted_at: None,
+            }
+        });
+    }
+}
+
 fn workflow_artifact_path(state: &WorkflowState, stage: ArtifactStage) -> CtxResult<PathBuf> {
     let record = state
         .artifacts
@@ -654,7 +670,7 @@ fn rfc3339_now() -> String {
     let mp = (5 * doy + 2).div_euclid(153);
     let day = doy - (153 * mp + 2).div_euclid(5) + 1;
     let month = mp + if mp < 10 { 3 } else { -9 };
-    year += i64::from(month <= 2);
+    year += if month <= 2 { 1 } else { 0 };
     let hour = sod.div_euclid(3_600);
     let minute = sod.rem_euclid(3_600).div_euclid(60);
     let second = sod.rem_euclid(60);
@@ -1167,26 +1183,35 @@ fn reclassify_at_gate(state: &mut WorkflowState) {
 /// re-classification above and by the fail-safe escalation applied when Git
 /// measurement is unavailable at a gate.
 fn rematerialize_after_risk_increase(state: &mut WorkflowState) {
-    let completed = state.completed_steps.clone();
+    let desired = materialize(state.kind, &state.classification, state.profile);
     let known: Vec<String> = state.steps.iter().map(|step| step.id.clone()).collect();
-    let mut steps: Vec<WorkflowStep> = completed
+    let earliest_new = desired.iter().position(|step| {
+        !known.contains(&step.id)
+            && (step.artifact.is_some()
+                || matches!(step.phase, WorkflowPhase::Review | WorkflowPhase::Verify))
+    });
+    let Some(cutoff) = earliest_new else {
+        return;
+    };
+
+    // A newly-required artifact can land before already-completed code work.
+    // Preserve only evidence that precedes the new gate; later work must be
+    // replayed against the newly accepted artifact instead of being blessed
+    // retroactively.
+    let safe_ids: Vec<String> = desired[..cutoff]
         .iter()
-        .filter_map(|id| state.steps.iter().find(|step| &step.id == id).cloned())
+        .map(|step| step.id.clone())
         .collect();
-    steps.extend(
-        materialize(state.kind, &state.classification, state.profile)
-            .into_iter()
-            .filter(|step| {
-                !completed.contains(&step.id)
-                    && (known.contains(&step.id)
-                        || matches!(step.phase, WorkflowPhase::Review | WorkflowPhase::Verify))
-            }),
-    );
-    state.current_step = steps
+    state
+        .completed_steps
+        .retain(|completed| safe_ids.contains(completed));
+    state.steps = desired;
+    sync_artifact_records(state);
+    state.current_step = state
+        .steps
         .iter()
-        .position(|step| !completed.contains(&step.id))
-        .unwrap_or(steps.len());
-    state.steps = steps;
+        .position(|step| !state.completed_steps.contains(&step.id))
+        .unwrap_or(state.steps.len());
 }
 
 pub fn advance_with_evidence(
@@ -1195,6 +1220,16 @@ pub fn advance_with_evidence(
     outcome: StepOutcome,
     evidence: Option<&TransitionEvidence>,
 ) -> CtxResult<WorkflowState> {
+    if let Some(stage) = artifact_drift(&state)? {
+        reopen_artifact_gate(&mut state, stage)?;
+        state.updated_at = now_secs();
+        save(state_dir, &state, true)?;
+        return Err(format!(
+            "accepted {stage} artifact changed after approval; review and run `zirv workflow approve {}` again",
+            state.id
+        )
+        .into());
+    }
     if state.status == WorkflowStatus::AwaitingApproval {
         return Err("current workflow step is awaiting approval".into());
     }
@@ -1321,6 +1356,8 @@ pub fn advance_with_evidence(
             state.completed_steps.push(current.id.clone());
             state.current_step += 1;
             reclassify_at_gate(&mut state);
+            sync_artifact_records(&mut state);
+            ensure_current_artifact_template(&state)?;
             state.status = match state.current() {
                 None => WorkflowStatus::Completed,
                 Some(step) if step.approval => WorkflowStatus::AwaitingApproval,
@@ -1408,6 +1445,63 @@ pub fn approve(state_dir: &StateDir, mut state: WorkflowState) -> CtxResult<Work
     if state.status != WorkflowStatus::AwaitingApproval {
         return Err("workflow is not awaiting approval".into());
     }
+
+    if let Some(stage) = state.current().and_then(|step| step.artifact) {
+        // Accepted predecessor artifacts must still be the exact bytes that
+        // were reviewed. The current stage itself is intentionally excluded
+        // until pin_current_artifact replaces its acceptance record.
+        if let Some(drifted) = artifact_drift(&state)? {
+            if drifted != stage {
+                reopen_artifact_gate(&mut state, drifted)?;
+                save(state_dir, &state, true)?;
+                return Err(format!(
+                    "accepted {drifted} artifact changed after approval; re-approve it before {stage}"
+                )
+                .into());
+            }
+        }
+        let completed = state.current().expect("artifact step exists").clone();
+        let accepted = pin_current_artifact(&mut state)?;
+        if !state.completed_steps.contains(&completed.id) {
+            state.completed_steps.push(completed.id);
+        }
+        state.current_step += 1;
+        reclassify_at_gate(&mut state);
+        sync_artifact_records(&mut state);
+        ensure_current_artifact_template(&state)?;
+        state.status = match state.current() {
+            None => WorkflowStatus::Completed,
+            Some(step) if step.approval => WorkflowStatus::AwaitingApproval,
+            Some(_) => WorkflowStatus::Running,
+        };
+        state.updated_at = now_secs();
+        state.phase_started_at = state.updated_at;
+        let active = matches!(
+            state.status,
+            WorkflowStatus::Running | WorkflowStatus::AwaitingApproval
+        );
+        save(state_dir, &state, active)?;
+
+        let mut event = super::telemetry::TelemetryEvent::new(
+            super::telemetry::TelemetryKind::ArtifactAccepted,
+        );
+        event.workflow_id = Some(state.id.clone());
+        event.phase = Some(completed.phase);
+        event.intent = Some(state.classification.intent);
+        event.complexity = Some(state.classification.complexity);
+        event.risk = Some(state.classification.risk);
+        event.work_domain = Some(state.classification.work_domain.domain);
+        event.succeeded = Some(true);
+        event.artifact_stage = Some(accepted.to_string());
+        let _ = super::telemetry::record(
+            state_dir,
+            &state.repo,
+            &event,
+            &super::telemetry::TelemetryConfig::for_repo(&state.repo),
+        );
+        return Ok(state);
+    }
+
     state.status = WorkflowStatus::Running;
     state.updated_at = now_secs();
     save(state_dir, &state, true)?;
@@ -1454,6 +1548,18 @@ pub fn render_current_context(
         step.phase,
         state.status
     );
+    if let Some(stage) = step.artifact {
+        ensure_current_artifact_template(state)?;
+        let record = state
+            .artifacts
+            .get(stage.key())
+            .ok_or("current workflow artifact record is missing")?;
+        rendered.push_str(&format!(
+            "artifact: {} ({stage}; fill this committed work product, then wait for acceptance)\n",
+            record.rel_path
+        ));
+    }
+    append_accepted_artifacts(state, &mut rendered)?;
     if state.profile == WorkflowProfile::Frontend {
         let state_dir = StateDir::resolve(&|key| std::env::var(key).ok())?;
         let profile = super::frontend::ensure_profile(&state_dir, repo)?;
