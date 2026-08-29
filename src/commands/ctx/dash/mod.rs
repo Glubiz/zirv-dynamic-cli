@@ -3053,6 +3053,57 @@ fn fulfill_spawn_request(
     if let Some(reason) = cfg.agents.refusal(&req.agent) {
         return Err(SpawnRefusal::policy(reason));
     }
+    let requested_adapter = adapters::select(Some(&req.agent), &[], cfg)
+        .map_err(|e| SpawnRefusal::policy(e.to_string()))?;
+
+    // Issue #186 hardening: the dashboard's own Spawn overlay reaches this
+    // authority-side path directly, without passing through agent::run_with.
+    // Reuse the same fallback selector here so a root dashboard delegation
+    // does not hard-refuse an exhausted requested seat while another enabled
+    // harness has safe equivalent capacity.
+    let source_model = req.model.clone().or_else(|| {
+        let model_args = adapters::worker_model_args(cfg, &req.agent, requested_adapter.as_ref());
+        adapters::last_model_flag(&model_args).map(str::to_string)
+    });
+    let now = super::state::now_secs();
+    let route = super::fallback::route_new_delegation(
+        state,
+        cfg,
+        super::fallback::RouteRequest {
+            requested: &req.agent,
+            source_model: source_model.as_deref(),
+            source_model_explicit: req.model.is_some(),
+            bounds: super::fallback::TaskBounds {
+                tokens: None,
+                tool_calls: None,
+            },
+            now,
+        },
+        req.force,
+    );
+    let mut effective_req = req.clone();
+    if let Some(route) = route {
+        effective_req.agent = route.selected.clone();
+        effective_req.model = Some(route.model.clone());
+        let detail = route.detail();
+        let _ = super::log::append(
+            state,
+            &super::log::Decision {
+                ts: now,
+                session: &req.requested_by,
+                verb: "dash",
+                verdict: "reroute",
+                score: 0,
+                action: "harness-reroute",
+                detail: &detail,
+            },
+        );
+        push_error(errors, format!("dashboard spawn automatically routed {detail}"));
+    }
+    let req = &effective_req;
+    if let Some(reason) = cfg.agents.refusal(&req.agent) {
+        return Err(SpawnRefusal::policy(reason));
+    }
     let adapter = adapters::select(Some(&req.agent), &[], cfg)
         .map_err(|e| SpawnRefusal::policy(e.to_string()))?;
 
@@ -3084,7 +3135,6 @@ fn fulfill_spawn_request(
     // headless fallback would route straight around the gate (the headless
     // path is gated too, by the identical check in `agent::run_with`), the
     // same reasoning the pane cap and the depth cap above already apply.
-    let now = super::state::now_secs();
     let (collector, estimator) =
         super::pace::current_windows(state, &cfg.pace, now, adapter.provider());
     let gate = super::pace::spawn_gate(&collector, estimator.as_ref(), now, &cfg.pace);
