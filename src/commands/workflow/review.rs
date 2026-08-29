@@ -1691,41 +1691,40 @@ mod tests {
     /// -- a correct lookup table that never made it onto the command line
     /// would restrict nothing.
     #[test]
-    fn a_reviewer_is_always_pinned_read_only_or_refused() {
+    fn a_reviewer_seat_is_always_pinned_read_only_or_refused() {
+        let repo = tempdir().unwrap();
+        let claude = reviewer_argv("claude", repo.path(), false).unwrap();
+        assert_eq!(&claude[..4], ["agent", "claude", "-", "--"]);
         assert_eq!(
-            reviewer_argv("claude").unwrap(),
-            [
-                "agent",
-                "claude",
-                "-",
-                "--",
-                "--disallowedTools=Write,Edit,Bash,NotebookEdit"
-            ]
-        );
-        // Issue #89: the two `--ignore-*` flags ride along only when the
-        // codex binary actually installed on this machine advertises them
-        // (CI has no codex at all, a developer box may have 0.147.0), so
-        // assert the invariant -- the read-only pin is always present and
-        // the optional flags can only ever trail it -- not one machine's
-        // exact argv.
-        let codex = reviewer_argv("codex").unwrap();
-        assert_eq!(
-            &codex[..6],
-            ["agent", "codex", "-", "--", "--sandbox", "read-only"]
-        );
-        let trailing = &codex[6..];
-        assert!(
-            trailing.is_empty() || trailing == ["--ignore-rules", "--ignore-user-config"],
-            "unexpected trailing reviewer flags: {trailing:?}"
-        );
-        let error = reviewer_argv("nope").unwrap_err().to_string();
-        assert!(
-            error.contains("cannot pin the reviewer read-only"),
-            "{error}"
+            claude.last().map(String::as_str),
+            Some("--disallowedTools=Write,Edit,Bash,NotebookEdit"),
+            "the reviewer seat's hard read-only floor must be appended last"
         );
         assert!(
-            reviewer_argv("Claude").is_err(),
-            "the name is validated too"
+            claude.iter().any(|arg| arg.contains("workflow agent seat: reviewer@1")),
+            "the provider-neutral reviewer manifest must reach the harness system prompt"
+        );
+
+        let codex = reviewer_argv("codex", repo.path(), false).unwrap();
+        assert_eq!(&codex[..4], ["agent", "codex", "-", "--"]);
+        assert!(
+            codex
+                .windows(2)
+                .any(|pair| pair == ["--sandbox", "read-only"]),
+            "codex reviewer must retain the adapter-owned read-only sandbox pin: {codex:?}"
+        );
+        assert!(
+            codex.iter().any(|arg| arg.contains("reviewer@1")),
+            "the same reviewer seat must be addressable through codex"
+        );
+
+        let error = reviewer_argv("nope", repo.path(), false)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unknown") || error.contains("unsupported"), "{error}");
+        assert!(
+            reviewer_argv("Claude", repo.path(), false).is_err(),
+            "the adapter name is validated too"
         );
     }
 
