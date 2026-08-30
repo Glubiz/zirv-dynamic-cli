@@ -1770,11 +1770,30 @@ mod tests {
 
         guard.adopt_child_pid(1);
 
-        assert_eq!(
-            guard.record().start_time,
-            process_start_secs(1),
-            "start_time must move with pid, not stay pinned to the supervisor's own"
-        );
+        // `process_start_secs` derives its answer as `now - elapsed`, so two
+        // calls a few instructions apart can straddle a second boundary and
+        // land one second off each other -- issue #218's flake. Compare
+        // within a small tolerance instead of exact equality. That tolerance
+        // still catches the real regression: pid 1's start time is the
+        // machine's boot time, while a pinned, unmoved `start_time` would
+        // still read this test process's own (recent) start -- hours or more
+        // away from pid 1's, never within 2 seconds of it.
+        let actual = guard.record().start_time;
+        let expected = process_start_secs(1);
+        match (actual, expected) {
+            (Some(actual), Some(expected)) => {
+                let diff = actual.abs_diff(expected);
+                assert!(
+                    diff <= 2,
+                    "start_time must move with pid, not stay pinned to the supervisor's own \
+                     (adopted={actual}, live={expected}, diff={diff}s)"
+                );
+            }
+            _ => panic!(
+                "start_time must move with pid, not stay pinned to the supervisor's own \
+                 (adopted={actual:?}, live={expected:?})"
+            ),
+        }
         assert!(
             record_is_alive(guard.record()),
             "the repointed record must read live, not falsely dead from a stale start_time"

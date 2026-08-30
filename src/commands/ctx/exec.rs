@@ -2103,6 +2103,22 @@ fn supervise_run(
     soft_warned: &mut bool,
     budget_exhausted: &mut bool,
 ) -> CtxResult<Outcome> {
+    // Issue #203: `evaluate_worker_budget` reads the transcript fresh on
+    // every tick, so it can see a `HardStop` the instant the child's last
+    // chunk lands on disk -- often milliseconds before the child itself
+    // calls `exit()`. `supervise_child` checks `try_wait` *before* every
+    // tick, including the very next one, but a `Tick::Stop` on this same
+    // tick short-circuits straight to `terminate` and `Outcome::
+    // StoppedByTick`, which carries no exit code -- so a child that was
+    // already on its way out on its own has its real code discarded for
+    // `EXIT_BUDGET_EXHAUSTED`. One tick of grace (`Tick::Continue` instead
+    // of `Stop`, exactly once) gives that next `try_wait` a chance to
+    // observe a natural exit first -- the same spirit as the `limit_hit`
+    // path's own brief final drain/wait below, letting a child that is
+    // already on its way out finish naturally instead of being overridden.
+    // Only a child still alive on the SECOND consecutive `HardStop` tick is
+    // actually killed for budget.
+    let mut budget_grace_given = false;
     let mut tick = || {
         if pace::scan_for_limit(
             &tap.try_lines(),
@@ -2169,6 +2185,13 @@ fn supervise_run(
         // run that never asked to be bounded pays nothing extra here.
         match evaluate_worker_budget(adapter, budget, transcript, prior_usage, prior_tool_calls) {
             Some(agent::BudgetState::HardStop { used, limit }) => {
+                // Issue #203: give a child that is about to exit on its own
+                // one poll's worth of room to do so, so `try_wait` -- not
+                // this kill -- is what reports its real exit code.
+                if !budget_grace_given {
+                    budget_grace_given = true;
+                    return Tick::Continue;
+                }
                 eprintln!(
                     "zirv ctx exec: token/tool-call budget exhausted ({used}/{limit}); \
                      stopping now -- this run will not restart"
