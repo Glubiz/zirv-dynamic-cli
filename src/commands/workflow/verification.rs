@@ -719,23 +719,59 @@ fn parse_cargo_test_failure_names(output: &str) -> std::collections::BTreeSet<St
 /// observed* `failures:` line -- reset on every new one -- so memory stays
 /// bounded by the shape of one such section, never by total output size;
 /// `MAX_PENDING_LINES` is a defensive backstop against a pathological
-/// producer that never resets it.
+/// producer that never resets it. `pending` is only ever drained into
+/// `names` on a `test result: FAILED` line that was itself preceded by a
+/// `failures:` line since the last such drain/reset (`saw_failures_header`)
+/// -- otherwise a `test result: FAILED` block that never printed a
+/// `failures:` header (nothing captured, or a differently-shaped tool's
+/// output) would wrongly promote unrelated non-failure lines it happened to
+/// see into failing test names.
+///
+/// `partial` -- the not-yet-newline-terminated tail of the current line --
+/// is bounded the same way: `MAX_PARTIAL_LINE_BYTES` is far larger than any
+/// real cargo `failures:`/`test result:`/test-name line, so once it grows
+/// past that a real line can never be hiding in it. The excess is discarded
+/// and `partial_overflowed` marks the rest of that (poisoned) line as
+/// ignorable up to its next newline, rather than buffering an unbounded
+/// amount of a single newline-less stream -- which would otherwise defeat
+/// the memory cap the capped *display* tail is meant to provide.
 #[derive(Default)]
 struct FailureNameScanner {
     names: std::collections::BTreeSet<String>,
     pending: Vec<String>,
     partial: Vec<u8>,
+    partial_overflowed: bool,
+    saw_failures_header: bool,
 }
 
 impl FailureNameScanner {
     const MAX_PENDING_LINES: usize = 4096;
+    /// Far longer than any real `failures:`/`test result:`/test-name line
+    /// cargo (or any other supported check runner) ever emits -- once an
+    /// unterminated line exceeds this, it cannot be one of those lines, so
+    /// it is safe to discard rather than accumulate without bound.
+    const MAX_PARTIAL_LINE_BYTES: usize = 4096;
 
     fn feed(&mut self, chunk: &[u8]) {
         self.partial.extend_from_slice(chunk);
         while let Some(newline) = self.partial.iter().position(|&byte| byte == b'\n') {
             let line_bytes: Vec<u8> = self.partial.drain(..=newline).collect();
+            if std::mem::take(&mut self.partial_overflowed) {
+                // The line that just ended was already discarded as
+                // over-length; only the newline itself resynced us.
+                continue;
+            }
             let line = String::from_utf8_lossy(&line_bytes);
             self.observe_line(line.trim_end_matches(['\n', '\r']));
+        }
+        if self.partial.len() > Self::MAX_PARTIAL_LINE_BYTES {
+            // No newline showed up before the buffer grew past what any
+            // real line of interest could be. Drop it -- keeping only the
+            // fact that a poisoned, still-unterminated line is in flight --
+            // rather than let a newline-less stream grow this without
+            // bound for the life of the check.
+            self.partial.clear();
+            self.partial_overflowed = true;
         }
     }
 
@@ -743,10 +779,19 @@ impl FailureNameScanner {
         let trimmed = line.trim();
         if trimmed == "failures:" {
             self.pending.clear();
+            self.saw_failures_header = true;
             return;
         }
         if line.contains("test result: FAILED") {
-            self.names.extend(self.pending.drain(..));
+            if self.saw_failures_header {
+                self.names.extend(self.pending.drain(..));
+            } else {
+                // No `failures:` header was observed since the last reset,
+                // so nothing in `pending` is trustworthy as a failing test
+                // name -- discard it rather than draining it into `names`.
+                self.pending.clear();
+            }
+            self.saw_failures_header = false;
             return;
         }
         if trimmed.is_empty() || trimmed.starts_with("----") {
@@ -760,7 +805,7 @@ impl FailureNameScanner {
     /// Consumes the scanner, flushing any final unterminated line (a stream
     /// that ends without a trailing newline) before returning the names.
     fn finish(mut self) -> std::collections::BTreeSet<String> {
-        if !self.partial.is_empty() {
+        if !self.partial.is_empty() && !self.partial_overflowed {
             let line = String::from_utf8_lossy(&self.partial).into_owned();
             self.observe_line(line.trim_end_matches(['\n', '\r']));
         }
@@ -2552,6 +2597,88 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; 
                 .any(|name| name.contains("forged")),
             "a repository-authored check must never widen the operator's baseline: {:?}",
             baseline.failing_tests
+        );
+    }
+
+    /// A check whose output stream contains no newlines at all (a hung or
+    /// misbehaving tool writing an ever-growing single line) must not grow
+    /// `FailureNameScanner::partial` without bound -- that would defeat the
+    /// memory cap the 16 KiB display tail is supposed to provide. Feed
+    /// several hundred KB across many chunks, entirely newline-free, and
+    /// assert the scanner's internal buffer stays bounded (not just that it
+    /// eventually finishes) and that no names are ever produced from it.
+    #[test]
+    fn a_newline_less_flood_keeps_the_scanners_partial_buffer_bounded() {
+        let mut scanner = FailureNameScanner::default();
+        let chunk = vec![b'x'; 4096];
+        for _ in 0..128 {
+            scanner.feed(&chunk);
+            assert!(
+                scanner.partial.len() <= FailureNameScanner::MAX_PARTIAL_LINE_BYTES,
+                "partial must never be allowed to grow past the bound: got {} bytes",
+                scanner.partial.len()
+            );
+        }
+        // Fed 128 * 4096 = 512 KiB total with never a single newline.
+        let names = scanner.finish();
+        assert!(
+            names.is_empty(),
+            "a newline-less flood can never contain a real failing test name: {names:?}"
+        );
+    }
+
+    /// `test result: FAILED` with no preceding `failures:` line since the
+    /// last reset must drain nothing into `names` -- otherwise arbitrary
+    /// non-summary output lines that merely happened to precede an
+    /// unrelated `test result: FAILED` line (from a different tool, or a
+    /// `failures:` header lost to some earlier eviction) could be
+    /// misreported as failing test names.
+    #[test]
+    fn test_result_failed_without_a_failures_header_yields_no_names() {
+        let mut scanner = FailureNameScanner::default();
+        scanner.feed(b"running 1 test\n");
+        scanner.feed(b"not_actually_a_test_name\n");
+        scanner.feed(b"neither is this one\n");
+        scanner.feed(
+            b"test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; \
+              finished in 0.01s\n",
+        );
+        let names = scanner.finish();
+        assert!(
+            names.is_empty(),
+            "a `test result: FAILED` with no preceding `failures:` header must yield no names: \
+             {names:?}"
+        );
+    }
+
+    /// Multi-binary behavior must still work with the `failures:`-header
+    /// gate in place: each binary's own `failures:` ... `test result:
+    /// FAILED` block is independently recognized, and a block missing the
+    /// header (simulating a binary whose `failures:` line was lost) drains
+    /// nothing while leaving the properly-headered blocks around it intact.
+    #[test]
+    fn multi_binary_blocks_each_require_their_own_failures_header() {
+        let mut scanner = FailureNameScanner::default();
+        // First binary: proper `failures:` header, one real name.
+        scanner.feed(b"failures:\n");
+        scanner.feed(b"    crate_a::tests::first_failure\n");
+        scanner.feed(b"test result: FAILED. 0 passed; 1 failed\n");
+        // Second binary: no `failures:` header at all -- must contribute
+        // nothing, even though it also ends in `test result: FAILED`.
+        scanner.feed(b"some_unrelated_line\n");
+        scanner.feed(b"test result: FAILED. 0 passed; 1 failed\n");
+        // Third binary: proper header again, a different real name.
+        scanner.feed(b"failures:\n");
+        scanner.feed(b"    crate_b::tests::second_failure\n");
+        scanner.feed(b"test result: FAILED. 0 passed; 1 failed\n");
+        let names = scanner.finish();
+        assert_eq!(
+            names,
+            std::collections::BTreeSet::from([
+                "crate_a::tests::first_failure".to_string(),
+                "crate_b::tests::second_failure".to_string(),
+            ]),
+            "each binary's block must be judged independently by its own header: {names:?}"
         );
     }
 }
