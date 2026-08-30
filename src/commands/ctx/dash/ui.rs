@@ -124,10 +124,17 @@ pub fn row_state_for(state: &PaneState) -> RowState {
 /// `age_secs` is `None` when no registry record could be found for this row
 /// (a race between a fresh spawn and its own registration, in practice) --
 /// it renders as [`style::PLACEHOLDER`], never a fabricated `0s`.
+///
+/// `score` (issue #209/v3 §C, restored after #207 dropped it) is this row's
+/// cached rot score -- `score::cached_score`'s own `None` means *unknown*,
+/// never *healthy*, and renders the same dim placeholder a dead row's score
+/// always does regardless of what is cached for it (a dead pane's last
+/// reading is stale, not a live verdict).
 pub struct SidebarRow {
     pub short: String,
     pub harness: String,
     pub age_secs: Option<u64>,
+    pub score: Option<u32>,
     pub state: RowState,
     pub attached: bool,
     pub selected: bool,
@@ -312,11 +319,52 @@ pub(crate) fn header_rows(area_height: u16) -> u16 {
     1.min(area_height)
 }
 
-/// Splits `area` into (header, sidebar, main): [`header_rows`] header rows, a
-/// `sidebar_cols`-wide sidebar, a one-column separator, and everything else
-/// as the active pane's grid.
-pub fn layout(area: Rect, sidebar_cols: u16) -> (Rect, Rect, Rect) {
-    let header_h = header_rows(area.height);
+/// Pure: how many rows each of the frame's fixed (non-body) chrome pieces
+/// get, in `(header, rule_top, rule_bottom, footer)` order -- issue #209/v3
+/// §A4/§D replaces the sidebar's own full rounded box with a full-width rule
+/// above and below the body plus a new footer row, mirroring the header.
+///
+/// Reserved in priority order, each capped at 1.min(remaining): the header
+/// first (unchanged from before this phase), then the footer (the new
+/// signal row this phase adds -- kept as close to the header's own
+/// guarantee as the remaining height allows), then the two rules last,
+/// since they are pure decoration and a terminal too short for all four
+/// should lose the decoration before it loses either signal row. Every
+/// subtraction is guarded (`saturating_sub`/`.min`), so a zero- or one-row
+/// frame degrades to all-zero chrome rather than underflowing -- the
+/// release profile is `panic = "abort"`.
+pub(crate) fn chrome_rows(area_height: u16) -> (u16, u16, u16, u16) {
+    let header_h = header_rows(area_height);
+    let remaining = area_height.saturating_sub(header_h);
+    let footer_h = 1.min(remaining);
+    let remaining = remaining.saturating_sub(footer_h);
+    let rule_top_h = 1.min(remaining);
+    let remaining = remaining.saturating_sub(rule_top_h);
+    let rule_bottom_h = 1.min(remaining);
+    (header_h, rule_top_h, rule_bottom_h, footer_h)
+}
+
+/// Every rect [`layout`] hands the render loop, named rather than
+/// positional: `header`/`sidebar`/`main`/`footer` are drawn into directly;
+/// `rule_top`/`rule_bottom` are the full-width flat rules that replace the
+/// sidebar's old box border (issue #209/v3 §A4), each zero-height on a frame
+/// too short to afford it (see [`chrome_rows`]).
+pub struct DashLayout {
+    pub header: Rect,
+    pub rule_top: Rect,
+    pub sidebar: Rect,
+    pub main: Rect,
+    pub rule_bottom: Rect,
+    pub footer: Rect,
+}
+
+/// Splits `area` into every chrome rect a v3 frame draws: one header row, a
+/// full-width top rule, a `sidebar_cols`-wide sidebar with a one-column
+/// divider before the grid, a bottom rule mirroring the top one, and one
+/// footer row (§D) -- see [`DashLayout`] and [`chrome_rows`] for how each
+/// piece's height is decided.
+pub fn layout(area: Rect, sidebar_cols: u16) -> DashLayout {
+    let (header_h, rule_top_h, rule_bottom_h, footer_h) = chrome_rows(area.height);
     let header = Rect {
         x: area.x,
         y: area.y,
@@ -324,8 +372,17 @@ pub fn layout(area: Rect, sidebar_cols: u16) -> (Rect, Rect, Rect) {
         height: header_h,
     };
 
-    let body_y = area.y + header_h;
-    let body_h = area.height.saturating_sub(header_h);
+    let rule_top = Rect {
+        x: area.x,
+        y: area.y + header_h,
+        width: area.width,
+        height: rule_top_h,
+    };
+
+    let body_y = area.y + header_h + rule_top_h;
+    let body_h = area
+        .height
+        .saturating_sub(header_h + rule_top_h + rule_bottom_h + footer_h);
     let sidebar_w = sidebar_cols.min(area.width);
     let sidebar = Rect {
         x: area.x,
@@ -342,7 +399,56 @@ pub fn layout(area: Rect, sidebar_cols: u16) -> (Rect, Rect, Rect) {
         height: body_h,
     };
 
-    (header, sidebar, main)
+    let rule_bottom = Rect {
+        x: area.x,
+        y: body_y + body_h,
+        width: area.width,
+        height: rule_bottom_h,
+    };
+
+    let footer = Rect {
+        x: area.x,
+        y: body_y + body_h + rule_bottom_h,
+        width: area.width,
+        height: footer_h,
+    };
+
+    DashLayout {
+        header,
+        rule_top,
+        sidebar,
+        main,
+        rule_bottom,
+        footer,
+    }
+}
+
+/// Issue #209/v3 §A4/§D: the full-width flat rule that replaces the
+/// sidebar's old box border, drawn once above the body (mirroring the
+/// header) and once below it (mirroring the footer). `divider_col` is the
+/// sidebar's own width -- the rule draws a `┬`/`┴` junction there against
+/// the sidebar/grid divider, `top` selects which junction glyph. Dim,
+/// matching `--t-line` in the approved mock, same as
+/// [`render_sidebar_divider`].
+pub fn render_rule(f: &mut Frame, area: Rect, divider_col: u16, top: bool) {
+    if area.is_empty() {
+        return;
+    }
+    let cols = area.width as usize;
+    let junction_at = (divider_col as usize).min(cols.saturating_sub(1));
+    let junction = if top { '\u{252c}' } else { '\u{2534}' };
+    let mut line = String::with_capacity(cols);
+    for col in 0..cols {
+        line.push(if col == junction_at && divider_col < area.width {
+            junction
+        } else {
+            '\u{2500}'
+        });
+    }
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(line, style::tui::muted()))),
+        area,
+    );
 }
 
 /// Maps a `vt100` color to its `ratatui` equivalent. The first sixteen
@@ -500,6 +606,327 @@ pub fn render_header(f: &mut Frame, area: Rect, facts: &HeaderFacts) {
     );
 }
 
+/// Issue #209/v3 §D: the focused session's active `zirv workflow` position,
+/// as much as the footer needs -- the rest of `workflow::ActiveWorkflowSummary`
+/// (attempts, artifacts, review evidence, ...) has no footer segment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FooterWorkflow {
+    /// This session's repo has no active workflow at all.
+    None,
+    Active {
+        kind: String,
+        step: String,
+        /// The current step is gated on the operator's own approval
+        /// (`WorkflowStatus::AwaitingApproval`) -- Q4: escalates to
+        /// yellow-bold, the same weight unread mail already gets.
+        gated: bool,
+    },
+}
+
+/// The footer's own facts for the focused pane (Q1: focused-only, never one
+/// row per live harness) -- issue #209/v3 §D's new signal row, one below
+/// the grid. `None` when nothing is focused at all (an empty dashboard);
+/// nothing draws.
+pub enum FooterFacts {
+    None,
+    Alive(FooterAliveFacts),
+    Dead(FooterDeadFacts),
+}
+
+/// The healthy/attention footer shapes (mock §04's first two examples) --
+/// they differ only in *values*, not in which fields exist.
+pub struct FooterAliveFacts {
+    pub harness: String,
+    /// `None` when no cached score exists yet for this session -- renders
+    /// the same `✻ –` unknown placeholder the wrap bar's own `BarState`
+    /// uses for the identical case.
+    pub score: Option<u32>,
+    pub usage_five_hour: Option<f64>,
+    pub usage_seven_day: Option<f64>,
+    /// Total unread mail (broadcast + direct) for this session. The mock's
+    /// footer shows one unlabeled number, unlike the wrap bar's own
+    /// broadcast/direct `+`-split -- `0` renders the dim placeholder.
+    pub unread_mail: usize,
+    pub workflow: FooterWorkflow,
+    /// Always `true` in this phase: a focused pane can only ever be one
+    /// this dashboard itself spawned and is actively running its own
+    /// supervise/idle/reap loop over (`ui::SidebarRow::focused`'s own doc
+    /// comment -- focus never lands on a view-only registry row). There is
+    /// no dash-observable "degraded" signal the way `wrap`'s own in-process
+    /// child monitoring has one (`chrome::BarState::degraded`); surfacing
+    /// that would need new plumbing this issue's scope (§E) does not call
+    /// for, so the footer's supervision segment stays the mock's own
+    /// steady-state `● supervised` until such a signal exists.
+    pub supervised: bool,
+}
+
+/// The dead-pane-focused footer shape (mock §04's third example): a
+/// different message entirely, not just different values -- there is no
+/// verdict, usage or mail segment for a session that has already exited.
+pub struct FooterDeadFacts {
+    pub harness: String,
+    pub exited_age_secs: Option<u64>,
+    pub workflow: FooterWorkflow,
+}
+
+/// One footer segment, already styled per-piece (a segment is sometimes
+/// more than one span -- the verdict's glyph+word and its dim score number,
+/// for instance) but not yet joined to its neighbours. Named to keep every
+/// footer-assembly signature below readable, the same reason `chrome.rs`
+/// names its own `Segments` alias.
+type FooterSeg = Vec<(String, Style)>;
+
+/// Pure: `workflow`'s own footer text, in its full and width-compressed
+/// forms (§D's drop order compresses the workflow segment before dropping
+/// it outright) -- `(full, compressed)`, both already styled. `None` has
+/// only the one dim `▸ –` form; a gated step's compressed form gains the
+/// `!` suffix mentioned nowhere but the mock's own 44-column example.
+fn footer_workflow_spans(workflow: &FooterWorkflow) -> (FooterSeg, FooterSeg) {
+    match workflow {
+        FooterWorkflow::None => {
+            let dim = vec![(
+                format!("\u{25b8} {}", style::PLACEHOLDER),
+                style::tui::muted(),
+            )];
+            (dim.clone(), dim)
+        }
+        FooterWorkflow::Active { kind, step, gated } => {
+            if *gated {
+                let style = style::tui::warning().add_modifier(Modifier::BOLD);
+                let full = vec![(format!("\u{25b8} {step} awaits approval"), style)];
+                let compressed = vec![(format!("\u{25b8} {step}!"), style)];
+                (full, compressed)
+            } else {
+                let style = style::tui::muted();
+                let full = vec![(format!("\u{25b8} {kind} \u{b7} {step}"), style)];
+                let compressed = vec![(format!("\u{25b8} {step}"), style)];
+                (full, compressed)
+            }
+        }
+    }
+}
+
+/// Three plain spaces between top-level footer segments, mirroring
+/// `chrome::BAR_SEGMENT_GAP` -- the footer reuses the wrap bar's own
+/// grammar verbatim (minus the chip, per the mock's own note).
+const FOOTER_SEGMENT_GAP: &str = "   ";
+
+/// Pure: the alive-pane footer's spans, width-budgeted to `cols`, applying
+/// §D's own drop order: usage first, then the verdict's score number, then
+/// the workflow segment (full form, then compressed, then dropped
+/// entirely), then the harness label -- verdict word/glyph, mail and
+/// supervision are never dropped.
+fn footer_alive_spans(
+    facts: &FooterAliveFacts,
+    advise_at: u32,
+    compact_at: u32,
+    cols: u16,
+) -> Vec<Span<'static>> {
+    let cols = cols as usize;
+
+    let harness: FooterSeg = vec![(facts.harness.clone(), Style::default())];
+
+    let (verdict_full, verdict_reduced): (FooterSeg, FooterSeg) = match facts.score {
+        Some(score) => {
+            let band = rot_band_for(score, advise_at, compact_at);
+            let word = match band {
+                RotBand::Fresh => "fresh",
+                RotBand::Warming => "warming",
+                RotBand::Rotting => "rotting",
+            };
+            let style = footer_rot_style(band);
+            let full = vec![
+                (format!("{ROT_GLYPH} {word}"), style),
+                (format!(" {score}"), style::tui::muted()),
+            ];
+            let reduced = vec![(format!("{ROT_GLYPH} {word}"), style)];
+            (full, reduced)
+        }
+        None => {
+            let unknown = vec![(
+                format!("{ROT_GLYPH} {}", style::PLACEHOLDER),
+                style::tui::muted(),
+            )];
+            (unknown.clone(), unknown)
+        }
+    };
+
+    let usage: FooterSeg = {
+        let five = facts
+            .usage_five_hour
+            .map(style::format_pct)
+            .unwrap_or_else(|| style::PLACEHOLDER.to_string());
+        let seven = facts
+            .usage_seven_day
+            .map(style::format_pct)
+            .unwrap_or_else(|| style::PLACEHOLDER.to_string());
+        vec![(format!("\u{25d4} {five}\u{b7}{seven}"), style::tui::muted())]
+    };
+
+    let mail: FooterSeg = if facts.unread_mail == 0 {
+        vec![(
+            format!("\u{2709} {}", style::PLACEHOLDER),
+            style::tui::muted(),
+        )]
+    } else {
+        let style = style::tui::warning().add_modifier(Modifier::BOLD);
+        vec![(format!("\u{2709} {}", facts.unread_mail), style)]
+    };
+
+    let (workflow_full, workflow_compressed) = footer_workflow_spans(&facts.workflow);
+
+    let supervision: FooterSeg = if facts.supervised {
+        vec![
+            ("\u{25cf} ".to_string(), style::tui::ok()),
+            ("supervised".to_string(), Style::default()),
+        ]
+    } else {
+        vec![("\u{25b2} unsupervised".to_string(), style::tui::error())]
+    };
+
+    // §D's own drop order, most to least generous: every segment present,
+    // then usage dropped, then the verdict's score number dropped too, then
+    // the workflow segment compressed, then dropped entirely, then the
+    // harness label dropped as a last resort -- the verdict word/glyph,
+    // mail and supervision segments are never dropped. Mirrors
+    // `chrome::status_bar`'s own tiered-candidate shape.
+    let tiers = [
+        join_footer_segments(&[
+            &harness,
+            &verdict_full,
+            &usage,
+            &mail,
+            &workflow_full,
+            &supervision,
+        ]),
+        join_footer_segments(&[&harness, &verdict_full, &mail, &workflow_full, &supervision]),
+        join_footer_segments(&[
+            &harness,
+            &verdict_reduced,
+            &mail,
+            &workflow_full,
+            &supervision,
+        ]),
+        join_footer_segments(&[
+            &harness,
+            &verdict_reduced,
+            &mail,
+            &workflow_compressed,
+            &supervision,
+        ]),
+        join_footer_segments(&[&harness, &verdict_reduced, &mail, &supervision]),
+        join_footer_segments(&[&verdict_reduced, &mail, &supervision]),
+    ];
+    choose_footer_tier(&tiers, cols)
+}
+
+/// Pure: joins `segments` with [`FOOTER_SEGMENT_GAP`] between each one
+/// present, in order.
+fn join_footer_segments(segments: &[&FooterSeg]) -> FooterSeg {
+    let mut out = FooterSeg::new();
+    for (i, seg) in segments.iter().enumerate() {
+        if i > 0 {
+            out.push((FOOTER_SEGMENT_GAP.to_string(), Style::default()));
+        }
+        out.extend(seg.iter().cloned());
+    }
+    out
+}
+
+/// Pure: total display width of a joined footer segment.
+fn footer_seg_width(pieces: &[(String, Style)]) -> usize {
+    pieces.iter().map(|(t, _)| style::display_width(t)).sum()
+}
+
+/// Pure: the first `tiers` entry (most generous first) that fits `cols`, or
+/// -- if even the narrowest tier overflows -- that narrowest tier hard-
+/// truncated to `cols` with no ellipsis, exactly `chrome::status_bar`'s own
+/// last resort. `Paragraph` would clip silently past `area`'s own width
+/// regardless; this keeps the pure function itself honest about `cols` for
+/// its own tests.
+fn choose_footer_tier(tiers: &[FooterSeg], cols: usize) -> Vec<Span<'static>> {
+    let chosen = tiers
+        .iter()
+        .find(|tier| footer_seg_width(tier) <= cols)
+        .unwrap_or_else(|| tiers.last().expect("at least one tier"));
+
+    if footer_seg_width(chosen) <= cols {
+        return chosen
+            .iter()
+            .map(|(text, style)| Span::styled(text.clone(), *style))
+            .collect();
+    }
+    let plain: String = chosen.iter().map(|(t, _)| t.as_str()).collect();
+    vec![Span::raw(
+        style::truncate_display(&plain, cols).into_owned(),
+    )]
+}
+
+/// Pure: the dead-pane-focused footer's spans (mock §04's third example) --
+/// a different message entirely, not the alive shape with blanks. The
+/// exited notice and the restore hint are never dropped; `harness` and the
+/// workflow segment are the only droppable pieces, in that order (the
+/// restore hint is the one actionable thing this state exists to tell the
+/// operator, so it survives longest).
+fn footer_dead_spans(facts: &FooterDeadFacts, cols: u16) -> Vec<Span<'static>> {
+    let cols = cols as usize;
+
+    let harness: FooterSeg = vec![(facts.harness.clone(), Style::default())];
+
+    let exited: FooterSeg = {
+        let age = facts
+            .exited_age_secs
+            .map(style::format_age)
+            .unwrap_or_else(|| style::PLACEHOLDER.to_string());
+        vec![
+            ("\u{2717} exited".to_string(), style::tui::error()),
+            (format!(" {age} ago"), style::tui::muted()),
+        ]
+    };
+
+    let (workflow_full, _) = footer_workflow_spans(&facts.workflow);
+
+    let restore_hint: FooterSeg = vec![
+        ("\u{21ba} ".to_string(), style::tui::accent()),
+        (
+            "^A r".to_string(),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        (" restore".to_string(), style::tui::hint()),
+    ];
+
+    let tiers = [
+        join_footer_segments(&[&harness, &exited, &workflow_full, &restore_hint]),
+        join_footer_segments(&[&harness, &exited, &restore_hint]),
+        join_footer_segments(&[&exited, &restore_hint]),
+    ];
+    choose_footer_tier(&tiers, cols)
+}
+
+/// Issue #209/v3 §D: the footer signal row, describing whichever pane is
+/// focused. `advise_at`/`compact_at` are `rot::ScoreConfig`'s own
+/// thresholds, threaded through exactly as [`render_sidebar`] takes them.
+pub fn render_footer(
+    f: &mut Frame,
+    area: Rect,
+    facts: &FooterFacts,
+    advise_at: u32,
+    compact_at: u32,
+) {
+    if area.is_empty() {
+        return;
+    }
+    let spans = match facts {
+        FooterFacts::None => return,
+        FooterFacts::Alive(alive) => footer_alive_spans(alive, advise_at, compact_at, area.width),
+        FooterFacts::Dead(dead) => footer_dead_spans(dead, area.width),
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(spans)),
+        Rect { height: 1, ..area },
+    );
+}
+
 /// Pure: the first sidebar row drawn, given how many rows there are, how many
 /// fit inside the block's border, and which one the cursor is on.
 ///
@@ -552,71 +979,254 @@ fn glyph_style_for(state: RowState) -> Style {
     }
 }
 
-/// Pure: a sidebar row split into its glyph and the rest of the line
-/// (`{short:<8} {harness}`, with the age right-aligned against whatever
-/// column budget is left), both already fitted to `cols` display columns as
-/// one unit. Shared by [`sidebar_row_text`] (the plain-text test/measurement
+/// The colour band a rot score falls into, mirroring the same three-band
+/// collapse `chrome::verdict_paint` draws for the wrap status bar (healthy
+/// vs. advise vs. compact-or-restart) but keyed on the score alone: the
+/// dashboard does not track each pane's live context-token count the way
+/// `wrap` does, so there is no token-gate escalation (`rot::verdict_for`) to
+/// fold in here -- see [`rot_band_for`]'s own doc comment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RotBand {
+    Fresh,
+    Warming,
+    Rotting,
+}
+
+/// Pure: which [`RotBand`] a raw rot `score` falls into, given the same
+/// `advise_at`/`compact_at` thresholds `rot::ScoreConfig` already carries
+/// (passed through rather than re-read, so this stays a plain function of
+/// its arguments). `restart_at` collapses into `Rotting` alongside
+/// `compact_at`, matching `chrome::verdict_paint`'s own three-colour band.
+pub fn rot_band_for(score: u32, advise_at: u32, compact_at: u32) -> RotBand {
+    if score >= compact_at {
+        RotBand::Rotting
+    } else if score >= advise_at {
+        RotBand::Warming
+    } else {
+        RotBand::Fresh
+    }
+}
+
+/// The sidebar's own rot-glyph style: warming is yellow, rotting is
+/// red-bold, and -- per the approved mock (§03) -- fresh gets no colour of
+/// its own at all, inheriting whatever tone the row it sits in already
+/// carries. Never call this for a selected row: see `render_sidebar`'s own
+/// selected-row handling, which drops every glyph's own colour outright
+/// (§B) rather than composing it with `Modifier::REVERSED`.
+fn sidebar_rot_style(band: RotBand) -> Style {
+    match band {
+        RotBand::Fresh => Style::default(),
+        RotBand::Warming => style::tui::warning(),
+        RotBand::Rotting => style::tui::error(),
+    }
+}
+
+/// The footer's own rot-verdict style (§D): unlike the sidebar, fresh gets
+/// an explicit green here -- the footer has no surrounding row tone to
+/// inherit the way a sidebar row does, so it colours all three bands
+/// outright, exactly `chrome::verdict_paint` does for the wrap bar's own
+/// verdict segment.
+fn footer_rot_style(band: RotBand) -> Style {
+    match band {
+        RotBand::Fresh => style::tui::ok(),
+        RotBand::Warming => style::tui::warning(),
+        RotBand::Rotting => style::tui::error(),
+    }
+}
+
+/// The rot glyph itself -- the same star `chrome::status_bar` already draws
+/// for the wrap bar's own verdict segment, so a session reads identically
+/// whether it is shown from inside (wrap) or from the dash.
+const ROT_GLYPH: &str = "\u{273b}";
+
+/// Pure: a sidebar row's rot column text, colourless -- [`render_sidebar`]
+/// paints it. `None` (dead pane, or no cached score at all) is always the
+/// shared placeholder, never a fabricated reading: a dead pane's last cached
+/// score is stale, not a live verdict, so it renders the same as "unknown"
+/// regardless of what happens to still be cached for it.
+fn rot_text(row: &SidebarRow) -> String {
+    if row.state == RowState::Dead {
+        return style::PLACEHOLDER.to_string();
+    }
+    match row.score {
+        Some(score) => format!("{ROT_GLYPH}{score}"),
+        None => style::PLACEHOLDER.to_string(),
+    }
+}
+
+/// One sidebar row's pieces, already fitted to `cols` display columns as one
+/// unit. Shared by [`sidebar_row_text`] (the plain-text test/measurement
 /// surface) and [`render_sidebar`] (the styled renderer), so the two can
 /// never disagree about layout.
-fn sidebar_row_parts(row: &SidebarRow, tick: usize, cols: u16) -> (String, String) {
+///
+/// Width pressure drops fields in a fixed order (§C): the age column goes
+/// first, then the rot score's own digits -- its glyph survives alone
+/// (`rot` becomes just [`ROT_GLYPH`]), so the verdict's colour never
+/// disappears outright, only the number attached to it. `short`/`harness`
+/// are the last resort, hard-truncated exactly as before this phase.
+struct SidebarLayout {
+    glyph: String,
+    left: String,
+    rot: String,
+    age: String,
+}
+
+/// Pure: lays a sidebar row out into [`SidebarLayout`]'s pieces, applying
+/// the §C width-degradation order above. See [`sidebar_row_parts`]'s own
+/// former doc comment (kept here) for the original `{short:<8} {harness}`
+/// shape this still produces for `left`.
+fn sidebar_row_parts(row: &SidebarRow, tick: usize, cols: u16) -> SidebarLayout {
     let cols = cols as usize;
     let glyph = glyph_char_for(row.state, tick).to_string();
     if cols == 0 {
-        return (String::new(), String::new());
+        return SidebarLayout {
+            glyph: String::new(),
+            left: String::new(),
+            rot: String::new(),
+            age: String::new(),
+        };
     }
     let glyph_w = style::display_width(&glyph);
     if cols <= glyph_w {
-        return (
-            style::truncate_display(&glyph, cols).into_owned(),
-            String::new(),
-        );
+        return SidebarLayout {
+            glyph: style::truncate_display(&glyph, cols).into_owned(),
+            left: String::new(),
+            rot: String::new(),
+            age: String::new(),
+        };
     }
 
     let rest_cols = cols - glyph_w - 1; // one separating space
     let left = format!("{:<8} {}", row.short, row.harness);
+    let left_w = style::display_width(&left);
     let age = row
         .age_secs
         .map(style::format_age)
         .unwrap_or_else(|| style::PLACEHOLDER.to_string());
-    let left_w = style::display_width(&left);
     let age_w = style::display_width(&age);
+    let rot_full = rot_text(row);
+    let rot_full_w = style::display_width(&rot_full);
+    let rot_glyph_only = ROT_GLYPH.to_string();
+    let rot_glyph_w = style::display_width(&rot_glyph_only);
+    let pad = |n: usize| " ".repeat(n);
 
-    let rest = if left_w + 1 + age_w <= rest_cols {
-        let pad = rest_cols - left_w - age_w;
-        format!("{left}{}{age}", " ".repeat(pad))
-    } else {
-        let truncated = style::truncate_display(&left, rest_cols).into_owned();
-        let fill = rest_cols.saturating_sub(style::display_width(&truncated));
-        format!("{truncated}{}", " ".repeat(fill))
-    };
-    (glyph, rest)
+    // §C's drop order, most to least generous: full rot number + age, then
+    // the rot number reduced to just its coloured glyph (age dropped), then
+    // no rot column at all (age dropped too), then a hard truncation of
+    // `left` itself. Whichever tier fits gets the *entire* leftover slack as
+    // trailing padding on its last surviving field (age right-aligned when
+    // it survives, otherwise the rot glyph or `left` itself) -- exactly the
+    // single-tier version's own `pad`/`fill` did -- so a selected row's
+    // REVERSED background always reaches the full `cols` width, never just
+    // the text.
+    if left_w + 1 + rot_full_w + 1 + age_w <= rest_cols {
+        let slack = rest_cols - (left_w + 1 + rot_full_w + 1 + age_w);
+        return SidebarLayout {
+            glyph,
+            left,
+            rot: rot_full,
+            age: format!("{}{age}", pad(slack)),
+        };
+    }
+    if left_w + 1 + rot_full_w <= rest_cols {
+        let slack = rest_cols - (left_w + 1 + rot_full_w);
+        return SidebarLayout {
+            glyph,
+            left,
+            rot: format!("{rot_full}{}", pad(slack)),
+            age: String::new(),
+        };
+    }
+    if left_w + 1 + rot_glyph_w <= rest_cols {
+        let slack = rest_cols - (left_w + 1 + rot_glyph_w);
+        return SidebarLayout {
+            glyph,
+            left,
+            rot: format!("{rot_glyph_only}{}", pad(slack)),
+            age: String::new(),
+        };
+    }
+    if left_w <= rest_cols {
+        let slack = rest_cols - left_w;
+        return SidebarLayout {
+            glyph,
+            left: format!("{left}{}", pad(slack)),
+            rot: String::new(),
+            age: String::new(),
+        };
+    }
+    // Nothing fit even bare `left`: hard-truncate it, exactly as before this
+    // phase.
+    let truncated = style::truncate_display(&left, rest_cols).into_owned();
+    let fill = rest_cols.saturating_sub(style::display_width(&truncated));
+    SidebarLayout {
+        glyph,
+        left: format!("{truncated}{}", pad(fill)),
+        rot: String::new(),
+        age: String::new(),
+    }
 }
 
 /// Pure: one sidebar row's full plain text, exactly `cols` display columns
 /// wide (or shorter only when `cols` itself has no room for a full row) --
-/// `{glyph} {short:<8} {harness} {age}`, age right-aligned. Built from the
-/// same [`sidebar_row_parts`] the styled renderer uses, so the two can never
+/// `{glyph} {short:<8} {harness} {rot} {age}`, age right-aligned, padded to
+/// fill whatever room the dropped fields left behind. Built from the same
+/// [`sidebar_row_parts`] the styled renderer uses, so the two can never
 /// disagree about layout; test-only, since nothing in the render path needs
 /// the unstyled concatenation.
 #[cfg(test)]
 fn sidebar_row_text(row: &SidebarRow, tick: usize, cols: u16) -> String {
-    let (glyph, rest) = sidebar_row_parts(row, tick, cols);
+    let layout = sidebar_row_parts(row, tick, cols);
+    let mut rest = layout.left;
+    for part in [layout.rot, layout.age] {
+        if !part.is_empty() {
+            rest.push(' ');
+            rest.push_str(&part);
+        }
+    }
     if rest.is_empty() {
-        glyph
+        layout.glyph
     } else {
-        format!("{glyph} {rest}")
+        format!("{} {rest}", layout.glyph)
     }
 }
 
-pub fn render_sidebar(f: &mut Frame, area: Rect, rows: &[SidebarRow], tick: usize) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded);
-    // The rows and columns the border actually leaves room for -- what the
-    // offset and the row truncation are computed against, so the window and
-    // the drawn area cannot disagree. `Block::inner` saturates, so a sidebar
-    // narrower than its own border yields zero of both rather than underflow.
-    let inner = block.inner(area);
+/// Issue #209/v3 §A4: the sidebar's own flat divider column -- what used to
+/// be the right edge of its full rounded `Block::bordered()` -- against the
+/// grid. Dim, matching `--t-line` in the approved mock; a full box is now
+/// reserved for the banner and overlays only.
+pub fn render_sidebar_divider(f: &mut Frame, area: Rect) {
+    if area.is_empty() {
+        return;
+    }
+    let line = "\u{2502}".repeat(area.height as usize);
+    let lines: Vec<Line> = line
+        .chars()
+        .map(|c| Line::from(Span::styled(c.to_string(), style::tui::muted())))
+        .collect();
+    f.render_widget(Paragraph::new(Text::from(lines)), area);
+}
+
+/// `advise_at`/`compact_at` are `rot::ScoreConfig`'s own thresholds, passed
+/// through by the caller (`dash::mod` already has the loaded `CtxConfig`)
+/// rather than duplicated here as defaults -- an operator's configured
+/// thresholds drive the sidebar's rot colour exactly as they drive
+/// `rot::verdict_for`'s own bands.
+pub fn render_sidebar(
+    f: &mut Frame,
+    area: Rect,
+    rows: &[SidebarRow],
+    tick: usize,
+    advise_at: u32,
+    compact_at: u32,
+) {
+    // Issue #209/v3 §A4: the sidebar no longer draws its own full rounded
+    // box -- that framing is reserved for the banner and overlays now, per
+    // the approved mock. What used to be `Block::inner` is simply `area`
+    // itself; the flat divider that replaces the box's right border is
+    // drawn separately by `render_sidebar_divider`, called alongside this
+    // from the same layout the removed block used to own.
+    let inner = area;
     let visible = inner.height as usize;
     let selected = rows.iter().position(|r| r.selected).unwrap_or(0);
     let offset = sidebar_offset(rows.len(), visible, selected);
@@ -626,7 +1236,7 @@ pub fn render_sidebar(f: &mut Frame, area: Rect, rows: &[SidebarRow], tick: usiz
         .skip(offset)
         .take(visible)
         .map(|row| {
-            let (glyph, rest) = sidebar_row_parts(row, tick, inner.width);
+            let layout = sidebar_row_parts(row, tick, inner.width);
             let mut base = Style::default();
             // A view-only row is a live session in the registry that this
             // dashboard did not spawn: the sidebar cursor can walk onto it,
@@ -639,36 +1249,60 @@ pub fn render_sidebar(f: &mut Frame, area: Rect, rows: &[SidebarRow], tick: usiz
             }
             // The keyboard-focus marker used to be a literal `*` prefix
             // character; folded into the row's own weight instead so the
-            // compact `{glyph} {short} {harness} {age}` format never needs a
-            // fifth column for it. Combined with `selected` (REVERSED) this
-            // is exactly `style::tui::selected_strong()`'s own shape.
+            // compact `{glyph} {short} {harness} {rot} {age}` format never
+            // needs a sixth column for it. Combined with `selected`
+            // (REVERSED) this is exactly `style::tui::selected_strong()`'s
+            // own shape.
             if row.focused {
                 base = base.add_modifier(Modifier::BOLD);
             }
-            let mut glyph_style = glyph_style_for(row.state).patch(base);
-            let mut rest_style = base;
-            if row.selected {
-                glyph_style = glyph_style.add_modifier(Modifier::REVERSED);
-                rest_style = rest_style.add_modifier(Modifier::REVERSED);
+            let rot_band = row
+                .score
+                .filter(|_| row.state != RowState::Dead)
+                .map(|score| rot_band_for(score, advise_at, compact_at));
+            // Bug fix (issue #209/v3 §B, operator-reported): a selected row
+            // used to patch REVERSED onto the glyph's *own* fg colour
+            // (cyan/green/red from `glyph_style_for`) -- ratatui's REVERSED
+            // swaps fg and bg at render time, so that colour became the
+            // row's background while the glyph itself rendered in whatever
+            // the terminal treats as the default foreground: a colored block
+            // with a background-colored glyph, not a uniformly reversed row.
+            // On a selected row every glyph (state and rot alike) drops its
+            // own colour entirely and joins the row's plain `base` style
+            // before REVERSED is applied, exactly as the mock's focused row
+            // shows -- the state is still legible from the glyph *character*
+            // (spinner/●/✗/·), just not from an extra colour layered under
+            // the reversal.
+            let (glyph_style, rot_style, plain_style) = if row.selected {
+                let reversed = base.add_modifier(Modifier::REVERSED);
+                (reversed, reversed, reversed)
+            } else {
+                // `None` (dead pane, or nothing cached) renders the same
+                // muted placeholder every other unknown value in this row
+                // already does -- not `base`, which would draw the en dash
+                // at full strength.
+                let rot_style = match rot_band {
+                    Some(band) => sidebar_rot_style(band).patch(base),
+                    None => style::tui::muted().patch(base),
+                };
+                (glyph_style_for(row.state).patch(base), rot_style, base)
+            };
+            let mut spans = vec![
+                Span::styled(layout.glyph, glyph_style),
+                Span::styled(format!(" {}", layout.left), plain_style),
+            ];
+            if !layout.rot.is_empty() {
+                spans.push(Span::styled(" ".to_string(), plain_style));
+                spans.push(Span::styled(layout.rot, rot_style));
             }
-            let line = Line::from(vec![
-                Span::styled(glyph, glyph_style),
-                Span::styled(format!(" {rest}"), rest_style),
-            ]);
-            ListItem::new(line)
+            if !layout.age.is_empty() {
+                spans.push(Span::styled(format!(" {}", layout.age), plain_style));
+            }
+            ListItem::new(Line::from(spans))
         })
         .collect();
 
-    // The same affordance the grid's `SCROLL -N` marker gives a scrolled pane,
-    // in the one place the sidebar has room for it: a window into a longer
-    // list says so, so a truncated session list does not read as the whole of
-    // it. A list that fits keeps the bare title.
-    let title = if rows.len() > visible && visible > 0 {
-        format!("panes {}-{}/{}", offset + 1, offset + visible, rows.len())
-    } else {
-        "panes".to_string()
-    };
-    f.render_widget(List::new(items).block(block.title(title)), area);
+    f.render_widget(List::new(items), area);
 }
 
 /// Pure: whether visible-grid cell `(row, col)` falls inside a selection
@@ -904,6 +1538,14 @@ fn draft_lines(text: &str) -> Vec<String> {
         .collect()
 }
 
+/// The border colour every dialog frame draws in (except the warn variant,
+/// which keeps yellow): dim cyan, per the approved v3 mock (§A2). Shared by
+/// [`render_dialog`] and [`render_list_dialog`] so the two frame primitives
+/// can never drift from each other.
+fn dialog_border_style() -> Style {
+    Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM)
+}
+
 /// The plain (non-list) dialog frame: rounded, one column of horizontal
 /// interior padding, opaque (`Clear` first, or the pane grid underneath
 /// bleeds through every cell neither the border nor the text reaches -- see
@@ -925,6 +1567,12 @@ fn render_dialog(f: &mut Frame, area: Rect, title: &str, lines: &[String]) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
+        // Issue #209/v3 §A2: the shared dialog frame's border was colourless
+        // (the terminal default) -- the approved mock gives every dialog a
+        // dim-cyan border, matching the list-dialog primitive right below.
+        // Not `tui::accent()` itself: that is now bold (§A1), and a bold
+        // border would out-shout the title it is meant to frame.
+        .border_style(dialog_border_style())
         .padding(Padding::horizontal(1))
         .title(Span::styled(title.to_string(), style::tui::accent()));
     // `Clear` first, or the dialog is transparent: a `Block` paints only its
@@ -1032,11 +1680,20 @@ pub fn render_list_dialog(f: &mut Frame, area: Rect, spec: &ListDialogSpec) {
     let border_style = if spec.warn {
         style::tui::warning()
     } else {
-        Style::default()
+        // Issue #209/v3 §A2: dim-cyan, not the terminal-default colourless
+        // border every dialog drew before.
+        dialog_border_style()
     };
-    let title_text = match spec.count {
-        Some(n) => format!("{} ({n})", spec.title),
-        None => spec.title.to_string(),
+    // Issue #209/v3 §A3: `{title} · {n}` -- the title keeps its own accent
+    // (or warning) weight and the count is a separate, dim span, replacing
+    // the old single-span `{title} (n)` where the count read at the same
+    // weight as the title itself.
+    let title_spans: Vec<Span<'static>> = match spec.count {
+        Some(n) => vec![
+            Span::styled(spec.title.to_string(), title_style),
+            Span::styled(format!(" \u{b7} {n}"), style::tui::muted()),
+        ],
+        None => vec![Span::styled(spec.title.to_string(), title_style)],
     };
 
     let content_rows = spec.rows.len().max(1);
@@ -1051,7 +1708,7 @@ pub fn render_list_dialog(f: &mut Frame, area: Rect, spec: &ListDialogSpec) {
         .border_type(BorderType::Rounded)
         .border_style(border_style)
         .padding(Padding::horizontal(1))
-        .title(Span::styled(title_text, title_style));
+        .title(Line::from(title_spans));
 
     f.render_widget(Clear, rect);
     let inner = block.inner(rect);
@@ -1084,16 +1741,22 @@ pub fn render_list_dialog(f: &mut Frame, area: Rect, spec: &ListDialogSpec) {
                     .iter()
                     .map(|s| style::display_width(s.content.as_ref()))
                     .sum();
+                // Bug fix (issue #209/v3 §B): the same defect as the
+                // sidebar's selected row (see `render_sidebar`'s own doc
+                // comment) -- patching REVERSED onto a span's own colour
+                // (the QuitConfirm spinner glyph, in practice) swapped that
+                // colour into the background and left the glyph rendered in
+                // the terminal's default foreground instead of reversing
+                // uniformly. Every span on the cursor row drops its own
+                // style and takes the same plain reversed one.
+                let reversed_style = Style::default().add_modifier(Modifier::REVERSED);
                 let mut reversed: Vec<Span> = spans
                     .into_iter()
-                    .map(|s| Span::styled(s.content, s.style.add_modifier(Modifier::REVERSED)))
+                    .map(|s| Span::styled(s.content, reversed_style))
                     .collect();
                 let pad = inner_width.saturating_sub(raw_width);
                 if pad > 0 {
-                    reversed.push(Span::styled(
-                        " ".repeat(pad),
-                        Style::default().add_modifier(Modifier::REVERSED),
-                    ));
+                    reversed.push(Span::styled(" ".repeat(pad), reversed_style));
                 }
                 lines.push(Line::from(reversed));
             } else {
@@ -1154,11 +1817,10 @@ fn render_mail_dialog(f: &mut Frame, area: Rect, view: &MailView) {
             count: Some(view.items.len()),
             rows,
             cursor,
-            footer: &[
-                ("\u{23ce}", "read+consume"),
-                ("c", "compose"),
-                ("esc", "close"),
-            ],
+            // Issue #209/v3 §A5: shares `MAIL_FOOTER` with the help overlay's
+            // own "dialogs:" listing rather than a second, easily-drifting
+            // copy of the same four hints.
+            footer: MAIL_FOOTER,
             warn: false,
             empty_message: "(no mail)",
         },
@@ -1572,6 +2234,10 @@ const QUIT_FOOTER: &[(&str, &str)] = &[("\u{23ce}", "quit and shut down"), ("esc
 const MAIL_FOOTER: &[(&str, &str)] = &[
     ("\u{23ce}", "read+consume"),
     ("c", "compose"),
+    // Issue #209/v3 §A5: `j/k` already moved the cursor (shared with every
+    // other list dialog's up/down handling); this only documents it, per
+    // the approved mock's footer.
+    ("j/k", "move"),
     ("esc", "close"),
 ];
 const MEMORY_FOOTER: &[(&str, &str)] = &[
@@ -2033,22 +2699,35 @@ mod tests {
         assert!(text.trim().is_empty(), "got {text:?}");
     }
 
+    /// Issue #209/v3 §A4/§D: the sidebar's own box border becomes a
+    /// full-width top rule and bottom rule around the body, plus a new
+    /// footer row -- one of each on a frame with room for all four.
     #[test]
-    fn layout_reserves_the_header_rows_and_the_sidebar() {
-        let (h, s, m) = layout(Rect::new(0, 0, 100, 30), 24);
-        assert_eq!(h.height, 1, "one header row at every height");
-        assert_eq!(s.width, 24);
-        assert_eq!(m.width, 76 - 1);
-        assert_eq!(m.height, 29);
+    fn layout_reserves_the_header_rules_footer_and_the_sidebar() {
+        let l = layout(Rect::new(0, 0, 100, 30), 24);
+        assert_eq!(l.header.height, 1, "one header row at every height");
+        assert_eq!(l.rule_top.height, 1);
+        assert_eq!(l.rule_bottom.height, 1);
+        assert_eq!(l.footer.height, 1);
+        assert_eq!(l.sidebar.width, 24);
+        assert_eq!(l.main.width, 100 - 24 - 1);
+        assert_eq!(l.sidebar.height, 30 - 1 - 1 - 1 - 1);
+        assert_eq!(l.main.height, l.sidebar.height);
     }
 
     #[test]
     fn layout_is_stable_on_a_tiny_area_without_underflow() {
-        let (h, s, m) = layout(Rect::new(0, 0, 10, 2), 24);
-        assert_eq!(h.height, 1);
-        assert_eq!(s.width, 10);
-        assert_eq!(m.width, 0);
-        assert_eq!(m.height, 1);
+        let l = layout(Rect::new(0, 0, 10, 2), 24);
+        assert_eq!(l.header.height, 1);
+        // Only the header and the footer fit in a two-row frame -- the
+        // rules are the first chrome dropped (`chrome_rows`'s own priority
+        // order), and the body has nothing left at all.
+        assert_eq!(l.footer.height, 1);
+        assert_eq!(l.rule_top.height, 0);
+        assert_eq!(l.rule_bottom.height, 0);
+        assert_eq!(l.sidebar.width, 10);
+        assert_eq!(l.main.width, 0);
+        assert_eq!(l.main.height, 0);
     }
 
     /// The header is one row at every height. A zero/one-row frame never
@@ -2065,10 +2744,20 @@ mod tests {
         );
         assert_eq!(header_rows(super::super::super::chrome::MIN_DASH_ROWS), 1);
         assert_eq!(header_rows(200), 1);
-        // And the body never loses more rows than the header gained.
+        // And the body never loses more rows than the fixed chrome gained --
+        // every row of `height` is accounted for by exactly one of the six
+        // rects `layout` hands back.
         for height in 0..=64u16 {
-            let (h, _, m) = layout(Rect::new(0, 0, 80, height), 24);
-            assert_eq!(h.height + m.height, height, "height {height} lost a row");
+            let l = layout(Rect::new(0, 0, 80, height), 24);
+            assert_eq!(
+                l.header.height
+                    + l.rule_top.height
+                    + l.main.height
+                    + l.rule_bottom.height
+                    + l.footer.height,
+                height,
+                "height {height} lost a row"
+            );
         }
     }
 
@@ -2251,6 +2940,7 @@ mod tests {
             short: short.to_string(),
             harness: harness.to_string(),
             age_secs: Some(90),
+            score: None,
             state,
             attached: true,
             selected: false,
@@ -2348,11 +3038,11 @@ mod tests {
         let backend = TestBackend::new(40, 6);
         let mut term = Terminal::new(backend).expect("terminal");
         for width in 0..=40u16 {
-            term.draw(|f| render_sidebar(f, Rect::new(0, 0, width, 6), &rows, 0))
+            term.draw(|f| render_sidebar(f, Rect::new(0, 0, width, 6), &rows, 0, 40, 60))
                 .expect("draw");
         }
         let text = render_and_capture_text(Rect::new(0, 0, 40, 6), |f, area| {
-            render_sidebar(f, area, &rows, 0)
+            render_sidebar(f, area, &rows, 0, 40, 60)
         });
         assert!(text.contains("sess0006"), "got {text}");
     }
@@ -2368,6 +3058,7 @@ mod tests {
                 short: "aaa11111".to_string(),
                 harness: "claude".to_string(),
                 age_secs: Some(5),
+                score: None,
                 state: RowState::Working,
                 attached: true,
                 selected: false,
@@ -2377,6 +3068,7 @@ mod tests {
                 short: "bbb22222".to_string(),
                 harness: "codex".to_string(),
                 age_secs: Some(5),
+                score: None,
                 state: RowState::Unknown,
                 attached: false,
                 selected: true,
@@ -2385,32 +3077,37 @@ mod tests {
         ];
         let backend = TestBackend::new(40, 6);
         let mut term = Terminal::new(backend).expect("terminal");
-        term.draw(|f| render_sidebar(f, Rect::new(0, 0, 40, 6), &rows, 0))
+        term.draw(|f| render_sidebar(f, Rect::new(0, 0, 40, 6), &rows, 0, 40, 60))
             .expect("draw");
         let buf = term.backend().buffer();
-        // Row 0 of the list sits inside the block's own border.
+        // Issue #209/v3 §A4: the sidebar no longer draws its own box, so row
+        // 0 is the frame's own first row (`y = 0`), not one row in from a
+        // border that no longer exists.
         assert!(
-            !buf[(2, 1)].modifier.contains(Modifier::DIM),
+            !buf[(2, 0)].modifier.contains(Modifier::DIM),
             "an attached pane row is drawn at full strength"
         );
         assert!(
-            buf[(2, 2)].modifier.contains(Modifier::DIM),
+            buf[(2, 1)].modifier.contains(Modifier::DIM),
             "a view-only row is dimmed"
         );
         assert!(
-            buf[(2, 2)].modifier.contains(Modifier::REVERSED),
+            buf[(2, 1)].modifier.contains(Modifier::REVERSED),
             "and still carries the selection highlight the cursor put on it"
         );
     }
 
     /// A long session list scrolls the window to keep the selected row on
-    /// screen, and says which window of the list this is.
+    /// screen. Issue #209/v3 §A4: the sidebar no longer has a title to say
+    /// which window this is (the box that title lived in is gone), so this
+    /// only exercises the scrolling itself now.
     #[test]
-    fn a_long_session_list_scrolls_to_the_selected_row_and_says_it_is_a_window() {
+    fn a_long_session_list_scrolls_to_keep_the_selected_row_on_screen() {
         let row = |i: usize, selected: bool| SidebarRow {
             short: format!("sess{i:04}"),
             harness: String::new(),
             age_secs: None,
+            score: None,
             state: RowState::Idle,
             attached: true,
             selected,
@@ -2418,7 +3115,7 @@ mod tests {
         };
         let rows: Vec<SidebarRow> = (0..12).map(|i| row(i, i == 10)).collect();
         let text = render_and_capture_text(Rect::new(0, 0, 30, 6), |f, area| {
-            render_sidebar(f, area, &rows, 0)
+            render_sidebar(f, area, &rows, 0, 40, 60)
         });
         assert!(
             text.contains("sess0010"),
@@ -2428,22 +3125,14 @@ mod tests {
             !text.contains("sess0000"),
             "and the window has scrolled off the top: {text}"
         );
-        assert!(
-            text.contains("8-11/12"),
-            "the title says which window of the list this is: {text}"
-        );
 
         let rows: Vec<SidebarRow> = (0..3).map(|i| row(i, i == 0)).collect();
         let text = render_and_capture_text(Rect::new(0, 0, 30, 6), |f, area| {
-            render_sidebar(f, area, &rows, 0)
+            render_sidebar(f, area, &rows, 0, 40, 60)
         });
         assert!(
             text.contains("sess0000") && text.contains("sess0002"),
             "{text}"
-        );
-        assert!(
-            text.contains("panes") && !text.contains("/3"),
-            "a list that fits keeps the bare title: {text}"
         );
     }
 
@@ -2465,11 +3154,519 @@ mod tests {
             Rect::new(0, 0, 0, 8),
             Rect::new(0, 0, 1, 1),
         ] {
-            term.draw(|f| render_sidebar(f, area, &rows, 0))
+            term.draw(|f| render_sidebar(f, area, &rows, 0, 40, 60))
                 .expect("draw");
         }
-        term.draw(|f| render_sidebar(f, Rect::new(0, 0, 30, 8), &[], 0))
+        term.draw(|f| render_sidebar(f, Rect::new(0, 0, 30, 8), &[], 0, 40, 60))
             .expect("draw");
+    }
+
+    // Issue #209/v3 §B: the selected-row REVERSED-over-colored-glyph bug fix.
+
+    /// A selected row's own state glyph (cyan for `Working`, in this case)
+    /// must drop its colour entirely and join the row's uniform reversed
+    /// style -- not layer REVERSED on top of its own fg, which used to
+    /// render a colored block with a background-colored glyph.
+    #[test]
+    fn a_selected_rows_state_glyph_carries_no_explicit_fg() {
+        let mut row = sidebar_row("aaa11111", "claude", RowState::Working);
+        row.selected = true;
+        let backend = TestBackend::new(40, 4);
+        let mut term = Terminal::new(backend).expect("terminal");
+        term.draw(|f| render_sidebar(f, Rect::new(0, 0, 40, 4), &[row], 0, 40, 60))
+            .expect("draw");
+        let buf = term.backend().buffer();
+        let glyph_cell = &buf[(0, 0)];
+        assert_eq!(
+            glyph_cell.fg,
+            Color::Reset,
+            "a selected row's glyph must carry no explicit fg colour, got {:?}",
+            glyph_cell.fg
+        );
+        assert!(
+            glyph_cell.modifier.contains(Modifier::REVERSED),
+            "and still reverses uniformly with the rest of the row"
+        );
+    }
+
+    /// The same fix, for a selected row whose rot glyph is coloured
+    /// (rotting, red-bold): it must drop that colour too when selected.
+    #[test]
+    fn a_selected_rows_rot_glyph_carries_no_explicit_fg_either() {
+        let mut row = sidebar_row("aaa11111", "claude", RowState::Idle);
+        row.score = Some(90); // well past any default compact_at threshold
+        row.selected = true;
+        let backend = TestBackend::new(40, 4);
+        let mut term = Terminal::new(backend).expect("terminal");
+        term.draw(|f| render_sidebar(f, Rect::new(0, 0, 40, 4), &[row], 0, 40, 60))
+            .expect("draw");
+        let buf = term.backend().buffer();
+        for x in 0..40u16 {
+            let cell = &buf[(x, 0)];
+            assert_eq!(
+                cell.fg,
+                Color::Reset,
+                "no cell in a selected row may carry an explicit fg colour, got {:?} at column {x}",
+                cell.fg
+            );
+        }
+    }
+
+    /// The list-dialog primitive's own cursor row has the identical defect
+    /// with `ListDialogRow::glyph` (the QuitConfirm spinner, in practice):
+    /// its glyph must not carry its own colour once reversed either.
+    #[test]
+    fn a_list_dialog_cursor_rows_glyph_carries_no_explicit_fg() {
+        let spec = ListDialogSpec {
+            title: "quit",
+            count: None,
+            rows: vec![ListDialogRow {
+                text: "wrk claude".to_string(),
+                checked: None,
+                glyph: Some(("\u{2807}".to_string(), style::tui::accent())),
+            }],
+            cursor: Some(0),
+            footer: &[],
+            warn: false,
+            empty_message: "",
+        };
+        let backend = TestBackend::new(40, 10);
+        let mut term = Terminal::new(backend).expect("terminal");
+        term.draw(|f| render_list_dialog(f, f.area(), &spec))
+            .expect("draw");
+        let buf = term.backend().buffer();
+        let rect = centered(Rect::new(0, 0, 40, 10), dialog_width(40), 5);
+        // The cursor row is the first content row inside the frame's border
+        // and horizontal padding.
+        let row_y = rect.y + 1;
+        let glyph_x = rect.x + 2;
+        let cell = &buf[(glyph_x, row_y)];
+        assert_eq!(
+            cell.fg,
+            Color::Reset,
+            "the cursor row's glyph must carry no explicit fg colour, got {:?}",
+            cell.fg
+        );
+        assert!(cell.modifier.contains(Modifier::REVERSED));
+    }
+
+    // Issue #209/v3 §C: the sidebar rot column.
+
+    #[test]
+    fn rot_band_thresholds_match_advise_and_compact_at() {
+        assert_eq!(rot_band_for(0, 40, 60), RotBand::Fresh);
+        assert_eq!(rot_band_for(39, 40, 60), RotBand::Fresh);
+        assert_eq!(rot_band_for(40, 40, 60), RotBand::Warming);
+        assert_eq!(rot_band_for(59, 40, 60), RotBand::Warming);
+        assert_eq!(rot_band_for(60, 40, 60), RotBand::Rotting);
+        assert_eq!(rot_band_for(100, 40, 60), RotBand::Rotting);
+    }
+
+    /// A fresh score renders in the sidebar with no colour of its own --
+    /// it inherits the row's tone (here: none, since the row is neither
+    /// dim nor focused nor selected).
+    #[test]
+    fn a_fresh_sidebar_score_inherits_the_row_tone() {
+        let mut row = sidebar_row("aaa11111", "claude", RowState::Idle);
+        row.score = Some(12);
+        let text = sidebar_row_text(&row, 0, 40);
+        assert!(text.contains("\u{273b}12"), "got {text:?}");
+        let backend = TestBackend::new(40, 4);
+        let mut term = Terminal::new(backend).expect("terminal");
+        term.draw(|f| render_sidebar(f, Rect::new(0, 0, 40, 4), &[row], 0, 40, 60))
+            .expect("draw");
+        let buf = term.backend().buffer();
+        // `⠹ aaa11111 claude ✻12  1m` -- the rot glyph sits right after the
+        // harness; scanning the row for it directly keeps this independent
+        // of exact column math.
+        let rot_col = (0..40u16)
+            .find(|&x| buf[(x, 0)].symbol() == "\u{273b}")
+            .expect("rot glyph must be drawn somewhere on the row");
+        assert_eq!(
+            buf[(rot_col, 0)].fg,
+            Color::Reset,
+            "fresh must carry no colour of its own"
+        );
+    }
+
+    #[test]
+    fn a_warming_sidebar_score_is_yellow() {
+        let mut row = sidebar_row("aaa11111", "claude", RowState::Idle);
+        row.score = Some(47);
+        let backend = TestBackend::new(40, 4);
+        let mut term = Terminal::new(backend).expect("terminal");
+        term.draw(|f| render_sidebar(f, Rect::new(0, 0, 40, 4), &[row], 0, 40, 60))
+            .expect("draw");
+        let buf = term.backend().buffer();
+        let rot_col = (0..40u16)
+            .find(|&x| buf[(x, 0)].symbol() == "\u{273b}")
+            .expect("rot glyph must be drawn");
+        assert_eq!(buf[(rot_col, 0)].fg, Color::Yellow);
+    }
+
+    #[test]
+    fn a_rotting_sidebar_score_is_red_and_bold() {
+        let mut row = sidebar_row("aaa11111", "claude", RowState::Idle);
+        row.score = Some(81);
+        let backend = TestBackend::new(40, 4);
+        let mut term = Terminal::new(backend).expect("terminal");
+        term.draw(|f| render_sidebar(f, Rect::new(0, 0, 40, 4), &[row], 0, 40, 60))
+            .expect("draw");
+        let buf = term.backend().buffer();
+        let rot_col = (0..40u16)
+            .find(|&x| buf[(x, 0)].symbol() == "\u{273b}")
+            .expect("rot glyph must be drawn");
+        let cell = &buf[(rot_col, 0)];
+        assert_eq!(cell.fg, Color::Red);
+        assert!(cell.modifier.contains(Modifier::BOLD));
+    }
+
+    /// A dead pane always shows the placeholder, even with a stale score
+    /// still cached from before it exited -- a dead pane's last reading is
+    /// stale, not a live verdict.
+    #[test]
+    fn a_dead_pane_shows_the_placeholder_regardless_of_a_cached_score() {
+        let mut row = sidebar_row("aaa11111", "codex", RowState::Dead);
+        row.score = Some(12);
+        let text = sidebar_row_text(&row, 0, 40);
+        assert!(
+            text.contains(style::PLACEHOLDER),
+            "dead pane must show the placeholder: {text:?}"
+        );
+        assert!(
+            !text.contains('\u{273b}'),
+            "and never the rot glyph: {text:?}"
+        );
+    }
+
+    /// No cached score at all (an idle/working pane whose transcript has not
+    /// resolved yet) also shows the placeholder, never a fabricated zero.
+    #[test]
+    fn no_cached_score_shows_the_placeholder() {
+        let row = sidebar_row("aaa11111", "claude", RowState::Idle);
+        let text = sidebar_row_text(&row, 0, 40);
+        assert!(text.contains(style::PLACEHOLDER), "got {text:?}");
+    }
+
+    /// §C's own width-degradation order: the age column drops first, then
+    /// the rot score's own digits (the glyph survives alone), and only then
+    /// does anything about `short`/`harness` give way.
+    #[test]
+    fn sidebar_rot_column_degrades_age_first_then_the_score_number() {
+        let mut row = sidebar_row("aaa11111", "claude", RowState::Idle);
+        row.score = Some(47);
+        // Plenty of room: age and the full score both show.
+        let wide = sidebar_row_text(&row, 0, 40);
+        assert!(wide.contains("\u{273b}47"), "got {wide:?}");
+        assert!(wide.contains("1m"), "got {wide:?}");
+
+        // Narrower: age drops, the score number survives.
+        let mut cols = 40u16;
+        let mut lost_age_at = None;
+        while cols > 0 {
+            let text = sidebar_row_text(&row, 0, cols);
+            if !text.contains("1m") && text.contains("\u{273b}47") {
+                lost_age_at = Some(cols);
+                break;
+            }
+            cols -= 1;
+        }
+        assert!(
+            lost_age_at.is_some(),
+            "age must drop while the full score number still fits"
+        );
+
+        // Narrower still: the score number drops too, but the coloured
+        // glyph survives alone.
+        let mut lost_number_at = None;
+        while cols > 0 {
+            let text = sidebar_row_text(&row, 0, cols);
+            if !text.contains("\u{273b}47") && text.contains('\u{273b}') {
+                lost_number_at = Some(cols);
+                break;
+            }
+            cols -= 1;
+        }
+        assert!(
+            lost_number_at.is_some(),
+            "the score's own digits must drop before the glyph itself does"
+        );
+    }
+
+    /// Every sidebar row, at every width, never exceeds the column budget --
+    /// the same invariant `a_sidebar_row_degrades_gracefully_at_every_width`
+    /// already holds for the pre-rot-column shape, extended to a row that
+    /// actually carries a score.
+    #[test]
+    fn a_sidebar_row_with_a_score_degrades_gracefully_at_every_width() {
+        let mut row = sidebar_row("aaa11111", "claude", RowState::Working);
+        row.score = Some(47);
+        for cols in 0..=64u16 {
+            let text = sidebar_row_text(&row, 3, cols);
+            assert!(
+                style::display_width(&text) <= cols as usize,
+                "width {cols} produced {text:?}"
+            );
+        }
+    }
+
+    // Issue #209/v3 §D: the footer signal row.
+
+    fn alive_footer_facts() -> FooterAliveFacts {
+        FooterAliveFacts {
+            harness: "claude".to_string(),
+            score: Some(12),
+            usage_five_hour: Some(61.0),
+            usage_seven_day: Some(18.0),
+            unread_mail: 0,
+            workflow: FooterWorkflow::Active {
+                kind: "feature".to_string(),
+                step: "design".to_string(),
+                gated: false,
+            },
+            supervised: true,
+        }
+    }
+
+    /// The mock's own "healthy" example (§04): fresh green verdict with a
+    /// dim score number, usage windows, no mail, the workflow's kind and
+    /// step, and supervised.
+    #[test]
+    fn footer_renders_the_healthy_example() {
+        let facts = FooterFacts::Alive(alive_footer_facts());
+        let text = render_and_capture_text(Rect::new(0, 0, 80, 1), |f, area| {
+            render_footer(f, area, &facts, 40, 60)
+        });
+        assert!(text.contains("claude"), "got {text:?}");
+        assert!(text.contains("fresh"), "got {text:?}");
+        assert!(text.contains("12"), "got {text:?}");
+        assert!(text.contains("61%"), "got {text:?}");
+        assert!(text.contains("18%"), "got {text:?}");
+        assert!(text.contains("feature"), "got {text:?}");
+        assert!(text.contains("design"), "got {text:?}");
+        assert!(text.contains("supervised"), "got {text:?}");
+    }
+
+    /// The mock's own "attention" example: warming, unread mail, and a
+    /// gated workflow step -- `▸ {step} awaits approval`.
+    #[test]
+    fn footer_renders_the_attention_example() {
+        let facts = FooterFacts::Alive(FooterAliveFacts {
+            harness: "claude".to_string(),
+            score: Some(47),
+            usage_five_hour: Some(62.0),
+            usage_seven_day: Some(31.0),
+            unread_mail: 2,
+            workflow: FooterWorkflow::Active {
+                kind: "feature".to_string(),
+                step: "spec".to_string(),
+                gated: true,
+            },
+            supervised: true,
+        });
+        let text = render_and_capture_text(Rect::new(0, 0, 80, 1), |f, area| {
+            render_footer(f, area, &facts, 40, 60)
+        });
+        assert!(text.contains("warming"), "got {text:?}");
+        assert!(text.contains('2'), "unread mail count: got {text:?}");
+        assert!(
+            text.contains("spec awaits approval"),
+            "gated step reads as awaiting approval: got {text:?}"
+        );
+    }
+
+    /// A rotting verdict, and a session with no unread mail (the dim
+    /// placeholder, never a literal `0`).
+    #[test]
+    fn footer_renders_a_rotting_verdict_and_dim_placeholder_mail() {
+        let mut alive = alive_footer_facts();
+        alive.score = Some(90);
+        alive.unread_mail = 0;
+        let facts = FooterFacts::Alive(alive);
+        let text = render_and_capture_text(Rect::new(0, 0, 80, 1), |f, area| {
+            render_footer(f, area, &facts, 40, 60)
+        });
+        assert!(text.contains("rotting"), "got {text:?}");
+        assert!(text.contains(style::PLACEHOLDER), "got {text:?}");
+    }
+
+    /// A session with no active workflow at all renders the dim `▸ –`
+    /// placeholder.
+    #[test]
+    fn footer_renders_no_active_workflow_as_a_dim_placeholder() {
+        let mut alive = alive_footer_facts();
+        alive.workflow = FooterWorkflow::None;
+        let facts = FooterFacts::Alive(alive);
+        let text = render_and_capture_text(Rect::new(0, 0, 80, 1), |f, area| {
+            render_footer(f, area, &facts, 40, 60)
+        });
+        assert!(text.contains(style::PLACEHOLDER), "got {text:?}");
+    }
+
+    /// The mock's own "dead pane focused" example: a different message
+    /// entirely -- exited-age and the restore hint, not the alive shape.
+    #[test]
+    fn footer_renders_the_dead_pane_example() {
+        let facts = FooterFacts::Dead(FooterDeadFacts {
+            harness: "codex".to_string(),
+            exited_age_secs: Some(12 * 60),
+            workflow: FooterWorkflow::Active {
+                kind: "feature".to_string(),
+                step: "implement".to_string(),
+                gated: false,
+            },
+        });
+        let text = render_and_capture_text(Rect::new(0, 0, 80, 1), |f, area| {
+            render_footer(f, area, &facts, 40, 60)
+        });
+        assert!(text.contains("codex"), "got {text:?}");
+        assert!(text.contains("exited"), "got {text:?}");
+        assert!(text.contains("12m"), "got {text:?}");
+        assert!(text.contains("feature"), "got {text:?}");
+        assert!(text.contains("implement"), "got {text:?}");
+        assert!(text.contains("restore"), "got {text:?}");
+    }
+
+    /// `FooterFacts::None` (nothing focused at all) draws nothing.
+    #[test]
+    fn footer_draws_nothing_when_nothing_is_focused() {
+        let text = render_and_capture_text(Rect::new(0, 0, 80, 1), |f, area| {
+            render_footer(f, area, &FooterFacts::None, 40, 60)
+        });
+        assert!(text.trim().is_empty(), "got {text:?}");
+    }
+
+    /// §D's own workflow-segment states, at the pure `footer_workflow_spans`
+    /// level: no active workflow, an ungated step (dim), and a gated step
+    /// (yellow-bold with "awaits approval"/"!" wording).
+    #[test]
+    fn footer_workflow_segment_states() {
+        let (full, compressed) = footer_workflow_spans(&FooterWorkflow::None);
+        let joined = |seg: &FooterSeg| seg.iter().map(|(t, _)| t.as_str()).collect::<String>();
+        assert!(joined(&full).contains(style::PLACEHOLDER));
+        assert_eq!(full, compressed);
+
+        let (full, compressed) = footer_workflow_spans(&FooterWorkflow::Active {
+            kind: "feature".to_string(),
+            step: "design".to_string(),
+            gated: false,
+        });
+        assert!(joined(&full).contains("feature"));
+        assert!(joined(&full).contains("design"));
+        assert!(joined(&compressed).contains("design"));
+        assert!(!joined(&compressed).contains("feature"));
+        for (_, style) in full.iter().chain(compressed.iter()) {
+            assert!(
+                !style.add_modifier.contains(Modifier::BOLD),
+                "an ungated workflow segment must not be bold"
+            );
+        }
+
+        let (full, compressed) = footer_workflow_spans(&FooterWorkflow::Active {
+            kind: "feature".to_string(),
+            step: "spec".to_string(),
+            gated: true,
+        });
+        assert!(joined(&full).contains("spec awaits approval"));
+        assert!(joined(&compressed).contains("spec!"));
+        for (_, style) in full.iter().chain(compressed.iter()) {
+            assert_eq!(style.fg, Some(Color::Yellow));
+            assert!(style.add_modifier.contains(Modifier::BOLD));
+        }
+    }
+
+    /// §D's drop order: usage drops first, then the verdict's score number,
+    /// then the workflow segment (full form, then compressed, then dropped
+    /// entirely), then the harness label -- verdict, mail and supervision
+    /// never drop.
+    #[test]
+    fn footer_drop_order_matches_the_spec() {
+        let facts = FooterFacts::Alive(alive_footer_facts());
+        let render = |cols: u16| {
+            render_and_capture_text(Rect::new(0, 0, cols, 1), |f, area| {
+                render_footer(f, area, &facts, 40, 60)
+            })
+        };
+
+        let wide = render(80);
+        assert!(wide.contains("61%"), "usage shows at 80 cols: {wide:?}");
+        assert!(
+            wide.contains("claude"),
+            "harness shows at 80 cols: {wide:?}"
+        );
+        assert!(wide.contains("feature"), "workflow long form: {wide:?}");
+
+        // Narrowing must drop usage before it drops the harness, and the
+        // workflow's long form before it drops the harness too -- never the
+        // verdict word, mail, or supervision.
+        let mut saw_usage_drop = false;
+        let mut saw_workflow_compress = false;
+        let mut saw_harness_drop = false;
+        for cols in (0..=80u16).rev() {
+            let text = render(cols);
+            if !text.contains('\u{25d4}') && !saw_usage_drop && text.contains("claude") {
+                saw_usage_drop = true;
+            }
+            if !text.contains("feature") && text.contains("design") && !saw_workflow_compress {
+                saw_workflow_compress = true;
+            }
+            if !text.contains("claude") {
+                saw_harness_drop = true;
+                // Once the harness is gone, the irreducible core must
+                // survive: verdict word, mail and supervision are never
+                // dropped outright (down to whatever `cols` can still hold).
+                if cols >= 20 {
+                    assert!(
+                        text.contains("fresh") || text.contains(style::PLACEHOLDER),
+                        "verdict must survive at {cols} cols: {text:?}"
+                    );
+                }
+                break;
+            }
+        }
+        assert!(saw_usage_drop, "usage must drop before the harness does");
+        assert!(
+            saw_workflow_compress,
+            "the workflow segment must compress before the harness drops"
+        );
+        assert!(saw_harness_drop, "the harness must eventually drop too");
+    }
+
+    /// The dead-pane footer's own drop order: the exited notice and the
+    /// restore hint are never dropped, even at an absurdly narrow width.
+    #[test]
+    fn footer_dead_pane_never_drops_the_exited_notice_or_restore_hint() {
+        let facts = FooterFacts::Dead(FooterDeadFacts {
+            harness: "codex".to_string(),
+            exited_age_secs: Some(720),
+            workflow: FooterWorkflow::None,
+        });
+        // Tight but not absurd: the harness and workflow segment have
+        // dropped, but the exited notice and restore hint -- the one thing
+        // this state exists to tell the operator -- still fit and survive.
+        let tight = render_and_capture_text(Rect::new(0, 0, 35, 1), |f, area| {
+            render_footer(f, area, &facts, 40, 60)
+        });
+        assert!(tight.contains("exited"), "got {tight:?}");
+        assert!(tight.contains("restore"), "got {tight:?}");
+        assert!(
+            !tight.contains("codex"),
+            "harness must have dropped by 30 cols: {tight:?}"
+        );
+
+        // And at every width, including absurdly narrow ones, the row never
+        // exceeds its own column budget -- the release profile is `panic =
+        // "abort"`, so an overflow here would take the operator's terminal
+        // with it.
+        for cols in [80u16, 40, 20, 10, 1, 0] {
+            let text = render_and_capture_text(Rect::new(0, 0, cols, 1), |f, area| {
+                render_footer(f, area, &facts, 40, 60)
+            });
+            assert!(
+                style::display_width(&text) <= cols as usize,
+                "width {cols} produced {text:?}"
+            );
+        }
     }
 
     #[test]
@@ -2898,9 +4095,15 @@ mod tests {
 
     #[test]
     fn every_help_line_fits_an_eighty_column_terminal_with_the_default_sidebar() {
+        // Issue #209/v3 §A5: `MAIL_FOOTER` grew a `j/k move` hint, widening
+        // the "dialogs:" section's own `mail` row from 43 to 52 chars --
+        // still comfortably inside the ~74-column interior a `dialog_
+        // width(80)` overlay actually has (`render_list_dialog`'s own
+        // horizontal padding), so the cap moves with it rather than the
+        // hint being dropped to keep an arbitrary old number.
         for line in help_lines() {
             assert!(
-                line.chars().count() <= 49,
+                line.chars().count() <= 55,
                 "help line too long for an 80-col terminal: {line:?} ({} chars)",
                 line.chars().count()
             );

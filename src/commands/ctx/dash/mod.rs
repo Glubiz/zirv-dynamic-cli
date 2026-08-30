@@ -44,6 +44,7 @@ use super::state::StateDir;
 use super::term;
 use super::window;
 use super::{handoff, handover, mail, memory, prompt, score, sessions};
+use crate::commands::workflow;
 
 pub(crate) use pane::{Pane, PaneSpec, PaneState, ScrollOutcome};
 
@@ -684,6 +685,7 @@ struct PaneRowMeta {
 fn assemble_sidebar(
     panes: &[PaneRowMeta],
     registry: &[(sessions::Record, sessions::Liveness)],
+    scores: &ScoreMap,
     selected: usize,
     focused: usize,
     dashboard_pid: u32,
@@ -702,6 +704,7 @@ fn assemble_sidebar(
             short: p.short.clone(),
             harness: p.harness.clone(),
             age_secs: age_of(&p.short),
+            score: scores.get(&p.short).copied(),
             state: p.state,
             attached: true,
             selected: false,
@@ -727,6 +730,7 @@ fn assemble_sidebar(
             short: record.short.clone(),
             harness: record.agent.clone(),
             age_secs: Some(now_secs.saturating_sub(record.started_at)),
+            score: scores.get(&record.short).copied(),
             state: ui::RowState::Unknown,
             attached: false,
             selected: false,
@@ -845,6 +849,70 @@ fn assemble_header_facts(
     }
 }
 
+/// Pure: assembles `ui::FooterFacts` (issue #209/v3 §D) for the **focused**
+/// pane (Q1) from already-computed ingredients, the same separation-of-
+/// concerns `assemble_header_facts` keeps: the impure disk reads happen in
+/// `FactsCache::refresh_if_due`, this only shapes what they already found.
+///
+/// `focused_row` is the sidebar row already marked `focused` in this tick's
+/// `assemble_sidebar` output, reused rather than re-derived: it already
+/// carries the harness, cached score, age and dead/alive state the footer
+/// needs, and reusing it means the sidebar and the footer can never disagree
+/// about which pane is focused or what its own facts are. `None` (an empty
+/// dashboard, nothing focused) is `ui::FooterFacts::None` -- nothing draws.
+fn assemble_footer_facts(
+    focused_row: Option<&ui::SidebarRow>,
+    usage: &[ui::HarnessUsage],
+    mail: Option<(usize, usize)>,
+    workflow: Option<&workflow::ActiveWorkflowSummary>,
+) -> ui::FooterFacts {
+    let Some(row) = focused_row else {
+        return ui::FooterFacts::None;
+    };
+
+    let footer_workflow = match workflow {
+        Some(wf) => ui::FooterWorkflow::Active {
+            kind: wf.kind.to_string(),
+            step: wf.step.clone(),
+            gated: wf.awaiting_approval,
+        },
+        None => ui::FooterWorkflow::None,
+    };
+
+    if row.state == ui::RowState::Dead {
+        return ui::FooterFacts::Dead(ui::FooterDeadFacts {
+            harness: row.harness.clone(),
+            exited_age_secs: row.age_secs,
+            workflow: footer_workflow,
+        });
+    }
+
+    let (five_hour, seven_day) = usage
+        .iter()
+        .find(|u| u.name == row.harness.as_str())
+        .map(|u| (u.five_hour, u.seven_day))
+        .unwrap_or((None, None));
+    // N7's own broadcast/direct split collapses into one total here: the
+    // mock's footer shows a single unlabeled number, unlike the wrap bar's
+    // own richer `+`-suffixed segment (`chrome::status_bar`'s own `mail`).
+    let unread_mail = mail
+        .map(|(broadcast, direct)| broadcast + direct)
+        .unwrap_or(0);
+
+    ui::FooterFacts::Alive(ui::FooterAliveFacts {
+        harness: row.harness.clone(),
+        score: row.score,
+        usage_five_hour: five_hour,
+        usage_seven_day: seven_day,
+        unread_mail,
+        workflow: footer_workflow,
+        // Always true: see `ui::FooterAliveFacts::supervised`'s own doc
+        // comment for why there is no dash-observable "degraded" signal to
+        // fold in here yet.
+        supervised: true,
+    })
+}
+
 /// Cached rot scores, keyed by session short id. An **absent** key is the
 /// unknown case (`score::cached_score` returned `None`: no transcript yet, an
 /// unreadable one, an unresolvable agent), which the sidebar renders as
@@ -896,6 +964,15 @@ struct DiskFacts {
     /// either itself, or a redraw could stall on a stale rollout file or the
     /// network.
     usage: Vec<ui::HarnessUsage>,
+    /// Issue #209/v3 §D: the dashboard's own repo's active `zirv workflow`,
+    /// as much as the footer's workflow segment needs. `workflow::
+    /// active_workflow_summary` is the same plain-file read `zirv workflow
+    /// status` itself uses with no `--id` -- no subprocess, no scan --
+    /// so it costs nothing more than the scores/usage reads right above it
+    /// to fold into this same throttled tick. `None` covers "no active
+    /// workflow" and "failed to load" alike; the footer renders the same
+    /// dim `▸ –` either way.
+    workflow: Option<workflow::ActiveWorkflowSummary>,
 }
 
 /// Who the dashboard is, for the reads that are scoped to it: the repo it
@@ -959,6 +1036,10 @@ impl FactsCache {
         let slug = super::state::repo_slug(repo);
         self.disk.memory_count = memory::list(state, &slug).map(|v| v.len()).unwrap_or(0);
         self.registry = sessions::list(state);
+        // Issue #209/v3 §D: same throttled tick as the reads above it, same
+        // no-subprocess/no-scan discipline -- see `DiskFacts::workflow`'s
+        // own doc comment.
+        self.disk.workflow = workflow::active_workflow_summary(state, repo);
 
         // Task 7: one usage entry per enabled harness, read straight off
         // disk. `window::load_for` is a file read, never a scan/poll -- see
@@ -1878,7 +1959,7 @@ fn effective_main(area: Rect, sidebar_cols: u16, zoomed: bool) -> Rect {
     if zoomed {
         area
     } else {
-        ui::layout(area, sidebar_cols).2
+        ui::layout(area, sidebar_cols).main
     }
 }
 
@@ -5729,6 +5810,7 @@ pub fn run_dashboard(
         let rows = assemble_sidebar(
             &build_pane_rows(&panes),
             &visible_registry,
+            &facts_cache.disk.scores,
             selected,
             focused,
             std::process::id(),
@@ -6749,7 +6831,7 @@ pub fn run_dashboard(
             );
         }
         let frame_area = Rect::new(0, 0, term_size.0, term_size.1);
-        let (header_area, sidebar_area, _) = ui::layout(frame_area, sidebar_cols);
+        let layout = ui::layout(frame_area, sidebar_cols);
         // F5: the grid and any overlay are drawn into the *effective* main
         // rect, which is the whole frame while zoomed. Before this, zoom
         // resized the pty (so the child re-laid itself out for a full-width
@@ -6766,6 +6848,7 @@ pub fn run_dashboard(
         let rows = assemble_sidebar(
             &build_pane_rows(&panes),
             &visible_registry,
+            &facts_cache.disk.scores,
             selected,
             focused,
             std::process::id(),
@@ -6790,11 +6873,50 @@ pub fn run_dashboard(
             errors.last().cloned(),
             live_notice(&notices, Instant::now()).map(str::to_string),
         );
+        // Issue #209/v3 §D: the footer describes whichever pane is focused
+        // (Q1) -- reuses this tick's own sidebar row rather than re-deriving
+        // the same facts a second way (see `assemble_footer_facts`'s own
+        // doc comment).
+        let footer_facts = assemble_footer_facts(
+            rows.iter().find(|r| r.focused),
+            &facts_cache.disk.usage,
+            facts_cache.disk.mail,
+            facts_cache.disk.workflow.as_ref(),
+        );
 
         let draw = terminal.draw(|f| {
             if !zoomed {
-                ui::render_header(f, header_area, &facts);
-                ui::render_sidebar(f, sidebar_area, &rows, render_tick);
+                ui::render_header(f, layout.header, &facts);
+                ui::render_rule(f, layout.rule_top, layout.sidebar.width, true);
+                ui::render_sidebar(
+                    f,
+                    layout.sidebar,
+                    &rows,
+                    render_tick,
+                    cfg.score.advise_at,
+                    cfg.score.compact_at,
+                );
+                ui::render_sidebar_divider(
+                    f,
+                    Rect {
+                        x: layout.sidebar.x + layout.sidebar.width,
+                        y: layout.sidebar.y,
+                        width: (layout
+                            .main
+                            .x
+                            .saturating_sub(layout.sidebar.x + layout.sidebar.width))
+                        .min(1),
+                        height: layout.sidebar.height,
+                    },
+                );
+                ui::render_rule(f, layout.rule_bottom, layout.sidebar.width, false);
+                ui::render_footer(
+                    f,
+                    layout.footer,
+                    &footer_facts,
+                    cfg.score.advise_at,
+                    cfg.score.compact_at,
+                );
             }
             if let Some(pane) = panes.get(focused) {
                 // A selection only ever names the pane it started on
@@ -7425,17 +7547,18 @@ mod tests {
     /// and with the sidebar drawn the pane's origin is genuinely not `(0, 0)`.
     #[test]
     fn a_forwarded_wheel_lands_in_the_childs_own_coordinate_space() {
-        // The real geometry: an 80x24 frame, one header row, a 24-column
-        // sidebar and its separator -- so the pane starts at column 25, row 1.
-        let main = ui::layout(Rect::new(0, 0, 80, 24), 24).2;
-        assert_eq!((main.x, main.y), (25, 1), "sanity: the pane is inset");
+        // The real geometry: an 80x24 frame, one header row, one rule row
+        // (issue #209/v3 §A4/§D), a 24-column sidebar and its separator --
+        // so the pane starts at column 25, row 2.
+        let main = ui::layout(Rect::new(0, 0, 80, 24), 24).main;
+        assert_eq!((main.x, main.y), (25, 2), "sanity: the pane is inset");
 
         assert_eq!(
-            pane_local_mouse(main, 25, 1),
+            pane_local_mouse(main, 25, 2),
             (1, 1),
             "the pane's own top-left cell is its (1, 1), not the frame's"
         );
-        assert_eq!(pane_local_mouse(main, 31, 5), (7, 5));
+        assert_eq!(pane_local_mouse(main, 31, 6), (7, 5));
         // Bottom-right corner of the pane, and nothing past it.
         assert_eq!(
             pane_local_mouse(main, main.x + main.width - 1, main.y + main.height - 1),
@@ -7754,7 +7877,7 @@ mod tests {
         let zoomed = effective_main(area, 24, true);
         assert_eq!(zoomed, area);
         let unzoomed = effective_main(area, 24, false);
-        assert_eq!(unzoomed, ui::layout(area, 24).2);
+        assert_eq!(unzoomed, ui::layout(area, 24).main);
     }
 
     /// F5: the draw target itself, not just the pty resize. Zoom used to
@@ -7775,7 +7898,7 @@ mod tests {
             plain_target, zoomed_target,
             "and that is genuinely different from the un-zoomed rect"
         );
-        assert_eq!(plain_target, ui::layout(frame, sidebar_cols).2);
+        assert_eq!(plain_target, ui::layout(frame, sidebar_cols).main);
     }
 
     // F7: focus (the pane on screen and under the keyboard) versus selection
@@ -7881,7 +8004,7 @@ mod tests {
             sessions::Liveness::Live,
         )];
         // Selection has walked onto the view-only row; focus is still pane 1.
-        let rows = assemble_sidebar(&panes, &registry, 2, 1, DASHBOARD_PID, 0);
+        let rows = assemble_sidebar(&panes, &registry, &HashMap::new(), 2, 1, DASHBOARD_PID, 0);
         assert!(
             rows[2].selected,
             "the sidebar cursor is on the view-only row"
@@ -7951,7 +8074,7 @@ mod tests {
             pane_row("aaa11111", "claude"),
             pane_row("bbb22222", "claude"),
         ];
-        let rows = assemble_sidebar(&panes, &[], 0, 0, DASHBOARD_PID, 0);
+        let rows = assemble_sidebar(&panes, &[], &HashMap::new(), 0, 0, DASHBOARD_PID, 0);
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].short, "aaa11111");
         assert!(rows[0].attached);
@@ -7966,7 +8089,7 @@ mod tests {
             registry_record("ccc33333", "codex", Some(DASHBOARD_PID)),
             sessions::Liveness::Live,
         )];
-        let rows = assemble_sidebar(&panes, &registry, 0, 0, DASHBOARD_PID, 0);
+        let rows = assemble_sidebar(&panes, &registry, &HashMap::new(), 0, 0, DASHBOARD_PID, 0);
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[1].short, "ccc33333");
         assert!(!rows[1].attached, "a registry-only row is never attached");
@@ -7980,7 +8103,7 @@ mod tests {
             registry_record("ccc33333", "codex", Some(DASHBOARD_PID + 1)),
             sessions::Liveness::Live,
         )];
-        let rows = assemble_sidebar(&panes, &registry, 0, 0, DASHBOARD_PID, 0);
+        let rows = assemble_sidebar(&panes, &registry, &HashMap::new(), 0, 0, DASHBOARD_PID, 0);
         assert_eq!(
             rows.len(),
             1,
@@ -7995,7 +8118,7 @@ mod tests {
             registry_record("ccc33333", "codex", None),
             sessions::Liveness::Live,
         )];
-        let rows = assemble_sidebar(&panes, &registry, 0, 0, DASHBOARD_PID, 0);
+        let rows = assemble_sidebar(&panes, &registry, &HashMap::new(), 0, 0, DASHBOARD_PID, 0);
         assert_eq!(
             rows.len(),
             1,
@@ -8011,7 +8134,7 @@ mod tests {
             registry_record("aaa11111", "claude", Some(DASHBOARD_PID)),
             sessions::Liveness::Live,
         )];
-        let rows = assemble_sidebar(&panes, &registry, 0, 0, DASHBOARD_PID, 0);
+        let rows = assemble_sidebar(&panes, &registry, &HashMap::new(), 0, 0, DASHBOARD_PID, 0);
         assert_eq!(
             rows.len(),
             1,
@@ -8026,7 +8149,7 @@ mod tests {
             registry_record("ddd44444", "codex", Some(DASHBOARD_PID)),
             sessions::Liveness::Stale,
         )];
-        let rows = assemble_sidebar(&[], &registry, 0, 0, DASHBOARD_PID, 0);
+        let rows = assemble_sidebar(&[], &registry, &HashMap::new(), 0, 0, DASHBOARD_PID, 0);
         assert!(
             rows.is_empty(),
             "a dead session must not appear as a view-only row"
@@ -8040,7 +8163,7 @@ mod tests {
             registry_record("ccc33333", "codex", Some(DASHBOARD_PID)),
             sessions::Liveness::Live,
         )];
-        let rows = assemble_sidebar(&panes, &registry, 1, 0, DASHBOARD_PID, 0);
+        let rows = assemble_sidebar(&panes, &registry, &HashMap::new(), 1, 0, DASHBOARD_PID, 0);
         assert!(!rows[0].selected);
         assert!(rows[1].selected);
     }
@@ -8054,7 +8177,7 @@ mod tests {
         let mut record = registry_record("aaa11111", "claude", Some(DASHBOARD_PID));
         record.started_at = 100;
         let registry = vec![(record, sessions::Liveness::Live)];
-        let rows = assemble_sidebar(&panes, &registry, 0, 0, DASHBOARD_PID, 160);
+        let rows = assemble_sidebar(&panes, &registry, &HashMap::new(), 0, 0, DASHBOARD_PID, 160);
         assert_eq!(rows[0].age_secs, Some(60));
     }
 
@@ -8063,8 +8186,32 @@ mod tests {
     #[test]
     fn assemble_sidebar_leaves_age_unknown_with_no_matching_registry_record() {
         let panes = vec![pane_row("aaa11111", "claude")];
-        let rows = assemble_sidebar(&panes, &[], 0, 0, DASHBOARD_PID, 160);
+        let rows = assemble_sidebar(&panes, &[], &HashMap::new(), 0, 0, DASHBOARD_PID, 160);
         assert_eq!(rows[0].age_secs, None);
+    }
+
+    /// Issue #209/v3 §C: a pane's own cached score threads through by short
+    /// id, both for this dashboard's own panes and for a view-only registry
+    /// row it owns; a short id with no entry at all leaves it `None`, never
+    /// a fabricated `0`.
+    #[test]
+    fn assemble_sidebar_threads_the_scores_map_through_by_short_id() {
+        let panes = vec![
+            pane_row("aaa11111", "claude"),
+            pane_row("bbb22222", "codex"),
+        ];
+        let mut record = registry_record("ccc33333", "claude", Some(DASHBOARD_PID));
+        record.started_at = 100;
+        let registry = vec![(record, sessions::Liveness::Live)];
+        let mut scores: ScoreMap = HashMap::new();
+        scores.insert("aaa11111".to_string(), 47);
+        scores.insert("ccc33333".to_string(), 12);
+
+        let rows = assemble_sidebar(&panes, &registry, &scores, 0, 0, DASHBOARD_PID, 160);
+
+        assert_eq!(rows[0].score, Some(47), "own pane, scored");
+        assert_eq!(rows[1].score, None, "own pane, no cached score");
+        assert_eq!(rows[2].score, Some(12), "view-only registry row, scored");
     }
 
     #[test]
@@ -8104,6 +8251,109 @@ mod tests {
         );
         assert_eq!(facts.harness, "claude (opus)");
         assert_eq!(facts.notice.as_deref(), Some("spawned claude as wrk-2"));
+    }
+
+    // Issue #209/v3 §D: `assemble_footer_facts`.
+
+    fn focused_alive_row(score: Option<u32>) -> ui::SidebarRow {
+        ui::SidebarRow {
+            short: "aaa11111".to_string(),
+            harness: "claude".to_string(),
+            age_secs: Some(90),
+            score,
+            state: ui::RowState::Idle,
+            attached: true,
+            selected: false,
+            focused: true,
+        }
+    }
+
+    #[test]
+    fn assemble_footer_facts_is_none_with_nothing_focused() {
+        let facts = assemble_footer_facts(None, &[], None, None);
+        assert!(matches!(facts, ui::FooterFacts::None));
+    }
+
+    #[test]
+    fn assemble_footer_facts_carries_score_usage_and_mail_for_the_focused_row() {
+        let row = focused_alive_row(Some(47));
+        let usage = vec![ui::HarnessUsage {
+            name: "claude",
+            five_hour: Some(61.0),
+            seven_day: Some(18.0),
+            credits: false,
+        }];
+        let facts = assemble_footer_facts(Some(&row), &usage, Some((2, 1)), None);
+        match facts {
+            ui::FooterFacts::Alive(alive) => {
+                assert_eq!(alive.harness, "claude");
+                assert_eq!(alive.score, Some(47));
+                assert_eq!(alive.usage_five_hour, Some(61.0));
+                assert_eq!(alive.usage_seven_day, Some(18.0));
+                // N7's broadcast/direct split collapses into one total.
+                assert_eq!(alive.unread_mail, 3);
+                assert!(matches!(alive.workflow, ui::FooterWorkflow::None));
+                assert!(alive.supervised);
+            }
+            _ => panic!("expected FooterFacts::Alive"),
+        }
+    }
+
+    /// A dead focused row produces `FooterFacts::Dead`, never `Alive` --
+    /// there is no verdict/usage/mail to show for an exited pane.
+    #[test]
+    fn assemble_footer_facts_is_dead_for_a_dead_focused_row() {
+        let mut row = focused_alive_row(Some(12));
+        row.state = ui::RowState::Dead;
+        row.age_secs = Some(720);
+        let facts = assemble_footer_facts(Some(&row), &[], None, None);
+        match facts {
+            ui::FooterFacts::Dead(dead) => {
+                assert_eq!(dead.harness, "claude");
+                assert_eq!(dead.exited_age_secs, Some(720));
+            }
+            _ => panic!("expected FooterFacts::Dead"),
+        }
+    }
+
+    #[test]
+    fn assemble_footer_facts_carries_the_active_workflow_summary_through() {
+        let row = focused_alive_row(None);
+        let summary = workflow::ActiveWorkflowSummary {
+            kind: "feature",
+            step: "design".to_string(),
+            awaiting_approval: false,
+        };
+        let facts = assemble_footer_facts(Some(&row), &[], None, Some(&summary));
+        match facts {
+            ui::FooterFacts::Alive(alive) => match alive.workflow {
+                ui::FooterWorkflow::Active { kind, step, gated } => {
+                    assert_eq!(kind, "feature");
+                    assert_eq!(step, "design");
+                    assert!(!gated);
+                }
+                ui::FooterWorkflow::None => panic!("expected an active workflow segment"),
+            },
+            _ => panic!("expected FooterFacts::Alive"),
+        }
+    }
+
+    #[test]
+    fn assemble_footer_facts_marks_an_awaiting_approval_workflow_as_gated() {
+        let row = focused_alive_row(None);
+        let summary = workflow::ActiveWorkflowSummary {
+            kind: "feature",
+            step: "spec".to_string(),
+            awaiting_approval: true,
+        };
+        let facts = assemble_footer_facts(Some(&row), &[], None, Some(&summary));
+        match facts {
+            ui::FooterFacts::Alive(alive) => match alive.workflow {
+                ui::FooterWorkflow::Active { gated, .. } => assert!(gated),
+                ui::FooterWorkflow::None => panic!("expected an active workflow segment"),
+            },
+            _ => panic!("expected FooterFacts::Alive"),
+        }
     }
 
     /// Task 7: `refresh_if_due` fills `disk.usage` with one entry per enabled
@@ -15160,8 +15410,9 @@ mod tests {
         let mut term_rows = 24u16;
         let mut full = Rect::new(0, 0, 80, 24);
         let mut errors = Vec::new();
-        // sidebar 20, not zoomed: main width = 100 - 20 - 1 = 79, height = 40 - 1
-        // (`ui::header_rows` takes one row at every height).
+        // sidebar 20, not zoomed: main width = 100 - 20 - 1 = 79, height =
+        // 40 - 4 (issue #209/v3 §A4/§D: one header row, one top rule, one
+        // bottom rule, one footer row -- `ui::chrome_rows`).
         apply_terminal_resize(
             100,
             40,
@@ -15179,7 +15430,7 @@ mod tests {
         // vt100 `size()` returns (rows, cols).
         assert_eq!(
             panes[0].screen().size(),
-            (39, 79),
+            (36, 79),
             "the pane's screen was resized to the new inner geometry"
         );
 
