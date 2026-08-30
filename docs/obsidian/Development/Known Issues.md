@@ -14,6 +14,7 @@ Each entry gets a changelog comment at the top of the file, newest first:
 <!-- Updated YYYY-MM-DD (branch, state): what changed -->
 ```
 
+<!-- Updated 2026-08-30 (feat/209-dash-v3, issue #209, v2.39.0): recorded that `zirv workflow advance`'s test-step gate cannot pass on a host with known pre-existing test-suite failures (issue #215, filed on this workflow) -->
 <!-- Updated 2026-08-30 (feat/202-tui-redesign, issue #202, v2.38.0): corrected the "PaneState::WaitingInput" entry's stale sidebar-glyph list (working/idle/dead glyphs changed by the TUI redesign) -- see [[Ctx Supervisors]] -->
 <!-- Updated 2026-08-29 (release/187-ai-native-sdlc, PR #200 review round): recorded the pre-existing over-budget mid-poll exit-code clobber flake (issue #203) surfaced while diffing the full-suite failure list against baseline -->
 <!-- Updated 2026-08-28 (release/2.35.0 closeout, issues #176/#177/#178): recorded a pre-existing `zirv context sync --report` discrepancy discovered while regenerating managed context for the release -- `--report` claimed no differences against a tree `--generate` immediately afterward found a real diff for; out of this branch's scope, not investigated further -->
@@ -68,6 +69,10 @@ Each entry gets a changelog comment at the top of the file, newest first:
 <!-- Updated 2026-08-13 (feat/dashboard, docs sweep): dashboard panes carry no rot score yet -->
 <!-- Updated 2026-08-13 (feat/agent-coordination, review round): markdown header absorption; registry short is a stable address; supervision env scrubbed on every spawn -->
 <!-- Updated 2026-08-13 (feat/agent-coordination, console-safety round): portable-pty do_kill inversion; ConPTY control-byte broadcast; empty nudge prefixes -->
+
+## `zirv workflow advance`'s test-step gate cannot pass on a host with known-baseline test failures
+
+**Discovered 2026-08-30 (`feat/209-dash-v3`, issue #209), filed as issue #215.** The workflow engine's test step demands fresh passing evidence from `zirv test changed`, which runs the full serial `cargo test` suite and hard-fails on any failure name at all. On this Windows dev machine, `main` itself has roughly six pre-existing failing `wrap`/`exec` test names (the documented per-host baseline — see CLAUDE.md's "This Windows dev machine" section), so the gate is structurally unpassable here even when a branch introduces zero new failure names, verified by a sorted failure-NAME diff against a pristine `main` worktree. Worked around manually for this workflow (the evidence was reviewed by hand against the baseline rather than accepted by the gate). The gate needs a baseline/waiver mechanism — e.g. accept evidence when the failure-name set is a subset of a recorded per-host baseline, or an explicit operator-approved waiver recorded in workflow state — not fixed as part of this branch, since it is a `zirv workflow`-engine gap unrelated to the dash TUI change this branch actually makes.
 
 ## An over-budget mid-poll kill can clobber a child's real exit code (flaky test)
 

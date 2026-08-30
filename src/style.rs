@@ -305,9 +305,17 @@ pub mod tui {
         Style::default().fg(Color::Green)
     }
 
-    /// A value the reader should notice first.
+    /// A value the reader should notice first. Bold (issue #209/v3): the
+    /// approved v3 mock sharpens every accent-toned surface at once --
+    /// spinners, frame titles, focused borders -- rather than leaving cyan
+    /// to carry the emphasis alone. Checked against every consumer before
+    /// this changed (`tui::accent()`'s own callers, all inside the
+    /// dashboard); none asserted the un-bolded `Style` by equality, so none
+    /// needed a test update for the added modifier.
     pub fn accent() -> Style {
-        Style::default().fg(Color::Cyan)
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
     }
 
     /// The zirv brand chip: black text on a cyan background, bold. One per
