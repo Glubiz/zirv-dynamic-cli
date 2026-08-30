@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-29
+last-verified: 2026-08-30
 ---
 
 # Decision Log
@@ -23,6 +23,13 @@ last-verified: 2026-08-29
 - If the entry is longer than the cap, the "why" is a spec, not an ADR — write it under `docs/superpowers/specs/` and link to it.
 
 ## Decisions
+
+### 2026-08-30 — Centralized terminal design system in `src/style.rs`; ANSI base-colour-only semantic palette; explicit-bool colour gating (issue #202, v2.38.0)
+**Context:** The launch banner, status bar, dashboard header/sidebar/dialogs, `zirv help`, `ctx status`, and `context status` had each grown their own ad hoc truncation, colour, and glyph conventions over many prior rounds, drifting independently and duplicating width-truncation logic in at least three files.
+**Decision:** One module, `src/style.rs`, owns every terminal-facing text primitive: a semantic `Tone` palette (`paint`) restricted to the ANSI base 16 colours, display-width-aware truncation/padding (via the new `unicode-width` dependency), `format_age`/`format_pct`, the shared `PLACEHOLDER` en dash, and `style::tui`'s ratatui-specific tokens (`chip()`, `SPINNER_FRAMES`). Every colour decision takes an explicit `colour: bool` parameter rather than querying the terminal itself, gated once at each call site by `console::colors_enabled()`.
+**Rejected:** A 256-colour/truecolor palette — ANSI base colours only, for terminal-compatibility breadth and because a harness-grammar chrome (rounded frames, brand chip, spinners) reads clearly in 16 colours. Querying `colors_enabled()` from inside `style.rs` itself — an explicit bool keeps every renderer a pure function, directly unit-testable for both the coloured and plain-piped cases without an environment/terminal shim.
+**Consequences:** The launch banner degrades through a three-tier ladder (rounded box → compact `▎ zirv …` lines under 56 columns or unknown width → legacy plain when VT is unavailable); the status bar and dashboard header/sidebar both truncate by dropping segments in a documented priority order rather than hard-clipping arbitrary text. Any future terminal-facing surface should extend `style.rs` rather than hand-rolling its own paint/truncate helpers.
+**Spec / link:** `src/style.rs`, `src/commands/ctx/chrome.rs`, `src/commands/ctx/dash/ui.rs`; [[Ctx Supervisors]]'s "Terminal chrome"/"The dashboard header and sidebar" sections; [[Technology Stack]]'s `unicode-width` entry; issue #202.
 
 ### 2026-08-29 — ModelTier stays a routing hint; adapters never guess concrete model ids (PR #200 review)
 **Context:** The SDLC spec's Dispatch section said `Fast|Standard|Deep` map to concrete vendor models (haiku/sonnet/opus-class). The implementation deliberately passes the tier through as a hint and lets each adapter/operator config pick real models; the conformance review flagged the mismatch.

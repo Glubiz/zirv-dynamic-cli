@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-29
+last-verified: 2026-08-30
 ---
 
 # Work Journal
@@ -19,6 +19,11 @@ last-verified: 2026-08-29
 **Follow-up:** anything unfinished (optional).
 
 ## Entries
+
+### 2026-08-30: TUI redesign — style.rs foundation, wrap chrome, dashboard chrome, CLI surfaces (`feat/202-tui-redesign`, issue #202, v2.38.0)
+**What:** Audited the terminal chrome across `wrap`'s banner/status bar, the dashboard header/sidebar/dialogs, and `zirv help`/`ctx status`/`context status`, produced an approved design artifact, then landed it in three implementation waves plus a version bump: (1) `src/style.rs`, a single terminal design system (semantic `Tone` palette, display-width-aware truncation via new dep `unicode-width`, `format_age`/`format_pct`/`PLACEHOLDER`, `style::tui` ratatui tokens); (2) `chrome.rs`'s launch banner (rounded-box/compact/legacy degradation ladder) and status bar (chip + glyph-tagged priority-truncated segments); (3) the dashboard (`dash/`) header/sidebar redesign, one shared `render_list_dialog` primitive across six overlays, and the new `Ctrl+A e` errors overlay, plus styled `zirv help`/`ctx status`/`context status`.
+**Key changes:** `src/style.rs` (new); `src/commands/ctx/chrome.rs`, `dash/mod.rs`, `dash/ui.rs`, `status.rs`, `context_status.rs`, `help.rs`; `output.rs` gained `success()`; `Cargo.toml` → 2.38.0. See [[Ctx Supervisors]]'s "Terminal chrome"/"The dashboard header and sidebar" sections, [[Ctx Subsystem]]'s `status` verb entry, [[Built-in Commands]]'s `help` entry, [[Technology Stack]]'s `unicode-width` entry, and the same-day [[Decision Log]] entry.
+**Follow-up:** Verification/review still pending — no PR opened yet. The one pre-existing baseline failure on this machine remains `commands::ctx::wrap::win::` (see [[Known Issues]]/CLAUDE.md); a Linux/Docker `wrap::` verification round (mandatory for anything touching `chrome.rs`/`wrap`/`dash` per this repo's own working instructions) has not yet been run for this branch.
 
 ### 2026-08-29: PR #200 five-leg review round and fix wave (`release/187-ai-native-sdlc`)
 **What:** Full review of the SDLC release PR: spec conformance (20/22 implemented), superpowers parity/token analysis (~10–16x cheaper per cycle, enforcement is code not prose), Windows gates + CLI smoke, Docker/Linux wrap verification, and a correctness pass; then one fix wave.

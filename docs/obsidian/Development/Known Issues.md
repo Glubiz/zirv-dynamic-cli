@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-29
+last-verified: 2026-08-30
 ---
 
 # Known Issues
@@ -14,6 +14,7 @@ Each entry gets a changelog comment at the top of the file, newest first:
 <!-- Updated YYYY-MM-DD (branch, state): what changed -->
 ```
 
+<!-- Updated 2026-08-30 (feat/202-tui-redesign, issue #202, v2.38.0): corrected the "PaneState::WaitingInput" entry's stale sidebar-glyph list (working/idle/dead glyphs changed by the TUI redesign) -- see [[Ctx Supervisors]] -->
 <!-- Updated 2026-08-29 (release/187-ai-native-sdlc, PR #200 review round): recorded the pre-existing over-budget mid-poll exit-code clobber flake (issue #203) surfaced while diffing the full-suite failure list against baseline -->
 <!-- Updated 2026-08-28 (release/2.35.0 closeout, issues #176/#177/#178): recorded a pre-existing `zirv context sync --report` discrepancy discovered while regenerating managed context for the release -- `--report` claimed no differences against a tree `--generate` immediately afterward found a real diff for; out of this branch's scope, not investigated further -->
 <!-- Updated 2026-08-27 (release/2.32.0, PR #171 review round, issue #155): recorded that a delegated worker's token/tool-call budget resets to zero on a rot restart or nudge relaunch instead of carrying the exhausted spend forward (tracked as issue #169) -->
@@ -605,9 +606,16 @@ assuming there's still room.
 
 Removed 2026-08-14 (round-9 review): the variant had no producer and never
 rendered in the real dashboard render loop, so the sidebar could never show
-it. Real glyphs are `●` working, `○` idle, `·` view-only, `✕` ended. A true
-"waiting on input" indicator would need a new turn-signal kind end-to-end,
-not just a state variant — do not re-add the enum case without one.
+it. A true "waiting on input" indicator would need a new turn-signal kind
+end-to-end, not just a state variant — do not re-add the enum case without
+one.
+
+**Glyphs updated 2026-08-30 (issue #202, v2.38.0 sidebar redesign):** a
+working pane now renders an advancing [`style::tui::SPINNER_FRAMES`] braille
+frame instead of `●`, a live-but-idle pane renders green `●` (was `○`), a
+dead/ended pane renders red `✗` (U+2717, was `✕` U+2715), and a view-only
+registry row this dashboard did not spawn still renders uncoloured `·`. See
+[[Ctx Supervisors]]'s "The dashboard header and sidebar" section.
 
 ## The mail-vs-`composed` delivery decision is open-coded at ~11 call sites, not one seam
 
