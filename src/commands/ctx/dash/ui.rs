@@ -415,6 +415,26 @@ fn header_spans(facts: &HeaderFacts, cols: u16) -> Vec<Span<'static>> {
         None
     };
 
+    // The chip and the hint cluster always show, and the live count and
+    // SELECT marker are short and fixed-shape; the harness/model label is
+    // the one variable-length piece of the left side, so it is the one that
+    // gives up room when the row is narrow. Ellipsis-truncate it to
+    // whatever is left after those fixed pieces, rather than drawing it at
+    // full length: a long-but-valid label would otherwise consume the row
+    // and push the hint cluster past the Paragraph's own right edge, where
+    // ratatui clips it off-screen with no ellipsis and no warning.
+    let hints_w = style::display_width(HEADER_HINTS);
+    let gap_before_hints = 2usize;
+    let chip_w = style::display_width(&chip_text);
+    let live_w = style::display_width(&live_text);
+    let select_w = select_text
+        .as_deref()
+        .map(style::display_width)
+        .unwrap_or(0);
+    let fixed_w = chip_w + live_w + select_w;
+    let harness_budget = cols.saturating_sub(fixed_w + hints_w + gap_before_hints);
+    let harness_text = style::truncate_display_ellipsis(&harness_text, harness_budget).into_owned();
+
     let mut left: Vec<(String, Style)> = vec![
         (chip_text, style::tui::chip()),
         (harness_text, style::tui::title()),
@@ -425,8 +445,6 @@ fn header_spans(facts: &HeaderFacts, cols: u16) -> Vec<Span<'static>> {
     }
     let left_w: usize = left.iter().map(|(t, _)| style::display_width(t)).sum();
 
-    let hints_w = style::display_width(HEADER_HINTS);
-    let gap_before_hints = 2usize;
     let reserved = left_w + hints_w + gap_before_hints;
     let middle_budget = cols.saturating_sub(reserved);
 
@@ -851,6 +869,24 @@ fn dialog_width(area_width: u16) -> u16 {
     area_width.saturating_sub(4).max(1).min(area_width.max(1))
 }
 
+/// A dialog's own row count (content rows plus `extra_rows` of chrome --
+/// border/footer/blank lines) as a `u16`, clamped rather than cast: `rows`
+/// comes from caller-controlled data (mail, memory, restore lists) with no
+/// upper bound, so a plain `rows as u16` would silently wrap on a five-digit
+/// row count, and `rows as u16 + extra_rows` (`+` on `u16`, not
+/// `saturating_add`) can then overflow -- which panics in every debug/test
+/// build (this profile has no `overflow-checks` override, so the default
+/// `true` for dev/test applies) and silently wraps in release. Saturating
+/// both the cast and the add means an enormous row count degrades to
+/// "as tall as it can possibly be", clamped again by the caller's own
+/// `.min(area.height)`, instead of corrupting the layout or aborting the
+/// whole dashboard.
+fn dialog_row_count(rows: usize, extra_rows: u16) -> u16 {
+    u16::try_from(rows)
+        .unwrap_or(u16::MAX)
+        .saturating_add(extra_rows)
+}
+
 /// Splits a draft/input string on `\n` into one dialog-line entry per visual
 /// row, so a multi-line draft renders one dialog row per visual line: the
 /// first row keeps the `> ` prompt prefix, every continuation row gets a
@@ -883,7 +919,7 @@ fn render_dialog(f: &mut Frame, area: Rect, title: &str, lines: &[String]) {
     if area.is_empty() {
         return;
     }
-    let h = (lines.len() as u16 + 2).min(area.height);
+    let h = dialog_row_count(lines.len(), 2).min(area.height);
     let w = dialog_width(area.width);
     let rect = centered(area, w, h);
     let block = Block::default()
@@ -1006,7 +1042,7 @@ pub fn render_list_dialog(f: &mut Frame, area: Rect, spec: &ListDialogSpec) {
     let content_rows = spec.rows.len().max(1);
     // +1 blank row above the footer, +1 the footer row itself, +2 for the
     // block's own top/bottom border.
-    let h = (content_rows as u16 + 2 + 2).min(area.height);
+    let h = dialog_row_count(content_rows, 2 + 2).min(area.height);
     let w = dialog_width(area.width);
     let rect = centered(area, w, h);
 
@@ -2094,6 +2130,24 @@ mod tests {
         assert!(text.contains("SELECT"), "header text was: {text}");
     }
 
+    /// A long-but-valid harness/model label must not consume the whole row:
+    /// the hint cluster (`^A e errors  ^A ? help`) has priority over the
+    /// label and must still be visible at a typical terminal width, even
+    /// though only the label itself -- not the hints -- gets ellipsis-
+    /// truncated to make room.
+    #[test]
+    fn header_keeps_the_hint_cluster_visible_behind_an_absurdly_long_model_name() {
+        let mut facts = base_facts();
+        facts.harness =
+            "claude-".to_string() + &"opus-4-1-20260830-preview-extra-long-alias".repeat(4);
+        let area = Rect::new(0, 0, 80, 1);
+        let text = render_and_capture_text(area, |f, area| render_header(f, area, &facts));
+        assert!(text.contains("errors"), "hints missing: {text}");
+        assert!(text.contains("help"), "hints missing: {text}");
+        // The chip stays intact even though the label had to give up room.
+        assert!(text.contains("zirv"), "chip missing: {text}");
+    }
+
     fn render_and_capture_text(area: Rect, draw: impl FnOnce(&mut Frame, Rect)) -> String {
         let backend = TestBackend::new(area.width, area.height);
         let mut term = Terminal::new(backend).unwrap();
@@ -2633,6 +2687,60 @@ mod tests {
         for w in 0..=64u16 {
             assert!(dialog_width(w) >= 1);
             assert!(dialog_width(w) <= w.max(1));
+        }
+    }
+
+    #[test]
+    fn dialog_row_count_saturates_instead_of_wrapping_or_overflowing() {
+        // Before this existed, `rows as u16 + extra` would silently wrap on
+        // a five-digit row count and, right at the u16 boundary, overflow
+        // the subsequent `+` -- which panics in every debug/test build
+        // (this profile has no `overflow-checks` override).
+        assert_eq!(dialog_row_count(0, 4), 4);
+        assert_eq!(dialog_row_count(10, 4), 14);
+        assert_eq!(dialog_row_count(u16::MAX as usize, 4), u16::MAX);
+        assert_eq!(dialog_row_count(100_000, 4), u16::MAX);
+        assert_eq!(dialog_row_count(usize::MAX, 4), u16::MAX);
+    }
+
+    /// A pathologically large row count (tens of thousands of mail rows, say)
+    /// must render without panicking and the resulting height must never
+    /// exceed the area it was clamped against -- the same guarantee the
+    /// small-row-count dialogs already have, just exercised at a size where
+    /// the old `content_rows as u16 + 2 + 2` cast/add could wrap or overflow.
+    #[test]
+    fn render_list_dialog_never_panics_on_an_enormous_row_count_or_a_very_wide_row() {
+        let mut rows: Vec<ListDialogRow> = (0..70_000)
+            .map(|i| ListDialogRow::plain(format!("row {i}")))
+            .collect();
+        // A single absurdly wide row, too: `display_width` on it is far
+        // larger than any real terminal, exercising the same cast risk on
+        // the cursor row's own reversed-padding width math.
+        rows.push(ListDialogRow::plain("x".repeat(200_000)));
+        let cursor = Some(rows.len() - 1);
+
+        let spec = ListDialogSpec {
+            title: "mail",
+            count: Some(rows.len()),
+            rows,
+            cursor,
+            footer: MAIL_FOOTER,
+            warn: false,
+            empty_message: "(no mail)",
+        };
+
+        for area in [
+            Rect::new(0, 0, 10, 3),
+            Rect::new(0, 0, 40, 10),
+            Rect::new(0, 0, 200, 60),
+        ] {
+            let backend = TestBackend::new(area.width, area.height);
+            let mut term = Terminal::new(backend).expect("terminal");
+            term.draw(|f| render_list_dialog(f, area, &spec))
+                .expect("draw must not panic on an enormous row count");
+            let buf = term.backend().buffer();
+            assert_eq!(buf.area.width, area.width);
+            assert_eq!(buf.area.height, area.height);
         }
     }
 

@@ -79,15 +79,52 @@ pub fn paint(text: &str, tone: Tone, colour: bool) -> String {
 /// than the crate's own "undefined" for those code points) so a string that
 /// happens to carry one never under- or over-counts by an unpredictable
 /// amount.
+///
+/// Known limitation: this sums *scalar values* (`char`s), not grapheme
+/// clusters. A multi-codepoint cluster that a terminal renders as one glyph
+/// -- a ZWJ emoji sequence (`👨\u{200d}👩\u{200d}👧`), a regional-indicator
+/// flag pair, a base character plus combining marks -- is measured as the
+/// sum of its parts, which overcounts the column width a real terminal
+/// actually uses for it. Fixing that precisely needs Unicode grapheme
+/// segmentation (e.g. the `unicode-segmentation` crate), which this module
+/// deliberately does not depend on; [`truncate_display`] and
+/// [`truncate_display_ellipsis`] compensate only for the specific failure
+/// mode that segmentation would otherwise prevent -- a cut landing on a
+/// dangling zero-width joiner -- not for the overcount itself.
 pub fn display_width(s: &str) -> usize {
     s.chars()
         .map(|c| UnicodeWidthChar::width(c).unwrap_or(0))
         .sum()
 }
 
+/// Backs `end` up past a trailing zero-width joiner (U+200D) left dangling
+/// at a truncation boundary. `leftmost_fit_end`'s scan below happily keeps
+/// consuming zero-width scalars (a ZWJ included) as long as they fit for
+/// free -- they never add to `width` -- so a join sequence like
+/// `👨\u{200d}👩` can end up cut right after the ZWJ, once the emoji it was
+/// about to join doesn't fit. That leaves a lone ZWJ as the last character
+/// of the truncated string: not a glyph a terminal can render, since a ZWJ
+/// only ever means "join with what follows". Backing up past it (and any
+/// further trailing ZWJs, for a longer chain) drops the whole dangling
+/// join instead, so a cluster is always kept whole or dropped whole.
+///
+/// Plain combining marks and variation selectors are deliberately left
+/// alone: `leftmost_fit_end` only ever keeps one when it fit for free right
+/// after its base, so it is never split from it in the first place.
+fn trim_trailing_zwj(s: &str, mut end: usize) -> usize {
+    while let Some(prev) = s[..end].chars().next_back() {
+        if prev != '\u{200d}' {
+            break;
+        }
+        end -= prev.len_utf8();
+    }
+    end
+}
+
 /// Byte length of the leftmost prefix of `s` whose display width is `<=
 /// max_cols`, choosing the longest such prefix and never splitting a
-/// codepoint in half.
+/// codepoint in half, and never leaving a dangling zero-width joiner as the
+/// last character (see [`trim_trailing_zwj`]).
 fn leftmost_fit_end(s: &str, max_cols: usize) -> usize {
     let mut width = 0usize;
     let mut end = 0usize;
@@ -99,12 +136,14 @@ fn leftmost_fit_end(s: &str, max_cols: usize) -> usize {
         width += w;
         end = idx + ch.len_utf8();
     }
-    end
+    trim_trailing_zwj(s, end)
 }
 
 /// Byte offset of the start of the rightmost suffix of `s` whose display
 /// width is `<= max_cols`, choosing the longest such suffix and never
-/// splitting a codepoint in half.
+/// splitting a codepoint in half, and never leaving a leading zero-width
+/// joiner stranded without the base it was meant to join (the mirror image
+/// of [`trim_trailing_zwj`], for the suffix side).
 #[allow(dead_code)] // used by middle_truncate; first caller lands with the #202 follow-up
 fn rightmost_fit_start(s: &str, max_cols: usize) -> usize {
     let mut width = 0usize;
@@ -116,6 +155,12 @@ fn rightmost_fit_start(s: &str, max_cols: usize) -> usize {
         }
         width += w;
         start = idx;
+    }
+    while let Some(next) = s[start..].chars().next() {
+        if next != '\u{200d}' {
+            break;
+        }
+        start += next.len_utf8();
     }
     start
 }
@@ -380,6 +425,58 @@ mod tests {
         let out = truncate_display("日本語", 3);
         assert!(display_width(&out) <= 3);
         assert_eq!(out, "日");
+    }
+
+    #[test]
+    fn truncate_display_never_strands_a_base_char_from_its_combining_mark() {
+        // "e" + combining acute accent (U+0301), width 0, then more content.
+        // Whatever the base fits, whichever zero-width marks fit right after
+        // it are free (they never add to the running width), so the mark
+        // must never be dropped while its base is kept.
+        let s = "e\u{0301}bcdef";
+        for cols in 0..=display_width(s) {
+            let out = truncate_display(s, cols);
+            assert!(display_width(&out) <= cols, "cols={cols} out={out:?}");
+            if out.starts_with('e') {
+                assert!(
+                    out.starts_with("e\u{0301}") || out == "e",
+                    "base kept without checking for its mark: cols={cols} out={out:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn truncate_display_keeps_or_drops_a_zwj_emoji_family_whole() {
+        // Man + ZWJ + Woman + ZWJ + Girl: a three-codepoint join sequence a
+        // terminal renders as one glyph. At every budget, the truncated
+        // result must never end on a bare ZWJ -- that would be a dangling
+        // "join with what follows" marker with nothing left to join.
+        let family = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}";
+        for cols in 0..=display_width(family) {
+            let out = truncate_display(family, cols);
+            assert!(display_width(&out) <= cols, "cols={cols} out={out:?}");
+            assert!(
+                !out.ends_with('\u{200d}'),
+                "cols={cols} left a dangling ZWJ: {out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn truncate_display_ellipsis_keeps_or_drops_a_zwj_emoji_family_whole() {
+        let family = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}";
+        for cols in 0..=display_width(family) + 2 {
+            let out = truncate_display_ellipsis(family, cols);
+            assert!(display_width(&out) <= cols, "cols={cols} out={out:?}");
+            // Strip a trailing ellipsis before checking for a dangling ZWJ:
+            // the ellipsis itself is never part of the joined cluster.
+            let without_ellipsis = out.strip_suffix('\u{2026}').unwrap_or(&out);
+            assert!(
+                !without_ellipsis.ends_with('\u{200d}'),
+                "cols={cols} left a dangling ZWJ: {out:?}"
+            );
+        }
     }
 
     #[test]
