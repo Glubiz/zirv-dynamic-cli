@@ -24,6 +24,13 @@ last-verified: 2026-08-30
 
 ## Decisions
 
+### 2026-08-30 — Linux release binary switches to a static musl build (issue #210, v2.39.1)
+**Context:** `cd.yaml`'s Linux release asset was built on `ubuntu-24.04` and linked GLIBC_2.39; verified in a clean Docker container, it failed to run on Debian 12 and Ubuntu 22.04 (both still common `install.sh` targets) with a missing-symbol error, while the CI runner itself never surfaced the mismatch.
+**Decision:** Cross-compile the Linux asset to `x86_64-unknown-linux-musl` (`rustup target add` + `musl-tools`) and ship that static binary under the same asset name (`zirv-<version>-linux.tar.gz`), verified in Docker to build and run correctly on both Debian 12 and Alpine.
+**Rejected:** Pinning the build job to an older Ubuntu runner (e.g. 22.04, glibc 2.35) — narrows the failure but doesn't eliminate it; a glibc 2.35 binary still refuses to run on RHEL 9 and any other distro shipping an older glibc than the pinned runner's.
+**Consequences:** The Linux release binary is now static and distro-independent going forward, at the cost of a slightly larger binary and a musl-specific CI toolchain step. Releases already published at v2.39.0 and earlier remain glibc-linked and still fail on older distros — no binary retrofit, see [[Known Issues]].
+**Spec / link:** `.github/workflows/cd.yaml`; issue #210.
+
 ### 2026-08-30 — Centralized terminal design system in `src/style.rs`; ANSI base-colour-only semantic palette; explicit-bool colour gating (issue #202, v2.38.0)
 **Context:** The launch banner, status bar, dashboard header/sidebar/dialogs, `zirv help`, `ctx status`, and `context status` had each grown their own ad hoc truncation, colour, and glyph conventions over many prior rounds, drifting independently and duplicating width-truncation logic in at least three files.
 **Decision:** One module, `src/style.rs`, owns every terminal-facing text primitive: a semantic `Tone` palette (`paint`) restricted to the ANSI base 16 colours, display-width-aware truncation/padding (via the new `unicode-width` dependency), `format_age`/`format_pct`, the shared `PLACEHOLDER` en dash, and `style::tui`'s ratatui-specific tokens (`chip()`, `SPINNER_FRAMES`). Every colour decision takes an explicit `colour: bool` parameter rather than querying the terminal itself, gated once at each call site by `console::colors_enabled()`.

@@ -398,22 +398,28 @@ disabling the harnesses themselves (claude, codex) — a separate file from
 
 ## Installation
 
-Choose one of the following methods:
+Pick your OS below. Each has one copy-paste command.
 
-### Homebrew (macOS & Linux)
+### Windows
+
+```bash
+choco install zirv
+```
+
+### macOS
 
 ```bash
 brew tap glubiz/homebrew-tap
 brew install zirv
 ```
 
-### Chocolatey (Windows)
+> If Homebrew reports the tap as untrusted, run `brew trust glubiz/tap` and retry.
 
-```bash
-choco install zirv
-```
+The published binary is universal (Intel and Apple Silicon), so this works on either Mac.
 
-### Install Script (macOS & Linux)
+### Linux
+
+Recommended — install script:
 
 ```bash
 curl -sSfL https://raw.githubusercontent.com/Glubiz/zirv-dynamic-cli/main/install.sh | sh
@@ -422,35 +428,49 @@ curl -sSfL https://raw.githubusercontent.com/Glubiz/zirv-dynamic-cli/main/instal
 To install a specific version:
 
 ```bash
-curl -sSfL https://raw.githubusercontent.com/Glubiz/zirv-dynamic-cli/main/install.sh | sh -s -- 2.38.0
+curl -sSfL https://raw.githubusercontent.com/Glubiz/zirv-dynamic-cli/main/install.sh | sh -s -- <version>
 ```
 
-### Cargo (All Platforms)
+Alternative — Homebrew on Linux, via the same tap:
 
 ```bash
-cargo build --release
-# Add `target/release` to your PATH
+brew tap glubiz/homebrew-tap
+brew install zirv
 ```
+
+> If Homebrew reports the tap as untrusted, run `brew trust glubiz/tap` and retry.
+
+The prebuilt Linux release is x86_64-only. On other architectures (aarch64, armv7, ...) the install script fails fast with a pointer to the source build; the Homebrew formula does not guard the architecture, so skip it there and build from source instead (see below). Releases up to 2.39.0 additionally require glibc 2.39+; from 2.39.1 the Linux binary is fully static.
+
+### From source (any platform/arch)
+
+```bash
+cargo install --git https://github.com/Glubiz/zirv-dynamic-cli
+```
+
+Works today without a crates.io publish, and is the only supported path on architectures the release pipeline doesn't build for (e.g. Linux aarch64).
 
 ### Precompiled Binaries
 Download the latest release from the [GitHub Releases]:
 https://github.com/Glubiz/zirv-dynamic-cli/releases
 
+Assets per version: `zirv-<version>-linux.tar.gz` (x86_64), `zirv-<version>-macos.tar.gz` (universal x86_64+arm64), `zirv-<version>-windows.exe`.
+
 ## Upgrading
 
-### Homebrew
+### Homebrew (macOS & Linux)
 
 ```bash
 brew upgrade zirv
 ```
 
-### Chocolatey
+### Chocolatey (Windows)
 
 ```bash
 choco upgrade zirv
 ```
 
-### Install Script
+### Install Script (Linux)
 
 Re-run the install script to get the latest version:
 
@@ -458,10 +478,10 @@ Re-run the install script to get the latest version:
 curl -sSfL https://raw.githubusercontent.com/Glubiz/zirv-dynamic-cli/main/install.sh | sh
 ```
 
-### Cargo
+### From source
 
 ```bash
-cargo build --release
+cargo install --git https://github.com/Glubiz/zirv-dynamic-cli --force
 ```
 
 ## Usage

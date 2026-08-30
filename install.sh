@@ -2,7 +2,7 @@
 set -eu
 
 REPO="Glubiz/zirv-dynamic-cli"
-INSTALL_DIR="/usr/local/bin"
+INSTALL_DIR="${ZIRV_INSTALL_DIR:-/usr/local/bin}"
 BINARY_NAME="zirv"
 
 get_latest_version() {
@@ -13,9 +13,31 @@ get_latest_version() {
 
 detect_platform() {
     OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+    ARCH=$(uname -m)
+
     case "$OS" in
-        linux*)  echo "linux" ;;
-        darwin*) echo "macos" ;;
+        linux*)
+            case "$ARCH" in
+                x86_64|amd64) ;;
+                *)
+                    echo "Error: Unsupported architecture for Linux: ${ARCH}." >&2
+                    echo "The prebuilt Linux release is x86_64-only. Build from source instead:" >&2
+                    echo "  cargo install --git https://github.com/Glubiz/zirv-dynamic-cli" >&2
+                    exit 1
+                    ;;
+            esac
+            echo "linux"
+            ;;
+        darwin*)
+            case "$ARCH" in
+                x86_64|amd64|arm64|aarch64) ;;
+                *)
+                    echo "Error: Unsupported architecture for macOS: ${ARCH}." >&2
+                    exit 1
+                    ;;
+            esac
+            echo "macos"
+            ;;
         *)
             echo "Error: Unsupported operating system: $OS" >&2
             exit 1
@@ -40,11 +62,20 @@ main() {
     trap 'rm -rf "$TMPDIR"' EXIT
 
     echo "Downloading ${URL}..."
-    curl -sSfL -o "${TMPDIR}/${ARCHIVE}" "$URL"
+    curl -sSfL -o "${TMPDIR}/${ARCHIVE}" "$URL" || {
+        echo "Error: Failed to download ${URL}" >&2
+        echo "Check that v${VERSION} exists: https://github.com/${REPO}/releases" >&2
+        exit 1
+    }
 
     echo "Extracting..."
     tar -xzf "${TMPDIR}/${ARCHIVE}" -C "$TMPDIR"
     chmod +x "${TMPDIR}/${BINARY_NAME}"
+
+    if [ ! -d "$INSTALL_DIR" ]; then
+        echo "Creating ${INSTALL_DIR}..."
+        mkdir -p "$INSTALL_DIR" 2>/dev/null || sudo mkdir -p "$INSTALL_DIR"
+    fi
 
     if [ -w "$INSTALL_DIR" ]; then
         mv "${TMPDIR}/${BINARY_NAME}" "${INSTALL_DIR}/${BINARY_NAME}"
