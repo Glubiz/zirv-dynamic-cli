@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-24
+last-verified: 2026-08-30
 ---
 
 # Technology Stack
@@ -46,6 +46,7 @@ last-verified: 2026-08-24
 | `crossterm` | 0.29 | Terminal event/key input and raw-mode primitives for the dashboard's own event loop (`dash/mod.rs`) |
 | `ratatui` | 0.30 | Immediate-mode TUI rendering for the dashboard's header, sidebar, pane grid, and overlays (`dash/ui.rs`) |
 | `vt100` | 0.16 | Embedded terminal-screen emulation, one `vt100::Screen` per dashboard pane, so a pane's own child renders correctly without owning the real terminal |
+| `unicode-width` | 0.2.2 | Display-width-aware text truncation/padding for `style.rs` (issue #202, v2.38.0) — zirv's single terminal design system: semantic `Tone`/`paint`, `format_age`/`format_pct`/the shared `PLACEHOLDER` en dash, and `style::tui`'s ratatui tokens (the brand `chip()`, `SPINNER_FRAMES`). A CJK/emoji character's on-screen column width differs from its `char`/byte count, so every truncation/padding decision across `chrome.rs`'s banner/status bar and `dash/ui.rs`'s header/sidebar/dialogs goes through this crate rather than counting characters |
 | `ureq` | 3 | Blocking HTTP client for `ctx::poll::HttpPoller` — this crate's **first** HTTP dependency (2026-08-16). Deliberately narrow in scope: it backs only the active usage-poll *fallback*, consulted solely when the passive collector reading (statusline tee or codex rollout scan) has already gone stale at a pacing decision point — never on a path that must stay network-free (`wrap`'s status-bar redraw never constructs a poller). Chosen over `reqwest` for a synchronous, blocking call with no async runtime coupling needed for one occasional GET; pulls in `rustls` (and transitively `ring`/`cc`) rather than a system TLS dependency, keeping the binary's TLS story self-contained the way the rest of the dependency tree already is |
 
 ### Platform-specific

@@ -1,6 +1,6 @@
 [package]
 name = "zirv"
-version = "2.37.0"
+version = "2.38.0"
 edition = "2024"
 authors = ["Jonathan Solskov <josj@zirv.io>"]
 description = "A CLI tool for executing developer-defined YAML scripts with support for interactive commands and OS-specific execution."
@@ -31,6 +31,7 @@ crossterm = "0.29"
 ratatui = "0.30"
 vt100 = "0.16"
 ureq = "3"
+unicode-width = "0.2.2"
 
 [dev-dependencies]
 tempfile = "3.27.0"

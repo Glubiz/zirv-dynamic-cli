@@ -62,6 +62,28 @@ use super::prompt::{self, PromptRole};
 use super::resume;
 use super::state::{StateDir, now_secs, repo_slug};
 use super::surface::Kind;
+use crate::style::{self, Tone};
+
+/// Bold section-header line: the same "\ntitle text" shape this module's
+/// sections already use, with the whole line painted bold (`Tone::Emphasis`)
+/// when `colour` is on. Unlike `status.rs`'s own `header` helper, the title
+/// here already carries its own trailing punctuation (a colon plus, often,
+/// an explanatory parenthetical), so this paints the caller-supplied text
+/// verbatim rather than appending a colon itself.
+fn header(colour: bool, title: &str) -> String {
+    format!("\n{}", style::paint(title, Tone::Emphasis, colour))
+}
+
+/// Tone for a drift-finding `Severity`: `High` reads as an error (red),
+/// `Warning` as a caution (yellow), `Info` as de-emphasized detail (dim) --
+/// the same three-way split `status.rs` uses for session liveness.
+fn severity_tone(severity: Severity) -> Tone {
+    match severity {
+        Severity::High => Tone::Err,
+        Severity::Warning => Tone::Warn,
+        Severity::Info => Tone::Muted,
+    }
+}
 
 /// Bytes-per-token divisor for [`estimate_tokens`]: a rough heuristic for
 /// English prose and source code under common vendor tokenizers (roughly
@@ -131,11 +153,16 @@ fn render_surface_line<W: Write>(
     surface: &Surface,
     cfg: &ContextConfig,
     indent: &str,
+    colour: bool,
 ) -> CtxResult<()> {
     let bytes = surface.text.len();
     let tokens = estimate_tokens(bytes);
     let oversized = oversized_threshold(surface.layer, cfg).is_some_and(|budget| bytes > budget);
-    let flag = if oversized { "  [OVERSIZED]" } else { "" };
+    let flag = if oversized {
+        format!("  {}", style::paint("[OVERSIZED]", Tone::Warn, colour))
+    } else {
+        String::new()
+    };
     // Issue #105: a managed native file is still listed here -- its size
     // still counts toward budgets -- but is excluded from the duplicate/
     // precedence-level drift analysis below (`context_cli::
@@ -150,9 +177,17 @@ fn render_surface_line<W: Write>(
     };
     writeln!(
         w,
-        "{indent}{} ({}) -- {bytes}B, ~{tokens} tok (est.){flag}{managed_note}",
-        surface.path.display(),
-        surface.layer.label()
+        "{indent}{} {}{flag}{}",
+        style::paint(&surface.path.display().to_string(), Tone::Accent, colour),
+        style::paint(
+            &format!(
+                "({}) -- {bytes}B, ~{tokens} tok (est.)",
+                surface.layer.label()
+            ),
+            Tone::Muted,
+            colour
+        ),
+        style::paint(managed_note, Tone::Muted, colour),
     )?;
     Ok(())
 }
@@ -167,6 +202,7 @@ fn render_instruction_surfaces<W: Write>(
     w: &mut W,
     surfaces: &[Surface],
     cfg: &ContextConfig,
+    colour: bool,
 ) -> CtxResult<()> {
     let mut instructions: Vec<&Surface> = surfaces
         .iter()
@@ -179,30 +215,52 @@ fn render_instruction_surfaces<W: Write>(
 
     writeln!(
         w,
-        "\ninstruction surfaces (bytes measured on disk; tokens are estimated -- see the method \
-         note at the end of this report):"
+        "{}",
+        header(
+            colour,
+            "instruction surfaces (bytes measured on disk; tokens are estimated -- see the \
+             method note at the end of this report):"
+        )
     )?;
     writeln!(
         w,
-        "  canonical (.zirv/context/, shared across harnesses unless noted):"
+        "  {}",
+        style::paint(
+            "canonical (.zirv/context/, shared across harnesses unless noted):",
+            Tone::Emphasis,
+            colour
+        )
     )?;
     if canonical.is_empty() {
-        writeln!(w, "    (none found)")?;
+        writeln!(
+            w,
+            "    {}",
+            style::paint("(none found)", Tone::Muted, colour)
+        )?;
     }
     for surface in &canonical {
-        render_surface_line(w, surface, cfg, "    ")?;
+        render_surface_line(w, surface, cfg, "    ", colour)?;
     }
 
     writeln!(
         w,
-        "  native / harness-specific (zirv reads these for drift detection only; it never \
-         injects them itself -- see `zirv context sync`):"
+        "  {}",
+        style::paint(
+            "native / harness-specific (zirv reads these for drift detection only; it never \
+             injects them itself -- see `zirv context sync`):",
+            Tone::Emphasis,
+            colour
+        )
     )?;
     if native.is_empty() {
-        writeln!(w, "    (none found)")?;
+        writeln!(
+            w,
+            "    {}",
+            style::paint("(none found)", Tone::Muted, colour)
+        )?;
     }
     for surface in &native {
-        render_surface_line(w, surface, cfg, "    ")?;
+        render_surface_line(w, surface, cfg, "    ", colour)?;
     }
 
     let settings_count = surfaces
@@ -212,8 +270,15 @@ fn render_instruction_surfaces<W: Write>(
     if settings_count > 0 {
         writeln!(
             w,
-            "  + {settings_count} settings surface(s) discovered (not size-flagged: structured \
-             content, not prose)"
+            "  {}",
+            style::paint(
+                &format!(
+                    "+ {settings_count} settings surface(s) discovered (not size-flagged: \
+                     structured content, not prose)"
+                ),
+                Tone::Muted,
+                colour
+            )
         )?;
     }
     Ok(())
@@ -223,13 +288,22 @@ fn render_instruction_surfaces<W: Write>(
 /// `BTreeMap<&'static str, _>` keyed by finding kind so the per-kind
 /// breakdown renders in a fixed, deterministic order regardless of how many
 /// findings of each kind exist or what order `analyze` produced them in.
-fn render_drift_section<W: Write>(w: &mut W, findings: &[Finding], verbose: bool) -> CtxResult<()> {
+fn render_drift_section<W: Write>(
+    w: &mut W,
+    findings: &[Finding],
+    verbose: bool,
+    colour: bool,
+) -> CtxResult<()> {
     writeln!(
         w,
-        "\nduplicate / conflict findings (drift analysis over the surfaces above):"
+        "{}",
+        header(
+            colour,
+            "duplicate / conflict findings (drift analysis over the surfaces above):"
+        )
     )?;
     if findings.is_empty() {
-        writeln!(w, "  none found")?;
+        writeln!(w, "  {}", style::paint("none found", Tone::Muted, colour))?;
         return Ok(());
     }
 
@@ -240,9 +314,16 @@ fn render_drift_section<W: Write>(w: &mut W, findings: &[Finding], verbose: bool
     let info_count = findings.len() - warning_count;
     writeln!(
         w,
-        "  {} total ({warning_count} warning -- \"contradiction\" is the only warning-severity \
-         kind --, {info_count} info)",
-        findings.len()
+        "  {}",
+        style::paint(
+            &format!(
+                "{} total ({warning_count} warning -- \"contradiction\" is the only \
+                 warning-severity kind --, {info_count} info)",
+                findings.len()
+            ),
+            Tone::Muted,
+            colour
+        )
     )?;
 
     let mut tally: std::collections::BTreeMap<&'static str, (Severity, usize)> =
@@ -252,17 +333,41 @@ fn render_drift_section<W: Write>(w: &mut W, findings: &[Finding], verbose: bool
         entry.1 += 1;
     }
     for (kind, (severity, count)) in &tally {
-        writeln!(w, "    {kind}: {count} ({})", severity.as_str())?;
+        writeln!(
+            w,
+            "    {}",
+            style::paint(
+                &format!("{kind}: {count} ({})", severity.as_str()),
+                severity_tone(*severity),
+                colour
+            )
+        )?;
     }
 
     if verbose {
-        writeln!(w, "\n  findings (verbose):")?;
+        writeln!(
+            w,
+            "\n  {}",
+            style::paint("findings (verbose):", Tone::Emphasis, colour)
+        )?;
         for finding in findings {
-            writeln!(w, "    [{}] {}", finding.severity.as_str(), finding.title)?;
+            writeln!(
+                w,
+                "    {}",
+                style::paint(
+                    &format!("[{}] {}", finding.severity.as_str(), finding.title),
+                    severity_tone(finding.severity),
+                    colour
+                )
+            )?;
             for evidence in &finding.evidence {
-                writeln!(w, "        {evidence}")?;
+                writeln!(w, "        {}", style::paint(evidence, Tone::Muted, colour))?;
             }
-            writeln!(w, "        {}", finding.detail)?;
+            writeln!(
+                w,
+                "        {}",
+                style::paint(&finding.detail, Tone::Muted, colour)
+            )?;
         }
     }
     Ok(())
@@ -278,34 +383,54 @@ fn render_memory_section<W: Write>(
     repo: &Path,
     slug: &str,
     cfg: &CtxConfig,
+    colour: bool,
 ) -> CtxResult<()> {
     let entries = memory::render_for_prompt(state, repo, slug, cfg);
     let summary = prompt::memory_injection_summary(&entries, cfg.memory.core_max_bytes);
 
-    writeln!(w, "\nmemory bank:")?;
+    writeln!(w, "{}", header(colour, "memory bank:"))?;
     if !cfg.memory.enabled {
         writeln!(
             w,
-            "  disabled (memory.enabled = false): nothing is injected"
+            "  {}",
+            style::paint(
+                "disabled (memory.enabled = false): nothing is injected",
+                Tone::Muted,
+                colour
+            )
         )?;
     } else if summary.total_entries == 0 {
-        writeln!(w, "  empty")?;
+        writeln!(w, "  {}", style::paint("empty", Tone::Muted, colour))?;
     } else {
         writeln!(
             w,
-            "  {} entries total, {} selected within budget, {} bytes injected (~{} tok, est.), \
-             {} omitted",
-            summary.total_entries,
-            summary.selected_entries,
-            summary.injected_bytes,
-            estimate_tokens(summary.injected_bytes),
-            summary.omitted_entries
+            "  {}",
+            style::paint(
+                &format!(
+                    "{} entries total, {} selected within budget, {} bytes injected (~{} tok, \
+                     est.), {} omitted",
+                    summary.total_entries,
+                    summary.selected_entries,
+                    summary.injected_bytes,
+                    estimate_tokens(summary.injected_bytes),
+                    summary.omitted_entries
+                ),
+                Tone::Muted,
+                colour
+            )
         )?;
     }
     writeln!(
         w,
-        "  budget (memory.core_max_bytes): {} bytes",
-        cfg.memory.core_max_bytes
+        "  {}",
+        style::paint(
+            &format!(
+                "budget (memory.core_max_bytes): {} bytes",
+                cfg.memory.core_max_bytes
+            ),
+            Tone::Muted,
+            colour
+        )
     )?;
     Ok(())
 }
@@ -329,25 +454,35 @@ fn render_mail_section<W: Write>(
     state: &StateDir,
     slug: &str,
     cfg: &CtxConfig,
+    colour: bool,
 ) -> CtxResult<()> {
     writeln!(
         w,
-        "\nmail (pending, read non-destructively -- this report never consumes a message):"
+        "{}",
+        header(
+            colour,
+            "mail (pending, read non-destructively -- this report never consumes a message):"
+        )
     )?;
     let swept = mail::sweep_undeliverable(state, slug);
     let messages = match mail::list(state, slug, None, None) {
         Ok(messages) => messages,
         Err(e) => {
-            writeln!(w, "  (unreadable: {e})")?;
+            writeln!(
+                w,
+                "  {}",
+                style::paint(&format!("(unreadable: {e})"), Tone::Err, colour)
+            )?;
             return Ok(());
         }
     };
     if messages.is_empty() {
-        if swept > 0 {
-            writeln!(w, "  none pending ({swept} undeliverable, swept)")?;
+        let note = if swept > 0 {
+            format!("none pending ({swept} undeliverable, swept)")
         } else {
-            writeln!(w, "  none pending")?;
-        }
+            "none pending".to_string()
+        };
+        writeln!(w, "  {}", style::paint(&note, Tone::Muted, colour))?;
         return Ok(());
     }
 
@@ -360,18 +495,30 @@ fn render_mail_section<W: Write>(
     };
     writeln!(
         w,
-        "  {} message(s) pending{swept_note}, {bytes} raw body bytes (~{} tok, est.) -- \
-         mail.max_delivered_bytes budget: {} ({} budget)",
-        messages.len(),
-        estimate_tokens(bytes),
-        cfg.mail.max_delivered_bytes,
-        if exceeds { "exceeds" } else { "fits within" }
+        "  {}",
+        style::paint(
+            &format!(
+                "{} message(s) pending{swept_note}, {bytes} raw body bytes (~{} tok, est.) -- \
+                 mail.max_delivered_bytes budget: {} ({} budget)",
+                messages.len(),
+                estimate_tokens(bytes),
+                cfg.mail.max_delivered_bytes,
+                if exceeds { "exceeds" } else { "fits within" }
+            ),
+            Tone::Muted,
+            colour
+        )
     )?;
     if !cfg.mail.enabled {
         writeln!(
             w,
-            "  mail delivery is disabled (mail.enabled = false): these messages are stored but \
-             will not be injected into any session"
+            "  {}",
+            style::paint(
+                "mail delivery is disabled (mail.enabled = false): these messages are stored \
+                 but will not be injected into any session",
+                Tone::Warn,
+                colour
+            )
         )?;
     }
     Ok(())
@@ -381,23 +528,47 @@ fn render_mail_section<W: Write>(
 /// half. A handoff is only ever injected via `zirv ctx resume`, not by a
 /// normal launch, so this is explicitly labeled conditional rather than
 /// folded into the per-harness composed total below.
-fn render_handoff_section<W: Write>(w: &mut W, state: &StateDir, repo: &Path) -> CtxResult<()> {
+fn render_handoff_section<W: Write>(
+    w: &mut W,
+    state: &StateDir,
+    repo: &Path,
+    colour: bool,
+) -> CtxResult<()> {
     writeln!(
         w,
-        "\nhandoff (only injected via `zirv ctx resume`; not part of a normal launch):"
+        "{}",
+        header(
+            colour,
+            "handoff (only injected via `zirv ctx resume`; not part of a normal launch):"
+        )
     )?;
     match handoff::latest_for_repo(state, repo) {
         Ok(Some((path, handoff))) => {
             let resume_bytes = resume::resume_prompt(&handoff).len();
             writeln!(
                 w,
-                "  latest: {} -- would inject {resume_bytes}B (~{} tok, est.) if resumed",
-                path.display(),
-                estimate_tokens(resume_bytes)
+                "  {}",
+                style::paint(
+                    &format!(
+                        "latest: {} -- would inject {resume_bytes}B (~{} tok, est.) if resumed",
+                        path.display(),
+                        estimate_tokens(resume_bytes)
+                    ),
+                    Tone::Muted,
+                    colour
+                )
             )?;
         }
-        Ok(None) => writeln!(w, "  none available")?,
-        Err(e) => writeln!(w, "  (unreadable: {e})")?,
+        Ok(None) => writeln!(
+            w,
+            "  {}",
+            style::paint("none available", Tone::Muted, colour)
+        )?,
+        Err(e) => writeln!(
+            w,
+            "  {}",
+            style::paint(&format!("(unreadable: {e})"), Tone::Err, colour)
+        )?,
     }
     Ok(())
 }
@@ -414,20 +585,37 @@ fn render_harness_roster_section<W: Write>(
     w: &mut W,
     cfg: &CtxConfig,
     compiled_by_adapter: &[(&'static str, compile::CompiledContext)],
+    colour: bool,
 ) -> CtxResult<()> {
     writeln!(
         w,
-        "\nharness / orchestration layer (Orchestrator sessions only):"
+        "{}",
+        header(
+            colour,
+            "harness / orchestration layer (Orchestrator sessions only):"
+        )
     )?;
     writeln!(
         w,
-        "  static harness-teaching text: {}B",
-        prompt::HARNESS_PROMPT.len()
+        "  {}",
+        style::paint(
+            &format!(
+                "static harness-teaching text: {}B",
+                prompt::HARNESS_PROMPT.len()
+            ),
+            Tone::Muted,
+            colour
+        )
     )?;
     if !cfg.prompt.harnesses {
         writeln!(
             w,
-            "  derived harness roster: disabled (prompt.harnesses = false)"
+            "  {}",
+            style::paint(
+                "derived harness roster: disabled (prompt.harnesses = false)",
+                Tone::Muted,
+                colour
+            )
         )?;
         return Ok(());
     }
@@ -435,18 +623,41 @@ fn render_harness_roster_section<W: Write>(
     for (name, compiled) in compiled_by_adapter {
         match &compiled.harness_roster {
             Some(roster) => {
-                let flag = if roster.truncated { " [TRUNCATED]" } else { "" };
+                let flag = if roster.truncated {
+                    format!("  {}", style::paint("[TRUNCATED]", Tone::Warn, colour))
+                } else {
+                    String::new()
+                };
                 writeln!(
                     w,
-                    "  derived roster as seen by {name}: {}B raw, {}B delivered (~{} tok, \
-                     est.){flag} -- budget (context.max_harness_roster_bytes): {}",
-                    roster.raw_bytes,
-                    roster.delivered_bytes,
-                    estimate_tokens(roster.delivered_bytes),
-                    cfg.context.max_harness_roster_bytes
+                    "  derived roster as seen by {}: {}{flag}{}",
+                    style::paint(name, Tone::Accent, colour),
+                    style::paint(
+                        &format!(
+                            "{}B raw, {}B delivered (~{} tok, est.)",
+                            roster.raw_bytes,
+                            roster.delivered_bytes,
+                            estimate_tokens(roster.delivered_bytes),
+                        ),
+                        Tone::Muted,
+                        colour
+                    ),
+                    style::paint(
+                        &format!(
+                            " -- budget (context.max_harness_roster_bytes): {}",
+                            cfg.context.max_harness_roster_bytes
+                        ),
+                        Tone::Muted,
+                        colour
+                    )
                 )?;
             }
-            None => writeln!(w, "  derived roster as seen by {name}: none (empty roster)")?,
+            None => writeln!(
+                w,
+                "  derived roster as seen by {}: {}",
+                style::paint(name, Tone::Accent, colour),
+                style::paint("none (empty roster)", Tone::Muted, colour)
+            )?,
         }
     }
     Ok(())
@@ -465,32 +676,58 @@ fn render_harness_roster_section<W: Write>(
 fn render_per_harness_section<W: Write>(
     w: &mut W,
     compiled_by_adapter: &[(&'static str, compile::CompiledContext)],
+    colour: bool,
 ) -> CtxResult<()> {
     writeln!(
         w,
-        "\nper-harness zirv-managed context (Orchestrator session; excludes mail, task text and \
-         handoff, which are shown separately above and are only added at an actual launch):"
+        "{}",
+        header(
+            colour,
+            "per-harness zirv-managed context (Orchestrator session; excludes mail, task text \
+             and handoff, which are shown separately above and are only added at an actual \
+             launch):"
+        )
     )?;
 
     for (name, compiled) in compiled_by_adapter {
-        writeln!(w, "\n  -- {name} --")?;
+        writeln!(w, "\n  -- {} --", style::paint(name, Tone::Accent, colour))?;
         match &compiled.composed {
             Some(composed) => {
                 let bytes = composed.text.len();
                 writeln!(
                     w,
-                    "    total zirv-managed context estimate: {bytes}B (~{} tok, est.)",
-                    estimate_tokens(bytes)
+                    "    {}",
+                    style::paint(
+                        &format!(
+                            "total zirv-managed context estimate: {bytes}B (~{} tok, est.)",
+                            estimate_tokens(bytes)
+                        ),
+                        Tone::Muted,
+                        colour
+                    )
                 )?;
             }
             None => writeln!(
                 w,
-                "    prompt injection is disabled (prompt.enabled = false)"
+                "    {}",
+                style::paint(
+                    "prompt injection is disabled (prompt.enabled = false)",
+                    Tone::Muted,
+                    colour
+                )
             )?,
         }
 
         if compiled.provenance.is_empty() {
-            writeln!(w, "    canonical context (.zirv/context/): none found")?;
+            writeln!(
+                w,
+                "    {}",
+                style::paint(
+                    "canonical context (.zirv/context/): none found",
+                    Tone::Muted,
+                    colour
+                )
+            )?;
         }
         for provenance in &compiled.provenance {
             // Issue #155, Phase 3: a deduped surface (skipped because the
@@ -503,42 +740,71 @@ fn render_per_harness_section<W: Write>(
             // "zero delivered and NOT because the budget cut it", which an
             // operator would otherwise have no way to tell apart from a bug.
             let flag = if provenance.truncated {
-                " [TRUNCATED]"
+                format!(" {}", style::paint("[TRUNCATED]", Tone::Warn, colour))
             } else if provenance.delivered_bytes == 0 {
-                " [DEDUPED]"
+                format!(" {}", style::paint("[DEDUPED]", Tone::Muted, colour))
             } else {
-                ""
+                String::new()
             };
             writeln!(
                 w,
-                "    canonical context: {} -- {}B raw, {}B delivered{flag}",
-                provenance.surface.path().display(),
-                provenance.raw_bytes,
-                provenance.delivered_bytes
+                "    canonical context: {} {}{flag}",
+                style::paint(
+                    &provenance.surface.path().display().to_string(),
+                    Tone::Accent,
+                    colour
+                ),
+                style::paint(
+                    &format!(
+                        "-- {}B raw, {}B delivered",
+                        provenance.raw_bytes, provenance.delivered_bytes
+                    ),
+                    Tone::Muted,
+                    colour
+                )
             )?;
         }
 
         writeln!(
             w,
-            "    core memory: {} selected, {}B delivered, {} omitted",
-            compiled.core_memory.selected_entries,
-            compiled.core_memory.injected_bytes,
-            compiled.core_memory.omitted_entries
+            "    {}",
+            style::paint(
+                &format!(
+                    "core memory: {} selected, {}B delivered, {} omitted",
+                    compiled.core_memory.selected_entries,
+                    compiled.core_memory.injected_bytes,
+                    compiled.core_memory.omitted_entries
+                ),
+                Tone::Muted,
+                colour
+            )
         )?;
         writeln!(
             w,
-            "    retrieved memory: {} selected, {}B delivered, {} omitted",
-            compiled.retrieved_memory.selected_entries,
-            compiled.retrieved_memory.injected_bytes,
-            compiled.retrieved_memory.omitted_entries
+            "    {}",
+            style::paint(
+                &format!(
+                    "retrieved memory: {} selected, {}B delivered, {} omitted",
+                    compiled.retrieved_memory.selected_entries,
+                    compiled.retrieved_memory.injected_bytes,
+                    compiled.retrieved_memory.omitted_entries
+                ),
+                Tone::Muted,
+                colour
+            )
         )?;
 
         writeln!(
             w,
-            "    policy alignment (no false equivalence across harnesses):"
+            "    {}",
+            style::paint(
+                "policy alignment (no false equivalence across harnesses):",
+                Tone::Emphasis,
+                colour
+            )
         )?;
         for line in compiled.policy.render().lines() {
-            writeln!(w, "      {line}")?;
+            writeln!(w, "      {}", style::paint(line, Tone::Muted, colour))?;
         }
     }
     Ok(())
@@ -550,49 +816,46 @@ fn render_per_harness_section<W: Write>(
 /// roster provenance, memory's omitted count, mail's exceeds/fits
 /// comparison); this section is the flat reference list an operator can
 /// scan without re-reading every section.
-fn render_budgets_section<W: Write>(w: &mut W, cfg: &CtxConfig) -> CtxResult<()> {
-    writeln!(w, "\nconfigured hard budgets:")?;
-    writeln!(
-        w,
-        "  prompt.max_repo_bytes = {} (repo <.zirv/system-prompt.md> layer)",
-        cfg.prompt.max_repo_bytes
-    )?;
-    writeln!(
-        w,
-        "  context.max_common_bytes = {} (.zirv/context/common.md)",
-        cfg.context.max_common_bytes
-    )?;
-    writeln!(
-        w,
-        "  context.max_harness_bytes = {} (.zirv/context/claude.md or codex.md)",
-        cfg.context.max_harness_bytes
-    )?;
-    writeln!(
-        w,
-        "  context.max_harness_roster_bytes = {} (derived harness roster, truncated at compose \
-         time the same way memory and canonical context are)",
-        cfg.context.max_harness_roster_bytes
-    )?;
-    writeln!(
-        w,
-        "  mail.max_delivered_bytes = {} (pending mail, at actual delivery)",
-        cfg.mail.max_delivered_bytes
-    )?;
-    writeln!(
-        w,
-        "  memory.core_max_bytes = {} (always-present core memory)",
-        cfg.memory.core_max_bytes
-    )?;
-    writeln!(
-        w,
-        "  memory.retrieval_max_bytes = {} (context-ranked memory)",
-        cfg.memory.retrieval_max_bytes
-    )?;
-    writeln!(
-        w,
-        "  memory.retrieval_max_entries = {} (context-ranked memory entry cap)",
-        cfg.memory.retrieval_max_entries
-    )?;
+fn render_budgets_section<W: Write>(w: &mut W, cfg: &CtxConfig, colour: bool) -> CtxResult<()> {
+    writeln!(w, "{}", header(colour, "configured hard budgets:"))?;
+    let lines = [
+        format!(
+            "prompt.max_repo_bytes = {} (repo <.zirv/system-prompt.md> layer)",
+            cfg.prompt.max_repo_bytes
+        ),
+        format!(
+            "context.max_common_bytes = {} (.zirv/context/common.md)",
+            cfg.context.max_common_bytes
+        ),
+        format!(
+            "context.max_harness_bytes = {} (.zirv/context/claude.md or codex.md)",
+            cfg.context.max_harness_bytes
+        ),
+        format!(
+            "context.max_harness_roster_bytes = {} (derived harness roster, truncated at \
+             compose time the same way memory and canonical context are)",
+            cfg.context.max_harness_roster_bytes
+        ),
+        format!(
+            "mail.max_delivered_bytes = {} (pending mail, at actual delivery)",
+            cfg.mail.max_delivered_bytes
+        ),
+        format!(
+            "memory.core_max_bytes = {} (always-present core memory)",
+            cfg.memory.core_max_bytes
+        ),
+        format!(
+            "memory.retrieval_max_bytes = {} (context-ranked memory)",
+            cfg.memory.retrieval_max_bytes
+        ),
+        format!(
+            "memory.retrieval_max_entries = {} (context-ranked memory entry cap)",
+            cfg.memory.retrieval_max_entries
+        ),
+    ];
+    for line in lines {
+        writeln!(w, "  {}", style::paint(&line, Tone::Muted, colour))?;
+    }
     Ok(())
 }
 
@@ -601,28 +864,41 @@ fn render_budgets_section<W: Write>(w: &mut W, cfg: &CtxConfig) -> CtxResult<()>
 /// appears anywhere in this report -- every total figure is spelled "total
 /// zirv-managed context", always qualified. See
 /// `unknown_vendor_context_is_disclosed_and_no_total_context_claim_is_made`.
-fn render_unknown_context_section<W: Write>(w: &mut W) -> CtxResult<()> {
+fn render_unknown_context_section<W: Write>(w: &mut W, colour: bool) -> CtxResult<()> {
+    writeln!(w, "{}", header(colour, "what zirv cannot see:"))?;
     writeln!(
         w,
-        "\nwhat zirv cannot see:\n  Every figure in this report measures or estimates only \
-         zirv-managed context: the surfaces, memory, mail, handoff and harness layers listed \
-         above. Each harness's own hidden system prompt and built-in tool/context scaffolding \
-         are UNKNOWN to zirv and are never folded into any number above. This report never \
-         states a single combined figure for everything a harness sees -- only for the \
-         zirv-managed portion of it."
+        "  {}",
+        style::paint(
+            "Every figure in this report measures or estimates only zirv-managed context: the \
+             surfaces, memory, mail, handoff and harness layers listed above. Each harness's own \
+             hidden system prompt and built-in tool/context scaffolding are UNKNOWN to zirv and \
+             are never folded into any number above. This report never states a single combined \
+             figure for everything a harness sees -- only for the zirv-managed portion of it.",
+            Tone::Muted,
+            colour
+        )
     )?;
     Ok(())
 }
 
-fn render_token_estimate_note<W: Write>(w: &mut W) -> CtxResult<()> {
+fn render_token_estimate_note<W: Write>(w: &mut W, colour: bool) -> CtxResult<()> {
+    writeln!(w, "{}", header(colour, "token estimate method:"))?;
     writeln!(
         w,
-        "\ntoken estimate method:\n  Every \"~N tok (est.)\" figure above is bytes / \
-         {BYTES_PER_TOKEN} rounded up -- a rough heuristic for English prose and source code, \
-         not a real tokenizer (zirv does not depend on one). Byte counts are measured directly \
-         from disk or state; token counts are always estimates, and real tokenization varies by \
-         vendor, model, language and content type (code vs. prose vs. non-ASCII), so actual \
-         counts can differ meaningfully from this estimate."
+        "  {}",
+        style::paint(
+            &format!(
+                "Every \"~N tok (est.)\" figure above is bytes / {BYTES_PER_TOKEN} rounded up -- \
+                 a rough heuristic for English prose and source code, not a real tokenizer (zirv \
+                 does not depend on one). Byte counts are measured directly from disk or state; \
+                 token counts are always estimates, and real tokenization varies by vendor, \
+                 model, language and content type (code vs. prose vs. non-ASCII), so actual \
+                 counts can differ meaningfully from this estimate."
+            ),
+            Tone::Muted,
+            colour
+        )
     )?;
     Ok(())
 }
@@ -633,6 +909,7 @@ pub fn run_with<W: Write>(
     repo: &Path,
     env: EnvLookup<'_>,
     now: u64,
+    colour: bool,
 ) -> CtxResult<i32> {
     let home = crate::utils::home_dir().ok();
     let state = StateDir::resolve(env)?;
@@ -641,20 +918,25 @@ pub fn run_with<W: Write>(
 
     writeln!(
         w,
-        "zirv context status -- read-only: starts no session, spawns no agent binary, makes no \
-         network call\n"
+        "{}\n",
+        style::paint(
+            "zirv context status -- read-only: starts no session, spawns no agent binary, makes \
+             no network call",
+            Tone::Emphasis,
+            colour
+        )
     )?;
 
     let surfaces =
         optimize::collect_surfaces(home.as_deref(), repo, cfg.optimize.max_surface_bytes);
-    render_instruction_surfaces(w, &surfaces, &cfg.context)?;
+    render_instruction_surfaces(w, &surfaces, &cfg.context, colour)?;
 
     let findings = drift::analyze(&context_cli::surfaces_for_drift(&surfaces));
-    render_drift_section(w, &findings, args.verbose)?;
+    render_drift_section(w, &findings, args.verbose, colour)?;
 
-    render_memory_section(w, &state, repo, &slug, &cfg)?;
-    render_mail_section(w, &state, &slug, &cfg)?;
-    render_handoff_section(w, &state, repo)?;
+    render_memory_section(w, &state, repo, &slug, &cfg, colour)?;
+    render_mail_section(w, &state, &slug, &cfg, colour)?;
+    render_handoff_section(w, &state, repo, colour)?;
 
     // Computed once, here, and shared by both sections below: the harness
     // roster section and the per-harness section both need `compile::
@@ -681,11 +963,11 @@ pub fn run_with<W: Write>(
         })
         .collect();
 
-    render_harness_roster_section(w, &cfg, &compiled_by_adapter)?;
-    render_per_harness_section(w, &compiled_by_adapter)?;
-    render_budgets_section(w, &cfg)?;
-    render_unknown_context_section(w)?;
-    render_token_estimate_note(w)?;
+    render_harness_roster_section(w, &cfg, &compiled_by_adapter, colour)?;
+    render_per_harness_section(w, &compiled_by_adapter, colour)?;
+    render_budgets_section(w, &cfg, colour)?;
+    render_unknown_context_section(w, colour)?;
+    render_token_estimate_note(w, colour)?;
 
     Ok(0)
 }
@@ -693,7 +975,7 @@ pub fn run_with<W: Write>(
 pub fn run<W: Write>(args: &StatusArgs, w: &mut W) -> CtxResult<i32> {
     let repo = std::env::current_dir()?;
     let env = env_from_process();
-    run_with(args, w, &repo, &env, now_secs())
+    run_with(args, w, &repo, &env, now_secs(), console::colors_enabled())
 }
 
 #[cfg(test)]
@@ -760,6 +1042,7 @@ mod tests {
                 &self.repo,
                 &|k| self.env.get(k).cloned(),
                 now,
+                false,
             )
             .expect("run_with");
             (code, String::from_utf8(out).expect("utf8"))
@@ -815,6 +1098,7 @@ mod tests {
             &fixture.repo,
             &|k| env.get(k).cloned(),
             1_700_000_000,
+            false,
         )
         .expect("run_with");
 
@@ -1081,6 +1365,7 @@ mod tests {
             &fixture.repo,
             &|k| env.get(k).cloned(),
             1_700_000_000,
+            false,
         )
         .expect("run_with");
         let out = String::from_utf8(out).expect("utf8");

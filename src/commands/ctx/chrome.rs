@@ -14,6 +14,7 @@
 //! the child's pty.
 
 use super::config::{ChromeConfig, DashConfig};
+use crate::style::{self, Tone};
 
 /// Below this width the banner and the status bar both risk wrapping their
 /// own text across lines, which corrupts the bar's single-line redraw.
@@ -119,11 +120,23 @@ pub enum HarnessRule {
 }
 
 impl HarnessRule {
+    /// The old, full-sentence form: used only by the legacy (no-VT) banner
+    /// tier, which never changed shape from the pre-#202 banner.
     pub fn describe(&self) -> &'static str {
         match self {
             HarnessRule::Explicit => "requested with --agent",
             HarnessRule::Configured => "configured as the default agent",
             HarnessRule::FirstEnabledReady => "the first enabled, ready harness",
+        }
+    }
+
+    /// A single word, for the box/compact banner tiers, which have no room
+    /// for `describe`'s full sentence.
+    fn short_word(&self) -> &'static str {
+        match self {
+            HarnessRule::Explicit => "explicit",
+            HarnessRule::Configured => "configured",
+            HarnessRule::FirstEnabledReady => "auto",
         }
     }
 }
@@ -150,6 +163,31 @@ pub struct BannerFacts {
     pub model: Option<String>,
 }
 
+/// One coloured piece of a banner content line or a status-bar assembly.
+/// `Tone` covers everything `style::paint` already knows how to do;
+/// `CyanPlain`/`CyanDim`/`Chip` are the handful of treatments this module
+/// needs that have no `Tone` of their own (the resume glyph and the compact
+/// tier's rule are plain cyan, the banner box border is dimmed cyan so it
+/// recedes behind its content, and the status bar's brand chip is a filled
+/// background, not a foreground colour at all).
+#[derive(Debug, Clone, Copy)]
+enum Paint {
+    Tone(Tone),
+    /// Plain cyan -- no bold, no dim.
+    CyanPlain,
+    /// Cyan, dimmed -- the banner box border's own colour.
+    CyanDim,
+    /// Black text on a cyan background, bold -- the status bar's leading
+    /// brand chip.
+    Chip,
+}
+
+/// An ordered list of `(text, paint)` pieces -- one banner content line, or
+/// one status-bar segment/assembly. Named so a `Segments` (and,
+/// where two of them travel together, a tuple of two) never counts as
+/// clippy's own "very complex type".
+type Segments = Vec<(String, Paint)>;
+
 /// `colour` here is already the final decision (`Chrome::colour`, or an
 /// explicit test value): forcing styling on rather than letting
 /// `StyledObject`'s own `Display` impl re-check the process-global
@@ -157,30 +195,145 @@ pub struct BannerFacts {
 /// `force_styling`, a caller that computed `colour = true` still rendered
 /// plain text whenever the global flag happened to be off (a no-color CI
 /// environment, or -- in tests -- a leftover from whichever test last
-/// touched `console::set_colors_enabled` and ran first).
-fn styled(
-    text: &str,
-    colour: bool,
-    apply: impl FnOnce(console::StyledObject<&str>) -> console::StyledObject<&str>,
-) -> String {
-    if colour {
-        apply(console::style(text).force_styling(true)).to_string()
-    } else {
-        text.to_string()
+/// touched `console::set_colors_enabled` and ran first). `Tone` delegates to
+/// `style::paint`, which already has this exact rule built in.
+fn paint_seg(text: &str, paint: Paint, colour: bool) -> String {
+    if let Paint::Tone(tone) = paint {
+        return style::paint(text, tone, colour);
+    }
+    if !colour {
+        return text.to_string();
+    }
+    match paint {
+        Paint::CyanPlain => console::style(text).force_styling(true).cyan().to_string(),
+        Paint::CyanDim => console::style(text)
+            .force_styling(true)
+            .cyan()
+            .dim()
+            .to_string(),
+        Paint::Chip => console::style(text)
+            .force_styling(true)
+            .black()
+            .on_cyan()
+            .bold()
+            .to_string(),
+        Paint::Tone(_) => unreachable!("handled above"),
     }
 }
 
-/// Pure text builder for the launch banner. `colour` and `vt` both have to be
-/// true for any styling to appear; without either one the banner is plain
-/// text, which is always legible and always a valid fallback.
-pub fn banner(facts: &BannerFacts, colour: bool, vt: bool) -> String {
-    let colour = colour && vt;
+/// Colours one banner content line or one status-bar assembly, built from an
+/// ordered list of `(text, paint)` pairs. Every width decision -- whether it
+/// fits, where to cut it if not -- is made from the pairs' concatenated
+/// *plain* text, never from an already-styled/ANSI-bearing string: escape
+/// codes inserted by colouring an earlier piece must never skew where a
+/// wide/CJK/emoji character later on gets cut, and a cut mid-escape-sequence
+/// would corrupt the terminal's own state.
+///
+/// `pad` right-pads with plain spaces to exactly `avail` columns -- the
+/// banner box needs this so its right border always lines up; the status bar
+/// never pads. `ellipsis` appends a single `…` when truncation actually
+/// happens (the banner's contract); the status bar's own last-resort hard
+/// truncate passes `false` so its result stays an exact prefix of the
+/// untruncated text with nothing appended, matching `style::truncate_display`
+/// rather than `style::truncate_display_ellipsis`.
+fn render_line(
+    segments: &[(String, Paint)],
+    avail: usize,
+    colour: bool,
+    pad: bool,
+    ellipsis: bool,
+) -> String {
+    let plain: String = segments.iter().map(|(t, _)| t.as_str()).collect();
+    let plain_width = style::display_width(&plain);
+
+    if plain_width <= avail {
+        let mut out = String::new();
+        for (text, paint) in segments {
+            out.push_str(&paint_seg(text, *paint, colour));
+        }
+        if pad && plain_width < avail {
+            out.push_str(&" ".repeat(avail - plain_width));
+        }
+        return out;
+    }
+
+    let ellipsis_cost = if ellipsis && avail > 0 { 1 } else { 0 };
+    let content_budget = avail.saturating_sub(ellipsis_cost);
+    let mut out = String::new();
+    let mut remaining = content_budget;
+    let mut kept_width = 0usize;
+    for (text, paint) in segments {
+        if remaining == 0 {
+            break;
+        }
+        let w = style::display_width(text);
+        if w <= remaining {
+            out.push_str(&paint_seg(text, *paint, colour));
+            remaining -= w;
+            kept_width += w;
+        } else {
+            let piece = style::truncate_display(text, remaining);
+            kept_width += style::display_width(&piece);
+            out.push_str(&paint_seg(&piece, *paint, colour));
+            remaining = 0;
+        }
+    }
+    if ellipsis && avail > 0 {
+        out.push('\u{2026}');
+        kept_width += 1;
+    }
+    if pad && kept_width < avail {
+        out.push_str(&" ".repeat(avail - kept_width));
+    }
+    out
+}
+
+/// Below this width the banner box's own frame (the title alone costs 9
+/// columns: `╭─ zirv ╮`) stops being worth drawing; narrower terminals get
+/// the compact, borderless tier instead.
+const BANNER_BOX_MIN_COLS: u16 = 56;
+
+/// A hard floor under the box's own width, independent of content: shorter
+/// than this and the title `╭─ zirv ╮` itself would not fit.
+const BANNER_BOX_MIN_WIDTH: usize = 9;
+
+/// Pure text builder for the launch banner. Degrades in one direction only:
+///
+/// * `vt == false` -- a terminal that cannot do VT processing at all -- gets
+///   the legacy, pre-#202 plain-line form regardless of `colour` or `cols`;
+///   colour would render as raw escape bytes without VT, so it is never
+///   attempted.
+/// * `vt == true` and `cols` is at least [`BANNER_BOX_MIN_COLS`] gets the
+///   rounded box.
+/// * `vt == true` and `cols` is narrower than that (or unknown -- `None`,
+///   meaning the terminal size probe itself failed) gets the compact,
+///   borderless tier: a real width is required to compute a box that always
+///   joins its own corners, so an unknown width is treated the same as a
+///   too-narrow one rather than guessed at.
+/// * `colour == false` at any tier renders the same text with zero ANSI --
+///   every tier's own rendering already goes through `paint_seg`/
+///   `render_line`, which round-trip exactly under `colour == false`.
+pub fn banner(facts: &BannerFacts, colour: bool, vt: bool, cols: Option<u16>) -> String {
+    if !vt {
+        return banner_legacy(facts);
+    }
+    match cols {
+        Some(c) if c >= BANNER_BOX_MIN_COLS => banner_box(facts, colour, c),
+        _ => banner_compact(facts, colour, cols),
+    }
+}
+
+/// The pre-#202 banner text, unstyled: plain lines, no box, no glyphs. This
+/// is what every terminal that cannot do VT processing still gets -- always
+/// legible, always a valid fallback -- and it is deliberately left bit-for-
+/// bit identical to the original `banner` so no behavior changes for that
+/// tier.
+fn banner_legacy(facts: &BannerFacts) -> String {
     let mut lines = Vec::new();
 
     lines.push(format!(
-        "{} {} ({})",
-        styled("zirv chat", colour, |s| s.cyan().bold()),
-        styled(&facts.harness, colour, |s| s.bold()),
+        "zirv chat {} ({})",
+        facts.harness,
         facts.rule.describe()
     ));
     lines.push(format!("session {}", facts.session));
@@ -210,6 +363,147 @@ pub fn banner(facts: &BannerFacts, colour: bool, vt: bool) -> String {
     lines.join("\n")
 }
 
+/// The banner's per-harness roster segment, shared by the box and compact
+/// tiers: `{name} ●` for an enabled harness, `{name} ○ disabled` for a
+/// disabled one, one space between entries.
+fn harness_roster_segments(harnesses: &[(String, bool)]) -> Segments {
+    let mut segments = Vec::new();
+    for (index, (name, enabled)) in harnesses.iter().enumerate() {
+        if index > 0 {
+            segments.push((" ".to_string(), Paint::Tone(Tone::Plain)));
+        }
+        segments.push((name.clone(), Paint::Tone(Tone::Plain)));
+        segments.push((" ".to_string(), Paint::Tone(Tone::Plain)));
+        if *enabled {
+            segments.push(("●".to_string(), Paint::Tone(Tone::Ok)));
+        } else {
+            segments.push(("○".to_string(), Paint::Tone(Tone::Muted)));
+            segments.push((" disabled".to_string(), Paint::Tone(Tone::Muted)));
+        }
+    }
+    segments
+}
+
+/// The rounded-box banner tier: the same frame grammar Claude Code's own
+/// welcome box uses. Every content line is truncated (with an ellipsis) to
+/// fit inside the box, and the box's own width is computed from the widest
+/// line's *display* width so the border always joins its own corners, even
+/// with a CJK or emoji harness/session name.
+fn banner_box(facts: &BannerFacts, colour: bool, cols: u16) -> String {
+    let mut line1: Segments = vec![(facts.harness.clone(), Paint::Tone(Tone::Emphasis))];
+    if let Some(model) = &facts.model {
+        line1.push((" · ".to_string(), Paint::Tone(Tone::Muted)));
+        line1.push((format!("model {model}"), Paint::Tone(Tone::Muted)));
+    }
+    line1.push((" · ".to_string(), Paint::Tone(Tone::Muted)));
+    line1.push((
+        format!("rule {}", facts.rule.short_word()),
+        Paint::Tone(Tone::Muted),
+    ));
+
+    let mut line2: Segments = vec![
+        ("session ".to_string(), Paint::Tone(Tone::Muted)),
+        (facts.session.clone(), Paint::Tone(Tone::Muted)),
+        (" · ".to_string(), Paint::Tone(Tone::Muted)),
+        ("harnesses ".to_string(), Paint::Tone(Tone::Muted)),
+    ];
+    line2.extend(harness_roster_segments(&facts.harnesses));
+
+    let line3 = facts.resuming.as_ref().map(|resuming| {
+        vec![
+            ("↺".to_string(), Paint::CyanPlain),
+            (" resuming · ".to_string(), Paint::Tone(Tone::Muted)),
+            (resuming.clone(), Paint::Tone(Tone::Muted)),
+        ]
+    });
+
+    let mut content_lines: Vec<Segments> = vec![line1, line2];
+    if let Some(line3) = line3 {
+        content_lines.push(line3);
+    }
+
+    let plain_width_of = |segs: &[(String, Paint)]| -> usize {
+        style::display_width(&segs.iter().map(|(t, _)| t.as_str()).collect::<String>())
+    };
+    let widest = content_lines
+        .iter()
+        .map(|segs| plain_width_of(segs))
+        .max()
+        .unwrap_or(0);
+    let box_width = (cols as usize).min(widest + 4).max(BANNER_BOX_MIN_WIDTH);
+    let avail = box_width.saturating_sub(4);
+
+    let mut out = String::new();
+    out.push_str(&banner_box_top(box_width, colour));
+    for segs in &content_lines {
+        out.push('\n');
+        out.push_str(&paint_seg("│  ", Paint::CyanDim, colour));
+        out.push_str(&render_line(segs, avail, colour, true, true));
+        out.push_str(&paint_seg("│", Paint::CyanDim, colour));
+    }
+    out.push('\n');
+    out.push_str(&banner_box_bottom(box_width, colour));
+    out
+}
+
+fn banner_box_top(box_width: usize, colour: bool) -> String {
+    let inner = box_width.saturating_sub(BANNER_BOX_MIN_WIDTH);
+    format!(
+        "{}{}{}",
+        paint_seg("╭─ ", Paint::CyanDim, colour),
+        paint_seg("zirv", Paint::Tone(Tone::Accent), colour),
+        paint_seg(&format!(" {}╮", "─".repeat(inner)), Paint::CyanDim, colour),
+    )
+}
+
+fn banner_box_bottom(box_width: usize, colour: bool) -> String {
+    let inner = box_width.saturating_sub(2);
+    paint_seg(&format!("╰{}╯", "─".repeat(inner)), Paint::CyanDim, colour)
+}
+
+/// The narrow-terminal (or unknown-width) banner tier: two lines, no box, no
+/// padding to a fixed width -- there is no border to keep joined, so this
+/// only truncates against a *known* `cols`, and renders full text when the
+/// width itself is unknown (`None`) rather than guessing.
+fn banner_compact(facts: &BannerFacts, colour: bool, cols: Option<u16>) -> String {
+    let mut line1: Segments = vec![
+        ("▎ ".to_string(), Paint::CyanPlain),
+        ("zirv ".to_string(), Paint::Tone(Tone::Accent)),
+        (facts.harness.clone(), Paint::Tone(Tone::Emphasis)),
+    ];
+    if let Some(model) = &facts.model {
+        line1.push((" · ".to_string(), Paint::Tone(Tone::Muted)));
+        line1.push((model.clone(), Paint::Tone(Tone::Muted)));
+    }
+    line1.push((" · ".to_string(), Paint::Tone(Tone::Muted)));
+    line1.push((
+        facts.rule.short_word().to_string(),
+        Paint::Tone(Tone::Muted),
+    ));
+
+    let mut line2: Segments = vec![
+        ("▎ ".to_string(), Paint::CyanPlain),
+        ("session ".to_string(), Paint::Tone(Tone::Muted)),
+        (facts.session.clone(), Paint::Tone(Tone::Muted)),
+        (" · ".to_string(), Paint::Tone(Tone::Muted)),
+    ];
+    line2.extend(harness_roster_segments(&facts.harnesses));
+
+    let plain_width_of = |segs: &[(String, Paint)]| -> usize {
+        style::display_width(&segs.iter().map(|(t, _)| t.as_str()).collect::<String>())
+    };
+    let avail1 = cols
+        .map(|c| c as usize)
+        .unwrap_or_else(|| plain_width_of(&line1));
+    let avail2 = cols
+        .map(|c| c as usize)
+        .unwrap_or_else(|| plain_width_of(&line2));
+
+    let l1 = render_line(&line1, avail1, colour, false, true);
+    let l2 = render_line(&line2, avail2, colour, false, true);
+    format!("{l1}\n{l2}")
+}
+
 /// Decorates the aggregated no-adapter error (one line per candidate, each
 /// naming why it was skipped) without changing its text: the first line gets
 /// emphasis, every following line is indented and dimmed. `colour` false
@@ -222,10 +516,10 @@ pub fn style_no_adapter_error(raw: &str, colour: bool) -> String {
             out.push('\n');
         }
         if index == 0 {
-            out.push_str(&styled(line, colour, |s| s.red().bold()));
+            out.push_str(&style::paint(line, Tone::Err, colour));
         } else {
             out.push_str("  ");
-            out.push_str(&styled(line, colour, |s| s.dim()));
+            out.push_str(&style::paint(line, Tone::Muted, colour));
         }
     }
     out
@@ -265,69 +559,185 @@ pub struct BarState {
     pub degraded: bool,
 }
 
-/// Pure renderer: one line, right-truncated to `cols`, no cursor-addressing
-/// escapes of its own (the caller wraps it in the redraw sequence). `colour`
-/// dims the whole line rather than picking out individual fields, since this
-/// is status chrome, not something that needs field-level emphasis.
-pub fn status_bar(state: &BarState, cols: u16, colour: bool) -> String {
-    let score_verdict = match (state.score, state.verdict) {
-        (Some(score), Some(verdict)) => format!("{score} {}", verdict.as_str()),
-        _ => PLACEHOLDER.to_string(),
-    };
-    // Both windows are honest lower bounds by the time they reach here --
-    // `window::available` already dropped whichever had provably reset -- so
-    // each present value gets its own labeled segment; an absent one is
-    // simply omitted, never shown as a fabricated zero.
-    let usage = match (state.usage_five_hour, state.usage_seven_day) {
-        (Some(five), Some(week)) => format!("5h {five:.0}% wk {week:.0}%"),
-        (Some(five), None) => format!("5h {five:.0}%"),
-        (None, Some(week)) => format!("wk {week:.0}%"),
-        (None, None) => PLACEHOLDER.to_string(),
-    };
-    // N7: a direct count of zero renders as plain `mail N` -- identical to
-    // the bar's pre-N7 wording -- and only grows a `+direct` suffix once
-    // something is actually addressed to this session specifically.
-    let mail = match state.unread_mail {
-        None => PLACEHOLDER.to_string(),
-        Some((broadcast, 0)) => broadcast.to_string(),
-        Some((broadcast, direct)) => format!("{broadcast}+{direct}"),
-    };
-    let supervision = if state.degraded {
-        "degraded"
-    } else {
-        "supervised"
-    };
-
-    let text = format!(
-        "{} | score {score_verdict} | usage {usage} | mail {mail} | {supervision}",
-        state.harness
-    );
-    let truncated = right_truncate(&text, cols as usize);
-    if colour {
-        // `force_styling`: same reasoning as `styled` above -- `colour` is
-        // already the final decision, so this must not be re-gated by the
-        // process-global `console::colors_enabled()` flag a second time.
-        console::style(truncated)
-            .dim()
-            .force_styling(true)
-            .to_string()
-    } else {
-        truncated
+/// The colour band a verdict's glyph and word render in: green for the
+/// healthy end, yellow for the advise/warming middle, red+bold for the
+/// compact/restart end -- the same three-band shape `rot`'s own thresholds
+/// already draw, just carried into colour.
+fn verdict_paint(verdict: Verdict) -> Paint {
+    match verdict {
+        Verdict::Healthy => Paint::Tone(Tone::Ok),
+        Verdict::Advise => Paint::Tone(Tone::Warn),
+        Verdict::Compact | Verdict::Restart => Paint::Tone(Tone::Err),
     }
 }
 
-/// Keeps the leftmost `cols` characters (not bytes: a multi-byte placeholder
-/// character must not be split), dropping whatever would overflow on the
-/// right. Never produces more than `cols` characters.
+/// Three plain spaces: the separator between two top-level bar segments
+/// (chip/harness/verdict/usage/mail/supervision). A single space separates
+/// pieces *within* one segment.
+const BAR_SEGMENT_GAP: &str = "   ";
+
+/// Pure renderer: one line, never wider than `cols`, no cursor-addressing
+/// escapes of its own (the caller wraps it in the redraw sequence).
 ///
-/// Shared with the dashboard's own renderers (`dash::ui`), which have exactly
-/// the same problem in a different frame: a header line and a sidebar row both
-/// have to degrade to whatever width they are given without splitting a glyph.
-pub(crate) fn right_truncate(s: &str, cols: usize) -> String {
-    if s.chars().count() <= cols {
-        return s.to_string();
+/// Six segments, in priority order: the `zirv` brand chip, the harness name,
+/// the rot verdict (glyph, word and score), the usage windows, unread mail,
+/// and supervision state. When the assembled line would exceed `cols`,
+/// segments drop out from *least* to *most* important -- usage, then the
+/// verdict's score number (the verdict word itself stays), then the harness
+/// name, then the chip -- since those are progressively more disposable than
+/// knowing whether the session is rotting, has mail, or is even supervised
+/// at all, which are never dropped outright. If even that irreducible core
+/// still overflows, it is hard-truncated (no ellipsis, an exact prefix) as
+/// the last resort, exactly like the bar's original right-truncation.
+pub fn status_bar(state: &BarState, cols: u16, colour: bool) -> String {
+    let cols = cols as usize;
+    let gap = || (BAR_SEGMENT_GAP.to_string(), Paint::Tone(Tone::Plain));
+
+    let chip: Segments = vec![(
+        if colour {
+            " zirv ".to_string()
+        } else {
+            "zirv".to_string()
+        },
+        Paint::Chip,
+    )];
+
+    let harness: Segments = vec![(state.harness.clone(), Paint::Tone(Tone::Plain))];
+
+    let (verdict_full, verdict_reduced): (Segments, Segments) = match (state.verdict, state.score) {
+        (Some(verdict), Some(score)) => {
+            let paint = verdict_paint(verdict);
+            let full = vec![
+                ("✻ ".to_string(), paint),
+                (verdict.as_str().to_string(), paint),
+                (" ".to_string(), Paint::Tone(Tone::Plain)),
+                (score.to_string(), Paint::Tone(Tone::Muted)),
+            ];
+            let reduced = vec![
+                ("✻ ".to_string(), paint),
+                (verdict.as_str().to_string(), paint),
+            ];
+            (full, reduced)
+        }
+        _ => {
+            let unknown = vec![
+                ("✻ ".to_string(), Paint::Tone(Tone::Muted)),
+                (PLACEHOLDER.to_string(), Paint::Tone(Tone::Muted)),
+            ];
+            (unknown.clone(), unknown)
+        }
+    };
+
+    // Both windows are honest lower bounds by the time they reach here --
+    // `window::available` already dropped whichever had provably reset --
+    // but the segment always shows both slots so the layout never shifts:
+    // an absent half renders `PLACEHOLDER`, never a fabricated 0%.
+    let usage: Segments = {
+        let five = state
+            .usage_five_hour
+            .map(style::format_pct)
+            .unwrap_or_else(|| PLACEHOLDER.to_string());
+        let seven = state
+            .usage_seven_day
+            .map(style::format_pct)
+            .unwrap_or_else(|| PLACEHOLDER.to_string());
+        vec![(format!("◔ {five}·{seven}"), Paint::Tone(Tone::Muted))]
+    };
+
+    // N7: a direct count of zero renders as plain `✉ N` -- identical to the
+    // bar's pre-N7 wording -- and only grows a `+direct` suffix once
+    // something is actually addressed to this session specifically. `None`
+    // and an explicit `(0, 0)` both mean "nothing unread", so both get the
+    // same never-a-zero placeholder rather than a literal `✉ 0`.
+    let mail: Segments = match state.unread_mail {
+        None | Some((0, 0)) => vec![
+            ("✉ ".to_string(), Paint::Tone(Tone::Muted)),
+            (PLACEHOLDER.to_string(), Paint::Tone(Tone::Muted)),
+        ],
+        Some((broadcast, 0)) => vec![
+            ("✉ ".to_string(), Paint::Tone(Tone::Warn)),
+            (broadcast.to_string(), Paint::Tone(Tone::Warn)),
+        ],
+        Some((broadcast, direct)) => vec![
+            ("✉ ".to_string(), Paint::Tone(Tone::Warn)),
+            (format!("{broadcast}+{direct}"), Paint::Tone(Tone::Warn)),
+        ],
+    };
+
+    let supervision: Segments = if state.degraded {
+        vec![("▲ degraded".to_string(), Paint::Tone(Tone::Err))]
+    } else {
+        vec![
+            ("● ".to_string(), Paint::Tone(Tone::Ok)),
+            ("supervised".to_string(), Paint::Tone(Tone::Plain)),
+        ]
+    };
+
+    let assemble = |include_chip: bool,
+                    include_harness: bool,
+                    include_score: bool,
+                    include_usage: bool|
+     -> Segments {
+        let mut present: Vec<&[(String, Paint)]> = Vec::new();
+        if include_chip {
+            present.push(&chip);
+        }
+        if include_harness {
+            present.push(&harness);
+        }
+        present.push(if include_score {
+            &verdict_full
+        } else {
+            &verdict_reduced
+        });
+        if include_usage {
+            present.push(&usage);
+        }
+        present.push(&mail);
+        present.push(&supervision);
+
+        let mut combined = Vec::new();
+        for (index, segs) in present.into_iter().enumerate() {
+            if index > 0 {
+                combined.push(gap());
+            }
+            combined.extend(segs.iter().cloned());
+        }
+        combined
+    };
+    let plain_width = |segs: &[(String, Paint)]| -> usize {
+        style::display_width(&segs.iter().map(|(t, _)| t.as_str()).collect::<String>())
+    };
+
+    // Drop order: usage, then the verdict's score number, then the harness
+    // name, then the chip -- the verdict word, mail and supervision are
+    // never dropped outright; `render_line`'s own hard-truncate is the only
+    // thing that can still cut into them, and only once every droppable
+    // segment is already gone.
+    let mut include_chip = true;
+    let mut include_harness = true;
+    let mut include_score = true;
+    let mut include_usage = true;
+    let mut combined = assemble(include_chip, include_harness, include_score, include_usage);
+
+    if plain_width(&combined) > cols {
+        include_usage = false;
+        combined = assemble(include_chip, include_harness, include_score, include_usage);
     }
-    s.chars().take(cols).collect()
+    if plain_width(&combined) > cols {
+        include_score = false;
+        combined = assemble(include_chip, include_harness, include_score, include_usage);
+    }
+    if plain_width(&combined) > cols {
+        include_harness = false;
+        combined = assemble(include_chip, include_harness, include_score, include_usage);
+    }
+    if plain_width(&combined) > cols {
+        include_chip = false;
+        combined = assemble(include_chip, include_harness, include_score, include_usage);
+    }
+
+    render_line(&combined, cols, colour, false, false)
 }
 
 /// The pty size to open (or resize to) when the bar reserves the bottom row:
@@ -536,9 +946,13 @@ mod tests {
         }
     }
 
+    // The legacy (no-VT) tier: bit-for-bit the pre-#202 banner, so these
+    // keep asserting on its full-sentence rule descriptions and `key: value`
+    // line shape. `vt = false` selects this tier regardless of `cols`.
+
     #[test]
     fn the_banner_shows_the_model_when_configured() {
-        let without = banner(&facts(), false, false);
+        let without = banner(&facts(), false, false, None);
         assert!(
             !without.to_lowercase().contains("model"),
             "no line at all when unset: {without}"
@@ -546,13 +960,13 @@ mod tests {
 
         let mut with_model = facts();
         with_model.model = Some("fable".to_string());
-        let text = banner(&with_model, false, false);
+        let text = banner(&with_model, false, false, None);
         assert!(text.contains("model: fable"), "got {text}");
     }
 
     #[test]
     fn the_banner_names_the_harness_and_the_rule_that_chose_it() {
-        let text = banner(&facts(), false, false);
+        let text = banner(&facts(), false, false, None);
         assert!(text.contains("claude"), "got {text}");
         assert!(
             text.contains("configured as the default agent"),
@@ -562,7 +976,7 @@ mod tests {
 
     #[test]
     fn the_banner_lists_every_enabled_harness_and_marks_the_disabled_ones() {
-        let text = banner(&facts(), false, false);
+        let text = banner(&facts(), false, false, None);
         assert!(text.contains("claude"), "got {text}");
         assert!(text.contains("codex (disabled)"), "got {text}");
         assert!(
@@ -573,33 +987,142 @@ mod tests {
 
     #[test]
     fn the_banner_says_when_a_stored_handoff_is_being_resumed() {
-        let without = banner(&facts(), false, false);
+        let without = banner(&facts(), false, false, None);
         assert!(!without.to_lowercase().contains("resuming"));
 
         let mut with_resume = facts();
         with_resume.resuming = Some("the last stored handoff".to_string());
-        let text = banner(&with_resume, false, false);
+        let text = banner(&with_resume, false, false, None);
         assert!(text.to_lowercase().contains("resuming"), "got {text}");
         assert!(text.contains("the last stored handoff"), "got {text}");
     }
 
     #[test]
-    fn the_banner_is_plain_text_when_the_terminal_cannot_do_vt() {
-        let with_vt = banner(&facts(), true, true);
-        let without_vt = banner(&facts(), true, false);
-        assert_ne!(
-            with_vt, without_vt,
-            "colour requested with vt must differ from colour requested without it"
-        );
+    fn vt_false_always_selects_the_legacy_tier_regardless_of_colour_or_cols() {
+        let plain = banner(&facts(), false, false, None);
+        let colour_requested = banner(&facts(), true, false, Some(100));
         assert_eq!(
-            without_vt,
-            banner(&facts(), false, false),
-            "no vt must render identically to no colour at all"
+            plain, colour_requested,
+            "no vt must render identically to no colour at all, whatever cols is"
         );
         assert!(
-            console::strip_ansi_codes(&with_vt) == without_vt,
-            "the same content survives either way"
+            !plain.contains('\u{1b}'),
+            "no vt means no escape codes at all: {plain}"
         );
+    }
+
+    // The box tier (vt = true, cols >= BANNER_BOX_MIN_COLS): the rounded
+    // frame, real glyphs, and the short one-word rule label.
+
+    #[test]
+    fn the_box_tier_names_the_harness_model_and_short_rule_word() {
+        let mut with_model = facts();
+        with_model.model = Some("sonnet".to_string());
+        let text = banner(&with_model, false, true, Some(80));
+        assert!(text.contains("claude"), "got {text}");
+        assert!(text.contains("model sonnet"), "got {text}");
+        assert!(text.contains("rule configured"), "got {text}");
+        assert!(
+            text.starts_with("\u{256d}"),
+            "opens with the box's top-left corner: {text}"
+        );
+    }
+
+    #[test]
+    fn the_box_tier_omits_the_model_segment_when_unset() {
+        let text = banner(&facts(), false, true, Some(80));
+        assert!(!text.contains("model "), "got {text}");
+    }
+
+    #[test]
+    fn the_box_tier_lists_the_harness_roster_with_ready_and_disabled_glyphs() {
+        let text = banner(&facts(), false, true, Some(80));
+        assert!(text.contains("claude \u{25cf}"), "got {text}");
+        assert!(text.contains("codex \u{25cb} disabled"), "got {text}");
+    }
+
+    #[test]
+    fn the_box_tier_shows_a_resume_line_only_when_resuming() {
+        let without = banner(&facts(), false, true, Some(80));
+        assert!(!without.contains('\u{21ba}'), "got {without}");
+
+        let mut with_resume = facts();
+        with_resume.resuming = Some("handoff from c357a8fb".to_string());
+        let text = banner(&with_resume, false, true, Some(80));
+        assert!(text.contains('\u{21ba}'), "got {text}");
+        assert!(text.contains("handoff from c357a8fb"), "got {text}");
+    }
+
+    #[test]
+    fn the_box_tiers_border_always_joins_its_own_corners() {
+        for name in [
+            "claude",
+            "a-very-long-harness-name-indeed",
+            "日本語エージェント",
+        ] {
+            let mut long = facts();
+            long.harness = name.to_string();
+            for cols in [BANNER_BOX_MIN_COLS, 80, 200] {
+                let text = banner(&long, false, true, Some(cols));
+                for line in text.lines() {
+                    assert_eq!(
+                        style::display_width(line),
+                        style::display_width(text.lines().next().unwrap()),
+                        "every line has the same display width as the top border: {text}"
+                    );
+                }
+                assert!(
+                    text.lines()
+                        .all(|l| style::display_width(l) <= cols as usize),
+                    "no line exceeds the terminal width: {text}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_box_tier_round_trips_exactly_under_colour() {
+        let coloured = banner(&facts(), true, true, Some(80));
+        let plain = banner(&facts(), false, true, Some(80));
+        assert_eq!(
+            console::strip_ansi_codes(&coloured),
+            plain,
+            "colour must never change the underlying text"
+        );
+        assert_ne!(coloured, plain, "colour must actually add something");
+    }
+
+    // The compact tier (vt = true, cols < BANNER_BOX_MIN_COLS, or cols
+    // unknown): two lines, no box, no padding.
+
+    #[test]
+    fn the_compact_tier_is_selected_below_the_box_width_floor_and_when_cols_is_unknown() {
+        let narrow = banner(&facts(), false, true, Some(BANNER_BOX_MIN_COLS - 1));
+        assert!(narrow.starts_with('\u{258e}'), "got {narrow}");
+        assert!(!narrow.contains('\u{256d}'), "no box corner: {narrow}");
+
+        let unknown = banner(&facts(), false, true, None);
+        assert!(unknown.starts_with('\u{258e}'), "got {unknown}");
+        assert!(!unknown.contains('\u{256d}'), "no box corner: {unknown}");
+    }
+
+    #[test]
+    fn the_compact_tier_names_the_harness_and_the_roster() {
+        // Wide enough (unlike the box tier's floor of 56) for the whole
+        // roster line to fit without its own ellipsis truncation kicking in.
+        let text = banner(&facts(), false, true, Some(50));
+        assert!(text.contains("zirv"), "got {text}");
+        assert!(text.contains("claude"), "got {text}");
+        assert!(text.contains("session abc12345"), "got {text}");
+        assert!(text.contains("codex \u{25cb} disabled"), "got {text}");
+    }
+
+    #[test]
+    fn the_compact_tier_round_trips_exactly_under_colour() {
+        let coloured = banner(&facts(), true, true, Some(50));
+        let plain = banner(&facts(), false, true, Some(50));
+        assert_eq!(console::strip_ansi_codes(&coloured), plain);
+        assert_ne!(coloured, plain, "colour must actually add something");
     }
 
     #[test]
@@ -651,45 +1174,98 @@ mod tests {
     fn the_bar_renders_harness_score_verdict_usage_mail_and_supervision_state() {
         let line = status_bar(&bar_state(), 200, false);
         assert!(line.contains("claude"), "got {line}");
-        assert!(line.contains("42"), "got {line}");
-        assert!(line.contains("advise"), "got {line}");
-        assert!(line.contains("5h 63%"), "got {line}");
-        assert!(line.contains("wk 51%"), "got {line}");
-        assert!(line.contains("mail 2"), "got {line}");
-        assert!(line.contains("supervised"), "got {line}");
+        assert!(line.contains("\u{273b} advise 42"), "got {line}");
+        assert!(line.contains("\u{25d4} 63%\u{b7}51%"), "got {line}");
+        assert!(line.contains("\u{2709} 2"), "got {line}");
+        assert!(line.contains("\u{25cf} supervised"), "got {line}");
     }
 
     #[test]
-    fn only_the_five_hour_window_renders_without_a_week_segment() {
+    fn only_the_five_hour_window_is_known_the_other_half_is_a_placeholder() {
         let mut state = bar_state();
         state.usage_seven_day = None;
         let line = status_bar(&state, 200, false);
-        assert!(line.contains("5h 63%"), "got {line}");
-        assert!(!line.contains("wk"), "got {line}");
+        assert!(line.contains("\u{25d4} 63%\u{b7}\u{2013}"), "got {line}");
     }
 
     #[test]
-    fn only_the_seven_day_window_renders_without_a_five_hour_segment() {
+    fn only_the_seven_day_window_is_known_the_other_half_is_a_placeholder() {
         let mut state = bar_state();
         state.usage_five_hour = None;
         let line = status_bar(&state, 200, false);
-        assert!(line.contains("wk 51%"), "got {line}");
-        assert!(!line.contains("5h"), "got {line}");
+        assert!(line.contains("\u{25d4} \u{2013}\u{b7}51%"), "got {line}");
     }
 
     #[test]
-    fn the_bar_is_truncated_from_the_right_and_never_exceeds_the_terminal_width() {
+    fn the_bar_never_exceeds_the_terminal_width_at_any_size() {
         let full = status_bar(&bar_state(), 200, false);
         assert!(
-            full.chars().count() > 20,
+            style::display_width(&full) > 20,
             "sanity: the untruncated line is long"
         );
 
-        let truncated = status_bar(&bar_state(), 12, false);
-        assert_eq!(truncated.chars().count(), 12);
+        for cols in [1u16, 5, 12, 20, 30, 50, 80, 200] {
+            let line = status_bar(&bar_state(), cols, false);
+            assert!(
+                style::display_width(&line) <= cols as usize,
+                "cols={cols} produced {line:?} with width {}",
+                style::display_width(&line)
+            );
+        }
+    }
+
+    /// Priority truncation: as the width tightens, the least important
+    /// segments drop first (usage, then the score number, then the harness
+    /// name, then the chip), while the verdict word, mail and supervision
+    /// stay legible as long as possible.
+    #[test]
+    fn narrow_widths_drop_segments_in_priority_order() {
+        let full = status_bar(&bar_state(), 200, true);
+        assert!(full.contains("zirv"), "the full line carries the chip");
+
+        // Wide enough for everything but the usage window (full is 60
+        // columns; dropping usage alone brings it to 48).
+        let no_usage = status_bar(&bar_state(), 50, false);
         assert!(
-            full.starts_with(&truncated),
-            "truncation drops the right side, not the left: {truncated:?} vs {full:?}"
+            !no_usage.contains('\u{25d4}'),
+            "usage should be the first thing dropped: {no_usage}"
+        );
+        assert!(
+            no_usage.contains("42") && no_usage.contains("claude") && no_usage.contains("zirv"),
+            "the score, harness and chip should still be present here: {no_usage}"
+        );
+
+        // Every droppable segment gone (usage, score, harness and chip all
+        // dropped, at 36/45/48/60 columns respectively) but the protected
+        // core (verdict word, mail, supervision -- 29 columns) still fits
+        // whole.
+        let core_only = status_bar(&bar_state(), 30, false);
+        assert!(!core_only.contains('\u{25d4}'), "got {core_only}");
+        assert!(!core_only.contains("zirv"), "the chip is gone: {core_only}");
+        assert!(
+            !core_only.contains("claude"),
+            "the harness name is gone: {core_only}"
+        );
+        assert!(
+            core_only.contains("\u{273b} advise"),
+            "the verdict word survives: {core_only}"
+        );
+        assert!(core_only.contains("supervised"), "got {core_only}");
+        assert!(
+            style::display_width(&core_only) <= 30,
+            "still within budget: {core_only}"
+        );
+    }
+
+    #[test]
+    fn even_the_protected_core_is_hard_truncated_as_a_last_resort() {
+        // The protected core (verdict word + mail + supervision) alone is
+        // 29 columns; a terminal narrower than that still must not overflow.
+        let line = status_bar(&bar_state(), 10, false);
+        assert_eq!(style::display_width(&line), 10);
+        assert!(
+            "\u{273b} advise   \u{2709} 2   \u{25cf} supervised".starts_with(&line),
+            "the hard truncate is an exact prefix of the protected core, no ellipsis: {line:?}"
         );
     }
 
@@ -698,12 +1274,12 @@ mod tests {
         let mut degraded = bar_state();
         degraded.degraded = true;
         let line = status_bar(&degraded, 200, false);
-        assert!(line.contains("degraded"), "got {line}");
+        assert!(line.contains("\u{25b2} degraded"), "got {line}");
         assert!(!line.contains("supervised"), "got {line}");
     }
 
     #[test]
-    fn unknown_usage_or_unread_mail_renders_as_a_placeholder_not_a_zero() {
+    fn unknown_score_verdict_usage_and_mail_render_as_placeholders_not_zeros() {
         let mut unknown = bar_state();
         unknown.usage_five_hour = None;
         unknown.usage_seven_day = None;
@@ -713,10 +1289,63 @@ mod tests {
         let line = status_bar(&unknown, 200, false);
 
         assert!(!line.contains('0'), "no invented zero anywhere: {line}");
+        // One placeholder for the verdict, two for the usage window's own
+        // two slots, one for mail: the field structure changed (usage now
+        // always shows both halves) but the never-a-zero contract has not.
         assert_eq!(
             line.matches('\u{2013}').count(),
-            3,
-            "one placeholder each for score/verdict, usage and mail: {line}"
+            4,
+            "verdict, both usage halves, and mail: {line}"
+        );
+    }
+
+    // The chip is the one segment whose *text*, not just its styling,
+    // depends on `colour` (` zirv ` padded to fill a background vs. the
+    // bare word `zirv` with no background to fill), so it is deliberately
+    // excluded from the strip-round-trip check below; a narrow `cols` that
+    // drops the chip entirely isolates every other segment, which must
+    // still round-trip exactly.
+    #[test]
+    fn the_verdict_mail_and_supervision_segments_round_trip_exactly_under_colour() {
+        for state in [bar_state(), {
+            let mut d = bar_state();
+            d.degraded = true;
+            d
+        }] {
+            let coloured = status_bar(&state, 30, true);
+            let plain = status_bar(&state, 30, false);
+            assert!(
+                !plain.contains("zirv"),
+                "sanity: the chip is dropped at this width"
+            );
+            assert_eq!(console::strip_ansi_codes(&coloured), plain);
+            assert_ne!(coloured, plain, "colour must actually add something");
+        }
+    }
+
+    #[test]
+    fn colour_off_renders_the_chip_as_a_bare_word_with_no_padding() {
+        let line = status_bar(&bar_state(), 200, false);
+        assert!(
+            line.starts_with("zirv"),
+            "the bare word, no leading padding space: {line}"
+        );
+        assert!(
+            line.starts_with("zirv   claude"),
+            "exactly one 3-space segment gap follows it: {line}"
+        );
+    }
+
+    #[test]
+    fn colour_on_renders_the_chip_as_a_padded_background_word() {
+        let coloured = status_bar(&bar_state(), 200, true);
+        let plain = console::strip_ansi_codes(&coloured).to_string();
+        // The chip's own trailing space plus the 3-space segment gap: four
+        // spaces between it and the harness name, not three.
+        assert!(
+            plain.starts_with(" zirv    claude"),
+            "the chip gains a leading/trailing padding space to fill its \
+             background: {plain}"
         );
     }
 
@@ -727,20 +1356,28 @@ mod tests {
         let mut both = bar_state();
         both.unread_mail = Some((2, 1));
         let line = status_bar(&both, 200, false);
-        assert!(line.contains("mail 2+1"), "got {line}");
+        assert!(line.contains("\u{2709} 2+1"), "got {line}");
 
         let mut broadcast_only = bar_state();
         broadcast_only.unread_mail = Some((2, 0));
         let line = status_bar(&broadcast_only, 200, false);
         assert!(
-            line.contains("mail 2") && !line.contains('+'),
+            line.contains("\u{2709} 2") && !line.contains('+'),
             "no direct mail means the plain count, unchanged from before N7: {line}"
         );
 
         let mut direct_only = bar_state();
         direct_only.unread_mail = Some((0, 3));
         let line = status_bar(&direct_only, 200, false);
-        assert!(line.contains("mail 0+3"), "got {line}");
+        assert!(line.contains("\u{2709} 0+3"), "got {line}");
+
+        let mut none_unread = bar_state();
+        none_unread.unread_mail = Some((0, 0));
+        let line = status_bar(&none_unread, 200, false);
+        assert!(
+            line.contains("\u{2709} \u{2013}"),
+            "an explicit (0, 0) is still nothing unread, not a literal zero: {line}"
+        );
     }
 
     #[test]

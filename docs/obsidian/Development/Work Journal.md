@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-29
+last-verified: 2026-08-30
 ---
 
 # Work Journal
@@ -19,6 +19,21 @@ last-verified: 2026-08-29
 **Follow-up:** anything unfinished (optional).
 
 ## Entries
+
+### 2026-08-30: TUI redesign — style.rs foundation, wrap chrome, dashboard chrome, CLI surfaces (`feat/202-tui-redesign`, issue #202, v2.38.0)
+**What:** Audited the terminal chrome across `wrap`'s banner/status bar, the dashboard header/sidebar/dialogs, and `zirv help`/`ctx status`/`context status`, produced an approved design artifact, then landed it in three implementation waves plus a version bump: (1) `src/style.rs`, a single terminal design system (semantic `Tone` palette, display-width-aware truncation via new dep `unicode-width`, `format_age`/`format_pct`/`PLACEHOLDER`, `style::tui` ratatui tokens); (2) `chrome.rs`'s launch banner (rounded-box/compact/legacy degradation ladder) and status bar (chip + glyph-tagged priority-truncated segments); (3) the dashboard (`dash/`) header/sidebar redesign, one shared `render_list_dialog` primitive across six overlays, and the new `Ctrl+A e` errors overlay, plus styled `zirv help`/`ctx status`/`context status`.
+**Key changes:** `src/style.rs` (new); `src/commands/ctx/chrome.rs`, `dash/mod.rs`, `dash/ui.rs`, `status.rs`, `context_status.rs`, `help.rs`; `output.rs` gained `success()`; `Cargo.toml` → 2.38.0. See [[Ctx Supervisors]]'s "Terminal chrome"/"The dashboard header and sidebar" sections, [[Ctx Subsystem]]'s `status` verb entry, [[Built-in Commands]]'s `help` entry, [[Technology Stack]]'s `unicode-width` entry, and the same-day [[Decision Log]] entry.
+**Follow-up:** Verification now complete — full nextest 3086/3087 (single failure = the known `wrap::win::` baseline), serial `cargo test` the same, `fmt`/`clippy -D warnings` clean on both Windows and the Linux Docker round (`rust:1-bookworm`: 126/126 `wrap::` real-PTY tests + clippy), and a native sonnet review round approved with zero findings. The codex cross-review round returned three confirmed findings (dangling-ZWJ truncation, dash header hints clipped by a long model name, list-dialog u16 height overflow), all fixed with regression tests in `d6cfce5` and re-verified on all gates incl. the Linux Docker round; a final full-PR sonnet review found no defects.
+
+### 2026-08-30: HARNESS_PROMPT v11 — design-review gate and autonomous lifecycle engagement (issues #204/#205, `feat/202-tui-redesign`, commit `8b196f3`)
+**What:** Bumped the injected meta-harness prompt layer (`prompt.rs::HARNESS_PROMPT`) to v11 with two new orchestrator bullets. #204: an operator-handed design/UX-shaped task (a UI redesign, a visual or interaction overhaul) now requires an audit of the current state and representative target designs put to the operator for explicit approval before implementation is dispatched — scoped to operator-facing design direction only, so an autonomous frontend baseline with no design dimension still proceeds without asking. #205: with no active `zirv workflow` and a substantial incoming task, the orchestrator seat now starts the lifecycle itself (`zirv workflow start <kind> --task "..."`), trusting `classify.rs`'s size-adaptive gating to right-size the gates, and is told to consult `zirv workflow status` mid-session since the injected prompt does not refresh after launch.
+**Key changes:** `src/commands/ctx/prompt.rs` (`HARNESS_PROMPT` v10 → v11). See [[Context Management]]'s "zirv as a meta-harness" section (new v11 paragraph).
+**Follow-up:** None recorded — implemented and documented same day as the #202 verification pass above.
+
+### 2026-08-30: Issue-tracker cleanup — closures and new filings
+**What:** Closed #187 and #190–#194 (all shipped in merged PR #200) and #180 (duplicate of #203). Filed #204 and #205 (both implemented same day, see the entry above) and #206 (a multiline-paste input bug, not yet triaged).
+**Key changes:** Issue tracker only — no code or vault-page changes beyond this entry and [[Active Work]]'s matching note.
+**Follow-up:** Remaining open priorities: #179 (spawn-request auth, security), #203 (budget-kill exit-code clobber flake), #198 (frontend template refresh), #206.
 
 ### 2026-08-29: PR #200 five-leg review round and fix wave (`release/187-ai-native-sdlc`)
 **What:** Full review of the SDLC release PR: spec conformance (20/22 implemented), superpowers parity/token analysis (~10–16x cheaper per cycle, enforcement is code not prose), Windows gates + CLI smoke, Docker/Linux wrap verification, and a correctness pass; then one fix wave.

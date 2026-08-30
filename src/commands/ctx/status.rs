@@ -10,21 +10,19 @@ use super::permit;
 use super::sessions::{self, Liveness};
 use super::state::{StateDir, repo_slug};
 use super::{CtxResult, log};
+use crate::style::{self, Tone};
 
-/// One unit, whichever is largest without going to zero: seconds under a
-/// minute, then minutes, hours, days. A session registry entry's age is
-/// usually minutes to days old, never sub-second, so this deliberately does
-/// not go finer than seconds.
-fn format_age(seconds: u64) -> String {
-    if seconds < 60 {
-        format!("{seconds}s")
-    } else if seconds < 3600 {
-        format!("{}m", seconds / 60)
-    } else if seconds < 86_400 {
-        format!("{}h", seconds / 3600)
-    } else {
-        format!("{}d", seconds / 86_400)
-    }
+/// Bold section-header line: a blank line, then the painted title and colon
+/// -- the same "\ntitle:" shape `style::section_header` documents, with the
+/// title painted bold (`Tone::Emphasis`) when `colour` is on.
+fn header(colour: bool, title: &str) -> String {
+    format!("\n{}:", style::paint(title, Tone::Emphasis, colour))
+}
+
+/// Bold inline field label, no leading blank line -- for a line whose label
+/// and value share one row (e.g. `mail: 2 unread`).
+fn label(colour: bool, title: &str) -> String {
+    style::paint(title, Tone::Emphasis, colour)
 }
 
 /// Issue #139: whether `record`'s pinned launch-time safety-policy
@@ -68,6 +66,7 @@ fn sessions_lines(
     state: &StateDir,
     now: u64,
     env: EnvLookup<'_>,
+    colour: bool,
 ) -> Vec<String> {
     let mut records = records.to_vec();
     records.sort_by(|a, b| a.0.short.cmp(&b.0.short));
@@ -80,29 +79,46 @@ fn sessions_lines(
     let mut lines: Vec<String> = records
         .iter()
         .map(|(record, liveness)| {
+            let is_live = matches!(liveness, Liveness::Live) && record.reachable;
+            // NEW-3: `unreachable` is a third state, not a flavour of
+            // live: the process is running, but it bound no turn-signal
+            // socket, so it can never notice a `zirv ctx nudge`. Showing
+            // it as plain `live` invited an operator to nudge something
+            // that would silently ignore them. A record whose pid no
+            // longer exists (`Liveness::Stale`; swept from disk as a
+            // side effect of this very listing, see `sessions::list`'s
+            // own doc comment) still reports `dead`, unambiguously --
+            // issue #166 -- rather than `stale`, which read as one more
+            // shade of live: being gone outranks being unreachable.
+            let liveness_word = match (liveness, record.reachable) {
+                (Liveness::Stale, _) => "dead",
+                (Liveness::Live, true) => "live",
+                (Liveness::Live, false) => "unreachable",
+            };
+            let liveness_tone = match liveness_word {
+                "live" => Tone::Ok,
+                "unreachable" => Tone::Warn,
+                _ => Tone::Err,
+            };
+            let bullet = if is_live {
+                style::paint("\u{25cf}", Tone::Ok, colour)
+            } else {
+                style::paint("\u{25cb}", Tone::Muted, colour)
+            };
             let mut line = format!(
-                "  {}  {}  {}  pid {}  {}  {}  {}",
-                record.short,
-                record.agent,
-                record.verb,
-                record.pid,
-                format_age(now.saturating_sub(record.started_at)),
-                // NEW-3: `unreachable` is a third state, not a flavour of
-                // live: the process is running, but it bound no turn-signal
-                // socket, so it can never notice a `zirv ctx nudge`. Showing
-                // it as plain `live` invited an operator to nudge something
-                // that would silently ignore them. A record whose pid no
-                // longer exists (`Liveness::Stale`; swept from disk as a
-                // side effect of this very listing, see `sessions::list`'s
-                // own doc comment) still reports `dead`, unambiguously --
-                // issue #166 -- rather than `stale`, which read as one more
-                // shade of live: being gone outranks being unreachable.
-                match (liveness, record.reachable) {
-                    (Liveness::Stale, _) => "dead",
-                    (Liveness::Live, true) => "live",
-                    (Liveness::Live, false) => "unreachable",
-                },
-                record.repo_slug,
+                "  {} {}  {}  {}  pid {}  {}  {}  {}",
+                bullet,
+                style::paint(&record.short, Tone::Accent, colour),
+                style::paint(&record.agent, Tone::Accent, colour),
+                style::paint(&record.verb.to_string(), Tone::Accent, colour),
+                style::paint(&record.pid.to_string(), Tone::Muted, colour),
+                style::paint(
+                    &crate::style::format_age(now.saturating_sub(record.started_at)),
+                    Tone::Muted,
+                    colour
+                ),
+                style::paint(liveness_word, liveness_tone, colour),
+                style::paint(&record.repo_slug, Tone::Muted, colour),
             );
             // Issue #139: named here, not just silently folded into the
             // stricter verdict a hook prompt would show -- an operator
@@ -110,14 +126,26 @@ fn sessions_lines(
             // running a narrower policy than the repo currently resolves
             // to.
             if policy_snapshot_is_stale(record, env) {
-                line.push_str(
-                    "  policy snapshot stale (current policy is wider); relaunch to adopt",
-                );
+                line.push_str(&format!(
+                    "  {}",
+                    style::paint(
+                        "policy snapshot stale (current policy is wider); relaunch to adopt",
+                        Tone::Warn,
+                        colour
+                    )
+                ));
             }
             let delivery = mail::session_delivery_metrics(state, &record.short, now);
             line.push_str(&format!(
-                "  mail queue {} unread {} recent in:{} out:{}",
-                delivery.queued, delivery.unread, delivery.recent_in, delivery.recent_out
+                "  {}",
+                style::paint(
+                    &format!(
+                        "mail queue {} unread {} recent in:{} out:{}",
+                        delivery.queued, delivery.unread, delivery.recent_in, delivery.recent_out
+                    ),
+                    Tone::Muted,
+                    colour
+                )
             ));
             line
         })
@@ -138,11 +166,13 @@ fn sessions_lines(
         })
         .unwrap_or_default();
     orphan_sockets.sort();
-    lines.extend(
-        orphan_sockets
-            .into_iter()
-            .map(|short| format!("  {short}  (no record)")),
-    );
+    lines.extend(orphan_sockets.into_iter().map(|short| {
+        format!(
+            "  {}  {}",
+            style::paint(&short, Tone::Accent, colour),
+            style::paint("(no record)", Tone::Muted, colour)
+        )
+    }));
 
     lines
 }
@@ -164,34 +194,61 @@ fn group_header(
     group: Option<&group::WorkGroup>,
     fallback_id: &str,
     live_shorts: &std::collections::BTreeSet<&str>,
+    colour: bool,
 ) -> String {
     let Some(wg) = group else {
-        return format!("  {fallback_id}");
+        return format!("  {}", style::paint(fallback_id, Tone::Accent, colour));
     };
     let status = if wg.closed_at.is_some() {
         "closed"
     } else {
         "open"
     };
+    let status_tone = if wg.closed_at.is_some() {
+        Tone::Muted
+    } else {
+        Tone::Ok
+    };
     let mut header = format!(
-        "  {} [{status}] scope=\"{}\" child_limit={}",
-        wg.work_group_id, wg.scope, wg.child_limit
+        "  {} [{}] {}",
+        style::paint(&wg.work_group_id, Tone::Accent, colour),
+        style::paint(status, status_tone, colour),
+        style::paint(
+            &format!("scope=\"{}\" child_limit={}", wg.scope, wg.child_limit),
+            Tone::Muted,
+            colour
+        ),
     );
     if let Some(budget) = wg.token_budget {
-        header.push_str(&format!(" budget={budget}"));
+        header.push_str(&style::paint(
+            &format!(" budget={budget}"),
+            Tone::Muted,
+            colour,
+        ));
     }
     if let Some(deadline) = wg.deadline_secs {
-        header.push_str(&format!(" deadline={deadline}s"));
+        header.push_str(&style::paint(
+            &format!(" deadline={deadline}s"),
+            Tone::Muted,
+            colour,
+        ));
     }
     if let Some(sub) = &wg.sub_orchestrator_session {
-        header.push_str(&format!(" sub-orchestrator={sub}"));
+        header.push_str(&style::paint(
+            &format!(" sub-orchestrator={sub}"),
+            Tone::Muted,
+            colour,
+        ));
     }
     let claimant_alive = wg
         .sub_orchestrator_session
         .as_deref()
         .is_some_and(|s| live_shorts.contains(s));
     if group::is_abandoned(wg, claimant_alive) {
-        header.push_str(" ABANDONED");
+        header.push_str(&format!(
+            " {}",
+            style::paint("ABANDONED", Tone::Err, colour)
+        ));
     }
     header
 }
@@ -209,6 +266,7 @@ fn push_group_block(
     header: String,
     children: &[&log::DelegationRow],
     live_sessions: &std::collections::BTreeSet<&str>,
+    colour: bool,
 ) {
     lines.push(header);
 
@@ -219,20 +277,38 @@ fn push_group_block(
         } else {
             row.outcome.as_str()
         };
+        let outcome_tone = if outcome == "running" {
+            Tone::Ok
+        } else {
+            Tone::Plain
+        };
         let model = row
             .model
             .as_deref()
             .map(|m| format!(" ({m})"))
             .unwrap_or_default();
         lines.push(format!(
-            "    {}  {}{model}  input {} | cache_creation {} | cache_read {} | output {}  wall {}  {outcome}",
-            row.session,
-            row.agent,
-            row.input_tokens,
-            row.cache_creation_input_tokens,
-            row.cache_read_input_tokens,
-            row.output_tokens,
-            format_age(row.wall_ms / 1000),
+            "    {}  {}{}  {}  wall {}  {}",
+            style::paint(&row.session, Tone::Accent, colour),
+            style::paint(&row.agent, Tone::Accent, colour),
+            style::paint(&model, Tone::Muted, colour),
+            style::paint(
+                &format!(
+                    "input {} | cache_creation {} | cache_read {} | output {}",
+                    row.input_tokens,
+                    row.cache_creation_input_tokens,
+                    row.cache_read_input_tokens,
+                    row.output_tokens
+                ),
+                Tone::Muted,
+                colour
+            ),
+            style::paint(
+                &crate::style::format_age(row.wall_ms / 1000),
+                Tone::Muted,
+                colour
+            ),
+            style::paint(outcome, outcome_tone, colour),
         ));
         totals[0] = totals[0].saturating_add(row.input_tokens);
         totals[1] = totals[1].saturating_add(row.cache_creation_input_tokens);
@@ -241,8 +317,15 @@ fn push_group_block(
     }
 
     lines.push(format!(
-        "    total: input {} | cache_creation {} | cache_read {} | output {}",
-        totals[0], totals[1], totals[2], totals[3]
+        "    {}",
+        style::paint(
+            &format!(
+                "total: input {} | cache_creation {} | cache_read {} | output {}",
+                totals[0], totals[1], totals[2], totals[3]
+            ),
+            Tone::Muted,
+            colour
+        )
     ));
 }
 
@@ -265,6 +348,7 @@ pub fn group_tree_lines(
     groups: &[group::WorkGroup],
     delegations: &[log::DelegationRow],
     records: &[(sessions::Record, Liveness)],
+    colour: bool,
 ) -> Vec<String> {
     if delegations.is_empty() {
         return Vec::new();
@@ -301,9 +385,10 @@ pub fn group_tree_lines(
         seen.insert(wg.work_group_id.as_str());
         push_group_block(
             &mut lines,
-            group_header(Some(wg), "", &live_shorts),
+            group_header(Some(wg), "", &live_shorts, colour),
             &children,
             &live_sessions,
+            colour,
         );
     }
 
@@ -321,9 +406,10 @@ pub fn group_tree_lines(
             .collect();
         push_group_block(
             &mut lines,
-            group_header(None, id, &live_shorts),
+            group_header(None, id, &live_shorts, colour),
             &children,
             &live_sessions,
+            colour,
         );
     }
 
@@ -334,9 +420,10 @@ pub fn group_tree_lines(
     if !ungrouped.is_empty() {
         push_group_block(
             &mut lines,
-            group_header(None, "ungrouped", &live_shorts),
+            group_header(None, "ungrouped", &live_shorts, colour),
             &ungrouped,
             &live_sessions,
+            colour,
         );
     }
 
@@ -351,14 +438,19 @@ pub fn group_tree_lines(
 /// "; " here (dropping the "no agent is both enabled and ready:" summary
 /// line) so the status line stays on one row like every other line `status`
 /// prints, instead of splitting a single logical fact across several.
-fn describe_chat(cfg: &CtxConfig) -> String {
+fn describe_chat(cfg: &CtxConfig, colour: bool) -> String {
     match adapters::resolve_default(cfg) {
         Ok((adapter, origin)) => {
             let rule = match origin {
                 DefaultOrigin::Configured => "configured",
                 DefaultOrigin::FirstEnabledReady => "first enabled and ready",
             };
-            format!("chat: {} ({rule})", adapter.name())
+            format!(
+                "{} {} ({})",
+                label(colour, "chat:"),
+                style::paint(adapter.name(), Tone::Accent, colour),
+                style::paint(rule, Tone::Muted, colour)
+            )
         }
         Err(e) => {
             let full = e.to_string();
@@ -368,7 +460,11 @@ fn describe_chat(cfg: &CtxConfig) -> String {
             } else {
                 reasons.join("; ")
             };
-            format!("chat: unavailable ({detail})")
+            format!(
+                "{} {} ({detail})",
+                label(colour, "chat:"),
+                style::paint("unavailable", Tone::Err, colour)
+            )
         }
     }
 }
@@ -418,13 +514,19 @@ pub fn run_with<W: Write>(
     w: &mut W,
     repo: &Path,
     env: EnvLookup<'_>,
+    colour: bool,
 ) -> CtxResult<i32> {
     let state = StateDir::resolve(env)?;
-    writeln!(w, "state dir: {}", state.root().display())?;
+    writeln!(
+        w,
+        "{} {}",
+        label(colour, "state dir:"),
+        style::paint(&state.root().display().to_string(), Tone::Muted, colour)
+    )?;
 
     match crate::settings::AgentGate::load(repo, env) {
         Ok(gate) => {
-            writeln!(w, "\nagents:")?;
+            writeln!(w, "{}", header(colour, "agents"))?;
             for adapter in crate::commands::ctx::adapters::all(None) {
                 let name = adapter.name();
                 let (enabled, location) = gate
@@ -432,14 +534,26 @@ pub fn run_with<W: Write>(
                     .find(|(n, _)| *n == name)
                     .map(|(_, s)| (s.enabled, s.location()))
                     .unwrap_or((true, "default".to_string()));
+                let state_word = if enabled { "enabled" } else { "disabled" };
+                let state_tone = if enabled { Tone::Ok } else { Tone::Muted };
                 writeln!(
                     w,
-                    "  {name:<8} {:<8} ({location})",
-                    if enabled { "enabled" } else { "disabled" }
+                    "  {} {} ({})",
+                    style::paint(&format!("{name:<8}"), Tone::Accent, colour),
+                    style::paint(&format!("{state_word:<8}"), state_tone, colour),
+                    style::paint(&location, Tone::Muted, colour),
                 )?;
             }
         }
-        Err(e) => writeln!(w, "\nagents: (settings unreadable: {e})")?,
+        Err(e) => writeln!(
+            w,
+            "\n{}",
+            style::paint(
+                &format!("agents: (settings unreadable: {e})"),
+                Tone::Emphasis,
+                colour
+            )
+        )?,
     }
 
     // `zirv ctx status` is the diagnostic verb, so a config load failure
@@ -459,17 +573,24 @@ pub fn run_with<W: Write>(
         matches!(&cfg_result, Err(e) if super::config::is_repo_forbidden(e.as_ref()));
     match &cfg_result {
         Ok(cfg) => {
-            writeln!(w, "\n{}", describe_chat(cfg))?;
+            writeln!(w, "\n{}", describe_chat(cfg, colour))?;
             for layer in &cfg.unparsable_layers {
                 writeln!(
                     w,
-                    "config: {} unparsable ({}) \u{2014} layer ignored",
-                    layer.path.display(),
-                    layer.message
+                    "{}",
+                    style::paint(
+                        &format!(
+                            "config: {} unparsable ({}) \u{2014} layer ignored",
+                            layer.path.display(),
+                            layer.message
+                        ),
+                        Tone::Warn,
+                        colour
+                    )
                 )?;
             }
             if let Some(line) = describe_injection_fallback(cfg) {
-                writeln!(w, "{line}")?;
+                writeln!(w, "{}", style::paint(&line, Tone::Warn, colour))?;
             }
             writeln!(
                 w,
@@ -509,25 +630,42 @@ pub fn run_with<W: Write>(
                     } else {
                         "full"
                     };
-                    let readiness = if adapters::select(Some(name), &[], cfg).is_ok() {
-                        "ready"
-                    } else {
-                        "unavailable"
-                    };
+                    let ready = adapters::select(Some(name), &[], cfg).is_ok();
+                    let readiness = if ready { "ready" } else { "unavailable" };
+                    let enabled = cfg.agents.is_enabled(name);
+                    let enabled_word = if enabled { "enabled" } else { "disabled" };
                     writeln!(
                         w,
-                        "  fallback {name}: {} / {readiness} / {capacity} / {headroom}",
-                        if cfg.agents.is_enabled(name) {
-                            "enabled"
-                        } else {
-                            "disabled"
-                        }
+                        "  {} {}: {} / {} / {} / {}",
+                        label(colour, "fallback"),
+                        style::paint(name, Tone::Accent, colour),
+                        style::paint(
+                            enabled_word,
+                            if enabled { Tone::Ok } else { Tone::Muted },
+                            colour
+                        ),
+                        style::paint(readiness, if ready { Tone::Ok } else { Tone::Err }, colour),
+                        style::paint(capacity, Tone::Muted, colour),
+                        style::paint(&headroom, Tone::Muted, colour),
                     )?;
                 }
             }
         }
-        Err(e) if repo_forbidden => writeln!(w, "\nCONFIG REJECTED: {e}")?,
-        Err(e) => writeln!(w, "\nchat: unavailable (configuration error: {e})")?,
+        Err(e) if repo_forbidden => writeln!(
+            w,
+            "\n{}",
+            style::paint(&format!("CONFIG REJECTED: {e}"), Tone::Err, colour)
+        )?,
+        Err(e) => writeln!(
+            w,
+            "\n{} {}",
+            label(colour, "chat:"),
+            style::paint(
+                &format!("unavailable (configuration error: {e})"),
+                Tone::Err,
+                colour
+            )
+        )?,
     }
 
     let mail_slug = repo_slug(repo);
@@ -552,19 +690,37 @@ pub fn run_with<W: Write>(
         mail_agent.as_deref(),
         mail_session.as_deref(),
     ) {
-        Ok(messages) if mail_swept > 0 => writeln!(
+        Ok(messages) => {
+            let count = messages.len();
+            let count_tone = if count == 0 { Tone::Muted } else { Tone::Plain };
+            let swept_note = if mail_swept > 0 {
+                format!(" ({mail_swept} undeliverable, swept)")
+            } else {
+                String::new()
+            };
+            writeln!(
+                w,
+                "{} {}",
+                label(colour, "mail:"),
+                style::paint(
+                    &format!("\u{2709} {count} unread{swept_note}"),
+                    count_tone,
+                    colour
+                )
+            )?;
+        }
+        Err(_) => writeln!(
             w,
-            "mail: {} unread ({mail_swept} undeliverable, swept)",
-            messages.len()
+            "{} {}",
+            label(colour, "mail:"),
+            style::paint("(unreadable)", Tone::Err, colour)
         )?,
-        Ok(messages) => writeln!(w, "mail: {} unread", messages.len())?,
-        Err(_) => writeln!(w, "mail: (unreadable)")?,
     }
     let recent_mail = mail::recent_flow_lines(&state, crate::commands::ctx::state::now_secs(), 5);
     if !recent_mail.is_empty() {
-        writeln!(w, "mail flow (last hour):")?;
+        writeln!(w, "{}", label(colour, "mail flow (last hour):"))?;
         for line in recent_mail {
-            writeln!(w, "  {line}")?;
+            writeln!(w, "  {}", style::paint(&line, Tone::Muted, colour))?;
         }
     }
 
@@ -592,12 +748,28 @@ pub fn run_with<W: Write>(
         let live_permits = permit::live_records(&state);
         writeln!(
             w,
-            "heavy operations: {} of {} slots in use",
-            live_permits.len(),
-            cfg.supervise.max_heavy_operations
+            "{} {}",
+            label(colour, "heavy operations:"),
+            style::paint(
+                &format!(
+                    "{} of {} slots in use",
+                    live_permits.len(),
+                    cfg.supervise.max_heavy_operations
+                ),
+                Tone::Muted,
+                colour
+            )
         )?;
         for record in &live_permits {
-            writeln!(w, "  pid {} -- {}", record.pid, record.label)?;
+            writeln!(
+                w,
+                "  {}",
+                style::paint(
+                    &format!("pid {} -- {}", record.pid, record.label),
+                    Tone::Muted,
+                    colour
+                )
+            )?;
         }
     }
 
@@ -615,23 +787,28 @@ pub fn run_with<W: Write>(
     // record's file off disk as a side effect of being called at all).
     let groups = group::list(&state);
     let delegations = log::read_delegations(&state, 200);
-    let group_tree = group_tree_lines(&groups, &delegations, &session_records);
+    let group_tree = group_tree_lines(&groups, &delegations, &session_records, colour);
     if !group_tree.is_empty() {
-        writeln!(w, "\nwork groups:")?;
+        writeln!(w, "{}", header(colour, "work groups"))?;
         for line in &group_tree {
             writeln!(w, "{line}")?;
         }
     }
 
-    writeln!(w, "\nsessions:")?;
+    writeln!(w, "{}", header(colour, "sessions"))?;
     let session_lines = sessions_lines(
         &session_records,
         &state,
         crate::commands::ctx::state::now_secs(),
         env,
+        colour,
     );
     if session_lines.is_empty() {
-        writeln!(w, "  no supervised sessions")?;
+        writeln!(
+            w,
+            "  {}",
+            style::paint("no supervised sessions", Tone::Muted, colour)
+        )?;
     } else {
         for line in &session_lines {
             writeln!(w, "{line}")?;
@@ -647,14 +824,27 @@ pub fn run_with<W: Write>(
         crate::commands::ctx::state::now_secs(),
     );
     if memory_summary.count == 0 {
-        writeln!(w, "memory: empty")?;
+        writeln!(
+            w,
+            "{} {}",
+            label(colour, "memory:"),
+            style::paint("empty", Tone::Muted, colour)
+        )?;
     } else {
         writeln!(
             w,
-            "memory: {} entries, oldest {}d, {} stale >30d",
-            memory_summary.count,
-            memory_summary.oldest_written_days.unwrap_or(0),
-            memory_summary.stale_count
+            "{} {}",
+            label(colour, "memory:"),
+            style::paint(
+                &format!(
+                    "{} entries, oldest {}d, {} stale >30d",
+                    memory_summary.count,
+                    memory_summary.oldest_written_days.unwrap_or(0),
+                    memory_summary.stale_count
+                ),
+                Tone::Muted,
+                colour
+            )
         )?;
     }
 
@@ -695,8 +885,16 @@ pub fn run_with<W: Write>(
             // never drift apart on what they tell the operator to do.
             writeln!(
                 w,
-                "\nusage windows: {provider}: no usage source ({})",
-                crate::commands::ctx::poll::usage_source_hint(provider)
+                "{} {}",
+                header(colour, "usage windows"),
+                style::paint(
+                    &format!(
+                        "{provider}: no usage source ({})",
+                        crate::commands::ctx::poll::usage_source_hint(provider)
+                    ),
+                    Tone::Muted,
+                    colour
+                )
             )?;
         }
         Some(provider) => {
@@ -712,33 +910,61 @@ pub fn run_with<W: Write>(
             );
             let describe =
                 |name: &str, window: Option<&crate::commands::ctx::window::Window>| match window {
-                    Some(found) => format!("{name} {:.0}%", found.used_percentage),
-                    None => format!("{name} unknown"),
+                    Some(found) => format!("{name} {}", style::format_pct(found.used_percentage)),
+                    None => format!("{name} {}", style::PLACEHOLDER),
                 };
             writeln!(
                 w,
-                "\nusage windows: {}, {} (see `zirv ctx usage` for detail)",
-                describe("five_hour", windows.five_hour.as_ref()),
-                describe("seven_day", windows.seven_day.as_ref())
+                "{} {}",
+                header(colour, "usage windows"),
+                style::paint(
+                    &format!(
+                        "{}, {} (see `zirv ctx usage` for detail)",
+                        describe("five_hour", windows.five_hour.as_ref()),
+                        describe("seven_day", windows.seven_day.as_ref())
+                    ),
+                    Tone::Muted,
+                    colour
+                )
             )?;
         }
         None => {}
     }
 
-    writeln!(w, "\nlatest handoff for {}:", repo.display())?;
+    writeln!(
+        w,
+        "\n{}",
+        style::paint(
+            &format!("latest handoff for {}:", repo.display()),
+            Tone::Emphasis,
+            colour
+        )
+    )?;
     match latest_for_repo(&state, repo)? {
         Some((path, handoff)) => {
-            writeln!(w, "  {}", path.display())?;
+            writeln!(
+                w,
+                "  {}",
+                style::paint(&path.display().to_string(), Tone::Muted, colour)
+            )?;
             writeln!(w, "  task: {}", handoff.task)?;
             writeln!(w, "  next: {}", handoff.next_step)?;
         }
-        None => writeln!(w, "  no handoff stored")?,
+        None => writeln!(
+            w,
+            "  {}",
+            style::paint("no handoff stored", Tone::Muted, colour)
+        )?,
     }
 
-    writeln!(w, "\nrecent decisions:")?;
+    writeln!(w, "{}", header(colour, "recent decisions"))?;
     let lines = log::tail(&state, args.decisions)?;
     if lines.is_empty() {
-        writeln!(w, "  none recorded")?;
+        writeln!(
+            w,
+            "  {}",
+            style::paint("none recorded", Tone::Muted, colour)
+        )?;
     } else {
         for line in lines.iter().rev() {
             writeln!(w, "  {line}")?;
@@ -755,7 +981,7 @@ pub fn run_with<W: Write>(
 pub fn run<W: Write>(args: &StatusArgs, w: &mut W) -> CtxResult<i32> {
     let repo = std::env::current_dir()?;
     let env = env_from_process();
-    run_with(args, w, &repo, &env)
+    run_with(args, w, &repo, &env, console::colors_enabled())
 }
 
 #[cfg(test)]
@@ -778,9 +1004,13 @@ mod tests {
         let env = env_for(&state);
 
         let mut out = Vec::new();
-        let code = run_with(&StatusArgs { decisions: 10 }, &mut out, tmp.path(), &|k| {
-            env.get(k).cloned()
-        })
+        let code = run_with(
+            &StatusArgs { decisions: 10 },
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            false,
+        )
         .expect("runs");
         assert_eq!(code, 0);
 
@@ -809,9 +1039,13 @@ mod tests {
 
         let env = env_for(&state);
         let mut out = Vec::new();
-        let code = run_with(&StatusArgs { decisions: 10 }, &mut out, &repo, &|k| {
-            env.get(k).cloned()
-        })
+        let code = run_with(
+            &StatusArgs { decisions: 10 },
+            &mut out,
+            &repo,
+            &|k| env.get(k).cloned(),
+            false,
+        )
         .expect("runs");
 
         assert_eq!(
@@ -845,9 +1079,13 @@ mod tests {
 
         let env = env_for(&state);
         let mut out = Vec::new();
-        let code = run_with(&StatusArgs { decisions: 10 }, &mut out, &repo, &|k| {
-            env.get(k).cloned()
-        })
+        let code = run_with(
+            &StatusArgs { decisions: 10 },
+            &mut out,
+            &repo,
+            &|k| env.get(k).cloned(),
+            false,
+        )
         .expect("runs");
 
         assert_eq!(
@@ -880,9 +1118,13 @@ mod tests {
 
         let env = env_for(&state);
         let mut out = Vec::new();
-        let code = run_with(&StatusArgs { decisions: 10 }, &mut out, &repo, &|k| {
-            env.get(k).cloned()
-        })
+        let code = run_with(
+            &StatusArgs { decisions: 10 },
+            &mut out,
+            &repo,
+            &|k| env.get(k).cloned(),
+            false,
+        )
         .expect("runs");
 
         assert_eq!(code, 1, "a REPO_FORBIDDEN rejection must fail the command");
@@ -931,9 +1173,13 @@ mod tests {
         .expect("store");
 
         let mut out = Vec::new();
-        run_with(&StatusArgs { decisions: 10 }, &mut out, tmp.path(), &|k| {
-            env.get(k).cloned()
-        })
+        run_with(
+            &StatusArgs { decisions: 10 },
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            false,
+        )
         .expect("runs");
         let text = String::from_utf8(out).expect("utf8");
 
@@ -959,9 +1205,13 @@ mod tests {
         let _server = signal::SignalServer::bind(&state.socket_for("abcdef12-3456")).expect("bind");
 
         let mut out = Vec::new();
-        run_with(&StatusArgs { decisions: 5 }, &mut out, tmp.path(), &|k| {
-            env.get(k).cloned()
-        })
+        run_with(
+            &StatusArgs { decisions: 5 },
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            false,
+        )
         .expect("runs");
         let text = String::from_utf8(out).expect("utf8");
         assert!(text.contains("abcdef12"), "session prefix listed: {text}");
@@ -1000,9 +1250,13 @@ mod tests {
         );
 
         let mut out = Vec::new();
-        run_with(&StatusArgs { decisions: 5 }, &mut out, &repo, &|k| {
-            env.get(k).cloned()
-        })
+        run_with(
+            &StatusArgs { decisions: 5 },
+            &mut out,
+            &repo,
+            &|k| env.get(k).cloned(),
+            false,
+        )
         .expect("runs");
         let text = String::from_utf8(out).expect("utf8");
         assert!(
@@ -1045,9 +1299,13 @@ mod tests {
         );
 
         let mut out = Vec::new();
-        run_with(&StatusArgs { decisions: 5 }, &mut out, &repo, &|k| {
-            env.get(k).cloned()
-        })
+        run_with(
+            &StatusArgs { decisions: 5 },
+            &mut out,
+            &repo,
+            &|k| env.get(k).cloned(),
+            false,
+        )
         .expect("runs");
         let text = String::from_utf8(out).expect("utf8");
         assert!(
@@ -1093,9 +1351,13 @@ mod tests {
         );
 
         let mut out = Vec::new();
-        let code = run_with(&StatusArgs { decisions: 5 }, &mut out, &repo, &|k| {
-            env.get(k).cloned()
-        })
+        let code = run_with(
+            &StatusArgs { decisions: 5 },
+            &mut out,
+            &repo,
+            &|k| env.get(k).cloned(),
+            false,
+        )
         .expect("runs");
         assert_eq!(
             code, 0,
@@ -1136,9 +1398,13 @@ mod tests {
         }
 
         let mut out = Vec::new();
-        run_with(&StatusArgs { decisions: 2 }, &mut out, tmp.path(), &|k| {
-            env.get(k).cloned()
-        })
+        run_with(
+            &StatusArgs { decisions: 2 },
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            false,
+        )
         .expect("runs");
         let text = String::from_utf8(out).expect("utf8");
         assert!(text.contains("tick4"));
@@ -1165,9 +1431,13 @@ mod tests {
         .expect("write");
 
         let mut out = Vec::new();
-        run_with(&StatusArgs { decisions: 5 }, &mut out, tmp.path(), &|k| {
-            env.get(k).cloned()
-        })
+        run_with(
+            &StatusArgs { decisions: 5 },
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            false,
+        )
         .expect("runs");
         let text = String::from_utf8(out).expect("utf8");
 
@@ -1190,7 +1460,7 @@ mod tests {
     fn status_names_the_agent_chat_would_launch_and_the_rule_that_chose_it() {
         let default_cfg = CtxConfig::default();
         assert_eq!(
-            describe_chat(&default_cfg),
+            describe_chat(&default_cfg, false),
             "chat: claude (first enabled and ready)"
         );
 
@@ -1198,7 +1468,10 @@ mod tests {
             agent: Some("claude".to_string()),
             ..CtxConfig::default()
         };
-        assert_eq!(describe_chat(&configured_cfg), "chat: claude (configured)");
+        assert_eq!(
+            describe_chat(&configured_cfg, false),
+            "chat: claude (configured)"
+        );
     }
 
     /// When nothing is both enabled and ready, `describe_chat` degrades to
@@ -1227,9 +1500,13 @@ mod tests {
         .expect("write");
 
         let mut out = Vec::new();
-        run_with(&StatusArgs { decisions: 5 }, &mut out, tmp.path(), &|k| {
-            env.get(k).cloned()
-        })
+        run_with(
+            &StatusArgs { decisions: 5 },
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            false,
+        )
         .expect("runs");
         let text = String::from_utf8(out).expect("utf8");
 
@@ -1276,13 +1553,17 @@ mod tests {
         }
 
         let mut out = Vec::new();
-        run_with(&StatusArgs { decisions: 5 }, &mut out, tmp.path(), &|k| {
-            env.get(k).cloned()
-        })
+        run_with(
+            &StatusArgs { decisions: 5 },
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            false,
+        )
         .expect("runs");
         let text = String::from_utf8(out).expect("utf8");
 
-        assert!(text.contains("mail: 2 unread"), "got {text}");
+        assert!(text.contains("mail: \u{2709} 2 unread"), "got {text}");
     }
 
     /// Issue #155, Phase 5(e): `heavy operations: N of M slots in use`
@@ -1310,9 +1591,13 @@ mod tests {
             permit::acquire(&state, 3, "session ab12cd34: cargo build").expect("permit granted");
 
         let mut out = Vec::new();
-        run_with(&StatusArgs { decisions: 5 }, &mut out, tmp.path(), &|k| {
-            env.get(k).cloned()
-        })
+        run_with(
+            &StatusArgs { decisions: 5 },
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            false,
+        )
         .expect("runs");
         let text = String::from_utf8(out).expect("utf8");
 
@@ -1353,9 +1638,13 @@ mod tests {
         .expect("write");
 
         let mut out = Vec::new();
-        run_with(&StatusArgs { decisions: 5 }, &mut out, tmp.path(), &|k| {
-            env.get(k).cloned()
-        })
+        run_with(
+            &StatusArgs { decisions: 5 },
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            false,
+        )
         .expect("runs");
         let text = String::from_utf8(out).expect("utf8");
 
@@ -1460,14 +1749,18 @@ mod tests {
         );
 
         let mut out = Vec::new();
-        run_with(&StatusArgs { decisions: 5 }, &mut out, tmp.path(), &|k| {
-            env.get(k).cloned()
-        })
+        run_with(
+            &StatusArgs { decisions: 5 },
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            false,
+        )
         .expect("runs");
         let text = String::from_utf8(out).expect("utf8");
 
         assert!(
-            text.contains("mail: 2 unread"),
+            text.contains("mail: \u{2709} 2 unread"),
             "only the broadcast and the directed-here message count, not the one \
              directed at bbbb2222: {text}"
         );
@@ -1518,14 +1811,18 @@ mod tests {
 
         let env = env_for(state.root());
         let mut out = Vec::new();
-        run_with(&StatusArgs { decisions: 5 }, &mut out, tmp.path(), &|k| {
-            env.get(k).cloned()
-        })
+        run_with(
+            &StatusArgs { decisions: 5 },
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            false,
+        )
         .expect("runs");
         let text = String::from_utf8(out).expect("utf8");
 
         assert!(
-            text.contains("mail: 1 unread (1 undeliverable, swept)"),
+            text.contains("mail: \u{2709} 1 unread (1 undeliverable, swept)"),
             "got {text}"
         );
     }
@@ -1557,9 +1854,13 @@ mod tests {
         .expect("store");
 
         let mut out = Vec::new();
-        run_with(&StatusArgs { decisions: 5 }, &mut out, tmp.path(), &|k| {
-            env.get(k).cloned()
-        })
+        run_with(
+            &StatusArgs { decisions: 5 },
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            false,
+        )
         .expect("runs");
         let text = String::from_utf8(out).expect("utf8");
         assert!(text.contains("usage"), "got {text}");
@@ -1567,9 +1868,10 @@ mod tests {
     }
 
     /// The fourth surface change: a window whose `resets_at` has provably
-    /// passed must read as "unknown", the same wording the line already uses
-    /// for a genuinely absent window -- never a stale percent presented as
-    /// current.
+    /// passed must read as `style::PLACEHOLDER` (issue #202: unknown values
+    /// use the shared placeholder, never the word "unknown"), the same
+    /// treatment the line already uses for a genuinely absent window --
+    /// never a stale percent presented as current.
     #[test]
     fn status_shows_unknown_for_a_usage_window_that_has_expired() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -1592,9 +1894,13 @@ mod tests {
         .expect("store");
 
         let mut out = Vec::new();
-        run_with(&StatusArgs { decisions: 5 }, &mut out, tmp.path(), &|k| {
-            env.get(k).cloned()
-        })
+        run_with(
+            &StatusArgs { decisions: 5 },
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            false,
+        )
         .expect("runs");
         let text = String::from_utf8(out).expect("utf8");
         assert!(
@@ -1602,7 +1908,7 @@ mod tests {
             "an expired window must not render as a current percent: {text}"
         );
         assert!(
-            text.contains("five_hour unknown"),
+            text.contains(&format!("five_hour {}", crate::style::PLACEHOLDER)),
             "expired reads the same as never-recorded: {text}"
         );
     }
@@ -1645,9 +1951,13 @@ mod tests {
         .expect("store");
 
         let mut out = Vec::new();
-        run_with(&StatusArgs { decisions: 5 }, &mut out, tmp.path(), &|k| {
-            env.get(k).cloned()
-        })
+        run_with(
+            &StatusArgs { decisions: 5 },
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            false,
+        )
         .expect("runs");
         let text = String::from_utf8(out).expect("utf8");
         assert!(text.contains("openai: no usage source"), "got {text}");
@@ -1688,9 +1998,13 @@ mod tests {
         .expect("write");
 
         let mut out = Vec::new();
-        run_with(&StatusArgs { decisions: 5 }, &mut out, tmp.path(), &|k| {
-            env.get(k).cloned()
-        })
+        run_with(
+            &StatusArgs { decisions: 5 },
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            false,
+        )
         .expect("runs");
         let text = String::from_utf8(out).expect("utf8");
         assert!(
@@ -1719,9 +2033,13 @@ mod tests {
         env.insert("ZIRV_CTX_AGENT_BIN".to_string(), shim.display().to_string());
 
         let mut out = Vec::new();
-        run_with(&StatusArgs { decisions: 5 }, &mut out, tmp.path(), &|k| {
-            env.get(k).cloned()
-        })
+        run_with(
+            &StatusArgs { decisions: 5 },
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            false,
+        )
         .expect("runs");
         let text = String::from_utf8(out).expect("utf8");
         assert!(
@@ -1746,9 +2064,13 @@ mod tests {
         );
 
         let mut out = Vec::new();
-        run_with(&StatusArgs { decisions: 5 }, &mut out, tmp.path(), &|k| {
-            env.get(k).cloned()
-        })
+        run_with(
+            &StatusArgs { decisions: 5 },
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            false,
+        )
         .expect("runs");
         let text = String::from_utf8(out).expect("utf8");
         assert!(
@@ -1783,9 +2105,13 @@ mod tests {
         let _guard = crate::commands::ctx::sessions::SessionGuard::register(&state, record);
 
         let mut out = Vec::new();
-        run_with(&StatusArgs { decisions: 5 }, &mut out, &repo, &|k| {
-            env.get(k).cloned()
-        })
+        run_with(
+            &StatusArgs { decisions: 5 },
+            &mut out,
+            &repo,
+            &|k| env.get(k).cloned(),
+            false,
+        )
         .expect("runs");
         let text = String::from_utf8(out).expect("utf8");
 
@@ -1823,9 +2149,13 @@ mod tests {
         let _guard = crate::commands::ctx::sessions::SessionGuard::register(&state, record);
 
         let mut out = Vec::new();
-        run_with(&StatusArgs { decisions: 5 }, &mut out, &repo, &|k| {
-            env.get(k).cloned()
-        })
+        run_with(
+            &StatusArgs { decisions: 5 },
+            &mut out,
+            &repo,
+            &|k| env.get(k).cloned(),
+            false,
+        )
         .expect("runs");
         let text = String::from_utf8(out).expect("utf8");
 
@@ -1876,9 +2206,13 @@ mod tests {
         let _guard = crate::commands::ctx::sessions::SessionGuard::register(&state, record);
 
         let mut out = Vec::new();
-        run_with(&StatusArgs { decisions: 5 }, &mut out, &repo, &|k| {
-            env.get(k).cloned()
-        })
+        run_with(
+            &StatusArgs { decisions: 5 },
+            &mut out,
+            &repo,
+            &|k| env.get(k).cloned(),
+            false,
+        )
         .expect("runs");
         let text = String::from_utf8(out).expect("utf8");
 
@@ -1901,9 +2235,13 @@ mod tests {
                 .expect("bind");
 
         let mut out = Vec::new();
-        run_with(&StatusArgs { decisions: 5 }, &mut out, tmp.path(), &|k| {
-            env.get(k).cloned()
-        })
+        run_with(
+            &StatusArgs { decisions: 5 },
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            false,
+        )
         .expect("runs");
         let text = String::from_utf8(out).expect("utf8");
 
@@ -1933,9 +2271,13 @@ mod tests {
         .expect("write leftover marker");
 
         let mut out = Vec::new();
-        run_with(&StatusArgs { decisions: 5 }, &mut out, tmp.path(), &|k| {
-            env.get(k).cloned()
-        })
+        run_with(
+            &StatusArgs { decisions: 5 },
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            false,
+        )
         .expect("runs");
         let text = String::from_utf8(out).expect("utf8");
 
@@ -1959,9 +2301,13 @@ mod tests {
         assert!(
             {
                 let mut out = Vec::new();
-                run_with(&StatusArgs { decisions: 5 }, &mut out, tmp.path(), &|k| {
-                    env.get(k).cloned()
-                })
+                run_with(
+                    &StatusArgs { decisions: 5 },
+                    &mut out,
+                    tmp.path(),
+                    &|k| env.get(k).cloned(),
+                    false,
+                )
                 .expect("runs");
                 String::from_utf8(out)
                     .expect("utf8")
@@ -1993,9 +2339,13 @@ mod tests {
         .expect("remember");
 
         let mut out = Vec::new();
-        run_with(&StatusArgs { decisions: 5 }, &mut out, tmp.path(), &|k| {
-            env.get(k).cloned()
-        })
+        run_with(
+            &StatusArgs { decisions: 5 },
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            false,
+        )
         .expect("runs");
         let text = String::from_utf8(out).expect("utf8");
         let line = text
@@ -2063,7 +2413,7 @@ mod tests {
             delegation_row("wg-1", "sess-a", "codex", 1_000, 91_000, 500),
             delegation_row("wg-1", "sess-b", "claude", 2_000, 40_000, 900),
         ];
-        let lines = group_tree_lines(&groups, &delegations, &[]);
+        let lines = group_tree_lines(&groups, &delegations, &[], false);
         let text = lines.join("\n");
 
         assert!(text.contains("wg-1"), "got {text}");
@@ -2079,7 +2429,7 @@ mod tests {
     #[test]
     fn ungrouped_delegations_are_still_listed() {
         let delegations = vec![ungrouped_delegation_row("sess-c", "codex")];
-        let text = group_tree_lines(&[], &delegations, &[]).join("\n");
+        let text = group_tree_lines(&[], &delegations, &[], false).join("\n");
         assert!(text.contains("ungrouped"), "got {text}");
         assert!(text.contains("sess-c"), "got {text}");
     }
@@ -2088,7 +2438,7 @@ mod tests {
     /// has never delegated.
     #[test]
     fn no_groups_and_no_delegations_render_nothing() {
-        assert!(group_tree_lines(&[], &[], &[]).is_empty());
+        assert!(group_tree_lines(&[], &[], &[], false).is_empty());
     }
 
     /// A delegation's `work_group_id` naming a group this listing never
@@ -2098,7 +2448,7 @@ mod tests {
     #[test]
     fn a_delegation_naming_an_unknown_group_still_shows_up() {
         let delegations = vec![delegation_row("wg-ghost", "sess-d", "codex", 100, 200, 50)];
-        let text = group_tree_lines(&[], &delegations, &[]).join("\n");
+        let text = group_tree_lines(&[], &delegations, &[], false).join("\n");
         assert!(
             text.contains("wg-ghost"),
             "the bare id still names it: {text}"
@@ -2121,7 +2471,7 @@ mod tests {
             std::path::Path::new("/repo"),
             sessions::Verb::Exec,
         );
-        let text = group_tree_lines(&groups, &[row], &[(record, Liveness::Live)]).join("\n");
+        let text = group_tree_lines(&groups, &[row], &[(record, Liveness::Live)], false).join("\n");
         assert!(text.contains("running"), "got {text}");
         assert!(
             !text.contains("failed"),
@@ -2154,12 +2504,14 @@ mod tests {
             std::slice::from_ref(&group),
             std::slice::from_ref(&row),
             &[],
+            false,
         )
         .join("\n");
         assert!(dead_text.contains("ABANDONED"), "got {dead_text}");
 
         // Alive: the exact same group, with its claimant now live.
-        let alive_text = group_tree_lines(&[group], &[row], &[(record, Liveness::Live)]).join("\n");
+        let alive_text =
+            group_tree_lines(&[group], &[row], &[(record, Liveness::Live)], false).join("\n");
         assert!(!alive_text.contains("ABANDONED"), "got {alive_text}");
     }
 
@@ -2175,9 +2527,13 @@ mod tests {
         let env = env_for(state.root());
 
         let mut out = Vec::new();
-        let code = run_with(&StatusArgs { decisions: 5 }, &mut out, tmp.path(), &|k| {
-            env.get(k).cloned()
-        })
+        let code = run_with(
+            &StatusArgs { decisions: 5 },
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            false,
+        )
         .expect("runs");
         assert_eq!(code, 0);
         let text = String::from_utf8(out).expect("utf8");
@@ -2196,9 +2552,13 @@ mod tests {
         let env = env_for(state.root());
 
         let mut out = Vec::new();
-        let code = run_with(&StatusArgs { decisions: 5 }, &mut out, tmp.path(), &|k| {
-            env.get(k).cloned()
-        })
+        let code = run_with(
+            &StatusArgs { decisions: 5 },
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            false,
+        )
         .expect("runs");
         assert_eq!(code, 0);
         let text = String::from_utf8(out).expect("utf8");
@@ -2236,9 +2596,13 @@ mod tests {
         let env = env_for(state.root());
 
         let mut out = Vec::new();
-        let code = run_with(&StatusArgs { decisions: 5 }, &mut out, tmp.path(), &|k| {
-            env.get(k).cloned()
-        })
+        let code = run_with(
+            &StatusArgs { decisions: 5 },
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            false,
+        )
         .expect("runs");
         assert_eq!(code, 0);
         let text = String::from_utf8(out).expect("utf8");
@@ -2290,9 +2654,13 @@ mod tests {
         let env = env_for(state.root());
 
         let mut out = Vec::new();
-        let code = run_with(&StatusArgs { decisions: 5 }, &mut out, tmp.path(), &|k| {
-            env.get(k).cloned()
-        })
+        let code = run_with(
+            &StatusArgs { decisions: 5 },
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            false,
+        )
         .expect("runs");
         assert_eq!(code, 0, "an unknown group id must not fail the command");
         let text = String::from_utf8(out).expect("utf8");
@@ -2341,9 +2709,13 @@ mod tests {
         let env = env_for(state.root());
 
         let mut out = Vec::new();
-        let code = run_with(&StatusArgs { decisions: 5 }, &mut out, tmp.path(), &|k| {
-            env.get(k).cloned()
-        })
+        let code = run_with(
+            &StatusArgs { decisions: 5 },
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            false,
+        )
         .expect("runs");
         assert_eq!(code, 0, "a corrupt line must not fail the command");
         let text = String::from_utf8(out).expect("utf8");

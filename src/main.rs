@@ -18,6 +18,7 @@ mod input;
 mod output;
 mod script_runner;
 mod settings;
+mod style;
 mod utils;
 
 use input::Input;
@@ -290,7 +291,7 @@ async fn main() {
                 std::process::exit(ctx::dispatch(&["ctx".to_string(), "chat".to_string()]));
             }
             BareTarget::Help => {
-                if let Err(e) = show_help(&mut std::io::stdout()) {
+                if let Err(e) = show_help(&mut std::io::stdout(), console::colors_enabled()) {
                     output::error(e);
                     std::process::exit(1);
                 }
@@ -300,7 +301,7 @@ async fn main() {
     }
 
     if is_top_level_help(&argv) {
-        if let Err(e) = show_help(&mut std::io::stdout()) {
+        if let Err(e) = show_help(&mut std::io::stdout(), console::colors_enabled()) {
             output::error(e);
             std::process::exit(1);
         }
@@ -325,7 +326,7 @@ async fn main() {
 
     match input.command.as_str() {
         "help" | "h" => {
-            if let Err(e) = show_help(&mut std::io::stdout()) {
+            if let Err(e) = show_help(&mut std::io::stdout(), console::colors_enabled()) {
                 output::error(e);
                 std::process::exit(1);
             }
@@ -674,7 +675,7 @@ mod tests {
 
         let _cwd = commands::ctx::testenv::CwdGuard::enter(&temp_path)?;
         let mut buffer = std::io::Cursor::new(Vec::new());
-        commands::help::show_help(&mut buffer)?;
+        commands::help::show_help(&mut buffer, false)?;
         let output = String::from_utf8(buffer.into_inner())?;
 
         // The directory itself must never be listed as an invocable script.

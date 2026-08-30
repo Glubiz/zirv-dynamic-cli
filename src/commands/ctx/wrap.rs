@@ -3553,7 +3553,7 @@ mod tests {
             "codex must not inherit claude's own legacy reading: {codex_text}"
         );
         assert!(
-            codex_text.contains("usage \u{2013}"),
+            codex_text.contains("\u{25d4} \u{2013}\u{b7}\u{2013}"),
             "and must show the placeholder, not a fabricated zero: {codex_text}"
         );
 
@@ -3608,7 +3608,7 @@ mod tests {
             "an expired window must not render as a current percent: {text}"
         );
         assert!(
-            text.contains("usage \u{2013}"),
+            text.contains("\u{25d4} \u{2013}\u{b7}\u{2013}"),
             "expired-and-nothing-else renders the placeholder: {text}"
         );
     }

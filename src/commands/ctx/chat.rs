@@ -369,7 +369,16 @@ pub fn run_with<W: Write, E: Write>(
             resuming: resuming.then(|| "the last stored handoff for this repo".to_string()),
             model: cfg.chat.model.clone(),
         };
-        writeln!(w, "{}", chrome::banner(&facts, chrome.colour, vt_ok))?;
+        // `size.0 == 0` only ever means the terminal-size probe itself
+        // failed (`probe_terminal`'s own `unwrap_or((0, 0))`), not a real
+        // zero-width terminal -- treated as "unknown" so the banner falls
+        // back to its compact tier instead of rendering a zero-width box.
+        let banner_cols = (size.0 > 0).then_some(size.0);
+        writeln!(
+            w,
+            "{}",
+            chrome::banner(&facts, chrome.colour, vt_ok, banner_cols)
+        )?;
     }
 
     let env = quiet_env(env, args.quiet);
