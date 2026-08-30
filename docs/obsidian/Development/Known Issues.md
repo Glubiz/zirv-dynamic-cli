@@ -15,6 +15,8 @@ Each entry gets a changelog comment at the top of the file, newest first:
 ```
 
 <!-- Updated 2026-08-30 (worktree-fix-bug-batch-213-215-218-203, issues #213/#215/#203/#218): resolved issue #215 (the test/deploy gate is now baseline-waivable via `zirv test baseline`), issue #203 (the mid-poll over-budget kill now gives one tick of grace before it can clobber a child's real exit code), and issue #218 (the flaky `adopt_child_pid` clock-boundary test); also fixed issue #213 (codex argv overflow), not previously a Known Issues entry -->
+
+<!-- Updated 2026-08-30 (worktree-feat-210-install-experience, issue #210, v2.39.1): resolved the Linux release binary's GLIBC_2.39 incompatibility for NEW releases (cd.yaml now ships a static musl build) and hardened install.sh; recorded two residuals below -- already-published (<= 2.39.0) releases stay glibc-linked, and the separate cli.zirv.io landing page still advertises a broken install path -->
 <!-- Updated 2026-08-30 (feat/209-dash-v3, issue #209, v2.39.0): recorded that `zirv workflow advance`'s test-step gate cannot pass on a host with known pre-existing test-suite failures (issue #215, filed on this workflow) -->
 <!-- Updated 2026-08-30 (feat/202-tui-redesign, issue #202, v2.38.0): corrected the "PaneState::WaitingInput" entry's stale sidebar-glyph list (working/idle/dead glyphs changed by the TUI redesign) -- see [[Ctx Supervisors]] -->
 <!-- Updated 2026-08-29 (release/187-ai-native-sdlc, PR #200 review round): recorded the pre-existing over-budget mid-poll exit-code clobber flake (issue #203) surfaced while diffing the full-suite failure list against baseline -->
@@ -71,6 +73,13 @@ Each entry gets a changelog comment at the top of the file, newest first:
 <!-- Updated 2026-08-13 (feat/agent-coordination, review round): markdown header absorption; registry short is a stable address; supervision env scrubbed on every spawn -->
 <!-- Updated 2026-08-13 (feat/agent-coordination, console-safety round): portable-pty do_kill inversion; ConPTY control-byte broadcast; empty nudge prefixes -->
 
+## Already-published Linux release binaries (<= v2.39.0) remain glibc-linked and fail on older distros
+
+**Recorded 2026-08-30 (issue #210).** `cd.yaml` now cross-compiles the Linux release asset to a static `x86_64-unknown-linux-musl` binary (see the 2026-08-30 [[Decision Log]] entry), fixing the GLIBC_2.39-vs-Debian-12/Ubuntu-22.04 failure for every release from v2.39.1 onward. Releases already published at v2.39.0 and earlier were built on `ubuntu-24.04` and linked GLIBC_2.39, so `install.sh <version>` pinned to one of those older versions still downloads a binary that fails to run on an older distro. There is no binary retrofit — a pinned old-version install on an incompatible distro must upgrade to >= v2.39.1 or build from source (`cargo install --git https://github.com/Glubiz/zirv-dynamic-cli`).
+
+## The `cli.zirv.io` landing page advertises a broken install path
+
+**Recorded 2026-08-30 (issue #210), out of this repo's scope.** The separate `Glubiz/zirv-generic-frontend` repo's `cli.zirv.io` landing page (`src/content/channels.ts`) links to a 404 install-script URL and tells operators to run `cargo install zirv`, which is not published to crates.io. Not fixed here — this repo's `install.sh`/README/`cd.yaml` are corrected (above), but the landing page's copy is a different repository's content; a separate PR on `zirv-generic-frontend` is fixing it.
 ## `zirv workflow advance`'s test-step gate cannot pass on a host with known-baseline test failures
 
 **Resolved 2026-08-30 (`worktree-fix-bug-batch-213-215-218-203`, issue #215).** Discovered 2026-08-30 (`feat/209-dash-v3`, issue #209): the workflow test/deploy gate demanded an outright-passing report, hard-failing on any test failure at all — structurally unpassable on a host (like this one) with a documented pre-existing per-host baseline of failing test names. Fixed with a baseline-waiver mechanism: `zirv test baseline` records the operator's own per-repository set of already-known failing test names at `~/.zirv/test-baseline/<repo_slug>.json`, and `latest_is_fresh_and_passing`/`VerificationReport::evaluate_against_baseline` now pass the gate when a failing report's failing test names are all a subset of that recorded baseline, printing every waived name loudly. An empty/missing baseline reproduces the exact old strict behavior. See [[Workflows]]'s "Baseline-waivable test gate" section.

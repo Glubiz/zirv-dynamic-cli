@@ -82,8 +82,14 @@ jobs:
                 target/aarch64-apple-darwin/release/zirv \
                 -output zirv
             else
-              # Linux
-              cp target/release/zirv zirv
+              # Linux: static musl build. The default glibc build (from
+              # ubuntu-24.04) links GLIBC_2.39, which fails to run on
+              # Debian 12 / Ubuntu 22.04; musl gives a static-pie binary
+              # that runs everywhere.
+              sudo apt-get update && sudo apt-get install -y musl-tools
+              rustup target add x86_64-unknown-linux-musl
+              cargo build --release --target x86_64-unknown-linux-musl
+              cp target/x86_64-unknown-linux-musl/release/zirv zirv
             fi
 
             chmod +x zirv
