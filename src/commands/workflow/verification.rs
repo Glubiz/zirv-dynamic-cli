@@ -508,6 +508,17 @@ pub struct CheckResult {
     pub duration_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure_output: Option<String>,
+    /// Failing test names recognized *while the check's output streamed in*,
+    /// via [`FailureNameScanner`] -- independent of `failure_output`, which
+    /// is only ever a capped display tail (see `MAX_FAILURE_OUTPUT_BYTES`)
+    /// that a large enough amount of *later* output (a subprocess inheriting
+    /// the real stdout fd, say) can evict the summary from entirely, even
+    /// though the summary was seen during capture. `#[serde(default)]` so a
+    /// report persisted before this field existed still deserializes, with
+    /// callers falling back to parsing `failure_output` text exactly as they
+    /// did before -- see `evaluate_against_baseline` and `run_baseline`.
+    #[serde(default)]
+    pub failure_test_names: Vec<String>,
 }
 
 fn default_check_source() -> CheckSource {
@@ -587,11 +598,7 @@ impl VerificationReport {
                 blocking.push(format!("{} ({:?})", check.id, check.status));
                 continue;
             }
-            let names = check
-                .failure_output
-                .as_deref()
-                .map(parse_cargo_test_failure_names)
-                .unwrap_or_default();
+            let names = failure_names_for(check);
             if names.is_empty() {
                 blocking.push(format!(
                     "{} (failed, but no individual test names could be parsed from its output)",
@@ -649,6 +656,27 @@ pub struct BaselineEvaluation {
 /// still be missing here even when they are present in the real, uncapped
 /// log -- this is best-effort against whatever text survived the cap, not a
 /// guarantee every failing binary is found.
+/// The failing test names for one already-`Failed` `Unit` check: the names
+/// [`FailureNameScanner`] recognized while the check's own output streamed
+/// in, when there are any, since those survive a display-tail eviction that
+/// [`parse_cargo_test_failure_names`] cannot see past (issue #215's Windows
+/// follow-up -- a real run's capped `failure_output` held no `failures:`
+/// text at all, even though the failing test's own summary had been printed
+/// well before the cap-evicting flood that followed it). Falls back to
+/// parsing `failure_output` text for a report persisted before
+/// `failure_test_names` existed, or for a `dry_run` check that was never
+/// actually executed and so was never scanned.
+fn failure_names_for(check: &CheckResult) -> std::collections::BTreeSet<String> {
+    if !check.failure_test_names.is_empty() {
+        return check.failure_test_names.iter().cloned().collect();
+    }
+    check
+        .failure_output
+        .as_deref()
+        .map(parse_cargo_test_failure_names)
+        .unwrap_or_default()
+}
+
 fn parse_cargo_test_failure_names(output: &str) -> std::collections::BTreeSet<String> {
     let lines: Vec<&str> = output.lines().collect();
     let mut names = std::collections::BTreeSet::new();
@@ -671,6 +699,73 @@ fn parse_cargo_test_failure_names(output: &str) -> std::collections::BTreeSet<St
         }
     }
     names
+}
+
+/// The streaming counterpart to [`parse_cargo_test_failure_names`]: applies
+/// the identical `failures:` -> nearest-following `test result: FAILED`
+/// matching rule, but incrementally, one line at a time, as a check's output
+/// arrives -- rather than against whatever text happens to survive
+/// `read_capped_tail`'s cap. A capped *display* tail is fine to lose an
+/// early binary's failure summary to a large enough later flood (this is
+/// still `MAX_FAILURE_OUTPUT_BYTES`-bounded, not a full second uncapped
+/// buffer); it is not fine for that flood to also erase the operator's only
+/// way of learning the failing test's *name*, which is exactly what a real
+/// Windows run of `zirv test baseline` hit: a check's own stdout fd was
+/// inherited by a later-spawned subprocess whose own output dwarfed the
+/// 16 KiB tail, leaving zero bytes of `failures:`/`test result: FAILED`
+/// text behind for [`parse_cargo_test_failure_names`] to find.
+///
+/// `pending` only ever holds the lines seen since the *most recently
+/// observed* `failures:` line -- reset on every new one -- so memory stays
+/// bounded by the shape of one such section, never by total output size;
+/// `MAX_PENDING_LINES` is a defensive backstop against a pathological
+/// producer that never resets it.
+#[derive(Default)]
+struct FailureNameScanner {
+    names: std::collections::BTreeSet<String>,
+    pending: Vec<String>,
+    partial: Vec<u8>,
+}
+
+impl FailureNameScanner {
+    const MAX_PENDING_LINES: usize = 4096;
+
+    fn feed(&mut self, chunk: &[u8]) {
+        self.partial.extend_from_slice(chunk);
+        while let Some(newline) = self.partial.iter().position(|&byte| byte == b'\n') {
+            let line_bytes: Vec<u8> = self.partial.drain(..=newline).collect();
+            let line = String::from_utf8_lossy(&line_bytes);
+            self.observe_line(line.trim_end_matches(['\n', '\r']));
+        }
+    }
+
+    fn observe_line(&mut self, line: &str) {
+        let trimmed = line.trim();
+        if trimmed == "failures:" {
+            self.pending.clear();
+            return;
+        }
+        if line.contains("test result: FAILED") {
+            self.names.extend(self.pending.drain(..));
+            return;
+        }
+        if trimmed.is_empty() || trimmed.starts_with("----") {
+            return;
+        }
+        if self.pending.len() < Self::MAX_PENDING_LINES {
+            self.pending.push(trimmed.to_string());
+        }
+    }
+
+    /// Consumes the scanner, flushing any final unterminated line (a stream
+    /// that ends without a trailing newline) before returning the names.
+    fn finish(mut self) -> std::collections::BTreeSet<String> {
+        if !self.partial.is_empty() {
+            let line = String::from_utf8_lossy(&self.partial).into_owned();
+            self.observe_line(line.trim_end_matches(['\n', '\r']));
+        }
+        self.names
+    }
 }
 
 /// An operator-owned record of failing test names that are already known
@@ -764,13 +859,22 @@ fn command_for_shell(command: &str) -> Command {
     }
 }
 
-/// The retained tail, plus whether the stream ended in a read error rather
-/// than at EOF. An error read as a clean end silently turned a truncated
-/// failure log into a complete-looking one.
-fn read_capped_tail(mut reader: impl Read, cap: usize) -> (Vec<u8>, bool) {
+/// The retained tail (whether the stream ended in a read error rather than
+/// at EOF is the second element -- an error read as a clean end silently
+/// turned a truncated failure log into a complete-looking one), plus the
+/// failing test names a [`FailureNameScanner`] recognized in the *full*,
+/// uncapped stream as it went by -- see that struct's doc comment for why
+/// this must happen during capture rather than against the capped tail
+/// alone. Every check's output goes through this path (`run_check`); only
+/// the retained-tail element is ever a display artifact.
+fn read_capped_tail_and_scan(
+    mut reader: impl Read,
+    cap: usize,
+) -> (Vec<u8>, bool, std::collections::BTreeSet<String>) {
     let mut kept = Vec::with_capacity(cap);
     let mut chunk = [0u8; 8192];
     let mut errored = false;
+    let mut scanner = FailureNameScanner::default();
     loop {
         let count = match reader.read(&mut chunk) {
             Ok(0) => break,
@@ -780,6 +884,7 @@ fn read_capped_tail(mut reader: impl Read, cap: usize) -> (Vec<u8>, bool) {
             }
             Ok(count) => count,
         };
+        scanner.feed(&chunk[..count]);
         if count >= cap {
             kept.clear();
             kept.extend_from_slice(&chunk[count - cap..count]);
@@ -791,7 +896,7 @@ fn read_capped_tail(mut reader: impl Read, cap: usize) -> (Vec<u8>, bool) {
         }
         kept.extend_from_slice(&chunk[..count]);
     }
-    (kept, errored)
+    (kept, errored, scanner.finish())
 }
 
 /// The last `cap` bytes as text, on a char boundary. `utils::truncate_bytes`
@@ -855,6 +960,7 @@ fn check_result(check: &ResolvedCheck, status: CheckStatus) -> CheckResult {
         exit_code: None,
         duration_ms: 0,
         failure_output: None,
+        failure_test_names: Vec::new(),
     }
 }
 
@@ -872,19 +978,28 @@ fn run_check(repo: &Path, check: &ResolvedCheck, dry_run: bool) -> CheckResult {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let result = (|| -> CtxResult<(CheckStatus, Option<i32>, Vec<u8>)> {
+    /// One check's raw run outcome: status, exit code, combined capped
+    /// output, and the failing test names a `FailureNameScanner` recognized
+    /// while that output streamed by.
+    type RawCheckOutcome = (
+        CheckStatus,
+        Option<i32>,
+        Vec<u8>,
+        std::collections::BTreeSet<String>,
+    );
+    let result = (|| -> CtxResult<RawCheckOutcome> {
         let mut child = command.spawn()?;
         let mut job = crate::commands::ctx::supervise::JobGuard::adopt(child.id());
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
         let stdout_thread = std::thread::spawn(move || {
             stdout
-                .map(|stdout| read_capped_tail(stdout, MAX_FAILURE_OUTPUT_BYTES))
+                .map(|stdout| read_capped_tail_and_scan(stdout, MAX_FAILURE_OUTPUT_BYTES))
                 .unwrap_or_default()
         });
         let stderr_thread = std::thread::spawn(move || {
             stderr
-                .map(|stderr| read_capped_tail(stderr, MAX_FAILURE_OUTPUT_BYTES))
+                .map(|stderr| read_capped_tail_and_scan(stderr, MAX_FAILURE_OUTPUT_BYTES))
                 .unwrap_or_default()
         });
 
@@ -909,23 +1024,41 @@ fn run_check(repo: &Path, check: &ResolvedCheck, dry_run: bool) -> CheckResult {
             }
             std::thread::sleep(Duration::from_millis(25));
         };
-        let (mut output, mut errored) = stdout_thread.join().unwrap_or_default();
-        let (stderr_output, stderr_errored) = stderr_thread.join().unwrap_or_default();
+        let (mut output, mut errored, mut names) = stdout_thread.join().unwrap_or_default();
+        let (stderr_output, stderr_errored, stderr_names) =
+            stderr_thread.join().unwrap_or_default();
         output.extend(stderr_output);
         errored |= stderr_errored;
+        names.extend(stderr_names);
         if output.len() > MAX_FAILURE_OUTPUT_BYTES {
             output.drain(..output.len() - MAX_FAILURE_OUTPUT_BYTES);
         }
         if errored {
             output.extend_from_slice(b"\n[output stream ended in a read error]");
         }
-        Ok((status, code, output))
+        Ok((status, code, output, names))
     })();
 
-    let (status, exit_code, output) =
-        result.unwrap_or_else(|err| (CheckStatus::Failed, None, err.to_string().into_bytes()));
+    let (status, exit_code, output, failure_test_names) = result.unwrap_or_else(|err| {
+        (
+            CheckStatus::Failed,
+            None,
+            err.to_string().into_bytes(),
+            std::collections::BTreeSet::new(),
+        )
+    });
     let failure_output = (status != CheckStatus::Passed)
         .then(|| scrub_output(&tail_text(&output, MAX_FAILURE_OUTPUT_BYTES)));
+    // Scrubbed the same way `failure_output` is: a name recognized inside
+    // repository-controlled text is still repository-controlled text.
+    let failure_test_names: Vec<String> = if status == CheckStatus::Passed {
+        Vec::new()
+    } else {
+        failure_test_names
+            .into_iter()
+            .map(|name| scrub_line(&name))
+            .collect()
+    };
     CheckResult {
         id: check.id.clone(),
         kind: check.kind,
@@ -935,6 +1068,7 @@ fn run_check(repo: &Path, check: &ResolvedCheck, dry_run: bool) -> CheckResult {
         exit_code,
         duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
         failure_output,
+        failure_test_names,
     }
 }
 
@@ -1262,6 +1396,20 @@ fn run_and_report(
 /// only path that ever writes a baseline -- `zirv test changed`/`zirv
 /// verify`/a workflow gate never do, so a baseline only ever reflects
 /// failures an operator ran this command and looked at.
+///
+/// Only ever ingests names from a check whose `source` is *not*
+/// `repo_supplied()` -- today that means `CheckSource::DiscoveredToolchain`,
+/// zirv's own built-in Cargo checks, never `RepoConfig` (`<repo>/.zirv/
+/// verify.toml`) or `DiscoveredScript` (`npm run <id>`, whose body is
+/// `package.json` text). Both of the latter run command text the checkout
+/// itself authored; a repository is UNTRUSTED and may only ever narrow what
+/// an operator can do (see `CLAUDE.md`'s "Repo-owned surfaces" rule), so a
+/// repo-authored check that prints forged `failures:`/`test result: FAILED`
+/// text must never be able to widen the operator's baseline with names of
+/// its own choosing that it plans to actually break later. Such a check
+/// still fails the run and still blocks the gate -- it is simply never
+/// consulted for baseline *names*, exactly like any other unrecordable
+/// check.
 fn run_baseline(repo: &Path, args: &RunArgs, writer: &mut impl Write) -> CtxResult<i32> {
     let (code, report) = run_and_persist(repo, VerificationMode::All, args, writer)?;
     if args.dry_run {
@@ -1277,11 +1425,15 @@ fn run_baseline(repo: &Path, args: &RunArgs, writer: &mut impl Write) -> CtxResu
             unrecordable.push(format!("{} ({:?})", check.id, check.status));
             continue;
         }
-        let names = check
-            .failure_output
-            .as_deref()
-            .map(parse_cargo_test_failure_names)
-            .unwrap_or_default();
+        if check.source.repo_supplied() {
+            unrecordable.push(format!(
+                "{} (a repository-defined check's output is never trusted to widen the \
+                 operator's baseline)",
+                check.id
+            ));
+            continue;
+        }
+        let names = failure_names_for(check);
         if names.is_empty() {
             unrecordable.push(format!(
                 "{} (failed, but no individual test names could be parsed from its output)",
@@ -1703,6 +1855,7 @@ mod tests {
                 exit_code: Some(0),
                 duration_ms: 1,
                 failure_output: None,
+                failure_test_names: Vec::new(),
             }],
         };
         save_report(&state, &report).unwrap();
@@ -1783,6 +1936,7 @@ mod tests {
                 exit_code: Some(0),
                 duration_ms: 1,
                 failure_output: None,
+                failure_test_names: Vec::new(),
             }],
             started_at: 0,
             finished_at: 0,
@@ -1838,6 +1992,7 @@ mod tests {
                 exit_code: Some(0),
                 duration_ms: 1,
                 failure_output: None,
+                failure_test_names: Vec::new(),
             }],
         }
     }
@@ -1917,8 +2072,8 @@ mod tests {
         let input: Vec<u8> = (0..MAX_FAILURE_OUTPUT_BYTES + 4096)
             .map(|index| (index % 251) as u8)
             .collect();
-        let (retained, errored) =
-            read_capped_tail(std::io::Cursor::new(&input), MAX_FAILURE_OUTPUT_BYTES);
+        let (retained, errored, _names) =
+            read_capped_tail_and_scan(std::io::Cursor::new(&input), MAX_FAILURE_OUTPUT_BYTES);
         assert!(!errored);
         assert_eq!(retained.len(), MAX_FAILURE_OUTPUT_BYTES);
         assert_eq!(retained, input[input.len() - MAX_FAILURE_OUTPUT_BYTES..]);
@@ -2058,6 +2213,7 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; 
             exit_code: (status != CheckStatus::Passed).then_some(101),
             duration_ms: 1,
             failure_output: failure_output.map(str::to_string),
+            failure_test_names: Vec::new(),
         }
     }
 
@@ -2165,6 +2321,7 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; 
             exit_code: Some(1),
             duration_ms: 1,
             failure_output: Some("warning: unused variable".into()),
+            failure_test_names: Vec::new(),
         }]);
         // Even a baseline that happens to contain the exact failure text must
         // not waive a check that names no individual tests at all.
@@ -2259,6 +2416,142 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; 
         assert!(
             latest_is_fresh_and_passing(&state, repo.path(), true).unwrap(),
             "the same failure, now baselined, satisfies the gate"
+        );
+    }
+
+    /// Regression for a real `zirv test baseline` run on this Windows host
+    /// (recorded 2026-08-30, repo slug
+    /// `D--GitHub-zirv-dynamic-cli--claude-worktrees-fix-bug-batch-213-215-
+    /// 218-203`, ts 1788109790): `cargo test --verbose` genuinely failed
+    /// `commands::ctx::wrap::tests::win::a_supervised_wrap_binds_a_turn_
+    /// signal_transport`, but the check's persisted `failure_output` -- the
+    /// `MAX_FAILURE_OUTPUT_BYTES` capped *display* tail -- contained no
+    /// `failures:` text anywhere at all (confirmed by grepping the actual
+    /// stored report file byte-for-byte). A later-spawned subprocess in the
+    /// same test run inherited the real stdout fd and printed far more than
+    /// the cap afterwards, evicting the already-printed `failures:`/`test
+    /// result: FAILED` summary entirely -- CRLF line endings throughout,
+    /// since this is real cmd.exe/Cargo-on-Windows output.
+    /// `parse_cargo_test_failure_names` against that capped text -- the only
+    /// thing `run_baseline` consulted before this fix -- necessarily
+    /// returned nothing, which is exactly the "0 failing test name(s)
+    /// recorded" the operator saw. This test reproduces that exact shape (a
+    /// real CRLF summary immediately followed by a same-stream flood that
+    /// exceeds the cap) directly against the capture seam
+    /// (`read_capped_tail_and_scan`, backed by `FailureNameScanner`), and
+    /// proves the name is recovered even though the display tail still
+    /// legitimately loses it.
+    #[test]
+    fn a_late_output_flood_cannot_evict_the_earlier_failing_name_from_capture() {
+        let real_name =
+            "commands::ctx::wrap::tests::win::a_supervised_wrap_binds_a_turn_signal_transport";
+        let mut input = Vec::new();
+        input.extend_from_slice(b"running 1 test\r\n");
+        input.extend_from_slice(format!("test {real_name} ... FAILED\r\n").as_bytes());
+        input.extend_from_slice(b"\r\nfailures:\r\n\r\n");
+        input.extend_from_slice(format!("---- {real_name} stdout ----\r\n").as_bytes());
+        input.extend_from_slice(b"thread panicked at src\\commands\\ctx\\wrap.rs:1:\r\n\r\n");
+        input.extend_from_slice(b"failures:\r\n");
+        input.extend_from_slice(format!("    {real_name}\r\n").as_bytes());
+        input.extend_from_slice(
+            b"\r\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered \
+              out; finished in 7.04s\r\n",
+        );
+        // A later-spawned subprocess (a stubbed Claude/Codex launch, in the
+        // real run) inheriting the real stdout fd and printing far more than
+        // the cap -- the actual defect, not a contrived worst case. The cap
+        // is on the *whole* stream's last `MAX_FAILURE_OUTPUT_BYTES` bytes,
+        // so the filler alone (not the filler plus the block) must exceed
+        // the cap for the block to be fully outside that window.
+        let after_block = input.len();
+        while input.len() - after_block <= MAX_FAILURE_OUTPUT_BYTES {
+            input.extend_from_slice(b"[17:08:14] zirv \xe2\x96\xb8 sandbox posture noise\r\n");
+        }
+
+        let (retained, errored, names) =
+            read_capped_tail_and_scan(std::io::Cursor::new(&input), MAX_FAILURE_OUTPUT_BYTES);
+        assert!(!errored);
+        let retained_text = String::from_utf8_lossy(&retained);
+        assert!(
+            !retained_text.contains("failures:"),
+            "sanity check: the capped display tail must actually have been evicted by the \
+             flood, reproducing the real bug -- got {retained_text:?}"
+        );
+        assert!(
+            names.contains(real_name),
+            "the streaming scan must recover the name even though the display tail lost it: \
+             {names:?}"
+        );
+
+        // The same recovery must reach the gate/baseline seam, not just the
+        // scanner in isolation.
+        let check = CheckResult {
+            id: "test".into(),
+            kind: CheckKind::Unit,
+            command: "cargo test --verbose -- --test-threads=1".into(),
+            source: CheckSource::DiscoveredToolchain,
+            status: CheckStatus::Failed,
+            exit_code: Some(101),
+            duration_ms: 1,
+            failure_output: Some(retained_text.into_owned()),
+            failure_test_names: names.into_iter().collect(),
+        };
+        assert!(
+            failure_names_for(&check).contains(real_name),
+            "evaluate_against_baseline/run_baseline must prefer the recovered name"
+        );
+    }
+
+    /// #215 follow-up (security): a check whose command text was written in
+    /// the repository's own `.zirv/verify.toml` is UNTRUSTED -- it must
+    /// never be able to widen the operator's baseline by printing forged
+    /// cargo-shaped `failures:`/`test result: FAILED` output for a test name
+    /// the repository invents (and could later actually break, now
+    /// pre-waived). `run_baseline` must record nothing from it, no matter
+    /// how convincing its output looks.
+    #[test]
+    fn a_repo_defined_checks_forged_failure_output_cannot_enter_the_baseline() {
+        let repo = git_repo();
+        let home = tempdir().unwrap();
+        let _home_guard = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let state_root = tempdir().unwrap();
+        let forged_command = if cfg!(windows) {
+            "echo failures: && echo     fake::forged && echo test result: FAILED \
+             forged-by-repo-check && exit /b 101"
+        } else {
+            "printf \"failures:\\n    fake::forged\\ntest result: FAILED \
+             forged-by-repo-check\\n\"; exit 101"
+        };
+        write_verify_toml(
+            repo.path(),
+            &format!(
+                "schema_version=1\n[[checks]]\nid='forged'\nkind='unit'\ncommand='{forged_command}'\n"
+            ),
+        );
+        let mut out = Vec::new();
+        with_state(state_root.path(), || {
+            run_baseline(
+                repo.path(),
+                &RunArgs {
+                    repo: None,
+                    checks: vec![],
+                    dry_run: false,
+                    json: false,
+                },
+                &mut out,
+            )
+            .expect("run baseline")
+        });
+        let baseline = load_baseline(repo.path())
+            .unwrap()
+            .expect("a baseline is still recorded, just an empty one");
+        assert!(
+            !baseline
+                .failing_tests
+                .iter()
+                .any(|name| name.contains("forged")),
+            "a repository-authored check must never widen the operator's baseline: {:?}",
+            baseline.failing_tests
         );
     }
 }
