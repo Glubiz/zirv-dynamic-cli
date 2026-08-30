@@ -11,22 +11,6 @@ use super::sessions::{self, Liveness};
 use super::state::{StateDir, repo_slug};
 use super::{CtxResult, log};
 
-/// One unit, whichever is largest without going to zero: seconds under a
-/// minute, then minutes, hours, days. A session registry entry's age is
-/// usually minutes to days old, never sub-second, so this deliberately does
-/// not go finer than seconds.
-fn format_age(seconds: u64) -> String {
-    if seconds < 60 {
-        format!("{seconds}s")
-    } else if seconds < 3600 {
-        format!("{}m", seconds / 60)
-    } else if seconds < 86_400 {
-        format!("{}h", seconds / 3600)
-    } else {
-        format!("{}d", seconds / 86_400)
-    }
-}
-
 /// Issue #139: whether `record`'s pinned launch-time safety-policy
 /// fingerprint (`sessions::Record::safety_policy_sha256`) differs from the
 /// fingerprint of the policy `record.repo` resolves to RIGHT NOW. Degrades
@@ -86,7 +70,7 @@ fn sessions_lines(
                 record.agent,
                 record.verb,
                 record.pid,
-                format_age(now.saturating_sub(record.started_at)),
+                crate::style::format_age(now.saturating_sub(record.started_at)),
                 // NEW-3: `unreachable` is a third state, not a flavour of
                 // live: the process is running, but it bound no turn-signal
                 // socket, so it can never notice a `zirv ctx nudge`. Showing
@@ -232,7 +216,7 @@ fn push_group_block(
             row.cache_creation_input_tokens,
             row.cache_read_input_tokens,
             row.output_tokens,
-            format_age(row.wall_ms / 1000),
+            crate::style::format_age(row.wall_ms / 1000),
         ));
         totals[0] = totals[0].saturating_add(row.input_tokens);
         totals[1] = totals[1].saturating_add(row.cache_creation_input_tokens);

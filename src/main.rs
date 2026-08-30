@@ -18,6 +18,7 @@ mod input;
 mod output;
 mod script_runner;
 mod settings;
+mod style;
 mod utils;
 
 use input::Input;

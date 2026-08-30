@@ -9,6 +9,13 @@ pub fn warn(msg: impl Display) {
     eprintln!("{} {msg}", style("warning:").yellow().bold());
 }
 
+/// Issue #202, phase 1: added ahead of its first caller, which lands in a
+/// later phase of the terminal design system rollout.
+#[allow(dead_code)]
+pub fn success(msg: impl Display) {
+    eprintln!("{} {msg}", style("done:").green().bold());
+}
+
 /// Progress a human reads, not output a caller parses. On stderr with the
 /// rest of it, so a setup script can redirect one without losing the other.
 pub fn note(msg: impl Display) {

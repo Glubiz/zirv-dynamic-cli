@@ -258,11 +258,11 @@ async fn heavy_permit_for(
 fn warn_permit_config_load_failed_once(err: &dyn std::error::Error) {
     static WARNED: std::sync::Once = std::sync::Once::new();
     WARNED.call_once(|| {
-        eprintln!(
-            "zirv: WARNING: ctx config failed to load ({err}) -- the heavy-operation permit \
-             budget is falling back to its built-in defaults (max_heavy_operations=1, no extra \
+        crate::output::warn(format!(
+            "ctx config failed to load ({err}) -- the heavy-operation permit budget is falling \
+             back to its built-in defaults (max_heavy_operations=1, no extra \
              heavy_command_patterns) rather than being disabled."
-        );
+        ));
     });
 }
 
@@ -298,12 +298,12 @@ async fn wait_for_permit(
             return Some(permit);
         }
         if waited >= max_wait {
-            eprintln!(
-                "zirv: WARNING: waited {}s for a heavy-operation slot ({limit} in use) before \
-                 running `{command}` -- proceeding WITHOUT a permit. This heavy operation is now \
-                 running UNGOVERNED alongside whatever else is holding the budget.",
+            crate::output::warn(format!(
+                "waited {}s for a heavy-operation slot ({limit} in use) before running \
+                 `{command}` -- proceeding WITHOUT a permit. This heavy operation is now running \
+                 UNGOVERNED alongside whatever else is holding the budget.",
                 max_wait.as_secs()
-            );
+            ));
             return None;
         }
         if !announced {
@@ -318,10 +318,11 @@ async fn wait_for_permit(
                 .into_iter()
                 .map(|record| record.label)
                 .collect();
-            eprintln!(
-                "zirv: waiting for a heavy-operation slot ({limit} in use: {}) before running `{command}`",
+            crate::output::note(format!(
+                "waiting for a heavy-operation slot ({limit} in use: {}) before running \
+                 `{command}`",
                 holders.join(", ")
-            );
+            ));
             announced = true;
         }
         sleep(poll_interval).await;
