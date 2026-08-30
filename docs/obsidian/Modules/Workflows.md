@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-29
+last-verified: 2026-08-30
 ---
 
 # Workflows
@@ -82,6 +82,8 @@ Low-risk work omits design/reviewer ceremony; substantial or high-risk feature/r
 The frontend profile overlays those same durable workflows rather than creating a parallel engine. Design/plan/implement/debug/test/review/verify steps select their frontend phase skill; frontend design does not pause for a theme vote or initialization approval. Existing risk-based independent code review and all permission policy still apply.
 
 State files are atomic private JSON. The `active` pointer names one running/approval-pending workflow. Completion/failure clears it, so a later session cannot redispatch finished work. A failed step stops after three attempts.
+
+**A read-only summary accessor for external readers (issue #209, v2.39.0).** `active_workflow_summary(state, repo) -> Option<ActiveWorkflowSummary>` (`kind`, current `step`, `awaiting_approval`) makes `engine::load_active`'s same active-workflow pointer/state read available to a caller that only needs enough to show a session's workflow position, without exposing `engine::WorkflowState` wholesale (artifacts, review findings, classification, attempt counts). Built for the dashboard's new footer signal row (see [[Ctx Supervisors]]'s "The dashboard header, sidebar and footer"), which calls it once per `FactsCache` throttle tick, keyed to the dashboard's own repo — no subprocess, no scan, the same cost as the plain file reads `zirv workflow status` already makes. `None` covers "no active workflow for this repo" and "failed to load" alike (a torn write, an unsupported schema version left by an older binary); a caller has no way to tell the two apart from this accessor, deliberately, since surfacing a parse error where a caller expects a status summary would be a worse failure mode than treating both as "nothing to show."
 
 ## Autonomous frontend quality
 
