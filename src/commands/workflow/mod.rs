@@ -26,6 +26,46 @@ pub mod skill;
 pub mod telemetry;
 pub mod verification;
 
+/// A workflow's position, as much as issue #209/v3's dashboard footer
+/// segment (§D) needs to show it: which methodology, which step, and
+/// whether that step is gated on the operator's approval right now.
+/// Deliberately smaller than `engine::WorkflowState` -- the dashboard reads
+/// this on its own disk-facts throttle (`ctx::dash::mod::FactsCache::
+/// refresh_if_due`) and has no use for the rest of a workflow's state
+/// (artifacts, review findings, classification, ...), the same "small data
+/// interface" this module's own doc comment above calls for rather than
+/// exposing `ctx` to workflow internals wholesale.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveWorkflowSummary {
+    pub kind: &'static str,
+    pub step: String,
+    pub awaiting_approval: bool,
+}
+
+/// The same read `zirv workflow status` uses when no explicit `--id` is
+/// given (`engine::load_active`): the repo's active-workflow pointer file,
+/// then that workflow's own state file -- both plain file reads, no
+/// subprocess, safe to call on a ~1s render-loop throttle.
+///
+/// `None` covers every reason there is nothing to show: no active workflow
+/// for this repo, or one that failed to load (a torn write mid-save, an
+/// unsupported schema version left behind by an older binary). The
+/// dashboard's footer renders the same dim `▸ –` placeholder either way --
+/// surfacing a parse error where an operator expects a status glyph would
+/// be a worse failure mode than just not showing one.
+pub fn active_workflow_summary(
+    state: &crate::commands::ctx::state::StateDir,
+    repo: &std::path::Path,
+) -> Option<ActiveWorkflowSummary> {
+    let wf = engine::load_active(state, repo).ok().flatten()?;
+    let step = wf.current().map(|s| s.id.clone()).unwrap_or_default();
+    Some(ActiveWorkflowSummary {
+        kind: wf.kind.as_str(),
+        step,
+        awaiting_approval: wf.status == engine::WorkflowStatus::AwaitingApproval,
+    })
+}
+
 /// Reserved top-level names handled by this command tree. Later workflow
 /// layers add implementations for every name; reserving the complete surface
 /// now prevents a repository script from taking one over between releases.
@@ -250,5 +290,92 @@ mod tests {
         let cli = WorkflowCli::try_parse_from(["zirv", "frontend", "profile"])
             .expect("frontend profile should parse");
         assert!(matches!(cli.command, WorkflowCommand::Frontend(_)));
+    }
+
+    // Issue #209/v3 §D: `active_workflow_summary`, the dashboard footer's
+    // own read of the same active-workflow state `zirv workflow status`
+    // resolves.
+
+    fn test_classification() -> classify::Classification {
+        classify::Classification {
+            intent: classify::Intent::Feature,
+            complexity: classify::Complexity::Bounded,
+            risk: classify::RiskBand::Low,
+            risk_score: 0,
+            changed_files: 1,
+            changed_lines: 10,
+            declared_scope: true,
+            work_domain: classify::DomainClassification::default(),
+            risk_measurement: classify::RiskMeasurement::default(),
+            reasons: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn active_workflow_summary_is_none_with_nothing_active() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let state = crate::commands::ctx::state::StateDir::from_root(root.path().to_path_buf());
+        assert_eq!(active_workflow_summary(&state, repo.path()), None);
+    }
+
+    #[test]
+    fn active_workflow_summary_carries_the_kind_and_current_step() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let state_dir = crate::commands::ctx::state::StateDir::from_root(root.path().to_path_buf());
+        let wf = engine::WorkflowState::start(
+            repo.path().to_path_buf(),
+            "small feature".into(),
+            engine::WorkflowKind::Feature,
+            None,
+            true,
+            test_classification(),
+        );
+        engine::save(&state_dir, &wf, true).expect("save active workflow");
+
+        let summary = active_workflow_summary(&state_dir, repo.path())
+            .expect("an active workflow was just saved");
+        assert_eq!(summary.kind, "feature");
+        assert_eq!(summary.step, wf.current().unwrap().id);
+    }
+
+    #[test]
+    fn active_workflow_summary_reports_awaiting_approval() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let state_dir = crate::commands::ctx::state::StateDir::from_root(root.path().to_path_buf());
+        let mut wf = engine::WorkflowState::start(
+            repo.path().to_path_buf(),
+            "small feature".into(),
+            engine::WorkflowKind::Feature,
+            None,
+            true,
+            test_classification(),
+        );
+        wf.status = engine::WorkflowStatus::AwaitingApproval;
+        engine::save(&state_dir, &wf, true).expect("save active workflow");
+
+        let summary = active_workflow_summary(&state_dir, repo.path()).expect("saved active");
+        assert!(summary.awaiting_approval);
+    }
+
+    #[test]
+    fn active_workflow_summary_is_none_for_a_different_repo() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let other_repo = tempfile::tempdir().unwrap();
+        let state_dir = crate::commands::ctx::state::StateDir::from_root(root.path().to_path_buf());
+        let wf = engine::WorkflowState::start(
+            repo.path().to_path_buf(),
+            "small feature".into(),
+            engine::WorkflowKind::Feature,
+            None,
+            true,
+            test_classification(),
+        );
+        engine::save(&state_dir, &wf, true).expect("save active workflow");
+
+        assert_eq!(active_workflow_summary(&state_dir, other_repo.path()), None);
     }
 }

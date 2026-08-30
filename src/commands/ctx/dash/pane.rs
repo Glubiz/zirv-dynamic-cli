@@ -1421,6 +1421,21 @@ impl Pane {
         &self.agent_name
     }
 
+    /// Whether this pane's own turn-signal socket bound successfully at
+    /// spawn time -- `Pane::spawn`'s own doc comment: "a bind failure
+    /// degrades this pane to unsupervised (`reachable: false` on its
+    /// registry record) rather than failing the spawn." Fixed for the
+    /// pane's whole life (the bind is attempted exactly once, in `spawn`),
+    /// so this is always current -- no registry re-read needed the way a
+    /// liveness probe would.
+    ///
+    /// Issue #209/v3 codex review finding 5: the footer's supervision
+    /// segment reads this for the focused pane instead of assuming every
+    /// alive pane is supervised.
+    pub fn reachable(&self) -> bool {
+        self.server.is_some()
+    }
+
     /// This pane's own zirv session id (the uuid `PaneSpec::session_id`
     /// carried in) -- the roster's own `RosterPane::session_id`, and what a
     /// verified adapter's `resume_args` is asked to resume.

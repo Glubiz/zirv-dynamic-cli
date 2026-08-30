@@ -440,7 +440,7 @@ brew install zirv
 
 > If Homebrew reports the tap as untrusted, run `brew trust glubiz/tap` and retry.
 
-The prebuilt Linux release is x86_64-only. On other architectures (aarch64, armv7, ...) the install script fails fast with a pointer to the source build; the Homebrew formula does not guard the architecture, so skip it there and build from source instead (see below). Releases up to 2.38.1 additionally require glibc 2.39+; from 2.38.2 the Linux binary is fully static.
+The prebuilt Linux release is x86_64-only. On other architectures (aarch64, armv7, ...) the install script fails fast with a pointer to the source build; the Homebrew formula does not guard the architecture, so skip it there and build from source instead (see below). Releases up to 2.39.0 additionally require glibc 2.39+; from 2.39.1 the Linux binary is fully static.
 
 ### From source (any platform/arch)
 
