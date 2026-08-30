@@ -10,6 +10,7 @@
 
 - [Just Run `zirv`](#just-run-zirv)
   - [AI setup and harness migration](#ai-setup-and-harness-migration)
+  - [The dashboard: multiple sessions in one terminal](#the-dashboard-multiple-sessions-in-one-terminal)
 - [Features](#features)
 - [Installation](#installation)
 - [Upgrading](#upgrading)
@@ -29,7 +30,15 @@
 - [Shortcuts](#shortcuts)
   - [Reserved Command Names](#reserved-command-names)
 - [Development Workflows](#development-workflows)
+  - [The full verb set](#the-full-verb-set)
+  - [Lifecycle and artifacts](#lifecycle-and-artifacts)
+  - [Deploy tiers](#deploy-tiers)
+  - [Agent registry](#agent-registry)
+  - [Maintain loop](#maintain-loop)
+  - [Frontend quality](#frontend-quality)
 - [Context Management (zirv ctx)](#context-management-zirv-ctx)
+  - [Cross-harness fallback and handover](#cross-harness-fallback-and-handover)
+  - [Permission auditing and safe-list proposals](#permission-auditing-and-safe-list-proposals-issue-178)
 - [Supported Platforms](#supported-platforms)
 - [Contribution](#contribution)
 - [License](#license)
@@ -158,6 +167,50 @@ console over. Each of them still scrubs `ZIRV_CTX_SESSION`,
 `ZIRV_CTX_SOCKET` and `ZIRV_CTX_TRANSCRIPT` off every child it launches
 before setting its own, so a worker can never inherit another session's
 identity.
+
+#### The dashboard: multiple sessions in one terminal
+
+On a real, large-enough terminal (at least 80x20 — a taller floor than
+`wrap`'s), `zirv chat` (bare `zirv` included) opens a session multiplexer
+instead of a single wrapped session: a dashboard process owning several
+interactive sessions at once, each a supervised ConPTY child rendered through
+its own embedded terminal-screen model, behind a persistent header and
+sidebar. Too small a terminal falls back to the single-pane `wrap` session
+instead, with a one-line notice naming the floor; `--simple` skips the
+dashboard entirely.
+
+The first pane is always the orchestrator you are talking to. Further panes
+come from the `s` (spawn) dashboard command, or from a `zirv ctx agent`
+invocation run *inside* one of the dashboard's own panes, which asks the
+dashboard to open a fresh pane rather than running headless — an untrusted
+request the dashboard re-validates against live configuration (pane cap,
+adapter gate, working-directory match) before honoring it, never treated as
+authority on its own. Every live pane and its role are tracked in the same
+session registry `zirv ctx status` reports (see [Session registry and
+nudging](#session-registry-and-nudging) above), so `zirv ctx nudge`/`zirv ctx
+send --to-session` can address one pane directly.
+
+All dashboard keybindings live behind one `Ctrl+A` prefix: digits `1`-`9`
+switch panes, `Tab`/arrows navigate, `s`/`n`/`m` open spawn/nudge/mail
+overlays, `o` opens the handover picker (swap the focused pane's model or
+harness in place — see [Cross-harness fallback and
+handover](#cross-harness-fallback-and-handover) below), `z` zooms the focused
+pane, `e` shows recent errors, `?`/`h` shows help, and `q` quits. On quit, the
+dashboard writes a restore roster so a next launch can offer to reopen the
+same panes.
+
+The dashboard itself is repo-forbidden configuration (see [Trust
+boundary](#trust-boundary) below — a checkout cannot switch it on/off or
+change its own limits):
+
+```toml
+[dash]
+enabled = true              # ZIRV_CTX_DASH
+sidebar_cols = 28           # ZIRV_CTX_DASH_SIDEBAR_COLS
+roster_max_age_secs = 3600  # ZIRV_CTX_DASH_ROSTER_MAX_AGE_SECS
+max_panes = 9                # ZIRV_CTX_DASH_MAX_PANES
+mouse = true                 # ZIRV_CTX_DASH_MOUSE
+```
 
 ### `zirv memory`
 
@@ -365,7 +418,7 @@ curl -sSfL https://raw.githubusercontent.com/Glubiz/zirv-dynamic-cli/main/instal
 To install a specific version:
 
 ```bash
-curl -sSfL https://raw.githubusercontent.com/Glubiz/zirv-dynamic-cli/main/install.sh | sh -s -- 2.5.0
+curl -sSfL https://raw.githubusercontent.com/Glubiz/zirv-dynamic-cli/main/install.sh | sh -s -- 2.38.0
 ```
 
 ### Cargo (All Platforms)
@@ -760,9 +813,9 @@ marks it as shadowed in the listing.
 
 ## Reserved Command Names
 
-`help`, `version`, `init`, `create`, `ctx`, `memory`, `chat`, `agent`, `skill`,
-`workflow`, `test`, `verify`, `artifact`, `frontend`, and their short aliases `h`, `v`,
-`i`, `c`, are handled as built-in commands before zirv ever
+`help`, `version`, `init`, `create`, `ctx`, `memory`, `context`, `setup`, `report`,
+`chat`, `agent`, `skill`, `workflow`, `test`, `verify`, `artifact`, `frontend`, and
+their short aliases `h`, `v`, `i`, `c`, are handled as built-in commands before zirv ever
 looks in `.zirv/`. The comparison is case-insensitive (`Chat`/`CHAT` collide
 just as much as `chat`, matching how NTFS/APFS resolve script filenames), so
 a differently-cased script or shortcut is caught too, even though only the
@@ -792,6 +845,7 @@ zirv workflow start bugfix --task "fix authentication race" --agent codex
 zirv workflow start feature --task "use only shipped methodology" --built-in-only
 zirv workflow status
 zirv frontend profile
+zirv frontend capabilities --agent claude
 zirv frontend check
 zirv frontend render
 zirv frontend review --agent codex
@@ -806,6 +860,92 @@ Built-in workflows cover `feature`, `bugfix`, `refactor`, `spike`, and
 proportional design, approval, test, and review depth; sensitive auth/security
 and database/schema changes cannot be downgraded below High risk.
 
+### The full verb set
+
+```bash
+zirv workflow list                              # built-in workflow definitions
+zirv workflow show feature                       # one definition's steps
+zirv workflow classify --task "..."               # classify without starting
+zirv workflow start feature --task "..." [--agent claude] [--built-in-only]
+zirv workflow status [id]                         # one instance, or the active one
+zirv workflow resume <id>                         # restore as the active workflow
+zirv workflow context [id]                        # the current step's resolved skill context
+zirv workflow artifacts <id> [--json]              # committed work-product state
+zirv workflow agents list|show <id>|dispatch <id> --adapter <name> --prompt <task>
+zirv workflow approve <id>                        # approve the current gated step
+zirv workflow advance <id> --outcome success|failure
+zirv workflow review package <id> | run --agent <name> | add | ...
+zirv workflow maintain scan [--repo <path>] [--json]
+zirv workflow stats                               # local bounded telemetry
+```
+
+### Lifecycle and artifacts
+
+A workflow instance moves through `intent → spec → plan → implement → test →
+review → verify → deploy`. Ceremony is proportional to classification: a
+trivial bugfix skips straight to the debug/test/verify spine, while
+substantial or high-risk feature/refactor work gains intent, plan (and, for
+substantial/high-risk work, spec) artifact gates plus an approval-gated design
+step. Frontend work overlays the same engine rather than running a separate
+one, selected automatically from task language and changed frontend paths.
+
+Artifact steps write fixed templates to `.zirv/work/<workflow-id>/` (`intent.md`,
+`spec.md`, `plan.md`, ...) committed to the repository. `zirv workflow approve`
+refuses an untouched template, then pins the accepted file's SHA-256 digest and
+timestamp in private state; a later step folds only accepted, hash-matching
+artifacts into prompt context. Editing or deleting an accepted file after the
+fact reopens its acceptance gate and invalidates later completed steps, so
+implementation can never silently proceed against a plan that changed
+underneath it — `zirv workflow artifacts <id>` shows pending/accepted/drifted
+state directly.
+
+Classification is re-measured (never downgraded) whenever a workflow advances
+into a review or verify step, so a review/verify gate the initial `workflow
+start` measurement missed (an empty tree, before any code existed) still gets
+added once the real change exists.
+
+### Deploy tiers
+
+`[workflow.deploy] tier = "development" | "staging" | "production"` in
+`~/.zirv/ctx.toml` (`ZIRV_CTX_WORKFLOW_DEPLOY_TIER` for the final override) is
+operator-only; a repository may set only `workflow.deploy.minimum_tier`, and a
+running workflow's resolved tier only ever ratchets upward:
+
+| Tier | Deploy step |
+|---|---|
+| `development` | Auto-advances once test/review/verify evidence passes |
+| `staging` | Requires an explicit `zirv workflow approve` on the deploy step |
+| `production` | Requires approval, plus at least one fresh independent `reviewer`-seat run and fresh final `zirv verify` evidence; an open finding or stale evidence blocks it outright |
+
+### Agent registry
+
+Workflow seats are provider-neutral data, not harness-specific plugins: a
+`WorkflowStep.agent` addresses one by id. Built-in seats are `implementer`,
+`reviewer`, `doc-keeper`, `security-scanner`, and `explorer` — `reviewer` is
+pinned read-only by its own adapter. `~/.zirv/agents/*` (operator-global) may
+replace a built-in seat; `.zirv/agents/*` (repository) is disabled unless the
+operator sets `workflow.repo_agents_enabled`, and even then may only add
+non-colliding ids — a repository manifest can never rewrite `reviewer` or grant
+itself capabilities it does not already have. `zirv workflow agents list|show`
+inspects the resolved registry and provenance; `zirv workflow agents dispatch
+<id> --adapter <name> --prompt <task>` launches that seat directly.
+
+### Maintain loop
+
+`zirv workflow maintain scan` is an invoked scanner, not a daemon: it runs
+every operator-configured deterministic detector once, reading detector
+commands only from `[workflow.maintain.detectors.<id>]` in the operator's own
+`~/.zirv/ctx.toml` (repository config cannot define one). Each detector is a
+bounded command judged by exit code/timeout or a stdout line-count threshold;
+zirv retains only exit code, timeout state, and line/byte counts, never
+detector command or output bodies. A breach parks one bounded incident
+workflow at its Intent acceptance gate (`.zirv/work/<id>/intent.md`, committed
+with detector metadata) and, when operator-only `[report] repository =
+"owner/repo"` is configured, auto-files a title-deduplicated GitHub issue. A
+clean scan clears the incident marker, so a later recurrence opens fresh.
+
+### Frontend quality
+
 Frontend tasks are selected automatically from task and path evidence. Zirv
 derives a repository-specific design profile, classifies each surface as
 persuade/operate/read/experience, and requires a product-grounded design thesis,
@@ -816,16 +956,25 @@ responsive, content, motion, internationalization, media, performance, and
 anti-slop hazards. Zirv starts and cleans up the discovered dev server, captures
 narrow/intermediate/wide screenshots, and requires a fresh AI review with 13
 explicit UI/UX scores, each at least 4/5. The score is produced by an isolated,
-read-only Zirv reviewer rather than accepted from CLI arguments. There is no
-frontend init command or questionnaire: the active agent owns routine design,
-rendering, and review decisions. Missing, stale, truncated, unavailable, weak,
-or failed evidence cannot advance frontend test, review, or verify gates.
+read-only Zirv reviewer rather than accepted from CLI arguments. `zirv frontend
+capabilities --agent <claude|codex> [--json]` reports the same provider-neutral
+skill/provenance contract and logical capability matrix `zirv skill show
+--agent` reports elsewhere. There is no frontend init command or
+questionnaire: the active agent owns routine design, rendering, and review
+decisions. Missing, stale, truncated, unavailable, weak, or failed evidence
+cannot advance frontend test, review, or verify gates.
 
 Detector waivers are schema-versioned TOML in `.zirv/frontend-waivers.toml` or
 the operator-owned `~/.zirv/frontend-waivers.toml`. Every waiver names a rule,
 an exact path or `/**` prefix, an optional evidence value, and a reason.
-Repository waivers can disposition advisory craft findings; only the
-operator-owned file can waive a blocking accessibility finding.
+Repository waivers are advisory only: they can disposition advisory craft
+findings, but only the operator-owned file can waive a blocking accessibility
+finding.
+
+[Glubiz/zirv-generic-frontend](https://github.com/Glubiz/zirv-generic-frontend)
+is the reference frontend template built against this contract — it is also
+the source behind [cli.zirv.io](https://cli.zirv.io), the site rendering this
+README.
 
 Optional repository checks live in `.zirv/verify.toml`. Custom skills may be
 shared under `.zirv/skills/` or kept operator-global under
@@ -904,6 +1053,8 @@ including `score`, `handoff` and `status`, works on all three platforms.
 | `zirv ctx send [--to-session <prefix>]` / `zirv ctx inbox` | Leaves or reads short notes between agent sessions on this machine, scoped to the repo, optionally addressed to one live session |
 | `zirv ctx nudge <prefix> --message <text>` | Wakes a live supervised session early with a message, instead of waiting for it to poll |
 | `zirv ctx remember --key <k> --text <t>` / `zirv ctx recall` / `zirv ctx forget <k>` | Reads and writes this repo's cross-session memory bank |
+| `zirv ctx handover [--agent <name>] [--model <tier\|id>] [--dry-run] [--force]` | Swaps the orchestrator seat's harness or model in place mid-session, carrying a handoff packet across the swap — see [Cross-harness fallback and handover](#cross-harness-fallback-and-handover) below |
+| `zirv ctx permissions audit\|compile\|propose` | Audits, compiles, or (operator opt-in) proposes command-permission approvals from recent transcripts — see [Permission auditing](#permission-auditing-and-safe-list-proposals-issue-178) below |
 
 ### Signals and verdicts
 
@@ -1393,6 +1544,67 @@ A pause is announced once, not once per check, and appears in the decision log a
 a single `pace-wait` entry. Parks and relaunches are logged too. Check the
 current picture, including how fresh each reading is, with `zirv ctx usage`.
 
+### Cross-harness fallback and handover
+
+Beyond waiting out a subscription window, zirv can steer work onto a
+*different* harness. `fallback.rs` connects the agent roster, usage windows,
+model-tier ladder, and delegation path: a **new** delegation (`zirv ctx
+agent`, a dashboard spawn) can be rerouted away from an exhausted or
+measured-low-headroom harness before it ever starts, while an **already
+running** supervised session can only move once that harness itself stops on
+a recognized usage-limit message — steering never interrupts a session that
+is still making progress. Either way the alternate harness must be enabled,
+ready, capacity-compatible, budget-compatible, and able to provide a verified
+equivalent model tier (`cheap`/`standard`/`deep`); zirv never guesses a tier
+translation for an operator-pinned model it cannot verify.
+
+`zirv ctx status` reports the resolved policy and, for each harness in the
+fallback order, its readiness, capacity and current headroom:
+
+```
+fallback: enabled | order claude -> codex | steer below 25% headroom | candidate min 40% | unknown assumes 50%
+  fallback claude: ready / capacity ok / 62% measured
+  fallback codex: ready / capacity ok / 50% assumed
+```
+
+Configure it under `[fallback]` in `~/.zirv/ctx.toml`:
+
+```toml
+[fallback]
+enabled = true
+order = ["claude", "codex"]
+predictive_headroom_pct = 25.0        # steer new work below this headroom
+min_candidate_headroom_pct = 40.0     # a candidate needs at least this much headroom to accept work
+unknown_headroom_pct = 50.0           # assumed headroom when no reading exists (0 opts out)
+small_task_max_tokens = 0
+small_task_max_tool_calls = 0
+```
+
+A repository checkout may only narrow these values (see [Trust
+boundary](#trust-boundary) above); `ZIRV_CTX_FALLBACK*` environment variables
+are the operator's final override.
+
+**`zirv ctx handover`** performs the swap directly, on demand, mid-session —
+the same mechanism the dashboard's `Ctrl+A o` picker and automatic fallback
+routing both use underneath:
+
+```bash
+zirv ctx handover --agent codex --model standard
+zirv ctx handover --model deep      # same harness, a different model tier
+zirv ctx handover --dry-run          # print the resolved swap; change nothing
+```
+
+`--model` accepts a literal model id or a generic tier (`cheap`/`standard`/
+`deep`), resolved per target harness — `claude`'s `deep` is `opus`, `codex`'s
+is `gpt-5.6-sol`, for example, each overridable via `[handover.<agent>]` in
+`~/.zirv/ctx.toml` or `ZIRV_CTX_HANDOVER_<AGENT>_<TIER>`. The swap carries a
+distilled handoff packet across so the successor session picks up task
+continuity; by default it waits for a verified-idle turn boundary, and
+`--force` swaps mid-turn instead. `handover` (and `handover.<agent>.<tier>`)
+is repo-forbidden: swapping the orchestrator seat's harness or model picks
+which vendor account gets spent, so only the operator's own `~/.zirv/ctx.toml`,
+`ZIRV_CTX_HANDOVER_*`, or flags may set it.
+
 ### Reviewing your instruction files
 
 `zirv ctx optimize` reads the CLAUDE.md hierarchy and the settings layers that
@@ -1612,7 +1824,15 @@ sandboxing off, only the operator can.
 
 `[safety]` is zirv's harness-neutral shell-command classifier. Claude projects
 it through its native rule lists and `Bash|PowerShell` hook; codex currently has no verified
-per-command channel and relies on its sandbox/approval boundary instead:
+per-command channel and relies on its sandbox/approval boundary instead. `gh`
+and `glab` (GitHub's and GitLab's CLIs) are treated identically throughout —
+both are subcommand-based CLIs with the same `<tool> <resource> <verb>` shape,
+and a mutating `gh api`/`glab api` call (a non-`GET` `--method`/`-X`, or a
+body flag such as `-f`/`--field`/`--input`) is classified the same way a
+destructive git or publish command is. See [Permission auditing and safe-list
+proposals](#permission-auditing-and-safe-list-proposals-issue-178) below for turning
+repeated prompts on these two CLIs into either a standing operator allow or a
+proposed policy change:
 
 ```toml
 [safety]
@@ -1669,6 +1889,64 @@ apply` wires into claude's `PreToolUse` hook for `Bash` and `PowerShell` calls,
 so the same
 evaluator zirv's own CLI uses is what claude consults before running a
 command — see [Context Management](#context-management-zirv-ctx).
+
+### Permission auditing and safe-list proposals (issue #178)
+
+`zirv ctx permissions` turns recent transcripts into a report on which
+commands kept needing a human, so a policy decision can be made about the
+*family* of command instead of clicking through the same prompt every session:
+
+```bash
+zirv ctx permissions audit --agent codex --sessions 5     # read-only report
+zirv ctx permissions audit --agent claude --json
+zirv ctx permissions compile --agent codex --dry-run       # write eligible allows
+zirv ctx permissions propose --agent claude --dry-run       # file a safe-list issue
+```
+
+- **`audit`** is strictly read-only. It extracts every escalated/denied
+  permission request from the sampled transcripts (codex: `require_escalated`
+  exec requests; claude: headless `dontAsk` denials and interactive
+  sandbox-escape asks), groups them by a normalized command family (`gh pr`,
+  `cargo publish`, ...), and reports each group's sample command, cause, and a
+  reusability verdict: whether a saved approval for this family would
+  plausibly match the *next* equivalent invocation, or whether it collapses to
+  a one-off (a long literal payload, or a pipe into `jq`/`grep`/`awk`/`sed`
+  whose own argument is what varies).
+- **`compile`** runs the same audit, then *writes* eligible families as
+  standing `[safety] allow` entries in the operator's own `~/.zirv/ctx.toml`.
+  A family is eligible only when it is reusable, has at least two normalized
+  tokens (a bare program name is too coarse — it would authorize whatever a
+  future invocation is told to run), and is not a **protected** family:
+  destructive git (`git push --force`, `git reset --hard`, `git rebase`, ...),
+  a global binary/config install, a credential/secret command, a
+  publish/release action, an interpreter/shell/remote-exec program, or a
+  mutating `gh api`/`glab api` call always stay prompting regardless of
+  reusability. `--agent codex` compiles are still written as real `[safety]`
+  entries — claude reads them too — but a printed caveat makes clear this
+  changes nothing about codex's own launch posture, since codex has no
+  per-command approval hook yet for zirv to pin against.
+- **`propose`** is the mirror image: instead of escalated/denied requests, it
+  looks at operator-**approved** prompts and classifies which are so clearly
+  safe they should never have prompted at all — today, only a documented
+  `gh`/`glab` collaboration verb (`SAFE_COLLABORATION_VERBS`: creating or
+  updating a PR/issue, or commenting — never merge, close/reopen, delete,
+  release, auth, or an arbitrary API call), matched at the exact
+  `(program, resource, verb)` triple, unchained and unpiped. Eligible families
+  are proposed as a deduplicated GitHub issue per family, one comment per new
+  occurrence on a re-run.
+
+`propose` is **disabled by default** — it auto-files issues on a public GitHub
+repository. Enable it explicitly, operator-side only:
+
+```toml
+# ~/.zirv/.settings.toml
+[permissions]
+propose_enabled = true
+```
+
+Above a threshold of 5 total requests in one audit, `zirv ctx optimize`'s own
+friction pass surfaces the same summary as a finding, well before a session
+reaches the volume that originally motivated this feature.
 
 ## Supported Platforms
 - Windows (see the platform note under [Context Management](#context-management-zirv-ctx): `zirv ctx` supervision is unix only)
