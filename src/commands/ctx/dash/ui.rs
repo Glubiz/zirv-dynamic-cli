@@ -861,10 +861,16 @@ fn footer_seg_width(pieces: &[(String, Style)]) -> usize {
 /// regardless; this keeps the pure function itself honest about `cols` for
 /// its own tests.
 fn choose_footer_tier(tiers: &[FooterSeg], cols: usize) -> Vec<Span<'static>> {
-    let chosen = tiers
+    let chosen = match tiers
         .iter()
         .find(|tier| footer_seg_width(tier) <= cols)
-        .unwrap_or_else(|| tiers.last().expect("at least one tier"));
+        .or_else(|| tiers.last())
+    {
+        Some(tier) => tier,
+        // An empty tier list renders as an empty row rather than panicking
+        // the render loop; every current caller passes a non-empty literal.
+        None => return Vec::new(),
+    };
 
     if footer_seg_width(chosen) <= cols {
         return chosen
