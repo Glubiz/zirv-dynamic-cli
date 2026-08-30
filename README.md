@@ -173,11 +173,11 @@ identity.
 On a real, large-enough terminal (at least 80x20 — a taller floor than
 `wrap`'s), `zirv chat` (bare `zirv` included) opens a session multiplexer
 instead of a single wrapped session: a dashboard process owning several
-interactive sessions at once, each a supervised ConPTY child rendered through
-its own embedded terminal-screen model, behind a persistent header and
-sidebar. Too small a terminal falls back to the single-pane `wrap` session
-instead, with a one-line notice naming the floor; `--simple` skips the
-dashboard entirely.
+interactive sessions at once, each a supervised PTY child (ConPTY on Windows,
+a native PTY elsewhere) rendered through its own embedded terminal-screen
+model, behind a persistent header and sidebar. Too small a terminal falls back
+to the single-pane `wrap` session instead, with a one-line notice naming the
+floor; `--simple` skips the dashboard entirely.
 
 The first pane is always the orchestrator you are talking to. Further panes
 come from the `s` (spawn) dashboard command, or from a `zirv ctx agent`
@@ -199,17 +199,21 @@ pane, `e` shows recent errors, `?`/`h` shows help, and `q` quits. On quit, the
 dashboard writes a restore roster so a next launch can offer to reopen the
 same panes.
 
-The dashboard itself is repo-forbidden configuration (see [Trust
+Every dashboard control below is repo-forbidden (see [Trust
 boundary](#trust-boundary) below — a checkout cannot switch it on/off or
-change its own limits):
+change its own limits) with one deliberate exception: `idle_quiet_ms` is a
+pure per-session timing knob over a session the operator already chose to run
+interactively, not a cap standing between an untrusted layer and something it
+must not raise for itself, so a repository may set it:
 
 ```toml
 [dash]
-enabled = true              # ZIRV_CTX_DASH
-sidebar_cols = 28           # ZIRV_CTX_DASH_SIDEBAR_COLS
-roster_max_age_secs = 3600  # ZIRV_CTX_DASH_ROSTER_MAX_AGE_SECS
-max_panes = 9                # ZIRV_CTX_DASH_MAX_PANES
-mouse = true                 # ZIRV_CTX_DASH_MOUSE
+enabled = true               # ZIRV_CTX_DASH
+sidebar_cols = 24            # ZIRV_CTX_DASH_SIDEBAR_COLS
+roster_max_age_secs = 604800 # ZIRV_CTX_DASH_ROSTER_MAX_AGE_SECS
+max_panes = 9                 # ZIRV_CTX_DASH_MAX_PANES
+mouse = true                  # ZIRV_CTX_DASH_MOUSE
+idle_quiet_ms = 10000          # ZIRV_CTX_DASH_IDLE_QUIET_MS -- repo-settable
 ```
 
 ### `zirv memory`
@@ -874,7 +878,7 @@ zirv workflow artifacts <id> [--json]              # committed work-product stat
 zirv workflow agents list|show <id>|dispatch <id> --adapter <name> --prompt <task>
 zirv workflow approve <id>                        # approve the current gated step
 zirv workflow advance <id> --outcome success|failure
-zirv workflow review package <id> | run --agent <name> | add | ...
+zirv workflow review package <id> | run <id> --agent <name> | add | ...
 zirv workflow maintain scan [--repo <path>] [--json]
 zirv workflow stats                               # local bounded telemetry
 ```
@@ -1562,10 +1566,16 @@ translation for an operator-pinned model it cannot verify.
 fallback order, its readiness, capacity and current headroom:
 
 ```
-fallback: enabled | order claude -> codex | steer below 25% headroom | candidate min 40% | unknown assumes 50%
-  fallback claude: ready / capacity ok / 62% measured
-  fallback codex: ready / capacity ok / 50% assumed
+fallback: enabled | order claude -> codex | steer below 20% headroom | candidate min 10% | unknown assumes 25%
+  fallback claude: enabled / ready / full / 62% measured
+  fallback codex: enabled / ready / small-only / 25% assumed
 ```
+
+Each harness line is `{enabled|disabled} / {ready|unavailable} / {small-only|full}
+/ {headroom}`: whether `.settings.toml`/`ZIRV_AGENT_<NAME>_ENABLED` has that
+adapter on, whether it currently resolves and is ready to launch, whether
+`[agents]` capacity-limits it to small tasks only, and the same measured/
+assumed/opted-out headroom reading described above.
 
 Configure it under `[fallback]` in `~/.zirv/ctx.toml`:
 
@@ -1573,11 +1583,11 @@ Configure it under `[fallback]` in `~/.zirv/ctx.toml`:
 [fallback]
 enabled = true
 order = ["claude", "codex"]
-predictive_headroom_pct = 25.0        # steer new work below this headroom
-min_candidate_headroom_pct = 40.0     # a candidate needs at least this much headroom to accept work
-unknown_headroom_pct = 50.0           # assumed headroom when no reading exists (0 opts out)
-small_task_max_tokens = 0
-small_task_max_tool_calls = 0
+predictive_headroom_pct = 20.0        # steer new work below this headroom
+min_candidate_headroom_pct = 10.0     # a candidate needs at least this much headroom to accept work
+unknown_headroom_pct = 25.0           # assumed headroom when no reading exists (0 opts out)
+small_task_max_tokens = 40000
+small_task_max_tool_calls = 24
 ```
 
 A repository checkout may only narrow these values (see [Trust
@@ -1825,11 +1835,14 @@ sandboxing off, only the operator can.
 `[safety]` is zirv's harness-neutral shell-command classifier. Claude projects
 it through its native rule lists and `Bash|PowerShell` hook; codex currently has no verified
 per-command channel and relies on its sandbox/approval boundary instead. `gh`
-and `glab` (GitHub's and GitLab's CLIs) are treated identically throughout —
-both are subcommand-based CLIs with the same `<tool> <resource> <verb>` shape,
-and a mutating `gh api`/`glab api` call (a non-`GET` `--method`/`-X`, or a
-body flag such as `-f`/`--field`/`--input`) is classified the same way a
-destructive git or publish command is. See [Permission auditing and safe-list
+and `glab` (GitHub's and GitLab's CLIs) are both subcommand-based CLIs with the
+same `<tool> <resource> <verb>` shape; this classifier's own read-only carve-out
+recognizes a mutating `gh api` call specifically (a non-`GET` `--method`/`-X`,
+or a body flag such as `-f`/`-F`/`--input`) and classifies it the same way a
+destructive git or publish command is. `zirv ctx permissions`' separate
+classifier checks the equivalent mutating-vs-read shape for both `gh api` and
+`glab api`, using its own flag list (`-f`/`--field`/`--input`) — see
+[Permission auditing and safe-list
 proposals](#permission-auditing-and-safe-list-proposals-issue-178) below for turning
 repeated prompts on these two CLIs into either a standing operator allow or a
 proposed policy change:
@@ -1899,8 +1912,8 @@ commands kept needing a human, so a policy decision can be made about the
 ```bash
 zirv ctx permissions audit --agent codex --sessions 5     # read-only report
 zirv ctx permissions audit --agent claude --json
-zirv ctx permissions compile --agent codex --dry-run       # write eligible allows
-zirv ctx permissions propose --agent claude --dry-run       # file a safe-list issue
+zirv ctx permissions compile --agent codex --dry-run       # preview eligible allows; writes nothing
+zirv ctx permissions propose --agent claude --dry-run       # preview proposed issues; files/comments nothing
 ```
 
 - **`audit`** is strictly read-only. It extracts every escalated/denied
@@ -1931,9 +1944,12 @@ zirv ctx permissions propose --agent claude --dry-run       # file a safe-list i
   `gh`/`glab` collaboration verb (`SAFE_COLLABORATION_VERBS`: creating or
   updating a PR/issue, or commenting — never merge, close/reopen, delete,
   release, auth, or an arbitrary API call), matched at the exact
-  `(program, resource, verb)` triple, unchained and unpiped. Eligible families
-  are proposed as a deduplicated GitHub issue per family, one comment per new
-  occurrence on a re-run.
+  `(program, resource, verb)` triple, unchained and unpiped. Evidence is
+  grouped by family; a family with no open proposal issue yet files one, and a
+  family whose evidence has changed since the last run gets one updated
+  comment on its existing issue — a family already reported with unchanged
+  evidence is skipped, so a re-run over an overlapping transcript window never
+  re-comments the same evidence.
 
 `propose` is **disabled by default** — it auto-files issues on a public GitHub
 repository. Enable it explicitly, operator-side only:
