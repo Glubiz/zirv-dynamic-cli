@@ -1586,10 +1586,41 @@ pub(crate) fn shrink_for_inline_argv(mut text: String, budget: usize) -> (String
     // out for a pathologically small `budget`.
     const HARD_NOTE: &str =
         "\n\n[prompt truncated: exceeded the safe command-line size for this launch]";
-    let cap = budget.saturating_sub(HARD_NOTE.len());
+    // Defensive clamp (cross-review round): a `budget` no larger than the
+    // note itself would otherwise make `budget.saturating_sub(HARD_NOTE.
+    // len())` bottom out at 0 while the note is still appended afterwards,
+    // handing back text longer than `budget` -- the one thing this function
+    // exists to prevent. Below this floor there is no room for the note at
+    // all, so skip it and return the bare truncation.
+    if budget <= HARD_NOTE.len() {
+        return (crate::utils::truncate_bytes(text, Some(budget)), true);
+    }
+    let cap = budget - HARD_NOTE.len();
     text = crate::utils::truncate_bytes(text, Some(cap));
     text.push_str(HARD_NOTE);
     (text, true)
+}
+
+/// Total bytes the adapter's own [`AgentAdapter::system_prompt_args`] would
+/// actually put on argv for `text` -- summed across every arg it returns,
+/// since they all land on the same command line together. This is the
+/// "callable seam" defect 1's fix (cross-review round) reuses instead of
+/// duplicating an adapter's escaping: codex's `-c developer_instructions=
+/// <json>` (`CodexAdapter::system_prompt_args`) JSON-encodes `text`
+/// afterwards, so newlines, quotes, backslashes and control characters all
+/// expand on the way out (a `\n` becomes the two bytes `\\n`), and a raw
+/// prompt safely under [`INLINE_ARGV_PROMPT_BUDGET_BYTES`] can still render
+/// past it. Calling the adapter's real method here, rather than
+/// re-implementing its escaping, means this can never drift from what a
+/// launch actually delivers -- and it is a true no-op measurement for an
+/// adapter whose `system_prompt_args` does no escaping at all (claude's own
+/// `--append-system-prompt <text>` is 1:1 with the raw text).
+fn rendered_inline_arg_len(adapter: &dyn AgentAdapter, text: &str) -> usize {
+    adapter
+        .system_prompt_args(text)
+        .iter()
+        .map(|arg| arg.len())
+        .sum()
 }
 
 /// Turns a composed prompt into launch arguments for this agent. Two things
@@ -1690,9 +1721,59 @@ pub fn injection_args_for_session(
     // priority-ordered strip of the lowest-value layers when over it -- see
     // its own doc comment for the exact order and the hard-cap backstop that
     // guarantees this never overflows regardless of how the strip goes.
-    let inline_text = if composed.text.len() > INLINE_ARGV_PROMPT_BUDGET_BYTES {
-        let (shrunk, degraded) =
-            shrink_for_inline_argv(composed.text.clone(), INLINE_ARGV_PROMPT_BUDGET_BYTES);
+    //
+    // Defect 1 fix (cross-review round): the budget must bound the FINAL
+    // RENDERED argument, not the raw composed text -- codex JSON-escapes the
+    // text afterwards (`rendered_inline_arg_len`'s own doc comment), so a
+    // newline-dense prompt can be safely under `INLINE_ARGV_PROMPT_BUDGET_
+    // BYTES` in raw form and still render past it. So: measure the rendered
+    // form first, and only enter the shrink loop when that is actually over
+    // budget -- a prompt whose rendered form already fits never touches
+    // `shrink_for_inline_argv` at all, so it stays byte-identical to before
+    // this fix. Inside the loop, each attempt re-shrinks the ORIGINAL
+    // composed text (never the previous attempt's already-shrunk text) with
+    // a raw budget scaled down by exactly how far over budget the rendered
+    // form still was, and re-renders to check again.
+    let mut inline_text = composed.text.clone();
+    let mut degraded = false;
+    if rendered_inline_arg_len(adapter, &inline_text) > INLINE_ARGV_PROMPT_BUDGET_BYTES {
+        let mut raw_budget = INLINE_ARGV_PROMPT_BUDGET_BYTES;
+        const MAX_RENDER_ITERS: u32 = 4;
+        for _ in 0..MAX_RENDER_ITERS {
+            let (shrunk, shrink_degraded) =
+                shrink_for_inline_argv(composed.text.clone(), raw_budget);
+            inline_text = shrunk;
+            degraded = degraded || shrink_degraded;
+            let rendered_len = rendered_inline_arg_len(adapter, &inline_text);
+            if rendered_len <= INLINE_ARGV_PROMPT_BUDGET_BYTES {
+                break;
+            }
+            // Scale the raw budget down by exactly how far over budget the
+            // rendered form still is (e.g. rendering at 2x raw halves the
+            // next raw budget), then try again. `.min(raw_budget - 1)`
+            // guarantees forward progress on every iteration even when the
+            // ratio rounds to a no-op.
+            let ratio = INLINE_ARGV_PROMPT_BUDGET_BYTES as f64 / rendered_len as f64;
+            let scaled = ((raw_budget as f64) * ratio).floor() as usize;
+            raw_budget = scaled.min(raw_budget.saturating_sub(1));
+        }
+
+        // Hard fallback: the proportional loop above ran out of attempts and
+        // the rendered form is still over budget (escaping that does not
+        // scale linearly with raw length, or a `raw_budget` that bottomed
+        // out). Halve the already-shrunk text and re-render until it fits --
+        // geometric, so this always terminates, the same "always guarantees
+        // the invariant" backstop `shrink_for_inline_argv`'s own hard cap
+        // already relies on, just measured on the rendered form instead of
+        // the raw one.
+        while !inline_text.is_empty()
+            && rendered_inline_arg_len(adapter, &inline_text) > INLINE_ARGV_PROMPT_BUDGET_BYTES
+        {
+            degraded = true;
+            let half = inline_text.len() / 2;
+            inline_text = crate::utils::truncate_bytes(inline_text, Some(half));
+        }
+
         if degraded {
             eprintln!(
                 "zirv ctx: the composed prompt ({} bytes) exceeds the safe inline command-line \
@@ -1701,10 +1782,7 @@ pub fn injection_args_for_session(
                 composed.text.len()
             );
         }
-        shrunk
-    } else {
-        composed.text.clone()
-    };
+    }
     let inline = adapter.system_prompt_args(&inline_text);
 
     // On the cmd.exe shim the inline form is only ever reached here when the
@@ -5830,6 +5908,23 @@ mod tests {
         assert!(out.len() <= budget);
     }
 
+    /// Defect 2 (cross-review round, defensive): a `budget` no larger than
+    /// the hard-cap note itself used to make `budget.saturating_sub(HARD_
+    /// NOTE.len())` bottom out at 0 while the note was still appended
+    /// afterwards, handing back text longer than `budget`. Below that floor
+    /// there is no room for the note, so it must be skipped entirely rather
+    /// than pushing the result over budget.
+    #[test]
+    fn shrink_for_inline_argv_clamps_when_budget_is_smaller_than_the_hard_note() {
+        let (out, degraded) = shrink_for_inline_argv("x".repeat(1000), 10);
+        assert!(degraded);
+        assert!(
+            out.len() <= 10,
+            "must never exceed budget even when it is smaller than the hard-cap note: {} > 10",
+            out.len()
+        );
+    }
+
     /// End-to-end: `injection_args_for_session` on an adapter with no
     /// file-based system-prompt flag (codex, today) never hands back an
     /// inline argument anywhere near Windows' ~32KB `CreateProcessW` limit,
@@ -5903,5 +5998,45 @@ mod tests {
 
         assert_eq!(args[0], "-c");
         assert_eq!(args[1], "developer_instructions=\"small session prompt\"");
+    }
+
+    /// Defect 1 (cross-review round): the budget must bound the RENDERED
+    /// argument, not the raw composed text. Codex's `developer_instructions=
+    /// <json>` delivery JSON-escapes the text afterwards, so a newline-dense
+    /// prompt can be safely under `INLINE_ARGV_PROMPT_BUDGET_BYTES` in raw
+    /// form (each `\n` is one byte) while still rendering well past it
+    /// (each `\n` becomes the two bytes `\\n`) -- exactly the shape that
+    /// used to still hard-fail Windows' ~32KB `CreateProcessW` limit even
+    /// though the old raw-only check saw nothing to shrink.
+    #[test]
+    fn injection_args_for_session_shrinks_by_rendered_size_for_a_newline_dense_prompt() {
+        let mut text = String::from("base instructions\n");
+        text.push_str(&"\n".repeat(20_000));
+        assert!(
+            text.len() <= INLINE_ARGV_PROMPT_BUDGET_BYTES,
+            "the raw prompt must be under budget for this to exercise defect 1, not the old \
+             raw-only overflow path: {} bytes",
+            text.len()
+        );
+        let composed = ComposedPrompt {
+            text,
+            sources: vec![PromptSource::Default],
+            version: DEFAULT_PROMPT_VERSION,
+        };
+
+        let (_state_tmp, state) = scratch_state();
+        let adapter = CodexAdapter::new(Some("/tmp/fake-codex"));
+        let args =
+            injection_args_for_session(&adapter, &[], Some(&composed), &state, "sess-213-defect1")
+                .expect("args");
+
+        assert_eq!(args[0], "-c");
+        assert!(args[1].starts_with("developer_instructions="));
+        assert!(
+            args[1].len() <= INLINE_ARGV_PROMPT_BUDGET_BYTES + 512,
+            "the RENDERED argument must be shrunk to fit the budget even though the raw prompt \
+             was already under it: {} bytes",
+            args[1].len()
+        );
     }
 }
