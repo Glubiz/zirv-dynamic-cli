@@ -652,6 +652,10 @@ struct PaneRowMeta {
     short: String,
     harness: String,
     state: ui::RowState,
+    /// Issue #209/v3 codex review finding 5: `Pane::reachable()`, threaded
+    /// through so the footer's supervision segment can render the truth
+    /// instead of an assumed `supervised`.
+    supervised: bool,
 }
 
 /// Combines this dashboard's own panes (attached, in pane order) with every
@@ -709,6 +713,7 @@ fn assemble_sidebar(
             attached: true,
             selected: false,
             focused: false,
+            supervised: p.supervised,
         })
         .collect();
 
@@ -735,6 +740,9 @@ fn assemble_sidebar(
             attached: false,
             selected: false,
             focused: false,
+            // No `Pane` to ask, and never `focused` -- see `SidebarRow::
+            // supervised`'s own doc comment.
+            supervised: true,
         });
     }
 
@@ -858,18 +866,30 @@ fn assemble_header_facts(
 /// `assemble_sidebar` output, reused rather than re-derived: it already
 /// carries the harness, cached score, age and dead/alive state the footer
 /// needs, and reusing it means the sidebar and the footer can never disagree
-/// about which pane is focused or what its own facts are. `None` (an empty
-/// dashboard, nothing focused) is `ui::FooterFacts::None` -- nothing draws.
+/// about which pane is focused or what its own facts are.
+///
+/// `None` means there is no attached pane at all right now -- an empty
+/// dashboard, or (codex review finding 1) the tick right after the last one
+/// exited: `reap_ended_panes` removes an `Ended` pane from `panes` in the
+/// same tick it detects the exit, so `focused_row` can never actually carry
+/// `RowState::Dead` in the live loop the way the sidebar's own glyph styling
+/// still accounts for. `last_exited` (`(harness, age since it exited)`,
+/// from `reap_ended_panes`'s own `LastExited`, only ever set when that
+/// reap left `panes` empty) is what makes the dead-pane footer variant
+/// reachable for exactly that case; with nothing focused and no exit to
+/// report either, this is `ui::FooterFacts::None` and nothing draws.
+///
+/// `mail` (codex review finding 2) is the FOCUSED pane's own unread count
+/// (`FactsCache::disk.mail_by_session`, looked up by its short id) -- never
+/// the dashboard's own fixed launch identity's, which answers a different
+/// question (see `MailMap`'s own doc comment).
 fn assemble_footer_facts(
     focused_row: Option<&ui::SidebarRow>,
     usage: &[ui::HarnessUsage],
     mail: Option<(usize, usize)>,
     workflow: Option<&workflow::ActiveWorkflowSummary>,
+    last_exited: Option<(&str, Option<u64>)>,
 ) -> ui::FooterFacts {
-    let Some(row) = focused_row else {
-        return ui::FooterFacts::None;
-    };
-
     let footer_workflow = match workflow {
         Some(wf) => ui::FooterWorkflow::Active {
             kind: wf.kind.to_string(),
@@ -877,6 +897,17 @@ fn assemble_footer_facts(
             gated: wf.awaiting_approval,
         },
         None => ui::FooterWorkflow::None,
+    };
+
+    let Some(row) = focused_row else {
+        return match last_exited {
+            Some((harness, exited_age_secs)) => ui::FooterFacts::Dead(ui::FooterDeadFacts {
+                harness: harness.to_string(),
+                exited_age_secs,
+                workflow: footer_workflow,
+            }),
+            None => ui::FooterFacts::None,
+        };
     };
 
     if row.state == ui::RowState::Dead {
@@ -906,10 +937,11 @@ fn assemble_footer_facts(
         usage_seven_day: seven_day,
         unread_mail,
         workflow: footer_workflow,
-        // Always true: see `ui::FooterAliveFacts::supervised`'s own doc
-        // comment for why there is no dash-observable "degraded" signal to
-        // fold in here yet.
-        supervised: true,
+        // Issue #209/v3 codex review finding 5: `Pane::reachable()`, via
+        // `SidebarRow::supervised` -- a pane whose turn-signal socket
+        // failed to bind at spawn runs genuinely unsupervised, and the
+        // footer now says so instead of assuming every alive pane is fine.
+        supervised: row.supervised,
     })
 }
 
@@ -918,6 +950,19 @@ fn assemble_footer_facts(
 /// unreadable one, an unresolvable agent), which the sidebar renders as
 /// `rot --`. Nothing here ever stores a placeholder zero.
 type ScoreMap = HashMap<String, u32>;
+
+/// `mail::unread_counts`'s own `(broadcast, direct)`, keyed by session short
+/// id -- issue #209/v3 codex review finding 2. `mail::unread_counts`'s
+/// `direct` count is relative to a *particular session's own identity*
+/// (`msg.to_session == session_short`), not the repo as a whole, so a single
+/// `Option<(usize, usize)>` scoped to the dashboard's own launch identity
+/// (`DiskFacts`'s old `mail` field, kept for whatever else eventually reads
+/// it) cannot answer "how much mail is addressed to the *focused* pane" --
+/// it can only ever answer that for the dashboard's own fixed identity.
+/// Populated exactly like `ScoreMap`: every attached pane, by its own
+/// `agent()`/`short()`, plus every live registry row this dashboard owns.
+/// An absent key means mail is disabled, never a fabricated `(0, 0)`.
+type MailMap = HashMap<String, (usize, usize)>;
 
 /// How often the header's own disk-backed facts (rot scores, mail,
 /// memory-bank size) -- and the session registry the sidebar's view-only rows come
@@ -973,6 +1018,10 @@ struct DiskFacts {
     /// workflow" and "failed to load" alike; the footer renders the same
     /// dim `▸ –` either way.
     workflow: Option<workflow::ActiveWorkflowSummary>,
+    /// Issue #209/v3 codex review finding 2: per-session unread mail, for
+    /// the footer's own `✉` segment -- see [`MailMap`]'s own doc comment
+    /// for why `mail` above cannot answer this.
+    mail_by_session: MailMap,
 }
 
 /// Who the dashboard is, for the reads that are scoped to it: the repo it
@@ -1038,7 +1087,18 @@ impl FactsCache {
         self.registry = sessions::list(state);
         // Issue #209/v3 §D: same throttled tick as the reads above it, same
         // no-subprocess/no-scan discipline -- see `DiskFacts::workflow`'s
-        // own doc comment.
+        // own doc comment. Deliberately the dashboard's own `repo`, not a
+        // per-pane one (codex review finding 3, refuted): a workflow is a
+        // repo-level singleton with no session dimension at all
+        // (`engine::WorkflowState`/`load_active` take a repo, never a
+        // session id), and every other per-session disk read in this loop
+        // -- scores, mail, memory -- is already keyed off this same shared
+        // `repo` by the identical, deliberate convention `Pane::spawn`'s own
+        // doc comment documents for `cwd` vs. `repo` (issue #119): a
+        // worktree-hosted pane's *argv* runs in its own working tree, but
+        // its identity for every disk read stays the dashboard's repo,
+        // because the session/state store is shared across every pane this
+        // dashboard hosts.
         self.disk.workflow = workflow::active_workflow_summary(state, repo);
 
         // Task 7: one usage entry per enabled harness, read straight off
@@ -1088,6 +1148,40 @@ impl FactsCache {
             }
             if let Some(score) = score::cached_score(state, &record.repo, &record.session) {
                 self.disk.scores.insert(record.short.clone(), score);
+            }
+        }
+
+        // Issue #209/v3 codex review finding 2: `mail_by_session`, mirroring
+        // the `scores` loop right above -- every attached pane by its own
+        // agent/short, then every live registry row this dashboard owns.
+        // Rebuilt rather than updated in place for the identical reason
+        // `scores` is: a reaped pane's short must not linger with a stale
+        // count once something else reuses it.
+        self.disk.mail_by_session.clear();
+        if cfg.mail.enabled {
+            for pane in panes {
+                if let Some(counts) =
+                    mail::unread_counts(state, repo, pane.agent(), pane.short(), true)
+                {
+                    self.disk
+                        .mail_by_session
+                        .insert(pane.short().to_string(), counts);
+                }
+            }
+            for (record, liveness) in &self.registry {
+                if *liveness != sessions::Liveness::Live
+                    || self.disk.mail_by_session.contains_key(&record.short)
+                    || record.owner_pid != Some(std::process::id())
+                {
+                    continue;
+                }
+                if let Some(counts) =
+                    mail::unread_counts(state, &record.repo, &record.agent, &record.short, true)
+                {
+                    self.disk
+                        .mail_by_session
+                        .insert(record.short.clone(), counts);
+                }
             }
         }
     }
@@ -1140,6 +1234,22 @@ fn insert_fixup(old_pane_count: usize, new_pane_count: usize, selected: usize) -
     }
 }
 
+/// Issue #209/v3 codex review finding 1: `reap_ended_panes` removes an ended
+/// pane from `panes` (and reindexes `focused`/`selected`) in the same tick it
+/// detects the exit -- well before `assemble_sidebar`/`assemble_footer_facts`
+/// ever run downstream that tick. A `SidebarRow` with `RowState::Dead` is
+/// therefore never actually observed by either: `panes` never contains an
+/// `Ended` pane by the time rows are built from it. `LastExited` is the
+/// dashboard's own record of the pane it just lost, kept only for as long as
+/// there is nothing else to focus instead (`panes` is empty) -- once a new or
+/// restored pane takes focus, `assemble_footer_facts` finds a real focused
+/// row again and this becomes irrelevant until the next full reap, so it
+/// never needs an explicit clear.
+struct LastExited {
+    harness: String,
+    exited_at: Instant,
+}
+
 /// Removes every pane whose child has exited, in place: each one is shut down
 /// first (`Pane::shutdown` -- idempotent, and with the child already gone the
 /// quit ladder is a no-op, so this is really "release the registry record and
@@ -1155,6 +1265,11 @@ fn insert_fixup(old_pane_count: usize, new_pane_count: usize, selected: usize) -
 /// (`empty_exit_code`) once the last pane is gone: a dashboard whose sessions
 /// all died badly used to exit 0 regardless, which is the same dishonest exit
 /// `exec`/`wrap` are careful never to report.
+///
+/// `last_exited` records whichever pane this call reaps last, but only when
+/// it leaves `panes` empty -- see [`LastExited`]'s own doc comment for why
+/// that is exactly the condition under which the footer would otherwise have
+/// nothing to describe.
 #[allow(clippy::too_many_arguments)]
 fn reap_ended_panes(
     panes: &mut Vec<Pane>,
@@ -1166,6 +1281,7 @@ fn reap_ended_panes(
     errors: &mut Vec<String>,
     reaped_codes: &mut Vec<i32>,
     reaped_recent: &mut HashSet<String>,
+    last_exited: &mut Option<LastExited>,
 ) {
     let mut index = 0;
     while index < panes.len() {
@@ -1199,6 +1315,12 @@ fn reap_ended_panes(
                 pane.short()
             ),
         );
+        if panes.is_empty() {
+            *last_exited = Some(LastExited {
+                harness: pane.agent().to_string(),
+                exited_at: Instant::now(),
+            });
+        }
         (*focused, *selected) = reap_fixup(index, *focused, *selected);
         // Deliberately no `index += 1`: the next pane has shifted into this
         // slot and has not been looked at yet.
@@ -5211,6 +5333,7 @@ fn build_pane_rows(panes: &[Pane]) -> Vec<PaneRowMeta> {
             short: pane.short().to_string(),
             harness: pane.agent().to_string(),
             state: ui::row_state_for(&pane.state()),
+            supervised: pane.reachable(),
         })
         .collect()
 }
@@ -5641,6 +5764,9 @@ pub fn run_dashboard(
     // from the view-only sidebar rows so a just-released session does not
     // re-list (and become nudge-targetable) off the up-to-1s-stale snapshot.
     let mut reaped_recent: HashSet<String> = HashSet::new();
+    // Issue #209/v3 codex review finding 1: the footer's dead-pane fallback
+    // -- see `LastExited`'s own doc comment.
+    let mut last_exited: Option<LastExited> = None;
 
     let exit_code: i32 = 'main: loop {
         // Task 2: bumps the tick counter every iteration and writes a line
@@ -5684,6 +5810,7 @@ pub fn run_dashboard(
             &mut errors,
             &mut reaped_codes,
             &mut reaped_recent,
+            &mut last_exited,
         );
 
         // The geometry any pane spawned during this tick gets -- the terminal
@@ -6876,12 +7003,30 @@ pub fn run_dashboard(
         // Issue #209/v3 §D: the footer describes whichever pane is focused
         // (Q1) -- reuses this tick's own sidebar row rather than re-deriving
         // the same facts a second way (see `assemble_footer_facts`'s own
-        // doc comment).
+        // doc comment). `last_exited` (codex review finding 1) is what makes
+        // the dead-pane variant reachable once `reap_ended_panes` has
+        // already removed the row `focused` used to name.
+        let focused_row = rows.iter().find(|r| r.focused);
+        // Codex review finding 2: the focused pane's OWN mail queue, not
+        // the dashboard's fixed launch identity's -- see `MailMap`'s own
+        // doc comment.
+        let focused_mail =
+            focused_row.and_then(|row| facts_cache.disk.mail_by_session.get(&row.short).copied());
         let footer_facts = assemble_footer_facts(
-            rows.iter().find(|r| r.focused),
+            focused_row,
             &facts_cache.disk.usage,
-            facts_cache.disk.mail,
+            focused_mail,
             facts_cache.disk.workflow.as_ref(),
+            last_exited.as_ref().map(|info| {
+                (
+                    info.harness.as_str(),
+                    Some(
+                        Instant::now()
+                            .saturating_duration_since(info.exited_at)
+                            .as_secs(),
+                    ),
+                )
+            }),
         );
 
         let draw = terminal.draw(|f| {
@@ -8033,6 +8178,7 @@ mod tests {
             short: short.to_string(),
             harness: harness.to_string(),
             state: ui::RowState::Idle,
+            supervised: true,
         }
     }
 
@@ -8256,6 +8402,10 @@ mod tests {
     // Issue #209/v3 §D: `assemble_footer_facts`.
 
     fn focused_alive_row(score: Option<u32>) -> ui::SidebarRow {
+        focused_alive_row_supervised(score, true)
+    }
+
+    fn focused_alive_row_supervised(score: Option<u32>, supervised: bool) -> ui::SidebarRow {
         ui::SidebarRow {
             short: "aaa11111".to_string(),
             harness: "claude".to_string(),
@@ -8265,13 +8415,29 @@ mod tests {
             attached: true,
             selected: false,
             focused: true,
+            supervised,
         }
     }
 
     #[test]
-    fn assemble_footer_facts_is_none_with_nothing_focused() {
-        let facts = assemble_footer_facts(None, &[], None, None);
+    fn assemble_footer_facts_is_none_with_nothing_focused_and_no_exit_to_report() {
+        let facts = assemble_footer_facts(None, &[], None, None, None);
         assert!(matches!(facts, ui::FooterFacts::None));
+    }
+
+    /// Codex review finding 1: with nothing focused (the dashboard's last
+    /// pane was just reaped) but a `last_exited` snapshot, the footer shows
+    /// the dead-pane variant instead of drawing nothing.
+    #[test]
+    fn assemble_footer_facts_is_dead_when_nothing_is_focused_but_something_just_exited() {
+        let facts = assemble_footer_facts(None, &[], None, None, Some(("codex", Some(720))));
+        match facts {
+            ui::FooterFacts::Dead(dead) => {
+                assert_eq!(dead.harness, "codex");
+                assert_eq!(dead.exited_age_secs, Some(720));
+            }
+            _ => panic!("expected FooterFacts::Dead"),
+        }
     }
 
     #[test]
@@ -8283,7 +8449,7 @@ mod tests {
             seven_day: Some(18.0),
             credits: false,
         }];
-        let facts = assemble_footer_facts(Some(&row), &usage, Some((2, 1)), None);
+        let facts = assemble_footer_facts(Some(&row), &usage, Some((2, 1)), None, None);
         match facts {
             ui::FooterFacts::Alive(alive) => {
                 assert_eq!(alive.harness, "claude");
@@ -8299,6 +8465,18 @@ mod tests {
         }
     }
 
+    /// Codex review finding 5: an unsupervised focused pane (a turn-signal
+    /// bind failure at spawn) must render as such, not as `supervised`.
+    #[test]
+    fn assemble_footer_facts_carries_unsupervised_through() {
+        let row = focused_alive_row_supervised(None, false);
+        let facts = assemble_footer_facts(Some(&row), &[], None, None, None);
+        match facts {
+            ui::FooterFacts::Alive(alive) => assert!(!alive.supervised),
+            _ => panic!("expected FooterFacts::Alive"),
+        }
+    }
+
     /// A dead focused row produces `FooterFacts::Dead`, never `Alive` --
     /// there is no verdict/usage/mail to show for an exited pane.
     #[test]
@@ -8306,7 +8484,7 @@ mod tests {
         let mut row = focused_alive_row(Some(12));
         row.state = ui::RowState::Dead;
         row.age_secs = Some(720);
-        let facts = assemble_footer_facts(Some(&row), &[], None, None);
+        let facts = assemble_footer_facts(Some(&row), &[], None, None, None);
         match facts {
             ui::FooterFacts::Dead(dead) => {
                 assert_eq!(dead.harness, "claude");
@@ -8324,7 +8502,7 @@ mod tests {
             step: "design".to_string(),
             awaiting_approval: false,
         };
-        let facts = assemble_footer_facts(Some(&row), &[], None, Some(&summary));
+        let facts = assemble_footer_facts(Some(&row), &[], None, Some(&summary), None);
         match facts {
             ui::FooterFacts::Alive(alive) => match alive.workflow {
                 ui::FooterWorkflow::Active { kind, step, gated } => {
@@ -8346,7 +8524,7 @@ mod tests {
             step: "spec".to_string(),
             awaiting_approval: true,
         };
-        let facts = assemble_footer_facts(Some(&row), &[], None, Some(&summary));
+        let facts = assemble_footer_facts(Some(&row), &[], None, Some(&summary), None);
         match facts {
             ui::FooterFacts::Alive(alive) => match alive.workflow {
                 ui::FooterWorkflow::Active { gated, .. } => assert!(gated),
@@ -8596,6 +8774,57 @@ mod tests {
             "a foreign-owned record must never be scored, undisplayable as it is: {:?}",
             cache.disk.scores
         );
+    }
+
+    /// Codex review finding 2: `mail_by_session` reads each owned session's
+    /// OWN unread mail, not the dashboard's fixed launch identity's --
+    /// mirrors `refresh_if_due_scores_only_registry_records_this_dashboard_
+    /// owns` above, but for mail's direct/broadcast split.
+    #[test]
+    fn refresh_if_due_reads_mail_by_session_for_a_registry_row_this_dashboard_owns() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let cfg = CtxConfig::default();
+
+        let session = "5c0d0004-4444-4222-8333-555555555555";
+        let record = sessions::Record::new(session, "claude", &repo, sessions::Verb::Dash);
+        let short = record.short.clone();
+        let _guard = sessions::SessionGuard::register(&state, record);
+
+        // Addressed directly to `short`, not "any" -- must land in that
+        // session's own `direct` count, never the dashboard's own identity
+        // (`owner(&repo)` below uses `"sess0000"`, a different session
+        // entirely).
+        let slug = super::super::state::repo_slug(&repo);
+        mail::store(
+            &state,
+            &slug,
+            &mail::Message {
+                from_session: "other".to_string(),
+                from_agent: "codex".to_string(),
+                to: "any".to_string(),
+                to_session: Some(short.clone()),
+                sent: 1,
+                body: "hi".to_string(),
+            },
+            &cfg,
+        )
+        .expect("store");
+
+        let mut cache = FactsCache::new(Instant::now());
+        cache.refresh_if_due(&cfg, &state, owner(&repo), &[], Instant::now());
+
+        assert_eq!(
+            cache.disk.mail_by_session.get(&short).copied(),
+            Some((0, 1)),
+            "the owned session's own direct mail: {:?}",
+            cache.disk.mail_by_session
+        );
+        // The dashboard's own fixed identity (`sess0000`) has no mail of
+        // its own here -- confirming the two are genuinely independent.
+        assert!(!cache.disk.mail_by_session.contains_key("sess0000"));
     }
 
     // Task 8: mail + memory overlay reducers -- pure, no I/O.
@@ -9077,6 +9306,7 @@ mod tests {
                 &mut errors,
                 &mut Vec::new(),
                 &mut HashSet::new(),
+                &mut None,
             );
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -9116,6 +9346,69 @@ mod tests {
             listed[0].1.from_session, dashboard_short,
             "composed mail still carries the dashboard's own short"
         );
+    }
+
+    /// Codex review finding 1, on the real reap path (not just the pure
+    /// `assemble_footer_facts` shaping): reaping the dashboard's only pane
+    /// leaves `last_exited` filled with its harness, so the footer has
+    /// something to describe even though `panes` (and therefore any
+    /// `SidebarRow`) no longer does.
+    #[test]
+    fn reap_ended_panes_records_the_last_exited_pane_when_it_leaves_panes_empty() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let cfg = CtxConfig::default();
+
+        let spec = PaneSpec {
+            agent_name: "test-agent".to_string(),
+            argv: trivial_argv(),
+            role: prompt::PromptRole::Orchestrator,
+            verb: sessions::Verb::Chat,
+            session_id: "77777777-2222-4333-8444-555555555555".to_string(),
+            title: "orch".to_string(),
+        };
+        let mut panes = vec![
+            Pane::spawn(
+                spec,
+                &state,
+                &repo,
+                &repo,
+                (80, 24),
+                &[],
+                true,
+                pane::DEFAULT_IDLE_QUIET,
+            )
+            .expect("spawn"),
+        ];
+        let mut queues: Vec<VecDeque<String>> = vec![VecDeque::new()];
+        let (mut focused, mut selected) = (0usize, 0usize);
+        let mut errors = Vec::new();
+        let mut last_exited: Option<LastExited> = None;
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline && !panes.is_empty() {
+            for pane in panes.iter_mut() {
+                pane.drain();
+            }
+            reap_ended_panes(
+                &mut panes,
+                &mut queues,
+                &cfg,
+                &state,
+                &mut focused,
+                &mut selected,
+                &mut errors,
+                &mut Vec::new(),
+                &mut HashSet::new(),
+                &mut last_exited,
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(panes.is_empty(), "sanity: the pane was reaped");
+        let recorded = last_exited.expect("last_exited must be filled once panes is empty");
+        assert_eq!(recorded.harness, "test-agent");
     }
 
     #[test]
@@ -13530,6 +13823,7 @@ mod tests {
                 &mut errors,
                 &mut reaped_codes,
                 &mut reaped_recent,
+                &mut None,
             );
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -14482,6 +14776,7 @@ mod tests {
                 &mut errors,
                 &mut Vec::new(),
                 &mut HashSet::new(),
+                &mut None,
             );
             std::thread::sleep(Duration::from_millis(50));
         }

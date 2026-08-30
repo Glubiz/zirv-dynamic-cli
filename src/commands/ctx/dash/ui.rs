@@ -139,6 +139,13 @@ pub struct SidebarRow {
     pub attached: bool,
     pub selected: bool,
     pub focused: bool,
+    /// Issue #209/v3 codex review finding 5: `Pane::reachable()` for an
+    /// attached row (whether this pane's own turn-signal socket bound at
+    /// spawn time); `true` for a view-only registry row, which has no
+    /// `Pane` of its own to ask and can never be `focused` anyway (see
+    /// `focused`'s own doc comment) -- the footer is the only reader, and
+    /// it only ever reads this off the focused row.
+    pub supervised: bool,
 }
 
 /// A minimal draft/view struct shared by the overlay seams below. Only what
@@ -648,15 +655,17 @@ pub struct FooterAliveFacts {
     /// broadcast/direct `+`-split -- `0` renders the dim placeholder.
     pub unread_mail: usize,
     pub workflow: FooterWorkflow,
-    /// Always `true` in this phase: a focused pane can only ever be one
-    /// this dashboard itself spawned and is actively running its own
-    /// supervise/idle/reap loop over (`ui::SidebarRow::focused`'s own doc
-    /// comment -- focus never lands on a view-only registry row). There is
-    /// no dash-observable "degraded" signal the way `wrap`'s own in-process
-    /// child monitoring has one (`chrome::BarState::degraded`); surfacing
-    /// that would need new plumbing this issue's scope (§E) does not call
-    /// for, so the footer's supervision segment stays the mock's own
-    /// steady-state `● supervised` until such a signal exists.
+    /// `Pane::reachable()` for the focused pane (issue #209/v3 codex review
+    /// finding 5): whether its own turn-signal socket bound successfully at
+    /// spawn time. `false` is the same "degrades to unsupervised" case
+    /// `Pane::spawn`'s own doc comment describes for a failed bind -- a
+    /// dashboard pane that cannot act on a wake-up is still legitimate and
+    /// visible, but the footer must say so rather than assume every alive
+    /// pane is fine. Not the same signal as `wrap`'s own in-process
+    /// `chrome::BarState::degraded` (there is no dash-observable analogue
+    /// of THAT one -- a supervising *loop* going bad mid-session, as
+    /// opposed to never having bound in the first place), which stays out
+    /// of this issue's scope (§E).
     pub supervised: bool,
 }
 
@@ -713,9 +722,10 @@ const FOOTER_SEGMENT_GAP: &str = "   ";
 
 /// Pure: the alive-pane footer's spans, width-budgeted to `cols`, applying
 /// §D's own drop order: usage first, then the verdict's score number, then
-/// the workflow segment (full form, then compressed, then dropped
-/// entirely), then the harness label -- verdict word/glyph, mail and
-/// supervision are never dropped.
+/// the workflow segment compresses (full form to `step!`), then the
+/// harness label drops, then -- last resort -- the now-harness-less
+/// workflow segment drops too. Verdict word/glyph, mail and supervision are
+/// never dropped.
 fn footer_alive_spans(
     facts: &FooterAliveFacts,
     advise_at: u32,
@@ -784,12 +794,18 @@ fn footer_alive_spans(
         vec![("\u{25b2} unsupervised".to_string(), style::tui::error())]
     };
 
-    // §D's own drop order, most to least generous: every segment present,
-    // then usage dropped, then the verdict's score number dropped too, then
-    // the workflow segment compressed, then dropped entirely, then the
-    // harness label dropped as a last resort -- the verdict word/glyph,
-    // mail and supervision segments are never dropped. Mirrors
-    // `chrome::status_bar`'s own tiered-candidate shape.
+    // §D's own drop order, most to least generous -- usage, then the
+    // verdict's score number, then the workflow segment compresses (long
+    // form to `step!`), then the harness label drops (the mock's own
+    // 44-column example: `▸ spec!` survives with no harness at all), and
+    // only as the very last resort before the irreducible core does the
+    // now-harness-less workflow segment drop too. The verdict word/glyph,
+    // mail and supervision segments are never dropped. Issue #209/v3 codex
+    // review finding 4: harness must drop *before* the workflow segment is
+    // removed outright, not after -- the original tier order dropped
+    // workflow to nothing while still holding onto the harness, which
+    // never matches the mock at 44 columns. Mirrors `chrome::status_bar`'s
+    // own tiered-candidate shape.
     let tiers = [
         join_footer_segments(&[
             &harness,
@@ -814,7 +830,7 @@ fn footer_alive_spans(
             &workflow_compressed,
             &supervision,
         ]),
-        join_footer_segments(&[&harness, &verdict_reduced, &mail, &supervision]),
+        join_footer_segments(&[&verdict_reduced, &mail, &workflow_compressed, &supervision]),
         join_footer_segments(&[&verdict_reduced, &mail, &supervision]),
     ];
     choose_footer_tier(&tiers, cols)
@@ -2945,6 +2961,7 @@ mod tests {
             attached: true,
             selected: false,
             focused: false,
+            supervised: true,
         }
     }
 
@@ -3063,6 +3080,7 @@ mod tests {
                 attached: true,
                 selected: false,
                 focused: true,
+                supervised: true,
             },
             SidebarRow {
                 short: "bbb22222".to_string(),
@@ -3073,6 +3091,7 @@ mod tests {
                 attached: false,
                 selected: true,
                 focused: false,
+                supervised: true,
             },
         ];
         let backend = TestBackend::new(40, 6);
@@ -3112,6 +3131,7 @@ mod tests {
             attached: true,
             selected,
             focused: false,
+            supervised: true,
         };
         let rows: Vec<SidebarRow> = (0..12).map(|i| row(i, i == 10)).collect();
         let text = render_and_capture_text(Rect::new(0, 0, 30, 6), |f, area| {
@@ -3630,6 +3650,51 @@ mod tests {
             "the workflow segment must compress before the harness drops"
         );
         assert!(saw_harness_drop, "the harness must eventually drop too");
+    }
+
+    /// The mock's own 44-column drop-order example (§04): warming verdict
+    /// (score number already gone), unread mail, the workflow compressed to
+    /// `spec!` (gated -- the `!` suffix), supervised -- and, critically, NO
+    /// harness label at all. Issue #209/v3 codex review finding 4: the
+    /// harness must drop while the workflow segment is still compressed,
+    /// not the other way around.
+    #[test]
+    fn footer_44_col_mock_example_renders_exactly() {
+        let facts = FooterFacts::Alive(FooterAliveFacts {
+            harness: "claude".to_string(),
+            score: Some(47),
+            usage_five_hour: Some(62.0),
+            usage_seven_day: Some(31.0),
+            unread_mail: 2,
+            workflow: FooterWorkflow::Active {
+                kind: "feature".to_string(),
+                step: "spec".to_string(),
+                gated: true,
+            },
+            supervised: true,
+        });
+        let text = render_and_capture_text(Rect::new(0, 0, 44, 1), |f, area| {
+            render_footer(f, area, &facts, 40, 60)
+        });
+        assert!(text.contains("warming"), "got {text:?}");
+        assert!(
+            !text.contains("47"),
+            "the score number must have dropped by 44 cols: got {text:?}"
+        );
+        assert!(text.contains('2'), "unread mail count: got {text:?}");
+        assert!(
+            text.contains("spec!"),
+            "compressed gated workflow: got {text:?}"
+        );
+        assert!(text.contains("supervised"), "got {text:?}");
+        assert!(
+            !text.contains("claude"),
+            "the harness must have dropped by 44 cols: got {text:?}"
+        );
+        assert!(
+            style::display_width(&text) <= 44,
+            "must never exceed its own column budget: got {text:?}"
+        );
     }
 
     /// The dead-pane footer's own drop order: the exited notice and the
