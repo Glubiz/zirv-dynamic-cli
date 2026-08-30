@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use super::CtxResult;
 
@@ -492,13 +492,80 @@ impl Default for MailConfig {
     }
 }
 
-/// Operator-only switches over the workflow subsystem
-/// (`src/commands/workflow/`). Every key here is `REPO_FORBIDDEN`: each one
-/// decides whether repository-authored content -- shell commands in
-/// `.zirv/verify.toml`, `npm run` scripts named by `package.json`, skill
-/// methodology in `.zirv/skills/` -- gets executed or injected at all, or how
-/// long local telemetry is kept, and a checkout must never be able to answer
-/// that for the operator.
+/// Deploy policy embedded under `[workflow.deploy]`. `tier` is operator-only;
+/// `minimum_tier` is the single repository-controlled workflow key and may
+/// only ratchet strictness upward during layered config resolution.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WorkflowDeployConfig {
+    pub tier: crate::commands::workflow::deploy::DeployTier,
+    pub minimum_tier: Option<crate::commands::workflow::deploy::DeployTier>,
+}
+
+impl Default for WorkflowDeployConfig {
+    fn default() -> Self {
+        Self {
+            tier: crate::commands::workflow::deploy::DeployTier::Development,
+            minimum_tier: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MaintainDetectorMode {
+    #[default]
+    ExitNonzero,
+    LineCount,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MaintainDetectorConfig {
+    pub command: String,
+    pub mode: MaintainDetectorMode,
+    pub threshold: u64,
+}
+
+impl Default for MaintainDetectorConfig {
+    fn default() -> Self {
+        Self {
+            command: String::new(),
+            mode: MaintainDetectorMode::ExitNonzero,
+            threshold: 1,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WorkflowMaintainConfig {
+    pub timeout_secs: u64,
+    pub detectors: std::collections::BTreeMap<String, MaintainDetectorConfig>,
+}
+
+impl Default for WorkflowMaintainConfig {
+    fn default() -> Self {
+        Self {
+            timeout_secs: 60,
+            detectors: std::collections::BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ReportConfig {
+    /// GitHub owner/repository used by workflow maintenance incident filing.
+    /// The ordinary `zirv report` command intentionally keeps its product
+    /// default and does not consume this destination.
+    pub repository: Option<String>,
+}
+
+/// Operator-controlled switches over the workflow subsystem
+/// (`src/commands/workflow/`). Every field is repo-forbidden except the
+/// explicitly folded `workflow.deploy.minimum_tier`, which can only make the
+/// effective deploy tier stricter.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct WorkflowConfig {
@@ -510,6 +577,13 @@ pub struct WorkflowConfig {
     /// skills can only ever *add* ids (see `skill::load_dir`); this turns the
     /// whole layer off.
     pub repo_skills_enabled: bool,
+    /// Whether untrusted repository-provided `.zirv/agents/` manifests are
+    /// loaded. Off by default: a checkout may propose a new role only after
+    /// the operator explicitly enables this layer, and may never replace a
+    /// trusted built-in/operator id.
+    pub repo_agents_enabled: bool,
+    pub deploy: WorkflowDeployConfig,
+    pub maintain: WorkflowMaintainConfig,
     /// Local workflow telemetry. Previously read straight from the process
     /// environment, which a repository script could set for itself.
     pub telemetry_enabled: bool,
@@ -522,6 +596,9 @@ impl Default for WorkflowConfig {
         Self {
             repo_checks_enabled: true,
             repo_skills_enabled: true,
+            repo_agents_enabled: false,
+            deploy: WorkflowDeployConfig::default(),
+            maintain: WorkflowMaintainConfig::default(),
             telemetry_enabled: true,
             telemetry_max_events: 1000,
             telemetry_retention_days: 30,
@@ -986,6 +1063,7 @@ pub struct CtxConfig {
     pub context: ContextConfig,
     pub mail: MailConfig,
     pub workflow: WorkflowConfig,
+    pub report: ReportConfig,
     pub memory: MemoryConfig,
     pub setup: SetupConfig,
     pub chrome: ChromeConfig,
@@ -1328,6 +1406,21 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         EnvKind::Bool,
     ),
     (
+        "ZIRV_CTX_WORKFLOW_REPO_AGENTS",
+        &["workflow", "repo_agents_enabled"],
+        EnvKind::Bool,
+    ),
+    (
+        "ZIRV_CTX_WORKFLOW_DEPLOY_TIER",
+        &["workflow", "deploy", "tier"],
+        EnvKind::Str,
+    ),
+    (
+        "ZIRV_CTX_REPORT_REPOSITORY",
+        &["report", "repository"],
+        EnvKind::Str,
+    ),
+    (
         "ZIRV_CTX_WORKFLOW_TELEMETRY",
         &["workflow", "telemetry_enabled"],
         EnvKind::Bool,
@@ -1505,6 +1598,33 @@ fn merge(base: &mut toml::Table, over: toml::Table) {
 /// for `merge()` to clobber the operator's with in the first place.
 fn take_nested(table: &mut toml::Table, section: &str, key: &str) -> Option<toml::Value> {
     table.get_mut(section)?.as_table_mut()?.remove(key)
+}
+
+fn take_nested3(
+    table: &mut toml::Table,
+    section: &str,
+    subsection: &str,
+    key: &str,
+) -> Option<toml::Value> {
+    table
+        .get_mut(section)?
+        .as_table_mut()?
+        .get_mut(subsection)?
+        .as_table_mut()?
+        .remove(key)
+}
+
+fn deploy_tier_at(
+    value: Option<toml::Value>,
+    key: &str,
+) -> CtxResult<Option<crate::commands::workflow::deploy::DeployTier>> {
+    value
+        .map(|value| {
+            value
+                .try_into()
+                .map_err(|error| format!("invalid {key}: {error}").into())
+        })
+        .transpose()
 }
 
 /// A `toml::Value::Array` of strings (from `take_nested`) as owned
@@ -1775,6 +1895,16 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
         &["workflow", "repo_skills_enabled"],
         "ZIRV_CTX_WORKFLOW_REPO_SKILLS",
     ),
+    (
+        &["workflow", "repo_agents_enabled"],
+        "ZIRV_CTX_WORKFLOW_REPO_AGENTS",
+    ),
+    (
+        &["workflow", "deploy", "tier"],
+        "ZIRV_CTX_WORKFLOW_DEPLOY_TIER",
+    ),
+    (&["workflow", "maintain"], "~/.zirv/ctx.toml only"),
+    (&["report", "repository"], "ZIRV_CTX_REPORT_REPOSITORY"),
     (
         &["workflow", "telemetry_enabled"],
         "ZIRV_CTX_WORKFLOW_TELEMETRY",
@@ -2238,6 +2368,14 @@ impl CtxConfig {
             "fallback",
             "small_task_max_tool_calls",
         ));
+        let home_deploy_tier = deploy_tier_at(
+            take_nested3(&mut merged, "workflow", "deploy", "tier"),
+            "workflow.deploy.tier",
+        )?;
+        let home_deploy_minimum = deploy_tier_at(
+            take_nested3(&mut merged, "workflow", "deploy", "minimum_tier"),
+            "workflow.deploy.minimum_tier",
+        )?;
 
         // Read on its own first: the repo layer is the one layer that comes
         // from a checkout rather than from the operator.
@@ -2301,7 +2439,29 @@ impl CtxConfig {
             "fallback",
             "small_task_max_tool_calls",
         ));
+        let repo_deploy_minimum = deploy_tier_at(
+            take_nested3(&mut repo_layer, "workflow", "deploy", "minimum_tier"),
+            "workflow.deploy.minimum_tier",
+        )?;
         merge(&mut merged, repo_layer);
+
+        let default_deploy = WorkflowDeployConfig::default();
+        let declared_minimum = home_deploy_minimum.max(repo_deploy_minimum);
+        let effective_deploy = home_deploy_tier
+            .unwrap_or(default_deploy.tier)
+            .max(declared_minimum.unwrap_or(default_deploy.tier));
+        insert_path(
+            &mut merged,
+            &["workflow", "deploy", "tier"],
+            toml::Value::String(effective_deploy.to_string()),
+        );
+        if let Some(minimum) = declared_minimum {
+            insert_path(
+                &mut merged,
+                &["workflow", "deploy", "minimum_tier"],
+                toml::Value::String(minimum.to_string()),
+            );
+        }
 
         // Re-inserted after the merge, before env: env (below) must still be
         // able to overwrite this outright, the same final-word precedence
@@ -5041,6 +5201,155 @@ mod tests {
         assert!(cfg.agents.is_enabled("claude"));
     }
 
+    #[test]
+    fn repo_deploy_minimum_can_only_raise_operator_tier() {
+        use crate::commands::workflow::deploy::DeployTier;
+
+        let home = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".zirv/ctx.toml"),
+            "[workflow.deploy]\ntier = \"staging\"\nminimum_tier = \"development\"\n",
+        )
+        .expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[workflow.deploy]\nminimum_tier = \"production\"\n",
+        )
+        .expect("repo");
+
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|key| empty.get(key).cloned()).expect("load");
+        assert_eq!(cfg.workflow.deploy.tier, DeployTier::Production);
+        assert_eq!(
+            cfg.workflow.deploy.minimum_tier,
+            Some(DeployTier::Production)
+        );
+    }
+
+    #[test]
+    fn repo_deploy_minimum_cannot_lower_operator_tier() {
+        use crate::commands::workflow::deploy::DeployTier;
+
+        let home = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".zirv/ctx.toml"),
+            "[workflow.deploy]\ntier = \"production\"\n",
+        )
+        .expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[workflow.deploy]\nminimum_tier = \"development\"\n",
+        )
+        .expect("repo");
+
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|key| empty.get(key).cloned()).expect("load");
+        assert_eq!(cfg.workflow.deploy.tier, DeployTier::Production);
+    }
+
+    #[test]
+    fn repo_cannot_choose_deploy_tier_but_operator_env_can_override_the_fold() {
+        use crate::commands::workflow::deploy::DeployTier;
+
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[workflow.deploy]\ntier = \"development\"\n",
+        )
+        .expect("repo");
+        let empty = env_map(&[]);
+        let error = CtxConfig::load(repo.path(), &|key| empty.get(key).cloned())
+            .expect_err("repo tier must be forbidden")
+            .to_string();
+        assert!(error.contains("workflow.deploy.tier"), "{error}");
+
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[workflow.deploy]\nminimum_tier = \"production\"\n",
+        )
+        .expect("repo");
+        let env = env_map(&[("ZIRV_CTX_WORKFLOW_DEPLOY_TIER", "development")]);
+        let cfg = CtxConfig::load(repo.path(), &|key| env.get(key).cloned()).expect("env");
+        assert_eq!(cfg.workflow.deploy.tier, DeployTier::Development);
+        assert_eq!(
+            cfg.workflow.deploy.minimum_tier,
+            Some(DeployTier::Production),
+            "the declared repo minimum remains inspectable even when operator env overrides it"
+        );
+    }
+
+    #[test]
+    fn repo_cannot_configure_maintain_commands_or_report_destination() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+
+        for body in [
+            "[workflow.maintain]\ntimeout_secs = 1\n[workflow.maintain.detectors.bad]\ncommand = \"echo bad\"\n",
+            "[report]\nrepository = \"attacker/repo\"\n",
+        ] {
+            std::fs::write(repo.path().join(".zirv/ctx.toml"), body).expect("write");
+            let empty = env_map(&[]);
+            let error = CtxConfig::load(repo.path(), &|key| empty.get(key).cloned())
+                .expect_err("repo authority must be rejected")
+                .to_string();
+            assert!(
+                error.contains("workflow.maintain") || error.contains("report.repository"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn operator_can_configure_maintain_detector_and_report_destination() {
+        let home = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".zirv/ctx.toml"),
+            "[workflow.maintain]\ntimeout_secs = 12\n[workflow.maintain.detectors.audit]\ncommand = \"printf issue\"\nmode = \"line-count\"\nthreshold = 1\n[report]\nrepository = \"owner/incidents\"\n",
+        )
+        .expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tempfile::tempdir().expect("repo");
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|key| empty.get(key).cloned()).expect("load");
+        assert_eq!(cfg.workflow.maintain.timeout_secs, 12);
+        let detector = cfg
+            .workflow
+            .maintain
+            .detectors
+            .get("audit")
+            .expect("detector");
+        assert_eq!(detector.command, "printf issue");
+        assert_eq!(detector.mode, MaintainDetectorMode::LineCount);
+        assert_eq!(detector.threshold, 1);
+        assert_eq!(cfg.report.repository.as_deref(), Some("owner/incidents"));
+    }
+
+    #[test]
+    fn report_destination_env_is_operator_final_word() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tempfile::tempdir().expect("repo");
+        let env = env_map(&[("ZIRV_CTX_REPORT_REPOSITORY", "operator/incidents")]);
+        let cfg = CtxConfig::load(repo.path(), &|key| env.get(key).cloned()).expect("load");
+        assert_eq!(cfg.report.repository.as_deref(), Some("operator/incidents"));
+    }
+
     /// Every configurable key in `CtxConfig`'s tree, as (table path, key)
     /// pairs. `table path` is dot-joined to match how a nested table's
     /// header appears in the sample-config file (`"pace.use_credits"`); the
@@ -5160,6 +5469,11 @@ mod tests {
         ("dash", "idle_quiet_ms"),
         ("workflow", "repo_checks_enabled"),
         ("workflow", "repo_skills_enabled"),
+        ("workflow", "repo_agents_enabled"),
+        ("workflow.deploy", "tier"),
+        ("workflow.deploy", "minimum_tier"),
+        ("workflow.maintain", "timeout_secs"),
+        ("report", "repository"),
         ("workflow", "telemetry_enabled"),
         ("workflow", "telemetry_max_events"),
         ("workflow", "telemetry_retention_days"),

@@ -637,6 +637,26 @@ mod tests {
     }
 
     #[test]
+    fn absent_implicit_source_model_assumes_standard_quality() {
+        // No `--model` flag at all (the common case for a plain `--prompt`
+        // exec/loop run) is zirv's own worker default, not an operator's
+        // pinned choice -- `standard` is the conservative baseline a
+        // cross-harness continuation may assume. Only a *concrete but
+        // unclassified* source model (see the tests below) refuses to guess.
+        let cfg = CtxConfig::default();
+        assert_eq!(
+            equivalent_model("codex", None, false, "claude", &cfg),
+            Some("sonnet".to_string())
+        );
+    }
+
+    #[test]
+    fn absent_explicit_source_model_never_guesses_standard_quality() {
+        let cfg = CtxConfig::default();
+        assert_eq!(equivalent_model("codex", None, true, "claude", &cfg), None);
+    }
+
+    #[test]
     fn unclassified_operator_worker_default_also_never_guesses_a_quality_tier() {
         let cfg = CtxConfig::default();
         assert_eq!(

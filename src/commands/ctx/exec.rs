@@ -92,6 +92,24 @@ pub struct ExecArgs {
     pub simple: bool,
 }
 
+/// One vendor-backed portion of a logical supervised execution. A cross-harness
+/// fallback produces more than one segment; a normal run produces exactly one.
+#[derive(Debug, Clone)]
+pub struct ExecutionSegment {
+    pub session: String,
+    pub agent: String,
+    pub model: Option<String>,
+    pub usage: TranscriptUsage,
+    pub wall_ms: u64,
+}
+
+/// Accounting returned to callers that need to attribute one logical
+/// delegation across cross-harness continuations.
+#[derive(Debug, Clone, Default)]
+pub struct ExecutionReport {
+    pub segments: Vec<ExecutionSegment>,
+}
+
 /// Flags that pin a launch to a conversation that already exists. A restart is
 /// a deliberate escape from the session that rotted, so inheriting any of them
 /// would march the fresh child straight back into it and burn the whole
@@ -332,17 +350,31 @@ pub fn run_with<W: Write>(
     )
 }
 
-/// T11 (sleep injection): identical to the former `run_with` in every way
-/// except `now_fn`/`sleep_fn` are now parameters instead of a real-clock
-/// closure hardcoded two calls deep in the body. Before this, the pacing
-/// gate's fail-safe delay (`blind_delay_secs`, T8) was verifiable at the
-/// unit level (`pace.rs`'s own `FakeClock` tests) but not at this
-/// integration level -- exec's own tests had to zero the delay out via
-/// `base_env` just to stay fast, which meant nothing here proved the delay
-/// actually reaches a real `sleep_fn` call with the right duration. Tests
-/// now inject a recording closure the same way `pace.rs`'s `FakeClock` does,
-/// so a future refactor that silently drops the sleep call is a test
-/// failure, not a shipped no-op.
+/// Same supervised execution as [run_with], plus the per-harness accounting
+/// segments that make a cross-harness continuation observable to its caller.
+pub fn run_with_report<W: Write>(
+    args: &ExecArgs,
+    w: &mut W,
+    repo: &Path,
+    env: EnvLookup<'_>,
+) -> CtxResult<(i32, ExecutionReport)> {
+    let mut report = ExecutionReport::default();
+    let code = run_with_clock_inner(
+        args,
+        w,
+        repo,
+        env,
+        &super::state::now_secs,
+        &|d: Duration| std::thread::sleep(d),
+        None,
+        &mut report,
+    )?;
+    Ok((code, report))
+}
+
+/// T11 (sleep injection): identical to the former run_with in every way
+/// except now_fn/sleep_fn are now parameters instead of a real-clock
+/// closure hardcoded two calls deep in the body.
 pub(crate) fn run_with_clock<W: Write>(
     args: &ExecArgs,
     w: &mut W,
@@ -350,6 +382,21 @@ pub(crate) fn run_with_clock<W: Write>(
     env: EnvLookup<'_>,
     now_fn: &dyn Fn() -> u64,
     sleep_fn: &dyn Fn(Duration),
+) -> CtxResult<i32> {
+    let mut report = ExecutionReport::default();
+    run_with_clock_inner(args, w, repo, env, now_fn, sleep_fn, None, &mut report)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_with_clock_inner<W: Write>(
+    args: &ExecArgs,
+    w: &mut W,
+    repo: &Path,
+    env: EnvLookup<'_>,
+    now_fn: &dyn Fn() -> u64,
+    sleep_fn: &dyn Fn(Duration),
+    stable_short: Option<&str>,
+    report: &mut ExecutionReport,
 ) -> CtxResult<i32> {
     let cfg = CtxConfig::load_for_launch(repo, env)?;
     // Gated only by `cfg.chrome.events` (which already folds in `--quiet` on
@@ -360,6 +407,8 @@ pub(crate) fn run_with_clock<W: Write>(
         super::announce::Announcer::new(cfg.chrome.events, console::colors_enabled_stderr());
     let agent_name = args.agent.as_deref().or(cfg.agent.as_deref());
     let adapter = adapters::select(agent_name, &args.command, &cfg)?;
+    let execution_started = Instant::now();
+    let execution_model = adapters::last_model_flag(&args.command).map(str::to_string);
     // Issue #155 review finding C2: refused here, before anything is
     // spawned, rather than left to silently never fire -- see
     // `AgentAdapter::counts_tool_calls`'s own doc comment for why this
@@ -470,7 +519,9 @@ pub(crate) fn run_with_clock<W: Write>(
     // reuses this exact value rather than recomputing `short_id(session)`,
     // which rotates on every restart and stranded any mail addressed to the
     // session a sender had actually resolved.
-    let registry_short = super::sessions::short_id(session.as_str());
+    let registry_short = stable_short
+        .map(str::to_string)
+        .unwrap_or_else(|| super::sessions::short_id(session.as_str()));
     // An adapter with no system-prompt injection mechanism never reaches
     // `injection_args_for_session`'s output at all -- folding mail into
     // `composed` for one only would silently destroy it, so for such an
@@ -731,7 +782,6 @@ pub(crate) fn run_with_clock<W: Write>(
     // budget bounds the whole supervised run, not just its latest incarnation.
     let mut prior_usage = TranscriptUsage::default();
     let mut prior_tool_calls: u32 = 0;
-    let has_budget = worker_budget.tokens.is_some() || worker_budget.tool_calls.is_some();
 
     let socket_path = state.socket_for(session.as_str());
     let server = match signal::SignalServer::bind(&socket_path) {
@@ -940,6 +990,7 @@ pub(crate) fn run_with_clock<W: Write>(
             repo,
             super::sessions::Verb::Exec,
         )
+        .with_stable_short(&registry_short)
         .with_safety_policy_sha256(safety_policy_sha256)
         // Issue #169: `exec::run_with` has no `PromptRole` parameter to get
         // wrong (see `agent.rs`'s own module doc comment: a delegated run is
@@ -1063,6 +1114,15 @@ pub(crate) fn run_with_clock<W: Write>(
                 "zirv ctx exec: token/tool-call budget exhausted, stopping (exit \
                  {EXIT_BUDGET_EXHAUSTED})"
             )?;
+            record_execution_segment(
+                report,
+                adapter.as_ref(),
+                &session,
+                &transcript,
+                &prior_usage,
+                execution_model.as_deref(),
+                execution_started,
+            );
             session_guard.release();
             return Ok(EXIT_BUDGET_EXHAUSTED);
         }
@@ -1119,6 +1179,15 @@ pub(crate) fn run_with_clock<W: Write>(
                         &cfg,
                     );
                 }
+                record_execution_segment(
+                    report,
+                    adapter.as_ref(),
+                    &session,
+                    &transcript,
+                    &prior_usage,
+                    execution_model.as_deref(),
+                    execution_started,
+                );
                 session_guard.release();
                 return Ok(code);
             }
@@ -1146,17 +1215,15 @@ pub(crate) fn run_with_clock<W: Write>(
             );
             let stored = handoff::store(&state, repo, session.as_str(), &note)?;
 
-            // Issue #169.2: harvest the outgoing child's own spend before its
-            // transcript is superseded, so a nudge restart never resets the
-            // budget meter.
-            if has_budget {
-                harvest_spend(
-                    adapter.as_ref(),
-                    &transcript,
-                    &mut prior_usage,
-                    &mut prior_tool_calls,
-                );
-            }
+            // Harvest every outgoing child even for an unbounded run: the same
+            // accumulator now feeds both budget enforcement and delegation
+            // accounting, so skipping it would hide pre-handoff/restart spend.
+            harvest_spend(
+                adapter.as_ref(),
+                &transcript,
+                &mut prior_usage,
+                &mut prior_tool_calls,
+            );
             session = SessionId::new_v4();
             session_guard.refresh_session(session.as_str());
             transcript = derive_transcript(&session);
@@ -1378,27 +1445,43 @@ pub(crate) fn run_with_clock<W: Write>(
                 .map(|raw| super::config::split_csv_list(&raw))
                 .unwrap_or_default();
             let source_model = adapters::last_model_flag(&args.command);
+            let route_request = super::fallback::RouteRequest {
+                requested: adapter.name(),
+                source_model,
+                source_model_explicit: source_model.is_some(),
+                bounds: super::fallback::TaskBounds {
+                    tokens: worker_budget.tokens,
+                    tool_calls: worker_budget.tool_calls,
+                },
+                now: now_fn(),
+            };
             let route = (adapter_builds_launch && prompt.is_some())
                 .then(|| {
-                    super::fallback::route_blocked_session(
-                        &state,
-                        &cfg,
-                        super::fallback::RouteRequest {
-                            requested: adapter.name(),
-                            source_model,
-                            source_model_explicit: source_model.is_some(),
-                            bounds: super::fallback::TaskBounds {
-                                tokens: worker_budget.tokens,
-                                tool_calls: worker_budget.tool_calls,
-                            },
-                            now: now_fn(),
-                        },
-                        &visited,
-                    )
+                    super::fallback::route_blocked_session(&state, &cfg, route_request, &visited)
                 })
                 .flatten();
+            let deferred_reset = (route.is_none() && adapter_builds_launch && prompt.is_some())
+                .then(|| {
+                    super::fallback::earliest_reset_choice(&state, &cfg, route_request, &visited)
+                })
+                .flatten();
+            let alternate = route
+                .as_ref()
+                .map(|route| (route.selected.clone(), route.model.clone(), route.detail()))
+                .or_else(|| {
+                    deferred_reset.as_ref().and_then(|choice| {
+                        if !choice.is_cross_harness() {
+                            return None;
+                        }
+                        Some((
+                            choice.selected.clone(),
+                            choice.model.clone()?,
+                            choice.detail(),
+                        ))
+                    })
+                });
 
-            if let Some(route) = route {
+            if let Some((selected_agent, selected_model, selection_detail)) = alternate {
                 let jsonl = std::fs::read_to_string(&transcript).unwrap_or_default();
                 let ctx = adapter.structural_context(&jsonl, cfg.handoff.tail_items);
                 let (note, source) = handoff::distill_or_structural(
@@ -1410,17 +1493,28 @@ pub(crate) fn run_with_clock<W: Write>(
                 );
                 let stored = handoff::store(&state, repo, session.as_str(), &note)?;
 
-                // Preserve the delegation's original budget across the vendor
-                // boundary. This harvest includes the just-stopped child plus
-                // every prior restart already accumulated in these counters.
-                if has_budget {
-                    harvest_spend(
-                        adapter.as_ref(),
-                        &transcript,
-                        &mut prior_usage,
-                        &mut prior_tool_calls,
-                    );
-                }
+                // The source-harness portion is complete at this boundary.
+                // Record it before harvesting the current transcript into the
+                // budget accumulator, otherwise the helper would count it twice.
+                record_execution_segment(
+                    report,
+                    adapter.as_ref(),
+                    &session,
+                    &transcript,
+                    &prior_usage,
+                    execution_model.as_deref(),
+                    execution_started,
+                );
+
+                // Preserve both accounting and any configured delegation budget
+                // across the vendor boundary. This includes the just-stopped
+                // child plus every prior restart already accumulated here.
+                harvest_spend(
+                    adapter.as_ref(),
+                    &transcript,
+                    &mut prior_usage,
+                    &mut prior_tool_calls,
+                );
                 let spent_tokens = prior_usage
                     .context_total()
                     .saturating_add(prior_usage.output_tokens);
@@ -1455,7 +1549,7 @@ pub(crate) fn run_with_clock<W: Write>(
 
                 let detail = format!(
                     "{}; {} handoff at {}",
-                    route.detail(),
+                    selection_detail,
                     source,
                     stored.display()
                 );
@@ -1481,9 +1575,9 @@ pub(crate) fn run_with_clock<W: Write>(
                     "{prompt_text}\n\nThe previous harness exhausted its usage window. Continue from this handoff without redoing completed work:\n\n{}",
                     note.to_markdown()
                 );
-                let target = adapters::select(Some(&route.selected), &[], &cfg)?;
+                let target = adapters::select(Some(&selected_agent), &[], &cfg)?;
                 let nested_args = ExecArgs {
-                    agent: Some(route.selected.clone()),
+                    agent: Some(selected_agent.clone()),
                     session_id: None,
                     transcript: None,
                     prompt: Some(continuation),
@@ -1491,7 +1585,7 @@ pub(crate) fn run_with_clock<W: Write>(
                     timeout_secs: args.timeout_secs,
                     budget_tokens: remaining_tokens,
                     max_tool_calls: remaining_tool_calls,
-                    command: target.model_args(&route.model),
+                    command: target.model_args(&selected_model),
                     simple: args.simple,
                 };
 
@@ -1512,9 +1606,25 @@ pub(crate) fn run_with_clock<W: Write>(
                 // the continuation is registered. Releasing first prevents two
                 // live registry entries from claiming one logical worker.
                 session_guard.release();
-                return run_with_clock(&nested_args, w, repo, &nested_env, now_fn, sleep_fn);
+                return run_with_clock_inner(
+                    &nested_args,
+                    w,
+                    repo,
+                    &nested_env,
+                    now_fn,
+                    sleep_fn,
+                    Some(&registry_short),
+                    report,
+                );
             }
 
+            let wait_detail = deferred_reset
+                .as_ref()
+                .map(super::fallback::ResetChoice::detail)
+                .unwrap_or_else(|| {
+                    "agent reported a usage limit; parking until the current window resets"
+                        .to_string()
+                });
             let _ = log::append(
                 &state,
                 &log::Decision {
@@ -1524,13 +1634,10 @@ pub(crate) fn run_with_clock<W: Write>(
                     verdict: "limit",
                     score: 100,
                     action: "limit-park",
-                    detail: "agent reported a usage limit; parking until the window resets",
+                    detail: &wait_detail,
                 },
             );
-            writeln!(
-                w,
-                "zirv ctx exec: the agent reported a usage limit, parking until the window resets"
-            )?;
+            writeln!(w, "zirv ctx exec: {wait_detail}")?;
 
             pace::wait_for_window(
                 w,
@@ -1561,24 +1668,28 @@ pub(crate) fn run_with_clock<W: Write>(
                     w,
                     "zirv ctx exec: usage limit hit and the original prompt is unknown, so it cannot relaunch. Pass --prompt to enable parking."
                 )?;
+                record_execution_segment(
+                    report,
+                    adapter.as_ref(),
+                    &session,
+                    &transcript,
+                    &prior_usage,
+                    execution_model.as_deref(),
+                    execution_started,
+                );
                 session_guard.release();
                 return Ok(EXIT_ROT_EXHAUSTED);
             };
 
-            // A park is not a restart: the restart budget (`max_restarts`)
-            // is for rot, not for waiting. The token/tool-call budget is a
-            // different ceiling, for the whole run regardless of why it
-            // relaunched -- a park mints a fresh transcript exactly like a
-            // restart does, so its outgoing child's spend is harvested here
-            // too (issue #169.2).
-            if has_budget {
-                harvest_spend(
-                    adapter.as_ref(),
-                    &transcript,
-                    &mut prior_usage,
-                    &mut prior_tool_calls,
-                );
-            }
+            // A park mints a fresh transcript exactly like a restart, so the
+            // outgoing child's spend must be harvested for both whole-run
+            // accounting and any configured token/tool-call ceiling.
+            harvest_spend(
+                adapter.as_ref(),
+                &transcript,
+                &mut prior_usage,
+                &mut prior_tool_calls,
+            );
             session = SessionId::new_v4();
             session_guard.refresh_session(session.as_str());
             transcript = derive_transcript(&session);
@@ -1678,6 +1789,15 @@ pub(crate) fn run_with_clock<W: Write>(
                     detail: "no prompt available for restart",
                 },
             );
+            record_execution_segment(
+                report,
+                adapter.as_ref(),
+                &session,
+                &transcript,
+                &prior_usage,
+                execution_model.as_deref(),
+                execution_started,
+            );
             session_guard.release();
             return Ok(exhausted_code);
         };
@@ -1699,6 +1819,15 @@ pub(crate) fn run_with_clock<W: Write>(
                 w,
                 "zirv ctx exec: {reason} after {restarts} restarts, giving up with exit {exhausted_code}"
             )?;
+            record_execution_segment(
+                report,
+                adapter.as_ref(),
+                &session,
+                &transcript,
+                &prior_usage,
+                execution_model.as_deref(),
+                execution_started,
+            );
             session_guard.release();
             return Ok(exhausted_code);
         }
@@ -1752,17 +1881,14 @@ pub(crate) fn run_with_clock<W: Write>(
             "zirv ctx exec: {reason} detected, restarting ({restarts}/{max_restarts}) with a {source} handoff"
         )?;
 
-        // Issue #169.2: harvest the outgoing child's own spend before its
-        // transcript is superseded, so a rot/timeout restart never resets
-        // the budget meter.
-        if has_budget {
-            harvest_spend(
-                adapter.as_ref(),
-                &transcript,
-                &mut prior_usage,
-                &mut prior_tool_calls,
-            );
-        }
+        // Harvest before superseding the transcript so both accounting and
+        // any configured whole-run budget include this rot/timeout child.
+        harvest_spend(
+            adapter.as_ref(),
+            &transcript,
+            &mut prior_usage,
+            &mut prior_tool_calls,
+        );
         session = SessionId::new_v4();
         session_guard.refresh_session(session.as_str());
         // The new session writes somewhere new, so the next iteration's watcher
@@ -1831,6 +1957,27 @@ pub(crate) fn run_with_clock<W: Write>(
 /// flushed its first line. Shared by [`evaluate_worker_budget`] and
 /// [`harvest_spend`] (issue #169.2), so the two can never drift on how one
 /// transcript's own spend is computed.
+fn record_execution_segment(
+    report: &mut ExecutionReport,
+    adapter: &dyn adapters::AgentAdapter,
+    session: &SessionId,
+    transcript: &Path,
+    prior_usage: &TranscriptUsage,
+    model: Option<&str>,
+    started: Instant,
+) {
+    let current = read_transcript_spend(adapter, transcript)
+        .map(|(usage, _)| usage)
+        .unwrap_or_default();
+    report.segments.push(ExecutionSegment {
+        session: session.as_str().to_string(),
+        agent: adapter.name().to_string(),
+        model: model.map(str::to_string),
+        usage: add_usage(prior_usage, &current),
+        wall_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+    });
+}
+
 fn read_transcript_spend(
     adapter: &dyn adapters::AgentAdapter,
     transcript: &Path,
@@ -2854,6 +3001,52 @@ mod tests {
         );
     }
 
+    /// The "restarts >= max_restarts" give-up exit used to return without
+    /// ever calling `record_execution_segment`, silently dropping the
+    /// harvested spend for the child that just rotted from `ExecutionReport`.
+    /// `max_restarts: 0` means give-up fires on the very first rot, so
+    /// exactly one child ran and exactly one segment must be recorded for it.
+    #[test]
+    fn an_exhausted_restart_budget_still_records_its_final_segment() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let session = "33333333-3333-4333-8444-555555555555";
+        let env = base_env(&tmp.path().join("state"));
+
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        unsafe {
+            std::env::set_var("FAKE_AGENT_MODE", "rot");
+            std::env::set_var("FAKE_AGENT_SLEEP", "30");
+        }
+        let args = ExecArgs {
+            agent: Some("claude".to_string()),
+            session_id: Some(session.to_string()),
+            transcript: Some(transcript_for(&home, tmp.path(), session)),
+            prompt: Some("do the work".to_string()),
+            max_restarts: Some(0),
+            budget_tokens: None,
+            max_tool_calls: None,
+            timeout_secs: Some(60),
+            simple: false,
+            command: fake_agent_command(session),
+        };
+        let mut out = Vec::new();
+        let result = run_with_report(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE");
+            std::env::remove_var("FAKE_AGENT_SLEEP");
+        }
+
+        let (code, report) = result.expect("runs");
+        assert_eq!(code, EXIT_ROT_EXHAUSTED);
+        assert_eq!(
+            report.segments.len(),
+            1,
+            "the rotted child's spend must still be recorded before giving up: {:?}",
+            report.segments
+        );
+    }
+
     fn walk_md(dir: &std::path::Path) -> Vec<PathBuf> {
         let mut found = Vec::new();
         let Ok(entries) = std::fs::read_dir(dir) else {
@@ -2991,6 +3184,57 @@ mod tests {
         assert!(
             text.contains("cannot restart"),
             "say why supervision stood down: {text}"
+        );
+    }
+
+    /// Same "no prompt to restart with" exit as
+    /// `a_run_with_no_discoverable_prompt_refuses_to_restart`, but through
+    /// `run_with_report`: exactly one child ever ran, so the accounting
+    /// caller (`agent.rs`'s `append_execution_segments`) must see exactly one
+    /// segment. Two identical `record_execution_segment` calls on this exit
+    /// path used to double it, double-summing cost and writing the
+    /// delegation log entry twice.
+    #[test]
+    fn the_no_prompt_exit_records_exactly_one_execution_segment() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let session = "44444444-3333-4333-8444-555555555555";
+        let env = base_env(&tmp.path().join("state"));
+
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        unsafe {
+            std::env::set_var("FAKE_AGENT_MODE", "rot");
+            // Keep the child alive past the first scoring tick so rot is seen.
+            std::env::set_var("FAKE_AGENT_SLEEP", "30");
+        }
+        let mut command = fake_agent_command(session);
+        command.retain(|a| a != "-p" && a != "do the work");
+        let args = ExecArgs {
+            agent: Some("claude".to_string()),
+            session_id: Some(session.to_string()),
+            transcript: Some(transcript_for(&home, tmp.path(), session)),
+            prompt: None,
+            max_restarts: Some(2),
+            budget_tokens: None,
+            max_tool_calls: None,
+            timeout_secs: Some(60),
+            simple: false,
+            command,
+        };
+        let mut out = Vec::new();
+        let result = run_with_report(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE");
+            std::env::remove_var("FAKE_AGENT_SLEEP");
+        }
+
+        let (code, report) = result.expect("runs");
+        assert_eq!(code, EXIT_ROT_EXHAUSTED);
+        assert_eq!(
+            report.segments.len(),
+            1,
+            "exactly one child ran, so exactly one segment must be recorded: {:?}",
+            report.segments
         );
     }
 

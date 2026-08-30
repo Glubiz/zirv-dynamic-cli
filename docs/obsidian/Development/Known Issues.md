@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-28
+last-verified: 2026-08-29
 ---
 
 # Known Issues
@@ -14,6 +14,7 @@ Each entry gets a changelog comment at the top of the file, newest first:
 <!-- Updated YYYY-MM-DD (branch, state): what changed -->
 ```
 
+<!-- Updated 2026-08-29 (release/187-ai-native-sdlc, PR #200 review round): recorded the pre-existing over-budget mid-poll exit-code clobber flake (issue #203) surfaced while diffing the full-suite failure list against baseline -->
 <!-- Updated 2026-08-28 (release/2.35.0 closeout, issues #176/#177/#178): recorded a pre-existing `zirv context sync --report` discrepancy discovered while regenerating managed context for the release -- `--report` claimed no differences against a tree `--generate` immediately afterward found a real diff for; out of this branch's scope, not investigated further -->
 <!-- Updated 2026-08-27 (release/2.32.0, PR #171 review round, issue #155): recorded that a delegated worker's token/tool-call budget resets to zero on a rot restart or nudge relaunch instead of carrying the exhausted spend forward (tracked as issue #169) -->
 <!-- Updated 2026-08-26 (fix/145-146-dash-discovery-pane-send, issues #145/#146, v2.30.1): resolved "no sessions are registered" despite live sessions -- sessions::is_alive was EPERM-blind (any kill(pid, 0) failure read as dead, conflating "no such process" with "exists, no permission to signal"), sweeping every session a sandboxed caller couldn't signal as stale; also added a dash-discovery fallback so a stale/dead inherited DASH_REQUESTS_ENV no longer strands a delegated agent headless when another dashboard is live. Recorded a new residual below: pid recycling can keep a stale session/dashboard record alive with no start-time disambiguator -->
@@ -66,6 +67,10 @@ Each entry gets a changelog comment at the top of the file, newest first:
 <!-- Updated 2026-08-13 (feat/dashboard, docs sweep): dashboard panes carry no rot score yet -->
 <!-- Updated 2026-08-13 (feat/agent-coordination, review round): markdown header absorption; registry short is a stable address; supervision env scrubbed on every spawn -->
 <!-- Updated 2026-08-13 (feat/agent-coordination, console-safety round): portable-pty do_kill inversion; ConPTY control-byte broadcast; empty nudge prefixes -->
+
+## An over-budget mid-poll kill can clobber a child's real exit code (flaky test)
+
+`commands::ctx::exec::tests::a_failed_exit_with_an_over_budget_transcript_keeps_its_failure_code` fails roughly 1-in-3 runs on a loaded machine with `left: 77, right: 3`: `evaluate_worker_budget`'s mid-poll `HardStop` check can kill a child that was already exiting with its own failure code, so `EXIT_BUDGET_EXHAUSTED` overwrites the real code. Pre-existing on `main` (introduced with `44f3735`), verified by stash-isolation during the PR #200 review round — do not chase it as a branch regression. Tracked as issue #203; suggested fix is the `limit_hit`-style final drain before honoring the kill.
 
 ## `zirv context sync --report` under-reports drift that `--generate` actually finds
 

@@ -509,9 +509,14 @@ pub fn run_with<W: Write>(
                     } else {
                         "full"
                     };
+                    let readiness = if adapters::select(Some(name), &[], cfg).is_ok() {
+                        "ready"
+                    } else {
+                        "unavailable"
+                    };
                     writeln!(
                         w,
-                        "  fallback {name}: {} / {capacity} / {headroom}",
+                        "  fallback {name}: {} / {readiness} / {capacity} / {headroom}",
                         if cfg.agents.is_enabled(name) {
                             "enabled"
                         } else {

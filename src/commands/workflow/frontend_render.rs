@@ -1157,7 +1157,7 @@ fn launch_visual_reviewer(
     model: Option<&str>,
     prompt: String,
 ) -> CtxResult<String> {
-    let mut argv = super::review::reviewer_argv(agent)?;
+    let mut argv = super::review::reviewer_argv(agent, repo, true)?;
     let separator = argv
         .iter()
         .position(|argument| argument == "--")

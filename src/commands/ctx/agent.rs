@@ -378,7 +378,7 @@ fn flags_pin_model(flags: &[String]) -> bool {
 /// flag may mean something different (or be invalid) on codex and vice versa.
 /// Empty passthrough is safe, and a model-only passthrough can be replaced by
 /// the verified equivalent tier. Anything else declines automatic routing.
-fn translated_route_flags(
+pub(crate) fn translated_route_flags(
     flags: &[String],
     target: &dyn AgentAdapter,
     target_model: &str,
@@ -934,18 +934,14 @@ pub fn run_with<W: Write>(
         tool_calls: args.max_tool_calls,
     };
 
-    let route = super::fallback::route_new_delegation(
-        &state,
-        &cfg,
-        super::fallback::RouteRequest {
-            requested: &args.name,
-            source_model: requested_model,
-            source_model_explicit,
-            bounds,
-            now,
-        },
-        args.force,
-    );
+    let route_request = super::fallback::RouteRequest {
+        requested: &args.name,
+        source_model: requested_model,
+        source_model_explicit,
+        bounds,
+        now,
+    };
+    let route = super::fallback::route_new_delegation(&state, &cfg, route_request, args.force);
     let mut routed_args = args.clone();
     let mut route_applied = None;
     if let Some(route) = route
@@ -974,17 +970,42 @@ pub fn run_with<W: Write>(
         route_applied = Some(route);
     }
 
+    // If no harness can run immediately, select the admissible seat whose
+    // hard gate clears first. A deferred cross-harness choice still obeys the
+    // same argv portability rule as an immediate reroute; if vendor-specific
+    // flags cannot be translated, waiting stays on the requested harness.
+    let mut deferred_reset = None;
+    if route_applied.is_none()
+        && !args.force
+        && let Some(choice) =
+            super::fallback::earliest_reset_choice(&state, &cfg, route_request, &[])
+    {
+        if choice.is_cross_harness() {
+            if let Some(model) = choice.model.as_deref()
+                && let Ok(target_adapter) = adapters::select(Some(&choice.selected), &[], &cfg)
+                && let Some(flags) =
+                    translated_route_flags(&args.flags, target_adapter.as_ref(), model)
+            {
+                routed_args.name = choice.selected.clone();
+                routed_args.flags = flags;
+                deferred_reset = Some(choice);
+            }
+        } else {
+            deferred_reset = Some(choice);
+        }
+    }
+
     // The ordinary spawn gate still owns the final decision for whichever
-    // harness will actually launch. If cross-harness translation was unsafe
-    // (for example vendor-specific passthrough flags), this is the requested
-    // harness and today's refusal behavior remains intact.
+    // harness will actually launch. A deferred reset is the one exception:
+    // the headless exec pacing gate below will wait until that exact seat is
+    // usable rather than treating the hard gate as a permanent refusal.
     let provider = adapters::provider_for_agent_name(Some(&routed_args.name));
     let (collector, estimator) = pace::current_windows(&state, &cfg.pace, now, provider);
     let gate = pace::spawn_gate(&collector, estimator.as_ref(), now, &cfg.pace);
     if let Some(note) = pace::describe_spawn_gate(&gate) {
         eprintln!("zirv ctx agent: {note}");
     }
-    if spawn_blocked(&gate, args.force) {
+    if spawn_blocked(&gate, args.force) && deferred_reset.is_none() {
         let fallback_note = if route_applied.is_none() && cfg.fallback.enabled {
             " No admissible fallback harness had enough trusted/assumed headroom."
         } else {
@@ -995,6 +1016,24 @@ pub fn run_with<W: Write>(
              reset, or pass --force to spend anyway.{fallback_note}"
         )
         .into());
+    }
+    if let Some(choice) = deferred_reset.as_ref() {
+        let detail = choice.detail();
+        let parent_session =
+            super::mail::session_identity(env).unwrap_or_else(|| "delegation".to_string());
+        let _ = super::log::append(
+            &state,
+            &super::log::Decision {
+                ts: now,
+                session: &parent_session,
+                verb: "agent",
+                verdict: "wait",
+                score: 0,
+                action: "harness-reset-wait",
+                detail: &detail,
+            },
+        );
+        eprintln!("zirv ctx agent: {detail}; pacing until that seat is available");
     }
 
     // Issue #170: resolved once, here, before the dashboard-join fork below,
@@ -1019,15 +1058,17 @@ pub fn run_with<W: Write>(
         }
     };
 
-    if let Some(result) = try_join_dashboard(
-        args,
-        &prompt,
-        w,
-        repo,
-        env,
-        DASH_ACK_TIMEOUT,
-        DASH_CLAIM_EXTENSION,
-    ) {
+    if deferred_reset.is_none()
+        && let Some(result) = try_join_dashboard(
+            args,
+            &prompt,
+            w,
+            repo,
+            env,
+            DASH_ACK_TIMEOUT,
+            DASH_CLAIM_EXTENSION,
+        )
+    {
         // Finding 4: the dashboard answered definitively, and only `Ok(0)`
         // (`answer_for_ack`'s spawned-a-pane arm) means work actually
         // started. A refusal spawned nothing, so a group minted for it
@@ -1131,8 +1172,8 @@ pub fn run_with<W: Write>(
     // permanently burn the group's admission slot for a child that never
     // ran. `state` is the same handle resolved above for the spawn gate,
     // unused since; reused here rather than re-resolved.
-    let code = match exec::run_with(&exec_args, w, repo, &env) {
-        Ok(code) => code,
+    let (code, execution_report) = match exec::run_with_report(&exec_args, w, repo, &env) {
+        Ok(result) => result,
         Err(e) => {
             if let Some(id) = &args.group {
                 super::group::rollback_admission(&state, id);
@@ -1171,51 +1212,47 @@ pub fn run_with<W: Write>(
     }
 
     // Best effort throughout: a delegation that ran must never fail because
-    // its accounting could not be written (issue #155, Phase 2).
+    // its accounting could not be written (issue #155, Phase 2). Issue #186
+    // hardening: exec now reports every vendor-backed segment of one logical
+    // delegation, so a cross-harness continuation is neither charged to the
+    // wrong agent nor omitted from the cost tree.
     if let Ok(state_dir) = super::state::StateDir::resolve(&env) {
-        let usage = std::fs::read_to_string(adapter.transcript_path(&super::event::SessionRef {
-            id: SessionId::parse(&worker_session),
-            cwd: repo.to_path_buf(),
-        }))
-        .ok()
-        .and_then(|body| adapter.transcript_usage(&body))
-        .unwrap_or_default();
         let parent_session = super::mail::session_identity(&env).unwrap_or_default();
         let outcome = delegation_outcome(code);
-        let detail = format!(
-            "{} ({}): {} in / {} cache-creation / {} cache-read / {} out in {}ms -- {}",
-            args.name,
-            model.as_deref().unwrap_or("default worker model"),
-            usage.input_tokens,
-            usage.cache_creation_input_tokens,
-            usage.cache_read_input_tokens,
-            usage.output_tokens,
-            wall_ms,
+        let total = append_execution_segments(
+            &state_dir,
+            &execution_report,
+            &parent_session,
+            args.group.as_deref(),
+            code,
             outcome,
         );
-        let _ = super::log::append_delegation(
-            &state_dir,
-            &super::log::Delegation {
-                ts: super::state::now_secs(),
-                session: &worker_session,
-                parent_session: &parent_session,
-                // Issue #155 review finding D2: this used to be hardcoded
-                // `None`, so a completed headless delegation never recorded
-                // the group it actually ran under -- `zirv ctx status`'s
-                // group tree (`status::group_tree_lines`) renders every such
-                // delegation as ungrouped even though `--group` traveled all
-                // the way through `resolve_worker_budget` above.
-                work_group_id: args.group.as_deref(),
-                agent: &args.name,
-                model: model.as_deref(),
-                input_tokens: usage.input_tokens,
-                cache_creation_input_tokens: usage.cache_creation_input_tokens,
-                cache_read_input_tokens: usage.cache_read_input_tokens,
-                output_tokens: usage.output_tokens,
-                wall_ms,
-                exit_code: code,
-                outcome,
-            },
+        let route: Vec<String> = execution_report
+            .segments
+            .iter()
+            .map(|segment| match segment.model.as_deref() {
+                Some(model) => format!("{} ({model})", segment.agent),
+                None => format!("{} (default model)", segment.agent),
+            })
+            .collect();
+
+        let route = if route.is_empty() {
+            format!(
+                "{} ({})",
+                args.name,
+                model.as_deref().unwrap_or("default worker model")
+            )
+        } else {
+            route.join(" -> ")
+        };
+        let detail = format!(
+            "{route}: {} in / {} cache-creation / {} cache-read / {} out in {}ms -- {}",
+            total.input_tokens,
+            total.cache_creation_input_tokens,
+            total.cache_read_input_tokens,
+            total.output_tokens,
+            wall_ms,
+            outcome,
         );
         let _ = super::log::append(
             &state_dir,
@@ -1232,6 +1269,50 @@ pub fn run_with<W: Write>(
     }
 
     Ok(code)
+}
+
+fn append_execution_segments(
+    state: &super::state::StateDir,
+    report: &exec::ExecutionReport,
+    parent_session: &str,
+    work_group_id: Option<&str>,
+    exit_code: i32,
+    outcome: &'static str,
+) -> TranscriptUsage {
+    let mut total = TranscriptUsage::default();
+    for segment in &report.segments {
+        total.input_tokens = total
+            .input_tokens
+            .saturating_add(segment.usage.input_tokens);
+        total.cache_creation_input_tokens = total
+            .cache_creation_input_tokens
+            .saturating_add(segment.usage.cache_creation_input_tokens);
+        total.cache_read_input_tokens = total
+            .cache_read_input_tokens
+            .saturating_add(segment.usage.cache_read_input_tokens);
+        total.output_tokens = total
+            .output_tokens
+            .saturating_add(segment.usage.output_tokens);
+        let _ = super::log::append_delegation(
+            state,
+            &super::log::Delegation {
+                ts: super::state::now_secs(),
+                session: &segment.session,
+                parent_session,
+                work_group_id,
+                agent: &segment.agent,
+                model: segment.model.as_deref(),
+                input_tokens: segment.usage.input_tokens,
+                cache_creation_input_tokens: segment.usage.cache_creation_input_tokens,
+                cache_read_input_tokens: segment.usage.cache_read_input_tokens,
+                output_tokens: segment.usage.output_tokens,
+                wall_ms: segment.wall_ms,
+                exit_code,
+                outcome,
+            },
+        );
+    }
+    total
 }
 
 pub fn run<W: Write>(args: &AgentArgs, w: &mut W) -> CtxResult<i32> {
@@ -2318,6 +2399,52 @@ mod tests {
             0,
             "--quiet must not change the outcome"
         );
+    }
+
+    #[test]
+    fn cross_harness_execution_segments_are_both_persisted_and_summed() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = crate::commands::ctx::state::StateDir::from_root(tmp.path().join("state"));
+        let report = exec::ExecutionReport {
+            segments: vec![
+                exec::ExecutionSegment {
+                    session: "aaaaaaaa-1111-4111-8111-111111111111".to_string(),
+                    agent: "claude".to_string(),
+                    model: Some("sonnet".to_string()),
+                    usage: TranscriptUsage {
+                        input_tokens: 10,
+                        cache_creation_input_tokens: 20,
+                        cache_read_input_tokens: 30,
+                        output_tokens: 40,
+                    },
+                    wall_ms: 100,
+                },
+                exec::ExecutionSegment {
+                    session: "bbbbbbbb-2222-4222-8222-222222222222".to_string(),
+                    agent: "codex".to_string(),
+                    model: Some("gpt-5.6-terra".to_string()),
+                    usage: TranscriptUsage {
+                        input_tokens: 1,
+                        cache_creation_input_tokens: 2,
+                        cache_read_input_tokens: 3,
+                        output_tokens: 4,
+                    },
+                    wall_ms: 200,
+                },
+            ],
+        };
+
+        let total = append_execution_segments(&state, &report, "parent", Some("wg-1"), 0, "ok");
+        assert_eq!(total.input_tokens, 11);
+        assert_eq!(total.cache_creation_input_tokens, 22);
+        assert_eq!(total.cache_read_input_tokens, 33);
+        assert_eq!(total.output_tokens, 44);
+
+        let rows = crate::commands::ctx::log::tail_delegations(&state, 10).expect("rows");
+        assert_eq!(rows.len(), 2, "both vendor segments must be visible");
+        assert!(rows.iter().any(|row| row.contains("\"agent\":\"claude\"")));
+        assert!(rows.iter().any(|row| row.contains("\"agent\":\"codex\"")));
+        assert!(rows.iter().any(|row| row.contains("gpt-5.6-terra")));
     }
 
     /// Issue #155, Phase 2: the end-to-end write, against a real

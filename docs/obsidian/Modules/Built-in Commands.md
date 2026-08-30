@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-28
+last-verified: 2026-08-29
 ---
 
 # Built-in Commands
@@ -83,6 +83,10 @@ An interactive `apply` run (real terminal on both stdin and stdout, not `--dry-r
 - `restore --list [--provider P] [--scope S] [--json]` — enumerates runs across both the repo-scoped and home-scoped `ai-reset` roots: id, human-readable timestamp, provider/scope/kind, file count, and a `status` of `absent`/`identical`/`differs`/`mixed`, computed by comparing each target's current on-disk state against its backup copy (`target_state`/`aggregate_state`) — `differs` means restoring would overwrite content that has since changed.
 - `restore <id> [--dry-run] [--yes] [--include-auth]` — restores one run. Mirrors `reset`'s safety contract: refuses without `--dry-run`/`--yes`, validates every backup source and current destination for symlinks *before* writing anything (fail-closed, same order as `reset`), never restores a target under an auth filename (`.credentials.json`, `auth.json`) unless `--include-auth` is passed at restore time (independent of whether it was passed at backup time), and refuses a manifest whose `schema_version` isn't `SUPPORTED_MANIFEST_SCHEMA_VERSION`, naming the version. **Before writing anything it takes its own backup of the current state** (`kind: "restore"`, written into the same root the restored run came from) — so a restore is itself undoable via another `restore`. A restore that only partially completes (some target writes fail) reports every path it wrote and every path it didn't, rather than failing silently half-applied.
 - `restore --latest [--provider P] [--scope S]` — resolves the most recent matching run instead of naming an id.
+
+### AI-native workflow lifecycle
+
+The top-level `workflow` tree now includes committed work-product inspection, provider-neutral agent inspection, PR-aware review, and the invoked maintain scanner. Key lifecycle verbs are `zirv workflow artifacts <id>`, `zirv workflow agents list|show|dispatch`, `zirv workflow review package|run|ingest-pr-comments`, and `zirv workflow maintain scan`. `workflow agents dispatch <id> --adapter <name> --prompt <task> [--model <provider-id>]` is the explicit provider-neutral seat execution surface; the manifest remains methodology, while effective canonical policy and the adapter enforce authority. The maintain verb is intentionally nested under `workflow`: it re-enters the same durable state machine at the Intent gate rather than creating a separate maintenance engine.
 
 ### `report` (`commands/report.rs`)
 
