@@ -1,5 +1,6 @@
 use std::{fs, io::Write, path::Path, path::PathBuf};
 
+use crate::style::{self, Tone};
 use crate::utils::{
     SCRIPT_DIR_NAME, SUPPORTED_EXTENSIONS, Shortcuts, home_dir, is_reserved_command,
     is_reserved_zirv_file, parse_script_content,
@@ -10,7 +11,24 @@ use crate::utils::{
 /// before ever looking at `.zirv/`, so that name can never be invoked.
 const SHADOWED_NOTE: &str = "  (shadowed by a built-in command, unreachable)";
 
-fn write_scripts<W: Write>(writer: &mut W, dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
+/// Bold section-header line (blank line, then the title painted bold) --
+/// the same shape `status.rs`/`context_status.rs` use for their own section
+/// headers (issue #202: one visual language everywhere).
+fn header(colour: bool, title: &str) -> String {
+    format!("\n{}", style::paint(title, Tone::Emphasis, colour))
+}
+
+/// Bold inline field label (e.g. `Name:`, `Description:`) -- no leading
+/// blank line.
+fn label(colour: bool, title: &str) -> String {
+    style::paint(title, Tone::Emphasis, colour)
+}
+
+fn write_scripts<W: Write>(
+    writer: &mut W,
+    dir: &Path,
+    colour: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
@@ -29,20 +47,30 @@ fn write_scripts<W: Write>(writer: &mut W, dir: &Path) -> Result<(), Box<dyn std
             let file_name = path.file_name().unwrap().to_string_lossy();
             let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
             let shadowed = if is_reserved_command(stem) {
-                SHADOWED_NOTE
+                style::paint(SHADOWED_NOTE, Tone::Warn, colour)
             } else {
-                ""
+                String::new()
             };
             writeln!(writer, "-------------------------------------------------")?;
-            writeln!(writer, "File: {file_name}{shadowed}")?;
-            writeln!(writer, "  Name: {}", script.name)?;
+            writeln!(
+                writer,
+                "{} {}{shadowed}",
+                label(colour, "File:"),
+                style::paint(&file_name, Tone::Accent, colour)
+            )?;
+            writeln!(writer, "  {} {}", label(colour, "Name:"), script.name)?;
             if let Some(desc) = script.description {
-                writeln!(writer, "  Description: {desc}")?;
+                writeln!(
+                    writer,
+                    "  {} {}",
+                    label(colour, "Description:"),
+                    style::paint(&desc, Tone::Muted, colour)
+                )?;
             }
             if let Some(params) = &script.params {
-                writeln!(writer, "  Required Parameters:")?;
+                writeln!(writer, "  {}", label(colour, "Required Parameters:"))?;
                 for param in params {
-                    writeln!(writer, "    {param}")?;
+                    writeln!(writer, "    {}", style::paint(param, Tone::Muted, colour))?;
                 }
             }
         }
@@ -51,18 +79,73 @@ fn write_scripts<W: Write>(writer: &mut W, dir: &Path) -> Result<(), Box<dyn std
     Ok(())
 }
 
-fn write_shortcuts<W: Write>(writer: &mut W, dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
+fn write_shortcuts<W: Write>(
+    writer: &mut W,
+    dir: &Path,
+    colour: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let shortcuts_path = dir.join(".shortcuts.yaml");
     if shortcuts_path.exists() {
         let content = fs::read_to_string(shortcuts_path)?;
         let shortcuts: Shortcuts = serde_yaml_ng::from_str(&content)?;
         for (key, value) in shortcuts.shortcuts {
             let shadowed = if is_reserved_command(&key) {
-                SHADOWED_NOTE
+                style::paint(SHADOWED_NOTE, Tone::Warn, colour)
             } else {
-                ""
+                String::new()
             };
-            writeln!(writer, "  {key} -> {value}{shadowed}")?;
+            writeln!(
+                writer,
+                "  {} -> {}{shadowed}",
+                style::paint(&key, Tone::Accent, colour),
+                style::paint(&value, Tone::Muted, colour)
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// One row of a name/description table: `desc` may span more than one line
+/// (e.g. `ctx`'s verb list), in which case every line after the first is
+/// printed indented under the description column, with no name of its own.
+struct Row {
+    name: &'static str,
+    desc: &'static [&'static str],
+}
+
+/// Prints `rows` as a name/description table: names painted `Tone::Accent`,
+/// descriptions `Tone::Muted`, names padded (by display width, so a
+/// wide-character name would still line up) to the width of the widest name
+/// in the table -- "aligned columns" per issue #202's design, rather than
+/// the hand-typed, inconsistently-aligned spacing this replaced.
+fn write_table<W: Write>(
+    writer: &mut W,
+    rows: &[Row],
+    colour: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let name_width = rows
+        .iter()
+        .map(|row| style::display_width(row.name))
+        .max()
+        .unwrap_or(0);
+    for row in rows {
+        let pad = " ".repeat(name_width.saturating_sub(style::display_width(row.name)));
+        for (i, line) in row.desc.iter().enumerate() {
+            if i == 0 {
+                writeln!(
+                    writer,
+                    "  {}{pad}  {}",
+                    style::paint(row.name, Tone::Accent, colour),
+                    style::paint(line, Tone::Muted, colour)
+                )?;
+            } else {
+                writeln!(
+                    writer,
+                    "  {}  {}",
+                    " ".repeat(name_width),
+                    style::paint(line, Tone::Muted, colour)
+                )?;
+            }
         }
     }
     Ok(())
@@ -73,7 +156,10 @@ fn write_shortcuts<W: Write>(writer: &mut W, dir: &Path) -> Result<(), Box<dyn s
 /// generated help away, and what replaced it printed nothing at all in a
 /// directory with no scripts -- so the flags it documents were discoverable
 /// from no help output anywhere.
-fn write_builtins<W: Write>(writer: &mut W) -> Result<(), Box<dyn std::error::Error>> {
+fn write_builtins<W: Write>(
+    writer: &mut W,
+    colour: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     writeln!(writer, "zirv {}\n", env!("CARGO_PKG_VERSION"))?;
     writeln!(
         writer,
@@ -93,118 +179,172 @@ fn write_builtins<W: Write>(writer: &mut W) -> Result<(), Box<dyn std::error::Er
     )?;
     writeln!(
         writer,
-        "been configured, a guided setup wizard runs first -- see `zirv setup`.\n"
+        "been configured, a guided setup wizard runs first -- see `zirv setup`."
     )?;
-    writeln!(writer, "Commands:")?;
-    writeln!(writer, "  help, h        Show this help")?;
-    writeln!(writer, "  version, v     Print the version")?;
-    writeln!(writer, "  init, i        Create a .zirv directory here")?;
-    writeln!(writer, "  create, c      Create a new script")?;
-    writeln!(
+    writeln!(writer, "{}", header(colour, "Commands:"))?;
+    write_table(
         writer,
-        "  report         File a Zirv bug or feature request on GitHub"
+        &[
+            Row {
+                name: "help, h",
+                desc: &["Show this help"],
+            },
+            Row {
+                name: "version, v",
+                desc: &["Print the version"],
+            },
+            Row {
+                name: "init, i",
+                desc: &["Create a .zirv directory here"],
+            },
+            Row {
+                name: "create, c",
+                desc: &["Create a new script"],
+            },
+            Row {
+                name: "report",
+                desc: &["File a Zirv bug or feature request on GitHub"],
+            },
+            Row {
+                name: "setup",
+                desc: &["Configure AI context, memory, hooks, migration, and safe resets"],
+            },
+            Row {
+                name: "skill",
+                desc: &["Inspect model-agnostic engineering skills"],
+            },
+            Row {
+                name: "workflow",
+                desc: &["Run and inspect development workflows"],
+            },
+            Row {
+                name: "test",
+                desc: &["Run repository-aware verification checks"],
+            },
+            Row {
+                name: "verify",
+                desc: &["Run final repository verification"],
+            },
+            Row {
+                name: "artifact",
+                desc: &["Register and inspect workflow artifacts"],
+            },
+            Row {
+                name: "frontend",
+                desc: &["Inspect autonomous frontend quality state"],
+            },
+            Row {
+                name: "ctx",
+                desc: &[
+                    "Context management (score, loop, exec, wrap, handoff, resume,",
+                    "hook, status, usage, optimize, chat, agent, send, inbox)",
+                ],
+            },
+            Row {
+                name: "memory",
+                desc: &[
+                    "Manage the memory bank without an AI session (init, status, list, recall,",
+                    "remember, forget, verify)",
+                ],
+            },
+            Row {
+                name: "chat",
+                desc: &["Alias for `zirv ctx chat`: start an interactive orchestrator session"],
+            },
+            Row {
+                name: "agent <name> <prompt>",
+                desc: &["Alias for `zirv ctx agent`: delegate one task to another harness"],
+            },
+        ],
+        colour,
     )?;
-    writeln!(
+    writeln!(writer, "{}", header(colour, "Options:"))?;
+    write_table(
         writer,
-        "  setup          Configure AI context, memory, hooks, migration, and safe resets"
+        &[
+            Row {
+                name: "--dry-run",
+                desc: &["Print each step instead of running it"],
+            },
+            Row {
+                name: "-h, --help",
+                desc: &["Show this help"],
+            },
+        ],
+        colour,
     )?;
-    writeln!(
+    writeln!(writer, "{}", header(colour, "create only:"))?;
+    write_table(
         writer,
-        "  skill          Inspect model-agnostic engineering skills"
-    )?;
-    writeln!(
-        writer,
-        "  workflow       Run and inspect development workflows"
-    )?;
-    writeln!(
-        writer,
-        "  test           Run repository-aware verification checks"
-    )?;
-    writeln!(writer, "  verify         Run final repository verification")?;
-    writeln!(
-        writer,
-        "  artifact       Register and inspect workflow artifacts"
-    )?;
-    writeln!(
-        writer,
-        "  frontend       Inspect autonomous frontend quality state"
-    )?;
-    writeln!(
-        writer,
-        "  ctx            Context management (score, loop, exec, wrap, handoff, resume,"
-    )?;
-    writeln!(
-        writer,
-        "                 hook, status, usage, optimize, chat, agent, send, inbox)"
-    )?;
-    writeln!(
-        writer,
-        "  memory         Manage the memory bank without an AI session (init, status, list, recall,"
-    )?;
-    writeln!(writer, "                 remember, forget, verify)")?;
-    writeln!(
-        writer,
-        "  chat           Alias for `zirv ctx chat`: start an interactive orchestrator session"
-    )?;
-    writeln!(
-        writer,
-        "  agent <name> <prompt>  Alias for `zirv ctx agent`: delegate one task to another harness"
-    )?;
-    writeln!(writer, "\nOptions:")?;
-    writeln!(
-        writer,
-        "  --dry-run      Print each step instead of running it"
-    )?;
-    writeln!(writer, "  -h, --help     Show this help")?;
-    writeln!(writer, "\ncreate only:")?;
-    writeln!(
-        writer,
-        "  --name <NAME>  Script name; skips the interactive prompt"
-    )?;
-    writeln!(writer, "  --shortcut <K> Shortcut key; skips the prompt")?;
-    writeln!(
-        writer,
-        "  --global [b]   Create in ~/.zirv (bare means true)"
+        &[
+            Row {
+                name: "--name <NAME>",
+                desc: &["Script name; skips the interactive prompt"],
+            },
+            Row {
+                name: "--shortcut <K>",
+                desc: &["Shortcut key; skips the prompt"],
+            },
+            Row {
+                name: "--global [b]",
+                desc: &["Create in ~/.zirv (bare means true)"],
+            },
+        ],
+        colour,
     )?;
     Ok(())
 }
 
-pub fn show_help<W: Write>(writer: &mut W) -> Result<(), Box<dyn std::error::Error>> {
+pub fn show_help<W: Write>(writer: &mut W, colour: bool) -> Result<(), Box<dyn std::error::Error>> {
     let base_dir = PathBuf::from(SCRIPT_DIR_NAME);
 
-    write_builtins(writer)?;
+    write_builtins(writer, colour)?;
 
     if base_dir.exists() {
-        writeln!(writer, "\nAvailable Scripts:")?;
-        write_scripts(writer, &base_dir)?;
+        writeln!(writer, "{}", header(colour, "Available Scripts:"))?;
+        write_scripts(writer, &base_dir, colour)?;
 
         let shortcuts_path = base_dir.join(".shortcuts.yaml");
         if shortcuts_path.exists() {
-            writeln!(writer, "\nAvailable Shortcuts:")?;
-            write_shortcuts(writer, &base_dir)?;
+            writeln!(writer, "{}", header(colour, "Available Shortcuts:"))?;
+            write_shortcuts(writer, &base_dir, colour)?;
         }
     }
 
     let root = home_dir()?.join(SCRIPT_DIR_NAME);
 
     if root.exists() {
-        writeln!(writer, "\nGlobal Base Scripts:")?;
+        writeln!(writer, "{}", header(colour, "Global Base Scripts:"))?;
         writeln!(
             writer,
-            "Global scripts are overwritten by above mentioned scripts if they share name."
+            "{}",
+            style::paint(
+                "Global scripts are overwritten by above mentioned scripts if they share name.",
+                Tone::Muted,
+                colour
+            )
         )?;
-        writeln!(writer, "Home Directory: {root:?}")?;
-        write_scripts(writer, &root)?;
+        writeln!(
+            writer,
+            "{}",
+            style::paint(&format!("Home Directory: {root:?}"), Tone::Muted, colour)
+        )?;
+        write_scripts(writer, &root, colour)?;
 
         let shortcuts_path = root.join(".shortcuts.yaml");
         if shortcuts_path.exists() {
-            writeln!(writer, "\nGlobal Shortcuts:")?;
-            write_shortcuts(writer, &root)?;
+            writeln!(writer, "{}", header(colour, "Global Shortcuts:"))?;
+            write_shortcuts(writer, &root, colour)?;
         }
     } else {
         writeln!(
             writer,
-            "No scripts found. Please create a .zirv directory in {root:?}."
+            "{}",
+            style::paint(
+                &format!("No scripts found. Please create a .zirv directory in {root:?}."),
+                Tone::Muted,
+                colour
+            )
         )?;
     }
 
@@ -237,7 +377,7 @@ mod tests {
         let _guard = crate::commands::ctx::testenv::EnvGuard::set(home.path(), Some(empty.path()));
 
         let mut out = Cursor::new(Vec::new());
-        show_help(&mut out)?;
+        show_help(&mut out, false)?;
         let text = String::from_utf8(out.into_inner())?;
 
         for expected in [
@@ -281,7 +421,7 @@ commands: []
         let _cwd = crate::commands::ctx::testenv::CwdGuard::enter(&temp_path)?;
 
         let mut buffer = Cursor::new(Vec::new());
-        show_help(&mut buffer)?;
+        show_help(&mut buffer, false)?;
         let output = String::from_utf8(buffer.into_inner())?;
 
         assert!(output.contains("File:"), "Output should contain 'File:'");
@@ -329,7 +469,7 @@ shortcuts:
         let _cwd = crate::commands::ctx::testenv::CwdGuard::enter(&temp_path)?;
 
         let mut buffer = Cursor::new(Vec::new());
-        show_help(&mut buffer)?;
+        show_help(&mut buffer, false)?;
         let output = String::from_utf8(buffer.into_inner())?;
 
         assert!(
@@ -367,7 +507,7 @@ shortcuts:
         // process sitting in a temp directory that is about to be deleted.
         let _cwd = crate::commands::ctx::testenv::CwdGuard::enter(&temp_path)?;
         let mut buffer = Cursor::new(Vec::new());
-        let result = show_help(&mut buffer);
+        let result = show_help(&mut buffer, false);
         result?;
 
         let output = String::from_utf8(buffer.into_inner())?;
@@ -389,7 +529,7 @@ shortcuts:
         let _guard = crate::commands::ctx::testenv::EnvGuard::set(home.path(), Some(empty.path()));
 
         let mut out = Cursor::new(Vec::new());
-        show_help(&mut out)?;
+        show_help(&mut out, false)?;
         let text = String::from_utf8(out.into_inner())?;
 
         assert!(text.contains("chat"), "got {text}");
@@ -407,7 +547,7 @@ shortcuts:
         let _guard = crate::commands::ctx::testenv::EnvGuard::set(home.path(), Some(empty.path()));
 
         let mut out = Cursor::new(Vec::new());
-        show_help(&mut out)?;
+        show_help(&mut out, false)?;
         let text = String::from_utf8(out.into_inner())?;
 
         assert!(text.contains("memory"), "got {text}");
@@ -433,7 +573,7 @@ shortcuts:
         let _cwd = crate::commands::ctx::testenv::CwdGuard::enter(&temp_path)?;
 
         let mut buffer = Cursor::new(Vec::new());
-        let result = show_help(&mut buffer);
+        let result = show_help(&mut buffer, false);
 
         result?;
         let output = String::from_utf8(buffer.into_inner())?;
@@ -465,7 +605,7 @@ shortcuts:
         let _cwd = crate::commands::ctx::testenv::CwdGuard::enter(&temp_path)?;
 
         let mut buffer = Cursor::new(Vec::new());
-        let result = show_help(&mut buffer);
+        let result = show_help(&mut buffer, false);
 
         result?;
         let output = String::from_utf8(buffer.into_inner())?;
@@ -499,7 +639,7 @@ shortcuts:
         let _cwd = crate::commands::ctx::testenv::CwdGuard::enter(&temp_path)?;
 
         let mut buffer = Cursor::new(Vec::new());
-        let result = show_help(&mut buffer);
+        let result = show_help(&mut buffer, false);
 
         result?;
         let output = String::from_utf8(buffer.into_inner())?;
@@ -533,7 +673,7 @@ shortcuts:
         // process sitting in a temp directory that is about to be deleted.
         let _cwd = crate::commands::ctx::testenv::CwdGuard::enter(&temp_path)?;
         let mut buffer = Cursor::new(Vec::new());
-        let result = show_help(&mut buffer);
+        let result = show_help(&mut buffer, false);
         result?;
 
         let output = String::from_utf8(buffer.into_inner())?;
@@ -580,7 +720,7 @@ shortcuts:
         // process sitting in a temp directory that is about to be deleted.
         let _cwd = crate::commands::ctx::testenv::CwdGuard::enter(&temp_path)?;
         let mut buffer = Cursor::new(Vec::new());
-        let result = show_help(&mut buffer);
+        let result = show_help(&mut buffer, false);
         result?;
 
         let output = String::from_utf8(buffer.into_inner())?;
@@ -617,7 +757,7 @@ shortcuts:
         // process sitting in a temp directory that is about to be deleted.
         let _cwd = crate::commands::ctx::testenv::CwdGuard::enter(&temp_path)?;
         let mut buffer = Cursor::new(Vec::new());
-        let result = show_help(&mut buffer);
+        let result = show_help(&mut buffer, false);
         result?;
 
         let output = String::from_utf8(buffer.into_inner())?;
