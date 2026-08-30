@@ -546,6 +546,207 @@ impl VerificationReport {
                 .iter()
                 .all(|check| check.status == CheckStatus::Passed)
     }
+
+    /// Whether this (already-failing) report's failures are covered by an
+    /// operator-recorded [`TestBaseline`] -- see issue #215. A baseline can
+    /// only ever waive a *named* test failure on a `Unit`-kind check parsed
+    /// out of that check's own captured output; a `Format`/`Lint`/`Build`/
+    /// `Typecheck`/`Custom` check that isn't `Passed`, a `Unit` check whose
+    /// status isn't exactly `Failed` (a `TimedOut`/`Skipped`/`DryRun` check
+    /// names no individual test), or a `Failed` `Unit` check whose output
+    /// yields no parseable names, always blocks the gate outright: none of
+    /// those describe a specific known failure the operator could have
+    /// looked at and chosen to baseline. `passed()` itself is untouched by
+    /// any of this -- this is a second, weaker gate the caller falls back to
+    /// only once `passed()` has already said no.
+    pub fn evaluate_against_baseline(&self, baseline: Option<&TestBaseline>) -> BaselineEvaluation {
+        if self.passed() {
+            return BaselineEvaluation {
+                gate_passed: true,
+                waived: Vec::new(),
+                blocking: Vec::new(),
+            };
+        }
+        if self.checks.is_empty() {
+            return BaselineEvaluation {
+                gate_passed: false,
+                waived: Vec::new(),
+                blocking: vec!["no checks were run".to_string()],
+            };
+        }
+        let baseline_names: std::collections::BTreeSet<&str> = baseline
+            .map(|baseline| baseline.failing_tests.iter().map(String::as_str).collect())
+            .unwrap_or_default();
+        let mut waived = std::collections::BTreeSet::new();
+        let mut blocking = Vec::new();
+        for check in &self.checks {
+            if check.status == CheckStatus::Passed {
+                continue;
+            }
+            if check.status != CheckStatus::Failed || check.kind != CheckKind::Unit {
+                blocking.push(format!("{} ({:?})", check.id, check.status));
+                continue;
+            }
+            let names = check
+                .failure_output
+                .as_deref()
+                .map(parse_cargo_test_failure_names)
+                .unwrap_or_default();
+            if names.is_empty() {
+                blocking.push(format!(
+                    "{} (failed, but no individual test names could be parsed from its output)",
+                    check.id
+                ));
+                continue;
+            }
+            let mut new_names = Vec::new();
+            for name in names {
+                if baseline_names.contains(name.as_str()) {
+                    waived.insert(name);
+                } else {
+                    new_names.push(name);
+                }
+            }
+            if !new_names.is_empty() {
+                blocking.push(format!(
+                    "{}: new failing test(s) not in the recorded baseline: {}",
+                    check.id,
+                    new_names.join(", ")
+                ));
+            }
+        }
+        BaselineEvaluation {
+            gate_passed: blocking.is_empty(),
+            waived: waived.into_iter().collect(),
+            blocking,
+        }
+    }
+}
+
+/// The result of weighing a failing [`VerificationReport`] against an
+/// operator's recorded [`TestBaseline`]. `waived` is only ever non-empty when
+/// `gate_passed` is true; `blocking` explains, per check, why the gate stayed
+/// closed when it did not.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BaselineEvaluation {
+    pub gate_passed: bool,
+    pub waived: Vec<String>,
+    pub blocking: Vec<String>,
+}
+
+/// Extracts the sorted, deduplicated set of failing test names from cargo
+/// test output. Cargo prints a `failures:` section twice per test binary when
+/// run `--verbose`: first followed by each failing test's own `----  <name>
+/// stdout ----` dump, then again -- immediately before the `test result:
+/// FAILED` line -- followed by nothing but the bare, indented names. Rather
+/// than trying to tell those two sections apart by shape (a panic message
+/// inside the first section is indented exactly like a name line in the
+/// second), this walks backward from each `test result: FAILED` line to the
+/// *nearest* preceding `failures:` line, which is always the plain name list.
+/// A multi-binary `cargo test` run repeats this pattern once per binary, and
+/// every occurrence is unioned into one set. Output is only ever a capped
+/// tail (see `MAX_FAILURE_OUTPUT_BYTES`), so an early binary's failures can
+/// still be missing here even when they are present in the real, uncapped
+/// log -- this is best-effort against whatever text survived the cap, not a
+/// guarantee every failing binary is found.
+fn parse_cargo_test_failure_names(output: &str) -> std::collections::BTreeSet<String> {
+    let lines: Vec<&str> = output.lines().collect();
+    let mut names = std::collections::BTreeSet::new();
+    for (index, line) in lines.iter().enumerate() {
+        if !line.contains("test result: FAILED") {
+            continue;
+        }
+        let Some(header) = lines[..index]
+            .iter()
+            .rposition(|line| line.trim() == "failures:")
+        else {
+            continue;
+        };
+        for candidate in &lines[header + 1..index] {
+            let trimmed = candidate.trim();
+            if trimmed.is_empty() || trimmed.starts_with("----") {
+                continue;
+            }
+            names.insert(trimmed.to_string());
+        }
+    }
+    names
+}
+
+/// An operator-owned record of failing test names that are already known
+/// about for one repository, stored under `~/.zirv/test-baseline/` -- never
+/// under `<repo>/.zirv/`, which is untrusted checkout content that may only
+/// narrow what a repository can do (see `CLAUDE.md`'s "Repo-owned surfaces"
+/// rule and `crate::commands::ctx::config::CtxConfig::load`'s identical
+/// `~/.zirv/ctx.toml`-then-repo-layer convention). A repository can never
+/// read, write, or widen this file: it lives outside the checkout entirely,
+/// keyed by [`repo_slug`], and is only ever written by the explicit
+/// `zirv test baseline` operator action -- see [`save_baseline`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TestBaseline {
+    pub schema_version: u32,
+    /// Sorted, deduplicated failing test names as of `recorded_at`.
+    #[serde(default)]
+    pub failing_tests: Vec<String>,
+    pub recorded_at: u64,
+}
+
+const TEST_BASELINE_SCHEMA_VERSION: u32 = 1;
+
+fn test_baseline_dir() -> CtxResult<PathBuf> {
+    Ok(crate::utils::home_dir()?
+        .join(crate::utils::SCRIPT_DIR_NAME)
+        .join("test-baseline"))
+}
+
+fn test_baseline_path(repo: &Path) -> CtxResult<PathBuf> {
+    Ok(test_baseline_dir()?.join(format!("{}.json", repo_slug(repo))))
+}
+
+/// Loads the operator's recorded baseline for `repo`, or `None` when nothing
+/// has ever been recorded. Never `Err` on a plain "not there yet" -- only a
+/// genuine I/O failure or an unreadable/future schema propagates, and even
+/// then callers on the gate path (see `latest_is_fresh_and_passing`) treat
+/// that the same as "no baseline" rather than letting a broken baseline file
+/// brick every gate check: current strict behavior (any failure closes the
+/// gate) is exactly what "no baseline" already means.
+pub fn load_baseline(repo: &Path) -> CtxResult<Option<TestBaseline>> {
+    let path = test_baseline_path(repo)?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let baseline: TestBaseline = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
+    if baseline.schema_version != TEST_BASELINE_SCHEMA_VERSION {
+        return Err(format!(
+            "test baseline '{}': unsupported schema_version {}",
+            path.display(),
+            baseline.schema_version
+        )
+        .into());
+    }
+    Ok(Some(baseline))
+}
+
+/// Records (or overwrites) the operator's baseline for `repo` with exactly
+/// `failing_tests` -- always an explicit operator action (`zirv test
+/// baseline`), never a side effect of an ordinary `zirv test`/`zirv verify`
+/// run, so a baseline only ever reflects failures an operator has actually
+/// looked at and chosen to waive.
+pub fn save_baseline(
+    repo: &Path,
+    failing_tests: std::collections::BTreeSet<String>,
+) -> CtxResult<TestBaseline> {
+    let baseline = TestBaseline {
+        schema_version: TEST_BASELINE_SCHEMA_VERSION,
+        failing_tests: failing_tests.into_iter().collect(),
+        recorded_at: now_secs(),
+    };
+    create_private_dir_all(&test_baseline_dir()?)?;
+    write_private(
+        &test_baseline_path(repo)?,
+        &serde_json::to_string_pretty(&baseline)?,
+    )?;
+    Ok(baseline)
 }
 
 fn command_for_shell(command: &str) -> Command {
@@ -831,12 +1032,34 @@ pub fn latest_is_fresh_and_passing(
     let Some(report) = load_latest(state, repo)? else {
         return Ok(false);
     };
-    Ok(report.passed()
-        && (!final_only || report.mode == VerificationMode::Final)
+    if !((!final_only || report.mode == VerificationMode::Final)
         // A `--check format` run is evidence about formatting, not about the
         // change set, so it can never satisfy a step gate.
         && report.narrowed_to.is_empty()
         && report.change_fingerprint == change_fingerprint(repo)?)
+    {
+        return Ok(false);
+    }
+    if report.passed() {
+        return Ok(true);
+    }
+    // #215: a report with failures can still satisfy the gate if every
+    // failure is a named test already covered by the operator's own
+    // per-repository baseline (`zirv test baseline`) -- see
+    // `VerificationReport::evaluate_against_baseline`. A baseline file that
+    // fails to load (never recorded, or a genuine read error) degrades to
+    // "no baseline", which reproduces today's strict any-failure-closes-the-
+    // gate behavior exactly.
+    let baseline = load_baseline(repo).unwrap_or(None);
+    let evaluation = report.evaluate_against_baseline(baseline.as_ref());
+    if evaluation.gate_passed && !evaluation.waived.is_empty() {
+        crate::output::warn(format!(
+            "test gate passed only because these failing test(s) are covered by the recorded \
+             baseline for this repository: {}",
+            evaluation.waived.join(", ")
+        ));
+    }
+    Ok(evaluation.gate_passed)
 }
 
 fn run_mode(
@@ -989,12 +1212,14 @@ fn is_broken_pipe(error: &(dyn std::error::Error + 'static)) -> bool {
 
 /// One run: results printed first, then persisted. A persistence failure is a
 /// warning on the way out, never a reason to lose the results themselves.
-fn run_and_report(
+/// Returns the report alongside the exit code so `run_baseline` can inspect
+/// its checks without re-running anything.
+fn run_and_persist(
     repo: &Path,
     mode: VerificationMode,
     args: &RunArgs,
     writer: &mut impl Write,
-) -> CtxResult<i32> {
+) -> CtxResult<(i32, VerificationReport)> {
     let report = run_mode(repo, mode, &args.checks, args.dry_run)?;
     // `zirv verify | head` closes the pipe mid-report. Printing is the part
     // that failed, so the run's own results are still worth storing -- without
@@ -1013,11 +1238,74 @@ fn run_and_report(
              fresh run"
         ));
     }
-    Ok(if args.dry_run || report.passed() {
+    let code = if args.dry_run || report.passed() {
         0
     } else {
         1
-    })
+    };
+    Ok((code, report))
+}
+
+fn run_and_report(
+    repo: &Path,
+    mode: VerificationMode,
+    args: &RunArgs,
+    writer: &mut impl Write,
+) -> CtxResult<i32> {
+    run_and_persist(repo, mode, args, writer).map(|(code, _report)| code)
+}
+
+/// `zirv test baseline`: runs every check (`VerificationMode::All`, like
+/// `zirv test all`), prints and persists the report exactly as any other run
+/// does, then records the `Unit`-kind checks' failing test names as this
+/// repository's operator-owned baseline (`save_baseline`). Deliberately the
+/// only path that ever writes a baseline -- `zirv test changed`/`zirv
+/// verify`/a workflow gate never do, so a baseline only ever reflects
+/// failures an operator ran this command and looked at.
+fn run_baseline(repo: &Path, args: &RunArgs, writer: &mut impl Write) -> CtxResult<i32> {
+    let (code, report) = run_and_persist(repo, VerificationMode::All, args, writer)?;
+    if args.dry_run {
+        return Ok(code);
+    }
+    let mut failing = std::collections::BTreeSet::new();
+    let mut unrecordable = Vec::new();
+    for check in &report.checks {
+        if check.status == CheckStatus::Passed {
+            continue;
+        }
+        if check.status != CheckStatus::Failed || check.kind != CheckKind::Unit {
+            unrecordable.push(format!("{} ({:?})", check.id, check.status));
+            continue;
+        }
+        let names = check
+            .failure_output
+            .as_deref()
+            .map(parse_cargo_test_failure_names)
+            .unwrap_or_default();
+        if names.is_empty() {
+            unrecordable.push(format!(
+                "{} (failed, but no individual test names could be parsed from its output)",
+                check.id
+            ));
+            continue;
+        }
+        failing.extend(names);
+    }
+    let count = failing.len();
+    let baseline = save_baseline(repo, failing)?;
+    writeln!(
+        writer,
+        "recorded baseline for {}: {count} failing test name(s) at {}",
+        scrub_line(&repo_slug(repo)),
+        baseline.recorded_at
+    )?;
+    for note in &unrecordable {
+        crate::output::warn(format!(
+            "not recorded in the baseline (not a single named test failure): {}",
+            scrub_line(note)
+        ));
+    }
+    Ok(0)
 }
 
 #[derive(Debug, Args)]
@@ -1045,6 +1333,11 @@ pub enum TestCommand {
     Changed(RunArgs),
     /// Run every configured/discovered check.
     All(RunArgs),
+    /// Run every check and record its failing test names as this
+    /// repository's operator-owned baseline (issue #215), so a later step
+    /// gate may waive exactly these pre-existing failures instead of
+    /// blocking on them forever. Always an explicit operator action.
+    Baseline(RunArgs),
 }
 
 #[derive(Debug, Args)]
@@ -1110,11 +1403,23 @@ fn write_report(writer: &mut impl Write, report: &VerificationReport, json: bool
 }
 
 pub fn run_test(args: &TestArgs, writer: &mut impl Write) -> CtxResult<i32> {
-    let (mode, args) = match &args.command {
-        TestCommand::Changed(args) => (VerificationMode::Changed, args),
-        TestCommand::All(args) => (VerificationMode::All, args),
-    };
-    run_and_report(&resolved_repo(args.repo.as_deref())?, mode, args, writer)
+    match &args.command {
+        TestCommand::Changed(args) => run_and_report(
+            &resolved_repo(args.repo.as_deref())?,
+            VerificationMode::Changed,
+            args,
+            writer,
+        ),
+        TestCommand::All(args) => run_and_report(
+            &resolved_repo(args.repo.as_deref())?,
+            VerificationMode::All,
+            args,
+            writer,
+        ),
+        TestCommand::Baseline(args) => {
+            run_baseline(&resolved_repo(args.repo.as_deref())?, args, writer)
+        }
+    }
 }
 
 pub fn run_verify(args: &VerifyArgs, writer: &mut impl Write) -> CtxResult<i32> {
@@ -1682,5 +1987,278 @@ mod tests {
         );
         assert_eq!(failed.status, CheckStatus::Failed);
         assert!(failed.failure_output.unwrap().contains("actionable"));
+    }
+
+    // -- #215: baseline-waivable test gate ---------------------------------
+
+    #[test]
+    fn cargo_test_failure_names_are_parsed_from_the_final_summary_not_the_verbose_dump() {
+        let output = "running 2 tests\n\
+test wrap::tests::a ... FAILED\n\
+test wrap::tests::b ... ok\n\
+\n\
+failures:\n\
+\n\
+---- wrap::tests::a stdout ----\n\
+thread 'wrap::tests::a' panicked at src/lib.rs:1:\n\
+    left: 1\n\
+   right: 2\n\
+\n\
+\n\
+failures:\n\
+    wrap::tests::a\n\
+\n\
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n";
+        let names = parse_cargo_test_failure_names(output);
+        assert_eq!(
+            names,
+            std::collections::BTreeSet::from(["wrap::tests::a".to_string()])
+        );
+    }
+
+    #[test]
+    fn cargo_test_failure_names_are_unioned_across_multiple_binaries() {
+        let output = "\
+failures:\n\
+    bin_one::tests::x\n\
+\n\
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\
+\n\
+running 1 test\n\
+test bin_two::tests::y ... FAILED\n\
+\n\
+failures:\n\
+    bin_two::tests::y\n\
+\n\
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n";
+        let names = parse_cargo_test_failure_names(output);
+        assert_eq!(
+            names,
+            std::collections::BTreeSet::from([
+                "bin_one::tests::x".to_string(),
+                "bin_two::tests::y".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn cargo_test_failure_names_are_empty_when_there_is_no_failures_section() {
+        let output = "running 1 test\ntest tests::a ... ok\n\ntest result: ok. 1 passed; 0 failed; \
+                       0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n";
+        assert!(parse_cargo_test_failure_names(output).is_empty());
+    }
+
+    fn unit_check(id: &str, status: CheckStatus, failure_output: Option<&str>) -> CheckResult {
+        CheckResult {
+            id: id.into(),
+            kind: CheckKind::Unit,
+            command: "cargo test".into(),
+            source: CheckSource::DiscoveredToolchain,
+            status,
+            exit_code: (status != CheckStatus::Passed).then_some(101),
+            duration_ms: 1,
+            failure_output: failure_output.map(str::to_string),
+        }
+    }
+
+    fn report_with_checks(checks: Vec<CheckResult>) -> VerificationReport {
+        VerificationReport {
+            schema_version: VERIFY_REPORT_SCHEMA_VERSION,
+            id: "evaluate".into(),
+            mode: VerificationMode::Final,
+            source: "configured".into(),
+            repo: PathBuf::from("/repo"),
+            change_fingerprint: 1,
+            changed_paths: vec![],
+            fallback_to_full: false,
+            narrowed_to: vec![],
+            notes: vec![],
+            started_at: 0,
+            finished_at: 0,
+            checks,
+        }
+    }
+
+    fn cargo_failure_output(name: &str) -> String {
+        format!(
+            "failures:\n    {name}\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 \
+             measured; 0 filtered out; finished in 0.00s\n"
+        )
+    }
+
+    fn baseline_of(names: &[&str]) -> TestBaseline {
+        TestBaseline {
+            schema_version: TEST_BASELINE_SCHEMA_VERSION,
+            failing_tests: names.iter().map(|name| name.to_string()).collect(),
+            recorded_at: 0,
+        }
+    }
+
+    #[test]
+    fn a_passing_report_gates_regardless_of_any_baseline() {
+        let report = report_with_checks(vec![unit_check("test", CheckStatus::Passed, None)]);
+        let evaluation = report.evaluate_against_baseline(None);
+        assert!(evaluation.gate_passed);
+        assert!(evaluation.waived.is_empty());
+    }
+
+    #[test]
+    fn an_empty_baseline_keeps_the_gate_strict() {
+        let report = report_with_checks(vec![unit_check(
+            "test",
+            CheckStatus::Failed,
+            Some(&cargo_failure_output("wrap::tests::a")),
+        )]);
+        let evaluation = report.evaluate_against_baseline(None);
+        assert!(
+            !evaluation.gate_passed,
+            "no baseline must never waive anything"
+        );
+        assert!(
+            evaluation
+                .blocking
+                .iter()
+                .any(|line| line.contains("wrap::tests::a"))
+        );
+    }
+
+    #[test]
+    fn a_failure_set_that_is_a_subset_of_the_baseline_passes_and_reports_the_waiver() {
+        let report = report_with_checks(vec![unit_check(
+            "test",
+            CheckStatus::Failed,
+            Some(&cargo_failure_output("wrap::tests::a")),
+        )]);
+        let baseline = baseline_of(&["wrap::tests::a", "win::tests::b"]);
+        let evaluation = report.evaluate_against_baseline(Some(&baseline));
+        assert!(evaluation.gate_passed);
+        assert_eq!(evaluation.waived, vec!["wrap::tests::a".to_string()]);
+    }
+
+    #[test]
+    fn a_failure_not_in_the_baseline_blocks_the_gate_and_names_the_new_failure() {
+        let output = "failures:\n    wrap::tests::a\n    new::regression\n\ntest result: FAILED. 0 \
+                       passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n";
+        let report =
+            report_with_checks(vec![unit_check("test", CheckStatus::Failed, Some(output))]);
+        let baseline = baseline_of(&["wrap::tests::a"]);
+        let evaluation = report.evaluate_against_baseline(Some(&baseline));
+        assert!(!evaluation.gate_passed);
+        assert!(
+            evaluation
+                .blocking
+                .iter()
+                .any(|line| line.contains("new::regression")),
+            "got {:?}",
+            evaluation.blocking
+        );
+    }
+
+    #[test]
+    fn a_non_unit_check_failure_is_never_waivable_even_with_a_matching_baseline() {
+        let report = report_with_checks(vec![CheckResult {
+            id: "clippy".into(),
+            kind: CheckKind::Lint,
+            command: "cargo clippy".into(),
+            source: CheckSource::DiscoveredToolchain,
+            status: CheckStatus::Failed,
+            exit_code: Some(1),
+            duration_ms: 1,
+            failure_output: Some("warning: unused variable".into()),
+        }]);
+        // Even a baseline that happens to contain the exact failure text must
+        // not waive a check that names no individual tests at all.
+        let baseline = baseline_of(&["warning: unused variable"]);
+        let evaluation = report.evaluate_against_baseline(Some(&baseline));
+        assert!(!evaluation.gate_passed);
+    }
+
+    #[test]
+    fn a_timed_out_unit_check_is_never_waivable() {
+        let report = report_with_checks(vec![unit_check("test", CheckStatus::TimedOut, None)]);
+        let baseline = baseline_of(&["wrap::tests::a"]);
+        let evaluation = report.evaluate_against_baseline(Some(&baseline));
+        assert!(!evaluation.gate_passed);
+    }
+
+    #[test]
+    fn baseline_round_trips_through_the_operator_home_directory() {
+        let home = tempdir().unwrap();
+        let _home_guard = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = PathBuf::from("/some/repo");
+        let failing: std::collections::BTreeSet<String> =
+            ["b::two", "a::one"].iter().map(|s| s.to_string()).collect();
+        let saved = save_baseline(&repo, failing).expect("save baseline");
+        assert_eq!(
+            saved.failing_tests,
+            vec!["a::one", "b::two"],
+            "stored sorted"
+        );
+
+        let loaded = load_baseline(&repo)
+            .expect("load baseline")
+            .expect("baseline exists");
+        assert_eq!(loaded.failing_tests, saved.failing_tests);
+        assert_eq!(loaded.recorded_at, saved.recorded_at);
+
+        let path = home
+            .path()
+            .join(".zirv")
+            .join("test-baseline")
+            .join(format!("{}.json", repo_slug(&repo)));
+        assert!(
+            path.exists(),
+            "baseline must live under ~/.zirv/, not the repo"
+        );
+    }
+
+    #[test]
+    fn no_baseline_file_loads_as_none() {
+        let home = tempdir().unwrap();
+        let _home_guard = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        assert!(
+            load_baseline(&PathBuf::from("/never/recorded"))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// End-to-end through the real gate seam (`latest_is_fresh_and_passing`,
+    /// the exact function `engine.rs`'s test-step gate and `deploy.rs`'s
+    /// production gate both call): a baseline recorded for this repository
+    /// lets a report whose only failure is in that baseline satisfy the gate.
+    #[test]
+    fn the_freshness_gate_accepts_a_report_whose_failures_are_baselined() {
+        let repo = git_repo();
+        let home = tempdir().unwrap();
+        let _home_guard = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let state_root = tempdir().unwrap();
+        let state = StateDir::from_root(state_root.path().to_path_buf());
+        let fingerprint = change_fingerprint(repo.path()).unwrap();
+
+        let mut report = report_with_checks(vec![unit_check(
+            "test",
+            CheckStatus::Failed,
+            Some(&cargo_failure_output("wrap::tests::a")),
+        )]);
+        report.repo = repo.path().to_path_buf();
+        report.mode = VerificationMode::Final;
+        report.change_fingerprint = fingerprint;
+        save_report(&state, &report).unwrap();
+
+        assert!(
+            !latest_is_fresh_and_passing(&state, repo.path(), true).unwrap(),
+            "no baseline recorded yet: must still be strict"
+        );
+
+        save_baseline(
+            repo.path(),
+            std::collections::BTreeSet::from(["wrap::tests::a".to_string()]),
+        )
+        .unwrap();
+        assert!(
+            latest_is_fresh_and_passing(&state, repo.path(), true).unwrap(),
+            "the same failure, now baselined, satisfies the gate"
+        );
     }
 }
