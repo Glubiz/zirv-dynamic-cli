@@ -21,7 +21,7 @@ last-verified: 2026-08-30
 | version | `2.26.0` |
 | edition | `2024` |
 | license | MIT |
-| repository | https://github.com/Glubiz/zirv |
+| repository | https://github.com/Glubiz/zirv-dynamic-cli |
 
 ## Dependencies
 
