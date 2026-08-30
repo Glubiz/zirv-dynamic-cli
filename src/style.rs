@@ -5,15 +5,6 @@
 //! calls or inline ratatui styles scattered across call sites, so every
 //! surface stays visually consistent and every colour decision degrades the
 //! same way on a no-color terminal.
-//!
-//! Issue #202, phase 1: this module lands the shared API before its
-//! callers are migrated one surface at a time in later phases (`chrome.rs`'s
-//! own `PLACEHOLDER`/`styled` in particular are intentionally left alone
-//! here). `#[allow(dead_code)]` covers the gap until those follow-up phases
-//! wire each item into a real call site; every item is exercised by this
-//! module's own tests in the meantime.
-
-#![allow(dead_code)]
 
 use std::borrow::Cow;
 
@@ -26,6 +17,7 @@ use unicode_width::UnicodeWidthChar;
 pub const PLACEHOLDER: &str = "\u{2013}";
 
 /// The standard 2-space indent step used across CLI output.
+#[allow(dead_code)] // first caller lands with the remaining CLI-surface migration (#202 follow-up)
 pub const INDENT: &str = "  ";
 
 /// Semantic tones for terminal text. Each tone names *why* text is styled,
@@ -113,6 +105,7 @@ fn leftmost_fit_end(s: &str, max_cols: usize) -> usize {
 /// Byte offset of the start of the rightmost suffix of `s` whose display
 /// width is `<= max_cols`, choosing the longest such suffix and never
 /// splitting a codepoint in half.
+#[allow(dead_code)] // used by middle_truncate; first caller lands with the #202 follow-up
 fn rightmost_fit_start(s: &str, max_cols: usize) -> usize {
     let mut width = 0usize;
     let mut start = s.len();
@@ -165,6 +158,7 @@ pub fn truncate_display_ellipsis(s: &str, max_cols: usize) -> Cow<'_, str> {
 /// Degrades sensibly at tiny widths: `max_cols == 0` is empty, `max_cols ==
 /// 1` is just `…`, and anything larger splits the remaining budget between
 /// head and tail (head gets the extra column on an odd split).
+#[allow(dead_code)] // first caller lands with the remaining CLI-surface migration (#202 follow-up)
 pub fn middle_truncate(s: &str, max_cols: usize) -> Cow<'_, str> {
     if display_width(s) <= max_cols {
         return Cow::Borrowed(s);
@@ -211,6 +205,7 @@ pub fn format_pct(v: f64) -> String {
 
 /// A section header line, in the convention already used across the
 /// `status`/`context_status` surfaces: a blank line, then `<title>:`.
+#[allow(dead_code)] // first caller lands with the remaining CLI-surface migration (#202 follow-up)
 pub fn section_header(title: &str) -> String {
     format!("\n{title}:")
 }
@@ -234,6 +229,7 @@ pub mod tui {
     }
 
     /// The currently selected row/item.
+    #[allow(dead_code)] // dash uses selected_strong today; kept as the plain-selection token
     pub fn selected() -> Style {
         Style::default().add_modifier(Modifier::REVERSED)
     }
@@ -268,6 +264,25 @@ pub mod tui {
     pub fn accent() -> Style {
         Style::default().fg(Color::Cyan)
     }
+
+    /// The zirv brand chip: black text on a cyan background, bold. One per
+    /// screen (the dashboard header's own ` zirv ` badge) -- everything else
+    /// in the dashboard's chrome stays default-palette monochrome except the
+    /// semantic states above, so this is the one place a *background* colour
+    /// is ever used.
+    pub fn chip() -> Style {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    }
+
+    /// Braille spinner frames for a working pane's sidebar glyph. Advanced
+    /// one frame per render tick (`SPINNER_FRAMES[tick %
+    /// SPINNER_FRAMES.len()]`), not on a clock of its own: the dashboard
+    /// already redraws every frame, so a tick counter threaded through the
+    /// render state is enough -- no new polling.
+    pub const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 }
 
 #[cfg(test)]
@@ -489,6 +504,30 @@ mod tests {
     #[test]
     fn tui_selected_is_reversed() {
         assert!(tui::selected().add_modifier.contains(Modifier::REVERSED));
+    }
+
+    #[test]
+    fn tui_chip_is_black_on_cyan_and_bold() {
+        let style = tui::chip();
+        assert_eq!(style.fg, Some(Color::Black));
+        assert_eq!(style.bg, Some(Color::Cyan));
+        assert!(style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn tui_spinner_frames_are_ten_single_column_braille_glyphs() {
+        assert_eq!(tui::SPINNER_FRAMES.len(), 10);
+        for frame in tui::SPINNER_FRAMES {
+            assert_eq!(
+                display_width(frame),
+                1,
+                "spinner frame {frame:?} must be exactly one column wide"
+            );
+        }
+        // Every frame is distinct -- a spinner that repeats a frame within
+        // one cycle would look like it stalled for a tick.
+        let unique: std::collections::HashSet<&&str> = tui::SPINNER_FRAMES.iter().collect();
+        assert_eq!(unique.len(), tui::SPINNER_FRAMES.len());
     }
 
     #[test]

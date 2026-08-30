@@ -390,8 +390,7 @@ fn harness_roster_segments(harnesses: &[(String, bool)]) -> Segments {
 /// line's *display* width so the border always joins its own corners, even
 /// with a CJK or emoji harness/session name.
 fn banner_box(facts: &BannerFacts, colour: bool, cols: u16) -> String {
-    let mut line1: Segments =
-        vec![(facts.harness.clone(), Paint::Tone(Tone::Emphasis))];
+    let mut line1: Segments = vec![(facts.harness.clone(), Paint::Tone(Tone::Emphasis))];
     if let Some(model) = &facts.model {
         line1.push((" · ".to_string(), Paint::Tone(Tone::Muted)));
         line1.push((format!("model {model}"), Paint::Tone(Tone::Muted)));
@@ -605,30 +604,29 @@ pub fn status_bar(state: &BarState, cols: u16, colour: bool) -> String {
 
     let harness: Segments = vec![(state.harness.clone(), Paint::Tone(Tone::Plain))];
 
-    let (verdict_full, verdict_reduced): (Segments, Segments) =
-        match (state.verdict, state.score) {
-            (Some(verdict), Some(score)) => {
-                let paint = verdict_paint(verdict);
-                let full = vec![
-                    ("✻ ".to_string(), paint),
-                    (verdict.as_str().to_string(), paint),
-                    (" ".to_string(), Paint::Tone(Tone::Plain)),
-                    (score.to_string(), Paint::Tone(Tone::Muted)),
-                ];
-                let reduced = vec![
-                    ("✻ ".to_string(), paint),
-                    (verdict.as_str().to_string(), paint),
-                ];
-                (full, reduced)
-            }
-            _ => {
-                let unknown = vec![
-                    ("✻ ".to_string(), Paint::Tone(Tone::Muted)),
-                    (PLACEHOLDER.to_string(), Paint::Tone(Tone::Muted)),
-                ];
-                (unknown.clone(), unknown)
-            }
-        };
+    let (verdict_full, verdict_reduced): (Segments, Segments) = match (state.verdict, state.score) {
+        (Some(verdict), Some(score)) => {
+            let paint = verdict_paint(verdict);
+            let full = vec![
+                ("✻ ".to_string(), paint),
+                (verdict.as_str().to_string(), paint),
+                (" ".to_string(), Paint::Tone(Tone::Plain)),
+                (score.to_string(), Paint::Tone(Tone::Muted)),
+            ];
+            let reduced = vec![
+                ("✻ ".to_string(), paint),
+                (verdict.as_str().to_string(), paint),
+            ];
+            (full, reduced)
+        }
+        _ => {
+            let unknown = vec![
+                ("✻ ".to_string(), Paint::Tone(Tone::Muted)),
+                (PLACEHOLDER.to_string(), Paint::Tone(Tone::Muted)),
+            ];
+            (unknown.clone(), unknown)
+        }
+    };
 
     // Both windows are honest lower bounds by the time they reach here --
     // `window::available` already dropped whichever had provably reset --
@@ -740,16 +738,6 @@ pub fn status_bar(state: &BarState, cols: u16, colour: bool) -> String {
     }
 
     render_line(&combined, cols, colour, false, false)
-}
-
-/// Keeps the leftmost `cols` display columns (not bytes, not even
-/// characters: a wide/CJK/emoji character must not be split in half),
-/// dropping whatever would overflow on the right. Never produces a result
-/// wider than `cols` columns. A thin wrapper over `style::truncate_display`;
-/// kept under its own name because `dash::ui`'s header/sidebar renderers
-/// still call it under this name and are owned by another change.
-pub(crate) fn right_truncate(s: &str, cols: usize) -> String {
-    style::truncate_display(s, cols).into_owned()
 }
 
 /// The pty size to open (or resize to) when the bar reserves the bottom row:

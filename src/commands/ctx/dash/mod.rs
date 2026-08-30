@@ -79,6 +79,9 @@ pub enum DashAction {
     /// nearest free mnemonic, a deliberate deviation from the issue's own
     /// literal "Ctrl+A m" wording to avoid silently breaking either binding.
     Handover,
+    /// `Ctrl+A e` (issue #202 phase 2b) -- opens the kept-errors overlay
+    /// (`push_error`'s own buffer, newest first).
+    ShowErrors,
     Zoom,
     Quit,
     /// `Ctrl+A ?` or `Ctrl+A h`/`H` -- opens the help overlay listing every
@@ -157,6 +160,7 @@ pub fn filter_key(prefix_armed: bool, key: KeyEvent) -> (bool, InputVerdict) {
         KeyCode::Char('m') => Some(DashAction::Mail),
         KeyCode::Char('M') => Some(DashAction::Memory),
         KeyCode::Char('o') => Some(DashAction::Handover),
+        KeyCode::Char('e') => Some(DashAction::ShowErrors),
         KeyCode::Char('z') => Some(DashAction::Zoom),
         KeyCode::Char('v') => Some(DashAction::ToggleSelectMode),
         KeyCode::Char('q') => Some(DashAction::Quit),
@@ -370,6 +374,7 @@ fn overlay_name(overlay: &ui::Overlay) -> &'static str {
         ui::Overlay::Memory(_) => "memory",
         ui::Overlay::Restore(_) => "restore",
         ui::Overlay::Help => "help",
+        ui::Overlay::Errors(_) => "errors",
     }
 }
 
@@ -637,25 +642,16 @@ impl KeyLog {
 }
 
 // Task 7: sidebar row assembly (dashboard panes + view-only registry rows)
-// and the header's own live facts (rot scores, mail, memory-bank size,
-// session count), both refreshed at most once per second.
+// and the header's own live facts (mail, memory-bank size, session count),
+// both refreshed at most once per second.
 
 /// One dashboard-owned pane's row inputs, decoupled from `Pane` itself so
 /// `assemble_sidebar` stays pure and testable without a real spawn.
 struct PaneRowMeta {
     short: String,
-    title: String,
-    glyph: char,
-    preview: String,
+    harness: String,
+    state: ui::RowState,
 }
-
-/// The glyph a view-only registry row gets: this dashboard does not own that
-/// session's turn-signal stream, so `PaneState`'s Working/Idle distinction is
-/// genuinely unknown here -- only that the process is still alive
-/// (`assemble_sidebar`'s caller has already filtered to `Liveness::Live`).
-/// Deliberately distinct from every glyph `ui::glyph_for` produces, so a
-/// view-only row never claims to know a pane state it cannot see.
-const VIEW_ONLY_GLYPH: char = '\u{00b7}';
 
 /// Combines this dashboard's own panes (attached, in pane order) with every
 /// OTHER live session in the registry that THIS SAME dashboard process
@@ -677,24 +673,36 @@ const VIEW_ONLY_GLYPH: char = '\u{00b7}';
 /// -- `registry` is whatever the caller already read via `sessions::list`,
 /// and `dashboard_pid` is passed in rather than read via
 /// `std::process::id()` here so tests can exercise foreign vs. own owners.
+///
+/// `now_secs` (`super::state::now_secs()`) is likewise passed in rather than
+/// read here: every row's age is `now_secs - record.started_at` for the
+/// registry record matching its own short id -- a pane's own record is
+/// always in `registry` too (only the dedup above keeps it from being listed
+/// a second time), so this is the one age source both row kinds share. `None`
+/// only when no matching record exists at all, a race between a fresh spawn
+/// and its own registration.
 fn assemble_sidebar(
     panes: &[PaneRowMeta],
     registry: &[(sessions::Record, sessions::Liveness)],
-    scores: &ScoreMap,
     selected: usize,
     focused: usize,
     dashboard_pid: u32,
+    now_secs: u64,
 ) -> Vec<ui::SidebarRow> {
     let own_shorts: HashSet<&str> = panes.iter().map(|p| p.short.as_str()).collect();
+    let started_at: HashMap<&str, u64> = registry
+        .iter()
+        .map(|(record, _)| (record.short.as_str(), record.started_at))
+        .collect();
+    let age_of = |short: &str| started_at.get(short).map(|at| now_secs.saturating_sub(*at));
 
     let mut rows: Vec<ui::SidebarRow> = panes
         .iter()
         .map(|p| ui::SidebarRow {
-            glyph: p.glyph,
-            title: p.title.clone(),
             short: p.short.clone(),
-            preview: p.preview.clone(),
-            score: scores.get(&p.short).copied(),
+            harness: p.harness.clone(),
+            age_secs: age_of(&p.short),
+            state: p.state,
             attached: true,
             selected: false,
             focused: false,
@@ -716,11 +724,10 @@ fn assemble_sidebar(
             continue;
         }
         rows.push(ui::SidebarRow {
-            glyph: VIEW_ONLY_GLYPH,
-            title: format!("{} {}", record.verb.as_str(), record.agent),
             short: record.short.clone(),
-            preview: String::new(),
-            score: scores.get(&record.short).copied(),
+            harness: record.agent.clone(),
+            age_secs: Some(now_secs.saturating_sub(record.started_at)),
+            state: ui::RowState::Unknown,
             attached: false,
             selected: false,
             focused: false,
@@ -814,43 +821,27 @@ const fn follow_focus(selected: usize, focused: usize, pane_count: usize) -> usi
 
 /// Pure: assembles `ui::HeaderFacts` from already-computed ingredients. Kept
 /// separate from `FactsCache::refresh_if_due` (the impure disk-reading half)
-/// so the header's own rendering rule -- a disabled/absent mail read renders
-/// as no mail segment at all, never a hollow `mail 0+0` -- is exercised
-/// without a state dir. Mirrors `ui`'s own `HeaderFacts` field order.
+/// and from the transient `errors`/`notices` channels' own storage, so the
+/// header's own precedence rule -- a fresh notice shows over a sticky error,
+/// never both at once -- is exercised without a state dir. Mirrors `ui`'s own
+/// `HeaderFacts` field order.
 fn assemble_header_facts(
     harness: String,
     select_mode: bool,
-    score: Option<u32>,
-    mail: Option<(usize, usize)>,
-    memory_count: usize,
-    sessions: usize,
-    usage: Vec<ui::HarnessUsage>,
+    live: usize,
+    total: usize,
+    error_count: usize,
+    latest_error: Option<String>,
+    notice: Option<String>,
 ) -> ui::HeaderFacts {
-    let (mail_broadcast, mail_direct) = mail.unwrap_or((0, 0));
     ui::HeaderFacts {
         harness,
         select_mode,
-        score,
-        mail_broadcast,
-        mail_direct,
-        memory_count,
-        sessions,
-        usage,
-    }
-}
-
-/// Pure: the header's harness segment.
-///
-/// `harness_label` is the dashboard's own launch identity -- the agent plus any
-/// `chat.model` disclosure, which is repo-settable on the strength of staying
-/// visible, so it never drops off. `focused_title` names the pane whose grid is
-/// actually on screen, appended only once focus has moved off the orchestrator:
-/// a single-pane dashboard would otherwise just repeat itself, and the rot
-/// score beside it belongs to whichever pane this names.
-fn harness_segment(harness_label: &str, focused: usize, focused_title: Option<&str>) -> String {
-    match focused_title {
-        Some(title) if focused > 0 => format!("{harness_label} \u{25b8} {title}"),
-        _ => harness_label.to_string(),
+        live,
+        total,
+        error_count,
+        latest_error,
+        notice,
     }
 }
 
@@ -3607,6 +3598,22 @@ fn clamp_cursor(cursor: usize, len: usize) -> usize {
     if len == 0 { 0 } else { cursor.min(len - 1) }
 }
 
+/// One `j`/`k` (or Down/Up) press against a list cursor: `delta` is `+1` for
+/// "down/next", `-1` for "up/previous". Shared by every browsing-mode
+/// reducer that walks a flat list -- issue #202 phase 2b factors the
+/// copy-pasted `clamp_cursor(cursor + 1, len)` / `cursor.saturating_sub(1)`
+/// pair out of the new errors/handover reducers below, plus `restore_
+/// overlay_reduce` (an existing one, updated here to prove the shape holds
+/// there too; `mail_overlay_reduce`/`memory_overlay_reduce` are left as they
+/// were, to keep this change's diff proportional to what it is fixing).
+fn move_cursor(cursor: usize, len: usize, delta: isize) -> usize {
+    if delta >= 0 {
+        clamp_cursor(cursor.saturating_add(delta as usize), len)
+    } else {
+        cursor.saturating_sub(delta.unsigned_abs())
+    }
+}
+
 /// Inserts a newline for every compose-style overlay. These reducers keep
 /// the insertion point at the end of the draft, so an unmodified Enter can
 /// follow Claude Code's portable convention by replacing the trailing
@@ -4030,11 +4037,11 @@ pub fn restore_overlay_reduce(
             (None, Some(RestoreEffect::Confirm(checked)))
         }
         KeyCode::Down | KeyCode::Char('j') => {
-            view.cursor = clamp_cursor(view.cursor + 1, view.entries.len());
+            view.cursor = move_cursor(view.cursor, view.entries.len(), 1);
             (Some(view), None)
         }
         KeyCode::Up | KeyCode::Char('k') => {
-            view.cursor = view.cursor.saturating_sub(1);
+            view.cursor = move_cursor(view.cursor, view.entries.len(), -1);
             (Some(view), None)
         }
         KeyCode::Char(' ') => {
@@ -4044,6 +4051,103 @@ pub fn restore_overlay_reduce(
             (Some(view), None)
         }
         _ => (Some(view), None),
+    }
+}
+
+/// What confirming/cancelling the `Ctrl+A e` errors overlay means. Read-only
+/// -- browsing the kept errors touches no storage -- so unlike every other
+/// reducer here there is no effect type at all: `None` closes it, `Some`
+/// carries the (possibly cursor-moved) view back.
+pub fn errors_overlay_reduce(mut view: ui::ErrorsView, key: KeyEvent) -> Option<ui::ErrorsView> {
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => None,
+        KeyCode::Down | KeyCode::Char('j') => {
+            view.cursor = move_cursor(view.cursor, view.items.len(), 1);
+            Some(view)
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            view.cursor = move_cursor(view.cursor, view.items.len(), -1);
+            Some(view)
+        }
+        _ => Some(view),
+    }
+}
+
+/// Builds the `Ctrl+A e` overlay's own view: every kept error
+/// (`push_error`'s buffer, `MAX_KEPT_ERRORS`), newest first -- a snapshot
+/// taken once when the overlay opens, the same convention every other
+/// overlay here already follows (mail/memory/restore do not live-update
+/// while open either).
+fn build_errors_view(errors: &[String]) -> ui::ErrorsView {
+    ui::ErrorsView {
+        items: errors.iter().rev().cloned().collect(),
+        cursor: 0,
+    }
+}
+
+/// What confirming/cancelling the quit confirmation dialog means -- pulled
+/// out of the event loop's own match arm (issue #202 phase 2b) so the "which
+/// key does what" decision is a pure, independently testable function; the
+/// actual shutdown sequence (`on_quit`/`render_shutting_down`/
+/// `shutdown_all`/breaking the loop) stays at the call site, since none of
+/// that is expressible from inside a pure reducer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuitConfirmEffect {
+    Confirm,
+}
+
+pub fn quit_confirm_reduce(
+    working: Vec<String>,
+    key: KeyEvent,
+) -> (Option<Vec<String>>, Option<QuitConfirmEffect>) {
+    match key.code {
+        KeyCode::Enter => (None, Some(QuitConfirmEffect::Confirm)),
+        KeyCode::Esc => (None, None),
+        _ => (Some(working), None),
+    }
+}
+
+/// What confirming a handover pick means -- the operator's own choice, not
+/// yet applied to a real pane. Pulled out of the event loop's own match arm
+/// (issue #202 phase 2b) the same way `quit_confirm_reduce` was: the actual
+/// swap (looking the target pane up by short id, checking it is `Idle`,
+/// calling `handover_pane`) stays at the call site, since it needs mutable
+/// access to `panes`/`errors` a pure reducer cannot have.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HandoverEffect {
+    Swap {
+        target_short: String,
+        target_agent: String,
+        target_model: String,
+    },
+}
+
+pub fn handover_overlay_reduce(
+    mut draft: ui::HandoverDraft,
+    key: KeyEvent,
+) -> (Option<ui::HandoverDraft>, Option<HandoverEffect>) {
+    match key.code {
+        KeyCode::Esc => (None, None),
+        KeyCode::Up => {
+            draft.cursor = move_cursor(draft.cursor, draft.items.len(), -1);
+            (Some(draft), None)
+        }
+        KeyCode::Down => {
+            draft.cursor = move_cursor(draft.cursor, draft.items.len(), 1);
+            (Some(draft), None)
+        }
+        KeyCode::Enter => match draft.items.get(draft.cursor).cloned() {
+            Some((target_agent, _tier, target_model)) => (
+                None,
+                Some(HandoverEffect::Swap {
+                    target_short: draft.target_short.clone(),
+                    target_agent,
+                    target_model,
+                }),
+            ),
+            None => (Some(draft), None),
+        },
+        _ => (Some(draft), None),
     }
 }
 
@@ -5024,9 +5128,8 @@ fn build_pane_rows(panes: &[Pane]) -> Vec<PaneRowMeta> {
         .iter()
         .map(|pane| PaneRowMeta {
             short: pane.short().to_string(),
-            title: pane.title().to_string(),
-            glyph: ui::glyph_for(&pane.state()),
-            preview: pane.last_line(),
+            harness: pane.agent().to_string(),
+            state: ui::row_state_for(&pane.state()),
         })
         .collect()
 }
@@ -5396,6 +5499,11 @@ pub fn run_dashboard(
     // sticky `errors` channel (⚠) so a confirmation like "spawned … as …"
     // shows briefly and then clears instead of pinning behind a warning glyph.
     let mut notices: Vec<Notice> = Vec::new();
+    // Issue #202 phase 2b: the sidebar's own working-pane spinner frame
+    // index (`tick % style::tui::SPINNER_FRAMES.len()`). Advanced once per
+    // drawn frame, not on a clock of its own -- the dashboard already
+    // redraws every frame, so this is the only "polling" the spinner needs.
+    let mut render_tick: usize = 0;
     // P4: one line per candidate the liveness check just held back. Pushed
     // here rather than at the partition above only because `notices` does not
     // exist yet up there. It says "kept for next launch" because that is now
@@ -5621,10 +5729,10 @@ pub fn run_dashboard(
         let rows = assemble_sidebar(
             &build_pane_rows(&panes),
             &visible_registry,
-            &facts_cache.disk.scores,
             selected,
             focused,
             std::process::id(),
+            super::state::now_secs(),
         );
         let total_rows = rows.len();
         selected = selected.min(total_rows.saturating_sub(1));
@@ -5669,8 +5777,13 @@ pub fn run_dashboard(
                                 let took = overlay_name(&current);
                                 match current {
                                     ui::Overlay::None => {}
-                                    ui::Overlay::QuitConfirm(working) => match key.code {
-                                        KeyCode::Enter => {
+                                    ui::Overlay::QuitConfirm(working) => {
+                                        let (next, effect) = quit_confirm_reduce(working, key);
+                                        overlay = match next {
+                                            Some(w) => ui::Overlay::QuitConfirm(w),
+                                            None => ui::Overlay::None,
+                                        };
+                                        if matches!(effect, Some(QuitConfirmEffect::Confirm)) {
                                             // `overlay` was taken above, so this is the
                                             // one quit path that cannot have a restore
                                             // dialog pending: it *is* the open overlay.
@@ -5688,9 +5801,7 @@ pub fn run_dashboard(
                                             shutdown_all(&mut panes, cfg, &mut errors);
                                             break 'main 0;
                                         }
-                                        KeyCode::Esc => {}
-                                        _ => overlay = ui::Overlay::QuitConfirm(working),
-                                    },
+                                    }
                                     ui::Overlay::Spawn(draft) => {
                                         let (next, effect) = spawn_overlay_reduce(draft, key);
                                         overlay = match next {
@@ -5919,28 +6030,25 @@ pub fn run_dashboard(
                                         }
                                     }
                                     // Issue #84.
-                                    ui::Overlay::Handover(mut draft) => match key.code {
-                                        KeyCode::Esc => {}
-                                        KeyCode::Up => {
-                                            draft.cursor = draft.cursor.saturating_sub(1);
-                                            overlay = ui::Overlay::Handover(draft);
-                                        }
-                                        KeyCode::Down => {
-                                            if draft.cursor + 1 < draft.items.len() {
-                                                draft.cursor += 1;
-                                            }
-                                            overlay = ui::Overlay::Handover(draft);
-                                        }
-                                        KeyCode::Enter => {
-                                            let choice = draft.items.get(draft.cursor).cloned();
+                                    ui::Overlay::Handover(draft) => {
+                                        let (next, effect) = handover_overlay_reduce(draft, key);
+                                        overlay = match next {
+                                            Some(d) => ui::Overlay::Handover(d),
+                                            None => ui::Overlay::None,
+                                        };
+                                        if let Some(HandoverEffect::Swap {
+                                            target_short,
+                                            target_agent,
+                                            target_model,
+                                        }) = effect
+                                        {
                                             let idx = panes
                                                 .iter()
-                                                .position(|p| p.short() == draft.target_short);
-                                            match (choice, idx) {
-                                                (
-                                                    Some((target_agent, _tier, target_model)),
-                                                    Some(idx),
-                                                ) if panes[idx].state() == PaneState::Idle => {
+                                                .position(|p| p.short() == target_short);
+                                            match idx {
+                                                Some(idx)
+                                                    if panes[idx].state() == PaneState::Idle =>
+                                                {
                                                     handover_pane(
                                                         &mut panes[idx],
                                                         &target_agent,
@@ -5950,28 +6058,32 @@ pub fn run_dashboard(
                                                         &mut errors,
                                                     );
                                                 }
-                                                (Some(_), Some(_)) => push_error(
+                                                Some(_) => push_error(
                                                     &mut errors,
                                                     format!(
-                                                        "handover: pane {} is not idle; retry \
-                                                         once it is",
-                                                        draft.target_short
+                                                        "handover: pane {target_short} is not \
+                                                         idle; retry once it is"
                                                     ),
                                                 ),
-                                                _ => push_error(
+                                                None => push_error(
                                                     &mut errors,
                                                     "handover: target pane no longer exists"
                                                         .to_string(),
                                                 ),
                                             }
                                         }
-                                        _ => overlay = ui::Overlay::Handover(draft),
-                                    },
+                                    }
                                     // Any key closes it (tmux's own key-list
                                     // convention): `overlay` was already reset
                                     // to `None` by the `mem::take` above, so
                                     // there is nothing to reassign here.
                                     ui::Overlay::Help => {}
+                                    ui::Overlay::Errors(view) => {
+                                        overlay = match errors_overlay_reduce(view, key) {
+                                            Some(v) => ui::Overlay::Errors(v),
+                                            None => ui::Overlay::None,
+                                        };
+                                    }
                                 }
                                 // Task 2: the take/assign pair. An overlay that
                                 // reopens itself (`took=X now=X`) is a key
@@ -6236,6 +6348,9 @@ pub fn run_dashboard(
                                     InputVerdict::Dash(DashAction::Memory) => {
                                         overlay =
                                             ui::Overlay::Memory(build_memory_view(state, repo));
+                                    }
+                                    InputVerdict::Dash(DashAction::ShowErrors) => {
+                                        overlay = ui::Overlay::Errors(build_errors_view(&errors));
                                     }
                                     InputVerdict::Dash(DashAction::Help) => {
                                         overlay = ui::Overlay::Help;
@@ -6651,45 +6766,35 @@ pub fn run_dashboard(
         let rows = assemble_sidebar(
             &build_pane_rows(&panes),
             &visible_registry,
-            &facts_cache.disk.scores,
             selected,
             focused,
             std::process::id(),
+            super::state::now_secs(),
         );
+        render_tick = render_tick.wrapping_add(1);
 
         // L13: a live notice (info) shows as plain text and takes precedence
         // while fresh; once it expires the sticky error line (⚠) shows through
         // again. Only genuine failures reach `errors` now -- informational
         // confirmations go to `notices`.
-        let focused_pane = panes.get(focused);
-        let label = harness_segment(
-            &harness_label,
-            focused,
-            focused_pane.map(|pane| pane.title()),
-        );
-        let harness = if let Some(note) = live_notice(&notices, Instant::now()) {
-            format!("{label}  {note}")
-        } else if let Some(last) = errors.last() {
-            format!("{label}  \u{26a0} {last}")
-        } else {
-            label
-        };
-        // The focused pane's own rot score, read out of the throttled cache
-        // rather than off disk: this runs on every frame.
+        let total_live = rows
+            .iter()
+            .filter(|r| r.state != ui::RowState::Dead)
+            .count();
         let facts = assemble_header_facts(
-            harness,
+            harness_label.clone(),
             !mouse_capture,
-            focused_pane.and_then(|pane| facts_cache.disk.scores.get(pane.short()).copied()),
-            facts_cache.disk.mail,
-            facts_cache.disk.memory_count,
+            total_live,
             rows.len(),
-            facts_cache.disk.usage.clone(),
+            errors.len(),
+            errors.last().cloned(),
+            live_notice(&notices, Instant::now()).map(str::to_string),
         );
 
         let draw = terminal.draw(|f| {
             if !zoomed {
                 ui::render_header(f, header_area, &facts);
-                ui::render_sidebar(f, sidebar_area, &rows);
+                ui::render_sidebar(f, sidebar_area, &rows, render_tick);
             }
             if let Some(pane) = panes.get(focused) {
                 // A selection only ever names the pane it started on
@@ -6724,7 +6829,7 @@ pub fn run_dashboard(
                     f.set_cursor_position(pos);
                 }
             }
-            ui::render_overlay(f, main_area, &overlay);
+            ui::render_overlay(f, main_area, &overlay, render_tick);
         });
         if let Err(e) = draw {
             push_error(&mut errors, format!("draw: {e}"));
@@ -6960,6 +7065,10 @@ mod tests {
         assert!(matches!(
             filter_key(true, key(KeyCode::Char('M'), KeyModifiers::NONE)).1,
             InputVerdict::Dash(DashAction::Memory)
+        ));
+        assert!(matches!(
+            filter_key(true, key(KeyCode::Char('e'), KeyModifiers::NONE)).1,
+            InputVerdict::Dash(DashAction::ShowErrors)
         ));
         assert!(matches!(
             filter_key(true, key(KeyCode::Char('z'), KeyModifiers::NONE)).1,
@@ -7763,13 +7872,16 @@ mod tests {
 
     #[test]
     fn assemble_sidebar_marks_the_focused_pane_separately_from_the_selection() {
-        let panes = vec![pane_row("aaa11111", "orch"), pane_row("bbb22222", "wrk")];
+        let panes = vec![
+            pane_row("aaa11111", "claude"),
+            pane_row("bbb22222", "claude"),
+        ];
         let registry = vec![(
             registry_record("ccc33333", "codex", Some(DASHBOARD_PID)),
             sessions::Liveness::Live,
         )];
         // Selection has walked onto the view-only row; focus is still pane 1.
-        let rows = assemble_sidebar(&panes, &registry, &no_scores(), 2, 1, DASHBOARD_PID);
+        let rows = assemble_sidebar(&panes, &registry, 2, 1, DASHBOARD_PID, 0);
         assert!(
             rows[2].selected,
             "the sidebar cursor is on the view-only row"
@@ -7793,19 +7905,12 @@ mod tests {
 
     // Task 7: sidebar row assembly + header facts.
 
-    fn pane_row(short: &str, title: &str) -> PaneRowMeta {
+    fn pane_row(short: &str, harness: &str) -> PaneRowMeta {
         PaneRowMeta {
             short: short.to_string(),
-            title: title.to_string(),
-            glyph: '\u{25cf}',
-            preview: "hi".to_string(),
+            harness: harness.to_string(),
+            state: ui::RowState::Idle,
         }
-    }
-
-    /// No session has been scored yet -- every row is unknown, which is what a
-    /// dashboard's very first frame genuinely looks like.
-    fn no_scores() -> ScoreMap {
-        ScoreMap::new()
     }
 
     fn owner(repo: &Path) -> FactsOwner<'_> {
@@ -7843,10 +7948,10 @@ mod tests {
     #[test]
     fn assemble_sidebar_lists_dashboard_panes_first_in_pane_order() {
         let panes = vec![
-            pane_row("aaa11111", "orch"),
-            pane_row("bbb22222", "wrk claude"),
+            pane_row("aaa11111", "claude"),
+            pane_row("bbb22222", "claude"),
         ];
-        let rows = assemble_sidebar(&panes, &[], &no_scores(), 0, 0, DASHBOARD_PID);
+        let rows = assemble_sidebar(&panes, &[], 0, 0, DASHBOARD_PID, 0);
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].short, "aaa11111");
         assert!(rows[0].attached);
@@ -7856,25 +7961,26 @@ mod tests {
 
     #[test]
     fn assemble_sidebar_appends_view_only_registry_rows_owned_by_this_dashboard() {
-        let panes = vec![pane_row("aaa11111", "orch")];
+        let panes = vec![pane_row("aaa11111", "claude")];
         let registry = vec![(
             registry_record("ccc33333", "codex", Some(DASHBOARD_PID)),
             sessions::Liveness::Live,
         )];
-        let rows = assemble_sidebar(&panes, &registry, &no_scores(), 0, 0, DASHBOARD_PID);
+        let rows = assemble_sidebar(&panes, &registry, 0, 0, DASHBOARD_PID, 0);
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[1].short, "ccc33333");
         assert!(!rows[1].attached, "a registry-only row is never attached");
+        assert_eq!(rows[1].state, ui::RowState::Unknown);
     }
 
     #[test]
     fn assemble_sidebar_excludes_a_registry_record_owned_by_a_different_dashboard() {
-        let panes = vec![pane_row("aaa11111", "orch")];
+        let panes = vec![pane_row("aaa11111", "claude")];
         let registry = vec![(
             registry_record("ccc33333", "codex", Some(DASHBOARD_PID + 1)),
             sessions::Liveness::Live,
         )];
-        let rows = assemble_sidebar(&panes, &registry, &no_scores(), 0, 0, DASHBOARD_PID);
+        let rows = assemble_sidebar(&panes, &registry, 0, 0, DASHBOARD_PID, 0);
         assert_eq!(
             rows.len(),
             1,
@@ -7884,12 +7990,12 @@ mod tests {
 
     #[test]
     fn assemble_sidebar_excludes_a_registry_record_with_no_owner() {
-        let panes = vec![pane_row("aaa11111", "orch")];
+        let panes = vec![pane_row("aaa11111", "claude")];
         let registry = vec![(
             registry_record("ccc33333", "codex", None),
             sessions::Liveness::Live,
         )];
-        let rows = assemble_sidebar(&panes, &registry, &no_scores(), 0, 0, DASHBOARD_PID);
+        let rows = assemble_sidebar(&panes, &registry, 0, 0, DASHBOARD_PID, 0);
         assert_eq!(
             rows.len(),
             1,
@@ -7900,12 +8006,12 @@ mod tests {
 
     #[test]
     fn assemble_sidebar_dedupes_a_panes_own_registry_record() {
-        let panes = vec![pane_row("aaa11111", "orch")];
+        let panes = vec![pane_row("aaa11111", "claude")];
         let registry = vec![(
             registry_record("aaa11111", "claude", Some(DASHBOARD_PID)),
             sessions::Liveness::Live,
         )];
-        let rows = assemble_sidebar(&panes, &registry, &no_scores(), 0, 0, DASHBOARD_PID);
+        let rows = assemble_sidebar(&panes, &registry, 0, 0, DASHBOARD_PID, 0);
         assert_eq!(
             rows.len(),
             1,
@@ -7920,7 +8026,7 @@ mod tests {
             registry_record("ddd44444", "codex", Some(DASHBOARD_PID)),
             sessions::Liveness::Stale,
         )];
-        let rows = assemble_sidebar(&[], &registry, &no_scores(), 0, 0, DASHBOARD_PID);
+        let rows = assemble_sidebar(&[], &registry, 0, 0, DASHBOARD_PID, 0);
         assert!(
             rows.is_empty(),
             "a dead session must not appear as a view-only row"
@@ -7929,47 +8035,75 @@ mod tests {
 
     #[test]
     fn assemble_sidebar_marks_the_selected_index_in_the_combined_list() {
-        let panes = vec![pane_row("aaa11111", "orch")];
+        let panes = vec![pane_row("aaa11111", "claude")];
         let registry = vec![(
             registry_record("ccc33333", "codex", Some(DASHBOARD_PID)),
             sessions::Liveness::Live,
         )];
-        let rows = assemble_sidebar(&panes, &registry, &no_scores(), 1, 0, DASHBOARD_PID);
+        let rows = assemble_sidebar(&panes, &registry, 1, 0, DASHBOARD_PID, 0);
         assert!(!rows[0].selected);
         assert!(rows[1].selected);
     }
 
+    /// Every row's age is `now_secs - started_at` off the matching registry
+    /// record -- the one age source both an attached pane and a view-only
+    /// row share.
     #[test]
-    fn assemble_header_facts_omits_mail_when_none() {
-        let facts =
-            assemble_header_facts("claude".to_string(), false, None, None, 3, 5, Vec::new());
-        assert_eq!(facts.mail_broadcast, 0);
-        assert_eq!(facts.mail_direct, 0);
-        assert_eq!(facts.memory_count, 3);
-        assert_eq!(facts.sessions, 5);
-        assert!(!facts.select_mode);
+    fn assemble_sidebar_computes_each_rows_age_from_the_matching_registry_record() {
+        let panes = vec![pane_row("aaa11111", "claude")];
+        let mut record = registry_record("aaa11111", "claude", Some(DASHBOARD_PID));
+        record.started_at = 100;
+        let registry = vec![(record, sessions::Liveness::Live)];
+        let rows = assemble_sidebar(&panes, &registry, 0, 0, DASHBOARD_PID, 160);
+        assert_eq!(rows[0].age_secs, Some(60));
+    }
+
+    /// No matching registry record at all (a race between a fresh spawn and
+    /// its own registration) leaves the age unknown, never a fabricated 0.
+    #[test]
+    fn assemble_sidebar_leaves_age_unknown_with_no_matching_registry_record() {
+        let panes = vec![pane_row("aaa11111", "claude")];
+        let rows = assemble_sidebar(&panes, &[], 0, 0, DASHBOARD_PID, 160);
+        assert_eq!(rows[0].age_secs, None);
     }
 
     #[test]
-    fn assemble_header_facts_carries_the_broadcast_direct_split_through() {
+    fn assemble_header_facts_carries_select_mode_live_and_total_through() {
+        let facts = assemble_header_facts("claude".to_string(), false, 2, 5, 0, None, None);
+        assert!(!facts.select_mode);
+        assert_eq!(facts.live, 2);
+        assert_eq!(facts.total, 5);
+        assert_eq!(facts.error_count, 0);
+        assert_eq!(facts.latest_error, None);
+        assert_eq!(facts.notice, None);
+
         let facts = assemble_header_facts(
             "claude".to_string(),
-            false,
-            Some(12),
-            Some((2, 1)),
-            0,
+            true,
             1,
-            Vec::new(),
+            1,
+            3,
+            Some("mail send: disk full".to_string()),
+            None,
         );
-        assert_eq!(facts.mail_broadcast, 2);
-        assert_eq!(facts.mail_direct, 1);
-        assert_eq!(facts.score, Some(12));
+        assert!(facts.select_mode);
+        assert_eq!(facts.error_count, 3);
+        assert_eq!(facts.latest_error.as_deref(), Some("mail send: disk full"));
     }
 
     #[test]
-    fn assemble_header_facts_carries_select_mode_through() {
-        let facts = assemble_header_facts("claude".to_string(), true, None, None, 0, 1, Vec::new());
-        assert!(facts.select_mode);
+    fn assemble_header_facts_carries_the_harness_and_notice_through() {
+        let facts = assemble_header_facts(
+            "claude (opus)".to_string(),
+            false,
+            1,
+            1,
+            0,
+            None,
+            Some("spawned claude as wrk-2".to_string()),
+        );
+        assert_eq!(facts.harness, "claude (opus)");
+        assert_eq!(facts.notice.as_deref(), Some("spawned claude as wrk-2"));
     }
 
     /// Task 7: `refresh_if_due` fills `disk.usage` with one entry per enabled
@@ -8061,19 +8195,6 @@ mod tests {
             "an expired window must not render as a current percent"
         );
         assert_eq!(claude.seven_day, None);
-    }
-
-    /// The harness segment names the pane the score beside it belongs to,
-    /// without ever dropping the repo-settable `chat.model` disclosure.
-    #[test]
-    fn the_harness_segment_names_the_focused_pane_once_focus_leaves_pane_zero() {
-        assert_eq!(harness_segment("claude", 0, Some("orch")), "claude");
-        assert_eq!(harness_segment("claude", 0, None), "claude");
-        assert_eq!(harness_segment("claude", 2, None), "claude");
-        assert_eq!(
-            harness_segment("claude (a-model)", 1, Some("wrk codex")),
-            "claude (a-model) \u{25b8} wrk codex"
-        );
     }
 
     #[test]
