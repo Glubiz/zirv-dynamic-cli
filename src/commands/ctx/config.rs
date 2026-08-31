@@ -589,6 +589,13 @@ pub struct WorkflowConfig {
     pub telemetry_enabled: bool,
     pub telemetry_max_events: usize,
     pub telemetry_retention_days: u64,
+    /// Issue #223: how hard zirv pushes a session that has done substantial
+    /// edit work with no active `zirv workflow` toward starting one. A
+    /// checkout must not be able to loosen or tighten this for itself --
+    /// same trust boundary as `deploy.tier`, minus the repo narrowing
+    /// carve-out `deploy.minimum_tier` gets, since there is no direction here
+    /// a repo may safely push.
+    pub adoption: crate::commands::workflow::adoption::AdoptionPolicy,
 }
 
 impl Default for WorkflowConfig {
@@ -602,6 +609,7 @@ impl Default for WorkflowConfig {
             telemetry_enabled: true,
             telemetry_max_events: 1000,
             telemetry_retention_days: 30,
+            adoption: crate::commands::workflow::adoption::AdoptionPolicy::default(),
         }
     }
 }
@@ -1416,6 +1424,11 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         EnvKind::Str,
     ),
     (
+        "ZIRV_CTX_WORKFLOW_ADOPTION",
+        &["workflow", "adoption"],
+        EnvKind::Str,
+    ),
+    (
         "ZIRV_CTX_REPORT_REPOSITORY",
         &["report", "repository"],
         EnvKind::Str,
@@ -1903,6 +1916,10 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
         &["workflow", "deploy", "tier"],
         "ZIRV_CTX_WORKFLOW_DEPLOY_TIER",
     ),
+    // A repo checkout must not be able to loosen its own adoption pressure
+    // (or falsely tighten it to `enforce`, holding an operator's own agent
+    // dispatches on a repo's say-so) -- see issue #223 and `adoption.rs`.
+    (&["workflow", "adoption"], "ZIRV_CTX_WORKFLOW_ADOPTION"),
     (&["workflow", "maintain"], "~/.zirv/ctx.toml only"),
     (&["report", "repository"], "ZIRV_CTX_REPORT_REPOSITORY"),
     (
@@ -5292,6 +5309,63 @@ mod tests {
     }
 
     #[test]
+    fn workflow_adoption_defaults_to_nudge() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tempfile::tempdir().expect("tempdir");
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|key| empty.get(key).cloned()).expect("load");
+        assert_eq!(
+            cfg.workflow.adoption,
+            crate::commands::workflow::adoption::AdoptionPolicy::Nudge
+        );
+    }
+
+    #[test]
+    fn workflow_adoption_env_override_parses_every_level() {
+        use crate::commands::workflow::adoption::AdoptionPolicy;
+
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tempfile::tempdir().expect("tempdir");
+
+        for (raw, expected) in [
+            ("off", AdoptionPolicy::Off),
+            ("advise", AdoptionPolicy::Advise),
+            ("nudge", AdoptionPolicy::Nudge),
+            ("enforce", AdoptionPolicy::Enforce),
+        ] {
+            let env = env_map(&[("ZIRV_CTX_WORKFLOW_ADOPTION", raw)]);
+            let cfg =
+                CtxConfig::load(repo.path(), &|key| env.get(key).cloned()).expect("env override");
+            assert_eq!(cfg.workflow.adoption, expected, "raw value {raw}");
+        }
+    }
+
+    /// SECURITY: `workflow.adoption` is operator-only -- a repo checkout must
+    /// not be able to loosen its own adoption pressure to `off`, nor tighten
+    /// it to `enforce` to hold an operator's own agent dispatches hostage.
+    #[test]
+    fn a_repo_ctx_toml_cannot_set_workflow_adoption() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tempfile::tempdir().expect("repo");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[workflow]\nadoption = \"off\"\n",
+        )
+        .expect("write");
+        let empty: HashMap<String, String> = HashMap::new();
+        let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+            .expect_err("a repo may not set workflow.adoption");
+        assert!(
+            is_repo_forbidden(err.as_ref()),
+            "must be a security refusal: {err}"
+        );
+    }
+
+    #[test]
     fn repo_cannot_configure_maintain_commands_or_report_destination() {
         let home = tempfile::tempdir().expect("tempdir");
         let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
@@ -5472,6 +5546,7 @@ mod tests {
         ("workflow", "repo_agents_enabled"),
         ("workflow.deploy", "tier"),
         ("workflow.deploy", "minimum_tier"),
+        ("workflow", "adoption"),
         ("workflow.maintain", "timeout_secs"),
         ("report", "repository"),
         ("workflow", "telemetry_enabled"),

@@ -84,6 +84,14 @@ pub enum TelemetryKind {
     FrontendDetectorRun,
     FrontendRenderRun,
     FrontendVisualReview,
+    /// Issue #223: a session's own signals first crossed the "substantial
+    /// edit work" threshold (`adoption::is_substantial`). Recorded at most
+    /// once per session -- `workflow_id` stays `None` (this is a session-
+    /// level fact, not a workflow one), `session_id` names the session.
+    AdoptionDetected,
+    /// Issue #223: a session recorded as `AdoptionDetected` with no active
+    /// workflow later has one active. Recorded at most once per session.
+    AdoptionRecovered,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -160,6 +168,11 @@ pub struct TelemetryEvent {
     /// Provider-neutral agent manifest id, populated by agent dispatch in phase 3.
     #[serde(default)]
     pub agent_id: Option<String>,
+    /// Issue #223: for `AdoptionDetected`/`AdoptionRecovered` only, whether a
+    /// `zirv workflow` was active at that moment. `#[serde(default)]` so
+    /// every event file written before this field existed still deserializes.
+    #[serde(default)]
+    pub workflow_active: Option<bool>,
 }
 
 impl TelemetryEvent {
@@ -201,6 +214,7 @@ impl TelemetryEvent {
             artifact_stage: None,
             deploy_tier: None,
             agent_id: None,
+            workflow_active: None,
         }
     }
 
@@ -403,6 +417,33 @@ pub struct WorkflowStats {
     pub confirmed_findings_per_review: Option<f64>,
 }
 
+/// Issue #223: how often substantial edit work actually ran inside a `zirv
+/// workflow`, and how much of that came from a nudge rather than already
+/// being underway. Derived from `AdoptionDetected`/`AdoptionRecovered`
+/// events, each recorded at most once per session (`ctx::hook`'s own
+/// `detected_recorded`/`recovered_recorded` guards).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
+pub struct AdoptionStats {
+    pub substantial_sessions: usize,
+    pub with_workflow_at_detection: usize,
+    pub recovered_after_nudge: usize,
+}
+
+impl AdoptionStats {
+    /// Sessions that ran a `zirv workflow` at some point: already active when
+    /// detected, plus ones that started one afterward.
+    pub fn ran_a_workflow(&self) -> usize {
+        self.with_workflow_at_detection + self.recovered_after_nudge
+    }
+
+    /// `None` when no substantial session has been observed at all -- never a
+    /// manufactured 0%, the same convention `review_defect_rate` uses.
+    pub fn rate(&self) -> Option<f64> {
+        (self.substantial_sessions > 0)
+            .then(|| self.ran_a_workflow() as f64 / self.substantial_sessions as f64)
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct StatsReport {
     pub events: usize,
@@ -438,6 +479,8 @@ pub struct StatsReport {
     /// event has been recorded at all -- the "no regression in
     /// review-confirmed defect rates" accounting hook issue #155 asks for.
     pub review_defect_rate: Option<f64>,
+    /// Issue #223. Always last -- see `run_stats`'s own ordering comment.
+    pub adoption: AdoptionStats,
 }
 
 pub fn aggregate(events: &[TelemetryEvent]) -> StatsReport {
@@ -458,6 +501,7 @@ pub fn aggregate(events: &[TelemetryEvent]) -> StatsReport {
     let mut deploy_gate_failures = 0usize;
     let mut maintenance_scans = 0usize;
     let mut maintenance_breaches = 0usize;
+    let mut adoption = AdoptionStats::default();
     let mut finding_snapshots: BTreeMap<String, (u64, String, u32, u32, u32)> = BTreeMap::new();
     let mut workflows: BTreeMap<String, WorkflowStats> = BTreeMap::new();
     let mut review_runs = 0usize;
@@ -560,6 +604,13 @@ pub fn aggregate(events: &[TelemetryEvent]) -> StatsReport {
                     maintenance_breaches += 1;
                 }
             }
+            TelemetryKind::AdoptionDetected => {
+                adoption.substantial_sessions += 1;
+                if event.workflow_active == Some(true) {
+                    adoption.with_workflow_at_detection += 1;
+                }
+            }
+            TelemetryKind::AdoptionRecovered => adoption.recovered_after_nudge += 1,
             _ => {}
         }
         if let Some(workflow_id) = &event.workflow_id
@@ -647,6 +698,7 @@ pub fn aggregate(events: &[TelemetryEvent]) -> StatsReport {
         workflows,
         review_runs,
         review_defect_rate,
+        adoption,
     }
 }
 
@@ -808,8 +860,26 @@ pub fn run_stats(args: &StatsArgs, writer: &mut impl Write) -> CtxResult<i32> {
             report.maintenance_scans,
             report.maintenance_breaches
         )?;
+        // Issue #223: deliberately the LAST line of the report.
+        writeln!(writer, "{}", render_adoption_line(&report.adoption))?;
     }
     Ok(0)
+}
+
+/// `adoption: no substantial sessions observed` when nothing has crossed the
+/// threshold yet; otherwise `adoption: {ran}/{substantial} substantial
+/// sessions ran a workflow ({pct}%), {n} adopted after a nudge`.
+fn render_adoption_line(stats: &AdoptionStats) -> String {
+    match stats.rate() {
+        None => "adoption: no substantial sessions observed".to_string(),
+        Some(rate) => format!(
+            "adoption: {}/{} substantial sessions ran a workflow ({:.0}%), {} adopted after a nudge",
+            stats.ran_a_workflow(),
+            stats.substantial_sessions,
+            rate * 100.0,
+            stats.recovered_after_nudge
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -1118,6 +1188,93 @@ mod tests {
         let stats = aggregate(&[phase]);
         assert_eq!(stats.review_runs, 0);
         assert_eq!(stats.review_defect_rate, None);
+    }
+
+    /// Issue #223: `AdoptionDetected`'s own `workflow_active` payload sorts a
+    /// substantial session into "already had a workflow" vs. not, and
+    /// `AdoptionRecovered` is counted separately (it never re-adds to
+    /// `substantial_sessions` -- that already happened at detection).
+    #[test]
+    fn aggregate_counts_adoption_detected_and_recovered_events() {
+        let mut already_running = TelemetryEvent::new(TelemetryKind::AdoptionDetected);
+        already_running.session_id = Some("s1".into());
+        already_running.workflow_active = Some(true);
+
+        let mut gap_opened = TelemetryEvent::new(TelemetryKind::AdoptionDetected);
+        gap_opened.session_id = Some("s2".into());
+        gap_opened.workflow_active = Some(false);
+
+        let mut gap_closed = TelemetryEvent::new(TelemetryKind::AdoptionRecovered);
+        gap_closed.session_id = Some("s2".into());
+        gap_closed.workflow_active = Some(true);
+
+        let mut still_open = TelemetryEvent::new(TelemetryKind::AdoptionDetected);
+        still_open.session_id = Some("s3".into());
+        still_open.workflow_active = Some(false);
+
+        let stats = aggregate(&[already_running, gap_opened, gap_closed, still_open]).adoption;
+
+        assert_eq!(stats.substantial_sessions, 3);
+        assert_eq!(stats.with_workflow_at_detection, 1);
+        assert_eq!(stats.recovered_after_nudge, 1);
+        assert_eq!(stats.ran_a_workflow(), 2);
+        assert_eq!(stats.rate(), Some(2.0 / 3.0));
+    }
+
+    #[test]
+    fn adoption_rate_is_none_with_no_substantial_sessions() {
+        let stats = AdoptionStats::default();
+        assert_eq!(stats.rate(), None);
+        assert_eq!(
+            render_adoption_line(&stats),
+            "adoption: no substantial sessions observed"
+        );
+    }
+
+    #[test]
+    fn adoption_line_matches_the_documented_shape() {
+        let stats = AdoptionStats {
+            substantial_sessions: 5,
+            with_workflow_at_detection: 3,
+            recovered_after_nudge: 1,
+        };
+        assert_eq!(
+            render_adoption_line(&stats),
+            "adoption: 4/5 substantial sessions ran a workflow (80%), 1 adopted after a nudge"
+        );
+    }
+
+    /// `run_stats` cannot be driven directly in a test (it resolves its own
+    /// state dir from the real process environment, which tests must never
+    /// set -- see this crate's own "no `std::env::set_var` in tests" rule),
+    /// so this pins the same end-to-end shape `run_stats` builds from
+    /// `aggregate` + `render_adoption_line`, with the adoption line last.
+    #[test]
+    fn adoption_line_is_appended_after_the_sdlc_lifecycle_line() {
+        let mut event = TelemetryEvent::new(TelemetryKind::AdoptionDetected);
+        event.workflow_active = Some(true);
+        let report = aggregate(&[event]);
+
+        let mut rendered = String::new();
+        rendered.push_str(&format!(
+            "sdlc lifecycle: {} artifact acceptances, {} agent dispatches, deploy gates {} \
+             evaluations/{} failures, maintenance {} scans/{} breaches\n",
+            report.artifact_acceptances,
+            report.agent_dispatches,
+            report.deploy_gate_evaluations,
+            report.deploy_gate_failures,
+            report.maintenance_scans,
+            report.maintenance_breaches
+        ));
+        rendered.push_str(&render_adoption_line(&report.adoption));
+        assert!(
+            rendered
+                .lines()
+                .last()
+                .expect("at least one line")
+                .starts_with("adoption:"),
+            "the adoption line must be last: {rendered}"
+        );
     }
 
     #[test]

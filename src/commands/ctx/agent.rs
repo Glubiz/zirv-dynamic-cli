@@ -899,6 +899,47 @@ fn live_join_target(inherited: &Path, env: EnvLookup<'_>) -> Option<PathBuf> {
     }
 }
 
+/// Issue #223 §E: `workflow.adoption = enforce`'s delegation gate. Refuses
+/// only when all four hold -- the policy is `enforce`, this call carries a
+/// session identity ([`adapters::SESSION_ENV`]), that session's own adoption
+/// record (`hook::adoption_record_path`/`load_adoption_record`, the same
+/// record `ctx::hook`'s Stop/Prompt handlers maintain) says substantial, and
+/// no `zirv workflow` is active for `repo` right now -- so an operator
+/// running `zirv agent` from a plain shell with no session identity at all is
+/// never blocked.
+fn adoption_enforcement_refusal(
+    state: &super::state::StateDir,
+    repo: &Path,
+    cfg: &CtxConfig,
+    env: EnvLookup<'_>,
+) -> Option<String> {
+    use crate::commands::workflow::adoption::AdoptionPolicy;
+
+    if cfg.workflow.adoption != AdoptionPolicy::Enforce {
+        return None;
+    }
+    let session = env(adapters::SESSION_ENV)?;
+    let path = super::hook::adoption_record_path(state, &session);
+    let record = super::hook::load_adoption_record(&path);
+    if !record.substantial {
+        return None;
+    }
+    if crate::commands::workflow::engine::load_active(state, repo)
+        .ok()
+        .flatten()
+        .is_some()
+    {
+        return None;
+    }
+    let kind = super::hook::classified_kind(repo);
+    Some(format!(
+        "zirv agent: held by workflow.adoption = enforce -- this session has done substantial \
+         work ({} edit calls over {} turns) with no active zirv workflow. Start one first: zirv \
+         workflow start {kind} --task \"<summary>\"",
+        record.edit_like_calls, record.turns
+    ))
+}
+
 pub fn run_with<W: Write>(
     args: &AgentArgs,
     w: &mut W,
@@ -923,6 +964,14 @@ pub fn run_with<W: Write>(
     // an exhausted/low-headroom seat can be translated to an equivalent tier
     // on another enabled harness. This does not launch anything.
     let state = super::state::StateDir::resolve(env)?;
+
+    // Issue #223 §E: refuses before any routing/spawn decision below, so an
+    // enforced session never even gets as far as picking a route or joining
+    // a dashboard.
+    if let Some(message) = adoption_enforcement_refusal(&state, repo, &cfg, env) {
+        return Err(message.into());
+    }
+
     let now = super::state::now_secs();
     let requested_adapter = adapters::select(Some(&args.name), &[], &cfg)?;
     let requested_command =
@@ -1324,6 +1373,8 @@ pub fn run<W: Write>(args: &AgentArgs, w: &mut W) -> CtxResult<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::ctx::hook;
+    use crate::commands::ctx::state::StateDir;
     use std::collections::HashMap;
     use std::path::PathBuf;
 
@@ -1344,6 +1395,127 @@ mod tests {
             "budget-exhausted"
         );
         assert_eq!(delegation_outcome(1), "failed");
+    }
+
+    fn test_classification() -> crate::commands::workflow::classify::Classification {
+        crate::commands::workflow::classify::classify(
+            &crate::commands::workflow::classify::ClassificationInput {
+                task: String::new(),
+                paths: Vec::new(),
+                changed_lines: 0,
+                tests_changed: true,
+                intent_override: None,
+                complexity_override: None,
+                risk_override: None,
+            },
+        )
+        .expect("classify")
+    }
+
+    /// Issue #223 §E: `workflow.adoption = enforce` refuses a delegation when
+    /// all four conditions hold -- enforce policy, a session identity, a
+    /// substantial adoption record, and no active workflow.
+    #[test]
+    fn enforce_refuses_a_substantial_session_with_no_active_workflow() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(root.path().to_path_buf());
+        let session = "sess-enforce-1";
+        let path = hook::adoption_record_path(&state, session);
+        hook::save_adoption_record(&path, &hook::AdoptionRecord::substantial_for_test(7, 9));
+
+        let mut cfg = CtxConfig::default();
+        cfg.workflow.adoption = crate::commands::workflow::adoption::AdoptionPolicy::Enforce;
+        let env: HashMap<String, String> =
+            [(adapters::SESSION_ENV.to_string(), session.to_string())].into();
+
+        let message =
+            adoption_enforcement_refusal(&state, repo.path(), &cfg, &|k| env.get(k).cloned())
+                .expect("must refuse");
+        assert!(message.contains("workflow.adoption = enforce"), "{message}");
+        assert!(message.contains("7 edit calls over 9 turns"), "{message}");
+        assert!(
+            message.contains("zirv workflow start"),
+            "must point at the fix: {message}"
+        );
+    }
+
+    /// An active workflow lifts the gate even though the record still says
+    /// substantial.
+    #[test]
+    fn enforce_allows_a_substantial_session_with_an_active_workflow() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(root.path().to_path_buf());
+        let session = "sess-enforce-2";
+        let path = hook::adoption_record_path(&state, session);
+        hook::save_adoption_record(&path, &hook::AdoptionRecord::substantial_for_test(7, 9));
+        crate::commands::workflow::engine::save(
+            &state,
+            &crate::commands::workflow::engine::WorkflowState::start(
+                repo.path().to_path_buf(),
+                "small feature".into(),
+                crate::commands::workflow::engine::WorkflowKind::Feature,
+                None,
+                true,
+                test_classification(),
+            ),
+            true,
+        )
+        .expect("save active workflow");
+
+        let mut cfg = CtxConfig::default();
+        cfg.workflow.adoption = crate::commands::workflow::adoption::AdoptionPolicy::Enforce;
+        let env: HashMap<String, String> =
+            [(adapters::SESSION_ENV.to_string(), session.to_string())].into();
+
+        assert_eq!(
+            adoption_enforcement_refusal(&state, repo.path(), &cfg, &|k| env.get(k).cloned()),
+            None,
+            "an active workflow must lift the gate"
+        );
+    }
+
+    /// `nudge` (or any policy below `enforce`) never gates a delegation.
+    #[test]
+    fn enforce_gate_is_inert_below_the_enforce_policy() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(root.path().to_path_buf());
+        let session = "sess-enforce-3";
+        let path = hook::adoption_record_path(&state, session);
+        hook::save_adoption_record(&path, &hook::AdoptionRecord::substantial_for_test(7, 9));
+
+        let mut cfg = CtxConfig::default();
+        cfg.workflow.adoption = crate::commands::workflow::adoption::AdoptionPolicy::Nudge;
+        let env: HashMap<String, String> =
+            [(adapters::SESSION_ENV.to_string(), session.to_string())].into();
+
+        assert_eq!(
+            adoption_enforcement_refusal(&state, repo.path(), &cfg, &|k| env.get(k).cloned()),
+            None,
+            "nudge must never block a delegation"
+        );
+    }
+
+    /// An operator with no session identity at all (a plain shell, not a
+    /// supervised harness session) is never blocked.
+    #[test]
+    fn enforce_gate_never_blocks_an_operator_with_no_session_identity() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(root.path().to_path_buf());
+        // No adoption record is even written: there is no session id to key
+        // one on.
+        let mut cfg = CtxConfig::default();
+        cfg.workflow.adoption = crate::commands::workflow::adoption::AdoptionPolicy::Enforce;
+        let empty: HashMap<String, String> = HashMap::new();
+
+        assert_eq!(
+            adoption_enforcement_refusal(&state, repo.path(), &cfg, &|k| empty.get(k).cloned()),
+            None,
+            "no session identity means no session to gate"
+        );
     }
 
     /// `--force` is the operator saying they accept the spend. Only a

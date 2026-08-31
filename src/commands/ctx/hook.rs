@@ -5,9 +5,13 @@ use serde::{Deserialize, Serialize};
 
 use super::adapters::{self, SESSION_ENV, SOCKET_ENV};
 use super::config::{CtxConfig, EnvLookup, env_from_process};
+use super::event::input_hash;
 use super::rot::{Score, Verdict};
 use super::state::{StateDir, now_secs};
+use super::supervise::Watcher;
 use super::{CtxResult, log, score, signal};
+use crate::commands::workflow::adoption::{self, AdoptionPolicy, AdoptionSignals};
+use crate::commands::workflow::{classify, engine, telemetry};
 
 #[derive(Debug, clap::Args)]
 pub struct HookArgs {
@@ -78,11 +82,18 @@ fn optimize_hint(reason: super::optimize::RecommendReason) -> &'static str {
 
 /// Decides what the Stop hook prints. `None` means print nothing, which is also
 /// what every failure path does.
+///
+/// `adoption_nudge` (issue #223) rides along as an extra line: a session can
+/// be perfectly `Healthy` by rot's own measure and still be doing substantial
+/// edit work with no active `zirv workflow`, so it is folded into both the
+/// healthy-session hint path and the ordinary advisory below, not gated
+/// behind either.
 pub fn stop_output(
     payload: &HookPayload,
     score: &Score,
     socket: Option<&Path>,
     optimize_recommended: Option<super::optimize::RecommendReason>,
+    adoption_nudge: Option<&str>,
 ) -> Option<String> {
     if payload.stop_hook_active {
         return None;
@@ -90,15 +101,28 @@ pub fn stop_output(
     if socket.is_some() {
         return None;
     }
-    if score.verdict == Verdict::Healthy && optimize_recommended.is_none() {
+    if score.verdict == Verdict::Healthy
+        && optimize_recommended.is_none()
+        && adoption_nudge.is_none()
+    {
         return None;
     }
 
     // A healthy session is never told to /compact or resume: the only thing
-    // worth saying is the optimize hint that got it here in the first place.
+    // worth saying is the optimize hint (and adoption nudge, if any) that got
+    // it here in the first place.
     if score.verdict == Verdict::Healthy {
-        let hint = optimize_recommended.map(optimize_hint).unwrap_or_default();
-        return serde_json::to_string(&serde_json::json!({ "systemMessage": hint })).ok();
+        let mut message = optimize_recommended
+            .map(optimize_hint)
+            .unwrap_or_default()
+            .to_string();
+        if let Some(nudge) = adoption_nudge {
+            if !message.is_empty() {
+                message.push('\n');
+            }
+            message.push_str(nudge);
+        }
+        return serde_json::to_string(&serde_json::json!({ "systemMessage": message })).ok();
     }
 
     let mut advisory = format!(
@@ -110,6 +134,10 @@ pub fn stop_output(
     if let Some(reason) = optimize_recommended {
         advisory.push(' ');
         advisory.push_str(optimize_hint(reason));
+    }
+    if let Some(nudge) = adoption_nudge {
+        advisory.push('\n');
+        advisory.push_str(nudge);
     }
     serde_json::to_string(&serde_json::json!({ "systemMessage": advisory })).ok()
 }
@@ -155,6 +183,228 @@ fn cfg_or_operator_only_gate(repo: &Path, env: EnvLookup<'_>) -> CtxConfig {
     }
 }
 
+/// Issue #223: per-session workflow-adoption bookkeeping, refreshed on every
+/// Stop/Notify hook call and re-read (never re-scanned) by the Prompt hook.
+/// `edit_like_calls`/`turns` are the same cumulative counts
+/// `adoption::signals` would report over the whole transcript;
+/// `offset`/`consumed` are this record's own [`Watcher`] resume position, so
+/// a fresh hook-per-turn process still only ever parses the bytes appended
+/// since the last one -- the same append-only-cost property `score.rs`'s own
+/// incremental checkpoint has, kept as a separate small fold here rather than
+/// widening that (separately versioned, heavily depended-on) schema.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub(crate) struct AdoptionRecord {
+    pub(crate) substantial: bool,
+    pub(crate) edit_like_calls: usize,
+    pub(crate) turns: usize,
+    workflow_active: bool,
+    first_detected_turn: Option<usize>,
+    last_nudged_turn: Option<usize>,
+    detected_recorded: bool,
+    recovered_recorded: bool,
+    #[serde(default)]
+    offset: u64,
+    #[serde(default)]
+    consumed: u64,
+}
+
+/// One file per session id, named after a hash of it (mirrors `score.rs`'s
+/// `checkpoint_path`): session ids are not always filesystem-safe on their
+/// own, and are far too long/variable-shaped across adapters to trust as a
+/// filename directly.
+///
+/// `pub(crate)`: `agent::run_with`'s own enforce-policy gate (issue #223 §E)
+/// reads the same record this hook writes, rather than keeping a second copy
+/// of this path/schema.
+pub(crate) fn adoption_record_path(state: &StateDir, session: &str) -> std::path::PathBuf {
+    state
+        .adoption()
+        .join(format!("{:016x}.json", input_hash(session)))
+}
+
+/// `Default` (nothing detected yet) on any doubt at all -- missing, corrupt,
+/// unreadable -- exactly like every other best-effort state read a hook makes.
+pub(crate) fn load_adoption_record(path: &Path) -> AdoptionRecord {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|body| serde_json::from_str(&body).ok())
+        .unwrap_or_default()
+}
+
+/// Test-only, cross-module (`agent::run_with`'s enforce-gate tests build a
+/// record directly rather than driving a whole Stop hook call): a record
+/// already past the substantial threshold.
+#[cfg(test)]
+impl AdoptionRecord {
+    pub(crate) fn substantial_for_test(edit_like_calls: usize, turns: usize) -> Self {
+        Self {
+            substantial: true,
+            edit_like_calls,
+            turns,
+            ..Self::default()
+        }
+    }
+}
+
+/// Best-effort, like `score.rs`'s `save_checkpoint`: a record that fails to
+/// write costs the next hook call a full-session refold, never a hook failure.
+///
+/// `pub(crate)`: also used directly by `agent::run_with`'s enforce-gate tests
+/// (issue #223 §E) to seed a record without driving a whole Stop hook call.
+pub(crate) fn save_adoption_record(path: &Path, record: &AdoptionRecord) {
+    let Ok(json) = serde_json::to_string(record) else {
+        return;
+    };
+    if let Some(dir) = path.parent() {
+        let _ = super::state::create_private_dir_all(dir);
+    }
+    let _ = super::state::write_private(path, &json);
+}
+
+/// Folds only the transcript bytes appended since `record`'s own resume
+/// position into its cumulative `edit_like_calls`. A restarted transcript
+/// (compaction, rewrite) restarts the fold from zero, the same rule
+/// `RotState` applies to the score itself.
+fn fold_adoption_delta(
+    record: &mut AdoptionRecord,
+    transcript: &Path,
+    adapter: &dyn adapters::AgentAdapter,
+) {
+    if !adapter.capabilities().events {
+        return;
+    }
+    let mut watcher = Watcher::resuming(transcript.to_path_buf(), record.offset, record.consumed);
+    let Ok(Some(appended)) = watcher.read_appended() else {
+        return;
+    };
+    if appended.restarted {
+        record.edit_like_calls = 0;
+    }
+    record.edit_like_calls +=
+        adoption::signals(&adapter.parse_events(&appended.lines)).edit_like_calls;
+    let (offset, consumed) = watcher.position();
+    record.offset = offset;
+    record.consumed = consumed;
+}
+
+/// The workflow kind named in a nudge's `zirv workflow start <kind>`, from
+/// the same git-diff classifier `zirv workflow classify` runs -- only ever
+/// called once a nudge is actually due, since it shells out to `git`. Any
+/// failure (no git, no diff, classification error) falls back to `feature`.
+///
+/// `pub(crate)`: also used by `agent::run_with`'s enforce-policy refusal
+/// message (issue #223 §E), which names the same kind for the same reason.
+pub(crate) fn classified_kind(repo: &Path) -> String {
+    classify::git_change_input(repo, String::new())
+        .and_then(|input| classify::classify(&input))
+        .map(|classification| {
+            match classification.intent {
+                classify::Intent::Bugfix => "bugfix",
+                classify::Intent::Refactor => "refactor",
+                classify::Intent::Spike => "spike",
+                classify::Intent::Review => "review",
+                classify::Intent::Feature | classify::Intent::Other => "feature",
+            }
+            .to_string()
+        })
+        .unwrap_or_else(|_| "feature".to_string())
+}
+
+/// Workflow-adoption detection and Stop-hook nudge text, in one pass.
+/// `None` whenever nothing should be added to the hook's own output -- the
+/// policy is `off`, this session is a delegated worker, or no nudge is due --
+/// which is also every failure path: like every other hook function, this
+/// must never fail loudly.
+///
+/// Delegated workers are never nudged: only the top-level session a human is
+/// actually looking at should be told to start a workflow. A worker
+/// pane/headless child inherits [`super::agent::WORK_GROUP_ENV`] from its own
+/// delegation lineage (see that constant's own doc comment); a top-level
+/// interactive session never has it set. This is the one real "am I a
+/// delegated worker" signal already wired into a spawned child's own process
+/// env today -- `telemetry::TelemetryEvent::parent_session_id` exists as a
+/// field but nothing in this codebase populates it yet.
+fn adoption_stop_nudge(
+    state: &StateDir,
+    repo: &Path,
+    session: &str,
+    cfg: &CtxConfig,
+    score: &Score,
+    transcript: &Path,
+    env: EnvLookup<'_>,
+) -> Option<String> {
+    if cfg.workflow.adoption == AdoptionPolicy::Off {
+        return None;
+    }
+    if env(super::agent::WORK_GROUP_ENV)
+        .filter(|v| !v.is_empty())
+        .is_some()
+    {
+        return None;
+    }
+
+    let path = adoption_record_path(state, session);
+    let mut record = load_adoption_record(&path);
+
+    if let Ok(adapter) = adapters::select(cfg.agent.as_deref(), &[], cfg) {
+        fold_adoption_delta(&mut record, transcript, adapter.as_ref());
+    }
+    record.turns = score.signals.turns;
+    let signals = AdoptionSignals {
+        edit_like_calls: record.edit_like_calls,
+        turns: record.turns,
+    };
+    record.substantial = adoption::is_substantial(&signals);
+    record.workflow_active = engine::load_active(state, repo).ok().flatten().is_some();
+
+    let telemetry_cfg = telemetry::TelemetryConfig::from_config(&cfg.workflow);
+    if record.substantial && !record.detected_recorded {
+        record.detected_recorded = true;
+        if !record.workflow_active {
+            record.first_detected_turn.get_or_insert(record.turns);
+        }
+        let mut event = telemetry::TelemetryEvent::new(telemetry::TelemetryKind::AdoptionDetected);
+        event.session_id = Some(session.to_string());
+        event.workflow_active = Some(record.workflow_active);
+        let _ = telemetry::record(state, repo, &event, &telemetry_cfg);
+    }
+    if record.workflow_active && record.first_detected_turn.is_some() && !record.recovered_recorded
+    {
+        record.recovered_recorded = true;
+        let mut event = telemetry::TelemetryEvent::new(telemetry::TelemetryKind::AdoptionRecovered);
+        event.session_id = Some(session.to_string());
+        event.workflow_active = Some(true);
+        let _ = telemetry::record(state, repo, &event, &telemetry_cfg);
+    }
+
+    let due = if cfg.workflow.adoption >= AdoptionPolicy::Nudge {
+        adoption::nudge_due(
+            cfg.workflow.adoption,
+            record.substantial,
+            record.workflow_active,
+            record.turns,
+            record.last_nudged_turn,
+        )
+    } else {
+        // `Advise`: fires exactly once, the turn substantial-without-workflow
+        // first becomes true. `nudge_due` itself never fires below `Nudge`
+        // (see its own doc comment), so `Advise`'s single notice is decided
+        // here instead.
+        record.substantial && !record.workflow_active && record.last_nudged_turn.is_none()
+    };
+    let text = due.then(|| {
+        record.last_nudged_turn = Some(record.turns);
+        adoption::nudge_text(
+            &signals,
+            Some(&classified_kind(repo)),
+            cfg.workflow.adoption,
+        )
+    });
+
+    save_adoption_record(&path, &record);
+    text
+}
+
 pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResult<i32> {
     // Every early return is deliberate: a hook that errors must still exit 0.
     let Ok(payload) = HookPayload::parse(stdin) else {
@@ -194,6 +444,7 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
     }
 
     let mut optimize_recommended = None;
+    let mut adoption_nudge = None;
     if let Ok(state) = StateDir::resolve(env) {
         let _ = log::append(
             &state,
@@ -231,21 +482,41 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
                 now,
             );
         }
+
+        adoption_nudge =
+            adoption_stop_nudge(&state, &repo, &session, &cfg, &score, transcript, env);
     }
 
-    if let Some(line) = stop_output(&payload, &score, socket.as_deref(), optimize_recommended) {
+    if let Some(line) = stop_output(
+        &payload,
+        &score,
+        socket.as_deref(),
+        optimize_recommended,
+        adoption_nudge.as_deref(),
+    ) {
         let _ = writeln!(w, "{line}");
     }
     Ok(0)
 }
 
 /// UserPromptSubmit is the only hook that can add context to the model, which
-/// is how the marker signal gets installed.
-pub fn prompt_output(marker: &str) -> String {
-    let context = format!(
-        "Start every final answer in this session with the prefix {marker} on the first line. \
-         Mid-turn status notes do not need it. This is a context-health marker read by zirv ctx."
-    );
+/// is how the marker signal gets installed. `adoption_nudge` (issue #223)
+/// rides as a second line when one is due -- the marker line above stays
+/// exactly as it was, so an operator relying on it for the rot signal sees no
+/// change.
+pub fn prompt_output(marker: &str, adoption_nudge: Option<&str>) -> String {
+    let mut lines = Vec::new();
+    if !marker.is_empty() {
+        lines.push(format!(
+            "Start every final answer in this session with the prefix {marker} on the first \
+             line. Mid-turn status notes do not need it. This is a context-health marker read by \
+             zirv ctx."
+        ));
+    }
+    if let Some(nudge) = adoption_nudge {
+        lines.push(nudge.to_string());
+    }
+    let context = lines.join("\n");
     serde_json::json!({
         "hookSpecificOutput": {
             "hookEventName": "UserPromptSubmit",
@@ -541,17 +812,72 @@ pub fn run_notify<W: Write>(w: &mut W, payload: &str, env: EnvLookup<'_>) -> Ctx
     run_stop(w, &raw, env)
 }
 
+/// Issue #223: the `UserPromptSubmit` half of the adoption nudge. Unlike the
+/// Stop hook, this never re-scans the transcript -- it only re-reads the
+/// per-session record `adoption_stop_nudge` already maintains and re-checks
+/// `zirv workflow start`/`resume` live, since a workflow can start in another
+/// pane between one Stop and the next prompt. `None` on any doubt at all: no
+/// session identity, no record, not substantial, a workflow already active,
+/// or simply not due yet.
+fn prompt_adoption_nudge(repo: &Path, cfg: &CtxConfig, env: EnvLookup<'_>) -> Option<String> {
+    if cfg.workflow.adoption < AdoptionPolicy::Nudge {
+        return None;
+    }
+    if env(super::agent::WORK_GROUP_ENV)
+        .filter(|v| !v.is_empty())
+        .is_some()
+    {
+        return None;
+    }
+    let session = env(SESSION_ENV)?;
+    let state = StateDir::resolve(env).ok()?;
+    let path = adoption_record_path(&state, &session);
+    let mut record = load_adoption_record(&path);
+    if !record.substantial {
+        return None;
+    }
+    // Live re-check: a workflow may have started in another pane since the
+    // last Stop hook wrote this record.
+    let workflow_active_now = engine::load_active(&state, repo).ok().flatten().is_some();
+    if !adoption::nudge_due(
+        cfg.workflow.adoption,
+        record.substantial,
+        workflow_active_now,
+        record.turns,
+        record.last_nudged_turn,
+    ) {
+        return None;
+    }
+    let signals = AdoptionSignals {
+        edit_like_calls: record.edit_like_calls,
+        turns: record.turns,
+    };
+    let text = adoption::nudge_text(
+        &signals,
+        Some(&classified_kind(repo)),
+        cfg.workflow.adoption,
+    );
+    record.last_nudged_turn = Some(record.turns);
+    save_adoption_record(&path, &record);
+    Some(text)
+}
+
 pub fn run<W: Write>(args: &HookArgs, w: &mut W) -> CtxResult<i32> {
     let env = env_from_process();
     match &args.event {
         HookEvent::Stop => run_stop(w, &read_stdin(), &env),
         HookEvent::Prompt => {
             let repo = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-            let marker = super::config::CtxConfig::load(&repo, &env)
-                .map(|cfg| cfg.score.marker)
-                .unwrap_or_else(|_| super::config::DEFAULT_MARKER.to_string());
-            if !marker.is_empty() {
-                let _ = writeln!(w, "{}", prompt_output(&marker));
+            let cfg = super::config::CtxConfig::load(&repo, &env).ok();
+            let marker = cfg
+                .as_ref()
+                .map(|cfg| cfg.score.marker.clone())
+                .unwrap_or_else(|| super::config::DEFAULT_MARKER.to_string());
+            let adoption_nudge = cfg
+                .as_ref()
+                .and_then(|cfg| prompt_adoption_nudge(&repo, cfg, &env));
+            if !marker.is_empty() || adoption_nudge.is_some() {
+                let _ = writeln!(w, "{}", prompt_output(&marker, adoption_nudge.as_deref()));
             }
             Ok(0)
         }
@@ -614,14 +940,20 @@ mod tests {
     #[test]
     fn a_healthy_session_prints_nothing() {
         assert_eq!(
-            stop_output(&payload(), &score_of(Verdict::Healthy, 10), None, None),
+            stop_output(
+                &payload(),
+                &score_of(Verdict::Healthy, 10),
+                None,
+                None,
+                None
+            ),
             None
         );
     }
 
     #[test]
     fn an_advisory_verdict_prints_a_non_blocking_system_message() {
-        let out = stop_output(&payload(), &score_of(Verdict::Advise, 45), None, None)
+        let out = stop_output(&payload(), &score_of(Verdict::Advise, 45), None, None, None)
             .expect("advisory expected");
         let parsed: serde_json::Value = serde_json::from_str(&out).expect("valid json");
         assert!(parsed["systemMessage"].is_string());
@@ -639,8 +971,14 @@ mod tests {
 
     #[test]
     fn a_restart_verdict_still_only_advises() {
-        let out = stop_output(&payload(), &score_of(Verdict::Restart, 95), None, None)
-            .expect("advisory expected");
+        let out = stop_output(
+            &payload(),
+            &score_of(Verdict::Restart, 95),
+            None,
+            None,
+            None,
+        )
+        .expect("advisory expected");
         let parsed: serde_json::Value = serde_json::from_str(&out).expect("valid json");
         assert!(parsed.get("decision").is_none());
         let text = parsed["systemMessage"].as_str().unwrap_or_default();
@@ -657,6 +995,7 @@ mod tests {
             &score_of(Verdict::Restart, 95),
             Some(std::path::Path::new("/tmp/s/ab.sock")),
             None,
+            None,
         );
         assert_eq!(out, None, "the supervisor intervenes, not the hook");
     }
@@ -667,7 +1006,7 @@ mod tests {
         let mut p = payload();
         p.stop_hook_active = true;
         assert_eq!(
-            stop_output(&p, &score_of(Verdict::Restart, 95), None, None),
+            stop_output(&p, &score_of(Verdict::Restart, 95), None, None, None),
             None
         );
     }
@@ -783,6 +1122,452 @@ mod tests {
         }
         std::fs::write(&path, text).expect("write");
         path
+    }
+
+    /// `turns` user/assistant pairs; the first `edit_calls.min(turns)` turns
+    /// each carry one `Edit` tool call, so `adoption::signals` over the whole
+    /// parse reports exactly `(edit_calls.min(turns), turns)`.
+    fn transcript_with_edits(
+        dir: &std::path::Path,
+        turns: usize,
+        edit_calls: usize,
+    ) -> std::path::PathBuf {
+        let path = dir.join("adoption.jsonl");
+        let mut text = String::new();
+        let mut remaining = edit_calls;
+        for _ in 0..turns {
+            text.push_str("{\"type\":\"user\",\"message\":{\"content\":\"go\"}}\n");
+            let mut content = "{\"type\":\"text\",\"text\":\"ok\"}".to_string();
+            if remaining > 0 {
+                content.push_str(
+                    ",{\"type\":\"tool_use\",\"id\":\"t\",\"name\":\"Edit\",\"input\":{}}",
+                );
+                remaining -= 1;
+            }
+            text.push_str(&format!(
+                "{{\"type\":\"assistant\",\"message\":{{\"content\":[{content}],\"usage\":{{\"input_tokens\":100}}}}}}\n"
+            ));
+        }
+        std::fs::write(&path, text).expect("write");
+        path
+    }
+
+    /// Minimal, valid `Score` for direct `adoption_stop_nudge` calls -- the
+    /// function only reads `score.signals.turns`.
+    fn score_with_turns(turns: usize) -> Score {
+        Score {
+            score: 0,
+            verdict: Verdict::Healthy,
+            context_tokens: 0,
+            signals: Signals {
+                turns,
+                tool_failure_rate: 0.0,
+                repetition_hits: 0,
+                max_repeat: 0,
+                marker_miss_rate: None,
+            },
+        }
+    }
+
+    /// Issue #223: `adoption_stop_nudge` is `off` -- no record is even
+    /// written, since nothing about it may ever be consulted.
+    #[test]
+    fn adoption_off_writes_no_record_and_nudges_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = tempfile::tempdir().expect("repo");
+        let state = StateDir::from_root(dir.path().to_path_buf());
+        let transcript = transcript_with_edits(dir.path(), 6, 5);
+        let mut cfg = CtxConfig::default();
+        cfg.workflow.adoption = AdoptionPolicy::Off;
+
+        let text = adoption_stop_nudge(
+            &state,
+            repo.path(),
+            "sess-off",
+            &cfg,
+            &score_with_turns(6),
+            &transcript,
+            &|_| None,
+        );
+        assert_eq!(text, None);
+        assert!(
+            !adoption_record_path(&state, "sess-off").exists(),
+            "off must not even persist a record"
+        );
+    }
+
+    /// A delegated worker (carrying `agent::WORK_GROUP_ENV`) is never
+    /// nudged, no matter how substantial its own work looks.
+    #[test]
+    fn adoption_skips_a_delegated_worker() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = tempfile::tempdir().expect("repo");
+        let state = StateDir::from_root(dir.path().to_path_buf());
+        let transcript = transcript_with_edits(dir.path(), 6, 5);
+        let mut cfg = CtxConfig::default();
+        cfg.workflow.adoption = AdoptionPolicy::Nudge;
+        let env: std::collections::HashMap<String, String> = [(
+            crate::commands::ctx::agent::WORK_GROUP_ENV.to_string(),
+            "wg-1".to_string(),
+        )]
+        .into();
+
+        let text = adoption_stop_nudge(
+            &state,
+            repo.path(),
+            "sess-worker",
+            &cfg,
+            &score_with_turns(6),
+            &transcript,
+            &|k| env.get(k).cloned(),
+        );
+        assert_eq!(text, None, "a delegated worker must never be nudged");
+    }
+
+    /// Substantial work (>= 5 edit calls) with no active workflow, under
+    /// `nudge`: the first call nudges immediately and persists a record
+    /// saying so; an unchanged follow-up call (no new turns) stays silent.
+    #[test]
+    fn adoption_nudges_once_immediately_then_holds_until_the_next_window() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = tempfile::tempdir().expect("repo");
+        let state = StateDir::from_root(dir.path().to_path_buf());
+        let transcript = transcript_with_edits(dir.path(), 6, 5);
+        let mut cfg = CtxConfig::default();
+        cfg.workflow.adoption = AdoptionPolicy::Nudge;
+
+        let first = adoption_stop_nudge(
+            &state,
+            repo.path(),
+            "sess-nudge",
+            &cfg,
+            &score_with_turns(6),
+            &transcript,
+            &|_| None,
+        )
+        .expect("substantial work must nudge immediately");
+        assert!(first.contains("5 edit calls over 6 turns"), "{first}");
+        assert!(first.contains("zirv workflow start"), "{first}");
+
+        // Same transcript, same turn count -- nothing new happened, so the
+        // cooldown must hold.
+        let second = adoption_stop_nudge(
+            &state,
+            repo.path(),
+            "sess-nudge",
+            &cfg,
+            &score_with_turns(6),
+            &transcript,
+            &|_| None,
+        );
+        assert_eq!(second, None, "must not nudge twice for the same turn");
+    }
+
+    /// `advise` fires exactly once -- `nudge_due` itself never fires below
+    /// `Nudge`, so the Stop hook's own one-shot path is what must produce the
+    /// single notice here.
+    #[test]
+    fn adoption_advise_nudges_exactly_once() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = tempfile::tempdir().expect("repo");
+        let state = StateDir::from_root(dir.path().to_path_buf());
+        let transcript = transcript_with_edits(dir.path(), 6, 5);
+        let mut cfg = CtxConfig::default();
+        cfg.workflow.adoption = AdoptionPolicy::Advise;
+
+        let first = adoption_stop_nudge(
+            &state,
+            repo.path(),
+            "sess-advise",
+            &cfg,
+            &score_with_turns(6),
+            &transcript,
+            &|_| None,
+        );
+        assert!(first.is_some(), "advise must still fire once");
+
+        let second = adoption_stop_nudge(
+            &state,
+            repo.path(),
+            "sess-advise",
+            &cfg,
+            &score_with_turns(6),
+            &transcript,
+            &|_| None,
+        );
+        assert_eq!(second, None, "advise must never repeat");
+    }
+
+    /// `enforce` carries the same nudge text plus the delegation-gate
+    /// sentence.
+    #[test]
+    fn adoption_enforce_appends_the_delegation_gate_sentence() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = tempfile::tempdir().expect("repo");
+        let state = StateDir::from_root(dir.path().to_path_buf());
+        let transcript = transcript_with_edits(dir.path(), 6, 5);
+        let mut cfg = CtxConfig::default();
+        cfg.workflow.adoption = AdoptionPolicy::Enforce;
+
+        let text = adoption_stop_nudge(
+            &state,
+            repo.path(),
+            "sess-enforce",
+            &cfg,
+            &score_with_turns(6),
+            &transcript,
+            &|_| None,
+        )
+        .expect("enforce must still nudge");
+        assert!(text.contains("workflow.adoption = enforce"), "{text}");
+        assert!(text.contains("zirv agent delegation is held"), "{text}");
+    }
+
+    /// A session with an active workflow is never nudged even though its own
+    /// edit-call count would otherwise be substantial -- and the telemetry
+    /// recorded for it says the workflow was already active at detection.
+    #[test]
+    fn adoption_stays_silent_and_records_workflow_active_at_detection() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = tempfile::tempdir().expect("repo");
+        let state = StateDir::from_root(dir.path().to_path_buf());
+        let transcript = transcript_with_edits(dir.path(), 6, 5);
+        crate::commands::workflow::engine::save(
+            &state,
+            &crate::commands::workflow::engine::WorkflowState::start(
+                repo.path().to_path_buf(),
+                "task".into(),
+                crate::commands::workflow::engine::WorkflowKind::Feature,
+                None,
+                true,
+                classify::classify(&classify::ClassificationInput {
+                    task: String::new(),
+                    paths: Vec::new(),
+                    changed_lines: 0,
+                    tests_changed: true,
+                    intent_override: None,
+                    complexity_override: None,
+                    risk_override: None,
+                })
+                .expect("classify"),
+            ),
+            true,
+        )
+        .expect("save active workflow");
+        let mut cfg = CtxConfig::default();
+        cfg.workflow.adoption = AdoptionPolicy::Nudge;
+
+        let text = adoption_stop_nudge(
+            &state,
+            repo.path(),
+            "sess-active",
+            &cfg,
+            &score_with_turns(6),
+            &transcript,
+            &|_| None,
+        );
+        assert_eq!(text, None, "an active workflow must never be nudged");
+
+        let events = telemetry::list(&state, repo.path()).expect("list");
+        let detected = events
+            .iter()
+            .find(|e| e.kind == telemetry::TelemetryKind::AdoptionDetected)
+            .expect("AdoptionDetected must still be recorded");
+        assert_eq!(detected.workflow_active, Some(true));
+    }
+
+    /// Once a session is recorded as substantial with no active workflow, a
+    /// later call that finds one active records exactly one
+    /// `AdoptionRecovered` event.
+    #[test]
+    fn adoption_records_recovery_once_a_workflow_starts_after_detection() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = tempfile::tempdir().expect("repo");
+        let state = StateDir::from_root(dir.path().to_path_buf());
+        let transcript = transcript_with_edits(dir.path(), 6, 5);
+        let mut cfg = CtxConfig::default();
+        cfg.workflow.adoption = AdoptionPolicy::Nudge;
+
+        adoption_stop_nudge(
+            &state,
+            repo.path(),
+            "sess-recover",
+            &cfg,
+            &score_with_turns(6),
+            &transcript,
+            &|_| None,
+        );
+        let events = telemetry::list(&state, repo.path()).expect("list");
+        let detected = events
+            .iter()
+            .find(|e| e.kind == telemetry::TelemetryKind::AdoptionDetected)
+            .expect("must record detection");
+        assert_eq!(detected.workflow_active, Some(false));
+
+        crate::commands::workflow::engine::save(
+            &state,
+            &crate::commands::workflow::engine::WorkflowState::start(
+                repo.path().to_path_buf(),
+                "task".into(),
+                crate::commands::workflow::engine::WorkflowKind::Feature,
+                None,
+                true,
+                classify::classify(&classify::ClassificationInput {
+                    task: String::new(),
+                    paths: Vec::new(),
+                    changed_lines: 0,
+                    tests_changed: true,
+                    intent_override: None,
+                    complexity_override: None,
+                    risk_override: None,
+                })
+                .expect("classify"),
+            ),
+            true,
+        )
+        .expect("save active workflow");
+
+        adoption_stop_nudge(
+            &state,
+            repo.path(),
+            "sess-recover",
+            &cfg,
+            &score_with_turns(6),
+            &transcript,
+            &|_| None,
+        );
+        let events = telemetry::list(&state, repo.path()).expect("list");
+        let recovered = events
+            .iter()
+            .filter(|e| e.kind == telemetry::TelemetryKind::AdoptionRecovered)
+            .count();
+        assert_eq!(recovered, 1, "recovery must be recorded exactly once");
+    }
+
+    /// The Prompt hook's own live re-check: a record still saying
+    /// substantial-without-workflow must not fire once a workflow has
+    /// actually started, even though the record on disk has not caught up
+    /// yet (only the next Stop call refreshes it).
+    #[test]
+    fn prompt_adoption_nudge_live_check_suppresses_once_a_workflow_starts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = tempfile::tempdir().expect("repo");
+        let state = StateDir::from_root(dir.path().to_path_buf());
+        let session = "sess-prompt-1";
+        let path = adoption_record_path(&state, session);
+        save_adoption_record(&path, &AdoptionRecord::substantial_for_test(7, 9));
+
+        let mut cfg = CtxConfig::default();
+        cfg.workflow.adoption = AdoptionPolicy::Nudge;
+        let env: std::collections::HashMap<String, String> =
+            [(SESSION_ENV.to_string(), session.to_string())].into();
+        let state_env: std::collections::HashMap<String, String> = [(
+            crate::commands::ctx::state::STATE_ENV.to_string(),
+            dir.path().display().to_string(),
+        )]
+        .into();
+        let lookup = |k: &str| env.get(k).cloned().or_else(|| state_env.get(k).cloned());
+
+        // Before any workflow exists, the live re-check finds none, so it
+        // nudges exactly like the record on disk suggests.
+        let before = prompt_adoption_nudge(repo.path(), &cfg, &lookup);
+        assert!(before.is_some(), "no active workflow yet: must nudge");
+
+        crate::commands::workflow::engine::save(
+            &state,
+            &crate::commands::workflow::engine::WorkflowState::start(
+                repo.path().to_path_buf(),
+                "task".into(),
+                crate::commands::workflow::engine::WorkflowKind::Feature,
+                None,
+                true,
+                classify::classify(&classify::ClassificationInput {
+                    task: String::new(),
+                    paths: Vec::new(),
+                    changed_lines: 0,
+                    tests_changed: true,
+                    intent_override: None,
+                    complexity_override: None,
+                    risk_override: None,
+                })
+                .expect("classify"),
+            ),
+            true,
+        )
+        .expect("save active workflow");
+
+        // The persisted record still says substantial-without-workflow (only
+        // a Stop call would refresh it), but the live re-check must still
+        // suppress the nudge.
+        let after = prompt_adoption_nudge(repo.path(), &cfg, &lookup);
+        assert_eq!(
+            after, None,
+            "a workflow started in another pane must suppress the nudge"
+        );
+    }
+
+    /// `stop_output` folds an adoption nudge into a healthy session's
+    /// systemMessage even when there is no optimize hint at all.
+    #[test]
+    fn stop_output_includes_the_adoption_nudge_on_an_otherwise_healthy_session() {
+        let out = stop_output(
+            &payload(),
+            &score_of(Verdict::Healthy, 10),
+            None,
+            None,
+            Some("[zirv workflow] substantial work detected"),
+        )
+        .expect("a healthy session with a due nudge must still print");
+        let parsed: serde_json::Value = serde_json::from_str(&out).expect("valid json");
+        let text = parsed["systemMessage"].as_str().unwrap_or_default();
+        assert!(text.contains("substantial work detected"), "{text}");
+    }
+
+    /// `stop_output` appends the nudge as its own line after the ordinary
+    /// advisory, rather than replacing it.
+    #[test]
+    fn stop_output_appends_the_adoption_nudge_after_the_advisory() {
+        let out = stop_output(
+            &payload(),
+            &score_of(Verdict::Advise, 45),
+            None,
+            None,
+            Some("[zirv workflow] substantial work detected"),
+        )
+        .expect("advisory expected");
+        let parsed: serde_json::Value = serde_json::from_str(&out).expect("valid json");
+        let text = parsed["systemMessage"].as_str().unwrap_or_default();
+        assert!(
+            text.contains("advise"),
+            "the rot advisory must survive: {text}"
+        );
+        assert!(
+            text.contains("substantial work detected"),
+            "the nudge must be appended: {text}"
+        );
+    }
+
+    /// `prompt_output` keeps the marker line intact and adds the nudge as a
+    /// second line.
+    #[test]
+    fn prompt_output_keeps_the_marker_line_and_appends_the_nudge() {
+        let out = prompt_output("[zirv]", Some("[zirv workflow] substantial work detected"));
+        let parsed: serde_json::Value = serde_json::from_str(&out).expect("valid json");
+        let context = parsed["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .expect("additionalContext");
+        let mut lines = context.lines();
+        assert!(
+            lines.next().unwrap_or_default().contains("[zirv]"),
+            "the marker line must stay first: {context}"
+        );
+        assert!(
+            lines
+                .next()
+                .unwrap_or_default()
+                .contains("substantial work detected"),
+            "the nudge must ride as a second line: {context}"
+        );
     }
 
     #[test]
@@ -1143,7 +1928,7 @@ mod tests {
 
     #[test]
     fn prompt_hook_emits_the_documented_injection_shape() {
-        let out = prompt_output("[zirv]");
+        let out = prompt_output("[zirv]", None);
         let parsed: serde_json::Value = serde_json::from_str(&out).expect("valid json");
         assert_eq!(
             parsed["hookSpecificOutput"]["hookEventName"], "UserPromptSubmit",
@@ -1166,7 +1951,7 @@ mod tests {
 
     #[test]
     fn prompt_hook_uses_the_configured_marker() {
-        let out = prompt_output("[acme]");
+        let out = prompt_output("[acme]", None);
         assert!(out.contains("[acme]"));
         assert!(
             !out.contains("[zirv]"),

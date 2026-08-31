@@ -87,6 +87,7 @@ Plus a third, read-only case: `zirv ctx optimize` reads the repo's own CLAUDE.md
 | `workflow.repo_checks_enabled` | `ZIRV_CTX_WORKFLOW_REPO_CHECKS` |
 | `workflow.repo_skills_enabled` | `ZIRV_CTX_WORKFLOW_REPO_SKILLS` |
 | `workflow.repo_agents_enabled` | `ZIRV_CTX_WORKFLOW_REPO_AGENTS` |
+| `workflow.adoption` | `ZIRV_CTX_WORKFLOW_ADOPTION` |
 | `workflow.maintain` | `~/.zirv/ctx.toml only` |
 | `report.repository` | `ZIRV_CTX_REPORT_REPOSITORY` |
 | `workflow.telemetry_enabled` | `ZIRV_CTX_WORKFLOW_TELEMETRY` |
