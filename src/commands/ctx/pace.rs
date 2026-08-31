@@ -138,6 +138,16 @@ pub fn note_limit_wording_drift<W: Write>(
 /// instead retries the same session within the restart budget, with a short
 /// backoff). Each entry needs more context than a bare `capacity`/
 /// `overloaded` word match, by design.
+///
+/// Security review (2026-08-31): every entry here must be a phrase a
+/// PROVIDER is documented to emit, never a bare HTTP status/reason phrase or
+/// other generic text an unrelated process could plausibly print --
+/// `"503 service unavailable"` used to be in this table and was removed for
+/// exactly that reason: a proxy, a local dev server, or any other tool this
+/// worker's output happens to contain could print that line with nothing to
+/// do with the harness's own provider account, and matching it would
+/// misclassify an unrelated failure as a transient, auto-retried capacity
+/// condition.
 const CAPACITY_PATTERNS: &[(&str, &str)] = &[
     (
         "selected model is at capacity",
@@ -151,7 +161,6 @@ const CAPACITY_PATTERNS: &[(&str, &str)] = &[
     ("currently at capacity", "currently at capacity"),
     ("overloaded_error", "overloaded_error"),
     ("the model is overloaded", "The model is overloaded"),
-    ("503 service unavailable", "503 Service Unavailable"),
 ];
 
 /// The human-readable label for the first `CAPACITY_PATTERNS` entry `line`
@@ -3596,7 +3605,6 @@ mod tests {
         assert!(is_capacity_error(
             "The model is overloaded, please try again"
         ));
-        assert!(is_capacity_error("HTTP/1.1 503 Service Unavailable"));
         assert!(
             is_capacity_error("SELECTED MODEL IS AT CAPACITY"),
             "matched case-insensitively"
@@ -3612,6 +3620,25 @@ mod tests {
         assert!(
             !is_capacity_error("the server felt overloaded but kept going"),
             "a bare 'overloaded' word must not match"
+        );
+    }
+
+    /// Security review finding B (2026-08-31): a bare HTTP status/reason
+    /// phrase, or an unrelated process's own "overloaded" wording, must
+    /// never be misread as a provider capacity condition -- `CAPACITY_
+    /// PATTERNS` keeps only phrasings a provider itself is documented to
+    /// emit, not generic status text any process could print.
+    /// `"503 service unavailable"` used to be in this table and is the
+    /// regression this pins.
+    #[test]
+    fn capacity_matching_excludes_generic_http_status_and_unrelated_overloaded_wording() {
+        assert!(
+            !is_capacity_error("HTTP 503 Service Unavailable from localhost:8080"),
+            "a bare HTTP status/reason phrase is not a provider-specific capacity signal"
+        );
+        assert!(
+            !is_capacity_error("the queue is overloaded"),
+            "an unrelated process's own 'overloaded' wording must not match"
         );
     }
 

@@ -2484,27 +2484,104 @@ fn accepted_spawn_cwd(req_cwd: &Path, repo: &Path) -> Option<PathBuf> {
     }
 }
 
-/// Issue #228: the directory a pane should actually launch into, given
-/// `accepted` (`accepted_spawn_cwd`'s own return -- the dashboard's own
-/// repo-family acceptance, unaffected by this function) and an optional,
-/// explicitly requested `--workdir`.
+/// Default pane `--workdir` roots when the operator has configured no
+/// additional ones of their own (`CtxConfig::dash::workdir_roots`): the
+/// dashboard's own repo root, and that repo root's PARENT directory -- so a
+/// sibling checkout (`git worktree add ../other`, or a plain sibling clone,
+/// issue #228's own use case) is accepted with zero configuration, while a
+/// directory sharing only a string prefix with the repo (`zirv-other` next
+/// to `zirv`) is not: containment below is `Path::starts_with`, which
+/// compares path COMPONENTS, never raw string bytes.
+///
+/// Canonicalised the same lenient way `same_directory` canonicalises,
+/// falling back to the literal path when canonicalisation fails (a `repo`
+/// that does not exist on disk, which only happens in a test).
+fn default_workdir_roots(repo: &Path) -> Vec<PathBuf> {
+    let canon_repo = std::fs::canonicalize(repo).unwrap_or_else(|_| repo.to_path_buf());
+    let mut roots = vec![canon_repo.clone()];
+    if let Some(parent) = canon_repo.parent() {
+        roots.push(parent.to_path_buf());
+    }
+    roots
+}
+
+/// The full set of roots a pane `--workdir` request must canonicalise
+/// inside: [`default_workdir_roots`] plus whatever the operator widened with
+/// in `[dash] workdir_roots` / `ZIRV_CTX_DASH_WORKDIR_ROOTS` (`REPO_FORBIDDEN`
+/// -- see `DashConfig::workdir_roots`'s own doc comment; a repo checkout can
+/// never contribute to this list).
+fn workdir_roots(cfg: &CtxConfig, repo: &Path) -> Vec<PathBuf> {
+    let mut roots = default_workdir_roots(repo);
+    for extra in &cfg.dash.workdir_roots {
+        let path = PathBuf::from(extra);
+        roots.push(std::fs::canonicalize(&path).unwrap_or(path));
+    }
+    roots
+}
+
+/// Whether `candidate` (already canonicalised by the caller) sits inside one
+/// of `roots`. `Path::starts_with` compares path COMPONENTS, not string
+/// bytes, so `D:\GitHub\zirv-other` never matches a root of
+/// `D:\GitHub\zirv` -- the exact prefix-collision `same_directory`'s own
+/// canonicalise-then-compare style would get wrong if this used a plain
+/// string check instead.
+fn workdir_within_roots(candidate: &Path, roots: &[PathBuf]) -> bool {
+    roots.iter().any(|root| candidate.starts_with(root))
+}
+
+/// The text a same-uid pane's own `zirv agent` invocation prints when its
+/// `--workdir` is refused here -- specific enough that an operator who wants
+/// the directory reachable knows exactly which key to set and where.
+fn workdir_outside_roots_reason(dir: &Path, roots: &[PathBuf]) -> String {
+    format!(
+        "workdir {} is outside the dashboard's workdir roots ({}); add it to [dash] \
+         workdir_roots in ~/.zirv/ctx.toml",
+        dir.display(),
+        roots
+            .iter()
+            .map(|r| r.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+/// Issue #228 (security review, 2026-08-31): the directory a pane should
+/// actually launch into, given `accepted` (`accepted_spawn_cwd`'s own return
+/// -- the dashboard's own repo-family acceptance, unaffected by this
+/// function) and an optional, explicitly requested `--workdir`.
 ///
 /// `workdir` is `SpawnRequest::workdir`, untrusted JSON like every other
 /// field on that struct -- a same-uid pane could forge it (the same trust
 /// boundary issue #179 already documents for the rest of the request), so
 /// it is re-validated here with the identical rule `agent::validate_workdir`
 /// already ran on the requesting side (must exist, be a directory, sit
-/// inside a git repository) rather than trusted outright. Deliberately NOT
-/// checked against `repo`/`accepted` the way `accepted_spawn_cwd` checks
-/// `req.cwd` -- an unrelated repo is the entire point of the feature (issue
-/// #228's own bug report: cross-repo delegation from inside a dashboard),
-/// so a `--workdir` need not be any relation of the dashboard's own repo,
-/// only a real checkout.
+/// inside a git repository) rather than trusted outright.
+///
+/// Deliberately NOT checked against `repo`/`accepted` the way
+/// `accepted_spawn_cwd` checks `req.cwd` -- delegation to a repo other than
+/// the dashboard's own is the entire point of the feature (issue #228's own
+/// bug report: cross-repo delegation from inside a dashboard). It IS,
+/// however, checked against `roots`: request forgery by a same-uid sibling
+/// pane is in the accepted threat model (issue #179), so `--workdir` may
+/// only name a directory the OPERATOR has opened -- the dashboard's own repo
+/// family, or an explicitly widened root -- never an arbitrary git checkout
+/// elsewhere on the machine. See [`workdir_roots`]'s own doc comment for
+/// what the default confinement is and how an operator widens it.
 ///
 /// `Ok(accepted)`, unchanged, when `workdir` is `None` -- pre-#228 behaviour.
-fn resolved_spawn_cwd(accepted: PathBuf, workdir: Option<&Path>) -> CtxResult<PathBuf> {
+fn resolved_spawn_cwd(
+    accepted: PathBuf,
+    workdir: Option<&Path>,
+    roots: &[PathBuf],
+) -> CtxResult<PathBuf> {
     match workdir {
-        Some(dir) => super::agent::validate_workdir(dir),
+        Some(dir) => {
+            let canon = super::agent::validate_workdir(dir)?;
+            if !workdir_within_roots(&canon, roots) {
+                return Err(workdir_outside_roots_reason(dir, roots).into());
+            }
+            Ok(canon)
+        }
         None => Ok(accepted),
     }
 }
@@ -3180,13 +3257,21 @@ fn fulfill_spawn_request(
     };
     // Issue #228: an explicit `--workdir` is a validated, harness-agnostic
     // escape from the dashboard's own repo family the gate above just
-    // enforced. `SpawnRefusal::channel`, not `::policy`: an invalid workdir
-    // is the same "this dashboard cannot host it as asked" shape as a repo
-    // mismatch above, not a policy judgment on the task itself, and the
-    // requester's own headless fallback runs the identical check. See
-    // `resolved_spawn_cwd`'s own doc comment for why `req.workdir` is
-    // re-validated here rather than trusted outright.
-    let spawn_cwd = resolved_spawn_cwd(spawn_cwd, req.workdir.as_deref())
+    // enforced -- but only within the operator's own workdir roots
+    // (security review, 2026-08-31): request forgery by a same-uid sibling
+    // pane is in the accepted threat model (issue #179), so an unconfined
+    // `--workdir` would let a compromised pane obtain write authority over
+    // any git checkout on the machine, not only ones the operator opened.
+    // `SpawnRefusal::channel`, not `::policy`: an invalid or out-of-roots
+    // workdir is the same "this dashboard cannot host it as asked" shape as
+    // a repo mismatch above, not a policy judgment on the task itself, and
+    // the requester's own headless fallback (unrestricted -- it runs as the
+    // operator's own command, never a pane's) runs the identical validation
+    // check minus the roots confinement. See `resolved_spawn_cwd`'s own doc
+    // comment for why `req.workdir` is re-validated here rather than trusted
+    // outright, and [`workdir_roots`] for the confinement itself.
+    let roots = workdir_roots(cfg, repo);
+    let spawn_cwd = resolved_spawn_cwd(spawn_cwd, req.workdir.as_deref(), &roots)
         .map_err(|e| SpawnRefusal::channel(e.to_string()))?;
     // R2: every pane in the vector is a live one -- `reap_ended_panes` takes
     // an exited pane out on the very next tick -- so the cap is a plain
@@ -11044,47 +11129,198 @@ mod tests {
     }
 
     /// Issue #228: `resolved_spawn_cwd` is `Ok(accepted)` unchanged when no
-    /// `--workdir` was requested -- pre-#228 behaviour, byte for byte.
+    /// `--workdir` was requested -- pre-#228 behaviour, byte for byte. Roots
+    /// are irrelevant on this path, so an empty slice is passed.
     #[test]
     fn resolved_spawn_cwd_is_unchanged_with_no_workdir() {
         let accepted = PathBuf::from("/some/accepted/repo");
         assert_eq!(
-            resolved_spawn_cwd(accepted.clone(), None).expect("no workdir never fails"),
+            resolved_spawn_cwd(accepted.clone(), None, &[]).expect("no workdir never fails"),
             accepted
         );
     }
 
-    /// Issue #228's own bug report: a `--workdir` naming a git repository
-    /// wholly unrelated to the dashboard's own is accepted -- cross-repo
-    /// delegation is the entire point of the feature, so `resolved_spawn_cwd`
-    /// must never compare `workdir` against `accepted`/`repo` the way
-    /// `accepted_spawn_cwd` compares `req.cwd`.
-    #[test]
-    fn resolved_spawn_cwd_accepts_a_workdir_unrelated_to_the_dashboards_own_repo() {
-        if !git_available() {
-            eprintln!("skipping: git not found on PATH");
-            return;
-        }
-        let root = tempfile::tempdir().expect("tempdir");
-        let other = root.path().join("other-repo");
-        std::fs::create_dir_all(&other).expect("mkdir");
+    /// Creates a real temp git repo at `dir` (`git init -q`), for the
+    /// workdir-roots tests below that need more than one real repository.
+    fn git_init_repo(dir: &Path) {
+        std::fs::create_dir_all(dir).expect("mkdir");
         assert!(
             std::process::Command::new("git")
                 .arg("-C")
-                .arg(&other)
+                .arg(dir)
                 .arg("init")
                 .arg("-q")
                 .output()
                 .expect("git init")
                 .status
-                .success()
+                .success(),
+            "git init must succeed in {dir:?}"
         );
+    }
 
-        let accepted = root.path().join("dashboard-repo");
-        let resolved = resolved_spawn_cwd(accepted, Some(&other)).expect("a real repo is fine");
+    /// Security review (2026-08-31), finding A: sibling checkout accepted.
+    /// A `--workdir` naming a git repository that lives ALONGSIDE the
+    /// dashboard's own repo -- not inside it, not named by `req.cwd` -- is
+    /// accepted because the default roots include the repo's own PARENT
+    /// directory. This is the feature's own use case (issue #228): `git
+    /// worktree add ../other`, or a plain sibling clone, work with zero
+    /// operator configuration.
+    #[test]
+    fn resolved_spawn_cwd_accepts_a_sibling_repo_within_the_default_roots() {
+        if !git_available() {
+            eprintln!("skipping: git not found on PATH");
+            return;
+        }
+        let root = tempfile::tempdir().expect("tempdir");
+        let dashboard_repo = root.path().join("dashboard-repo");
+        let sibling = root.path().join("sibling-repo");
+        git_init_repo(&dashboard_repo);
+        git_init_repo(&sibling);
+
+        let roots = default_workdir_roots(&dashboard_repo);
+        let resolved = resolved_spawn_cwd(dashboard_repo, Some(&sibling), &roots)
+            .expect("a sibling checkout is within the default roots");
         assert_eq!(
             resolved,
-            std::fs::canonicalize(&other).expect("canonicalize")
+            std::fs::canonicalize(&sibling).expect("canonicalize")
+        );
+    }
+
+    /// Descendant of the dashboard repo accepted: a `--workdir` naming a
+    /// subdirectory of the dashboard's own repo checkout is within the
+    /// default roots trivially (it canonicalises to a path under the repo
+    /// root itself), and `agent::validate_workdir`'s own git-ancestry check
+    /// finds the SAME repository by walking upward from it.
+    #[test]
+    fn resolved_spawn_cwd_accepts_a_descendant_of_the_dashboard_repo() {
+        if !git_available() {
+            eprintln!("skipping: git not found on PATH");
+            return;
+        }
+        let root = tempfile::tempdir().expect("tempdir");
+        let dashboard_repo = root.path().join("dashboard-repo");
+        git_init_repo(&dashboard_repo);
+        let nested = dashboard_repo.join("nested-dir");
+        std::fs::create_dir_all(&nested).expect("mkdir");
+
+        let roots = default_workdir_roots(&dashboard_repo);
+        let resolved = resolved_spawn_cwd(dashboard_repo, Some(&nested), &roots)
+            .expect("a descendant of the dashboard's own repo must be accepted");
+        assert_eq!(
+            resolved,
+            std::fs::canonicalize(&nested).expect("canonicalize")
+        );
+    }
+
+    /// Finding A's headline case: a real git repository that is neither the
+    /// dashboard's own repo, a descendant of it, nor a sibling under its
+    /// parent must be refused -- with the exact reason shape an operator
+    /// needs to fix it, naming the offending directory, the current roots,
+    /// and the config key that would widen them.
+    #[test]
+    fn resolved_spawn_cwd_refuses_a_repo_outside_the_default_roots_with_the_exact_reason() {
+        if !git_available() {
+            eprintln!("skipping: git not found on PATH");
+            return;
+        }
+        let root = tempfile::tempdir().expect("tempdir");
+        let dashboard_repo = root.path().join("nested").join("dashboard-repo");
+        git_init_repo(&dashboard_repo);
+        let elsewhere = root.path().join("elsewhere");
+        git_init_repo(&elsewhere);
+
+        let roots = default_workdir_roots(&dashboard_repo);
+        let err = resolved_spawn_cwd(dashboard_repo, Some(&elsewhere), &roots)
+            .expect_err("a repo outside the roots must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&format!(
+                "workdir {} is outside the dashboard's workdir roots (",
+                elsewhere.display()
+            )),
+            "got {msg}"
+        );
+        assert!(
+            msg.contains("add it to [dash] workdir_roots in ~/.zirv/ctx.toml"),
+            "got {msg}"
+        );
+    }
+
+    /// An operator-configured root (`[dash] workdir_roots` /
+    /// `ZIRV_CTX_DASH_WORKDIR_ROOTS`, via `workdir_roots(cfg, repo)`) widens
+    /// acceptance beyond the default roots -- and the same directory is
+    /// refused without that configuration, proving the widening (not some
+    /// unrelated default) is what accepted it.
+    #[test]
+    fn workdir_roots_operator_configured_root_widens_acceptance() {
+        if !git_available() {
+            eprintln!("skipping: git not found on PATH");
+            return;
+        }
+        let base = tempfile::tempdir().expect("tempdir");
+        let dashboard_repo = base.path().join("dashboard").join("repo");
+        git_init_repo(&dashboard_repo);
+        let extra = base.path().join("target").join("extra-repo");
+        git_init_repo(&extra);
+
+        let default_cfg = CtxConfig::default();
+        let default_roots = workdir_roots(&default_cfg, &dashboard_repo);
+        let refused = resolved_spawn_cwd(dashboard_repo.clone(), Some(&extra), &default_roots)
+            .expect_err("outside the default roots, an unconfigured operator refuses it");
+        assert!(
+            refused
+                .to_string()
+                .contains("outside the dashboard's workdir roots"),
+            "got {refused}"
+        );
+
+        let mut widened_cfg = CtxConfig::default();
+        widened_cfg.dash.workdir_roots = vec![extra.to_string_lossy().to_string()];
+        let widened_roots = workdir_roots(&widened_cfg, &dashboard_repo);
+        let resolved = resolved_spawn_cwd(dashboard_repo, Some(&extra), &widened_roots)
+            .expect("the operator-configured root must widen acceptance");
+        assert_eq!(
+            resolved,
+            std::fs::canonicalize(&extra).expect("canonicalize")
+        );
+    }
+
+    /// The prefix-collision case: a directory that shares only a string
+    /// PREFIX with an operator-configured root (`zirv-other` beside a root
+    /// named `zirv`) must be refused. `workdir_within_roots` uses
+    /// `Path::starts_with`, which compares path COMPONENTS, never raw
+    /// string bytes -- a naive `str::starts_with` over the canonicalised
+    /// path strings would wrongly accept `zirv-other` here.
+    #[test]
+    fn resolved_spawn_cwd_refuses_a_string_prefix_collision_with_an_operator_root() {
+        if !git_available() {
+            eprintln!("skipping: git not found on PATH");
+            return;
+        }
+        let base = tempfile::tempdir().expect("tempdir");
+        // The dashboard's own repo lives in a wholly separate subtree so its
+        // default roots (itself, its parent) cannot accidentally cover
+        // `base/target/*` and mask the collision this test is pinning.
+        let dashboard_repo = base.path().join("dashboard").join("repo");
+        git_init_repo(&dashboard_repo);
+        let zirv = base.path().join("target").join("zirv");
+        let zirv_other = base.path().join("target").join("zirv-other");
+        git_init_repo(&zirv);
+        git_init_repo(&zirv_other);
+
+        let mut cfg = CtxConfig::default();
+        cfg.dash.workdir_roots = vec![zirv.to_string_lossy().to_string()];
+        let roots = workdir_roots(&cfg, &dashboard_repo);
+
+        // Sanity: the configured root itself is of course accepted.
+        assert!(resolved_spawn_cwd(dashboard_repo.clone(), Some(&zirv), &roots).is_ok());
+
+        let err = resolved_spawn_cwd(dashboard_repo, Some(&zirv_other), &roots)
+            .expect_err("a string-prefix collision must not satisfy containment");
+        assert!(
+            err.to_string()
+                .contains("is outside the dashboard's workdir roots"),
+            "got {err}"
         );
     }
 
@@ -11092,28 +11328,29 @@ mod tests {
     /// refused even though it exists as a plain directory -- the identical
     /// rule `agent::validate_workdir` enforces at the CLI layer, re-run here
     /// because a `SpawnRequest` is untrusted data (a same-uid pane could
-    /// forge one naming any directory at all).
+    /// forge one naming any directory at all). This check runs BEFORE the
+    /// roots confinement, so it fires regardless of what roots are passed.
     #[test]
     fn resolved_spawn_cwd_refuses_a_workdir_with_no_git_ancestry() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let not_a_repo = tmp.path().join("plain-dir");
         std::fs::create_dir_all(&not_a_repo).expect("mkdir");
-        let err = resolved_spawn_cwd(tmp.path().to_path_buf(), Some(&not_a_repo))
+        let err = resolved_spawn_cwd(tmp.path().to_path_buf(), Some(&not_a_repo), &[])
             .expect_err("not a git repo");
         assert!(err.to_string().contains("git repository"), "got {err}");
     }
 
     /// The full gate, not only the extracted decision function: a request
     /// whose own `cwd` matches this dashboard's repo (satisfying `accepted_
-    /// spawn_cwd` as always) but whose `workdir` names a wholly separate git
-    /// repository must pass the repo gate rather than being refused for a
-    /// mismatch -- `workdir` is deliberately exempt from that comparison.
-    /// Mirrors `fulfill_spawn_request_no_longer_refuses_a_linked_worktree_
-    /// at_the_repo_gate`'s own "force a later refusal to prove an earlier
-    /// gate passed" shape, since no agent binary is guaranteed in a test
+    /// spawn_cwd` as always) but whose `workdir` names a sibling repository
+    /// -- within the default roots, but not named by `req.cwd` -- must pass
+    /// the repo gate rather than being refused for a mismatch. Mirrors
+    /// `fulfill_spawn_request_no_longer_refuses_a_linked_worktree_at_the_
+    /// repo_gate`'s own "force a later refusal to prove an earlier gate
+    /// passed" shape, since no agent binary is guaranteed in a test
     /// environment.
     #[test]
-    fn fulfill_spawn_request_honours_a_workdir_naming_an_unrelated_repo() {
+    fn fulfill_spawn_request_honours_a_workdir_naming_a_sibling_repo() {
         if !git_available() {
             eprintln!("skipping: git not found on PATH");
             return;
@@ -11121,20 +11358,8 @@ mod tests {
         let root = tempfile::tempdir().expect("tempdir");
         let dashboard_repo = root.path().join("dashboard-repo");
         let target_repo = root.path().join("target-repo");
-        for repo in [&dashboard_repo, &target_repo] {
-            std::fs::create_dir_all(repo).expect("mkdir");
-            assert!(
-                std::process::Command::new("git")
-                    .arg("-C")
-                    .arg(repo)
-                    .arg("init")
-                    .arg("-q")
-                    .output()
-                    .expect("git init")
-                    .status
-                    .success()
-            );
-        }
+        git_init_repo(&dashboard_repo);
+        git_init_repo(&target_repo);
 
         let mut req = spawn_request("do the work", &dashboard_repo);
         req.workdir = Some(target_repo.clone());
@@ -11147,6 +11372,35 @@ mod tests {
             reason.contains("pane limit reached"),
             "the repo gate and the workdir override must both have accepted this request, \
              leaving the pane cap as the refusal; got {reason}"
+        );
+    }
+
+    /// The full gate's own refusal, with the exact reason: a `--workdir`
+    /// naming a real git repository outside both the repo-family gate and
+    /// the workdir roots must be refused there, not silently honoured.
+    #[test]
+    fn fulfill_spawn_request_refuses_a_workdir_outside_the_workdir_roots() {
+        if !git_available() {
+            eprintln!("skipping: git not found on PATH");
+            return;
+        }
+        let root = tempfile::tempdir().expect("tempdir");
+        let dashboard_repo = root.path().join("nested").join("dashboard-repo");
+        git_init_repo(&dashboard_repo);
+        let elsewhere = root.path().join("elsewhere");
+        git_init_repo(&elsewhere);
+
+        let mut req = spawn_request("do the work", &dashboard_repo);
+        req.workdir = Some(elsewhere);
+        let cfg = CtxConfig::default();
+        let reason = refusal_for(&req, &cfg, &dashboard_repo);
+        assert!(
+            reason.contains("is outside the dashboard's workdir roots"),
+            "got {reason}"
+        );
+        assert!(
+            reason.contains("add it to [dash] workdir_roots in ~/.zirv/ctx.toml"),
+            "got {reason}"
         );
     }
 
