@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-12
+last-verified: 2026-08-31
 ---
 
 # Script Files
@@ -74,7 +74,7 @@ commands:
     - command: ls -a
 ```
 
-A list-of-lists entry (`CommandTypes::Commands`) joins its inner commands with `&&` and opens them in a new terminal window (`cmd /K` on Windows, `osascript`/Terminal.app on macOS, `gnome-terminal`/`x-terminal-emulator`/`xterm` on Linux) rather than running inline — it requires a desktop/GUI session and errors clearly when none is available (e.g. over SSH). See `.zirv/test-concurrentcy.yaml` in this repo for a minimal example.
+A list-of-lists entry (`CommandTypes::Commands`) joins its inner commands with `&&` and opens them in a new terminal window (`cmd /K` on Windows, `osascript`/Terminal.app on macOS, `gnome-terminal`/`x-terminal-emulator`/`xterm` on Linux) rather than running inline — it requires a desktop/GUI session and errors clearly when none is available (e.g. over SSH). See `.zirv/commands/test-concurrentcy.yaml` in this repo for a minimal example.
 
 ### Agent step
 
@@ -92,10 +92,10 @@ Runs a supervised AI-agent task in-process through the same machinery `zirv ctx 
 There is no dedicated "run another script" step type. Because `command` is just a shell string, one script chains into another by literally invoking `zirv <name>`:
 
 ```yaml
-# .zirv/commit.yaml (this repo)
+# .zirv/commands/commit.yaml (this repo)
 commands:
   - command: cargo fmt
-  - command: zirv t          # re-invokes .zirv/test.yaml (shortcut "t") as a fresh zirv process
+  - command: zirv t          # re-invokes .zirv/commands/test.yaml (shortcut "t") as a fresh zirv process
     options:
       proceed_on_failure: false
   - command: git add .

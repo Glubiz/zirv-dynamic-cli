@@ -2,8 +2,8 @@ use std::{fs, io::Write, path::Path, path::PathBuf};
 
 use crate::style::{self, Tone};
 use crate::utils::{
-    SCRIPT_DIR_NAME, SUPPORTED_EXTENSIONS, Shortcuts, home_dir, is_reserved_command,
-    is_reserved_zirv_file, parse_script_content,
+    COMMANDS_DIR_NAME, SCRIPT_DIR_NAME, SUPPORTED_EXTENSIONS, Shortcuts, home_dir,
+    is_reserved_command, is_reserved_zirv_file, parse_script_content,
 };
 
 /// Note appended when a script or shortcut name collides with a built-in
@@ -301,8 +301,15 @@ pub fn show_help<W: Write>(writer: &mut W, colour: bool) -> Result<(), Box<dyn s
     write_builtins(writer, colour)?;
 
     if base_dir.exists() {
-        writeln!(writer, "{}", header(colour, "Available Scripts:"))?;
-        write_scripts(writer, &base_dir, colour)?;
+        // Issue #212: scripts live in `.zirv/commands/` as of zirv 3.0;
+        // `.shortcuts.yaml` stays at the `.zirv` root -- it is config, not a
+        // script. The two are listed independently: a root with only
+        // shortcuts (no commands/ yet) still shows them, and vice versa.
+        let commands_dir = base_dir.join(COMMANDS_DIR_NAME);
+        if commands_dir.is_dir() {
+            writeln!(writer, "{}", header(colour, "Available Scripts:"))?;
+            write_scripts(writer, &commands_dir, colour)?;
+        }
 
         let shortcuts_path = base_dir.join(".shortcuts.yaml");
         if shortcuts_path.exists() {
@@ -329,7 +336,10 @@ pub fn show_help<W: Write>(writer: &mut W, colour: bool) -> Result<(), Box<dyn s
             "{}",
             style::paint(&format!("Home Directory: {root:?}"), Tone::Muted, colour)
         )?;
-        write_scripts(writer, &root, colour)?;
+        let commands_dir = root.join(COMMANDS_DIR_NAME);
+        if commands_dir.is_dir() {
+            write_scripts(writer, &commands_dir, colour)?;
+        }
 
         let shortcuts_path = root.join(".shortcuts.yaml");
         if shortcuts_path.exists() {
@@ -364,6 +374,14 @@ mod tests {
         let zirv_dir = temp_dir.join(".zirv");
         create_dir_all(&zirv_dir).unwrap();
         zirv_dir
+    }
+
+    /// Issue #212: scripts now live in `.zirv/commands/`, not the `.zirv`
+    /// root. Creates that subdirectory (if needed) and returns its path.
+    fn setup_commands_dir(zirv_dir: &Path) -> PathBuf {
+        let commands_dir = zirv_dir.join(COMMANDS_DIR_NAME);
+        create_dir_all(&commands_dir).unwrap();
+        commands_dir
     }
 
     /// Intercepting `--help` replaced clap's generated help, and what replaced
@@ -405,15 +423,16 @@ mod tests {
         let temp_dir = tempdir()?;
         let temp_path = temp_dir.path().to_path_buf();
         let zirv_dir = setup_zirv_dir(&temp_path);
+        let commands_dir = setup_commands_dir(&zirv_dir);
 
-        // Create a dummy script file (YAML) in .zirv.
+        // Create a dummy script file (YAML) in .zirv/commands.
         let script_content = r#"
 name: "Test Script"
 description: "A dummy script for testing."
 params: []
 commands: []
         "#;
-        let script_file = zirv_dir.join("test.yaml");
+        let script_file = commands_dir.join("test.yaml");
         write(&script_file, script_content)?;
 
         // NEW-1: a guard, so a failing assertion below cannot leave the whole
@@ -445,6 +464,7 @@ commands: []
         let temp_dir = tempdir()?;
         let temp_path = temp_dir.path().to_path_buf();
         let zirv_dir = setup_zirv_dir(&temp_path);
+        let commands_dir = setup_commands_dir(&zirv_dir);
 
         // Create a dummy script file.
         let script_content = r#"
@@ -453,10 +473,10 @@ description: "A dummy script for testing shortcuts."
 params: []
 commands: []
         "#;
-        let script_file = zirv_dir.join("test.yaml");
+        let script_file = commands_dir.join("test.yaml");
         write(&script_file, script_content)?;
 
-        // Create a shortcuts file mapping "t" to "test.yaml".
+        // Create a shortcuts file (still at the .zirv root) mapping "t" to "test.yaml".
         let shortcuts_content = r#"
 shortcuts:
   t: "test.yaml"
@@ -497,7 +517,11 @@ shortcuts:
         let temp_dir = tempdir()?;
         let temp_path = temp_dir.path().to_path_buf();
         let zirv_dir = setup_zirv_dir(&temp_path);
-        write(zirv_dir.join("test.yaml"), "name: \"Test\"\ncommands: []\n")?;
+        let commands_dir = setup_commands_dir(&zirv_dir);
+        write(
+            commands_dir.join("test.yaml"),
+            "name: \"Test\"\ncommands: []\n",
+        )?;
         write(
             zirv_dir.join(".shortcuts.yaml"),
             "shortcuts:\n  t: \"test.yaml\"\n",
@@ -561,9 +585,10 @@ shortcuts:
         let temp_dir = tempdir()?;
         let temp_path = temp_dir.path().to_path_buf();
         let zirv_dir = setup_zirv_dir(&temp_path);
+        let commands_dir = setup_commands_dir(&zirv_dir);
 
         write(
-            zirv_dir.join("test.yaml"),
+            commands_dir.join("test.yaml"),
             "name: \"Test Script\"\ncommands: []\n",
         )?;
         write(zirv_dir.join("ctx.toml"), "[score]\nwindow = 4\n")?;
@@ -590,9 +615,10 @@ shortcuts:
         let temp_dir = tempdir()?;
         let temp_path = temp_dir.path().to_path_buf();
         let zirv_dir = setup_zirv_dir(&temp_path);
+        let commands_dir = setup_commands_dir(&zirv_dir);
 
         write(
-            zirv_dir.join("test.yaml"),
+            commands_dir.join("test.yaml"),
             "name: \"Test Script\"\ncommands: []\n",
         )?;
         write(
@@ -624,9 +650,10 @@ shortcuts:
         let temp_dir = tempdir()?;
         let temp_path = temp_dir.path().to_path_buf();
         let zirv_dir = setup_zirv_dir(&temp_path);
+        let commands_dir = setup_commands_dir(&zirv_dir);
 
         write(
-            zirv_dir.join("test.yaml"),
+            commands_dir.join("test.yaml"),
             "name: \"Test Script\"\ncommands: []\n",
         )?;
         write(
@@ -659,13 +686,14 @@ shortcuts:
         let temp_dir = tempdir()?;
         let temp_path = temp_dir.path().to_path_buf();
         let zirv_dir = setup_zirv_dir(&temp_path);
+        let commands_dir = setup_commands_dir(&zirv_dir);
 
         write(
-            zirv_dir.join("help.yaml"),
+            commands_dir.join("help.yaml"),
             "name: \"My Help Script\"\ncommands: []\n",
         )?;
         write(
-            zirv_dir.join("build.yaml"),
+            commands_dir.join("build.yaml"),
             "name: \"Build\"\ncommands: []\n",
         )?;
 
@@ -710,9 +738,10 @@ shortcuts:
         let temp_dir = tempdir()?;
         let temp_path = temp_dir.path().to_path_buf();
         let zirv_dir = setup_zirv_dir(&temp_path);
+        let commands_dir = setup_commands_dir(&zirv_dir);
 
         write(
-            zirv_dir.join("Chat.yaml"),
+            commands_dir.join("Chat.yaml"),
             "name: \"My Chat Script\"\ncommands: []\n",
         )?;
 
@@ -743,9 +772,10 @@ shortcuts:
         let temp_dir = tempdir()?;
         let temp_path = temp_dir.path().to_path_buf();
         let zirv_dir = setup_zirv_dir(&temp_path);
+        let commands_dir = setup_commands_dir(&zirv_dir);
 
         write(
-            zirv_dir.join("commit.yaml"),
+            commands_dir.join("commit.yaml"),
             "name: \"Commit\"\ncommands: []\n",
         )?;
         write(

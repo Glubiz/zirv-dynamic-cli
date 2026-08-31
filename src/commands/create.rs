@@ -2,7 +2,7 @@ use dialoguer::{Confirm, Input};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::utils::{SCRIPT_DIR_NAME, Shortcuts, home_dir, is_reserved_command};
+use crate::utils::{COMMANDS_DIR_NAME, SCRIPT_DIR_NAME, Shortcuts, home_dir, is_reserved_command};
 
 const DEFAULT_TEMPLATE: &str = r#"name: "Name"
 description: "Description"
@@ -179,11 +179,14 @@ where
         }
     }
 
-    let target_dir: PathBuf = if global {
+    let zirv_root: PathBuf = if global {
         home_dir()?.join(SCRIPT_DIR_NAME)
     } else {
         std::env::current_dir()?.join(SCRIPT_DIR_NAME)
     };
+    // Scripts live in `.zirv/commands/` as of zirv 3.0 (issue #212);
+    // `.shortcuts.yaml` stays at `zirv_root` -- it is config, not a script.
+    let target_dir = zirv_root.join(COMMANDS_DIR_NAME);
 
     if !target_dir.exists() {
         fs::create_dir_all(&target_dir)?;
@@ -202,7 +205,7 @@ where
     }
 
     if !shortcut.trim().is_empty() {
-        let shortcuts_path = target_dir.join(".shortcuts.yaml");
+        let shortcuts_path = zirv_root.join(".shortcuts.yaml");
         let Some(mut shortcuts) = read_shortcuts(&shortcuts_path, non_interactive, &confirm_fn)?
         else {
             return Ok(());
@@ -311,7 +314,11 @@ mod tests {
         with_fake_env(fake_home.path(), fake_cwd.path(), || {
             create_script_core("mytest", "mt", false, true, unreachable_confirm).unwrap();
 
-            let script_path = fake_cwd.path().join(".zirv").join("mytest.yaml");
+            let script_path = fake_cwd
+                .path()
+                .join(".zirv")
+                .join(COMMANDS_DIR_NAME)
+                .join("mytest.yaml");
             assert!(script_path.exists());
 
             let shortcuts_path = fake_cwd.path().join(".zirv").join(".shortcuts.yaml");
@@ -329,13 +336,21 @@ mod tests {
         with_fake_env(fake_home.path(), fake_cwd.path(), || {
             create_script_core("globaltest", "", true, true, unreachable_confirm).unwrap();
 
-            let script_path = fake_home.path().join(".zirv").join("globaltest.yaml");
+            let script_path = fake_home
+                .path()
+                .join(".zirv")
+                .join(COMMANDS_DIR_NAME)
+                .join("globaltest.yaml");
             assert!(
                 script_path.exists(),
-                "script should land in the global .zirv"
+                "script should land in the global .zirv/commands"
             );
 
-            let local_path = fake_cwd.path().join(".zirv").join("globaltest.yaml");
+            let local_path = fake_cwd
+                .path()
+                .join(".zirv")
+                .join(COMMANDS_DIR_NAME)
+                .join("globaltest.yaml");
             assert!(!local_path.exists());
         });
     }
@@ -363,7 +378,11 @@ mod tests {
             assert!(result.is_err());
             assert!(result.unwrap_err().to_string().contains("help"));
 
-            let script_path = fake_cwd.path().join(".zirv").join("help.yaml");
+            let script_path = fake_cwd
+                .path()
+                .join(".zirv")
+                .join(COMMANDS_DIR_NAME)
+                .join("help.yaml");
             assert!(!script_path.exists(), "must not write the file on error");
         });
     }
@@ -410,7 +429,11 @@ mod tests {
         with_fake_env(fake_home.path(), fake_cwd.path(), || {
             create_script_core("help", "", false, false, |_| Ok(true)).unwrap();
 
-            let script_path = fake_cwd.path().join(".zirv").join("help.yaml");
+            let script_path = fake_cwd
+                .path()
+                .join(".zirv")
+                .join(COMMANDS_DIR_NAME)
+                .join("help.yaml");
             assert!(script_path.exists(), "confirmed collision should proceed");
         });
     }
@@ -427,7 +450,11 @@ mod tests {
                 "declining is a graceful abort, not an error"
             );
 
-            let script_path = fake_cwd.path().join(".zirv").join("help.yaml");
+            let script_path = fake_cwd
+                .path()
+                .join(".zirv")
+                .join(COMMANDS_DIR_NAME)
+                .join("help.yaml");
             assert!(
                 !script_path.exists(),
                 "must not write the file when declined"
@@ -448,8 +475,45 @@ mod tests {
             };
             create_script(opts).unwrap();
 
-            let script_path = fake_cwd.path().join(".zirv").join("e2e.yaml");
+            let script_path = fake_cwd
+                .path()
+                .join(".zirv")
+                .join(COMMANDS_DIR_NAME)
+                .join("e2e.yaml");
             assert!(script_path.exists());
+        });
+    }
+
+    /// Issue #212: `create` writes into `.zirv/commands/`, creating the
+    /// directory itself, while `.shortcuts.yaml` stays at the `.zirv` root.
+    #[test]
+    fn create_writes_into_commands_and_keeps_shortcuts_at_the_root() {
+        let fake_home = tempdir().unwrap();
+        let fake_cwd = tempdir().unwrap();
+
+        with_fake_env(fake_home.path(), fake_cwd.path(), || {
+            create_script_core("rooted", "r", false, true, unreachable_confirm).unwrap();
+
+            let zirv = fake_cwd.path().join(".zirv");
+            assert!(
+                zirv.join(COMMANDS_DIR_NAME).is_dir(),
+                "commands/ must be created"
+            );
+            assert!(zirv.join(COMMANDS_DIR_NAME).join("rooted.yaml").exists());
+            assert!(
+                !zirv.join("rooted.yaml").exists(),
+                "the script must not also land at the .zirv root"
+            );
+            assert!(
+                zirv.join(".shortcuts.yaml").exists(),
+                ".shortcuts.yaml must stay at the .zirv root, not move into commands/"
+            );
+            assert!(
+                !zirv
+                    .join(COMMANDS_DIR_NAME)
+                    .join(".shortcuts.yaml")
+                    .exists()
+            );
         });
     }
 

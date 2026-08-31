@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-20
+last-verified: 2026-08-31
 ---
 
 # Architecture Overview
@@ -9,7 +9,7 @@ last-verified: 2026-08-20
 - Single binary crate `zirv`. Entry point `src/main.rs` intercepts `ctx`, workflow commands, aliases, and top-level help before legacy clap/script resolution.
 - Module map: `main.rs` (dispatch) -> top-level built-ins, `commands/workflow/`, `commands/ctx/`, or `input.rs`/`script_runner/` for legacy scripts. `commands/workflow/` owns provider-neutral development methodology and durable lifecycle state; `commands/ctx/` owns agent supervision/context.
 - **If changed:** update [[Script Resolution]] (dispatch order lives in `main.rs`), [[Technology Stack]] (if a module gains/drops a dependency), [[Script Runner]] and [[Ctx Subsystem]] (module-level detail for their halves of the tree).
-- **Gotchas:** `zirv ctx` is matched on raw `argv[1]`, ahead of clap parsing — a `.zirv/ctx.yaml` script named `ctx` can never be reached (see [[Script Resolution]]). `zirv --help`/`-h` is also intercepted on raw argv so clap's auto-generated help never fires.
+- **Gotchas:** `zirv ctx` is matched on raw `argv[1]`, ahead of clap parsing — a `.zirv/commands/ctx.yaml` script named `ctx` can never be reached (see [[Script Resolution]]). `zirv --help`/`-h` is also intercepted on raw argv so clap's auto-generated help never fires. Scripts resolve from `.zirv/commands/` (and `~/.zirv/commands/`), not the `.zirv` root, as of zirv 3.0 (issue #212) — the root holds only config (`ctx.toml`, `.settings.toml`, `verify.toml`, `.shortcuts.yaml`, `system-prompt.md`, `context/`, `memory/`).
 
 ## Module map
 
@@ -17,12 +17,12 @@ last-verified: 2026-08-20
 src/
 ├── main.rs              # entry point: ctx interception, help interception, built-in dispatch
 ├── input.rs              # clap Input struct; script path resolution (get_file_path)
-├── utils.rs               # SUPPORTED_EXTENSIONS/SCRIPT_DIR_NAME, file parsing, Shortcuts, suggestions
+├── utils.rs               # SUPPORTED_EXTENSIONS/SCRIPT_DIR_NAME/COMMANDS_DIR_NAME, file parsing, Shortcuts, suggestions
 ├── output.rs              # console output helpers (step/error/warn/dry_run)
 ├── commands/
-│   ├── create.rs          # `zirv create` / `c` — interactive script scaffolding
+│   ├── create.rs          # `zirv create` / `c` — interactive script scaffolding, writes into .zirv/commands/
 │   ├── help.rs             # `zirv help` / `h` — usage + script/shortcut listing
-│   ├── init.rs             # `zirv init` / `i` — creates a .zirv directory
+│   ├── init.rs             # `zirv init` / `i` — creates a .zirv directory and its commands/ subdirectory
 │   ├── version.rs          # `zirv version` / `v`
 │   ├── workflow/            # skills, workflows, risk, tests, reviews, artifacts, telemetry
 │   └── ctx/                # `zirv ctx <verb>` — AI-agent context management subsystem

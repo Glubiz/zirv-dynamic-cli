@@ -495,7 +495,10 @@ Run:
 ```bash
 zirv init
 ```
-Creates a `.zirv/` directory with a sample script. This directory is where you will define your scripts. The `.zirv/` directory is created in the current working directory or in the HOME directory depending on the commandline interactions.
+Creates a `.zirv/` directory, its `.zirv/commands/` subdirectory (where you
+will define your scripts, as of zirv 3.0), and a default `.shortcuts.yaml`.
+The `.zirv/` directory is created in the current working directory or in the
+HOME directory depending on the commandline interactions.
 
 ### Creating a New Script
 ```bash
@@ -503,7 +506,8 @@ zirv create
 ```
 Interactively asks for the script name, an optional shortcut key, and whether
 to create it locally or in the global `~/.zirv` folder, then writes a
-template script (and shortcut entry, if given).
+template script into `.zirv/commands/` (or `~/.zirv/commands/`), plus a
+shortcut entry in `.zirv/.shortcuts.yaml` if one was given.
 
 To script the creation (e.g. in CI or setup scripts), pass any of the three
 answers as flags to skip the corresponding prompt; passing all three skips
@@ -524,7 +528,7 @@ non-interactive mode (all three flags given) a collision is an error instead,
 since there is no prompt to fall back on.
 
 ### Running Scripts
-Place your script files in `.zirv/` (e.g., `build.yaml`):
+Place your script files in `.zirv/commands/` (e.g., `build.yaml`):
   
 ```yaml
 name: Build
@@ -543,9 +547,12 @@ Execute the script with:
 zirv build
 ```
 
-If the name doesn't match any script or shortcut (checked locally in `.zirv/`,
-then globally in `~/.zirv/`), zirv suggests up to 3 close matches by edit
-distance and points you to `zirv help`:
+If the name doesn't match any script or shortcut (checked locally in
+`.zirv/commands/`, then globally in `~/.zirv/commands/`), zirv suggests up to
+3 close matches by edit distance and points you to `zirv help`. If a script
+was left at the `.zirv` root instead of moved into `commands/` (the pre-3.0
+layout), the error names it and says where it needs to move — there is no
+fallback lookup at the old location:
 
 ```
 error: No script or shortcut found for 'buld'. Did you mean: build? Run `zirv help` to see available scripts and shortcuts.
@@ -717,12 +724,15 @@ with that adapter's own error.
 
 ## Configuration
 ### Directory Structure
-The `.zirv/` directory contains your scripts and a configuration file. The structure is as follows:
+The `.zirv/` directory contains zirv's configuration; your scripts live in its
+`commands/` subdirectory (zirv 3.0). The structure is as follows:
 
 ```
 .zirv/
 ├── .shortcuts.yaml
-├── ...command files
+├── ctx.toml
+├── commands/
+│   └── ...your script files
 ```
 
 ### Schema Examples
@@ -1477,7 +1487,7 @@ Replace a long-lived orchestrator session with a stateless loop, and wrap worker
 dispatch so individual runs get restarted rather than merely killed:
 
 ```yaml
-# .zirv/issue-loop.yaml
+# .zirv/commands/issue-loop.yaml
 name: Issue Loop
 commands:
   - command: zirv ctx loop --prompt-file .zirv/issue-loop-prompt.md --interval-secs 900

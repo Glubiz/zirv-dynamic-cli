@@ -659,17 +659,19 @@ mod tests {
         let temp_dir = tempfile::tempdir()?;
         let temp_path = temp_dir.path().to_path_buf();
         let zirv_dir = temp_path.join(".zirv");
+        let commands_dir = zirv_dir.join(utils::COMMANDS_DIR_NAME);
         std::fs::create_dir_all(zirv_dir.join("context"))?;
         std::fs::write(
             zirv_dir.join("context").join("common.md"),
             "Always run tests.",
         )?;
+        std::fs::create_dir_all(&commands_dir)?;
         std::fs::write(
-            zirv_dir.join("context.yaml"),
+            commands_dir.join("context.yaml"),
             "name: \"My Context Script\"\ncommands: []\n",
         )?;
         std::fs::write(
-            zirv_dir.join("build.yaml"),
+            commands_dir.join("build.yaml"),
             "name: \"Build\"\ncommands: []\n",
         )?;
 

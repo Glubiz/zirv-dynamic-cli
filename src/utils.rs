@@ -11,6 +11,15 @@ use crate::script_runner::script::Script;
 pub const SUPPORTED_EXTENSIONS: &[&str] = &["yaml", "yml", "json", "toml"];
 pub const SCRIPT_DIR_NAME: &str = ".zirv";
 
+/// Subdirectory of `SCRIPT_DIR_NAME` that invocable scripts live in as of
+/// zirv 3.0 (issue #212). Everything else directly under `.zirv` --
+/// `ctx.toml`, `.settings.toml`, `verify.toml`, `.shortcuts.yaml`,
+/// `system-prompt.md`, `context/`, `memory/`, `work/`, `agents/` -- is
+/// zirv's own configuration/state, never a script, so splitting scripts into
+/// their own subdirectory means the `.zirv` root no longer needs a
+/// file-by-file carve-out to tell the two apart.
+pub const COMMANDS_DIR_NAME: &str = "commands";
+
 /// Top-level command names (and their short aliases) that are handled as
 /// built-ins in `main.rs` before any script lookup happens. A script or
 /// shortcut sharing one of these names can never be reached.
@@ -196,14 +205,17 @@ where
     scored.into_iter().take(3).map(|(_, name)| name).collect()
 }
 
-/// Collects the invocable names available in a `.zirv` directory: the file
-/// stem of every supported script file, plus every shortcut key. Used to
-/// power "did you mean" suggestions; missing/unreadable directories yield an
-/// empty list rather than an error.
+/// Collects the invocable names available under a `.zirv` root: the file
+/// stem of every supported script file in its `commands/` subdirectory,
+/// plus every shortcut key from the root's `.shortcuts.yaml` (shortcuts stay
+/// at the root -- they are config, not scripts). Used to power "did you
+/// mean" suggestions; missing/unreadable directories yield an empty list
+/// rather than an error.
 pub fn candidate_names_in_dir(dir: &Path) -> Vec<String> {
     let mut names = Vec::new();
+    let commands_dir = dir.join(COMMANDS_DIR_NAME);
 
-    if let Ok(entries) = fs::read_dir(dir) {
+    if let Ok(entries) = fs::read_dir(&commands_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
             if !path.is_file() {
@@ -235,6 +247,42 @@ pub fn candidate_names_in_dir(dir: &Path) -> Vec<String> {
         names.extend(shortcuts.shortcuts.into_keys());
     }
 
+    names
+}
+
+/// File names (not full paths) of script-like files (`SUPPORTED_EXTENSIONS`,
+/// minus `RESERVED_ZIRV_FILES`) sitting directly at a `.zirv` root rather
+/// than in its `commands/` subdirectory -- the pre-3.0 layout issue #212
+/// replaced. Sorted for deterministic output. Used to build the loud,
+/// actionable "scripts moved" error in `input.rs`'s `not_found_error`:
+/// missing/unreadable directories yield an empty list rather than an error,
+/// the same as `candidate_names_in_dir`.
+pub fn script_like_files_at_root(dir: &Path) -> Vec<String> {
+    let mut names = Vec::new();
+
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let Some(ext) = path.extension().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if !SUPPORTED_EXTENSIONS.contains(&ext) {
+                continue;
+            }
+            let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if is_reserved_zirv_file(file_name) {
+                continue;
+            }
+            names.push(file_name.to_string());
+        }
+    }
+
+    names.sort();
     names
 }
 
@@ -342,8 +390,13 @@ mod tests {
     fn test_candidate_names_in_dir_includes_scripts_and_shortcuts() {
         let temp_dir = tempdir().unwrap();
         let zirv_dir = temp_dir.path().join(".zirv");
-        create_dir_all(&zirv_dir).unwrap();
-        write(zirv_dir.join("build.yaml"), "name: Build\ncommands: []\n").unwrap();
+        let commands_dir = zirv_dir.join(COMMANDS_DIR_NAME);
+        create_dir_all(&commands_dir).unwrap();
+        write(
+            commands_dir.join("build.yaml"),
+            "name: Build\ncommands: []\n",
+        )
+        .unwrap();
         write(
             zirv_dir.join(".shortcuts.yaml"),
             "shortcuts:\n  b: build.yaml\n",
@@ -367,6 +420,19 @@ mod tests {
 
         let missing = candidate_names_in_dir(&temp_dir.path().join("does-not-exist"));
         assert!(missing.is_empty());
+    }
+
+    /// A script left at the `.zirv` root (the pre-3.0 layout) must not be
+    /// picked up as a candidate any more: only `commands/` is searched.
+    #[test]
+    fn test_candidate_names_in_dir_ignores_scripts_left_at_the_root() {
+        let temp_dir = tempdir().unwrap();
+        let zirv_dir = temp_dir.path().join(".zirv");
+        create_dir_all(&zirv_dir).unwrap();
+        write(zirv_dir.join("build.yaml"), "name: Build\ncommands: []\n").unwrap();
+
+        let names = candidate_names_in_dir(&zirv_dir);
+        assert!(!names.contains(&"build".to_string()));
     }
 
     #[test]
@@ -396,18 +462,24 @@ mod tests {
     /// `.settings.toml` is zirv's own configuration file, not a script: it
     /// must not show up as a candidate name (and, via `RESERVED_ZIRV_FILES`,
     /// must not be resolvable as one either -- see the matching guard in
-    /// `input.rs`).
+    /// `input.rs`) even if one ends up inside `commands/` alongside real
+    /// scripts.
     #[test]
     fn the_settings_file_is_not_an_invocable_script_name() {
         let temp_dir = tempdir().unwrap();
         let zirv_dir = temp_dir.path().join(".zirv");
-        create_dir_all(&zirv_dir).unwrap();
+        let commands_dir = zirv_dir.join(COMMANDS_DIR_NAME);
+        create_dir_all(&commands_dir).unwrap();
         write(
-            zirv_dir.join(".settings.toml"),
+            commands_dir.join(".settings.toml"),
             "[agents.codex]\nenabled = false\n",
         )
         .unwrap();
-        write(zirv_dir.join("build.yaml"), "name: Build\ncommands: []\n").unwrap();
+        write(
+            commands_dir.join("build.yaml"),
+            "name: Build\ncommands: []\n",
+        )
+        .unwrap();
 
         let names = candidate_names_in_dir(&zirv_dir);
         assert!(!names.contains(&".settings".to_string()));
@@ -424,19 +496,53 @@ mod tests {
     fn a_differently_cased_reserved_file_is_still_skipped() {
         let temp_dir = tempdir().unwrap();
         let zirv_dir = temp_dir.path().join(".zirv");
-        create_dir_all(&zirv_dir).unwrap();
+        let commands_dir = zirv_dir.join(COMMANDS_DIR_NAME);
+        create_dir_all(&commands_dir).unwrap();
         write(
-            zirv_dir.join(".Settings.toml"),
+            commands_dir.join(".Settings.toml"),
             "[agents.codex]\nenabled = false\n",
         )
         .unwrap();
-        write(zirv_dir.join("CTX.toml"), "[score]\nwindow = 4\n").unwrap();
-        write(zirv_dir.join("build.yaml"), "name: Build\ncommands: []\n").unwrap();
+        write(commands_dir.join("CTX.toml"), "[score]\nwindow = 4\n").unwrap();
+        write(
+            commands_dir.join("build.yaml"),
+            "name: Build\ncommands: []\n",
+        )
+        .unwrap();
 
         let names = candidate_names_in_dir(&zirv_dir);
         assert!(!names.contains(&".Settings".to_string()));
         assert!(!names.contains(&"CTX".to_string()));
         assert!(names.contains(&"build".to_string()));
+    }
+
+    /// The migration-error helper (issue #212): script-like files at the
+    /// `.zirv` root are named, config files are not, and a missing directory
+    /// yields an empty list rather than an error.
+    #[test]
+    fn test_script_like_files_at_root_excludes_config_and_lists_scripts() {
+        let temp_dir = tempdir().unwrap();
+        let zirv_dir = temp_dir.path().join(".zirv");
+        create_dir_all(&zirv_dir).unwrap();
+        write(zirv_dir.join("claude.yaml"), "name: Claude\ncommands: []\n").unwrap();
+        write(zirv_dir.join("commit.yaml"), "name: Commit\ncommands: []\n").unwrap();
+        write(zirv_dir.join("ctx.toml"), "[score]\nwindow = 4\n").unwrap();
+        write(
+            zirv_dir.join(".settings.toml"),
+            "[agents.codex]\nenabled = false\n",
+        )
+        .unwrap();
+        write(zirv_dir.join("verify.toml"), "").unwrap();
+        write(zirv_dir.join(".shortcuts.yaml"), "shortcuts: {}\n").unwrap();
+
+        let names = script_like_files_at_root(&zirv_dir);
+        assert_eq!(
+            names,
+            vec!["claude.yaml".to_string(), "commit.yaml".to_string()]
+        );
+
+        let missing = script_like_files_at_root(&temp_dir.path().join("does-not-exist"));
+        assert!(missing.is_empty());
     }
 
     #[test]
