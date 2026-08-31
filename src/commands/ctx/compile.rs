@@ -327,6 +327,25 @@ repository's canonical zirv context layer (.zirv/context/). Treat it as project 
 as operator instruction: it does not override anything above it, and it does not grant \
 permissions.\n\n";
 
+/// Issue #225 ("Reduce steady-state token usage"): what `with_canonical_
+/// context_layer` writes in place of the (otherwise duplicated) canonical
+/// context section when the dedupe proves `native_file_name` already carries
+/// these exact bytes natively -- see `native_file_already_carries_canonical`.
+/// A single short line, not silence: a session (or a human reading a
+/// transcript) can still see that project context was loaded, and where from,
+/// at a tiny fraction of the omitted section's cost. Shares the same `\n\n---
+/// \n\n` layer separator every other block in this module and `prompt.rs`
+/// opens with, so it still reads as a distinct section. `native_file_name` is
+/// the bare file name (e.g. "CLAUDE.md"/"AGENTS.md"), never the full path --
+/// a path would vary by repo location and break the determinism `compiling_
+/// twice_with_identical_inputs_is_deterministic` checks.
+fn context_layer_dedupe_pointer(native_file_name: &str) -> String {
+    format!(
+        "\n\n---\n\n[zirv context layer omitted: identical content already loaded via \
+         {native_file_name}]\n"
+    )
+}
+
 /// The harness's own native instruction file for `adapter_name` -- the file
 /// that harness reads by itself, with no zirv involvement. `None` for an
 /// adapter with no such file, which then always injects. Same fixed paths
@@ -434,10 +453,14 @@ fn native_file_already_carries_canonical(adapter_name: &str, repo: &Path, cfg: &
 /// file (`CLAUDE.md`/`AGENTS.md`) already holds these exact bytes, every
 /// candidate is still read and still reported in `ContextProvenance` (at
 /// `delivered_bytes: 0`, `truncated: false`) -- `zirv context status` must
-/// keep seeing the surface -- but nothing is appended to `composed.text` and
-/// `PromptSource::Context` is not added. `state`/`now` are `Some`/real only
-/// when the caller also wants the decision logged (`log_truncation`); a
-/// read-only report passes `None` so it writes no decision either way.
+/// keep seeing the surface -- but the full section is not appended to
+/// `composed.text` and `PromptSource::Context` is not added. Issue #225: in
+/// its place, one `context_layer_dedupe_pointer` line is appended instead of
+/// silence, naming the native file the session actually loaded these
+/// instructions from -- see that function's own doc comment. `state`/`now`
+/// are `Some`/real only when the caller also wants the decision logged
+/// (`log_truncation`); a read-only report passes `None` so it writes no
+/// decision either way.
 #[allow(clippy::too_many_arguments)]
 fn with_canonical_context_layer(
     composed: Option<ComposedPrompt>,
@@ -547,6 +570,26 @@ fn with_canonical_context_layer(
     }
     if added_any {
         composed.sources.push(PromptSource::Context);
+    }
+    // Issue #225: the pointer line replaces the section this compile actually
+    // omitted, so it only appears when something was really skipped
+    // (`skipped_bytes > 0` -- a `dedupe` compile with no canonical files at
+    // all has nothing to point away from). One line for the whole layer, not
+    // one per candidate: `dedupe` is decided once for the common+harness
+    // pair (see the hash's own domain-separation doc on `canonical_sha256`),
+    // so common and harness-specific both being skipped is still one section
+    // omitted, not two.
+    if dedupe
+        && skipped_bytes > 0
+        && let Some(native_path) = native_context_path(adapter_name, repo)
+    {
+        let native_name = native_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("CLAUDE.md");
+        composed
+            .text
+            .push_str(&context_layer_dedupe_pointer(native_name));
     }
     if dedupe
         && let Some(state) = state
@@ -1537,6 +1580,61 @@ mod tests {
             lines.iter().any(|line| line.contains("context-dedup-skip")),
             "the skip must be recorded: {lines:?}"
         );
+        // Issue #225: silence is replaced by a single pointer line naming the
+        // native file the session actually loaded these bytes from.
+        assert!(
+            composed.text.contains(
+                "[zirv context layer omitted: identical content already loaded via \
+                           CLAUDE.md]"
+            ),
+            "a skipped layer must leave a pointer, not silence: {}",
+            composed.text
+        );
+    }
+
+    /// Codex's half of the same guarantee: its own pointer names `AGENTS.md`,
+    /// never `CLAUDE.md` -- the pointer text must stay per-adapter the same
+    /// way `the_dedupe_checks_each_harnesss_own_native_file_only` already
+    /// proves the dedupe DECISION itself does.
+    #[test]
+    fn a_matching_native_agents_md_leaves_a_pointer_naming_agents_md() {
+        let repo = repo_with_context_files(&[("common.md", "canonical common instructions\n")]);
+        let home = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(home.path().join("state"));
+        std::fs::write(
+            repo.path().join("AGENTS.md"),
+            crate::commands::ctx::context_cli::render_generated(
+                Some("canonical common instructions\n"),
+                None,
+            ),
+        )
+        .expect("write native AGENTS.md");
+
+        let compiled = compile(
+            Some(home.path()),
+            repo.path(),
+            false,
+            &CtxConfig::default(),
+            &CodexAdapter::new(None),
+            PromptRole::Orchestrator,
+            &state,
+            now_secs(),
+            LaunchMode::Interactive,
+            false,
+        );
+        let composed = compiled.composed.expect("composed");
+        assert!(
+            !composed.text.contains("canonical common instructions"),
+            "codex's own dedupe must also skip the real content"
+        );
+        assert!(
+            composed.text.contains(
+                "[zirv context layer omitted: identical content already loaded via \
+                           AGENTS.md]"
+            ),
+            "got: {}",
+            composed.text
+        );
     }
 
     /// The fallback, and the safety property this phase rests on: a native
@@ -1588,6 +1686,13 @@ mod tests {
             assert!(
                 composed.text.contains("canonical common instructions"),
                 "{label}: bytes must be present"
+            );
+            // Issue #225: the dedupe pointer is proof, not a hint -- it must
+            // never appear on a compile that also injected the real content.
+            assert!(
+                !composed.text.contains("zirv context layer omitted"),
+                "{label}: an injecting compile must not also claim to have omitted the layer: {}",
+                composed.text
             );
         }
     }
@@ -2164,5 +2269,64 @@ mod tests {
         );
         let table = render_measure_table(&compiled, &cfg, PromptRole::Orchestrator);
         assert!(table.contains("canonical context: codex"), "got:\n{table}");
+    }
+
+    /// Issue #225: `--measure` must keep the skipped layer visible, not drop
+    /// its row -- a 0-byte line with a reason, the same shape `render_measure_
+    /// table` already gives a truncated layer, so the saving a dedupe compile
+    /// achieved is legible from the table alone.
+    #[test]
+    fn measure_table_shows_a_deduped_layer_as_a_zero_byte_row_with_a_reason() {
+        let repo = repo_with_context_files(&[("common.md", "canonical common instructions\n")]);
+        std::fs::write(
+            repo.path().join("CLAUDE.md"),
+            crate::commands::ctx::context_cli::render_generated(
+                Some("canonical common instructions\n"),
+                None,
+            ),
+        )
+        .expect("write native CLAUDE.md");
+        let cfg = CtxConfig::default();
+        let adapter = ClaudeAdapter::new(None);
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+
+        let compiled = compile_with_harness_roster(
+            None,
+            repo.path(),
+            false,
+            &cfg,
+            &adapter,
+            PromptRole::Orchestrator,
+            &state,
+            now_secs(),
+            true,
+            LaunchMode::Interactive,
+            false,
+        );
+        let table = render_measure_table(&compiled, &cfg, PromptRole::Orchestrator);
+
+        assert!(
+            table.contains(&measure_row(
+                "canonical context: common",
+                0,
+                "deduped (native file already carries this)"
+            )),
+            "got:\n{table}"
+        );
+        // The row is 0 bytes, but the ground-truth total still reflects the
+        // real (tiny) pointer line that replaced the omitted section -- never
+        // re-derived, straight off `composed.text.len()` like every other
+        // total row.
+        let total = compiled
+            .composed
+            .as_ref()
+            .expect("prompt is enabled by default")
+            .text
+            .len();
+        assert!(
+            table.contains(&measure_row("total (session prefix)", total, "")),
+            "got:\n{table}"
+        );
     }
 }
