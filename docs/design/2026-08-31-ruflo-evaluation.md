@@ -117,7 +117,7 @@ caller, scoring stays pure).
 `.zirv/memory/` flat, plus tests pinning ranking order on fixed inputs; no schema change to
 stored memory required.
 
-**Follow-up issue: TBD**
+**Follow-up issue: [#241](https://github.com/Glubiz/zirv-dynamic-cli/issues/241)**
 
 ### b. Auto-triggered lifecycle workers on workflow gate transitions
 
@@ -135,7 +135,7 @@ requests already are.
 new spawn-on-transition config (operator-controlled, matching `REPO_FORBIDDEN` posture for
 anything that changes what gets auto-launched), tests per transition.
 
-**Follow-up issue: TBD**
+**Follow-up issue: [#242](https://github.com/Glubiz/zirv-dynamic-cli/issues/242)**
 
 ### c. Deterministic prompt-injection/PII screening on transcript/mail/inbox surfaces
 
@@ -157,7 +157,7 @@ to avoid.
 is), integration points across mail/transcript/inbox read paths, and a real ruleset informed
 by, not copied from, AIDefence's category design.
 
-**Follow-up issue: TBD**
+**Follow-up issue: [#243](https://github.com/Glubiz/zirv-dynamic-cli/issues/243)**
 
 ### d. Hook-surface gap analysis vs Ruflo's documented 18 hooks
 
@@ -172,7 +172,7 @@ of its 18 name a lifecycle moment zirv currently has no hook for at all.
 **Scope:** S — a research/comparison pass producing a short gap list; no code change unless a
 real gap is found, in which case it becomes its own follow-up.
 
-**Follow-up issue: TBD**
+**Follow-up issue: [#244](https://github.com/Glubiz/zirv-dynamic-cli/issues/244)**
 
 ### e. Usage-window-aware harness/model routing for `zirv agent`
 
@@ -189,7 +189,7 @@ than reactive fallback after a hit limit).
 reads into a routing decision at dispatch time rather than only a post-hoc fallback; tests
 per routing decision.
 
-**Follow-up issue: TBD**
+**Follow-up issue: [#245](https://github.com/Glubiz/zirv-dynamic-cli/issues/245)**
 
 ## 5. Conclusion
 

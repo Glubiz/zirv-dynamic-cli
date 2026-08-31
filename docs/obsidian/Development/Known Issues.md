@@ -14,6 +14,7 @@ Each entry gets a changelog comment at the top of the file, newest first:
 <!-- Updated YYYY-MM-DD (branch, state): what changed -->
 ```
 
+<!-- Updated 2026-08-31 (feature/225-240-token-cost-ruflo, issue #225 measurement closeout): recorded that PowerShell's `>` redirection re-encodes captured stdout to UTF-16 (silently doubling byte counts) when capturing real command output for token measurement -- cmd.exe's `>` avoids it -->
 <!-- Updated 2026-08-31 (worktree-issues-223-225, v3.2.0, issues #223/#225): recorded that commands::ctx::supervise::tests::terminate_* SIGTERM tests flake under parallel `-j 8` load on this Windows dev machine (pass in isolation and under the required serial `--test-threads=1` run) -->
 <!-- Updated 2026-08-31 (fix/bug-batch-227-228-229-232-233, v3.1.0, review round 2): documented `sibling_root_for`'s filesystem/drive-root guard on the default parent-directory workdir root (a second claude finding, fixed), and recorded the codex finding that the default parent-directory root still grants a forged same-uid pane request implicit authority over sibling checkouts as a residual (explicit per-sibling allowlisting rejected -- defeats the sibling-delegation use case; #179 remains the real fix) -->
 <!-- Updated 2026-08-31 (fix/bug-batch-227-228-229-232-233, v3.1.0, review round): narrowed the issue #228 residual below -- `resolved_spawn_cwd` now confines a pane `--workdir` to operator-owned workdir roots (default: the dashboard's own repo root plus its parent directory, widened only via `[dash] workdir_roots`/`ZIRV_CTX_DASH_WORKDIR_ROOTS`), so a forged spawn request can only reach a repo inside those roots, not any git repo the dashboard user can reach; the headless `zirv agent --workdir` path stays unrestricted beyond exists/dir/git-repo, since it runs as the operator's own command -->
@@ -78,6 +79,10 @@ Each entry gets a changelog comment at the top of the file, newest first:
 <!-- Updated 2026-08-13 (feat/dashboard, docs sweep): dashboard panes carry no rot score yet -->
 <!-- Updated 2026-08-13 (feat/agent-coordination, review round): markdown header absorption; registry short is a stable address; supervision env scrubbed on every spawn -->
 <!-- Updated 2026-08-13 (feat/agent-coordination, console-safety round): portable-pty do_kill inversion; ConPTY control-byte broadcast; empty nudge prefixes -->
+
+## PowerShell's `>` redirection re-encodes captured stdout to UTF-16, silently doubling byte counts
+
+**Recorded 2026-08-31 (`feature/225-240-token-cost-ruflo`, issue #225 measurement closeout) — a measurement-tooling gotcha on this Windows machine, not a zirv bug.** Capturing a command's real stdout via PowerShell's own `>` operator (e.g. `zirv ctx compile --measure > out.txt`) writes the file in UTF-16 with a BOM, not UTF-8 — a byte count taken off the captured file comes out roughly double the real UTF-8 byte count the harness/tokenizer actually sees, and feeding it straight to a UTF-8-assuming tokenizer either mis-tokenizes the BOM/null-interleaved bytes or errors outright. Worked around for `docs/benchmarks/token-cost.md` §6.6 by capturing through `cmd /c "... > file"` instead, which writes plain UTF-8 with no BOM. Applies to any future real-token measurement pass, or any other capture of zirv's own text output for byte/token accounting, on a machine where PowerShell is the default shell.
 
 ## A forged dashboard spawn request can point a fresh worker pane's writes at any repo inside the dashboard's workdir roots
 
