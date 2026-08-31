@@ -316,10 +316,7 @@ const ESC: u8 = 0x1b;
 fn find_marker(bytes: &[u8], marker: &[u8]) -> Option<usize> {
     let mut at = 0;
     while at + marker.len() <= bytes.len() {
-        match bytes[at..].iter().position(|byte| *byte == ESC) {
-            Some(offset) => at += offset,
-            None => return None,
-        }
+        at += bytes[at..].iter().position(|byte| *byte == ESC)?;
         if at + marker.len() > bytes.len() {
             return None;
         }
