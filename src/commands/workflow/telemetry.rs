@@ -230,7 +230,11 @@ impl TelemetryEvent {
     /// future reporting surface needs it, landed now so it is not
     /// re-derived incorrectly a second time, the same "accessor lands ahead
     /// of its production caller" pattern `log::tail_delegations` used.
-    #[allow(dead_code)]
+    ///
+    /// Issue #225: now consumed by `StatsReport::overall_cache_hit_ratio`
+    /// and `PhaseStats`/`AdapterStats::cache_hit_ratio` (via `aggregate`'s
+    /// own per-event accumulation, not by calling this method directly on
+    /// each event) -- `zirv workflow stats` is its first CLI surface.
     pub fn cache_hit_ratio(&self) -> Option<f64> {
         let read = self.cache_read_input_tokens?;
         let total = self.input_tokens?;
@@ -381,6 +385,23 @@ pub struct PhaseStats {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub failures: usize,
+    /// Issue #225: the subset of `input_tokens` served from cache, summed
+    /// only over events that actually carried the field -- see
+    /// `TelemetryEvent::cache_read_input_tokens`'s own doc comment for why
+    /// this is a subset of `input_tokens`, never an addition to it.
+    #[serde(default)]
+    pub cache_read_input_tokens: u64,
+    /// How many of `events` actually reported `cache_read_input_tokens`.
+    /// Zero means "no cache data at all", which `cache_hit_ratio` must
+    /// carry as `None`, never a manufactured 0%.
+    #[serde(default)]
+    pub cache_events: usize,
+    /// Same formula and same "no data, no ratio" contract as
+    /// `TelemetryEvent::cache_hit_ratio`, applied to this phase's summed
+    /// totals -- a real field (via `cache_hit_ratio_from`), not a method, so
+    /// `--json` carries it without a consumer re-deriving the formula.
+    #[serde(default)]
+    pub cache_hit_ratio: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -391,6 +412,29 @@ pub struct AdapterStats {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub failures: usize,
+    /// See `PhaseStats::cache_read_input_tokens`.
+    #[serde(default)]
+    pub cache_read_input_tokens: u64,
+    /// See `PhaseStats::cache_events`.
+    #[serde(default)]
+    pub cache_events: usize,
+    /// See `PhaseStats::cache_hit_ratio`.
+    #[serde(default)]
+    pub cache_hit_ratio: Option<f64>,
+}
+
+/// Shared by `PhaseStats`/`AdapterStats`/`StatsReport`'s own cache-hit
+/// fields: schema v2's formula (`cache_read_input_tokens / input_tokens`,
+/// `input_tokens` already the combined total -- see `TelemetryEvent::
+/// cache_read_input_tokens`'s doc comment), `None` whenever nothing in the
+/// aggregated set ever reported cache data, never a manufactured 0%.
+fn cache_hit_ratio_from(
+    cache_events: usize,
+    cache_read_input_tokens: u64,
+    input_tokens: u64,
+) -> Option<f64> {
+    (cache_events > 0 && input_tokens > 0)
+        .then(|| cache_read_input_tokens as f64 / input_tokens as f64)
 }
 
 /// Per-`workflow_id` breakdown (issue #155's "each shipped item showing its
@@ -479,6 +523,28 @@ pub struct StatsReport {
     /// event has been recorded at all -- the "no regression in
     /// review-confirmed defect rates" accounting hook issue #155 asks for.
     pub review_defect_rate: Option<f64>,
+    /// Issue #225: combined input tokens across every event that reported
+    /// one, regardless of whether it also carried a `phase`/`adapter` --
+    /// the ground truth `overall_cache_hit_ratio` is computed from, and a
+    /// wider set than either `phases` or `adapters` covers alone.
+    #[serde(default)]
+    pub overall_input_tokens: u64,
+    /// See `PhaseStats::cache_read_input_tokens`, summed over every event.
+    #[serde(default)]
+    pub overall_cache_read_input_tokens: u64,
+    /// How many events reported `cache_read_input_tokens` at all. Zero means
+    /// `overall_cache_hit_ratio` must be `None`, never a manufactured 0%.
+    #[serde(default)]
+    pub overall_cache_events: usize,
+    /// The schema-v2 cache-hit formula (`cache_read_input_tokens /
+    /// input_tokens`, `input_tokens` already the combined total) applied
+    /// across every event in this report, not just those with a phase or an
+    /// adapter. A real field (via `cache_hit_ratio_from`), not a method, so
+    /// `--json` carries it directly. `None` when nothing in the report ever
+    /// carried cache data -- see `TelemetryEvent::cache_hit_ratio`'s own doc
+    /// comment for why this is never a manufactured 0%.
+    #[serde(default)]
+    pub overall_cache_hit_ratio: Option<f64>,
     /// Issue #223. Always last -- see `run_stats`'s own ordering comment.
     pub adoption: AdoptionStats,
 }
@@ -505,7 +571,24 @@ pub fn aggregate(events: &[TelemetryEvent]) -> StatsReport {
     let mut finding_snapshots: BTreeMap<String, (u64, String, u32, u32, u32)> = BTreeMap::new();
     let mut workflows: BTreeMap<String, WorkflowStats> = BTreeMap::new();
     let mut review_runs = 0usize;
+    let mut overall_input_tokens = 0u64;
+    let mut overall_cache_read_input_tokens = 0u64;
+    let mut overall_cache_events = 0usize;
     for event in events {
+        overall_input_tokens = overall_input_tokens.saturating_add(event.input_tokens.unwrap_or(0));
+        // `TelemetryEvent::cache_hit_ratio()`'s own "no data, no ratio"
+        // gate (both fields present AND `input_tokens > 0`) is reused here
+        // to decide whether THIS event counts toward any `cache_events`
+        // tally below -- a stricter, more correct gate than a bare
+        // `cache_read_input_tokens.is_some()` would be, since an event with
+        // cache data but no (or zero) `input_tokens` could never produce a
+        // ratio on its own either.
+        let has_cache_data = event.cache_hit_ratio().is_some();
+        if has_cache_data {
+            overall_cache_read_input_tokens = overall_cache_read_input_tokens
+                .saturating_add(event.cache_read_input_tokens.unwrap_or(0));
+            overall_cache_events += 1;
+        }
         if let Some(phase) = event.phase {
             let entry = phases.entry(phase.to_string()).or_default();
             entry.events += 1;
@@ -520,6 +603,12 @@ pub fn aggregate(events: &[TelemetryEvent]) -> StatsReport {
                 .saturating_add(event.output_tokens.unwrap_or(0));
             if event.input_tokens.is_some() || event.output_tokens.is_some() {
                 entry.token_events += 1;
+            }
+            if has_cache_data {
+                entry.cache_read_input_tokens = entry
+                    .cache_read_input_tokens
+                    .saturating_add(event.cache_read_input_tokens.unwrap_or(0));
+                entry.cache_events += 1;
             }
             if event.succeeded == Some(false) {
                 entry.failures += 1;
@@ -539,6 +628,12 @@ pub fn aggregate(events: &[TelemetryEvent]) -> StatsReport {
                 .saturating_add(event.output_tokens.unwrap_or(0));
             if event.input_tokens.is_some() || event.output_tokens.is_some() {
                 entry.token_events += 1;
+            }
+            if has_cache_data {
+                entry.cache_read_input_tokens = entry
+                    .cache_read_input_tokens
+                    .saturating_add(event.cache_read_input_tokens.unwrap_or(0));
+                entry.cache_events += 1;
             }
             if event.succeeded == Some(false) {
                 entry.failures += 1;
@@ -660,6 +755,25 @@ pub fn aggregate(events: &[TelemetryEvent]) -> StatsReport {
         stats.confirmed_findings_per_review = (stats.review_runs > 0)
             .then(|| f64::from(stats.findings_meaningful) / stats.review_runs as f64);
     }
+    for stats in phases.values_mut() {
+        stats.cache_hit_ratio = cache_hit_ratio_from(
+            stats.cache_events,
+            stats.cache_read_input_tokens,
+            stats.input_tokens,
+        );
+    }
+    for stats in adapters.values_mut() {
+        stats.cache_hit_ratio = cache_hit_ratio_from(
+            stats.cache_events,
+            stats.cache_read_input_tokens,
+            stats.input_tokens,
+        );
+    }
+    let overall_cache_hit_ratio = cache_hit_ratio_from(
+        overall_cache_events,
+        overall_cache_read_input_tokens,
+        overall_input_tokens,
+    );
     let review_defect_rate =
         (review_runs > 0).then(|| findings_meaningful as f64 / review_runs as f64);
     let slowest_phase = phases
@@ -698,6 +812,10 @@ pub fn aggregate(events: &[TelemetryEvent]) -> StatsReport {
         workflows,
         review_runs,
         review_defect_rate,
+        overall_input_tokens,
+        overall_cache_read_input_tokens,
+        overall_cache_events,
+        overall_cache_hit_ratio,
         adoption,
     }
 }
@@ -735,6 +853,32 @@ pub struct StatsArgs {
     pub clear: bool,
 }
 
+/// The `, cache hit N.N%` suffix `run_stats` appends to each `adapter
+/// <name>:` line -- empty when this adapter never reported cache data
+/// (`cache_hit_ratio: None`), never a manufactured `, cache hit 0.0%`.
+/// Pure and pulled out of `run_stats` so its exact formatting is unit
+/// tested without needing a `StateDir`/telemetry fixture on disk.
+fn adapter_cache_hit_suffix(stats: &AdapterStats) -> String {
+    stats
+        .cache_hit_ratio
+        .map(|ratio| format!(", cache hit {:.1}%", ratio * 100.0))
+        .unwrap_or_default()
+}
+
+/// The overall `cache hit: ...` line `run_stats` prints right after the
+/// per-phase/per-adapter token totals -- `"cache hit: n/a"` when nothing in
+/// the report ever carried cache data, never a manufactured 0%. Pure for the
+/// same reason as [`adapter_cache_hit_suffix`].
+fn overall_cache_hit_line(report: &StatsReport) -> String {
+    match report.overall_cache_hit_ratio {
+        Some(ratio) => format!(
+            "cache hit: {:.1}% of combined input tokens were cache reads (schema v2 formula)",
+            ratio * 100.0
+        ),
+        None => "cache hit: n/a".to_string(),
+    }
+}
+
 pub fn run_stats(args: &StatsArgs, writer: &mut impl Write) -> CtxResult<i32> {
     let repo = match args.repo.as_deref() {
         Some(repo) => repo.canonicalize().unwrap_or_else(|_| repo.to_path_buf()),
@@ -766,14 +910,24 @@ pub fn run_stats(args: &StatsArgs, writer: &mut impl Write) -> CtxResult<i32> {
         for (adapter, stats) in &report.adapters {
             writeln!(
                 writer,
-                "adapter {adapter}: {} events, {} ms, {} tokens ({} measured events), {} failures",
+                "adapter {adapter}: {} events, {} ms, {} tokens ({} measured events), {} \
+                 failures{}",
                 stats.events,
                 stats.duration_ms,
                 stats.input_tokens.saturating_add(stats.output_tokens),
                 stats.token_events,
-                stats.failures
+                stats.failures,
+                adapter_cache_hit_suffix(stats)
             )?;
         }
+        // Issue #225: right after the token totals above (per-phase, then
+        // per-adapter) -- the one place an operator already looks to answer
+        // "how expensive was this workflow", so the cache line answers "how
+        // much of that was actually free" in the same glance. Schema v2's
+        // own formula (`TelemetryEvent::cache_hit_ratio`'s doc comment):
+        // `cache_read_input_tokens` is a SUBSET of the combined
+        // `input_tokens`, not a third figure to add to it.
+        writeln!(writer, "{}", overall_cache_hit_line(&report))?;
         if !report.token_sources.is_empty() {
             writeln!(
                 writer,
@@ -1297,5 +1451,100 @@ mod tests {
         .unwrap();
         let stored = list(&state, repo.path()).unwrap();
         assert_eq!(stored[0].model.as_deref().unwrap().len(), MAX_LABEL_BYTES);
+    }
+
+    /// Issue #225: the overall/per-phase/per-adapter cache-hit fields all use
+    /// schema v2's SUM-of-classes formula (`cache_read_input_tokens` summed
+    /// / `input_tokens` summed), never an average of each event's own
+    /// per-event ratio -- summing first is what "of combined input tokens"
+    /// in the printed line actually means.
+    #[test]
+    fn aggregate_reports_a_sum_based_cache_hit_ratio_never_an_average_of_ratios() {
+        let mut claude_a = TelemetryEvent::new(TelemetryKind::PhaseCompleted);
+        claude_a.adapter = Some("claude".into());
+        claude_a.phase = Some(WorkflowPhase::Implement);
+        claude_a.input_tokens = Some(100_000);
+        claude_a.cache_read_input_tokens = Some(90_000);
+
+        let mut claude_b = TelemetryEvent::new(TelemetryKind::PhaseCompleted);
+        claude_b.adapter = Some("claude".into());
+        claude_b.phase = Some(WorkflowPhase::Implement);
+        claude_b.input_tokens = Some(10_000);
+        claude_b.cache_read_input_tokens = Some(1_000);
+
+        // A per-event average of (0.9 + 0.1) / 2 would be 0.5 -- the sum-based
+        // formula must instead land on 91_000 / 110_000.
+        let report = aggregate(&[claude_a, claude_b]);
+        let expected = 91_000f64 / 110_000f64;
+
+        assert!((report.overall_cache_hit_ratio.expect("has cache data") - expected).abs() < 1e-9);
+        let phase = &report.phases["implement"];
+        assert!((phase.cache_hit_ratio.expect("has cache data") - expected).abs() < 1e-9);
+        let adapter = &report.adapters["claude"];
+        assert!((adapter.cache_hit_ratio.expect("has cache data") - expected).abs() < 1e-9);
+    }
+
+    /// Never a manufactured 0%: an event that carries `input_tokens` but no
+    /// cache fields at all must leave every cache-hit field `None`, not `0.0`.
+    #[test]
+    fn aggregate_never_manufactures_a_zero_cache_hit_ratio_without_data() {
+        let mut event = TelemetryEvent::new(TelemetryKind::PhaseCompleted);
+        event.adapter = Some("codex".into());
+        event.phase = Some(WorkflowPhase::Implement);
+        event.input_tokens = Some(1_000);
+        // No cache_read_input_tokens set at all.
+
+        let report = aggregate(&[event]);
+        assert_eq!(report.overall_cache_hit_ratio, None);
+        assert_eq!(report.phases["implement"].cache_hit_ratio, None);
+        assert_eq!(report.adapters["codex"].cache_hit_ratio, None);
+    }
+
+    /// `run_stats` prints these two pure helpers verbatim: the per-adapter
+    /// suffix carries a ratio only when the adapter actually has cache data,
+    /// and the overall line matches the exact wording issue #225 asks for.
+    #[test]
+    fn run_stats_cache_line_helpers_format_data_and_no_data_correctly() {
+        let mut with_data = TelemetryEvent::new(TelemetryKind::PhaseCompleted);
+        with_data.adapter = Some("claude".into());
+        with_data.input_tokens = Some(1_000);
+        with_data.cache_read_input_tokens = Some(875);
+        let report_with_data = aggregate(&[with_data]);
+        let claude_stats = &report_with_data.adapters["claude"];
+        assert_eq!(adapter_cache_hit_suffix(claude_stats), ", cache hit 87.5%");
+        assert_eq!(
+            overall_cache_hit_line(&report_with_data),
+            "cache hit: 87.5% of combined input tokens were cache reads (schema v2 formula)"
+        );
+
+        let mut without_data = TelemetryEvent::new(TelemetryKind::PhaseCompleted);
+        without_data.adapter = Some("codex".into());
+        without_data.input_tokens = Some(1_000);
+        let report_without_data = aggregate(&[without_data]);
+        let codex_stats = &report_without_data.adapters["codex"];
+        assert_eq!(
+            adapter_cache_hit_suffix(codex_stats),
+            "",
+            "no data must not append a manufactured ratio"
+        );
+        assert_eq!(
+            overall_cache_hit_line(&report_without_data),
+            "cache hit: n/a"
+        );
+    }
+
+    /// `--json` must carry the ratio as a real field, not require the
+    /// consumer to re-derive it from the raw counters.
+    #[test]
+    fn stats_report_json_carries_the_overall_cache_hit_ratio_field() {
+        let mut event = TelemetryEvent::new(TelemetryKind::PhaseCompleted);
+        event.input_tokens = Some(1_000);
+        event.cache_read_input_tokens = Some(500);
+        let report = aggregate(&[event]);
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(
+            json.contains("\"overall_cache_hit_ratio\":0.5"),
+            "got {json}"
+        );
     }
 }

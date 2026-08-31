@@ -501,17 +501,33 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
 
 /// UserPromptSubmit is the only hook that can add context to the model, which
 /// is how the marker signal gets installed. `adoption_nudge` (issue #223)
-/// rides as a second line when one is due -- the marker line above stays
-/// exactly as it was, so an operator relying on it for the rot signal sees no
-/// change.
+/// rides as a second line when one is due -- the marker line stays exactly as
+/// it was, so an operator relying on it for the rot signal sees no change.
+///
+/// Issue #225 (steady-state token reduction): the marker sentence is paid,
+/// uncached, on EVERY user turn -- unlike the once-per-session prompt layers
+/// in `prompt.rs`, it cannot ride the provider's cache. It used to be 170
+/// bytes; the shorter wording below keeps the exact same contract (start
+/// every FINAL answer with the marker on line 1, mid-turn notes are exempt,
+/// it is a context-health marker) in <= 90 bytes for the default `[zirv]`
+/// marker. `score.rs`/`rot.rs`'s `marker_miss_rate` only checks for the
+/// marker prefix at the start of a line, never this sentence's wording, so
+/// rewording it here changes no detection logic.
+///
+/// Split out of [`prompt_output`] so `zirv ctx compile --measure` (issue
+/// #225) can report this sentence's own byte cost without re-deriving its
+/// wording a second way -- the measurement and the actual injected text can
+/// never drift apart on what "the hook context" means.
+pub fn per_turn_context_text(marker: &str) -> String {
+    format!(
+        "Prefix each final answer with {marker} on line 1 (mid-turn exempt): zirv ctx health marker."
+    )
+}
+
 pub fn prompt_output(marker: &str, adoption_nudge: Option<&str>) -> String {
     let mut lines = Vec::new();
     if !marker.is_empty() {
-        lines.push(format!(
-            "Start every final answer in this session with the prefix {marker} on the first \
-             line. Mid-turn status notes do not need it. This is a context-health marker read by \
-             zirv ctx."
-        ));
+        lines.push(per_turn_context_text(marker));
     }
     if let Some(nudge) = adoption_nudge {
         lines.push(nudge.to_string());
@@ -1957,6 +1973,37 @@ mod tests {
             !out.contains("[zirv]"),
             "nothing user-specific is hardcoded"
         );
+    }
+
+    /// Issue #225: this `additionalContext` is paid, uncached, on every user
+    /// turn -- unlike the once-per-session prompt layers in `prompt.rs`, so it
+    /// carries a hard byte budget the way `HARNESS_PROMPT`'s own doc comment
+    /// tracks a shape budget. Pinned against the raw sentence, not the
+    /// wrapping JSON, so growth in `additionalContext`'s own text is caught
+    /// even if `hookSpecificOutput`'s envelope grows for an unrelated reason.
+    #[test]
+    fn prompt_hook_context_stays_under_the_ninety_byte_steady_state_budget() {
+        let parsed: serde_json::Value =
+            serde_json::from_str(&prompt_output("[zirv]", None)).expect("valid json");
+        let context = parsed["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .expect("additionalContext")
+            .to_string();
+        assert!(
+            context.len() <= 90,
+            "steady-state per-turn context must stay <= 90 bytes for the default marker, \
+             got {} bytes: {context}",
+            context.len()
+        );
+        // Same contract the old 170-byte sentence carried: start every FINAL
+        // answer with the marker on line 1, mid-turn notes are exempt, and
+        // it is a context-health marker read by zirv ctx -- just shorter.
+        for claim in ["final", "[zirv]", "mid-turn", "zirv ctx"] {
+            assert!(
+                context.contains(claim),
+                "the trimmed sentence must still say '{claim}': {context}"
+            );
+        }
     }
 
     /// Observational is not the same as silent: a compaction is the single
