@@ -566,7 +566,7 @@ impl ClaudeAdapter {
         // this to also allow-list memory/logs/groups/handoffs, reasoning
         // that `zirv ctx remember`/`recall`/`forget`/`nudge`/`group`/...
         // needed the same OS-sandbox write access `zirv ctx send` does.
-        // With `is_zirv_ctx_escape_safe`'s own fix (above), every one of
+        // With `is_reserved_zirv_escape_safe`'s own allow-list, every one of
         // those `zirv ctx <state-verb>` invocations already rides the
         // ALWAYS-ALLOWED unsandboxed retry, so no prompt is ever paid for
         // those writes regardless of what this OS-sandbox allowlist says.
@@ -622,9 +622,19 @@ impl ClaudeAdapter {
 /// existing read-only-`gh` carve-out and the new `[safety] escape_allow`
 /// gate (`safety::run_check_hook_mode_with_env`): an operator who pre-
 /// cleared a family kept getting re-prompted on every repeat regardless.
-/// The attested, fail-closed safety hook is now the SOLE zirv-side decision
-/// point for an escape; the operator's own native rules, if any, still
-/// apply on top, per the same documented precedence.
+/// The attested, fail-closed safety hook remains the final zirv-side decision
+/// point for an escape; the operator's own native rules, if any, still apply
+/// on top, per the same documented precedence.
+///
+/// Issue #224 adds one narrow native projection: `permissions.allow` and the
+/// sandbox's `excludedCommands` receive one pattern per name in
+/// `utils::RESERVED_COMMANDS`. Those names are dispatched before repo script
+/// lookup and cannot be shadowed; a non-reserved `zirv <script>` gets no rule.
+/// The outer `zirv report` process therefore runs outside the sandbox and its
+/// fixed, captured `gh auth token --hostname github.com` child may read the
+/// credential file, without allowing direct `gh auth *` (or blanket `gh *`)
+/// outside the sandbox. PreToolUse still evaluates every invocation, so repo
+/// `deny`/`ask` rules continue to narrow this default despite native allow.
 #[cfg_attr(windows, allow(unused_variables))]
 fn launch_settings_value(
     safety: &super::super::safety::SafetyPolicy,
@@ -632,6 +642,11 @@ fn launch_settings_value(
     mail_write_dir: Option<&Path>,
 ) -> Result<Value, serde_json::Error> {
     let fingerprint = super::super::safety::policy_fingerprint(safety)?;
+    let reserved_zirv_patterns = super::super::safety::reserved_zirv_command_patterns();
+    let reserved_zirv_permission_rules: Vec<String> = reserved_zirv_patterns
+        .iter()
+        .map(|pattern| format!("Bash({pattern})"))
+        .collect();
     #[cfg_attr(windows, allow(unused_mut))]
     let mut settings = serde_json::json!({
         "disableAllHooks": false,
@@ -645,6 +660,7 @@ fn launch_settings_value(
             }]
         },
         "permissions": {
+            "allow": reserved_zirv_permission_rules,
             "deny": [
                 "Read(~/.ssh/**)",
                 "Read(~/.aws/**)",
@@ -692,6 +708,7 @@ fn launch_settings_value(
             "enabled": true,
             "autoAllowBashIfSandboxed": true,
             "allowUnsandboxedCommands": true,
+            "excludedCommands": reserved_zirv_patterns,
             "failIfUnavailable": true,
             "filesystem": filesystem
             }),
@@ -1207,15 +1224,14 @@ impl AgentAdapter for ClaudeAdapter {
     /// appended last, unchanged from before this method took a
     /// `SafetyPolicy` parameter.
     ///
-    /// The permission-list tokens remain byte-identical to the pre-#83
-    /// hardcoded projection under the shipped default, modulo the scratchpad
-    /// rules below: `safety::builtin_deny`/
-    /// `builtin_allow` strip exactly `SHIPPED_POSTURE_DENY`/`_ALLOW`'s own
-    /// `Bash(...)` wrapper and this method re-adds it, so the round trip
-    /// reproduces the original strings verbatim, in the original order --
-    /// pinned by
-    /// `default_sandbox_args_stays_byte_identical_to_the_pre_safety_shipped_
-    /// default` below.
+    /// The static permission families still round-trip byte-identically:
+    /// `safety::builtin_deny`/`builtin_allow` strip
+    /// `SHIPPED_POSTURE_DENY`/`_ALLOW`'s own `Bash(...)` wrapper and this
+    /// method re-adds it in the original order. Issue #224 then appends the
+    /// reserved zirv patterns generated from `utils::RESERVED_COMMANDS`, and
+    /// the launch-computed scratchpad rules remain last. The full order is
+    /// pinned by `the_headless_projection_is_byte_exact_against_the_shipped_
+    /// constants` below.
     ///
     /// **Fix round 4 (2026-08-23, issue #104):** `SHIPPED_POSTURE_ALLOW`
     /// gained more non-`Bash` entries (`Read(~/.claude/**)`, `Edit(~/.claude
@@ -1247,8 +1263,11 @@ impl AgentAdapter for ClaudeAdapter {
     /// independent gates a command must clear. The conservative projection
     /// therefore still emits no blanket Bash allow: the hook's explicit
     /// `"allow"` carries ordinary commands, while an ask verdict cannot
-    /// accidentally be bypassed by native pre-approval. Every projected
-    /// launch also carries a Zirv-owned `--settings` layer
+    /// accidentally be bypassed by native pre-approval. Issue #224's narrow
+    /// reserved-built-in rules are projected separately into that launch
+    /// settings layer; the hook remains an independent gate, so repo ask/deny
+    /// rules still narrow them. Every projected launch carries the Zirv-owned
+    /// `--settings` layer
     /// that attests this hook for the process. On macOS/Linux/WSL2 it enables
     /// Claude's OS sandbox in auto-allow mode, fails closed if that boundary
     /// cannot start, denies common credential paths to Bash and the built-in
@@ -2253,6 +2272,48 @@ mod tests {
         assert!(read_denies.iter().any(|entry| entry == "Read(~/.ssh/**)"));
     }
 
+    /// Issue #224: Claude's native permission and sandbox layers must mirror
+    /// the classifier's reserved-name boundary. Excluding the outer `zirv
+    /// report` process lets its fixed, captured `gh auth token` child reach
+    /// the credential file without exposing direct `gh auth *` to the model.
+    #[test]
+    fn launch_settings_project_reserved_builtins_without_widening_scripts_or_gh() {
+        let settings = test_launch_settings();
+        let permission_allow = settings["permissions"]["allow"]
+            .as_array()
+            .expect("reserved built-in permission rules");
+        for name in crate::utils::RESERVED_COMMANDS {
+            let expected = serde_json::json!(format!("Bash(zirv {name} *)"));
+            assert!(
+                permission_allow.contains(&expected),
+                "reserved permission rule {expected} missing from {settings}"
+            );
+        }
+        assert!(!permission_allow.contains(&serde_json::json!("Bash(zirv *)")));
+        assert!(!permission_allow.contains(&serde_json::json!("Bash(gh *)")));
+
+        #[cfg(not(windows))]
+        {
+            let exclusions = settings["sandbox"]["excludedCommands"]
+                .as_array()
+                .expect("reserved built-in sandbox exclusions");
+            for name in crate::utils::RESERVED_COMMANDS {
+                let expected = serde_json::json!(format!("zirv {name} *"));
+                assert!(
+                    exclusions.contains(&expected),
+                    "reserved sandbox exclusion {expected} missing from {settings}"
+                );
+            }
+            assert!(!exclusions.contains(&serde_json::json!("zirv *")));
+            assert!(!exclusions.contains(&serde_json::json!("gh *")));
+            assert!(
+                settings["sandbox"]["filesystem"]["denyRead"]
+                    .as_array()
+                    .is_some_and(|rules| rules.iter().any(|rule| rule == "~/.config/gh/hosts.yml"))
+            );
+        }
+    }
+
     /// Issue #147: `zirv ctx send`'s mailbox writes must work inside the
     /// sandbox, but ONLY the mail tree -- never the policy-snapshot/
     /// attestation directory that sits right alongside it under the same
@@ -2523,16 +2584,11 @@ mod tests {
         assert!(deny_arg.starts_with("--disallowedTools="));
     }
 
-    /// Issue #98: the injected prompt mandates `zirv ctx status`/`inbox`/
-    /// `send`/`nudge`/`remember`/`recall`, `zirv agent <name> "..."`, and
-    /// `zirv <script>` -- previously denied by the shipped posture since
-    /// `SHIPPED_POSTURE_ALLOW` had no entry for `zirv` at all. Issue #104
-    /// later replaced the narrower per-subcommand `cargo fmt`/`cargo
-    /// clippy` entries this test originally pinned with the whole `cargo *`
-    /// family, which still covers them. Pins that the generated
-    /// `--allowedTools=` token carries both families.
+    /// Issue #224: the generated headless argv allows every reserved zirv
+    /// built-in, but never the old blanket `zirv *` family that also covered
+    /// untrusted repo scripts. The `cargo *` family remains unchanged.
     #[test]
-    fn default_sandbox_args_allows_zirvs_own_commands() {
+    fn default_sandbox_args_allow_reserved_zirv_builtins_but_not_scripts() {
         let adapter = ClaudeAdapter::new(None);
         let args = adapter.default_sandbox_args(
             &Default::default(),
@@ -2543,12 +2599,16 @@ mod tests {
             .iter()
             .find(|a| a.starts_with("--allowedTools="))
             .expect("an --allowedTools= token");
-        for rule in ["Bash(zirv *)", "Bash(cargo *)"] {
+        for name in crate::utils::RESERVED_COMMANDS {
+            let rule = format!("Bash(zirv {name} *)");
             assert!(
-                allow_arg.contains(rule),
+                allow_arg.contains(&rule),
                 "allow rule '{rule}' missing from {allow_arg}"
             );
         }
+        assert!(allow_arg.contains("Bash(cargo *)"));
+        assert!(!allow_arg.contains("Bash(zirv *)"));
+        assert!(!allow_arg.contains("Bash(zirv somescript *)"));
     }
 
     /// Issue #83: `default_sandbox_args` now projects `safety::SafetyPolicy`
@@ -2570,16 +2630,18 @@ mod tests {
             super::super::LaunchMode::Headless,
         );
 
-        // `SHIPPED_POSTURE_ALLOW`'s own non-`Bash(...)` entries (`Read(./
-        // **)`/`Edit(./**)` and the rest) are prepended separately only
-        // because `safety::builtin_allow` filters them out, so iterating the
-        // original constant directly reproduces the exact same order with
-        // no duplication; the scratchpad rules (computed from the real temp
-        // dir, not part of the `&'static` constant) are appended after.
+        // `SHIPPED_POSTURE_ALLOW`'s entries remain first. Issue #224's
+        // source-derived reserved rules follow the command entries because
+        // `safety::builtin_allow` appends them; scratchpad rules come last.
         let mut expected_allow: Vec<String> = super::super::SHIPPED_POSTURE_ALLOW
             .iter()
             .map(|(rule, _)| rule.to_string())
             .collect();
+        expected_allow.extend(
+            super::super::super::safety::reserved_zirv_command_patterns()
+                .into_iter()
+                .map(|pattern| format!("Bash({pattern})")),
+        );
         expected_allow.extend(super::super::scratchpad_rules(&std::env::temp_dir()));
         let mut expected_deny: Vec<String> = super::super::SHIPPED_POSTURE_DENY
             .iter()

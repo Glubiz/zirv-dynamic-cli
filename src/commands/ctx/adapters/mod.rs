@@ -257,13 +257,16 @@ pub fn flags_pin_policy(flags: &[String]) -> bool {
 
 /// One family of in-repo-development or destructive actions zirv's own
 /// shipped-default "sandboxed, no prompts" posture takes a position on --
-/// the single source both `ClaudeAdapter::default_sandbox_args` (which
+/// the shared static source both `ClaudeAdapter::default_sandbox_args` (which
 /// projects every entry onto a concrete `Bash(...)`/`Read(...)`/`Edit(...)`
 /// permission rule) and codex's own `default_sandbox_args` (a coarse
 /// `--sandbox workspace-write --ask-for-approval never` pair, documented
 /// against this same list -- see that method's own doc comment) are
 /// expressions of, so the two harnesses' postures cannot independently
-/// drift into disagreement about what "sandboxed, no prompts" means.
+/// drift into disagreement about what "sandboxed, no prompts" means. Zirv's
+/// case-insensitive reserved built-ins are the one generated family alongside
+/// this constant; `safety::reserved_zirv_command_patterns` derives them from
+/// the dispatch layer's `utils::RESERVED_COMMANDS` source of truth.
 ///
 /// **Why `dontAsk` alone is not enough (2026-08-22, fix round 2):** a fresh
 /// install with no operator-configured `permissions.allow` denies every
@@ -314,7 +317,7 @@ pub fn flags_pin_policy(flags: &[String]) -> bool {
 /// denial. The narrow per-subcommand entries are replaced with whole
 /// `Bash(<tool> *)` families (`git *`, `gh *`, `cargo *`, `npm *`, `npx *`,
 /// `node *`, `python *`, `python3 *`, `pip *`, `go *`, `dotnet *`, `make *`,
-/// `gradle *`, `mvn *`, `pytest *`, `zirv *`) plus a set of read-only shell
+/// `gradle *`, `mvn *`, `pytest *`) plus a set of read-only shell
 /// utilities -- the deny list, not per-verb narrowing, is what still keeps
 /// each family's destructive half blocked (`git clean *`, `git push
 /// --delete *`, `gh repo delete *`, `gh release delete *`, `gh auth *`,
@@ -322,10 +325,10 @@ pub fn flags_pin_policy(flags: &[String]) -> bool {
 /// alongside the pre-existing force-push/reset/rebase/curl/wget/sudo/su/
 /// security entries -- deny still wins, verified live in fix round 2).
 ///
-/// `zirv *` (issue #98): the injected session prompt routinely instructs a
-/// session to run `zirv ctx ...`/`zirv agent ...` -- denying zirv's own CLI
-/// by omission would make that prompt-mandated guidance unusable under
-/// `dontAsk`.
+/// Issue #224 replaces issue #98's former blanket `zirv *` family with rules
+/// derived from `utils::RESERVED_COMMANDS` in `safety::builtin_allow`.
+/// Zirv's own built-ins remain usable under `dontAsk`, while repo-defined
+/// `zirv <script>` invocations return to the unmatched-command gate.
 ///
 /// Also added: `Read(~/.claude/**)`/`Edit(~/.claude/projects/**)` (inspect
 /// the harness's own settings/memory, and write Claude Code's own
@@ -392,10 +395,6 @@ pub const SHIPPED_POSTURE_ALLOW: &[(&str, &str)] = &[
     ("Bash(gradle *)", "the Java/Kotlin/Gradle toolchain"),
     ("Bash(mvn *)", "the Java/Maven toolchain"),
     ("Bash(pytest *)", "test with the Python toolchain"),
-    (
-        "Bash(zirv *)",
-        "zirv's own CLI (issue #98) -- the injected prompt routinely instructs a session to run it; denying it by omission would make that guidance unusable under dontAsk",
-    ),
     // Read-only shell utilities.
     ("Bash(ls *)", "list directory contents, read-only"),
     ("Bash(grep *)", "search file contents, read-only"),
