@@ -328,6 +328,24 @@ fn prompt_delivery_via_stdin(adapter: &dyn adapters::AgentAdapter, session: &Ses
     adapters::launch_reparses_through_shim(&probe)
 }
 
+/// Issue #220: whether `build_headless` should route THIS prompt to stdin
+/// rather than argv. `shim` is [`prompt_delivery_via_stdin`]'s own answer --
+/// a Windows `cmd.exe`/`powershell -File` reparse, which forces stdin
+/// regardless of size, exactly as before this issue. `prompt_len` is the
+/// second, independent reason: `adapter.headless_cmd` puts the prompt on
+/// argv verbatim on every platform, and a prompt over
+/// [`super::prompt::INLINE_ARGV_PROMPT_BUDGET_BYTES`] -- issue #213's own
+/// Windows-safe figure, reused rather than duplicated -- overflows
+/// `CreateProcessW`'s ~32KB command-line limit outright (`os error 206`) on
+/// a perfectly ordinary, non-shim launch: a `zirv workflow review run`
+/// package embeds the full diff, and a plain `zirv agent codex "<...>"` can
+/// just be handed a long string. Checked on every platform, not only
+/// Windows, so the same prompt always takes the same delivery path
+/// regardless of where zirv runs.
+fn headless_prompt_via_stdin(shim: bool, prompt_len: usize) -> bool {
+    shim || prompt_len > super::prompt::INLINE_ARGV_PROMPT_BUDGET_BYTES
+}
+
 /// T11: real-clock wrapper. `run_with_clock` (below) does the actual work;
 /// this hands it the two real-world functions -- `state::now_secs` and a
 /// genuine `std::thread::sleep` -- so every caller outside this module
@@ -899,9 +917,17 @@ fn run_with_clock_inner<W: Write>(
     // making relaunches reachable in more shapes than before.
     let prompt_via_stdin = prompt_delivery_via_stdin(adapter.as_ref(), &session);
     let relaunch_system_prompt_supported = adapter.system_prompt_supported(&[]);
+    // Issue #220: `headless_prompt_via_stdin` also routes an oversized
+    // prompt to stdin regardless of `prompt_via_stdin` -- see its own doc
+    // comment. Measured per call, not hoisted out here as a single flag,
+    // because `build_headless` is the one chokepoint every relaunch --
+    // nudge, park, rot restart -- reuses with its own, possibly
+    // differently-sized, `prompt_text` (see the call sites' own comments).
     let build_headless =
         |prompt_text: &str, session: &SessionId, extra: &[String]| -> (Command, Option<String>) {
-            if prompt_via_stdin && let Some(command) = adapter.headless_cmd_stdin(session, extra) {
+            if headless_prompt_via_stdin(prompt_via_stdin, prompt_text.len())
+                && let Some(command) = adapter.headless_cmd_stdin(session, extra)
+            {
                 return (command, Some(prompt_text.to_string()));
             }
             (adapter.headless_cmd(prompt_text, session, extra), None)
@@ -2307,6 +2333,40 @@ mod tests {
         home.join(".claude/projects")
             .join(crate::commands::ctx::adapters::claude::project_slug(repo))
             .join(format!("{session}.jsonl"))
+    }
+
+    /// Issue #220: a non-shim launch (`shim == false`) with a prompt safely
+    /// under the budget keeps the prompt on argv -- byte-for-byte the
+    /// pre-#220 behavior, so an ordinary short task prompt never starts
+    /// taking the stdin path it never needed.
+    #[test]
+    fn headless_prompt_via_stdin_stays_on_argv_when_short_and_no_shim() {
+        assert!(!headless_prompt_via_stdin(false, 100));
+        assert!(!headless_prompt_via_stdin(
+            false,
+            super::super::prompt::INLINE_ARGV_PROMPT_BUDGET_BYTES
+        ));
+    }
+
+    /// Issue #220's actual fix: a prompt over the budget routes to stdin
+    /// even with no shim in play at all -- the class of overflow a `zirv
+    /// workflow review run` package (full diff embedded) or a long `zirv
+    /// agent codex "<...>"` prompt hits on a perfectly ordinary, direct
+    /// `.exe` launch.
+    #[test]
+    fn headless_prompt_via_stdin_switches_to_stdin_once_the_prompt_exceeds_the_budget() {
+        assert!(headless_prompt_via_stdin(
+            false,
+            super::super::prompt::INLINE_ARGV_PROMPT_BUDGET_BYTES + 1
+        ));
+    }
+
+    /// The shim reason (issue #213/FIX B) must keep forcing stdin regardless
+    /// of size, including for a prompt far under the budget -- this function
+    /// must never regress that existing guarantee while adding the new one.
+    #[test]
+    fn headless_prompt_via_stdin_still_forces_stdin_for_a_shim_launch_regardless_of_size() {
+        assert!(headless_prompt_via_stdin(true, 1));
     }
 
     /// Final wave item 1: `adapter.launches_through_cmd_shim()` only
@@ -4893,6 +4953,75 @@ mod tests {
             argv.contains("heads up: switch focus"),
             "--simple must not drop the nudge's own guidance for an adapter whose channel does \
              not need composed: {argv}"
+        );
+    }
+
+    /// Issue #220, end to end: `zirv workflow review run`'s compact review
+    /// package embeds the FULL diff as the task prompt, and a plain `zirv
+    /// agent codex "<...>"` can just be handed a long string -- either way,
+    /// the old code always put that text on argv (`adapter.headless_cmd`),
+    /// which overflows `CreateProcessW`'s ~32KB command-line limit on
+    /// Windows (`os error 206`) even on a perfectly ordinary, non-shim
+    /// launch (`sh <fixture>`, never `cmd.exe /c <shim>` -- so the ONLY
+    /// reason this prompt can land on stdin here is the new size-based
+    /// routing, not `prompt_delivery_via_stdin`'s pre-existing shim check).
+    /// `fake-codex-agent.sh` drains and logs stdin exactly so a test like
+    /// this one can tell the two delivery paths apart.
+    #[test]
+    fn an_oversized_prompt_is_delivered_on_stdin_instead_of_argv() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let state_dir = tmp.path().join("state");
+        let argv_log = tmp.path().join("argv.log");
+        let mut env = base_env(&state_dir);
+        env.insert("ZIRV_CTX_PACE".to_string(), "false".to_string());
+        env.insert("ZIRV_CTX_POLL_MS".to_string(), "50".to_string());
+        env.insert(
+            "ZIRV_CTX_AGENT_BIN".to_string(),
+            format!("sh {}", fixture("fake-codex-agent.sh").display()),
+        );
+
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let _fake_agent = crate::commands::ctx::testenv::VarGuard::set(&[(
+            "FAKE_AGENT_ARGV_LOG",
+            argv_log.to_str(),
+        )]);
+
+        let marker = "OVERSIZED_PROMPT_MARKER_9f3c1a";
+        let oversized_prompt = format!(
+            "{marker}{}",
+            "x".repeat(super::super::prompt::INLINE_ARGV_PROMPT_BUDGET_BYTES + 500)
+        );
+
+        let args = ExecArgs {
+            agent: Some("codex".to_string()),
+            session_id: None,
+            transcript: None,
+            prompt: Some(oversized_prompt.clone()),
+            max_restarts: Some(0),
+            budget_tokens: None,
+            max_tool_calls: None,
+            timeout_secs: Some(30),
+            simple: true,
+            command: Vec::new(),
+        };
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        assert_eq!(
+            code.expect("an oversized prompt must not fail the launch"),
+            0
+        );
+
+        let argv = std::fs::read_to_string(&argv_log).unwrap_or_default();
+        for line in argv.lines().filter(|line| !line.starts_with("stdin: ")) {
+            assert!(
+                !line.contains(marker),
+                "an oversized prompt must never be encoded onto argv: {line}"
+            );
+        }
+        assert!(
+            argv.contains(&format!("stdin: {oversized_prompt}")),
+            "an oversized prompt must instead reach the child on stdin: {argv}"
         );
     }
 
