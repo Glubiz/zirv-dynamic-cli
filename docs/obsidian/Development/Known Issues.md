@@ -14,6 +14,7 @@ Each entry gets a changelog comment at the top of the file, newest first:
 <!-- Updated YYYY-MM-DD (branch, state): what changed -->
 ```
 
+<!-- Updated 2026-08-31 (worktree-issues-223-225, v3.2.0, issues #223/#225): recorded that commands::ctx::supervise::tests::terminate_* SIGTERM tests flake under parallel `-j 8` load on this Windows dev machine (pass in isolation and under the required serial `--test-threads=1` run) -->
 <!-- Updated 2026-08-31 (fix/bug-batch-227-228-229-232-233, v3.1.0, review round 2): documented `sibling_root_for`'s filesystem/drive-root guard on the default parent-directory workdir root (a second claude finding, fixed), and recorded the codex finding that the default parent-directory root still grants a forged same-uid pane request implicit authority over sibling checkouts as a residual (explicit per-sibling allowlisting rejected -- defeats the sibling-delegation use case; #179 remains the real fix) -->
 <!-- Updated 2026-08-31 (fix/bug-batch-227-228-229-232-233, v3.1.0, review round): narrowed the issue #228 residual below -- `resolved_spawn_cwd` now confines a pane `--workdir` to operator-owned workdir roots (default: the dashboard's own repo root plus its parent directory, widened only via `[dash] workdir_roots`/`ZIRV_CTX_DASH_WORKDIR_ROOTS`), so a forged spawn request can only reach a repo inside those roots, not any git repo the dashboard user can reach; the headless `zirv agent --workdir` path stays unrestricted beyond exists/dir/git-repo, since it runs as the operator's own command -->
 <!-- Updated 2026-08-31 (fix/bug-batch-227-228-229-232-233, v3.1.0): resolved issue #229/#232 (zirv workflow review run's lenient per-finding ZIRV_REVIEW_RESULT ingestion, raw-output salvage on failure, code-first package truncation), recorded new residuals for issue #228 (--workdir/--headless on zirv agent -- a forged dashboard spawn request can now point a worker pane's writes at any git repo the dashboard user can reach, not only the dashboard's own repo family) and issue #227 (zirv ctx loop still only recognizes LIMIT_HIT_PATTERNS, not the new codex capacity/account-exhaustion classes), and a common.md-over-budget test failure plus a Windows Git Bash PATH gotcha hit while fixing it -->
@@ -929,6 +930,10 @@ worth knowing: a mis-cased built-in like `zirv Help` now exits 1 with
 `cargo test --verbose -- --test-threads=1` is required, not optional — tests
 share state (state dir, fixtures) and will flake or corrupt each other under
 the default parallel test runner.
+
+## `commands::ctx::supervise::tests::terminate_*` SIGTERM tests flake under parallel load (this Windows dev machine)
+
+`terminate_stops_a_child_that_ignores_sigterm`/`terminate_pid_stops_a_process_that_ignores_sigterm` (and their already-dead siblings) spawn a real child, send it a grace-period SIGTERM-equivalent, and assert it stops within a bounded window — under `nextest`'s default parallel `-j 8` scheduling on this host, enough concurrent process spawns/kills contend for the same OS-level teardown budget that the grace window is occasionally missed. Both tests pass reliably run in isolation and under the required serial `cargo test -- --test-threads=1` (see "Tests must run with `--test-threads=1`" above); this is scheduling contention under load, not a defect in `terminate`/`terminate_pid` themselves. Alongside the existing `wrap::win::` exit-code/turn-signal baseline failures documented in this repo's own `CLAUDE.md` ("This Windows dev machine" section) — diff the sorted failure-NAME list against `main`, don't chase either class.
 
 ## `wrap`'s pty-harness tests wedge their spawned child on at least one macOS machine
 

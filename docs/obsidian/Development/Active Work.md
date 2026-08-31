@@ -16,6 +16,10 @@ Entries use the format:
 
 ## In Progress
 
+### Workflow adoption (detect/nudge/enforce) and steady-state token reductions — awaiting PR (worktree-issues-223-225, 2026-08-31)
+**Status (2026-08-31):** Both issues implemented on one branch, v3.2.0. #223: a pure detector (`commands/workflow/adoption.rs`) plus operator-only `[workflow] adoption` policy (`Off < Advise < Nudge < Enforce`, default `Nudge`, `REPO_FORBIDDEN`) delivers per-policy through the existing Stop/Prompt hooks (`systemMessage` advisory, `additionalContext` nudge, or a `zirv agent` delegation refusal under `Enforce`), with new `AdoptionDetected`/`AdoptionRecovered` telemetry backing a `zirv workflow stats` adoption-rate line. #225: new `zirv ctx compile [--measure]` verb and `zirv ctx status --brief` give a reproducible per-layer byte/token baseline (`docs/benchmarks/token-cost.md` §6), the per-turn hook marker line shrank 170→89 bytes, and `zirv workflow stats`/`zirv ctx usage` gained schema-v2 cache-hit lines. v3.1.0 was merged in from `main` mid-flight (independent surfaces, no substantive conflicts).
+**Next:** Run the five verification gates, a Linux/Docker round, and a codex cross-review round (`zirv agent codex`), then open the PR. See [[Ctx Subsystem]], [[Workflows]], [[Usage and Pacing]], [[Untrusted Configuration]], and the matching 2026-08-31 [[Decision Log]]/[[Work Journal]] entries.
+
 ### Issue #198 — two parts, one in flight (2026-08-30)
 **Status (2026-08-30):** Issue #198 covers two related refreshes tracked together: **part 1**, refreshing the `Glubiz/zirv-generic-frontend` template repository itself (dependency bump, a real README, `.zirv/` script audit against the current schema) — not yet started, no branch/PR in either repo; **part 2**, this repo's `README.md` (`docs/198-readme-refresh`) — PR open, see the matching 2026-08-30 [[Work Journal]] entry for what it closed.
 **Next:** Start part 1 in `zirv-generic-frontend` once part 2 merges, so the template's own README can link back at a README that already documents `zirv frontend capabilities` and the workflow lifecycle.
