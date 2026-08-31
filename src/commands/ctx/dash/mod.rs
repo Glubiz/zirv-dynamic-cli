@@ -2484,6 +2484,31 @@ fn accepted_spawn_cwd(req_cwd: &Path, repo: &Path) -> Option<PathBuf> {
     }
 }
 
+/// Issue #228: the directory a pane should actually launch into, given
+/// `accepted` (`accepted_spawn_cwd`'s own return -- the dashboard's own
+/// repo-family acceptance, unaffected by this function) and an optional,
+/// explicitly requested `--workdir`.
+///
+/// `workdir` is `SpawnRequest::workdir`, untrusted JSON like every other
+/// field on that struct -- a same-uid pane could forge it (the same trust
+/// boundary issue #179 already documents for the rest of the request), so
+/// it is re-validated here with the identical rule `agent::validate_workdir`
+/// already ran on the requesting side (must exist, be a directory, sit
+/// inside a git repository) rather than trusted outright. Deliberately NOT
+/// checked against `repo`/`accepted` the way `accepted_spawn_cwd` checks
+/// `req.cwd` -- an unrelated repo is the entire point of the feature (issue
+/// #228's own bug report: cross-repo delegation from inside a dashboard),
+/// so a `--workdir` need not be any relation of the dashboard's own repo,
+/// only a real checkout.
+///
+/// `Ok(accepted)`, unchanged, when `workdir` is `None` -- pre-#228 behaviour.
+fn resolved_spawn_cwd(accepted: PathBuf, workdir: Option<&Path>) -> CtxResult<PathBuf> {
+    match workdir {
+        Some(dir) => super::agent::validate_workdir(dir),
+        None => Ok(accepted),
+    }
+}
+
 /// The `extra` argv a freshly spawned **dashboard pane** launches with: its
 /// composed-prompt injection arguments plus `AgentAdapter::session_pin_args`,
 /// which pins the harness's own conversation to the uuid this pane is
@@ -3153,6 +3178,16 @@ fn fulfill_spawn_request(
             req.cwd.display()
         )));
     };
+    // Issue #228: an explicit `--workdir` is a validated, harness-agnostic
+    // escape from the dashboard's own repo family the gate above just
+    // enforced. `SpawnRefusal::channel`, not `::policy`: an invalid workdir
+    // is the same "this dashboard cannot host it as asked" shape as a repo
+    // mismatch above, not a policy judgment on the task itself, and the
+    // requester's own headless fallback runs the identical check. See
+    // `resolved_spawn_cwd`'s own doc comment for why `req.workdir` is
+    // re-validated here rather than trusted outright.
+    let spawn_cwd = resolved_spawn_cwd(spawn_cwd, req.workdir.as_deref())
+        .map_err(|e| SpawnRefusal::channel(e.to_string()))?;
     // R2: every pane in the vector is a live one -- `reap_ended_panes` takes
     // an exited pane out on the very next tick -- so the cap is a plain
     // `len()` again rather than a filtered count over a vector that only ever
@@ -3276,6 +3311,15 @@ fn fulfill_spawn_request(
         req.force,
     );
     let mut effective_req = req.clone();
+    // Issue #228: from here on, `effective_req.cwd` (and so `req.cwd` once
+    // rebound below) IS the actual accepted spawn location -- `spawn_cwd`
+    // itself when no `--workdir` was honoured (a no-op copy: `accepted_
+    // spawn_cwd` never returns anything but `req.cwd.to_path_buf()`), or the
+    // validated workdir otherwise. `worker_pane_extra_args` (widened
+    // writable roots) is the one remaining reader of `req.cwd` past this
+    // point, and it must see the directory the pane is actually about to
+    // run in, not the requester's own.
+    effective_req.cwd = spawn_cwd.clone();
     if let Some(route) = route {
         effective_req.agent = route.selected.clone();
         effective_req.model = Some(route.model.clone());
@@ -6065,6 +6109,14 @@ pub fn run_dashboard(
                                                     // `zirv ctx agent --force`
                                                     // directly instead.
                                                     force: false,
+                                                    // The overlay has no
+                                                    // `--workdir` of its own
+                                                    // either (issue #228):
+                                                    // this spawn runs at the
+                                                    // dashboard's own repo,
+                                                    // exactly as before that
+                                                    // flag existed.
+                                                    workdir: None,
                                                 };
                                                 let panes_before_spawn = panes.len();
                                                 // `trusted_interactive: true` --
@@ -10122,6 +10174,7 @@ mod tests {
             parent_session: None,
             work_group_id: None,
             force: false,
+            workdir: None,
         }
     }
 
@@ -10988,6 +11041,132 @@ mod tests {
             reason.contains("repo-b"),
             "names the request's own repo: {reason}"
         );
+    }
+
+    /// Issue #228: `resolved_spawn_cwd` is `Ok(accepted)` unchanged when no
+    /// `--workdir` was requested -- pre-#228 behaviour, byte for byte.
+    #[test]
+    fn resolved_spawn_cwd_is_unchanged_with_no_workdir() {
+        let accepted = PathBuf::from("/some/accepted/repo");
+        assert_eq!(
+            resolved_spawn_cwd(accepted.clone(), None).expect("no workdir never fails"),
+            accepted
+        );
+    }
+
+    /// Issue #228's own bug report: a `--workdir` naming a git repository
+    /// wholly unrelated to the dashboard's own is accepted -- cross-repo
+    /// delegation is the entire point of the feature, so `resolved_spawn_cwd`
+    /// must never compare `workdir` against `accepted`/`repo` the way
+    /// `accepted_spawn_cwd` compares `req.cwd`.
+    #[test]
+    fn resolved_spawn_cwd_accepts_a_workdir_unrelated_to_the_dashboards_own_repo() {
+        if !git_available() {
+            eprintln!("skipping: git not found on PATH");
+            return;
+        }
+        let root = tempfile::tempdir().expect("tempdir");
+        let other = root.path().join("other-repo");
+        std::fs::create_dir_all(&other).expect("mkdir");
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&other)
+                .arg("init")
+                .arg("-q")
+                .output()
+                .expect("git init")
+                .status
+                .success()
+        );
+
+        let accepted = root.path().join("dashboard-repo");
+        let resolved = resolved_spawn_cwd(accepted, Some(&other)).expect("a real repo is fine");
+        assert_eq!(
+            resolved,
+            std::fs::canonicalize(&other).expect("canonicalize")
+        );
+    }
+
+    /// The negative half: a `--workdir` that is not a git repository is
+    /// refused even though it exists as a plain directory -- the identical
+    /// rule `agent::validate_workdir` enforces at the CLI layer, re-run here
+    /// because a `SpawnRequest` is untrusted data (a same-uid pane could
+    /// forge one naming any directory at all).
+    #[test]
+    fn resolved_spawn_cwd_refuses_a_workdir_with_no_git_ancestry() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let not_a_repo = tmp.path().join("plain-dir");
+        std::fs::create_dir_all(&not_a_repo).expect("mkdir");
+        let err = resolved_spawn_cwd(tmp.path().to_path_buf(), Some(&not_a_repo))
+            .expect_err("not a git repo");
+        assert!(err.to_string().contains("git repository"), "got {err}");
+    }
+
+    /// The full gate, not only the extracted decision function: a request
+    /// whose own `cwd` matches this dashboard's repo (satisfying `accepted_
+    /// spawn_cwd` as always) but whose `workdir` names a wholly separate git
+    /// repository must pass the repo gate rather than being refused for a
+    /// mismatch -- `workdir` is deliberately exempt from that comparison.
+    /// Mirrors `fulfill_spawn_request_no_longer_refuses_a_linked_worktree_
+    /// at_the_repo_gate`'s own "force a later refusal to prove an earlier
+    /// gate passed" shape, since no agent binary is guaranteed in a test
+    /// environment.
+    #[test]
+    fn fulfill_spawn_request_honours_a_workdir_naming_an_unrelated_repo() {
+        if !git_available() {
+            eprintln!("skipping: git not found on PATH");
+            return;
+        }
+        let root = tempfile::tempdir().expect("tempdir");
+        let dashboard_repo = root.path().join("dashboard-repo");
+        let target_repo = root.path().join("target-repo");
+        for repo in [&dashboard_repo, &target_repo] {
+            std::fs::create_dir_all(repo).expect("mkdir");
+            assert!(
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(repo)
+                    .arg("init")
+                    .arg("-q")
+                    .output()
+                    .expect("git init")
+                    .status
+                    .success()
+            );
+        }
+
+        let mut req = spawn_request("do the work", &dashboard_repo);
+        req.workdir = Some(target_repo.clone());
+        let mut cfg = CtxConfig::default();
+        // Forces a refusal *after* the repo/workdir gates so this test can
+        // assert they were satisfied without a real agent binary.
+        cfg.dash.max_panes = 0;
+        let reason = refusal_for(&req, &cfg, &dashboard_repo);
+        assert!(
+            reason.contains("pane limit reached"),
+            "the repo gate and the workdir override must both have accepted this request, \
+             leaving the pane cap as the refusal; got {reason}"
+        );
+    }
+
+    /// The other negative half at the full gate: a `req.cwd` that matches
+    /// this dashboard (so `accepted_spawn_cwd` alone would let it through)
+    /// but a `workdir` naming a plain, non-git directory must still be
+    /// refused -- the workdir override does not bypass its own validation
+    /// just because the outer repo gate already passed.
+    #[test]
+    fn fulfill_spawn_request_refuses_a_workdir_with_no_git_ancestry() {
+        let repo = std::env::current_dir().expect("cwd");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let not_a_repo = tmp.path().join("plain-dir");
+        std::fs::create_dir_all(&not_a_repo).expect("mkdir");
+
+        let mut req = spawn_request("do the work", &repo);
+        req.workdir = Some(not_a_repo);
+        let cfg = CtxConfig::default();
+        let reason = refusal_for(&req, &cfg, &repo);
+        assert!(reason.contains("git repository"), "got {reason}");
     }
 
     /// Issue #155 review finding D2: the pane-side admission choke point for

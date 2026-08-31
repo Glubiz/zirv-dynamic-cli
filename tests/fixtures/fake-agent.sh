@@ -20,6 +20,11 @@
 #   FAKE_AGENT_ARGV_LOG=<path>              append the full argv of each run,
 #                                           so a test can assert on injected
 #                                           flags such as --append-system-prompt
+#   FAKE_AGENT_CWD_LOG=<path>               append the process's own working
+#                                           directory per run (issue #228: a
+#                                           test can assert a headless
+#                                           spawn's child actually launched
+#                                           in the requested --workdir)
 #
 #   healthy  distinct tool inputs, marker on every final, 20k tokens
 #   rot      identical tool input, every result an error, marker only on the
@@ -78,6 +83,7 @@ cwd=$(pwd)
 if windows_cwd=$(pwd -W 2>/dev/null); then
   cwd="$windows_cwd"
 fi
+[ -z "${FAKE_AGENT_CWD_LOG:-}" ] || printf '%s\n' "$cwd" >> "$FAKE_AGENT_CWD_LOG"
 slug=$(printf '%s' "$cwd" | tr -c 'A-Za-z0-9-' '-')
 dir="$HOME/.claude/projects/$slug"
 mkdir -p "$dir"
