@@ -1169,9 +1169,23 @@ pub fn sweep_undeliverable(state: &StateDir, repo_slug: &str) -> usize {
 ///
 /// `None` when mail is disabled outright (`mail_enabled = false`, honored
 /// exactly like delivery does: an operator who turned mail off must never be
-/// told mail is waiting) or on any read error -- moved here, byte for byte,
-/// from `wrap.rs`'s own `unread_mail_counts` (T12b/N7), which now delegates
-/// to this function instead of keeping a second copy of the same logic.
+/// told mail is waiting) or the cwd-slug read itself errors -- moved here,
+/// byte for byte, from `wrap.rs`'s own `unread_mail_counts` (T12b/N7), which
+/// now delegates to this function instead of keeping a second copy of the
+/// same logic.
+///
+/// Issue #219 follow-up: also counts `session_short`'s REGISTERED mailbox
+/// (`registered_slug_for_short`) when it differs from `repo`'s cwd-derived
+/// slug -- the same worktree-checkout gap `run_inbox_with` closed for `zirv
+/// ctx inbox`, here for the callers above so a wrap status bar or dash
+/// header running from a worktree does not undercount (or silently show
+/// zero for) mail that landed in the main checkout's mailbox. The two slugs
+/// are always distinct directories, so a message is never counted twice.
+/// The extra read is a single small registry-record read plus one more
+/// directory scan, gated behind both callers' own existing cadence throttle
+/// (`redraw_bar_if_due`'s 1s gate, `dash::mod`'s own tick), so it never adds
+/// a per-frame cost; a registered-slug read that itself errors degrades to
+/// "counted from cwd only" rather than losing the cwd count too.
 pub fn unread_counts(
     state: &StateDir,
     repo: &Path,
@@ -1182,7 +1196,13 @@ pub fn unread_counts(
     if !mail_enabled {
         return None;
     }
-    let found = list(state, &repo_slug(repo), Some(agent), Some(session_short)).ok()?;
+    let cwd_slug = repo_slug(repo);
+    let mut found = list(state, &cwd_slug, Some(agent), Some(session_short)).ok()?;
+    if let Some(registered_slug) = registered_slug_for_short(state, session_short, &cwd_slug)
+        && let Ok(extra) = list(state, &registered_slug, Some(agent), Some(session_short))
+    {
+        found.extend(extra);
+    }
     let direct = found
         .iter()
         .filter(|(_, msg)| msg.to_session.as_deref() == Some(session_short))
@@ -1495,7 +1515,19 @@ fn registered_slug_if_different(
     cwd_slug: &str,
 ) -> Option<String> {
     let short = session_identity(env)?;
-    let record = sessions::load_record(state, &short)?;
+    registered_slug_for_short(state, &short, cwd_slug)
+}
+
+/// The short-id-keyed half of `registered_slug_if_different` above, split
+/// out for `unread_counts`: its callers (`wrap.rs`'s 1s-throttled status
+/// bar redraw, `dash::mod`'s header tick) already have the session's short
+/// id in hand from a registry record or a live pane, with no `EnvLookup` to
+/// pull one from -- forcing an `EnvLookup` through those call sites just for
+/// this lookup would mean touching `wrap.rs`/`dash/mod.rs`, which the
+/// worktree-mail fix deliberately left alone. `None` under the same
+/// conditions `registered_slug_if_different` documents.
+fn registered_slug_for_short(state: &StateDir, short: &str, cwd_slug: &str) -> Option<String> {
+    let record = sessions::load_record(state, short)?;
     (record.repo_slug != cwd_slug).then_some(record.repo_slug)
 }
 
@@ -2513,6 +2545,43 @@ mod tests {
         assert_eq!(
             result, None,
             "a genuine read error must never masquerade as an empty mailbox"
+        );
+    }
+
+    /// Issue #219 follow-up: `unread_counts` backs both the wrap status bar
+    /// and the dash header (see its own doc comment), and suffered the exact
+    /// same worktree-checkout gap `run_inbox_with` did before that fix -- a
+    /// session's own REGISTERED mailbox (where delivery actually filed the
+    /// message, per `run_send_with`/`run_nudge_with`) was never checked when
+    /// `repo` resolved to a worktree cwd whose slug differs from it.
+    #[test]
+    fn unread_counts_sees_mail_filed_under_the_registered_slug_from_a_worktree_cwd() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+
+        let main_repo = tmp.path().join("main-repo");
+        let worktree_repo = main_repo.join(".claude").join("worktrees").join("agent-x");
+        assert_ne!(
+            repo_slug(&main_repo),
+            repo_slug(&worktree_repo),
+            "sanity: a worktree checkout must mint a distinct slug from its main checkout"
+        );
+
+        let session = "abcdef12-3456-4789-8abc-def012345678";
+        let record = sessions::Record::new(session, "claude", &main_repo, sessions::Verb::Wrap);
+        let short = record.short.clone();
+        let _guard = sessions::SessionGuard::register(&state, record);
+
+        // Delivered exactly the way `run_send_with`/`run_nudge_with` already
+        // do: filed under the target's registered slug, not the cwd.
+        let msg = session_addressed("sender", &short, "any");
+        store(&state, &repo_slug(&main_repo), &msg, &CtxConfig::default()).expect("store");
+
+        assert_eq!(
+            unread_counts(&state, &worktree_repo, "claude", &short, true),
+            Some((0, 1)),
+            "the registered-slug mailbox must be counted even though `repo` resolves to \
+             a different, worktree-derived slug"
         );
     }
 
