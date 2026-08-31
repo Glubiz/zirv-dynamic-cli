@@ -167,6 +167,96 @@ pub fn kbd_enhancement_pop_bytes() -> &'static [u8] {
     KBD_ENHANCEMENT_POP
 }
 
+/// Whether `wrap`/`chat` turned bracketed paste on for the operator's *own*
+/// terminal, and therefore whether the emergency handler owes it a matching
+/// `?2004l`. Set by [`RawGuard::enter`], cleared by its `restore`. Kept
+/// separate from [`BAR_ACTIVE`] for the same reason [`KBD_ENHANCED`] is: the
+/// mode is set independently of the bar, and a `?2004l` for a mode zirv never
+/// set would be a stray write into someone else's terminal state.
+static BRACKETED_PASTE: AtomicBool = AtomicBool::new(false);
+
+pub fn set_bracketed_paste(on: bool) {
+    BRACKETED_PASTE.store(on, Ordering::SeqCst);
+}
+
+pub fn bracketed_paste_on() -> bool {
+    BRACKETED_PASTE.load(Ordering::SeqCst)
+}
+
+/// Issue #206. A terminal only wraps a paste in `ESC[200~ ... ESC[201~` while
+/// bracketed-paste mode is on, and a paste that arrives *without* those
+/// markers is indistinguishable from the operator typing each line and
+/// pressing Enter -- which is exactly what the wrapped agent then does with
+/// it, one submitted turn per pasted line.
+///
+/// The wrapped agent asks for the mode itself, and `wrap` forwards its output
+/// verbatim so that request does reach the real terminal. But it only holds
+/// for as long as some child has asked and the request has landed: not before
+/// the agent starts, not in the gap a relaunch opens while the replacement
+/// agent is still booting, and not at all for a command that never asks. zirv
+/// is the process that owns the operator's terminal for the whole session, so
+/// zirv sets the mode for the whole session, and puts it back on the way out.
+/// Both supported adapters parse the markers, so there is nothing to make
+/// this adapter-aware about.
+///
+/// Constants for the same async-signal-safety reason [`DASH_RESET`] is one:
+/// the off sequence is written from the emergency handler.
+const BRACKETED_PASTE_ON: &[u8] = b"\x1b[?2004h";
+const BRACKETED_PASTE_OFF: &[u8] = b"\x1b[?2004l";
+
+pub fn bracketed_paste_on_bytes() -> &'static [u8] {
+    BRACKETED_PASTE_ON
+}
+
+pub fn bracketed_paste_off_bytes() -> &'static [u8] {
+    BRACKETED_PASTE_OFF
+}
+
+/// Best-effort, like every other terminal write in this module: a console
+/// that cannot be written to simply keeps whatever mode it had, and the flag
+/// stays clear so nothing later owes it an undo.
+fn enable_bracketed_paste() {
+    if !stdout_is_terminal() {
+        return;
+    }
+    // Flagged before the write, not after: a kill landing mid-write must
+    // leave the handler owing the undo. Turning the mode off when it was
+    // never on is a no-op in every terminal.
+    set_bracketed_paste(true);
+    write_stdout_raw(bracketed_paste_on_bytes());
+}
+
+/// Idempotent, like [`RawGuard::restore`] itself.
+fn disable_bracketed_paste() {
+    if !bracketed_paste_on() {
+        return;
+    }
+    set_bracketed_paste(false);
+    write_stdout_raw(bracketed_paste_off_bytes());
+}
+
+/// `RawGuard` is keyed on stdin, but bracketed paste is asked for on stdout;
+/// a session with a terminal on one and a file on the other must not have the
+/// escape sequence written into that file.
+#[cfg(windows)]
+fn stdout_is_terminal() -> bool {
+    match windows::std_handles(STDIN_FD) {
+        Ok((_, output)) => windows::console_mode(output).is_ok(),
+        Err(_) => false,
+    }
+}
+
+#[cfg(unix)]
+fn stdout_is_terminal() -> bool {
+    // SAFETY: isatty takes a plain fd and only ever returns 0 or 1.
+    unsafe { libc::isatty(STDOUT_FD) == 1 }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn stdout_is_terminal() -> bool {
+    false
+}
+
 /// The bytes that put a terminal back after a dashboard session: cursor
 /// shown, mouse reporting off, scroll region reset, alternate screen left.
 /// Used by the dashboard's own teardown, its panic hook, and the
@@ -330,6 +420,11 @@ fn restore_console_from_handler() {
     // whether zirv itself pushed the kitty stack entry.
     if kbd_enhanced() {
         write_stdout_raw(KBD_ENHANCEMENT_POP);
+    }
+    // #206: gated on the flag for the same reason -- only a mode zirv itself
+    // turned on is zirv's to turn back off.
+    if bracketed_paste_on() {
+        write_stdout_raw(bracketed_paste_off_bytes());
     }
     restore_stashed_console_modes();
 }
@@ -635,6 +730,9 @@ impl RawGuard {
         // kill does not leave the user's shell without echo.
         stash_console_state(fd, saved);
         install_console_restore_handler();
+        // #206: for the life of the supervised session the operator's paste
+        // is bracketed, whatever the wrapped agent has or has not asked for.
+        enable_bracketed_paste();
         Ok(Self {
             fd,
             saved,
@@ -649,6 +747,9 @@ impl RawGuard {
             return Ok(());
         }
         self.active = false;
+        // Before the mode restore, so the sequence is still written while the
+        // terminal is the one this guard set up.
+        disable_bracketed_paste();
         if unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, &self.saved) } != 0 {
             return Err("tcsetattr failed: could not restore the terminal".into());
         }
@@ -806,6 +907,9 @@ impl RawGuard {
             return Err(e);
         }
 
+        // #206: only now, with VT output processing on, is the sequence sure
+        // to be interpreted rather than printed.
+        enable_bracketed_paste();
         Ok(Self {
             input,
             output,
@@ -825,6 +929,8 @@ impl RawGuard {
             return Ok(());
         }
         self.active = false;
+        // Written while VT output processing is still on -- see `enter`.
+        disable_bracketed_paste();
         let input = windows::set_console_mode(self.input, self.saved_input);
         let output = windows::set_console_mode(self.output, self.saved_output);
         input
@@ -1272,6 +1378,61 @@ mod tests {
     #[test]
     fn kbd_enhancement_pop_bytes_is_the_csi_pop_sequence() {
         assert_eq!(kbd_enhancement_pop_bytes(), b"\x1b[<u");
+    }
+
+    /// #206. Same guard shape as the flags above: a failing assertion must not
+    /// leave a process-global flag claiming zirv owes the terminal an undo.
+    #[test]
+    fn the_bracketed_paste_flag_round_trips() {
+        struct PasteFlagGuard(bool);
+        impl Drop for PasteFlagGuard {
+            fn drop(&mut self) {
+                set_bracketed_paste(self.0);
+            }
+        }
+        let _restore = PasteFlagGuard(bracketed_paste_on());
+
+        set_bracketed_paste(true);
+        assert!(bracketed_paste_on());
+        set_bracketed_paste(false);
+        assert!(!bracketed_paste_on());
+    }
+
+    /// The exact DECSET/DECRST pair, because a paste is only bracketed while
+    /// mode 2004 is on and only these two bytes strings toggle it.
+    #[test]
+    fn the_bracketed_paste_sequences_are_decset_and_decrst_2004() {
+        assert_eq!(bracketed_paste_on_bytes(), b"\x1b[?2004h");
+        assert_eq!(bracketed_paste_off_bytes(), b"\x1b[?2004l");
+    }
+
+    /// The undo is owed only for a mode zirv itself set: a stray `?2004l`
+    /// would turn bracketing off under an application that asked for it.
+    #[test]
+    fn disabling_bracketed_paste_is_a_no_op_when_the_flag_is_clear() {
+        struct PasteFlagGuard(bool);
+        impl Drop for PasteFlagGuard {
+            fn drop(&mut self) {
+                set_bracketed_paste(self.0);
+            }
+        }
+        let _restore = PasteFlagGuard(bracketed_paste_on());
+
+        set_bracketed_paste(false);
+        disable_bracketed_paste();
+        assert!(
+            !bracketed_paste_on(),
+            "still clear, and nothing was written"
+        );
+
+        set_bracketed_paste(true);
+        disable_bracketed_paste();
+        assert!(
+            !bracketed_paste_on(),
+            "and it clears the flag when it was set"
+        );
+        disable_bracketed_paste();
+        assert!(!bracketed_paste_on(), "idempotent");
     }
 
     /// C6: `SIG_IGN` is inherited across `fork`/`exec` and is how a parent
