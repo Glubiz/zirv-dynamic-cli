@@ -358,16 +358,38 @@ fn headless_prompt_via_stdin(shim: bool, argv_total_len: usize) -> bool {
 
 /// The total bytes `command`'s argv would actually put on the OS command
 /// line: the program plus every argument, with one separator byte counted
-/// between each token (a deliberately generous, OS-agnostic proxy for the
-/// quoting `CreateProcessW`'s own command-line join performs -- an
-/// under-count here would let a launch through that still overflows).
+/// between each token, and each argument's own length inflated for the
+/// worst case of Windows' `CreateProcessW` quoting -- an under-count here
+/// would let a launch through that still overflows.
 /// [`headless_prompt_via_stdin`]'s own doc comment explains why this has to
 /// be the WHOLE command, not just the prompt argument.
+///
+/// Review follow-up (post-merge): the raw byte length alone is not a safe
+/// proxy for what actually lands on the command line. `std::process::
+/// Command` on Windows builds a UTF-16 command line using the same quoting
+/// `CommandLineToArgvW` expects: every `"` is escaped to `\"`, a run of
+/// backslashes immediately before a quote doubles, and any argument
+/// containing whitespace (a composed prompt almost always does) is wrapped
+/// in a surrounding pair of quotes. A quote-and-backslash-heavy prompt can
+/// therefore measure safely under `INLINE_ARGV_PROMPT_BUDGET_BYTES` in raw
+/// bytes and still expand past `CreateProcessW`'s 32,767-char limit,
+/// reproducing os error 206 despite this function's own budget check.
+/// Per argument this counts `len + count('"') + count('\\') + 2` --
+/// `len` for the literal bytes, one extra byte per `"`/`\\` for the
+/// worst case where every one of them needs escaping, and `+ 2` for a
+/// surrounding pair of quotes -- which over-counts an argument with no
+/// quotes/backslashes/whitespace at all (no quoting needed) but never
+/// under-counts one that does, which is the direction that matters: this
+/// is deliberately a conservative, platform-independent estimate rather
+/// than a byte-exact reproduction of `CreateProcessW`'s own algorithm.
 fn headless_argv_len(command: &Command) -> usize {
     let mut total = command.get_program().to_string_lossy().len();
     for arg in command.get_args() {
+        let arg = arg.to_string_lossy();
+        let quotes = arg.matches('"').count();
+        let backslashes = arg.matches('\\').count();
         total += 1;
-        total += arg.to_string_lossy().len();
+        total += arg.len() + quotes + backslashes + 2;
     }
     total
 }
@@ -2448,6 +2470,44 @@ mod tests {
             headless_prompt_via_stdin(false, total),
             "a prompt safely under budget on its own must still route to stdin once the other \
              arguments on the same command line push the WHOLE argv over budget"
+        );
+    }
+
+    /// Review follow-up regression: raw byte length alone under-counts a
+    /// quote-and-backslash-heavy prompt. Windows' `CreateProcessW`/
+    /// `CommandLineToArgvW` quoting escapes every `"` and doubles a run of
+    /// backslashes ahead of one, and wraps a whitespace-bearing argument in
+    /// its own surrounding quotes, so a prompt built almost entirely of `"`
+    /// and `\` characters can measure comfortably UNDER the raw-byte budget
+    /// and still expand past the real 32,767-char Windows command-line
+    /// limit -- reproducing os error 206 despite `headless_argv_len`'s own
+    /// budget check. This prompt is constructed to sit just under the
+    /// raw-byte budget by itself; the escaping-aware estimate must still
+    /// route it to stdin.
+    #[test]
+    fn a_quote_and_backslash_heavy_prompt_under_the_raw_budget_still_routes_to_stdin() {
+        let budget = super::super::prompt::INLINE_ARGV_PROMPT_BUDGET_BYTES;
+        let half = (budget - 200) / 2;
+        let prompt = format!("{}{}", "\"".repeat(half), "\\".repeat(half));
+        assert!(
+            prompt.len() < budget,
+            "the raw prompt must sit under the raw-byte budget by construction: {} vs {budget}",
+            prompt.len()
+        );
+
+        let mut command = Command::new("claude");
+        command
+            .arg("-p")
+            .arg(&prompt)
+            .arg("--session-id")
+            .arg("abc");
+        let total = headless_argv_len(&command);
+        assert!(
+            headless_prompt_via_stdin(false, total),
+            "a prompt under the raw-byte budget but heavy on quote/backslash characters must \
+             still route to stdin once Windows' own command-line quoting is estimated: raw {} \
+             vs budget {budget}, escaping-aware total {total}",
+            prompt.len()
         );
     }
 
