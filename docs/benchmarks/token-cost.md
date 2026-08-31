@@ -697,6 +697,23 @@ total (session prefix)       31215 bytes
 a real 7,426-byte (23.8%) reduction — see §6.6 for the real (non-`bytes/4`)
 token figure.
 
+**Cross-platform correction (same day, from the review round):** pinning only
+the two native files `-text` froze *Windows-CRLF-derived* bytes, which a
+Linux/macOS checkout — whose `.zirv/context/*.md` inputs smudge to LF — can
+never re-render byte-identically, so the dedupe would have stayed suppressed
+everywhere except this machine. The final `.gitattributes` therefore also pins
+the render inputs `/.zirv/context/*.md text eol=lf` (making `render_generated`
+output uniform LF on every platform), anchors all patterns to the repo root
+(an unanchored `CLAUDE.md` even captured `.zirv/context/claude.md` on
+case-insensitive filesystems), and the natives were regenerated from LF
+inputs. Verified via `git checkout-index --prefix` (fresh-checkout
+simulation): zero CRLF bytes in all five files. The LF normalization also
+shrinks the prefix further: the post-dedupe total is now **22,919 bytes**
+(claude) / **22,920 bytes** (codex) at this commit, vs. the 23,789/23,790
+measured above on the CRLF-mixed state; the §6.6 tokenizer figures were
+captured on that earlier state and so slightly *overstate* the surviving
+prefix.
+
 ### 6.3 Top contributors, ranked (claude harness, from §6.2)
 
 | Rank | Layer | Bytes | Share of the 19,170-byte total |

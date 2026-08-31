@@ -1,15 +1,21 @@
-# zirv-managed native compatibility files (CLAUDE.md, AGENTS.md) are rendered
-# by `render_generated` (src/commands/ctx/context_cli.rs) from the current
-# on-disk `.zirv/context/*.md` sources plus a few hardcoded LF separators.
-# Because that render embeds whatever line endings `.zirv/context/*.md`
-# happen to carry on disk, its output is not uniformly LF or uniformly CRLF
-# -- so `eol=lf`/`eol=crlf` (which force a *uniform* line ending on checkout)
-# cannot reproduce it byte-for-byte. `-text` disables line-ending
-# normalization entirely: git checks these files out with EXACTLY the bytes
-# committed, on every platform and regardless of core.autocrlf, which is what
-# `zirv ctx compile`'s byte-exact context-layer dedupe (issue #155 Phase 3,
-# `native_file_already_carries_canonical` in compile.rs) needs to fire
-# durably across `git checkout`/clone/branch-switch instead of being
-# permanently suppressed by an EOL mismatch. See issue #225.
-CLAUDE.md -text
-AGENTS.md -text
+# Byte-exact context-layer dedupe (issue #225; #155 Phase 3).
+#
+# `zirv ctx compile` skips injecting the canonical `.zirv/context/*.md` layer
+# only when the generated native file (CLAUDE.md / AGENTS.md) byte-exactly
+# matches what `render_generated` (src/commands/ctx/context_cli.rs) would emit
+# right now from the on-disk sources. That render embeds the sources' line
+# endings verbatim plus hardcoded LF separators, so the comparison survives a
+# checkout only if BOTH sides are byte-stable across platforms:
+#
+# - `/.zirv/context/*.md text eol=lf` pins the render inputs to LF on every
+#   checkout, regardless of core.autocrlf, making the render output uniform LF
+#   everywhere.
+# - `/CLAUDE.md -text` / `/AGENTS.md -text` freeze the committed render output
+#   exactly as generated (no normalization on either add or checkout).
+#
+# Patterns are anchored to the repo root: an unanchored `CLAUDE.md` matches at
+# any depth, and on case-insensitive filesystems it even captures
+# `.zirv/context/claude.md`.
+/CLAUDE.md -text
+/AGENTS.md -text
+/.zirv/context/*.md text eol=lf
