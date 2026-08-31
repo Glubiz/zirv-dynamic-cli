@@ -178,6 +178,176 @@ fn find_cursor_position_report(bytes: &[u8]) -> Option<std::ops::Range<usize>> {
     None
 }
 
+/// The markers a bracketed-paste-aware terminal wraps pasted text in.
+const PASTE_START: &[u8] = b"\x1b[200~";
+const PASTE_END: &[u8] = b"\x1b[201~";
+
+/// How much of an unterminated paste span is held before it is flushed as-is.
+/// Far above any plausible paste, so a real one is never split; low enough
+/// that a terminal that sends a start marker and no end marker cannot make
+/// `wrap` eat unbounded memory.
+const PASTE_SPAN_CAP: usize = 1024 * 1024;
+
+/// The other half of that backstop. A paste arrives in one burst, so a span
+/// still open this long after it opened is a marker the terminal never
+/// closed -- and holding the operator's keystrokes any longer for it would be
+/// exactly the "wrap made the session worse" failure this guard exists to
+/// prevent.
+const PASTE_SPAN_MAX: Duration = Duration::from_secs(5);
+
+/// The shortest trailing fragment of `PASTE_START` that is held back waiting
+/// for the rest of the marker. `ESC` and `ESC [` are deliberately below the
+/// floor: they are the start of Esc-to-interrupt and of every arrow key, and
+/// withholding those until the *next* keystroke would break the session in a
+/// far more visible way than an unrecognised paste ever could.
+const MIN_HELD_MARKER_PREFIX: usize = 3;
+
+/// Keeps a bracketed paste whole on the operator-input path.
+///
+/// Issue #206. A terminal wraps pasted text in `ESC[200~ ... ESC[201~` so the
+/// agent's composer can tell a paste from typing and keep the pasted newlines
+/// as newlines rather than submitting a turn per line. `wrap` reads the
+/// operator's console 4096 bytes at a time and writes each read straight to
+/// the child's pty, which leaves two ways for that span to come apart:
+///
+/// - A read boundary can fall inside a marker, so the child is handed
+///   `ESC[20` and `0~...` and never sees a paste at all.
+/// - The stdin pump and the injector share one writer. Without this guard an
+///   injected advisory can be written *between* two chunks of a paste, i.e.
+///   inside the span, which is the same corruption from the other side.
+///
+/// So a span is accumulated here and written once, markers included and
+/// contents byte-for-byte untouched: no `\r`/`\n` translation, no synthetic
+/// Enter. Outside a span this is a passthrough that copies nothing.
+///
+/// Pure, like [`CprFilter`]: `now` is passed in rather than read, so every
+/// verdict is reproducible in a test.
+#[derive(Debug, Default)]
+pub struct PasteGuard {
+    /// Either a trailing fragment of a start marker (when no span is open) or
+    /// the whole of the open span, start marker included.
+    held: Vec<u8>,
+    /// When the currently open span's start marker arrived.
+    span_started: Option<Instant>,
+}
+
+impl PasteGuard {
+    /// Returns the bytes to forward: the empty slice while a span is still
+    /// being accumulated, the whole span the moment it closes, and otherwise
+    /// exactly what came in.
+    pub fn filter<'a>(&mut self, bytes: &'a [u8], now: Instant) -> std::borrow::Cow<'a, [u8]> {
+        if bytes.is_empty() {
+            return std::borrow::Cow::Borrowed(bytes);
+        }
+        // Backstop first: a span the terminal never closed must not hold this
+        // read -- or any read after it -- hostage.
+        if let Some(started) = self.span_started
+            && now.duration_since(started) >= PASTE_SPAN_MAX
+        {
+            self.span_started = None;
+            let mut flushed = std::mem::take(&mut self.held);
+            flushed.extend_from_slice(bytes);
+            return std::borrow::Cow::Owned(flushed);
+        }
+        // The overwhelmingly common read: no span open, nothing held, and not
+        // a byte that could begin a marker. Copies nothing.
+        if self.span_started.is_none() && self.held.is_empty() && !bytes.contains(&ESC) {
+            return std::borrow::Cow::Borrowed(bytes);
+        }
+
+        // `held` is either a marker fragment or the open span so far, and in
+        // both cases it belongs immediately before this read.
+        let mut work = std::mem::take(&mut self.held);
+        work.extend_from_slice(bytes);
+        let mut out: Vec<u8> = Vec::with_capacity(work.len());
+        let mut at = 0usize;
+        loop {
+            if self.span_started.is_some() {
+                match find_marker(&work[at..], PASTE_END) {
+                    Some(offset) => {
+                        let end = at + offset + PASTE_END.len();
+                        out.extend_from_slice(&work[at..end]);
+                        self.span_started = None;
+                        at = end;
+                    }
+                    None if work.len() - at > PASTE_SPAN_CAP => {
+                        // Over the cap the span is abandoned, not truncated:
+                        // every byte still goes to the child, just no longer
+                        // as one write.
+                        out.extend_from_slice(&work[at..]);
+                        self.span_started = None;
+                        break;
+                    }
+                    None => {
+                        self.held.extend_from_slice(&work[at..]);
+                        break;
+                    }
+                }
+            } else {
+                match find_marker(&work[at..], PASTE_START) {
+                    Some(offset) => {
+                        out.extend_from_slice(&work[at..at + offset]);
+                        at += offset;
+                        self.span_started = Some(now);
+                    }
+                    None => {
+                        let keep = trailing_marker_prefix(&work[at..], PASTE_START);
+                        out.extend_from_slice(&work[at..work.len() - keep]);
+                        self.held
+                            .extend_from_slice(&work[work.len() - keep..work.len()]);
+                        break;
+                    }
+                }
+            }
+            if at >= work.len() {
+                break;
+            }
+        }
+        std::borrow::Cow::Owned(out)
+    }
+}
+
+/// `ESC`, the only byte either marker can start with.
+const ESC: u8 = 0x1b;
+
+/// The first offset in `bytes` where `marker` appears whole. Scans from the
+/// `ESC`s rather than every position, so an open span re-scanned across
+/// successive reads stays cheap.
+fn find_marker(bytes: &[u8], marker: &[u8]) -> Option<usize> {
+    let mut at = 0;
+    while at + marker.len() <= bytes.len() {
+        match bytes[at..].iter().position(|byte| *byte == ESC) {
+            Some(offset) => at += offset,
+            None => return None,
+        }
+        if at + marker.len() > bytes.len() {
+            return None;
+        }
+        if &bytes[at..at + marker.len()] == marker {
+            return Some(at);
+        }
+        at += 1;
+    }
+    None
+}
+
+/// How many bytes at the end of `bytes` are a strict, long-enough prefix of
+/// `marker` -- i.e. how much has to be held back in case the rest of the
+/// marker is in the next read. Zero unless the tail is at least
+/// [`MIN_HELD_MARKER_PREFIX`] bytes long; see that constant for why the
+/// shorter fragments are forwarded instead.
+fn trailing_marker_prefix(bytes: &[u8], marker: &[u8]) -> usize {
+    let longest = (marker.len() - 1).min(bytes.len());
+    let mut len = longest;
+    while len >= MIN_HELD_MARKER_PREFIX {
+        if bytes[bytes.len() - len..] == marker[..len] {
+            return len;
+        }
+        len -= 1;
+    }
+    0
+}
+
 #[derive(Debug, clap::Args)]
 pub struct WrapArgs {
     /// Adapter name: claude or codex. Detected from the command when omitted.
@@ -1971,19 +2141,29 @@ pub fn run_with(
     std::thread::spawn(move || {
         let mut buf = [0u8; 4096];
         let mut stdin = std::io::stdin();
+        // #206. Owned by this thread rather than shared: a relaunch swaps the
+        // pty behind `input_writer` but never restarts this pump, so a paste
+        // being accumulated when the child is replaced is still delivered
+        // whole, to the new pty.
+        let mut paste = PasteGuard::default();
         loop {
             match stdin.read(&mut buf) {
                 Ok(0) | Err(_) => return,
                 Ok(n) => {
+                    let now = Instant::now();
                     // The console host's own probe was already answered
                     // synthetically; the terminal's duplicate answer must not
                     // reach the agent as keystrokes.
-                    let bytes = {
+                    let filtered = {
                         let Ok(mut filter) = input_filter.lock() else {
                             return;
                         };
-                        filter.filter(&buf[..n], Instant::now())
+                        filter.filter(&buf[..n], now)
                     };
+                    // #206: and a bracketed paste reaches the agent's composer
+                    // as one write, so its newlines stay newlines instead of
+                    // submitting a turn per line.
+                    let bytes = paste.filter(filtered.as_ref(), now);
                     if bytes.is_empty() {
                         continue;
                     }
@@ -7553,6 +7733,160 @@ mod tests {
                     "gpt".to_string(),
                 ]
             );
+        }
+    }
+
+    /// Issue #206: a bracketed paste must reach the wrapped composer as one
+    /// block, whatever the console's read boundaries do to it.
+    mod bracketed_paste {
+        use super::*;
+
+        fn feed(guard: &mut PasteGuard, chunks: &[&[u8]], now: Instant) -> Vec<Vec<u8>> {
+            chunks
+                .iter()
+                .map(|chunk| guard.filter(chunk, now).into_owned())
+                .filter(|out| !out.is_empty())
+                .collect()
+        }
+
+        /// The whole point: however the reads fall, the child is handed the
+        /// span in exactly one write, markers included.
+        #[test]
+        fn a_span_split_across_reads_is_forwarded_as_one_write() {
+            let mut guard = PasteGuard::default();
+            let now = Instant::now();
+            let writes = feed(
+                &mut guard,
+                &[b"\x1b[200~one\rtwo", b"\rthree\x1b[201~"],
+                now,
+            );
+            assert_eq!(
+                writes,
+                vec![b"\x1b[200~one\rtwo\rthree\x1b[201~".to_vec()],
+                "one write, markers preserved"
+            );
+        }
+
+        /// The nastiest boundary: the marker itself is cut in half.
+        #[test]
+        fn a_marker_cut_in_half_by_a_read_boundary_still_forms_one_span() {
+            let mut guard = PasteGuard::default();
+            let now = Instant::now();
+            let writes = feed(
+                &mut guard,
+                &[b"\x1b[20", b"0~alpha\rbeta\x1b[20", b"1~"],
+                now,
+            );
+            assert_eq!(
+                writes,
+                vec![b"\x1b[200~alpha\rbeta\x1b[201~".to_vec()],
+                "a marker split across two reads is still one span"
+            );
+        }
+
+        /// Pasted line endings are data, never submissions: nothing in here
+        /// may rewrite a `\r` or an `\n` or add one.
+        #[test]
+        fn line_endings_inside_a_span_are_untouched() {
+            let mut guard = PasteGuard::default();
+            let now = Instant::now();
+            let body: &[u8] = b"a\r\nb\nc\rd";
+            let mut input = PASTE_START.to_vec();
+            input.extend_from_slice(body);
+            input.extend_from_slice(PASTE_END);
+            let out = guard.filter(&input, now).into_owned();
+            assert_eq!(out, input, "byte for byte, CR and LF included");
+        }
+
+        /// Outside a span the guard is invisible, and costs no copy.
+        #[test]
+        fn bytes_outside_a_span_pass_straight_through() {
+            let mut guard = PasteGuard::default();
+            let now = Instant::now();
+            let out = guard.filter(b"hello\r", now);
+            assert_eq!(out.as_ref(), b"hello\r");
+            assert!(matches!(out, std::borrow::Cow::Borrowed(_)), "no copy");
+        }
+
+        /// Esc is how the operator interrupts an agent. Holding it back
+        /// waiting to see whether it grows into a paste marker would be a
+        /// worse bug than the one this guard fixes.
+        #[test]
+        fn a_lone_escape_is_never_held_back() {
+            let mut guard = PasteGuard::default();
+            let now = Instant::now();
+            assert_eq!(guard.filter(b"\x1b", now).as_ref(), b"\x1b");
+            assert_eq!(guard.filter(b"\x1b[", now).as_ref(), b"\x1b[");
+            assert_eq!(guard.filter(b"\x1b[A", now).as_ref(), b"\x1b[A");
+        }
+
+        /// A fragment held for a marker that never arrives is released with
+        /// the bytes that proved it was not one -- in order, unmodified.
+        #[test]
+        fn a_held_fragment_that_is_not_a_marker_is_released_intact() {
+            let mut guard = PasteGuard::default();
+            let now = Instant::now();
+            let writes = feed(&mut guard, &[b"\x1b[2", b"~rest"], now);
+            assert_eq!(writes, vec![b"\x1b[2~rest".to_vec()]);
+        }
+
+        /// A start marker with no end marker must not swallow the session:
+        /// past the cap the span is flushed exactly as it arrived.
+        #[test]
+        fn an_unterminated_span_is_flushed_once_it_outgrows_the_cap() {
+            let mut guard = PasteGuard::default();
+            let now = Instant::now();
+            assert!(guard.filter(PASTE_START, now).is_empty(), "span opened");
+            let bulk = vec![b'x'; PASTE_SPAN_CAP + 1];
+            let out = guard.filter(&bulk, now).into_owned();
+            assert!(out.starts_with(PASTE_START), "the marker is not eaten");
+            assert_eq!(
+                out.len(),
+                PASTE_START.len() + bulk.len(),
+                "everything held is flushed as-is"
+            );
+            // The span is over, so ordinary keys flow again.
+            assert_eq!(guard.filter(b"q", now).as_ref(), b"q");
+        }
+
+        /// The same backstop in the time dimension, for a span that stays
+        /// small but never closes.
+        #[test]
+        fn an_unterminated_span_is_flushed_once_its_deadline_passes() {
+            let mut guard = PasteGuard::default();
+            let opened = Instant::now();
+            assert!(guard.filter(b"\x1b[200~typed", opened).is_empty());
+            let out = guard
+                .filter(b"more", opened + PASTE_SPAN_MAX + Duration::from_secs(1))
+                .into_owned();
+            assert_eq!(out, b"\x1b[200~typedmore".to_vec());
+            assert_eq!(guard.filter(b"q", Instant::now()).as_ref(), b"q");
+        }
+
+        /// Text either side of a span rides along in the right order, and a
+        /// second paste opens a second span.
+        #[test]
+        fn spans_and_ordinary_typing_keep_their_order() {
+            let mut guard = PasteGuard::default();
+            let now = Instant::now();
+            let writes = feed(
+                &mut guard,
+                &[b"ab\x1b[200~in\x1b[201~cd\x1b[200~two\x1b[201~ef"],
+                now,
+            );
+            assert_eq!(
+                writes,
+                vec![b"ab\x1b[200~in\x1b[201~cd\x1b[200~two\x1b[201~ef".to_vec()]
+            );
+        }
+
+        /// A stray *end* marker outside a span is not a span: it is just
+        /// bytes, and it is forwarded like any other.
+        #[test]
+        fn a_stray_end_marker_is_not_treated_as_a_span() {
+            let mut guard = PasteGuard::default();
+            let now = Instant::now();
+            assert_eq!(guard.filter(PASTE_END, now).as_ref(), PASTE_END);
         }
     }
 
