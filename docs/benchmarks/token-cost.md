@@ -588,3 +588,119 @@ not claim it is.
    data point, not a distribution.
 7. Fill the row in §3, replacing "not yet measured" with the number and a
    link/reference to the raw capture.
+
+## 6. Per-turn steady-state cost
+
+Issue #225 ("Reduce steady-state token usage of running sessions") asks a
+different question than §1–§5: not "what did one completed task cost" but
+"what does every single turn of an already-running session pay, before the
+model reads or writes a word of the actual task". Two costs make up that
+answer — the once-per-launch prompt prefix (cached after the first turn, so
+its ongoing cost is a cache-write once and a cache-read every turn after)
+and the per-turn hook `additionalContext` (injected fresh on every
+`UserPromptSubmit`, so it is **never** cached).
+
+### 6.1 Method
+
+- **Prompt prefix**: `zirv ctx compile --measure` (new in this issue,
+  `src/commands/ctx/compile.rs`), run from an interactive orchestrator seat
+  in this repository. It composes exactly as a real launch would
+  (`compile::compile_with_harness_roster`, the same function every launch
+  path but `resume` calls) and prints one row per layer with its raw byte
+  count, a `bytes / 4` estimated-token column, and a `total (session
+  prefix)` row that is the real `ComposedPrompt::text.len()` — not a sum of
+  the itemized rows, so a layer with no dedicated row (the operator's own
+  `system-prompt.md`, an active workflow step) is still accounted for in
+  the total even though it has no line of its own.
+- **Per-turn hook context**: the byte length of
+  `hook::per_turn_context_text("[zirv]")`
+  (`src/commands/ctx/hook.rs`), the exact sentence
+  `hook::prompt_output` injects as `additionalContext` on every
+  `UserPromptSubmit` hook call — also the last row `--measure` prints.
+- **Status checkpoint sizes**:
+  `commands::ctx::status::tests::brief_status_is_smaller_than_full_status_for_the_same_fixture`
+  (`src/commands/ctx/status.rs`), a fixture with 5 delegations across 2
+  work groups and 3 live sessions, run once through `status::run_with` with
+  `--brief` off and once with it on.
+
+### 6.2 Baseline: `zirv ctx compile --measure`, this repository
+
+Run against this repo's own working tree at commit `5fbfc93` (this issue's
+own merge of the #223/#225 integration branch), as an interactive
+orchestrator seat, for each of the two shipped adapters:
+
+```
+$ zirv ctx compile --measure
+layer                      bytes   ~tokens  note
+default prompt                1191      298
+harness prompt                5433     1358  orchestrator only
+harness roster                 400      100
+canonical context: common     4080     1020
+canonical context: claude     3143      786
+memory: core                  2045      511
+total (session prefix)       19170     4793
+per-turn hook context           89       22  paid uncached every user turn
+~tokens = bytes / 4 (estimate; cache reads bill this prefix every turn)
+
+$ zirv ctx compile --agent codex --measure
+layer                      bytes   ~tokens  note
+default prompt                1191      298
+harness prompt                5433     1358  orchestrator only
+harness roster                 401      100
+canonical context: common     4080     1020
+canonical context: codex      2528      632
+memory: core                  2045      511
+total (session prefix)       18555     4639
+per-turn hook context           89       22  paid uncached every user turn
+~tokens = bytes / 4 (estimate; cache reads bill this prefix every turn)
+```
+
+Both runs were taken on a clean working tree (no uncommitted diff), which is
+why no `memory: retrieval` row appears — that layer is derived from live
+`git diff`/`git ls-files` output (see §1's note on why it sits last in the
+composed prefix) and a clean tree selects nothing for it; a dirty tree would
+add a row and a slightly larger total, never a smaller one.
+
+### 6.3 Top contributors, ranked (claude harness, from §6.2)
+
+| Rank | Layer | Bytes | Share of the 19,170-byte total |
+| --- | --- | --- | --- |
+| 1 | harness prompt (orchestrator only) | 5,433 | 28.3% |
+| 2 | canonical context: common | 4,080 | 21.3% |
+| 3 | canonical context: claude | 3,143 | 16.4% |
+| 4 | memory: core | 2,045 | 10.7% |
+| 5 | default prompt | 1,191 | 6.2% |
+| 6 | harness roster | 400 | 2.1% |
+
+The remaining ~15% of the total is the composition overhead between layers
+(section headers/separators `compose`/`compile.rs` insert, which get no row
+of their own) — the reason §6.1 defines the total as the real
+`composed.text.len()` rather than a sum of the itemized rows.
+
+### 6.4 Before/after for each reduction shipped in this issue
+
+| Reduction | Before | After | Multiplier | Source |
+| --- | --- | --- | --- | --- |
+| Per-turn hook context (`hook::prompt_output`) | 170 bytes | 89 bytes | every user turn, uncached | `hook.rs`'s own history (the sentence this issue replaced) vs. `commands::ctx::hook::tests::prompt_hook_context_stays_under_the_ninety_byte_steady_state_budget`, which pins the 89-byte figure directly on `per_turn_context_text("[zirv]")` |
+| `zirv ctx status` full vs. `--brief` | 2,113 bytes | 1,188 bytes | once per checkpoint (`HARNESS_PROMPT` names task start, after long steps, and before reporting done — not a fixed count this document can quote without inventing one) | `commands::ctx::status::tests::brief_status_is_smaller_than_full_status_for_the_same_fixture`, fixture: 5 delegations across 2 work groups, 3 live sessions |
+| `.zirv/context/common.md` | — | 4,080 bytes (cap: `context.max_common_bytes` = 4,096) | every session launch (cached after the first turn) | `zirv ctx compile --measure`'s own `canonical context: common` row, §6.2 — the integrator, not this change, is responsible for keeping this file under its shipped budget (`commands::ctx::compile::tests::this_repositorys_canonical_common_context_fits_the_shipped_budget`) |
+
+The hook-context and status rows are the two genuinely *new* reductions this
+issue ships; the `common.md` row is cited for completeness (it is the
+single largest non-harness-prompt contributor in §6.3) but its cap is
+enforced and maintained elsewhere, not changed by this issue.
+
+### 6.5 Reading the estimated-token column
+
+Every `~tokens` figure in this document, `--measure`'s own output included,
+is `bytes / 4` rounded to the nearest integer — a rough, provider-agnostic
+approximation `--measure`'s own trailing line states explicitly, not a real
+tokenizer count. It is useful for ranking contributors against each other
+(§6.3) and for a rough before/after delta (§6.4), but it is **not** a
+substitute for a measured token count. A real before/after token delta for
+this issue's changes must come from `token_cost_analysis.py`
+(`docs/benchmarks/token_cost_analysis.py`), run against real transcripts
+captured before and after the change ships — the same "non-negotiable rule"
+at the top of this document (every cell is either an actually observed
+number or says "not yet measured") applies here too; the `~tokens` column
+is an estimate by definition and is labeled as one everywhere it appears.
