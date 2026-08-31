@@ -569,36 +569,48 @@ pub(crate) fn reserved_zirv_command_patterns() -> Vec<String> {
 }
 
 /// Reserved built-in names excluded from the auto-allow entirely -- code
-/// review fix (CRITICAL, issue #224 review round 4, two independent
-/// reviewers): unlike `agent`/`chat` (an unconditional-then-flag-gated
-/// carve-out) or `ctx` (verb-scoped), these names have NO safe unconditional
-/// form at all, because the risk lives in the PAYLOAD their structured
+/// review fix (CRITICAL, issue #224 review rounds 4-5, two independent
+/// reviewers plus a round-5 veto on `frontend`): unlike `agent`/`chat`/
+/// `artifact` (an unconditional-then-flag-gated carve-out) or `ctx`
+/// (verb-scoped), these names have NO safe unconditional OR flag-gated form
+/// at all, because the risk lives in the PAYLOAD their structured
 /// (non-arbitrary-argv) args select, not in a caller-controlled trailing
-/// command:
+/// command or an identifiable dangerous flag. Two distinct reasons land a
+/// name here:
 ///
-/// - `setup`: `zirv setup reset --scope global --yes` (`setup::run_reset`)
-///   targets the OPERATOR's real `~/.claude`/`~/.codex` (`claude_config_
-///   dir`/`codex_config_dir`), outside any repository, gated only by a
-///   `--yes` the supervised model itself can pass. Run unattended and
-///   unsandboxed, it can wipe the PreToolUse hook and attested launch
-///   settings this entire safety module depends on.
-/// - `test`/`verify`: both execute commands the repository itself wrote in
-///   `.zirv/verify.toml` (`workflow::verification`) -- an EXPLICITLY
-///   untrusted, narrow-only surface everywhere else in this codebase (a repo
-///   may only narrow `deny`/`ask`, never add to `allow`; `.zirv/verify.toml`
-///   is exactly that same trust boundary one layer down). Auto-allowing
-///   `test`/`verify` handed repo-authored commands silent, unsandboxed
-///   execution, inverting the one invariant this whole module exists to
-///   hold. On `main` (pre-#224) the safety hook's ordinary `Ask` prompt was
-///   the only control over that surface; this restores exactly that.
+/// **Destructive config** -- `setup`: `zirv setup reset --scope global
+/// --yes` (`setup::run_reset`) targets the OPERATOR's real `~/.claude`/
+/// `~/.codex` (`claude_config_dir`/`codex_config_dir`), outside any
+/// repository, gated only by a `--yes` the supervised model itself can pass.
+/// Run unattended and unsandboxed, it can wipe the PreToolUse hook and
+/// attested launch settings this entire safety module depends on.
 ///
-/// These names therefore return to the plain pre-#224 unmatched-command
+/// **Repo-authored payload** -- `test`/`verify`/`frontend`: all three
+/// ultimately execute content the repository itself wrote, inverting the
+/// one invariant this whole module exists to hold (a repo may only narrow
+/// `deny`/`ask`, never add to `allow`).
+/// - `test`/`verify` (`workflow::verification`) run a command literally
+///   written in the repo's own `.zirv/verify.toml` -- already documented as
+///   EXPLICITLY untrusted, one layer down from this module's own trust
+///   boundary.
+/// - `frontend render` (`workflow::frontend_render::discover_package_server`)
+///   only ever spawns one of a fixed `{npm,pnpm,yarn,bun} run {dev,start,
+///   preview}` argv, but that IS the repo's own `package.json` script BODY
+///   running -- the fixed program/argv enum narrows WHICH toolchain runs,
+///   not WHAT the repo told it to do. `Bash(npm *)`'s existing shipped
+///   allow keeps that risk sandboxed (`SHIPPED_POSTURE_ALLOW` never enters
+///   `sandbox.excludedCommands`); a `zirv frontend` auto-allow would instead
+///   project into the native sandbox exclusion, so the repo-authored script
+///   body would run UNSANDBOXED -- the same repo-authored-payload class as
+///   `verify.toml`, one indirection further removed.
+///
+/// All four names therefore return to the plain pre-#224 unmatched-command
 /// default (`Ask` headless, `Allow` interactive under an operator's own
 /// eyes) with no reserved-name auto-allow and no generated pattern in
 /// `reserved_zirv_command_patterns` -- hence no native `permissions.allow`/
 /// `sandbox.excludedCommands` projection either, since that projection
 /// consumes the same generated list.
-const DESTRUCTIVE_OR_UNTRUSTED_PAYLOAD_BUILTINS: &[&str] = &["setup", "test", "verify"];
+const DESTRUCTIVE_OR_UNTRUSTED_PAYLOAD_BUILTINS: &[&str] = &["setup", "test", "verify", "frontend"];
 
 /// The built-in allow set: command families from
 /// `adapters::SHIPPED_POSTURE_ALLOW`, plus the reserved zirv built-ins above.
@@ -5977,7 +5989,7 @@ mod tests {
     /// built-ins without an operator prompt. It stays NARROWER than the
     /// policy layer's reserved-name allow: repo scripts still ask.
     ///
-    /// **The real partition, as of round 4's review (there is no human gate
+    /// **The real partition, as of round 5's review (there is no human gate
     /// under headless `dontAsk` -- a bare "Claude's own gate still applies"
     /// is not a real backstop there, and this comment used to say exactly
     /// that):** a reserved built-in's auto-allow depends on what its payload
@@ -5985,8 +5997,9 @@ mod tests {
     /// single`, never on dispatch unshadowability alone --
     /// - **Structured, zirv-owned payload -- name-level allow, unconditional:**
     ///   `report`, `help`, `version`, `memory`, `context`, `init`, `create`,
-    ///   `workflow`, `skill`, `frontend`. Their arguments are prompts, ids, or
-    ///   paths; nothing they take reaches a shell with caller-chosen content.
+    ///   `workflow`, `skill`. Their arguments are prompts, ids, or paths;
+    ///   nothing they take reaches a shell with caller-chosen OR
+    ///   repository-authored content.
     /// - **`ctx` -- verb-scoped, not name-level:** only verbs in `ctx_base_
     ///   allow_verbs` ([`ZIRV_CTX_ESCAPE_SAFE_VERBS`] minus `usage`) auto-allow;
     ///   `exec`/`wrap`/`chat`/`resume`/`loop`/`agent`/`handover` carry an
@@ -6002,14 +6015,18 @@ mod tests {
     /// - **`artifact` -- name-level allow, flag-gated to a hard `Deny`:** the
     ///   same treatment for `--server-command`, which shells out to
     ///   caller-controlled text (`artifact_present_server_command_deny_rule`).
-    /// - **`setup`/`test`/`verify` -- excluded entirely, no auto-allow at
-    ///   any level:** their structured args select a DESTRUCTIVE action
-    ///   (`setup reset --scope global`, wiping the operator's real
-    ///   `~/.claude`/`~/.codex`) or a REPO-AUTHORED payload (`test`/`verify`
-    ///   run `.zirv/verify.toml` commands, an explicitly untrusted surface
-    ///   everywhere else in this module) with no safe unconditional or
-    ///   flag-gated form -- see [`DESTRUCTIVE_OR_UNTRUSTED_PAYLOAD_
-    ///   BUILTINS`]'s own doc comment.
+    /// - **`setup`/`test`/`verify`/`frontend` -- excluded entirely, no
+    ///   auto-allow at any level:** their structured args select a
+    ///   DESTRUCTIVE action (`setup reset --scope global`, wiping the
+    ///   operator's real `~/.claude`/`~/.codex`) or a REPO-AUTHORED payload
+    ///   (`test`/`verify` run `.zirv/verify.toml` commands directly;
+    ///   `frontend render` runs the repo's own `package.json` script body
+    ///   one indirection further removed, and -- unlike the already-shipped
+    ///   `Bash(npm *)` allow, which stays inside claude's OS sandbox -- an
+    ///   auto-allowed `zirv frontend` would have projected into `sandbox.
+    ///   excludedCommands`, running that same repo-authored payload
+    ///   UNSANDBOXED) with no safe unconditional or flag-gated form -- see
+    ///   [`DESTRUCTIVE_OR_UNTRUSTED_PAYLOAD_BUILTINS`]'s own doc comment.
     #[test]
     fn unsandboxed_retries_allow_reserved_builtins_but_not_repo_scripts() {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -7270,24 +7287,31 @@ mod tests {
         );
     }
 
-    /// Code review fix (CRITICAL, issue #224 review round 4, two independent
-    /// reviewers): `setup`/`test`/`verify` have no safe auto-allow form at
-    /// any level -- `setup reset --scope global --yes` targets the
-    /// operator's real `~/.claude`/`~/.codex` outside any repo, and
-    /// `test`/`verify` execute the repository's own, explicitly untrusted
-    /// `.zirv/verify.toml` commands. All three revert to the plain
-    /// pre-#224 unmatched-command default. Before this fix, all three
+    /// Code review fix (CRITICAL, issue #224 review rounds 4-5, two
+    /// independent reviewers plus a round-5 veto on `frontend`): `setup`/
+    /// `test`/`verify`/`frontend` have no safe auto-allow form at any level
+    /// -- `setup reset --scope global --yes` targets the operator's real
+    /// `~/.claude`/`~/.codex` outside any repo; `test`/`verify` execute the
+    /// repository's own, explicitly untrusted `.zirv/verify.toml` commands;
+    /// `frontend render` runs the repository's own `package.json` script
+    /// body, and unlike the already-shipped `Bash(npm *)` allow (which
+    /// stays inside claude's OS sandbox), an auto-allowed `zirv frontend`
+    /// would have projected into `sandbox.excludedCommands`, running that
+    /// same repo-authored payload UNSANDBOXED. All four revert to the plain
+    /// pre-#224 unmatched-command default. Before this fix, all four
     /// evaluated to Allow headlessly.
     #[test]
-    fn setup_test_and_verify_have_no_auto_allow_at_any_level() {
+    fn setup_test_verify_and_frontend_have_no_auto_allow_at_any_level() {
         let policy = SafetyPolicy::default();
         for command in [
             "zirv setup reset --provider all --scope global --yes",
             "zirv test changed",
             "zirv verify",
+            "zirv frontend render",
             "ZIRV SETUP RESET --provider all --scope global --yes",
             "ZIRV TEST CHANGED",
             "ZIRV VERIFY",
+            "ZIRV FRONTEND RENDER",
         ] {
             let outcome = evaluate(&policy, command, LaunchMode::Headless);
             assert_eq!(
@@ -7304,7 +7328,8 @@ mod tests {
     /// caller-controlled shell command. `zirv workflow status`/`zirv ctx
     /// status`/bare `zirv agent claude "x"` are the same assertions rounds
     /// 1-3 already covered elsewhere; this test is round 4's own audit
-    /// checklist, one command per still-allowed name.
+    /// checklist, one command per still-allowed name (`frontend` moved to
+    /// the excluded list in round 5 -- see the previous test).
     #[test]
     fn every_other_reserved_builtin_stays_allowed() {
         let policy = SafetyPolicy::default();
@@ -7318,7 +7343,6 @@ mod tests {
             "zirv create foo",
             "zirv workflow status",
             "zirv skill list",
-            "zirv frontend profile",
             "zirv ctx status",
             "zirv agent claude \"x\"",
             "zirv artifact register foo.png",

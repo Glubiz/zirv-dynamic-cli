@@ -2286,13 +2286,17 @@ mod tests {
     /// reserved name keeps its name-level entry, since its payload is a
     /// prompt or a path, not arbitrary argv.
     ///
-    /// Code review fix (CRITICAL, issue #224 review round 4): `setup`,
-    /// `test`, and `verify` get NO entry at all, at either level -- see
-    /// `safety::DESTRUCTIVE_OR_UNTRUSTED_PAYLOAD_BUILTINS`'s own doc
-    /// comment. `agent`/`chat`/`artifact` DO keep their name-level entry
-    /// despite carrying their own flag-gated `Deny` in `safety::evaluate_
-    /// single` (a native settings glob cannot express that narrowing, see
-    /// `safety::reserved_zirv_command_patterns`'s own doc comment).
+    /// Code review fix (CRITICAL, issue #224 review rounds 4-5): `setup`,
+    /// `test`, `verify`, and `frontend` get NO entry at all, at either
+    /// level -- see `safety::DESTRUCTIVE_OR_UNTRUSTED_PAYLOAD_BUILTINS`'s
+    /// own doc comment (`frontend` added in round 5: its native sandbox
+    /// exclusion would have run the repository's own `package.json` script
+    /// body unsandboxed, unlike the already-shipped, sandbox-confined
+    /// `Bash(npm *)` allow). `agent`/`chat`/`artifact` DO keep their
+    /// name-level entry despite carrying their own flag-gated `Deny` in
+    /// `safety::evaluate_single` (a native settings glob cannot express
+    /// that narrowing, see `safety::reserved_zirv_command_patterns`'s own
+    /// doc comment).
     #[test]
     fn launch_settings_project_reserved_builtins_without_widening_scripts_or_gh() {
         let settings = test_launch_settings();
@@ -2300,7 +2304,7 @@ mod tests {
             .as_array()
             .expect("reserved built-in permission rules");
         for name in crate::utils::RESERVED_COMMANDS {
-            if matches!(*name, "ctx" | "setup" | "test" | "verify") {
+            if matches!(*name, "ctx" | "setup" | "test" | "verify" | "frontend") {
                 continue;
             }
             let expected = serde_json::json!(format!("Bash(zirv {name} *)"));
@@ -2321,13 +2325,16 @@ mod tests {
         // `usage tee -- <cmd>` -- unlike the escape-safe retry path, a
         // native permission/sandbox glob cannot see the fourth token.
         assert!(!permission_allow.contains(&serde_json::json!("Bash(zirv ctx usage *)")));
-        // Issue #224 review round 4: `setup reset --scope global --yes`
+        // Issue #224 review rounds 4-5: `setup reset --scope global --yes`
         // targets the operator's real `~/.claude`/`~/.codex`; `test`/
         // `verify` execute the repository's own untrusted `.zirv/
-        // verify.toml` commands. Neither has a safe unconditional form.
+        // verify.toml` commands; `frontend render` runs the repository's
+        // own `package.json` script body. None has a safe unconditional
+        // form.
         assert!(!permission_allow.contains(&serde_json::json!("Bash(zirv setup *)")));
         assert!(!permission_allow.contains(&serde_json::json!("Bash(zirv test *)")));
         assert!(!permission_allow.contains(&serde_json::json!("Bash(zirv verify *)")));
+        assert!(!permission_allow.contains(&serde_json::json!("Bash(zirv frontend *)")));
 
         #[cfg(not(windows))]
         {
@@ -2335,7 +2342,7 @@ mod tests {
                 .as_array()
                 .expect("reserved built-in sandbox exclusions");
             for name in crate::utils::RESERVED_COMMANDS {
-                if matches!(*name, "ctx" | "setup" | "test" | "verify") {
+                if matches!(*name, "ctx" | "setup" | "test" | "verify" | "frontend") {
                     continue;
                 }
                 let expected = serde_json::json!(format!("zirv {name} *"));
@@ -2354,6 +2361,7 @@ mod tests {
             assert!(!exclusions.contains(&serde_json::json!("zirv setup *")));
             assert!(!exclusions.contains(&serde_json::json!("zirv test *")));
             assert!(!exclusions.contains(&serde_json::json!("zirv verify *")));
+            assert!(!exclusions.contains(&serde_json::json!("zirv frontend *")));
             assert!(
                 settings["sandbox"]["filesystem"]["denyRead"]
                     .as_array()
@@ -2641,9 +2649,9 @@ mod tests {
     /// `launch_settings_project_reserved_builtins_without_widening_scripts_
     /// or_gh`'s own doc comment for why.
     ///
-    /// Code review fix (CRITICAL, issue #224 review round 4): `setup`,
-    /// `test`, and `verify` get no entry at all here either -- see that same
-    /// doc comment's round-4 addendum.
+    /// Code review fix (CRITICAL, issue #224 review rounds 4-5): `setup`,
+    /// `test`, `verify`, and `frontend` get no entry at all here either --
+    /// see that same doc comment's rounds-4-5 addendum.
     #[test]
     fn default_sandbox_args_allow_reserved_zirv_builtins_but_not_scripts() {
         let adapter = ClaudeAdapter::new(None);
@@ -2657,7 +2665,7 @@ mod tests {
             .find(|a| a.starts_with("--allowedTools="))
             .expect("an --allowedTools= token");
         for name in crate::utils::RESERVED_COMMANDS {
-            if matches!(*name, "ctx" | "setup" | "test" | "verify") {
+            if matches!(*name, "ctx" | "setup" | "test" | "verify" | "frontend") {
                 continue;
             }
             let rule = format!("Bash(zirv {name} *)");
@@ -2676,6 +2684,7 @@ mod tests {
         assert!(!allow_arg.contains("Bash(zirv setup *)"));
         assert!(!allow_arg.contains("Bash(zirv test *)"));
         assert!(!allow_arg.contains("Bash(zirv verify *)"));
+        assert!(!allow_arg.contains("Bash(zirv frontend *)"));
         assert!(!allow_arg.contains("Bash(zirv somescript *)"));
     }
 
