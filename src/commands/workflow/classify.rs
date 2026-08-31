@@ -467,6 +467,28 @@ fn is_zirv_owned_path(path: &Path) -> bool {
     matches!(path.components().next(), Some(std::path::Component::Normal(name)) if name == ".zirv")
 }
 
+/// True for a repo-relative path whose first two components are
+/// `.zirv/work` -- the workflow's own work-product directory (plans,
+/// execute-plan artifacts, raw reviewer salvage). Narrower than
+/// `is_zirv_owned_path` above (which also covers `.zirv/ctx.toml` and other
+/// repository config a reviewer legitimately needs to see): a review
+/// package and its staleness fingerprint must ignore workflow bookkeeping
+/// specifically, not every `.zirv/` path, or a real change to
+/// `.zirv/commands/*` would silently vanish from what gets reviewed.
+///
+/// #229/#232: an operator ticking a checkbox in the untracked
+/// `.zirv/work/<id>/plan.md` while an independent review ran changed the
+/// repository's change-set fingerprint out from under the review, so the
+/// completed round was refused with "the change set changed during
+/// review" even though nothing the reviewer was asked to look at had
+/// changed. `review::package` and `verification::change_fingerprint` both
+/// exclude paths this returns true for.
+pub(crate) fn is_workflow_work_path(path: &Path) -> bool {
+    let mut components = path.components();
+    matches!(components.next(), Some(std::path::Component::Normal(name)) if name == ".zirv")
+        && matches!(components.next(), Some(std::path::Component::Normal(name)) if name == "work")
+}
+
 pub fn git_change_input(repo: &Path, task: String) -> CtxResult<ClassificationInput> {
     // The same base `review::package` uses (merge-base against origin/main,
     // then main, then HEAD^, then HEAD). Measuring against bare HEAD made
@@ -979,6 +1001,25 @@ mod tests {
         assert!(is_zirv_owned_path(Path::new(".zirv/ctx.toml")));
         assert!(!is_zirv_owned_path(Path::new("src/x.tsx")));
         assert!(!is_zirv_owned_path(Path::new("docs/.zirv/notes.md")));
+    }
+
+    /// #229/#232: narrower than `is_zirv_owned_path` -- only the workflow's
+    /// own `.zirv/work/**` bookkeeping must be excluded from a review
+    /// package or its staleness fingerprint, not sibling `.zirv/` config
+    /// like `.zirv/ctx.toml` or `.zirv/commands/*`, which are real
+    /// repository content a reviewer needs to see.
+    #[test]
+    fn is_workflow_work_path_matches_only_zirv_work_not_other_zirv_state() {
+        assert!(is_workflow_work_path(Path::new(".zirv/work/abc/plan.md")));
+        assert!(is_workflow_work_path(Path::new(".zirv/work")));
+        assert!(!is_workflow_work_path(Path::new(".zirv/ctx.toml")));
+        assert!(!is_workflow_work_path(Path::new(
+            ".zirv/commands/build.yaml"
+        )));
+        assert!(!is_workflow_work_path(Path::new("src/x.tsx")));
+        assert!(!is_workflow_work_path(Path::new(
+            "docs/.zirv/work/notes.md"
+        )));
     }
 
     #[test]

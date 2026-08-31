@@ -17,7 +17,8 @@
 #                                that argv token (or stdin, drained below) is
 #                                the only place mail can ever land.
 #   FAKE_AGENT_MODE_FILE=<path>  one mode per line, popped per run
-#                                (hang|limit|healthy, default healthy) --
+#                                (hang|limit|capacity|account|healthy, default
+#                                healthy) --
 #                                the only way a test drives a restart of the
 #                                *main* agent is a nudge or a `limit` park.
 #                                `hang` is what keeps the process alive
@@ -120,6 +121,15 @@ case "$mode" in
   hang) while true; do "$sleep_bin" 1; done ;;
   limit)
     printf "You've hit your session limit · resets 3:45pm\n"
+    exit 1
+    ;;
+  # Issue #227: the exact wording from the bug report's transcript.
+  capacity)
+    printf "ERROR: Selected model is at capacity. Please try a different model.\n"
+    exit 1
+    ;;
+  account)
+    printf "Error: insufficient_quota - You exceeded your current quota, please check your plan and billing details.\n"
     exit 1
     ;;
   *) exit 0 ;;
