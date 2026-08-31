@@ -37,6 +37,17 @@ pub const EXIT_TIMEOUT: i32 = 76;
 /// Phase 5(d)). Unlike the two codes above, this is never followed by a
 /// restart: a budget checkpoints the run once and stops it for good.
 pub const EXIT_BUDGET_EXHAUSTED: i32 = 77;
+/// Issue #227: the restart budget is spent while every restart kept hitting
+/// a transient provider capacity/overload error (`pace::CAPACITY_PATTERNS`).
+/// Distinct from `EXIT_ROT_EXHAUSTED`: the session itself never rotted, the
+/// provider just could not serve it -- retried within budget with a short
+/// backoff (`capacity_backoff_secs`) before landing here.
+pub const EXIT_CAPACITY_EXHAUSTED: i32 = 78;
+/// Issue #227: the provider reported the account itself is out of usable
+/// credits/quota (`pace::ACCOUNT_EXHAUSTED_PATTERNS`) -- a hard, non-
+/// retryable condition. Never follows a restart: burning the budget cannot
+/// fix a billing problem, so this fires on the very first occurrence.
+pub const EXIT_ACCOUNT_EXHAUSTED: i32 = 79;
 
 /// The supervisor reports its own outcomes through the same `i32` an agent's
 /// exit code arrives on, so "exited with code 75" reads as something the
@@ -51,7 +62,30 @@ pub fn describe_exit(code: i32) -> String {
         EXIT_BUDGET_EXHAUSTED => {
             "the token/tool-call budget was spent and the run was stopped".to_string()
         }
+        EXIT_CAPACITY_EXHAUSTED => {
+            "the provider kept reporting capacity/overload errors and the restart budget ran out"
+                .to_string()
+        }
+        EXIT_ACCOUNT_EXHAUSTED => {
+            "the provider account is out of usable credits/quota; restarting cannot fix a \
+             billing problem"
+                .to_string()
+        }
         other => format!("exited with code {other}"),
+    }
+}
+
+/// Issue #227: backoff before retrying a headless worker that failed on a
+/// transient provider capacity error -- 15s/30s/60s, capped at 60s for a
+/// fourth or later attempt. `attempt` is 1-based: the restart about to be
+/// made (`restarts` after it is incremented). Pure, so the schedule is
+/// table-tested without a real clock.
+fn capacity_backoff_secs(attempt: u32) -> u64 {
+    match attempt {
+        0 => 0,
+        1 => 15,
+        2 => 30,
+        _ => 60,
     }
 }
 
@@ -1228,18 +1262,79 @@ fn run_with_clock_inner<W: Write>(
         // as non-blocking as every tick's own call and can still lose the
         // race it looks like it closes (root-caused via a deterministic
         // repro in `supervise.rs`'s own test module, not by inspection alone).
+        // Issue #227: a provider capacity/overload error and an account/
+        // billing exhaustion are both text-tail conditions, exactly like a
+        // vendor usage-limit message, so they are read off the same final
+        // drain rather than a second read of the tap (which would lose
+        // lines: `drain_to_eof` is destructive). Checked only when `limit_
+        // hit` is still false: a vendor-confirmed usage-limit message always
+        // wins the classification on the rare tail that somehow carries more
+        // than one of these phrasings. `account_pattern` wins over `capacity_
+        // pattern` for the same reason -- burning the restart budget on a
+        // capacity retry when the account itself is empty would just fail
+        // again immediately.
+        let mut capacity_pattern: Option<&'static str> = None;
+        let mut account_pattern: Option<&'static str> = None;
         if !limit_hit {
+            let final_lines = tap.drain_to_eof(supervise::FINAL_DRAIN_BUDGET);
             limit_hit = pace::scan_for_limit(
-                &tap.drain_to_eof(supervise::FINAL_DRAIN_BUDGET),
+                &final_lines,
                 &state,
                 session.as_str(),
                 "exec",
                 &mut std::io::stderr(),
             );
+            if !limit_hit {
+                account_pattern = pace::scan_for_account_exhausted(&final_lines);
+                if account_pattern.is_none() {
+                    capacity_pattern = pace::scan_for_capacity_error(&final_lines);
+                }
+            }
+        }
+
+        // Issue #227: an account/billing exhaustion is a hard, non-retryable
+        // condition -- unlike a usage window (which resets on its own) or a
+        // capacity error (which is worth retrying), restarting cannot fix an
+        // empty account, so this gives up immediately without spending any
+        // of the restart budget. Gated on a genuinely non-zero exit: a clean
+        // exit with incidental matching text (vanishingly unlikely given how
+        // specific these phrases are) must still read as success.
+        if let Some(label) = account_pattern
+            && matches!(outcome, Outcome::Exited(code) if code != 0)
+        {
+            let _ = log::append(
+                &state,
+                &log::Decision {
+                    ts: now_secs(),
+                    session: session.as_str(),
+                    verb: "exec",
+                    verdict: "account",
+                    score: 0,
+                    action: "account-exhausted",
+                    detail: label,
+                },
+            );
+            writeln!(
+                w,
+                "zirv ctx exec: {} account exhausted ({label}); this is not retryable -- \
+                 check billing before restarting (exit {EXIT_ACCOUNT_EXHAUSTED})",
+                adapter.name()
+            )?;
+            record_execution_segment(
+                report,
+                adapter.as_ref(),
+                &session,
+                &transcript,
+                &prior_usage,
+                execution_model.as_deref(),
+                execution_started,
+            );
+            session_guard.release();
+            return Ok(EXIT_ACCOUNT_EXHAUSTED);
         }
 
         match outcome {
-            Outcome::Exited(code) if !limit_hit => {
+            Outcome::Exited(code) if !(limit_hit || capacity_pattern.is_some() && code != 0) => {
                 // Issue #37: a clean session end -- no rot, no timeout, no
                 // restart -- previously never harvested at all. Gated on
                 // `cfg.memory.harvest` here too, before the transcript is
@@ -1835,8 +1930,24 @@ fn run_with_clock_inner<W: Write>(
             continue;
         }
 
-        let reason = if rotted { "rot" } else { "timeout" };
-        let exhausted_code = if rotted {
+        // Issue #227: only a genuinely non-zero `Outcome::Exited` counts --
+        // the match arm above already excludes a capacity-flagged clean exit
+        // from reaching here at all, and `TimedOut`/`StoppedByTick` are the
+        // supervisor's own kill, never the child's own capacity-triggered
+        // exit.
+        let capacity_exit =
+            capacity_pattern.is_some() && matches!(outcome, Outcome::Exited(code) if code != 0);
+
+        let reason = if capacity_exit {
+            "capacity"
+        } else if rotted {
+            "rot"
+        } else {
+            "timeout"
+        };
+        let exhausted_code = if capacity_exit {
+            EXIT_CAPACITY_EXHAUSTED
+        } else if rotted {
             EXIT_ROT_EXHAUSTED
         } else {
             EXIT_TIMEOUT
@@ -1898,10 +2009,21 @@ fn run_with_clock_inner<W: Write>(
                     detail: "restart budget exhausted",
                 },
             );
-            writeln!(
-                w,
-                "zirv ctx exec: {reason} after {restarts} restarts, giving up with exit {exhausted_code}"
-            )?;
+            if capacity_exit {
+                let label = capacity_pattern.unwrap_or("provider capacity error");
+                writeln!(
+                    w,
+                    "zirv ctx exec: {} finished: provider capacity limit ({label}) after \
+                     {restarts} restarts; workspace changes are uncommitted (exit \
+                     {exhausted_code})",
+                    adapter.name()
+                )?;
+            } else {
+                writeln!(
+                    w,
+                    "zirv ctx exec: {reason} after {restarts} restarts, giving up with exit {exhausted_code}"
+                )?;
+            }
             record_execution_segment(
                 report,
                 adapter.as_ref(),
@@ -1963,6 +2085,20 @@ fn run_with_clock_inner<W: Write>(
             w,
             "zirv ctx exec: {reason} detected, restarting ({restarts}/{max_restarts}) with a {source} handoff"
         )?;
+
+        // Issue #227: a short backoff before actually relaunching, only for
+        // a capacity retry -- a rot/timeout restart is unaffected (the
+        // session itself needed a fresh start, not a delay). Reuses the
+        // injected `sleep_fn` (the same seam `pace::wait_for_window` already
+        // relies on for tests), so no wall-clock time is spent under a fake
+        // clock.
+        if capacity_exit {
+            let backoff = capacity_backoff_secs(restarts);
+            if backoff > 0 {
+                writeln!(w, "zirv ctx exec: backing off {backoff}s before retrying")?;
+                sleep_fn(Duration::from_secs(backoff));
+            }
+        }
 
         // Harvest before superseding the transcript so both accounting and
         // any configured whole-run budget include this rot/timeout child.
@@ -4240,6 +4376,199 @@ mod tests {
         assert!(
             !log.contains("\"action\":\"limit-park\""),
             "and it must never park a healthy run: {log}"
+        );
+    }
+
+    // -- Issue #227: provider capacity errors -------------------------------
+
+    /// A worker that hits a transient provider capacity error (codex's
+    /// `Selected model is at capacity`) is restarted within the existing
+    /// restart budget, with a short backoff between attempts -- not parked
+    /// (there is no usage-window reset to wait for) and not silently
+    /// returned as a bare `exit 1`.
+    #[test]
+    fn a_capacity_error_restarts_within_budget_with_a_backoff() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let state = tmp.path().join("state");
+        let session = "11111111-c000-4333-8444-555555555555";
+        let env = base_env(&state);
+
+        // First child hits a capacity error, second runs clean.
+        let modes = tmp.path().join("modes.txt");
+        std::fs::write(&modes, "capacity\nhealthy\n").expect("write modes");
+
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        unsafe {
+            std::env::set_var("FAKE_AGENT_MODE_FILE", &modes);
+        }
+        let args = ExecArgs {
+            agent: Some("claude".to_string()),
+            session_id: Some(session.to_string()),
+            transcript: Some(transcript_for(&home, tmp.path(), session)),
+            prompt: Some("do the work".to_string()),
+            max_restarts: Some(1),
+            budget_tokens: None,
+            max_tool_calls: None,
+            timeout_secs: Some(60),
+            simple: false,
+            command: fake_agent_command(session),
+        };
+        let mut out = Vec::new();
+        let slept: std::cell::RefCell<Vec<u64>> = std::cell::RefCell::new(Vec::new());
+        let code = run_with_clock(
+            &args,
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            &crate::commands::ctx::state::now_secs,
+            &|d: Duration| slept.borrow_mut().push(d.as_secs()),
+        );
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE_FILE");
+        }
+
+        assert_eq!(
+            code.expect("runs"),
+            0,
+            "the restarted child finished cleanly, so exec exits with its code"
+        );
+        // T8's blind-mode pacing delay also calls `sleep_fn` (with `0`, since
+        // `base_env` zeros `ZIRV_CTX_PACE_BLIND_DELAY_SECS`) ahead of every
+        // launch, so the capacity backoff is not necessarily the only entry
+        // -- just the one call for its own real, nonzero duration.
+        assert_eq!(
+            slept.borrow().iter().filter(|&&secs| secs == 15).count(),
+            1,
+            "the first capacity retry backs off 15s exactly once via the injected sleep_fn, got {:?}",
+            slept.borrow()
+        );
+
+        let log = std::fs::read_to_string(state.join("logs/decisions.jsonl")).expect("log");
+        assert!(
+            log.contains("\"verdict\":\"capacity\"") && log.contains("\"action\":\"restart\""),
+            "a capacity retry is a restart, not a park or a bare failure: {log}"
+        );
+        assert!(
+            !log.contains("\"action\":\"limit-park\""),
+            "a capacity error has no usage window to park against: {log}"
+        );
+        assert_eq!(
+            transcripts_in(&home).len(),
+            2,
+            "the retry is a new session with its own transcript"
+        );
+    }
+
+    /// Once the restart budget is spent, a capacity error gives up with a
+    /// dedicated exit code and a stderr line naming the pattern and attempt
+    /// count -- never a bare `exit 1`.
+    #[test]
+    fn a_capacity_error_exhausts_the_restart_budget_with_a_structured_reason() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let state = tmp.path().join("state");
+        let session = "22222222-c000-4333-8444-555555555555";
+        let env = base_env(&state);
+
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        unsafe {
+            std::env::set_var("FAKE_AGENT_MODE", "capacity");
+        }
+        let args = ExecArgs {
+            agent: Some("claude".to_string()),
+            session_id: Some(session.to_string()),
+            transcript: Some(transcript_for(&home, tmp.path(), session)),
+            prompt: Some("do the work".to_string()),
+            max_restarts: Some(0),
+            budget_tokens: None,
+            max_tool_calls: None,
+            timeout_secs: Some(60),
+            simple: false,
+            command: fake_agent_command(session),
+        };
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE");
+        }
+
+        assert_eq!(code.expect("runs"), EXIT_CAPACITY_EXHAUSTED);
+        let printed = String::from_utf8(out).expect("utf8");
+        assert!(
+            printed.contains("Selected model is at capacity"),
+            "names the matched pattern: {printed}"
+        );
+        assert!(
+            printed.contains("0 restarts"),
+            "names the attempt count: {printed}"
+        );
+        assert!(
+            printed.contains("uncommitted"),
+            "warns that workspace changes are uncommitted: {printed}"
+        );
+        let log = std::fs::read_to_string(state.join("logs/decisions.jsonl")).expect("log");
+        assert!(
+            log.contains("\"verdict\":\"capacity\"") && log.contains("\"action\":\"give-up\""),
+            "got {log}"
+        );
+    }
+
+    // -- Issue #227 (operator follow-up): account/billing exhaustion --------
+
+    /// An account/billing exhaustion (e.g. `insufficient_quota`) is a hard,
+    /// non-retryable condition: the worker gives up immediately, spending
+    /// none of the restart budget, even though it is configured.
+    #[test]
+    fn an_account_exhaustion_gives_up_immediately_without_spending_the_restart_budget() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let state = tmp.path().join("state");
+        let session = "33333333-c000-4333-8444-555555555555";
+        let env = base_env(&state);
+
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        unsafe {
+            std::env::set_var("FAKE_AGENT_MODE", "account");
+        }
+        let args = ExecArgs {
+            agent: Some("claude".to_string()),
+            session_id: Some(session.to_string()),
+            transcript: Some(transcript_for(&home, tmp.path(), session)),
+            prompt: Some("do the work".to_string()),
+            // A generous budget: an account exhaustion must never touch it.
+            max_restarts: Some(5),
+            budget_tokens: None,
+            max_tool_calls: None,
+            timeout_secs: Some(60),
+            simple: false,
+            command: fake_agent_command(session),
+        };
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE");
+        }
+
+        assert_eq!(code.expect("runs"), EXIT_ACCOUNT_EXHAUSTED);
+        let printed = String::from_utf8(out).expect("utf8");
+        assert!(
+            printed.contains("not retryable"),
+            "must say this cannot be fixed by restarting: {printed}"
+        );
+        let log = std::fs::read_to_string(state.join("logs/decisions.jsonl")).expect("log");
+        assert!(
+            log.contains("\"action\":\"account-exhausted\""),
+            "got {log}"
+        );
+        assert!(
+            !log.contains("\"action\":\"restart\""),
+            "must never restart on an account exhaustion: {log}"
+        );
+        assert_eq!(
+            transcripts_in(&home).len(),
+            1,
+            "no retry was attempted -- exactly the one child that failed"
         );
     }
 

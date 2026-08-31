@@ -589,6 +589,18 @@ pub struct WorkflowConfig {
     pub telemetry_enabled: bool,
     pub telemetry_max_events: usize,
     pub telemetry_retention_days: u64,
+    /// Extra environment variable names, read from zirv's own process
+    /// environment at check-run time and set on a verification check child
+    /// (`workflow::verification::run_check`) -- ADDED to that function's own
+    /// built-in `DEFAULT_CHECK_ENV_PASSTHROUGH` (the SSH-agent family plus
+    /// GPG's terminal/homedir pointers), never a replacement for it. Issue
+    /// #233: an operator whose check toolchain needs a variable outside that
+    /// default set (a corporate proxy token, say) names it here instead of
+    /// prefixing every `verify.toml` command with a shell workaround.
+    /// Empty by default. `REPO_FORBIDDEN`: the untrusted repo checkout that
+    /// owns `verify.toml` must never be able to widen what its own checks
+    /// can read from the operator's environment.
+    pub check_env_passthrough: Vec<String>,
 }
 
 impl Default for WorkflowConfig {
@@ -602,6 +614,7 @@ impl Default for WorkflowConfig {
             telemetry_enabled: true,
             telemetry_max_events: 1000,
             telemetry_retention_days: 30,
+            check_env_passthrough: Vec::new(),
         }
     }
 }
@@ -800,6 +813,33 @@ pub struct DashConfig {
     /// raise for itself (`dash.max_panes`), and not a switch over the
     /// operator's own terminal/machine (`dash.mouse`/`dash.sidebar_cols`).
     pub idle_quiet_ms: u64,
+    /// Security review (2026-08-31, issue #228 follow-up): the roots a pane
+    /// `--workdir` request (`spawnreq::SpawnRequest::workdir`) must
+    /// canonicalise inside before `dash::mod::fulfill_spawn_request` will
+    /// honour it. Without a confinement rule, `agent::validate_workdir`'s own
+    /// check ("exists, is a directory, sits inside SOME git repository") lets
+    /// a same-uid pane's forged request (issue #179's accepted threat model)
+    /// obtain write authority over any repo checkout on the machine, not only
+    /// ones the operator opened.
+    ///
+    /// The dashboard's own repo root and that root's parent directory are
+    /// always roots, unconditionally -- a sibling checkout (`git worktree add
+    /// ../other`, or a plain sibling clone) works with zero configuration,
+    /// which is the feature's own use case (issue #228). This list is
+    /// ADDITIONAL roots an operator opts into beyond those two, each an
+    /// absolute path; a relative or nonexistent entry is kept literally
+    /// (canonicalised best-effort, the same lenient fallback `same_directory`
+    /// uses) rather than rejected outright, so a typo narrows rather than
+    /// crashing the load.
+    ///
+    /// `REPO_FORBIDDEN`: a repo checkout must not be able to widen which
+    /// directories a pane spawned from it may write into -- the exact
+    /// privilege-widening asymmetry `sandbox.extra_allow` already holds for
+    /// claude's own permission rules. `ZIRV_CTX_DASH_WORKDIR_ROOTS`
+    /// (comma-separated, the same shape as `ZIRV_CTX_SANDBOX_EXTRA_ALLOW`)
+    /// replaces the merged file value outright, the operator's own final
+    /// word.
+    pub workdir_roots: Vec<String>,
 }
 
 impl Default for DashConfig {
@@ -811,6 +851,7 @@ impl Default for DashConfig {
             max_panes: 9,
             mouse: true,
             idle_quiet_ms: 10_000,
+            workdir_roots: Vec::new(),
         }
     }
 }
@@ -1917,6 +1958,15 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
         &["workflow", "telemetry_retention_days"],
         "ZIRV_CTX_WORKFLOW_TELEMETRY_RETENTION_DAYS",
     ),
+    // Issue #233: the SSH-agent-family passthrough allowlist a verification
+    // check child receives is operator-owned, the same widening-only
+    // asymmetry as `sandbox.extra_allow` above -- a repo checkout must not be
+    // able to name additional environment variables its own `verify.toml`
+    // checks can read from the operator's process environment.
+    (
+        &["workflow", "check_env_passthrough"],
+        "ZIRV_CTX_WORKFLOW_CHECK_ENV_PASSTHROUGH",
+    ),
     // A repo checkout must not be able to switch either memory scope's own
     // gate on or off for itself, grow its cap, or turn on automatic
     // harvesting -- this is about the CONFIGURATION, not the shared scope's
@@ -2008,6 +2058,11 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     // way that trade goes is the operator's call about their own terminal,
     // not a checked-out repo's.
     (&["dash", "mouse"], "ZIRV_CTX_DASH_MOUSE"),
+    // Security review (2026-08-31): a repo checkout must not be able to
+    // widen which directories a pane spawned from it may run in and write
+    // to -- the same privilege-widening asymmetry `sandbox.extra_allow`
+    // already holds. See `DashConfig::workdir_roots`'s own doc comment.
+    (&["dash", "workdir_roots"], "ZIRV_CTX_DASH_WORKDIR_ROOTS"),
     // A repo checkout must not be able to flip a spend decision (skipping
     // throttle/pause gating on the operator's own vendor plan), re-enable
     // the active API-poll fallback an operator turned off, or change its
@@ -2662,6 +2717,26 @@ impl CtxConfig {
         };
         if let Some(raw) = env("ZIRV_CTX_SANDBOX_EXTRA_ALLOW") {
             cfg.sandbox.extra_allow = split_csv_list(&raw);
+        }
+
+        // Same operator-only override shape as `extra_allow` right above:
+        // `dash.workdir_roots` is `REPO_FORBIDDEN` outright (see its own doc
+        // comment), so there is no repo contribution to union in -- only the
+        // operator's own home layer, or `ZIRV_CTX_DASH_WORKDIR_ROOTS`
+        // replacing it outright when set.
+        if let Some(raw) = env("ZIRV_CTX_DASH_WORKDIR_ROOTS") {
+            cfg.dash.workdir_roots = split_csv_list(&raw);
+        }
+
+        // Same operator-only override shape as `extra_allow` right above:
+        // when set, `ZIRV_CTX_WORKFLOW_CHECK_ENV_PASSTHROUGH` replaces
+        // whatever `workflow.check_env_passthrough` the merged TOML layers
+        // produced (`REPO_FORBIDDEN` already means that can only be the
+        // operator's own `~/.zirv/ctx.toml`). This list is itself only ever
+        // ADDED to `verification::DEFAULT_CHECK_ENV_PASSTHROUGH` at the
+        // point of use, never a replacement for those built-in defaults.
+        if let Some(raw) = env("ZIRV_CTX_WORKFLOW_CHECK_ENV_PASSTHROUGH") {
+            cfg.workflow.check_env_passthrough = split_csv_list(&raw);
         }
 
         // Same union as `extra_deny` above, for `heavy_command_patterns`: the
@@ -4875,6 +4950,100 @@ mod tests {
         );
     }
 
+    /// Security review (2026-08-31): `dash.workdir_roots` is operator-only,
+    /// the same widening-only asymmetry `repo_layer_cannot_add_sandbox_
+    /// extra_allow_entries` above pins for `sandbox.extra_allow` -- a repo
+    /// checkout naming a root here would let its own compromised pane obtain
+    /// write authority over any directory under it, defeating the whole
+    /// point of confining pane `--workdir` in the first place.
+    #[test]
+    fn repo_layer_cannot_set_dash_workdir_roots() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[dash]\nworkdir_roots = [\"/\"]\n",
+        )
+        .expect("write");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let empty = env_map(&[]);
+        let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+            .expect_err("a repo may not widen its own pane's workdir roots")
+            .to_string();
+        assert!(err.contains("dash.workdir_roots"), "got {err}");
+        assert!(
+            err.contains("ZIRV_CTX_DASH_WORKDIR_ROOTS"),
+            "names the operator escape hatch: {err}"
+        );
+    }
+
+    /// Issue #233: `workflow.check_env_passthrough` is operator-only, the
+    /// identical widening-only asymmetry `repo_layer_cannot_add_sandbox_
+    /// extra_allow_entries` above pins for `sandbox.extra_allow` -- a repo
+    /// checkout naming a variable here would let its own `verify.toml`
+    /// checks read it out of the operator's process environment.
+    #[test]
+    fn repo_layer_cannot_set_workflow_check_env_passthrough() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[workflow]\ncheck_env_passthrough = [\"AWS_SECRET_ACCESS_KEY\"]\n",
+        )
+        .expect("write");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let empty = env_map(&[]);
+        let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+            .expect_err("a repo may not widen the check-env passthrough allowlist")
+            .to_string();
+        assert!(err.contains("workflow.check_env_passthrough"), "got {err}");
+        assert!(
+            err.contains("ZIRV_CTX_WORKFLOW_CHECK_ENV_PASSTHROUGH"),
+            "names the operator escape hatch: {err}"
+        );
+    }
+
+    /// The operator's own `~/.zirv/ctx.toml` may set
+    /// `workflow.check_env_passthrough` (only `REPO_FORBIDDEN` blocks the
+    /// repo layer, never the home layer), and
+    /// `ZIRV_CTX_WORKFLOW_CHECK_ENV_PASSTHROUGH` overrides it from the
+    /// environment -- the same operator-in-both-directions shape
+    /// `the_operator_may_set_sandbox_extra_allow_and_deny_from_the_
+    /// environment` pins for `sandbox.extra_allow`.
+    #[test]
+    fn the_operator_may_set_workflow_check_env_passthrough_from_home_config_and_env() {
+        let home = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".zirv/ctx.toml"),
+            "[workflow]\ncheck_env_passthrough = [\"CORP_PROXY_TOKEN\"]\n",
+        )
+        .expect("write");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tempfile::tempdir().expect("tempdir");
+
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert_eq!(
+            cfg.workflow.check_env_passthrough,
+            vec!["CORP_PROXY_TOKEN".to_string()],
+            "the operator's own home-layer entry must survive"
+        );
+
+        let env = env_map(&[(
+            "ZIRV_CTX_WORKFLOW_CHECK_ENV_PASSTHROUGH",
+            "MY_VAR_A, MY_VAR_B",
+        )]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert_eq!(
+            cfg.workflow.check_env_passthrough,
+            vec!["MY_VAR_A".to_string(), "MY_VAR_B".to_string()],
+            "the env value replaces the file-layer value outright"
+        );
+    }
+
     /// Issue #147: `safety.escape_allow` is operator-only, the identical
     /// asymmetry `repo_layer_cannot_add_sandbox_extra_allow_entries` above
     /// pins for `sandbox.extra_allow` -- a repo checkout adding to it would
@@ -4975,6 +5144,34 @@ mod tests {
             cfg.sandbox.extra_deny,
             vec!["Bash(terraform apply *)".to_string()],
             "the env value replaces the file-layer union outright"
+        );
+    }
+
+    /// Same operator-final-word shape as `sandbox.extra_allow`'s own env
+    /// override, pinned separately for `dash.workdir_roots` since it has no
+    /// union counterpart to fold with (the key is `REPO_FORBIDDEN` outright,
+    /// so only the operator's own home layer or this env var ever populate
+    /// it -- there is nothing for a repo layer to contribute).
+    #[test]
+    fn the_operator_may_widen_dash_workdir_roots_from_the_environment() {
+        let home = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".zirv/ctx.toml"),
+            "[dash]\nworkdir_roots = [\"/from/home/layer\"]\n",
+        )
+        .expect("write");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tempfile::tempdir().expect("tempdir");
+        let env = env_map(&[(
+            "ZIRV_CTX_DASH_WORKDIR_ROOTS",
+            "/from/env/one, /from/env/two",
+        )]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert_eq!(
+            cfg.dash.workdir_roots,
+            vec!["/from/env/one".to_string(), "/from/env/two".to_string()],
+            "the env value replaces the home-layer value outright"
         );
     }
 
@@ -5467,6 +5664,7 @@ mod tests {
         ("dash", "max_panes"),
         ("dash", "mouse"),
         ("dash", "idle_quiet_ms"),
+        ("dash", "workdir_roots"),
         ("workflow", "repo_checks_enabled"),
         ("workflow", "repo_skills_enabled"),
         ("workflow", "repo_agents_enabled"),
@@ -5477,6 +5675,7 @@ mod tests {
         ("workflow", "telemetry_enabled"),
         ("workflow", "telemetry_max_events"),
         ("workflow", "telemetry_retention_days"),
+        ("workflow", "check_env_passthrough"),
         ("policy", "repo_fs_write"),
         ("policy", "outside_repo_fs_write"),
         ("policy", "shell_exec"),

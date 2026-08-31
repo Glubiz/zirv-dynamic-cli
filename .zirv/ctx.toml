@@ -167,6 +167,7 @@ model = "fable"
 # roster_max_age_secs = 604_800      # REPO-FORBIDDEN (ZIRV_CTX_DASH_ROSTER_MAX_AGE_SECS): how long a quit-time roster stays offered for restore. Default: 604800 (7 days).
 # max_panes = 9                      # REPO-FORBIDDEN (ZIRV_CTX_DASH_MAX_PANES): most panes one dashboard may hold at once, counting the orchestrator. Default: 9.
 # mouse = true                       # REPO-FORBIDDEN (ZIRV_CTX_DASH_MOUSE): whether the dashboard captures the mouse for wheel-scroll. Default: true.
+# workdir_roots = []                 # REPO-FORBIDDEN (ZIRV_CTX_DASH_WORKDIR_ROOTS): additional roots a pane `--workdir` request may canonicalise inside, beyond the dashboard's own repo root and that root's parent (always allowed). Default: [] (empty).
 # idle_quiet_ms = 10000              # not REPO-FORBIDDEN (a tuning knob, like pace.soft_percent): how long a signal-less pane's pty output must be quiet before it counts as Idle. Default: 10000 (10s).
 
 # [workflow]                         # operator-controlled except workflow.deploy.minimum_tier, the one repo narrowing-only carve-out.
@@ -176,6 +177,7 @@ model = "fable"
 # telemetry_enabled = true           # REPO-FORBIDDEN (ZIRV_CTX_WORKFLOW_TELEMETRY): local workflow telemetry (`zirv workflow stats`). Default: true.
 # telemetry_max_events = 1000        # REPO-FORBIDDEN (ZIRV_CTX_WORKFLOW_TELEMETRY_MAX_EVENTS): how many events one repository keeps before the oldest are pruned. Default: 1000.
 # telemetry_retention_days = 30      # REPO-FORBIDDEN (ZIRV_CTX_WORKFLOW_TELEMETRY_RETENTION_DAYS): how long an event is kept. Default: 30.
+# check_env_passthrough = []         # REPO-FORBIDDEN (ZIRV_CTX_WORKFLOW_CHECK_ENV_PASSTHROUGH): extra environment variable names ADDED to the built-in verification-check allowlist (SSH_AUTH_SOCK, SSH_AGENT_PID, SSH_ASKPASS, GPG_TTY, GNUPGHOME), read from zirv's own environment and set on each check child. Default: [].
 
 # [workflow.deploy]
 # tier = "development"               # REPO-FORBIDDEN (ZIRV_CTX_WORKFLOW_DEPLOY_TIER): development < staging < production. Operator env overrides all layers. Default: "development".

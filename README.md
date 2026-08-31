@@ -1239,6 +1239,7 @@ checkout:
 | `dash.roster_max_age_secs` | `ZIRV_CTX_DASH_ROSTER_MAX_AGE_SECS` |
 | `dash.max_panes` | `ZIRV_CTX_DASH_MAX_PANES` |
 | `dash.mouse` | `ZIRV_CTX_DASH_MOUSE` |
+| `dash.workdir_roots` | `ZIRV_CTX_DASH_WORKDIR_ROOTS` |
 | `supervise.max_heavy_workers` | `ZIRV_CTX_SUPERVISE_MAX_HEAVY_WORKERS` (deprecated alias for `max_heavy_operations`) |
 | `supervise.max_heavy_operations` | `ZIRV_CTX_SUPERVISE_MAX_HEAVY_OPERATIONS` |
 | `pace.use_credits` | `ZIRV_CTX_PACE_USE_CREDITS_CLAUDE` (the table-node match also blocks `pace.use_credits.codex` alone) |
@@ -1269,6 +1270,7 @@ checkout:
 | `workflow.telemetry_enabled` | `ZIRV_CTX_WORKFLOW_TELEMETRY` |
 | `workflow.telemetry_max_events` | `ZIRV_CTX_WORKFLOW_TELEMETRY_MAX_EVENTS` |
 | `workflow.telemetry_retention_days` | `ZIRV_CTX_WORKFLOW_TELEMETRY_RETENTION_DAYS` |
+| `workflow.check_env_passthrough` | `ZIRV_CTX_WORKFLOW_CHECK_ENV_PASSTHROUGH` |
 
 The `mail.*`/`chrome.events` entries close the same hole `prompt.max_repo_bytes`
 does: mail is folded into a launched worker's prompt as its own layer, so a

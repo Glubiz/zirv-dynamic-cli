@@ -114,6 +114,18 @@ pub struct SpawnRequest {
     /// fail-closed default `interactive` above already establishes.
     #[serde(default)]
     pub force: bool,
+    /// Issue #228: a harness-agnostic `--workdir`, independent of `cwd`
+    /// above. `cwd` stays what it always was -- the requesting session's
+    /// own repo, checked by `dash::accepted_spawn_cwd` to decide whether
+    /// THIS dashboard may host the pane at all -- while `workdir`, once
+    /// re-validated at the fulfilment side (`agent::validate_workdir`; a
+    /// request is untrusted data, never authority, the same premise every
+    /// other field on this struct is built on), is where the pane actually
+    /// runs and where its filesystem policy is widened to. `None` -- also
+    /// what a request written by an older build deserialises to -- means
+    /// unchanged pre-#228 behaviour: the pane runs at the accepted `cwd`.
+    #[serde(default)]
+    pub workdir: Option<PathBuf>,
 }
 
 /// The role a request actually gets. Unstated or unrecognised is
@@ -437,6 +449,7 @@ mod tests {
             parent_session: None,
             work_group_id: None,
             force: false,
+            workdir: None,
         }
     }
 
@@ -451,6 +464,10 @@ mod tests {
         assert_eq!(req.role, None);
         assert_eq!(req.parent_session, None);
         assert_eq!(req.work_group_id, None);
+        assert_eq!(
+            req.workdir, None,
+            "an unstated workdir must fall back to the accepted `cwd` (pre-#228 behaviour)"
+        );
         assert!(
             !req.force,
             "an unstated force must never override a quota refusal"
@@ -471,6 +488,23 @@ mod tests {
         assert_eq!(role_of(&req), PromptRole::Worker);
         req.role = Some("sub-orchestrator".to_string());
         assert_eq!(role_of(&req), PromptRole::SubOrchestrator);
+    }
+
+    /// Issue #228: `workdir` is independent of `cwd` -- both survive the
+    /// same round trip a request actually takes through this channel
+    /// (`write_request`/`take_requests`, exercised elsewhere in this file),
+    /// but this pins the plain serde shape directly.
+    #[test]
+    fn a_request_carrying_an_explicit_workdir_round_trips_independently_of_cwd() {
+        let mut req = sample_request();
+        req.workdir = Some(PathBuf::from("/some/other/repo"));
+        let json = serde_json::to_string(&req).expect("serialize");
+        let back: SpawnRequest = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.workdir, Some(PathBuf::from("/some/other/repo")));
+        assert_eq!(
+            back.cwd, req.cwd,
+            "workdir must never be conflated with the requester's own cwd"
+        );
     }
 
     #[test]
