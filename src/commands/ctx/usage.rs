@@ -268,6 +268,37 @@ pub fn report<W: Write>(
     Ok(())
 }
 
+/// Issue #225: the default view's own cache-hit line -- unlike `render_
+/// sessions`' per-session ratio (which manufactures 0.0% for a session with
+/// no raw token data at all), this aggregate is `n/a` whenever the trailing
+/// window carries nothing, never a manufactured 0%. Same denominator
+/// `render_sessions` uses (RAW input + cache_creation + cache_read, never the
+/// legacy combined `input_tokens` meaning), summed across every session in
+/// `spend` rather than reported per session.
+fn cache_hit_line(spend: &[window::SessionSpend]) -> String {
+    let (input, cache_creation, cache_read) = spend.iter().fold(
+        (0u64, 0u64, 0u64),
+        |(input, cache_creation, cache_read), s| {
+            (
+                input.saturating_add(s.input_tokens),
+                cache_creation.saturating_add(s.cache_creation_input_tokens),
+                cache_read.saturating_add(s.cache_read_input_tokens),
+            )
+        },
+    );
+    let denom = input
+        .saturating_add(cache_creation)
+        .saturating_add(cache_read);
+    if denom == 0 {
+        "cache hit (this window): n/a".to_string()
+    } else {
+        format!(
+            "cache hit (this window): {:.1}% (cache_read / (input + cache_creation + cache_read))",
+            (cache_read as f64 / denom as f64) * 100.0
+        )
+    }
+}
+
 /// Prints a per-session breakdown of the four raw token classes over the
 /// trailing window `spend` was computed for: one line per session with its
 /// raw counts, the cache-hit ratio to one decimal, and the event count. The
@@ -416,13 +447,19 @@ pub fn run_with<W: Write>(
             let (collector, estimator) = pace::current_windows(&state, &cfg.pace, now, provider);
             report(w, &collector, estimator.as_ref(), now, &cfg.pace)?;
 
+            // Issue #225: the default view's own cache-hit line, computed
+            // from the same `SessionSpend` totals `render_sessions`'
+            // `--sessions` breakdown already reads -- fetched once here and
+            // reused below rather than resolving the projects root twice.
+            // Best-effort like `render_sessions`' own read: a failure to
+            // resolve the projects root degrades to an empty window (`n/a`)
+            // rather than turning a working `zirv ctx usage` into an error.
+            let mut spend = window::projects_root()
+                .map(|root| window::session_spend(&root, now, 86_400))
+                .unwrap_or_default();
+            writeln!(w, "{}", cache_hit_line(&spend))?;
+
             if args.sessions {
-                // Best-effort: a failure to resolve the projects root
-                // degrades to the "no session activity" line rather than
-                // turning a working `zirv ctx usage` into an error.
-                let mut spend = window::projects_root()
-                    .map(|root| window::session_spend(&root, now, 86_400))
-                    .unwrap_or_default();
                 spend.sort_by(|a, b| {
                     let total = |s: &window::SessionSpend| {
                         s.input_tokens
@@ -1200,5 +1237,64 @@ mod tests {
         render_sessions(&mut out, &[]).expect("render");
         let text = String::from_utf8(out).expect("utf8");
         assert!(text.contains("no session activity"), "got {text}");
+    }
+
+    /// Issue #225: the default view's aggregate cache-hit line sums across
+    /// every session in the window rather than reporting one session's own
+    /// ratio -- two sessions with different individual ratios (90% and 10%)
+    /// must land on the SUM-based combined ratio, same "sum first" contract
+    /// `workflow::telemetry`'s cache-hit fields use.
+    #[test]
+    fn the_cache_hit_line_sums_across_every_session_in_the_window() {
+        let spend = vec![
+            window::SessionSpend {
+                session: "sess-a".to_string(),
+                input_tokens: 10_000,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 90_000,
+                output_tokens: 500,
+                events: 5,
+                newest_at: 1_700_000_000,
+            },
+            window::SessionSpend {
+                session: "sess-b".to_string(),
+                input_tokens: 90_000,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 10_000,
+                output_tokens: 500,
+                events: 5,
+                newest_at: 1_700_000_000,
+            },
+        ];
+        // Combined: (90_000 + 10_000) / (10_000 + 90_000 + 90_000 + 10_000)
+        // = 100_000 / 200_000 = 50.0%, not the average of 90% and 10%.
+        let text = cache_hit_line(&spend);
+        assert_eq!(
+            text,
+            "cache hit (this window): 50.0% (cache_read / (input + cache_creation + cache_read))"
+        );
+    }
+
+    /// Never a manufactured 0%: an empty window (nothing recorded, or the
+    /// projects root could not be resolved) must report `n/a`.
+    #[test]
+    fn the_cache_hit_line_is_n_a_when_the_window_is_empty() {
+        assert_eq!(cache_hit_line(&[]), "cache hit (this window): n/a");
+    }
+
+    /// A session with tokens but all zero (a session that ran with no cache
+    /// activity recorded at all) also stays `n/a`, not a manufactured 0%.
+    #[test]
+    fn the_cache_hit_line_is_n_a_when_every_session_has_zero_tokens() {
+        let spend = vec![window::SessionSpend {
+            session: "sess-a".to_string(),
+            input_tokens: 0,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            output_tokens: 0,
+            events: 0,
+            newest_at: 1_700_000_000,
+        }];
+        assert_eq!(cache_hit_line(&spend), "cache hit (this window): n/a");
     }
 }

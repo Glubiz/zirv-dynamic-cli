@@ -336,6 +336,14 @@ impl StateDir {
         self.0.join("workflow-telemetry")
     }
 
+    /// Issue #223: per-session workflow-adoption bookkeeping, one file per
+    /// session id (`<state>/adoption/<session-id>.json`). Session ids are
+    /// unique per harness process, so unlike `workflow_telemetry` above this
+    /// is not further sliced by repository.
+    pub fn adoption(&self) -> PathBuf {
+        self.0.join("adoption")
+    }
+
     /// Autonomous frontend profiles and visual evidence. Profiles are local
     /// derived state: repository files remain the source of truth and are
     /// never modified while Zirv infers a design direction.

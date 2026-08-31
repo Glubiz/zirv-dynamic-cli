@@ -160,8 +160,18 @@ ideas instead of building them.";
 /// what the workflow demands, and to consult `zirv workflow status` after
 /// starting one mid-session because the injected prompt itself does not
 /// refresh until relaunch.
+///
+/// v12 (issue #225, steady-state token reduction): the checkpoint bullet now
+/// points at `zirv ctx status --brief`, not the unbounded default `zirv ctx
+/// status`, because a session that checks status at every natural checkpoint
+/// -- exactly what this bullet tells it to do -- was paying for a
+/// one-line-per-delegation work-group tree and a one-line-per-session list on
+/// every such check. `--brief` (`StatusArgs`) collapses those sections to
+/// their totals while keeping every section present, so the same checkpoint
+/// habit costs far fewer tokens with no loss of the signal this bullet asks
+/// for.
 pub const HARNESS_PROMPT: &str = "\
-zirv meta-harness (v11)
+zirv meta-harness (v12)
 
 - zirv is the harness managing context, usage, and cross-harness communication for this session. \
 It is not one of the agents; it is what launched and supervises the agent in this seat.
@@ -178,8 +188,8 @@ not a fallback or a lesser option: treat it exactly like dispatching a native su
 for when to delegate, same confidence in the result, no extra hesitation because the work lands on \
 a different vendor's model.
 - Use zirv on your own initiative, without waiting to be asked: delegate substantial independent \
-work to another harness with `zirv agent`; check `zirv ctx status` and `zirv ctx inbox` at natural \
-checkpoints (task start, after long steps, before reporting done). A `[zirv \u{25b8} mail]` line \
+work to another harness with `zirv agent`; check `zirv ctx status --brief` and `zirv ctx inbox` at \
+natural checkpoints (task start, after long steps, before reporting done). A `[zirv \u{25b8} mail]` line \
 typed into this session is not one of those checkpoints -- it means mail has already arrived, so \
 run `zirv ctx inbox` (never `--peek`, which leaves it unread for next time) right away instead of \
 waiting for the next checkpoint. Steer a live worker with `zirv ctx send` and `zirv ctx nudge`; \
@@ -3852,7 +3862,7 @@ mod tests {
     #[test]
     fn the_harness_layer_only_promises_the_mail_a_worker_is_actually_told_to_send() {
         assert!(
-            HARNESS_PROMPT.starts_with("zirv meta-harness (v11)"),
+            HARNESS_PROMPT.starts_with("zirv meta-harness (v12)"),
             "a reworded layer carries its own version: {}",
             HARNESS_PROMPT.lines().next().unwrap_or_default()
         );
@@ -3922,7 +3932,7 @@ mod tests {
     #[test]
     fn the_harness_layer_teaches_the_fan_out_send_mode_too() {
         assert!(
-            HARNESS_PROMPT.starts_with("zirv meta-harness (v11)"),
+            HARNESS_PROMPT.starts_with("zirv meta-harness (v12)"),
             "a reworded layer carries its own version: {}",
             HARNESS_PROMPT.lines().next().unwrap_or_default()
         );
@@ -4000,7 +4010,7 @@ mod tests {
             "must say which one wins"
         );
         assert!(
-            HARNESS_PROMPT.contains("(v11)"),
+            HARNESS_PROMPT.contains("(v12)"),
             "a changed instruction layer must bump its own version token"
         );
     }

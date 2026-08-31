@@ -33,6 +33,7 @@
   - [The full verb set](#the-full-verb-set)
   - [Lifecycle and artifacts](#lifecycle-and-artifacts)
   - [Deploy tiers](#deploy-tiers)
+  - [Workflow adoption](#workflow-adoption)
   - [Agent registry](#agent-registry)
   - [Maintain loop](#maintain-loop)
   - [Frontend quality](#frontend-quality)
@@ -951,6 +952,21 @@ running workflow's resolved tier only ever ratchets upward:
 | `staging` | Requires an explicit `zirv workflow approve` on the deploy step |
 | `production` | Requires approval, plus at least one fresh independent `reviewer`-seat run and fresh final `zirv verify` evidence; an open finding or stale evidence blocks it outright |
 
+### Workflow adoption
+
+`[workflow] adoption = "off" | "advise" | "nudge" | "enforce"` in
+`~/.zirv/ctx.toml` (`ZIRV_CTX_WORKFLOW_ADOPTION` for the final override) is
+operator-only and detects a session that has done "substantial" edit work --
+at least 5 edit-like tool calls, or at least 1 edit-like call over 12 turns --
+with no active `zirv workflow`:
+
+| Level | Behavior |
+|---|---|
+| `off` | No detection, no nudge, no gate. |
+| `advise` | A one-time nudge rides the Stop hook's `systemMessage` once substantial work is detected. |
+| `nudge` (default) | The same nudge, repeated every 5 turns while the session stays substantial with no active workflow, and also surfaced on the next prompt (`UserPromptSubmit`) if a workflow still has not started. |
+| `enforce` | The `nudge` behavior, plus `zirv agent` (`ctx::agent::run_with`) refuses to dispatch for a session recorded as substantial with no active workflow, until one is started. |
+
 ### Agent registry
 
 Workflow seats are provider-neutral data, not harness-specific plugins: a
@@ -1265,6 +1281,7 @@ checkout:
 | `workflow.repo_skills_enabled` | `ZIRV_CTX_WORKFLOW_REPO_SKILLS` |
 | `workflow.repo_agents_enabled` | `ZIRV_CTX_WORKFLOW_REPO_AGENTS` |
 | `workflow.deploy.tier` | `ZIRV_CTX_WORKFLOW_DEPLOY_TIER` |
+| `workflow.adoption` | `ZIRV_CTX_WORKFLOW_ADOPTION` |
 | `workflow.maintain` | `~/.zirv/ctx.toml only` |
 | `report.repository` | `ZIRV_CTX_REPORT_REPOSITORY` |
 | `workflow.telemetry_enabled` | `ZIRV_CTX_WORKFLOW_TELEMETRY` |
@@ -1306,6 +1323,10 @@ reaches `resolve_default`'s *configured* arm, which never consults the
 repo-narrowing guard the no-`agent`-configured fallback loop has (see
 [.settings.toml](#settingstoml) below) -- without this, a repo checkout could
 pick which vendor account gets spent with that guard never in the way.
+`workflow.adoption` closes the same hole once more for the workflow-adoption
+nudge/enforce gate (issue #223): a repo checkout must not be able to turn its
+own adoption pressure down to `off`, or up to `enforce` to hold an operator's
+own agent dispatches hostage.
 Everything else, including `chrome.banner`/`chrome.bar`,
 `supervise.max_nudges`, and every threshold, is still repo-configurable.
 

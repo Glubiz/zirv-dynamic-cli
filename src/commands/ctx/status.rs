@@ -430,6 +430,139 @@ pub fn group_tree_lines(
     lines
 }
 
+/// One raw `[input, cache_creation, cache_read, output]` total across
+/// `children`, shared by [`group_tree_lines_brief`]'s per-group line and its
+/// own grand total.
+fn group_totals(children: &[&log::DelegationRow]) -> [u64; 4] {
+    let mut totals = [0u64; 4];
+    for row in children {
+        totals[0] = totals[0].saturating_add(row.input_tokens);
+        totals[1] = totals[1].saturating_add(row.cache_creation_input_tokens);
+        totals[2] = totals[2].saturating_add(row.cache_read_input_tokens);
+        totals[3] = totals[3].saturating_add(row.output_tokens);
+    }
+    totals
+}
+
+/// Issue #225 (`zirv ctx status --brief`): the same work-group accounting
+/// [`group_tree_lines`] renders, collapsed to ONE line per group -- the
+/// existing `group_header` line with its own totals appended, no
+/// per-delegation row -- plus a final grand total across every group,
+/// orphan id, and the ungrouped bucket. A session checking status at every
+/// natural checkpoint (`HARNESS_PROMPT`'s own advice) does not need to see
+/// each delegation again on every check; it needs "was delegating cheaper
+/// than doing it here" at a glance, which is exactly what the per-group
+/// total already answers.
+pub fn group_tree_lines_brief(
+    groups: &[group::WorkGroup],
+    delegations: &[log::DelegationRow],
+    records: &[(sessions::Record, Liveness)],
+    colour: bool,
+) -> Vec<String> {
+    if delegations.is_empty() {
+        return Vec::new();
+    }
+
+    let live_shorts: std::collections::BTreeSet<&str> = records
+        .iter()
+        .filter(|(_, liveness)| *liveness == Liveness::Live)
+        .map(|(record, _)| record.short.as_str())
+        .collect();
+
+    let mut lines = Vec::new();
+    let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    let mut grand = [0u64; 4];
+    let mut grand_delegations = 0usize;
+    let mut grand_groups = 0usize;
+
+    let mut summarize =
+        |lines: &mut Vec<String>, header: String, children: &[&log::DelegationRow]| {
+            let totals = group_totals(children);
+            lines.push(format!(
+                "{header}  {}",
+                style::paint(
+                    &format!(
+                        "{} deleg. -- input {} | cache_creation {} | cache_read {} | output {}",
+                        children.len(),
+                        totals[0],
+                        totals[1],
+                        totals[2],
+                        totals[3]
+                    ),
+                    Tone::Muted,
+                    colour
+                )
+            ));
+            for (i, total) in totals.iter().enumerate() {
+                grand[i] = grand[i].saturating_add(*total);
+            }
+            grand_delegations += children.len();
+            grand_groups += 1;
+        };
+
+    for wg in groups {
+        let children: Vec<&log::DelegationRow> = delegations
+            .iter()
+            .filter(|d| d.work_group_id.as_deref() == Some(wg.work_group_id.as_str()))
+            .collect();
+        if children.is_empty() {
+            continue;
+        }
+        seen.insert(wg.work_group_id.as_str());
+        summarize(
+            &mut lines,
+            group_header(Some(wg), "", &live_shorts, colour),
+            &children,
+        );
+    }
+
+    let mut orphan_ids: Vec<&str> = delegations
+        .iter()
+        .filter_map(|d| d.work_group_id.as_deref())
+        .filter(|id| !seen.contains(id))
+        .collect();
+    orphan_ids.sort_unstable();
+    orphan_ids.dedup();
+    for id in orphan_ids {
+        let children: Vec<&log::DelegationRow> = delegations
+            .iter()
+            .filter(|d| d.work_group_id.as_deref() == Some(id))
+            .collect();
+        summarize(
+            &mut lines,
+            group_header(None, id, &live_shorts, colour),
+            &children,
+        );
+    }
+
+    let ungrouped: Vec<&log::DelegationRow> = delegations
+        .iter()
+        .filter(|d| d.work_group_id.is_none())
+        .collect();
+    if !ungrouped.is_empty() {
+        summarize(
+            &mut lines,
+            group_header(None, "ungrouped", &live_shorts, colour),
+            &ungrouped,
+        );
+    }
+
+    lines.push(format!(
+        "  {}",
+        style::paint(
+            &format!(
+                "grand total: {grand_delegations} deleg. across {grand_groups} groups -- input \
+                 {} | cache_creation {} | cache_read {} | output {}",
+                grand[0], grand[1], grand[2], grand[3]
+            ),
+            Tone::Emphasis,
+            colour
+        )
+    ));
+
+    lines
+}
+
 /// The `chat:` status line: the adapter `zirv ctx chat` would launch and the
 /// rule that picked it (`adapters::resolve_default`'s own `DefaultOrigin`),
 /// or -- degrading rather than failing the whole command -- a summary of why
@@ -507,6 +640,17 @@ pub struct StatusArgs {
     /// How many recent supervisor decisions to show.
     #[arg(long, default_value_t = 10)]
     pub decisions: usize,
+    /// Collapse every unbounded section (work groups, sessions) to its
+    /// totals -- every section still appears, just without a line per
+    /// delegation or per session. Issue #225: `HARNESS_PROMPT` tells a
+    /// session to check `zirv ctx status` at natural checkpoints, so the
+    /// default view's one-line-per-delegation work-group tree and
+    /// one-line-per-session list were paid on every such check; `--brief`
+    /// is the cheap version of the same read. `--decisions` is ignored in
+    /// this mode: the "recent decisions" section is omitted, with a note
+    /// pointing back at the full view.
+    #[arg(long, default_value_t = false)]
+    pub brief: bool,
 }
 
 pub fn run_with<W: Write>(
@@ -526,23 +670,40 @@ pub fn run_with<W: Write>(
 
     match crate::settings::AgentGate::load(repo, env) {
         Ok(gate) => {
-            writeln!(w, "{}", header(colour, "agents"))?;
-            for adapter in crate::commands::ctx::adapters::all(None) {
-                let name = adapter.name();
-                let (enabled, location) = gate
-                    .states()
-                    .find(|(n, _)| *n == name)
-                    .map(|(_, s)| (s.enabled, s.location()))
-                    .unwrap_or((true, "default".to_string()));
-                let state_word = if enabled { "enabled" } else { "disabled" };
-                let state_tone = if enabled { Tone::Ok } else { Tone::Muted };
-                writeln!(
-                    w,
-                    "  {} {} ({})",
-                    style::paint(&format!("{name:<8}"), Tone::Accent, colour),
-                    style::paint(&format!("{state_word:<8}"), state_tone, colour),
-                    style::paint(&location, Tone::Muted, colour),
-                )?;
+            if args.brief {
+                let parts: Vec<String> = crate::commands::ctx::adapters::all(None)
+                    .into_iter()
+                    .map(|adapter| {
+                        let name = adapter.name();
+                        let (enabled, location) = gate
+                            .states()
+                            .find(|(n, _)| *n == name)
+                            .map(|(_, s)| (s.enabled, s.location()))
+                            .unwrap_or((true, "default".to_string()));
+                        let state_word = if enabled { "enabled" } else { "disabled" };
+                        format!("{name} {state_word} ({location})")
+                    })
+                    .collect();
+                writeln!(w, "{} {}", label(colour, "agents:"), parts.join(", "))?;
+            } else {
+                writeln!(w, "{}", header(colour, "agents"))?;
+                for adapter in crate::commands::ctx::adapters::all(None) {
+                    let name = adapter.name();
+                    let (enabled, location) = gate
+                        .states()
+                        .find(|(n, _)| *n == name)
+                        .map(|(_, s)| (s.enabled, s.location()))
+                        .unwrap_or((true, "default".to_string()));
+                    let state_word = if enabled { "enabled" } else { "disabled" };
+                    let state_tone = if enabled { Tone::Ok } else { Tone::Muted };
+                    writeln!(
+                        w,
+                        "  {} {} ({})",
+                        style::paint(&format!("{name:<8}"), Tone::Accent, colour),
+                        style::paint(&format!("{state_word:<8}"), state_tone, colour),
+                        style::paint(&location, Tone::Muted, colour),
+                    )?;
+                }
             }
         }
         Err(e) => writeln!(
@@ -609,7 +770,7 @@ pub fn run_with<W: Write>(
                 cfg.fallback.min_candidate_headroom_pct,
                 cfg.fallback.unknown_headroom_pct,
             )?;
-            if cfg.fallback.enabled {
+            if cfg.fallback.enabled && !args.brief {
                 let now = crate::commands::ctx::state::now_secs();
                 for name in &cfg.fallback.order {
                     let provider = adapters::provider_for_agent_name(Some(name));
@@ -716,11 +877,14 @@ pub fn run_with<W: Write>(
             style::paint("(unreadable)", Tone::Err, colour)
         )?,
     }
-    let recent_mail = mail::recent_flow_lines(&state, crate::commands::ctx::state::now_secs(), 5);
-    if !recent_mail.is_empty() {
-        writeln!(w, "{}", label(colour, "mail flow (last hour):"))?;
-        for line in recent_mail {
-            writeln!(w, "  {}", style::paint(&line, Tone::Muted, colour))?;
+    if !args.brief {
+        let recent_mail =
+            mail::recent_flow_lines(&state, crate::commands::ctx::state::now_secs(), 5);
+        if !recent_mail.is_empty() {
+            writeln!(w, "{}", label(colour, "mail flow (last hour):"))?;
+            for line in recent_mail {
+                writeln!(w, "  {}", style::paint(&line, Tone::Muted, colour))?;
+            }
         }
     }
 
@@ -760,16 +924,18 @@ pub fn run_with<W: Write>(
                 colour
             )
         )?;
-        for record in &live_permits {
-            writeln!(
-                w,
-                "  {}",
-                style::paint(
-                    &format!("pid {} -- {}", record.pid, record.label),
-                    Tone::Muted,
-                    colour
-                )
-            )?;
+        if !args.brief {
+            for record in &live_permits {
+                writeln!(
+                    w,
+                    "  {}",
+                    style::paint(
+                        &format!("pid {} -- {}", record.pid, record.label),
+                        Tone::Muted,
+                        colour
+                    )
+                )?;
+            }
         }
     }
 
@@ -787,7 +953,11 @@ pub fn run_with<W: Write>(
     // record's file off disk as a side effect of being called at all).
     let groups = group::list(&state);
     let delegations = log::read_delegations(&state, 200);
-    let group_tree = group_tree_lines(&groups, &delegations, &session_records, colour);
+    let group_tree = if args.brief {
+        group_tree_lines_brief(&groups, &delegations, &session_records, colour)
+    } else {
+        group_tree_lines(&groups, &delegations, &session_records, colour)
+    };
     if !group_tree.is_empty() {
         writeln!(w, "{}", header(colour, "work groups"))?;
         for line in &group_tree {
@@ -795,23 +965,53 @@ pub fn run_with<W: Write>(
         }
     }
 
-    writeln!(w, "{}", header(colour, "sessions"))?;
-    let session_lines = sessions_lines(
-        &session_records,
-        &state,
-        crate::commands::ctx::state::now_secs(),
-        env,
-        colour,
-    );
-    if session_lines.is_empty() {
+    if args.brief {
+        // Issue #225: the same live-session question `sessions_lines` answers
+        // in full below, collapsed to a count plus (when this invocation is
+        // itself a registered session) which one it is -- the fact a session
+        // reading its own status at a checkpoint actually needs.
+        let live_count = session_records
+            .iter()
+            .filter(|(record, liveness)| matches!(liveness, Liveness::Live) && record.reachable)
+            .count();
+        let this_line = env(super::adapters::SESSION_ENV)
+            .map(|full| sessions::short_id(&full))
+            .and_then(|short| {
+                session_records
+                    .iter()
+                    .find(|(record, _)| record.short == short)
+            })
+            .map(|(record, _)| format!(" (this session {} {})", record.short, record.verb))
+            .unwrap_or_default();
         writeln!(
             w,
-            "  {}",
-            style::paint("no supervised sessions", Tone::Muted, colour)
+            "{} {}",
+            label(colour, "sessions:"),
+            style::paint(
+                &format!("{live_count} live{this_line}"),
+                Tone::Muted,
+                colour
+            )
         )?;
     } else {
-        for line in &session_lines {
-            writeln!(w, "{line}")?;
+        writeln!(w, "{}", header(colour, "sessions"))?;
+        let session_lines = sessions_lines(
+            &session_records,
+            &state,
+            crate::commands::ctx::state::now_secs(),
+            env,
+            colour,
+        );
+        if session_lines.is_empty() {
+            writeln!(
+                w,
+                "  {}",
+                style::paint("no supervised sessions", Tone::Muted, colour)
+            )?;
+        } else {
+            for line in &session_lines {
+                writeln!(w, "{line}")?;
+            }
         }
     }
 
@@ -931,43 +1131,77 @@ pub fn run_with<W: Write>(
         None => {}
     }
 
-    writeln!(
-        w,
-        "\n{}",
-        style::paint(
-            &format!("latest handoff for {}:", repo.display()),
-            Tone::Emphasis,
-            colour
-        )
-    )?;
-    match latest_for_repo(&state, repo)? {
-        Some((path, handoff)) => {
+    if args.brief {
+        match latest_for_repo(&state, repo)? {
+            Some((_, handoff)) => writeln!(
+                w,
+                "{} {}",
+                label(colour, "handoff:"),
+                style::paint(
+                    &format!("{} -- next: {}", handoff.task, handoff.next_step),
+                    Tone::Muted,
+                    colour
+                )
+            )?,
+            None => writeln!(
+                w,
+                "{} {}",
+                label(colour, "handoff:"),
+                style::paint("none stored", Tone::Muted, colour)
+            )?,
+        }
+    } else {
+        writeln!(
+            w,
+            "\n{}",
+            style::paint(
+                &format!("latest handoff for {}:", repo.display()),
+                Tone::Emphasis,
+                colour
+            )
+        )?;
+        match latest_for_repo(&state, repo)? {
+            Some((path, handoff)) => {
+                writeln!(
+                    w,
+                    "  {}",
+                    style::paint(&path.display().to_string(), Tone::Muted, colour)
+                )?;
+                writeln!(w, "  task: {}", handoff.task)?;
+                writeln!(w, "  next: {}", handoff.next_step)?;
+            }
+            None => writeln!(
+                w,
+                "  {}",
+                style::paint("no handoff stored", Tone::Muted, colour)
+            )?,
+        }
+    }
+
+    if args.brief {
+        writeln!(
+            w,
+            "{} {}",
+            label(colour, "decisions:"),
+            style::paint(
+                &format!("run without --brief for the last {}", args.decisions),
+                Tone::Muted,
+                colour
+            )
+        )?;
+    } else {
+        writeln!(w, "{}", header(colour, "recent decisions"))?;
+        let lines = log::tail(&state, args.decisions)?;
+        if lines.is_empty() {
             writeln!(
                 w,
                 "  {}",
-                style::paint(&path.display().to_string(), Tone::Muted, colour)
+                style::paint("none recorded", Tone::Muted, colour)
             )?;
-            writeln!(w, "  task: {}", handoff.task)?;
-            writeln!(w, "  next: {}", handoff.next_step)?;
-        }
-        None => writeln!(
-            w,
-            "  {}",
-            style::paint("no handoff stored", Tone::Muted, colour)
-        )?,
-    }
-
-    writeln!(w, "{}", header(colour, "recent decisions"))?;
-    let lines = log::tail(&state, args.decisions)?;
-    if lines.is_empty() {
-        writeln!(
-            w,
-            "  {}",
-            style::paint("none recorded", Tone::Muted, colour)
-        )?;
-    } else {
-        for line in lines.iter().rev() {
-            writeln!(w, "  {line}")?;
+        } else {
+            for line in lines.iter().rev() {
+                writeln!(w, "  {line}")?;
+            }
         }
     }
 
@@ -1005,7 +1239,10 @@ mod tests {
 
         let mut out = Vec::new();
         let code = run_with(
-            &StatusArgs { decisions: 10 },
+            &StatusArgs {
+                decisions: 10,
+                brief: false,
+            },
             &mut out,
             tmp.path(),
             &|k| env.get(k).cloned(),
@@ -1040,7 +1277,10 @@ mod tests {
         let env = env_for(&state);
         let mut out = Vec::new();
         let code = run_with(
-            &StatusArgs { decisions: 10 },
+            &StatusArgs {
+                decisions: 10,
+                brief: false,
+            },
             &mut out,
             &repo,
             &|k| env.get(k).cloned(),
@@ -1080,7 +1320,10 @@ mod tests {
         let env = env_for(&state);
         let mut out = Vec::new();
         let code = run_with(
-            &StatusArgs { decisions: 10 },
+            &StatusArgs {
+                decisions: 10,
+                brief: false,
+            },
             &mut out,
             &repo,
             &|k| env.get(k).cloned(),
@@ -1119,7 +1362,10 @@ mod tests {
         let env = env_for(&state);
         let mut out = Vec::new();
         let code = run_with(
-            &StatusArgs { decisions: 10 },
+            &StatusArgs {
+                decisions: 10,
+                brief: false,
+            },
             &mut out,
             &repo,
             &|k| env.get(k).cloned(),
@@ -1174,7 +1420,10 @@ mod tests {
 
         let mut out = Vec::new();
         run_with(
-            &StatusArgs { decisions: 10 },
+            &StatusArgs {
+                decisions: 10,
+                brief: false,
+            },
             &mut out,
             tmp.path(),
             &|k| env.get(k).cloned(),
@@ -1206,7 +1455,10 @@ mod tests {
 
         let mut out = Vec::new();
         run_with(
-            &StatusArgs { decisions: 5 },
+            &StatusArgs {
+                decisions: 5,
+                brief: false,
+            },
             &mut out,
             tmp.path(),
             &|k| env.get(k).cloned(),
@@ -1251,7 +1503,10 @@ mod tests {
 
         let mut out = Vec::new();
         run_with(
-            &StatusArgs { decisions: 5 },
+            &StatusArgs {
+                decisions: 5,
+                brief: false,
+            },
             &mut out,
             &repo,
             &|k| env.get(k).cloned(),
@@ -1300,7 +1555,10 @@ mod tests {
 
         let mut out = Vec::new();
         run_with(
-            &StatusArgs { decisions: 5 },
+            &StatusArgs {
+                decisions: 5,
+                brief: false,
+            },
             &mut out,
             &repo,
             &|k| env.get(k).cloned(),
@@ -1352,7 +1610,10 @@ mod tests {
 
         let mut out = Vec::new();
         let code = run_with(
-            &StatusArgs { decisions: 5 },
+            &StatusArgs {
+                decisions: 5,
+                brief: false,
+            },
             &mut out,
             &repo,
             &|k| env.get(k).cloned(),
@@ -1399,7 +1660,10 @@ mod tests {
 
         let mut out = Vec::new();
         run_with(
-            &StatusArgs { decisions: 2 },
+            &StatusArgs {
+                decisions: 2,
+                brief: false,
+            },
             &mut out,
             tmp.path(),
             &|k| env.get(k).cloned(),
@@ -1432,7 +1696,10 @@ mod tests {
 
         let mut out = Vec::new();
         run_with(
-            &StatusArgs { decisions: 5 },
+            &StatusArgs {
+                decisions: 5,
+                brief: false,
+            },
             &mut out,
             tmp.path(),
             &|k| env.get(k).cloned(),
@@ -1501,7 +1768,10 @@ mod tests {
 
         let mut out = Vec::new();
         run_with(
-            &StatusArgs { decisions: 5 },
+            &StatusArgs {
+                decisions: 5,
+                brief: false,
+            },
             &mut out,
             tmp.path(),
             &|k| env.get(k).cloned(),
@@ -1554,7 +1824,10 @@ mod tests {
 
         let mut out = Vec::new();
         run_with(
-            &StatusArgs { decisions: 5 },
+            &StatusArgs {
+                decisions: 5,
+                brief: false,
+            },
             &mut out,
             tmp.path(),
             &|k| env.get(k).cloned(),
@@ -1592,7 +1865,10 @@ mod tests {
 
         let mut out = Vec::new();
         run_with(
-            &StatusArgs { decisions: 5 },
+            &StatusArgs {
+                decisions: 5,
+                brief: false,
+            },
             &mut out,
             tmp.path(),
             &|k| env.get(k).cloned(),
@@ -1639,7 +1915,10 @@ mod tests {
 
         let mut out = Vec::new();
         run_with(
-            &StatusArgs { decisions: 5 },
+            &StatusArgs {
+                decisions: 5,
+                brief: false,
+            },
             &mut out,
             tmp.path(),
             &|k| env.get(k).cloned(),
@@ -1750,7 +2029,10 @@ mod tests {
 
         let mut out = Vec::new();
         run_with(
-            &StatusArgs { decisions: 5 },
+            &StatusArgs {
+                decisions: 5,
+                brief: false,
+            },
             &mut out,
             tmp.path(),
             &|k| env.get(k).cloned(),
@@ -1812,7 +2094,10 @@ mod tests {
         let env = env_for(state.root());
         let mut out = Vec::new();
         run_with(
-            &StatusArgs { decisions: 5 },
+            &StatusArgs {
+                decisions: 5,
+                brief: false,
+            },
             &mut out,
             tmp.path(),
             &|k| env.get(k).cloned(),
@@ -1855,7 +2140,10 @@ mod tests {
 
         let mut out = Vec::new();
         run_with(
-            &StatusArgs { decisions: 5 },
+            &StatusArgs {
+                decisions: 5,
+                brief: false,
+            },
             &mut out,
             tmp.path(),
             &|k| env.get(k).cloned(),
@@ -1895,7 +2183,10 @@ mod tests {
 
         let mut out = Vec::new();
         run_with(
-            &StatusArgs { decisions: 5 },
+            &StatusArgs {
+                decisions: 5,
+                brief: false,
+            },
             &mut out,
             tmp.path(),
             &|k| env.get(k).cloned(),
@@ -1952,7 +2243,10 @@ mod tests {
 
         let mut out = Vec::new();
         run_with(
-            &StatusArgs { decisions: 5 },
+            &StatusArgs {
+                decisions: 5,
+                brief: false,
+            },
             &mut out,
             tmp.path(),
             &|k| env.get(k).cloned(),
@@ -1999,7 +2293,10 @@ mod tests {
 
         let mut out = Vec::new();
         run_with(
-            &StatusArgs { decisions: 5 },
+            &StatusArgs {
+                decisions: 5,
+                brief: false,
+            },
             &mut out,
             tmp.path(),
             &|k| env.get(k).cloned(),
@@ -2034,7 +2331,10 @@ mod tests {
 
         let mut out = Vec::new();
         run_with(
-            &StatusArgs { decisions: 5 },
+            &StatusArgs {
+                decisions: 5,
+                brief: false,
+            },
             &mut out,
             tmp.path(),
             &|k| env.get(k).cloned(),
@@ -2065,7 +2365,10 @@ mod tests {
 
         let mut out = Vec::new();
         run_with(
-            &StatusArgs { decisions: 5 },
+            &StatusArgs {
+                decisions: 5,
+                brief: false,
+            },
             &mut out,
             tmp.path(),
             &|k| env.get(k).cloned(),
@@ -2106,7 +2409,10 @@ mod tests {
 
         let mut out = Vec::new();
         run_with(
-            &StatusArgs { decisions: 5 },
+            &StatusArgs {
+                decisions: 5,
+                brief: false,
+            },
             &mut out,
             &repo,
             &|k| env.get(k).cloned(),
@@ -2150,7 +2456,10 @@ mod tests {
 
         let mut out = Vec::new();
         run_with(
-            &StatusArgs { decisions: 5 },
+            &StatusArgs {
+                decisions: 5,
+                brief: false,
+            },
             &mut out,
             &repo,
             &|k| env.get(k).cloned(),
@@ -2207,7 +2516,10 @@ mod tests {
 
         let mut out = Vec::new();
         run_with(
-            &StatusArgs { decisions: 5 },
+            &StatusArgs {
+                decisions: 5,
+                brief: false,
+            },
             &mut out,
             &repo,
             &|k| env.get(k).cloned(),
@@ -2236,7 +2548,10 @@ mod tests {
 
         let mut out = Vec::new();
         run_with(
-            &StatusArgs { decisions: 5 },
+            &StatusArgs {
+                decisions: 5,
+                brief: false,
+            },
             &mut out,
             tmp.path(),
             &|k| env.get(k).cloned(),
@@ -2272,7 +2587,10 @@ mod tests {
 
         let mut out = Vec::new();
         run_with(
-            &StatusArgs { decisions: 5 },
+            &StatusArgs {
+                decisions: 5,
+                brief: false,
+            },
             &mut out,
             tmp.path(),
             &|k| env.get(k).cloned(),
@@ -2302,7 +2620,10 @@ mod tests {
             {
                 let mut out = Vec::new();
                 run_with(
-                    &StatusArgs { decisions: 5 },
+                    &StatusArgs {
+                        decisions: 5,
+                        brief: false,
+                    },
                     &mut out,
                     tmp.path(),
                     &|k| env.get(k).cloned(),
@@ -2340,7 +2661,10 @@ mod tests {
 
         let mut out = Vec::new();
         run_with(
-            &StatusArgs { decisions: 5 },
+            &StatusArgs {
+                decisions: 5,
+                brief: false,
+            },
             &mut out,
             tmp.path(),
             &|k| env.get(k).cloned(),
@@ -2528,7 +2852,10 @@ mod tests {
 
         let mut out = Vec::new();
         let code = run_with(
-            &StatusArgs { decisions: 5 },
+            &StatusArgs {
+                decisions: 5,
+                brief: false,
+            },
             &mut out,
             tmp.path(),
             &|k| env.get(k).cloned(),
@@ -2553,7 +2880,10 @@ mod tests {
 
         let mut out = Vec::new();
         let code = run_with(
-            &StatusArgs { decisions: 5 },
+            &StatusArgs {
+                decisions: 5,
+                brief: false,
+            },
             &mut out,
             tmp.path(),
             &|k| env.get(k).cloned(),
@@ -2597,7 +2927,10 @@ mod tests {
 
         let mut out = Vec::new();
         let code = run_with(
-            &StatusArgs { decisions: 5 },
+            &StatusArgs {
+                decisions: 5,
+                brief: false,
+            },
             &mut out,
             tmp.path(),
             &|k| env.get(k).cloned(),
@@ -2655,7 +2988,10 @@ mod tests {
 
         let mut out = Vec::new();
         let code = run_with(
-            &StatusArgs { decisions: 5 },
+            &StatusArgs {
+                decisions: 5,
+                brief: false,
+            },
             &mut out,
             tmp.path(),
             &|k| env.get(k).cloned(),
@@ -2710,7 +3046,10 @@ mod tests {
 
         let mut out = Vec::new();
         let code = run_with(
-            &StatusArgs { decisions: 5 },
+            &StatusArgs {
+                decisions: 5,
+                brief: false,
+            },
             &mut out,
             tmp.path(),
             &|k| env.get(k).cloned(),
@@ -2720,5 +3059,208 @@ mod tests {
         assert_eq!(code, 0, "a corrupt line must not fail the command");
         let text = String::from_utf8(out).expect("utf8");
         assert!(text.contains("sess-good"), "got {text}");
+    }
+
+    /// Issue #225: `group_tree_lines_brief` answers the same "was delegating
+    /// cheaper than doing it here" question `group_tree_lines` does, but with
+    /// one line per group instead of one per delegation -- each child's own
+    /// session id must NOT appear, only the group's own id and its combined
+    /// totals, plus a final grand total across every group shown.
+    #[test]
+    fn the_brief_group_tree_collapses_each_group_to_one_line_with_a_grand_total() {
+        let groups = vec![
+            sample_group("wg-1", "phase 5 implementation"),
+            sample_group("wg-2", "phase 6 review"),
+        ];
+        let delegations = vec![
+            delegation_row("wg-1", "sess-a", "codex", 1_000, 91_000, 500),
+            delegation_row("wg-1", "sess-b", "claude", 2_000, 40_000, 900),
+            delegation_row("wg-2", "sess-c", "codex", 500, 1_000, 100),
+        ];
+        let lines = group_tree_lines_brief(&groups, &delegations, &[], false);
+        let text = lines.join("\n");
+
+        assert!(text.contains("wg-1"), "got {text}");
+        assert!(text.contains("wg-2"), "got {text}");
+        assert!(
+            !text.contains("sess-a") && !text.contains("sess-b") && !text.contains("sess-c"),
+            "brief must not show a per-delegation session id: {text}"
+        );
+        assert!(
+            text.contains("grand total"),
+            "must sum across every group shown: {text}"
+        );
+        // 1000 + 2000 + 500 input tokens across all three delegations.
+        assert!(
+            text.contains("input 3500"),
+            "the grand total must sum every group's totals: {text}"
+        );
+        assert!(
+            text.contains("3 deleg."),
+            "the grand total must count every delegation: {text}"
+        );
+    }
+
+    /// Same "nothing to show is nothing shown" rule the full tree follows.
+    #[test]
+    fn the_brief_group_tree_renders_nothing_for_no_delegations() {
+        assert!(group_tree_lines_brief(&[], &[], &[], false).is_empty());
+    }
+
+    /// End-to-end: `--brief` keeps every section present but collapses the
+    /// unbounded ones, so a fixture with several delegations across multiple
+    /// groups and several live sessions renders strictly fewer bytes than
+    /// the default view -- while both views still answer the same questions
+    /// (agents, mail, work groups, sessions, handoff, decisions).
+    #[test]
+    fn brief_status_is_smaller_than_full_status_for_the_same_fixture() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        state.ensure().expect("ensure");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+
+        // Two groups, five delegations total.
+        group::create(&state, &sample_group("wg-1", "phase 5 implementation"))
+            .expect("create wg-1");
+        group::create(&state, &sample_group("wg-2", "phase 6 review")).expect("create wg-2");
+        for row in [
+            delegation_row("wg-1", "sess-a", "codex", 1_000, 91_000, 500),
+            delegation_row("wg-1", "sess-b", "claude", 2_000, 40_000, 900),
+            delegation_row("wg-1", "sess-c", "codex", 300, 2_000, 100),
+            delegation_row("wg-2", "sess-d", "codex", 500, 1_000, 100),
+            delegation_row("wg-2", "sess-e", "claude", 700, 3_000, 200),
+        ] {
+            log::append_delegation(
+                &state,
+                &log::Delegation {
+                    ts: row.ts,
+                    session: &row.session,
+                    parent_session: &row.parent_session,
+                    work_group_id: row.work_group_id.as_deref(),
+                    agent: &row.agent,
+                    model: row.model.as_deref(),
+                    input_tokens: row.input_tokens,
+                    cache_creation_input_tokens: row.cache_creation_input_tokens,
+                    cache_read_input_tokens: row.cache_read_input_tokens,
+                    output_tokens: row.output_tokens,
+                    wall_ms: row.wall_ms,
+                    exit_code: row.exit_code,
+                    outcome: &row.outcome,
+                },
+            )
+            .expect("append");
+        }
+
+        // Three live sessions, one of which is "this" invocation.
+        let guard_a = crate::commands::ctx::sessions::SessionGuard::register(
+            &state,
+            crate::commands::ctx::sessions::Record::new(
+                "aaaa1111-2222-4333-8444-555555555555",
+                "claude",
+                &repo,
+                crate::commands::ctx::sessions::Verb::Wrap,
+            ),
+        );
+        let guard_b = crate::commands::ctx::sessions::SessionGuard::register(
+            &state,
+            crate::commands::ctx::sessions::Record::new(
+                "bbbb2222-2222-4333-8444-555555555555",
+                "codex",
+                &repo,
+                crate::commands::ctx::sessions::Verb::Exec,
+            ),
+        );
+        let guard_c = crate::commands::ctx::sessions::SessionGuard::register(
+            &state,
+            crate::commands::ctx::sessions::Record::new(
+                "cccc3333-2222-4333-8444-555555555555",
+                "claude",
+                &repo,
+                crate::commands::ctx::sessions::Verb::Chat,
+            ),
+        );
+
+        let mut env_map = env_for(state.root());
+        env_map.insert(
+            crate::commands::ctx::adapters::SESSION_ENV.to_string(),
+            "aaaa1111-2222-4333-8444-555555555555".to_string(),
+        );
+        let env = move |k: &str| env_map.get(k).cloned();
+
+        let mut full_out = Vec::new();
+        run_with(
+            &StatusArgs {
+                decisions: 5,
+                brief: false,
+            },
+            &mut full_out,
+            &repo,
+            &env,
+            false,
+        )
+        .expect("full runs");
+        let full_text = String::from_utf8(full_out).expect("utf8");
+
+        let mut brief_out = Vec::new();
+        run_with(
+            &StatusArgs {
+                decisions: 5,
+                brief: true,
+            },
+            &mut brief_out,
+            &repo,
+            &env,
+            false,
+        )
+        .expect("brief runs");
+        let brief_text = String::from_utf8(brief_out).expect("utf8");
+
+        assert!(
+            brief_text.len() < full_text.len(),
+            "brief ({} bytes) must be smaller than full ({} bytes)",
+            brief_text.len(),
+            full_text.len()
+        );
+        // Every section is still present in brief, just collapsed.
+        for section in [
+            "agents:",
+            "mail:",
+            "heavy operations:",
+            "work groups:",
+            "sessions:",
+            "memory:",
+            "handoff:",
+            "decisions:",
+        ] {
+            assert!(
+                brief_text.contains(section),
+                "brief must keep the '{section}' section: {brief_text}"
+            );
+        }
+        // Collapsed content: no per-delegation session id, and the
+        // "this session" clause names the live session whose env we set.
+        assert!(
+            !brief_text.contains("sess-a"),
+            "brief must not list a per-delegation session id: {brief_text}"
+        );
+        assert!(
+            brief_text.contains("run without --brief for the last 5"),
+            "decisions must point back at the full view: {brief_text}"
+        );
+        assert!(
+            brief_text.contains("this session"),
+            "the live invoking session must be named: {brief_text}"
+        );
+        assert!(
+            brief_text.contains("3 live"),
+            "all three registered sessions must be counted: {brief_text}"
+        );
+
+        drop(guard_a);
+        drop(guard_b);
+        drop(guard_c);
     }
 }
