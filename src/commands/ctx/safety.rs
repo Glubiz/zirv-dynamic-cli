@@ -539,19 +539,18 @@ pub fn builtin_deny() -> Vec<Rule> {
 /// issue #224's own original complaint (supervised sessions prompted on
 /// zirv's own built-ins) for the common case.
 ///
-/// The design intent (NOT independently live-verified the way this file's
-/// other claude-permission claims are -- see `SHIPPED_POSTURE_ALLOW`'s own
-/// "verified live" doc comment for that bar) is that `evaluate_single`'s own
-/// verdict is the enforcing layer for the dangerous case: this generated
-/// pattern is expected to matter only for the safe delegation it also
-/// covers, on the assumption that claude applies the more restrictive of a
-/// PreToolUse hook's own decision and its native settings (issue #147's own
-/// comment on `launch_settings_value` documents the mirror-image case: a
-/// native `ask`/`deny` rule overriding a hook `Allow`). If that assumption
-/// is wrong for the hook-silent, native-allow-still-matches combination this
-/// creates, the residual gap is in claude's own native permission
-/// resolution, not in `evaluate_single`/[`reserved_zirv_auto_allow_rule`],
-/// which correctly withhold `Allow` regardless.
+/// **Round 3 correction:** keeping this pattern means the SAME native rule
+/// still matches the dangerous, flag-pinning invocation once the hook goes
+/// silent for `Ask` -- silence is not "no opinion", it is "defer to native
+/// settings", and this generated glob cannot narrow itself around the
+/// dangerous case. `evaluate_single` therefore never lets that shape reach a
+/// silent `Ask`: `agent_or_chat_posture_pinning_deny_rule` denies it
+/// outright instead, and a hook `Deny` is tested to emit an explicit
+/// decision in every permission mode -- it cannot be silently outrun by this
+/// pattern the way `Ask` could. This generated pattern is therefore load-
+/// bearing ONLY for the safe delegation case; it must never be relied on to
+/// narrow itself around a dangerous one, which is exactly what letting the
+/// dangerous case reach `Ask` would have required.
 pub(crate) fn reserved_zirv_command_patterns() -> Vec<String> {
     crate::utils::RESERVED_COMMANDS
         .iter()
@@ -660,6 +659,18 @@ fn evaluate_single(policy: &SafetyPolicy, command: &str, fallback: Verdict) -> O
             matched: Some(rule.clone()),
         };
     }
+    // Code review fix (CRITICAL, issue #224 review round 3): a posture-
+    // pinning `zirv agent`/`zirv chat` invocation that reaches this point
+    // (no operator override matched above) is denied outright rather than
+    // falling through to the ordinary unmatched-command default. See
+    // `agent_or_chat_posture_pinning_deny_rule`'s own doc comment for why
+    // `Ask` was not enough.
+    if let Some(rule) = agent_or_chat_posture_pinning_deny_rule(command) {
+        return Outcome {
+            verdict: Verdict::Deny,
+            matched: Some(rule),
+        };
+    }
     Outcome {
         verdict: fallback,
         matched: None,
@@ -678,6 +689,27 @@ fn reserved_zirv_command_name(command: &str) -> Option<String> {
     }
     let name = tokens.get(1)?;
     crate::utils::is_reserved_command(name).then(|| name.to_ascii_lowercase())
+}
+
+/// The token-shape check [`reserved_zirv_auto_allow_rule`] and
+/// [`agent_or_chat_posture_pinning_deny_rule`] both need: `command` directly
+/// invoking the installed `zirv` executable with a reserved first argument.
+/// Directory-qualified programs are excluded, same reasoning as [`reserved_
+/// zirv_command_name`]. Returns the lowercased reserved name alongside the
+/// full token list, since both callers need to look further into the
+/// remaining tokens (a `ctx` verb, or `agent`/`chat`'s forwarded flags).
+fn reserved_zirv_invocation(command: &str) -> Option<(String, Vec<String>)> {
+    let tokens = sql_tokens(&collapse_whitespace(command))?;
+    let program = tokens.first()?;
+    if program.contains('/') || program.contains('\\') || sql_program_name(program) != "zirv" {
+        return None;
+    }
+    let name = tokens.get(1)?;
+    if !crate::utils::is_reserved_command(name) {
+        return None;
+    }
+    let name = name.to_ascii_lowercase();
+    Some((name, tokens))
 }
 
 /// The `evaluate_single` auto-allow gate for a reserved zirv built-in --
@@ -704,23 +736,12 @@ fn reserved_zirv_command_name(command: &str) -> Option<String> {
 /// author was assumed to be the operator; under an unconditional auto-allow
 /// it can be the supervised model itself, so `zirv agent claude "x" --
 /// --permission-mode bypassPermissions` spawned an unattended worker with a
-/// weakened posture and no prompt anywhere. Every token past the reserved
-/// name is scanned (not only the slice after a literal `--`): a false `Ask`
-/// on a prompt that happens to contain a flag-shaped word costs nothing,
-/// while missing a real one reopens exactly this hole. Reuses `adapters::
-/// flags_pin_policy` as the single source of truth for which flags pin a
-/// posture, rather than a second hand-maintained list.
+/// weakened posture and no prompt anywhere. When this returns `None` for
+/// that shape, `evaluate_single` does not fall all the way through to the
+/// ordinary unmatched-command default -- see `agent_or_chat_posture_
+/// pinning_deny_rule` below for why a plain `Ask` was not enough.
 fn reserved_zirv_auto_allow_rule(command: &str) -> Option<Rule> {
-    let tokens = sql_tokens(&collapse_whitespace(command))?;
-    let program = tokens.first()?;
-    if program.contains('/') || program.contains('\\') || sql_program_name(program) != "zirv" {
-        return None;
-    }
-    let name = tokens.get(1)?;
-    if !crate::utils::is_reserved_command(name) {
-        return None;
-    }
-    let name = name.to_ascii_lowercase();
+    let (name, tokens) = reserved_zirv_invocation(command)?;
     if name != "ctx" {
         if matches!(name.as_str(), "agent" | "chat")
             && super::adapters::flags_pin_policy(&tokens[2..])
@@ -739,6 +760,49 @@ fn reserved_zirv_auto_allow_rule(command: &str) -> Option<Rule> {
             pattern: format!("zirv ctx {verb} *"),
             origin: Origin::BuiltIn,
         })
+}
+
+/// The hard floor `evaluate_single` applies to a `zirv agent`/`zirv chat`
+/// invocation whose forwarded flags pin a weaker posture on the spawned
+/// harness, once neither [`reserved_zirv_auto_allow_rule`] nor an
+/// operator's own `~/.zirv/ctx.toml` allow rule of the same shape has
+/// already granted `Allow` -- code review fix (CRITICAL, issue #224 review
+/// round 3), replacing the plain `Ask` fallback this used to reach.
+///
+/// **Why `Ask` was not enough:** under headless `dontAsk`, an `Ask` verdict
+/// makes the safety hook go silent (`hook_output`'s `Verdict::Ask if
+/// dont_ask => return None`) -- but `reserved_zirv_command_patterns` still
+/// has to carry a blanket `Bash(zirv agent *)`/`Bash(zirv chat *)` native
+/// permission rule (and matching sandbox exclusion) for the SAFE delegation
+/// case, since a static glob cannot itself express "except when flags pin a
+/// weaker posture" (see that function's own doc comment). With the hook
+/// silent, that same native rule still matches the DANGEROUS invocation too,
+/// so the escalation would still run -- in precisely the unattended,
+/// unsupervised context this review exists to close. A hook `Deny` is
+/// tested (`hook_output_deny_still_denies_in_every_permission_mode`) to
+/// always emit an explicit decision, in every permission mode, which cannot
+/// be silently outrun by a separately-matching native allow rule the way
+/// `Ask` could. A posture-weakening spawn attempt from a supervised model is
+/// also, on its own terms, an escalation attempt rather than an ambiguous
+/// case worth a prompt -- `Deny` is the semantically correct verdict, not
+/// only the technically enforceable one.
+///
+/// This function carries no operator-override reading of its own -- by the
+/// time `evaluate_single` reaches it, an operator's own explicit allow rule
+/// of the same shape has already had its chance to grant `Allow` first,
+/// preserving the same override this shape already had before this round
+/// (see `evaluate_single`'s own call site). Scans every token past the
+/// reserved name, not only the slice after a literal `--`, mirroring
+/// [`reserved_zirv_auto_allow_rule`]'s own conservative choice.
+fn agent_or_chat_posture_pinning_deny_rule(command: &str) -> Option<Rule> {
+    let (name, tokens) = reserved_zirv_invocation(command)?;
+    if !matches!(name.as_str(), "agent" | "chat") {
+        return None;
+    }
+    super::adapters::flags_pin_policy(&tokens[2..]).then(|| Rule {
+        pattern: format!("zirv {name} *"),
+        origin: Origin::BuiltIn,
+    })
 }
 
 /// `deny`/`ask` rules may narrow the reserved built-in default. Their first
@@ -7004,18 +7068,23 @@ mod tests {
         }
     }
 
-    /// Code review fix (CRITICAL, issue #224 review round 2): before this
-    /// fix, `zirv agent`/`zirv chat`'s name-level auto-allow ignored their
-    /// own forwarded flags entirely, even though those flags reach the
+    /// Code review fix (CRITICAL, issue #224 review round 2/3): before round
+    /// 2's fix, `zirv agent`/`zirv chat`'s name-level auto-allow ignored
+    /// their own forwarded flags entirely, even though those flags reach the
     /// spawned harness's CLI verbatim AND can suppress zirv's own computed
     /// posture prefix (`agent::worker_launch_flags` ->
     /// `adapters::policy_launch_args` -> `adapters::flags_pin_policy`). A
     /// supervised model could therefore delegate to a worker with no
     /// guardrails and no prompt anywhere -- `zirv agent claude "x" --
-    /// --permission-mode bypassPermissions` evaluated to Allow before this
-    /// fix.
+    /// --permission-mode bypassPermissions` evaluated to Allow before that
+    /// fix. Round 2 itself only reached `Ask`, which round 3 upgrades to a
+    /// hard `Deny` -- see `agent_or_chat_posture_pinning_deny_rule`'s own
+    /// doc comment for why `Ask` was not enough (it goes silent under
+    /// headless `dontAsk`, and the native `Bash(zirv agent *)` rule this
+    /// generated list still has to carry for the safe case would then still
+    /// let the dangerous invocation through).
     #[test]
-    fn agent_and_chat_lose_auto_allow_when_forwarded_flags_pin_a_weaker_posture() {
+    fn agent_and_chat_are_denied_outright_when_forwarded_flags_pin_a_weaker_posture() {
         let policy = SafetyPolicy::default();
         let denied = [
             "zirv agent claude \"x\" -- --permission-mode bypassPermissions",
@@ -7030,8 +7099,8 @@ mod tests {
             let outcome = evaluate(&policy, command, LaunchMode::Headless);
             assert_eq!(
                 outcome.verdict,
-                Verdict::Ask,
-                "{command}: expected Ask, got {:?}",
+                Verdict::Deny,
+                "{command}: expected Deny, got {:?}",
                 outcome.verdict
             );
         }
@@ -7051,6 +7120,33 @@ mod tests {
                 outcome.verdict
             );
         }
+    }
+
+    /// The built-in `Deny` above is not absolute: an operator's own
+    /// `~/.zirv/ctx.toml` `[safety] allow` entry of the same shape is their
+    /// own explicit, informed choice and still wins, the same override this
+    /// shape already had when it fell through to `Ask` (round 2) -- see
+    /// `evaluate_single`'s own call site for where this precedence is
+    /// preserved. Repo-authored `allow` entries do not exist at all
+    /// (`REPO_FORBIDDEN` rejects `safety.allow` in a repo `ctx.toml`), so
+    /// only `Origin::Operator` is exercised here.
+    #[test]
+    fn an_operators_own_allow_rule_still_overrides_the_posture_pinning_deny() {
+        let mut policy = SafetyPolicy::default();
+        policy.allow.push(Rule {
+            pattern: "zirv agent *".to_string(),
+            origin: Origin::Operator,
+        });
+        let outcome = evaluate(
+            &policy,
+            "zirv agent claude \"x\" -- --permission-mode bypassPermissions",
+            LaunchMode::Headless,
+        );
+        assert_eq!(outcome.verdict, Verdict::Allow, "{outcome:?}");
+        assert_eq!(
+            outcome.matched.map(|rule| rule.origin),
+            Some(Origin::Operator)
+        );
     }
 
     /// The reserved-name fast path in `evaluate_single` must not let a
