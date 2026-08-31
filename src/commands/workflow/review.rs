@@ -1776,10 +1776,16 @@ pub(crate) fn reviewer_argv(
     let read_only = crate::commands::ctx::adapters::read_only_args_for_agent_name(agent)
         .ok_or_else(|| format!("unknown adapter '{agent}'; cannot pin the reviewer read-only"))?;
     seat_args.extend(read_only);
+    // The reviewer is a supervised headless worker by construction: it
+    // reads the package from stdin and needs the trailing harness flags
+    // below, which a dashboard pane cannot carry. Say so explicitly, or a
+    // `review run` issued from inside a dashboard is refused by the pane
+    // gate instead of running (#228 made that refusal loud on purpose).
     let mut argv = vec![
         "agent".to_string(),
         agent.to_string(),
         "-".to_string(),
+        "--headless".to_string(),
         "--".to_string(),
     ];
     argv.extend(seat_args);
@@ -3000,7 +3006,12 @@ mod tests {
     fn a_reviewer_seat_is_always_pinned_read_only_or_refused() {
         let repo = tempdir().unwrap();
         let claude = reviewer_argv("claude", repo.path(), false).unwrap();
-        assert_eq!(&claude[..4], ["agent", "claude", "-", "--"]);
+        assert_eq!(
+            &claude[..5],
+            ["agent", "claude", "-", "--headless", "--"],
+            "the reviewer must ask for a headless worker explicitly: inside a \
+             dashboard the pane gate refuses trailing harness flags otherwise"
+        );
         assert_eq!(
             claude.last().map(String::as_str),
             Some("--disallowedTools=Write,Edit,Bash,NotebookEdit"),
@@ -3014,7 +3025,7 @@ mod tests {
         );
 
         let codex = reviewer_argv("codex", repo.path(), false).unwrap();
-        assert_eq!(&codex[..4], ["agent", "codex", "-", "--"]);
+        assert_eq!(&codex[..5], ["agent", "codex", "-", "--headless", "--"]);
         assert!(
             codex
                 .windows(2)
