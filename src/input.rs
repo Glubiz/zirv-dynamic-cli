@@ -96,6 +96,24 @@ fn find_script_in_dir(
             }
         };
         if let Some(mapped_file) = shortcuts.as_ref().and_then(|s| s.shortcuts.get(name)) {
+            // Review finding (post-#212): `.shortcuts.yaml` is repo-owned,
+            // untrusted config, and since #212 script resolution only ever
+            // looks inside `commands_dir` -- a target like `../legacy.yaml`
+            // must not be allowed to resolve outside it (it would otherwise
+            // land back on the very `.zirv` root the hard cutover removed
+            // from lookup) or via an absolute/rooted path escape further
+            // still. Checked before ever joining, so a malicious target is
+            // refused loudly rather than silently resolving somewhere else.
+            if !shortcut_target_is_confined(mapped_file) {
+                return Err(format!(
+                    "shortcut '{name}' in {} maps to '{mapped_file}', which would resolve \
+                     outside .zirv/commands/ -- shortcut targets must stay inside that \
+                     directory (zirv 3.0 moved scripts to .zirv/commands/, issue #212); fix \
+                     the mapping to a plain file name or a path relative to commands/",
+                    shortcuts_path.display()
+                )
+                .into());
+            }
             let path = commands_dir.join(mapped_file);
             if path.exists() {
                 return Ok(Some(path.canonicalize()?));
@@ -110,6 +128,33 @@ fn find_script_in_dir(
     }
 
     Ok(None)
+}
+
+/// Whether a `.shortcuts.yaml` mapped target stays confined to the directory
+/// it is about to be joined against: never rooted/absolute (Unix `/x`,
+/// Windows `C:\x` or a driveless `\x`, both caught by `Path::has_root`) and
+/// never containing a `..` component. `.shortcuts.yaml` is repo-owned,
+/// untrusted config (see `Untrusted Configuration` in the vault) that must
+/// only ever narrow, never widen, what a lookup can reach.
+///
+/// Before issue #212, the mapped file was joined straight against the
+/// `.zirv` root itself, so the same kind of target could already escape
+/// `.zirv` entirely (a `..` walked one directory above it; an absolute path
+/// bypassed the join altogether) -- this was already a latent path-traversal
+/// gap, just bounded one level higher up. After #212 moved script lookup
+/// into `.zirv/commands/`, joining unchecked against that narrower directory
+/// means `../legacy.yaml` resolves to `.zirv/legacy.yaml` -- silently
+/// reviving the exact pre-3.0 root layout the hard cutover was meant to
+/// retire -- while a longer `../../x.yaml` or an absolute path can still
+/// walk out past `.zirv` altogether. This closes both at the new boundary.
+fn shortcut_target_is_confined(mapped_file: &str) -> bool {
+    let path = Path::new(mapped_file);
+    if path.has_root() {
+        return false;
+    }
+    !path
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
 }
 
 impl Input {
@@ -350,6 +395,60 @@ mod tests {
                 .get_file_path()
                 .expect("a direct extension match must still resolve");
             assert!(path.ends_with("build.yaml"), "got: {}", path.display());
+        });
+    }
+
+    /// Review finding (post-#212): `.shortcuts.yaml` is repo-owned, untrusted
+    /// config, and since #212 script resolution only ever looks inside
+    /// `commands_dir` -- a `../legacy.yaml` mapping must not be allowed to
+    /// resolve outside it (landing back on the `.zirv` root the hard cutover
+    /// removed from lookup, or escaping further still) and must error
+    /// clearly instead. A sibling shortcut whose target genuinely lives
+    /// inside `commands/` must keep working exactly as before.
+    #[test]
+    fn a_shortcut_target_escaping_commands_errors_instead_of_resolving_at_the_root() {
+        let fake_home = tempdir().unwrap();
+        let fake_cwd = tempdir().unwrap();
+        let zirv_dir = fake_cwd.path().join(SCRIPT_DIR_NAME);
+        let commands_dir = zirv_dir.join(COMMANDS_DIR_NAME);
+        create_dir_all(&commands_dir).unwrap();
+        write(commands_dir.join("safe.yaml"), "name: Safe\ncommands: []\n").unwrap();
+        // The "legacy" script sitting right at the `.zirv` root -- the
+        // pre-3.0 location `../legacy.yaml` (relative to `commands/`) would
+        // land on.
+        write(zirv_dir.join("legacy.yaml"), "name: Legacy\ncommands: []\n").unwrap();
+        write(
+            zirv_dir.join(".shortcuts.yaml"),
+            "shortcuts:\n  legacy: ../legacy.yaml\n  ok: safe.yaml\n",
+        )
+        .unwrap();
+
+        with_fake_env(fake_home.path(), fake_cwd.path(), || {
+            let escaping = Input {
+                command: "legacy".to_string(),
+                ..Default::default()
+            };
+            let err = escaping
+                .get_file_path()
+                .expect_err("a shortcut escaping commands/ must not resolve");
+            let message = err.to_string();
+            assert!(
+                message.contains("legacy") && message.contains("../legacy.yaml"),
+                "expected the shortcut and its target to be named, got: {message}"
+            );
+            assert!(
+                message.contains("commands/"),
+                "expected the confinement boundary to be named, got: {message}"
+            );
+
+            let confined = Input {
+                command: "ok".to_string(),
+                ..Default::default()
+            };
+            let path = confined
+                .get_file_path()
+                .expect("a shortcut whose target lives inside commands/ must still resolve");
+            assert!(path.ends_with("safe.yaml"), "got: {}", path.display());
         });
     }
 
