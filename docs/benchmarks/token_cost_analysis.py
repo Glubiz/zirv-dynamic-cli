@@ -40,6 +40,14 @@ See docs/benchmarks/token-cost.md section 4.1 for the full write-up,
 caveats, and how to reproduce. Raw output from the run this document's
 numbers were taken from is committed alongside this script as
 token_cost_report.json.
+
+Issue #225 measurement closeout: `--first-turn` switches to a second,
+prefix-scoped mode (`first_turn_usage`/`run_first_turn_report`) that reports
+only each session's FIRST usage-bearing assistant row instead of the whole
+file's summed usage -- that row's `cache_creation_input_tokens` is the real,
+tokenizer-accurate cost of ingesting the session's prompt prefix for the
+first time (section 6 of token-cost.md), which the whole-file summary above
+cannot isolate. See docs/benchmarks/token-cost.md section 6.6.
 """
 
 import json
@@ -90,6 +98,91 @@ def walk_jsonl(root):
         for name in filenames:
             if name.endswith(".jsonl"):
                 yield os.path.join(dirpath, name)
+
+
+def first_turn_usage(path):
+    """Issue #225 measurement-closeout addition: unlike `analyze_file` (which
+    sums usage across an entire session), this returns only the FIRST
+    usage-bearing `"type":"assistant"` row's four raw classes. That row is
+    the one turn whose `cache_creation_input_tokens` was paid to ingest the
+    session's prompt prefix for the first time (everything after it either
+    hits the cache or reflects turn-specific content) -- the real,
+    tokenizer-accurate cost of "ingesting the prefix" that `docs/benchmarks/
+    token-cost.md` section 6 needs and `zirv ctx compile --measure`'s
+    `bytes / 4` column can only estimate. Returns None if the file has no
+    usage-bearing assistant row at all (same convention as `analyze_file`)."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if row.get("type") != "assistant":
+                    continue
+                message = row.get("message") or {}
+                usage = message.get("usage")
+                if not usage:
+                    continue
+                ts = parse_iso8601(row.get("timestamp") or "")
+                return {
+                    "path": path,
+                    "input_tokens": int(usage.get("input_tokens") or 0),
+                    "cache_creation_input_tokens": int(
+                        usage.get("cache_creation_input_tokens") or 0
+                    ),
+                    "cache_read_input_tokens": int(usage.get("cache_read_input_tokens") or 0),
+                    "output_tokens": int(usage.get("output_tokens") or 0),
+                    "date": ts.isoformat() if ts is not None else None,
+                    "is_subagent": "subagents" in path.replace("\\", "/").lower().split("/"),
+                }
+    except OSError as error:
+        print(f"skip {path}: {error}", file=sys.stderr)
+        return None
+    return None
+
+
+def run_first_turn_report(roots):
+    """`--first-turn` CLI mode: one row per session's first usage-bearing
+    turn, split top-level vs subagent (mirrors `analyze_file`'s own
+    population split), reporting median/p95 `cache_creation_input_tokens` --
+    the real per-session prompt-prefix ingestion cost, not an estimate."""
+    records = []
+    for root in roots:
+        if not os.path.isdir(root):
+            print(f"# root does not exist, skipping: {root}", file=sys.stderr)
+            continue
+        for path in walk_jsonl(root):
+            record = first_turn_usage(path)
+            if record is not None:
+                records.append(record)
+
+    top_level = [r for r in records if not r["is_subagent"]]
+    subagent = [r for r in records if r["is_subagent"]]
+
+    def summarize_first_turn(rows):
+        creation = [r["cache_creation_input_tokens"] for r in rows]
+        return {
+            "sessions": len(rows),
+            "median_cache_creation_input_tokens": median_or_none(creation),
+            "p95_cache_creation_input_tokens": p95_or_none(creation),
+            "median_input_tokens": median_or_none([r["input_tokens"] for r in rows]),
+        }
+
+    report = {
+        "mode": "first-turn",
+        "generated_at": datetime.now(tz=timezone.utc).isoformat(),
+        "roots_scanned": roots,
+        "top_level_only": summarize_first_turn(top_level),
+        "subagent_only": summarize_first_turn(subagent),
+        "top_level_sessions": sorted(
+            top_level, key=lambda r: r["date"] or "", reverse=True
+        )[:20],
+    }
+    print(json.dumps(report, indent=2, default=str))
 
 
 def analyze_file(path):
@@ -235,6 +328,10 @@ def main():
             roots.append(s)
 
     print(f"# scanning roots: {roots}", file=sys.stderr)
+
+    if "--first-turn" in sys.argv[1:]:
+        run_first_turn_report(roots)
+        return
 
     sessions = []
     files_seen = 0
