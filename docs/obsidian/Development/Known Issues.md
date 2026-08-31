@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-30
+last-verified: 2026-08-31
 ---
 
 # Known Issues
@@ -14,6 +14,7 @@ Each entry gets a changelog comment at the top of the file, newest first:
 <!-- Updated YYYY-MM-DD (branch, state): what changed -->
 ```
 
+<!-- Updated 2026-08-31 (fix/issue-batch-220-219-206-214, v2.40.0): resolved issue #220 (build_headless now budgets the whole headless argv, not just the #213 system-prompt layer, closing the os-error-206 gap #213 left open for a large task prompt), issue #219 (zirv ctx inbox/unread_counts now also scan a worktree session's registered mailbox slug, not just its cwd's), and a workflow-classifier gotcha (untracked .zirv/work paths no longer count as change-surface evidence, so stale zirv-owned state can no longer force every new workflow into the Frontend domain); issue #214 (--frontend-root on workflow start/advance) is a new capability, not a Known Issues resolution. Issue #206 (multiline paste splits into separate wrap submissions) is still in flight on the same branch, not fixed here -- see [[Ctx Supervisors]]'s TODO placeholder. -->
 <!-- Updated 2026-08-30 (worktree-fix-bug-batch-213-215-218-203, issues #213/#215/#203/#218): resolved issue #215 (the test/deploy gate is now baseline-waivable via `zirv test baseline`), issue #203 (the mid-poll over-budget kill now gives one tick of grace before it can clobber a child's real exit code), and issue #218 (the flaky `adopt_child_pid` clock-boundary test); also fixed issue #213 (codex argv overflow), not previously a Known Issues entry -->
 
 <!-- Updated 2026-08-30 (worktree-feat-210-install-experience, issue #210, v2.39.1): resolved the Linux release binary's GLIBC_2.39 incompatibility for NEW releases (cd.yaml now ships a static musl build) and hardened install.sh; recorded two residuals below -- already-published (<= 2.39.0) releases stay glibc-linked, and the separate cli.zirv.io landing page still advertises a broken install path -->
@@ -87,6 +88,18 @@ Each entry gets a changelog comment at the top of the file, newest first:
 ## An over-budget mid-poll kill can clobber a child's real exit code (flaky test)
 
 **Resolved 2026-08-30 (`worktree-fix-bug-batch-213-215-218-203`, issue #203).** `commands::ctx::exec::tests::a_failed_exit_with_an_over_budget_transcript_keeps_its_failure_code` used to fail roughly 1-in-3 runs on a loaded machine with `left: 77, right: 3`: the mid-poll `HardStop` check could kill a child that was already exiting (cleanly or with its own real failure code), so `EXIT_BUDGET_EXHAUSTED` overwrote the real code. Fixed with one tick of grace: the tick returns `Tick::Continue` instead of `Tick::Stop` the first time it sees `HardStop`, letting the next `try_wait` observe a natural exit first; only a child still alive on the *second* consecutive `HardStop` tick is actually killed for budget. See [[Ctx Supervisors]]'s "A mid-poll budget kill got one tick of grace" note.
+
+## An oversized headless launch could still overflow Windows' argv limit even after issue #213
+
+**Resolved 2026-08-31 (`fix/issue-batch-220-219-206-214`, issue #220, v2.40.0).** Issue #213 (2026-08-30) shrunk an oversized COMPOSED SYSTEM PROMPT to a 24KB budget before it reached an adapter's argv, but `exec.rs::build_headless` still put the operator's own task prompt on argv unconditionally off a shim launch — a large task prompt (an operator's own, or a `zirv workflow review run --agent` package with a large diff) riding beside a near-budget system prompt on the same command line could still cross Windows' `CreateProcessW` ~32KB ceiling (`os error 206`), the exact failure #213 was meant to close. Fixed by measuring the WHOLE assembled argv (`headless_argv_len`, program plus every argument including the #213 system-prompt layer) at `build_headless` — the one chokepoint every headless launch/relaunch/nudge/park reuses — and delivering via `adapter.headless_cmd_stdin` whenever the total exceeds `prompt::INLINE_ARGV_PROMPT_BUDGET_BYTES`, in addition to the existing shim trigger. See [[Decision Log]]'s 2026-08-31 entry, [[Ctx Subsystem]], [[Ctx Adapters]].
+
+## Mail addressed to a git-worktree session sat "queued" forever
+
+**Resolved 2026-08-31 (`fix/issue-batch-220-219-206-214`, issue #219, v2.40.0).** Delivery already filed mail under a target session's REGISTERED repo slug (correct for a worktree checkout, whose path never canonicalizes to the main checkout's), but `zirv ctx inbox` (plain/`--peek`/`--json`/`--thread`) and `unread_counts` (wrap's status bar, the dashboard header) derived their own mailbox only from `repo_slug(current_dir())` — so a session running out of a worktree never looked in the directory its own mail was actually filed under, and `send --status` stayed stuck at `queued` no matter how long the recipient session ran. Worked around during earlier triage by reading `%LOCALAPPDATA%\zirv\ctx\mail\<main-repo-slug>\*.md` directly. Fixed by widening the READ side: `run_inbox_with`/`unread_counts` now also scan the caller's own registered slug when it differs from the cwd-derived one, merging both directories' listings by `sent` time. See [[Decision Log]]'s 2026-08-31 entry, [[Ctx Subsystem]].
+
+## A stale `.zirv/work` artifact could force every new workflow into the Frontend domain
+
+**Resolved 2026-08-31 (`fix/issue-batch-220-219-206-214`, issue #214, v2.40.0).** Discovered 2026-08-31 while starting a new workflow in this repository: `classify.rs::git_change_input` counted every untracked path (including zirv's own state under `.zirv/work/<id>/...`) as change-surface evidence, so a leftover untracked file from a prior session — observed in practice, a stale `.zirv/work/<old-id>/dash-v3-mock.html` left over from the issue #209 dash-v3 session — made EVERY subsequently-classified workflow in this repository read as touching frontend files, regardless of what the new workflow's own task actually was. Fixed by `is_zirv_owned_path` (a leading `.zirv` path component, matched only at the start, so `docs/.zirv/notes.md` is unaffected), which now excludes such paths from both the change-surface path list and the line-count estimate `git_change_input` builds.
 
 ## `zirv context sync --report` under-reports drift that `--generate` actually finds
 

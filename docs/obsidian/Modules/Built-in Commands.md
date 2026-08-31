@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-30
+last-verified: 2026-08-31
 ---
 
 # Built-in Commands
@@ -87,6 +87,8 @@ An interactive `apply` run (real terminal on both stdin and stdout, not `--dry-r
 ### AI-native workflow lifecycle
 
 The top-level `workflow` tree now includes committed work-product inspection, provider-neutral agent inspection, PR-aware review, and the invoked maintain scanner. Key lifecycle verbs are `zirv workflow artifacts <id>`, `zirv workflow agents list|show|dispatch`, `zirv workflow review package|run|ingest-pr-comments`, and `zirv workflow maintain scan`. `workflow agents dispatch <id> --adapter <name> --prompt <task> [--model <provider-id>]` is the explicit provider-neutral seat execution surface; the manifest remains methodology, while effective canonical policy and the adapter enforce authority. The maintain verb is intentionally nested under `workflow`: it re-enters the same durable state machine at the Intent gate rather than creating a separate maintenance engine.
+
+**`--frontend-root <path>` on `workflow start`/`workflow advance` (issue #214, v2.40.0).** A Frontend-profile workflow's own auto-run detector/render evidence gate normally scans the workflow's own `--repo` — wrong when the workflow is tracked in one repository but its frontend actually lives in a sibling checkout. `--frontend-root` (absolutized against the current directory, canonicalized, and hard-refused if it isn't an existing directory) sets `WorkflowState.frontend_target_root`, which the detector/render gate then scans instead of `state.repo`; `advance` persists the flag into state **before** the gate runs, so a fail-closed advance still records it rather than forcing the operator to pass it again on retry. `zirv workflow status` prints `frontend target root: <path>` (human-readable text; JSON already carried the field) whenever it is set. A gate failure now names the scanned root and suggests `zirv frontend check --all --repo <root>` / `zirv frontend render --repo <root>`, or `--frontend-root` if the frontend lives elsewhere. See [[Workflows]] for the Frontend-profile gate itself.
 
 ### `report` (`commands/report.rs`)
 

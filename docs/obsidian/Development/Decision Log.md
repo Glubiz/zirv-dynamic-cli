@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-30
+last-verified: 2026-08-31
 ---
 
 # Decision Log
@@ -23,6 +23,20 @@ last-verified: 2026-08-30
 - If the entry is longer than the cap, the "why" is a spec, not an ADR — write it under `docs/superpowers/specs/` and link to it.
 
 ## Decisions
+
+### 2026-08-31 — An oversized headless launch's WHOLE argv is budgeted, reusing #213's stdin fallback rather than a new mechanism (issue #220)
+**Context:** Issue #213 (2026-08-30) shrunk an oversized composed system-prompt to `INLINE_ARGV_PROMPT_BUDGET_BYTES` before it ever reached an adapter's argv, but `exec.rs::build_headless` still routed the operator's own task prompt to argv unconditionally off a shim launch — a large task prompt (an operator's own, or a workflow review package's diff-heavy one) riding beside a near-budget system prompt on the same command line could still overflow Windows' `CreateProcessW` ~32KB ceiling (`os error 206`), the exact failure #213 was meant to close.
+**Decision:** `build_headless` now measures `headless_argv_len` — the byte length of the whole assembled command (program plus every argument, the #213 system-prompt layer included) — and delivers the prompt via `adapter.headless_cmd_stdin` whenever that total exceeds the SAME `INLINE_ARGV_PROMPT_BUDGET_BYTES` #213 already established, in addition to the existing shim trigger. The child is spawned with piped stdio, never a PTY, for this delivery path.
+**Rejected:** A private temp file for the prompt (mirroring claude's file-based system-prompt delivery) — `headless_cmd_stdin` already exists, is already exercised on every shim launch, and needs no new file-lifetime/cleanup contract. A separate, smaller budget just for the task prompt — the two texts share one command line, so only their combined length is the real constraint; budgeting them independently could still overflow the same ceiling.
+**Consequences:** `build_headless` is the one chokepoint every headless launch, relaunch, nudge, and park reuses, so this fix covers all of them uniformly rather than needing a fix per call site. Any future inline-argv-only adapter constraint should measure the WHOLE assembled command, not one argument in isolation — the same lesson #213's own review round already learned for the system-prompt layer alone.
+**Spec / link:** `src/commands/ctx/exec.rs`'s `headless_argv_len`/`headless_prompt_via_stdin`/`build_headless`; `src/commands/ctx/prompt.rs`'s `INLINE_ARGV_PROMPT_BUDGET_BYTES` (reused, not duplicated); [[Ctx Subsystem]]'s "Chat, Agent and Mail" section; [[Ctx Adapters]]; issue #220.
+
+### 2026-08-31 — Worktree mail widens the READ side to the registered slug, rather than canonicalizing worktree slugs (issue #219)
+**Context:** Delivery already filed mail under a target session's REGISTERED repo slug (`sessions::Record::repo_slug`), so a session running from a git worktree checkout was correctly addressable — but `zirv ctx inbox`/`unread_counts` derived their own mailbox only from `repo_slug(current_dir())`, which never canonicalizes to the main checkout's, so mail addressed to a worktree session sat "queued" forever with no reader ever looking in the right directory.
+**Decision:** Widen the READ side instead: `run_inbox_with`/`unread_counts` now also scan the caller's own registered slug (`registered_slug_if_different`/`registered_slug_for_short`, via `sessions::load_record`) when it differs from the cwd-derived one, merging both directories' listings by `sent` time and consuming/marking each message in whichever directory it was actually found in.
+**Rejected:** Canonicalizing worktree paths so they slug identically to the main checkout — would change existing, already-stored slug values for every other state (memory, handoffs, workflow) keyed off `repo_slug`, a far larger blast radius than the one read-side gap this issue actually reported; a prior canonicalization pass (2026-08-21, `repo_slug` now canonicalizes `/var`↔`/private/var` etc.) deliberately left worktrees as a distinct slug, and nothing here revisits that.
+**Consequences:** A worktree session's mailbox is now genuinely two directories from the read side's point of view, never double-counted since they are always distinct. Any future per-session read surface (a new `zirv ctx` verb that lists a session's own mail) should reuse `registered_slug_if_different`/`registered_slug_for_short` rather than re-deriving from cwd alone.
+**Spec / link:** `src/commands/ctx/mail.rs`'s `registered_slug_if_different`/`registered_slug_for_short`/`run_inbox_with`/`unread_counts`; [[Ctx Subsystem]]'s "Chat, Agent and Mail" section; [[Known Issues]]; issue #219.
 
 ### 2026-08-30 — The test/deploy gate's baseline is operator-owned under `~/.zirv`, subset-of-names semantics, explicit recording only (issue #215)
 **Context:** `zirv workflow advance`'s test/verify step demanded an outright-passing `zirv test` report, hard-failing on any named test failure — structurally unpassable on a host with a documented, pre-existing per-host baseline of failing test names (this Windows dev machine's own `wrap`/`exec` set), even when a branch introduces zero new failure names.
