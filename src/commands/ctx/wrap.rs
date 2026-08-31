@@ -199,7 +199,9 @@ const PASTE_SPAN_MAX: Duration = Duration::from_secs(5);
 /// for the rest of the marker. `ESC` and `ESC [` are deliberately below the
 /// floor: they are the start of Esc-to-interrupt and of every arrow key, and
 /// withholding those until the *next* keystroke would break the session in a
-/// far more visible way than an unrecognised paste ever could.
+/// far more visible way than an unrecognised paste ever could. Nothing is
+/// lost by forwarding them: [`PasteGuard::forwarded_start_prefix`] remembers
+/// that it did, so a marker split there still opens its span.
 const MIN_HELD_MARKER_PREFIX: usize = 3;
 
 /// Keeps a bracketed paste whole on the operator-input path.
@@ -229,6 +231,17 @@ pub struct PasteGuard {
     held: Vec<u8>,
     /// When the currently open span's start marker arrived.
     span_started: Option<Instant>,
+    /// How many bytes of `PASTE_START` the *previous* read ended on and this
+    /// guard forwarded anyway because they were shorter than
+    /// [`MIN_HELD_MARKER_PREFIX`] -- so 1 (`ESC`) or 2 (`ESC [`), or `None`.
+    ///
+    /// Those bytes are not held back, but they are still remembered: if the
+    /// very next read opens with the rest of the marker, the span genuinely
+    /// started back there and has to be opened, or the body streams through
+    /// read by read and the one-write guarantee is lost exactly where the
+    /// terminal split hardest. Cleared by the next read whatever it turns out
+    /// to be, so the memory can never span more than one read.
+    forwarded_start_prefix: Option<usize>,
 }
 
 impl PasteGuard {
@@ -247,10 +260,29 @@ impl PasteGuard {
             self.span_started = None;
             let mut flushed = std::mem::take(&mut self.held);
             flushed.extend_from_slice(bytes);
+            self.forwarded_start_prefix = forwarded_start_prefix(&flushed);
             return std::borrow::Cow::Owned(flushed);
         }
+        // The previous read ended on an `ESC` or `ESC [` that was forwarded
+        // rather than held (see `MIN_HELD_MARKER_PREFIX`). If this read opens
+        // with the rest of the start marker, that really was a paste
+        // beginning: open the span here, and gather from this read on. The
+        // marker's first bytes are already on the wire, so the child still
+        // receives the whole of it, just as two writes rather than one.
+        //
+        // `take` runs however the rest of the condition goes, which is what
+        // clears the memory for every read that is not the continuation.
+        if let Some(sent) = self.forwarded_start_prefix.take()
+            && self.span_started.is_none()
+            && self.held.is_empty()
+            && bytes.starts_with(&PASTE_START[sent..])
+        {
+            self.span_started = Some(now);
+        }
         // The overwhelmingly common read: no span open, nothing held, and not
-        // a byte that could begin a marker. Copies nothing.
+        // a byte that could begin a marker. Copies nothing. Deliberately
+        // *after* the check above -- the tail of a start marker (`200~`)
+        // carries no `ESC` of its own and would slip straight through here.
         if self.span_started.is_none() && self.held.is_empty() && !bytes.contains(&ESC) {
             return std::borrow::Cow::Borrowed(bytes);
         }
@@ -303,7 +335,27 @@ impl PasteGuard {
                 break;
             }
         }
+        // Only a read that ends outside a span, holding nothing, can leave a
+        // forwarded fragment behind to remember.
+        self.forwarded_start_prefix = if self.span_started.is_none() && self.held.is_empty() {
+            forwarded_start_prefix(&out)
+        } else {
+            None
+        };
         std::borrow::Cow::Owned(out)
+    }
+}
+
+/// The length of the 1- or 2-byte tail of `bytes` that is a prefix of
+/// [`PASTE_START`] -- the fragments [`trailing_marker_prefix`] deliberately
+/// forwards instead of holding. `None` when the read ends on anything else.
+fn forwarded_start_prefix(bytes: &[u8]) -> Option<usize> {
+    if bytes.ends_with(&PASTE_START[..2]) {
+        Some(2)
+    } else if bytes.ends_with(&PASTE_START[..1]) {
+        Some(1)
+    } else {
+        None
     }
 }
 
@@ -7815,6 +7867,66 @@ mod tests {
             assert_eq!(guard.filter(b"\x1b", now).as_ref(), b"\x1b");
             assert_eq!(guard.filter(b"\x1b[", now).as_ref(), b"\x1b[");
             assert_eq!(guard.filter(b"\x1b[A", now).as_ref(), b"\x1b[A");
+        }
+
+        /// The other half of that rule. `ESC` goes out immediately, but the
+        /// guard remembers it did: when the rest of the start marker turns up
+        /// in the next read the span really did begin back there, so the body
+        /// is still gathered into one write rather than streaming through.
+        #[test]
+        fn a_start_marker_split_after_the_escape_still_opens_one_span() {
+            let mut guard = PasteGuard::default();
+            let now = Instant::now();
+            // The body is deliberately spread over a further read: without
+            // the span the guard would stream those reads straight through.
+            let writes = feed(&mut guard, &[b"\x1b", b"[200~a\r", b"\nb\x1b[201~"], now);
+            assert_eq!(
+                writes,
+                vec![b"\x1b".to_vec(), b"[200~a\r\nb\x1b[201~".to_vec()],
+                "the escape is already on the wire; the rest arrives as one write"
+            );
+            assert_eq!(
+                writes.concat(),
+                b"\x1b[200~a\r\nb\x1b[201~".to_vec(),
+                "and nothing is lost, added or rewritten"
+            );
+        }
+
+        /// Same, split one byte later -- and with the body spread over a
+        /// further read, to show it is genuinely accumulated.
+        #[test]
+        fn a_start_marker_split_after_the_csi_introducer_still_opens_one_span() {
+            let mut guard = PasteGuard::default();
+            let now = Instant::now();
+            let writes = feed(&mut guard, &[b"\x1b[", b"200~a\r", b"\nb\x1b[201~"], now);
+            assert_eq!(
+                writes,
+                vec![b"\x1b[".to_vec(), b"200~a\r\nb\x1b[201~".to_vec()]
+            );
+            assert_eq!(writes.concat(), b"\x1b[200~a\r\nb\x1b[201~".to_vec());
+        }
+
+        /// The memory lasts exactly one read: an escape followed by anything
+        /// else is two ordinary reads and stays that way.
+        #[test]
+        fn an_escape_not_followed_by_a_marker_leaves_the_next_read_untouched() {
+            let mut guard = PasteGuard::default();
+            let now = Instant::now();
+            let writes = feed(&mut guard, &[b"\x1b", b"OK"], now);
+            assert_eq!(writes, vec![b"\x1b".to_vec(), b"OK".to_vec()]);
+            // And the stale memory is gone: a bare `200~` later is just text.
+            assert_eq!(guard.filter(b"200~", now).as_ref(), b"200~");
+        }
+
+        /// The end marker needs no such memory: inside an open span every
+        /// byte is accumulated already, a trailing `ESC` included, so a split
+        /// end marker is reassembled by the next read on its own.
+        #[test]
+        fn an_end_marker_split_after_the_escape_is_reassembled_inside_the_span() {
+            let mut guard = PasteGuard::default();
+            let now = Instant::now();
+            let writes = feed(&mut guard, &[b"\x1b[200~body\x1b", b"[201~"], now);
+            assert_eq!(writes, vec![b"\x1b[200~body\x1b[201~".to_vec()]);
         }
 
         /// A fragment held for a marker that never arrives is released with
