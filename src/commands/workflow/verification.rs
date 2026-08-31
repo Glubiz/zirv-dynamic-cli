@@ -1016,7 +1016,69 @@ fn check_result(check: &ResolvedCheck, status: CheckStatus) -> CheckResult {
     }
 }
 
-fn run_check(repo: &Path, check: &ResolvedCheck, dry_run: bool) -> CheckResult {
+/// Environment variable names always passed from the zirv process's own
+/// environment into a verification check child, with no `[workflow]
+/// check_env_passthrough` configuration at all. `run_check` already spawns
+/// the check with `std::process::Command::new`, which inherits the parent's
+/// full environment by default (no `env_clear`/`env_remove` sits between
+/// zirv and the check child) -- so on a machine where the zirv process
+/// itself has these set, the child already sees them. This list exists as
+/// an explicit, tested guarantee for that path rather than an implicit
+/// consequence of never having called `env_clear`, and as the seam a future
+/// sandboxing change (`Command::env_clear` for stricter check isolation)
+/// would have to widen instead of quietly regressing (issue #233: a
+/// macOS/Linux desktop session's `ssh-agent` family -- `SSH_AUTH_SOCK`,
+/// `SSH_AGENT_PID`, `SSH_ASKPASS` -- plus GPG's terminal/homedir pointers --
+/// `GPG_TTY`, `GNUPGHOME` -- so a check that shells out to `ssh`/git-over-ssh/
+/// `gpg` (e.g. `gitlab-ci-local`'s remote-variable fetch) passes without a
+/// per-command shell workaround).
+const DEFAULT_CHECK_ENV_PASSTHROUGH: &[&str] = &[
+    "SSH_AUTH_SOCK",
+    "SSH_AGENT_PID",
+    "SSH_ASKPASS",
+    "GPG_TTY",
+    "GNUPGHOME",
+];
+
+/// Whether `a` and `b` name the same environment variable. Unix environment
+/// blocks are case-sensitive; Windows's is not, so an operator-configured
+/// `[workflow] check_env_passthrough` entry that only differs in case from a
+/// `DEFAULT_CHECK_ENV_PASSTHROUGH` name must still be treated as the same
+/// name there, matching how the OS itself resolves the child's environment.
+#[cfg(windows)]
+fn env_names_match(a: &str, b: &str) -> bool {
+    a.eq_ignore_ascii_case(b)
+}
+
+#[cfg(not(windows))]
+fn env_names_match(a: &str, b: &str) -> bool {
+    a == b
+}
+
+/// `DEFAULT_CHECK_ENV_PASSTHROUGH` plus `extra` (the operator's own
+/// `[workflow] check_env_passthrough`, `~/.zirv/ctx.toml`/`ZIRV_CTX_*` only
+/// -- REPO_FORBIDDEN, see `config.rs`), deduplicated by [`env_names_match`]
+/// so the operator key can only ADD names, never narrow or replace the
+/// built-in defaults.
+fn resolved_check_env_passthrough(extra: &[String]) -> Vec<String> {
+    let mut names: Vec<String> = DEFAULT_CHECK_ENV_PASSTHROUGH
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect();
+    for name in extra {
+        if !names.iter().any(|existing| env_names_match(existing, name)) {
+            names.push(name.clone());
+        }
+    }
+    names
+}
+
+fn run_check(
+    repo: &Path,
+    check: &ResolvedCheck,
+    dry_run: bool,
+    check_env_passthrough: &[String],
+) -> CheckResult {
     if dry_run {
         return check_result(check, CheckStatus::DryRun);
     }
@@ -1030,6 +1092,15 @@ fn run_check(repo: &Path, check: &ResolvedCheck, dry_run: bool) -> CheckResult {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // Explicit guarantee, not a no-op: see `DEFAULT_CHECK_ENV_PASSTHROUGH`'s
+    // own doc comment. Read from zirv's own process environment at check
+    // time, exactly like every other operator-config-gated env read in this
+    // codebase (never a repo-controlled value).
+    for name in resolved_check_env_passthrough(check_env_passthrough) {
+        if let Ok(value) = std::env::var(&name) {
+            command.env(&name, value);
+        }
+    }
     /// One check's raw run outcome: status, exit code, combined capped
     /// output, and the failing test names a `FailureNameScanner` recognized
     /// while that output streamed by.
@@ -1258,7 +1329,8 @@ fn run_mode(
     // Not `?`: an unparseable ctx.toml closes the repo-check gate (and
     // announces itself) rather than failing the whole command, which a
     // checkout could otherwise use to brick `zirv test`/`zirv verify`.
-    let repo_checks_enabled = super::repo_gates(repo).checks;
+    let repo_gates = super::repo_gates(repo);
+    let repo_checks_enabled = repo_gates.checks;
     let mut notes = resolved.notes;
     let paths = changed_paths(repo)?;
     let mut fallback_to_full = false;
@@ -1331,7 +1403,7 @@ fn run_mode(
             checks.push(check_result(check, CheckStatus::Skipped));
             continue;
         }
-        let result = run_check(repo, check, dry_run);
+        let result = run_check(repo, check, dry_run, &repo_gates.check_env_passthrough);
         if check.source.repo_supplied() {
             repo_spent = repo_spent.saturating_add(Duration::from_millis(result.duration_ms));
         }
@@ -2212,6 +2284,7 @@ mod tests {
                 },
             ),
             false,
+            &[],
         );
         assert_eq!(passed.status, CheckStatus::Passed);
         assert!(passed.failure_output.is_none());
@@ -2227,9 +2300,140 @@ mod tests {
                 },
             ),
             false,
+            &[],
         );
         assert_eq!(failed.status, CheckStatus::Failed);
         assert!(failed.failure_output.unwrap().contains("actionable"));
+    }
+
+    // -- #233: verification checks see the operator's SSH-agent env family -
+
+    /// Round-trips `SSH_AUTH_SOCK` through a real check child with no
+    /// `[workflow] check_env_passthrough` configuration at all (the "safe
+    /// defaults" requirement): the check prints the variable back out on the
+    /// failure path (where output is retained), and the captured text must
+    /// contain the value the *test* set on zirv's own process, not the
+    /// literal, unexpanded `$SSH_AUTH_SOCK`/`%SSH_AUTH_SOCK%` the shell
+    /// prints for an unset variable.
+    #[test]
+    fn a_check_child_sees_ssh_auth_sock_via_the_default_allowlist_with_no_config() {
+        let repo = tempdir().unwrap();
+        let marker = "zirv-issue-233-ssh-auth-sock-marker";
+        // SAFETY: this suite runs single-threaded / process-per-test.
+        unsafe {
+            std::env::set_var("SSH_AUTH_SOCK", marker);
+        }
+        let result = run_check(
+            repo.path(),
+            &spec(
+                "ssh-auth-sock",
+                if cfg!(windows) {
+                    "echo %SSH_AUTH_SOCK% & exit /b 3"
+                } else {
+                    "echo \"$SSH_AUTH_SOCK\" >&2; exit 3"
+                },
+            ),
+            false,
+            &[],
+        );
+        unsafe {
+            std::env::remove_var("SSH_AUTH_SOCK");
+        }
+        assert_eq!(result.status, CheckStatus::Failed);
+        let output = result.failure_output.unwrap();
+        assert!(
+            output.contains(marker),
+            "the check child must see the operator's own SSH_AUTH_SOCK with no config \
+             at all: got {output}"
+        );
+    }
+
+    /// A name in the operator's own `[workflow] check_env_passthrough`
+    /// reaches a real check child end to end via `run_check`'s explicit
+    /// `command.env(name, value)` call. `Command::new` already inherits the
+    /// parent's full environment by default (no `env_clear`/`env_remove`
+    /// sits between zirv and the check child -- see
+    /// `DEFAULT_CHECK_ENV_PASSTHROUGH`'s own doc comment), so this variable
+    /// would reach the child regardless; the ADD-not-replace contract itself
+    /// is pinned at the unit level, with no process spawn involved, by
+    /// `resolved_check_env_passthrough_adds_to_not_replaces_the_defaults`
+    /// right below. What this test actually catches is a regression in the
+    /// explicit-passthrough loop itself (e.g. the wrong name/value pair, or
+    /// the loop silently dropped).
+    #[test]
+    fn a_check_env_passthrough_entry_reaches_the_check_child() {
+        let repo = tempdir().unwrap();
+        let custom_marker = "zirv-issue-233-custom-marker";
+        // SAFETY: this suite runs single-threaded / process-per-test.
+        unsafe {
+            std::env::set_var("ZIRV_ISSUE_233_CUSTOM", custom_marker);
+        }
+        let command = if cfg!(windows) {
+            "echo %ZIRV_ISSUE_233_CUSTOM% & exit /b 3"
+        } else {
+            "echo \"$ZIRV_ISSUE_233_CUSTOM\" >&2; exit 3"
+        };
+        let result = run_check(
+            repo.path(),
+            &spec("custom", command),
+            false,
+            &["ZIRV_ISSUE_233_CUSTOM".to_string()],
+        );
+        unsafe {
+            std::env::remove_var("ZIRV_ISSUE_233_CUSTOM");
+        }
+        let output = result.failure_output.unwrap();
+        assert!(
+            output.contains(custom_marker),
+            "an operator-configured check_env_passthrough entry must reach the check \
+             child: got {output}"
+        );
+    }
+
+    /// Pure unit coverage of the merge itself, independent of process spawn:
+    /// the operator's own entries are appended to the built-in defaults,
+    /// matched case-insensitively on Windows (so a differently-cased
+    /// duplicate of a default name does not produce a second entry) and
+    /// case-sensitively on unix (so it does).
+    #[test]
+    fn resolved_check_env_passthrough_adds_to_not_replaces_the_defaults() {
+        let resolved = resolved_check_env_passthrough(&["MY_CUSTOM_VAR".to_string()]);
+        for default in DEFAULT_CHECK_ENV_PASSTHROUGH {
+            assert!(
+                resolved.iter().any(|name| name == default),
+                "the default '{default}' must survive: {resolved:?}"
+            );
+        }
+        assert!(
+            resolved.iter().any(|name| name == "MY_CUSTOM_VAR"),
+            "the operator's own entry must be added: {resolved:?}"
+        );
+        assert_eq!(
+            resolved.len(),
+            DEFAULT_CHECK_ENV_PASSTHROUGH.len() + 1,
+            "adds one name on top of the defaults, never fewer: {resolved:?}"
+        );
+
+        // An exact-cased duplicate of a default is never added twice, on
+        // either platform.
+        let exact_dup = resolved_check_env_passthrough(&["SSH_AUTH_SOCK".to_string()]);
+        assert_eq!(exact_dup.len(), DEFAULT_CHECK_ENV_PASSTHROUGH.len());
+
+        let differently_cased = resolved_check_env_passthrough(&["ssh_auth_sock".to_string()]);
+        if cfg!(windows) {
+            assert_eq!(
+                differently_cased.len(),
+                DEFAULT_CHECK_ENV_PASSTHROUGH.len(),
+                "Windows matching is case-insensitive: {differently_cased:?}"
+            );
+        } else {
+            assert_eq!(
+                differently_cased.len(),
+                DEFAULT_CHECK_ENV_PASSTHROUGH.len() + 1,
+                "unix matching is case-sensitive, so this is a distinct addition: \
+                 {differently_cased:?}"
+            );
+        }
     }
 
     // -- #215: baseline-waivable test gate ---------------------------------

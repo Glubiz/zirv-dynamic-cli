@@ -176,6 +176,7 @@ model = "fable"
 # telemetry_enabled = true           # REPO-FORBIDDEN (ZIRV_CTX_WORKFLOW_TELEMETRY): local workflow telemetry (`zirv workflow stats`). Default: true.
 # telemetry_max_events = 1000        # REPO-FORBIDDEN (ZIRV_CTX_WORKFLOW_TELEMETRY_MAX_EVENTS): how many events one repository keeps before the oldest are pruned. Default: 1000.
 # telemetry_retention_days = 30      # REPO-FORBIDDEN (ZIRV_CTX_WORKFLOW_TELEMETRY_RETENTION_DAYS): how long an event is kept. Default: 30.
+# check_env_passthrough = []         # REPO-FORBIDDEN (ZIRV_CTX_WORKFLOW_CHECK_ENV_PASSTHROUGH): extra environment variable names ADDED to the built-in verification-check allowlist (SSH_AUTH_SOCK, SSH_AGENT_PID, SSH_ASKPASS, GPG_TTY, GNUPGHOME), read from zirv's own environment and set on each check child. Default: [].
 
 # [workflow.deploy]
 # tier = "development"               # REPO-FORBIDDEN (ZIRV_CTX_WORKFLOW_DEPLOY_TIER): development < staging < production. Operator env overrides all layers. Default: "development".

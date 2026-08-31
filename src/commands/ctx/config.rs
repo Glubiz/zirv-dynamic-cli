@@ -589,6 +589,18 @@ pub struct WorkflowConfig {
     pub telemetry_enabled: bool,
     pub telemetry_max_events: usize,
     pub telemetry_retention_days: u64,
+    /// Extra environment variable names, read from zirv's own process
+    /// environment at check-run time and set on a verification check child
+    /// (`workflow::verification::run_check`) -- ADDED to that function's own
+    /// built-in `DEFAULT_CHECK_ENV_PASSTHROUGH` (the SSH-agent family plus
+    /// GPG's terminal/homedir pointers), never a replacement for it. Issue
+    /// #233: an operator whose check toolchain needs a variable outside that
+    /// default set (a corporate proxy token, say) names it here instead of
+    /// prefixing every `verify.toml` command with a shell workaround.
+    /// Empty by default. `REPO_FORBIDDEN`: the untrusted repo checkout that
+    /// owns `verify.toml` must never be able to widen what its own checks
+    /// can read from the operator's environment.
+    pub check_env_passthrough: Vec<String>,
 }
 
 impl Default for WorkflowConfig {
@@ -602,6 +614,7 @@ impl Default for WorkflowConfig {
             telemetry_enabled: true,
             telemetry_max_events: 1000,
             telemetry_retention_days: 30,
+            check_env_passthrough: Vec::new(),
         }
     }
 }
@@ -1917,6 +1930,15 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
         &["workflow", "telemetry_retention_days"],
         "ZIRV_CTX_WORKFLOW_TELEMETRY_RETENTION_DAYS",
     ),
+    // Issue #233: the SSH-agent-family passthrough allowlist a verification
+    // check child receives is operator-owned, the same widening-only
+    // asymmetry as `sandbox.extra_allow` above -- a repo checkout must not be
+    // able to name additional environment variables its own `verify.toml`
+    // checks can read from the operator's process environment.
+    (
+        &["workflow", "check_env_passthrough"],
+        "ZIRV_CTX_WORKFLOW_CHECK_ENV_PASSTHROUGH",
+    ),
     // A repo checkout must not be able to switch either memory scope's own
     // gate on or off for itself, grow its cap, or turn on automatic
     // harvesting -- this is about the CONFIGURATION, not the shared scope's
@@ -2662,6 +2684,17 @@ impl CtxConfig {
         };
         if let Some(raw) = env("ZIRV_CTX_SANDBOX_EXTRA_ALLOW") {
             cfg.sandbox.extra_allow = split_csv_list(&raw);
+        }
+
+        // Same operator-only override shape as `extra_allow` right above:
+        // when set, `ZIRV_CTX_WORKFLOW_CHECK_ENV_PASSTHROUGH` replaces
+        // whatever `workflow.check_env_passthrough` the merged TOML layers
+        // produced (`REPO_FORBIDDEN` already means that can only be the
+        // operator's own `~/.zirv/ctx.toml`). This list is itself only ever
+        // ADDED to `verification::DEFAULT_CHECK_ENV_PASSTHROUGH` at the
+        // point of use, never a replacement for those built-in defaults.
+        if let Some(raw) = env("ZIRV_CTX_WORKFLOW_CHECK_ENV_PASSTHROUGH") {
+            cfg.workflow.check_env_passthrough = split_csv_list(&raw);
         }
 
         // Same union as `extra_deny` above, for `heavy_command_patterns`: the
@@ -4875,6 +4908,72 @@ mod tests {
         );
     }
 
+    /// Issue #233: `workflow.check_env_passthrough` is operator-only, the
+    /// identical widening-only asymmetry `repo_layer_cannot_add_sandbox_
+    /// extra_allow_entries` above pins for `sandbox.extra_allow` -- a repo
+    /// checkout naming a variable here would let its own `verify.toml`
+    /// checks read it out of the operator's process environment.
+    #[test]
+    fn repo_layer_cannot_set_workflow_check_env_passthrough() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[workflow]\ncheck_env_passthrough = [\"AWS_SECRET_ACCESS_KEY\"]\n",
+        )
+        .expect("write");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let empty = env_map(&[]);
+        let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+            .expect_err("a repo may not widen the check-env passthrough allowlist")
+            .to_string();
+        assert!(err.contains("workflow.check_env_passthrough"), "got {err}");
+        assert!(
+            err.contains("ZIRV_CTX_WORKFLOW_CHECK_ENV_PASSTHROUGH"),
+            "names the operator escape hatch: {err}"
+        );
+    }
+
+    /// The operator's own `~/.zirv/ctx.toml` may set
+    /// `workflow.check_env_passthrough` (only `REPO_FORBIDDEN` blocks the
+    /// repo layer, never the home layer), and
+    /// `ZIRV_CTX_WORKFLOW_CHECK_ENV_PASSTHROUGH` overrides it from the
+    /// environment -- the same operator-in-both-directions shape
+    /// `the_operator_may_set_sandbox_extra_allow_and_deny_from_the_
+    /// environment` pins for `sandbox.extra_allow`.
+    #[test]
+    fn the_operator_may_set_workflow_check_env_passthrough_from_home_config_and_env() {
+        let home = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".zirv/ctx.toml"),
+            "[workflow]\ncheck_env_passthrough = [\"CORP_PROXY_TOKEN\"]\n",
+        )
+        .expect("write");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tempfile::tempdir().expect("tempdir");
+
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert_eq!(
+            cfg.workflow.check_env_passthrough,
+            vec!["CORP_PROXY_TOKEN".to_string()],
+            "the operator's own home-layer entry must survive"
+        );
+
+        let env = env_map(&[(
+            "ZIRV_CTX_WORKFLOW_CHECK_ENV_PASSTHROUGH",
+            "MY_VAR_A, MY_VAR_B",
+        )]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert_eq!(
+            cfg.workflow.check_env_passthrough,
+            vec!["MY_VAR_A".to_string(), "MY_VAR_B".to_string()],
+            "the env value replaces the file-layer value outright"
+        );
+    }
+
     /// Issue #147: `safety.escape_allow` is operator-only, the identical
     /// asymmetry `repo_layer_cannot_add_sandbox_extra_allow_entries` above
     /// pins for `sandbox.extra_allow` -- a repo checkout adding to it would
@@ -5477,6 +5576,7 @@ mod tests {
         ("workflow", "telemetry_enabled"),
         ("workflow", "telemetry_max_events"),
         ("workflow", "telemetry_retention_days"),
+        ("workflow", "check_env_passthrough"),
         ("policy", "repo_fs_write"),
         ("policy", "outside_repo_fs_write"),
         ("policy", "shell_exec"),
