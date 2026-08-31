@@ -582,6 +582,12 @@ pub struct WorkflowState {
     pub review_evidence: Vec<super::review::ReviewRunEvidence>,
     #[serde(default)]
     pub usage_checkpoint: Option<UsageCheckpoint>,
+    /// Repository whose frontend the detector/render evidence should scan
+    /// instead of `repo`, for workflows tracked in one repository while the
+    /// actual frontend under test lives in a sibling checkout. `None` keeps
+    /// the historical single-repo behavior of scanning `repo` itself.
+    #[serde(default)]
+    pub frontend_target_root: Option<PathBuf>,
     #[serde(default)]
     pub phase_started_at: u64,
     pub status: WorkflowStatus,
@@ -632,6 +638,7 @@ impl WorkflowState {
             review_findings: Vec::new(),
             review_evidence: Vec::new(),
             usage_checkpoint: None,
+            frontend_target_root: None,
             phase_started_at: now,
             status,
             created_at: now,
@@ -1422,25 +1429,31 @@ pub fn advance_with_evidence(
         .ok_or("workflow has no current step")?;
     match outcome {
         StepOutcome::Success => {
+            let frontend_root = state
+                .frontend_target_root
+                .as_deref()
+                .unwrap_or(state.repo.as_path());
             if state.profile == WorkflowProfile::Frontend
                 && matches!(
                     current.phase,
                     WorkflowPhase::Test | WorkflowPhase::Review | WorkflowPhase::Verify
                 )
-                && !super::frontend_detector::latest_is_fresh_and_passing(state_dir, &state.repo)?
+                && !super::frontend_detector::latest_is_fresh_and_passing(state_dir, frontend_root)?
             {
                 let report = super::frontend_detector::detect_for_workflow(
                     state_dir,
-                    &state.repo,
+                    frontend_root,
                     matches!(current.phase, WorkflowPhase::Review | WorkflowPhase::Verify),
                 )?;
                 if !report.passed() || report.truncated || report.analyzed_files.is_empty() {
                     return Err(format!(
-                        "frontend step '{}' automatically ran the detector, but evidence did not pass ({} blocking, {} files, truncated={}); inspect with `zirv frontend check --all`",
+                        "frontend step '{}' automatically ran the detector against '{}', but evidence did not pass ({} blocking, {} files, truncated={}); inspect with `zirv frontend check --all --repo {}`, or set `--frontend-root` if the frontend lives in a different repository",
                         current.id,
+                        frontend_root.display(),
                         report.blocking_count(),
                         report.analyzed_files.len(),
-                        report.truncated
+                        report.truncated,
+                        frontend_root.display()
                     )
                     .into());
                 }
@@ -1895,6 +1908,12 @@ pub struct StartArgs {
     pub complexity: Option<Complexity>,
     #[arg(long, value_enum)]
     pub risk: Option<RiskBand>,
+    /// Repository whose frontend the auto-run detector/render evidence
+    /// should scan for a Frontend-profile workflow, when it differs from
+    /// `--repo` (for example a workflow tracked in this repo whose frontend
+    /// lives in a sibling checkout).
+    #[arg(long)]
+    pub frontend_root: Option<PathBuf>,
     #[arg(long)]
     pub json: bool,
 }
@@ -1986,6 +2005,11 @@ pub struct AdvanceArgs {
     pub output_tokens: Option<u64>,
     #[arg(long, default_value_t = 0)]
     pub workers: u32,
+    /// Set (or update) the sibling repository whose frontend the auto-run
+    /// detector/render evidence should scan for this workflow, for example
+    /// once it becomes clear the tracked repo isn't the one under test.
+    #[arg(long)]
+    pub frontend_root: Option<PathBuf>,
 }
 
 fn resolve_repo(repo: Option<&Path>) -> CtxResult<PathBuf> {
@@ -1993,6 +2017,27 @@ fn resolve_repo(repo: Option<&Path>) -> CtxResult<PathBuf> {
         Some(path) => path.canonicalize().unwrap_or_else(|_| path.to_path_buf()),
         None => std::env::current_dir()?,
     })
+}
+
+/// Resolves and validates `--frontend-root`: absolutized against the current
+/// directory, then required to exist and be a directory so a typo fails
+/// loudly at parse time instead of surfacing later as "0 files scanned".
+fn resolve_frontend_root(path: &Path) -> CtxResult<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let canonical = absolute.canonicalize().map_err(|err| {
+        format!(
+            "frontend root '{}' does not exist: {err}",
+            absolute.display()
+        )
+    })?;
+    if !canonical.is_dir() {
+        return Err(format!("frontend root '{}' is not a directory", canonical.display()).into());
+    }
+    Ok(canonical)
 }
 
 fn resolve_state() -> CtxResult<StateDir> {
@@ -2007,6 +2052,9 @@ fn write_state(writer: &mut impl Write, state: &WorkflowState, json: bool) -> Ct
         writeln!(writer, "workflow: {}", state.id)?;
         writeln!(writer, "kind: {}", state.kind.as_str())?;
         writeln!(writer, "profile: {:?}", state.profile)?;
+        if let Some(frontend_root) = &state.frontend_target_root {
+            writeln!(writer, "frontend target root: {}", frontend_root.display())?;
+        }
         writeln!(writer, "deploy tier: {}", state.deploy_tier)?;
         writeln!(writer, "status: {:?}", state.status)?;
         writeln!(
@@ -2165,6 +2213,9 @@ pub fn run(args: &WorkflowArgs, writer: &mut impl Write) -> CtxResult<i32> {
             );
             apply_effective_deploy_tier(&mut state, deploy_tier);
             state.usage_checkpoint = usage_checkpoint(&state.repo);
+            if let Some(frontend_root) = &args.frontend_root {
+                state.frontend_target_root = Some(resolve_frontend_root(frontend_root)?);
+            }
             ensure_current_artifact_template(&state)?;
             if work_dir_is_gitignored(&state.repo) {
                 writeln!(
@@ -2276,6 +2327,9 @@ pub fn run(args: &WorkflowArgs, writer: &mut impl Write) -> CtxResult<i32> {
             let repo = resolve_repo(args.repo.as_deref())?;
             let state_dir = resolve_state()?;
             let mut state = load(&state_dir, &repo, &args.id)?;
+            if let Some(frontend_root) = &args.frontend_root {
+                state.frontend_target_root = Some(resolve_frontend_root(frontend_root)?);
+            }
             let evidence = enrich_transition_evidence(
                 &mut state,
                 TransitionEvidence {
@@ -2598,6 +2652,162 @@ mod tests {
             error.contains("automatically ran the detector")
                 || error.contains("cannot inspect changed paths"),
             "{error}"
+        );
+    }
+
+    #[test]
+    fn frontend_gate_uses_frontend_target_root_when_set() {
+        // #214: the workflow is tracked in `workflow_repo`, but the real
+        // frontend under test lives in a sibling `target_repo` -- the
+        // detector must scan `frontend_target_root`, not `state.repo`, once
+        // it is set.
+        let workflow_repo = tempdir().unwrap();
+        let target_repo = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.email=t@example.com",
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(dir)
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed in {}", dir.display());
+        };
+        // Both repos are real (empty) git checkouts, so `changed_paths`
+        // resolves cleanly instead of surfacing an unrelated "not a git
+        // repository" error that would mask what this test is about.
+        git(workflow_repo.path(), &["init", "-q"]);
+        std::fs::write(workflow_repo.path().join("README.md"), "readme\n").unwrap();
+        git(workflow_repo.path(), &["add", "."]);
+        git(workflow_repo.path(), &["commit", "-q", "-m", "base"]);
+
+        git(target_repo.path(), &["init", "-q"]);
+        std::fs::write(target_repo.path().join("README.md"), "readme\n").unwrap();
+        git(target_repo.path(), &["add", "."]);
+        git(target_repo.path(), &["commit", "-q", "-m", "base"]);
+        // A minimal, clean stylesheet: no images, semantic-action targets,
+        // gradients, motion, or viewport hazards, so the detector should
+        // report zero blocking findings for it.
+        std::fs::write(
+            target_repo.path().join("style.css"),
+            ".card { color: rebeccapurple; }\n",
+        )
+        .unwrap();
+
+        let mut classification = low_classification();
+        classification.work_domain.domain = WorkDomain::Frontend;
+        classification.work_domain.score = 55;
+
+        let build_state = |classification: Classification| {
+            let mut state = WorkflowState::start(
+                workflow_repo.path().to_path_buf(),
+                "build a frontend component".into(),
+                WorkflowKind::Feature,
+                None,
+                true,
+                classification,
+            );
+            let test_index = state
+                .steps
+                .iter()
+                .position(|step| step.phase == WorkflowPhase::Test)
+                .unwrap();
+            state.completed_steps = state.steps[..test_index]
+                .iter()
+                .map(|step| step.id.clone())
+                .collect();
+            state.current_step = test_index;
+            state.status = WorkflowStatus::Running;
+            state
+        };
+
+        // Without a frontend target root, the gate fails closed scanning the
+        // frontend-less workflow repo -- same failure mode as #214.
+        let without_root = advance_with_evidence(
+            &state_dir,
+            build_state(classification.clone()),
+            StepOutcome::Success,
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            without_root.contains("automatically ran the detector"),
+            "{without_root}"
+        );
+
+        // With the frontend target root pointed at the sibling repo, the
+        // detector gate must pass -- execution proceeds past it to the
+        // unrelated general test-evidence gate, which `workflow_repo` has no
+        // recorded evidence for.
+        let mut state = build_state(classification);
+        state.frontend_target_root = Some(target_repo.path().canonicalize().unwrap());
+        let with_root = advance_with_evidence(&state_dir, state, StepOutcome::Success, None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            !with_root.contains("automatically ran the detector"),
+            "{with_root}"
+        );
+        assert!(
+            with_root.contains("requires fresh passing evidence"),
+            "{with_root}"
+        );
+    }
+
+    #[test]
+    fn advance_frontend_root_flag_persists_into_state() {
+        let repo = tempdir().unwrap();
+        let target_repo = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+        let state = skip_leading_artifact_steps(WorkflowState::start(
+            repo.path().to_path_buf(),
+            "small feature".into(),
+            WorkflowKind::Feature,
+            None,
+            true,
+            low_classification(),
+        ));
+        let id = state.id.clone();
+        save(&state_dir, &state, true).unwrap();
+
+        let _state_dir_env = crate::commands::ctx::testenv::VarGuard::set(&[(
+            "ZIRV_CTX_STATE_DIR",
+            Some(root.path().to_str().expect("utf-8 tempdir path")),
+        )]);
+        let args = WorkflowArgs {
+            command: WorkflowSubcommand::Advance(AdvanceArgs {
+                id: id.clone(),
+                outcome: StepOutcome::Failure,
+                repo: Some(repo.path().to_path_buf()),
+                json: false,
+                duration_ms: None,
+                agent: None,
+                model: None,
+                role: None,
+                input_tokens: None,
+                output_tokens: None,
+                workers: 0,
+                frontend_root: Some(target_repo.path().to_path_buf()),
+            }),
+        };
+        let mut out = Vec::new();
+        run(&args, &mut out).unwrap();
+
+        let reloaded = load(&state_dir, repo.path(), &id).unwrap();
+        assert_eq!(
+            reloaded.frontend_target_root,
+            Some(target_repo.path().canonicalize().unwrap())
         );
     }
 
