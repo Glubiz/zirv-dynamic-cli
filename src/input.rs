@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 use clap::Parser;
 
 use crate::utils::{
-    SCRIPT_DIR_NAME, SUPPORTED_EXTENSIONS, Shortcuts, candidate_names_in_dir, home_dir,
-    is_reserved_zirv_file, suggest_matches,
+    COMMANDS_DIR_NAME, SCRIPT_DIR_NAME, SUPPORTED_EXTENSIONS, Shortcuts, candidate_names_in_dir,
+    home_dir, is_reserved_zirv_file, script_like_files_at_root, suggest_matches,
 };
 
 #[derive(Debug, Parser, Default)]
@@ -43,10 +43,16 @@ impl Input {
     }
 }
 
+/// `root_dir` is a `.zirv` root: scripts resolve from its `commands/`
+/// subdirectory (issue #212), while `.shortcuts.yaml` -- config, not a
+/// script -- is read from the root itself, same as it always has been. A
+/// shortcut's mapped file is resolved from `commands/` too, since that is
+/// where the script it points at now lives.
 fn find_script_in_dir(
-    dir: &Path,
+    root_dir: &Path,
     name: &str,
 ) -> Result<Option<PathBuf>, Box<dyn std::error::Error>> {
+    let commands_dir = root_dir.join(COMMANDS_DIR_NAME);
     for ext in SUPPORTED_EXTENSIONS {
         let file_name = format!("{name}.{ext}");
         // A name like ".settings" would otherwise resolve to
@@ -57,13 +63,13 @@ fn find_script_in_dir(
         if is_reserved_zirv_file(&file_name) {
             continue;
         }
-        let path = dir.join(&file_name);
+        let path = commands_dir.join(&file_name);
         if path.exists() {
             return Ok(Some(path.canonicalize()?));
         }
     }
 
-    let shortcuts_path = dir.join(".shortcuts.yaml");
+    let shortcuts_path = root_dir.join(".shortcuts.yaml");
     if shortcuts_path.exists() {
         // A malformed `.shortcuts.yaml` must not take down every script
         // lookup: `create` already treats this file as recoverable rather
@@ -90,12 +96,12 @@ fn find_script_in_dir(
             }
         };
         if let Some(mapped_file) = shortcuts.as_ref().and_then(|s| s.shortcuts.get(name)) {
-            let path = dir.join(mapped_file);
+            let path = commands_dir.join(mapped_file);
             if path.exists() {
                 return Ok(Some(path.canonicalize()?));
             }
             for ext in SUPPORTED_EXTENSIONS {
-                let path = dir.join(format!("{mapped_file}.{ext}"));
+                let path = commands_dir.join(format!("{mapped_file}.{ext}"));
                 if path.exists() {
                     return Ok(Some(path.canonicalize()?));
                 }
@@ -127,18 +133,61 @@ impl Input {
     }
 }
 
+/// How many stray root-level script files `not_found_error` names before it
+/// stops listing them -- an operator with a large pre-3.0 `.zirv/` gets a
+/// useful sample, not a wall of text.
+const MAX_STRAY_SCRIPTS_LISTED: usize = 10;
+
 /// Builds the "no script or shortcut" error, enriched with up to 3 "did you
 /// mean" suggestions drawn from local (then global) script names and
 /// shortcut keys, plus a pointer to `zirv help`.
+///
+/// Issue #212 (zirv 3.0, hard cutover): scripts moved from the `.zirv` root
+/// into `.zirv/commands/`, with no transitional root lookup. When the root
+/// still has script-like files -- almost certainly a pre-3.0 layout rather
+/// than an unrelated typo -- the error names them (relative to the `.zirv`
+/// they were found under) and says where they need to move, instead of
+/// leaving the operator to guess why a script that is plainly right there
+/// doesn't resolve.
 fn not_found_error(command: &str) -> Box<dyn std::error::Error> {
-    let mut candidates = candidate_names_in_dir(&PathBuf::from(SCRIPT_DIR_NAME));
-    if let Ok(home) = home_dir() {
+    let local_root = PathBuf::from(SCRIPT_DIR_NAME);
+    let home = home_dir().ok();
+
+    let mut candidates = candidate_names_in_dir(&local_root);
+    if let Some(home) = &home {
         candidates.extend(candidate_names_in_dir(&home.join(SCRIPT_DIR_NAME)));
     }
-
     let suggestions = suggest_matches(command, candidates.iter().map(String::as_str));
 
+    let mut stray: Vec<String> = script_like_files_at_root(&local_root)
+        .into_iter()
+        .map(|name| format!(".zirv/{name}"))
+        .collect();
+    if let Some(home) = &home {
+        stray.extend(
+            script_like_files_at_root(&home.join(SCRIPT_DIR_NAME))
+                .into_iter()
+                .map(|name| format!("~/.zirv/{name}")),
+        );
+    }
+
     let mut message = format!("No script or shortcut found for '{command}'.");
+    if !stray.is_empty() {
+        let shown: Vec<&String> = stray.iter().take(MAX_STRAY_SCRIPTS_LISTED).collect();
+        let listed = shown
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let more = stray.len().saturating_sub(shown.len());
+        message.push_str(&format!(
+            " zirv 3.0 moved scripts from the .zirv root into .zirv/commands/: {listed}",
+        ));
+        if more > 0 {
+            message.push_str(&format!(" (+{more} more)"));
+        }
+        message.push_str(" still need to move there.");
+    }
     if !suggestions.is_empty() {
         message.push_str(&format!(" Did you mean: {}?", suggestions.join(", ")));
     }
@@ -188,9 +237,16 @@ mod tests {
     fn test_get_file_path_missing_script_suggests_closest_match() {
         let fake_home = tempdir().unwrap();
         let fake_cwd = tempdir().unwrap();
-        let zirv_dir = fake_cwd.path().join(SCRIPT_DIR_NAME);
-        create_dir_all(&zirv_dir).unwrap();
-        write(zirv_dir.join("build.yaml"), "name: Build\ncommands: []\n").unwrap();
+        let commands_dir = fake_cwd
+            .path()
+            .join(SCRIPT_DIR_NAME)
+            .join(COMMANDS_DIR_NAME);
+        create_dir_all(&commands_dir).unwrap();
+        write(
+            commands_dir.join("build.yaml"),
+            "name: Build\ncommands: []\n",
+        )
+        .unwrap();
 
         with_fake_env(fake_home.path(), fake_cwd.path(), || {
             let input = Input {
@@ -214,9 +270,16 @@ mod tests {
     fn test_get_file_path_missing_script_no_suggestion_when_nothing_close() {
         let fake_home = tempdir().unwrap();
         let fake_cwd = tempdir().unwrap();
-        let zirv_dir = fake_cwd.path().join(SCRIPT_DIR_NAME);
-        create_dir_all(&zirv_dir).unwrap();
-        write(zirv_dir.join("deploy.yaml"), "name: Deploy\ncommands: []\n").unwrap();
+        let commands_dir = fake_cwd
+            .path()
+            .join(SCRIPT_DIR_NAME)
+            .join(COMMANDS_DIR_NAME);
+        create_dir_all(&commands_dir).unwrap();
+        write(
+            commands_dir.join("deploy.yaml"),
+            "name: Deploy\ncommands: []\n",
+        )
+        .unwrap();
 
         with_fake_env(fake_home.path(), fake_cwd.path(), || {
             let input = Input {
@@ -235,8 +298,9 @@ mod tests {
         let fake_home = tempdir().unwrap();
         let fake_cwd = tempdir().unwrap();
         let zirv_dir = fake_cwd.path().join(SCRIPT_DIR_NAME);
-        create_dir_all(&zirv_dir).unwrap();
-        write(zirv_dir.join("test.yaml"), "name: Test\ncommands: []\n").unwrap();
+        let commands_dir = zirv_dir.join(COMMANDS_DIR_NAME);
+        create_dir_all(&commands_dir).unwrap();
+        write(commands_dir.join("test.yaml"), "name: Test\ncommands: []\n").unwrap();
         write(
             zirv_dir.join(".shortcuts.yaml"),
             "shortcuts:\n  tst: test.yaml\n",
@@ -268,8 +332,13 @@ mod tests {
         let fake_home = tempdir().unwrap();
         let fake_cwd = tempdir().unwrap();
         let zirv_dir = fake_cwd.path().join(SCRIPT_DIR_NAME);
-        create_dir_all(&zirv_dir).unwrap();
-        write(zirv_dir.join("build.yaml"), "name: Build\ncommands: []\n").unwrap();
+        let commands_dir = zirv_dir.join(COMMANDS_DIR_NAME);
+        create_dir_all(&commands_dir).unwrap();
+        write(
+            commands_dir.join("build.yaml"),
+            "name: Build\ncommands: []\n",
+        )
+        .unwrap();
         write(zirv_dir.join(".shortcuts.yaml"), "not: [valid, yaml for,").unwrap();
 
         with_fake_env(fake_home.path(), fake_cwd.path(), || {
@@ -366,6 +435,155 @@ mod tests {
                 err.to_string().contains("zirv help"),
                 "a normal not-found error, not a parse error: {err}"
             );
+        });
+    }
+
+    /// Issue #212, core behavior: a script in `.zirv/commands/` resolves,
+    /// and the identical file sitting at the `.zirv` root (the pre-3.0
+    /// layout) does not -- with no transitional root lookup.
+    #[test]
+    fn a_script_resolves_from_commands_but_not_from_the_zirv_root() {
+        let fake_home = tempdir().unwrap();
+        let fake_cwd = tempdir().unwrap();
+        let commands_dir = fake_cwd
+            .path()
+            .join(SCRIPT_DIR_NAME)
+            .join(COMMANDS_DIR_NAME);
+        create_dir_all(&commands_dir).unwrap();
+        write(
+            commands_dir.join("build.yaml"),
+            "name: Build\ncommands: []\n",
+        )
+        .unwrap();
+
+        with_fake_env(fake_home.path(), fake_cwd.path(), || {
+            let input = Input {
+                command: "build".to_string(),
+                ..Default::default()
+            };
+            let path = input
+                .get_file_path()
+                .expect("a script in commands/ must resolve");
+            assert!(path.ends_with("build.yaml"), "got: {}", path.display());
+        });
+    }
+
+    /// Same script, but left at the `.zirv` root instead of moved into
+    /// `commands/`: it must not resolve, and the error must name the stray
+    /// file and say where it needs to move.
+    #[test]
+    fn a_script_left_at_the_zirv_root_does_not_resolve_and_is_named_in_the_error() {
+        let fake_home = tempdir().unwrap();
+        let fake_cwd = tempdir().unwrap();
+        let zirv_dir = fake_cwd.path().join(SCRIPT_DIR_NAME);
+        create_dir_all(&zirv_dir).unwrap();
+        write(zirv_dir.join("build.yaml"), "name: Build\ncommands: []\n").unwrap();
+
+        with_fake_env(fake_home.path(), fake_cwd.path(), || {
+            let input = Input {
+                command: "build".to_string(),
+                ..Default::default()
+            };
+            let err = input
+                .get_file_path()
+                .expect_err("a script at the .zirv root must not resolve any more");
+            let message = err.to_string();
+            assert!(
+                message.contains("build.yaml"),
+                "expected the stray file to be named, got: {message}"
+            );
+            assert!(
+                message.contains(".zirv/commands"),
+                "expected the move instruction to name the new location, got: {message}"
+            );
+        });
+    }
+
+    /// Global `~/.zirv/commands/` resolves with the same local-first
+    /// precedence as before the move.
+    #[test]
+    fn a_global_commands_script_resolves_and_local_still_takes_precedence() {
+        let fake_home = tempdir().unwrap();
+        let fake_cwd = tempdir().unwrap();
+        let global_commands = fake_home
+            .path()
+            .join(SCRIPT_DIR_NAME)
+            .join(COMMANDS_DIR_NAME);
+        create_dir_all(&global_commands).unwrap();
+        write(
+            global_commands.join("deploy.yaml"),
+            "name: Global Deploy\ncommands: []\n",
+        )
+        .unwrap();
+
+        with_fake_env(fake_home.path(), fake_cwd.path(), || {
+            // No local .zirv at all: falls through to the global commands/.
+            let input = Input {
+                command: "deploy".to_string(),
+                ..Default::default()
+            };
+            let path = input
+                .get_file_path()
+                .expect("a global commands/ script must resolve");
+            assert!(path.ends_with("deploy.yaml"), "got: {}", path.display());
+        });
+
+        // A local script of the same name still wins over the global one.
+        let local_commands = fake_cwd
+            .path()
+            .join(SCRIPT_DIR_NAME)
+            .join(COMMANDS_DIR_NAME);
+        create_dir_all(&local_commands).unwrap();
+        write(
+            local_commands.join("deploy.yaml"),
+            "name: Local Deploy\ncommands: []\n",
+        )
+        .unwrap();
+
+        with_fake_env(fake_home.path(), fake_cwd.path(), || {
+            let input = Input {
+                command: "deploy".to_string(),
+                ..Default::default()
+            };
+            let path = input.get_file_path().unwrap();
+            let resolved = std::fs::read_to_string(&path).unwrap();
+            assert!(
+                resolved.contains("Local Deploy"),
+                "the local script must take precedence over the global one, got: {resolved}"
+            );
+        });
+    }
+
+    /// Config files at the `.zirv` root (`ctx.toml`, `.settings.toml`,
+    /// `verify.toml`, `.shortcuts.yaml`) must never be listed as "script-like"
+    /// in the migration error -- they still belong at the root.
+    #[test]
+    fn config_files_at_the_root_are_never_listed_as_stray_scripts() {
+        let fake_home = tempdir().unwrap();
+        let fake_cwd = tempdir().unwrap();
+        let zirv_dir = fake_cwd.path().join(SCRIPT_DIR_NAME);
+        create_dir_all(&zirv_dir).unwrap();
+        write(zirv_dir.join("ctx.toml"), "[score]\nwindow = 4\n").unwrap();
+        write(
+            zirv_dir.join(".settings.toml"),
+            "[agents.codex]\nenabled = false\n",
+        )
+        .unwrap();
+        write(zirv_dir.join("verify.toml"), "").unwrap();
+        write(zirv_dir.join(".shortcuts.yaml"), "shortcuts: {}\n").unwrap();
+
+        with_fake_env(fake_home.path(), fake_cwd.path(), || {
+            let input = Input {
+                command: "nope".to_string(),
+                ..Default::default()
+            };
+            let err = input.get_file_path().unwrap_err();
+            let message = err.to_string();
+            assert!(
+                !message.contains("moved scripts"),
+                "config-only root must not trigger the migration hint, got: {message}"
+            );
+            assert!(message.contains("zirv help"), "got: {message}");
         });
     }
 }
