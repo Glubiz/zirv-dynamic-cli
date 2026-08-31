@@ -1462,23 +1462,25 @@ pub fn advance_with_evidence(
                 && matches!(current.phase, WorkflowPhase::Review | WorkflowPhase::Verify)
                 && !super::frontend_render::latest_visual_is_fresh_and_passing(
                     state_dir,
-                    &state.repo,
+                    frontend_root,
                 )?
             {
-                let render = super::frontend_render::render(state_dir, &state.repo)?;
+                let render = super::frontend_render::render(state_dir, frontend_root)?;
                 if !render.passed() {
                     return Err(format!(
-                        "frontend step '{}' could not collect automatic rendered evidence: {}; inspect with `zirv frontend render`",
+                        "frontend step '{}' could not collect automatic rendered evidence against '{}': {}; inspect with `zirv frontend render --repo {}`",
                         current.id,
-                        render.notes.join("; ")
+                        frontend_root.display(),
+                        render.notes.join("; "),
+                        frontend_root.display()
                     )
                     .into());
                 }
                 let review = super::frontend_render::review(
                     state_dir,
-                    &state.repo,
+                    frontend_root,
                     &super::frontend_render::VisualReviewArgs {
-                        repo: Some(state.repo.clone()),
+                        repo: Some(frontend_root.to_path_buf()),
                         agent: None,
                         model: None,
                         json: false,
@@ -2329,6 +2331,14 @@ pub fn run(args: &WorkflowArgs, writer: &mut impl Write) -> CtxResult<i32> {
             let mut state = load(&state_dir, &repo, &args.id)?;
             if let Some(frontend_root) = &args.frontend_root {
                 state.frontend_target_root = Some(resolve_frontend_root(frontend_root)?);
+                // Persisted before the gate runs: a fail-closed advance below
+                // must not force the operator to pass `--frontend-root` again
+                // on retry.
+                let active = matches!(
+                    state.status,
+                    WorkflowStatus::Running | WorkflowStatus::AwaitingApproval
+                );
+                save(&state_dir, &state, active)?;
             }
             let evidence = enrich_transition_evidence(
                 &mut state,
@@ -2812,6 +2822,78 @@ mod tests {
     }
 
     #[test]
+    fn advance_persists_frontend_root_before_the_gate_even_when_it_still_fails_closed() {
+        // #214 follow-up: `--frontend-root` must be saved before the gate
+        // runs, so a fail-closed advance (the target root has no fresh
+        // evidence yet) still records the root -- the operator should not
+        // have to pass the flag again on retry.
+        let workflow_repo = tempdir().unwrap();
+        let target_repo = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+
+        let mut classification = low_classification();
+        classification.work_domain.domain = WorkDomain::Frontend;
+        classification.work_domain.score = 55;
+        let mut state = WorkflowState::start(
+            workflow_repo.path().to_path_buf(),
+            "build a frontend component".into(),
+            WorkflowKind::Feature,
+            None,
+            true,
+            classification,
+        );
+        let test_index = state
+            .steps
+            .iter()
+            .position(|step| step.phase == WorkflowPhase::Test)
+            .unwrap();
+        state.completed_steps = state.steps[..test_index]
+            .iter()
+            .map(|step| step.id.clone())
+            .collect();
+        state.current_step = test_index;
+        state.status = WorkflowStatus::Running;
+        let id = state.id.clone();
+        save(&state_dir, &state, true).unwrap();
+
+        let _state_dir_env = crate::commands::ctx::testenv::VarGuard::set(&[(
+            "ZIRV_CTX_STATE_DIR",
+            Some(root.path().to_str().expect("utf-8 tempdir path")),
+        )]);
+        let args = WorkflowArgs {
+            command: WorkflowSubcommand::Advance(AdvanceArgs {
+                id: id.clone(),
+                outcome: StepOutcome::Success,
+                repo: Some(workflow_repo.path().to_path_buf()),
+                json: false,
+                duration_ms: None,
+                agent: None,
+                model: None,
+                role: None,
+                input_tokens: None,
+                output_tokens: None,
+                workers: 0,
+                // `target_repo` is empty and has no detector evidence of its
+                // own, so the gate must still fail closed against it.
+                frontend_root: Some(target_repo.path().to_path_buf()),
+            }),
+        };
+        let mut out = Vec::new();
+        let result = run(&args, &mut out);
+        assert!(
+            result.is_err(),
+            "expected the gate to still fail closed against an empty target root"
+        );
+
+        let reloaded = load(&state_dir, workflow_repo.path(), &id).unwrap();
+        assert_eq!(
+            reloaded.frontend_target_root,
+            Some(target_repo.path().canonicalize().unwrap())
+        );
+    }
+
+    #[test]
     fn frontend_review_step_collects_visual_evidence_automatically_and_fails_closed() {
         let repo = tempdir().unwrap();
         let root = tempdir().unwrap();
@@ -2888,6 +2970,115 @@ mod tests {
         assert!(error.contains("automatic rendered evidence"), "{error}");
         assert!(error.contains("zirv frontend render"), "{error}");
         assert!(!error.contains("frontend review --help"), "{error}");
+    }
+
+    #[test]
+    fn frontend_render_gate_uses_frontend_target_root_when_set() {
+        // #214 follow-up: once `frontend_target_root` is set, the render/
+        // visual-review gate must scan it instead of `state.repo`, mirroring
+        // `frontend_gate_uses_frontend_target_root_when_set` for the
+        // detector gate.
+        let workflow_repo = tempdir().unwrap();
+        let target_repo = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.email=t@example.com",
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(dir)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed in {}", dir.display());
+        };
+        git(workflow_repo.path(), &["init", "-q"]);
+        std::fs::write(workflow_repo.path().join("README.md"), "readme\n").unwrap();
+        git(workflow_repo.path(), &["add", "."]);
+        git(workflow_repo.path(), &["commit", "-q", "-m", "base"]);
+
+        git(target_repo.path(), &["init", "-q"]);
+        std::fs::write(
+            target_repo.path().join("App.tsx"),
+            "export const App = () => <main />;\n",
+        )
+        .unwrap();
+        git(target_repo.path(), &["add", "App.tsx"]);
+        git(target_repo.path(), &["commit", "-q", "-m", "base"]);
+
+        // Pre-seed a fresh, passing detector report for `target_repo` so the
+        // detector gate above the render step is already satisfied and
+        // execution reaches the render/visual-review gate under test here.
+        let profile =
+            super::super::frontend::ensure_profile(&state_dir, target_repo.path()).unwrap();
+        let detector = super::super::frontend_detector::DetectorReport {
+            schema_version: super::super::frontend_detector::DETECTOR_REPORT_SCHEMA_VERSION,
+            id: uuid::Uuid::new_v4().to_string(),
+            repo: target_repo.path().canonicalize().unwrap(),
+            change_fingerprint: super::super::verification::change_fingerprint(target_repo.path())
+                .unwrap(),
+            profile_fingerprint: profile.source_fingerprint,
+            scope: super::super::frontend_detector::DetectorScope::Changed,
+            generated_at: now_secs(),
+            analyzed_files: vec![PathBuf::from("App.tsx")],
+            analyzed_bytes: 64,
+            truncated: false,
+            findings: Vec::new(),
+            waivers_loaded: 0,
+            waivers_rejected: 0,
+        };
+        super::super::frontend_detector::save_report(&state_dir, &detector).unwrap();
+
+        let mut classification = low_classification();
+        classification.risk = RiskBand::Medium;
+        classification.work_domain.domain = WorkDomain::Frontend;
+        classification.work_domain.score = 55;
+        let mut state = WorkflowState::start(
+            workflow_repo.path().to_path_buf(),
+            "review a frontend component".into(),
+            WorkflowKind::Review,
+            None,
+            true,
+            classification,
+        );
+        state.current_step = state
+            .steps
+            .iter()
+            .position(|step| step.phase == WorkflowPhase::Review)
+            .unwrap();
+        state.frontend_target_root = Some(target_repo.path().canonicalize().unwrap());
+
+        let error = advance_with_evidence(&state_dir, state, StepOutcome::Success, None)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("automatic rendered evidence"), "{error}");
+        let target_display = target_repo
+            .path()
+            .canonicalize()
+            .unwrap()
+            .display()
+            .to_string();
+        let workflow_display = workflow_repo
+            .path()
+            .canonicalize()
+            .unwrap()
+            .display()
+            .to_string();
+        assert!(
+            error.contains(&target_display),
+            "expected the render gate error to name the target root: {error}"
+        );
+        assert!(
+            !error.contains(&workflow_display),
+            "render gate must not scan the workflow repo once frontend_target_root is set: {error}"
+        );
     }
 
     #[test]
