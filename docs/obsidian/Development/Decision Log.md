@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-30
+last-verified: 2026-08-31
 ---
 
 # Decision Log
@@ -23,6 +23,13 @@ last-verified: 2026-08-30
 - If the entry is longer than the cap, the "why" is a spec, not an ADR — write it under `docs/superpowers/specs/` and link to it.
 
 ## Decisions
+
+### 2026-08-31 — Reserved zirv built-ins are trusted; repo scripts and direct gh auth are not (issue #224)
+**Context:** Supervised Claude sessions were prompted twice for Zirv's own mandatory commands: the safety hook turned their sandbox retry into `<sandbox: unsandboxed retry>`, and the generated settings kept credential-dependent `zirv report` inside the sandbox. The old issue #98 `Bash(zirv *)` workaround also silently allowed every repo-defined script.
+**Decision:** Derive one built-in allow/native permission/sandbox-exclusion pattern per case-insensitive `utils::RESERVED_COMMANDS` name, because main dispatch handles those names before script lookup and a checkout cannot shadow them. Preserve `deny`/`ask` precedence so a repo may narrow; leave non-reserved `zirv <script>` unmatched. Exclude the outer `zirv report` process, whose implementation makes a fixed captured `gh auth token --hostname github.com` lookup, rather than allowing direct `gh auth *` or blanket `gh *`.
+**Rejected:** Keep `Bash(zirv *)` — crosses the repo-script trust boundary. Add `~/.config/gh/hosts.yml` to sandbox `allowRead` — exposes the credential file to every sandboxed subprocess. Add `gh *` to `excludedCommands` — lets arbitrary GitHub CLI mutations and credential commands bypass containment.
+**Consequences:** A new reserved name automatically enters every projection by changing the existing dispatch source of truth and therefore changes the policy fingerprint. Codex remains unchanged because it has no verified symmetric per-command settings projection.
+**Spec / link:** `src/utils.rs::RESERVED_COMMANDS`; `safety.rs::reserved_zirv_command_patterns`; `claude.rs::launch_settings_value`; [[Command Safety]]; [[Ctx Adapters]]; issue #224.
 
 ### 2026-08-30 — The test/deploy gate's baseline is operator-owned under `~/.zirv`, subset-of-names semantics, explicit recording only (issue #215)
 **Context:** `zirv workflow advance`'s test/verify step demanded an outright-passing `zirv test` report, hard-failing on any named test failure — structurally unpassable on a host with a documented, pre-existing per-host baseline of failing test names (this Windows dev machine's own `wrap`/`exec` set), even when a branch introduces zero new failure names.
@@ -362,13 +369,6 @@ last-verified: 2026-08-30
 **Rejected:** One uniform `Stance`-style fold for all four fields — would either forbid `deny`/`ask` from being repo-narrowable at all (losing real narrowing capability) or require inventing a `max` over glob-pattern lists, which isn't a meaningful operation.
 **Consequences:** The claude `PreToolUse` hook (`zirv ctx safety check`, wired by `zirv setup apply`, claude only — codex has no verified equivalent of the `permissionDecision` JSON contract) is now the single evaluator backing the CLI, the adapter projection, and the wired hook.
 **Spec / link:** `src/commands/ctx/safety.rs`; [[Command Safety]]; [[Untrusted Configuration]]'s "A third fold, now for `[safety]`"; issue #83.
-
-### 2026-08-23 — The shipped posture allows zirv's own commands (issue #98)
-**Context:** The injected prompt (`prompt.rs`'s `HARNESS_PROMPT`, `ORCHESTRATOR_PROMPT` in `adapters::claude`) mandates `zirv ctx status`/`inbox`/`send`/`nudge`/`remember`/`recall`, `zirv agent <name> "..."`, and `zirv <script>` — but `SHIPPED_POSTURE_ALLOW` had no entry for `zirv` at all. Under `dontAsk`, a denial is final for the whole session, so every one of those mandated commands was silently denied by omission: a prompt telling the model to run something the posture then refuses.
-**Decision:** Added `Bash(zirv *)` to `SHIPPED_POSTURE_ALLOW`, the same trust class as the already-allowed `make build`/`npm run build`, since `zirv <script>` runs repo-defined commands too. Also added `Bash(cargo fmt *)`/`Bash(cargo clippy *)`, which were missing alongside the existing `cargo build`/`test`/`check` entries. A destructive family unrelated to `zirv` still wins over this broad allow — deny is checked before allow, unchanged.
-**Rejected:** Narrower per-verb allow rules (`Bash(zirv ctx status)`, `Bash(zirv ctx inbox)`, ...) — `Bash(<verb> *)` prefix matching is the documented spelling every other allow entry in this list already uses, and a repo's own `zirv <script>` commands are legitimate, prompt-mandated work this list must not block either.
-**Consequences:** Any future addition to the injected prompt's mandated command set must be checked against `SHIPPED_POSTURE_ALLOW` before shipping — the invariant is now pinned by `prompt_mandated_zirv_commands_are_allowed_by_the_shipped_posture` (`safety.rs`).
-**Spec / link:** `src/commands/ctx/adapters/mod.rs`'s `SHIPPED_POSTURE_ALLOW`; `safety.rs`'s `prompt_mandated_zirv_commands_are_allowed_by_the_shipped_posture`; `claude.rs`'s `default_sandbox_args_allows_zirvs_own_commands`; [[Command Safety]]; [[Ctx Adapters]]; issue #98.
 
 ### 2026-08-23 — `zirv ctx send --all` fans out via per-session read tracking, not per-session copies (issue #94)
 **Context:** An undirected `zirv ctx send` (`to_session: None`) is deliberately first-come-first-served (2026-08-22 entry below) — right for the work-queue case, wrong for "notify every live session," which had no real mechanism of its own. Adding one meant choosing between storing a separate copy per live session at send time, or storing once with per-session read state.

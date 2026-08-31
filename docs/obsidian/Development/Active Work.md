@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-30
+last-verified: 2026-08-31
 ---
 
 # Active Work
@@ -49,6 +49,10 @@ Entries use the format:
 **Next:** maintainer review; mark PR #78 ready and merge the top stack PR when desired.
 
 ## Recently Completed
+
+### Issue #224 — reserved built-ins auto-allowed without widening repo scripts (`fix/224-safety-builtin-allow`, 2026-08-31)
+**Status (2026-08-31):** Implemented and locally regression-tested. `SafetyPolicy` derives one case-insensitive built-in allow from each `utils::RESERVED_COMMANDS` name; `zirv somescript`/`zirv deploy` return to the unmatched gate, repo `deny`/`ask` remains higher precedence, and sandbox retries of the non-launching built-ins no longer emit `<sandbox: unsandboxed retry>`. The retry gate stays narrower than the policy layer on purpose (issue #168's allow-list, plus `zirv report`). Claude's generated launch settings carry the corresponding native permission and sandbox-exclusion patterns. `zirv report` reaches its fixed internal GitHub credential lookup by excluding the trusted outer built-in, without a direct `gh auth *` or blanket `gh *` exception. Codex is deliberately unchanged.
+**Next:** Finish all five verification gates and commit this worktree; the integration branch will own the version bump and combined PR with issue #226. See [[Command Safety]], [[Ctx Adapters]], [[Untrusted Configuration]], and the 2026-08-31 [[Decision Log]]/[[Work Journal]] entries.
 
 ### Bug batch — baseline-waivable test gate, codex argv overflow, budget-kill exit-code fix, flaky sessions test — implemented, PR pending (`worktree-fix-bug-batch-213-215-218-203`, 2026-08-30, issues #215/#213/#203/#218)
 **Status (2026-08-30):** Four fixes on one worktree/branch, one PR to come. #215 (workflow test/deploy gate baseline): `zirv workflow advance`'s test/verify step, which previously hard-failed on any test failure in the evidence, now passes when a failing report's failing test names are all a subset of a new operator-owned `~/.zirv/test-baseline/<repo_slug>.json` baseline, recorded only by the new `zirv test baseline [--repo <path>] [--check <id>]... [--dry-run] [--json]` command (runs `VerificationMode::All`, persists evidence like any run, records the union of failing `Unit`-check test names); waived names print loudly, an empty/missing baseline reproduces the old strict behavior. #213 (codex argv overflow): `injection_args_for_session` now shrinks an oversized inline-argv-delivered codex composed prompt to a 24KB budget (`INLINE_ARGV_PROMPT_BUDGET_BYTES`) before spawn — stripping memory, then canonical context, then the workflow-step layer, with a tail-truncation backstop — instead of the launch hard-failing with Windows' `os error 206`; claude's file-based delivery is unaffected. #203 (budget-kill exit-code clobber): the mid-poll over-budget `HardStop` check in `exec.rs`'s `supervise_run` now gives one tick of grace before killing a child, so a naturally-exiting child's real exit code survives instead of being overwritten by `EXIT_BUDGET_EXHAUSTED` — a budget verdict now only ever replaces a clean (0) exit. #218 (test-only flake): `sessions.rs`'s `adopt_child_pid` test now tolerates ≤2s clock-boundary drift between two `process_start_secs` readings.

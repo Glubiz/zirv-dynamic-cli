@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-30
+last-verified: 2026-08-31
 ---
 
 # Work Journal
@@ -19,6 +19,11 @@ last-verified: 2026-08-30
 **Follow-up:** anything unfinished (optional).
 
 ## Entries
+
+### 2026-08-31: reserved zirv built-ins stop prompting (`fix/224-safety-builtin-allow`, issue #224)
+**What:** Replaced the broad `Bash(zirv *)` shipped allow with case-insensitive rules generated from `utils::RESERVED_COMMANDS`; reserved built-ins now clear ordinary hook evaluation, while non-reserved repo scripts remain gated and repo `deny`/`ask` can still narrow. The `--dangerously-disable-sandbox` retry gate was deliberately NOT widened to the whole reserved list: issue #168's CRITICAL allow-list still excludes the subprocess-launching built-ins (`zirv ctx exec`/`usage tee`/`wrap`/`resume`/`loop`/`handover`, `zirv agent`, `zirv chat`), and gained only `zirv report`. Claude launch settings mirror the reserved list into `permissions.allow` and `sandbox.excludedCommands`, so outer `zirv report` can perform its fixed captured GitHub credential lookup without exposing `gh auth *` or blanket `gh *`.
+**Key changes:** `src/commands/ctx/{safety.rs,adapters/mod.rs,adapters/claude.rs}` plus [[Command Safety]], [[Ctx Adapters]], [[Ctx Subsystem]], [[Untrusted Configuration]], and [[Decision Log]]. Regression tests cover case variants, repo-script gating, repo narrowing, hook retry output, and generated settings; policy snapshot/fingerprint behavior remains source-derived.
+**Follow-up:** Codex's adapter posture is intentionally unchanged because it has no symmetric verified per-command settings projection. Integration owns the release version bump.
 
 ### 2026-08-30: bug batch — baseline-waivable test gate, codex argv overflow, budget-kill exit-code fix, flaky sessions test (`worktree-fix-bug-batch-213-215-218-203`, issues #215/#213/#203/#218)
 **What:** Four fixes landed on one worktree/branch, one PR to come. #215: `zirv workflow advance`'s test/deploy gate — previously hard-failing on any test failure — now passes when a failing report's failing test names are all a subset of a new operator-owned `~/.zirv/test-baseline/<repo_slug>.json`, recorded only by the new `zirv test baseline [--repo <path>] [--check <id>]... [--dry-run] [--json]` command; waived names print loudly. #213: `injection_args_for_session` now shrinks an oversized codex inline-argv composed prompt to a 24KB budget (memory → context → workflow strip order, tail-truncation backstop) instead of hard-failing the launch with Windows' `os error 206`. #203: the mid-poll over-budget `HardStop` check now gives one tick of grace before killing a child, so a naturally-exiting child's real exit code survives instead of being clobbered by `EXIT_BUDGET_EXHAUSTED`. #218: `sessions.rs`'s `adopt_child_pid` test now tolerates ≤2s clock-boundary drift between two `process_start_secs` readings (test-only).
