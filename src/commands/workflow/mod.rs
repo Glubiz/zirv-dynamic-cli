@@ -81,6 +81,13 @@ pub(crate) struct RepoGates {
     pub checks: bool,
     pub skills: bool,
     pub agents: bool,
+    /// Operator-owned `[workflow] check_env_passthrough` (REPO_FORBIDDEN,
+    /// `~/.zirv/ctx.toml`/`ZIRV_CTX_*` only) -- extra environment variable
+    /// names ADDED to `verification::DEFAULT_CHECK_ENV_PASSTHROUGH` when a
+    /// check child is spawned. Empty (never widened) when the config could
+    /// not even be read, same fail-closed posture as `checks`/`skills`/
+    /// `agents` above.
+    pub check_env_passthrough: Vec<String>,
 }
 
 /// Resolves both gates, failing **closed** when the configuration cannot be
@@ -102,6 +109,7 @@ pub(crate) fn repo_gates(repo: &std::path::Path) -> RepoGates {
             checks: cfg.workflow.repo_checks_enabled,
             skills: cfg.workflow.repo_skills_enabled,
             agents: cfg.workflow.repo_agents_enabled,
+            check_env_passthrough: cfg.workflow.check_env_passthrough,
         },
         Err(error) => {
             announce_unreadable_config(&error.to_string());
@@ -109,6 +117,7 @@ pub(crate) fn repo_gates(repo: &std::path::Path) -> RepoGates {
                 checks: false,
                 skills: false,
                 agents: false,
+                check_env_passthrough: Vec::new(),
             }
         }
     }
