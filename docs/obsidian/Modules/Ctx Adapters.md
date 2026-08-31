@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-29
+last-verified: 2026-08-30
 ---
 
 # Ctx Adapters
@@ -69,6 +69,8 @@ Several methods have trait-default implementations that only `claude.rs` current
 `all(bin)`, `select`'s fallback, `describe_known_adapters`, `resolve_default`, and `readiness_note` all walk this table rather than naming adapters by hand, so none of them can drift from it or from each other — adding a third adapter is one entry here plus its own module.
 
 **`readiness_note` (`zirv ctx --help`'s `about` text) has two generated clauses.** The first names every adapter whose own `ready()` still fails. The second names every ready adapter whose `capabilities()` is not fully true. Codex now reports system-prompt support because direct launches use `developer_instructions`; `system_prompt_supported(launch)` narrows that answer for shell shims. Its remaining static gaps are rot score, usage, and turn signal.
+
+Codex has no file-based `developer_instructions` mechanism, so its composed system prompt always lands on argv (`-c developer_instructions=<json>`) — an oversized composed prompt used to hard-fail the whole launch on Windows (`os error 206`, the command line exceeding `CreateProcessW`'s ~32KB ceiling) under a workflow-heavy session with several accepted artifacts. Since issue #213 (2026-08-30), `prompt::injection_args_for_session` shrinks any inline-delivered composed prompt to a 24KB budget before it ever reaches the adapter, stripping memory/context/workflow layers in priority order rather than failing the launch — see [[Utilities]]'s "Inline-argv delivery is budgeted" section. Claude's file-based delivery path is unaffected.
 
 `resolve_default(cfg: &CtxConfig) -> CtxResult<(Box<dyn AgentAdapter>, DefaultOrigin)>` is the fallback `select` calls when neither an explicit `--agent` nor argv detection named an adapter, but it also stands on its own — callers that want to *explain* the default rather than just use it (`zirv ctx status`'s `chat:` line, `zirv ctx chat`'s own resolution) call it directly:
 
