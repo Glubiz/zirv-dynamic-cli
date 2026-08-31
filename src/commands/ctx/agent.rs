@@ -543,7 +543,11 @@ pub fn resolve_prompt(raw: &str, stdin: &mut dyn Read) -> CtxResult<String> {
 pub fn exit_note(code: i32) -> Option<String> {
     matches!(
         code,
-        exec::EXIT_ROT_EXHAUSTED | exec::EXIT_TIMEOUT | exec::EXIT_BUDGET_EXHAUSTED
+        exec::EXIT_ROT_EXHAUSTED
+            | exec::EXIT_TIMEOUT
+            | exec::EXIT_BUDGET_EXHAUSTED
+            | exec::EXIT_CAPACITY_EXHAUSTED
+            | exec::EXIT_ACCOUNT_EXHAUSTED
     )
     .then(|| exec::describe_exit(code))
 }
@@ -558,7 +562,35 @@ fn delegation_outcome(code: i32) -> &'static str {
         exec::EXIT_ROT_EXHAUSTED => "rot-exhausted",
         exec::EXIT_TIMEOUT => "timeout",
         exec::EXIT_BUDGET_EXHAUSTED => "budget-exhausted",
+        // Issue #227.
+        exec::EXIT_CAPACITY_EXHAUSTED => "capacity-exhausted",
+        exec::EXIT_ACCOUNT_EXHAUSTED => "account-exhausted",
         _ => "failed",
+    }
+}
+
+/// Issue #227: the report-back mail a `zirv agent` spawn sends to its own
+/// requester on a supervisor-detected failure, so the requester has a
+/// durable record even when it was not watching this delegation
+/// synchronously (a background/dashboard-pane spawn). Carries the same
+/// structured reason `exit_note`/`describe_exit` already produce for the
+/// stderr note, so the two never say different things about the same
+/// failure. Pure: no fs/clock/env, so the envelope shape is table-tested
+/// without a real mailbox.
+fn report_back_message(
+    code: i32,
+    worker_session: &str,
+    agent_name: &str,
+    to_session: &str,
+) -> super::mail::Message {
+    let reason = exec::describe_exit(code);
+    super::mail::Message {
+        from_session: worker_session.to_string(),
+        from_agent: agent_name.to_string(),
+        to: "any".to_string(),
+        to_session: Some(to_session.to_string()),
+        sent: super::state::now_secs(),
+        body: format!("zirv ctx agent: {agent_name} finished: {reason} (exit {code})"),
     }
 }
 
@@ -1363,6 +1395,26 @@ pub fn run_with<W: Write>(
     if let Ok(state_dir) = super::state::StateDir::resolve(&env) {
         let parent_session = super::mail::session_identity(&env).unwrap_or_default();
         let outcome = delegation_outcome(code);
+
+        // Issue #227: on a supervisor-detected failure, send a report-back
+        // mail to the spawning session with the same structured reason the
+        // stderr note (`exit_note`) already carries. The worker's own
+        // self-reported "tell your requester when you're done" instruction
+        // (dash panes only, see `prompt::with_report_back_layer`) never
+        // fires when the child died before reaching it -- a plain headless
+        // failure used to leave the requester with nothing but a bare exit
+        // code, no mail at all. Best-effort: a mail failure must never turn
+        // a completed delegation into a failed one, and this never touches
+        // the success path -- a clean run already has nothing new to say
+        // here (the caller's own `Ok(code)` return is that report).
+        if code != 0
+            && let Some(parent_short) = super::mail::session_identity(&env)
+            && super::prompt::is_addressable_short(&parent_short)
+        {
+            let msg = report_back_message(code, &worker_session, &args.name, &parent_short);
+            let repo_slug = super::state::repo_slug(repo);
+            let _ = super::mail::store_to(&state_dir, &repo_slug, &repo_slug, &msg, &cfg);
+        }
         let total = append_execution_segments(
             &state_dir,
             &execution_report,
@@ -1486,6 +1538,15 @@ mod tests {
         assert_eq!(
             delegation_outcome(exec::EXIT_BUDGET_EXHAUSTED),
             "budget-exhausted"
+        );
+        // Issue #227.
+        assert_eq!(
+            delegation_outcome(exec::EXIT_CAPACITY_EXHAUSTED),
+            "capacity-exhausted"
+        );
+        assert_eq!(
+            delegation_outcome(exec::EXIT_ACCOUNT_EXHAUSTED),
+            "account-exhausted"
         );
         assert_eq!(delegation_outcome(1), "failed");
     }
@@ -2527,6 +2588,17 @@ mod tests {
         );
         assert_eq!(exit_note(0), None, "success needs no explanation");
         assert_eq!(exit_note(3), None, "an ordinary agent failure is its own");
+        // Issue #227.
+        assert!(
+            exit_note(exec::EXIT_CAPACITY_EXHAUSTED)
+                .expect("capacity exhausted has a note")
+                .contains("capacity")
+        );
+        assert!(
+            exit_note(exec::EXIT_ACCOUNT_EXHAUSTED)
+                .expect("account exhausted has a note")
+                .contains("billing")
+        );
     }
 
     #[test]
@@ -2686,6 +2758,83 @@ mod tests {
             exit_note(exec::EXIT_ROT_EXHAUSTED)
                 .expect("a note exists")
                 .contains("restart budget")
+        );
+    }
+
+    /// Issue #227: `report_back_message`'s pure envelope shape -- the same
+    /// reason text `describe_exit` produces for the stderr note, addressed
+    /// to the requester's short id.
+    #[test]
+    fn report_back_message_carries_the_structured_reason() {
+        let msg = report_back_message(
+            exec::EXIT_CAPACITY_EXHAUSTED,
+            "worker-session-1",
+            "codex",
+            "aaaaaaaa",
+        );
+        assert_eq!(msg.from_session, "worker-session-1");
+        assert_eq!(msg.from_agent, "codex");
+        assert_eq!(msg.to_session, Some("aaaaaaaa".to_string()));
+        assert!(
+            msg.body.contains("capacity") && msg.body.contains("codex"),
+            "got {:?}",
+            msg.body
+        );
+    }
+
+    /// Issue #227: a headless delegation that FAILS (here, a rot-exhausted
+    /// give-up with the restart budget at zero) sends a report-back mail to
+    /// the spawning session -- the worker's own self-report only ever fires
+    /// for a dashboard pane and only on success, so without this the
+    /// requester previously learned nothing beyond a bare exit code for any
+    /// plain headless failure, success or not.
+    #[test]
+    fn a_failed_delegation_reports_back_to_the_spawning_session() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state = tmp.path().join("state");
+        let mut env = base_env(&state);
+        // A short, addressable parent session id -- `short_id` takes the
+        // first eight ASCII-alphanumeric characters.
+        env.insert(
+            crate::commands::ctx::adapters::SESSION_ENV.to_string(),
+            "aaaaaaaa-1111-4222-8333-444444444444".to_string(),
+        );
+        unsafe {
+            std::env::set_var("FAKE_AGENT_MODE", "rot");
+            std::env::set_var("FAKE_AGENT_SLEEP", "30");
+        }
+
+        let mut args = args_for("claude", "do the work");
+        args.max_restarts = Some(0);
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE");
+            std::env::remove_var("FAKE_AGENT_SLEEP");
+        }
+        assert_eq!(code.expect("runs"), exec::EXIT_ROT_EXHAUSTED);
+
+        let state_dir = crate::commands::ctx::state::StateDir::from_root(state);
+        let repo_slug = crate::commands::ctx::state::repo_slug(tmp.path());
+        let mailbox = state_dir.mail().join(&repo_slug);
+        let entries: Vec<_> = std::fs::read_dir(&mailbox)
+            .map(|dir| dir.flatten().collect())
+            .unwrap_or_default();
+        assert_eq!(
+            entries.len(),
+            1,
+            "exactly one report-back message must land in the mailbox"
+        );
+        let body = std::fs::read_to_string(entries[0].path()).expect("read mail");
+        assert!(
+            body.contains("To-session: aaaaaaaa"),
+            "addressed to the requester's short id: {body}"
+        );
+        assert!(
+            body.contains("restart budget"),
+            "carries the same structured reason as the stderr note: {body}"
         );
     }
 

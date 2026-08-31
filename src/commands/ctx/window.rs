@@ -1697,6 +1697,51 @@ mod tests {
         assert!(parse_rollout_line(&huge).is_none());
     }
 
+    /// Issue #227 (operator follow-up): a premium-tier codex account reports
+    /// only a weekly window (no 5-hour window at all) -- `windows_from_rate_
+    /// limits` must classify it as `seven_day` by its own reported length
+    /// rather than assuming "primary" always means five_hour, and must leave
+    /// `five_hour` genuinely `None` rather than inventing a reading for it.
+    #[test]
+    fn a_weekly_only_rate_limits_block_never_invents_a_five_hour_window() {
+        let json = serde_json::json!({
+            "primary": {
+                "used_percent": 42.0,
+                "window_minutes": 10_080, // 7 days
+                "resets_at": 1_772_722_537u64,
+            }
+        });
+        let windows = windows_from_rate_limits(&json, 1_772_000_000).expect("seven_day present");
+        assert!(
+            windows.five_hour.is_none(),
+            "no 5-hour data was reported, so none must be invented: {windows:?}"
+        );
+        let seven = windows.seven_day.expect("seven_day");
+        assert_eq!(seven.used_percentage, 42.0);
+        assert_eq!(seven.resets_at, 1_772_722_537);
+    }
+
+    /// The Pro-tier shape (both windows reported) still maps each slot by its
+    /// own length, unaffected by the weekly-only case above.
+    #[test]
+    fn a_pro_tier_rate_limits_block_maps_both_windows() {
+        let json = serde_json::json!({
+            "primary": {
+                "used_percent": 10.0,
+                "window_minutes": 300, // 5 hours
+                "resets_at": 1,
+            },
+            "secondary": {
+                "used_percent": 3.0,
+                "window_minutes": 10_080, // 7 days
+                "resets_at": 2,
+            }
+        });
+        let windows = windows_from_rate_limits(&json, 1).expect("both present");
+        assert_eq!(windows.five_hour.expect("five_hour").used_percentage, 10.0);
+        assert_eq!(windows.seven_day.expect("seven_day").used_percentage, 3.0);
+    }
+
     #[test]
     fn scan_finds_newest_by_timestamp_not_mtime() {
         let dir = tempfile::tempdir().unwrap();

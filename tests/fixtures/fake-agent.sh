@@ -36,6 +36,12 @@
 #   drift    prints a line that only loosely resembles a limit notice (the
 #            wording the strict patterns do NOT recognize) and exits 0, so a
 #            test can prove the breadcrumb is left without a park
+#   capacity issue #227: writes a healthy transcript, prints codex's
+#            "Selected model is at capacity" notice on stdout, then exits 1
+#            the way a transient provider capacity error would
+#   account  issue #227: writes a healthy transcript, prints an
+#            insufficient_quota/billing-exhaustion notice on stdout, then
+#            exits 1 the way a hard, non-retryable account exhaustion would
 #
 # FAKE_AGENT_MODE_FILE lets one test script a sequence across restarts, for
 # example "rot" then "healthy" to prove a restarted child is supervised on its
@@ -123,6 +129,14 @@ case "$mode" in
   drift)
     printf "Notice: you have reached your limit for this model\n"
     exit 0
+    ;;
+  capacity)
+    printf "ERROR: Selected model is at capacity. Please try a different model.\n"
+    exit 1
+    ;;
+  account)
+    printf "Error: insufficient_quota - You exceeded your current quota, please check your plan and billing details.\n"
+    exit 1
     ;;
   *) exit 0 ;;
 esac
