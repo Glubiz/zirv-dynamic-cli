@@ -2276,6 +2276,15 @@ mod tests {
     /// the classifier's reserved-name boundary. Excluding the outer `zirv
     /// report` process lets its fixed, captured `gh auth token` child reach
     /// the credential file without exposing direct `gh auth *` to the model.
+    ///
+    /// Code review fix (CRITICAL, issue #224 follow-up): `ctx` must NOT get
+    /// a name-level `Bash(zirv ctx *)`/`zirv ctx *` entry -- several of its
+    /// verbs (`exec`, `wrap`, ...) spawn a subprocess with caller-controlled
+    /// argv, and a blanket entry handed those an unattended, unsandboxed
+    /// escape. `ctx` instead gets one verb-scoped entry per `safety::
+    /// reserved_zirv_command_patterns`'s own generated list; every OTHER
+    /// reserved name keeps its name-level entry, since its payload is a
+    /// prompt or a path, not arbitrary argv.
     #[test]
     fn launch_settings_project_reserved_builtins_without_widening_scripts_or_gh() {
         let settings = test_launch_settings();
@@ -2283,6 +2292,9 @@ mod tests {
             .as_array()
             .expect("reserved built-in permission rules");
         for name in crate::utils::RESERVED_COMMANDS {
+            if *name == "ctx" {
+                continue;
+            }
             let expected = serde_json::json!(format!("Bash(zirv {name} *)"));
             assert!(
                 permission_allow.contains(&expected),
@@ -2290,7 +2302,17 @@ mod tests {
             );
         }
         assert!(!permission_allow.contains(&serde_json::json!("Bash(zirv *)")));
+        assert!(!permission_allow.contains(&serde_json::json!("Bash(zirv ctx *)")));
         assert!(!permission_allow.contains(&serde_json::json!("Bash(gh *)")));
+        assert!(permission_allow.contains(&serde_json::json!("Bash(zirv ctx status *)")));
+        assert!(permission_allow.contains(&serde_json::json!("Bash(zirv ctx inbox *)")));
+        assert!(!permission_allow.contains(&serde_json::json!("Bash(zirv ctx exec *)")));
+        assert!(!permission_allow.contains(&serde_json::json!("Bash(zirv ctx wrap *)")));
+        // `usage`'s own `tee` subcommand launches an arbitrary trailing
+        // statusline command, so a wildcard `usage *` entry would also cover
+        // `usage tee -- <cmd>` -- unlike the escape-safe retry path, a
+        // native permission/sandbox glob cannot see the fourth token.
+        assert!(!permission_allow.contains(&serde_json::json!("Bash(zirv ctx usage *)")));
 
         #[cfg(not(windows))]
         {
@@ -2298,6 +2320,9 @@ mod tests {
                 .as_array()
                 .expect("reserved built-in sandbox exclusions");
             for name in crate::utils::RESERVED_COMMANDS {
+                if *name == "ctx" {
+                    continue;
+                }
                 let expected = serde_json::json!(format!("zirv {name} *"));
                 assert!(
                     exclusions.contains(&expected),
@@ -2305,7 +2330,12 @@ mod tests {
                 );
             }
             assert!(!exclusions.contains(&serde_json::json!("zirv *")));
+            assert!(!exclusions.contains(&serde_json::json!("zirv ctx *")));
             assert!(!exclusions.contains(&serde_json::json!("gh *")));
+            assert!(exclusions.contains(&serde_json::json!("zirv ctx status *")));
+            assert!(!exclusions.contains(&serde_json::json!("zirv ctx exec *")));
+            assert!(!exclusions.contains(&serde_json::json!("zirv ctx wrap *")));
+            assert!(!exclusions.contains(&serde_json::json!("zirv ctx usage *")));
             assert!(
                 settings["sandbox"]["filesystem"]["denyRead"]
                     .as_array()
@@ -2587,6 +2617,11 @@ mod tests {
     /// Issue #224: the generated headless argv allows every reserved zirv
     /// built-in, but never the old blanket `zirv *` family that also covered
     /// untrusted repo scripts. The `cargo *` family remains unchanged.
+    ///
+    /// Code review fix (CRITICAL, issue #224 follow-up): `ctx` gets verb-
+    /// scoped entries only, never a blanket `Bash(zirv ctx *)` -- see
+    /// `launch_settings_project_reserved_builtins_without_widening_scripts_
+    /// or_gh`'s own doc comment for why.
     #[test]
     fn default_sandbox_args_allow_reserved_zirv_builtins_but_not_scripts() {
         let adapter = ClaudeAdapter::new(None);
@@ -2600,6 +2635,9 @@ mod tests {
             .find(|a| a.starts_with("--allowedTools="))
             .expect("an --allowedTools= token");
         for name in crate::utils::RESERVED_COMMANDS {
+            if *name == "ctx" {
+                continue;
+            }
             let rule = format!("Bash(zirv {name} *)");
             assert!(
                 allow_arg.contains(&rule),
@@ -2607,7 +2645,12 @@ mod tests {
             );
         }
         assert!(allow_arg.contains("Bash(cargo *)"));
+        assert!(allow_arg.contains("Bash(zirv ctx status *)"));
         assert!(!allow_arg.contains("Bash(zirv *)"));
+        assert!(!allow_arg.contains("Bash(zirv ctx *)"));
+        assert!(!allow_arg.contains("Bash(zirv ctx exec *)"));
+        assert!(!allow_arg.contains("Bash(zirv ctx wrap *)"));
+        assert!(!allow_arg.contains("Bash(zirv ctx usage *)"));
         assert!(!allow_arg.contains("Bash(zirv somescript *)"));
     }
 

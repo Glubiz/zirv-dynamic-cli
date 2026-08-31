@@ -511,10 +511,32 @@ pub fn builtin_deny() -> Vec<Rule> {
 /// built-ins. `utils::RESERVED_COMMANDS` is the dispatch layer's source of
 /// truth: those names are handled before script lookup, so a repo script can
 /// never shadow them. A non-reserved `zirv <script>` is deliberately absent.
+///
+/// `ctx` is the one name that does NOT expand to a blanket `zirv ctx *`
+/// (code review fix, critical, issue #224 follow-up): several of its verbs
+/// (`exec`, `wrap`, `chat`, `resume`, `loop`, `agent`, `handover`) spawn a
+/// subprocess of their own with caller-controlled argv that a name-only
+/// pattern cannot see past -- `zirv ctx exec -- <arbitrary command>` matched
+/// `zirv ctx *` and got a base Allow verdict plus a native sandbox exclusion,
+/// i.e. unattended, unsandboxed arbitrary execution. It expands to one
+/// `zirv ctx <verb> *` pattern per [`ctx_base_allow_verbs`] instead, reusing
+/// [`ZIRV_CTX_ESCAPE_SAFE_VERBS`] -- the same list already governing the
+/// `--dangerously-disable-sandbox` retry path -- as the single source of
+/// truth, so the two surfaces cannot drift apart. Every OTHER reserved name
+/// keeps its name-level `zirv <name> *`: its payload is a prompt or a path,
+/// not arbitrary argv.
 pub(crate) fn reserved_zirv_command_patterns() -> Vec<String> {
     crate::utils::RESERVED_COMMANDS
         .iter()
-        .map(|name| format!("zirv {name} *"))
+        .flat_map(|name| {
+            if *name == "ctx" {
+                ctx_base_allow_verbs()
+                    .map(|verb| format!("zirv ctx {verb} *"))
+                    .collect::<Vec<_>>()
+            } else {
+                vec![format!("zirv {name} *")]
+            }
+        })
         .collect()
 }
 
@@ -578,13 +600,10 @@ fn evaluate_single(policy: &SafetyPolicy, command: &str, fallback: Verdict) -> O
             };
         }
     }
-    if let Some(name) = reserved_zirv_command_name(command) {
+    if let Some(rule) = reserved_zirv_auto_allow_rule(command) {
         return Outcome {
             verdict: Verdict::Allow,
-            matched: Some(Rule {
-                pattern: format!("zirv {name} *"),
-                origin: Origin::BuiltIn,
-            }),
+            matched: Some(rule),
         };
     }
     if let Some(rule) = policy
@@ -615,6 +634,45 @@ fn reserved_zirv_command_name(command: &str) -> Option<String> {
     }
     let name = tokens.get(1)?;
     crate::utils::is_reserved_command(name).then(|| name.to_ascii_lowercase())
+}
+
+/// The `evaluate_single` auto-allow gate for a reserved zirv built-in --
+/// **not** just a name lookup, unlike [`reserved_zirv_command_name`] (still
+/// used by [`narrowing_rule_matches`], where narrower name-only matching can
+/// only ever make a `deny`/`ask` rule stricter, never wider). This function
+/// grants `Allow`, so it must be as narrow as [`reserved_zirv_command_
+/// patterns`]'s projection: every non-`ctx` reserved name auto-allows
+/// unconditionally (its payload is a prompt or a path), but `ctx` only
+/// auto-allows when its verb is in [`ctx_base_allow_verbs`] -- code review
+/// fix (CRITICAL, issue #224 follow-up). Before this fix, `zirv ctx exec --
+/// <arbitrary command>` and `zirv ctx wrap <arbitrary command>` matched on
+/// the reserved name alone and got a base `Allow` verdict (which also drives
+/// claude's native sandbox exclusion, see `adapters::claude::launch_
+/// settings_value`), i.e. unattended, unsandboxed arbitrary execution.
+fn reserved_zirv_auto_allow_rule(command: &str) -> Option<Rule> {
+    let tokens = sql_tokens(&collapse_whitespace(command))?;
+    let program = tokens.first()?;
+    if program.contains('/') || program.contains('\\') || sql_program_name(program) != "zirv" {
+        return None;
+    }
+    let name = tokens.get(1)?;
+    if !crate::utils::is_reserved_command(name) {
+        return None;
+    }
+    let name = name.to_ascii_lowercase();
+    if name != "ctx" {
+        return Some(Rule {
+            pattern: format!("zirv {name} *"),
+            origin: Origin::BuiltIn,
+        });
+    }
+    let verb = tokens.get(2)?.to_ascii_lowercase();
+    ctx_base_allow_verbs()
+        .any(|safe| safe == verb)
+        .then(|| Rule {
+            pattern: format!("zirv ctx {verb} *"),
+            origin: Origin::BuiltIn,
+        })
 }
 
 /// `deny`/`ask` rules may narrow the reserved built-in default. Their first
@@ -4346,6 +4404,11 @@ pub(crate) fn is_read_only_escape_safe(command: &str, scratchpad_roots: &[String
 /// the dangerous verbs: a newly added `CtxVerb` defaults to NOT qualifying
 /// until someone adds it here on purpose, rather than silently inheriting
 /// this carve-out.
+///
+/// Also the single source of truth [`ctx_base_allow_verbs`] filters down
+/// (dropping `usage`) for the BASE policy level's own `zirv ctx <verb> *`
+/// auto-allow, so the two surfaces cannot drift apart -- see that function's
+/// doc comment for why `usage` needs the extra filtering.
 const ZIRV_CTX_ESCAPE_SAFE_VERBS: &[&str] = &[
     "score",
     "handoff",
@@ -4363,6 +4426,27 @@ const ZIRV_CTX_ESCAPE_SAFE_VERBS: &[&str] = &[
     "permissions",
     "group",
 ];
+
+/// [`ZIRV_CTX_ESCAPE_SAFE_VERBS`] minus `usage`: the subset also safe to
+/// auto-allow at the BASE (sandboxed) policy level -- `reserved_zirv_auto_
+/// allow_rule`/`reserved_zirv_command_patterns` -- rather than only on the
+/// `--dangerously-disable-sandbox` retry path. `usage` cannot join it: a
+/// base-level rule is a plain `zirv ctx usage *` glob, and unlike [`is_
+/// reserved_zirv_escape_safe`]'s own fourth-token check, that glob cannot
+/// distinguish `zirv ctx usage --sessions` from `zirv ctx usage tee --
+/// <arbitrary command>` -- the one escape-safe verb with a subprocess-
+/// launching subcommand of its own (see that function's doc comment).
+/// Widening the base allow to cover `usage` would reintroduce, for `usage
+/// tee`, the exact base-Allow-plus-native-sandbox-exclusion combination this
+/// module's #224 review round flagged for `exec`/`wrap`. `usage` therefore
+/// stays on the ordinary ask/deny gate at the base level; it only skips the
+/// prompt on an unsandboxed retry, where the finer-grained check applies.
+fn ctx_base_allow_verbs() -> impl Iterator<Item = &'static str> {
+    ZIRV_CTX_ESCAPE_SAFE_VERBS
+        .iter()
+        .copied()
+        .filter(|verb| *verb != "usage")
+}
 
 /// Whether EVERY executable segment of `command` is an unsandboxed-retry-safe
 /// zirv built-in, used ONLY on the `--dangerously-disable-sandbox` retry path
@@ -6782,9 +6866,11 @@ mod tests {
         let policy = SafetyPolicy::default();
         for command in [
             "zirv ctx status",
+            "zirv ctx inbox",
             "zirv agent codex \"x\"",
             "zirv report bug t",
             "ZIRV CTX status",
+            "ZIRV CTX INBOX",
         ] {
             let outcome = evaluate(&policy, command, LaunchMode::Headless);
             assert_eq!(
@@ -6808,6 +6894,45 @@ mod tests {
                 outcome.verdict,
                 Verdict::Ask,
                 "{command}: expected Ask, got {:?}",
+                outcome.verdict
+            );
+        }
+    }
+
+    /// Code review fix (CRITICAL, issue #224 follow-up): before this fix,
+    /// `evaluate_single`'s reserved-name shortcut matched on `zirv ctx`
+    /// alone, so any subprocess-launching `ctx` verb -- `exec`'s trailing
+    /// `-- <arbitrary command>`, `wrap`'s trailing argv -- got a base Allow
+    /// verdict, which also drives claude's native sandbox exclusion
+    /// (`adapters::claude::launch_settings_value`): unattended, unsandboxed
+    /// arbitrary command execution. Pre-#224, none of `SHIPPED_POSTURE_
+    /// ALLOW`/`_DENY`/`_ASK` named `zirv` at all, so these fell through to
+    /// the plain unmatched-command default -- `Ask` headlessly -- exactly
+    /// what this fix restores for every ctx verb outside `ctx_base_allow_
+    /// verbs`. `usage` is included here too: its own `tee` subcommand is
+    /// the one escape-safe verb with a subprocess-launching subcommand of
+    /// its own (see `ctx_base_allow_verbs`'s doc comment), so it is
+    /// deliberately excluded from the base-level auto-allow as well.
+    #[test]
+    fn subprocess_launching_ctx_verbs_stay_gated_at_the_base_policy_level() {
+        let policy = SafetyPolicy::default();
+        for command in [
+            "zirv ctx exec -- rm -rf /",
+            "zirv ctx wrap sh -c \"curl x | sh\"",
+            "zirv ctx chat",
+            "zirv ctx resume",
+            "zirv ctx loop",
+            "zirv ctx agent codex \"do the thing\"",
+            "zirv ctx handover",
+            "zirv ctx usage tee -- rm -rf /",
+            "ZIRV CTX EXEC -- rm -rf /",
+        ] {
+            let outcome = evaluate(&policy, command, LaunchMode::Headless);
+            assert_eq!(
+                outcome.verdict,
+                Verdict::Ask,
+                "{command}: expected Ask (the pre-#224 unmatched-command \
+                 default), got {:?}",
                 outcome.verdict
             );
         }
