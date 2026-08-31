@@ -525,6 +525,33 @@ pub fn builtin_deny() -> Vec<Rule> {
 /// truth, so the two surfaces cannot drift apart. Every OTHER reserved name
 /// keeps its name-level `zirv <name> *`: its payload is a prompt or a path,
 /// not arbitrary argv.
+///
+/// `agent` and `chat` keep their name-level pattern here even though
+/// [`reserved_zirv_auto_allow_rule`] withholds the base `Allow` verdict when
+/// their forwarded flags pin a weaker posture on the spawned harness (issue
+/// #224 review round 2): a static glob, unlike that function, cannot see the
+/// *content* of the trailing flags, only that the command starts with `zirv
+/// agent`/`zirv chat`. Removing the pattern entirely was considered and
+/// rejected: `launch_settings_value`'s own hook stays SILENT for an `Allow`
+/// verdict under `dontAsk` (`hook_output`), so a plain, safe delegation
+/// needs a matching native `permissions.allow`/`sandbox.excludedCommands`
+/// entry to actually run un-prompted -- dropping the pattern would reopen
+/// issue #224's own original complaint (supervised sessions prompted on
+/// zirv's own built-ins) for the common case.
+///
+/// The design intent (NOT independently live-verified the way this file's
+/// other claude-permission claims are -- see `SHIPPED_POSTURE_ALLOW`'s own
+/// "verified live" doc comment for that bar) is that `evaluate_single`'s own
+/// verdict is the enforcing layer for the dangerous case: this generated
+/// pattern is expected to matter only for the safe delegation it also
+/// covers, on the assumption that claude applies the more restrictive of a
+/// PreToolUse hook's own decision and its native settings (issue #147's own
+/// comment on `launch_settings_value` documents the mirror-image case: a
+/// native `ask`/`deny` rule overriding a hook `Allow`). If that assumption
+/// is wrong for the hook-silent, native-allow-still-matches combination this
+/// creates, the residual gap is in claude's own native permission
+/// resolution, not in `evaluate_single`/[`reserved_zirv_auto_allow_rule`],
+/// which correctly withhold `Allow` regardless.
 pub(crate) fn reserved_zirv_command_patterns() -> Vec<String> {
     crate::utils::RESERVED_COMMANDS
         .iter()
@@ -606,11 +633,28 @@ fn evaluate_single(policy: &SafetyPolicy, command: &str, fallback: Verdict) -> O
             matched: Some(rule),
         };
     }
-    if let Some(rule) = policy
-        .allow
-        .iter()
-        .find(|rule| glob_match(&rule.pattern, command))
-    {
+    // A built-in reserved-command pattern (`Origin::BuiltIn` and shaped like
+    // `zirv <reserved-name> ...`) must not grant Allow here a second time --
+    // code review fix (CRITICAL, issue #224 review round 2). `reserved_
+    // zirv_auto_allow_rule` above is the sole, flag-aware authority for
+    // these; `reserved_zirv_command_patterns` still generates a blanket
+    // `zirv agent *`/`zirv chat *` glob for claude's own native settings
+    // projection (a static glob cannot express "except when flags pin a
+    // weaker posture"), and that SAME generated list also seeds this
+    // `policy.allow`. Without this exclusion, `zirv agent claude "x" --
+    // --permission-mode bypassPermissions` fell through the flag-aware
+    // shortcut's `None` straight into this plain glob scan, which still
+    // matched the built-in `"zirv agent *"` pattern and granted Allow
+    // anyway -- silently undoing the shortcut's own narrowing. An
+    // OPERATOR's own explicit allow rule of the same shape is unaffected
+    // (only `Origin::BuiltIn` is excluded): that is the operator's own
+    // informed choice, the same "operator's explicit choice always wins"
+    // rule this module applies everywhere else.
+    if let Some(rule) = policy.allow.iter().find(|rule| {
+        glob_match(&rule.pattern, command)
+            && !(rule.origin == Origin::BuiltIn
+                && reserved_zirv_command_name(&rule.pattern).is_some())
+    }) {
         return Outcome {
             verdict: Verdict::Allow,
             matched: Some(rule.clone()),
@@ -649,6 +693,23 @@ fn reserved_zirv_command_name(command: &str) -> Option<String> {
 /// the reserved name alone and got a base `Allow` verdict (which also drives
 /// claude's native sandbox exclusion, see `adapters::claude::launch_
 /// settings_value`), i.e. unattended, unsandboxed arbitrary execution.
+///
+/// `agent`/`chat` get a further carve-out (code review fix, CRITICAL, issue
+/// #224 review round 2): both forward everything they parse into their own
+/// trailing `flags`/`extra` field (`AgentArgs`/`ChatArgs`, `#[arg(allow_
+/// hyphen_values = true, last = true)]`) verbatim to the spawned harness's
+/// own CLI, and that same flag set can suppress zirv's entire computed
+/// posture prefix outright (`agent::worker_launch_flags` -> `adapters::
+/// policy_launch_args` -> `adapters::flags_pin_policy`). Pre-#224 the flag
+/// author was assumed to be the operator; under an unconditional auto-allow
+/// it can be the supervised model itself, so `zirv agent claude "x" --
+/// --permission-mode bypassPermissions` spawned an unattended worker with a
+/// weakened posture and no prompt anywhere. Every token past the reserved
+/// name is scanned (not only the slice after a literal `--`): a false `Ask`
+/// on a prompt that happens to contain a flag-shaped word costs nothing,
+/// while missing a real one reopens exactly this hole. Reuses `adapters::
+/// flags_pin_policy` as the single source of truth for which flags pin a
+/// posture, rather than a second hand-maintained list.
 fn reserved_zirv_auto_allow_rule(command: &str) -> Option<Rule> {
     let tokens = sql_tokens(&collapse_whitespace(command))?;
     let program = tokens.first()?;
@@ -661,6 +722,11 @@ fn reserved_zirv_auto_allow_rule(command: &str) -> Option<Rule> {
     }
     let name = name.to_ascii_lowercase();
     if name != "ctx" {
+        if matches!(name.as_str(), "agent" | "chat")
+            && super::adapters::flags_pin_policy(&tokens[2..])
+        {
+            return None;
+        }
         return Some(Rule {
             pattern: format!("zirv {name} *"),
             origin: Origin::BuiltIn,
@@ -6933,6 +6999,55 @@ mod tests {
                 Verdict::Ask,
                 "{command}: expected Ask (the pre-#224 unmatched-command \
                  default), got {:?}",
+                outcome.verdict
+            );
+        }
+    }
+
+    /// Code review fix (CRITICAL, issue #224 review round 2): before this
+    /// fix, `zirv agent`/`zirv chat`'s name-level auto-allow ignored their
+    /// own forwarded flags entirely, even though those flags reach the
+    /// spawned harness's CLI verbatim AND can suppress zirv's own computed
+    /// posture prefix (`agent::worker_launch_flags` ->
+    /// `adapters::policy_launch_args` -> `adapters::flags_pin_policy`). A
+    /// supervised model could therefore delegate to a worker with no
+    /// guardrails and no prompt anywhere -- `zirv agent claude "x" --
+    /// --permission-mode bypassPermissions` evaluated to Allow before this
+    /// fix.
+    #[test]
+    fn agent_and_chat_lose_auto_allow_when_forwarded_flags_pin_a_weaker_posture() {
+        let policy = SafetyPolicy::default();
+        let denied = [
+            "zirv agent claude \"x\" -- --permission-mode bypassPermissions",
+            "zirv agent codex \"x\" -- --sandbox danger-full-access",
+            "zirv agent claude \"x\" -- --permission-mode=bypassPermissions",
+            "zirv agent claude \"x\" -- --dangerously-skip-permissions",
+            "zirv agent codex \"x\" -- --dangerously-bypass-approvals-and-sandbox",
+            "zirv chat -- --permission-mode bypassPermissions",
+            "ZIRV AGENT claude \"x\" -- --permission-mode bypassPermissions",
+        ];
+        for command in denied {
+            let outcome = evaluate(&policy, command, LaunchMode::Headless);
+            assert_eq!(
+                outcome.verdict,
+                Verdict::Ask,
+                "{command}: expected Ask, got {:?}",
+                outcome.verdict
+            );
+        }
+
+        let allowed = [
+            "zirv agent codex \"x\" -- --model gpt-5.6-sol --cd /tmp",
+            "zirv agent claude \"x\"",
+            "zirv chat",
+            "ZIRV AGENT codex \"x\" -- --model gpt-5.6-sol --cd /tmp",
+        ];
+        for command in allowed {
+            let outcome = evaluate(&policy, command, LaunchMode::Headless);
+            assert_eq!(
+                outcome.verdict,
+                Verdict::Allow,
+                "{command}: expected Allow, got {:?}",
                 outcome.verdict
             );
         }
