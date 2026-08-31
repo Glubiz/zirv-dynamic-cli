@@ -833,12 +833,19 @@ fn render_measure_table(compiled: &CompiledContext, cfg: &CtxConfig, role: Promp
     let total_bytes = compiled.composed.as_ref().map_or(0, |c| c.text.len());
     rows.push(measure_row("total (session prefix)", total_bytes, ""));
 
-    let hook_bytes = super::hook::per_turn_context_text(&cfg.score.marker).len();
-    rows.push(measure_row(
-        "per-turn hook context",
-        hook_bytes,
-        "paid uncached every user turn",
-    ));
+    // `hook::prompt_output` only injects the marker sentence when a marker is
+    // configured at all, so an empty marker really costs 0 bytes per turn --
+    // the table must say so instead of overstating the steady-state cost
+    // (review finding on issue #225).
+    let (hook_bytes, hook_note) = if cfg.score.marker.is_empty() {
+        (0, "marker empty: nothing injected per turn")
+    } else {
+        (
+            super::hook::per_turn_context_text(&cfg.score.marker).len(),
+            "paid uncached every user turn",
+        )
+    };
+    rows.push(measure_row("per-turn hook context", hook_bytes, hook_note));
 
     let mut out = String::from("layer                      bytes   ~tokens  note\n");
     out.push_str(&rows.join("\n"));
@@ -1941,6 +1948,49 @@ mod tests {
             shared: true,
         }];
         assert_eq!(merge_memory_layers(&core, &retrieved).len(), 2);
+    }
+
+    /// Review finding on issue #225: with `score.marker = ""` the hook
+    /// injects nothing per turn (`hook::prompt_output` gates on a non-empty
+    /// marker), so `--measure` must report 0 bytes for that row instead of
+    /// overstating the steady-state cost with the default marker's sentence.
+    #[test]
+    fn measure_table_reports_zero_per_turn_bytes_when_the_marker_is_empty() {
+        let repo = repo_with_context_files(&[("common.md", "Keep the suite green.")]);
+        let mut cfg = CtxConfig::default();
+        cfg.score.marker = String::new();
+        let adapter = ClaudeAdapter::new(None);
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+
+        let compiled = compile_with_harness_roster(
+            None,
+            repo.path(),
+            false,
+            &cfg,
+            &adapter,
+            PromptRole::Orchestrator,
+            &state,
+            now_secs(),
+            true,
+            LaunchMode::Interactive,
+            false,
+        );
+
+        let table = render_measure_table(&compiled, &cfg, PromptRole::Orchestrator);
+
+        assert!(
+            table.contains(&measure_row(
+                "per-turn hook context",
+                0,
+                "marker empty: nothing injected per turn"
+            )),
+            "an empty marker costs nothing per turn: got:\n{table}"
+        );
+        assert!(
+            !table.contains("paid uncached every user turn"),
+            "the non-empty-marker note must not appear: got:\n{table}"
+        );
     }
 
     /// Issue #225: `zirv ctx compile --measure` must report the layers a
