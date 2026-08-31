@@ -3082,7 +3082,12 @@ pub(crate) mod tests {
         let repo = tmp.path().join("repo");
         std::fs::create_dir_all(&repo).expect("mkdir repo");
 
-        let spec = test_spec("11111111-2222-4333-8444-555555555555");
+        let mut spec = test_spec("11111111-2222-4333-8444-555555555555");
+        // Keep the child alive for the write below. The default test child
+        // exits immediately, so whether the pty accepts an injection before
+        // observing EOF is scheduler-dependent (and reliably returns EIO on
+        // macOS once the child wins that race).
+        spec.argv = long_lived_argv();
         let mut pane = Pane::spawn(
             spec,
             &state,
@@ -3107,22 +3112,14 @@ pub(crate) mod tests {
         pane.inject_visible("nudge from operator", "hello")
             .expect("inject_visible must succeed while the child is alive");
 
-        // The child exits immediately; give it a bounded window to be
-        // reaped rather than asserting on the very first poll.
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        let mut ended = false;
-        while std::time::Instant::now() < deadline {
-            pane.drain();
-            if matches!(pane.state(), PaneState::Ended(_)) {
-                ended = true;
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        assert!(ended, "the child must be reaped within the deadline");
+        pane.drain();
+        assert!(
+            !matches!(pane.state(), PaneState::Ended(_)),
+            "the long-lived child must still be alive after draining"
+        );
 
-        pane.shutdown("").expect("first shutdown");
-        pane.shutdown("").expect("shutdown must be idempotent");
+        pane.finish_shutdown().expect("first shutdown");
+        pane.finish_shutdown().expect("shutdown must be idempotent");
     }
 
     /// Code review (issue #119, round 2), BLOCKER: a worktree-hosted pane's

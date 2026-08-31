@@ -206,6 +206,16 @@ impl LaunchMode {
 /// explicit choice must demonstrably win over a zirv-computed default, not
 /// merely happen to survive because a CLI takes the last occurrence of a
 /// repeated flag. `policy_launch_args` is the sole caller that acts on this.
+///
+/// **`--dangerously-skip-permissions`/`--dangerously-bypass-approvals-and-
+/// sandbox` (issue #224 review round 2):** claude's and codex's own bare
+/// "remove every check" toggles pin the loosest possible posture outright,
+/// the same way a dedicated `--permission-mode`/`--sandbox` value does --
+/// leaving them out meant `policy_launch_args` still prepended zirv's own
+/// (functionally inert, since these toggles win regardless of position)
+/// prefix ahead of them, and `safety::reserved_zirv_auto_allow_rule` had no
+/// way to see that a `zirv agent`/`zirv chat` invocation's forwarded flags
+/// had asked the spawned harness to drop its own guardrails.
 pub fn flags_pin_policy(flags: &[String]) -> bool {
     const POLICY_FLAG_NAMES: &[&str] = &[
         "--disallowedTools",
@@ -217,6 +227,8 @@ pub fn flags_pin_policy(flags: &[String]) -> bool {
         "--ask-for-approval",
         "-a",
         "--approve-for-me",
+        "--dangerously-skip-permissions",
+        "--dangerously-bypass-approvals-and-sandbox",
     ];
     const CODEX_CONFIG_OVERRIDE_KEYS: &[&str] = &["approval_policy", "sandbox_mode"];
 
@@ -257,13 +269,16 @@ pub fn flags_pin_policy(flags: &[String]) -> bool {
 
 /// One family of in-repo-development or destructive actions zirv's own
 /// shipped-default "sandboxed, no prompts" posture takes a position on --
-/// the single source both `ClaudeAdapter::default_sandbox_args` (which
+/// the shared static source both `ClaudeAdapter::default_sandbox_args` (which
 /// projects every entry onto a concrete `Bash(...)`/`Read(...)`/`Edit(...)`
 /// permission rule) and codex's own `default_sandbox_args` (a coarse
 /// `--sandbox workspace-write --ask-for-approval never` pair, documented
 /// against this same list -- see that method's own doc comment) are
 /// expressions of, so the two harnesses' postures cannot independently
-/// drift into disagreement about what "sandboxed, no prompts" means.
+/// drift into disagreement about what "sandboxed, no prompts" means. Zirv's
+/// case-insensitive reserved built-ins are the one generated family alongside
+/// this constant; `safety::reserved_zirv_command_patterns` derives them from
+/// the dispatch layer's `utils::RESERVED_COMMANDS` source of truth.
 ///
 /// **Why `dontAsk` alone is not enough (2026-08-22, fix round 2):** a fresh
 /// install with no operator-configured `permissions.allow` denies every
@@ -314,7 +329,7 @@ pub fn flags_pin_policy(flags: &[String]) -> bool {
 /// denial. The narrow per-subcommand entries are replaced with whole
 /// `Bash(<tool> *)` families (`git *`, `gh *`, `cargo *`, `npm *`, `npx *`,
 /// `node *`, `python *`, `python3 *`, `pip *`, `go *`, `dotnet *`, `make *`,
-/// `gradle *`, `mvn *`, `pytest *`, `zirv *`) plus a set of read-only shell
+/// `gradle *`, `mvn *`, `pytest *`) plus a set of read-only shell
 /// utilities -- the deny list, not per-verb narrowing, is what still keeps
 /// each family's destructive half blocked (`git clean *`, `git push
 /// --delete *`, `gh repo delete *`, `gh release delete *`, `gh auth *`,
@@ -322,10 +337,10 @@ pub fn flags_pin_policy(flags: &[String]) -> bool {
 /// alongside the pre-existing force-push/reset/rebase/curl/wget/sudo/su/
 /// security entries -- deny still wins, verified live in fix round 2).
 ///
-/// `zirv *` (issue #98): the injected session prompt routinely instructs a
-/// session to run `zirv ctx ...`/`zirv agent ...` -- denying zirv's own CLI
-/// by omission would make that prompt-mandated guidance unusable under
-/// `dontAsk`.
+/// Issue #224 replaces issue #98's former blanket `zirv *` family with rules
+/// derived from `utils::RESERVED_COMMANDS` in `safety::builtin_allow`.
+/// Zirv's own built-ins remain usable under `dontAsk`, while repo-defined
+/// `zirv <script>` invocations return to the unmatched-command gate.
 ///
 /// Also added: `Read(~/.claude/**)`/`Edit(~/.claude/projects/**)` (inspect
 /// the harness's own settings/memory, and write Claude Code's own
@@ -392,10 +407,6 @@ pub const SHIPPED_POSTURE_ALLOW: &[(&str, &str)] = &[
     ("Bash(gradle *)", "the Java/Kotlin/Gradle toolchain"),
     ("Bash(mvn *)", "the Java/Maven toolchain"),
     ("Bash(pytest *)", "test with the Python toolchain"),
-    (
-        "Bash(zirv *)",
-        "zirv's own CLI (issue #98) -- the injected prompt routinely instructs a session to run it; denying it by omission would make that guidance unusable under dontAsk",
-    ),
     // Read-only shell utilities.
     ("Bash(ls *)", "list directory contents, read-only"),
     ("Bash(grep *)", "search file contents, read-only"),
@@ -2791,6 +2802,21 @@ pub(crate) fn git_common_dir(path: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #224 review round 2: the bare "drop every guardrail" toggles
+    /// pin the loosest posture just as decisively as a dedicated
+    /// `--permission-mode`/`--sandbox` value, so `flags_pin_policy` must
+    /// recognise them too -- see this function's own doc comment for why
+    /// `safety::reserved_zirv_auto_allow_rule` depends on this.
+    #[test]
+    fn flags_pin_policy_recognizes_the_dangerous_guardrail_removal_toggles() {
+        assert!(flags_pin_policy(&[
+            "--dangerously-skip-permissions".to_string()
+        ]));
+        assert!(flags_pin_policy(&[
+            "--dangerously-bypass-approvals-and-sandbox".to_string()
+        ]));
+    }
 
     /// Issue "codex approval hell" (2026-08-26): before this, `-c
     /// approval_policy=...`/`-c sandbox_mode=...` were invisible to
