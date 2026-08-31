@@ -1932,7 +1932,10 @@ fn launch_reviewer(agent: &str, package: &ReviewPackage) -> CtxResult<ReviewerRu
          variant (e.g. `blocker`, `high`, `needs-confirmation`) even if it seems more precise; \
          an unrecognised value is degraded to a fallback rather than kept as written, so use the \
          listed value that is closest. Do not add any field not listed above. Use an empty \
-         findings array when no concrete issue exists. Do not emit another result line.\n\n{}",
+         findings array when no concrete issue exists. Do not emit another result line. \
+         Print that line as plain text in your final message: zirv reads ONLY your stdout, so \
+         do not deliver findings through a harness tool (ReportFindings or similar) or a \
+         code-review mode -- a result sent any other way is lost.\n\n{}",
         serde_json::to_string(package)?
     );
     let mut child = Command::new(std::env::current_exe()?)
