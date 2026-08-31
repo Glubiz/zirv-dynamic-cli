@@ -92,6 +92,7 @@ Plus a third, read-only case: `zirv ctx optimize` reads the repo's own CLAUDE.md
 | `workflow.telemetry_enabled` | `ZIRV_CTX_WORKFLOW_TELEMETRY` |
 | `workflow.telemetry_max_events` | `ZIRV_CTX_WORKFLOW_TELEMETRY_MAX_EVENTS` |
 | `workflow.telemetry_retention_days` | `ZIRV_CTX_WORKFLOW_TELEMETRY_RETENTION_DAYS` |
+| `workflow.check_env_passthrough` | `ZIRV_CTX_WORKFLOW_CHECK_ENV_PASSTHROUGH` |
 | `context.max_common_bytes` | `ZIRV_CTX_CONTEXT_MAX_COMMON_BYTES` |
 | `context.max_harness_bytes` | `ZIRV_CTX_CONTEXT_MAX_HARNESS_BYTES` |
 | `context.max_harness_roster_bytes` | `ZIRV_CTX_CONTEXT_MAX_HARNESS_ROSTER_BYTES` |

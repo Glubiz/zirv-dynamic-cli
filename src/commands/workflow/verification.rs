@@ -1017,21 +1017,29 @@ fn check_result(check: &ResolvedCheck, status: CheckStatus) -> CheckResult {
 }
 
 /// Environment variable names always passed from the zirv process's own
-/// environment into a verification check child, with no `[workflow]
-/// check_env_passthrough` configuration at all. `run_check` already spawns
-/// the check with `std::process::Command::new`, which inherits the parent's
-/// full environment by default (no `env_clear`/`env_remove` sits between
-/// zirv and the check child) -- so on a machine where the zirv process
-/// itself has these set, the child already sees them. This list exists as
-/// an explicit, tested guarantee for that path rather than an implicit
-/// consequence of never having called `env_clear`, and as the seam a future
-/// sandboxing change (`Command::env_clear` for stricter check isolation)
-/// would have to widen instead of quietly regressing (issue #233: a
-/// macOS/Linux desktop session's `ssh-agent` family -- `SSH_AUTH_SOCK`,
-/// `SSH_AGENT_PID`, `SSH_ASKPASS` -- plus GPG's terminal/homedir pointers --
-/// `GPG_TTY`, `GNUPGHOME` -- so a check that shells out to `ssh`/git-over-ssh/
-/// `gpg` (e.g. `gitlab-ci-local`'s remote-variable fetch) passes without a
-/// per-command shell workaround).
+/// environment (or, on macOS only, the login session -- see
+/// `launchd_getenv` below) into a verification check child, with no
+/// `[workflow] check_env_passthrough` configuration at all. `run_check`
+/// already spawns the check with `std::process::Command::new`, which
+/// inherits the parent's full environment by default (no `env_clear`/
+/// `env_remove` sits between zirv and the check child) -- so on a machine
+/// where the zirv process itself has these set, the child already sees
+/// them. This list exists as an explicit, tested guarantee for that path
+/// rather than an implicit consequence of never having called `env_clear`,
+/// and as the seam a future sandboxing change (`Command::env_clear` for
+/// stricter check isolation) would have to widen instead of quietly
+/// regressing (issue #233: a macOS/Linux desktop session's `ssh-agent`
+/// family -- `SSH_AUTH_SOCK`, `SSH_AGENT_PID`, `SSH_ASKPASS` -- plus GPG's
+/// terminal/homedir pointers -- `GPG_TTY`, `GNUPGHOME` -- so a check that
+/// shells out to `ssh`/git-over-ssh/`gpg` (e.g. `gitlab-ci-local`'s
+/// remote-variable fetch) passes without a per-command shell workaround).
+///
+/// The reported case (issue #233) was worse than "zirv's own process has
+/// the value": the harness's shell child had no `SSH_AUTH_SOCK` in ITS OWN
+/// environment either, and the reporter's working workaround was `export
+/// SSH_AUTH_SOCK="$(launchctl getenv SSH_AUTH_SOCK)"`. `launchd_getenv`
+/// below is that same command, consulted only when a name in this list is
+/// absent from zirv's own process environment, and only on macOS.
 const DEFAULT_CHECK_ENV_PASSTHROUGH: &[&str] = &[
     "SSH_AUTH_SOCK",
     "SSH_AGENT_PID",
@@ -1073,6 +1081,92 @@ fn resolved_check_env_passthrough(extra: &[String]) -> Vec<String> {
     names
 }
 
+/// Where one allowlisted check-env variable's value came from. Only
+/// `Launchd` earns the one-line stderr notice `run_check` prints -- a value
+/// already sitting in zirv's own process environment needs no explanation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ResolvedCheckEnvValue {
+    Process(String),
+    Launchd(String),
+}
+
+/// Resolution order for one allowlisted name (issue #233): a value already
+/// present in zirv's own process environment always wins; only when it is
+/// ABSENT there is the macOS login-session fallback consulted, and only a
+/// non-empty result from it is used -- otherwise the name stays unset on the
+/// check child, exactly as it does today. `process_env`/`launchd_env` are
+/// injected so this merge is unit-tested cross-platform with a fake
+/// resolver; `run_check` wires the real lookups (`std::env::var` and
+/// `launchd_getenv`, which is a no-op on every platform but macOS).
+fn resolve_one_check_env_var(
+    name: &str,
+    process_env: &impl Fn(&str) -> Option<String>,
+    launchd_env: &impl Fn(&str) -> Option<String>,
+) -> Option<ResolvedCheckEnvValue> {
+    if let Some(value) = process_env(name) {
+        return Some(ResolvedCheckEnvValue::Process(value));
+    }
+    match launchd_env(name) {
+        Some(value) if !value.trim().is_empty() => Some(ResolvedCheckEnvValue::Launchd(value)),
+        _ => None,
+    }
+}
+
+/// `launchctl getenv <name>`: macOS's per-login-session environment, which
+/// is where a variable like `SSH_AUTH_SOCK` actually lives when the zirv
+/// process itself was not launched from that session's shell -- the exact
+/// gap issue #233 reported, and the exact command the reporter's own working
+/// workaround ran by hand. Bounded to a few seconds, no shell, stdin/stderr
+/// null; any failure (binary missing, non-zero exit, timeout, unreadable
+/// stdout) is silently `None` -- this is a best-effort fallback, never a
+/// reason to fail a check.
+#[cfg(target_os = "macos")]
+fn launchd_getenv(name: &str) -> Option<String> {
+    let mut command = Command::new("launchctl");
+    command
+        .args(["getenv", name])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = command.spawn().ok()?;
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    return None;
+                }
+                break;
+            }
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(_) => return None,
+        }
+    }
+    let mut stdout = child.stdout.take()?;
+    let mut buf = String::new();
+    stdout.read_to_string(&mut buf).ok()?;
+    let value = buf.trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
+/// Every platform but macOS: the login-session fallback does not exist, so
+/// this is always `None` and `launchctl` is never invoked.
+#[cfg(not(target_os = "macos"))]
+fn launchd_getenv(_name: &str) -> Option<String> {
+    None
+}
+
 fn run_check(
     repo: &Path,
     check: &ResolvedCheck,
@@ -1093,12 +1187,24 @@ fn run_check(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     // Explicit guarantee, not a no-op: see `DEFAULT_CHECK_ENV_PASSTHROUGH`'s
-    // own doc comment. Read from zirv's own process environment at check
-    // time, exactly like every other operator-config-gated env read in this
+    // own doc comment. Read from zirv's own process environment (then, on
+    // macOS only, the login session via `launchd_getenv`) at check time,
+    // exactly like every other operator-config-gated env read in this
     // codebase (never a repo-controlled value).
     for name in resolved_check_env_passthrough(check_env_passthrough) {
-        if let Ok(value) = std::env::var(&name) {
-            command.env(&name, value);
+        let resolved =
+            resolve_one_check_env_var(&name, &|key: &str| std::env::var(key).ok(), &|key: &str| {
+                launchd_getenv(key)
+            });
+        match resolved {
+            Some(ResolvedCheckEnvValue::Process(value)) => {
+                command.env(&name, value);
+            }
+            Some(ResolvedCheckEnvValue::Launchd(value)) => {
+                eprintln!("zirv \u{25b8} verify: {name} taken from the login session (launchctl)");
+                command.env(&name, value);
+            }
+            None => {}
         }
     }
     /// One check's raw run outcome: status, exit code, combined capped
@@ -2434,6 +2540,67 @@ mod tests {
                  {differently_cased:?}"
             );
         }
+    }
+
+    /// Pure, cross-platform coverage of the resolution order itself (issue
+    /// #233's macOS fallback), with a fake resolver on both sides -- no
+    /// process spawn, no real `launchctl`, so this runs and means the same
+    /// thing on every CI platform including this Windows dev machine.
+    #[test]
+    fn resolve_one_check_env_var_prefers_process_env_over_the_launchd_fallback() {
+        let process = |name: &str| (name == "SSH_AUTH_SOCK").then(|| "from-process".to_string());
+        let launchd = |name: &str| (name == "SSH_AUTH_SOCK").then(|| "from-launchd".to_string());
+        assert_eq!(
+            resolve_one_check_env_var("SSH_AUTH_SOCK", &process, &launchd),
+            Some(ResolvedCheckEnvValue::Process("from-process".to_string())),
+            "a value already in zirv's own process environment must win outright"
+        );
+    }
+
+    #[test]
+    fn resolve_one_check_env_var_falls_back_to_launchd_only_when_process_env_is_absent() {
+        let no_process = |_: &str| None;
+        let launchd = |name: &str| (name == "SSH_AUTH_SOCK").then(|| "from-launchd".to_string());
+        assert_eq!(
+            resolve_one_check_env_var("SSH_AUTH_SOCK", &no_process, &launchd),
+            Some(ResolvedCheckEnvValue::Launchd("from-launchd".to_string())),
+            "absent from the process env must fall back to the login session"
+        );
+    }
+
+    #[test]
+    fn resolve_one_check_env_var_is_none_when_both_resolvers_come_up_empty() {
+        let no_process = |_: &str| None;
+        let no_launchd = |_: &str| None;
+        assert_eq!(
+            resolve_one_check_env_var("SSH_AUTH_SOCK", &no_process, &no_launchd),
+            None,
+            "neither source has it, so the child's copy stays unset"
+        );
+    }
+
+    /// A blank/whitespace-only `launchctl getenv` result (the shape an unset
+    /// login-session variable actually prints) must not be treated as a real
+    /// value -- otherwise every unset variable would resolve to an empty
+    /// string on the check child instead of staying unset.
+    #[test]
+    fn resolve_one_check_env_var_treats_a_blank_launchd_result_as_absent() {
+        let no_process = |_: &str| None;
+        let blank_launchd = |name: &str| (name == "SSH_AUTH_SOCK").then(|| "   ".to_string());
+        assert_eq!(
+            resolve_one_check_env_var("SSH_AUTH_SOCK", &no_process, &blank_launchd),
+            None
+        );
+    }
+
+    /// On every platform but macOS, the real `launchd_getenv` is always
+    /// `None` and never spawns `launchctl` -- this is the seam
+    /// `resolve_one_check_env_var`'s fake-resolver tests above stand in for
+    /// in `run_check` itself.
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn launchd_getenv_is_always_none_off_macos() {
+        assert_eq!(launchd_getenv("SSH_AUTH_SOCK"), None);
     }
 
     // -- #215: baseline-waivable test gate ---------------------------------
