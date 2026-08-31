@@ -431,7 +431,14 @@ pub fn changed_paths(repo: &Path) -> CtxResult<Vec<PathBuf>> {
             String::from_utf8_lossy(&output.stdout)
                 .lines()
                 .filter(|line| !line.trim().is_empty())
-                .map(PathBuf::from),
+                .map(PathBuf::from)
+                // #229/#232: the workflow's own `.zirv/work/<id>/*` artifacts
+                // (plans, execute-plan pages, raw review salvage) are not the
+                // operator's change surface. Left in, an edit to one of them
+                // -- ticking a plan checkbox, a concurrent dashboard write --
+                // shifts `change_fingerprint` out from under an in-flight
+                // review and any other `changed_paths` consumer.
+                .filter(|path: &PathBuf| !super::classify::is_workflow_work_path(path)),
         );
     }
     paths.sort();
@@ -1867,6 +1874,42 @@ mod tests {
             report.change_fingerprint,
             change_fingerprint(repo.path()).unwrap(),
             "the report must describe the tree as it was before the edit"
+        );
+    }
+
+    /// #229: an operator ticking a checkbox in the untracked
+    /// `.zirv/work/<id>/plan.md` -- or any other write under `.zirv/work/`
+    /// -- must never move `change_fingerprint`, or an independent review
+    /// running concurrently gets refused with "the change set changed
+    /// during review" for a file the reviewer was never asked to look at.
+    #[test]
+    fn change_fingerprint_ignores_edits_under_zirv_work() {
+        let repo = git_repo();
+        let before = change_fingerprint(repo.path()).unwrap();
+
+        let work_dir = repo.path().join(".zirv").join("work").join("wf-1");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        std::fs::write(work_dir.join("plan.md"), "- [ ] task one\n").unwrap();
+        assert_eq!(
+            change_fingerprint(repo.path()).unwrap(),
+            before,
+            "creating a new untracked .zirv/work file must not move the fingerprint"
+        );
+
+        std::fs::write(work_dir.join("plan.md"), "- [x] task one\n").unwrap();
+        assert_eq!(
+            change_fingerprint(repo.path()).unwrap(),
+            before,
+            "editing an existing untracked .zirv/work file must not move the fingerprint either"
+        );
+
+        // Sanity: an edit outside `.zirv/work` still moves the fingerprint,
+        // so this test is not just asserting a broken no-op fingerprint.
+        std::fs::write(repo.path().join("src_marker.txt"), "changed\n").unwrap();
+        assert_ne!(
+            change_fingerprint(repo.path()).unwrap(),
+            before,
+            "an ordinary untracked file must still move the fingerprint"
         );
     }
 
