@@ -45,14 +45,14 @@
 
 use std::path::{Path, PathBuf};
 
-use super::adapters::AgentAdapter;
+use super::adapters::{self, AgentAdapter};
 use super::config::CtxConfig;
 use super::optimize::{self, Layer};
 use super::policy::{self, PolicyReport};
 use super::prompt::{self, ComposedPrompt, PromptRole, PromptSource};
 use super::state::StateDir;
 use super::surface::{ContextSurface, Trust};
-use super::{context, memory, retrieval};
+use super::{CtxResult, context, memory, retrieval};
 
 /// `log::Decision::action` for a canonical context layer cut by its budget.
 pub const TRUNCATED_ACTION: &str = "context-truncated";
@@ -712,6 +712,182 @@ pub fn compile_with_harness_roster(
         retrieved_memory: retrieved_memory_summary,
         harness_roster,
     }
+}
+
+/// Issue #225 ("Reduce steady-state token usage of running sessions"): `zirv
+/// ctx compile` is the measurement surface for what a session's own prompt
+/// prefix actually costs. It composes exactly as an orchestrator launch
+/// would for the current repo (`compile_with_harness_roster`, the same
+/// function every real launch path but `resume` calls), then either prints
+/// the composed text (the default, mirroring `resume --print-prompt`'s own
+/// read-only shape) or, with `--measure`, a deterministic per-layer
+/// byte/token table built from [`CompiledContext`]'s own provenance --
+/// never a second, hand-rolled walk of the layering `compose`/`compile_with_
+/// harness_roster` already own.
+#[derive(Debug, clap::Args)]
+pub struct CompileArgs {
+    /// Adapter name: claude or codex. Defaults to config, then claude.
+    #[arg(long)]
+    pub agent: Option<String>,
+    /// Print a deterministic per-layer byte/token measurement table instead
+    /// of the composed prompt text.
+    #[arg(long, default_value_t = false)]
+    pub measure: bool,
+}
+
+/// `bytes / 4`, rounded to the nearest integer -- the same rough token
+/// estimate every row of the measurement table uses. Deliberately crude: the
+/// table labels it an estimate, and an exact count needs the provider's own
+/// tokenizer, which this offline command has no way to call.
+fn estimate_tokens(bytes: usize) -> usize {
+    ((bytes as f64) / 4.0).round() as usize
+}
+
+fn measure_row(layer: &str, bytes: usize, note: &str) -> String {
+    let tokens = estimate_tokens(bytes);
+    let base = format!("{layer:<26} {bytes:>7} {tokens:>8}");
+    if note.is_empty() {
+        base
+    } else {
+        format!("{base}  {note}")
+    }
+}
+
+/// Builds the `--measure` table from a [`CompiledContext`] this repo/role/
+/// harness would actually get at launch, without re-deriving any layer's own
+/// byte count a second way: every number here comes straight off `compiled`
+/// (`composed.text.len()` for the ground-truth total) or off one of the two
+/// deterministic shipped-prompt constants (`DEFAULT_PROMPT`/`HARNESS_PROMPT`,
+/// which `compose` always copies verbatim -- see their own doc comments).
+/// Rows are pushed in composition order, not sorted by size, and a truncated
+/// layer is annotated with the exact config key/cap an operator would raise.
+fn render_measure_table(compiled: &CompiledContext, cfg: &CtxConfig, role: PromptRole) -> String {
+    let mut rows: Vec<String> = Vec::new();
+    let sources: &[PromptSource] = compiled
+        .composed
+        .as_ref()
+        .map(|c| c.sources.as_slice())
+        .unwrap_or(&[]);
+
+    rows.push(measure_row(
+        "default prompt",
+        prompt::DEFAULT_PROMPT.len(),
+        "",
+    ));
+
+    if role == PromptRole::Orchestrator && sources.contains(&PromptSource::Harness) {
+        rows.push(measure_row(
+            "harness prompt",
+            prompt::HARNESS_PROMPT.len(),
+            "orchestrator only",
+        ));
+    }
+
+    if let Some(roster) = &compiled.harness_roster {
+        let note = if roster.truncated {
+            format!("truncated to {}", cfg.context.max_harness_roster_bytes)
+        } else {
+            String::new()
+        };
+        rows.push(measure_row("harness roster", roster.delivered_bytes, &note));
+    }
+
+    for entry in &compiled.provenance {
+        let name = entry
+            .surface
+            .path()
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("context");
+        let label = format!("canonical context: {name}");
+        let (bytes, note) = if entry.delivered_bytes == 0 && entry.raw_bytes > 0 {
+            (0, "deduped (native file already carries this)".to_string())
+        } else if entry.truncated {
+            let cap = match entry.budget_key {
+                "context.max_common_bytes" => cfg.context.max_common_bytes,
+                "context.max_harness_bytes" => cfg.context.max_harness_bytes,
+                _ => entry.delivered_bytes,
+            };
+            (entry.delivered_bytes, format!("truncated to {cap}"))
+        } else {
+            (entry.delivered_bytes, String::new())
+        };
+        rows.push(measure_row(&label, bytes, &note));
+    }
+
+    if compiled.core_memory.total_entries > 0 {
+        rows.push(measure_row(
+            "memory: core",
+            compiled.core_memory.injected_bytes,
+            "",
+        ));
+    }
+    if compiled.retrieved_memory.total_entries > 0 {
+        rows.push(measure_row(
+            "memory: retrieval",
+            compiled.retrieved_memory.injected_bytes,
+            "",
+        ));
+    }
+
+    let total_bytes = compiled.composed.as_ref().map_or(0, |c| c.text.len());
+    rows.push(measure_row("total (session prefix)", total_bytes, ""));
+
+    let hook_bytes = super::hook::per_turn_context_text(&cfg.score.marker).len();
+    rows.push(measure_row(
+        "per-turn hook context",
+        hook_bytes,
+        "paid uncached every user turn",
+    ));
+
+    let mut out = String::from("layer                      bytes   ~tokens  note\n");
+    out.push_str(&rows.join("\n"));
+    out.push('\n');
+    out.push_str("~tokens = bytes / 4 (estimate; cache reads bill this prefix every turn)");
+    out
+}
+
+pub fn run_with<W: std::io::Write>(
+    args: &CompileArgs,
+    w: &mut W,
+    repo: &Path,
+    env: super::config::EnvLookup<'_>,
+) -> CtxResult<i32> {
+    let cfg = CtxConfig::load(repo, env)?;
+    let home = crate::utils::home_dir().ok();
+    let state = StateDir::resolve(env)?;
+    let adapter = adapters::select(args.agent.as_deref().or(cfg.agent.as_deref()), &[], &cfg)?;
+    let role = PromptRole::Orchestrator;
+
+    let compiled = compile_with_harness_roster(
+        home.as_deref(),
+        repo,
+        false,
+        &cfg,
+        adapter.as_ref(),
+        role,
+        &state,
+        super::state::now_secs(),
+        true,
+        super::adapters::LaunchMode::Interactive,
+        true,
+    );
+
+    if args.measure {
+        writeln!(w, "{}", render_measure_table(&compiled, &cfg, role))?;
+    } else {
+        match &compiled.composed {
+            Some(c) => writeln!(w, "{}", c.text)?,
+            None => writeln!(w, "(no prompt: disabled by config)")?,
+        }
+    }
+    Ok(0)
+}
+
+pub fn run<W: std::io::Write>(args: &CompileArgs, w: &mut W) -> CtxResult<i32> {
+    let repo = std::env::current_dir()?;
+    let env = super::config::env_from_process();
+    run_with(args, w, &repo, &env)
 }
 
 #[cfg(test)]
@@ -1765,5 +1941,178 @@ mod tests {
             shared: true,
         }];
         assert_eq!(merge_memory_layers(&core, &retrieved).len(), 2);
+    }
+
+    /// Issue #225: `zirv ctx compile --measure` must report the layers a
+    /// fixture with a canonical context file AND a repo `system-prompt.md`
+    /// actually produces, with a `total (session prefix)` that is the real
+    /// `composed.text.len()` -- not a re-summed approximation -- so the
+    /// repo layer (which gets no dedicated row) still counts toward it.
+    #[test]
+    fn measure_table_reports_expected_rows_and_the_real_total_for_a_fixture_repo() {
+        let repo = repo_with_context_files(&[(
+            "common.md",
+            "Always run the full test suite before committing.",
+        )]);
+        std::fs::write(
+            repo.path().join(".zirv/system-prompt.md"),
+            "Repo-specific onboarding note for this checkout.",
+        )
+        .expect("write repo system prompt");
+
+        let cfg = CtxConfig::default();
+        let adapter = ClaudeAdapter::new(None);
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+
+        let compiled = compile_with_harness_roster(
+            None,
+            repo.path(),
+            false,
+            &cfg,
+            &adapter,
+            PromptRole::Orchestrator,
+            &state,
+            now_secs(),
+            true,
+            LaunchMode::Interactive,
+            false,
+        );
+
+        let table = render_measure_table(&compiled, &cfg, PromptRole::Orchestrator);
+
+        assert!(
+            table.starts_with("layer                      bytes   ~tokens  note\n"),
+            "got:\n{table}"
+        );
+        assert!(
+            table.contains(&measure_row(
+                "default prompt",
+                prompt::DEFAULT_PROMPT.len(),
+                ""
+            )),
+            "got:\n{table}"
+        );
+        assert!(
+            table.contains(&measure_row(
+                "harness prompt",
+                prompt::HARNESS_PROMPT.len(),
+                "orchestrator only"
+            )),
+            "got:\n{table}"
+        );
+        assert!(table.contains("canonical context: common"), "got:\n{table}");
+        let total = compiled
+            .composed
+            .as_ref()
+            .expect("prompt is enabled by default")
+            .text
+            .len();
+        assert!(
+            table.contains(&measure_row("total (session prefix)", total, "")),
+            "the total row must be the real composed.text.len(): got:\n{table}"
+        );
+        assert!(table.contains("per-turn hook context"), "got:\n{table}");
+        assert!(
+            table.contains("paid uncached every user turn"),
+            "got:\n{table}"
+        );
+        assert!(
+            table.ends_with(
+                "~tokens = bytes / 4 (estimate; cache reads bill this prefix every turn)"
+            ),
+            "got:\n{table}"
+        );
+
+        // The repo `system-prompt.md` layer gets no dedicated row, but it
+        // must still be inside the ground-truth total: compiling the same
+        // fixture without it produces a strictly smaller total.
+        std::fs::remove_file(repo.path().join(".zirv/system-prompt.md")).expect("remove");
+        let without_repo_layer = compile_with_harness_roster(
+            None,
+            repo.path(),
+            false,
+            &cfg,
+            &adapter,
+            PromptRole::Orchestrator,
+            &state,
+            now_secs(),
+            true,
+            LaunchMode::Interactive,
+            false,
+        );
+        let smaller_total = without_repo_layer
+            .composed
+            .as_ref()
+            .expect("prompt is enabled by default")
+            .text
+            .len();
+        assert!(
+            smaller_total < total,
+            "removing the repo system-prompt layer must shrink the real total: \
+             {smaller_total} vs {total}"
+        );
+    }
+
+    /// A canonical context surface cut by its own byte cap must be annotated
+    /// with the exact config key an operator would raise, not a bare
+    /// "truncated" with no actionable cap.
+    #[test]
+    fn measure_table_names_the_exact_cap_a_truncated_layer_was_cut_by() {
+        let repo = repo_with_context_files(&[("common.md", &"x".repeat(200))]);
+        let mut cfg = CtxConfig::default();
+        cfg.context.max_common_bytes = 10;
+        let adapter = ClaudeAdapter::new(None);
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+
+        let compiled = compile_with_harness_roster(
+            None,
+            repo.path(),
+            false,
+            &cfg,
+            &adapter,
+            PromptRole::Orchestrator,
+            &state,
+            now_secs(),
+            true,
+            LaunchMode::Interactive,
+            false,
+        );
+        let table = render_measure_table(&compiled, &cfg, PromptRole::Orchestrator);
+        assert!(
+            table.contains("truncated to 10"),
+            "must name the exact cap: got:\n{table}"
+        );
+    }
+
+    /// Codex gets its own harness-specific row, distinct from claude's,
+    /// keyed off the surface's own file name rather than a hardcoded label.
+    #[test]
+    fn measure_table_labels_the_harness_specific_row_by_surface_file_name() {
+        let repo = repo_with_context_files(&[
+            ("common.md", "Shared instruction for every harness."),
+            ("codex.md", "Codex-only addition."),
+        ]);
+        let cfg = CtxConfig::default();
+        let adapter = CodexAdapter::new(None);
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+
+        let compiled = compile_with_harness_roster(
+            None,
+            repo.path(),
+            false,
+            &cfg,
+            &adapter,
+            PromptRole::Orchestrator,
+            &state,
+            now_secs(),
+            true,
+            LaunchMode::Interactive,
+            false,
+        );
+        let table = render_measure_table(&compiled, &cfg, PromptRole::Orchestrator);
+        assert!(table.contains("canonical context: codex"), "got:\n{table}");
     }
 }

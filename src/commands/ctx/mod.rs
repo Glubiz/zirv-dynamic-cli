@@ -401,6 +401,9 @@ pub enum CtxVerb {
     Permissions(permissions::PermissionsArgs),
     /// Open, inspect or close a bounded group of delegated work.
     Group(group::GroupArgs),
+    /// Compose the session prompt for the current repo/role/harness -- print
+    /// it, or measure its per-layer byte/token cost with `--measure`.
+    Compile(compile::CompileArgs),
 }
 
 /// What a clap parse failure costs, which is not the same for every verb.
@@ -491,6 +494,7 @@ pub fn dispatch(args: &[String]) -> i32 {
         CtxVerb::Handover(a) => handover::run(a, &mut out),
         CtxVerb::Permissions(a) => permissions::run(a, &mut out),
         CtxVerb::Group(a) => group::run(a, &mut out),
+        CtxVerb::Compile(a) => compile::run(a, &mut out),
     };
 
     match result {
