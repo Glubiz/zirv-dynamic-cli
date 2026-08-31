@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-27
+last-verified: 2026-08-31
 ---
 
 # _system-context
@@ -8,7 +8,7 @@ last-verified: 2026-08-27
 
 ## System Purpose
 
-`zirv` is a single Rust binary that executes developer-defined scripts (YAML/JSON/TOML) living in `.zirv/` directories, substituting `${var}` parameters and secrets and running shell/agent/concurrent steps in order. Its second half, `zirv ctx`, is an AI-agent-context-management subsystem: it supervises long-running Claude Code or Codex sessions, scoring supported transcripts with a deterministic rot engine and acting — advise, compact, or restart-with-handoff — before context-window degradation ruins the session. Codex supports direct prompt injection and lifecycle hooks, and its rollout JSON now derives real turn-boundary/token events for rot scoring (issue #86); tool-call/tool-result/compaction event mapping remains issue #11 — see [[Ctx Adapters]]. The two halves share one binary and one dispatch table but are otherwise decoupled: script steps can *invoke* a supervised agent run, but the ctx CLI surface is intercepted before script resolution ever runs. See [[Architecture Overview]] and [[Context Management]].
+`zirv` is a single Rust binary that executes developer-defined scripts (YAML/JSON/TOML) living in `.zirv/commands/` directories (issue #212, zirv 3.0 — see [[Script Resolution]]), substituting `${var}` parameters and secrets and running shell/agent/concurrent steps in order. Its second half, `zirv ctx`, is an AI-agent-context-management subsystem: it supervises long-running Claude Code or Codex sessions, scoring supported transcripts with a deterministic rot engine and acting — advise, compact, or restart-with-handoff — before context-window degradation ruins the session. Codex supports direct prompt injection and lifecycle hooks, and its rollout JSON now derives real turn-boundary/token events for rot scoring (issue #86); tool-call/tool-result/compaction event mapping remains issue #11 — see [[Ctx Adapters]]. The two halves share one binary and one dispatch table but are otherwise decoupled: script steps can *invoke* a supervised agent run, but the ctx CLI surface is intercepted before script resolution ever runs. See [[Architecture Overview]] and [[Context Management]].
 
 ## Architecture at a Glance
 
@@ -19,15 +19,15 @@ argv[1] in --help/-h? --yes--> show_help (raw-argv intercept, bypasses clap)
       |no
 Input::parse() (clap)  -->  help|version|init|create  -->  handled, return
       |no match
-Input::get_file_path()  -->  literal path | .zirv/<name>.ext | .zirv/.shortcuts.yaml
-                              | ~/.zirv/<name>.ext | ~/.zirv/.shortcuts.yaml
+Input::get_file_path()  -->  literal path | .zirv/commands/<name>.ext | .zirv/.shortcuts.yaml
+                              | ~/.zirv/commands/<name>.ext | ~/.zirv/.shortcuts.yaml
       |
 file_to_script (parse YAML/JSON/TOML)  -->  script_runner::execute
       |
 build_context (params + secrets)  -->  Script::run loop over CommandTypes steps
 ```
 
-Dispatch order matters: `ctx` and top-level `--help` are matched on **raw argv**, before clap ever runs, which is why `.zirv/ctx.yaml` is permanently unreachable (see Gotchas). The same raw-argv-first pattern repeats one layer down inside `ctx` itself: `commands::ctx::dispatch` reparses argv under its own `CtxCli` clap parser and never returns control to `main.rs` — it exits the process directly. Full detail: [[Architecture Overview]], [[Script Resolution]].
+Dispatch order matters: `ctx` and top-level `--help` are matched on **raw argv**, before clap ever runs, which is why `.zirv/commands/ctx.yaml` is permanently unreachable (see Gotchas). The same raw-argv-first pattern repeats one layer down inside `ctx` itself: `commands::ctx::dispatch` reparses argv under its own `CtxCli` clap parser and never returns control to `main.rs` — it exits the process directly. Full detail: [[Architecture Overview]], [[Script Resolution]].
 
 ## Module Quick Map
 
@@ -110,7 +110,7 @@ Every row's "vault page" is also the page whose "If changed" line names its own 
 
 - **Rot engine purity**: `rot.rs` must contain no `std::fs`, `std::time`, `std::env`, or `std::net` calls — every scoring function is data-in/data-out so identical events always produce an identical verdict. All I/O lives one layer up in `score.rs`. See [[Rot Engine]].
 - **`wrap` never degrades a session**: the release profile sets `panic = "abort"`, so `Drop`-based cleanup cannot be relied on — raw-mode terminal restore happens in explicit arms, `wrap.rs`'s hot path (`run_with`, `pump`) has zero `unwrap`/`expect`, and any supervision failure flips a one-way `degraded` flag that falls back to pure passthrough rather than crashing or corrupting the terminal. See [[Ctx Supervisors]], [[Technology Stack]].
-- **`.zirv/ctx.yaml` is shadowed**: `zirv ctx` is intercepted on raw argv in `main.rs` before any script lookup, so a script literally named `ctx` can never run. `.zirv/ctx.toml` is a different file (the config), excluded from script listing. See [[Ctx Subsystem]], [[Known Issues]].
+- **`.zirv/commands/ctx.yaml` is shadowed**: `zirv ctx` is intercepted on raw argv in `main.rs` before any script lookup, so a script literally named `ctx` can never run. `.zirv/ctx.toml` is a different file (the config, at the `.zirv` root), excluded from script listing. See [[Ctx Subsystem]], [[Known Issues]].
 - **Tests require `--test-threads=1`**: `cargo test --verbose -- --test-threads=1` — tests share state (state dir, fixtures) and flake or corrupt each other under the default parallel runner. See [[Testing Guide]].
 - **Repo-provided prompt/config text is untrusted**: `<repo>/.zirv/ctx.toml`'s repo layer and `<repo>/.zirv/system-prompt.md` are adversarial input, capped, labeled non-authoritative, and structurally unable to enable or uncap themselves (`REPO_FORBIDDEN` keys are hard config-load errors from a repo file). A layer that merely fails to *parse* as TOML is skipped (`config::UnparsableLayer`, announced once) rather than failing the whole load — a `REPO_FORBIDDEN` key rejection still hard-errors. See [[Untrusted Configuration]].
 - **`zirv ctx optimize` is report-only**: writes only to stdout, a timestamped state-dir copy, and an explicit `--out` path — never an analyzed file. Verified by a test that snapshots the analyzed tree before/after and asserts byte-identical. Its judgment/distiller model child also has `Write`/`Edit`/`Bash`/`NotebookEdit` structurally denied (`ClaudeAdapter::distiller_cmd`, one `=`-bound argv token), because its prompt embeds untrusted repo CLAUDE.md text — the guarantee is structural, not just "the model chose not to." See [[Utilities]], [[Untrusted Configuration]], [[Ctx Adapters]].
@@ -133,7 +133,7 @@ Run all four before claiming a change is done. Full detail: [[Getting Started]],
 ## Key Config Files
 
 - `.zirv/*.yaml|.json|.toml` — user-defined scripts (this repo's own dev scripts live under `.zirv/`, e.g. `commit.yaml`, `test.yaml`).
-- `.zirv/.shortcuts.yaml` — short-key → script-filename map, local or global (`~/.zirv/`). See [[Shortcuts]].
+- `.zirv/.shortcuts.yaml` — short-key → script-filename map, local or global (`~/.zirv/`); stays at the `.zirv` root as config, mapping to a script that itself resolves inside `.zirv/commands/`. See [[Shortcuts]].
 - `.zirv/ctx.toml` — the layered `zirv ctx` config's repo layer; subject to `REPO_FORBIDDEN` key rejection. See [[Ctx Subsystem]], [[Untrusted Configuration]].
 - `.claude/settings.json` — wires the doc-coverage `PreToolUse` hook (`bash scripts/check-doc-coverage.sh` on `Bash` tool calls).
 - `scripts/check-doc-coverage.sh`, `scripts/check-doc-staleness.sh` — enforce that vault pages stay updated and flag stale `last-verified` dates.
