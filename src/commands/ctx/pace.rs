@@ -102,9 +102,16 @@ pub fn note_limit_wording_drift<W: Write>(
     if strict || !is_loose_limit_mention(line) {
         return;
     }
+    // Issue #227: redacted and truncated before it ever reaches stderr or the
+    // decision log, so a field report can safely paste this line back into
+    // an issue -- the offending text is the whole point of the breadcrumb
+    // (new patterns get added from it), so it must not be dropped, only
+    // scrubbed.
+    let redacted = redact_for_log(line);
     let _ = writeln!(
         stderr,
-        "zirv ctx {verb}: possible usage-limit message not recognized by known patterns"
+        "zirv ctx {verb}: possible usage-limit message not recognized by known patterns: \
+         {redacted}"
     );
     let _ = log::append(
         state,
@@ -115,9 +122,172 @@ pub fn note_limit_wording_drift<W: Write>(
             verdict: "n/a",
             score: 0,
             action: "limit-wording-drift",
-            detail: line,
+            detail: &redacted,
         },
     );
+}
+
+/// Issue #227: a provider capacity/overload error (codex's `Selected model
+/// is at capacity` and close variants; the equivalent generic provider-
+/// overloaded wording, added because this table already carries the same
+/// "exact vendor phrase, matched case-insensitively" shape `LIMIT_HIT_
+/// PATTERNS` established). Deliberately a SEPARATE table from `LIMIT_HIT_
+/// PATTERNS`, not folded into it: a capacity error carries no usage-WINDOW
+/// reset time, so it must never route into `wait_for_window`'s park-until-
+/// reset behavior (`exec.rs`'s `capacity_pattern`/`capacity_exit` path
+/// instead retries the same session within the restart budget, with a short
+/// backoff). Each entry needs more context than a bare `capacity`/
+/// `overloaded` word match, by design.
+///
+/// Security review (2026-08-31): every entry here must be a phrase a
+/// PROVIDER is documented to emit, never a bare HTTP status/reason phrase or
+/// other generic text an unrelated process could plausibly print --
+/// `"503 service unavailable"` used to be in this table and was removed for
+/// exactly that reason: a proxy, a local dev server, or any other tool this
+/// worker's output happens to contain could print that line with nothing to
+/// do with the harness's own provider account, and matching it would
+/// misclassify an unrelated failure as a transient, auto-retried capacity
+/// condition.
+const CAPACITY_PATTERNS: &[(&str, &str)] = &[
+    (
+        "selected model is at capacity",
+        "Selected model is at capacity",
+    ),
+    ("model is at capacity", "model is at capacity"),
+    (
+        "is at capacity. please try a different model",
+        "is at capacity. Please try a different model",
+    ),
+    ("currently at capacity", "currently at capacity"),
+    ("overloaded_error", "overloaded_error"),
+    ("the model is overloaded", "The model is overloaded"),
+];
+
+/// The human-readable label for the first `CAPACITY_PATTERNS` entry `line`
+/// contains (case-insensitively), or `None`. Pure: no fs/clock/env/net.
+pub fn matched_capacity_pattern(line: &str) -> Option<&'static str> {
+    let lowered = line.to_lowercase();
+    CAPACITY_PATTERNS
+        .iter()
+        .find(|(needle, _)| lowered.contains(needle))
+        .map(|(_, label)| *label)
+}
+
+/// Single-line convenience wrapper, mirroring `is_limit_hit`'s own shape.
+/// `exec.rs` uses `scan_for_capacity_error` (which also needs the matched
+/// label); kept `pub` for the same reason `window.rs`'s `windows_from_rate_
+/// limits` is -- a small, directly testable building block other callers may
+/// reasonably want later.
+#[allow(dead_code)]
+pub fn is_capacity_error(line: &str) -> bool {
+    matched_capacity_pattern(line).is_some()
+}
+
+/// The first `CAPACITY_PATTERNS` label found across `lines`, or `None`.
+/// Mirrors `scan_for_limit`'s shape but stays pure (no state/logging): the
+/// capacity path logs and restarts through `exec.rs` itself, since giving up
+/// is conditional on the restart budget rather than unconditional the way a
+/// loose-wording breadcrumb is.
+pub fn scan_for_capacity_error(lines: &[String]) -> Option<&'static str> {
+    lines.iter().find_map(|line| matched_capacity_pattern(line))
+}
+
+/// Issue #227 (operator follow-up): the ACCOUNT itself is out of usable
+/// credits/quota -- an API-billing exhaustion, verified against OpenAI's own
+/// documented `insufficient_quota` error shape. Distinct from both
+/// `LIMIT_HIT_PATTERNS` (a rolling usage WINDOW that resets on its own) and
+/// `CAPACITY_PATTERNS` (a transient, retryable provider condition): burning
+/// the restart budget cannot fix an empty account, so a match here must give
+/// up immediately, spending none of it -- see `exec.rs`'s `account_pattern`
+/// path.
+const ACCOUNT_EXHAUSTED_PATTERNS: &[(&str, &str)] = &[
+    ("insufficient_quota", "insufficient_quota"),
+    ("exceeded your current quota", "exceeded your current quota"),
+    (
+        "check your plan and billing details",
+        "check your plan and billing details",
+    ),
+];
+
+pub fn matched_account_exhausted_pattern(line: &str) -> Option<&'static str> {
+    let lowered = line.to_lowercase();
+    ACCOUNT_EXHAUSTED_PATTERNS
+        .iter()
+        .find(|(needle, _)| lowered.contains(needle))
+        .map(|(_, label)| *label)
+}
+
+/// Single-line convenience wrapper; see `is_capacity_error`'s own doc
+/// comment for why this stays `pub` despite `exec.rs` only ever calling
+/// `scan_for_account_exhausted`.
+#[allow(dead_code)]
+pub fn is_account_exhausted(line: &str) -> bool {
+    matched_account_exhausted_pattern(line).is_some()
+}
+
+pub fn scan_for_account_exhausted(lines: &[String]) -> Option<&'static str> {
+    lines
+        .iter()
+        .find_map(|line| matched_account_exhausted_pattern(line))
+}
+
+/// Issue #227: redacts `text` for the `limit-wording-drift` decision log
+/// (and any other unknown-pattern breadcrumb) -- truncates to roughly 200
+/// bytes and blanks anything that looks like a bearer token, an `sk-`/
+/// `ghp_`-style API key, a `key=`/`token=` value, or an email address, so a
+/// field report can safely paste the logged line back into an issue. Pure:
+/// no fs/clock/env/net, table-tested on its own.
+pub fn redact_for_log(text: &str) -> String {
+    const MAX_BYTES: usize = 200;
+    let mut out = String::with_capacity(text.len().min(MAX_BYTES));
+    // Stateful: a bare `Bearer`/`Authorization:` marker word is left visible
+    // (it names the scheme, not a secret), but the token that immediately
+    // follows a `Bearer` marker is the secret itself and is blanked outright
+    // -- word-by-word matching alone cannot see "the next word", so this one
+    // rule needs one bit of memory across the loop.
+    let mut redact_next = false;
+    for word in text.split_whitespace() {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        if redact_next {
+            out.push_str("[redacted]");
+            redact_next = false;
+            continue;
+        }
+        let bare_lower = word.trim_end_matches(':').to_lowercase();
+        if bare_lower == "bearer" {
+            out.push_str(word);
+            redact_next = true;
+            continue;
+        }
+        out.push_str(&redact_word(word));
+    }
+    crate::utils::truncate_bytes(out, Some(MAX_BYTES))
+}
+
+/// One whitespace-delimited token, redacted if it looks secret-shaped on its
+/// own: `key=value`/`token=value` keeps the key, blanks the value; an
+/// `sk-`/`ghp_`/`gho_`-style API key or an email address is replaced
+/// outright. The `Bearer <token>` two-word shape is handled by the caller
+/// (`redact_for_log`), which has the state to see "the word after Bearer".
+fn redact_word(word: &str) -> String {
+    if let Some((key, _value)) = word.split_once('=')
+        && matches!(
+            key.to_lowercase().as_str(),
+            "key" | "token" | "apikey" | "api_key"
+        )
+    {
+        return format!("{key}=[redacted]");
+    }
+    let lower = word.to_lowercase();
+    if lower.starts_with("sk-") || lower.starts_with("ghp_") || lower.starts_with("gho_") {
+        return "[redacted]".to_string();
+    }
+    if word.contains('@') && word.contains('.') && !word.contains('=') {
+        return "[redacted]".to_string();
+    }
+    word.to_string()
 }
 
 /// The supervisors' single reading of a batch of tapped agent output: whether
@@ -3415,5 +3585,205 @@ mod tests {
             "once the floor has elapsed, the newer file is picked up"
         );
         assert_eq!(flags.last_codex_scan, first_now + 90);
+    }
+
+    // -- Issue #227: capacity/overload detection ---------------------------
+
+    #[test]
+    fn the_documented_capacity_strings_are_matched() {
+        assert_eq!(
+            matched_capacity_pattern(
+                "ERROR: Selected model is at capacity. Please try a different model."
+            ),
+            Some("Selected model is at capacity"),
+        );
+        assert!(is_capacity_error("the model is at capacity right now"));
+        assert!(is_capacity_error("gpt-5.6-sol is currently at capacity"));
+        assert!(is_capacity_error(
+            r#"{"error":{"type":"overloaded_error"}}"#
+        ));
+        assert!(is_capacity_error(
+            "The model is overloaded, please try again"
+        ));
+        assert!(
+            is_capacity_error("SELECTED MODEL IS AT CAPACITY"),
+            "matched case-insensitively"
+        );
+    }
+
+    #[test]
+    fn capacity_matching_requires_more_than_a_bare_word() {
+        assert!(
+            !is_capacity_error("we have capacity for more work today"),
+            "a bare 'capacity' word must not match"
+        );
+        assert!(
+            !is_capacity_error("the server felt overloaded but kept going"),
+            "a bare 'overloaded' word must not match"
+        );
+    }
+
+    /// Security review finding B (2026-08-31): a bare HTTP status/reason
+    /// phrase, or an unrelated process's own "overloaded" wording, must
+    /// never be misread as a provider capacity condition -- `CAPACITY_
+    /// PATTERNS` keeps only phrasings a provider itself is documented to
+    /// emit, not generic status text any process could print.
+    /// `"503 service unavailable"` used to be in this table and is the
+    /// regression this pins.
+    #[test]
+    fn capacity_matching_excludes_generic_http_status_and_unrelated_overloaded_wording() {
+        assert!(
+            !is_capacity_error("HTTP 503 Service Unavailable from localhost:8080"),
+            "a bare HTTP status/reason phrase is not a provider-specific capacity signal"
+        );
+        assert!(
+            !is_capacity_error("the queue is overloaded"),
+            "an unrelated process's own 'overloaded' wording must not match"
+        );
+    }
+
+    /// Issue #227: a capacity error is a distinct, transient class from a
+    /// vendor usage-window hit -- it must never also read as `is_limit_hit`,
+    /// which is what routes a run into `wait_for_window`'s park-until-reset
+    /// behavior. There is no usage window to wait for here.
+    #[test]
+    fn a_capacity_error_is_never_also_a_limit_hit() {
+        let line = "ERROR: Selected model is at capacity. Please try a different model.";
+        assert!(is_capacity_error(line));
+        assert!(!is_limit_hit(line));
+    }
+
+    #[test]
+    fn scan_for_capacity_error_finds_the_first_match_in_a_batch() {
+        let lines = vec![
+            "compiling...".to_string(),
+            "ERROR: Selected model is at capacity. Please try a different model.".to_string(),
+            "tokens used 559947".to_string(),
+        ];
+        assert_eq!(
+            scan_for_capacity_error(&lines),
+            Some("Selected model is at capacity")
+        );
+        assert_eq!(scan_for_capacity_error(&["all clear".to_string()]), None);
+    }
+
+    // -- Issue #227 (operator follow-up): account/billing exhaustion -------
+
+    #[test]
+    fn the_documented_account_exhaustion_strings_are_matched() {
+        assert!(is_account_exhausted(
+            "Error: insufficient_quota - you have run out of credits"
+        ));
+        assert!(is_account_exhausted(
+            "You exceeded your current quota, please check your plan and billing details."
+        ));
+    }
+
+    #[test]
+    fn account_exhaustion_is_distinct_from_capacity_and_limit_hit() {
+        let line = "You exceeded your current quota, please check your plan and billing details.";
+        assert!(is_account_exhausted(line));
+        assert!(
+            !is_capacity_error(line),
+            "billing exhaustion is not a retryable capacity condition"
+        );
+        assert!(
+            !is_limit_hit(line),
+            "billing exhaustion is not a rolling usage window"
+        );
+    }
+
+    #[test]
+    fn account_exhaustion_matching_requires_more_than_a_bare_word() {
+        assert!(
+            !is_account_exhausted("please review your billing settings before month end"),
+            "a bare 'billing' word must not match"
+        );
+        assert!(
+            !is_account_exhausted("your monthly quota resets tomorrow"),
+            "a bare 'quota' word must not match"
+        );
+    }
+
+    // -- Issue #227: redaction for the unknown-pattern log -----------------
+
+    #[test]
+    fn redact_for_log_blanks_bearer_and_prefixed_tokens() {
+        assert_eq!(
+            redact_for_log("auth failed: Authorization: Bearer sk-abc123XYZ"),
+            "auth failed: Authorization: Bearer [redacted]"
+        );
+        assert_eq!(
+            redact_for_log("token ghp_ABCDEF1234567890 rejected"),
+            "token [redacted] rejected"
+        );
+    }
+
+    #[test]
+    fn redact_for_log_blanks_key_and_token_assignments_but_keeps_the_key_name() {
+        assert_eq!(
+            redact_for_log("request failed with key=sk-abc123 token=xyz789"),
+            "request failed with key=[redacted] token=[redacted]"
+        );
+    }
+
+    #[test]
+    fn redact_for_log_blanks_email_addresses() {
+        assert_eq!(
+            redact_for_log("contact operator@example.com for access"),
+            "contact [redacted] for access"
+        );
+    }
+
+    #[test]
+    fn redact_for_log_truncates_to_roughly_two_hundred_bytes() {
+        let long = "word ".repeat(100);
+        let redacted = redact_for_log(&long);
+        assert!(
+            redacted.len() <= 200,
+            "must be capped at ~200 bytes, got {}",
+            redacted.len()
+        );
+    }
+
+    #[test]
+    fn redact_for_log_leaves_ordinary_text_unchanged() {
+        assert_eq!(
+            redact_for_log("You've reached your usage limit for this session"),
+            "You've reached your usage limit for this session"
+        );
+    }
+
+    /// Issue #227: the unknown-pattern breadcrumb must carry the (redacted)
+    /// offending text, not just an unhelpful "not recognized" line with
+    /// nothing to act on.
+    #[test]
+    fn the_unrecognized_pattern_breadcrumb_carries_the_redacted_text() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let mut stderr = Vec::new();
+
+        let line = "You've reached your usage limit for this session, contact ops@example.com";
+        note_limit_wording_drift(line, false, &state, "sess-1", "exec", &mut stderr);
+
+        let printed = String::from_utf8(stderr).expect("utf8");
+        assert!(
+            printed.contains("reached your usage limit"),
+            "the offending text must reach stderr: {printed}"
+        );
+        assert!(
+            !printed.contains("ops@example.com"),
+            "the email must be redacted: {printed}"
+        );
+
+        let log = std::fs::read_to_string(state.logs().join("decisions.jsonl")).expect("log");
+        assert!(
+            log.contains("reached your usage limit"),
+            "the offending text must reach the decision log: {log}"
+        );
+        assert!(
+            !log.contains("ops@example.com"),
+            "the email must be redacted in the log too: {log}"
+        );
     }
 }

@@ -17,6 +17,13 @@ use crate::commands::ctx::CtxResult;
 use crate::commands::ctx::state::{StateDir, now_secs};
 
 const MAX_REVIEW_DIFF_BYTES: usize = 96 * 1024;
+/// Hard ceiling on how much of a `git diff` invocation is read into memory
+/// before code-first reordering (`order_and_cap_diff`) runs. Reordering
+/// needs the WHOLE diff to classify and rank every changed file's hunk
+/// before any of it is cut to `MAX_REVIEW_DIFF_BYTES`, so this is
+/// deliberately much larger than that budget -- it exists only to bound
+/// memory against a pathological diff, not to shape what a reviewer sees.
+const MAX_RAW_DIFF_READ_BYTES: usize = 8 * 1024 * 1024;
 const MAX_REVIEW_EVIDENCE: usize = 16;
 const MAX_REVIEW_FINDINGS: usize = 256;
 const MAX_FINDINGS_PER_RUN: usize = 64;
@@ -361,6 +368,12 @@ fn read_capped_head(mut reader: impl Read, cap: usize) -> (Vec<u8>, bool) {
     (kept, truncated)
 }
 
+/// Reads the WHOLE `git diff` (bounded only by `MAX_RAW_DIFF_READ_BYTES`,
+/// well above the package's own `MAX_REVIEW_DIFF_BYTES` budget) so
+/// `order_and_cap_diff` can classify and reorder every file's hunk before
+/// anything is cut. `truncated` here means the raw safety ceiling itself was
+/// hit -- an extreme diff, not the ordinary code-first budget cut, which
+/// `order_and_cap_diff` reports separately.
 fn git_diff_capped(repo: &Path, base_sha: &str) -> CtxResult<(String, bool)> {
     let mut child = Command::new("git")
         .arg("-C")
@@ -378,7 +391,7 @@ fn git_diff_capped(repo: &Path, base_sha: &str) -> CtxResult<(String, bool)> {
         .take()
         .ok_or("git diff stderr was not captured")?;
     let stderr_thread = std::thread::spawn(move || read_capped_head(stderr, 16 * 1024).0);
-    let (stdout, truncated) = read_capped_head(stdout, MAX_REVIEW_DIFF_BYTES);
+    let (stdout, truncated) = read_capped_head(stdout, MAX_RAW_DIFF_READ_BYTES);
     let status = child.wait()?;
     let stderr = stderr_thread.join().unwrap_or_default();
     if !status.success() {
@@ -389,6 +402,183 @@ fn git_diff_capped(repo: &Path, base_sha: &str) -> CtxResult<(String, bool)> {
         .into());
     }
     Ok((String::from_utf8_lossy(&stdout).into_owned(), truncated))
+}
+
+/// Which reviewer-package priority band a hunk's path belongs to. Lower
+/// sorts first -- `order_and_cap_diff` never drops a higher band in favor of
+/// a lower one when the package doesn't fit its byte budget (#229: a
+/// package that could not fit the diff dropped every `src/` hunk and kept
+/// only renames, README, vault pages and Cargo.toml).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum HunkPriority {
+    Code,
+    Tests,
+    Config,
+    Docs,
+    /// A rename/move with no content change (`similarity index 100%`, no
+    /// `@@` hunk): the lowest-value bytes a package can spend, since a
+    /// reviewer gains nothing from re-reading unchanged content under a new
+    /// path.
+    PureRename,
+}
+
+/// File extensions (lowercase, no dot) treated as code regardless of
+/// directory, on top of anything already under `src/**`.
+const CODE_EXTENSIONS: &[&str] = &[
+    "rs", "ts", "tsx", "js", "jsx", "mjs", "cjs", "py", "go", "php", "java", "kt", "kts", "c", "h",
+    "cpp", "cc", "hpp", "hh", "cs", "rb", "swift", "scala", "sh", "ps1", "psm1",
+];
+
+fn path_is_under(path: &str, dir: &str) -> bool {
+    path == dir || path.starts_with(&format!("{dir}/")) || path.contains(&format!("/{dir}/"))
+}
+
+fn hunk_priority(path: &str, pure_rename: bool) -> HunkPriority {
+    if pure_rename {
+        return HunkPriority::PureRename;
+    }
+    let lower = path.to_ascii_lowercase();
+    if path_is_under(&lower, "tests")
+        || path_is_under(&lower, "test")
+        || path_is_under(&lower, "fixtures")
+        || lower.contains("__tests__")
+    {
+        return HunkPriority::Tests;
+    }
+    if path_is_under(&lower, "src") {
+        return HunkPriority::Code;
+    }
+    let extension = Path::new(&lower)
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    if CODE_EXTENSIONS.contains(&extension) {
+        return HunkPriority::Code;
+    }
+    let file_name = Path::new(&lower)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    if file_name == "cargo.toml" || matches!(extension, "toml" | "yaml" | "yml" | "json") {
+        return HunkPriority::Config;
+    }
+    if path_is_under(&lower, "docs") || extension == "md" || file_name.starts_with("readme") {
+        return HunkPriority::Docs;
+    }
+    // Unknown file type/location: not trusted as code, not assumed to be
+    // pure documentation either -- the middle tier.
+    HunkPriority::Config
+}
+
+/// One file's segment of a `git diff`, as emitted between consecutive
+/// `diff --git a/... b/...` headers.
+struct DiffHunk {
+    path: String,
+    pure_rename: bool,
+    body: String,
+}
+
+/// Extracts a hunk's path from its body. `+++ b/<path>` (or `--- a/<path>`
+/// for a deletion) is preferred because it is the only line git always
+/// spells the real path out on unambiguously; a binary-file diff has
+/// neither, so the `diff --git a/X b/Y` header itself is the fallback.
+fn diff_hunk_path(body: &str) -> Option<String> {
+    for line in body.lines() {
+        if let Some(rest) = line.strip_prefix("+++ b/") {
+            return Some(rest.to_string());
+        }
+    }
+    for line in body.lines() {
+        if let Some(rest) = line.strip_prefix("--- a/") {
+            return Some(rest.to_string());
+        }
+    }
+    let header = body.lines().next()?;
+    let rest = header.strip_prefix("diff --git a/")?;
+    rest.find(" b/").map(|index| rest[..index].to_string())
+}
+
+fn split_diff_hunks(diff: &str) -> Vec<DiffHunk> {
+    let mut hunks = Vec::new();
+    let mut current = String::new();
+    for line in diff.split_inclusive('\n') {
+        if line.starts_with("diff --git ") && !current.is_empty() {
+            if let Some(path) = diff_hunk_path(&current) {
+                let pure_rename = current.contains("\nrename from ") && !current.contains("\n@@ ");
+                hunks.push(DiffHunk {
+                    path,
+                    pure_rename,
+                    body: std::mem::take(&mut current),
+                });
+            } else {
+                current.clear();
+            }
+        }
+        current.push_str(line);
+    }
+    if !current.is_empty()
+        && let Some(path) = diff_hunk_path(&current)
+    {
+        let pure_rename = current.contains("\nrename from ") && !current.contains("\n@@ ");
+        hunks.push(DiffHunk {
+            path,
+            pure_rename,
+            body: current,
+        });
+    }
+    hunks
+}
+
+/// Reorders a raw `git diff` so code hunks are never silently dropped in
+/// favor of docs/config/renames when the package exceeds its byte budget
+/// (#229): `src/**` and other code-extension hunks first, then
+/// `tests/**`/fixtures, then config, then docs, then pure renames last.
+/// Whole-file hunks are dropped from the tail once the budget is exceeded
+/// -- never truncated mid-hunk -- and an explicit trailer names what was
+/// left out and how the reviewer can fetch it itself. `.zirv/work/**`
+/// hunks (workflow bookkeeping, not the operator's change) are dropped
+/// unconditionally, matching `package`'s own untracked-path exclusion.
+fn order_and_cap_diff(diff: &str, base_sha: &str, cap: usize) -> (String, bool) {
+    let mut hunks: Vec<DiffHunk> = split_diff_hunks(diff)
+        .into_iter()
+        .filter(|hunk| !super::classify::is_workflow_work_path(Path::new(&hunk.path)))
+        .collect();
+    hunks.sort_by(|a, b| {
+        hunk_priority(&a.path, a.pure_rename)
+            .cmp(&hunk_priority(&b.path, b.pure_rename))
+            .then_with(|| a.path.cmp(&b.path))
+    });
+
+    let mut kept = String::new();
+    let mut omitted: Vec<String> = Vec::new();
+    let mut over_budget = false;
+    for hunk in &hunks {
+        if !over_budget && kept.len().saturating_add(hunk.body.len()) <= cap {
+            kept.push_str(&hunk.body);
+        } else {
+            over_budget = true;
+            omitted.push(hunk.path.clone());
+        }
+    }
+
+    if omitted.is_empty() {
+        return (kept, false);
+    }
+    let all_paths = omitted.join(" ");
+    if kept.is_empty() {
+        return (
+            format!(
+                "(review package exceeds the {cap}-byte budget; no file fit) Run: git diff {base_sha}...HEAD -- {all_paths}\n"
+            ),
+            true,
+        );
+    }
+    kept.push_str(&format!(
+        "\n\nTRUNCATED: {} file(s) omitted: {}. Run: git diff {base_sha}...HEAD -- {all_paths}\n",
+        omitted.len(),
+        omitted.join(", "),
+    ));
+    (kept, true)
 }
 
 fn validate_github_repo_slug(raw: &str) -> CtxResult<String> {
@@ -524,7 +714,13 @@ fn package_pull_request(
     let repository = github_repo_slug(&state.repo, explicit_repo)?;
     let view = load_pull_request(&repository, pr)?;
     let args = vec!["pr".to_string(), "diff".to_string(), pr.to_string()];
-    let (diff, diff_truncated) = gh_output_capped(&repository, &args, MAX_REVIEW_DIFF_BYTES)?;
+    let (raw_diff, raw_diff_truncated) =
+        gh_output_capped(&repository, &args, MAX_RAW_DIFF_READ_BYTES)?;
+    // #229: same code-first ordering as a local `review::package` -- a PR
+    // diff that cannot fit the budget must not drop `src/` hunks first.
+    let (diff, diff_truncated) =
+        order_and_cap_diff(&raw_diff, &view.base_ref_oid, MAX_REVIEW_DIFF_BYTES);
+    let diff_truncated = diff_truncated || raw_diff_truncated;
     let change_fingerprint = pr_fingerprint(&view.head_ref_oid)?;
     let required_reviews = required_independent_reviews_for(state);
     Ok(ReviewPackage {
@@ -1070,12 +1266,22 @@ pub fn package(
     // `git diff <base>` includes committed branch changes plus current staged
     // and unstaged edits. Git omits untracked files, so include bounded file
     // bodies for those explicitly and union them into the changed path list.
-    let (mut diff, mut diff_truncated) = git_diff_capped(&state.repo, &diff_base_sha)?;
+    let (raw_diff, raw_diff_truncated) = git_diff_capped(&state.repo, &diff_base_sha)?;
+    // #229: order code first so a package that cannot fit the whole diff
+    // drops docs/config/renames before it ever drops a `src/` hunk, and
+    // tell the reviewer exactly how to fetch whatever got left out.
+    let (mut diff, mut diff_truncated) =
+        order_and_cap_diff(&raw_diff, &diff_base_sha, MAX_REVIEW_DIFF_BYTES);
+    diff_truncated |= raw_diff_truncated;
     let untracked: Vec<PathBuf> =
         git(&state.repo, &["ls-files", "--others", "--exclude-standard"])?
             .lines()
             .filter(|line| !line.is_empty())
             .map(PathBuf::from)
+            // #229/#232: the workflow's own `.zirv/work/<id>/*` artifacts are
+            // not the operator's change surface and must not reach the
+            // reviewer or shift the package's change_fingerprint.
+            .filter(|path| !super::classify::is_workflow_work_path(path))
             .collect();
     append_untracked(&mut diff, &mut diff_truncated, &state.repo, &untracked)?;
     // Always the full set of files touched since `base_sha`, never just the
@@ -1086,6 +1292,7 @@ pub fn package(
             .lines()
             .filter(|line| !line.is_empty())
             .map(PathBuf::from)
+            .filter(|path| !super::classify::is_workflow_work_path(path))
             .collect();
     changed_paths.extend(untracked);
     let changed_paths = changed_paths.into_iter().collect();
@@ -1277,59 +1484,180 @@ struct ReviewerRun {
     output: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ReviewerResponse {
-    findings: Vec<ReviewerFinding>,
+/// Maps a reviewer-authored severity string onto the canonical
+/// `FindingSeverity` enum. Exact enum spellings pass through case-
+/// insensitively; a fixed set of synonyms a model plausibly reaches for
+/// (`blocker`, `high`, `info`, ...) map onto the closest real value; anything
+/// else falls back to `Major` (never dropped) with the raw text returned so
+/// the caller can surface it instead of silently rewriting it (#232).
+fn normalize_severity(raw: &str) -> (FindingSeverity, Option<String>) {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "note" => (FindingSeverity::Note, None),
+        "minor" => (FindingSeverity::Minor, None),
+        "major" => (FindingSeverity::Major, None),
+        "critical" => (FindingSeverity::Critical, None),
+        "info" | "informational" | "nit" | "low" | "suggestion" => (FindingSeverity::Note, None),
+        "medium" | "moderate" | "warning" => (FindingSeverity::Minor, None),
+        "high" | "error" => (FindingSeverity::Major, None),
+        "blocker" | "severe" | "fatal" | "p0" => (FindingSeverity::Critical, None),
+        _ => (FindingSeverity::Major, Some(raw.to_string())),
+    }
 }
 
+/// Same idea as `normalize_severity`, for `recommended_disposition` (#229's
+/// second occurrence: a reviewer emitting `needs-confirmation` must degrade
+/// to `Open` rather than losing the whole result).
+fn normalize_disposition(raw: &str) -> (FindingDisposition, Option<String>) {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "open" => (FindingDisposition::Open, None),
+        "accepted" => (FindingDisposition::Accepted, None),
+        "dismissed" => (FindingDisposition::Dismissed, None),
+        "fixed" => (FindingDisposition::Fixed, None),
+        "residual" => (FindingDisposition::Residual, None),
+        "needs-confirmation" | "needs_confirmation" | "pending" | "unresolved" | "unknown" => {
+            (FindingDisposition::Open, None)
+        }
+        "accept" => (FindingDisposition::Accepted, None),
+        "dismiss" | "wont-fix" | "wontfix" => (FindingDisposition::Dismissed, None),
+        "fix" | "resolved" => (FindingDisposition::Fixed, None),
+        _ => (FindingDisposition::Open, Some(raw.to_string())),
+    }
+}
+
+/// A reviewer-authored severity string, normalised through
+/// `normalize_severity` at deserialization time so a synonym or an unknown
+/// value never fails parsing of the finding it appears on. `raw_if_unknown`
+/// is `Some` only when the value matched neither an exact enum spelling nor
+/// a listed synonym -- `build_review_findings` appends it to the finding's
+/// summary so a genuinely unexpected value is surfaced, not silently
+/// rewritten (#232).
+#[derive(Debug, Clone)]
+struct NormalizedSeverity {
+    value: FindingSeverity,
+    raw_if_unknown: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for NormalizedSeverity {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        let (value, raw_if_unknown) = normalize_severity(&raw);
+        Ok(Self {
+            value,
+            raw_if_unknown,
+        })
+    }
+}
+
+/// Same idea as `NormalizedSeverity`, for `recommended_disposition`.
+#[derive(Debug, Clone)]
+struct NormalizedDisposition {
+    value: FindingDisposition,
+    raw_if_unknown: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for NormalizedDisposition {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        let (value, raw_if_unknown) = normalize_disposition(&raw);
+        Ok(Self {
+            value,
+            raw_if_unknown,
+        })
+    }
+}
+
+/// A single reviewer-authored finding. Deliberately NOT
+/// `deny_unknown_fields`: a model that adds an extra key (`failure_scenario`
+/// was observed in #229) must never cost the whole finding, only fields this
+/// struct does not itself define are ignored the way `serde` already ignores
+/// them by default.
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct ReviewerFinding {
-    severity: FindingSeverity,
+    severity: NormalizedSeverity,
     summary: String,
     #[serde(default)]
     path: Option<PathBuf>,
     #[serde(default)]
     line: Option<u32>,
     #[serde(default)]
-    recommended_disposition: Option<FindingDisposition>,
+    recommended_disposition: Option<NormalizedDisposition>,
 }
 
+/// Parses one reviewer's `ZIRV_REVIEW_RESULT` line leniently (#229, #232):
+/// the envelope is read as a bare JSON value and rejected only when it is
+/// not a JSON object at all, and each finding inside `findings` is
+/// deserialized independently so one malformed entry (an empty summary, a
+/// field of the wrong type) is skipped with a warning to stderr instead of
+/// discarding every other finding the reviewer reported.
 fn parse_reviewer_output(output: &str) -> CtxResult<Vec<ReviewerFinding>> {
     if output.len() > MAX_REVIEW_OUTPUT_BYTES {
         return Err(format!("reviewer output exceeds {MAX_REVIEW_OUTPUT_BYTES} bytes").into());
     }
-    let mut result = None;
+    let mut result: Option<serde_json::Value> = None;
     for line in output.lines() {
         if let Some(json) = line.trim().strip_prefix(REVIEW_RESULT_PREFIX) {
             if result.is_some() {
                 return Err("reviewer emitted more than one structured result".into());
             }
-            result = Some(serde_json::from_str::<ReviewerResponse>(json)?);
+            result = Some(
+                serde_json::from_str::<serde_json::Value>(json)
+                    .map_err(|error| format!("reviewer result is not valid JSON: {error}"))?,
+            );
         }
     }
-    let response = result.ok_or("reviewer did not emit a structured Zirv review result")?;
-    if response.findings.len() > MAX_FINDINGS_PER_RUN {
+    let value = result.ok_or("reviewer did not emit a structured Zirv review result")?;
+    let Some(object) = value.as_object() else {
+        return Err("reviewer result is not a JSON object".into());
+    };
+    let findings_raw: Vec<serde_json::Value> = match object.get("findings") {
+        Some(serde_json::Value::Array(items)) => items.clone(),
+        Some(_) => {
+            eprintln!(
+                "warning: reviewer result's 'findings' field is not a JSON array; treating as no findings"
+            );
+            Vec::new()
+        }
+        None => Vec::new(),
+    };
+    if findings_raw.len() > MAX_FINDINGS_PER_RUN {
         return Err(format!(
             "reviewer returned more than {MAX_FINDINGS_PER_RUN} findings in one run"
         )
         .into());
     }
-    for finding in &response.findings {
+    let mut findings = Vec::with_capacity(findings_raw.len());
+    for (index, item) in findings_raw.into_iter().enumerate() {
+        let finding: ReviewerFinding = match serde_json::from_value(item) {
+            Ok(finding) => finding,
+            Err(error) => {
+                eprintln!("warning: skipping malformed reviewer finding at index {index}: {error}");
+                continue;
+            }
+        };
         let summary = finding.summary.trim();
         if summary.is_empty() || summary.len() > MAX_FINDING_SUMMARY_BYTES {
-            return Err("reviewer returned an empty or oversized finding summary".into());
+            eprintln!(
+                "warning: skipping reviewer finding at index {index}: empty or oversized summary"
+            );
+            continue;
         }
         if finding
             .path
             .as_ref()
             .is_some_and(|path| path.to_string_lossy().len() > MAX_FINDING_PATH_BYTES)
         {
-            return Err("reviewer returned an oversized finding path".into());
+            eprintln!("warning: skipping reviewer finding at index {index}: oversized path");
+            continue;
         }
+        findings.push(finding);
     }
-    Ok(response.findings)
+    Ok(findings)
 }
 
 /// Builds the persisted `ReviewFinding`s a reviewer's raw structured output
@@ -1340,15 +1668,27 @@ fn parse_reviewer_output(output: &str) -> CtxResult<Vec<ReviewerFinding>> {
 fn build_review_findings(findings: Vec<ReviewerFinding>, created_at: u64) -> Vec<ReviewFinding> {
     findings
         .into_iter()
-        .map(|finding| ReviewFinding {
-            id: uuid::Uuid::new_v4().to_string(),
-            severity: finding.severity,
-            summary: finding.summary.trim().to_string(),
-            path: finding.path,
-            line: finding.line,
-            disposition: FindingDisposition::Open,
-            recommended_disposition: finding.recommended_disposition,
-            created_at,
+        .map(|finding| {
+            let mut summary = finding.summary.trim().to_string();
+            if let Some(raw) = &finding.severity.raw_if_unknown {
+                summary.push_str(&format!(" [severity: {raw}]"));
+            }
+            let recommended_disposition = finding.recommended_disposition.map(|disposition| {
+                if let Some(raw) = &disposition.raw_if_unknown {
+                    summary.push_str(&format!(" [disposition: {raw}]"));
+                }
+                disposition.value
+            });
+            ReviewFinding {
+                id: uuid::Uuid::new_v4().to_string(),
+                severity: finding.severity.value,
+                summary: crate::utils::truncate_bytes(summary, Some(MAX_FINDING_SUMMARY_BYTES)),
+                path: finding.path,
+                line: finding.line,
+                disposition: FindingDisposition::Open,
+                recommended_disposition,
+                created_at,
+            }
         })
         .collect()
 }
@@ -1436,10 +1776,16 @@ pub(crate) fn reviewer_argv(
     let read_only = crate::commands::ctx::adapters::read_only_args_for_agent_name(agent)
         .ok_or_else(|| format!("unknown adapter '{agent}'; cannot pin the reviewer read-only"))?;
     seat_args.extend(read_only);
+    // The reviewer is a supervised headless worker by construction: it
+    // reads the package from stdin and needs the trailing harness flags
+    // below, which a dashboard pane cannot carry. Say so explicitly, or a
+    // `review run` issued from inside a dashboard is refused by the pane
+    // gate instead of running (#228 made that refusal loud on purpose).
     let mut argv = vec![
         "agent".to_string(),
         agent.to_string(),
         "-".to_string(),
+        "--headless".to_string(),
         "--".to_string(),
     ];
     argv.extend(seat_args);
@@ -1476,6 +1822,82 @@ fn records_evidence(run: &ReviewerRun, fingerprint_unchanged: bool) -> bool {
     !run.dashboard_spawn && run.code == 0 && fingerprint_unchanged
 }
 
+/// Formats a Unix timestamp (seconds since epoch, UTC) as `YYYYMMDDTHHMMSSZ`
+/// for a raw-envelope salvage filename. No calendar crate is a dependency of
+/// this binary, so Howard Hinnant's `civil_from_days` day-to-ymd algorithm is
+/// reproduced here in full rather than pulling one in for a filename.
+fn format_utc_timestamp(epoch_secs: u64) -> String {
+    let days = epoch_secs / 86_400;
+    let secs_of_day = epoch_secs % 86_400;
+    let z = days as i64 + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    let y = if m <= 2 { y + 1 } else { y };
+    let hour = secs_of_day / 3600;
+    let minute = (secs_of_day % 3600) / 60;
+    let second = secs_of_day % 60;
+    format!("{y:04}{m:02}{d:02}T{hour:02}{minute:02}{second:02}Z")
+}
+
+/// Salvages a reviewer's raw stdout when it could not become recorded review
+/// evidence -- a parse failure, a staleness refusal, a missing structured
+/// result, or a non-zero reviewer exit (#229, #232). Written under the
+/// workflow's own `.zirv/work/<id>/review/` artifact directory (repo-owned,
+/// not the machine-local `StateDir`) so the operator can read it directly
+/// and recover findings with `zirv workflow review add`. Never overwrites an
+/// existing salvage file from the same second: a numeric suffix is added
+/// instead.
+fn persist_raw_review_output(
+    repo: &Path,
+    workflow_id: &str,
+    agent: &str,
+    raw: &str,
+) -> CtxResult<PathBuf> {
+    let dir = repo
+        .join(".zirv")
+        .join("work")
+        .join(workflow_id)
+        .join("review");
+    std::fs::create_dir_all(&dir)?;
+    let agent_slug: String = agent
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+        .collect();
+    let agent_slug = if agent_slug.is_empty() {
+        "agent".to_string()
+    } else {
+        agent_slug
+    };
+    let timestamp = format_utc_timestamp(now_secs());
+    let mut path = dir.join(format!("raw-{timestamp}-{agent_slug}.txt"));
+    let mut suffix = 1u32;
+    while path.exists() {
+        path = dir.join(format!("raw-{timestamp}-{agent_slug}-{suffix}.txt"));
+        suffix += 1;
+    }
+    crate::commands::ctx::state::write_shared(&path, raw)?;
+    Ok(path)
+}
+
+/// The message suffix appended to an ingestion-failure error so the salvage
+/// path (when the write itself succeeded) is right there in the error text,
+/// not just logged separately.
+fn salvage_suffix(path: Option<&Path>) -> String {
+    path.map(|path| {
+        format!(
+            " raw reviewer output saved to {}; recover findings with `zirv workflow review add`",
+            path.display()
+        )
+    })
+    .unwrap_or_default()
+}
+
 fn launch_reviewer(agent: &str, package: &ReviewPackage) -> CtxResult<ReviewerRun> {
     let argv = reviewer_argv(agent, &package.repo_root, package.include_custom_agents)?;
     // A delta package must never read as a whole change: a reviewer told
@@ -1489,8 +1911,31 @@ fn launch_reviewer(agent: &str, package: &ReviewPackage) -> CtxResult<ReviewerRu
     } else {
         String::new()
     };
+    // #229/#232: earlier prompt text showed one example value per field and
+    // left the reviewer to guess the rest of the enum, which produced
+    // variants like `blocker` and `needs-confirmation` that a strict parser
+    // rejected outright. The contract now states the exact JSON shape, the
+    // field list, and every allowed value, so a model has no reason to
+    // invent one -- lenient parsing (`normalize_severity`/
+    // `normalize_disposition`) is a safety net for this prompt, not a
+    // substitute for it.
     let prompt = format!(
-        "{delta_notice}Review the following compact Zirv review package. Do not modify files. Return exactly one single-line result prefixed `{REVIEW_RESULT_PREFIX}` followed by JSON shaped as {{\"findings\":[{{\"severity\":\"major\",\"summary\":\"concrete reasoning\",\"path\":\"src/file.rs\",\"line\":12,\"recommended_disposition\":\"accepted\"}}]}}. Use an empty findings array when no concrete issue exists. Do not emit another result line.\n\n{}",
+        "{delta_notice}Review the following compact Zirv review package. Do not modify files. \
+         Return exactly one single-line result prefixed `{REVIEW_RESULT_PREFIX}` followed by a \
+         single JSON object shaped exactly as:\n\
+         {{\"findings\":[{{\"severity\":\"major\",\"summary\":\"concrete reasoning\",\"path\":\"src/file.rs\",\"line\":12,\"recommended_disposition\":\"accepted\"}}]}}\n\n\
+         Fields per finding: \"severity\" (required) -- one of exactly `note`, `minor`, `major`, \
+         `critical`; \"summary\" (required, non-empty, concrete reasoning) -- string; \"path\" \
+         (optional, repo-relative file path) -- string; \"line\" (optional) -- integer; \
+         \"recommended_disposition\" (optional) -- one of exactly `open`, `accepted`, \
+         `dismissed`, `fixed`, `residual`. Use ONLY these exact values -- do not invent a \
+         variant (e.g. `blocker`, `high`, `needs-confirmation`) even if it seems more precise; \
+         an unrecognised value is degraded to a fallback rather than kept as written, so use the \
+         listed value that is closest. Do not add any field not listed above. Use an empty \
+         findings array when no concrete issue exists. Do not emit another result line. \
+         Print that line as plain text in your final message: zirv reads ONLY your stdout, so \
+         do not deliver findings through a harness tool (ReportFindings or similar) or a \
+         code-review mode -- a result sent any other way is lost.\n\n{}",
         serde_json::to_string(package)?
     );
     let mut child = Command::new(std::env::current_exe()?)
@@ -1592,14 +2037,31 @@ fn run_independent_review(
         let current = load_pull_request(&repository, pr)?;
         let unchanged = current.head_ref_oid == package.head_sha;
         let recorded = records_evidence(&run, unchanged);
-        let findings = if recorded {
-            run.output
-                .as_deref()
-                .map(parse_reviewer_output)
-                .transpose()?
-                .unwrap_or_default()
+        // #229/#232: attempt to parse whenever there is output at all, not
+        // only when this round will end up `recorded` -- a parse failure or
+        // a stale PR head must not silently discard whatever the reviewer
+        // actually reported, and either way the raw bytes get salvaged
+        // below.
+        let parse_attempt = if run.dashboard_spawn {
+            Ok(Vec::new())
         } else {
-            Vec::new()
+            match run.output.as_deref() {
+                Some(output) => parse_reviewer_output(output),
+                None => Ok(Vec::new()),
+            }
+        };
+        let salvage_path = if !run.dashboard_spawn && (parse_attempt.is_err() || !recorded) {
+            let raw = run.output.clone().unwrap_or_default();
+            persist_raw_review_output(&state.repo, &state.id, &args.agent, &raw).ok()
+        } else {
+            None
+        };
+        let findings = match parse_attempt {
+            Ok(findings) if recorded => findings,
+            Ok(_) => Vec::new(),
+            Err(error) => {
+                return Err(format!("{error}{}", salvage_suffix(salvage_path.as_deref())).into());
+            }
         };
         let mut event =
             super::telemetry::TelemetryEvent::new(super::telemetry::TelemetryKind::ReviewRun);
@@ -1628,10 +2090,11 @@ fn run_independent_review(
             return Ok(code);
         }
         if code == 0 && !unchanged {
-            return Err(
-                "the pull request head changed during review; discard this review and rerun it"
-                    .into(),
-            );
+            return Err(format!(
+                "the pull request head changed during review; discard this review and rerun it{}",
+                salvage_suffix(salvage_path.as_deref())
+            )
+            .into());
         }
         if recorded {
             writeln!(
@@ -1646,28 +2109,43 @@ fn run_independent_review(
         return Ok(code);
     }
 
+    // #229/#232: the staleness fingerprint recomputed here is compared
+    // against `package.change_fingerprint`, which `package()` captured at
+    // the START of THIS run (immediately before dispatching the reviewer,
+    // above) -- never a fingerprint left over from an earlier attempt.
     let fingerprint_unchanged =
         verification::change_fingerprint(&state.repo)? == package.change_fingerprint;
-    // The reviewer runs `zirv workflow review add` against the same state file
-    // while this process waits. The snapshot loaded before the spawn is stale
-    // by definition, so the evidence is appended to freshly loaded state --
-    // writing the old snapshot back used to erase every finding the reviewer
-    // had just recorded.
-    let parsed_findings = if records_evidence(&run, fingerprint_unchanged) {
-        run.output
-            .as_deref()
-            .map(parse_reviewer_output)
-            .transpose()?
-            .unwrap_or_default()
+    // `records_evidence` -- not dashboard-spawned, exit 0, fingerprint intact
+    // -- is exactly "did this round actually complete a review".
+    let recorded = records_evidence(&run, fingerprint_unchanged);
+    // Parse whenever there is reviewer output to look at, regardless of
+    // whether this round will end up `recorded`: a parse failure, a stale
+    // fingerprint, or a non-zero reviewer exit must never silently discard a
+    // reviewer's structured findings -- the raw output is salvaged below so
+    // the operator can recover them with `zirv workflow review add`.
+    let parse_attempt = if run.dashboard_spawn {
+        Ok(Vec::new())
     } else {
-        Vec::new()
+        match run.output.as_deref() {
+            Some(output) => parse_reviewer_output(output),
+            None => Ok(Vec::new()),
+        }
+    };
+    let salvage_path = if !run.dashboard_spawn && (parse_attempt.is_err() || !recorded) {
+        let raw = run.output.clone().unwrap_or_default();
+        persist_raw_review_output(&state.repo, &args.id, &args.agent, &raw).ok()
+    } else {
+        None
+    };
+    let parsed_findings = match parse_attempt {
+        Ok(findings) => findings,
+        Err(error) => {
+            return Err(format!("{error}{}", salvage_suffix(salvage_path.as_deref())).into());
+        }
     };
     let mut state = engine::load(&state_dir, &state.repo, &args.id)?;
-    // `records_evidence` -- not dashboard-spawned, exit 0, fingerprint intact
-    // -- is exactly "did this round actually complete a review". Only a
-    // completed round can have converged; a dashboard ack or a failed launch
-    // reviewed nothing, so it is never mistaken for zero new findings.
-    let recorded = records_evidence(&run, fingerprint_unchanged);
+    // Only a completed round can have converged; a dashboard ack or a failed
+    // launch reviewed nothing, so it is never mistaken for zero new findings.
     let incoming_findings = build_review_findings(parsed_findings, now_secs());
     // Computed against the state loaded above, before `append_reviewer_
     // findings` merges `incoming_findings` into it -- otherwise every finding
@@ -1744,10 +2222,18 @@ fn run_independent_review(
         &event,
         &super::telemetry::TelemetryConfig::for_repo(&state.repo),
     );
-    if code == 0 && !fingerprint_unchanged && !run.dashboard_spawn {
-        return Err(
-            "the change set changed during review; review evidence was not recorded".into(),
-        );
+    // #229/#232: any round that did not end up `recorded` (a stale
+    // fingerprint or a non-zero reviewer exit -- dashboard spawns already
+    // returned their own message above) is explained to the operator with
+    // the salvage path, rather than a bare reviewer exit code and no trace
+    // of what the reviewer actually reported.
+    if !run.dashboard_spawn && !recorded {
+        let reason = if !fingerprint_unchanged {
+            "the change set changed during review; review evidence was not recorded".to_string()
+        } else {
+            format!("reviewer exited with status {code}; review evidence was not recorded")
+        };
+        return Err(format!("{reason}{}", salvage_suffix(salvage_path.as_deref())).into());
     }
     Ok(round_exit_code(&outcome, code))
 }
@@ -2101,6 +2587,210 @@ mod tests {
     }
 
     #[test]
+    fn format_utc_timestamp_matches_known_instants() {
+        assert_eq!(format_utc_timestamp(0), "19700101T000000Z");
+        assert_eq!(format_utc_timestamp(86_400), "19700102T000000Z");
+        // 2024-01-01T00:00:00Z
+        assert_eq!(format_utc_timestamp(1_704_067_200), "20240101T000000Z");
+    }
+
+    /// #229/#232: a reviewer that never emits a structured `ZIRV_REVIEW_
+    /// RESULT` line ("reviewer did not emit a structured Zirv review
+    /// result", observed verbatim in #232) must not lose whatever it DID
+    /// print -- the raw output is salvaged to `.zirv/work/<id>/review/` and
+    /// the salvage path is named in the returned error.
+    #[test]
+    fn a_reviewer_that_never_emits_a_structured_result_salvages_its_raw_output() {
+        let repo = git_repo();
+        let root = tempdir().unwrap();
+        unsafe {
+            std::env::set_var(crate::commands::ctx::state::STATE_ENV, root.path());
+        }
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+        let state = review_workflow(repo.path(), &state_dir);
+        let args = RunReviewArgs {
+            id: state.id.clone(),
+            agent: "claude".into(),
+            base: None,
+            pr: None,
+            github_repo: None,
+            repo: Some(repo.path().to_path_buf()),
+        };
+        let mut out = Vec::new();
+        let code = run_independent_review(&args, &mut out, &|_, _| {
+            Ok(ReviewerRun {
+                code: 0,
+                dashboard_spawn: false,
+                output: Some("ERROR: Selected model is at capacity\n".into()),
+            })
+        });
+        unsafe {
+            std::env::remove_var(crate::commands::ctx::state::STATE_ENV);
+        }
+        let error = code
+            .expect_err("no structured result must be an error")
+            .to_string();
+        assert!(
+            error.contains("did not emit a structured"),
+            "the underlying parse error must still be legible: {error}"
+        );
+        assert!(
+            error.contains("raw reviewer output saved to") && error.contains("review add"),
+            "the salvage path and recovery hint must be in the error: {error}"
+        );
+        let review_dir = repo
+            .path()
+            .join(".zirv/work")
+            .join(&state.id)
+            .join("review");
+        let entries: Vec<std::fs::DirEntry> = std::fs::read_dir(&review_dir)
+            .expect("salvage directory exists")
+            .collect::<std::io::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(entries.len(), 1, "exactly one salvage file was written");
+        let saved = std::fs::read_to_string(entries[0].path()).unwrap();
+        assert!(saved.contains("Selected model is at capacity"));
+    }
+
+    /// #232 (comment 2): a fresh `review run` packages a fingerprint at ITS
+    /// OWN start; if the working tree really changes during THAT SAME run,
+    /// the round is refused, but the reviewer's structured findings must
+    /// still be salvaged to disk rather than lost outright.
+    #[test]
+    fn a_staleness_refusal_still_salvages_the_raw_envelope() {
+        let repo = git_repo();
+        let root = tempdir().unwrap();
+        unsafe {
+            std::env::set_var(crate::commands::ctx::state::STATE_ENV, root.path());
+        }
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+        let state = review_workflow(repo.path(), &state_dir);
+        let repo_path = repo.path().to_path_buf();
+        let output = format!(
+            "{REVIEW_RESULT_PREFIX}{{\"findings\":[{{\"severity\":\"critical\",\"summary\":\"real defect found before the tree moved\"}}]}}"
+        );
+        let reviewer = move |_agent: &str, _package: &ReviewPackage| -> CtxResult<ReviewerRun> {
+            // Something else touches the tracked tree while this "reviewer"
+            // is nominally running -- an operator edit racing the review.
+            std::fs::write(repo_path.join("tracked.txt"), "raced\n")?;
+            Ok(ReviewerRun {
+                code: 0,
+                dashboard_spawn: false,
+                output: Some(output.clone()),
+            })
+        };
+        let args = RunReviewArgs {
+            id: state.id.clone(),
+            agent: "claude".into(),
+            base: None,
+            pr: None,
+            github_repo: None,
+            repo: Some(repo.path().to_path_buf()),
+        };
+        let mut out = Vec::new();
+        let code = run_independent_review(&args, &mut out, &reviewer);
+        unsafe {
+            std::env::remove_var(crate::commands::ctx::state::STATE_ENV);
+        }
+        let error = code
+            .expect_err("a real mid-run change must still refuse")
+            .to_string();
+        assert!(error.contains("the change set changed during review"));
+        assert!(
+            error.contains("raw reviewer output saved to"),
+            "the raw envelope must be salvaged before refusing: {error}"
+        );
+        assert!(
+            engine::load(&state_dir, repo.path(), &state.id)
+                .unwrap()
+                .review_findings
+                .is_empty(),
+            "a refused round must not record findings as if it had completed"
+        );
+        let review_dir = repo
+            .path()
+            .join(".zirv/work")
+            .join(&state.id)
+            .join("review");
+        let entry = std::fs::read_dir(&review_dir)
+            .expect("salvage directory exists")
+            .next()
+            .expect("a salvage file exists")
+            .unwrap();
+        let saved = std::fs::read_to_string(entry.path()).unwrap();
+        assert!(saved.contains("real defect found before the tree moved"));
+    }
+
+    /// #229/#232: a reviewer process that exits non-zero without a stale
+    /// fingerprint (a crashed harness, a capacity error the exit code itself
+    /// reflects) must not silently vanish as an unexplained non-zero status
+    /// -- the operator gets an explicit reason and, if there was output at
+    /// all, a salvage path.
+    #[test]
+    fn a_non_zero_reviewer_exit_is_explained_and_salvages_any_output() {
+        let repo = git_repo();
+        let root = tempdir().unwrap();
+        unsafe {
+            std::env::set_var(crate::commands::ctx::state::STATE_ENV, root.path());
+        }
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+        let state = review_workflow(repo.path(), &state_dir);
+        let args = RunReviewArgs {
+            id: state.id.clone(),
+            agent: "claude".into(),
+            base: None,
+            pr: None,
+            github_repo: None,
+            repo: Some(repo.path().to_path_buf()),
+        };
+        // A valid structured result, so this test isolates the "parsed fine
+        // but the process still exited non-zero" case from the separate
+        // "reviewer did not emit a structured result" parse-failure case
+        // already covered above.
+        let output = format!(
+            "{REVIEW_RESULT_PREFIX}{{\"findings\":[{{\"severity\":\"minor\",\"summary\":\"reported before the crash\"}}]}}"
+        );
+        let mut out = Vec::new();
+        let code = run_independent_review(&args, &mut out, &|_, _| {
+            Ok(ReviewerRun {
+                code: 17,
+                dashboard_spawn: false,
+                output: Some(output.clone()),
+            })
+        });
+        unsafe {
+            std::env::remove_var(crate::commands::ctx::state::STATE_ENV);
+        }
+        let error = code
+            .expect_err("a non-zero reviewer exit must be reported")
+            .to_string();
+        assert!(error.contains("reviewer exited with status 17"), "{error}");
+        assert!(error.contains("raw reviewer output saved to"), "{error}");
+        let review_dir = repo
+            .path()
+            .join(".zirv/work")
+            .join(&state.id)
+            .join("review");
+        let entry = std::fs::read_dir(&review_dir)
+            .expect("salvage directory exists")
+            .next()
+            .expect("a salvage file exists")
+            .unwrap();
+        assert!(
+            std::fs::read_to_string(entry.path())
+                .unwrap()
+                .contains("reported before the crash")
+        );
+        assert!(
+            engine::load(&state_dir, repo.path(), &state.id)
+                .unwrap()
+                .review_findings
+                .is_empty(),
+            "a non-zero-exit round must not record findings as if it had completed"
+        );
+    }
+
+    #[test]
     fn untracked_secrets_contribute_a_path_but_never_a_body() {
         let repo = tempdir().unwrap();
         std::fs::write(repo.path().join(".env"), "TOKEN=super-secret\n").unwrap();
@@ -2135,6 +2825,129 @@ mod tests {
         assert_eq!(diff.matches("sensitive filename").count(), 3);
         assert!(diff.contains("omitted: binary"));
         assert!(diff.contains("ordinary text"));
+    }
+
+    #[test]
+    fn hunk_priority_orders_code_before_tests_config_docs_and_pure_renames() {
+        assert_eq!(
+            hunk_priority("src/commands/workflow/review.rs", false),
+            HunkPriority::Code
+        );
+        assert_eq!(
+            hunk_priority("frontend/app/page.tsx", false),
+            HunkPriority::Code
+        );
+        assert_eq!(
+            hunk_priority("tests/fixtures/stub.sh", false),
+            HunkPriority::Tests
+        );
+        assert_eq!(
+            hunk_priority("services/api/tests/retry.rs", false),
+            HunkPriority::Tests
+        );
+        assert_eq!(hunk_priority("Cargo.toml", false), HunkPriority::Config);
+        assert_eq!(
+            hunk_priority(".zirv/verify.toml", false),
+            HunkPriority::Config
+        );
+        assert_eq!(
+            hunk_priority("docs/obsidian/notes.md", false),
+            HunkPriority::Docs
+        );
+        assert_eq!(hunk_priority("README.md", false), HunkPriority::Docs);
+        assert_eq!(
+            hunk_priority("src/renamed.rs", true),
+            HunkPriority::PureRename,
+            "a pure rename sorts last regardless of where it lives"
+        );
+        assert!(HunkPriority::Code < HunkPriority::Tests);
+        assert!(HunkPriority::Tests < HunkPriority::Config);
+        assert!(HunkPriority::Config < HunkPriority::Docs);
+        assert!(HunkPriority::Docs < HunkPriority::PureRename);
+    }
+
+    /// Builds a minimal but real-shaped `git diff --git` hunk so
+    /// `split_diff_hunks`/`diff_hunk_path` parse it the same way they parse
+    /// real `git diff` output.
+    fn fake_hunk(path: &str, body_lines: usize) -> String {
+        let mut body = format!(
+            "diff --git a/{path} b/{path}\nindex 1111111..2222222 100644\n--- a/{path}\n+++ b/{path}\n@@ -1,1 +1,{body_lines} @@\n"
+        );
+        for line in 0..body_lines {
+            body.push_str(&format!("+line {line} padding padding padding\n"));
+        }
+        body
+    }
+
+    /// #229: the compact review package truncated away every `src/` hunk on
+    /// a diff that did not fit, keeping only renames/docs/config. Ordering
+    /// must keep `src/` and drop docs first when the budget is exceeded, and
+    /// must tell the reviewer exactly what to fetch itself.
+    #[test]
+    fn order_and_cap_diff_drops_docs_before_dropping_code_when_over_budget() {
+        let code = fake_hunk("src/lib.rs", 5);
+        let docs = fake_hunk("docs/big-notes.md", 500);
+        let diff = format!("{docs}{code}");
+        let cap = code.len() + 40; // room for the code hunk plus a little slack, not the docs hunk
+
+        let (kept, truncated) = order_and_cap_diff(&diff, "base-sha", cap);
+
+        assert!(truncated);
+        assert!(
+            kept.contains("src/lib.rs"),
+            "the code hunk must survive truncation: {kept}"
+        );
+        assert!(
+            !kept.contains("docs/big-notes.md") || kept.contains("TRUNCATED"),
+            "the docs hunk's content must not silently survive in place of the trailer: {kept}"
+        );
+        assert!(
+            !kept.contains("+line 499 padding"),
+            "the docs hunk body itself must be dropped, not just reordered: {kept}"
+        );
+        assert!(
+            kept.contains("TRUNCATED: 1 file(s) omitted: docs/big-notes.md"),
+            "the trailer must name the omitted file: {kept}"
+        );
+        assert!(
+            kept.contains("git diff base-sha...HEAD -- docs/big-notes.md"),
+            "the trailer must tell the reviewer how to fetch it itself: {kept}"
+        );
+    }
+
+    /// If even the single highest-priority file cannot fit the budget, the
+    /// package must still point the reviewer at the diff command instead of
+    /// silently shipping an empty package.
+    #[test]
+    fn order_and_cap_diff_falls_back_to_a_command_when_even_the_first_file_does_not_fit() {
+        let huge_code = fake_hunk("src/huge.rs", 5_000);
+        let (kept, truncated) = order_and_cap_diff(&huge_code, "base-sha", 128);
+
+        assert!(truncated);
+        assert!(
+            !kept.contains("line 0 padding"),
+            "no partial hunk content must leak into the fallback: {kept}"
+        );
+        assert!(kept.contains("Run: git diff base-sha...HEAD -- src/huge.rs"));
+    }
+
+    /// #229/#232 (decision 5): a workflow's own `.zirv/work/<id>/*`
+    /// artifacts must never reach the reviewer as part of the reviewed
+    /// change set, whatever their size or priority tier would otherwise be.
+    #[test]
+    fn order_and_cap_diff_drops_workflow_owned_hunks_unconditionally() {
+        let owned = fake_hunk(".zirv/work/abc/plan.md", 3);
+        let code = fake_hunk("src/lib.rs", 3);
+        let diff = format!("{owned}{code}");
+
+        let (kept, truncated) = order_and_cap_diff(&diff, "base-sha", MAX_REVIEW_DIFF_BYTES);
+
+        assert!(
+            !truncated,
+            "excluding workflow-owned hunks is not itself a truncation"
+        );
+        assert!(kept.contains("src/lib.rs"));
+        assert!(!kept.contains(".zirv/work"));
     }
 
     /// T8: `dash_channel_active` reads whichever channel its `env` lookup
@@ -2196,7 +3009,12 @@ mod tests {
     fn a_reviewer_seat_is_always_pinned_read_only_or_refused() {
         let repo = tempdir().unwrap();
         let claude = reviewer_argv("claude", repo.path(), false).unwrap();
-        assert_eq!(&claude[..4], ["agent", "claude", "-", "--"]);
+        assert_eq!(
+            &claude[..5],
+            ["agent", "claude", "-", "--headless", "--"],
+            "the reviewer must ask for a headless worker explicitly: inside a \
+             dashboard the pane gate refuses trailing harness flags otherwise"
+        );
         assert_eq!(
             claude.last().map(String::as_str),
             Some("--disallowedTools=Write,Edit,Bash,NotebookEdit"),
@@ -2210,7 +3028,7 @@ mod tests {
         );
 
         let codex = reviewer_argv("codex", repo.path(), false).unwrap();
-        assert_eq!(&codex[..4], ["agent", "codex", "-", "--"]);
+        assert_eq!(&codex[..5], ["agent", "codex", "-", "--headless", "--"]);
         assert!(
             codex
                 .windows(2)
@@ -2513,11 +3331,14 @@ checksum = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f80"
         );
         let findings = parse_reviewer_output(&output).expect("structured result");
         assert_eq!(findings.len(), 1);
-        assert_eq!(findings[0].severity, FindingSeverity::Major);
+        assert_eq!(findings[0].severity.value, FindingSeverity::Major);
         assert_eq!(findings[0].path.as_deref(), Some(Path::new("src/main.rs")));
         assert_eq!(findings[0].line, Some(7));
         assert_eq!(
-            findings[0].recommended_disposition,
+            findings[0]
+                .recommended_disposition
+                .as_ref()
+                .map(|disposition| disposition.value),
             Some(FindingDisposition::Accepted)
         );
         assert!(parse_reviewer_output("review complete").is_err());
@@ -2525,6 +3346,125 @@ checksum = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f80"
             "{REVIEW_RESULT_PREFIX}{{\"findings\":[]}}\n{REVIEW_RESULT_PREFIX}{{\"findings\":[]}}"
         ))
         .is_err());
+    }
+
+    /// #229: the claude reviewer emitted an extra `failure_scenario` key per
+    /// finding and the whole result was rejected because `ReviewerFinding`
+    /// (and the envelope around it) used `deny_unknown_fields`. An unknown
+    /// field must be ignored, not cost the finding.
+    #[test]
+    fn an_unknown_field_on_a_finding_or_the_envelope_is_ignored_not_fatal() {
+        let output = format!(
+            "{REVIEW_RESULT_PREFIX}{{\"schema\":\"v9\",\"findings\":[{{\"severity\":\"major\",\
+             \"summary\":\"missing bounds check\",\"failure_scenario\":\"OOB read\"}}]}}"
+        );
+        let findings = parse_reviewer_output(&output).expect("unknown fields must not be fatal");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].severity.value, FindingSeverity::Major);
+    }
+
+    /// #229 (second occurrence) and #232: a reviewer that invents a severity
+    /// or disposition variant must degrade to the documented fallback
+    /// instead of losing the whole envelope. Listed synonyms map onto the
+    /// closest real value silently; a genuinely unrecognised value falls
+    /// back to major/open and is surfaced in the summary so it is never
+    /// silently rewritten away.
+    #[test]
+    fn unknown_severity_and_disposition_variants_degrade_instead_of_failing() {
+        assert_eq!(
+            normalize_severity("BLOCKER"),
+            (FindingSeverity::Critical, None)
+        );
+        assert_eq!(normalize_severity("info"), (FindingSeverity::Note, None));
+        assert_eq!(normalize_severity("Medium"), (FindingSeverity::Minor, None));
+        assert_eq!(
+            normalize_severity("catastrophic"),
+            (FindingSeverity::Major, Some("catastrophic".to_string()))
+        );
+        assert_eq!(
+            normalize_disposition("needs-confirmation"),
+            (FindingDisposition::Open, None)
+        );
+        assert_eq!(
+            normalize_disposition("wontfix"),
+            (FindingDisposition::Dismissed, None)
+        );
+        assert_eq!(
+            normalize_disposition("escalated"),
+            (FindingDisposition::Open, Some("escalated".to_string()))
+        );
+
+        let output = format!(
+            "{REVIEW_RESULT_PREFIX}{{\"findings\":[\
+             {{\"severity\":\"blocker\",\"summary\":\"auth bypass\",\"recommended_disposition\":\"needs-confirmation\"}},\
+             {{\"severity\":\"catastrophic\",\"summary\":\"data loss risk\"}}\
+             ]}}"
+        );
+        let findings = build_review_findings(parse_reviewer_output(&output).unwrap(), now_secs());
+        assert_eq!(findings.len(), 2);
+        assert_eq!(findings[0].severity, FindingSeverity::Critical);
+        assert_eq!(findings[0].disposition, FindingDisposition::Open);
+        assert_eq!(
+            findings[0].recommended_disposition,
+            Some(FindingDisposition::Open)
+        );
+        assert!(
+            !findings[0].summary.contains("[severity:"),
+            "a listed synonym must not clutter the summary: {}",
+            findings[0].summary
+        );
+        assert_eq!(findings[1].severity, FindingSeverity::Major);
+        assert!(
+            findings[1].summary.contains("[severity: catastrophic]"),
+            "a genuinely unknown value must be preserved in the summary: {}",
+            findings[1].summary
+        );
+    }
+
+    /// #229: one malformed finding (here, no `summary` at all) must not cost
+    /// the rest of the envelope's findings.
+    #[test]
+    fn a_single_malformed_finding_is_skipped_without_losing_the_rest() {
+        let output = format!(
+            "{REVIEW_RESULT_PREFIX}{{\"findings\":[\
+             {{\"severity\":\"major\"}},\
+             {{\"severity\":\"minor\",\"summary\":\"real finding\"}}\
+             ]}}"
+        );
+        let findings = parse_reviewer_output(&output).expect("the envelope itself is valid JSON");
+        assert_eq!(
+            findings.len(),
+            1,
+            "the finding missing `summary` is skipped"
+        );
+        assert_eq!(findings[0].summary, "real finding");
+    }
+
+    /// The envelope is rejected only when it is not a JSON object at all --
+    /// not when a known field is present but the wrong shape.
+    #[test]
+    fn the_envelope_is_rejected_only_when_it_is_not_a_json_object() {
+        assert!(
+            parse_reviewer_output(&format!("{REVIEW_RESULT_PREFIX}[1,2,3]"))
+                .unwrap_err()
+                .to_string()
+                .contains("not a JSON object")
+        );
+        // `findings` present but not an array: tolerated as zero findings,
+        // not a hard failure.
+        assert_eq!(
+            parse_reviewer_output(&format!("{REVIEW_RESULT_PREFIX}{{\"findings\":\"none\"}}"))
+                .expect("a wrong-shaped findings field must not reject the envelope")
+                .len(),
+            0
+        );
+        // `findings` missing entirely: also tolerated as zero findings.
+        assert_eq!(
+            parse_reviewer_output(&format!("{REVIEW_RESULT_PREFIX}{{}}"))
+                .expect("a missing findings field must not reject the envelope")
+                .len(),
+            0
+        );
     }
 
     #[test]

@@ -90,6 +90,74 @@ pub struct AgentArgs {
     /// dashboard honours the same override this process already decided on.
     #[arg(long, default_value_t = false)]
     pub force: bool,
+    /// Issue #228: a harness-agnostic working directory for this worker,
+    /// independent of the delegating session's own repo. Canonicalised and
+    /// validated up front (`validate_workdir`): must already exist, be a
+    /// directory, and sit inside a git repository -- there is no escape
+    /// hatch for one that is not. Honoured by both forks of this
+    /// delegation: a headless spawn's child process cwd and per-harness
+    /// sandbox derive from it exactly as they otherwise derive from the
+    /// current directory (`run_with`'s own `launch_repo`), and a pane spawn
+    /// carries it on the `SpawnRequest` (`spawnreq::SpawnRequest::workdir`)
+    /// for the dashboard to launch into and widen the pane's filesystem
+    /// policy to, once re-validated there.
+    #[arg(long)]
+    pub workdir: Option<PathBuf>,
+    /// Issue #228: forces the headless supervised path even from inside a
+    /// dashboard pane, skipping `try_join_dashboard` entirely. Preserves the
+    /// pre-#228 capability of running with restart/timeout/budget ceilings
+    /// or arbitrary trailing flags from inside a dashboard -- but only on
+    /// explicit request now, since any of those would otherwise hard-error
+    /// rather than silently demote (see `try_join_dashboard`'s own doc
+    /// comment).
+    #[arg(long, default_value_t = false)]
+    pub headless: bool,
+}
+
+/// Issue #228: `--workdir` is a first-class, harness-agnostic zirv flag --
+/// canonicalised and checked up front, before any spawn decision, so a bad
+/// directory fails loudly rather than surfacing as a confusing sandbox
+/// error deep inside the harness's own child process.
+///
+/// A worker's own filesystem sandbox is only ever narrowed from a directory
+/// zirv itself resolved and confirmed is a real repository checkout; there
+/// is deliberately no escape hatch for a directory that is not one (unlike,
+/// say, codex's own `--skip-git-repo-check`) -- see the acceptance criteria
+/// on issue #228.
+///
+/// `pub(crate)`, not private: `dash::mod::fulfill_spawn_request` re-runs
+/// this SAME check against `SpawnRequest::workdir` before honouring it,
+/// since a spawn request is untrusted data a same-uid pane could forge (the
+/// same trust boundary issue #179 already documents for every other field
+/// on that struct) -- defense in depth, not a second, independently
+/// drifting copy of the rule.
+pub(crate) fn validate_workdir(dir: &Path) -> CtxResult<PathBuf> {
+    let canon = std::fs::canonicalize(dir)
+        .map_err(|e| format!("--workdir {} does not exist: {e}", dir.display()))?;
+    if !canon.is_dir() {
+        return Err(format!("--workdir {} is not a directory", dir.display()).into());
+    }
+    if adapters::git_common_dir(&canon).is_none() {
+        return Err(format!(
+            "--workdir {} is not inside a git repository; zirv agent workers need a repository \
+             checkout",
+            dir.display()
+        )
+        .into());
+    }
+    Ok(canon)
+}
+
+/// Issue #228: the directory a headless spawn's child process cwd and
+/// per-harness sandbox actually derive from -- `workdir` when the operator
+/// gave one (by the time this is called in `run_with`, already validated
+/// and canonicalised by [`validate_workdir`]), else `repo` (today's
+/// behaviour, byte for byte unchanged). Pure so the "workdir wins when
+/// given" invariant is directly testable without spawning anything.
+fn effective_launch_repo(workdir: Option<&Path>, repo: &Path) -> PathBuf {
+    workdir
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| repo.to_path_buf())
 }
 
 /// The soft threshold, as a fraction of a budget. At or above it the worker
@@ -475,7 +543,11 @@ pub fn resolve_prompt(raw: &str, stdin: &mut dyn Read) -> CtxResult<String> {
 pub fn exit_note(code: i32) -> Option<String> {
     matches!(
         code,
-        exec::EXIT_ROT_EXHAUSTED | exec::EXIT_TIMEOUT | exec::EXIT_BUDGET_EXHAUSTED
+        exec::EXIT_ROT_EXHAUSTED
+            | exec::EXIT_TIMEOUT
+            | exec::EXIT_BUDGET_EXHAUSTED
+            | exec::EXIT_CAPACITY_EXHAUSTED
+            | exec::EXIT_ACCOUNT_EXHAUSTED
     )
     .then(|| exec::describe_exit(code))
 }
@@ -490,7 +562,35 @@ fn delegation_outcome(code: i32) -> &'static str {
         exec::EXIT_ROT_EXHAUSTED => "rot-exhausted",
         exec::EXIT_TIMEOUT => "timeout",
         exec::EXIT_BUDGET_EXHAUSTED => "budget-exhausted",
+        // Issue #227.
+        exec::EXIT_CAPACITY_EXHAUSTED => "capacity-exhausted",
+        exec::EXIT_ACCOUNT_EXHAUSTED => "account-exhausted",
         _ => "failed",
+    }
+}
+
+/// Issue #227: the report-back mail a `zirv agent` spawn sends to its own
+/// requester on a supervisor-detected failure, so the requester has a
+/// durable record even when it was not watching this delegation
+/// synchronously (a background/dashboard-pane spawn). Carries the same
+/// structured reason `exit_note`/`describe_exit` already produce for the
+/// stderr note, so the two never say different things about the same
+/// failure. Pure: no fs/clock/env, so the envelope shape is table-tested
+/// without a real mailbox.
+fn report_back_message(
+    code: i32,
+    worker_session: &str,
+    agent_name: &str,
+    to_session: &str,
+) -> super::mail::Message {
+    let reason = exec::describe_exit(code);
+    super::mail::Message {
+        from_session: worker_session.to_string(),
+        from_agent: agent_name.to_string(),
+        to: "any".to_string(),
+        to_session: Some(to_session.to_string()),
+        sent: super::state::now_secs(),
+        body: format!("zirv ctx agent: {agent_name} finished: {reason} (exit {code})"),
     }
 }
 
@@ -591,27 +691,43 @@ const EXIT_DASH_UNCONFIRMED: i32 = 1;
 /// delegation path in this codebase already holds), then waits up to
 /// `DASH_ACK_TIMEOUT` for the matching ack.
 ///
-/// `Some(result)` means the dashboard gave a definitive answer -- a pane was
-/// spawned, the request was refused on policy grounds, or it was *claimed* and
-/// then never confirmed even after `DASH_CLAIM_EXTENSION` (O3) -- and the
-/// caller's own headless path must NOT run.
+/// `Some(Ok(_))`/most of `Some(Err(_))` mean the dashboard gave a definitive
+/// answer -- a pane was spawned, the request was refused on policy grounds,
+/// or it was *claimed* and then never confirmed even after
+/// `DASH_CLAIM_EXTENSION` (O3) -- and the caller's own headless path must
+/// NOT run. Issue #228 adds one more `Some(Err(_))` case that is NOT a
+/// dashboard answer at all: an operator-facing hard error raised by THIS
+/// process, before any request is ever written, when the operator asked for
+/// options a pane structurally cannot honour (below) -- see that case's own
+/// note for why it hard-errors rather than joining the "falls through"
+/// list.
 ///
 /// `None` means the caller falls through to today's headless behavior
 /// unchanged, which covers: no dashboard channel at all (`DASH_REQUESTS_ENV`
 /// unset -- silent, byte-for-byte the pre-Task-11 behavior); the inherited
 /// directory absent or its owner dead, AND issue #145's own fallback scan of
 /// every other `<state>/dash/*` token directory (`live_join_target`) also
-/// found nothing live (notice printed, naming every candidate considered);
-/// options a pane cannot honour (`--max-restarts`/`--timeout-secs`/
-/// `--budget-tokens`/`--max-tool-calls`/`--flags` other than a lone
-/// `--model` pin, notice printed -- `--role`/`--group` are NOT in this list:
-/// both travel on the `SpawnRequest` itself, see its own fields); a prompt
-/// that would be misread as a flag (notice printed); a request that could
-/// not even be written (notice printed); an unclaimed ack timeout (notice
-/// printed, since that is a live channel that simply did not respond); and a
-/// `retryable` refusal, where the dashboard has answered that it spawned
-/// nothing for a reason that says nothing about whether the task may run
-/// (O2).
+/// found nothing live (notice printed, naming every candidate considered); a
+/// prompt that would be misread as a flag (notice printed); a request that
+/// could not even be written (notice printed); an unclaimed ack timeout
+/// (notice printed, since that is a live channel that simply did not
+/// respond); and a `retryable` refusal, where the dashboard has answered
+/// that it spawned nothing for a reason that says nothing about whether the
+/// task may run (O2).
+///
+/// Issue #228: options a pane structurally cannot honour (`--max-restarts`/
+/// `--timeout-secs`/`--budget-tokens`/`--max-tool-calls`/`--flags` other
+/// than a lone `--model` pin) USED TO print a notice and silently demote to
+/// headless (F9) -- an operator who was inside a dashboard specifically to
+/// get a pane could lose that without ever noticing. Now `Some(Err(_))`,
+/// naming what was refused and pointing at the new `--headless` flag (an
+/// explicit, loud way to keep the pre-#228 capability), so the demotion can
+/// never be silent. This function is never even reached for `--headless`:
+/// `run_with` checks it first and skips straight to the headless path.
+/// `--role`/`--group` are NOT in this list: both travel on the
+/// `SpawnRequest` itself, see its own fields. Neither is `--workdir`: panes
+/// support it directly (`SpawnRequest::workdir`), so it never reaches this
+/// gate at all.
 fn try_join_dashboard<W: Write>(
     args: &AgentArgs,
     prompt: &str,
@@ -648,17 +764,40 @@ fn try_join_dashboard<W: Write>(
     // SpawnRequest::role`/`work_group_id`, below) and the dashboard's own
     // `fulfill_spawn_request` re-validates both at the authority side, the
     // same as every other field a pane can honour.
-    if args.max_restarts.is_some()
-        || args.timeout_secs.is_some()
-        || args.budget_tokens.is_some()
-        || args.max_tool_calls.is_some()
-        || (!args.flags.is_empty() && pinned_model.is_none())
-    {
-        eprintln!(
-            "zirv ctx agent: dashboard panes don't support --max-restarts/--timeout-secs/\
-             --budget-tokens/--max-tool-calls/-- flags other than a --model pin; running headless"
-        );
-        return None;
+    // Issue #228: this used to print a notice and silently fall back to
+    // headless (F9) -- an operator who explicitly asked for a pane-capable
+    // run (by being inside a dashboard at all) got a demotion they might
+    // never notice in scrollback. Now it hard-errors, naming exactly what
+    // was refused, and says how to get either half of what was actually
+    // typed: drop the offending flags to keep the pane, or pass the new
+    // `--headless` flag (checked by `run_with` before this function is ever
+    // called) to keep them and run supervised headless instead. `--workdir`
+    // is deliberately NOT in this list -- panes support it (see
+    // `SpawnRequest::workdir`), so it never reaches this gate at all.
+    let mut offending: Vec<String> = Vec::new();
+    if args.max_restarts.is_some() {
+        offending.push("--max-restarts".to_string());
+    }
+    if args.timeout_secs.is_some() {
+        offending.push("--timeout-secs".to_string());
+    }
+    if args.budget_tokens.is_some() {
+        offending.push("--budget-tokens".to_string());
+    }
+    if args.max_tool_calls.is_some() {
+        offending.push("--max-tool-calls".to_string());
+    }
+    if !args.flags.is_empty() && pinned_model.is_none() {
+        offending.push(format!("-- {}", args.flags.join(" ")));
+    }
+    if !offending.is_empty() {
+        return Some(Err(format!(
+            "zirv ctx agent: dashboard panes don't support {} -- drop {}, or pass --headless to \
+             run a supervised headless worker instead",
+            offending.join(", "),
+            if offending.len() == 1 { "it" } else { "them" }
+        )
+        .into()));
     }
     // Defense in depth for the same rule `dash::fulfill_spawn_request`
     // enforces at the authority side: the request's prompt is encoded
@@ -688,6 +827,14 @@ fn try_join_dashboard<W: Write>(
         // watching that dashboard, so it does not claim `interactive`.
         interactive: false,
         role: args.role.clone(),
+        // Issue #228: a validated, harness-agnostic escape from the
+        // dashboard's own repo family -- by the time `run_with` reaches
+        // this call site, `args.workdir` (if any) has already passed
+        // `validate_workdir`, so this simply carries that canonical path
+        // for the fulfilment side to widen into (re-validated there too,
+        // since a `SpawnRequest` is untrusted data -- see `validate_
+        // workdir`'s own doc comment).
+        workdir: args.workdir.clone(),
         // `session_identity`, not `requested_by` above: the two are
         // deliberately separate (see `SpawnRequest::parent_session`'s own
         // doc comment) even though this call site happens to derive both
@@ -907,6 +1054,13 @@ pub fn run_with<W: Write>(
 ) -> CtxResult<i32> {
     validate_flags(&args.flags)?;
     validate_role(&args.role)?;
+    // Issue #228: validated and canonicalised before anything else in this
+    // delegation runs -- a bad `--workdir` must fail loudly, up front, not
+    // surface as a confusing sandbox error deep inside a harness's own
+    // child process. The canonical form (not the operator's raw spelling)
+    // is what every downstream use of `args.workdir` below actually reads,
+    // via `routed_args`/`args`'s own overwrite a few lines down.
+    let canonical_workdir = args.workdir.as_deref().map(validate_workdir).transpose()?;
     let prompt = resolve_prompt(&args.prompt, &mut std::io::stdin())?;
 
     // Loaded here rather than after the dashboard-join attempt below (its
@@ -943,6 +1097,10 @@ pub fn run_with<W: Write>(
     };
     let route = super::fallback::route_new_delegation(&state, &cfg, route_request, args.force);
     let mut routed_args = args.clone();
+    // Issue #228: every downstream read of `routed_args`/`args` (the
+    // dashboard-join request, and `launch_repo` below) must see the
+    // canonical path, never the operator's raw spelling.
+    routed_args.workdir = canonical_workdir.clone();
     let mut route_applied = None;
     if let Some(route) = route
         && let Ok(target_adapter) = adapters::select(Some(&route.selected), &[], &cfg)
@@ -1058,7 +1216,13 @@ pub fn run_with<W: Write>(
         }
     };
 
+    // Issue #228: `--headless` skips the dashboard-join attempt entirely,
+    // even from inside a live dashboard -- the one way to keep every option
+    // `try_join_dashboard` would otherwise hard-error on (restart budget,
+    // wall-clock timeout, budget ceilings, arbitrary trailing flags) while
+    // still asking for a pane-capable session to host the supervised run.
     if deferred_reset.is_none()
+        && !args.headless
         && let Some(result) = try_join_dashboard(
             args,
             &prompt,
@@ -1142,6 +1306,18 @@ pub fn run_with<W: Write>(
         }
     };
 
+    // Issue #228: the ONLY place this delegation's headless launch stops
+    // deriving its child process cwd and per-harness sandbox from `repo`
+    // (the delegating session's own directory) and starts deriving them
+    // from an explicit `--workdir` instead -- exactly the same way `exec::
+    // run_with_report`/`build_command` already derive both from whatever
+    // `repo` it is given, so no change to `exec.rs` itself was needed.
+    // `repo` is left untouched everywhere ELSE in this function (the spawn
+    // gate's `cfg`, and `try_join_dashboard`'s own `SpawnRequest::cwd`,
+    // which is the delegating session's own identity, not the worker's
+    // target): only the actual worker launch below reads `launch_repo`.
+    let launch_repo = effective_launch_repo(args.workdir.as_deref(), repo);
+
     let exec_args = ExecArgs {
         agent: Some(args.name.clone()),
         session_id: Some(worker_session.clone()),
@@ -1172,7 +1348,7 @@ pub fn run_with<W: Write>(
     // permanently burn the group's admission slot for a child that never
     // ran. `state` is the same handle resolved above for the spawn gate,
     // unused since; reused here rather than re-resolved.
-    let (code, execution_report) = match exec::run_with_report(&exec_args, w, repo, &env) {
+    let (code, execution_report) = match exec::run_with_report(&exec_args, w, &launch_repo, &env) {
         Ok(result) => result,
         Err(e) => {
             if let Some(id) = &args.group {
@@ -1219,6 +1395,26 @@ pub fn run_with<W: Write>(
     if let Ok(state_dir) = super::state::StateDir::resolve(&env) {
         let parent_session = super::mail::session_identity(&env).unwrap_or_default();
         let outcome = delegation_outcome(code);
+
+        // Issue #227: on a supervisor-detected failure, send a report-back
+        // mail to the spawning session with the same structured reason the
+        // stderr note (`exit_note`) already carries. The worker's own
+        // self-reported "tell your requester when you're done" instruction
+        // (dash panes only, see `prompt::with_report_back_layer`) never
+        // fires when the child died before reaching it -- a plain headless
+        // failure used to leave the requester with nothing but a bare exit
+        // code, no mail at all. Best-effort: a mail failure must never turn
+        // a completed delegation into a failed one, and this never touches
+        // the success path -- a clean run already has nothing new to say
+        // here (the caller's own `Ok(code)` return is that report).
+        if code != 0
+            && let Some(parent_short) = super::mail::session_identity(&env)
+            && super::prompt::is_addressable_short(&parent_short)
+        {
+            let msg = report_back_message(code, &worker_session, &args.name, &parent_short);
+            let repo_slug = super::state::repo_slug(repo);
+            let _ = super::mail::store_to(&state_dir, &repo_slug, &repo_slug, &msg, &cfg);
+        }
         let total = append_execution_segments(
             &state_dir,
             &execution_report,
@@ -1342,6 +1538,15 @@ mod tests {
         assert_eq!(
             delegation_outcome(exec::EXIT_BUDGET_EXHAUSTED),
             "budget-exhausted"
+        );
+        // Issue #227.
+        assert_eq!(
+            delegation_outcome(exec::EXIT_CAPACITY_EXHAUSTED),
+            "capacity-exhausted"
+        );
+        assert_eq!(
+            delegation_outcome(exec::EXIT_ACCOUNT_EXHAUSTED),
+            "account-exhausted"
         );
         assert_eq!(delegation_outcome(1), "failed");
     }
@@ -2126,7 +2331,222 @@ mod tests {
             budget_tokens: None,
             max_tool_calls: None,
             force: false,
+            workdir: None,
+            headless: false,
         }
+    }
+
+    /// Whether `git` is on `PATH` at all in this test environment -- the
+    /// `--workdir` git-ancestry tests below need a real `git` binary to shell
+    /// out to (`adapters::git_common_dir`), and must skip gracefully rather
+    /// than fail on a machine that somehow lacks one, the same precedent
+    /// `dash::mod`'s own `git_available` establishes.
+    fn git_available() -> bool {
+        std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    fn git_init(dir: &Path) -> bool {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .arg("init")
+            .arg("-q")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    /// Strips the `\\?\` extended-length prefix `std::fs::canonicalize` adds
+    /// on Windows and normalises separators/case, so a path git-bash's own
+    /// `pwd -W` reported (plain drive-letter form, forward slashes) can be
+    /// compared against one this test built with `Path::join` without either
+    /// side's own formatting quirks producing a false mismatch.
+    fn normalize_path_for_compare(p: &std::path::Path) -> String {
+        let s = p.display().to_string();
+        let stripped = s.strip_prefix(r"\\?\").unwrap_or(&s);
+        stripped.replace('\\', "/").to_lowercase()
+    }
+
+    #[test]
+    fn validate_workdir_rejects_a_directory_that_does_not_exist() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let missing = tmp.path().join("does-not-exist");
+        let err = validate_workdir(&missing).expect_err("a missing directory must be refused");
+        assert!(err.to_string().contains("--workdir"), "got {err}");
+    }
+
+    #[test]
+    fn validate_workdir_rejects_a_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let file = tmp.path().join("plain-file");
+        std::fs::write(&file, "x").expect("write");
+        let err = validate_workdir(&file).expect_err("a file is not a directory");
+        assert!(err.to_string().contains("is not a directory"), "got {err}");
+    }
+
+    /// The exact wording issue #228's own acceptance criteria specify:
+    /// "error: --workdir <dir> is not inside a git repository; zirv agent
+    /// workers need a repository checkout" (the "error: " prefix is added by
+    /// `crate::output::error` at the top-level dispatcher, not by this
+    /// function -- see its own doc comment).
+    #[test]
+    fn validate_workdir_rejects_a_directory_with_no_git_ancestry() {
+        if !git_available() {
+            eprintln!("skipping: git not found on PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let plain = tmp.path().join("plain-dir");
+        std::fs::create_dir_all(&plain).expect("mkdir");
+        let err = validate_workdir(&plain).expect_err("not a git repo");
+        let msg = err.to_string();
+        assert!(msg.contains("--workdir"), "got {msg}");
+        assert!(
+            msg.contains(
+                "is not inside a git repository; zirv agent workers need a repository \
+                          checkout"
+            ),
+            "must match issue #228's exact wording: {msg}"
+        );
+    }
+
+    /// No escape hatch (issue #228, decision 1): unlike, say, codex's own
+    /// `--skip-git-repo-check`, a non-repo `--workdir` has no override --
+    /// `validate_workdir` takes no such flag at all.
+    #[test]
+    fn validate_workdir_accepts_a_real_git_repo_and_canonicalises_it() {
+        if !git_available() {
+            eprintln!("skipping: git not found on PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("a-repo");
+        std::fs::create_dir_all(&repo).expect("mkdir");
+        assert!(git_init(&repo), "git init");
+        let canon = validate_workdir(&repo).expect("a real repo checkout is fine");
+        assert_eq!(canon, std::fs::canonicalize(&repo).expect("canonicalize"));
+    }
+
+    #[test]
+    fn effective_launch_repo_prefers_workdir_when_given_and_falls_back_to_repo_otherwise() {
+        let repo = Path::new("/current/repo");
+        let workdir = Path::new("/other/repo");
+        assert_eq!(
+            effective_launch_repo(Some(workdir), repo),
+            workdir.to_path_buf(),
+            "an explicit --workdir must win"
+        );
+        assert_eq!(
+            effective_launch_repo(None, repo),
+            repo.to_path_buf(),
+            "no --workdir is today's unchanged behaviour"
+        );
+    }
+
+    /// Issue #228, decision 1: a bad `--workdir` fails loudly, up front,
+    /// before any spawn decision -- not as a confusing sandbox error deep
+    /// inside a harness's own child process.
+    #[test]
+    fn run_with_rejects_a_missing_workdir_up_front() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let env = base_env(&tmp.path().join("state"));
+
+        let mut args = args_for("claude", "go");
+        args.workdir = Some(tmp.path().join("does-not-exist"));
+        let mut out = Vec::new();
+        let err = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned())
+            .expect_err("a missing --workdir must fail up front");
+        assert!(err.to_string().contains("--workdir"), "got {err}");
+    }
+
+    /// The exact user-facing wording issue #228 specifies, exercised through
+    /// the full `run_with` entry point rather than only `validate_workdir`
+    /// directly.
+    #[test]
+    fn run_with_rejects_a_workdir_with_no_git_ancestry_with_the_exact_wording() {
+        if !git_available() {
+            eprintln!("skipping: git not found on PATH");
+            return;
+        }
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let env = base_env(&tmp.path().join("state"));
+        let not_a_repo = tmp.path().join("plain-dir");
+        std::fs::create_dir_all(&not_a_repo).expect("mkdir");
+
+        let mut args = args_for("claude", "go");
+        args.workdir = Some(not_a_repo);
+        let mut out = Vec::new();
+        let err = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned())
+            .expect_err("a non-repo --workdir must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(
+                "is not inside a git repository; zirv agent workers need a repository \
+                          checkout"
+            ),
+            "got {msg}"
+        );
+    }
+
+    /// Issue #228, decision 2, the core of the feature: a headless
+    /// delegation's child process cwd (and so its per-harness sandbox) comes
+    /// from `--workdir`, not from the delegating session's own `repo` --
+    /// exercised end to end through `run_with`, with the fake agent
+    /// (`fake-agent.sh`'s `FAKE_AGENT_CWD_LOG`) reporting its own real `pwd`
+    /// back rather than this test trusting the plumbing without ever
+    /// spawning anything.
+    #[test]
+    fn a_headless_delegation_with_workdir_launches_its_child_process_there() {
+        if !git_available() {
+            eprintln!("skipping: git not found on PATH");
+            return;
+        }
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let target = tmp.path().join("target-repo");
+        std::fs::create_dir_all(&target).expect("mkdir");
+        assert!(git_init(&target), "git init");
+        let cwd_log = tmp.path().join("cwd.log");
+
+        let env = base_env(&tmp.path().join("state"));
+        // `FAKE_AGENT_CWD_LOG` (like `FAKE_AGENT_ARGV_LOG` elsewhere in this
+        // module) is read by the fixture script from its own REAL process
+        // environment, which it inherits from this test process -- not from
+        // the `EnvLookup` closure `run_with` itself reads config through, so
+        // it has to be a genuine `std::env::set_var`, not an entry in `env`.
+        unsafe {
+            std::env::set_var("FAKE_AGENT_CWD_LOG", &cwd_log);
+        }
+
+        let mut args = args_for("claude", "go");
+        args.workdir = Some(target.clone());
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_CWD_LOG");
+        }
+        assert_eq!(
+            code.expect("a headless delegation with an explicit workdir runs"),
+            0
+        );
+
+        let logged = std::fs::read_to_string(&cwd_log).expect("cwd log written");
+        let logged_cwd = logged.lines().next().expect("one logged cwd");
+        assert_eq!(
+            normalize_path_for_compare(std::path::Path::new(logged_cwd)),
+            normalize_path_for_compare(&target),
+            "the headless child's own process cwd must be the requested --workdir, not `repo`: \
+             logged {logged_cwd:?}, target {target:?}"
+        );
     }
 
     #[test]
@@ -2168,6 +2588,17 @@ mod tests {
         );
         assert_eq!(exit_note(0), None, "success needs no explanation");
         assert_eq!(exit_note(3), None, "an ordinary agent failure is its own");
+        // Issue #227.
+        assert!(
+            exit_note(exec::EXIT_CAPACITY_EXHAUSTED)
+                .expect("capacity exhausted has a note")
+                .contains("capacity")
+        );
+        assert!(
+            exit_note(exec::EXIT_ACCOUNT_EXHAUSTED)
+                .expect("account exhausted has a note")
+                .contains("billing")
+        );
     }
 
     #[test]
@@ -2327,6 +2758,83 @@ mod tests {
             exit_note(exec::EXIT_ROT_EXHAUSTED)
                 .expect("a note exists")
                 .contains("restart budget")
+        );
+    }
+
+    /// Issue #227: `report_back_message`'s pure envelope shape -- the same
+    /// reason text `describe_exit` produces for the stderr note, addressed
+    /// to the requester's short id.
+    #[test]
+    fn report_back_message_carries_the_structured_reason() {
+        let msg = report_back_message(
+            exec::EXIT_CAPACITY_EXHAUSTED,
+            "worker-session-1",
+            "codex",
+            "aaaaaaaa",
+        );
+        assert_eq!(msg.from_session, "worker-session-1");
+        assert_eq!(msg.from_agent, "codex");
+        assert_eq!(msg.to_session, Some("aaaaaaaa".to_string()));
+        assert!(
+            msg.body.contains("capacity") && msg.body.contains("codex"),
+            "got {:?}",
+            msg.body
+        );
+    }
+
+    /// Issue #227: a headless delegation that FAILS (here, a rot-exhausted
+    /// give-up with the restart budget at zero) sends a report-back mail to
+    /// the spawning session -- the worker's own self-report only ever fires
+    /// for a dashboard pane and only on success, so without this the
+    /// requester previously learned nothing beyond a bare exit code for any
+    /// plain headless failure, success or not.
+    #[test]
+    fn a_failed_delegation_reports_back_to_the_spawning_session() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state = tmp.path().join("state");
+        let mut env = base_env(&state);
+        // A short, addressable parent session id -- `short_id` takes the
+        // first eight ASCII-alphanumeric characters.
+        env.insert(
+            crate::commands::ctx::adapters::SESSION_ENV.to_string(),
+            "aaaaaaaa-1111-4222-8333-444444444444".to_string(),
+        );
+        unsafe {
+            std::env::set_var("FAKE_AGENT_MODE", "rot");
+            std::env::set_var("FAKE_AGENT_SLEEP", "30");
+        }
+
+        let mut args = args_for("claude", "do the work");
+        args.max_restarts = Some(0);
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE");
+            std::env::remove_var("FAKE_AGENT_SLEEP");
+        }
+        assert_eq!(code.expect("runs"), exec::EXIT_ROT_EXHAUSTED);
+
+        let state_dir = crate::commands::ctx::state::StateDir::from_root(state);
+        let repo_slug = crate::commands::ctx::state::repo_slug(tmp.path());
+        let mailbox = state_dir.mail().join(&repo_slug);
+        let entries: Vec<_> = std::fs::read_dir(&mailbox)
+            .map(|dir| dir.flatten().collect())
+            .unwrap_or_default();
+        assert_eq!(
+            entries.len(),
+            1,
+            "exactly one report-back message must land in the mailbox"
+        );
+        let body = std::fs::read_to_string(entries[0].path()).expect("read mail");
+        assert!(
+            body.contains("To-session: aaaaaaaa"),
+            "addressed to the requester's short id: {body}"
+        );
+        assert!(
+            body.contains("restart budget"),
+            "carries the same structured reason as the stderr note: {body}"
         );
     }
 
@@ -3085,36 +3593,58 @@ mod tests {
         );
     }
 
-    /// F9: `--max-restarts`, `--timeout-secs` and trailing `-- flags` are all
-    /// honoured by `exec::run_with` and carried by nothing in a
-    /// `SpawnRequest`. Silently dropping them would be worse than not using
-    /// the dashboard, so the join declines and the headless path runs.
-    /// `--quiet` stays allowed: it only shapes an announcement channel.
+    /// Issue #228: `--max-restarts`, `--timeout-secs`, either budget ceiling
+    /// and trailing `-- flags` beyond a lone `--model` pin are all honoured
+    /// by `exec::run_with` and carried by nothing in a `SpawnRequest`. This
+    /// USED TO print a notice and silently fall back to headless (F9) --
+    /// now it hard-errors instead, naming what was refused, so a demotion an
+    /// operator explicitly asked to avoid (by being inside a dashboard at
+    /// all) can never slip past unnoticed. `--quiet` and `--workdir` stay
+    /// allowed: neither is in this list at all (see the separate `--workdir`
+    /// and `--headless` tests below).
     #[test]
-    fn options_a_pane_cannot_honour_decline_the_dashboard_join() {
+    fn options_a_pane_cannot_honour_now_hard_error_instead_of_silently_demoting() {
         let tmp = crate::commands::ctx::testenv::repo();
         let home = tmp.path().join("home");
         let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
         let (requests_dir, env) = live_dashboard_dir(tmp.path());
 
-        for mutate in [
-            (|a: &mut AgentArgs| a.max_restarts = Some(2)) as fn(&mut AgentArgs),
-            |a: &mut AgentArgs| a.timeout_secs = Some(90),
-            |a: &mut AgentArgs| a.flags = vec!["--verbose".to_string()],
-            // A model pin plus anything else is still a decline: honouring
+        for (mutate, must_name) in [
+            (
+                (|a: &mut AgentArgs| a.max_restarts = Some(2)) as fn(&mut AgentArgs),
+                "--max-restarts",
+            ),
+            (
+                |a: &mut AgentArgs| a.timeout_secs = Some(90),
+                "--timeout-secs",
+            ),
+            (
+                |a: &mut AgentArgs| a.flags = vec!["--verbose".to_string()],
+                "--verbose",
+            ),
+            // A model pin plus anything else is still refused: honouring
             // half of what the operator typed is worse than not using the
             // dashboard at all.
-            |a: &mut AgentArgs| {
-                a.flags = vec![
-                    "--model".to_string(),
-                    "haiku".to_string(),
-                    "--verbose".to_string(),
-                ]
-            },
+            (
+                |a: &mut AgentArgs| {
+                    a.flags = vec![
+                        "--model".to_string(),
+                        "haiku".to_string(),
+                        "--verbose".to_string(),
+                    ]
+                },
+                "--verbose",
+            ),
             // Issue #155, Phase 5(d): a pane cannot honour either budget
             // ceiling, same reasoning as `max_restarts`/`timeout_secs` above.
-            |a: &mut AgentArgs| a.budget_tokens = Some(100_000),
-            |a: &mut AgentArgs| a.max_tool_calls = Some(50),
+            (
+                |a: &mut AgentArgs| a.budget_tokens = Some(100_000),
+                "--budget-tokens",
+            ),
+            (
+                |a: &mut AgentArgs| a.max_tool_calls = Some(50),
+                "--max-tool-calls",
+            ),
         ] {
             let mut args = joinable_args("claude", "go");
             mutate(&mut args);
@@ -3128,7 +3658,15 @@ mod tests {
                 Duration::from_millis(200),
                 Duration::from_millis(200),
             );
-            assert!(joined.is_none(), "must fall back to the headless path");
+            let err = joined
+                .expect("must answer definitively, not silently fall back")
+                .expect_err("must hard-error rather than demote");
+            let msg = err.to_string();
+            assert!(msg.contains(must_name), "got {msg}");
+            assert!(
+                msg.contains("--headless"),
+                "must say how to keep the flag and still run supervised: {msg}"
+            );
             assert!(
                 std::fs::read_dir(&requests_dir)
                     .expect("read requests dir")
@@ -3140,7 +3678,8 @@ mod tests {
         }
 
         // The control: the same call with none of them set does reach the
-        // channel (it writes a request, then times out unanswered).
+        // channel (it writes a request, then times out unanswered) -- the
+        // hard-error gate must not fire on a plain, pane-compatible request.
         let args = joinable_args("claude", "go");
         let mut out = Vec::new();
         let joined = try_join_dashboard(
@@ -3153,6 +3692,37 @@ mod tests {
             Duration::from_millis(200),
         );
         assert!(joined.is_none(), "an unanswered request still falls back");
+    }
+
+    /// Issue #228: `--headless` skips the dashboard-join attempt entirely --
+    /// checked in `run_with`, before `try_join_dashboard` is ever called --
+    /// so an operator can keep e.g. `--max-restarts` from inside a dashboard
+    /// on explicit request, exactly the pre-#228 capability, rather than
+    /// hitting the hard error the gate above now raises for it.
+    #[test]
+    fn headless_flag_bypasses_the_dashboard_join_and_keeps_pane_incompatible_options() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let (requests_dir, env) = live_dashboard_dir(tmp.path());
+
+        let mut args = args_for("claude", "go");
+        args.headless = true;
+        args.max_restarts = Some(0);
+        args.timeout_secs = Some(1);
+        let mut out = Vec::new();
+        // `run_with` itself, not `try_join_dashboard` directly: `--headless`
+        // is checked at `run_with`'s own call site, ahead of the function
+        // under test above.
+        let _ = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        assert!(
+            std::fs::read_dir(&requests_dir)
+                .expect("read requests dir")
+                .flatten()
+                .next()
+                .is_none(),
+            "--headless must never even attempt the dashboard-join channel"
+        );
     }
 
     /// R5: an unanswered, unclaimed request is taken back off disk before the
