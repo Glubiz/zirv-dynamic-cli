@@ -2499,10 +2499,24 @@ fn accepted_spawn_cwd(req_cwd: &Path, repo: &Path) -> Option<PathBuf> {
 fn default_workdir_roots(repo: &Path) -> Vec<PathBuf> {
     let canon_repo = std::fs::canonicalize(repo).unwrap_or_else(|_| repo.to_path_buf());
     let mut roots = vec![canon_repo.clone()];
-    if let Some(parent) = canon_repo.parent() {
-        roots.push(parent.to_path_buf());
+    if let Some(parent) = sibling_root_for(&canon_repo) {
+        roots.push(parent);
     }
     roots
+}
+
+/// The parent directory [`default_workdir_roots`] widens to ("sibling
+/// checkouts"), or `None` when that parent is itself a filesystem or drive
+/// root (`/`, `C:\`, `\\?\C:\`). A checkout sitting directly below the root
+/// -- `/workspace/repo`, `/app/repo`, `C:\repo`, the usual container and CI
+/// layout -- must not turn "sibling checkouts" into "every absolute path on
+/// the machine", which would reopen exactly the any-repo exposure the roots
+/// exist to close (review finding, 2026-08-31).
+fn sibling_root_for(canon_repo: &Path) -> Option<PathBuf> {
+    let parent = canon_repo.parent()?;
+    // A root has no parent of its own; refuse to widen to it.
+    parent.parent()?;
+    Some(parent.to_path_buf())
 }
 
 /// The full set of roots a pane `--workdir` request must canonicalise
@@ -11251,6 +11265,42 @@ mod tests {
     /// acceptance beyond the default roots -- and the same directory is
     /// refused without that configuration, proving the widening (not some
     /// unrelated default) is what accepted it.
+    #[test]
+    fn default_workdir_roots_never_widen_to_a_filesystem_or_drive_root() {
+        // Synthetic, non-existent paths: canonicalize fails and falls back
+        // to the path as given, which is exactly the shape a repo directly
+        // below the root has once canonicalised.
+        #[cfg(unix)]
+        let (below_root, nested, nested_parent, elsewhere) = (
+            Path::new("/repo"),
+            Path::new("/home/u/repo"),
+            PathBuf::from("/home/u"),
+            Path::new("/etc/other-repo"),
+        );
+        #[cfg(windows)]
+        let (below_root, nested, nested_parent, elsewhere) = (
+            Path::new(r"C:\repo"),
+            Path::new(r"D:\GitHub\repo"),
+            PathBuf::from(r"D:\GitHub"),
+            Path::new(r"C:\Windows\other-repo"),
+        );
+
+        assert_eq!(sibling_root_for(below_root), None);
+        assert_eq!(sibling_root_for(nested), Some(nested_parent.clone()));
+        #[cfg(windows)]
+        assert_eq!(sibling_root_for(Path::new(r"\\?\C:\repo")), None);
+
+        let roots = default_workdir_roots(below_root);
+        assert_eq!(roots, vec![below_root.to_path_buf()]);
+        assert!(
+            !workdir_within_roots(elsewhere, &roots),
+            "a checkout directly below the root must not make every path a sibling: {roots:?}"
+        );
+
+        let nested_roots = default_workdir_roots(nested);
+        assert_eq!(nested_roots, vec![nested.to_path_buf(), nested_parent]);
+    }
+
     #[test]
     fn workdir_roots_operator_configured_root_widens_acceptance() {
         if !git_available() {
