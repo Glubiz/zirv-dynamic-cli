@@ -1,12 +1,12 @@
 ---
-last-verified: 2026-08-12
+last-verified: 2026-08-31
 ---
 
 # Shortcuts
 
 > [!tip] Quick Reference
-> - `.shortcuts.yaml` maps a short key (e.g. `t`) to a target script file (e.g. `test.yaml`), living alongside the scripts it points to — local `.zirv/.shortcuts.yaml` or global `~/.zirv/.shortcuts.yaml`.
-> - It is consulted only *after* a direct `<name>.<ext>` match fails in that same directory, and it's tried for the local directory before the global one falls back to the same two-step check.
+> - `.shortcuts.yaml` maps a short key (e.g. `t`) to a target script file (e.g. `test.yaml`) that itself lives in `commands/` (issue #212, zirv 3.0). The shortcuts file stays at the `.zirv` root as config — local `.zirv/.shortcuts.yaml` or global `~/.zirv/.shortcuts.yaml` — while the script it points to resolves inside `.zirv/commands/`.
+> - It is consulted only *after* a direct `<name>.<ext>` match fails in `commands/`, and it's tried for the local directory before the global one falls back to the same two-step check.
 > - `zirv create --shortcut <key>` registers one at script-creation time; it's otherwise a hand-edited YAML map.
 > - Cross-links: the lookup order this file participates in is [[Script Resolution]]; the file structure the shortcut resolves *to* is [[Script Files]].
 
@@ -20,14 +20,14 @@ shortcuts:
   <key>: <script-filename-or-stem>
 ```
 
-`utils::Shortcuts` deserializes this into a `HashMap<String, String>`. The mapped value is resolved two ways, in order (`input::find_script_in_dir`):
+`utils::Shortcuts` deserializes this into a `HashMap<String, String>`. The mapped value is resolved two ways, in order (`input::find_script_in_dir`), against the root's `commands/` subdirectory rather than the root itself:
 
-1. As a literal path relative to the directory (`dir.join(mapped_file)`).
+1. As a literal path relative to `commands/` (`commands_dir.join(mapped_file)`).
 2. With each supported extension appended in turn (`yaml`, `yml`, `json`, `toml`), so `tp: test-params` works the same as `tp: test-params.yaml`.
 
 ## When it's consulted
 
-Only as a fallback. `find_script_in_dir` first tries `<name>.yaml`/`.yml`/`.json`/`.toml` directly; only if none of those exist does it read `.shortcuts.yaml` and look up `name` as a key. This happens once for the local `.zirv/` directory and, if nothing matched there, again for the global `~/.zirv/` directory. See [[Script Resolution]] for the full order.
+Only as a fallback. `find_script_in_dir` first tries `<name>.yaml`/`.yml`/`.json`/`.toml` directly inside `.zirv/commands/`; only if none of those exist does it read `.zirv/.shortcuts.yaml` (the root, not `commands/`) and look up `name` as a key. This happens once for the local `.zirv/` directory and, if nothing matched there, again for the global `~/.zirv/` directory. See [[Script Resolution]] for the full order.
 
 ## Resilience
 
@@ -43,7 +43,7 @@ A `.shortcuts.yaml` that fails to read or fails to parse does **not** abort the 
 
 `zirv create` (`c`) can register a shortcut interactively, or non-interactively via `--shortcut <key>` alongside `--name` and `--global`; an empty shortcut string means "no shortcut". The shortcut is appended into the target directory's `.shortcuts.yaml`.
 
-## Example (this repo's `.zirv/.shortcuts.yaml`)
+## Example (this repo's `.zirv/.shortcuts.yaml`, targets in `.zirv/commands/`)
 
 ```yaml
 shortcuts:
@@ -61,4 +61,4 @@ shortcuts:
   cl: claude.yaml
 ```
 
-So `zirv t` runs `.zirv/test.yaml`, and `zirv gc "message"` runs `.zirv/commit.yaml` — which itself chains to `zirv t` as one of its own steps (see [[Script Files]] on script chaining).
+So `zirv t` runs `.zirv/commands/test.yaml`, and `zirv gc "message"` runs `.zirv/commands/commit.yaml` — which itself chains to `zirv t` as one of its own steps (see [[Script Files]] on script chaining).

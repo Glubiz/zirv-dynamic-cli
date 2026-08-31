@@ -2,15 +2,19 @@ use dialoguer::Confirm;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::utils::COMMANDS_DIR_NAME;
+
 // Default shortcuts file content.
 const DEFAULT_SHORTCUTS: &str = r#"shortcuts:
   e: "example.yaml"
 "#;
 
-/// Creates `~/.zirv` and its default `.shortcuts.yaml` if either is missing,
-/// leaving an existing one untouched. The global half of `init_zirv_with`,
-/// pulled out so the first-run setup wizard (`commands::setup::run_first_run`)
-/// can scaffold the operator's home layer without duplicating this logic.
+/// Creates `~/.zirv`, its `commands/` subdirectory (issue #212: scripts live
+/// there as of zirv 3.0), and its default `.shortcuts.yaml` (which stays at
+/// the root -- it is config, not a script) if any is missing, leaving an
+/// existing one untouched. The global half of `init_zirv_with`, pulled out
+/// so the first-run setup wizard (`commands::setup::run_first_run`) can
+/// scaffold the operator's home layer without duplicating this logic.
 pub fn scaffold_global_zirv() -> Result<(), Box<dyn std::error::Error>> {
     // Instead of using dirs::home_dir(), use the HOME or USERPROFILE env variable.
     let home = std::env::var("HOME")
@@ -23,6 +27,11 @@ pub fn scaffold_global_zirv() -> Result<(), Box<dyn std::error::Error>> {
         fs::create_dir_all(&home_zirv)?;
         println!("Created .zirv in home directory: {home_zirv:?}");
     }
+    let home_commands = home_zirv.join(COMMANDS_DIR_NAME);
+    if !home_commands.exists() {
+        fs::create_dir_all(&home_commands)?;
+        println!("Created .zirv/commands in home directory: {home_commands:?}");
+    }
     // Create default .shortcuts.yaml in home folder if not present.
     let home_shortcuts = home_zirv.join(".shortcuts.yaml");
     if !home_shortcuts.exists() {
@@ -32,16 +41,19 @@ pub fn scaffold_global_zirv() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Creates `<current_dir>/.zirv` and its default `.shortcuts.yaml`. The local
-/// half of `init_zirv_with`'s confirmed branch, pulled out for the same
-/// reason `scaffold_global_zirv` is: the first-run wizard's project-layer
-/// step reuses it rather than duplicating the creation logic. Callers are
-/// expected to have already checked `current_dir.join(".zirv")` does not
-/// exist; this always (re-)creates it.
+/// Creates `<current_dir>/.zirv`, its `commands/` subdirectory, and its
+/// default `.shortcuts.yaml`. The local half of `init_zirv_with`'s confirmed
+/// branch, pulled out for the same reason `scaffold_global_zirv` is: the
+/// first-run wizard's project-layer step reuses it rather than duplicating
+/// the creation logic. Callers are expected to have already checked
+/// `current_dir.join(".zirv")` does not exist; this always (re-)creates it.
 pub fn scaffold_local_zirv(current_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let current_zirv = current_dir.join(".zirv");
     fs::create_dir_all(&current_zirv)?;
     println!("Created .zirv in current directory: {current_zirv:?}");
+    let current_commands = current_zirv.join(COMMANDS_DIR_NAME);
+    fs::create_dir_all(&current_commands)?;
+    println!("Created .zirv/commands in current directory: {current_commands:?}");
     let current_shortcuts = current_zirv.join(".shortcuts.yaml");
     if !current_shortcuts.exists() {
         fs::write(&current_shortcuts, DEFAULT_SHORTCUTS)?;
@@ -206,6 +218,39 @@ mod tests {
 
         let current_content = read_to_string(current_shortcuts).unwrap();
         assert_eq!(current_content, DEFAULT_SHORTCUTS_CONTENT);
+
+        Ok(())
+    }
+
+    /// Issue #212: `zirv init` creates `.zirv/commands/` (where `zirv create`
+    /// and script lookup now expect scripts to live) in both the home and
+    /// current directories, alongside the existing `.shortcuts.yaml`.
+    #[test]
+    fn init_zirv_creates_the_commands_directory() -> Result<(), Box<dyn std::error::Error>> {
+        let fake_home_dir = tempdir()?;
+        let fake_home_path = fake_home_dir.path().to_path_buf();
+        let fake_current_dir = tempdir()?;
+        let fake_current_path = fake_current_dir.path().to_path_buf();
+
+        let _guard =
+            crate::commands::ctx::testenv::EnvGuard::set(&fake_home_path, Some(&fake_current_path));
+
+        init_zirv_with(|| Ok(true)).unwrap();
+
+        assert!(
+            fake_home_path
+                .join(".zirv")
+                .join(COMMANDS_DIR_NAME)
+                .is_dir(),
+            "the home .zirv/commands directory should be created"
+        );
+        assert!(
+            fake_current_path
+                .join(".zirv")
+                .join(COMMANDS_DIR_NAME)
+                .is_dir(),
+            "the local .zirv/commands directory should be created"
+        );
 
         Ok(())
     }

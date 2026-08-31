@@ -455,6 +455,18 @@ fn band_for_score(score: u16) -> RiskBand {
     }
 }
 
+/// True for a repo-relative path whose first component is `.zirv`.
+///
+/// `.zirv/work/` (workflow work products) and other `.zirv/` state are
+/// deliberately not gitignored, so they show up as untracked paths. That
+/// state is zirv's own bookkeeping, not the operator's change surface, and
+/// must never drive a workflow's classification (a stale
+/// `.zirv/work/<id>/*.html` from an earlier workflow has previously flipped
+/// unrelated workflows to the Frontend domain).
+fn is_zirv_owned_path(path: &Path) -> bool {
+    matches!(path.components().next(), Some(std::path::Component::Normal(name)) if name == ".zirv")
+}
+
 pub fn git_change_input(repo: &Path, task: String) -> CtxResult<ClassificationInput> {
     // The same base `review::package` uses (merge-base against origin/main,
     // then main, then HEAD^, then HEAD). Measuring against bare HEAD made
@@ -505,6 +517,7 @@ pub fn git_change_input(repo: &Path, task: String) -> CtxResult<ClassificationIn
         .lines()
         .filter(|line| !line.is_empty())
         .map(PathBuf::from)
+        .filter(|path| !is_zirv_owned_path(path))
     {
         let absolute = repo.join(&path);
         if let Ok(metadata) = std::fs::symlink_metadata(&absolute)
@@ -958,5 +971,75 @@ mod tests {
         .expect("classification");
 
         assert_eq!(classification.work_domain.domain, WorkDomain::General);
+    }
+
+    #[test]
+    fn is_zirv_owned_path_matches_only_a_leading_zirv_component() {
+        assert!(is_zirv_owned_path(Path::new(".zirv/work/abc/mock.html")));
+        assert!(is_zirv_owned_path(Path::new(".zirv/ctx.toml")));
+        assert!(!is_zirv_owned_path(Path::new("src/x.tsx")));
+        assert!(!is_zirv_owned_path(Path::new("docs/.zirv/notes.md")));
+    }
+
+    #[test]
+    fn git_change_input_ignores_untracked_zirv_state_but_keeps_other_untracked_paths() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let git = |args: &[&str]| {
+            let status = Command::new("git")
+                .args([
+                    "-c",
+                    "user.email=t@example.com",
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(repo.path())
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(repo.path().join("README.md"), "readme\n").expect("write");
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "base"]);
+
+        let zirv_work_dir = repo.path().join(".zirv").join("work").join("old-id");
+        std::fs::create_dir_all(&zirv_work_dir).expect("create .zirv/work dir");
+        std::fs::write(
+            zirv_work_dir.join("dash-v3-mock.html"),
+            "<html>\n".repeat(50),
+        )
+        .expect("write stale workflow artifact");
+
+        std::fs::create_dir_all(repo.path().join("src")).expect("create src dir");
+        std::fs::write(
+            repo.path().join("src").join("x.tsx"),
+            "export const X = () => null;\n",
+        )
+        .expect("write untracked tsx");
+
+        let input = git_change_input(repo.path(), "unrelated change".into()).expect("input");
+
+        assert!(
+            !input.paths.iter().any(|path| path.starts_with(".zirv")),
+            "expected no .zirv paths in {:?}",
+            input.paths
+        );
+        assert!(
+            input
+                .paths
+                .iter()
+                .any(|path| path == Path::new("src/x.tsx")),
+            "expected src/x.tsx in {:?}",
+            input.paths
+        );
+        // Only the tsx contributes lines; the stale .zirv/work html must not.
+        assert!(
+            input.changed_lines < 50,
+            "expected .zirv/work content excluded from changed_lines, got {}",
+            input.changed_lines
+        );
     }
 }

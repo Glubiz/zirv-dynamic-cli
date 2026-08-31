@@ -1215,6 +1215,12 @@ pub fn sweep_undeliverable(state: &StateDir, repo_slug: &str) -> usize {
 /// told mail is waiting) or on any read error -- moved here, byte for byte,
 /// from `wrap.rs`'s own `unread_mail_counts` (T12b/N7), which now delegates
 /// to this function instead of keeping a second copy of the same logic.
+///
+/// Issues #219/#226: `list` supplements the cwd mailbox with delivery-
+/// envelope paths addressed to `session_short`, so a worktree or subdir cwd
+/// still counts its directed mail without counting undirected mail from the
+/// registered repository's mailbox. The wrap and dash cadence gates keep
+/// that envelope scan off their per-frame hot paths.
 pub fn unread_counts(
     state: &StateDir,
     repo: &Path,
@@ -2009,8 +2015,23 @@ pub fn run_inbox_with<W: Write>(
         session_identity(env)
     };
 
+    // Issues #219/#226: a consuming read with a session identity reaches
+    // every delivery-envelope path addressed to that session through
+    // `list`, regardless of the cwd slug. `--peek` remains broad for the
+    // cwd mailbox, then unions in only this caller's cross-mailbox directed
+    // paths; undirected/claim-once/fan-out messages never cross that scope.
     let mut messages = if args.peek {
-        list(&state, &slug, for_agent.as_deref(), None)?
+        let mut found = list(&state, &slug, for_agent.as_deref(), None)?;
+        if let Some(short) = session_identity(env) {
+            found.extend(list(&state, &slug, for_agent.as_deref(), Some(&short))?);
+            found.sort_by(|(left_path, left), (right_path, right)| {
+                left.sent
+                    .cmp(&right.sent)
+                    .then_with(|| left_path.cmp(right_path))
+            });
+            found.dedup_by(|left, right| left.0 == right.0);
+        }
+        found
     } else {
         match &reader {
             Some(short) => list(&state, &slug, for_agent.as_deref(), Some(short))?,
@@ -2051,7 +2072,9 @@ pub fn run_inbox_with<W: Write>(
             // A fan-out message (see `list`'s own fan-out scan and
             // `consume_reading`'s doc comment) is marked read for this
             // reader alone rather than moved, so another live session's own
-            // `zirv ctx inbox` still finds it.
+            // `zirv ctx inbox` still finds it. `consume` derives the actual
+            // mailbox from `path`, so a directed cross-slug message moves
+            // into the `read/` trail beside the file it came from.
             consume_reading(&state, &slug, path, reader.as_deref())?;
         }
     }
@@ -2514,6 +2537,59 @@ mod tests {
         assert_eq!(
             result, None,
             "a genuine read error must never masquerade as an empty mailbox"
+        );
+    }
+
+    /// Issue #219 follow-up: `unread_counts` backs both the wrap status bar
+    /// and the dash header. A worktree cwd must still count the directed mail
+    /// its delivery envelope files under the session's registered repo slug.
+    #[test]
+    fn unread_counts_sees_addressed_mail_from_a_worktree_cwd() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let state_dir = tmp.path().join("state");
+        let state = StateDir::from_root(state_dir.clone());
+
+        let main_repo = tmp.path().join("main-repo");
+        let worktree_repo = main_repo.join(".claude").join("worktrees").join("agent-x");
+        assert_ne!(
+            repo_slug(&main_repo),
+            repo_slug(&worktree_repo),
+            "sanity: a worktree checkout must mint a distinct slug from its main checkout"
+        );
+
+        let session = "abcdef12-3456-4789-8abc-def012345678";
+        let record = sessions::Record::new(session, "claude", &main_repo, sessions::Verb::Wrap);
+        let short = record.short.clone();
+        let _guard = sessions::SessionGuard::register(&state, record);
+
+        let sender_env = env_map(&[
+            (
+                super::super::state::STATE_ENV,
+                state_dir.to_str().expect("utf8"),
+            ),
+            (SESSION_ENV, "sender-99999999"),
+            (AGENT_ENV, "codex"),
+        ]);
+        run_send_with(
+            &SendArgs {
+                to_session: Some(short.clone()),
+                message: Some("count this report".to_string()),
+                ..SendArgs::default()
+            },
+            &mut Vec::new(),
+            &main_repo,
+            &|key| sender_env.get(key).cloned(),
+            &mut std::io::Cursor::new(Vec::<u8>::new()),
+        )
+        .expect("send");
+
+        assert_eq!(
+            unread_counts(&state, &worktree_repo, "claude", &short, true),
+            Some((0, 1)),
+            "addressed mail must be counted even though `repo` resolves to a different, \
+             worktree-derived slug"
         );
     }
 
@@ -3530,6 +3606,28 @@ This should not appear in the body.\n";
         // filed under nor the sender's own slug -- exactly the production
         // shape, and the one a same-slug send never exercises.
         let reader_cwd = repo.join("docs");
+
+        let mut peek = Vec::new();
+        run_inbox_with(
+            &InboxArgs {
+                peek: true,
+                ..InboxArgs::default()
+            },
+            &mut peek,
+            &reader_cwd,
+            &|key| recipient_env.get(key).cloned(),
+        )
+        .expect("recipient peek");
+        let peeked = String::from_utf8(peek).expect("utf8");
+        assert!(
+            peeked.contains("report back from the docs worker"),
+            "peek follows the caller's directed envelope too: {peeked}"
+        );
+        assert!(
+            !peeked.contains("the webhook route moved"),
+            "peek does not widen undirected mail across mailbox slugs: {peeked}"
+        );
+
         let mut inbox = Vec::new();
         run_inbox_with(&InboxArgs::default(), &mut inbox, &reader_cwd, &|key| {
             recipient_env.get(key).cloned()
@@ -3604,6 +3702,179 @@ This should not appear in the body.\n";
                 .len(),
             1,
             "the undirected message is untouched in its own mailbox"
+        );
+    }
+
+    /// Issue #219: a session registered from `main_repo` later reads its
+    /// inbox with a worktree cwd whose slug differs. Session-addressed mail
+    /// follows the delivery envelope to the file stored under the registered
+    /// repository, without widening the worktree's undirected mailbox view.
+    #[test]
+    fn inbox_reads_addressed_mail_from_a_worktree_cwd() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let state_dir = tmp.path().join("state");
+        let state = StateDir::from_root(state_dir.clone());
+
+        let main_repo = tmp.path().join("main-repo");
+        let worktree_repo = main_repo.join(".claude").join("worktrees").join("agent-x");
+        assert_ne!(
+            repo_slug(&main_repo),
+            repo_slug(&worktree_repo),
+            "sanity: a worktree checkout must mint a distinct slug from its main checkout"
+        );
+
+        let session = "abcdef12-3456-4789-8abc-def012345678";
+        let record = sessions::Record::new(session, "claude", &main_repo, sessions::Verb::Wrap);
+        let short = record.short.clone();
+        let _guard = sessions::SessionGuard::register(&state, record);
+
+        let sender_env = env_map(&[
+            (
+                super::super::state::STATE_ENV,
+                state_dir.to_str().expect("utf8"),
+            ),
+            (SESSION_ENV, "sender-99999999"),
+            (AGENT_ENV, "codex"),
+        ]);
+        run_send_with(
+            &SendArgs {
+                to_session: Some(short.clone()),
+                message: Some("worktree report".to_string()),
+                ..SendArgs::default()
+            },
+            &mut Vec::new(),
+            &main_repo,
+            &|key| sender_env.get(key).cloned(),
+            &mut std::io::Cursor::new(Vec::<u8>::new()),
+        )
+        .expect("send");
+
+        let mut env = env_map(&[(
+            super::super::state::STATE_ENV,
+            state_dir.to_str().expect("utf8"),
+        )]);
+        env.insert(SESSION_ENV.to_string(), session.to_string());
+
+        let mut out = Vec::new();
+        run_inbox_with(&inbox_args(false), &mut out, &worktree_repo, &|k| {
+            env.get(k).cloned()
+        })
+        .expect("inbox");
+
+        let printed = String::from_utf8(out).expect("utf8");
+        assert!(
+            printed.contains("worktree report"),
+            "a session must read mail addressed to it regardless of which slug \
+             directory the copy landed in: {printed}"
+        );
+        assert!(
+            list(&state, &repo_slug(&main_repo), None, None)
+                .expect("list")
+                .is_empty(),
+            "consumed out of the registered mailbox it was actually found in"
+        );
+        assert!(
+            list(&state, &repo_slug(&worktree_repo), None, None)
+                .expect("list")
+                .is_empty(),
+            "and nothing is created in the worktree's own (never-addressed) mailbox"
+        );
+    }
+
+    /// Issue #219, `send --status` side: once a worktree recipient follows
+    /// its address through the envelope registry, the receipt it writes must
+    /// be the SAME envelope the sender polls. `mark_delivery` and
+    /// `update_receipt` key off the mail path, not the cwd slug.
+    #[test]
+    fn send_status_reflects_a_worktree_recipient_reading_addressed_mail() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let state_dir = tmp.path().join("state");
+        let state = StateDir::from_root(state_dir.clone());
+
+        let main_repo = tmp.path().join("main-repo");
+        let worktree_repo = main_repo.join(".claude").join("worktrees").join("agent-x");
+
+        let session = "abcdef12-3456-4789-8abc-def012345678";
+        let record = sessions::Record::new(session, "claude", &main_repo, sessions::Verb::Wrap);
+        let short = record.short.clone();
+        let _guard = sessions::SessionGuard::register(&state, record);
+
+        let mut sender_env = env_map(&[(
+            super::super::state::STATE_ENV,
+            state_dir.to_str().expect("utf8"),
+        )]);
+        sender_env.insert(SESSION_ENV.to_string(), "sender-99999999".to_string());
+
+        let send_args = SendArgs {
+            to_session: Some(short.clone()),
+            message: Some("please pick up the report".to_string()),
+            json: true,
+            ..SendArgs::default()
+        };
+        let mut send_out = Vec::new();
+        let mut stdin = std::io::Cursor::new(Vec::<u8>::new());
+        run_send_with(
+            &send_args,
+            &mut send_out,
+            // The sender's own cwd is irrelevant: delivery already follows
+            // the target's registered slug regardless of it.
+            tmp.path(),
+            &|k| sender_env.get(k).cloned(),
+            &mut stdin,
+        )
+        .expect("send");
+        let sent_view: serde_json::Value =
+            serde_json::from_slice(&send_out).expect("send emits one JSON view");
+        assert_eq!(
+            sent_view["state"].as_str(),
+            Some("queued"),
+            "sanity: freshly sent and not yet read"
+        );
+        let message_id = sent_view["id"].as_str().expect("id").to_string();
+
+        // The recipient reads its mail from a worktree checkout of the repo
+        // it registered under -- a different slug than the one delivery
+        // filed under.
+        let mut reader_env = env_map(&[(
+            super::super::state::STATE_ENV,
+            state_dir.to_str().expect("utf8"),
+        )]);
+        reader_env.insert(SESSION_ENV.to_string(), session.to_string());
+        let mut inbox_out = Vec::new();
+        run_inbox_with(&inbox_args(false), &mut inbox_out, &worktree_repo, &|k| {
+            reader_env.get(k).cloned()
+        })
+        .expect("inbox");
+        assert!(
+            !inbox_out.is_empty(),
+            "the recipient must see the message from its worktree cwd"
+        );
+
+        let status_args = SendArgs {
+            status: Some(message_id),
+            json: true,
+            ..SendArgs::default()
+        };
+        let mut status_out = Vec::new();
+        let mut stdin2 = std::io::Cursor::new(Vec::<u8>::new());
+        run_send_with(
+            &status_args,
+            &mut status_out,
+            tmp.path(),
+            &|k| sender_env.get(k).cloned(),
+            &mut stdin2,
+        )
+        .expect("status");
+        let status_view: serde_json::Value =
+            serde_json::from_slice(&status_out).expect("status emits one JSON view");
+        assert_eq!(
+            status_view["state"].as_str(),
+            Some("read"),
+            "status must reflect that the worktree recipient actually read it: {status_view}"
         );
     }
 

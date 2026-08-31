@@ -20,7 +20,7 @@ Nextest's process-per-test isolation prevents `env::set_var` races. `--no-fail-f
 
 ## Conventions
 
-- Rust edition 2024. Options: `#[serde(default)]` or `Option<T>`; optional params: `?` (`"branch?"`). Scripts live in `.zirv/` or `~/.zirv/`.
+- Rust edition 2024. Options: `#[serde(default)]` or `Option<T>`; optional params: `?` (`"branch?"`). Scripts live in `.zirv/commands/` or `~/.zirv/commands/`; the `.zirv/` root holds only config and state.
 - Case-insensitive reserved built-ins (cannot be shadowed): ctx, chat, agent, skill, workflow, test, verify, artifact, memory, context, setup, report, help, version, init, create, frontend. `<repo>/.zirv/{ctx.toml,.settings.toml,verify.toml,.shortcuts.yaml}` are config, not scripts.
 - Report zirv bugs/feature gaps: `zirv report bug|feature <title> [--body <text>|--body-file <path>]`; never include secrets.
 - `rot.rs` is pure (no fs/clock/env/net): identical events give identical verdicts; I/O belongs in `score.rs`.

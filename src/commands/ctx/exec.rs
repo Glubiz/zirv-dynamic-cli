@@ -328,6 +328,72 @@ fn prompt_delivery_via_stdin(adapter: &dyn adapters::AgentAdapter, session: &Ses
     adapters::launch_reparses_through_shim(&probe)
 }
 
+/// Issue #220: whether `build_headless` should route THIS launch's prompt to
+/// stdin rather than argv. `shim` is [`prompt_delivery_via_stdin`]'s own
+/// answer -- a Windows `cmd.exe`/`powershell -File` reparse, which forces
+/// stdin regardless of size, exactly as before this issue. `argv_total_len`
+/// is the second, independent reason: `adapter.headless_cmd` puts the
+/// prompt on argv verbatim on every platform, and the WHOLE resulting
+/// command line -- program, prompt, and every other argument riding beside
+/// it, not the prompt token in isolation -- overflows `CreateProcessW`'s
+/// ~32KB command-line limit outright (`os error 206`) on a perfectly
+/// ordinary, non-shim launch once it exceeds
+/// [`super::prompt::INLINE_ARGV_PROMPT_BUDGET_BYTES`] (issue #213's own
+/// Windows-safe figure, reused rather than duplicated). Checked on every
+/// platform, not only Windows, so the same launch always takes the same
+/// delivery path regardless of where zirv runs.
+///
+/// Correctness follow-up (post-merge review): measuring the prompt alone
+/// missed a real overflow -- the #213 system-prompt layer (folded into
+/// `extra` as `--append-system-prompt <text>`/`-c developer_instructions=
+/// <json>`) rides on this SAME command line and can itself occupy close to
+/// the whole budget, so a prompt safely under budget by itself could still
+/// leave the total argv over it. The caller ([`headless_argv_len`]) now
+/// measures the fully assembled command `adapter.headless_cmd` would
+/// actually emit, so this function's own logic did not need to change --
+/// only what its second argument measures.
+fn headless_prompt_via_stdin(shim: bool, argv_total_len: usize) -> bool {
+    shim || argv_total_len > super::prompt::INLINE_ARGV_PROMPT_BUDGET_BYTES
+}
+
+/// The total bytes `command`'s argv would actually put on the OS command
+/// line: the program plus every argument, with one separator byte counted
+/// between each token, and each argument's own length inflated for the
+/// worst case of Windows' `CreateProcessW` quoting -- an under-count here
+/// would let a launch through that still overflows.
+/// [`headless_prompt_via_stdin`]'s own doc comment explains why this has to
+/// be the WHOLE command, not just the prompt argument.
+///
+/// Review follow-up (post-merge): the raw byte length alone is not a safe
+/// proxy for what actually lands on the command line. `std::process::
+/// Command` on Windows builds a UTF-16 command line using the same quoting
+/// `CommandLineToArgvW` expects: every `"` is escaped to `\"`, a run of
+/// backslashes immediately before a quote doubles, and any argument
+/// containing whitespace (a composed prompt almost always does) is wrapped
+/// in a surrounding pair of quotes. A quote-and-backslash-heavy prompt can
+/// therefore measure safely under `INLINE_ARGV_PROMPT_BUDGET_BYTES` in raw
+/// bytes and still expand past `CreateProcessW`'s 32,767-char limit,
+/// reproducing os error 206 despite this function's own budget check.
+/// Per argument this counts `len + count('"') + count('\\') + 2` --
+/// `len` for the literal bytes, one extra byte per `"`/`\\` for the
+/// worst case where every one of them needs escaping, and `+ 2` for a
+/// surrounding pair of quotes -- which over-counts an argument with no
+/// quotes/backslashes/whitespace at all (no quoting needed) but never
+/// under-counts one that does, which is the direction that matters: this
+/// is deliberately a conservative, platform-independent estimate rather
+/// than a byte-exact reproduction of `CreateProcessW`'s own algorithm.
+fn headless_argv_len(command: &Command) -> usize {
+    let mut total = command.get_program().to_string_lossy().len();
+    for arg in command.get_args() {
+        let arg = arg.to_string_lossy();
+        let quotes = arg.matches('"').count();
+        let backslashes = arg.matches('\\').count();
+        total += 1;
+        total += arg.len() + quotes + backslashes + 2;
+    }
+    total
+}
+
 /// T11: real-clock wrapper. `run_with_clock` (below) does the actual work;
 /// this hands it the two real-world functions -- `state::now_secs` and a
 /// genuine `std::thread::sleep` -- so every caller outside this module
@@ -899,12 +965,29 @@ fn run_with_clock_inner<W: Write>(
     // making relaunches reachable in more shapes than before.
     let prompt_via_stdin = prompt_delivery_via_stdin(adapter.as_ref(), &session);
     let relaunch_system_prompt_supported = adapter.system_prompt_supported(&[]);
+    // Issue #220: `headless_prompt_via_stdin` also routes an oversized
+    // launch to stdin regardless of `prompt_via_stdin` -- see its own doc
+    // comment. Measured per call, not hoisted out here as a single flag,
+    // because `build_headless` is the one chokepoint every relaunch --
+    // nudge, park, rot restart -- reuses with its own, possibly
+    // differently-sized, `prompt_text`/`extra` (see the call sites' own
+    // comments). Correctness follow-up (post-merge review): the probe
+    // measures the FULL `adapter.headless_cmd(prompt_text, session, extra)`
+    // argv -- not just `prompt_text.len()` -- because the #213 system-prompt
+    // layer folded into `extra` rides the same command line and can itself
+    // occupy close to the whole budget, so a prompt safely under budget on
+    // its own could still leave the total argv over it. Built once and
+    // reused as the argv-delivery fallback below, rather than built twice.
     let build_headless =
         |prompt_text: &str, session: &SessionId, extra: &[String]| -> (Command, Option<String>) {
-            if prompt_via_stdin && let Some(command) = adapter.headless_cmd_stdin(session, extra) {
+            let probe = adapter.headless_cmd(prompt_text, session, extra);
+            let argv_total_len = headless_argv_len(&probe);
+            if headless_prompt_via_stdin(prompt_via_stdin, argv_total_len)
+                && let Some(command) = adapter.headless_cmd_stdin(session, extra)
+            {
                 return (command, Some(prompt_text.to_string()));
             }
-            (adapter.headless_cmd(prompt_text, session, extra), None)
+            (probe, None)
         };
 
     // With no argv to pass through, the first launch is built exactly the way
@@ -2307,6 +2390,125 @@ mod tests {
         home.join(".claude/projects")
             .join(crate::commands::ctx::adapters::claude::project_slug(repo))
             .join(format!("{session}.jsonl"))
+    }
+
+    /// Issue #220: a non-shim launch (`shim == false`) whose total argv is
+    /// safely under the budget keeps the prompt on argv -- byte-for-byte the
+    /// pre-#220 behavior, so an ordinary short task prompt never starts
+    /// taking the stdin path it never needed.
+    #[test]
+    fn headless_prompt_via_stdin_stays_on_argv_when_short_and_no_shim() {
+        assert!(!headless_prompt_via_stdin(false, 100));
+        assert!(!headless_prompt_via_stdin(
+            false,
+            super::super::prompt::INLINE_ARGV_PROMPT_BUDGET_BYTES
+        ));
+    }
+
+    /// Issue #220's actual fix: a total argv over the budget routes to
+    /// stdin even with no shim in play at all -- the class of overflow a
+    /// `zirv workflow review run` package (full diff embedded) or a long
+    /// `zirv agent codex "<...>"` prompt hits on a perfectly ordinary,
+    /// direct `.exe` launch.
+    #[test]
+    fn headless_prompt_via_stdin_switches_to_stdin_once_the_total_argv_exceeds_the_budget() {
+        assert!(headless_prompt_via_stdin(
+            false,
+            super::super::prompt::INLINE_ARGV_PROMPT_BUDGET_BYTES + 1
+        ));
+    }
+
+    /// The shim reason (issue #213/FIX B) must keep forcing stdin regardless
+    /// of size, including for a total argv far under the budget -- this
+    /// function must never regress that existing guarantee while adding the
+    /// new one.
+    #[test]
+    fn headless_prompt_via_stdin_still_forces_stdin_for_a_shim_launch_regardless_of_size() {
+        assert!(headless_prompt_via_stdin(true, 1));
+    }
+
+    /// Post-merge correctness follow-up: the #213 system-prompt layer
+    /// (`--append-system-prompt <text>`/`-c developer_instructions=<json>`,
+    /// folded into `extra`) rides the SAME command line as the task prompt.
+    /// A prompt safely under the budget by itself must still route to
+    /// stdin once that other argument pushes the WHOLE argv over budget --
+    /// `headless_argv_len` is what has to catch this, not `prompt_text.
+    /// len()` alone (the bug this follow-up fixes).
+    #[test]
+    fn headless_argv_len_counts_every_argument_not_just_the_prompt() {
+        let prompt = "short task prompt";
+        assert!(prompt.len() < super::super::prompt::INLINE_ARGV_PROMPT_BUDGET_BYTES);
+
+        let mut under_budget = Command::new("claude");
+        under_budget
+            .arg("-p")
+            .arg(prompt)
+            .arg("--session-id")
+            .arg("abc");
+        assert!(!headless_prompt_via_stdin(
+            false,
+            headless_argv_len(&under_budget)
+        ));
+
+        // The system-prompt layer alone is large enough to push the total
+        // over budget, even though the prompt itself stayed small.
+        let large_system_prompt = "y".repeat(super::super::prompt::INLINE_ARGV_PROMPT_BUDGET_BYTES);
+        let mut over_budget = Command::new("claude");
+        over_budget
+            .arg("-p")
+            .arg(prompt)
+            .arg("--session-id")
+            .arg("abc")
+            .arg("--append-system-prompt")
+            .arg(&large_system_prompt);
+        let total = headless_argv_len(&over_budget);
+        assert!(
+            total > super::super::prompt::INLINE_ARGV_PROMPT_BUDGET_BYTES,
+            "the extra system-prompt argument must be counted toward the total: {total}"
+        );
+        assert!(
+            headless_prompt_via_stdin(false, total),
+            "a prompt safely under budget on its own must still route to stdin once the other \
+             arguments on the same command line push the WHOLE argv over budget"
+        );
+    }
+
+    /// Review follow-up regression: raw byte length alone under-counts a
+    /// quote-and-backslash-heavy prompt. Windows' `CreateProcessW`/
+    /// `CommandLineToArgvW` quoting escapes every `"` and doubles a run of
+    /// backslashes ahead of one, and wraps a whitespace-bearing argument in
+    /// its own surrounding quotes, so a prompt built almost entirely of `"`
+    /// and `\` characters can measure comfortably UNDER the raw-byte budget
+    /// and still expand past the real 32,767-char Windows command-line
+    /// limit -- reproducing os error 206 despite `headless_argv_len`'s own
+    /// budget check. This prompt is constructed to sit just under the
+    /// raw-byte budget by itself; the escaping-aware estimate must still
+    /// route it to stdin.
+    #[test]
+    fn a_quote_and_backslash_heavy_prompt_under_the_raw_budget_still_routes_to_stdin() {
+        let budget = super::super::prompt::INLINE_ARGV_PROMPT_BUDGET_BYTES;
+        let half = (budget - 200) / 2;
+        let prompt = format!("{}{}", "\"".repeat(half), "\\".repeat(half));
+        assert!(
+            prompt.len() < budget,
+            "the raw prompt must sit under the raw-byte budget by construction: {} vs {budget}",
+            prompt.len()
+        );
+
+        let mut command = Command::new("claude");
+        command
+            .arg("-p")
+            .arg(&prompt)
+            .arg("--session-id")
+            .arg("abc");
+        let total = headless_argv_len(&command);
+        assert!(
+            headless_prompt_via_stdin(false, total),
+            "a prompt under the raw-byte budget but heavy on quote/backslash characters must \
+             still route to stdin once Windows' own command-line quoting is estimated: raw {} \
+             vs budget {budget}, escaping-aware total {total}",
+            prompt.len()
+        );
     }
 
     /// Final wave item 1: `adapter.launches_through_cmd_shim()` only
@@ -4893,6 +5095,75 @@ mod tests {
             argv.contains("heads up: switch focus"),
             "--simple must not drop the nudge's own guidance for an adapter whose channel does \
              not need composed: {argv}"
+        );
+    }
+
+    /// Issue #220, end to end: `zirv workflow review run`'s compact review
+    /// package embeds the FULL diff as the task prompt, and a plain `zirv
+    /// agent codex "<...>"` can just be handed a long string -- either way,
+    /// the old code always put that text on argv (`adapter.headless_cmd`),
+    /// which overflows `CreateProcessW`'s ~32KB command-line limit on
+    /// Windows (`os error 206`) even on a perfectly ordinary, non-shim
+    /// launch (`sh <fixture>`, never `cmd.exe /c <shim>` -- so the ONLY
+    /// reason this prompt can land on stdin here is the new size-based
+    /// routing, not `prompt_delivery_via_stdin`'s pre-existing shim check).
+    /// `fake-codex-agent.sh` drains and logs stdin exactly so a test like
+    /// this one can tell the two delivery paths apart.
+    #[test]
+    fn an_oversized_prompt_is_delivered_on_stdin_instead_of_argv() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let state_dir = tmp.path().join("state");
+        let argv_log = tmp.path().join("argv.log");
+        let mut env = base_env(&state_dir);
+        env.insert("ZIRV_CTX_PACE".to_string(), "false".to_string());
+        env.insert("ZIRV_CTX_POLL_MS".to_string(), "50".to_string());
+        env.insert(
+            "ZIRV_CTX_AGENT_BIN".to_string(),
+            format!("sh {}", fixture("fake-codex-agent.sh").display()),
+        );
+
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let _fake_agent = crate::commands::ctx::testenv::VarGuard::set(&[(
+            "FAKE_AGENT_ARGV_LOG",
+            argv_log.to_str(),
+        )]);
+
+        let marker = "OVERSIZED_PROMPT_MARKER_9f3c1a";
+        let oversized_prompt = format!(
+            "{marker}{}",
+            "x".repeat(super::super::prompt::INLINE_ARGV_PROMPT_BUDGET_BYTES + 500)
+        );
+
+        let args = ExecArgs {
+            agent: Some("codex".to_string()),
+            session_id: None,
+            transcript: None,
+            prompt: Some(oversized_prompt.clone()),
+            max_restarts: Some(0),
+            budget_tokens: None,
+            max_tool_calls: None,
+            timeout_secs: Some(30),
+            simple: true,
+            command: Vec::new(),
+        };
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        assert_eq!(
+            code.expect("an oversized prompt must not fail the launch"),
+            0
+        );
+
+        let argv = std::fs::read_to_string(&argv_log).unwrap_or_default();
+        for line in argv.lines().filter(|line| !line.starts_with("stdin: ")) {
+            assert!(
+                !line.contains(marker),
+                "an oversized prompt must never be encoded onto argv: {line}"
+            );
+        }
+        assert!(
+            argv.contains(&format!("stdin: {oversized_prompt}")),
+            "an oversized prompt must instead reach the child on stdin: {argv}"
         );
     }
 

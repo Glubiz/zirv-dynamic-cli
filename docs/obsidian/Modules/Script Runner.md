@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-15
+last-verified: 2026-08-31
 ---
 
 # Script Runner
@@ -15,7 +15,7 @@ last-verified: 2026-08-15
 
 ## Purpose
 
-Executes a parsed `Script` — the runtime for everything under `.zirv/`. Builds a substitution context from CLI parameters and secrets, then runs each step in order: a shell command, a supervised AI-agent task, or a batch of commands opened in separate terminal windows.
+Executes a parsed `Script` — the runtime for everything under `.zirv/commands/` (and `~/.zirv/commands/`; see [[Script Resolution]] for where a script file is found). Builds a substitution context from CLI parameters and secrets, then runs each step in order: a shell command, a supervised AI-agent task, or a batch of commands opened in separate terminal windows.
 
 ## How It Works
 
