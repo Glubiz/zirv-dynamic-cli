@@ -1034,6 +1034,36 @@ fn scan_md_files(dir: &Path) -> CtxResult<Vec<PathBuf>> {
     Ok(paths)
 }
 
+/// Issue #226: the mailbox files an already-recorded delivery names for
+/// `short`, wherever they physically live.
+///
+/// A directed (`--to-session`) or role (`--to-role`) send is filed under its
+/// *recipient's registered* repo slug (`run_send_with` -> `store_to`), while
+/// every read resolves a mailbox from the reading process's own cwd
+/// (`repo_slug`). The two are the same slug only while a session reads from
+/// the exact directory it registered in: a session whose cwd is a
+/// subdirectory of its repo (or any other spelling that slugs differently)
+/// read an empty mailbox, and the message stayed `queued` forever with the
+/// unread counter wedged.
+///
+/// The recipient address is machine-wide, so a message addressed to *this*
+/// session is delivered to it whichever mailbox it landed in. This widens
+/// nothing else: undirected mail is addressed to a mailbox rather than to a
+/// session and is never named here, a claim-once target carries no session
+/// at all, and a fan-out target is excluded because its per-reader `.read`
+/// marker (and so its whole read-tracking contract) belongs to `list`'s own
+/// `fanout/` scan below, which stays repo-scoped exactly as `--all` fans out.
+fn directed_paths_for(state: &StateDir, short: &str) -> Vec<PathBuf> {
+    read_envelopes(state)
+        .into_iter()
+        .filter(|envelope| matches!(envelope.to.kind.as_str(), "session" | "role"))
+        .flat_map(|envelope| envelope.targets)
+        .filter(|target| target.session.as_deref() == Some(short))
+        .map(|target| state.mail().join(&target.mail_path))
+        .filter(|path| path.is_file())
+        .collect()
+}
+
 pub fn list(
     state: &StateDir,
     repo_slug: &str,
@@ -1044,20 +1074,33 @@ pub fn list(
     let dir = state.mail().join(repo_slug);
     let mut out = Vec::new();
 
-    if dir.is_dir() {
-        for path in scan_md_files(&dir)? {
-            let Ok(text) = std::fs::read_to_string(&path) else {
-                continue;
-            };
-            let msg = parse_markdown(&text);
-            let session_visible = match (for_session, &msg.to_session) {
-                (None, _) => true,
-                (Some(_), None) => true,
-                (Some(want), Some(addressed)) => addressed == want,
-            };
-            if agent_matches(&msg, for_agent) && session_visible {
-                out.push((path, msg));
-            }
+    let mut paths = if dir.is_dir() {
+        scan_md_files(&dir)?
+    } else {
+        Vec::new()
+    };
+    if let Some(short) = for_session {
+        paths.extend(directed_paths_for(state, short));
+        // Still oldest first across mailboxes: what sorts chronologically is
+        // the zero-padded seconds prefix `store_into` names a file with, not
+        // the slug directory above it. The full path breaks a tie so the
+        // `dedup` below (a message already scanned out of `dir`) still sees
+        // its identical paths side by side.
+        paths.sort_by(|a, b| a.file_name().cmp(&b.file_name()).then_with(|| a.cmp(b)));
+        paths.dedup();
+    }
+    for path in paths {
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let msg = parse_markdown(&text);
+        let session_visible = match (for_session, &msg.to_session) {
+            (None, _) => true,
+            (Some(_), None) => true,
+            (Some(want), Some(addressed)) => addressed == want,
+        };
+        if agent_matches(&msg, for_agent) && session_visible {
+            out.push((path, msg));
         }
     }
 
@@ -1193,8 +1236,19 @@ pub fn unread_counts(
 
 /// Moves a message into `read/`, creating the subdirectory as needed.
 /// Consumed messages are never deleted.
+///
+/// Issue #226: into the `read/` of the mailbox the message actually lives
+/// in, which is its recipient's (`store_to`), not the caller's own
+/// `repo_slug` -- those differ for every delivery `directed_paths_for` now
+/// hands a reader out of another slug's mailbox, and consuming into the
+/// reader's slug would file somebody else's read trail under this repo.
+/// `repo_slug` stays the fallback for a path that is not inside the mail
+/// directory at all.
 pub fn consume(state: &StateDir, repo_slug: &str, path: &Path) -> CtxResult<()> {
-    let read_dir = state.mail().join(repo_slug).join("read");
+    let read_dir = match path.parent() {
+        Some(mailbox) if mailbox.starts_with(state.mail()) => mailbox.join("read"),
+        _ => state.mail().join(repo_slug).join("read"),
+    };
     super::state::create_private_dir_all(&read_dir)?;
     let file_name = path
         .file_name()
@@ -3396,6 +3450,160 @@ This should not appear in the body.\n";
         assert!(
             printed.contains(&repo_slug(&target_repo)),
             "names the repo it was delivered into: {printed}"
+        );
+    }
+
+    /// Issue #226: a report-back between two sessions of one repository whose
+    /// cwds slug differently (a worker launched in `<repo>/docs/...`) went
+    /// undeliverable. The message is filed under the *recipient's registered*
+    /// slug, while the reader resolves its mailbox from its own cwd, so
+    /// `zirv ctx inbox` printed nothing, consumed nothing, and left the
+    /// receipt `queued` forever. Delivery of a directed message follows the
+    /// address, not either side's cwd.
+    #[test]
+    fn directed_mail_reaches_its_addressed_session_from_a_mismatched_cwd_slug() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let state_dir = tmp.path().join("state");
+        let state = StateDir::from_root(state_dir.clone());
+        let repo = tmp.path().join("repo");
+        let subdir = repo.join("docs/customer-relationship-management");
+        std::fs::create_dir_all(&subdir).expect("mkdir");
+
+        let recipient_id = "732fb38c-1111-4111-8111-111111111111";
+        let recipient = sessions::Record::new(recipient_id, "claude", &repo, sessions::Verb::Chat);
+        let recipient_short = recipient.short.clone();
+        let recipient_slug = recipient.repo_slug.clone();
+        let sender_id = "40049061-2222-4222-8222-222222222222";
+        let sender = sessions::Record::new(sender_id, "codex", &subdir, sessions::Verb::Exec);
+        assert_ne!(
+            sender.repo_slug, recipient_slug,
+            "sanity: a subdirectory cwd slugs differently from the repo root"
+        );
+        let _recipient = sessions::SessionGuard::register(&state, recipient);
+        let _sender = sessions::SessionGuard::register(&state, sender);
+
+        let sender_env = env_map(&[
+            (
+                super::super::state::STATE_ENV,
+                state_dir.to_str().expect("utf8"),
+            ),
+            (SESSION_ENV, sender_id),
+            (AGENT_ENV, "codex"),
+        ]);
+        let recipient_env = env_map(&[
+            (
+                super::super::state::STATE_ENV,
+                state_dir.to_str().expect("utf8"),
+            ),
+            (SESSION_ENV, recipient_id),
+            (AGENT_ENV, "claude"),
+        ]);
+        let args = SendArgs {
+            to_session: Some(recipient_short.clone()),
+            message: Some("report back from the docs worker".to_string()),
+            ..SendArgs::default()
+        };
+        let mut sent = Vec::new();
+        run_send_with(
+            &args,
+            &mut sent,
+            &subdir,
+            &|key| sender_env.get(key).cloned(),
+            &mut std::io::Cursor::new(Vec::<u8>::new()),
+        )
+        .expect("directed send");
+        let id = created_id(&sent);
+
+        // An undirected message in the recipient's own mailbox: nothing here
+        // may make one of those visible from another repo's cwd.
+        store(
+            &state,
+            &recipient_slug,
+            &sample("someone-else", 1_700_000_000),
+            &CtxConfig::default(),
+        )
+        .expect("store undirected mail");
+
+        // The reader's cwd slugs to neither the mailbox the message was
+        // filed under nor the sender's own slug -- exactly the production
+        // shape, and the one a same-slug send never exercises.
+        let reader_cwd = repo.join("docs");
+        let mut inbox = Vec::new();
+        run_inbox_with(&InboxArgs::default(), &mut inbox, &reader_cwd, &|key| {
+            recipient_env.get(key).cloned()
+        })
+        .expect("recipient inbox");
+        let printed = String::from_utf8(inbox).expect("utf8");
+        assert!(
+            printed.contains("report back from the docs worker"),
+            "the addressed session receives its directed mail: {printed}"
+        );
+        assert!(
+            !printed.contains("the webhook route moved"),
+            "and undirected mail stays scoped to its own mailbox: {printed}"
+        );
+
+        let view = delivery_view(
+            &state,
+            resolve_envelope(&state, &id).expect("envelope"),
+            now_secs(),
+        );
+        assert_eq!(view.state, ReceiptState::Read, "the receipt advances");
+        assert_eq!(view.receipts.len(), 1);
+        assert_eq!(view.receipts[0].session, recipient_short);
+        assert_eq!(view.receipts[0].state, ReceiptState::Read);
+
+        // The acceptance criterion the operator reads: `send --status`.
+        let mut status = Vec::new();
+        run_send_with(
+            &SendArgs {
+                status: Some(id.clone()),
+                ..SendArgs::default()
+            },
+            &mut status,
+            &subdir,
+            &|key| sender_env.get(key).cloned(),
+            &mut std::io::Cursor::new(Vec::<u8>::new()),
+        )
+        .expect("delivery status");
+        let status = String::from_utf8(status).expect("utf8");
+        assert!(
+            status.contains(&format!("message {id}: read"))
+                && status.contains(&format!("{recipient_short}: read")),
+            "send --status reports the consumed receipt as read: {status}"
+        );
+
+        // Consumed into the mailbox it actually lived in, not into a `read/`
+        // under whichever slug the reader happened to be standing in.
+        let read_dir = state.mail().join(&recipient_slug).join("read");
+        assert_eq!(
+            std::fs::read_dir(&read_dir)
+                .expect("recipient read dir")
+                .count(),
+            1,
+            "the message is filed in its own mailbox's read trail"
+        );
+        assert!(
+            !state.mail().join(repo_slug(&reader_cwd)).exists(),
+            "and no mailbox is invented for the reader's cwd"
+        );
+
+        // Second read: the directed message is gone (read once), and the
+        // undirected one is still nobody else's business.
+        let mut again = Vec::new();
+        run_inbox_with(&InboxArgs::default(), &mut again, &reader_cwd, &|key| {
+            recipient_env.get(key).cloned()
+        })
+        .expect("recipient inbox again");
+        assert!(again.is_empty(), "a consumed message is not re-delivered");
+        assert_eq!(
+            list(&state, &recipient_slug, None, None)
+                .expect("recipient mailbox")
+                .len(),
+            1,
+            "the undirected message is untouched in its own mailbox"
         );
     }
 
