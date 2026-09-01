@@ -495,6 +495,27 @@ fn apply_profile(profile: WorkflowProfile, steps: &mut [WorkflowStep]) {
     }
 }
 
+/// Default intent-step skill per kind, absent a `--brainstorm`/
+/// `--no-brainstorm` override: on for exploratory Feature/Spike, off for
+/// Bugfix/Refactor's autonomous default. `Review` has no intent step.
+fn default_brainstorm_for_kind(kind: WorkflowKind) -> bool {
+    matches!(kind, WorkflowKind::Feature | WorkflowKind::Spike)
+}
+
+/// Selects the intent step's skill, same shape as `apply_profile`.
+fn apply_brainstorm_selection(brainstorm: bool, steps: &mut [WorkflowStep]) {
+    for step in steps {
+        if step.phase == WorkflowPhase::Intent {
+            step.skill = if brainstorm {
+                "brainstorm"
+            } else {
+                "write-intent"
+            }
+            .into();
+        }
+    }
+}
+
 fn apply_deploy_tier(tier: DeployTier, steps: &mut Vec<WorkflowStep>) {
     if tier == DeployTier::Production
         && !steps.iter().any(|step| step.phase == WorkflowPhase::Review)
@@ -525,9 +546,11 @@ fn materialize(
     classification: &Classification,
     profile: WorkflowProfile,
     deploy_tier: DeployTier,
+    brainstorm: bool,
 ) -> Vec<WorkflowStep> {
     let mut steps = definition(kind).materialize(classification);
     apply_profile(profile, &mut steps);
+    apply_brainstorm_selection(brainstorm, &mut steps);
     apply_deploy_tier(deploy_tier, &mut steps);
     steps
 }
@@ -572,6 +595,10 @@ pub struct WorkflowState {
     pub current_step: usize,
     pub completed_steps: Vec<String>,
     pub attempts: BTreeMap<String, u8>,
+    /// Wall-clock milliseconds each completed step took, keyed by step id.
+    /// Read by `zirv workflow status` to render `completed: intent (2m10s)`.
+    #[serde(default)]
+    pub step_durations_ms: BTreeMap<String, u64>,
     /// Version-controlled workflow work products. Acceptance authority remains
     /// in this private state: repository markdown is never trusted as config.
     #[serde(default)]
@@ -590,6 +617,11 @@ pub struct WorkflowState {
     pub frontend_target_root: Option<PathBuf>,
     #[serde(default)]
     pub phase_started_at: u64,
+    /// Whether the intent step (when present) uses `brainstorm` (interactive
+    /// Q&A) or `write-intent` (autonomous). A state saved before this key
+    /// existed defaults to interactive on load.
+    #[serde(default = "default_true")]
+    pub brainstorm: bool,
     pub status: WorkflowStatus,
     pub created_at: u64,
     pub updated_at: u64,
@@ -610,7 +642,8 @@ impl WorkflowState {
     ) -> Self {
         let profile = WorkflowProfile::for_classification(&classification);
         let deploy_tier = DeployTier::Development;
-        let steps = materialize(kind, &classification, profile, deploy_tier);
+        let brainstorm = default_brainstorm_for_kind(kind);
+        let steps = materialize(kind, &classification, profile, deploy_tier, brainstorm);
         let status = if steps.first().is_some_and(|step| step.approval) {
             WorkflowStatus::AwaitingApproval
         } else {
@@ -634,12 +667,14 @@ impl WorkflowState {
             current_step: 0,
             completed_steps: Vec::new(),
             attempts: BTreeMap::new(),
+            step_durations_ms: BTreeMap::new(),
             artifacts,
             review_findings: Vec::new(),
             review_evidence: Vec::new(),
             usage_checkpoint: None,
             frontend_target_root: None,
             phase_started_at: now,
+            brainstorm,
             status,
             created_at: now,
             updated_at: now,
@@ -1330,6 +1365,7 @@ fn rematerialize_after_risk_increase(state: &mut WorkflowState) {
         &state.classification,
         state.profile,
         state.deploy_tier,
+        state.brainstorm,
     );
     let known: Vec<String> = state.steps.iter().map(|step| step.id.clone()).collect();
     let earliest_new = desired.iter().position(|step| {
@@ -1363,7 +1399,13 @@ fn rematerialize_after_risk_increase(state: &mut WorkflowState) {
 
 fn apply_effective_deploy_tier(state: &mut WorkflowState, effective: DeployTier) {
     let target = state.deploy_tier.max(effective);
-    let desired = materialize(state.kind, &state.classification, state.profile, target);
+    let desired = materialize(
+        state.kind,
+        &state.classification,
+        state.profile,
+        target,
+        state.brainstorm,
+    );
 
     let known: Vec<String> = state.steps.iter().map(|step| step.id.clone()).collect();
     let earliest_new = desired.iter().position(|step| !known.contains(&step.id));
@@ -1569,6 +1611,7 @@ pub fn advance_with_evidence(
                     .into());
                 }
             }
+            record_step_duration_ms(&mut state, &current.id);
             state.completed_steps.push(current.id.clone());
             state.current_step += 1;
             reclassify_at_gate(&mut state);
@@ -1655,6 +1698,9 @@ pub fn advance_with_evidence(
             &super::telemetry::TelemetryConfig::for_repo(&state.repo),
         );
     }
+    if outcome == StepOutcome::Success {
+        try_auto_spawn(state_dir, &state);
+    }
     Ok(state)
 }
 
@@ -1681,6 +1727,7 @@ pub fn approve(state_dir: &StateDir, mut state: WorkflowState) -> CtxResult<Work
         let completed = state.current().expect("artifact step exists").clone();
         let accepted = pin_current_artifact(&mut state)?;
         if !state.completed_steps.contains(&completed.id) {
+            record_step_duration_ms(&mut state, &completed.id);
             state.completed_steps.push(completed.id);
         }
         state.current_step += 1;
@@ -1724,6 +1771,22 @@ pub fn approve(state_dir: &StateDir, mut state: WorkflowState) -> CtxResult<Work
     state.updated_at = now_secs();
     save(state_dir, &state, true)?;
     Ok(state)
+}
+
+/// A headless worker must not answer `brainstorm`'s clarifying questions or
+/// write the intent artifact on the operator's behalf.
+const BRAINSTORM_HEADLESS_REFUSAL: &str = "This step needs an interactive operator. Do not answer the clarifying questions on their behalf or write the intent artifact; stop and report that the workflow is waiting for the operator.";
+
+fn refusal_for(skill_id: &str, headless: bool) -> Option<&'static str> {
+    (headless && skill_id == "brainstorm").then_some(BRAINSTORM_HEADLESS_REFUSAL)
+}
+
+/// Only the exact value `"1"` means headless -- `ZIRV_CTX_HEADLESS=0`, an
+/// empty string, or any other value must not trip the refusal. Split out of
+/// the `std::env::var` call site so the value comparison is testable without
+/// a real (racy) environment variable.
+fn is_headless_env(raw: Option<&str>) -> bool {
+    raw == Some("1")
 }
 
 /// Current ephemeral skill context for the context compiler/session prompt.
@@ -1787,18 +1850,22 @@ pub fn render_current_context(
         rendered.push_str(&super::frontend::render_profile(&profile));
         rendered.push('\n');
     }
+    let headless = is_headless_env(
+        std::env::var(crate::commands::ctx::adapters::HEADLESS_ENV)
+            .ok()
+            .as_deref(),
+    );
     let mut rendered_skill_ids = BTreeSet::new();
     for selected in step_skill_ids(step, &state.classification) {
         for skill in registry.resolve_stack(&selected)? {
             if !rendered_skill_ids.insert(skill.manifest.id.clone()) {
                 continue;
             }
+            let body = refusal_for(&skill.manifest.id, headless)
+                .unwrap_or_else(|| skill.manifest.instructions.trim());
             rendered.push_str(&format!(
                 "\n[skill {}@{}; source={}]\n{}\n",
-                skill.manifest.id,
-                skill.manifest.version,
-                skill.source,
-                skill.manifest.instructions.trim()
+                skill.manifest.id, skill.manifest.version, skill.source, body
             ));
         }
     }
@@ -1916,8 +1983,26 @@ pub struct StartArgs {
     /// lives in a sibling checkout).
     #[arg(long)]
     pub frontend_root: Option<PathBuf>,
+    /// Force the interactive `brainstorm` skill at the intent step.
+    #[arg(long, conflicts_with = "no_brainstorm")]
+    pub brainstorm: bool,
+    /// Force the autonomous `write-intent` skill at the intent step.
+    #[arg(long)]
+    pub no_brainstorm: bool,
     #[arg(long)]
     pub json: bool,
+}
+
+impl StartArgs {
+    pub(crate) fn brainstorm_override(&self) -> Option<bool> {
+        if self.brainstorm {
+            Some(true)
+        } else if self.no_brainstorm {
+            Some(false)
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Debug, Args)]
@@ -2046,6 +2131,258 @@ fn resolve_state() -> CtxResult<StateDir> {
     StateDir::resolve(&|key| std::env::var(key).ok())
 }
 
+/// Call before pushing `step_id` onto `completed_steps`, while
+/// `phase_started_at` still names its own start.
+fn record_step_duration_ms(state: &mut WorkflowState, step_id: &str) {
+    let elapsed_ms = now_secs()
+        .saturating_sub(state.phase_started_at)
+        .saturating_mul(1000);
+    state
+        .step_durations_ms
+        .insert(step_id.to_string(), elapsed_ms);
+}
+
+/// `<minutes>m<seconds>s`, e.g. `2m10s`.
+fn format_wall_clock(ms: u64) -> String {
+    let total_secs = ms / 1000;
+    format!("{}m{}s", total_secs / 60, total_secs % 60)
+}
+
+/// A bounded worker to auto-spawn after a gate transition.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct AutoSpawn {
+    pub phase: WorkflowPhase,
+    pub argv: Vec<String>,
+}
+
+/// Why a gate transition that WOULD otherwise be eligible (right phase,
+/// `Running`, enabled) did not produce an [`AutoSpawn`]. `Quiet` covers
+/// every case that is not worth an operator's attention: the config key is
+/// off, the phase is not Review/Test/Verify, or the workflow is
+/// `AwaitingApproval` -- an operator who never opted in, or a transition
+/// this feature was never meant to touch, must see nothing new. `NoPermit`/
+/// `NoAgent` are the opposite: the operator explicitly enabled this, so a
+/// skip is reported, not silent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AutoSpawnSkip {
+    Quiet,
+    NoPermit,
+    NoAgent,
+}
+
+/// Pure: whether a gate transition should auto-spawn a worker, the argv for
+/// it, or the reason it did not. `default_agent` is the operator's
+/// configured chat harness (`adapters::resolve_default`, the same one `zirv
+/// ctx chat` launches by default), consulted only when the workflow itself
+/// has no recorded adapter -- `state.adapter` always wins when set.
+pub(crate) fn auto_spawn_decision(
+    state: &WorkflowState,
+    enabled: bool,
+    permit_available: bool,
+    default_agent: Option<&str>,
+) -> Result<AutoSpawn, AutoSpawnSkip> {
+    if !enabled || state.status != WorkflowStatus::Running {
+        return Err(AutoSpawnSkip::Quiet);
+    }
+    let phase = state.current().ok_or(AutoSpawnSkip::Quiet)?.phase;
+    if !matches!(
+        phase,
+        WorkflowPhase::Review | WorkflowPhase::Test | WorkflowPhase::Verify
+    ) {
+        return Err(AutoSpawnSkip::Quiet);
+    }
+    if !permit_available {
+        return Err(AutoSpawnSkip::NoPermit);
+    }
+    let repo = state.repo.display().to_string();
+    let argv = match phase {
+        WorkflowPhase::Review => {
+            let agent = state
+                .adapter
+                .clone()
+                .or_else(|| default_agent.map(str::to_string))
+                .ok_or(AutoSpawnSkip::NoAgent)?;
+            vec![
+                "workflow".to_string(),
+                "review".to_string(),
+                "run".to_string(),
+                state.id.clone(),
+                "--agent".to_string(),
+                agent,
+                "--repo".to_string(),
+                repo,
+            ]
+        }
+        WorkflowPhase::Test => vec![
+            "test".to_string(),
+            "changed".to_string(),
+            "--repo".to_string(),
+            repo,
+        ],
+        WorkflowPhase::Verify => vec!["verify".to_string(), "--repo".to_string(), repo],
+        _ => unreachable!("filtered above"),
+    };
+    Ok(AutoSpawn { phase, argv })
+}
+
+#[cfg(unix)]
+fn detach(command: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt;
+    command.process_group(0);
+}
+
+#[cfg(windows)]
+fn detach(command: &mut std::process::Command) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    command.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
+}
+
+/// The operator explicitly enabled `auto_spawn_on_gate`, so a skip that
+/// reaches this point (as opposed to `AutoSpawnSkip::Quiet`) is reported,
+/// not silent.
+fn announce_auto_spawn_skip(
+    cfg: &crate::commands::ctx::config::CtxConfig,
+    phase: WorkflowPhase,
+    reason: &str,
+) {
+    crate::commands::ctx::announce::Announcer::new(cfg.chrome.events, false).emit(
+        &crate::commands::ctx::announce::Event::AutoSpawnSkipped {
+            phase: phase.to_string(),
+            reason: reason.to_string(),
+        },
+    );
+}
+
+/// Issue #242: spawns `spawn.argv` detached and never fails `advance` --
+/// `test changed`/`verify`/`review run` govern no heavy-operation permit of
+/// their own, so this acquires one on their behalf and leaks it (the child
+/// outlives this call): `HeavyPermit::set_child_pid` plus `permit::live_
+/// records`' own dead-owner sweep is exactly the mechanism that frees the
+/// slot once the detached child exits, the same as a parent that dies while
+/// its child keeps running.
+fn spawn_auto_worker(
+    state_dir: &StateDir,
+    state: &WorkflowState,
+    cfg: &crate::commands::ctx::config::CtxConfig,
+    spawn: AutoSpawn,
+) {
+    use crate::commands::ctx::permit;
+
+    // A race against `try_auto_spawn`'s own peek: the peek said a slot was
+    // free, but another caller took it before this real acquire ran.
+    let Some(permit) = permit::acquire(
+        state_dir,
+        cfg.supervise.max_heavy_operations,
+        &format!("auto-spawn: {}", spawn.argv.join(" ")),
+    ) else {
+        announce_auto_spawn_skip(cfg, spawn.phase, "no heavy-operation permit was free");
+        return;
+    };
+    let Ok(exe) = std::env::current_exe() else {
+        announce_auto_spawn_skip(
+            cfg,
+            spawn.phase,
+            "could not resolve the zirv executable path",
+        );
+        return;
+    };
+    let mut command = std::process::Command::new(exe);
+    command
+        .args(&spawn.argv)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    detach(&mut command);
+    let Ok(child) = command.spawn() else {
+        announce_auto_spawn_skip(cfg, spawn.phase, "failed to spawn the worker process");
+        return;
+    };
+    permit.set_child_pid(child.id());
+    std::mem::forget(permit);
+
+    let mut event =
+        super::telemetry::TelemetryEvent::new(super::telemetry::TelemetryKind::AgentDispatched);
+    event.workflow_id = Some(state.id.clone());
+    event.phase = Some(spawn.phase);
+    event.intent = Some(state.classification.intent);
+    event.complexity = Some(state.classification.complexity);
+    event.risk = Some(state.classification.risk);
+    event.work_domain = Some(state.classification.work_domain.domain);
+    event.agent_id = Some(format!("auto-spawn:{}", spawn.phase));
+    let _ = super::telemetry::record(
+        state_dir,
+        &state.repo,
+        &event,
+        &super::telemetry::TelemetryConfig::for_repo(&state.repo),
+    );
+
+    crate::commands::ctx::announce::Announcer::new(cfg.chrome.events, false).emit(
+        &crate::commands::ctx::announce::Event::AutoSpawned {
+            phase: spawn.phase.to_string(),
+            command: spawn.argv.join(" "),
+        },
+    );
+}
+
+/// Thin I/O wrapper around [`auto_spawn_decision`]: resolves config, a
+/// permit peek, and (only when the workflow itself has no adapter) the
+/// operator's default chat harness, then hands off to [`spawn_auto_worker`].
+/// Any failure along the way (config, permit, spawn) is silently degraded --
+/// never propagated to `advance`'s own result -- but a skip the operator's
+/// own `auto_spawn_on_gate = true` made eligible is announced, not silent.
+fn try_auto_spawn(state_dir: &StateDir, state: &WorkflowState) {
+    let cfg = match crate::commands::ctx::config::CtxConfig::load(&state.repo, &|key| {
+        std::env::var(key).ok()
+    }) {
+        Ok(cfg) => cfg,
+        Err(_) => return,
+    };
+    if !cfg.workflow.auto_spawn_on_gate {
+        return;
+    }
+    let permit_available =
+        crate::commands::ctx::permit::live_count(state_dir) < cfg.supervise.max_heavy_operations;
+    // `state.adapter` always wins; the operator's configured chat harness
+    // (the same one `adapters::resolve_default` picks for `zirv ctx chat`)
+    // is only worth resolving -- readiness probes and all -- when the
+    // workflow itself named none.
+    let default_agent = state
+        .adapter
+        .is_none()
+        .then(|| {
+            crate::commands::ctx::adapters::resolve_default(&cfg)
+                .ok()
+                .map(|(adapter, _)| adapter.name().to_string())
+        })
+        .flatten();
+    match auto_spawn_decision(state, true, permit_available, default_agent.as_deref()) {
+        Ok(spawn) => spawn_auto_worker(state_dir, state, &cfg, spawn),
+        Err(skip) => {
+            if let Some(reason) = auto_spawn_skip_reason(skip)
+                && let Some(phase) = state.current().map(|step| step.phase)
+            {
+                announce_auto_spawn_skip(&cfg, phase, reason);
+            }
+        }
+    }
+}
+
+/// The advisory text for a skip the operator's own `auto_spawn_on_gate =
+/// true` made eligible, or `None` for `Quiet` -- the ordinary, never-
+/// announced case (disabled, wrong phase, `AwaitingApproval`).
+fn auto_spawn_skip_reason(skip: AutoSpawnSkip) -> Option<&'static str> {
+    match skip {
+        AutoSpawnSkip::Quiet => None,
+        AutoSpawnSkip::NoPermit => Some("no heavy-operation permit was free"),
+        AutoSpawnSkip::NoAgent => Some(
+            "no adapter to run the reviewer as (the workflow has none, and no operator \
+             default chat harness could be resolved)",
+        ),
+    }
+}
+
 fn write_state(writer: &mut impl Write, state: &WorkflowState, json: bool) -> CtxResult<()> {
     if json {
         serde_json::to_writer_pretty(&mut *writer, state)?;
@@ -2072,6 +2409,21 @@ fn write_state(writer: &mut impl Write, state: &WorkflowState, json: bool) -> Ct
         {
             writeln!(writer, "risk measurement: unavailable ({reason})")?;
         }
+        // Issue #236: only meaningful when this workflow actually has an
+        // intent step -- `Review` never does, and a Bugfix/Refactor whose
+        // classification did not gate one in has nothing for the flag to
+        // select between.
+        if state
+            .steps
+            .iter()
+            .any(|step| step.phase == WorkflowPhase::Intent)
+        {
+            writeln!(
+                writer,
+                "brainstorm: {}",
+                if state.brainstorm { "on" } else { "off" }
+            )?;
+        }
         if let Some(step) = state.current() {
             writeln!(
                 writer,
@@ -2087,7 +2439,16 @@ fn write_state(writer: &mut impl Write, state: &WorkflowState, json: bool) -> Ct
         } else {
             writeln!(writer, "current: none")?;
         }
-        writeln!(writer, "completed: {}", state.completed_steps.join(", "))?;
+        let completed_rendered = state
+            .completed_steps
+            .iter()
+            .map(|id| match state.step_durations_ms.get(id) {
+                Some(&ms) => format!("{id} ({})", format_wall_clock(ms)),
+                None => id.clone(),
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        writeln!(writer, "completed: {completed_rendered}")?;
     }
     Ok(())
 }
@@ -2184,6 +2545,9 @@ pub fn run(args: &WorkflowArgs, writer: &mut impl Write) -> CtxResult<i32> {
             let definition = definition(args.kind);
             let profile = WorkflowProfile::for_classification(&classification);
             let deploy_tier = super::deploy::effective_tier(&repo)?;
+            let brainstorm = args
+                .brainstorm_override()
+                .unwrap_or_else(|| default_brainstorm_for_kind(args.kind));
             if let Some(agent) = &selected_agent {
                 let registry = SkillRegistry::load_for_repo(
                     &repo,
@@ -2196,7 +2560,13 @@ pub fn run(args: &WorkflowArgs, writer: &mut impl Write) -> CtxResult<i32> {
                     !args.built_in_only,
                 )?;
                 let report = super::capability::CapabilityReport::for_repo(agent, &repo)?;
-                for step in materialize(definition.kind, &classification, profile, deploy_tier) {
+                for step in materialize(
+                    definition.kind,
+                    &classification,
+                    profile,
+                    deploy_tier,
+                    brainstorm,
+                ) {
                     for skill in step_skill_ids(&step, &classification) {
                         registry.ensure_supported(&skill, &report)?;
                     }
@@ -2213,6 +2583,10 @@ pub fn run(args: &WorkflowArgs, writer: &mut impl Write) -> CtxResult<i32> {
                 !args.built_in_only,
                 classification,
             );
+            if brainstorm != state.brainstorm {
+                state.brainstorm = brainstorm;
+                apply_brainstorm_selection(brainstorm, &mut state.steps);
+            }
             apply_effective_deploy_tier(&mut state, deploy_tier);
             state.usage_checkpoint = usage_checkpoint(&state.repo);
             if let Some(frontend_root) = &args.frontend_root {
@@ -2466,6 +2840,7 @@ mod tests {
             &classification,
             profile,
             DeployTier::Development,
+            true,
         );
         let development_deploy = development
             .iter()
@@ -2483,6 +2858,7 @@ mod tests {
             &classification,
             profile,
             DeployTier::Staging,
+            true,
         );
         assert!(
             staging
@@ -2502,6 +2878,7 @@ mod tests {
             &classification,
             profile,
             DeployTier::Production,
+            true,
         );
         let review = production
             .iter()
@@ -2518,6 +2895,196 @@ mod tests {
         assert!(review < verify && verify < deploy);
         assert!(production[review].agent.as_deref() == Some("reviewer"));
         assert!(production[deploy].approval);
+    }
+
+    fn at_phase(mut state: WorkflowState, phase: WorkflowPhase) -> WorkflowState {
+        state.current_step = state
+            .steps
+            .iter()
+            .position(|step| step.phase == phase)
+            .expect("phase present in this workflow's steps");
+        state.status = WorkflowStatus::Running;
+        state
+    }
+
+    fn production_feature_state(repo: &Path) -> WorkflowState {
+        let mut classification = low_classification();
+        classification.complexity = Complexity::Substantial;
+        classification.risk = RiskBand::High;
+        let mut state = WorkflowState::start(
+            repo.to_path_buf(),
+            "ship it".into(),
+            WorkflowKind::Feature,
+            Some("claude".to_string()),
+            true,
+            classification,
+        );
+        apply_effective_deploy_tier(&mut state, DeployTier::Production);
+        state
+    }
+
+    #[test]
+    fn auto_spawn_decision_truth_table() {
+        let repo = tempdir().unwrap();
+        let state = production_feature_state(repo.path());
+
+        assert_eq!(
+            auto_spawn_decision(
+                &at_phase(state.clone(), WorkflowPhase::Review),
+                false,
+                true,
+                None
+            ),
+            Err(AutoSpawnSkip::Quiet),
+            "disabled must never fire"
+        );
+        assert_eq!(
+            auto_spawn_decision(
+                &at_phase(state.clone(), WorkflowPhase::Review),
+                true,
+                false,
+                None
+            ),
+            Err(AutoSpawnSkip::NoPermit),
+            "no permit must never fire"
+        );
+        assert_eq!(
+            auto_spawn_decision(
+                &at_phase(state.clone(), WorkflowPhase::Implement),
+                true,
+                true,
+                None
+            ),
+            Err(AutoSpawnSkip::Quiet),
+            "Implement must never fire"
+        );
+
+        let mut awaiting = at_phase(state.clone(), WorkflowPhase::Review);
+        awaiting.status = WorkflowStatus::AwaitingApproval;
+        assert_eq!(
+            auto_spawn_decision(&awaiting, true, true, None),
+            Err(AutoSpawnSkip::Quiet),
+            "AwaitingApproval must never fire"
+        );
+
+        let review = auto_spawn_decision(
+            &at_phase(state.clone(), WorkflowPhase::Review),
+            true,
+            true,
+            None,
+        )
+        .expect("Review with a workflow adapter fires");
+        assert_eq!(review.phase, WorkflowPhase::Review);
+        assert_eq!(
+            review.argv,
+            vec![
+                "workflow",
+                "review",
+                "run",
+                &state.id,
+                "--agent",
+                "claude",
+                "--repo",
+                &state.repo.display().to_string(),
+            ]
+        );
+
+        // `state.adapter` always wins over a configured default, even when
+        // both resolve.
+        let with_both = auto_spawn_decision(
+            &at_phase(state.clone(), WorkflowPhase::Review),
+            true,
+            true,
+            Some("codex"),
+        )
+        .expect("Review fires");
+        assert_eq!(
+            with_both.argv[5], "claude",
+            "the workflow's own adapter wins"
+        );
+
+        let mut no_adapter = at_phase(state.clone(), WorkflowPhase::Review);
+        no_adapter.adapter = None;
+        assert_eq!(
+            auto_spawn_decision(&no_adapter, true, true, None),
+            Err(AutoSpawnSkip::NoAgent),
+            "Review with no workflow adapter and no default must not fire"
+        );
+
+        let with_default = auto_spawn_decision(&no_adapter, true, true, Some("codex"))
+            .expect("Review with no workflow adapter falls back to the operator default");
+        assert_eq!(with_default.argv[5], "codex");
+
+        let test = auto_spawn_decision(
+            &at_phase(state.clone(), WorkflowPhase::Test),
+            true,
+            true,
+            None,
+        )
+        .expect("Test fires");
+        assert_eq!(test.phase, WorkflowPhase::Test);
+        assert_eq!(
+            test.argv,
+            vec![
+                "test",
+                "changed",
+                "--repo",
+                &state.repo.display().to_string()
+            ]
+        );
+
+        let verify = auto_spawn_decision(
+            &at_phase(state.clone(), WorkflowPhase::Verify),
+            true,
+            true,
+            None,
+        )
+        .expect("Verify fires");
+        assert_eq!(verify.phase, WorkflowPhase::Verify);
+        assert_eq!(
+            verify.argv,
+            vec!["verify", "--repo", &state.repo.display().to_string()]
+        );
+    }
+
+    /// `Quiet` is the only skip that stays silent -- the config-disabled
+    /// path, or a phase auto-spawn was never meant to touch. `NoPermit`/
+    /// `NoAgent` are eligible-but-skipped, so an operator who turned the
+    /// key on must see why.
+    #[test]
+    fn auto_spawn_skip_reason_is_silent_only_for_quiet() {
+        assert_eq!(auto_spawn_skip_reason(AutoSpawnSkip::Quiet), None);
+        assert!(auto_spawn_skip_reason(AutoSpawnSkip::NoPermit).is_some());
+        assert!(auto_spawn_skip_reason(AutoSpawnSkip::NoAgent).is_some());
+    }
+
+    #[test]
+    fn advance_with_evidence_records_no_agent_dispatched_event_when_auto_spawn_is_disabled() {
+        let repo = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+        let state = skip_leading_artifact_steps(WorkflowState::start(
+            repo.path().to_path_buf(),
+            "small feature".into(),
+            WorkflowKind::Feature,
+            None,
+            true,
+            low_classification(),
+        ));
+        save(&state_dir, &state, true).unwrap();
+
+        let advanced =
+            advance_with_evidence(&state_dir, state, StepOutcome::Success, None).unwrap();
+        assert_eq!(advanced.current().unwrap().phase, WorkflowPhase::Test);
+
+        let events = crate::commands::workflow::telemetry::list(&state_dir, &advanced.repo)
+            .unwrap_or_default();
+        assert!(
+            !events.iter().any(|event| {
+                event.kind == crate::commands::workflow::telemetry::TelemetryKind::AgentDispatched
+            }),
+            "auto_spawn_on_gate defaults to false; advance must never record a dispatch"
+        );
     }
 
     #[test]
@@ -2581,6 +3148,82 @@ mod tests {
                 .find(|step| step.phase == WorkflowPhase::Implement)
                 .is_some_and(|step| step.skill == "frontend-implement")
         );
+    }
+
+    #[test]
+    fn brainstorm_defaults_per_kind() {
+        assert!(default_brainstorm_for_kind(WorkflowKind::Feature));
+        assert!(default_brainstorm_for_kind(WorkflowKind::Spike));
+        assert!(!default_brainstorm_for_kind(WorkflowKind::Bugfix));
+        assert!(!default_brainstorm_for_kind(WorkflowKind::Refactor));
+        assert!(!default_brainstorm_for_kind(WorkflowKind::Review));
+    }
+
+    #[test]
+    fn brainstorm_flags_are_mutually_exclusive_and_resolve_to_an_override() {
+        use clap::Parser;
+        #[derive(clap::Parser)]
+        struct Cli {
+            #[command(flatten)]
+            args: StartArgs,
+        }
+        let plain =
+            Cli::try_parse_from(["zirv", "feature", "--task", "x"]).expect("no flags parses");
+        assert_eq!(plain.args.brainstorm_override(), None);
+
+        let on = Cli::try_parse_from(["zirv", "feature", "--task", "x", "--brainstorm"])
+            .expect("--brainstorm parses");
+        assert_eq!(on.args.brainstorm_override(), Some(true));
+
+        let off = Cli::try_parse_from(["zirv", "feature", "--task", "x", "--no-brainstorm"])
+            .expect("--no-brainstorm parses");
+        assert_eq!(off.args.brainstorm_override(), Some(false));
+
+        assert!(
+            Cli::try_parse_from([
+                "zirv",
+                "feature",
+                "--task",
+                "x",
+                "--brainstorm",
+                "--no-brainstorm",
+            ])
+            .is_err(),
+            "both flags together must be refused"
+        );
+    }
+
+    #[test]
+    fn brainstorm_selects_the_intent_step_skill_and_survives_an_explicit_override() {
+        let repo = tempdir().unwrap();
+        let feature = WorkflowState::start(
+            repo.path().to_path_buf(),
+            "small feature".into(),
+            WorkflowKind::Feature,
+            None,
+            true,
+            low_classification(),
+        );
+        assert_eq!(feature.current().unwrap().skill, "brainstorm");
+        assert!(feature.brainstorm);
+
+        let mut classification = low_classification();
+        classification.complexity = Complexity::Bounded;
+        classification.risk = RiskBand::Medium;
+        let bugfix = WorkflowState::start(
+            repo.path().to_path_buf(),
+            "small bugfix".into(),
+            WorkflowKind::Bugfix,
+            None,
+            true,
+            classification,
+        );
+        assert_eq!(bugfix.current().unwrap().skill, "write-intent");
+        assert!(!bugfix.brainstorm);
+
+        let mut overridden = bugfix;
+        apply_brainstorm_selection(true, &mut overridden.steps);
+        assert_eq!(overridden.current().unwrap().skill, "brainstorm");
     }
 
     #[test]
@@ -3316,6 +3959,71 @@ mod tests {
         assert!(statuses[0].drifted);
     }
 
+    /// A step with no recorded duration (an older saved state) renders its
+    /// bare id, never a bogus "0m0s".
+    #[test]
+    fn write_state_renders_completed_step_wall_clock_only_when_known() {
+        let repo = tempdir().unwrap();
+        let mut state = WorkflowState::start(
+            repo.path().to_path_buf(),
+            "small feature".into(),
+            WorkflowKind::Feature,
+            None,
+            true,
+            low_classification(),
+        );
+        state.completed_steps = vec!["intent".to_string(), "spec".to_string()];
+        state
+            .step_durations_ms
+            .insert("intent".to_string(), 130_000);
+        state.step_durations_ms.insert("spec".to_string(), 40_000);
+        let mut out = Vec::new();
+        write_state(&mut out, &state, false).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("completed: intent (2m10s), spec (0m40s)"),
+            "got: {text}"
+        );
+
+        // No recorded duration for a step (an older schema, or a test
+        // fixture that only sets `completed_steps` directly): the bare id,
+        // not a fabricated duration.
+        let mut legacy = state.clone();
+        legacy.step_durations_ms.clear();
+        let mut out = Vec::new();
+        write_state(&mut out, &legacy, false).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("completed: intent, spec"), "got: {text}");
+    }
+
+    #[test]
+    fn write_state_renders_brainstorm_only_when_the_workflow_has_an_intent_step() {
+        let repo = tempdir().unwrap();
+        let feature = WorkflowState::start(
+            repo.path().to_path_buf(),
+            "small feature".into(),
+            WorkflowKind::Feature,
+            None,
+            true,
+            low_classification(),
+        );
+        let mut out = Vec::new();
+        write_state(&mut out, &feature, false).unwrap();
+        assert!(String::from_utf8(out).unwrap().contains("brainstorm: on"));
+
+        let review = WorkflowState::start(
+            repo.path().to_path_buf(),
+            "independent review".into(),
+            WorkflowKind::Review,
+            None,
+            true,
+            low_classification(),
+        );
+        let mut out = Vec::new();
+        write_state(&mut out, &review, false).unwrap();
+        assert!(!String::from_utf8(out).unwrap().contains("brainstorm:"));
+    }
+
     /// `load` is the single choke point every id-resolving verb (`status`,
     /// `resume`, `context`, `artifacts`, `approve`, `advance`) goes through --
     /// pinned here so a bogus id gets the domain-shaped "unknown workflow"
@@ -3765,6 +4473,53 @@ mod tests {
         assert!(context.contains("[skill implement@1"));
         assert!(!context.contains("[skill execute-plan@1"));
         assert!(!context.contains("[skill worktree@1"));
+    }
+
+    #[test]
+    fn refusal_for_only_fires_for_brainstorm_when_headless() {
+        assert_eq!(
+            refusal_for("brainstorm", true),
+            Some(BRAINSTORM_HEADLESS_REFUSAL)
+        );
+        assert_eq!(refusal_for("brainstorm", false), None);
+        assert_eq!(refusal_for("write-intent", true), None);
+    }
+
+    /// Only the exact value `"1"` means headless -- an interactive launch
+    /// that inherited the variable set to `"0"`, empty, or anything else
+    /// from its own parent process must not be refused.
+    #[test]
+    fn is_headless_env_requires_the_exact_value_1() {
+        assert!(is_headless_env(Some("1")));
+        assert!(!is_headless_env(Some("0")));
+        assert!(!is_headless_env(Some("")));
+        assert!(!is_headless_env(Some("true")));
+        assert!(!is_headless_env(None));
+    }
+
+    #[test]
+    fn a_headless_worker_refuses_the_brainstorm_step() {
+        let repo = tempdir().unwrap();
+        let state = WorkflowState::start(
+            repo.path().to_path_buf(),
+            "small feature".into(),
+            WorkflowKind::Feature,
+            None,
+            true,
+            low_classification(),
+        );
+        assert_eq!(state.current().unwrap().skill, "brainstorm");
+        // SAFETY: nextest runs one test per process.
+        unsafe {
+            std::env::set_var(crate::commands::ctx::adapters::HEADLESS_ENV, "1");
+        }
+        let context = render_current_context(&state, repo.path(), None).unwrap();
+        unsafe {
+            std::env::remove_var(crate::commands::ctx::adapters::HEADLESS_ENV);
+        }
+        let context = context.unwrap();
+        assert!(context.contains(BRAINSTORM_HEADLESS_REFUSAL));
+        assert!(!context.contains("Explore the repository"));
     }
 
     #[test]

@@ -388,4 +388,80 @@ mod tests {
 
         assert_eq!(active_workflow_summary(&state_dir, other_repo.path()), None);
     }
+
+    /// Issue #242 follow-up: `engine::auto_spawn_decision`'s argv is built by
+    /// hand, so a renamed flag (`--repo`, `--agent`, the review-run
+    /// positional id) would fail only at runtime, silently, unless something
+    /// feeds it through the real parser. This does: every argv the pure
+    /// decision produces for Review/Test/Verify must parse through the same
+    /// `WorkflowCli` `main.rs` itself dispatches into, with the fields
+    /// landing where the decision meant them to.
+    #[test]
+    fn auto_spawn_argv_parses_through_the_real_top_level_cli() {
+        let repo = tempfile::tempdir().unwrap();
+        let mut classification = test_classification();
+        classification.complexity = classify::Complexity::Substantial;
+        classification.risk = classify::RiskBand::High;
+        let mut state = engine::WorkflowState::start(
+            repo.path().to_path_buf(),
+            "ship it".into(),
+            engine::WorkflowKind::Feature,
+            Some("claude".to_string()),
+            true,
+            classification,
+        );
+        state.status = engine::WorkflowStatus::Running;
+
+        for phase in [
+            skill::WorkflowPhase::Review,
+            skill::WorkflowPhase::Test,
+            skill::WorkflowPhase::Verify,
+        ] {
+            state.current_step = state
+                .steps
+                .iter()
+                .position(|step| step.phase == phase)
+                .unwrap_or_else(|| panic!("{phase:?} step must be present in this workflow"));
+            let spawn = engine::auto_spawn_decision(&state, true, true, None)
+                .unwrap_or_else(|skip| panic!("{phase:?} must be eligible to fire: {skip:?}"));
+
+            let mut argv = vec!["zirv".to_string()];
+            argv.extend(spawn.argv.clone());
+            let cli = WorkflowCli::try_parse_from(&argv)
+                .unwrap_or_else(|err| panic!("auto-spawn argv {argv:?} must parse: {err}"));
+
+            match phase {
+                skill::WorkflowPhase::Review => {
+                    let WorkflowCommand::Workflow(wf) = &cli.command else {
+                        panic!("expected a `workflow` subcommand, got {:?}", cli.command)
+                    };
+                    let engine::WorkflowSubcommand::Review(review_args) = &wf.command else {
+                        panic!("expected `workflow review`, got {:?}", wf.command)
+                    };
+                    let review::ReviewCommand::Run(run_args) = &review_args.command else {
+                        panic!("expected `review run`, got {:?}", review_args.command)
+                    };
+                    assert_eq!(run_args.id, state.id);
+                    assert_eq!(run_args.agent, "claude");
+                    assert_eq!(run_args.repo.as_deref(), Some(state.repo.as_path()));
+                }
+                skill::WorkflowPhase::Test => {
+                    let WorkflowCommand::Test(test_args) = &cli.command else {
+                        panic!("expected a `test` subcommand, got {:?}", cli.command)
+                    };
+                    let verification::TestCommand::Changed(run_args) = &test_args.command else {
+                        panic!("expected `test changed`, got {:?}", test_args.command)
+                    };
+                    assert_eq!(run_args.repo.as_deref(), Some(state.repo.as_path()));
+                }
+                skill::WorkflowPhase::Verify => {
+                    let WorkflowCommand::Verify(verify_args) = &cli.command else {
+                        panic!("expected a `verify` subcommand, got {:?}", cli.command)
+                    };
+                    assert_eq!(verify_args.run.repo.as_deref(), Some(state.repo.as_path()));
+                }
+                _ => unreachable!("only the three eligible phases are iterated"),
+            }
+        }
+    }
 }

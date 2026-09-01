@@ -648,6 +648,23 @@ pub struct CapabilityOutcome {
     pub mechanism: &'static str,
 }
 
+/// Issue #230 item 3: one degraded/unsupported capability, shaped to travel
+/// off this process entirely -- into `zirv agent`'s own JSON result, a
+/// dashboard `SpawnAck`, or a report-back mail body -- so a session that
+/// spawned a worker with a real capability gap learns about it as structured
+/// data rather than only from the worker's own (possibly silent) prompt
+/// text. See [`PolicyReport::degraded_capabilities`], the only constructor.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CapabilityWarning {
+    /// [`Capability::label`] -- human-readable, not the `[policy]` key.
+    pub capability: String,
+    /// The descriptor's own [`CapabilityDescriptor::mechanism`] text.
+    pub mechanism: String,
+    /// The requested stance and what the harness actually delivers for it,
+    /// e.g. `"deny -- degraded (partially enforced)"`.
+    pub detail: String,
+}
+
 /// What one policy actually means on one harness, for one launch posture.
 /// Built only by [`evaluate`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -689,6 +706,35 @@ impl PolicyReport {
         self.outcomes
             .iter()
             .filter(|outcome| outcome.support == Support::Degraded)
+            .collect()
+    }
+
+    /// Issue #230 item 3: the capabilities THIS report says are actually
+    /// weaker than what the policy asked for, in the narrow sense a
+    /// DELEGATOR needs to hear about at spawn time -- `zirv agent`'s own
+    /// synchronous result, the dashboard's `SpawnAck`, and the report-back
+    /// mail payload all build their warning line from this one method, so
+    /// the three surfaces can never describe one launch's degradation
+    /// differently.
+    ///
+    /// Only [`Support::Degraded`] (a real mechanism that only approximates
+    /// the request) and [`Support::Unsupported`] (no verified mechanism at
+    /// all, prompt text only) count. Deliberately excludes `Enforced`
+    /// (nothing to warn about), `OperatorControlled` (either a
+    /// `Stance::Allow` capability zirv imposed nothing on, or a capability
+    /// only the operator's own harness settings govern -- neither is a
+    /// spawn-time GAP a delegator can act on the way it can act on a
+    /// degraded/unsupported one), and every capability `evaluate` omitted
+    /// entirely (an unconfigured `network`).
+    pub fn degraded_capabilities(&self) -> Vec<CapabilityWarning> {
+        self.outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome.support, Support::Degraded | Support::Unsupported))
+            .map(|outcome| CapabilityWarning {
+                capability: outcome.capability.label().to_string(),
+                mechanism: outcome.mechanism.to_string(),
+                detail: format!("{} -- {}", outcome.stance.label(), outcome.support.label()),
+            })
             .collect()
     }
 
@@ -1001,6 +1047,75 @@ mod tests {
             Support::OperatorControlled,
             "an install that cannot take `on-request` must claim nothing"
         );
+    }
+
+    /// Issue #230 item 3: `degraded_capabilities` keeps only `Degraded`/
+    /// `Unsupported` outcomes, dropping `Enforced` (nothing to warn about)
+    /// and `OperatorControlled` (either `Allow`, or a capability only the
+    /// operator's own harness settings govern) -- exercised on a real
+    /// mixed report rather than a hand-built one, so this pins the actual
+    /// adapter behaviour rather than a synthetic fixture.
+    #[test]
+    fn degraded_capabilities_keeps_only_degraded_and_unsupported_outcomes() {
+        let policy = EffectivePolicy {
+            repo_fs_write: Stance::Deny, // claude: Degraded (SANDBOX-adjacent) on codex; Enforced on claude
+            shell_exec: Stance::Deny,    // codex: Unsupported
+            approval: Stance::Ask,       // Allow's stance is never reached here since Ask
+            git_push_destructive: Stance::Allow, // OperatorControlled: Allow, nothing to warn about
+            ..EffectivePolicy::default()
+        };
+        let codex = CodexAdapter::new(None);
+        let report = evaluate(&policy, &codex, adapters::LaunchMode::Headless);
+
+        let warnings = report.degraded_capabilities();
+        assert!(
+            !warnings.is_empty(),
+            "this policy must produce at least one real warning on codex"
+        );
+        for warning in &warnings {
+            assert!(!warning.capability.is_empty());
+            assert!(!warning.mechanism.is_empty());
+            assert!(!warning.detail.is_empty());
+        }
+        // Every outcome this report actually produced with a Degraded or
+        // Unsupported support must show up, one-for-one, as a warning; every
+        // Enforced/OperatorControlled outcome must not.
+        let expected: Vec<_> = report
+            .outcomes
+            .iter()
+            .filter(|o| matches!(o.support, Support::Degraded | Support::Unsupported))
+            .map(|o| o.capability.label().to_string())
+            .collect();
+        let got: Vec<_> = warnings.iter().map(|w| w.capability.clone()).collect();
+        assert_eq!(got, expected);
+        assert!(
+            report
+                .outcomes
+                .iter()
+                .any(|o| o.support == Support::OperatorControlled),
+            "the fixture must actually exercise an OperatorControlled outcome for this test to \
+             mean anything"
+        );
+        for outcome in report
+            .outcomes
+            .iter()
+            .filter(|o| o.support == Support::OperatorControlled)
+        {
+            assert!(
+                !got.contains(&outcome.capability.label().to_string()),
+                "OperatorControlled must never appear as a degraded-capability warning"
+            );
+        }
+    }
+
+    /// A report with nothing but `Enforced`/`OperatorControlled` outcomes
+    /// (the shipped default, `Allow` everywhere) warns about nothing.
+    #[test]
+    fn degraded_capabilities_is_empty_for_a_default_policy() {
+        let policy = EffectivePolicy::default();
+        let claude = ClaudeAdapter::new(None);
+        let report = evaluate(&policy, &claude, adapters::LaunchMode::Headless);
+        assert!(report.degraded_capabilities().is_empty());
     }
 
     #[test]

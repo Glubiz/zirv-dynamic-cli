@@ -25,6 +25,7 @@ use super::dash::spawnreq;
 use super::event::{SessionId, TranscriptUsage};
 use super::exec::{self, ExecArgs};
 use super::pace;
+use super::policy;
 
 #[derive(Debug, Clone, clap::Args)]
 pub struct AgentArgs {
@@ -569,6 +570,19 @@ fn delegation_outcome(code: i32) -> &'static str {
     }
 }
 
+/// Issue #230 item 3: the short `"<cap> (<mechanism>); ..."` rendering the
+/// report-back mail body uses for a launch's capability warnings. `detail`
+/// is left out of this one-line summary on purpose; it travels in full on
+/// the structured `CapabilityWarning` (the dashboard `SpawnAck` field) and on
+/// the per-warning stdout result lines.
+pub(crate) fn format_capability_warnings(warnings: &[policy::CapabilityWarning]) -> String {
+    warnings
+        .iter()
+        .map(|w| format!("{} ({})", w.capability, w.mechanism))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 /// Issue #227: the report-back mail a `zirv agent` spawn sends to its own
 /// requester on a supervisor-detected failure, so the requester has a
 /// durable record even when it was not watching this delegation
@@ -577,20 +591,34 @@ fn delegation_outcome(code: i32) -> &'static str {
 /// stderr note, so the two never say different things about the same
 /// failure. Pure: no fs/clock/env, so the envelope shape is table-tested
 /// without a real mailbox.
+///
+/// Issue #230 item 3: also carries the delegation's own capability warnings
+/// (`PolicyReport::degraded_capabilities`, computed once by the caller) when
+/// non-empty, so a requester who was not watching this delegation
+/// synchronously still learns its launch was not fully enforced -- the same
+/// warnings a watching caller reads on the stdout result lines.
 fn report_back_message(
     code: i32,
     worker_session: &str,
     agent_name: &str,
     to_session: &str,
+    warnings: &[policy::CapabilityWarning],
 ) -> super::mail::Message {
     let reason = exec::describe_exit(code);
+    let mut body = format!("zirv ctx agent: {agent_name} finished: {reason} (exit {code})");
+    if !warnings.is_empty() {
+        body.push_str(&format!(
+            "\ncapability warnings: {}",
+            format_capability_warnings(warnings)
+        ));
+    }
     super::mail::Message {
         from_session: worker_session.to_string(),
         from_agent: agent_name.to_string(),
         to: "any".to_string(),
         to_session: Some(to_session.to_string()),
         sent: super::state::now_secs(),
-        body: format!("zirv ctx agent: {agent_name} finished: {reason} (exit {code})"),
+        body,
     }
 }
 
@@ -632,6 +660,19 @@ pub const DASH_SPAWN_ACK_PREFIX: &str = "spawned in dashboard as ";
 fn answer_for_ack<W: Write>(ack: spawnreq::SpawnAck, w: &mut W) -> Option<CtxResult<i32>> {
     if ack.ok {
         let short = ack.short.unwrap_or_default();
+        // Issue #230 item 3: the same stdout result surface the headless
+        // fork prints to, one line per warning with full detail, so a
+        // delegator that joined a live dashboard sees what a headless fork
+        // of the same request would have.
+        for warning in &ack.capability_warnings {
+            if let Err(e) = writeln!(
+                w,
+                "capability warning: {} -- {}: {}",
+                warning.capability, warning.mechanism, warning.detail
+            ) {
+                return Some(Err(e.into()));
+            }
+        }
         return Some(
             writeln!(w, "{DASH_SPAWN_ACK_PREFIX}{short}")
                 .map(|_| 0)
@@ -1324,6 +1365,26 @@ pub fn run_with<W: Write>(
     // is whichever of the operator's own `--model`/`-m` passthrough or the
     // configured/default worker-model prepend actually won.
     let model = adapters::last_model_flag(&command).map(str::to_string);
+    // Issue #230 item 3: the same policy evaluation `compile::compile` will
+    // perform again, deep inside `exec::run_with_report` below, for the
+    // headless child's own prompt -- not threaded back out of that call
+    // (`ExecutionReport` carries usage/segments, not a `PolicyReport`), so
+    // this is a second, equally cheap, equally pure `policy::evaluate` call
+    // against the identical `(cfg.policy, adapter, LaunchMode::Headless)`
+    // inputs rather than a plumbing change through `exec.rs`. Computed once
+    // here and reused for both the stdout result line below and the
+    // report-back mail on a failure -- see the `Ok(code)` return at the end
+    // of this function for why it is printed there, not here (F1, review
+    // round): the delegator captures the SYNCHRONOUS RESULT of `zirv agent`
+    // on stdout, not stderr, so an early `eprintln!` here would either be
+    // missed entirely or -- if also kept at the end -- print the same
+    // warning twice.
+    let capability_warnings = policy::evaluate(
+        &cfg.policy,
+        adapter.as_ref(),
+        adapters::LaunchMode::Headless,
+    )
+    .degraded_capabilities();
     let worker_session = SessionId::new_v4().to_string();
     // Issue #170: this delegation binds `args.group` (if any) to the child
     // about to run headlessly as its SubOrchestrator -- first-claim-wins, so
@@ -1460,7 +1521,13 @@ pub fn run_with<W: Write>(
             && let Some(parent_short) = super::mail::session_identity(&env)
             && super::prompt::is_addressable_short(&parent_short)
         {
-            let msg = report_back_message(code, &worker_session, &args.name, &parent_short);
+            let msg = report_back_message(
+                code,
+                &worker_session,
+                &args.name,
+                &parent_short,
+                &capability_warnings,
+            );
             let repo_slug = super::state::repo_slug(repo);
             let _ = super::mail::store_to(&state_dir, &repo_slug, &repo_slug, &msg, &cfg);
         }
@@ -1511,6 +1578,18 @@ pub fn run_with<W: Write>(
                 detail: &detail,
             },
         );
+    }
+
+    // Issue #230 item 3: the delegator captures `zirv agent`'s synchronous
+    // stdout result, so each warning rides here with capability, mechanism
+    // and detail, only when non-empty. `zirv agent` has no structured/JSON
+    // result form to carry the full `CapabilityWarning` into.
+    for warning in &capability_warnings {
+        writeln!(
+            w,
+            "capability warning: {} -- {}: {}",
+            warning.capability, warning.mechanism, warning.detail
+        )?;
     }
 
     Ok(code)
@@ -2933,6 +3012,93 @@ mod tests {
         );
     }
 
+    /// Issue #230 item 3: the delegator captures `zirv agent`'s synchronous
+    /// stdout result, so a degraded capability must appear in the captured
+    /// `out` with its full `detail`.
+    #[test]
+    fn a_headless_run_with_a_degraded_capability_reports_it_in_the_captured_result() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        std::fs::create_dir_all(tmp.path().join(".zirv")).expect("mkdir .zirv");
+        // `approval = "deny"` on a headless claude launch resolves to
+        // `Support::Unsupported` (`ClaudeAdapter::policy_support`'s own
+        // `APPROVAL_UNSUPPORTED` arm) -- a real, non-`Enforced` degradation.
+        std::fs::write(
+            tmp.path().join(".zirv/ctx.toml"),
+            "[policy]\napproval = \"deny\"\n",
+        )
+        .expect("write ctx.toml");
+        let env = base_env(&tmp.path().join("state"));
+        unsafe {
+            std::env::set_var("FAKE_AGENT_MODE", "healthy");
+        }
+        let args = args_for("claude", "do the work");
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE");
+        }
+        assert_eq!(code.expect("runs"), 0);
+
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            text.contains("capability warning: approval/ask behavior --"),
+            "got {text}"
+        );
+        assert!(
+            text.contains("not enforced (advisory only)"),
+            "the detail field must ride along, not just capability/mechanism: {text}"
+        );
+    }
+
+    /// The other half: a clean run (no `[policy]` restriction at all) prints
+    /// nothing about capabilities.
+    #[test]
+    fn a_clean_headless_run_prints_nothing_about_capabilities() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let env = base_env(&tmp.path().join("state"));
+        unsafe {
+            std::env::set_var("FAKE_AGENT_MODE", "healthy");
+        }
+        let args = args_for("claude", "do the work");
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE");
+        }
+        assert_eq!(code.expect("runs"), 0);
+
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(!text.contains("capability warning"), "got {text}");
+    }
+
+    /// Issue #230 item 3: `format_capability_warnings`'s pure rendering --
+    /// empty input renders empty, and multiple warnings join on `"; "` in
+    /// the order they were given.
+    #[test]
+    fn format_capability_warnings_joins_capability_and_mechanism_pairs() {
+        assert_eq!(format_capability_warnings(&[]), "");
+        let warnings = vec![
+            policy::CapabilityWarning {
+                capability: "shell execution".to_string(),
+                mechanism: "no verified per-run mechanism".to_string(),
+                detail: "deny -- not enforced (advisory only)".to_string(),
+            },
+            policy::CapabilityWarning {
+                capability: "approval/ask behavior".to_string(),
+                mechanism: "on-request".to_string(),
+                detail: "ask -- degraded (partially enforced)".to_string(),
+            },
+        ];
+        assert_eq!(
+            format_capability_warnings(&warnings),
+            "shell execution (no verified per-run mechanism); approval/ask behavior (on-request)"
+        );
+    }
+
     /// Issue #227: `report_back_message`'s pure envelope shape -- the same
     /// reason text `describe_exit` produces for the stderr note, addressed
     /// to the requester's short id.
@@ -2943,12 +3109,43 @@ mod tests {
             "worker-session-1",
             "codex",
             "aaaaaaaa",
+            &[],
         );
         assert_eq!(msg.from_session, "worker-session-1");
         assert_eq!(msg.from_agent, "codex");
         assert_eq!(msg.to_session, Some("aaaaaaaa".to_string()));
         assert!(
             msg.body.contains("capacity") && msg.body.contains("codex"),
+            "got {:?}",
+            msg.body
+        );
+        assert!(
+            !msg.body.contains("capability warnings"),
+            "no warnings must mean no extra line: {:?}",
+            msg.body
+        );
+    }
+
+    /// Issue #230 item 3: when the delegation's own capability warnings are
+    /// non-empty, the report-back mail carries them as a second line, in
+    /// `format_capability_warnings`'s short `"<cap> (<mechanism>); ..."` form.
+    #[test]
+    fn report_back_message_carries_capability_warnings_when_present() {
+        let warnings = vec![policy::CapabilityWarning {
+            capability: "shell execution".to_string(),
+            mechanism: "no verified per-run mechanism".to_string(),
+            detail: "deny -- not enforced (advisory only)".to_string(),
+        }];
+        let msg = report_back_message(
+            exec::EXIT_CAPACITY_EXHAUSTED,
+            "worker-session-1",
+            "codex",
+            "aaaaaaaa",
+            &warnings,
+        );
+        assert!(
+            msg.body
+                .contains("capability warnings: shell execution (no verified per-run mechanism)"),
             "got {:?}",
             msg.body
         );
@@ -3337,6 +3534,38 @@ mod tests {
             inherited.trim(),
             groups[0].work_group_id,
             "the coordinator's own child must carry the group it was bound to"
+        );
+    }
+
+    /// Issue #236: every headless delegation sets `ZIRV_CTX_HEADLESS` on the
+    /// child, read by `engine::refusal_for` to refuse the `brainstorm` skill.
+    #[test]
+    fn a_headless_delegation_sets_the_headless_env_marker() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state_dir = tmp.path().join("state");
+        let mut env = base_env(&state_dir);
+        env.insert("ZIRV_CTX_PACE".to_string(), "false".to_string());
+        let headless_env_log = tmp.path().join("headless-env.log");
+
+        unsafe {
+            std::env::set_var("FAKE_AGENT_MODE", "healthy");
+            std::env::set_var("FAKE_AGENT_HEADLESS_ENV_LOG", &headless_env_log);
+        }
+        let args = args_for("claude", "do the work");
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE");
+            std::env::remove_var("FAKE_AGENT_HEADLESS_ENV_LOG");
+        }
+        assert_eq!(code.expect("runs"), 0);
+        assert_eq!(
+            std::fs::read_to_string(&headless_env_log)
+                .expect("the child logged its env")
+                .trim(),
+            "1"
         );
     }
 

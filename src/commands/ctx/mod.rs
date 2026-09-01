@@ -37,6 +37,7 @@ pub mod rot;
 pub mod run_loop;
 pub mod safety;
 pub mod score;
+pub mod screen;
 pub mod sessions;
 pub mod signal;
 pub mod state;

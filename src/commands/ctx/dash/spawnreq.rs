@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use super::super::CtxResult;
+use super::super::policy::CapabilityWarning;
 use super::super::prompt::PromptRole;
 use super::super::state::StateDir;
 
@@ -162,6 +163,16 @@ pub struct SpawnAck {
     pub reason: Option<String>,
     #[serde(default)]
     pub retryable: bool,
+    /// Issue #230 item 3: the degraded/unsupported capabilities the spawned
+    /// pane's own launch carries (`policy::PolicyReport::degraded_
+    /// capabilities`), so a requester waiting on this exact ack
+    /// (`agent::run_with`'s dashboard-join fork) can surface them the same
+    /// way its headless fork does. Empty -- and omitted from the wire form
+    /// entirely -- when the launch's policy report has nothing to warn
+    /// about, or for an ack an older build wrote; `#[serde(default)]` makes
+    /// both read the same way.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capability_warnings: Vec<CapabilityWarning>,
 }
 
 /// `<state>/dash/<dash_short>-<token>/requests`. `dash_short` is this
@@ -588,11 +599,39 @@ mod tests {
             short: Some("bbbb2222".to_string()),
             reason: None,
             retryable: false,
+            capability_warnings: Vec::new(),
         };
         write_ack(&dir, &stem, &ack).expect("write_ack");
 
         let got = wait_for_ack(&dir, &stem, Duration::from_secs(1)).expect("ack arrives");
         assert_eq!(got, ack);
+    }
+
+    /// Issue #230 item 3: `capability_warnings` round-trips through the same
+    /// JSON file channel every other ack field already does, and an older
+    /// ack with no such field deserialises to an empty list rather than
+    /// failing to parse.
+    #[test]
+    fn an_acks_capability_warnings_round_trip_and_default_to_empty() {
+        let (_tmp, dir) = dir();
+        let ack = SpawnAck {
+            ok: true,
+            short: Some("bbbb2222".to_string()),
+            reason: None,
+            retryable: false,
+            capability_warnings: vec![CapabilityWarning {
+                capability: "shell execution".to_string(),
+                mechanism: "no verified per-run mechanism".to_string(),
+                detail: "deny -- not enforced (advisory only)".to_string(),
+            }],
+        };
+        write_ack(&dir, "req-warn", &ack).expect("write_ack");
+        let got = wait_for_ack(&dir, "req-warn", Duration::from_secs(1)).expect("ack arrives");
+        assert_eq!(got, ack);
+
+        let old = r#"{"ok":true,"short":"cccc3333","reason":null}"#;
+        let parsed: SpawnAck = serde_json::from_str(old).expect("older acks still parse");
+        assert!(parsed.capability_warnings.is_empty());
     }
 
     #[test]
@@ -715,6 +754,7 @@ mod tests {
                 short: Some("bbbb2222".to_string()),
                 reason: None,
                 retryable: false,
+                capability_warnings: Vec::new(),
             },
         )
         .expect("write_ack");

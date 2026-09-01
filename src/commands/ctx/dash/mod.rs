@@ -40,6 +40,7 @@ use super::adapters;
 use super::adapters::AgentAdapter;
 use super::config::{CtxConfig, EnvLookup, validate_model_str};
 use super::event::{SessionId, SessionRef};
+use super::policy;
 use super::state::StateDir;
 use super::term;
 use super::window;
@@ -2718,10 +2719,11 @@ const FILE_DROP_TRUSTED_INTERACTIVE: bool = false;
 /// context/` layer and the policy report all in one call -- then mail
 /// listing scoped to this fresh session's own short id ->
 /// `prompt::with_mail_layer` -> `prompt::injection_args_for_session`), and
-/// spawns it. `Ok(short)` is
-/// the freshly spawned pane's own registry short id; `Err(reason)` is
-/// exactly the text `spawnreq::SpawnAck::reason` carries back to the
-/// requester.
+/// spawns it. `Ok((short, capability_warnings))` carries the freshly
+/// spawned pane's own registry short id, plus its degraded/unsupported
+/// capabilities (issue #230 item 3, F2) against the EFFECTIVE (post-reroute)
+/// adapter -- empty when nothing is degraded; `Err(reason)` is exactly the
+/// text `spawnreq::SpawnAck::reason` carries back to the requester.
 ///
 /// `trusted_interactive` (review round 1, 2026-08-27, Important): whether
 /// THIS SPECIFIC CALL originates from the dashboard's own in-process Spawn
@@ -3243,7 +3245,7 @@ fn fulfill_spawn_request(
     size: (u16, u16),
     requests_dir: &Path,
     errors: &mut Vec<String>,
-) -> Result<String, SpawnRefusal> {
+) -> Result<(String, Vec<policy::CapabilityWarning>), SpawnRefusal> {
     // Every one of these is checked before anything is spawned, resolved or
     // written, in cheapest-and-most-hostile-first order.
     if argv_unsafe_prompt(&req.prompt) {
@@ -3446,6 +3448,20 @@ fn fulfill_spawn_request(
     }
     let adapter = adapters::select(Some(&req.agent), &[], cfg)
         .map_err(|e| SpawnRefusal::policy(e.to_string()))?;
+    // Issue #230 item 3 (F2, review round): computed once here, against
+    // this ALREADY-RESOLVED, post-reroute `adapter` -- not a second
+    // `adapters::select` against the ORIGINAL request's agent, which is
+    // what let a rerouted spawn's ack describe a harness that was never
+    // launched. `mode` mirrors the exact match `compose_worker_prompt`
+    // itself uses below; no second policy evaluation happens anywhere else
+    // in this function.
+    let mode = if req.interactive {
+        adapters::LaunchMode::Interactive
+    } else {
+        adapters::LaunchMode::Headless
+    };
+    let capability_warnings =
+        policy::evaluate(&cfg.policy, adapter.as_ref(), mode).degraded_capabilities();
 
     // Issue #155, Phase 6(c): the spawn gate -- quota pressure refuses NEW
     // delegated work, never rotation of a session already running (see
@@ -3780,7 +3796,7 @@ fn fulfill_spawn_request(
         );
     }
 
-    Ok(short)
+    Ok((short, capability_warnings))
 }
 
 /// Pairs every request in one taken batch with its own file stem, in order.
@@ -3900,11 +3916,12 @@ fn drain_one_channel(
             requests_dir,
             errors,
         ) {
-            Ok(short) => spawnreq::SpawnAck {
+            Ok((short, capability_warnings)) => spawnreq::SpawnAck {
                 ok: true,
                 short: Some(short),
                 reason: None,
                 retryable: false,
+                capability_warnings,
             },
             Err(refusal) => {
                 // R6: a refusal means no pane exists and none ever will, so
@@ -3920,6 +3937,7 @@ fn drain_one_channel(
                     short: None,
                     reason: Some(refusal.reason),
                     retryable: refusal.retryable,
+                    capability_warnings: Vec::new(),
                 }
             }
         };
@@ -6257,7 +6275,7 @@ pub fn run_dashboard(
                                                 match fulfilled {
                                                     // L13: a spawn confirmation is
                                                     // information, not a warning.
-                                                    Ok(short) => push_notice(
+                                                    Ok((short, _)) => push_notice(
                                                         &mut notices,
                                                         Instant::now(),
                                                         format!("spawned {} as {short}", req.agent),
@@ -11640,6 +11658,129 @@ mod tests {
         );
     }
 
+    /// Issue #230 item 3 (F2, review round): a REROUTED spawn's capability
+    /// warnings must describe the EFFECTIVE (post-reroute) adapter, not the
+    /// originally requested one -- `fulfill_spawn_request` computes them
+    /// itself against its own already-resolved effective `adapter`, so
+    /// there is exactly one `policy::evaluate` call in this whole path.
+    /// Sibling of `dashboard_spawn_reroutes_an_exhausted_requested_harness_
+    /// before_admission` above, carried through to a successful spawn
+    /// instead of a post-routing refusal.
+    #[cfg(windows)]
+    #[test]
+    fn a_rerouted_spawns_capability_warnings_describe_the_effective_adapter() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().to_path_buf();
+        let now = crate::commands::ctx::state::now_secs();
+
+        crate::commands::ctx::window::store_for(
+            &state,
+            "anthropic",
+            &crate::commands::ctx::window::UsageWindows {
+                five_hour: Some(crate::commands::ctx::window::Window {
+                    used_percentage: 100.0,
+                    resets_at: now + 3_600,
+                    observed_at: now,
+                }),
+                seven_day: None,
+            },
+        )
+        .expect("store claude usage");
+        crate::commands::ctx::window::store_for(
+            &state,
+            "openai",
+            &crate::commands::ctx::window::UsageWindows {
+                five_hour: Some(crate::commands::ctx::window::Window {
+                    used_percentage: 10.0,
+                    resets_at: now + 3_600,
+                    observed_at: now,
+                }),
+                seven_day: None,
+            },
+        )
+        .expect("store codex usage");
+
+        // A trivial, always-exits `.cmd` shim so `agent_bin` resolves to a
+        // real, fast-exiting executable regardless of which adapter the
+        // reroute actually selects.
+        let shim = tmp.path().join("agent.cmd");
+        std::fs::write(&shim, "@echo off\r\n").expect("write shim");
+
+        let mut cfg = CtxConfig {
+            agent_bin: Some(shim.display().to_string()),
+            // `approval = "deny"` is `Unsupported` on claude
+            // (`APPROVAL_UNSUPPORTED`) and `Degraded` on codex
+            // (`APPROVAL_DENY_DEGRADED`) -- the two adapters' own mechanism
+            // TEXT differs, which is what makes the assertion below able to
+            // tell "warnings computed against claude" apart from "warnings
+            // computed against codex".
+            policy: crate::commands::ctx::policy::EffectivePolicy {
+                approval: crate::commands::ctx::policy::Stance::Deny,
+                ..Default::default()
+            },
+            ..CtxConfig::default()
+        };
+        cfg.pace.estimator = false;
+
+        let mut req = spawn_request("do the work", &repo);
+        req.agent = "claude".to_string();
+
+        let mut panes: Vec<Pane> = Vec::new();
+        let mut queues: Vec<VecDeque<String>> = Vec::new();
+        let mut errors = Vec::new();
+
+        let (_, capability_warnings) = fulfill_spawn_request(
+            &req,
+            true,
+            None,
+            &mut panes,
+            &mut queues,
+            &cfg,
+            &state,
+            &repo,
+            (80, 24),
+            &tmp.path().join("requests"),
+            &mut errors,
+        )
+        .expect("codex has headroom after the reroute");
+
+        assert!(
+            errors
+                .iter()
+                .any(|line| line.contains("dashboard spawn automatically routed claude -> codex")),
+            "must actually have rerouted: {errors:?}"
+        );
+
+        let codex_warnings = crate::commands::ctx::policy::evaluate(
+            &cfg.policy,
+            &crate::commands::ctx::adapters::codex::CodexAdapter::new(None),
+            crate::commands::ctx::adapters::LaunchMode::Interactive,
+        )
+        .degraded_capabilities();
+        assert!(
+            !codex_warnings.is_empty(),
+            "fixture must exercise a real warning"
+        );
+        assert_eq!(
+            capability_warnings, codex_warnings,
+            "the ack's own warnings must match codex's (the effective adapter's) policy \
+             report, not claude's (the originally requested one's)"
+        );
+        assert!(
+            !capability_warnings.iter().any(
+                |w| w.mechanism.contains("permission-mode") || w.mechanism.contains("tool pin")
+            ),
+            "must not carry claude's own mechanism text: {capability_warnings:?}"
+        );
+
+        for pane in &mut panes {
+            let _ = pane.shutdown("");
+        }
+    }
+
     /// Re-review (2026-08-27) finding 1: an admission granted by `admit_child`
     /// above must be rolled back when a LATER step in this same call fails
     /// before a pane is ever actually spawned -- otherwise a group's
@@ -12248,7 +12389,7 @@ mod tests {
         let mut sub_req = spawn_request("own this scope", &repo);
         sub_req.parent_session = Some(orch_short.clone());
         sub_req.role = Some("sub-orchestrator".to_string());
-        let sub_short = fulfill_spawn_request(
+        let (sub_short, _) = fulfill_spawn_request(
             &sub_req,
             false,
             Some(&orch_short),
