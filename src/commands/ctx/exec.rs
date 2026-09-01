@@ -534,6 +534,11 @@ fn run_with_clock_inner<W: Write>(
     // its own call below) computes this same slug internally but callers
     // still need their own copy for mail listing.
     let mail_slug = super::state::repo_slug(repo);
+    // Issue #249: this run's own supervising session, if any -- resolved
+    // once, from `env` alone, and reused at every mail-rendering call below
+    // (the launch-time delivery and every relaunch arm), never re-derived
+    // from anything a message itself carries.
+    let parent_short = agent::parent_identity(env);
 
     // A wrapped command that matches no adapter (no explicit `--agent`,
     // detection came up empty) is not actually the agent whose flags we would
@@ -703,7 +708,9 @@ fn run_with_clock_inner<W: Write>(
     // listing, not permanently the launch-time one.
     let mut mail_messages: Vec<super::mail::Message> = mail_entries
         .iter()
-        .map(|(path, msg)| super::mail::message_with_delivery_envelope(&state, path, msg))
+        .map(|(path, msg)| {
+            super::mail::message_with_delivery_envelope(&state, path, msg, parent_short.as_deref())
+        })
         .collect();
     if !mail_messages.is_empty() {
         announcer.emit(&super::announce::Event::MailDelivered {
@@ -711,7 +718,12 @@ fn run_with_clock_inner<W: Write>(
         });
     }
     let composed = if system_prompt_supported {
-        super::prompt::with_mail_layer(composed, &mail_messages, cfg.mail.max_delivered_bytes)
+        super::prompt::with_mail_layer(
+            composed,
+            &mail_messages,
+            cfg.mail.max_delivered_bytes,
+            parent_short.as_deref(),
+        )
     } else {
         composed
     };
@@ -943,6 +955,19 @@ fn run_with_clock_inner<W: Write>(
         if let Some(group) = env(super::agent::WORK_GROUP_ENV).filter(|id| !id.is_empty()) {
             turn_env.push((super::agent::WORK_GROUP_ENV.to_string(), group));
         }
+        // Issue #249: this run's own supervising session, if any, exported
+        // into the CHILD's real process environment -- not merely read by
+        // this supervisor's own in-process mail-rendering (`parent_short`,
+        // above). The child is what actually runs `zirv ctx send`/`zirv ctx
+        // inbox` as its own report-back/steering channel, as a brand new OS
+        // process that inherits nothing from this Rust closure, so it needs
+        // its own copy of the same fact. `agent::run_with`'s `parent_
+        // session_env` fold already resolved this to the delegating
+        // session's own id (never a stray inherited value -- see that
+        // fold's own doc comment), so a plain re-read here is exactly right.
+        if let Some(parent) = env(super::agent::PARENT_SESSION_ENV) {
+            turn_env.push((super::agent::PARENT_SESSION_ENV.to_string(), parent));
+        }
         turn_env
     };
 
@@ -1046,6 +1071,7 @@ fn run_with_clock_inner<W: Write>(
             (system_prompt_supported && composed.is_some()) || mail_in_composed,
             &mail_messages,
             cfg.mail.max_delivered_bytes,
+            parent_short.as_deref(),
         );
         let extra: Vec<String> = policy_extra
             .iter()
@@ -1509,6 +1535,7 @@ fn run_with_clock_inner<W: Write>(
                     fresh,
                     &nudge_mail_msgs,
                     cfg.mail.max_delivered_bytes,
+                    parent_short.as_deref(),
                 )
             } else {
                 fresh
@@ -1598,6 +1625,7 @@ fn run_with_clock_inner<W: Write>(
                 (relaunch_system_prompt_supported && composed.is_some()) || mail_in_composed,
                 &nudge_mail_msgs,
                 cfg.mail.max_delivered_bytes,
+                parent_short.as_deref(),
             );
             let extra: Vec<String> = policy_extra
                 .iter()
@@ -1921,6 +1949,7 @@ fn run_with_clock_inner<W: Write>(
                 (relaunch_system_prompt_supported && composed.is_some()) || mail_in_composed,
                 &mail_messages,
                 cfg.mail.max_delivered_bytes,
+                parent_short.as_deref(),
             );
             let (mut rebuilt, sp) = build_headless(&prompt_text, &session, &extra);
             rebuilt.current_dir(repo);
@@ -2152,6 +2181,7 @@ fn run_with_clock_inner<W: Write>(
             (relaunch_system_prompt_supported && composed.is_some()) || mail_in_composed,
             &mail_messages,
             cfg.mail.max_delivered_bytes,
+            parent_short.as_deref(),
         );
         // M8: the user's own extra flags survive the restart too, not just
         // zirv's own (the system prompt args, and now the sandbox/policy

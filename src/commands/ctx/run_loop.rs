@@ -124,6 +124,9 @@ pub(crate) fn run_with_clock<W: Write>(
         super::announce::Announcer::new(cfg.chrome.events, console::colors_enabled_stderr());
     let adapter = adapters::select(args.agent.as_deref().or(cfg.agent.as_deref()), &[], &cfg)?;
     let state = StateDir::resolve(env)?;
+    // Issue #249: this loop's own supervising session, if any -- resolved
+    // once, from `env` alone, and reused for every cycle's mail rendering.
+    let parent_short = super::agent::parent_identity(env);
 
     let interval = Duration::from_secs(args.interval_secs.unwrap_or(cfg.supervise.interval_secs));
     let max_cycle =
@@ -238,7 +241,14 @@ pub(crate) fn run_with_clock<W: Write>(
         };
         let mail_messages: Vec<super::mail::Message> = mail_entries
             .iter()
-            .map(|(path, msg)| super::mail::message_with_delivery_envelope(&state, path, msg))
+            .map(|(path, msg)| {
+                super::mail::message_with_delivery_envelope(
+                    &state,
+                    path,
+                    msg,
+                    parent_short.as_deref(),
+                )
+            })
             .collect();
         if !mail_messages.is_empty() {
             announcer.emit(&super::announce::Event::MailDelivered {
@@ -254,7 +264,12 @@ pub(crate) fn run_with_clock<W: Write>(
         // still folds mail into `composed` exactly as before.
         let system_prompt_supported = adapter.system_prompt_supported(&[]);
         let composed = if system_prompt_supported {
-            super::prompt::with_mail_layer(composed, &mail_messages, cfg.mail.max_delivered_bytes)
+            super::prompt::with_mail_layer(
+                composed,
+                &mail_messages,
+                cfg.mail.max_delivered_bytes,
+                parent_short.as_deref(),
+            )
         } else {
             composed
         };
@@ -365,6 +380,7 @@ pub(crate) fn run_with_clock<W: Write>(
             (system_prompt_supported && composed.is_some()) || mail_in_composed,
             &mail_messages,
             cfg.mail.max_delivered_bytes,
+            parent_short.as_deref(),
         );
 
         // FIX B: on a Windows npm `.cmd` shim launch, cmd.exe reparses the

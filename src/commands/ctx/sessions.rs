@@ -47,12 +47,19 @@ pub fn short_id(session: &str) -> String {
 /// session's seat, and a worker that inherits an orchestrator's copy would
 /// have its own subagent dispatches refused by a guard describing a seat it
 /// is not sitting in.
-pub const SUPERVISION_ENV: [&str; 5] = [
+///
+/// Issue #249: `PARENT_SESSION_ENV` rides along too -- it names the session
+/// THIS one's own env says spawned it, and a child that inherited a copy
+/// unscrubbed would see its grandparent's id instead of never having one of
+/// its own set at all (see `agent::parent_session_env`'s own doc comment for
+/// the same rule at the fold that sets it fresh).
+pub const SUPERVISION_ENV: [&str; 6] = [
     super::adapters::SESSION_ENV,
     super::adapters::SOCKET_ENV,
     super::adapters::SEAT_MODEL_ENV,
     super::wrap::TRANSCRIPT_ENV,
     super::adapters::LAUNCH_MODE_ENV,
+    super::agent::PARENT_SESSION_ENV,
 ];
 
 /// `portable_pty::CommandBuilder::new` seeds itself from `std::env::vars_os`,

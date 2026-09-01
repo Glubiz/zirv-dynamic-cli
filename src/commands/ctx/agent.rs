@@ -266,6 +266,33 @@ pub fn validate_role(role: &Option<String>) -> CtxResult<()> {
 /// harness remembering to type `--group` every time.
 pub const WORK_GROUP_ENV: &str = "ZIRV_CTX_WORK_GROUP";
 
+/// Issue #249: names the session that spawned THIS one, set explicitly at
+/// every worker-spawn seam (never inherited -- see [`parent_identity`]'s own
+/// doc comment) from the spawning process's own `mail::session_identity`, or
+/// from a dashboard's own server-verified requester. Consumed by every mail
+/// trust-render seam (`mail::render_delivery_message`, `prompt::
+/// render_mail_block`, `wrap::mail_advisory_line`, `dash::mod::mail_
+/// injection_label`) to decide whether a message's zirv-recorded sender
+/// matches this session's own supervising session -- the ONLY signal any of
+/// those seams may use for that decision; the payload body and any
+/// caller-supplied JSON are never trusted for it (issue #249's own security
+/// invariant).
+pub const PARENT_SESSION_ENV: &str = "ZIRV_CTX_PARENT_SESSION";
+
+/// The short id of the session THIS process's own environment names as its
+/// parent, or `None` when [`PARENT_SESSION_ENV`] is unset or not a plain
+/// short id ([`super::prompt::is_addressable_short`], the same bound
+/// `spawnreq::SpawnRequest::requested_by` is already held to).
+///
+/// Deliberately re-reads `env` fresh on every call rather than being cached:
+/// the one property this whole mechanism depends on is that the value never
+/// silently survives past the session it names, and a cache is exactly the
+/// kind of place that could paper over `env` having been re-scoped between
+/// two calls.
+pub(crate) fn parent_identity(env: EnvLookup<'_>) -> Option<String> {
+    env(PARENT_SESSION_ENV).filter(|id| super::prompt::is_addressable_short(id))
+}
+
 /// Issue #170: resolves what `--group` this delegation actually binds to,
 /// mutating `args.group` in place -- called once, at the very top of
 /// [`run_with`], before the dashboard-join fork so BOTH forks of this
@@ -351,6 +378,27 @@ fn group_env<'a>(
     move |key: &str| match &group {
         Some(id) if key == WORK_GROUP_ENV => Some(id.clone()),
         _ => env(key),
+    }
+}
+
+/// Issue #249: folds this delegation's own resolved parent id into the env
+/// lookup its headless launch runs under, the same shape [`group_env`]
+/// already established -- except, unlike [`WORK_GROUP_ENV`], [`PARENT_
+/// SESSION_ENV`] must NEVER fall through to whatever `env` already carries
+/// for that key: `parent` is always substituted outright, `None` included,
+/// so a value this process happened to inherit from further up its own
+/// delegation chain (its own parent's own parent) can never leak through to
+/// a child that must see THIS session's id, and no one else's.
+fn parent_session_env<'a>(
+    env: EnvLookup<'a>,
+    parent: Option<String>,
+) -> impl Fn(&str) -> Option<String> + 'a {
+    move |key: &str| {
+        if key == PARENT_SESSION_ENV {
+            parent.clone()
+        } else {
+            env(key)
+        }
     }
 }
 
@@ -1308,10 +1356,19 @@ pub fn run_with<W: Write>(
         cfg.chrome.events && !args.quiet,
         console::colors_enabled_stderr(),
     );
+    // Issue #249: resolved from the ORIGINAL, unshadowed `env` parameter --
+    // this delegating session's own identity -- never from anything already
+    // folded below, and never inherited from whatever `PARENT_SESSION_ENV`
+    // this process itself happens to carry (see `parent_session_env`'s own
+    // doc comment for why that would leak a grandparent's id to the worker
+    // about to be launched).
+    let worker_parent =
+        super::mail::session_identity(env).filter(|id| super::prompt::is_addressable_short(id));
     // Finding 3: the launch below runs under an env lookup that carries this
     // delegation's own group, so `exec::run_with` can export it to the child.
     let quieted = quiet_env(env, args.quiet);
-    let env = group_env(&quieted, args.group.clone());
+    let grouped = group_env(&quieted, args.group.clone());
+    let env = parent_session_env(&grouped, worker_parent);
 
     // Resolved here, ahead of `exec::run_with`'s own (identical) selection
     // further down, purely to compute the default worker model this spawn
@@ -3400,6 +3457,126 @@ mod tests {
             record["work_group_id"].as_str(),
             Some(group_id.as_str()),
             "and the delegation is recorded inside that group, not as ungrouped: {record}"
+        );
+    }
+
+    /// Issue #249, design A: a headless `zirv agent` delegation's own child
+    /// carries `PARENT_SESSION_ENV`, set from the DELEGATING session's own
+    /// identity (`ZIRV_CTX_SESSION` on the process that ran `zirv agent`) --
+    /// end to end, through the real child process's own environment, read
+    /// back via the fixture's env log (mirrors `a_headless_coordinators_
+    /// child_inherits_the_group_it_was_bound_to`'s own proof shape).
+    #[test]
+    fn a_headless_delegations_child_carries_the_delegating_sessions_identity_as_its_parent() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state_dir = tmp.path().join("state");
+        let mut env = base_env(&state_dir);
+        env.insert("ZIRV_CTX_PACE".to_string(), "false".to_string());
+        env.insert(
+            crate::commands::ctx::adapters::SESSION_ENV.to_string(),
+            "orch0001-2222-4333-8444-555555555555".to_string(),
+        );
+        let parent_env_log = tmp.path().join("parent-env.log");
+
+        unsafe {
+            std::env::set_var("FAKE_AGENT_MODE", "healthy");
+            std::env::set_var("FAKE_AGENT_PARENT_ENV_LOG", &parent_env_log);
+        }
+        let args = args_for("claude", "do the work");
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE");
+            std::env::remove_var("FAKE_AGENT_PARENT_ENV_LOG");
+        }
+        assert_eq!(code.expect("runs"), 0);
+
+        let logged = std::fs::read_to_string(&parent_env_log).expect("the child logged its env");
+        assert_eq!(
+            logged.trim(),
+            "orch0001",
+            "the child must see the DELEGATING session's own short id as its parent"
+        );
+    }
+
+    /// The "never rely on inheritance" half of design A: this delegation's
+    /// OWN process env already carries a `PARENT_SESSION_ENV` (as if it were
+    /// itself a worker calling `zirv agent` again to spawn a further child).
+    /// The new child must see THIS session's own id, never the grandparent's
+    /// -- `parent_session_env`'s whole reason for never falling through.
+    #[test]
+    fn a_headless_delegations_child_never_inherits_a_grandparents_parent_session() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state_dir = tmp.path().join("state");
+        let mut env = base_env(&state_dir);
+        env.insert("ZIRV_CTX_PACE".to_string(), "false".to_string());
+        // This process's OWN identity -- what the new child's parent must
+        // become.
+        env.insert(
+            crate::commands::ctx::adapters::SESSION_ENV.to_string(),
+            "worker01-2222-4333-8444-555555555555".to_string(),
+        );
+        // A stray, already-inherited value from further up the chain -- must
+        // never leak through to the new child.
+        env.insert(PARENT_SESSION_ENV.to_string(), "grandpar".to_string());
+        let parent_env_log = tmp.path().join("parent-env.log");
+
+        unsafe {
+            std::env::set_var("FAKE_AGENT_MODE", "healthy");
+            std::env::set_var("FAKE_AGENT_PARENT_ENV_LOG", &parent_env_log);
+        }
+        let args = args_for("claude", "do the work");
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE");
+            std::env::remove_var("FAKE_AGENT_PARENT_ENV_LOG");
+        }
+        assert_eq!(code.expect("runs"), 0);
+
+        let logged = std::fs::read_to_string(&parent_env_log).expect("the child logged its env");
+        assert_eq!(
+            logged.trim(),
+            "worker01",
+            "the child must see THIS session's own id, never the inherited grandparent's"
+        );
+    }
+
+    /// No identified delegating session (an operator's own raw terminal, no
+    /// `ZIRV_CTX_SESSION` at all) means no parent -- the child's env carries
+    /// no `PARENT_SESSION_ENV` at all, not an empty or placeholder value.
+    #[test]
+    fn a_headless_delegation_with_no_identified_delegating_session_sets_no_parent_env() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state_dir = tmp.path().join("state");
+        let mut env = base_env(&state_dir);
+        env.insert("ZIRV_CTX_PACE".to_string(), "false".to_string());
+        let parent_env_log = tmp.path().join("parent-env.log");
+
+        unsafe {
+            std::env::set_var("FAKE_AGENT_MODE", "healthy");
+            std::env::set_var("FAKE_AGENT_PARENT_ENV_LOG", &parent_env_log);
+        }
+        let args = args_for("claude", "do the work");
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE");
+            std::env::remove_var("FAKE_AGENT_PARENT_ENV_LOG");
+        }
+        assert_eq!(code.expect("runs"), 0);
+
+        let logged = std::fs::read_to_string(&parent_env_log).expect("the child logged its env");
+        assert_eq!(
+            logged.trim(),
+            "",
+            "with no identified delegating session, the child gets no parent at all"
         );
     }
 

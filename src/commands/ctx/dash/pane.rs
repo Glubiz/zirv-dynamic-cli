@@ -801,6 +801,16 @@ pub struct Pane {
     /// Also what `dash::mod::on_quit` persists into the restore roster, so a
     /// restored pane comes back inside the same group.
     work_group_id: Option<String>,
+    /// Issue #249: this pane's own server-verified supervising session
+    /// (`dash::mod::fulfill_spawn_request`'s `verified_parent` -- the
+    /// requester identity the per-pane intake-channel gate already proved,
+    /// never `SpawnRequest::parent_session`, which is unverified data on the
+    /// shared channel). `dash::mod::sweep_one_pane` reads this back to mark
+    /// mail from this session's own parent with the steering trust label
+    /// instead of the ordinary peer one. `None` for the dashboard's own
+    /// orchestrator pane and for any pane whose lineage could not be
+    /// verified.
+    parent_session: Option<String>,
     /// Whether `report_back_reminder_sweep`'s one-shot completion reminder
     /// has already been injected into this pane. Set the moment that
     /// injection succeeds and never cleared again -- unlike
@@ -1030,6 +1040,7 @@ impl Pane {
             report_to: None,
             intake_dir: None,
             work_group_id: None,
+            parent_session: None,
             report_reminder_sent: false,
             pending_submit: None,
             launch_mode,
@@ -1487,6 +1498,21 @@ impl Pane {
     /// The work group this pane belongs to, if any.
     pub fn work_group_id(&self) -> Option<&str> {
         self.work_group_id.as_deref()
+    }
+
+    /// Issue #249: records this pane's own server-verified supervising
+    /// session. Called right after `Pane::spawn` by the caller that already
+    /// derived it (`dash::mod::fulfill_spawn_request`'s `verified_parent`),
+    /// the same "computed once, stored once" pattern `set_report_to`/`set_
+    /// work_group_id` already establish.
+    pub fn set_parent_session(&mut self, parent: Option<String>) {
+        self.parent_session = parent;
+    }
+
+    /// This pane's own server-verified supervising session, if any --
+    /// `dash::mod::sweep_one_pane`'s own trust-label input.
+    pub fn parent_session(&self) -> Option<&str> {
+        self.parent_session.as_deref()
     }
 
     /// Whether `report_back_reminder_sweep`'s one-shot reminder has already
