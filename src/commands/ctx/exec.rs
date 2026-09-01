@@ -1593,7 +1593,7 @@ fn run_with_clock_inner<W: Write>(
                 cfg.supervise.max_nudges
             )?;
 
-            let combined = format!("{prompt_text}\n\n{}", note.to_markdown());
+            let combined = format!("{prompt_text}\n\n{}", handoff::labeled_for_injection(&note));
             let combined = super::prompt::task_prompt_with_composed_fallback(
                 &combined,
                 relaunch_system_prompt_supported,
@@ -1763,7 +1763,7 @@ fn run_with_clock_inner<W: Write>(
                 let prompt_text = prompt.clone().expect("route requires a known prompt");
                 let continuation = format!(
                     "{prompt_text}\n\nThe previous harness exhausted its usage window. Continue from this handoff without redoing completed work:\n\n{}",
-                    note.to_markdown()
+                    handoff::labeled_for_injection(&note)
                 );
                 let target = adapters::select(Some(&selected_agent), &[], &cfg)?;
                 let nested_args = ExecArgs {
@@ -2146,7 +2146,7 @@ fn run_with_clock_inner<W: Write>(
             composed.as_ref(),
             relaunch_system_prompt_supported,
         ));
-        let combined = format!("{prompt_text}\n\n{}", note.to_markdown());
+        let combined = format!("{prompt_text}\n\n{}", handoff::labeled_for_injection(&note));
         let combined = super::prompt::task_prompt_with_composed_fallback(
             &combined,
             relaunch_system_prompt_supported,
