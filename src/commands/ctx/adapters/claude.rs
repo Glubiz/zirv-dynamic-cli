@@ -555,31 +555,16 @@ impl ClaudeAdapter {
         let policy_dir = dir.join("policies");
         let policy_path = policy_dir.join(format!("{fingerprint}.json"));
         let path = dir.join(format!("claude-launch-settings-{fingerprint}.json"));
-        // Issue #147: `zirv ctx send` (and any other mail write) must
-        // succeed inside a sandboxed session, so the mailbox tree -- and
-        // ONLY the mailbox tree, never the policy-snapshot/attestation or
-        // log directories right above it -- is allow-listed for write.
-        // Best-effort: a state-dir resolution failure just omits the entry,
-        // it never blocks materializing the rest of this settings layer.
-        //
-        // Code review revert (issue #168 follow-up): a prior round widened
-        // this to also allow-list memory/logs/groups/handoffs, reasoning
-        // that `zirv ctx remember`/`recall`/`forget`/`nudge`/`group`/...
-        // needed the same OS-sandbox write access `zirv ctx send` does.
-        // With `is_reserved_zirv_escape_safe`'s own allow-list, every one of
-        // those `zirv ctx <state-verb>` invocations already rides the
-        // ALWAYS-ALLOWED unsandboxed retry, so no prompt is ever paid for
-        // those writes regardless of what this OS-sandbox allowlist says.
-        // Reverting to mail-only keeps the safety audit trail (`logs/`),
-        // the cross-session memory bank, group budgets, and handoffs
-        // UNWRITABLE from inside the sandbox on any OTHER path (an
-        // unlisted/unmatched command that is not `zirv ctx` at all) -- real
-        // defense-in-depth the widened list gave up for no operator-facing
-        // benefit.
-        let mail_dir =
+        // Issue #222: sandbox-confined Zirv built-ins persist workflow,
+        // verification, frontend, telemetry, and related state throughout
+        // the platform state root. Resolve that root once from the operator/
+        // platform environment; repository input cannot configure it.
+        // Best-effort: resolution failure omits allowWrite without blocking
+        // the rest of the attested settings layer.
+        let state_root =
             super::super::state::StateDir::resolve(&super::super::config::env_from_process())
                 .ok()
-                .map(|state| state.mail());
+                .map(|state| state.root().to_path_buf());
         let result = (|| -> std::io::Result<()> {
             super::super::state::create_private_dir_all(&dir)?;
             super::super::state::create_private_dir_all(&policy_dir)?;
@@ -587,7 +572,7 @@ impl ClaudeAdapter {
                 serde_json::to_string_pretty(safety).map_err(std::io::Error::other)?;
             policy_body.push('\n');
             super::super::state::write_private(&policy_path, &policy_body)?;
-            let settings = launch_settings_value(safety, &policy_path, mail_dir.as_deref())
+            let settings = launch_settings_value(safety, &policy_path, state_root.as_deref())
                 .map_err(std::io::Error::other)?;
             let mut body =
                 serde_json::to_string_pretty(&settings).map_err(std::io::Error::other)?;
@@ -626,27 +611,54 @@ impl ClaudeAdapter {
 /// point for an escape; the operator's own native rules, if any, still apply
 /// on top, per the same documented precedence.
 ///
-/// Issue #224 adds one narrow native projection: `permissions.allow` and the
-/// sandbox's `excludedCommands` receive one pattern per name in
-/// `utils::RESERVED_COMMANDS`. Those names are dispatched before repo script
-/// lookup and cannot be shadowed; a non-reserved `zirv <script>` gets no rule.
-/// The outer `zirv report` process therefore runs outside the sandbox and its
-/// fixed, captured `gh auth token --hostname github.com` child may read the
-/// credential file, without allowing direct `gh auth *` (or blanket `gh *`)
-/// outside the sandbox. PreToolUse still evaluates every invocation, so repo
-/// `deny`/`ask` rules continue to narrow this default despite native allow.
+/// Reserved Zirv built-ins and the explicit command-family table below form
+/// the native projection. PreToolUse still evaluates every invocation before
+/// execution, so dangerous `gh` and push forms and repo `deny`/`ask` rules
+/// continue to narrow the broad native families.
+struct CommandFamilyProjection {
+    pattern: &'static str,
+    sandbox_excluded: bool,
+}
+
+const PROMPT_FREE_COMMAND_FAMILIES: &[CommandFamilyProjection] = &[
+    CommandFamilyProjection {
+        pattern: "gh *",
+        sandbox_excluded: true,
+    },
+    CommandFamilyProjection {
+        pattern: "git push *",
+        sandbox_excluded: true,
+    },
+    CommandFamilyProjection {
+        pattern: "git worktree *",
+        sandbox_excluded: false,
+    },
+];
+
 #[cfg_attr(windows, allow(unused_variables))]
 fn launch_settings_value(
     safety: &super::super::safety::SafetyPolicy,
     policy_path: &Path,
-    mail_write_dir: Option<&Path>,
+    state_write_root: Option<&Path>,
 ) -> Result<Value, serde_json::Error> {
     let fingerprint = super::super::safety::policy_fingerprint(safety)?;
     let reserved_zirv_patterns = super::super::safety::reserved_zirv_command_patterns();
-    let reserved_zirv_permission_rules: Vec<String> = reserved_zirv_patterns
+    let mut reserved_zirv_permission_rules: Vec<String> = reserved_zirv_patterns
         .iter()
         .map(|pattern| format!("Bash({pattern})"))
         .collect();
+    reserved_zirv_permission_rules.extend(
+        PROMPT_FREE_COMMAND_FAMILIES
+            .iter()
+            .map(|family| format!("Bash({})", family.pattern)),
+    );
+    let mut sandbox_exclusions = super::super::safety::reserved_zirv_sandbox_exclusion_patterns();
+    sandbox_exclusions.extend(
+        PROMPT_FREE_COMMAND_FAMILIES
+            .iter()
+            .filter(|family| family.sandbox_excluded)
+            .map(|family| family.pattern.to_string()),
+    );
     #[cfg_attr(windows, allow(unused_mut))]
     let mut settings = serde_json::json!({
         "disableAllHooks": false,
@@ -693,14 +705,11 @@ fn launch_settings_value(
         let mut filesystem = serde_json::json!({
             "denyRead": super::super::safety::SANDBOX_DENY_READ_HOME_PATHS
         });
-        // Issue #147: `zirv ctx send`'s mailbox writes (`state.mail()`) must
-        // work inside the sandbox -- by default a sandboxed command may only
-        // write to the working directory and the session temp directory.
-        // Deliberately narrow: only the mail tree, never the policy-
-        // snapshot/attestation or log directories that sit alongside it
-        // under the same state root.
-        if let Some(mail_dir) = mail_write_dir {
-            filesystem["allowWrite"] = serde_json::json!([mail_dir.display().to_string()]);
+        // Sandbox-confined Zirv built-ins need the exact platform state root;
+        // the immutable policy snapshot is operator-owned launch state and is
+        // not added separately by this rule.
+        if let Some(state_root) = state_write_root {
+            filesystem["allowWrite"] = serde_json::json!([state_root.display().to_string()]);
         }
         object.insert(
             "sandbox".to_string(),
@@ -708,7 +717,7 @@ fn launch_settings_value(
             "enabled": true,
             "autoAllowBashIfSandboxed": true,
             "allowUnsandboxedCommands": true,
-            "excludedCommands": reserved_zirv_patterns,
+            "excludedCommands": sandbox_exclusions,
             "failIfUnavailable": true,
             "filesystem": filesystem
             }),
@@ -2272,10 +2281,9 @@ mod tests {
         assert!(read_denies.iter().any(|entry| entry == "Read(~/.ssh/**)"));
     }
 
-    /// Issue #224: Claude's native permission and sandbox layers must mirror
-    /// the classifier's reserved-name boundary. Excluding the outer `zirv
-    /// report` process lets its fixed, captured `gh auth token` child reach
-    /// the credential file without exposing direct `gh auth *` to the model.
+    /// Issue #222: Claude's native permission and sandbox layers project the
+    /// three-way allow/sandbox/ask partition without widening repo scripts or
+    /// subprocess-launching ctx verbs.
     ///
     /// Code review fix (CRITICAL, issue #224 follow-up): `ctx` must NOT get
     /// a name-level `Bash(zirv ctx *)`/`zirv ctx *` entry -- several of its
@@ -2286,25 +2294,14 @@ mod tests {
     /// reserved name keeps its name-level entry, since its payload is a
     /// prompt or a path, not arbitrary argv.
     ///
-    /// Code review fix (CRITICAL, issue #224 review rounds 4-5): `setup`,
-    /// `test`, `verify`, and `frontend` get NO entry at all, at either
-    /// level -- see `safety::DESTRUCTIVE_OR_UNTRUSTED_PAYLOAD_BUILTINS`'s
-    /// own doc comment (`frontend` added in round 5: its native sandbox
-    /// exclusion would have run the repository's own `package.json` script
-    /// body unsandboxed, unlike the already-shipped, sandbox-confined
-    /// `Bash(npm *)` allow). `agent`/`chat`/`artifact` DO keep their
-    /// name-level entry despite carrying their own flag-gated `Deny` in
-    /// `safety::evaluate_single` (a native settings glob cannot express
-    /// that narrowing, see `safety::reserved_zirv_command_patterns`'s own
-    /// doc comment).
     #[test]
-    fn launch_settings_project_reserved_builtins_without_widening_scripts_or_gh() {
+    fn launch_settings_project_the_prompt_free_command_family_partition() {
         let settings = test_launch_settings();
         let permission_allow = settings["permissions"]["allow"]
             .as_array()
             .expect("reserved built-in permission rules");
         for name in crate::utils::RESERVED_COMMANDS {
-            if matches!(*name, "ctx" | "setup" | "test" | "verify" | "frontend") {
+            if matches!(*name, "ctx" | "setup") {
                 continue;
             }
             let expected = serde_json::json!(format!("Bash(zirv {name} *)"));
@@ -2315,7 +2312,13 @@ mod tests {
         }
         assert!(!permission_allow.contains(&serde_json::json!("Bash(zirv *)")));
         assert!(!permission_allow.contains(&serde_json::json!("Bash(zirv ctx *)")));
-        assert!(!permission_allow.contains(&serde_json::json!("Bash(gh *)")));
+        for family in PROMPT_FREE_COMMAND_FAMILIES {
+            let rule = format!("Bash({})", family.pattern);
+            assert!(
+                permission_allow.contains(&serde_json::json!(rule)),
+                "native allow rule {rule} missing from {settings}"
+            );
+        }
         assert!(permission_allow.contains(&serde_json::json!("Bash(zirv ctx status *)")));
         assert!(permission_allow.contains(&serde_json::json!("Bash(zirv ctx inbox *)")));
         assert!(!permission_allow.contains(&serde_json::json!("Bash(zirv ctx exec *)")));
@@ -2325,16 +2328,11 @@ mod tests {
         // `usage tee -- <cmd>` -- unlike the escape-safe retry path, a
         // native permission/sandbox glob cannot see the fourth token.
         assert!(!permission_allow.contains(&serde_json::json!("Bash(zirv ctx usage *)")));
-        // Issue #224 review rounds 4-5: `setup reset --scope global --yes`
-        // targets the operator's real `~/.claude`/`~/.codex`; `test`/
-        // `verify` execute the repository's own untrusted `.zirv/
-        // verify.toml` commands; `frontend render` runs the repository's
-        // own `package.json` script body. None has a safe unconditional
-        // form.
         assert!(!permission_allow.contains(&serde_json::json!("Bash(zirv setup *)")));
-        assert!(!permission_allow.contains(&serde_json::json!("Bash(zirv test *)")));
-        assert!(!permission_allow.contains(&serde_json::json!("Bash(zirv verify *)")));
-        assert!(!permission_allow.contains(&serde_json::json!("Bash(zirv frontend *)")));
+        assert!(permission_allow.contains(&serde_json::json!("Bash(zirv test *)")));
+        assert!(permission_allow.contains(&serde_json::json!("Bash(zirv verify *)")));
+        assert!(permission_allow.contains(&serde_json::json!("Bash(zirv frontend *)")));
+        assert!(!permission_allow.contains(&serde_json::json!("Bash(zirv somescript *)")));
 
         #[cfg(not(windows))]
         {
@@ -2353,7 +2351,14 @@ mod tests {
             }
             assert!(!exclusions.contains(&serde_json::json!("zirv *")));
             assert!(!exclusions.contains(&serde_json::json!("zirv ctx *")));
-            assert!(!exclusions.contains(&serde_json::json!("gh *")));
+            for family in PROMPT_FREE_COMMAND_FAMILIES {
+                assert_eq!(
+                    exclusions.contains(&serde_json::json!(family.pattern)),
+                    family.sandbox_excluded,
+                    "sandbox projection for {} is wrong in {settings}",
+                    family.pattern
+                );
+            }
             assert!(exclusions.contains(&serde_json::json!("zirv ctx status *")));
             assert!(!exclusions.contains(&serde_json::json!("zirv ctx exec *")));
             assert!(!exclusions.contains(&serde_json::json!("zirv ctx wrap *")));
@@ -2362,6 +2367,7 @@ mod tests {
             assert!(!exclusions.contains(&serde_json::json!("zirv test *")));
             assert!(!exclusions.contains(&serde_json::json!("zirv verify *")));
             assert!(!exclusions.contains(&serde_json::json!("zirv frontend *")));
+            assert!(!exclusions.contains(&serde_json::json!("zirv somescript *")));
             assert!(
                 settings["sandbox"]["filesystem"]["denyRead"]
                     .as_array()
@@ -2370,49 +2376,31 @@ mod tests {
         }
     }
 
-    /// Issue #147: `zirv ctx send`'s mailbox writes must work inside the
-    /// sandbox, but ONLY the mail tree -- never the policy-snapshot/
-    /// attestation directory that sits right alongside it under the same
-    /// state root.
-    ///
-    /// Code review revert (issue #168 follow-up): Task 7 had widened this to
-    /// also allow-list memory/logs/groups/handoffs. With the `is_zirv_ctx_
-    /// escape_safe` fix above, every `zirv ctx <state-verb>` (`remember`/
-    /// `recall`/`forget`/`nudge`/`group`/...) already rides the ALWAYS-
-    /// ALLOWED unsandboxed retry, so no prompt is ever paid for those writes
-    /// regardless of what the OS sandbox's own `allowWrite` says. Reverting
-    /// to mail-only keeps the safety audit trail (`logs/`), the cross-
-    /// session memory bank, group budgets, and handoffs UNWRITABLE from
-    /// inside the sandbox on any OTHER path (an unlisted/unmatched command
-    /// that is not `zirv ctx` at all), which is a real defense-in-depth
-    /// layer the widened list gave up for no operator-facing benefit.
     #[cfg(not(windows))]
     #[test]
-    fn launch_settings_allow_write_to_the_mail_dir_but_never_the_policy_snapshot_dir() {
+    fn launch_settings_allow_write_to_the_state_root_but_not_the_policy_snapshot() {
         let policy = super::super::super::safety::SafetyPolicy::default();
-        let policy_path = Path::new("/state/logs/policies/abc123.json");
-        let mail_dir = Path::new("/state/mail");
+        let policy_path = Path::new("/operator/.zirv/runtime/policies/abc123.json");
+        let state_root = Path::new("/state");
         let settings =
-            launch_settings_value(&policy, policy_path, Some(mail_dir)).expect("settings");
+            launch_settings_value(&policy, policy_path, Some(state_root)).expect("settings");
         let allow_write = settings["sandbox"]["filesystem"]["allowWrite"]
             .as_array()
-            .expect("allowWrite must be present when a mail dir is given");
+            .expect("allowWrite must be present when a state root is given");
         assert!(
-            allow_write.iter().any(|entry| entry == "/state/mail"),
-            "the mail dir must be allow-listed for write: {settings}"
+            allow_write.iter().any(|entry| entry == "/state"),
+            "the state root must be allow-listed for write: {settings}"
         );
         assert!(
-            !allow_write
-                .iter()
-                .any(|entry| entry.as_str().is_some_and(|s| s.contains("policies"))),
-            "the policy-snapshot/attestation dir must never be allow-listed for write: {settings}"
+            !allow_write.contains(&serde_json::json!(policy_path.display().to_string())),
+            "the policy snapshot must not be separately allow-listed: {settings}"
         );
 
-        // No mail dir resolved (best-effort failure): no allowWrite key at
+        // No state root resolved (best-effort failure): no allowWrite key at
         // all, never an empty-but-present one that could mask a future bug.
-        let settings_without_mail =
+        let settings_without_state =
             launch_settings_value(&policy, policy_path, None).expect("settings");
-        assert!(settings_without_mail["sandbox"]["filesystem"]["allowWrite"].is_null());
+        assert!(settings_without_state["sandbox"]["filesystem"]["allowWrite"].is_null());
     }
 
     #[test]
@@ -2435,6 +2423,11 @@ mod tests {
     #[test]
     fn launch_settings_are_materialized_atomically_under_the_zirv_home() {
         let home = tempfile::tempdir().expect("tempdir");
+        let state = tempfile::tempdir().expect("state");
+        let _state = super::super::super::testenv::VarGuard::set(&[(
+            super::super::super::state::STATE_ENV,
+            Some(state.path().to_str().expect("utf8 state path")),
+        )]);
         let adapter = ClaudeAdapter::new(None)
             .with_home(home.path().to_path_buf())
             .with_live_launch_settings();
@@ -2461,16 +2454,26 @@ mod tests {
             &std::fs::read_to_string(path).expect("read materialized settings"),
         )
         .expect("valid settings JSON");
-        // Mirrors exactly how `launch_settings_path` computes the mail
-        // directory it passes through -- see that method's own doc comment.
-        let mail_dir = super::super::super::state::StateDir::resolve(
+        let state_root = super::super::super::state::StateDir::resolve(
             &super::super::super::config::env_from_process(),
         )
         .ok()
-        .map(|state| state.mail());
+        .map(|state| state.root().to_path_buf());
+        assert_eq!(
+            written["sandbox"]["filesystem"]["allowWrite"],
+            serde_json::json!([state.path().display().to_string()]),
+            "the materialized settings must allow the exact resolved state root"
+        );
+        assert!(
+            !written["sandbox"]["filesystem"]["allowWrite"]
+                .as_array()
+                .is_some_and(|entries| entries
+                    .contains(&serde_json::json!(policy_path.display().to_string()))),
+            "the immutable policy snapshot must not be separately allow-listed"
+        );
         assert_eq!(
             written,
-            launch_settings_value(&policy, &policy_path, mail_dir.as_deref()).expect("settings")
+            launch_settings_value(&policy, &policy_path, state_root.as_deref()).expect("settings")
         );
         let snapshotted: super::super::super::safety::SafetyPolicy = serde_json::from_str(
             &std::fs::read_to_string(policy_path).expect("read policy snapshot"),
@@ -2646,12 +2649,12 @@ mod tests {
     ///
     /// Code review fix (CRITICAL, issue #224 follow-up): `ctx` gets verb-
     /// scoped entries only, never a blanket `Bash(zirv ctx *)` -- see
-    /// `launch_settings_project_reserved_builtins_without_widening_scripts_
-    /// or_gh`'s own doc comment for why.
+    /// `launch_settings_project_the_prompt_free_command_family_partition`'s
+    /// own doc comment for why.
     ///
-    /// Code review fix (CRITICAL, issue #224 review rounds 4-5): `setup`,
-    /// `test`, `verify`, and `frontend` get no entry at all here either --
-    /// see that same doc comment's rounds-4-5 addendum.
+    /// Issue #222: payload-selecting `test`/`verify`/`frontend` are native-
+    /// allowed here but remain absent from sandbox exclusions; `setup` stays
+    /// outside every unattended allow surface.
     #[test]
     fn default_sandbox_args_allow_reserved_zirv_builtins_but_not_scripts() {
         let adapter = ClaudeAdapter::new(None);
@@ -2665,7 +2668,7 @@ mod tests {
             .find(|a| a.starts_with("--allowedTools="))
             .expect("an --allowedTools= token");
         for name in crate::utils::RESERVED_COMMANDS {
-            if matches!(*name, "ctx" | "setup" | "test" | "verify" | "frontend") {
+            if matches!(*name, "ctx" | "setup") {
                 continue;
             }
             let rule = format!("Bash(zirv {name} *)");
@@ -2682,9 +2685,9 @@ mod tests {
         assert!(!allow_arg.contains("Bash(zirv ctx wrap *)"));
         assert!(!allow_arg.contains("Bash(zirv ctx usage *)"));
         assert!(!allow_arg.contains("Bash(zirv setup *)"));
-        assert!(!allow_arg.contains("Bash(zirv test *)"));
-        assert!(!allow_arg.contains("Bash(zirv verify *)"));
-        assert!(!allow_arg.contains("Bash(zirv frontend *)"));
+        assert!(allow_arg.contains("Bash(zirv test *)"));
+        assert!(allow_arg.contains("Bash(zirv verify *)"));
+        assert!(allow_arg.contains("Bash(zirv frontend *)"));
         assert!(!allow_arg.contains("Bash(zirv somescript *)"));
     }
 
