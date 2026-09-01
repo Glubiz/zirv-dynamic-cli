@@ -661,6 +661,59 @@ why no `memory: retrieval` row appears — that layer is derived from live
 composed prefix) and a clean tree selects nothing for it; a dirty tree would
 add a row and a slightly larger total, never a smaller one.
 
+#### 6.2.1 The dedupe's EOL durability fix (2026-08-31, this issue's measurement closeout)
+
+Issue #155's `native_file_already_carries_canonical` (`compile.rs`) skips
+re-injecting the canonical `.zirv/context/` layer only when `CLAUDE.md`/
+`AGENTS.md` byte-for-byte equal a fresh `render_generated` call — a
+deliberately strict, byte-exact check (never weakened for this issue; see
+its own doc comment on why a wrong `true` here would silently strip
+instructions from a session). On this Windows checkout the dedupe was found
+**suppressed**: `render_generated` mixes whatever line endings
+`.zirv/context/{common,claude,codex}.md` carry on disk (CRLF here, via
+`core.autocrlf=true` and no `.gitattributes` override) with a handful of
+hardcoded LF separators (`out.push('\n')` in `render_generated`), while
+`CLAUDE.md`/`AGENTS.md` themselves checked out as uniform CRLF — a mismatch
+that cannot be fixed by pinning either native file to a single `eol=lf` or
+`eol=crlf`, since the render's own output is not uniform.
+
+Fix: `.gitattributes` now pins `CLAUDE.md -text` and `AGENTS.md -text`,
+disabling line-ending normalization for exactly those two files. `-text`
+freezes the exact bytes committed — including the mix — so `git checkout --
+CLAUDE.md AGENTS.md` restores them byte-identical on this repo regardless of
+platform or `core.autocrlf`, verified by checking out from a clean index and
+re-running `--measure` immediately after (both adapters showed the
+`deduped (native file already carries this)` note). With the fix, this
+repository's real dedupe state (current commit, with an active `zirv
+workflow` step — not the clean-tree §6.2 baseline above) measures:
+
+```
+$ zirv ctx compile --agent claude --measure   # dedupe firing
+total (session prefix)       23789 bytes
+$ zirv ctx compile --agent claude --measure   # dedupe_native=false, same commit
+total (session prefix)       31215 bytes
+```
+
+a real 7,426-byte (23.8%) reduction — see §6.6 for the real (non-`bytes/4`)
+token figure.
+
+**Cross-platform correction (same day, from the review round):** pinning only
+the two native files `-text` froze *Windows-CRLF-derived* bytes, which a
+Linux/macOS checkout — whose `.zirv/context/*.md` inputs smudge to LF — can
+never re-render byte-identically, so the dedupe would have stayed suppressed
+everywhere except this machine. The final `.gitattributes` therefore also pins
+the render inputs `/.zirv/context/*.md text eol=lf` (making `render_generated`
+output uniform LF on every platform), anchors all patterns to the repo root
+(an unanchored `CLAUDE.md` even captured `.zirv/context/claude.md` on
+case-insensitive filesystems), and the natives were regenerated from LF
+inputs. Verified via `git checkout-index --prefix` (fresh-checkout
+simulation): zero CRLF bytes in all five files. The LF normalization also
+shrinks the prefix further: the post-dedupe total is now **22,919 bytes**
+(claude) / **22,920 bytes** (codex) at this commit, vs. the 23,789/23,790
+measured above on the CRLF-mixed state; the §6.6 tokenizer figures were
+captured on that earlier state and so slightly *overstate* the surviving
+prefix.
+
 ### 6.3 Top contributors, ranked (claude harness, from §6.2)
 
 | Rank | Layer | Bytes | Share of the 19,170-byte total |
@@ -679,28 +732,181 @@ of their own) — the reason §6.1 defines the total as the real
 
 ### 6.4 Before/after for each reduction shipped in this issue
 
-| Reduction | Before | After | Multiplier | Source |
-| --- | --- | --- | --- | --- |
-| Per-turn hook context (`hook::prompt_output`) | 170 bytes | 89 bytes | every user turn, uncached | `hook.rs`'s own history (the sentence this issue replaced) vs. `commands::ctx::hook::tests::prompt_hook_context_stays_under_the_ninety_byte_steady_state_budget`, which pins the 89-byte figure directly on `per_turn_context_text("[zirv]")` |
-| `zirv ctx status` full vs. `--brief` | 2,113 bytes | 1,188 bytes | once per checkpoint (`HARNESS_PROMPT` names task start, after long steps, and before reporting done — not a fixed count this document can quote without inventing one) | `commands::ctx::status::tests::brief_status_is_smaller_than_full_status_for_the_same_fixture`, fixture: 5 delegations across 2 work groups, 3 live sessions |
-| `.zirv/context/common.md` | — | 4,080 bytes (cap: `context.max_common_bytes` = 4,096) | every session launch (cached after the first turn) | `zirv ctx compile --measure`'s own `canonical context: common` row, §6.2 — the integrator, not this change, is responsible for keeping this file under its shipped budget (`commands::ctx::compile::tests::this_repositorys_canonical_common_context_fits_the_shipped_budget`) |
+| Reduction | Before | After | Real tokens (Δ, §6.6) | Multiplier | Source |
+| --- | --- | --- | --- | --- | --- |
+| Per-turn hook context (`hook::prompt_output`) | 170 bytes | 89 bytes | 42 → 26 (Δ16, 38.1%) | every user turn, uncached | `hook.rs`'s own history (the sentence this issue replaced) vs. `commands::ctx::hook::tests::prompt_hook_context_stays_under_the_ninety_byte_steady_state_budget`, which pins the 89-byte figure directly on `per_turn_context_text("[zirv]")` |
+| `zirv ctx status` full vs. `--brief` | 2,113 bytes | 1,188 bytes | ~784 → ~371 (Δ~413, ~52.7%; ratio-calibrated, §6.6.3) | once per checkpoint (`HARNESS_PROMPT` names task start, after long steps, and before reporting done — not a fixed count this document can quote without inventing one) | `commands::ctx::status::tests::brief_status_is_smaller_than_full_status_for_the_same_fixture`, fixture: 5 delegations across 2 work groups, 3 live sessions |
+| Context-layer dedupe (issue #155 Phase 3, made durable by §6.2.1) | 31,215 bytes | 23,789 bytes | 7,492 → 5,555 (Δ1,937, 25.9%, claude); 7,286 → 5,554 (Δ1,732, 23.8%, codex) | every session launch (cached after the first turn) | `zirv ctx compile --measure`, this repository at commit `009718b`, `context.dedupe_native` toggled false/true — §6.2.1 |
+| `.zirv/context/common.md` | — | 4,080 bytes (cap: `context.max_common_bytes` = 4,096) | not applicable — this row is the layer the dedupe row above already covers, cited for completeness | every session launch (cached after the first turn) | `zirv ctx compile --measure`'s own `canonical context: common` row, §6.2 — the integrator, not this change, is responsible for keeping this file under its shipped budget (`commands::ctx::compile::tests::this_repositorys_canonical_common_context_fits_the_shipped_budget`) |
 
-The hook-context and status rows are the two genuinely *new* reductions this
-issue ships; the `common.md` row is cited for completeness (it is the
-single largest non-harness-prompt contributor in §6.3) but its cap is
-enforced and maintained elsewhere, not changed by this issue.
+The hook-context, status, and context-dedupe-durability rows are the
+genuinely *new* reductions/fixes this issue's measurement closeout covers;
+the `common.md` row is cited for completeness (it is the single largest
+non-harness-prompt contributor in §6.3) but its cap is enforced and
+maintained elsewhere, not changed by this issue. The "Real tokens" column is
+new as of the 2026-08-31 measurement closeout (§6.6) — every other column
+was already real/observed; only the token figures were previously `bytes/4`
+estimates, which §6.5 below now explains precisely.
 
 ### 6.5 Reading the estimated-token column
 
-Every `~tokens` figure in this document, `--measure`'s own output included,
-is `bytes / 4` rounded to the nearest integer — a rough, provider-agnostic
-approximation `--measure`'s own trailing line states explicitly, not a real
-tokenizer count. It is useful for ranking contributors against each other
-(§6.3) and for a rough before/after delta (§6.4), but it is **not** a
-substitute for a measured token count. A real before/after token delta for
-this issue's changes must come from `token_cost_analysis.py`
-(`docs/benchmarks/token_cost_analysis.py`), run against real transcripts
-captured before and after the change ships — the same "non-negotiable rule"
-at the top of this document (every cell is either an actually observed
-number or says "not yet measured") applies here too; the `~tokens` column
-is an estimate by definition and is labeled as one everywhere it appears.
+Every `~tokens` figure produced by `--measure` itself (the `layer` tables in
+§6.2 and §6.2.1) is `bytes / 4` rounded to the nearest integer — a rough,
+provider-agnostic approximation `--measure`'s own trailing line states
+explicitly, not a real tokenizer count. It remains useful for ranking
+contributors against each other (§6.3) and for a quick order-of-magnitude
+read, but it is **not** a substitute for a measured token count, and no cell
+in this document presents it as one.
+
+**As of the 2026-08-31 measurement closeout, §6.4's "Real tokens" column is
+no longer a `bytes/4` estimate** — see §6.6 for the method and full
+derivation. In short: the hook-context and context-layer-dedupe deltas are
+real tiktoken (`cl100k_base`) counts of the exact real text `zirv ctx
+compile` (or the sentence's own source) produced on this machine; the
+status `--brief` delta is a ratio-calibration onto the existing fixture
+byte figures using a real tiktoken measurement of the same command's live
+output, because the specific unit-test fixture's literal text cannot be
+reproduced without executing test-internal Rust code (out of scope for this
+measurement pass — see §6.6.3 for why). `cl100k_base` is a real,
+general-purpose BPE tokenizer, not Anthropic's own (no local Claude
+tokenizer or API token-count endpoint was available in this environment —
+see §6.6.1); on the real text measured here it landed at 4.17–4.28
+bytes/token for prose-shaped prefix content and 2.70–3.20 bytes/token for
+ID-dense `status` output, both measurably different from the flat `4.00`
+`bytes/4` assumes, which is exactly why a real tokenizer, not the estimate,
+belongs in an acceptance-evidence table. §6.6.5 additionally reports real
+*recorded* first-turn `cache_creation_input_tokens` from actual session
+transcripts on this machine — the only number in this whole document that
+required no tokenizer at all, real or estimated, because the vendor billed
+it directly.
+
+### 6.6 Real token measurement (issue #225 measurement closeout, 2026-08-31)
+
+Every number in this section was produced by an actual command run against
+real text or real transcripts on this machine at commit `009718b` (working
+tree also carries this issue's uncommitted §6.2.1 `.gitattributes` fix); none
+is `bytes/4`. Two distinct real methods are used, per source:
+
+- **Real tokenizer count**: for text this session could capture exactly
+  (the hook sentence's own source string; `zirv ctx compile`'s real stdout,
+  captured via `cmd /c "... > file"` rather than PowerShell's `>`, which
+  re-encodes stdout to UTF-16 and silently doubles the byte count — a
+  measurement pitfall worth naming so nobody repeats it), token-counted with
+  Python's `tiktoken` library, `cl100k_base` encoding. This is a real,
+  general-purpose BPE tokenizer — not Anthropic's own tokenizer, which has
+  no public library and was not reachable from this environment (no
+  `anthropic` SDK/API token-count endpoint available; `tiktoken` was
+  installed for this measurement — `pip install --user tiktoken` — since
+  neither ships with this repository). Labeled `tiktoken cl100k_base`
+  everywhere it appears, never presented as Claude's own count.
+- **Real recorded usage**: `token_cost_analysis.py`'s new `--first-turn`
+  mode (§6.6.5), reading real `cache_creation_input_tokens` off real
+  session transcripts — the vendor's own billed token count, no tokenizer
+  involved at all.
+
+#### 6.6.1 Why not Anthropic's own tokenizer
+
+Checked before falling back to `tiktoken`: no `anthropic` Python package,
+no local Claude tokenizer, and no network credential for a token-count API
+call were available in this environment. `tiktoken cl100k_base` is not
+Claude's own byte-pair encoding, so its counts will not exactly match what
+Anthropic bills — but it is a real trained tokenizer over real text, not an
+estimate, and every figure below is labeled with the method that produced
+it so a reader can tell exactly how much to trust it.
+
+#### 6.6.2 Context-layer dedupe (the headline number)
+
+Real composed-prompt text captured both ways at commit `009718b`, dedupe
+made durable by §6.2.1 (an active `zirv workflow` step inflates the total
+past §6.2's clean-tree baseline — see §6.2.1's own note):
+
+| Adapter | Before (dedupe off) | After (dedupe on) | Δ bytes | Δ tokens (`tiktoken cl100k_base`) | Δ % (tokens) |
+| --- | --- | --- | --- | --- | --- |
+| claude | 31,216 bytes / 7,492 tokens | 23,790 bytes / 5,555 tokens | 7,426 | 1,937 | 25.9% |
+| codex | 30,601 bytes / 7,286 tokens | 23,791 bytes / 5,554 tokens | 6,810 | 1,732 | 23.8% |
+
+(Byte figures are one larger than `--measure`'s own `total (session
+prefix)` row — `zirv ctx compile` without `--measure` prints the real
+composed text plus one trailing newline; `--measure` counts
+`ComposedPrompt::text.len()` itself. Real bytes/token on this text ran
+4.17–4.28, not the `4.00` `bytes/4` assumes.)
+
+#### 6.6.3 Per-turn hook context trim
+
+Exact real before/after sentences (`src/commands/ctx/hook.rs`, commit
+`fb8acf0`'s diff for the "before" wording, current source for "after"),
+tokenized directly — no capture pitfalls apply here, the strings are short
+enough to embed verbatim:
+
+| | Text | Bytes | Tokens (`tiktoken cl100k_base`) |
+| --- | --- | --- | --- |
+| Before | "Start every final answer in this session with the prefix [zirv] on the first line. Mid-turn status notes do not need it. This is a context-health marker read by zirv ctx." | 170 | 42 |
+| After | "Prefix each final answer with [zirv] on line 1 (mid-turn exempt): zirv ctx health marker." | 89 | 26 |
+
+Δ16 tokens (38.1%), paid uncached on every single user turn — smaller in
+absolute terms than the dedupe row, but the only row in this table whose
+saving repeats every turn rather than once per session.
+
+#### 6.6.4 `zirv ctx status` full vs. `--brief`
+
+The existing 2,113/1,188-byte figures come from
+`brief_status_is_smaller_than_full_status_for_the_same_fixture`
+(`status.rs`), a Rust unit test that builds its fixture (2 work groups, 5
+delegations, 3 live sessions) and asserts `brief_text.len() <
+full_text.len()` without printing either string — reproducing its exact
+literal output would mean modifying/instrumenting that test to print it,
+which this measurement pass did not do (out of scope: no `src/**/*.rs`
+changes). So this row uses a **ratio-calibration**, not a direct
+tokenization of the fixture text:
+
+```
+$ zirv ctx status            # this machine's real live state, cmd.exe redirection
+5,075 bytes -> 1,882 tokens (tiktoken cl100k_base) -- 2.697 bytes/token
+$ zirv ctx status --brief
+762 bytes -> 238 tokens (tiktoken cl100k_base) -- 3.202 bytes/token
+```
+
+Applying those real, observed bytes/token ratios (not `4.00`) to the
+existing fixture byte figures: 2,113 bytes / 2.697 ≈ **784 tokens** (full),
+1,188 bytes / 3.202 ≈ **371 tokens** (brief), Δ≈413 tokens (~52.7%). This is
+real-ratio-calibrated, explicitly weaker evidence than §6.6.2/§6.6.3's
+direct tokenization — stated here, not hidden, per this document's
+non-negotiable rule. The live full/brief capture itself (5,075→762 bytes,
+1,882→238 tokens, Δ1,644 tokens, 87.4%) is a fully real, directly measured
+number for the identical mechanism, just on a differently-shaped population
+(this machine's actual accumulated delegations/sessions today, not the
+5-delegation/2-group/3-session synthetic fixture) — reported here as
+corroborating real evidence, not as a substitute for the calibrated row
+above.
+
+#### 6.6.5 Real recorded usage: first-turn `cache_creation_input_tokens`
+
+`docs/benchmarks/token_cost_analysis.py --first-turn` (new mode added for
+this measurement closeout — see the script's own module docstring) reads,
+per session transcript, only the FIRST usage-bearing assistant row instead
+of summing the whole file (`analyze_file`'s existing behavior). That row's
+`cache_creation_input_tokens` is the real, vendor-billed cost of ingesting
+the session's prompt prefix for the first time — no tokenizer, real or
+estimated, needed. Run against every `*.jsonl` under this machine's
+zirv-dynamic-cli project directories (same roots as §4.1):
+
+| Population | n | Median `cache_creation` (first turn) | p95 |
+| --- | --- | --- | --- |
+| Top-level (non-subagent) sessions | 78 | 25,742.5 tokens | 67,117 tokens |
+| Subagent sessions | 712 | 12,219.5 tokens | 34,900 tokens |
+
+**Important scope caveat**: this real number is *larger* than §6.6.2's
+zirv-prefix-only figures (5,555–7,492 tokens) because a real first assistant
+turn also ingests the harness's own system prompt, tool schemas, and any
+MCP server definitions — none of which `zirv ctx compile --measure`
+reports, since that command measures only zirv's own injected layers, not
+the harness's native ones. So this table is not a substitute for §6.6.2's
+before/after (it has no "before the dedupe fix" vs. "after" split — the
+fix landed in this same working tree, so no real session has yet launched
+with it in effect) — it is real, independent corroboration that (a) actual
+first-turn prefix ingestion costs on this machine are large enough
+(tens of thousands of tokens) that the thousands-of-tokens savings in
+§6.6.2–§6.6.4 are a real, non-trivial fraction of it, and (b) zirv's own
+compiled prefix is a real but partial contributor to that total, not the
+whole of it — a scope distinction worth stating plainly rather than
+implying `--measure`'s total is "the" session-start cost.
