@@ -1360,10 +1360,7 @@ mod tests {
         .expect("save active workflow");
 
         unsafe {
-            std::env::set_var(
-                crate::commands::ctx::state::STATE_ENV,
-                state_dir.path(),
-            );
+            std::env::set_var(crate::commands::ctx::state::STATE_ENV, state_dir.path());
         }
         let cfg = CtxConfig::default();
         let adapter = ClaudeAdapter::new(None);
@@ -1403,7 +1400,11 @@ mod tests {
             "the orchestrator's own compiled prompt must still carry the active step: {:?}",
             orchestrator_composed.sources
         );
-        assert!(orchestrator_composed.text.contains("run the database migration"));
+        assert!(
+            orchestrator_composed
+                .text
+                .contains("run the database migration")
+        );
 
         let worker_composed = worker_compiled.composed.expect("composed");
         assert!(

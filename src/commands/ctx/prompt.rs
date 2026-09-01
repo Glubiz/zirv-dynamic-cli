@@ -5777,7 +5777,8 @@ mod tests {
     /// SAFETY: this suite runs single-threaded (`--test-threads=1`).
     fn with_active_workflow<R>(repo: &Path, f: impl FnOnce() -> R) -> R {
         let state_dir = tempfile::tempdir().expect("state tempdir");
-        let state = crate::commands::ctx::state::StateDir::from_root(state_dir.path().to_path_buf());
+        let state =
+            crate::commands::ctx::state::StateDir::from_root(state_dir.path().to_path_buf());
         let classification = crate::commands::workflow::classify::classify(
             &crate::commands::workflow::classify::ClassificationInput {
                 task: String::new(),
@@ -5804,10 +5805,7 @@ mod tests {
         )
         .expect("save active workflow");
         unsafe {
-            std::env::set_var(
-                crate::commands::ctx::state::STATE_ENV,
-                state_dir.path(),
-            );
+            std::env::set_var(crate::commands::ctx::state::STATE_ENV, state_dir.path());
         }
         let result = f();
         unsafe {

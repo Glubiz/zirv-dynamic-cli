@@ -2678,8 +2678,7 @@ mod tests {
             super::super::adapters::git_common_dir(repo.path()).expect("repo has a git common dir");
 
         let codex = super::super::adapters::codex::CodexAdapter::new(None);
-        let out =
-            with_headless_extra_writable_roots(Vec::new(), &codex, repo.path(), &mail_dir);
+        let out = with_headless_extra_writable_roots(Vec::new(), &codex, repo.path(), &mail_dir);
         let joined = out.join(" ");
         assert!(
             joined.contains(&expected_git_dir.display().to_string()),
@@ -2701,12 +2700,7 @@ mod tests {
         let claude = super::super::adapters::claude::ClaudeAdapter::new(None);
 
         let base = vec!["--model".to_string(), "sonnet".to_string()];
-        let out = with_headless_extra_writable_roots(
-            base.clone(),
-            &claude,
-            repo.path(),
-            &mail_dir,
-        );
+        let out = with_headless_extra_writable_roots(base.clone(), &claude, repo.path(), &mail_dir);
         assert_eq!(
             out, base,
             "claude has no verified writable-root mechanism, so this seam must add nothing"
