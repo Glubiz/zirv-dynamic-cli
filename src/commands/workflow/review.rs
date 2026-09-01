@@ -197,14 +197,18 @@ pub struct VerificationEvidence {
     /// operator's recorded per-repository baseline (issue #215) -- i.e.
     /// `verification::evaluate_against_operator_baseline(&report,
     /// repo).gate_passed`. Only ever `true` when `passed` is `false`; a raw
-    /// pass leaves this `false` and `waived_failing_tests` empty, and skips
-    /// serializing both so a genuine (non-waived) failure round-trips
-    /// exactly as it did before this field existed.
+    /// pass, or a still-failing report (a genuine failure alongside any
+    /// baselined one, or nothing baselined at all), leaves this `false` and
+    /// `waived_failing_tests` empty, and skips serializing both so a genuine
+    /// (non-waived, or only-partially-waived) failure round-trips exactly as
+    /// it did before this field existed.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub passed_with_baseline_waiver: bool,
     /// The sorted, deduplicated failing test names waived by the operator's
     /// baseline when `passed_with_baseline_waiver` is `true`; empty
-    /// otherwise.
+    /// otherwise -- including when the baseline covered some, but not all,
+    /// of this report's failures, since the report as a whole is still a
+    /// genuine failure in that case.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub waived_failing_tests: Vec<String>,
 }
@@ -217,7 +221,17 @@ impl VerificationEvidence {
             (false, Vec::new())
         } else {
             let evaluation = verification::evaluate_against_operator_baseline(&report, repo);
-            (evaluation.gate_passed, evaluation.waived)
+            if evaluation.gate_passed {
+                (true, evaluation.waived)
+            } else {
+                // A partially baselined genuine failure (or nothing
+                // baselined at all): `evaluation.waived` can still be
+                // non-empty here, but the report as a whole did NOT pass, so
+                // neither field may be populated -- otherwise a real
+                // regression would serialize alongside waiver fields that
+                // read as "this passed via baseline."
+                (false, Vec::new())
+            }
         };
         Self {
             report_id: report.id,
@@ -3918,6 +3932,55 @@ checksum = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f80"
         assert!(
             !json.contains("waived_failing_tests"),
             "a genuine failure must not mention waived tests at all: {json}"
+        );
+    }
+
+    /// Codex review finding (#238): a report with two failing unit tests
+    /// where the baseline covers only one is still a genuine failure --
+    /// `evaluate_against_baseline` returns `gate_passed:false` with BOTH a
+    /// non-empty `waived` and a non-empty `blocking`. `from_report` must not
+    /// copy `waived` in that case: surfacing an acknowledged-but-incomplete
+    /// waiver beside a real regression would read as "this passed via
+    /// baseline" when it did not.
+    #[test]
+    fn package_leaves_a_partially_baselined_failure_unwaived_and_out_of_the_json() {
+        let repo = git_repo();
+        let home = tempdir().unwrap();
+        let _home_guard = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let state_dir = StateDir::from_root(tempdir().unwrap().path().to_path_buf());
+        let state = running_review_state(repo.path(), "HEAD");
+
+        let fingerprint = verification::change_fingerprint(repo.path()).unwrap();
+        let report =
+            waivable_failing_report(repo.path(), fingerprint, &["a::one", "new::regression"]);
+        verification::save_report(&state_dir, &report).unwrap();
+        // The baseline covers only one of the two failures.
+        verification::save_baseline(
+            repo.path(),
+            std::collections::BTreeSet::from(["a::one".to_string()]),
+        )
+        .unwrap();
+
+        let package = package(&state_dir, &state, None).expect("package");
+        let evidence = package
+            .verification
+            .as_ref()
+            .expect("verification evidence");
+        assert!(!evidence.passed);
+        assert!(
+            !evidence.passed_with_baseline_waiver,
+            "a partially baselined failure must not read as a waived pass"
+        );
+        assert!(evidence.waived_failing_tests.is_empty());
+
+        let json = serde_json::to_string(&package).unwrap();
+        assert!(
+            !json.contains("passed_with_baseline_waiver"),
+            "a partially baselined failure must not mention the waiver key at all: {json}"
+        );
+        assert!(
+            !json.contains("waived_failing_tests"),
+            "a partially baselined failure must not mention waived tests at all: {json}"
         );
     }
 
