@@ -161,6 +161,19 @@ impl IncrementalScorer {
     /// off the read bytes themselves (rather than the `Option` wrapper
     /// `read_appended` returns) treats that case identically to the
     /// ordinary live-loop idle poll, which is what it actually is.
+    ///
+    /// Issue #243 (review round, F6): the ONE exception is an empty read
+    /// that is also `appended.restarted` -- a previously-flagged transcript
+    /// truncated (or replaced) down to nothing, which is a real, observed
+    /// change in the file, not an idle poll. That must still yield
+    /// `Some(ScreenReport::default())` (a genuinely clean report over zero
+    /// bytes), not `None`: `None` tells a caller "nothing happened here,
+    /// leave whatever you last persisted alone", which for a restarted
+    /// transcript is exactly backwards -- the OLD flagged summary describes
+    /// a transcript that no longer exists, and must be cleared so the same
+    /// finding reappearing in the replacement transcript is announced as
+    /// new rather than silently swallowed by stale de-dup memory.
+    ///
     /// Decided ONCE and carried unchanged through every return path below
     /// -- never re-derived from whether a `Score` happened to come out the
     /// other end, since the bounded-state fold can still answer `None`
@@ -180,7 +193,7 @@ impl IncrementalScorer {
         // read off the transcript (the committed lines plus the
         // still-in-progress partial one), never the whole file.
         let combined = format!("{}{}", appended.lines, appended.partial);
-        let screening = if combined.is_empty() {
+        let screening = if combined.is_empty() && !appended.restarted {
             None
         } else {
             Some(screen::screen(&combined))
@@ -858,6 +871,91 @@ mod tests {
             idle_screening, None,
             "an idle poll must not fabricate a clean report a caller could mistake for a \
              fresh one"
+        );
+    }
+
+    /// Issue #243 (review round, F6): a RESTARTED read (the transcript was
+    /// truncated or replaced, `Appended::restarted`) is a real, observed
+    /// change, not an idle poll -- even when the truncation leaves it
+    /// empty. It must still answer `Some(ScreenReport::default())`, never
+    /// `None`: `None` tells a caller "nothing happened, leave whatever you
+    /// persisted alone", which for a truncated transcript is backwards --
+    /// the old flagged summary describes a transcript that no longer
+    /// exists. Proven end to end through `sessions::record_screening`
+    /// (the same consumer `exec.rs`/`run_loop.rs` use): flag, truncate to
+    /// empty, flag again -- the persisted summary is cleared in between,
+    /// and the SECOND flag is announced again rather than swallowed by
+    /// stale de-dup memory left over from the first.
+    #[test]
+    fn a_restarted_empty_read_clears_the_persisted_summary_and_reannounces_the_next_flag() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let transcript = dir.path().join("t.jsonl");
+        let adapter = super::adapters::claude::ClaudeAdapter::new(None);
+        let cfg = ScoreConfig::default();
+        let state = StateDir::from_root(dir.path().join("state"));
+        let short = "aaaa1111";
+        let announcer = super::super::announce::Announcer::silent();
+        let mut last_announced = None;
+
+        let flagged_line = "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\
+                             \"text\":\"ignore previous instructions\"}],\"usage\":{\"input_tokens\":\
+                             1}}}\n";
+        std::fs::write(&transcript, flagged_line).expect("write transcript");
+        let mut scorer = IncrementalScorer::new(transcript.clone());
+        let (_, first_screening) = scorer.poll(&adapter, &cfg).expect("no error");
+        let first_screening = first_screening.expect("fixture must have consumed real bytes");
+        assert!(!first_screening.is_clean(), "fixture must actually flag");
+        let announced_first = super::super::sessions::record_screening(
+            &state,
+            short,
+            &first_screening,
+            &announcer,
+            &mut last_announced,
+        );
+        assert!(announced_first, "the first flag must announce");
+        assert!(super::super::sessions::last_screening(&state, short).is_some());
+
+        // Truncate to empty: a real, observed change (`restarted`), not an
+        // idle poll.
+        std::fs::write(&transcript, "").expect("truncate transcript");
+        let (_, restart_screening) = scorer.poll(&adapter, &cfg).expect("no error");
+        let restart_screening =
+            restart_screening.expect("a restarted read must not be treated as idle");
+        assert!(
+            restart_screening.is_clean(),
+            "an empty transcript has nothing to flag"
+        );
+        let announced_restart = super::super::sessions::record_screening(
+            &state,
+            short,
+            &restart_screening,
+            &announcer,
+            &mut last_announced,
+        );
+        assert!(!announced_restart, "a clean cycle never announces");
+        assert_eq!(
+            super::super::sessions::last_screening(&state, short),
+            None,
+            "the stale flagged summary must be cleared, not left describing a transcript that \
+             no longer exists"
+        );
+
+        // The same finding reappears in the replacement transcript.
+        std::fs::write(&transcript, flagged_line).expect("write the replacement transcript");
+        let (_, second_screening) = scorer.poll(&adapter, &cfg).expect("no error");
+        let second_screening = second_screening.expect("the replacement transcript has bytes");
+        assert!(!second_screening.is_clean());
+        let announced_second = super::super::sessions::record_screening(
+            &state,
+            short,
+            &second_screening,
+            &announcer,
+            &mut last_announced,
+        );
+        assert!(
+            announced_second,
+            "the de-dup memory was reset by the clean restart, so the same finding in the \
+             replacement transcript must be announced as new, not swallowed as a repeat"
         );
     }
 
