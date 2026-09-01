@@ -4935,6 +4935,9 @@ fn escape_denied_by_screen(candidate: &str) -> bool {
     if contains_unquoted_redirection(candidate) {
         return true;
     }
+    if text_names_credential_material(candidate) {
+        return true;
+    }
     let Some(tokens) = sql_tokens(&collapse_whitespace(candidate)) else {
         // A malformed shell fragment cannot be proven free of credential or
         // path-sensitive effects and must not cross an unsandboxed boundary.
@@ -4948,6 +4951,45 @@ fn escape_denied_by_screen(candidate: &str) -> bool {
         return true;
     }
     is_root_wide_find_scan(candidate)
+}
+
+/// Review round 2 (finding 96121126, Critical): [`sensitive_upload_path`] is
+/// a per-token *path* classifier, so a credential path embedded inside an
+/// opaque interpreter payload token -- `python3 -c 'open(... ".ssh",
+/// "id_rsa" ...)'` -- is never isolated as its own path token and slips the
+/// screen. A retried `bash <scratchpad>/x.sh` whose contents carry that line
+/// would then read a private key with no prompt, violating #222's own intent
+/// that credential reads must still stop. This is a deliberately coarse
+/// text-level tripwire over the whole candidate: if the raw text literally
+/// names credential material anywhere, the retry fails the screen and takes
+/// the ordinary ask/deny escalation. Benign gate scripts (cargo/phpstan/git)
+/// never contain these fragments, so no prompt regression. It cannot catch a
+/// payload that assembles the path obfuscated (`".ss"+"h"`, base64); that
+/// residual is the accepted interpreter-opacity tradeoff recorded in the
+/// workflow spec's risk table -- this closes only the literal, demonstrated
+/// vector.
+fn text_names_credential_material(candidate: &str) -> bool {
+    const FRAGMENTS: &[&str] = &[
+        ".ssh/",
+        "id_rsa",
+        "id_ed25519",
+        "id_ecdsa",
+        "id_dsa",
+        ".aws/",
+        ".azure/",
+        ".config/gcloud",
+        ".config/gh/hosts.yml",
+        ".kube/config",
+        ".docker/config.json",
+        ".git-credentials",
+        ".netrc",
+        ".pypirc",
+        ".npmrc",
+        ".credentials.json",
+        "auth.json",
+    ];
+    let lowered = candidate.replace('\\', "/").to_ascii_lowercase();
+    FRAGMENTS.iter().any(|fragment| lowered.contains(fragment))
 }
 
 /// Issue #147, design decision 2: whether EVERY executable segment of the
@@ -4989,6 +5031,46 @@ fn shell_text_clears_escape_screen(text: &str) -> bool {
         && segments
             .iter()
             .all(|segment| !command_fails_escape_screen(segment))
+}
+
+/// Whether a `sh`/`bash`/`zsh`/`dash` invocation's payload clears the escape
+/// screen. Review round 2 (delta-review probe): a naive scan for the first
+/// `-c` token misreads `bash script.sh -c anything`, where `-c` is a
+/// POSITIONAL argument to the already-selected script (bash runs `script.sh`
+/// and passes `-c anything` as `$1 $2`), not the interpreter's own flag. The
+/// interpreter reads options only UNTIL the first operand: whichever comes
+/// first decides the mode -- a `-c` option means the next token is an inline
+/// command string; the first non-option operand means script-file mode and
+/// that operand is the script. `--` ends option parsing. A bundled short
+/// group containing `c` (`-ec`) counts as the `-c` option. Anything we
+/// cannot resolve to a screened payload fails closed.
+fn shell_interpreter_payload_clears(tokens: &[String]) -> bool {
+    let mut index = 1;
+    while let Some(token) = tokens.get(index) {
+        if token == "--" {
+            return tokens
+                .get(index + 1)
+                .is_some_and(|script| shell_script_contents_clear_escape_screen(script));
+        }
+        if let Some(rest) = token.strip_prefix('-') {
+            // `-c`, or a bundled short group like `-ec` -- but never a long
+            // `--option`. Such a group means the next token is the inline
+            // command string.
+            let is_dash_c = !rest.is_empty()
+                && !rest.starts_with('-')
+                && rest.chars().all(|c| c.is_ascii_alphabetic())
+                && rest.contains('c');
+            if is_dash_c {
+                return tokens
+                    .get(index + 1)
+                    .is_some_and(|inline| shell_text_clears_escape_screen(inline));
+            }
+            index += 1;
+            continue;
+        }
+        return shell_script_contents_clear_escape_screen(token);
+    }
+    false
 }
 
 /// [`shell_text_clears_escape_screen`] over a script file's contents.
@@ -5050,23 +5132,10 @@ fn allow_verdict_retry_clears_escape_screen(command: &str, scratchpad_roots: &[S
         {
             return false;
         }
-        if matches!(program.as_str(), "sh" | "bash" | "zsh" | "dash") {
-            if let Some(index) = tokens.iter().position(|token| token == "-c") {
-                let Some(inline) = tokens.get(index + 1) else {
-                    return false;
-                };
-                if !shell_text_clears_escape_screen(inline) {
-                    return false;
-                }
-            } else {
-                let Some(script) = tokens.iter().skip(1).find(|token| !token.starts_with('-'))
-                else {
-                    return false;
-                };
-                if !shell_script_contents_clear_escape_screen(script) {
-                    return false;
-                }
-            }
+        if matches!(program.as_str(), "sh" | "bash" | "zsh" | "dash")
+            && !shell_interpreter_payload_clears(&tokens)
+        {
+            return false;
         }
         program != "zirv" || is_prompt_free_zirv_retry_safe(candidate)
     })
@@ -10007,13 +10076,30 @@ mod tests {
             "#!/bin/bash\ncat ~/.ssh/id_rsa\n",
         )
         .expect("screened script");
-        // Screened contents and an unreadable file both fail closed: the
-        // retry keeps the ordinary escalation instead of a silent pass.
-        // `bash -c 'cat ~/.ssh/id_rsa'` is already a semantic Deny (the
-        // `cat *.ssh*` glob matches the full text), so the `-c` case here
-        // uses a spelling only the inline-text screen catches.
+        // Finding 96121126: a credential path smuggled inside an opaque
+        // interpreter payload is not a Deny-classified segment, so the
+        // text-level credential tripwire must stop it.
+        std::fs::write(
+            std::path::Path::new(&scratchpad).join("evil-python.sh"),
+            "#!/bin/bash\npython3 -c 'import os; print(open(os.path.join(os.environ[\"HOME\"], \".ssh\", \"id_rsa\")).read())'\n",
+        )
+        .expect("interpreter script");
+        // Delta-review probe: `-c` as a POSITIONAL script argument must not
+        // fool the option parser into screening the benign arg instead of
+        // the script file bash actually runs.
+        std::fs::write(
+            std::path::Path::new(&scratchpad).join("takes-dash-c.sh"),
+            "#!/bin/bash\ncat ~/.ssh/id_rsa\n",
+        )
+        .expect("script invoked with its own -c arg");
+        // Screened contents (shell or interpreter), an unreadable file, an
+        // inline `-c` payload, and a `-c`-as-argument spelling all fail
+        // closed. `bash -c 'cat ~/.ssh/id_rsa'` is already a semantic Deny,
+        // so the inline case uses a spelling only the screen catches.
         let commands = [
             format!("bash {scratchpad}/evil-screen.sh 2>&1 | tail -60"),
+            format!("bash {scratchpad}/evil-python.sh 2>&1 | tail -60"),
+            format!("bash {scratchpad}/takes-dash-c.sh -c anything 2>&1 | tail -60"),
             format!("bash {scratchpad}/does-not-exist.sh 2>&1 | tail -60"),
             "bash -c 'openssl rsa -in ~/.ssh/id_rsa' | tail -1".to_string(),
         ];
