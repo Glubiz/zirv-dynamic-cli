@@ -603,8 +603,14 @@ fn has_denied_component(path: &Path) -> bool {
 /// got scanned. When `repo` is a git work tree, ask git for the candidate
 /// list instead -- tracked plus untracked-not-ignored -- which is both
 /// `.gitignore`-aware and cheaper than a manual recursive walk.
-fn collect_all_via_git(repo: &Path) -> CtxResult<(Vec<PathBuf>, bool)> {
-    let output = Command::new("git")
+///
+/// `Ok(None)` when git could not be spawned OR exited non-zero -- never a
+/// silent empty candidate list, which `collect_all` below would otherwise
+/// be unable to tell apart from a repository that genuinely has zero
+/// frontend files, failing the whole scan open into a "not applicable" pass
+/// on what was actually a git failure.
+fn collect_all_via_git(repo: &Path) -> CtxResult<Option<(Vec<PathBuf>, bool)>> {
+    let Ok(output) = Command::new("git")
         .arg("-C")
         .arg(repo)
         .args([
@@ -614,7 +620,13 @@ fn collect_all_via_git(repo: &Path) -> CtxResult<(Vec<PathBuf>, bool)> {
             "--others",
             "--exclude-standard",
         ])
-        .output()?;
+        .output()
+    else {
+        return Ok(None);
+    };
+    if !output.status.success() {
+        return Ok(None);
+    }
     let mut paths: Vec<PathBuf> = output
         .stdout
         .split(|byte| *byte == 0)
@@ -630,7 +642,7 @@ fn collect_all_via_git(repo: &Path) -> CtxResult<(Vec<PathBuf>, bool)> {
     paths.dedup();
     let truncated = paths.len() > MAX_FILES;
     paths.truncate(MAX_FILES);
-    Ok((paths, truncated))
+    Ok(Some((paths, truncated)))
 }
 
 fn is_git_work_tree(repo: &Path) -> bool {
@@ -645,8 +657,10 @@ fn is_git_work_tree(repo: &Path) -> bool {
 }
 
 fn collect_all(repo: &Path) -> CtxResult<(Vec<PathBuf>, bool)> {
-    if is_git_work_tree(repo) {
-        return collect_all_via_git(repo);
+    if is_git_work_tree(repo)
+        && let Some(result) = collect_all_via_git(repo)?
+    {
+        return Ok(result);
     }
     let mut paths = Vec::new();
     let mut entries = 0usize;
@@ -2154,6 +2168,40 @@ mod tests {
                 .any(|path| path.to_string_lossy().contains("ignored")),
             "a gitignored directory must not be scanned: {paths:?}"
         );
+    }
+
+    /// Reviewer finding: `collect_all_via_git` used to check only whether
+    /// `git` could be spawned, not whether `ls-files` actually exited zero
+    /// -- a non-zero exit produced an empty stdout, which read as "zero
+    /// frontend files in scope" and made the whole scan fail open into a
+    /// pass. `git ls-files` against a directory that is not a git
+    /// repository (or otherwise unusable) exits non-zero and must instead
+    /// signal the caller to fall back, never `Some(([], false))`.
+    #[test]
+    fn collect_all_via_git_falls_back_on_a_nonzero_exit() {
+        let dir = tempfile::tempdir().expect("dir");
+        assert_eq!(
+            collect_all_via_git(dir.path()).unwrap(),
+            None,
+            "a non-zero `git ls-files` exit must signal fallback, not an empty result"
+        );
+    }
+
+    /// End-to-end: `collect_all` itself must still find real frontend files
+    /// via the hand-rolled walk when git enumeration is unusable, rather
+    /// than silently reporting zero files in scope.
+    #[test]
+    fn collect_all_falls_back_to_the_directory_walk_when_git_is_unusable() {
+        let dir = tempfile::tempdir().expect("dir");
+        std::fs::write(
+            dir.path().join("Good.tsx"),
+            "export const Good = () => <img src={x} alt=\"\" />;\n",
+        )
+        .unwrap();
+
+        let (paths, truncated) = collect_all(dir.path()).unwrap();
+        assert!(!truncated);
+        assert!(paths.contains(&PathBuf::from("Good.tsx")), "{paths:?}");
     }
 
     /// #255 follow-up: a cached `not_applicable` report (0 frontend files in
