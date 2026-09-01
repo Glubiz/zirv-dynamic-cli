@@ -1457,11 +1457,14 @@ pub trait AgentAdapter: std::fmt::Debug {
     /// `cwd`, beyond `default_sandbox_args`'s own baseline sandbox flags.
     ///
     /// **Caller contract:** call only where both `cwd` and `mail_dir` are
-    /// already in hand for a launch that is actually happening -- today that
-    /// is `dash::worker_pane_extra_args` alone (see below), called
-    /// unconditionally for every dashboard-spawned worker pane, never
-    /// speculatively for a launch that may not occur. Added as a distinct
-    /// method (2026-08-26, codex approval-posture round)
+    /// already in hand for a launch that is actually happening -- that is
+    /// `dash::worker_pane_extra_args` (see below), called unconditionally for
+    /// every dashboard-spawned worker pane, and (issue #252, 2026-09-01)
+    /// `agent::run_with`'s own headless `zirv agent` launch, called
+    /// unconditionally there too so a headless codex worker gets the same
+    /// git-dir/mail-dir roots a dashboard pane always got. Never speculative
+    /// for a launch that may not occur. Added as a distinct method
+    /// (2026-08-26, codex approval-posture round)
     /// rather than folded into `default_sandbox_args` itself, since neither
     /// `cwd` nor `mail_dir` is available at that method's existing call site
     /// (`policy_launch_args`) without threading them through all seven
