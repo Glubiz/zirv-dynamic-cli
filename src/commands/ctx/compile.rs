@@ -574,7 +574,7 @@ fn with_canonical_context_layer(
             composed.text.push_str(CONTEXT_LAYER_HEADER);
             added_any = true;
         }
-        // Issue #243 slice 1: each candidate's own `[label]` line is
+        // Issue #243: each candidate's own `[label]` line is
         // extended when its text is flagged -- `CONTEXT_LAYER_HEADER` itself
         // stays byte-exact for `shrink_for_inline_argv`'s literal search.
         let screening = super::screen::screen(&text);
@@ -1113,7 +1113,7 @@ mod tests {
         );
     }
 
-    /// Issue #243 slice 1: a canonical `.zirv/context/common.md` carrying a
+    /// Issue #243: a canonical `.zirv/context/common.md` carrying a
     /// prompt-injection marker gets its own `[label]` line extended with a
     /// screening summary; a clean one does not.
     #[test]

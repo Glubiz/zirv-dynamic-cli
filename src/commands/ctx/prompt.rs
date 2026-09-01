@@ -771,7 +771,7 @@ pub fn with_memory_layer(
     // private/user/command-line layer that comes next.
     if !shared_delivered.is_empty() {
         composed.text.push_str(MEMORY_SHARED_LAYER_HEADER);
-        // Issue #243 slice 1: `MEMORY_SHARED_LAYER_HEADER` itself is left
+        // Issue #243: `MEMORY_SHARED_LAYER_HEADER` itself is left
         // byte-exact -- `shrink_for_inline_argv` searches for it literally
         // (`INLINE_TRUNCATION_LAYERS`) -- so a screening note is inserted
         // right after it, still inside the block this layer's own header
@@ -923,7 +923,7 @@ pub fn compose(
             // Labeled, capped, and last. Cloning a repository is enough to
             // write this text, so the session is told where it came from and
             // that it does not outrank the operator's instructions.
-            // Issue #243 slice 1: `screen`ed the same way the other
+            // Issue #243: `screen`ed the same way the other
             // repo-owned layers are; see `screen.rs`.
             let screening = super::screen::screen(&layer);
             let screening_suffix = if screening.is_clean() {
@@ -2648,7 +2648,7 @@ mod tests {
         assert!(!composed.text.contains("screening:"), "clean text: no note");
     }
 
-    /// Issue #243 slice 1: a repo `system-prompt.md` carrying a
+    /// Issue #243: a repo `system-prompt.md` carrying a
     /// prompt-injection marker gets its trust label extended with a
     /// screening summary.
     #[test]
@@ -4995,7 +4995,7 @@ mod tests {
         assert!(!composed.text.contains("screening:"), "clean body: no note");
     }
 
-    /// Issue #243 slice 1: a shared memory entry carrying a prompt-injection
+    /// Issue #243: a shared memory entry carrying a prompt-injection
     /// marker gets a screening note right after the shared block's label; a
     /// clean shared entry (the test above) gets none.
     #[test]

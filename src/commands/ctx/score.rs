@@ -147,7 +147,7 @@ impl IncrementalScorer {
         let Some(appended) = self.watcher.read_appended()? else {
             return Ok((None, ScreenReport::default()));
         };
-        // Issue #243 slice 2: screens exactly the bytes this cycle newly
+        // Issue #243: screens exactly the bytes this cycle newly
         // read off the transcript (the committed lines plus the
         // still-in-progress partial one), never the whole file.
         let screening = screen::screen(&format!("{}{}", appended.lines, appended.partial));
@@ -322,7 +322,7 @@ pub fn score_transcript_cached(
     score_with_checkpoint(&state_dir, transcript, adapter.as_ref(), &cfg.score)
 }
 
-/// Issue #243 slice 2: how much of a transcript's tail is screened when a
+/// Issue #243: how much of a transcript's tail is screened when a
 /// scoring cycle has no incremental cursor yet (first poll, an unresumable
 /// checkpoint, or no state dir at all) -- bounds the cost regardless of how
 /// large the transcript already is.
@@ -799,7 +799,7 @@ mod tests {
         assert!(err.to_string().contains("eventless"), "got {err}");
     }
 
-    /// Issue #243 slice 2: a transcript whose newly-appended bytes carry a
+    /// Issue #243: a transcript whose newly-appended bytes carry a
     /// prompt-injection marker is flagged; one with none is clean.
     #[test]
     fn score_transcript_cached_flags_an_injected_transcript() {
@@ -824,7 +824,7 @@ mod tests {
         assert!(!report.is_clean(), "expected flags, got none");
     }
 
-    /// Issue #243 slice 2: screening is a side channel, never a rot input --
+    /// Issue #243: screening is a side channel, never a rot input --
     /// the same transcript scores identically whether or not the screening
     /// half is read at all.
     #[test]

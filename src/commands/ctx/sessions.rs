@@ -386,7 +386,7 @@ pub struct Record {
     /// back-compat pattern `owner_pid` already established.
     #[serde(default)]
     pub start_time: Option<u64>,
-    /// Issue #243 slice 2: the `screen::ScreenReport::summary` of the most
+    /// Issue #243: the `screen::ScreenReport::summary` of the most
     /// recent scoring cycle that flagged something in the transcript bytes it
     /// ingested. `None` for a clean cycle, a record written before this field
     /// existed, or no scoring cycle yet -- `status.rs`'s own reader.
@@ -496,7 +496,7 @@ fn write_record(state: &StateDir, record: &Record) -> PathBuf {
     path
 }
 
-/// Issue #243 slice 2: read-modify-write of `short`'s own registry record
+/// Issue #243: read-modify-write of `short`'s own registry record
 /// with a fresh screening summary. Best-effort like every other registry
 /// write here -- a hook process is fresh every turn, never the supervisor
 /// that holds the live `SessionGuard`, so this is the only way to update a

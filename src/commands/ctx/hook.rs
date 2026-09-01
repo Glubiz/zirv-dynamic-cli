@@ -424,7 +424,7 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
     let repo = payload.repo();
     // Cached: this hook is a fresh process after every single turn, so scoring
     // the whole transcript each time is quadratic over a session's length.
-    // Issue #243 slice 2: also screens the bytes this cycle ingested.
+    // Issue #243: also screens the bytes this cycle ingested.
     let Ok((score, screening)) = score::score_transcript_cached(transcript, None, &repo, env)
     else {
         return Ok(0);
@@ -452,7 +452,7 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
     let mut optimize_recommended = None;
     let mut adoption_nudge = None;
     if let Ok(state) = StateDir::resolve(env) {
-        // Issue #243 slice 2: a flagged screening result rides the same
+        // Issue #243: a flagged screening result rides the same
         // decision line this cycle already writes, and is persisted onto the
         // session's own registry record for `zirv ctx status` to render --
         // never a new file, and cleared once a later cycle screens clean.
@@ -1249,7 +1249,7 @@ mod tests {
         assert!(log.contains("\"verb\":\"hook\""), "got {log}");
     }
 
-    /// Issue #243 slice 2: a transcript carrying a prompt-injection marker
+    /// Issue #243: a transcript carrying a prompt-injection marker
     /// gets a `screening:` clause on its decision-log line; a clean one
     /// (`run_scores_a_real_transcript_and_advises`, above) does not.
     #[test]
@@ -1300,7 +1300,7 @@ mod tests {
         assert!(!log.contains("screening:"), "got {log}");
     }
 
-    /// Issue #243 slice 2: a flagged cycle persists its summary onto the
+    /// Issue #243: a flagged cycle persists its summary onto the
     /// session's own registry record, for `zirv ctx status` to read.
     #[test]
     fn a_flagged_transcript_persists_a_screening_summary_onto_the_session_record() {

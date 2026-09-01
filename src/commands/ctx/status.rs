@@ -138,7 +138,7 @@ fn sessions_lines(
                     )
                 ));
             }
-            // Issue #243 slice 2: the last scoring cycle's own screening
+            // Issue #243: the last scoring cycle's own screening
             // finding, persisted onto the record itself -- see `hook.rs::
             // run_stop` and `sessions::set_last_screening`.
             if let Some(summary) = record.last_screening.as_deref().filter(|s| !s.is_empty()) {
@@ -1780,7 +1780,7 @@ mod tests {
         );
     }
 
-    /// Issue #243 slice 2: a session record carrying a screening summary
+    /// Issue #243: a session record carrying a screening summary
     /// (`hook.rs::run_stop`'s own write) shows a `screening:` note on its
     /// status line.
     #[test]
