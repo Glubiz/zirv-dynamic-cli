@@ -534,6 +534,11 @@ fn run_with_clock_inner<W: Write>(
     // its own call below) computes this same slug internally but callers
     // still need their own copy for mail listing.
     let mail_slug = super::state::repo_slug(repo);
+    // Issue #249: this run's own supervising session, if any -- resolved
+    // once, from `env` alone, and reused at every mail-rendering call below
+    // (the launch-time delivery and every relaunch arm), never re-derived
+    // from anything a message itself carries.
+    let parent_short = agent::parent_identity(env);
 
     // A wrapped command that matches no adapter (no explicit `--agent`,
     // detection came up empty) is not actually the agent whose flags we would
@@ -703,7 +708,9 @@ fn run_with_clock_inner<W: Write>(
     // listing, not permanently the launch-time one.
     let mut mail_messages: Vec<super::mail::Message> = mail_entries
         .iter()
-        .map(|(path, msg)| super::mail::message_with_delivery_envelope(&state, path, msg))
+        .map(|(path, msg)| {
+            super::mail::message_with_delivery_envelope(&state, path, msg, parent_short.as_deref())
+        })
         .collect();
     if !mail_messages.is_empty() {
         announcer.emit(&super::announce::Event::MailDelivered {
@@ -711,7 +718,12 @@ fn run_with_clock_inner<W: Write>(
         });
     }
     let composed = if system_prompt_supported {
-        super::prompt::with_mail_layer(composed, &mail_messages, cfg.mail.max_delivered_bytes)
+        super::prompt::with_mail_layer(
+            composed,
+            &mail_messages,
+            cfg.mail.max_delivered_bytes,
+            parent_short.as_deref(),
+        )
     } else {
         composed
     };
@@ -943,6 +955,19 @@ fn run_with_clock_inner<W: Write>(
         if let Some(group) = env(super::agent::WORK_GROUP_ENV).filter(|id| !id.is_empty()) {
             turn_env.push((super::agent::WORK_GROUP_ENV.to_string(), group));
         }
+        // Issue #249: this run's own supervising session, if any, exported
+        // into the CHILD's real process environment -- not merely read by
+        // this supervisor's own in-process mail-rendering (`parent_short`,
+        // above). The child is what actually runs `zirv ctx send`/`zirv ctx
+        // inbox` as its own report-back/steering channel, as a brand new OS
+        // process that inherits nothing from this Rust closure, so it needs
+        // its own copy of the same fact. `agent::run_with`'s `parent_
+        // session_env` fold already resolved this to the delegating
+        // session's own id (never a stray inherited value -- see that
+        // fold's own doc comment), so a plain re-read here is exactly right.
+        if let Some(parent) = env(super::agent::PARENT_SESSION_ENV) {
+            turn_env.push((super::agent::PARENT_SESSION_ENV.to_string(), parent));
+        }
         turn_env
     };
 
@@ -1052,6 +1077,7 @@ fn run_with_clock_inner<W: Write>(
             (system_prompt_supported && composed.is_some()) || mail_in_composed,
             &mail_messages,
             cfg.mail.max_delivered_bytes,
+            parent_short.as_deref(),
         );
         let extra: Vec<String> = policy_extra
             .iter()
@@ -1521,6 +1547,7 @@ fn run_with_clock_inner<W: Write>(
                     fresh,
                     &nudge_mail_msgs,
                     cfg.mail.max_delivered_bytes,
+                    parent_short.as_deref(),
                 )
             } else {
                 fresh
@@ -1610,6 +1637,7 @@ fn run_with_clock_inner<W: Write>(
                 (relaunch_system_prompt_supported && composed.is_some()) || mail_in_composed,
                 &nudge_mail_msgs,
                 cfg.mail.max_delivered_bytes,
+                parent_short.as_deref(),
             );
             let extra: Vec<String> = policy_extra
                 .iter()
@@ -1933,6 +1961,7 @@ fn run_with_clock_inner<W: Write>(
                 (relaunch_system_prompt_supported && composed.is_some()) || mail_in_composed,
                 &mail_messages,
                 cfg.mail.max_delivered_bytes,
+                parent_short.as_deref(),
             );
             let (mut rebuilt, sp) = build_headless(&prompt_text, &session, &extra);
             rebuilt.current_dir(repo);
@@ -2164,6 +2193,7 @@ fn run_with_clock_inner<W: Write>(
             (relaunch_system_prompt_supported && composed.is_some()) || mail_in_composed,
             &mail_messages,
             cfg.mail.max_delivered_bytes,
+            parent_short.as_deref(),
         );
         // M8: the user's own extra flags survive the restart too, not just
         // zirv's own (the system prompt args, and now the sandbox/policy
@@ -2508,7 +2538,20 @@ fn supervise_run(
 
 pub fn run<W: Write>(args: &ExecArgs, w: &mut W) -> CtxResult<i32> {
     let repo = std::env::current_dir()?;
-    let env = env_from_process();
+    let ambient = env_from_process();
+    // Issue #249/#250 review: this is a DIRECT CLI entry, not a supervisor
+    // spawn seam -- only `agent::run_with`'s fold (headless delegation) and
+    // dash's `verified_parent` (pane spawn) may ever establish parent
+    // lineage. A worker's own ambient process env may still carry a
+    // `PARENT_SESSION_ENV` it inherited from whatever launched IT (e.g. a
+    // worker with a real parent running this as a raw shell command rather
+    // than through `zirv agent`); left alone, that stale value would render
+    // its own parent's mail as steering for this brand new session, and
+    // export it onward to this session's own child. Scrubbed here with
+    // `agent::parent_session_env`'s own unconditional-substitute fold
+    // (`parent: None`), so a direct launch always resolves to no parent --
+    // fail-closed to peer trust.
+    let env = agent::parent_session_env(&ambient, None);
     run_with(args, w, &repo, &env)
 }
 
@@ -4947,6 +4990,98 @@ mod tests {
         assert!(
             argv.contains("another agent session"),
             "labeled as mail, not as an operator instruction: {argv}"
+        );
+    }
+
+    /// Fix 2 (issue #249/#250 review): a direct `zirv ctx exec` launch (the
+    /// bare `run` entry, which reads `env_from_process()`) must not trust an
+    /// inherited `PARENT_SESSION_ENV` off its own ambient process env -- only
+    /// a supervisor spawn seam (`agent::run_with`'s fold, or dash's
+    /// `verified_parent`) may establish parent lineage. Proves both halves
+    /// end to end: the mail from the ambient "parent" renders as ordinary
+    /// peer mail in this launch's own composed prompt (not steering), and
+    /// the launched child's own real environment carries no `PARENT_SESSION_
+    /// ENV` at all -- so it is not exported onward either.
+    #[test]
+    fn direct_exec_entry_ignores_an_inherited_parent_session_env() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let state_dir = tmp.path().join("state");
+        let argv_log = tmp.path().join("argv.log");
+        let parent_env_log = tmp.path().join("parent-env.log");
+        let session = "cececece-2222-4333-8444-555555555555";
+
+        let state = crate::commands::ctx::state::StateDir::from_root(state_dir.clone());
+        let slug = crate::commands::ctx::state::repo_slug(tmp.path());
+        crate::commands::ctx::mail::store(
+            &state,
+            &slug,
+            &crate::commands::ctx::mail::Message {
+                from_session: "grandpar".to_string(),
+                from_agent: "claude".to_string(),
+                to: "any".to_string(),
+                to_session: None,
+                sent: 1,
+                body: "scope now includes billing".to_string(),
+            },
+            &CtxConfig::default(),
+        )
+        .expect("store mail");
+
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let _cwd = crate::commands::ctx::testenv::CwdGuard::enter(tmp.path()).expect("enter repo");
+        // `run` (unlike `run_with`) reads every one of these off the REAL
+        // process environment, `PARENT_SESSION_ENV` included -- the whole
+        // seam under test.
+        let _vars = crate::commands::ctx::testenv::VarGuard::set(&[
+            (crate::commands::ctx::state::STATE_ENV, state_dir.to_str()),
+            ("ZIRV_CTX_PACE", Some("false")),
+            (
+                crate::commands::ctx::agent::PARENT_SESSION_ENV,
+                Some("grandpar"),
+            ),
+            ("FAKE_AGENT_MODE", Some("healthy")),
+            ("FAKE_AGENT_ARGV_LOG", argv_log.to_str()),
+            ("FAKE_AGENT_PARENT_ENV_LOG", parent_env_log.to_str()),
+        ]);
+
+        let args = ExecArgs {
+            agent: Some("claude".to_string()),
+            session_id: Some(session.to_string()),
+            transcript: Some(transcript_for(&home, tmp.path(), session)),
+            prompt: Some("do the work".to_string()),
+            max_restarts: Some(0),
+            budget_tokens: None,
+            max_tool_calls: None,
+            timeout_secs: Some(60),
+            simple: false,
+            command: fake_agent_command(session),
+        };
+        let mut out = Vec::new();
+        let code = run(&args, &mut out);
+        assert_eq!(code.expect("runs"), 0);
+
+        let argv = std::fs::read_to_string(&argv_log).expect("argv recorded");
+        assert!(
+            argv.contains("scope now includes billing"),
+            "the mail must still be delivered: {argv}"
+        );
+        assert!(
+            argv.contains("another agent session"),
+            "an inherited PARENT_SESSION_ENV from this process's own ambient env must render as \
+             ordinary peer mail, never steering: {argv}"
+        );
+        assert!(
+            !argv.contains("the session that spawned this one"),
+            "must not be marked as steering: {argv}"
+        );
+
+        let logged_parent = std::fs::read_to_string(&parent_env_log).unwrap_or_default();
+        assert_eq!(
+            logged_parent.trim(),
+            "",
+            "must not export the inherited parent onward to the launched child: \
+             {logged_parent:?}"
         );
     }
 

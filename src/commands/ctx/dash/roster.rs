@@ -88,6 +88,19 @@ pub struct RosterPane {
     /// old roster restores no worse than it already did.
     #[serde(default)]
     pub interactive: bool,
+    /// Issue #249/#250 review (Fix 4): this pane's own `Pane::parent_
+    /// session` at quit time -- the same server-verified fact `Pane::spawn`/
+    /// `Pane::handover` establish, never `SpawnRequest::parent_session`.
+    /// Without this, a dashboard quit/restore round-trip silently downgraded
+    /// a genuine worker's steering mail to peer: `spawn_restored_pane` had
+    /// nothing to hand `Pane::set_parent_session`, and `restored_pane_turn_
+    /// env` had nothing to re-export as `PARENT_SESSION_ENV` for the
+    /// restored child's own real process env either. `#[serde(default)]`,
+    /// the same fail-safe reasoning as `work_group_id`: an old-format roster
+    /// entry with no such key on disk restores as `None` (peer trust), not a
+    /// hard parse failure and not a fabricated parent.
+    #[serde(default)]
+    pub parent_session: Option<String>,
 }
 
 /// A full dashboard's worth of panes, stamped with the time it was written
@@ -237,6 +250,7 @@ mod tests {
                     report_reminder_sent: false,
                     work_group_id: None,
                     interactive: true,
+                    parent_session: None,
                 },
                 RosterPane {
                     agent: "codex".to_string(),
@@ -248,6 +262,7 @@ mod tests {
                     report_reminder_sent: true,
                     work_group_id: Some("wg-1".to_string()),
                     interactive: false,
+                    parent_session: Some("orch0001".to_string()),
                 },
             ],
         }
@@ -288,6 +303,11 @@ mod tests {
     /// `true`. Defaulting to `true` here would have handed every pane
     /// restored from a pre-upgrade roster the permissive interactive
     /// posture with no record it was ever actually spawned that way.
+    ///
+    /// Issue #249/#250 review (Fix 4): the identical requirement now also
+    /// covers `parent_session` -- a build that predates it wrote no such key
+    /// either, and `#[serde(default)]` must read that absence as `None`
+    /// (peer trust, the fail-safe side), not a fabricated parent.
     #[test]
     fn an_old_style_roster_entry_with_no_report_back_fields_loads_with_none_and_false() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -317,6 +337,11 @@ mod tests {
             !got.panes[0].interactive,
             "an old-format entry with no `interactive` key must default to fail-closed \
              (no pin), not the permissive side"
+        );
+        assert_eq!(
+            got.panes[0].parent_session, None,
+            "an old-format entry with no `parent_session` key must default to peer trust, \
+             not a fabricated parent"
         );
     }
 
