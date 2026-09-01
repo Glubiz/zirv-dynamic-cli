@@ -1436,6 +1436,12 @@ fn on_quit(
             // unconditionally pinning `Interactive` -- see `restored_pane_
             // turn_env`'s own doc comment.
             interactive: pane.launch_mode() == adapters::LaunchMode::Interactive,
+            // Issue #249/#250 review (Fix 4): this pane's own server-verified
+            // parent (`Pane::parent_session`), so a restore can hand it back
+            // to `Pane::set_parent_session` and re-export it as `PARENT_
+            // SESSION_ENV` -- without this, a quit/restore round-trip
+            // silently downgraded a genuine worker's steering mail to peer.
+            parent_session: pane.parent_session().map(str::to_string),
         })
         .collect();
     let panes_for_roster = merge_unoffered(live, unoffered);
@@ -3085,7 +3091,11 @@ fn compose_worker_prompt(
     // who has turned mail off has not asked for a task-completion channel that
     // silently fails at the end of every worker's run.
     let composed = if cfg.mail.enabled && system_prompt_supported {
-        prompt::with_report_back_layer(composed, &req.requested_by)
+        // Fix 5 (issue #249/#250 review): `parent_short` here is `verified_
+        // parent` (see this function's own parameter doc comment) -- the
+        // report-to ADDRESS may still be `req.requested_by`, but the
+        // authority claim inside the layer is only made when the two agree.
+        prompt::with_report_back_layer(composed, &req.requested_by, parent_short)
     } else {
         composed
     };
@@ -3235,10 +3245,15 @@ fn worker_task_prompt(
         parent_short,
     );
     let text = if cfg.mail.enabled {
+        // Fix 5 (issue #249/#250 review): see `compose_worker_prompt`'s
+        // identical `with_report_back_layer` call -- `parent_short` here is
+        // `verified_parent`, gating the authority claim, not the report-to
+        // address.
         prompt::task_prompt_with_report_back_fallback(
             &with_mail,
             system_prompt_supported,
             &req.requested_by,
+            parent_short,
         )
     } else {
         with_mail
@@ -4677,6 +4692,17 @@ fn restored_pane_turn_env(
     if let Some(group_id) = &candidate.work_group_id {
         turn_env.push((super::agent::WORK_GROUP_ENV.to_string(), group_id.clone()));
     }
+    // Issue #249/#250 review (Fix 4): and the parent lineage travels back
+    // with it too, the same pair `fulfill_spawn_request` pushes from
+    // `verified_parent` at first spawn -- a restore that dropped it left the
+    // restored child's own real process env with no `PARENT_SESSION_ENV` at
+    // all, so a nested `zirv ctx` call inside it (e.g. `zirv ctx inbox`)
+    // rendered this same pane's own parent's mail as peer even though this
+    // dashboard's own sweep (`Pane::parent_session`, restored separately via
+    // `set_parent_session`) still labels it steering.
+    if let Some(parent) = &candidate.parent_session {
+        turn_env.push((super::agent::PARENT_SESSION_ENV.to_string(), parent.clone()));
+    }
     (turn_env, pane_channel)
 }
 
@@ -4763,6 +4789,11 @@ fn spawn_restored_pane(
             }
             pane.set_intake_dir(pane_channel);
             pane.set_work_group_id(candidate.work_group_id.clone());
+            // Issue #249/#250 review (Fix 4): restores this pane's own
+            // dashboard-side parent lineage (mirrors `restored_pane_turn_
+            // env`'s identical re-export into the restored child's own real
+            // process env, just above).
+            pane.set_parent_session(candidate.parent_session.clone());
             panes.push(pane);
             nudge_queues.push(VecDeque::new());
         }
@@ -6299,15 +6330,26 @@ pub fn run_dashboard(
                                                 let fulfilled = fulfill_spawn_request(
                                                     &req,
                                                     true,
-                                                    // The operator's own
-                                                    // keypress, not a
-                                                    // session speaking: this
-                                                    // spawn IS the delegation
-                                                    // root, so there is no
-                                                    // requesting session to
-                                                    // derive (and `req`
-                                                    // claims no parent).
-                                                    None,
+                                                    // Fix 5 (issue #249/#250
+                                                    // review): this dashboard's
+                                                    // own session short id,
+                                                    // server-derived right here
+                                                    // in this event loop, never
+                                                    // read from `req` JSON --
+                                                    // the same authority `req`
+                                                    // itself claims no parent
+                                                    // for (this spawn IS the
+                                                    // delegation root). Before
+                                                    // this fix, `requester:
+                                                    // None` meant `verified_
+                                                    // parent` never agreed with
+                                                    // `req.requested_by` (also
+                                                    // `dashboard_short`), so the
+                                                    // report-back layer's
+                                                    // steering-authority promise
+                                                    // never actually fired for
+                                                    // an overlay-spawned pane.
+                                                    Some(&dashboard_short),
                                                     &mut panes,
                                                     &mut nudge_queues,
                                                     cfg,
@@ -10729,6 +10771,99 @@ mod tests {
             composed.sources
         );
         assert!(mail_entries.is_empty(), "no mail was waiting for this pane");
+    }
+
+    /// Fix 5 (issue #249/#250 review), mainstream failure mode: the
+    /// dashboard's own Spawn overlay builds a request whose `requested_by`
+    /// is the dashboard's own session short id and whose `parent_session`
+    /// is `None` (this spawn IS the delegation root) -- exactly the shape
+    /// `spawn_request`'s own fixture models (see its doc comment). Before
+    /// this fix the overlay's call site passed `requester: None` into
+    /// `fulfill_spawn_request`, so `verified_parent` (this test's own
+    /// `parent_short` parameter) never agreed with `req.requested_by`, and
+    /// the report-back layer's steering-authority sentence never actually
+    /// fired for an overlay-spawned pane even though the promise (`zirv
+    /// marks it as such when you read it`) implied it always would. With the
+    /// fixed call site passing the dashboard's own short id, `verified_
+    /// parent == req.requested_by` and the authority sentence appears.
+    #[test]
+    fn compose_worker_prompt_grants_authority_for_an_overlay_shaped_spawn() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = CtxConfig::default();
+        let repo = tmp.path();
+        let slug = super::super::state::repo_slug(repo);
+
+        let req = spawn_request("do the work", repo);
+        let (composed, _, _) = compose_worker_prompt(
+            &req,
+            &super::super::adapters::claude::ClaudeAdapter::new(None),
+            "cccc3333",
+            &cfg,
+            &state,
+            repo,
+            &slug,
+            Some(req.requested_by.as_str()),
+        );
+
+        let composed = composed.expect("a worker pane composes a prompt");
+        assert!(
+            composed.text.contains("authoritative"),
+            "an overlay-shaped spawn (verified_parent agrees with requested_by) must still get \
+             working steering: {}",
+            composed.text
+        );
+    }
+
+    /// The other half of the mainstream failure mode, end to end through
+    /// `fulfill_spawn_request`: the same overlay-shaped request's own
+    /// spawned pane records the verified parent, exactly the shape the
+    /// fixed overlay call site now passes (`Some(&dashboard_short)`, not
+    /// `None`).
+    #[test]
+    fn an_overlay_shaped_spawn_gets_its_own_verified_parent_from_the_requester_channel() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let cfg = CtxConfig {
+            agent_bin: Some("sleep 3".to_string()),
+            pace: crate::commands::ctx::config::PaceConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            ..CtxConfig::default()
+        };
+        let mut panes: Vec<Pane> = Vec::new();
+        let mut queues: Vec<VecDeque<String>> = Vec::new();
+
+        let req = spawn_request("do the work", &repo);
+        let mut errors = Vec::new();
+        fulfill_spawn_request(
+            &req,
+            true,
+            Some(req.requested_by.as_str()),
+            &mut panes,
+            &mut queues,
+            &cfg,
+            &state,
+            &repo,
+            (80, 24),
+            &tmp.path().join("requests"),
+            &mut errors,
+        )
+        .expect("spawns");
+
+        assert_eq!(
+            panes[0].parent_session(),
+            Some(req.requested_by.as_str()),
+            "an overlay-shaped spawn's own verified parent must reach the spawned pane: \
+             {errors:?}"
+        );
+
+        panes[0].finish_shutdown().expect("shutdown");
     }
 
     /// Issue #30, item 4a: a message directed at some other session must
@@ -15824,6 +15959,69 @@ mod tests {
         );
     }
 
+    /// Fix 4 (issue #249/#250 review): the roster's own recorded parent
+    /// lineage travels back with a restored pane too, the same way the
+    /// group binding above does -- without this, a quit/restore round-trip
+    /// silently downgraded a genuine worker's steering mail to peer, since
+    /// the restored child's own real process env carried no `PARENT_
+    /// SESSION_ENV` at all.
+    #[test]
+    fn restored_pane_turn_env_carries_the_roster_parent_session_forward() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let requests_dir = state.dash().join("aaaa1111-token").join("requests");
+        std::fs::create_dir_all(&requests_dir).expect("mkdir requests");
+
+        let mut candidate = restore_pane("cccc3333", "33333333-2222-4333-8444-555555555555");
+        candidate.parent_session = Some("orch0001".to_string());
+        let cfg = CtxConfig::default();
+        let mut errors = Vec::new();
+
+        let (turn_env, _pane_channel) =
+            restored_pane_turn_env(&cfg, &state, &repo, &candidate, &requests_dir, &mut errors);
+
+        assert!(
+            turn_env.contains(&(
+                super::super::agent::PARENT_SESSION_ENV.to_string(),
+                "orch0001".to_string()
+            )),
+            "the roster's own parent lineage must travel back with the restored pane: \
+             {turn_env:?}"
+        );
+    }
+
+    /// The other half of Fix 4: a roster entry with no recorded parent (an
+    /// old-format entry, or a pane that genuinely never had one) must not
+    /// fabricate one -- no `PARENT_SESSION_ENV` pair at all, the same
+    /// fail-safe shape `restored_pane_turn_env_restores_without_the_pin_for_
+    /// a_non_interactive_worker_pane` proves for the interactive pin.
+    #[test]
+    fn restored_pane_turn_env_carries_no_parent_session_when_the_roster_had_none() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let requests_dir = state.dash().join("aaaa1111-token").join("requests");
+        std::fs::create_dir_all(&requests_dir).expect("mkdir requests");
+
+        let candidate = restore_pane("dddd4444", "44444444-2222-4333-8444-555555555555");
+        assert_eq!(candidate.parent_session, None, "sanity: no recorded parent");
+        let cfg = CtxConfig::default();
+        let mut errors = Vec::new();
+
+        let (turn_env, _pane_channel) =
+            restored_pane_turn_env(&cfg, &state, &repo, &candidate, &requests_dir, &mut errors);
+
+        assert!(
+            !turn_env
+                .iter()
+                .any(|(k, _)| k == super::super::agent::PARENT_SESSION_ENV),
+            "a roster entry with no recorded parent must not fabricate one: {turn_env:?}"
+        );
+    }
+
     /// The other half of issue #160 finding 1: a worker pane that was
     /// spawned `Headless` (every file-dropped spawn request --
     /// `FILE_DROP_TRUSTED_INTERACTIVE` -- is always `Headless`, regardless
@@ -16099,6 +16297,86 @@ mod tests {
             restored[0].work_group_id(),
             Some("wg-1"),
             "and is still bound to its own group"
+        );
+
+        for pane in &mut restored {
+            let _ = pane.finish_shutdown();
+        }
+    }
+
+    /// Fix 4 (issue #249/#250 review): the full quit -> roster -> restore
+    /// round trip preserves a worker pane's own parent lineage. Mirrors
+    /// `a_coordinator_pane_survives_a_snapshot_and_restore_as_a_coordinator`'s
+    /// own recipe for `work_group_id`, but for `Pane::parent_session`.
+    #[cfg(unix)]
+    #[test]
+    fn a_worker_panes_parent_session_survives_a_snapshot_and_restore_round_trip() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let requests_dir = state.dash().join("aaaa1111-token").join("requests");
+        std::fs::create_dir_all(&requests_dir).expect("mkdir requests");
+
+        let session_id = "99999999-2222-4333-8444-555555555555";
+        let mut pane = Pane::spawn(
+            PaneSpec {
+                agent_name: "claude".to_string(),
+                argv: trivial_argv(),
+                role: prompt::PromptRole::Worker,
+                verb: sessions::Verb::Dash,
+                session_id: session_id.to_string(),
+                title: "wrk claude".to_string(),
+            },
+            &state,
+            &repo,
+            &repo,
+            (80, 24),
+            &[],
+            true,
+            pane::DEFAULT_IDLE_QUIET,
+        )
+        .expect("spawn");
+        pane.set_parent_session(Some("orch0001".to_string()));
+        let panes = vec![pane];
+
+        on_quit(&panes, &[], &[], &requests_dir, &state, &repo);
+        let slug = super::super::state::repo_slug(&repo);
+        let written = roster::take_roster(&state, &slug, super::super::state::now_secs(), 999_999)
+            .expect("a roster is written");
+        assert_eq!(written.panes.len(), 1);
+        assert_eq!(
+            written.panes[0].parent_session.as_deref(),
+            Some("orch0001"),
+            "the quit snapshot records the pane's own parent session"
+        );
+
+        let cfg = CtxConfig {
+            agent_bin: Some("sleep 3".to_string()),
+            ..Default::default()
+        };
+        let mut restored = Vec::new();
+        let mut nudge_queues = Vec::new();
+        let mut errors = Vec::new();
+        let mut deferred_restore = Vec::new();
+        spawn_restored_pane(
+            &written.panes[0],
+            &mut restored,
+            &mut nudge_queues,
+            &cfg,
+            &state,
+            &repo,
+            (80, 24),
+            &requests_dir,
+            &mut errors,
+            &mut deferred_restore,
+        );
+
+        assert_eq!(restored.len(), 1, "the candidate restored: {errors:?}");
+        assert_eq!(
+            restored[0].parent_session(),
+            Some("orch0001"),
+            "a restored worker pane's own parent lineage must survive the round trip"
         );
 
         for pane in &mut restored {

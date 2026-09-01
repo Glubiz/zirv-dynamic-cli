@@ -633,6 +633,17 @@ const PEER_TRUST_LINE: &str =
 /// parent_identity`, which reads a zirv-set env var on the READER's own
 /// process, not anything a sender wrote. A message cannot promote itself by
 /// forging either side of this comparison.
+///
+/// Accepted residual (issue #179 threat-model class): this comparison is
+/// only as trustworthy as `envelope.from.session` itself, which is `send`
+/// time's own `SESSION_ENV` read -- a plain env var, not a cryptographic
+/// credential. A same-uid process can set `ZIRV_CTX_SESSION` to any value it
+/// likes before sending, including a parent's own short id, and this
+/// function has no way to distinguish that from the genuine parent sending
+/// it. Out of scope for issue #249/#250 (which close the SEPARATE bug where
+/// zirv's own trust plumbing disagreed with itself about who counts as
+/// parent); socket-peer-credential hardening against a same-uid forger is
+/// tracked in issue #179.
 fn trust_line(envelope: &DeliveryEnvelope, parent_short: Option<&str>) -> String {
     let sender_short = sessions::short_id(&envelope.from.session);
     match parent_short {

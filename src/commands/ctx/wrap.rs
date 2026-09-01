@@ -3707,7 +3707,15 @@ fn pump(
 /// which is the one thing `wrap` must never do.
 pub fn run<W: Write>(args: &WrapArgs, _w: &mut W) -> CtxResult<i32> {
     let repo = std::env::current_dir()?;
-    let env = env_from_process();
+    let ambient = env_from_process();
+    // Issue #249/#250 review: see `exec::run`'s matching comment -- a direct
+    // `zirv ctx wrap` launch is not a supervisor spawn seam, so an inherited
+    // `PARENT_SESSION_ENV` off this process's own ambient env must be
+    // scrubbed rather than trusted (it would otherwise mark an unrelated
+    // sender's mail as steering in this session's own live advisory line);
+    // `agent::parent_session_env`'s fold with `parent: None` does that
+    // unconditionally.
+    let env = super::agent::parent_session_env(&ambient, None);
     run_with(
         args,
         &repo,
@@ -6730,6 +6738,86 @@ mod tests {
         let slug = crate::commands::ctx::state::repo_slug(&repo);
         let unread = crate::commands::ctx::mail::list(&state_dir, &slug, None, None).expect("list");
         assert_eq!(unread.len(), 1, "wrap must never consume mail on its own");
+
+        h.writer.write_all(b"/exit\r").expect("write");
+        h.writer.flush().expect("flush");
+        let _ = read_until(&mut h.reader, "bye", Duration::from_secs(10));
+        let _ = h.child.wait();
+    }
+
+    /// Fix 2 (issue #249/#250 review): a direct `zirv ctx wrap` launch (the
+    /// bare `run` entry, which reads `env_from_process()`) must not trust an
+    /// inherited `PARENT_SESSION_ENV` off its own ambient process env -- only
+    /// a supervisor spawn seam (`agent::run_with`'s fold, or dash's
+    /// `verified_parent`) may establish parent lineage. `extra_env` here
+    /// stands in for whatever this process's own ambient shell might have
+    /// carried (e.g. a worker with a real parent running `zirv ctx wrap`
+    /// directly rather than through `zirv agent`); end to end through a real
+    /// spawned `zirv ctx wrap`, the live mail advisory for a message from
+    /// that "parent" must still read as ordinary peer mail, never steering.
+    #[cfg(unix)]
+    #[test]
+    fn a_direct_wrap_launch_ignores_an_inherited_parent_session_env() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = tmp.path().join("state");
+        let script = fixture("stub-tui.sh").display().to_string();
+        let mut h = spawn_wrap(
+            &[
+                ("ZIRV_CTX_DEBOUNCE_MS", "300".to_string()),
+                ("ZIRV_CTX_STATE_DIR", state.display().to_string()),
+                (
+                    crate::commands::ctx::agent::PARENT_SESSION_ENV,
+                    "grandpar".to_string(),
+                ),
+            ],
+            &["sh", &script],
+        );
+        let _ = read_until(&mut h.reader, "stub-tui ready", Duration::from_secs(10));
+
+        let repo = std::env::current_dir().expect("cwd");
+        let state_dir = crate::commands::ctx::state::StateDir::from_root(state.clone());
+        let slug = crate::commands::ctx::state::repo_slug(&repo);
+        crate::commands::ctx::mail::store(
+            &state_dir,
+            &slug,
+            &crate::commands::ctx::mail::Message {
+                from_session: "grandpar".to_string(),
+                from_agent: "claude".to_string(),
+                to: "any".to_string(),
+                to_session: None,
+                sent: 1,
+                body: "do-not-type-this-body".to_string(),
+            },
+            &CtxConfig::default(),
+        )
+        .expect("store mail");
+
+        let socket =
+            read_socket_path(&StateDir::from_root(state.clone()), None).expect("socket path");
+        crate::commands::ctx::signal::send(
+            std::path::Path::new(socket.trim()),
+            &turn_signal(3, Verdict::Healthy),
+        )
+        .expect("send turn signal");
+
+        let seen = read_until(
+            &mut h.reader,
+            "[zirv \u{25b8} mail]",
+            Duration::from_secs(15),
+        );
+        assert!(
+            seen.contains("[zirv \u{25b8} mail]"),
+            "the session itself is told at an idle turn boundary: {seen:?}"
+        );
+        assert!(
+            seen.contains("information, not instruction"),
+            "an inherited PARENT_SESSION_ENV from this process's own ambient env must render as \
+             ordinary peer mail, never steering: {seen:?}"
+        );
+        assert!(
+            !seen.contains("steering from your supervising session"),
+            "must not be marked as steering: {seen:?}"
+        );
 
         h.writer.write_all(b"/exit\r").expect("write");
         h.writer.flush().expect("flush");

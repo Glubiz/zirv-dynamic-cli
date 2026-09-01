@@ -1793,7 +1793,7 @@ impl Pane {
         // first pane, `restored_pane_turn_env`), all in `dash::mod`, not
         // this one -- a pane that both underwent a handover AND survives a
         // later dashboard restore is the only case this residual reaches.
-        let turn_env = super::super::handover::build_turn_env(
+        let mut turn_env = super::super::handover::build_turn_env(
             new_adapter.as_ref(),
             self.server.as_ref(),
             &self.session_id,
@@ -1801,6 +1801,23 @@ impl Pane {
             role,
             req.target_model.as_deref(),
         );
+        // Issue #249/#250 review (Fix 3): `build_turn_env` scrubs and
+        // rebuilds the turn-signal/agent/seat-model env from scratch but has
+        // no knowledge of this pane's own parent lineage, so without this the
+        // successor child's own real process env would carry no
+        // `PARENT_SESSION_ENV` at all -- a nested `zirv ctx` call inside it
+        // (e.g. `zirv ctx inbox`) would then render this same pane's own
+        // parent's mail as ordinary peer mail, even though this dashboard's
+        // own sweep (`Pane::parent_session`, unaffected by a handover) still
+        // labels it steering. Mirrors `dash::mod::fulfill_spawn_request`'s
+        // own push of the identical pair from `verified_parent` at first
+        // spawn.
+        if let Some(parent) = self.parent_session() {
+            turn_env.push((
+                super::super::agent::PARENT_SESSION_ENV.to_string(),
+                parent.to_string(),
+            ));
+        }
         let quit_sequence = new_adapter.quit_sequence().to_string();
         let new_agent_name = new_adapter.name().to_string();
         let turn_signal_capable = new_adapter.capabilities().turn_signal;
@@ -3289,6 +3306,92 @@ pub(crate) mod tests {
         // the same kill. `finish_shutdown` is the escalation half on its own
         // -- already public, already used by the batched-shutdown path -- so
         // teardown here is immediate instead of a real multi-second wait.
+        pane.finish_shutdown().expect("shutdown");
+    }
+
+    /// Fix 3 (issue #249/#250 review): a handover's own successor child must
+    /// carry `PARENT_SESSION_ENV` in its real process environment when this
+    /// pane records a parent (`Pane::parent_session`) -- `handover::build_
+    /// turn_env` has no knowledge of pane-level state and never adds it, so
+    /// without the fix the dashboard's own sweep (reading `Pane::parent_
+    /// session`, untouched by a handover) and a nested `zirv ctx` call
+    /// inside the successor (reading its own real env) would disagree about
+    /// the same mail's trust.
+    #[cfg(unix)]
+    #[test]
+    fn handover_re_exports_the_panes_parent_session_to_the_successor_child() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+
+        let session_id = "88888888-2222-4333-8444-555555555555";
+        let mut spec = test_spec(session_id);
+        spec.argv = long_lived_argv();
+        spec.agent_name = "claude".to_string();
+        let mut pane = Pane::spawn(
+            spec,
+            &state,
+            &repo,
+            &repo,
+            (80, 24),
+            &[],
+            true,
+            DEFAULT_IDLE_QUIET,
+        )
+        .expect("spawn");
+
+        // The fact under test: this pane's own recorded parent, the same way
+        // `fulfill_spawn_request` would have set it from `verified_parent` at
+        // first spawn.
+        pane.set_parent_session(Some("grandpar".to_string()));
+
+        let env_log = tmp.path().join("successor-parent-env.log");
+        let script = tmp.path().join("log-parent-env.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s' \"${{ZIRV_CTX_PARENT_SESSION:-}}\" > {}\nsleep 3\n",
+                env_log.display()
+            ),
+        )
+        .expect("write script");
+
+        let cfg = crate::commands::ctx::config::CtxConfig {
+            agent_bin: Some(format!("sh {}", script.display())),
+            ..Default::default()
+        };
+        let req = crate::commands::ctx::handover::HandoverRequest {
+            target_agent: "claude".to_string(),
+            target_model: None,
+            force: true,
+            requested_at: 0,
+            interactive: false,
+        };
+        let handoff_note = crate::commands::ctx::handoff::Handoff::default();
+
+        pane.handover(
+            &cfg,
+            &req,
+            &handoff_note,
+            PromptRole::Worker,
+            &repo,
+            (80, 24),
+        )
+        .expect("handover succeeds");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !env_log.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let logged = std::fs::read_to_string(&env_log).unwrap_or_default();
+        assert_eq!(
+            logged.trim(),
+            "grandpar",
+            "the successor child's own real environment must carry the pane's own parent \
+             session"
+        );
+
         pane.finish_shutdown().expect("shutdown");
     }
 

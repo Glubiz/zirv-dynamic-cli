@@ -165,6 +165,64 @@ fn effective_launch_repo(workdir: Option<&Path>, repo: &Path) -> PathBuf {
 /// prompt cannot make dispatch slow.
 const MAX_WORKDIR_WARNING_CANDIDATES: usize = 32;
 
+/// Trailing punctuation a candidate token is stripped of before
+/// classification -- ordinary prose marks (`.,;:`), a closing paren, a
+/// trailing quote (belt-and-suspenders: the split below already treats a
+/// bare quote as a token boundary), and (Fix 6, issue #249/#250 review) a
+/// trailing backtick.
+const TRAILING_TOKEN_PUNCTUATION: [char; 8] = ['.', ',', ';', ':', ')', '"', '\'', '`'];
+
+/// Fix 6 (issue #249/#250 review): leading wrapping punctuation stripped
+/// from a candidate token before classification -- a backtick or an opening
+/// paren. Without this, `` `/tmp/other` `` or `(/tmp/other)` failed the
+/// `starts_with('/')` check outright (the trailing mark was already
+/// stripped by [`TRAILING_TOKEN_PUNCTUATION`], but nothing stripped the
+/// leading one) and the whole token was silently dropped as a candidate.
+/// Quotes need no leading counterpart here: the split in
+/// [`candidate_path_tokens`] already treats a bare `'`/`"` as a token
+/// boundary, so a quote-wrapped path never carries one at either edge to
+/// begin with.
+const LEADING_TOKEN_WRAPPING: [char; 2] = ['`', '('];
+
+/// Fix 6: whether `token` (already stripped of wrapping punctuation by
+/// [`candidate_path_tokens`]) looks like an absolute path -- Unix (`/...`,
+/// `~/...`), a Windows drive-letter path (`C:\...`/`C:/...`), or a Windows
+/// UNC path (`\\server\share...`). Pure classification, deliberately kept
+/// separate from [`out_of_repo_paths_in_prompt`]'s own `exists()`-on-disk
+/// gate so the tokenizer/classifier itself -- the Windows shapes included --
+/// is directly testable on any host, independent of what a drive-relative
+/// path would need to actually exist on THIS machine's disk.
+fn looks_like_absolute_path_token(token: &str) -> bool {
+    if token.starts_with('/') || token.starts_with("~/") || token.starts_with(r"\\") {
+        return true;
+    }
+    let mut chars = token.chars();
+    let Some(drive) = chars.next() else {
+        return false;
+    };
+    drive.is_ascii_alphabetic()
+        && chars.next() == Some(':')
+        && matches!(chars.next(), Some('\\') | Some('/'))
+}
+
+/// The whitespace/quote-delimited candidate tokens in `prompt`, stripped of
+/// wrapping punctuation and filtered to [`looks_like_absolute_path_token`],
+/// capped at [`MAX_WORKDIR_WARNING_CANDIDATES`]. Split out of
+/// [`out_of_repo_paths_in_prompt`] (Fix 6) so the tokenizer/classifier is
+/// unit-testable without that function's own `exists()`-on-disk gate.
+fn candidate_path_tokens(prompt: &str) -> impl Iterator<Item = &str> {
+    prompt
+        .split(|c: char| c.is_whitespace() || c == '\'' || c == '"')
+        .filter(|token| !token.is_empty())
+        .map(|token| {
+            token
+                .trim_end_matches(TRAILING_TOKEN_PUNCTUATION)
+                .trim_start_matches(LEADING_TOKEN_WRAPPING)
+        })
+        .filter(|token| looks_like_absolute_path_token(token))
+        .take(MAX_WORKDIR_WARNING_CANDIDATES)
+}
+
 /// Issue #250: absolute paths named in a delegated prompt that resolve
 /// outside `launch_repo` -- the worker's writable root
 /// ([`effective_launch_repo`] with `workdir: None` is exactly `launch_repo`
@@ -173,13 +231,16 @@ const MAX_WORKDIR_WARNING_CANDIDATES: usize = 32;
 /// run just to report BLOCKED, and this is the conservative heuristic that
 /// catches the disk-visible half of that up front.
 ///
-/// A candidate token is any whitespace- or quote-delimited run starting with
-/// `/` or `~/`, trailing punctuation like `.,;:)"'` stripped, `~/` expanded
-/// against `home` when given. A token that does not exist on disk, or that
-/// canonicalizes inside `launch_repo`, is silently dropped -- a false
-/// negative here is fine, a false positive is not. Pure aside from the `fs`
-/// calls each candidate needs, so a tempdir-backed test can exercise it
-/// directly without spawning anything.
+/// A candidate token ([`candidate_path_tokens`]) is any whitespace- or
+/// quote-delimited run that -- once stripped of wrapping punctuation such as
+/// backticks or parentheses -- looks like an absolute path
+/// ([`looks_like_absolute_path_token`]: `/...`, `~/...`, a Windows
+/// drive-letter path, or a UNC path), `~/` expanded against `home` when
+/// given. A token that does not exist on disk, or that canonicalizes inside
+/// `launch_repo`, is silently dropped -- a false negative here is fine, a
+/// false positive is not. Pure aside from the `fs` calls each candidate
+/// needs, so a tempdir-backed test can exercise it directly without
+/// spawning anything.
 fn out_of_repo_paths_in_prompt(
     prompt: &str,
     launch_repo: &Path,
@@ -188,12 +249,7 @@ fn out_of_repo_paths_in_prompt(
     let Ok(canonical_repo) = std::fs::canonicalize(launch_repo) else {
         return Vec::new();
     };
-    prompt
-        .split(|c: char| c.is_whitespace() || c == '\'' || c == '"')
-        .filter(|token| !token.is_empty())
-        .map(|token| token.trim_end_matches(['.', ',', ';', ':', ')', '"', '\'']))
-        .filter(|token| token.starts_with('/') || token.starts_with("~/"))
-        .take(MAX_WORKDIR_WARNING_CANDIDATES)
+    candidate_path_tokens(prompt)
         .filter_map(|token| {
             let candidate: PathBuf = match token.strip_prefix("~/") {
                 Some(rest) => home?.join(rest),
@@ -449,7 +505,15 @@ fn group_env<'a>(
 /// so a value this process happened to inherit from further up its own
 /// delegation chain (its own parent's own parent) can never leak through to
 /// a child that must see THIS session's id, and no one else's.
-fn parent_session_env<'a>(
+///
+/// `pub(crate)`, not private: issue #249/#250 review found the same
+/// unconditional-substitute shape is exactly what `exec::run`/`run_loop::
+/// run`/`wrap::run` (the direct CLI entry points, whose own `env` is the raw
+/// ambient process environment) need to scrub an inherited `PARENT_SESSION_
+/// ENV` with -- passing `parent: None` there, since only a supervisor spawn
+/// seam (this fold, or dash's `verified_parent`) may ever establish parent
+/// lineage.
+pub(crate) fn parent_session_env<'a>(
     env: EnvLookup<'a>,
     parent: Option<String>,
 ) -> impl Fn(&str) -> Option<String> + 'a {
@@ -2874,6 +2938,110 @@ mod tests {
             !found.contains(&last),
             "a candidate beyond the cap must never be checked: {found:?}"
         );
+    }
+
+    /// Fix 6 (issue #249/#250 review): a path wrapped in backticks -- a
+    /// common way to set a path apart in prose -- must still be recognized
+    /// and flagged when it exists and resolves outside the repo. Before
+    /// this fix the leading backtick was never stripped, so `starts_with`
+    /// failed and the whole token was silently dropped as a candidate.
+    #[test]
+    fn out_of_repo_paths_in_prompt_warns_on_a_backtick_wrapped_path() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        let outside = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        std::fs::create_dir_all(&outside).expect("mkdir outside");
+
+        let prompt = format!("fix the bug described in `{}`", outside.display());
+        let found = out_of_repo_paths_in_prompt(&prompt, &repo, None);
+
+        assert_eq!(
+            found,
+            vec![std::fs::canonicalize(&outside).expect("canonicalize")],
+            "a backtick-wrapped existing path outside the repo must still be flagged: {found:?}"
+        );
+    }
+
+    /// The parenthesized shape from the same fix: `(/path)` must resolve to
+    /// the same candidate a bare `/path` would.
+    #[test]
+    fn out_of_repo_paths_in_prompt_warns_on_a_parenthesized_path() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        let outside = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        std::fs::create_dir_all(&outside).expect("mkdir outside");
+
+        let prompt = format!("see ({}) for context", outside.display());
+        let found = out_of_repo_paths_in_prompt(&prompt, &repo, None);
+
+        assert_eq!(
+            found,
+            vec![std::fs::canonicalize(&outside).expect("canonicalize")],
+            "a parenthesized existing path outside the repo must still be flagged: {found:?}"
+        );
+    }
+
+    /// Fix 6: the tokenizer/classifier alone (no filesystem, so Windows
+    /// shapes are covered on any host, not just a Windows CI runner) must
+    /// recognize a backtick- or paren-wrapped Unix path as a candidate.
+    #[test]
+    fn candidate_path_tokens_strips_wrapping_punctuation_from_both_ends() {
+        let found: Vec<&str> =
+            candidate_path_tokens("see `/tmp/one` and (/tmp/two) and plain/tmp/three").collect();
+        assert_eq!(
+            found,
+            vec!["/tmp/one", "/tmp/two"],
+            "wrapping backticks and parens must be stripped from both ends: {found:?}"
+        );
+    }
+
+    /// Fix 6: a Windows drive-letter absolute path (`C:\...` or `C:/...`)
+    /// must be recognized as a candidate token, purely by shape -- tested
+    /// separately from `out_of_repo_paths_in_prompt`'s own `exists()` gate
+    /// (a drive-relative path cannot exist on a non-Windows host) so this
+    /// coverage does not depend on the host platform.
+    #[test]
+    fn looks_like_absolute_path_token_recognizes_windows_drive_letter_paths() {
+        assert!(looks_like_absolute_path_token(r"C:\Users\jane\project"));
+        assert!(looks_like_absolute_path_token("C:/Users/jane/project"));
+        assert!(looks_like_absolute_path_token(r"d:\data"));
+        assert!(
+            !looks_like_absolute_path_token("C:notanabsolutepath"),
+            "a bare drive-relative token with no separator is not absolute"
+        );
+        assert!(
+            !looks_like_absolute_path_token("relative/path"),
+            "an ordinary relative path is still not a candidate"
+        );
+    }
+
+    /// Fix 6: a Windows UNC path (`\\server\share\...`) must also be
+    /// recognized as a candidate token.
+    #[test]
+    fn looks_like_absolute_path_token_recognizes_windows_unc_paths() {
+        assert!(looks_like_absolute_path_token(
+            r"\\server\share\project\file.txt"
+        ));
+        assert!(
+            !looks_like_absolute_path_token(r"\single\backslash"),
+            "a single leading backslash is not a UNC path"
+        );
+    }
+
+    /// Fix 6: a Windows-shaped token wrapped in backticks or parens must
+    /// also survive the wrapping-punctuation strip, the same as the Unix
+    /// shapes above.
+    #[test]
+    fn candidate_path_tokens_recognizes_a_wrapped_windows_drive_letter_path() {
+        let found: Vec<&str> =
+            candidate_path_tokens(r"see `C:\Users\jane\project` please").collect();
+        assert_eq!(found, vec![r"C:\Users\jane\project"], "got {found:?}");
+
+        let found: Vec<&str> =
+            candidate_path_tokens(r"see (\\server\share\project) please").collect();
+        assert_eq!(found, vec![r"\\server\share\project"], "got {found:?}");
     }
 
     /// Issue #228, decision 1: a bad `--workdir` fails loudly, up front,

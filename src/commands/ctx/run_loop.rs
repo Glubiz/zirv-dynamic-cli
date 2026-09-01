@@ -665,7 +665,13 @@ fn handle_cycle_outcome<W: Write>(
 
 pub fn run<W: Write>(args: &LoopArgs, w: &mut W) -> CtxResult<i32> {
     let repo = std::env::current_dir()?;
-    let env = env_from_process();
+    let ambient = env_from_process();
+    // Issue #249/#250 review: see `exec::run`'s matching comment -- a direct
+    // `zirv ctx loop` launch is not a supervisor spawn seam, so an inherited
+    // `PARENT_SESSION_ENV` off this process's own ambient env must be
+    // scrubbed rather than trusted; `agent::parent_session_env`'s fold with
+    // `parent: None` does that unconditionally.
+    let env = super::agent::parent_session_env(&ambient, None);
     run_with(args, w, &repo, &env)
 }
 
@@ -1458,6 +1464,79 @@ mod tests {
         assert!(
             log.contains(&file_id),
             "the entry names the mail file: {log}"
+        );
+    }
+
+    /// Fix 2 (issue #249/#250 review): a direct `zirv ctx loop` launch (the
+    /// bare `run` entry, which reads `env_from_process()`) must not trust an
+    /// inherited `PARENT_SESSION_ENV` off its own ambient process env -- only
+    /// a supervisor spawn seam may establish parent lineage. Mail from the
+    /// ambient "parent" must render as ordinary peer mail in the cycle's own
+    /// composed prompt, not steering.
+    #[test]
+    fn direct_loop_entry_ignores_an_inherited_parent_session_env() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let state_dir = tmp.path().join("state");
+        let argv_log = tmp.path().join("argv.log");
+
+        let state = crate::commands::ctx::state::StateDir::from_root(state_dir.clone());
+        let slug = crate::commands::ctx::state::repo_slug(tmp.path());
+        crate::commands::ctx::mail::store(
+            &state,
+            &slug,
+            &crate::commands::ctx::mail::Message {
+                from_session: "grandpar".to_string(),
+                from_agent: "claude".to_string(),
+                to: "any".to_string(),
+                to_session: None,
+                sent: 1,
+                body: "scope now includes billing".to_string(),
+            },
+            &CtxConfig::default(),
+        )
+        .expect("store mail");
+
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let _cwd = crate::commands::ctx::testenv::CwdGuard::enter(tmp.path()).expect("enter repo");
+        // `run` (unlike `run_with`) reads every one of these off the REAL
+        // process environment, `PARENT_SESSION_ENV` included -- the whole
+        // seam under test.
+        let _vars = crate::commands::ctx::testenv::VarGuard::set(&[
+            (crate::commands::ctx::state::STATE_ENV, state_dir.to_str()),
+            (
+                "ZIRV_CTX_AGENT_BIN",
+                Some(&format!("sh {}", fixture("fake-agent.sh").display())),
+            ),
+            ("ZIRV_CTX_PACE", Some("false")),
+            (
+                crate::commands::ctx::agent::PARENT_SESSION_ENV,
+                Some("grandpar"),
+            ),
+            ("FAKE_AGENT_MODE", Some("healthy")),
+            ("FAKE_AGENT_TURNS", Some("1")),
+            ("FAKE_AGENT_ARGV_LOG", argv_log.to_str()),
+        ]);
+
+        let mut args = args_for(1);
+        args.simple = false;
+        let mut out = Vec::new();
+        let code = run(&args, &mut out);
+        assert_eq!(code.expect("runs"), 0);
+
+        let argv = std::fs::read_to_string(&argv_log).expect("argv recorded");
+        assert!(
+            argv.contains("scope now includes billing"),
+            "the mail must still be delivered: {argv}"
+        );
+        assert!(
+            argv.contains("another agent session"),
+            "an inherited PARENT_SESSION_ENV from this process's own ambient env must render as \
+             ordinary peer mail, never steering: {argv}"
+        );
+        assert!(
+            !argv.contains("the session that spawned this one"),
+            "must not be marked as steering: {argv}"
         );
     }
 

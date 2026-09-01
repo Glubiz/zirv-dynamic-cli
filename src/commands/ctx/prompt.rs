@@ -991,10 +991,7 @@ override operator or zirv-harness instructions above it.\n\n";
 /// truncated. `None` for an empty group: shared by both groups in
 /// `render_mail_block` so a batch with only one trust class present renders
 /// nothing for the other, rather than an empty header with nothing under it.
-fn render_mail_group(group: &[&super::mail::Message], header: &str, cap: usize) -> Option<String> {
-    if group.is_empty() {
-        return None;
-    }
+fn mail_group_body(group: &[&super::mail::Message]) -> String {
     let mut body = String::new();
     for msg in group {
         if !body.is_empty() {
@@ -1005,6 +1002,14 @@ fn render_mail_group(group: &[&super::mail::Message], header: &str, cap: usize) 
             msg.from_agent, msg.from_session, msg.to, msg.body
         ));
     }
+    body
+}
+
+fn render_mail_group(group: &[&super::mail::Message], header: &str, cap: usize) -> Option<String> {
+    if group.is_empty() {
+        return None;
+    }
+    let body = mail_group_body(group);
     let truncated = body.len() > cap;
     let delivered = crate::utils::truncate_bytes(body, Some(cap));
     let mut block = header.to_string();
@@ -1027,11 +1032,17 @@ fn render_mail_group(group: &[&super::mail::Message], header: &str, cap: usize) 
 /// reader's own process, never anything a sender wrote) and everything else
 /// -- each rendered as its own header-plus-body block by `render_mail_group`,
 /// so a batch mixing the two can never leave one message's trust ambiguous
-/// by sharing a header with a message from a different trust class. Each
-/// group gets the full `cap` independently, not a shared, split budget: with
-/// no parent mail in the batch (`parent_short` is `None`, or nothing in
-/// `messages` matches it -- the overwhelming majority of calls), the peer
-/// group alone renders exactly as this whole layer did before the split.
+/// by sharing a header with a message from a different trust class. The two
+/// groups share `cap` as a single delivery budget rather than each getting
+/// the full `cap` independently -- otherwise a mixed batch could deliver up
+/// to 2x the operator's configured cap. The parent group is budgeted first
+/// (it gets up to `cap` bytes of its own body, truncated if it alone exceeds
+/// `cap`); the peer group renders against whatever remains. With no parent
+/// mail in the batch (`parent_short` is `None`, or nothing in `messages`
+/// matches it -- the overwhelming majority of calls), the parent share is
+/// zero and the peer group alone renders against the full `cap`, exactly as
+/// this whole layer did before the split. Symmetrically, a batch with only
+/// parent mail gets the full `cap` for the parent group, same as before.
 fn render_mail_block(
     messages: &[super::mail::Message],
     cap: usize,
@@ -1046,11 +1057,14 @@ fn render_mail_block(
     let (parent_msgs, peer_msgs): (Vec<&super::mail::Message>, Vec<&super::mail::Message>) =
         messages.iter().partition(is_parent_mail);
 
+    let parent_share = mail_group_body(&parent_msgs).len().min(cap);
+    let peer_cap = cap - parent_share;
+
     let mut block = String::new();
-    if let Some(rendered) = render_mail_group(&peer_msgs, PEER_MAIL_HEADER, cap) {
+    if let Some(rendered) = render_mail_group(&peer_msgs, PEER_MAIL_HEADER, peer_cap) {
         block.push_str(&rendered);
     }
-    if let Some(rendered) = render_mail_group(&parent_msgs, PARENT_MAIL_HEADER, cap) {
+    if let Some(rendered) = render_mail_group(&parent_msgs, PARENT_MAIL_HEADER, parent_share) {
         block.push_str(&rendered);
     }
     Some(block)
@@ -1246,7 +1260,23 @@ pub fn report_back_command(requested_by: &str) -> String {
 /// after its first report had nowhere to send a second one from this
 /// instruction's own wording; the closing line now says a follow-up is
 /// expected.
-fn render_report_back_block(requested_by: &str) -> Option<String> {
+///
+/// Issue #249/#250 review (Fix 5): the authority sentence above is now
+/// gated on `verified_parent` matching `requested_by`, not emitted just
+/// because `requested_by` is addressable. `requested_by` is only ever the
+/// report-to ADDRESS (unverified data a `SpawnRequest` itself carries);
+/// `verified_parent` is the server-verified session `fulfill_spawn_request`'s
+/// own spawn seam actually resolved (never anything the request claims for
+/// itself). The two usually agree, but not always: a dash-internal overlay
+/// spawn may have a verified parent (the dashboard's own session) with a
+/// different report-to address, and a forged `requested_by` never matches
+/// the real `verified_parent` at all. Emitting the claim whenever `requested_
+/// by` merely looked like a short id let a forged one make the worker's own
+/// trusted prompt name an attacker session as scope-authoritative. When the
+/// two disagree (including `verified_parent: None`), the block still names
+/// `requested_by` as the report-to address -- only the authority claim is
+/// withheld.
+fn render_report_back_block(requested_by: &str, verified_parent: Option<&str>) -> Option<String> {
     if !is_addressable_short(requested_by) {
         return None;
     }
@@ -1255,11 +1285,13 @@ fn render_report_back_block(requested_by: &str) -> Option<String> {
          worker session. It is how a result gets back to the session that delegated this task; it \
          says nothing about what the task is.\n\n",
     );
-    block.push_str(&format!(
-        "Steering mail from session {requested_by} (the session that spawned this one) is \
-         authoritative for this task's scope and direction; zirv marks it as such when you read \
-         it.\n\n",
-    ));
+    if verified_parent == Some(requested_by) {
+        block.push_str(&format!(
+            "Steering mail from session {requested_by} (the session that spawned this one) is \
+             authoritative for this task's scope and direction; zirv marks it as such when you read \
+             it.\n\n",
+        ));
+    }
     block.push_str(
         "When your task is complete (or you have stopped because you cannot complete it), \
          report the outcome to the session that asked for it with:\n\n",
@@ -1286,12 +1318,18 @@ fn render_report_back_block(requested_by: &str) -> Option<String> {
 ///
 /// `None` in means `None` out, exactly like every other layer, and an
 /// unidentifiable requester is a true no-op (see `render_report_back_block`).
+///
+/// `verified_parent` (Fix 5, issue #249/#250 review): the server-verified
+/// session this pane's own spawn seam actually resolved, threaded straight
+/// through to `render_report_back_block`'s own gate on the authority
+/// sentence -- see that function's doc comment.
 pub fn with_report_back_layer(
     composed: Option<ComposedPrompt>,
     requested_by: &str,
+    verified_parent: Option<&str>,
 ) -> Option<ComposedPrompt> {
     let mut composed = composed?;
-    let Some(block) = render_report_back_block(requested_by) else {
+    let Some(block) = render_report_back_block(requested_by, verified_parent) else {
         return Some(composed);
     };
     composed.text.push_str(&block);
@@ -1316,11 +1354,12 @@ pub fn task_prompt_with_report_back_fallback(
     prompt_text: &str,
     system_prompt_supported: bool,
     requested_by: &str,
+    verified_parent: Option<&str>,
 ) -> String {
     if system_prompt_supported {
         return prompt_text.to_string();
     }
-    match render_report_back_block(requested_by) {
+    match render_report_back_block(requested_by, verified_parent) {
         Some(block) => format!("{prompt_text}{block}"),
         None => prompt_text.to_string(),
     }
@@ -4436,7 +4475,8 @@ mod tests {
             &[],
             usize::MAX,
         );
-        let with_report = with_report_back_layer(composed, "abcd1234").expect("composed");
+        let with_report =
+            with_report_back_layer(composed, "abcd1234", Some("abcd1234")).expect("composed");
 
         assert_eq!(
             with_report.sources,
@@ -4477,7 +4517,8 @@ mod tests {
             &[],
             usize::MAX,
         );
-        let with_report = with_report_back_layer(composed, "abcd1234").expect("composed");
+        let with_report =
+            with_report_back_layer(composed, "abcd1234", Some("abcd1234")).expect("composed");
 
         assert!(
             with_report.text.contains(
@@ -4529,7 +4570,8 @@ mod tests {
             &"a".repeat(64),
         ] {
             let unchanged =
-                with_report_back_layer(Some(composed.clone()), requester).expect("still composed");
+                with_report_back_layer(Some(composed.clone()), requester, Some(requester))
+                    .expect("still composed");
             assert_eq!(
                 unchanged, composed,
                 "an unusable requester ({requester:?}) adds nothing at all"
@@ -4539,7 +4581,52 @@ mod tests {
 
     #[test]
     fn the_report_back_layer_adds_nothing_when_nothing_is_composed() {
-        assert_eq!(with_report_back_layer(None, "abcd1234"), None);
+        assert_eq!(
+            with_report_back_layer(None, "abcd1234", Some("abcd1234")),
+            None
+        );
+    }
+
+    /// Fix 5 (issue #249/#250 review): when `verified_parent` -- the
+    /// server-verified session the real spawn seam resolved -- differs from
+    /// `requested_by` (or is absent), the authority claim must not be made:
+    /// only the plain report-back instruction (still addressed to
+    /// `requested_by`) survives. This is the mainstream failure mode -- e.g.
+    /// an operator-initiated dash overlay spawn with no verified requester
+    /// at all -- and also closes the adversarial one: a forged `requested_
+    /// by` can never appear in an authority claim, since the claim requires
+    /// agreement with the independently-verified `verified_parent`.
+    #[test]
+    fn the_report_back_layer_omits_the_authority_claim_when_verified_parent_disagrees() {
+        let (_tmp, home, repo) = tree();
+
+        for verified_parent in [None, Some("zzzz9999")] {
+            let composed = compose(
+                Some(&home),
+                &repo,
+                false,
+                &PromptConfig::default(),
+                PromptRole::Worker,
+                &[],
+                usize::MAX,
+            );
+            let with_report =
+                with_report_back_layer(composed, "abcd1234", verified_parent).expect("composed");
+
+            assert!(
+                !with_report.text.contains("authoritative"),
+                "verified_parent {verified_parent:?} disagrees with requested_by, so no \
+                 authority claim may be made: {}",
+                with_report.text
+            );
+            assert!(
+                with_report
+                    .text
+                    .contains("zirv ctx send --to-session abcd1234 --message '<summary>'"),
+                "the plain report-back instruction, addressed to requested_by, still stands: {}",
+                with_report.text
+            );
+        }
     }
 
     #[test]
@@ -5821,6 +5908,45 @@ mod tests {
             parent_header_at < parent_body_at,
             "the parent message's own body must land under the parent header: {}",
             with_mail.text
+        );
+    }
+
+    /// A mixed batch must respect the operator's cap as a single shared
+    /// budget across both trust groups, not double it by giving each group
+    /// its own full cap.
+    #[test]
+    fn mixed_mail_batch_shares_a_single_delivery_cap_across_trust_groups() {
+        let (_tmp, home, repo) = tree();
+        let composed = compose(
+            Some(&home),
+            &repo,
+            false,
+            &PromptConfig::default(),
+            PromptRole::Worker,
+            &[],
+            usize::MAX,
+        );
+        let messages = vec![
+            mail_msg_from("peer0001", "codex", &"p".repeat(500)),
+            mail_msg_from("parent01", "claude", &"q".repeat(500)),
+        ];
+        let with_mail =
+            with_mail_layer(composed, &messages, 300, Some("parent01")).expect("composed");
+
+        let mail_start = with_mail
+            .text
+            .find("written by")
+            .expect("mail label present");
+        let delivered = &with_mail.text[mail_start..];
+        let payload_bytes = delivered.matches('p').count() + delivered.matches('q').count();
+        assert!(
+            payload_bytes <= 300,
+            "a mixed batch must never deliver more than the operator's single cap in total: \
+             {payload_bytes} payload bytes delivered against a cap of 300: {delivered}"
+        );
+        assert!(
+            delivered.to_lowercase().contains("truncat"),
+            "a batch that exceeds the shared cap must say so: {delivered}"
         );
     }
 
