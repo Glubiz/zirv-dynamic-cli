@@ -2137,36 +2137,70 @@ fn format_wall_clock(ms: u64) -> String {
 }
 
 /// A bounded worker to auto-spawn after a gate transition.
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) struct AutoSpawn {
     pub phase: WorkflowPhase,
     pub argv: Vec<String>,
 }
 
-/// Pure: whether a gate transition should auto-spawn a worker, and the argv
-/// for it. Never fires into `AwaitingApproval`, for a phase other than
-/// Review/Test/Verify, or for a Review step whose workflow has no adapter to
-/// run the reviewer as.
+/// Why a gate transition that WOULD otherwise be eligible (right phase,
+/// `Running`, enabled) did not produce an [`AutoSpawn`]. `Quiet` covers
+/// every case that is not worth an operator's attention: the config key is
+/// off, the phase is not Review/Test/Verify, or the workflow is
+/// `AwaitingApproval` -- an operator who never opted in, or a transition
+/// this feature was never meant to touch, must see nothing new. `NoPermit`/
+/// `NoAgent` are the opposite: the operator explicitly enabled this, so a
+/// skip is reported, not silent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AutoSpawnSkip {
+    Quiet,
+    NoPermit,
+    NoAgent,
+}
+
+/// Pure: whether a gate transition should auto-spawn a worker, the argv for
+/// it, or the reason it did not. `default_agent` is the operator's
+/// configured chat harness (`adapters::resolve_default`, the same one `zirv
+/// ctx chat` launches by default), consulted only when the workflow itself
+/// has no recorded adapter -- `state.adapter` always wins when set.
 pub(crate) fn auto_spawn_decision(
     state: &WorkflowState,
     enabled: bool,
     permit_available: bool,
-) -> Option<AutoSpawn> {
-    if !enabled || !permit_available || state.status != WorkflowStatus::Running {
-        return None;
+    default_agent: Option<&str>,
+) -> Result<AutoSpawn, AutoSpawnSkip> {
+    if !enabled || state.status != WorkflowStatus::Running {
+        return Err(AutoSpawnSkip::Quiet);
     }
-    let phase = state.current()?.phase;
+    let phase = state.current().ok_or(AutoSpawnSkip::Quiet)?.phase;
+    if !matches!(
+        phase,
+        WorkflowPhase::Review | WorkflowPhase::Test | WorkflowPhase::Verify
+    ) {
+        return Err(AutoSpawnSkip::Quiet);
+    }
+    if !permit_available {
+        return Err(AutoSpawnSkip::NoPermit);
+    }
     let repo = state.repo.display().to_string();
     let argv = match phase {
-        WorkflowPhase::Review => vec![
-            "workflow".to_string(),
-            "review".to_string(),
-            "run".to_string(),
-            state.id.clone(),
-            "--agent".to_string(),
-            state.adapter.clone()?,
-            "--repo".to_string(),
-            repo,
-        ],
+        WorkflowPhase::Review => {
+            let agent = state
+                .adapter
+                .clone()
+                .or_else(|| default_agent.map(str::to_string))
+                .ok_or(AutoSpawnSkip::NoAgent)?;
+            vec![
+                "workflow".to_string(),
+                "review".to_string(),
+                "run".to_string(),
+                state.id.clone(),
+                "--agent".to_string(),
+                agent,
+                "--repo".to_string(),
+                repo,
+            ]
+        }
         WorkflowPhase::Test => vec![
             "test".to_string(),
             "changed".to_string(),
@@ -2174,9 +2208,9 @@ pub(crate) fn auto_spawn_decision(
             repo,
         ],
         WorkflowPhase::Verify => vec!["verify".to_string(), "--repo".to_string(), repo],
-        _ => return None,
+        _ => unreachable!("filtered above"),
     };
-    Some(AutoSpawn { phase, argv })
+    Ok(AutoSpawn { phase, argv })
 }
 
 #[cfg(unix)]
@@ -2191,6 +2225,22 @@ fn detach(command: &mut std::process::Command) {
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
     const DETACHED_PROCESS: u32 = 0x0000_0008;
     command.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
+}
+
+/// The operator explicitly enabled `auto_spawn_on_gate`, so a skip that
+/// reaches this point (as opposed to `AutoSpawnSkip::Quiet`) is reported,
+/// not silent.
+fn announce_auto_spawn_skip(
+    cfg: &crate::commands::ctx::config::CtxConfig,
+    phase: WorkflowPhase,
+    reason: &str,
+) {
+    crate::commands::ctx::announce::Announcer::new(cfg.chrome.events, false).emit(
+        &crate::commands::ctx::announce::Event::AutoSpawnSkipped {
+            phase: phase.to_string(),
+            reason: reason.to_string(),
+        },
+    );
 }
 
 /// Issue #242: spawns `spawn.argv` detached and never fails `advance` --
@@ -2208,14 +2258,22 @@ fn spawn_auto_worker(
 ) {
     use crate::commands::ctx::permit;
 
+    // A race against `try_auto_spawn`'s own peek: the peek said a slot was
+    // free, but another caller took it before this real acquire ran.
     let Some(permit) = permit::acquire(
         state_dir,
         cfg.supervise.max_heavy_operations,
         &format!("auto-spawn: {}", spawn.argv.join(" ")),
     ) else {
+        announce_auto_spawn_skip(cfg, spawn.phase, "no heavy-operation permit was free");
         return;
     };
     let Ok(exe) = std::env::current_exe() else {
+        announce_auto_spawn_skip(
+            cfg,
+            spawn.phase,
+            "could not resolve the zirv executable path",
+        );
         return;
     };
     let mut command = std::process::Command::new(exe);
@@ -2226,6 +2284,7 @@ fn spawn_auto_worker(
         .stderr(std::process::Stdio::null());
     detach(&mut command);
     let Ok(child) = command.spawn() else {
+        announce_auto_spawn_skip(cfg, spawn.phase, "failed to spawn the worker process");
         return;
     };
     permit.set_child_pid(child.id());
@@ -2255,10 +2314,12 @@ fn spawn_auto_worker(
     );
 }
 
-/// Thin I/O wrapper around [`auto_spawn_decision`]: resolves config and a
-/// permit peek, then hands off to [`spawn_auto_worker`]. Any failure along
-/// the way (config, permit, spawn) is silently degraded -- never propagated
-/// to `advance`'s own result.
+/// Thin I/O wrapper around [`auto_spawn_decision`]: resolves config, a
+/// permit peek, and (only when the workflow itself has no adapter) the
+/// operator's default chat harness, then hands off to [`spawn_auto_worker`].
+/// Any failure along the way (config, permit, spawn) is silently degraded --
+/// never propagated to `advance`'s own result -- but a skip the operator's
+/// own `auto_spawn_on_gate = true` made eligible is announced, not silent.
 fn try_auto_spawn(state_dir: &StateDir, state: &WorkflowState) {
     let cfg = match crate::commands::ctx::config::CtxConfig::load(&state.repo, &|key| {
         std::env::var(key).ok()
@@ -2266,12 +2327,47 @@ fn try_auto_spawn(state_dir: &StateDir, state: &WorkflowState) {
         Ok(cfg) => cfg,
         Err(_) => return,
     };
+    if !cfg.workflow.auto_spawn_on_gate {
+        return;
+    }
     let permit_available =
         crate::commands::ctx::permit::live_count(state_dir) < cfg.supervise.max_heavy_operations;
-    if let Some(spawn) =
-        auto_spawn_decision(state, cfg.workflow.auto_spawn_on_gate, permit_available)
-    {
-        spawn_auto_worker(state_dir, state, &cfg, spawn);
+    // `state.adapter` always wins; the operator's configured chat harness
+    // (the same one `adapters::resolve_default` picks for `zirv ctx chat`)
+    // is only worth resolving -- readiness probes and all -- when the
+    // workflow itself named none.
+    let default_agent = state
+        .adapter
+        .is_none()
+        .then(|| {
+            crate::commands::ctx::adapters::resolve_default(&cfg)
+                .ok()
+                .map(|(adapter, _)| adapter.name().to_string())
+        })
+        .flatten();
+    match auto_spawn_decision(state, true, permit_available, default_agent.as_deref()) {
+        Ok(spawn) => spawn_auto_worker(state_dir, state, &cfg, spawn),
+        Err(skip) => {
+            if let Some(reason) = auto_spawn_skip_reason(skip)
+                && let Some(phase) = state.current().map(|step| step.phase)
+            {
+                announce_auto_spawn_skip(&cfg, phase, reason);
+            }
+        }
+    }
+}
+
+/// The advisory text for a skip the operator's own `auto_spawn_on_gate =
+/// true` made eligible, or `None` for `Quiet` -- the ordinary, never-
+/// announced case (disabled, wrong phase, `AwaitingApproval`).
+fn auto_spawn_skip_reason(skip: AutoSpawnSkip) -> Option<&'static str> {
+    match skip {
+        AutoSpawnSkip::Quiet => None,
+        AutoSpawnSkip::NoPermit => Some("no heavy-operation permit was free"),
+        AutoSpawnSkip::NoAgent => Some(
+            "no adapter to run the reviewer as (the workflow has none, and no operator \
+             default chat harness could be resolved)",
+        ),
     }
 }
 
@@ -2820,36 +2916,52 @@ mod tests {
         let repo = tempdir().unwrap();
         let state = production_feature_state(repo.path());
 
-        assert!(
-            auto_spawn_decision(&at_phase(state.clone(), WorkflowPhase::Review), false, true)
-                .is_none(),
+        assert_eq!(
+            auto_spawn_decision(
+                &at_phase(state.clone(), WorkflowPhase::Review),
+                false,
+                true,
+                None
+            ),
+            Err(AutoSpawnSkip::Quiet),
             "disabled must never fire"
         );
-        assert!(
-            auto_spawn_decision(&at_phase(state.clone(), WorkflowPhase::Review), true, false)
-                .is_none(),
+        assert_eq!(
+            auto_spawn_decision(
+                &at_phase(state.clone(), WorkflowPhase::Review),
+                true,
+                false,
+                None
+            ),
+            Err(AutoSpawnSkip::NoPermit),
             "no permit must never fire"
         );
-        assert!(
+        assert_eq!(
             auto_spawn_decision(
                 &at_phase(state.clone(), WorkflowPhase::Implement),
                 true,
-                true
-            )
-            .is_none(),
+                true,
+                None
+            ),
+            Err(AutoSpawnSkip::Quiet),
             "Implement must never fire"
         );
 
         let mut awaiting = at_phase(state.clone(), WorkflowPhase::Review);
         awaiting.status = WorkflowStatus::AwaitingApproval;
-        assert!(
-            auto_spawn_decision(&awaiting, true, true).is_none(),
+        assert_eq!(
+            auto_spawn_decision(&awaiting, true, true, None),
+            Err(AutoSpawnSkip::Quiet),
             "AwaitingApproval must never fire"
         );
 
-        let review =
-            auto_spawn_decision(&at_phase(state.clone(), WorkflowPhase::Review), true, true)
-                .expect("Review with an adapter fires");
+        let review = auto_spawn_decision(
+            &at_phase(state.clone(), WorkflowPhase::Review),
+            true,
+            true,
+            None,
+        )
+        .expect("Review with a workflow adapter fires");
         assert_eq!(review.phase, WorkflowPhase::Review);
         assert_eq!(
             review.argv,
@@ -2865,15 +2977,39 @@ mod tests {
             ]
         );
 
-        let mut no_adapter = at_phase(state.clone(), WorkflowPhase::Review);
-        no_adapter.adapter = None;
-        assert!(
-            auto_spawn_decision(&no_adapter, true, true).is_none(),
-            "Review with no adapter to run the reviewer as must not fire"
+        // `state.adapter` always wins over a configured default, even when
+        // both resolve.
+        let with_both = auto_spawn_decision(
+            &at_phase(state.clone(), WorkflowPhase::Review),
+            true,
+            true,
+            Some("codex"),
+        )
+        .expect("Review fires");
+        assert_eq!(
+            with_both.argv[5], "claude",
+            "the workflow's own adapter wins"
         );
 
-        let test = auto_spawn_decision(&at_phase(state.clone(), WorkflowPhase::Test), true, true)
-            .expect("Test fires");
+        let mut no_adapter = at_phase(state.clone(), WorkflowPhase::Review);
+        no_adapter.adapter = None;
+        assert_eq!(
+            auto_spawn_decision(&no_adapter, true, true, None),
+            Err(AutoSpawnSkip::NoAgent),
+            "Review with no workflow adapter and no default must not fire"
+        );
+
+        let with_default = auto_spawn_decision(&no_adapter, true, true, Some("codex"))
+            .expect("Review with no workflow adapter falls back to the operator default");
+        assert_eq!(with_default.argv[5], "codex");
+
+        let test = auto_spawn_decision(
+            &at_phase(state.clone(), WorkflowPhase::Test),
+            true,
+            true,
+            None,
+        )
+        .expect("Test fires");
         assert_eq!(test.phase, WorkflowPhase::Test);
         assert_eq!(
             test.argv,
@@ -2885,14 +3021,29 @@ mod tests {
             ]
         );
 
-        let verify =
-            auto_spawn_decision(&at_phase(state.clone(), WorkflowPhase::Verify), true, true)
-                .expect("Verify fires");
+        let verify = auto_spawn_decision(
+            &at_phase(state.clone(), WorkflowPhase::Verify),
+            true,
+            true,
+            None,
+        )
+        .expect("Verify fires");
         assert_eq!(verify.phase, WorkflowPhase::Verify);
         assert_eq!(
             verify.argv,
             vec!["verify", "--repo", &state.repo.display().to_string()]
         );
+    }
+
+    /// `Quiet` is the only skip that stays silent -- the config-disabled
+    /// path, or a phase auto-spawn was never meant to touch. `NoPermit`/
+    /// `NoAgent` are eligible-but-skipped, so an operator who turned the
+    /// key on must see why.
+    #[test]
+    fn auto_spawn_skip_reason_is_silent_only_for_quiet() {
+        assert_eq!(auto_spawn_skip_reason(AutoSpawnSkip::Quiet), None);
+        assert!(auto_spawn_skip_reason(AutoSpawnSkip::NoPermit).is_some());
+        assert!(auto_spawn_skip_reason(AutoSpawnSkip::NoAgent).is_some());
     }
 
     #[test]
