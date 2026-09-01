@@ -170,8 +170,16 @@ ideas instead of building them.";
 /// their totals while keeping every section present, so the same checkpoint
 /// habit costs far fewer tokens with no loss of the signal this bullet asks
 /// for.
+///
+/// v13 (issue #246): the same checkpoint bullet now points at `zirv ctx
+/// status --brief --diff`. `--diff` (`StatusArgs`) prints only the sections
+/// whose rendered text changed since this session's own previous `--diff`
+/// call, using a small per-session snapshot kept in the state dir -- so a
+/// session that follows this bullet at every natural checkpoint, most of
+/// which land on an unchanged report, pays for the "no change" one-liner
+/// instead of the full `--brief` render each time.
 pub const HARNESS_PROMPT: &str = "\
-zirv meta-harness (v12)
+zirv meta-harness (v13)
 
 - zirv is the harness managing context, usage, and cross-harness communication for this session. \
 It is not one of the agents; it is what launched and supervises the agent in this seat.
@@ -188,8 +196,9 @@ not a fallback or a lesser option: treat it exactly like dispatching a native su
 for when to delegate, same confidence in the result, no extra hesitation because the work lands on \
 a different vendor's model.
 - Use zirv on your own initiative, without waiting to be asked: delegate substantial independent \
-work to another harness with `zirv agent`; check `zirv ctx status --brief` and `zirv ctx inbox` at \
-natural checkpoints (task start, after long steps, before reporting done). A `[zirv \u{25b8} mail]` line \
+work to another harness with `zirv agent`; check `zirv ctx status --brief --diff` and `zirv ctx \
+inbox` at natural checkpoints (task start, after long steps, before reporting done). A `[zirv \
+\u{25b8} mail]` line \
 typed into this session is not one of those checkpoints -- it means mail has already arrived, so \
 run `zirv ctx inbox` (never `--peek`, which leaves it unread for next time) right away instead of \
 waiting for the next checkpoint. Steer a live worker with `zirv ctx send` and `zirv ctx nudge`; \
@@ -3862,7 +3871,7 @@ mod tests {
     #[test]
     fn the_harness_layer_only_promises_the_mail_a_worker_is_actually_told_to_send() {
         assert!(
-            HARNESS_PROMPT.starts_with("zirv meta-harness (v12)"),
+            HARNESS_PROMPT.starts_with("zirv meta-harness (v13)"),
             "a reworded layer carries its own version: {}",
             HARNESS_PROMPT.lines().next().unwrap_or_default()
         );
@@ -3932,7 +3941,7 @@ mod tests {
     #[test]
     fn the_harness_layer_teaches_the_fan_out_send_mode_too() {
         assert!(
-            HARNESS_PROMPT.starts_with("zirv meta-harness (v12)"),
+            HARNESS_PROMPT.starts_with("zirv meta-harness (v13)"),
             "a reworded layer carries its own version: {}",
             HARNESS_PROMPT.lines().next().unwrap_or_default()
         );
@@ -4010,7 +4019,7 @@ mod tests {
             "must say which one wins"
         );
         assert!(
-            HARNESS_PROMPT.contains("(v12)"),
+            HARNESS_PROMPT.contains("(v13)"),
             "a changed instruction layer must bump its own version token"
         );
     }

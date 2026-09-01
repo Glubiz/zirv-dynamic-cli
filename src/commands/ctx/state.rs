@@ -344,6 +344,14 @@ impl StateDir {
         self.0.join("adoption")
     }
 
+    /// Issue #246: `status --diff`'s per-session snapshot of the previous
+    /// `--diff` call's rendered sections, one file per session id
+    /// (`<state>/status-snapshots/<session-id>.json`), mirroring
+    /// `adoption()`'s own per-session layout above.
+    pub fn status_snapshots(&self) -> PathBuf {
+        self.0.join("status-snapshots")
+    }
+
     /// Autonomous frontend profiles and visual evidence. Profiles are local
     /// derived state: repository files remain the source of truth and are
     /// never modified while Zirv infers a design direction.

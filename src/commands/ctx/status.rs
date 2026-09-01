@@ -1,14 +1,17 @@
 use std::io::Write;
 use std::path::Path;
 
+use serde::{Deserialize, Serialize};
+
 use super::adapters::{self, AGENT_ENV, DefaultOrigin};
 use super::config::{CtxConfig, EnvLookup, env_from_process};
+use super::event::input_hash;
 use super::group;
 use super::handoff::latest_for_repo;
 use super::mail;
 use super::permit;
 use super::sessions::{self, Liveness};
-use super::state::{StateDir, repo_slug};
+use super::state::{StateDir, now_secs, repo_slug};
 use super::{CtxResult, log};
 use crate::style::{self, Tone};
 
@@ -651,9 +654,18 @@ pub struct StatusArgs {
     /// pointing back at the full view.
     #[arg(long, default_value_t = false)]
     pub brief: bool,
+    /// Print only the sections whose rendered text changed since this
+    /// session's previous `--diff` call, using a small per-session snapshot
+    /// kept in the state dir (`StateDir::status_snapshots`, keyed by
+    /// `ZIRV_CTX_SESSION`). The diff view is plain text: sections either
+    /// changed or did not, so there is nothing color-coded to preserve.
+    /// Without `--diff`, output is unaffected -- no snapshot is read or
+    /// written.
+    #[arg(long, default_value_t = false)]
+    pub diff: bool,
 }
 
-pub fn run_with<W: Write>(
+fn render_report<W: Write>(
     args: &StatusArgs,
     w: &mut W,
     repo: &Path,
@@ -1212,6 +1224,234 @@ pub fn run_with<W: Write>(
     Ok(if repo_forbidden { 1 } else { 0 })
 }
 
+/// Issue #246: `status --diff`'s schema version for [`StatusSnapshot`].
+/// Bumping this on any future field/shape change makes an old snapshot
+/// silently fall back to "no snapshot yet" via [`load_status_snapshot`]
+/// rather than fail to parse.
+const STATUS_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
+
+/// A `status --diff` session's snapshot of the previous call's rendered
+/// sections, one file per session id
+/// (`StateDir::status_snapshots().join("<hash>.json")`), mirroring
+/// `hook.rs`'s `AdoptionRecord`/`adoption_record_path`/`load_adoption_
+/// record`/`save_adoption_record` pattern exactly.
+///
+/// `brief` and `repo_slug` are both part of the identity a stored snapshot
+/// must match to be usable: a `--brief --diff` snapshot and a plain
+/// `--diff` snapshot render different section sets for the same session id,
+/// and a slug recorded for a since-moved/renamed repo checkout is no longer
+/// this repo's own status. Either mismatch -- like a missing or corrupt
+/// file, or a schema version this build no longer understands -- is treated
+/// as "no snapshot yet" rather than surfaced as an error: `status --diff`
+/// must never fail just because its own bookkeeping is stale.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct StatusSnapshot {
+    schema_version: u32,
+    brief: bool,
+    repo_slug: String,
+    saved_at_secs: u64,
+    sections: Vec<(String, String)>,
+}
+
+/// One rendered section of a `status` report: `key` is the text before the
+/// first `:` on the section's first line (or the whole line, when there is
+/// no colon); `body` is every line belonging to the section, including its
+/// first, joined with `\n`. Pure text splitting -- no fs/clock/env -- so
+/// `--diff`'s unit tests exercise it directly.
+///
+/// A section starts at every non-empty line whose first character is not
+/// whitespace -- `render_report`'s own convention throughout this file:
+/// top-level lines start at column 0 (`key: ...`), continuation lines are
+/// indented. Blank lines (used only to visually separate sections) are
+/// dropped entirely: they carry no content to diff, and keeping them would
+/// force every snapshot to also track exact blank-line placement. A
+/// duplicate key (e.g. two "work group:" lines) is disambiguated with
+/// `#2`, `#3`, ... suffixes in encounter order, so [`diff_sections`] can
+/// still tell separate sections apart by key alone.
+fn split_sections(text: &str) -> Vec<(String, String)> {
+    let mut raw: Vec<(String, Vec<&str>)> = Vec::new();
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let starts_new_section = raw.is_empty() || !line.starts_with(char::is_whitespace);
+        if starts_new_section {
+            let key = line.split(':').next().unwrap_or(line).to_string();
+            raw.push((key, vec![line]));
+        } else {
+            raw.last_mut()
+                .expect("starts_new_section is true when raw is empty")
+                .1
+                .push(line);
+        }
+    }
+
+    let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    raw.into_iter()
+        .map(|(key, lines)| {
+            let ordinal = seen.entry(key.clone()).and_modify(|n| *n += 1).or_insert(1);
+            let key = if *ordinal == 1 {
+                key
+            } else {
+                format!("{key} #{ordinal}")
+            };
+            (key, lines.join("\n"))
+        })
+        .collect()
+}
+
+/// The result of comparing two [`split_sections`] outputs, keyed by their
+/// already-disambiguated section key.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct SectionDiff {
+    /// Sections new or changed in `cur`, in `cur`'s own order.
+    changed: Vec<(String, String)>,
+    /// Keys present in `prev` but absent from `cur`.
+    removed: Vec<String>,
+}
+
+/// Pure diff between two section lists. No fs/clock/env.
+fn diff_sections(prev: &[(String, String)], cur: &[(String, String)]) -> SectionDiff {
+    let prev_by_key: std::collections::HashMap<&str, &str> = prev
+        .iter()
+        .map(|(key, body)| (key.as_str(), body.as_str()))
+        .collect();
+    let cur_keys: std::collections::HashSet<&str> =
+        cur.iter().map(|(key, _)| key.as_str()).collect();
+
+    let changed = cur
+        .iter()
+        .filter(|(key, body)| prev_by_key.get(key.as_str()) != Some(&body.as_str()))
+        .cloned()
+        .collect();
+    let removed = prev
+        .iter()
+        .filter(|(key, _)| !cur_keys.contains(key.as_str()))
+        .map(|(key, _)| key.clone())
+        .collect();
+    SectionDiff { changed, removed }
+}
+
+/// `<state>/status-snapshots/<hash of session>.json`, mirroring `hook.rs`'s
+/// `adoption_record_path` exactly.
+fn status_snapshot_path(state: &StateDir, session: &str) -> std::path::PathBuf {
+    state
+        .status_snapshots()
+        .join(format!("{:016x}.json", input_hash(session)))
+}
+
+/// Best-effort, like `hook.rs`'s `load_adoption_record`: missing, corrupt,
+/// a schema version this build does not recognize, or a snapshot saved
+/// under a different `--brief`/repo identity all read as "no snapshot yet"
+/// (`None`) rather than an error.
+fn load_status_snapshot(path: &Path, brief: bool, repo_slug: &str) -> Option<StatusSnapshot> {
+    let body = std::fs::read_to_string(path).ok()?;
+    let snapshot: StatusSnapshot = serde_json::from_str(&body).ok()?;
+    if snapshot.schema_version != STATUS_SNAPSHOT_SCHEMA_VERSION
+        || snapshot.brief != brief
+        || snapshot.repo_slug != repo_slug
+    {
+        return None;
+    }
+    Some(snapshot)
+}
+
+/// Best-effort, like `hook.rs`'s `save_adoption_record`: a snapshot that
+/// fails to write costs the next `--diff` call a "no snapshot yet" reset,
+/// never a `status` failure. Prunes the directory to `KEEP_NEWEST` after a
+/// successful write, the same retention `adoption()` gets.
+fn save_status_snapshot(state: &StateDir, path: &Path, snapshot: &StatusSnapshot) {
+    let Ok(json) = serde_json::to_string(snapshot) else {
+        return;
+    };
+    if let Some(dir) = path.parent() {
+        let _ = super::state::create_private_dir_all(dir);
+    }
+    if super::state::write_private(path, &json).is_ok() {
+        super::state::prune_to_newest(&state.status_snapshots(), super::state::KEEP_NEWEST);
+    }
+}
+
+pub fn run_with<W: Write>(
+    args: &StatusArgs,
+    w: &mut W,
+    repo: &Path,
+    env: EnvLookup<'_>,
+    colour: bool,
+) -> CtxResult<i32> {
+    if !args.diff {
+        return render_report(args, w, repo, env, colour);
+    }
+
+    let Some(session) = mail::session_identity(env) else {
+        writeln!(
+            w,
+            "status --diff: no session identity (ZIRV_CTX_SESSION unset); showing the full \
+             report"
+        )?;
+        return render_report(args, w, repo, env, colour);
+    };
+
+    let state = StateDir::resolve(env)?;
+    let slug = repo_slug(repo);
+    let path = status_snapshot_path(&state, &session);
+    let previous = load_status_snapshot(&path, args.brief, &slug);
+
+    let mut rendered = Vec::new();
+    let code = render_report(args, &mut rendered, repo, env, false)?;
+    let text = String::from_utf8(rendered)
+        .map_err(|e| format!("status --diff: rendered report was not valid UTF-8: {e}"))?;
+    let sections = split_sections(&text);
+
+    match &previous {
+        None => {
+            writeln!(
+                w,
+                "status --diff: no snapshot for this session yet; full report follows"
+            )?;
+            write!(w, "{text}")?;
+        }
+        Some(snapshot) => {
+            let SectionDiff { changed, removed } = diff_sections(&snapshot.sections, &sections);
+            let age = style::format_age(now_secs().saturating_sub(snapshot.saved_at_secs));
+            if changed.is_empty() && removed.is_empty() {
+                writeln!(
+                    w,
+                    "status --diff: no change since {age} ({} sections)",
+                    sections.len()
+                )?;
+            } else {
+                writeln!(
+                    w,
+                    "status --diff: {} of {} sections changed since {age}",
+                    changed.len(),
+                    sections.len()
+                )?;
+                for (_, body) in &changed {
+                    writeln!(w, "{body}")?;
+                }
+                for key in &removed {
+                    writeln!(w, "{key}: (no longer reported)")?;
+                }
+            }
+        }
+    }
+
+    save_status_snapshot(
+        &state,
+        &path,
+        &StatusSnapshot {
+            schema_version: STATUS_SNAPSHOT_SCHEMA_VERSION,
+            brief: args.brief,
+            repo_slug: slug,
+            saved_at_secs: now_secs(),
+            sections,
+        },
+    );
+
+    Ok(code)
+}
+
 pub fn run<W: Write>(args: &StatusArgs, w: &mut W) -> CtxResult<i32> {
     let repo = std::env::current_dir()?;
     let env = env_from_process();
@@ -1242,6 +1482,7 @@ mod tests {
             &StatusArgs {
                 decisions: 10,
                 brief: false,
+                diff: false,
             },
             &mut out,
             tmp.path(),
@@ -1280,6 +1521,7 @@ mod tests {
             &StatusArgs {
                 decisions: 10,
                 brief: false,
+                diff: false,
             },
             &mut out,
             &repo,
@@ -1323,6 +1565,7 @@ mod tests {
             &StatusArgs {
                 decisions: 10,
                 brief: false,
+                diff: false,
             },
             &mut out,
             &repo,
@@ -1365,6 +1608,7 @@ mod tests {
             &StatusArgs {
                 decisions: 10,
                 brief: false,
+                diff: false,
             },
             &mut out,
             &repo,
@@ -1423,6 +1667,7 @@ mod tests {
             &StatusArgs {
                 decisions: 10,
                 brief: false,
+                diff: false,
             },
             &mut out,
             tmp.path(),
@@ -1458,6 +1703,7 @@ mod tests {
             &StatusArgs {
                 decisions: 5,
                 brief: false,
+                diff: false,
             },
             &mut out,
             tmp.path(),
@@ -1506,6 +1752,7 @@ mod tests {
             &StatusArgs {
                 decisions: 5,
                 brief: false,
+                diff: false,
             },
             &mut out,
             &repo,
@@ -1558,6 +1805,7 @@ mod tests {
             &StatusArgs {
                 decisions: 5,
                 brief: false,
+                diff: false,
             },
             &mut out,
             &repo,
@@ -1613,6 +1861,7 @@ mod tests {
             &StatusArgs {
                 decisions: 5,
                 brief: false,
+                diff: false,
             },
             &mut out,
             &repo,
@@ -1663,6 +1912,7 @@ mod tests {
             &StatusArgs {
                 decisions: 2,
                 brief: false,
+                diff: false,
             },
             &mut out,
             tmp.path(),
@@ -1699,6 +1949,7 @@ mod tests {
             &StatusArgs {
                 decisions: 5,
                 brief: false,
+                diff: false,
             },
             &mut out,
             tmp.path(),
@@ -1771,6 +2022,7 @@ mod tests {
             &StatusArgs {
                 decisions: 5,
                 brief: false,
+                diff: false,
             },
             &mut out,
             tmp.path(),
@@ -1827,6 +2079,7 @@ mod tests {
             &StatusArgs {
                 decisions: 5,
                 brief: false,
+                diff: false,
             },
             &mut out,
             tmp.path(),
@@ -1868,6 +2121,7 @@ mod tests {
             &StatusArgs {
                 decisions: 5,
                 brief: false,
+                diff: false,
             },
             &mut out,
             tmp.path(),
@@ -1918,6 +2172,7 @@ mod tests {
             &StatusArgs {
                 decisions: 5,
                 brief: false,
+                diff: false,
             },
             &mut out,
             tmp.path(),
@@ -2032,6 +2287,7 @@ mod tests {
             &StatusArgs {
                 decisions: 5,
                 brief: false,
+                diff: false,
             },
             &mut out,
             tmp.path(),
@@ -2097,6 +2353,7 @@ mod tests {
             &StatusArgs {
                 decisions: 5,
                 brief: false,
+                diff: false,
             },
             &mut out,
             tmp.path(),
@@ -2143,6 +2400,7 @@ mod tests {
             &StatusArgs {
                 decisions: 5,
                 brief: false,
+                diff: false,
             },
             &mut out,
             tmp.path(),
@@ -2186,6 +2444,7 @@ mod tests {
             &StatusArgs {
                 decisions: 5,
                 brief: false,
+                diff: false,
             },
             &mut out,
             tmp.path(),
@@ -2246,6 +2505,7 @@ mod tests {
             &StatusArgs {
                 decisions: 5,
                 brief: false,
+                diff: false,
             },
             &mut out,
             tmp.path(),
@@ -2296,6 +2556,7 @@ mod tests {
             &StatusArgs {
                 decisions: 5,
                 brief: false,
+                diff: false,
             },
             &mut out,
             tmp.path(),
@@ -2334,6 +2595,7 @@ mod tests {
             &StatusArgs {
                 decisions: 5,
                 brief: false,
+                diff: false,
             },
             &mut out,
             tmp.path(),
@@ -2368,6 +2630,7 @@ mod tests {
             &StatusArgs {
                 decisions: 5,
                 brief: false,
+                diff: false,
             },
             &mut out,
             tmp.path(),
@@ -2412,6 +2675,7 @@ mod tests {
             &StatusArgs {
                 decisions: 5,
                 brief: false,
+                diff: false,
             },
             &mut out,
             &repo,
@@ -2459,6 +2723,7 @@ mod tests {
             &StatusArgs {
                 decisions: 5,
                 brief: false,
+                diff: false,
             },
             &mut out,
             &repo,
@@ -2519,6 +2784,7 @@ mod tests {
             &StatusArgs {
                 decisions: 5,
                 brief: false,
+                diff: false,
             },
             &mut out,
             &repo,
@@ -2551,6 +2817,7 @@ mod tests {
             &StatusArgs {
                 decisions: 5,
                 brief: false,
+                diff: false,
             },
             &mut out,
             tmp.path(),
@@ -2590,6 +2857,7 @@ mod tests {
             &StatusArgs {
                 decisions: 5,
                 brief: false,
+                diff: false,
             },
             &mut out,
             tmp.path(),
@@ -2623,6 +2891,7 @@ mod tests {
                     &StatusArgs {
                         decisions: 5,
                         brief: false,
+                        diff: false,
                     },
                     &mut out,
                     tmp.path(),
@@ -2664,6 +2933,7 @@ mod tests {
             &StatusArgs {
                 decisions: 5,
                 brief: false,
+                diff: false,
             },
             &mut out,
             tmp.path(),
@@ -2855,6 +3125,7 @@ mod tests {
             &StatusArgs {
                 decisions: 5,
                 brief: false,
+                diff: false,
             },
             &mut out,
             tmp.path(),
@@ -2883,6 +3154,7 @@ mod tests {
             &StatusArgs {
                 decisions: 5,
                 brief: false,
+                diff: false,
             },
             &mut out,
             tmp.path(),
@@ -2930,6 +3202,7 @@ mod tests {
             &StatusArgs {
                 decisions: 5,
                 brief: false,
+                diff: false,
             },
             &mut out,
             tmp.path(),
@@ -2991,6 +3264,7 @@ mod tests {
             &StatusArgs {
                 decisions: 5,
                 brief: false,
+                diff: false,
             },
             &mut out,
             tmp.path(),
@@ -3049,6 +3323,7 @@ mod tests {
             &StatusArgs {
                 decisions: 5,
                 brief: false,
+                diff: false,
             },
             &mut out,
             tmp.path(),
@@ -3195,6 +3470,7 @@ mod tests {
             &StatusArgs {
                 decisions: 5,
                 brief: false,
+                diff: false,
             },
             &mut full_out,
             &repo,
@@ -3209,6 +3485,7 @@ mod tests {
             &StatusArgs {
                 decisions: 5,
                 brief: true,
+                diff: false,
             },
             &mut brief_out,
             &repo,
@@ -3262,5 +3539,333 @@ mod tests {
         drop(guard_a);
         drop(guard_b);
         drop(guard_c);
+    }
+
+    fn env_for_session(
+        state: &std::path::Path,
+        session: &str,
+    ) -> std::collections::HashMap<String, String> {
+        let mut env = env_for(state);
+        env.insert(
+            crate::commands::ctx::adapters::SESSION_ENV.to_string(),
+            session.to_string(),
+        );
+        env
+    }
+
+    #[test]
+    fn split_sections_groups_continuations_handles_no_colon_and_dedups_keys() {
+        let text = "state dir: /tmp/x\n\
+                     \n\
+                     agents:\n\
+                     \x20\x20claude enabled (default)\n\
+                     \x20\x20codex  disabled (repo)\n\
+                     \n\
+                     no colon here\n\
+                     \n\
+                     agents:\n\
+                     \x20\x20another\n";
+        let sections = split_sections(text);
+        assert_eq!(
+            sections,
+            vec![
+                ("state dir".to_string(), "state dir: /tmp/x".to_string()),
+                (
+                    "agents".to_string(),
+                    "agents:\n  claude enabled (default)\n  codex  disabled (repo)".to_string()
+                ),
+                ("no colon here".to_string(), "no colon here".to_string()),
+                ("agents #2".to_string(), "agents:\n  another".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn diff_sections_reports_changed_new_and_removed_in_cur_order() {
+        let prev = vec![
+            ("a".to_string(), "a: 1".to_string()),
+            ("b".to_string(), "b: 1".to_string()),
+            ("c".to_string(), "c: 1".to_string()),
+        ];
+        let cur = vec![
+            ("b".to_string(), "b: 1".to_string()),
+            ("a".to_string(), "a: 2".to_string()),
+            ("d".to_string(), "d: 1".to_string()),
+        ];
+
+        let SectionDiff { changed, removed } = diff_sections(&prev, &cur);
+
+        assert_eq!(
+            changed,
+            vec![
+                ("a".to_string(), "a: 2".to_string()),
+                ("d".to_string(), "d: 1".to_string()),
+            ]
+        );
+        assert_eq!(removed, vec!["c".to_string()]);
+    }
+
+    #[test]
+    fn diff_first_call_prints_full_report_and_writes_snapshot_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state_root = tmp.path().join("state");
+        let env = env_for_session(&state_root, "sess-diff-first");
+
+        let mut out = Vec::new();
+        let code = run_with(
+            &StatusArgs {
+                decisions: 10,
+                brief: false,
+                diff: true,
+            },
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            false,
+        )
+        .expect("runs");
+        assert_eq!(code, 0);
+
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            text.starts_with(
+                "status --diff: no snapshot for this session yet; full report follows\n"
+            ),
+            "got {text}"
+        );
+        assert!(text.contains("no supervised sessions"), "got {text}");
+
+        let state = StateDir::from_root(state_root);
+        let files: Vec<_> = std::fs::read_dir(state.status_snapshots())
+            .expect("read snapshot dir")
+            .collect();
+        assert_eq!(files.len(), 1, "exactly one snapshot file written");
+    }
+
+    #[test]
+    fn diff_second_call_with_no_change_prints_exactly_one_line() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state_root = tmp.path().join("state");
+        let env = env_for_session(&state_root, "sess-diff-nochange");
+        let args = StatusArgs {
+            decisions: 10,
+            brief: false,
+            diff: true,
+        };
+
+        let mut first = Vec::new();
+        run_with(
+            &args,
+            &mut first,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            false,
+        )
+        .expect("first runs");
+
+        let mut second = Vec::new();
+        run_with(
+            &args,
+            &mut second,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            false,
+        )
+        .expect("second runs");
+        let text = String::from_utf8(second).expect("utf8");
+
+        assert_eq!(
+            text.lines().count(),
+            1,
+            "exactly one line for no change: {text}"
+        );
+        assert!(
+            text.starts_with("status --diff: no change since "),
+            "got {text}"
+        );
+    }
+
+    #[test]
+    fn diff_reports_only_the_section_that_changed() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        state.ensure().expect("ensure");
+        let env = env_for_session(state.root(), "sess-diff-changed");
+        let args = StatusArgs {
+            decisions: 10,
+            brief: false,
+            diff: true,
+        };
+
+        let mut first = Vec::new();
+        run_with(
+            &args,
+            &mut first,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            false,
+        )
+        .expect("first runs");
+
+        crate::commands::ctx::handoff::store(
+            &state,
+            tmp.path(),
+            "sess-diff-changed",
+            &Handoff {
+                task: "Wire the webhook".to_string(),
+                next_step: "Write the test".to_string(),
+                ..Handoff::default()
+            },
+        )
+        .expect("store handoff");
+
+        let mut second = Vec::new();
+        run_with(
+            &args,
+            &mut second,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            false,
+        )
+        .expect("second runs");
+        let text = String::from_utf8(second).expect("utf8");
+
+        assert!(
+            text.starts_with("status --diff: 1 of "),
+            "exactly one section changed: {text}"
+        );
+        assert!(text.contains("Wire the webhook"), "changed body: {text}");
+        assert!(
+            !text.contains("no supervised sessions"),
+            "unrelated sections must not print: {text}"
+        );
+    }
+
+    #[test]
+    fn diff_snapshots_are_isolated_per_session() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        state.ensure().expect("ensure");
+        // `sessions::short_id` keeps only the first 8 alphanumeric
+        // characters, so these must differ within that window -- unlike
+        // most other fixtures in this file, a shared "sess-diff-" prefix
+        // would collide here.
+        let env_a = env_for_session(state.root(), "alpha-diff-session");
+        let env_b = env_for_session(state.root(), "beta-diff-session");
+        let args = StatusArgs {
+            decisions: 10,
+            brief: false,
+            diff: true,
+        };
+
+        let mut out_a = Vec::new();
+        run_with(
+            &args,
+            &mut out_a,
+            tmp.path(),
+            &|k| env_a.get(k).cloned(),
+            false,
+        )
+        .expect("a runs");
+
+        let mut out_b = Vec::new();
+        run_with(
+            &args,
+            &mut out_b,
+            tmp.path(),
+            &|k| env_b.get(k).cloned(),
+            false,
+        )
+        .expect("b runs");
+        let text_b = String::from_utf8(out_b).expect("utf8");
+
+        assert!(
+            text_b.starts_with(
+                "status --diff: no snapshot for this session yet; full report follows\n"
+            ),
+            "session b must not see session a's snapshot: {text_b}"
+        );
+    }
+
+    #[test]
+    fn diff_brief_and_full_snapshots_do_not_cross_match() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        state.ensure().expect("ensure");
+        let env = env_for_session(state.root(), "sess-diff-brief-full");
+
+        let mut full_out = Vec::new();
+        run_with(
+            &StatusArgs {
+                decisions: 10,
+                brief: false,
+                diff: true,
+            },
+            &mut full_out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            false,
+        )
+        .expect("full runs");
+
+        let mut brief_out = Vec::new();
+        run_with(
+            &StatusArgs {
+                decisions: 10,
+                brief: true,
+                diff: true,
+            },
+            &mut brief_out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            false,
+        )
+        .expect("brief runs");
+        let brief_text = String::from_utf8(brief_out).expect("utf8");
+
+        assert!(
+            brief_text.starts_with(
+                "status --diff: no snapshot for this session yet; full report follows\n"
+            ),
+            "a --brief --diff snapshot must not match an earlier full --diff snapshot: {brief_text}"
+        );
+    }
+
+    #[test]
+    fn diff_with_no_session_identity_shows_full_report_and_writes_no_snapshot() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state_root = tmp.path().join("state");
+        let env = env_for(&state_root);
+
+        let mut out = Vec::new();
+        let code = run_with(
+            &StatusArgs {
+                decisions: 10,
+                brief: false,
+                diff: true,
+            },
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            false,
+        )
+        .expect("runs");
+        assert_eq!(code, 0);
+
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            text.starts_with(
+                "status --diff: no session identity (ZIRV_CTX_SESSION unset); showing the \
+                 full report\n"
+            ),
+            "got {text}"
+        );
+        assert!(text.contains("no supervised sessions"), "got {text}");
+
+        let state = StateDir::from_root(state_root);
+        assert!(
+            !state.status_snapshots().exists(),
+            "no snapshot directory must be created when there is no session identity"
+        );
     }
 }

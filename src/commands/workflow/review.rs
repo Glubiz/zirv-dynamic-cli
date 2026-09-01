@@ -193,12 +193,32 @@ pub struct VerificationEvidence {
     pub fresh: bool,
     pub fingerprint: u64,
     pub checks: Vec<(String, super::verification::CheckStatus, u64)>,
+    /// #238: whether this (raw-failing) report nonetheless satisfies the
+    /// operator's recorded per-repository baseline (issue #215) -- i.e.
+    /// `verification::evaluate_against_operator_baseline(&report,
+    /// repo).gate_passed`. Only ever `true` when `passed` is `false`; a raw
+    /// pass leaves this `false` and `waived_failing_tests` empty, and skips
+    /// serializing both so a genuine (non-waived) failure round-trips
+    /// exactly as it did before this field existed.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub passed_with_baseline_waiver: bool,
+    /// The sorted, deduplicated failing test names waived by the operator's
+    /// baseline when `passed_with_baseline_waiver` is `true`; empty
+    /// otherwise.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub waived_failing_tests: Vec<String>,
 }
 
 impl VerificationEvidence {
-    fn from_report(report: VerificationReport, current_fingerprint: u64) -> Self {
+    fn from_report(report: VerificationReport, current_fingerprint: u64, repo: &Path) -> Self {
         let passed = report.passed();
         let fresh = report.change_fingerprint == current_fingerprint;
+        let (passed_with_baseline_waiver, waived_failing_tests) = if passed {
+            (false, Vec::new())
+        } else {
+            let evaluation = verification::evaluate_against_operator_baseline(&report, repo);
+            (evaluation.gate_passed, evaluation.waived)
+        };
         Self {
             report_id: report.id,
             mode: report.mode,
@@ -210,6 +230,8 @@ impl VerificationEvidence {
                 .into_iter()
                 .map(|check| (check.id, check.status, check.duration_ms))
                 .collect(),
+            passed_with_baseline_waiver,
+            waived_failing_tests,
         }
     }
 }
@@ -1297,7 +1319,7 @@ pub fn package(
     changed_paths.extend(untracked);
     let changed_paths = changed_paths.into_iter().collect();
     let verification = verification::load_latest(state_dir, &state.repo)?
-        .map(|report| VerificationEvidence::from_report(report, current_fingerprint));
+        .map(|report| VerificationEvidence::from_report(report, current_fingerprint, &state.repo));
     let required_reviews = required_independent_reviews_for(state);
     let escalated = required_reviews > required_independent_reviews(state.classification.risk);
     Ok(ReviewPackage {
@@ -1898,8 +1920,11 @@ fn salvage_suffix(path: Option<&Path>) -> String {
     .unwrap_or_default()
 }
 
-fn launch_reviewer(agent: &str, package: &ReviewPackage) -> CtxResult<ReviewerRun> {
-    let argv = reviewer_argv(agent, &package.repo_root, package.include_custom_agents)?;
+/// The prompt text sent to an independent reviewer for `package`, split out
+/// from `launch_reviewer` so its exact wording (in particular the #238
+/// baseline-waiver guidance) is unit-testable without spawning a real
+/// reviewer process.
+fn build_reviewer_prompt(package: &ReviewPackage) -> CtxResult<String> {
     // A delta package must never read as a whole change: a reviewer told
     // "this is the whole diff" when it is only what changed since the last
     // reviewed commit will report false findings about code it cannot see.
@@ -1919,8 +1944,12 @@ fn launch_reviewer(agent: &str, package: &ReviewPackage) -> CtxResult<ReviewerRu
     // invent one -- lenient parsing (`normalize_severity`/
     // `normalize_disposition`) is a safety net for this prompt, not a
     // substitute for it.
-    let prompt = format!(
+    Ok(format!(
         "{delta_notice}Review the following compact Zirv review package. Do not modify files. \
+         In the package's `verification` field, `passed:false` together with \
+         `passed_with_baseline_waiver:true` means every failing test is in the operator's \
+         recorded baseline (`waived_failing_tests`) and the gate passed -- treat it as \
+         operator-acknowledged, never as a regression or a blocking finding.\n\n\
          Return exactly one single-line result prefixed `{REVIEW_RESULT_PREFIX}` followed by a \
          single JSON object shaped exactly as:\n\
          {{\"findings\":[{{\"severity\":\"major\",\"summary\":\"concrete reasoning\",\"path\":\"src/file.rs\",\"line\":12,\"recommended_disposition\":\"accepted\"}}]}}\n\n\
@@ -1937,7 +1966,12 @@ fn launch_reviewer(agent: &str, package: &ReviewPackage) -> CtxResult<ReviewerRu
          do not deliver findings through a harness tool (ReportFindings or similar) or a \
          code-review mode -- a result sent any other way is lost.\n\n{}",
         serde_json::to_string(package)?
-    );
+    ))
+}
+
+fn launch_reviewer(agent: &str, package: &ReviewPackage) -> CtxResult<ReviewerRun> {
+    let argv = reviewer_argv(agent, &package.repo_root, package.include_custom_agents)?;
+    let prompt = build_reviewer_prompt(package)?;
     let mut child = Command::new(std::env::current_exe()?)
         .args(&argv)
         .stdin(Stdio::piped())
@@ -2279,11 +2313,19 @@ pub fn run(args: &ReviewArgs, writer: &mut impl Write) -> CtxResult<i32> {
                     }
                 )?;
                 if let Some(evidence) = &package.verification {
-                    writeln!(
+                    write!(
                         writer,
                         "verification: {} passed={}",
                         evidence.report_id, evidence.passed
                     )?;
+                    if evidence.passed_with_baseline_waiver {
+                        write!(
+                            writer,
+                            " (passed via operator baseline waiver; waived: {})",
+                            evidence.waived_failing_tests.join(", ")
+                        )?;
+                    }
+                    writeln!(writer)?;
                 } else {
                     writeln!(writer, "verification: none")?;
                 }
@@ -3764,6 +3806,188 @@ checksum = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f80"
         assert!(!package.diff_is_delta, "round 1 is never a delta");
         assert_eq!(package.diff_base_sha, package.base_sha);
         assert_eq!(package.head_sha.len(), 40);
+    }
+
+    /// A `Unit`-kind check whose only recorded failure is `name`, matching
+    /// `verification.rs`'s own `unit_check`/`cargo_failure_output` test
+    /// fixtures -- duplicated minimally here rather than made `pub(crate)`
+    /// since this is the only place `review.rs` needs it.
+    fn waivable_failing_report(
+        repo: &Path,
+        fingerprint: u64,
+        names: &[&str],
+    ) -> VerificationReport {
+        let failures = names
+            .iter()
+            .map(|name| format!("    {name}\n"))
+            .collect::<String>();
+        VerificationReport {
+            schema_version: verification::VERIFY_REPORT_SCHEMA_VERSION,
+            id: "waiver-test".into(),
+            mode: verification::VerificationMode::Final,
+            source: "configured".into(),
+            repo: repo.to_path_buf(),
+            change_fingerprint: fingerprint,
+            changed_paths: vec![],
+            fallback_to_full: false,
+            narrowed_to: vec![],
+            notes: vec![],
+            started_at: 0,
+            finished_at: 0,
+            checks: vec![verification::CheckResult {
+                id: "test".into(),
+                kind: verification::CheckKind::Unit,
+                command: "cargo test".into(),
+                source: verification::CheckSource::DiscoveredToolchain,
+                status: verification::CheckStatus::Failed,
+                exit_code: Some(101),
+                duration_ms: 1,
+                failure_output: Some(format!(
+                    "failures:\n{failures}\ntest result: FAILED. 0 passed; {} failed; 0 \
+                     ignored; 0 measured; 0 filtered out; finished in 0.00s\n",
+                    names.len()
+                )),
+                failure_test_names: Vec::new(),
+            }],
+        }
+    }
+
+    /// #238: a raw-failing verification report whose only failure is covered
+    /// by the operator's recorded baseline (issue #215) must not reach the
+    /// reviewer as a bare, waiver-blind `passed:false` -- that produced false
+    /// Critical "test verification failed" findings from every reviewer.
+    #[test]
+    fn package_reports_a_baseline_covered_failure_as_waived() {
+        let repo = git_repo();
+        let home = tempdir().unwrap();
+        let _home_guard = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let state_dir = StateDir::from_root(tempdir().unwrap().path().to_path_buf());
+        let state = running_review_state(repo.path(), "HEAD");
+
+        let fingerprint = verification::change_fingerprint(repo.path()).unwrap();
+        let report = waivable_failing_report(repo.path(), fingerprint, &["b::two", "a::one"]);
+        verification::save_report(&state_dir, &report).unwrap();
+        verification::save_baseline(
+            repo.path(),
+            std::collections::BTreeSet::from(["a::one".to_string(), "b::two".to_string()]),
+        )
+        .unwrap();
+
+        let package = package(&state_dir, &state, None).expect("package");
+        let evidence = package.verification.expect("verification evidence");
+        assert!(!evidence.passed, "the raw check result is still a failure");
+        assert!(evidence.passed_with_baseline_waiver);
+        assert_eq!(
+            evidence.waived_failing_tests,
+            vec!["a::one".to_string(), "b::two".to_string()],
+            "waived names must be sorted"
+        );
+    }
+
+    /// A failure the operator never baselined must stay a plain, unwaived
+    /// failure -- and, critically, the two new fields must be entirely absent
+    /// from the serialized JSON so a genuine (non-waived) failure round-trips
+    /// exactly as it did before this field existed.
+    #[test]
+    fn package_leaves_a_non_baselined_failure_unwaived_and_out_of_the_json() {
+        let repo = git_repo();
+        let home = tempdir().unwrap();
+        let _home_guard = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let state_dir = StateDir::from_root(tempdir().unwrap().path().to_path_buf());
+        let state = running_review_state(repo.path(), "HEAD");
+
+        let fingerprint = verification::change_fingerprint(repo.path()).unwrap();
+        let report = waivable_failing_report(repo.path(), fingerprint, &["new::regression"]);
+        verification::save_report(&state_dir, &report).unwrap();
+        // No baseline recorded at all in this fresh HOME.
+
+        let package = package(&state_dir, &state, None).expect("package");
+        let evidence = package
+            .verification
+            .as_ref()
+            .expect("verification evidence");
+        assert!(!evidence.passed);
+        assert!(!evidence.passed_with_baseline_waiver);
+        assert!(evidence.waived_failing_tests.is_empty());
+
+        let json = serde_json::to_string(&package).unwrap();
+        assert!(
+            !json.contains("passed_with_baseline_waiver"),
+            "a genuine failure must not mention the waiver key at all: {json}"
+        );
+        assert!(
+            !json.contains("waived_failing_tests"),
+            "a genuine failure must not mention waived tests at all: {json}"
+        );
+    }
+
+    /// The text (non-`--json`) render of `zirv workflow review package` must
+    /// carry the waiver suffix, with the waived names, only when the package
+    /// actually passed via the baseline -- a plain unwaived failure keeps
+    /// today's bare `verification: <id> passed=false` line.
+    #[test]
+    fn the_text_render_carries_the_waiver_suffix_only_when_waived() {
+        let repo = git_repo();
+        let home = tempdir().unwrap();
+        let _home_guard = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let root = tempdir().unwrap();
+        // SAFETY: this suite runs single-threaded (`--test-threads=1`).
+        unsafe {
+            std::env::set_var(crate::commands::ctx::state::STATE_ENV, root.path());
+        }
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+        let state = review_workflow(repo.path(), &state_dir);
+
+        let fingerprint = verification::change_fingerprint(repo.path()).unwrap();
+        let report = waivable_failing_report(repo.path(), fingerprint, &["a::one"]);
+        verification::save_report(&state_dir, &report).unwrap();
+        verification::save_baseline(
+            repo.path(),
+            std::collections::BTreeSet::from(["a::one".to_string()]),
+        )
+        .unwrap();
+
+        let args = ReviewArgs {
+            command: ReviewCommand::Package(PackageArgs {
+                state: ReviewStateArgs {
+                    id: state.id.clone(),
+                    repo: Some(repo.path().to_path_buf()),
+                    json: false,
+                },
+                base: None,
+                pr: None,
+                github_repo: None,
+            }),
+        };
+        let mut out = Vec::new();
+        run(&args, &mut out).unwrap();
+        unsafe {
+            std::env::remove_var(crate::commands::ctx::state::STATE_ENV);
+        }
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("passed via operator baseline waiver; waived: a::one"),
+            "got: {text}"
+        );
+    }
+
+    /// The reviewer prompt must tell an independent reviewer, in plain terms,
+    /// that a `passed:false` package can still be operator-acknowledged via
+    /// the baseline waiver -- otherwise a strict reader files a false
+    /// Critical finding on every waived run.
+    #[test]
+    fn the_reviewer_prompt_contains_the_baseline_waiver_guidance() {
+        let repo = git_repo();
+        let state_dir = StateDir::from_root(tempdir().unwrap().path().to_path_buf());
+        let state = running_review_state(repo.path(), "HEAD");
+        let package = package(&state_dir, &state, None).expect("package");
+
+        let prompt = build_reviewer_prompt(&package).expect("prompt");
+        assert!(
+            prompt.contains("passed_with_baseline_waiver")
+                && prompt.contains("operator-acknowledged"),
+            "got: {prompt}"
+        );
     }
 
     /// Integration level, on top of the `delta_base` unit tests above:
