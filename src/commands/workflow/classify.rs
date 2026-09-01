@@ -335,12 +335,16 @@ fn infer_work_domain(task: &str, paths: &[PathBuf]) -> DomainClassification {
         "dashboard",
         "design system",
     ];
+    // #255: capped below the 45 selection threshold -- task text alone can
+    // no longer select the Frontend domain. The bare word "frontend" shows
+    // up in plenty of non-UI work (permission families, CLI flags, docs);
+    // Frontend must also see at least one real frontend path signal below.
     if task_terms.iter().any(|term| task.contains(term))
         || task.starts_with("ui ")
         || task.ends_with(" ui")
     {
-        score = score.saturating_add(55);
-        reasons.push("task describes a frontend or visual surface (+55)".into());
+        score = score.saturating_add(40);
+        reasons.push("task describes a frontend or visual surface (+40)".into());
     }
 
     let lowered = paths
@@ -944,12 +948,14 @@ mod tests {
     }
 
     #[test]
-    fn frontend_domain_is_inferred_from_task_without_an_init_flag() {
+    fn frontend_domain_is_inferred_from_task_and_a_frontend_path_without_an_init_flag() {
+        // #255: task text alone is capped below the selection threshold, so
+        // this now needs one real frontend path signal alongside it.
         let classification = classify(&ClassificationInput {
             task: "Build a responsive billing dashboard UI".into(),
-            paths: Vec::new(),
-            changed_lines: 0,
-            tests_changed: false,
+            paths: vec![PathBuf::from("src/dashboard/Billing.tsx")],
+            changed_lines: 12,
+            tests_changed: true,
             intent_override: None,
             complexity_override: None,
             risk_override: None,
@@ -958,6 +964,26 @@ mod tests {
 
         assert_eq!(classification.work_domain.domain, WorkDomain::Frontend);
         assert!(classification.work_domain.score >= 45);
+    }
+
+    /// #255 repro: a task that only *mentions* "frontend" in passing (here,
+    /// documenting a permission family named after it) must not select the
+    /// Frontend methodology when the actual changed paths are not frontend
+    /// surfaces at all.
+    #[test]
+    fn task_text_mentioning_frontend_without_a_frontend_path_stays_general() {
+        let classification = classify(&ClassificationInput {
+            task: "Document the zirv frontend permission family boundaries".into(),
+            paths: vec![PathBuf::from("src/commands/ctx/safety.rs")],
+            changed_lines: 40,
+            tests_changed: true,
+            intent_override: None,
+            complexity_override: None,
+            risk_override: None,
+        })
+        .expect("classification");
+
+        assert_eq!(classification.work_domain.domain, WorkDomain::General);
     }
 
     #[test]
