@@ -1781,6 +1781,14 @@ fn refusal_for(skill_id: &str, headless: bool) -> Option<&'static str> {
     (headless && skill_id == "brainstorm").then_some(BRAINSTORM_HEADLESS_REFUSAL)
 }
 
+/// Only the exact value `"1"` means headless -- `ZIRV_CTX_HEADLESS=0`, an
+/// empty string, or any other value must not trip the refusal. Split out of
+/// the `std::env::var` call site so the value comparison is testable without
+/// a real (racy) environment variable.
+fn is_headless_env(raw: Option<&str>) -> bool {
+    raw == Some("1")
+}
+
 /// Current ephemeral skill context for the context compiler/session prompt.
 /// Completed steps are intentionally absent; the durable state remains in
 /// [`WorkflowState`] and is never accumulated into model context.
@@ -1842,7 +1850,11 @@ pub fn render_current_context(
         rendered.push_str(&super::frontend::render_profile(&profile));
         rendered.push('\n');
     }
-    let headless = std::env::var("ZIRV_CTX_HEADLESS").is_ok();
+    let headless = is_headless_env(
+        std::env::var(crate::commands::ctx::adapters::HEADLESS_ENV)
+            .ok()
+            .as_deref(),
+    );
     let mut rendered_skill_ids = BTreeSet::new();
     for selected in step_skill_ids(step, &state.classification) {
         for skill in registry.resolve_stack(&selected)? {
@@ -4473,6 +4485,18 @@ mod tests {
         assert_eq!(refusal_for("write-intent", true), None);
     }
 
+    /// Only the exact value `"1"` means headless -- an interactive launch
+    /// that inherited the variable set to `"0"`, empty, or anything else
+    /// from its own parent process must not be refused.
+    #[test]
+    fn is_headless_env_requires_the_exact_value_1() {
+        assert!(is_headless_env(Some("1")));
+        assert!(!is_headless_env(Some("0")));
+        assert!(!is_headless_env(Some("")));
+        assert!(!is_headless_env(Some("true")));
+        assert!(!is_headless_env(None));
+    }
+
     #[test]
     fn a_headless_worker_refuses_the_brainstorm_step() {
         let repo = tempdir().unwrap();
@@ -4487,11 +4511,11 @@ mod tests {
         assert_eq!(state.current().unwrap().skill, "brainstorm");
         // SAFETY: nextest runs one test per process.
         unsafe {
-            std::env::set_var("ZIRV_CTX_HEADLESS", "1");
+            std::env::set_var(crate::commands::ctx::adapters::HEADLESS_ENV, "1");
         }
         let context = render_current_context(&state, repo.path(), None).unwrap();
         unsafe {
-            std::env::remove_var("ZIRV_CTX_HEADLESS");
+            std::env::remove_var(crate::commands::ctx::adapters::HEADLESS_ENV);
         }
         let context = context.unwrap();
         assert!(context.contains(BRAINSTORM_HEADLESS_REFUSAL));

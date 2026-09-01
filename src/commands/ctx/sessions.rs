@@ -46,13 +46,18 @@ pub fn short_id(session: &str) -> String {
 /// `SEAT_MODEL_ENV` rides along for the same reason: it names *this*
 /// session's seat, and a worker that inherits an orchestrator's copy would
 /// have its own subagent dispatches refused by a guard describing a seat it
-/// is not sitting in.
-pub const SUPERVISION_ENV: [&str; 5] = [
+/// is not sitting in. `HEADLESS_ENV` rides along for the mirror-image
+/// reason: it is proof THIS launch is a headless worker, and an interactive
+/// session (`wrap`, `chat`, a dashboard pane) that inherited it from
+/// whatever spawned it would wrongly refuse its own interactive `brainstorm`
+/// step.
+pub const SUPERVISION_ENV: [&str; 6] = [
     super::adapters::SESSION_ENV,
     super::adapters::SOCKET_ENV,
     super::adapters::SEAT_MODEL_ENV,
     super::wrap::TRANSCRIPT_ENV,
     super::adapters::LAUNCH_MODE_ENV,
+    super::adapters::HEADLESS_ENV,
 ];
 
 /// `portable_pty::CommandBuilder::new` seeds itself from `std::env::vars_os`,

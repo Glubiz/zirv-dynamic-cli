@@ -68,7 +68,8 @@ discrepancy is noted, not resolved — nothing below depends on which total is "
 ## 5. Conclusion
 
 One real, closeable gap was found (`session-restore`) and is closed by this issue's new
-`zirv ctx hook session-start` handler and its `HARNESS_HOOKS` entry (matcher `resume|clear`).
+`zirv ctx hook session-start` handler, installed claude-only (`CLAUDE_SESSION_START_HOOK`,
+matcher `resume|clear`) since codex has no `SessionStart` event to fire it from.
 One further gap (`agent-spawned` lineage) is real but is a telemetry-population fix, not a new
 hook surface, and is deferred. Everything else either has an existing zirv equivalent
 (`pre-bash`, `session-end`, `notify`), is already covered by the same substrate a different
