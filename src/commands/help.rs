@@ -253,7 +253,10 @@ fn write_builtins<W: Write>(
             },
             Row {
                 name: "agent <name> <prompt>",
-                desc: &["Alias for `zirv ctx agent`: delegate one task to another harness"],
+                desc: &[
+                    "Alias for `zirv ctx agent`: delegate one task to another harness",
+                    "(--workdir <path> targets another repo/worktree)",
+                ],
             },
         ],
         colour,
@@ -558,6 +561,26 @@ shortcuts:
 
         assert!(text.contains("chat"), "got {text}");
         assert!(text.contains("agent"), "got {text}");
+        Ok(())
+    }
+
+    /// Issue #250: `--workdir` (issue #228) lets a dispatched worker's
+    /// sandbox and write policy derive from a different repo or worktree
+    /// than the one that dispatched it, but nothing in the help listing said
+    /// so -- a brief targeting a path outside the launch repo would spawn a
+    /// worker that burns a full run just to report BLOCKED. The `agent` row
+    /// now names the flag.
+    #[test]
+    fn help_agent_row_mentions_workdir() -> Result<(), Box<dyn std::error::Error>> {
+        let empty = tempdir()?;
+        let home = tempdir()?;
+        let _guard = crate::commands::ctx::testenv::EnvGuard::set(home.path(), Some(empty.path()));
+
+        let mut out = Cursor::new(Vec::new());
+        show_help(&mut out, false)?;
+        let text = String::from_utf8(out.into_inner())?;
+
+        assert!(text.contains("--workdir"), "got {text}");
         Ok(())
     }
 

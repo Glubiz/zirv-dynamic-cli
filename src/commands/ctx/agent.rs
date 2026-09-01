@@ -160,6 +160,66 @@ fn effective_launch_repo(workdir: Option<&Path>, repo: &Path) -> PathBuf {
         .unwrap_or_else(|| repo.to_path_buf())
 }
 
+/// The cap on how many path-like candidate tokens
+/// [`out_of_repo_paths_in_prompt`] will canonicalize/exists-check, so a huge
+/// prompt cannot make dispatch slow.
+const MAX_WORKDIR_WARNING_CANDIDATES: usize = 32;
+
+/// Issue #250: absolute paths named in a delegated prompt that resolve
+/// outside `launch_repo` -- the worker's writable root
+/// ([`effective_launch_repo`] with `workdir: None` is exactly `launch_repo`
+/// itself, byte for byte). Feeds `run_with`'s non-fatal dispatch-time
+/// warning: a brief naming a path outside the worker's sandbox burns a full
+/// run just to report BLOCKED, and this is the conservative heuristic that
+/// catches the disk-visible half of that up front.
+///
+/// A candidate token is any whitespace- or quote-delimited run starting with
+/// `/` or `~/`, trailing punctuation like `.,;:)"'` stripped, `~/` expanded
+/// against `home` when given. A token that does not exist on disk, or that
+/// canonicalizes inside `launch_repo`, is silently dropped -- a false
+/// negative here is fine, a false positive is not. Pure aside from the `fs`
+/// calls each candidate needs, so a tempdir-backed test can exercise it
+/// directly without spawning anything.
+fn out_of_repo_paths_in_prompt(
+    prompt: &str,
+    launch_repo: &Path,
+    home: Option<&Path>,
+) -> Vec<PathBuf> {
+    let Ok(canonical_repo) = std::fs::canonicalize(launch_repo) else {
+        return Vec::new();
+    };
+    prompt
+        .split(|c: char| c.is_whitespace() || c == '\'' || c == '"')
+        .filter(|token| !token.is_empty())
+        .map(|token| token.trim_end_matches(['.', ',', ';', ':', ')', '"', '\'']))
+        .filter(|token| token.starts_with('/') || token.starts_with("~/"))
+        .take(MAX_WORKDIR_WARNING_CANDIDATES)
+        .filter_map(|token| {
+            let candidate: PathBuf = match token.strip_prefix("~/") {
+                Some(rest) => home?.join(rest),
+                None => PathBuf::from(token),
+            };
+            let canonical = std::fs::canonicalize(&candidate).ok()?;
+            (!canonical.starts_with(&canonical_repo)).then_some(canonical)
+        })
+        .collect()
+}
+
+/// Prints [`out_of_repo_paths_in_prompt`]'s findings as non-fatal stderr
+/// warnings, one line per offending path. Never called when `--workdir` was
+/// given -- an explicit `--workdir` already says the operator meant to point
+/// the worker elsewhere, so there is nothing to warn about.
+fn warn_about_paths_outside_launch_repo(prompt: &str, launch_repo: &Path, home: Option<&Path>) {
+    for path in out_of_repo_paths_in_prompt(prompt, launch_repo, home) {
+        eprintln!(
+            "warning: brief references {}, which is outside the worker's writable root {}; if \
+             the work targets that location, dispatch with --workdir <its repo root>",
+            path.display(),
+            launch_repo.display()
+        );
+    }
+}
+
 /// The soft threshold, as a fraction of a budget. At or above it the worker
 /// is nudged to wrap up and checkpoint while it still has room to write a
 /// usable result; at the budget itself it is stopped.
@@ -1151,6 +1211,18 @@ pub fn run_with<W: Write>(
     // via `routed_args`/`args`'s own overwrite a few lines down.
     let canonical_workdir = args.workdir.as_deref().map(validate_workdir).transpose()?;
     let prompt = resolve_prompt(&args.prompt, &mut std::io::stdin())?;
+
+    // Issue #250: no `--workdir` means the worker stays confined to `repo`
+    // (see `effective_launch_repo`) -- a non-fatal nudge toward `--workdir`
+    // when the brief itself names a path outside it, so the operator finds
+    // out before the worker burns a full run just to report BLOCKED. Never
+    // consulted by the dispatch decision below; only ever prints to stderr.
+    if canonical_workdir.is_none() {
+        let home = env("HOME")
+            .or_else(|| env("USERPROFILE"))
+            .map(PathBuf::from);
+        warn_about_paths_outside_launch_repo(&prompt, repo, home.as_deref());
+    }
 
     // Loaded here rather than after the dashboard-join attempt below (its
     // former position): the spawn gate needs `cfg.pace` before either fork
@@ -2673,6 +2745,134 @@ mod tests {
             effective_launch_repo(None, repo),
             repo.to_path_buf(),
             "no --workdir is today's unchanged behaviour"
+        );
+    }
+
+    /// Issue #250: an existing path outside the launch repo, named in the
+    /// prompt, must be flagged so `run_with` can warn toward `--workdir`.
+    #[test]
+    fn out_of_repo_paths_in_prompt_warns_on_an_absolute_path_outside_the_repo() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        let outside = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        std::fs::create_dir_all(&outside).expect("mkdir outside");
+
+        let prompt = format!("fix the bug described in {}", outside.display());
+        let found = out_of_repo_paths_in_prompt(&prompt, &repo, None);
+
+        assert_eq!(
+            found,
+            vec![std::fs::canonicalize(&outside).expect("canonicalize")],
+            "an existing path outside the repo must be flagged"
+        );
+    }
+
+    /// A path inside the repo is exactly what a worker's writable root
+    /// already covers -- nothing to warn about.
+    #[test]
+    fn out_of_repo_paths_in_prompt_is_silent_for_a_path_inside_the_repo() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        let inside = repo.join("src");
+        std::fs::create_dir_all(&inside).expect("mkdir");
+
+        let prompt = format!("edit {}", inside.display());
+        let found = out_of_repo_paths_in_prompt(&prompt, &repo, None);
+
+        assert!(
+            found.is_empty(),
+            "a path inside the repo must not be flagged: {found:?}"
+        );
+    }
+
+    /// A path that does not exist on disk cannot be a real cross-repo
+    /// target -- likely a flag value, an example, or plain prose -- so it is
+    /// silently dropped rather than risking a false-positive warning.
+    #[test]
+    fn out_of_repo_paths_in_prompt_is_silent_for_a_path_that_does_not_exist() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let missing = tmp.path().join("nonexistent");
+
+        let prompt = format!("look at {}", missing.display());
+        let found = out_of_repo_paths_in_prompt(&prompt, &repo, None);
+
+        assert!(
+            found.is_empty(),
+            "a nonexistent path must not be flagged: {found:?}"
+        );
+    }
+
+    /// `~/` tokens expand against the given home dir before the exists/
+    /// inside-repo checks, the same as a shell would expand them.
+    #[test]
+    fn out_of_repo_paths_in_prompt_expands_a_tilde_path_via_home() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        let home = tmp.path().join("home");
+        let outside = home.join("elsewhere");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        std::fs::create_dir_all(&outside).expect("mkdir outside");
+
+        let prompt = "please work on ~/elsewhere today";
+        let found = out_of_repo_paths_in_prompt(prompt, &repo, Some(&home));
+
+        assert_eq!(
+            found,
+            vec![std::fs::canonicalize(&outside).expect("canonicalize")],
+            "a ~/ path must expand against the given home dir: {found:?}"
+        );
+    }
+
+    /// A `~/` token is simply not a candidate at all when no home dir is
+    /// known -- it must not be misread as a literal `~` directory.
+    #[test]
+    fn out_of_repo_paths_in_prompt_skips_a_tilde_path_with_no_home_given() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+
+        let prompt = "please work on ~/elsewhere today";
+        let found = out_of_repo_paths_in_prompt(prompt, &repo, None);
+
+        assert!(
+            found.is_empty(),
+            "no home dir means no expansion: {found:?}"
+        );
+    }
+
+    /// The scan is capped at `MAX_WORKDIR_WARNING_CANDIDATES` path-like
+    /// tokens so a huge prompt cannot make dispatch slow -- exercised with
+    /// more real, existing, out-of-repo directories than the cap allows.
+    #[test]
+    fn out_of_repo_paths_in_prompt_caps_the_number_of_candidates_scanned() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+
+        let mut prompt = String::new();
+        let mut dirs = Vec::new();
+        for i in 0..(MAX_WORKDIR_WARNING_CANDIDATES + 8) {
+            let dir = tmp.path().join(format!("outside-{i}"));
+            std::fs::create_dir_all(&dir).expect("mkdir");
+            prompt.push_str(&dir.display().to_string());
+            prompt.push(' ');
+            dirs.push(dir);
+        }
+
+        let found = out_of_repo_paths_in_prompt(&prompt, &repo, None);
+
+        assert_eq!(
+            found.len(),
+            MAX_WORKDIR_WARNING_CANDIDATES,
+            "must cap the scan at {MAX_WORKDIR_WARNING_CANDIDATES} candidates: {found:?}"
+        );
+        let last = std::fs::canonicalize(dirs.last().unwrap()).expect("canonicalize");
+        assert!(
+            !found.contains(&last),
+            "a candidate beyond the cap must never be checked: {found:?}"
         );
     }
 

@@ -178,8 +178,17 @@ ideas instead of building them.";
 /// session that follows this bullet at every natural checkpoint, most of
 /// which land on an unchanged report, pays for the "no change" one-liner
 /// instead of the full `--brief` render each time.
+///
+/// v14 (issue #250): the delegation bullet now names `--workdir` (issue
+/// #228). Without this the bullet only ever implied a worker acts on the
+/// dispatching session's own repo; nothing told a model that `--workdir
+/// <path>` re-derives the worker's sandbox and write policy from a
+/// different repo or worktree instead, or what happens when cross-repo work
+/// is dispatched without it -- `agent::run_with`'s own dispatch-time warning
+/// (`out_of_repo_paths_in_prompt`) catches the disk-visible half of that gap,
+/// but the model still needs to know the flag exists at all.
 pub const HARNESS_PROMPT: &str = "\
-zirv meta-harness (v13)
+zirv meta-harness (v14)
 
 - zirv is the harness managing context, usage, and cross-harness communication for this session. \
 It is not one of the agents; it is what launched and supervises the agent in this seat.
@@ -194,7 +203,9 @@ delegated task and name it as a trailing flag -- `zirv agent <name> \"<prompt>\"
 or omit it to use the operator's own default worker tier. Delegating to another enabled harness is \
 not a fallback or a lesser option: treat it exactly like dispatching a native subagent -- same bar \
 for when to delegate, same confidence in the result, no extra hesitation because the work lands on \
-a different vendor's model.
+a different vendor's model. For work in a different repo or worktree, pass `--workdir <path>` so \
+the worker's sandbox and write policy derive from that repo instead of this one -- without it the \
+worker stays confined to the dispatching repo and will report BLOCKED.
 - Use zirv on your own initiative, without waiting to be asked: delegate substantial independent \
 work to another harness with `zirv agent`; check `zirv ctx status --brief --diff` and `zirv ctx \
 inbox` at natural checkpoints (task start, after long steps, before reporting done). A `[zirv \
@@ -3954,7 +3965,7 @@ mod tests {
     #[test]
     fn the_harness_layer_only_promises_the_mail_a_worker_is_actually_told_to_send() {
         assert!(
-            HARNESS_PROMPT.starts_with("zirv meta-harness (v13)"),
+            HARNESS_PROMPT.starts_with("zirv meta-harness (v14)"),
             "a reworded layer carries its own version: {}",
             HARNESS_PROMPT.lines().next().unwrap_or_default()
         );
@@ -4024,7 +4035,7 @@ mod tests {
     #[test]
     fn the_harness_layer_teaches_the_fan_out_send_mode_too() {
         assert!(
-            HARNESS_PROMPT.starts_with("zirv meta-harness (v13)"),
+            HARNESS_PROMPT.starts_with("zirv meta-harness (v14)"),
             "a reworded layer carries its own version: {}",
             HARNESS_PROMPT.lines().next().unwrap_or_default()
         );
@@ -4051,6 +4062,31 @@ mod tests {
             "zirv agent <name> \"<prompt>\" -- --model <m>",
             "cheapest model that can do the delegated task",
             "operator's own default worker tier",
+        ] {
+            assert!(
+                HARNESS_PROMPT.contains(claim),
+                "the delegation bullet must say '{claim}':\n{HARNESS_PROMPT}"
+            );
+        }
+    }
+
+    /// Issue #250: the delegation bullet names `--workdir` (issue #228) so a
+    /// model dispatching cross-repo work knows the flag exists, and knows
+    /// what happens without it -- a worker confined to the dispatching repo
+    /// that reports BLOCKED, exactly what `agent::run_with`'s own
+    /// dispatch-time warning is a symptom of.
+    #[test]
+    fn the_harness_layer_names_workdir_for_cross_repo_delegation() {
+        assert!(
+            HARNESS_PROMPT.starts_with("zirv meta-harness (v14)"),
+            "a reworded layer carries its own version: {}",
+            HARNESS_PROMPT.lines().next().unwrap_or_default()
+        );
+        for claim in [
+            "--workdir <path>",
+            "different repo or worktree",
+            "confined to the dispatching repo",
+            "report BLOCKED",
         ] {
             assert!(
                 HARNESS_PROMPT.contains(claim),
@@ -4102,7 +4138,7 @@ mod tests {
             "must say which one wins"
         );
         assert!(
-            HARNESS_PROMPT.contains("(v13)"),
+            HARNESS_PROMPT.contains("(v14)"),
             "a changed instruction layer must bump its own version token"
         );
     }
