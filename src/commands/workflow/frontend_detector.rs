@@ -371,7 +371,11 @@ pub fn latest_is_fresh_and_passing(state: &StateDir, repo: &Path) -> CtxResult<b
     let profile = super::frontend::ensure_profile(state, repo)?;
     Ok(report.passed()
         && !report.truncated
-        && !report.analyzed_files.is_empty()
+        // #255: a fresh, non-truncated `not_applicable` report (0 frontend
+        // files in scope) is a legitimate pass, not missing evidence -- a
+        // Frontend-profile workflow with no frontend files must not re-run
+        // the detector at every single gate check.
+        && (!report.analyzed_files.is_empty() || report.not_applicable)
         && report.profile_fingerprint == profile.source_fingerprint
         && report.change_fingerprint == super::verification::change_fingerprint(repo)?)
 }
@@ -2149,6 +2153,75 @@ mod tests {
                 .iter()
                 .any(|path| path.to_string_lossy().contains("ignored")),
             "a gitignored directory must not be scanned: {paths:?}"
+        );
+    }
+
+    /// #255 follow-up: a cached `not_applicable` report (0 frontend files in
+    /// scope) must be reused as fresh-and-passing, so a Frontend-profile
+    /// workflow with no frontend files does not re-run the detector at
+    /// every gate check. The ordinary change-fingerprint freshness check
+    /// must still apply unchanged: a stale fingerprint still forces a
+    /// re-run.
+    #[test]
+    fn latest_is_fresh_and_passing_reuses_a_cached_not_applicable_report() {
+        let repo = tempfile::tempdir().expect("repo");
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.email=t@example.com",
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(repo.path())
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(repo.path().join("README.md"), "hello\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "base"]);
+
+        let root = tempfile::tempdir().expect("state root");
+        let state = StateDir::from_root(root.path().to_path_buf());
+        let repo_path = repo.path().canonicalize().unwrap();
+        let profile = super::super::frontend::ensure_profile(&state, &repo_path).unwrap();
+        let fingerprint = super::super::verification::change_fingerprint(&repo_path).unwrap();
+
+        let report = DetectorReport {
+            schema_version: DETECTOR_REPORT_SCHEMA_VERSION,
+            id: uuid::Uuid::new_v4().to_string(),
+            repo: repo_path.clone(),
+            change_fingerprint: fingerprint,
+            profile_fingerprint: profile.source_fingerprint,
+            scope: DetectorScope::Changed,
+            generated_at: now_secs(),
+            analyzed_files: Vec::new(),
+            analyzed_bytes: 0,
+            truncated: false,
+            findings: Vec::new(),
+            waivers_loaded: 0,
+            waivers_rejected: 0,
+            not_applicable: true,
+        };
+        save_report(&state, &report).unwrap();
+
+        assert!(
+            latest_is_fresh_and_passing(&state, &repo_path).unwrap(),
+            "a cached not-applicable report must be reused as fresh and passing"
+        );
+
+        // A further change moves the fingerprint out from under the cached
+        // report; it must no longer be considered fresh even though it is
+        // still `not_applicable`.
+        std::fs::write(repo.path().join("other.txt"), "changed\n").unwrap();
+        assert!(
+            !latest_is_fresh_and_passing(&state, &repo_path).unwrap(),
+            "a stale change fingerprint must still force a re-run"
         );
     }
 
