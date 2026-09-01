@@ -136,21 +136,55 @@ impl IncrementalScorer {
     /// Restart`) as a genuine `Healthy`/`0`, not the honest "no data" it
     /// actually is. See `full_score`'s matching guard, which this mirrors
     /// for the bounded-state fold path that never calls it.
+    /// Issue #243 (review round, F5): the screening half is `Option`, not a
+    /// plain `ScreenReport`, so "this poll consumed no new bytes at all"
+    /// (`None`) is distinguishable from "consumed bytes and found nothing"
+    /// (`Some(ScreenReport::default())`). Before this, both cases returned
+    /// the identical `ScreenReport::default()`, and a caller that fed every
+    /// poll's screening result straight into `sessions::record_screening`
+    /// (`exec.rs`/`run_loop.rs`'s own live supervision loops) could not
+    /// tell them apart: an ordinary IDLE poll -- nothing new to read --
+    /// looked exactly like a poll that read fresh, genuinely clean bytes,
+    /// so it deleted an already-persisted flagged summary and reset the
+    /// de-dup memory, making a real finding vanish (and then re-announce)
+    /// across every idle gap.
+    ///
+    /// `Some`/`None` is decided on `appended.lines`/`.partial` being
+    /// non-empty, not merely on `self.watcher.read_appended()` answering
+    /// `Some` at all: `Watcher::resuming` (a fresh process picking up a
+    /// checkpoint, exactly the Stop hook's own shape every turn) does not
+    /// restore its own `len`/`mtime` baseline, so its very first poll
+    /// cannot take the cheap "nothing changed" short-circuit inside
+    /// `read_appended` and instead performs a real read that comes back
+    /// EMPTY when the file has not actually grown since the checkpoint --
+    /// `Some(Appended { lines: "", partial: "", .. })`, not `None`. Keying
+    /// off the read bytes themselves (rather than the `Option` wrapper
+    /// `read_appended` returns) treats that case identically to the
+    /// ordinary live-loop idle poll, which is what it actually is.
+    /// Decided ONCE and carried unchanged through every return path below
+    /// -- never re-derived from whether a `Score` happened to come out the
+    /// other end, since the bounded-state fold can still answer `None`
+    /// (or, for an empty read, a stale-but-real `Some`) independently.
     pub fn poll(
         &mut self,
         adapter: &dyn AgentAdapter,
         cfg: &ScoreConfig,
-    ) -> CtxResult<(Option<Score>, ScreenReport)> {
+    ) -> CtxResult<(Option<Score>, Option<ScreenReport>)> {
         if !adapter.capabilities().events {
-            return Ok((None, ScreenReport::default()));
+            return Ok((None, None));
         }
         let Some(appended) = self.watcher.read_appended()? else {
-            return Ok((None, ScreenReport::default()));
+            return Ok((None, None));
         };
         // Issue #243: screens exactly the bytes this cycle newly
         // read off the transcript (the committed lines plus the
         // still-in-progress partial one), never the whole file.
-        let screening = screen::screen(&format!("{}{}", appended.lines, appended.partial));
+        let combined = format!("{}{}", appended.lines, appended.partial);
+        let screening = if combined.is_empty() {
+            None
+        } else {
+            Some(screen::screen(&combined))
+        };
         if appended.restarted || self.state.as_ref().is_none_or(|s| !s.built_for(cfg)) {
             self.state = RotState::new(cfg);
             // A restarted (truncated/rewritten) transcript may belong to a
@@ -366,8 +400,13 @@ fn score_with_checkpoint(
 
     // A poll that reports nothing new cannot be answered from a checkpoint
     // alone (an unreadable or empty transcript lands here too), so it falls
-    // back rather than guessing.
-    let Ok((Some(score), screening)) = scorer.poll(adapter, cfg) else {
+    // back rather than guessing. `screening` is `None` in exactly the same
+    // case `score` is (issue #243 review round, F5: both are set together,
+    // once, the instant `IncrementalScorer::poll` confirms it actually read
+    // appended bytes), so matching on `Some(score)` alone already implies
+    // `Some(screening)` here -- this fallback runs a fresh tail scan either
+    // way, never forwarding a stale/idle `None`.
+    let Ok((Some(score), Some(screening))) = scorer.poll(adapter, cfg) else {
         let score = full_score(adapter, transcript, cfg)?;
         return Ok((score, screen_tail(transcript, SCREEN_FALLBACK_CAP_BYTES)));
     };
@@ -770,13 +809,55 @@ mod tests {
         let transcript = write_transcript(dir.path(), 12, true, 20_000);
         let adapter = EventlessAdapter;
         let mut scorer = IncrementalScorer::new(transcript);
+        let (score, screening) = scorer
+            .poll(&adapter, &ScoreConfig::default())
+            .expect("no error");
+        assert_eq!(score, None, "no data, not a fabricated healthy score");
         assert_eq!(
-            scorer
-                .poll(&adapter, &ScoreConfig::default())
-                .expect("no error")
-                .0,
-            None,
-            "no data, not a fabricated healthy score"
+            screening, None,
+            "issue #243 (review round, F5): no bytes were consumed, so this must not be a \
+             fabricated clean report either"
+        );
+    }
+
+    /// Issue #243 (review round, F5): the core of the fix. A poll with
+    /// nothing new to read (nothing appended since the last one) must
+    /// answer `None` for the screening half too, exactly like the score
+    /// half already did -- never `Some(ScreenReport::default())`, which
+    /// used to be indistinguishable from "consumed fresh bytes and found
+    /// them clean". A live supervision loop that fed every poll's
+    /// screening result straight into `sessions::record_screening` could
+    /// not tell an ordinary idle poll apart from a genuinely clean one, so
+    /// it cleared an already-persisted flagged summary (and reset the
+    /// de-dup memory) on every idle gap.
+    #[test]
+    fn an_idle_poll_answers_none_for_both_the_score_and_the_screening_half() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let transcript = dir.path().join("t.jsonl");
+        let adapter = super::adapters::claude::ClaudeAdapter::new(None);
+        let cfg = ScoreConfig::default();
+
+        std::fs::write(
+            &transcript,
+            "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"[zirv] \
+             one\"}],\"usage\":{\"input_tokens\":1}}}\n",
+        )
+        .expect("write transcript");
+        let mut scorer = IncrementalScorer::new(transcript.clone());
+        let (first_score, first_screening) = scorer.poll(&adapter, &cfg).expect("no error");
+        assert!(first_score.is_some(), "fixture must produce a real score");
+        assert!(
+            first_screening.is_some(),
+            "fixture must have consumed real bytes"
+        );
+
+        // No append at all: the second poll has nothing new to read.
+        let (idle_score, idle_screening) = scorer.poll(&adapter, &cfg).expect("no error");
+        assert_eq!(idle_score, None, "nothing new was appended");
+        assert_eq!(
+            idle_screening, None,
+            "an idle poll must not fabricate a clean report a caller could mistake for a \
+             fresh one"
         );
     }
 

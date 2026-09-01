@@ -469,12 +469,16 @@ pub(crate) fn run_with_clock<W: Write>(
                     });
                 }
                 let poll_result = scorer.poll(adapter.as_ref(), &cfg.score);
-                // Issue #243 (review round, F4): same shared helper the
+                // Issue #243 (review round, F4/F5): same shared helper the
                 // Stop hook and `exec`'s own supervision loop use -- a
                 // codex/wrap-supervised cycle (no Claude Stop hook at all)
                 // otherwise never surfaces a live-detected injection
-                // marker or credential shape.
-                if let Ok((_, report)) = &poll_result {
+                // marker or credential shape. `Some(report)` only when
+                // this poll actually consumed new bytes -- an IDLE poll
+                // (`None`) must never reach `record_screening`, or its
+                // fabricated-clean default would clobber an already-
+                // persisted flagged summary on every idle gap.
+                if let Ok((_, Some(report))) = &poll_result {
                     super::sessions::record_screening(
                         &state,
                         &nudge_address,

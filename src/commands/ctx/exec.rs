@@ -2448,14 +2448,20 @@ fn supervise_run(
         }
         // A scoring failure must never kill a healthy run.
         let poll_result = scorer.poll(adapter, score_cfg);
-        // Issue #243 (review round, F3): consumes the screening half of
-        // every successful poll -- persisted and, when it changed,
-        // announced -- through the same shared helper the Stop hook uses
-        // (`sessions::record_screening`), so a codex/wrap-supervised
-        // session (no Claude Stop hook at all) still gets a live-detected
-        // injection marker or credential shape surfaced, not only silently
-        // dropped.
-        if let Ok((_, report)) = &poll_result {
+        // Issue #243 (review round, F3/F5): consumes the screening half of
+        // every poll that actually read new bytes -- persisted and, when
+        // it changed, announced -- through the same shared helper the Stop
+        // hook uses (`sessions::record_screening`), so a codex/wrap-
+        // supervised session (no Claude Stop hook at all) still gets a
+        // live-detected injection marker or credential shape surfaced, not
+        // only silently dropped. `Some(report)` only when bytes were
+        // genuinely consumed this poll (`IncrementalScorer::poll`'s own
+        // doc comment): an IDLE poll (`None`) must never reach
+        // `record_screening` at all, or its fabricated-clean default would
+        // clobber an already-persisted flagged summary and reset the
+        // de-dup memory, making a real finding vanish across every idle
+        // gap and then re-announce.
+        if let Ok((_, Some(report))) = &poll_result {
             super::sessions::record_screening(
                 state,
                 registry_short,
