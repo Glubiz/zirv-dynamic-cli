@@ -1608,6 +1608,7 @@ pub fn advance_with_evidence(
                     // visual-review, or the general test-evidence gate)
                     // can still fail closed, and the operator should not
                     // have to pass the flag again on retry.
+                    state.updated_at = now_secs();
                     save(state_dir, &state, true)?;
                 }
             }
