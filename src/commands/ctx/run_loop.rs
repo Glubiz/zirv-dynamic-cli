@@ -124,6 +124,9 @@ pub(crate) fn run_with_clock<W: Write>(
         super::announce::Announcer::new(cfg.chrome.events, console::colors_enabled_stderr());
     let adapter = adapters::select(args.agent.as_deref().or(cfg.agent.as_deref()), &[], &cfg)?;
     let state = StateDir::resolve(env)?;
+    // Issue #249: this loop's own supervising session, if any -- resolved
+    // once, from `env` alone, and reused for every cycle's mail rendering.
+    let parent_short = super::agent::parent_identity(env);
 
     let interval = Duration::from_secs(args.interval_secs.unwrap_or(cfg.supervise.interval_secs));
     let max_cycle =
@@ -242,7 +245,14 @@ pub(crate) fn run_with_clock<W: Write>(
         };
         let mail_messages: Vec<super::mail::Message> = mail_entries
             .iter()
-            .map(|(path, msg)| super::mail::message_with_delivery_envelope(&state, path, msg))
+            .map(|(path, msg)| {
+                super::mail::message_with_delivery_envelope(
+                    &state,
+                    path,
+                    msg,
+                    parent_short.as_deref(),
+                )
+            })
             .collect();
         if !mail_messages.is_empty() {
             announcer.emit(&super::announce::Event::MailDelivered {
@@ -258,7 +268,12 @@ pub(crate) fn run_with_clock<W: Write>(
         // still folds mail into `composed` exactly as before.
         let system_prompt_supported = adapter.system_prompt_supported(&[]);
         let composed = if system_prompt_supported {
-            super::prompt::with_mail_layer(composed, &mail_messages, cfg.mail.max_delivered_bytes)
+            super::prompt::with_mail_layer(
+                composed,
+                &mail_messages,
+                cfg.mail.max_delivered_bytes,
+                parent_short.as_deref(),
+            )
         } else {
             composed
         };
@@ -369,6 +384,7 @@ pub(crate) fn run_with_clock<W: Write>(
             (system_prompt_supported && composed.is_some()) || mail_in_composed,
             &mail_messages,
             cfg.mail.max_delivered_bytes,
+            parent_short.as_deref(),
         );
 
         // FIX B: on a Windows npm `.cmd` shim launch, cmd.exe reparses the
@@ -672,7 +688,13 @@ fn handle_cycle_outcome<W: Write>(
 
 pub fn run<W: Write>(args: &LoopArgs, w: &mut W) -> CtxResult<i32> {
     let repo = std::env::current_dir()?;
-    let env = env_from_process();
+    let ambient = env_from_process();
+    // Issue #249/#250 review: see `exec::run`'s matching comment -- a direct
+    // `zirv ctx loop` launch is not a supervisor spawn seam, so an inherited
+    // `PARENT_SESSION_ENV` off this process's own ambient env must be
+    // scrubbed rather than trusted; `agent::parent_session_env`'s fold with
+    // `parent: None` does that unconditionally.
+    let env = super::agent::parent_session_env(&ambient, None);
     run_with(args, w, &repo, &env)
 }
 
@@ -1465,6 +1487,79 @@ mod tests {
         assert!(
             log.contains(&file_id),
             "the entry names the mail file: {log}"
+        );
+    }
+
+    /// Fix 2 (issue #249/#250 review): a direct `zirv ctx loop` launch (the
+    /// bare `run` entry, which reads `env_from_process()`) must not trust an
+    /// inherited `PARENT_SESSION_ENV` off its own ambient process env -- only
+    /// a supervisor spawn seam may establish parent lineage. Mail from the
+    /// ambient "parent" must render as ordinary peer mail in the cycle's own
+    /// composed prompt, not steering.
+    #[test]
+    fn direct_loop_entry_ignores_an_inherited_parent_session_env() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let state_dir = tmp.path().join("state");
+        let argv_log = tmp.path().join("argv.log");
+
+        let state = crate::commands::ctx::state::StateDir::from_root(state_dir.clone());
+        let slug = crate::commands::ctx::state::repo_slug(tmp.path());
+        crate::commands::ctx::mail::store(
+            &state,
+            &slug,
+            &crate::commands::ctx::mail::Message {
+                from_session: "grandpar".to_string(),
+                from_agent: "claude".to_string(),
+                to: "any".to_string(),
+                to_session: None,
+                sent: 1,
+                body: "scope now includes billing".to_string(),
+            },
+            &CtxConfig::default(),
+        )
+        .expect("store mail");
+
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let _cwd = crate::commands::ctx::testenv::CwdGuard::enter(tmp.path()).expect("enter repo");
+        // `run` (unlike `run_with`) reads every one of these off the REAL
+        // process environment, `PARENT_SESSION_ENV` included -- the whole
+        // seam under test.
+        let _vars = crate::commands::ctx::testenv::VarGuard::set(&[
+            (crate::commands::ctx::state::STATE_ENV, state_dir.to_str()),
+            (
+                "ZIRV_CTX_AGENT_BIN",
+                Some(&format!("sh {}", fixture("fake-agent.sh").display())),
+            ),
+            ("ZIRV_CTX_PACE", Some("false")),
+            (
+                crate::commands::ctx::agent::PARENT_SESSION_ENV,
+                Some("grandpar"),
+            ),
+            ("FAKE_AGENT_MODE", Some("healthy")),
+            ("FAKE_AGENT_TURNS", Some("1")),
+            ("FAKE_AGENT_ARGV_LOG", argv_log.to_str()),
+        ]);
+
+        let mut args = args_for(1);
+        args.simple = false;
+        let mut out = Vec::new();
+        let code = run(&args, &mut out);
+        assert_eq!(code.expect("runs"), 0);
+
+        let argv = std::fs::read_to_string(&argv_log).expect("argv recorded");
+        assert!(
+            argv.contains("scope now includes billing"),
+            "the mail must still be delivered: {argv}"
+        );
+        assert!(
+            argv.contains("another agent session"),
+            "an inherited PARENT_SESSION_ENV from this process's own ambient env must render as \
+             ordinary peer mail, never steering: {argv}"
+        );
+        assert!(
+            !argv.contains("the session that spawned this one"),
+            "must not be marked as steering: {argv}"
         );
     }
 

@@ -161,6 +161,122 @@ fn effective_launch_repo(workdir: Option<&Path>, repo: &Path) -> PathBuf {
         .unwrap_or_else(|| repo.to_path_buf())
 }
 
+/// The cap on how many path-like candidate tokens
+/// [`out_of_repo_paths_in_prompt`] will canonicalize/exists-check, so a huge
+/// prompt cannot make dispatch slow.
+const MAX_WORKDIR_WARNING_CANDIDATES: usize = 32;
+
+/// Trailing punctuation a candidate token is stripped of before
+/// classification -- ordinary prose marks (`.,;:`), a closing paren, a
+/// trailing quote (belt-and-suspenders: the split below already treats a
+/// bare quote as a token boundary), and (Fix 6, issue #249/#250 review) a
+/// trailing backtick.
+const TRAILING_TOKEN_PUNCTUATION: [char; 8] = ['.', ',', ';', ':', ')', '"', '\'', '`'];
+
+/// Fix 6 (issue #249/#250 review): leading wrapping punctuation stripped
+/// from a candidate token before classification -- a backtick or an opening
+/// paren. Without this, `` `/tmp/other` `` or `(/tmp/other)` failed the
+/// `starts_with('/')` check outright (the trailing mark was already
+/// stripped by [`TRAILING_TOKEN_PUNCTUATION`], but nothing stripped the
+/// leading one) and the whole token was silently dropped as a candidate.
+/// Quotes need no leading counterpart here: the split in
+/// [`candidate_path_tokens`] already treats a bare `'`/`"` as a token
+/// boundary, so a quote-wrapped path never carries one at either edge to
+/// begin with.
+const LEADING_TOKEN_WRAPPING: [char; 2] = ['`', '('];
+
+/// Fix 6: whether `token` (already stripped of wrapping punctuation by
+/// [`candidate_path_tokens`]) looks like an absolute path -- Unix (`/...`,
+/// `~/...`), a Windows drive-letter path (`C:\...`/`C:/...`), or a Windows
+/// UNC path (`\\server\share...`). Pure classification, deliberately kept
+/// separate from [`out_of_repo_paths_in_prompt`]'s own `exists()`-on-disk
+/// gate so the tokenizer/classifier itself -- the Windows shapes included --
+/// is directly testable on any host, independent of what a drive-relative
+/// path would need to actually exist on THIS machine's disk.
+fn looks_like_absolute_path_token(token: &str) -> bool {
+    if token.starts_with('/') || token.starts_with("~/") || token.starts_with(r"\\") {
+        return true;
+    }
+    let mut chars = token.chars();
+    let Some(drive) = chars.next() else {
+        return false;
+    };
+    drive.is_ascii_alphabetic()
+        && chars.next() == Some(':')
+        && matches!(chars.next(), Some('\\') | Some('/'))
+}
+
+/// The whitespace/quote-delimited candidate tokens in `prompt`, stripped of
+/// wrapping punctuation and filtered to [`looks_like_absolute_path_token`],
+/// capped at [`MAX_WORKDIR_WARNING_CANDIDATES`]. Split out of
+/// [`out_of_repo_paths_in_prompt`] (Fix 6) so the tokenizer/classifier is
+/// unit-testable without that function's own `exists()`-on-disk gate.
+fn candidate_path_tokens(prompt: &str) -> impl Iterator<Item = &str> {
+    prompt
+        .split(|c: char| c.is_whitespace() || c == '\'' || c == '"')
+        .filter(|token| !token.is_empty())
+        .map(|token| {
+            token
+                .trim_end_matches(TRAILING_TOKEN_PUNCTUATION)
+                .trim_start_matches(LEADING_TOKEN_WRAPPING)
+        })
+        .filter(|token| looks_like_absolute_path_token(token))
+        .take(MAX_WORKDIR_WARNING_CANDIDATES)
+}
+
+/// Issue #250: absolute paths named in a delegated prompt that resolve
+/// outside `launch_repo` -- the worker's writable root
+/// ([`effective_launch_repo`] with `workdir: None` is exactly `launch_repo`
+/// itself, byte for byte). Feeds `run_with`'s non-fatal dispatch-time
+/// warning: a brief naming a path outside the worker's sandbox burns a full
+/// run just to report BLOCKED, and this is the conservative heuristic that
+/// catches the disk-visible half of that up front.
+///
+/// A candidate token ([`candidate_path_tokens`]) is any whitespace- or
+/// quote-delimited run that -- once stripped of wrapping punctuation such as
+/// backticks or parentheses -- looks like an absolute path
+/// ([`looks_like_absolute_path_token`]: `/...`, `~/...`, a Windows
+/// drive-letter path, or a UNC path), `~/` expanded against `home` when
+/// given. A token that does not exist on disk, or that canonicalizes inside
+/// `launch_repo`, is silently dropped -- a false negative here is fine, a
+/// false positive is not. Pure aside from the `fs` calls each candidate
+/// needs, so a tempdir-backed test can exercise it directly without
+/// spawning anything.
+fn out_of_repo_paths_in_prompt(
+    prompt: &str,
+    launch_repo: &Path,
+    home: Option<&Path>,
+) -> Vec<PathBuf> {
+    let Ok(canonical_repo) = std::fs::canonicalize(launch_repo) else {
+        return Vec::new();
+    };
+    candidate_path_tokens(prompt)
+        .filter_map(|token| {
+            let candidate: PathBuf = match token.strip_prefix("~/") {
+                Some(rest) => home?.join(rest),
+                None => PathBuf::from(token),
+            };
+            let canonical = std::fs::canonicalize(&candidate).ok()?;
+            (!canonical.starts_with(&canonical_repo)).then_some(canonical)
+        })
+        .collect()
+}
+
+/// Prints [`out_of_repo_paths_in_prompt`]'s findings as non-fatal stderr
+/// warnings, one line per offending path. Never called when `--workdir` was
+/// given -- an explicit `--workdir` already says the operator meant to point
+/// the worker elsewhere, so there is nothing to warn about.
+fn warn_about_paths_outside_launch_repo(prompt: &str, launch_repo: &Path, home: Option<&Path>) {
+    for path in out_of_repo_paths_in_prompt(prompt, launch_repo, home) {
+        eprintln!(
+            "warning: brief references {}, which is outside the worker's writable root {}; if \
+             the work targets that location, dispatch with --workdir <its repo root>",
+            path.display(),
+            launch_repo.display()
+        );
+    }
+}
+
 /// The soft threshold, as a fraction of a budget. At or above it the worker
 /// is nudged to wrap up and checkpoint while it still has room to write a
 /// usable result; at the budget itself it is stopped.
@@ -267,6 +383,33 @@ pub fn validate_role(role: &Option<String>) -> CtxResult<()> {
 /// harness remembering to type `--group` every time.
 pub const WORK_GROUP_ENV: &str = "ZIRV_CTX_WORK_GROUP";
 
+/// Issue #249: names the session that spawned THIS one, set explicitly at
+/// every worker-spawn seam (never inherited -- see [`parent_identity`]'s own
+/// doc comment) from the spawning process's own `mail::session_identity`, or
+/// from a dashboard's own server-verified requester. Consumed by every mail
+/// trust-render seam (`mail::render_delivery_message`, `prompt::
+/// render_mail_block`, `wrap::mail_advisory_line`, `dash::mod::mail_
+/// injection_label`) to decide whether a message's zirv-recorded sender
+/// matches this session's own supervising session -- the ONLY signal any of
+/// those seams may use for that decision; the payload body and any
+/// caller-supplied JSON are never trusted for it (issue #249's own security
+/// invariant).
+pub const PARENT_SESSION_ENV: &str = "ZIRV_CTX_PARENT_SESSION";
+
+/// The short id of the session THIS process's own environment names as its
+/// parent, or `None` when [`PARENT_SESSION_ENV`] is unset or not a plain
+/// short id ([`super::prompt::is_addressable_short`], the same bound
+/// `spawnreq::SpawnRequest::requested_by` is already held to).
+///
+/// Deliberately re-reads `env` fresh on every call rather than being cached:
+/// the one property this whole mechanism depends on is that the value never
+/// silently survives past the session it names, and a cache is exactly the
+/// kind of place that could paper over `env` having been re-scoped between
+/// two calls.
+pub(crate) fn parent_identity(env: EnvLookup<'_>) -> Option<String> {
+    env(PARENT_SESSION_ENV).filter(|id| super::prompt::is_addressable_short(id))
+}
+
 /// Issue #170: resolves what `--group` this delegation actually binds to,
 /// mutating `args.group` in place -- called once, at the very top of
 /// [`run_with`], before the dashboard-join fork so BOTH forks of this
@@ -352,6 +495,35 @@ fn group_env<'a>(
     move |key: &str| match &group {
         Some(id) if key == WORK_GROUP_ENV => Some(id.clone()),
         _ => env(key),
+    }
+}
+
+/// Issue #249: folds this delegation's own resolved parent id into the env
+/// lookup its headless launch runs under, the same shape [`group_env`]
+/// already established -- except, unlike [`WORK_GROUP_ENV`], [`PARENT_
+/// SESSION_ENV`] must NEVER fall through to whatever `env` already carries
+/// for that key: `parent` is always substituted outright, `None` included,
+/// so a value this process happened to inherit from further up its own
+/// delegation chain (its own parent's own parent) can never leak through to
+/// a child that must see THIS session's id, and no one else's.
+///
+/// `pub(crate)`, not private: issue #249/#250 review found the same
+/// unconditional-substitute shape is exactly what `exec::run`/`run_loop::
+/// run`/`wrap::run` (the direct CLI entry points, whose own `env` is the raw
+/// ambient process environment) need to scrub an inherited `PARENT_SESSION_
+/// ENV` with -- passing `parent: None` there, since only a supervisor spawn
+/// seam (this fold, or dash's `verified_parent`) may ever establish parent
+/// lineage.
+pub(crate) fn parent_session_env<'a>(
+    env: EnvLookup<'a>,
+    parent: Option<String>,
+) -> impl Fn(&str) -> Option<String> + 'a {
+    move |key: &str| {
+        if key == PARENT_SESSION_ENV {
+            parent.clone()
+        } else {
+            env(key)
+        }
     }
 }
 
@@ -1145,6 +1317,18 @@ pub fn run_with<W: Write>(
     let canonical_workdir = args.workdir.as_deref().map(validate_workdir).transpose()?;
     let prompt = resolve_prompt(&args.prompt, &mut std::io::stdin())?;
 
+    // Issue #250: no `--workdir` means the worker stays confined to `repo`
+    // (see `effective_launch_repo`) -- a non-fatal nudge toward `--workdir`
+    // when the brief itself names a path outside it, so the operator finds
+    // out before the worker burns a full run just to report BLOCKED. Never
+    // consulted by the dispatch decision below; only ever prints to stderr.
+    if canonical_workdir.is_none() {
+        let home = env("HOME")
+            .or_else(|| env("USERPROFILE"))
+            .map(PathBuf::from);
+        warn_about_paths_outside_launch_repo(&prompt, repo, home.as_deref());
+    }
+
     // Loaded here rather than after the dashboard-join attempt below (its
     // former position): the spawn gate needs `cfg.pace` before either fork
     // of this delegation -- a pane spawn and a headless run -- is chosen,
@@ -1349,10 +1533,19 @@ pub fn run_with<W: Write>(
         cfg.chrome.events && !args.quiet,
         console::colors_enabled_stderr(),
     );
+    // Issue #249: resolved from the ORIGINAL, unshadowed `env` parameter --
+    // this delegating session's own identity -- never from anything already
+    // folded below, and never inherited from whatever `PARENT_SESSION_ENV`
+    // this process itself happens to carry (see `parent_session_env`'s own
+    // doc comment for why that would leak a grandparent's id to the worker
+    // about to be launched).
+    let worker_parent =
+        super::mail::session_identity(env).filter(|id| super::prompt::is_addressable_short(id));
     // Finding 3: the launch below runs under an env lookup that carries this
     // delegation's own group, so `exec::run_with` can export it to the child.
     let quieted = quiet_env(env, args.quiet);
-    let env = group_env(&quieted, args.group.clone());
+    let grouped = group_env(&quieted, args.group.clone());
+    let env = parent_session_env(&grouped, worker_parent);
 
     // Resolved here, ahead of `exec::run_with`'s own (identical) selection
     // further down, purely to compute the default worker model this spawn
@@ -2698,6 +2891,238 @@ mod tests {
         );
     }
 
+    /// Issue #250: an existing path outside the launch repo, named in the
+    /// prompt, must be flagged so `run_with` can warn toward `--workdir`.
+    #[test]
+    fn out_of_repo_paths_in_prompt_warns_on_an_absolute_path_outside_the_repo() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        let outside = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        std::fs::create_dir_all(&outside).expect("mkdir outside");
+
+        let prompt = format!("fix the bug described in {}", outside.display());
+        let found = out_of_repo_paths_in_prompt(&prompt, &repo, None);
+
+        assert_eq!(
+            found,
+            vec![std::fs::canonicalize(&outside).expect("canonicalize")],
+            "an existing path outside the repo must be flagged"
+        );
+    }
+
+    /// A path inside the repo is exactly what a worker's writable root
+    /// already covers -- nothing to warn about.
+    #[test]
+    fn out_of_repo_paths_in_prompt_is_silent_for_a_path_inside_the_repo() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        let inside = repo.join("src");
+        std::fs::create_dir_all(&inside).expect("mkdir");
+
+        let prompt = format!("edit {}", inside.display());
+        let found = out_of_repo_paths_in_prompt(&prompt, &repo, None);
+
+        assert!(
+            found.is_empty(),
+            "a path inside the repo must not be flagged: {found:?}"
+        );
+    }
+
+    /// A path that does not exist on disk cannot be a real cross-repo
+    /// target -- likely a flag value, an example, or plain prose -- so it is
+    /// silently dropped rather than risking a false-positive warning.
+    #[test]
+    fn out_of_repo_paths_in_prompt_is_silent_for_a_path_that_does_not_exist() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let missing = tmp.path().join("nonexistent");
+
+        let prompt = format!("look at {}", missing.display());
+        let found = out_of_repo_paths_in_prompt(&prompt, &repo, None);
+
+        assert!(
+            found.is_empty(),
+            "a nonexistent path must not be flagged: {found:?}"
+        );
+    }
+
+    /// `~/` tokens expand against the given home dir before the exists/
+    /// inside-repo checks, the same as a shell would expand them.
+    #[test]
+    fn out_of_repo_paths_in_prompt_expands_a_tilde_path_via_home() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        let home = tmp.path().join("home");
+        let outside = home.join("elsewhere");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        std::fs::create_dir_all(&outside).expect("mkdir outside");
+
+        let prompt = "please work on ~/elsewhere today";
+        let found = out_of_repo_paths_in_prompt(prompt, &repo, Some(&home));
+
+        assert_eq!(
+            found,
+            vec![std::fs::canonicalize(&outside).expect("canonicalize")],
+            "a ~/ path must expand against the given home dir: {found:?}"
+        );
+    }
+
+    /// A `~/` token is simply not a candidate at all when no home dir is
+    /// known -- it must not be misread as a literal `~` directory.
+    #[test]
+    fn out_of_repo_paths_in_prompt_skips_a_tilde_path_with_no_home_given() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+
+        let prompt = "please work on ~/elsewhere today";
+        let found = out_of_repo_paths_in_prompt(prompt, &repo, None);
+
+        assert!(
+            found.is_empty(),
+            "no home dir means no expansion: {found:?}"
+        );
+    }
+
+    /// The scan is capped at `MAX_WORKDIR_WARNING_CANDIDATES` path-like
+    /// tokens so a huge prompt cannot make dispatch slow -- exercised with
+    /// more real, existing, out-of-repo directories than the cap allows.
+    #[test]
+    fn out_of_repo_paths_in_prompt_caps_the_number_of_candidates_scanned() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+
+        let mut prompt = String::new();
+        let mut dirs = Vec::new();
+        for i in 0..(MAX_WORKDIR_WARNING_CANDIDATES + 8) {
+            let dir = tmp.path().join(format!("outside-{i}"));
+            std::fs::create_dir_all(&dir).expect("mkdir");
+            prompt.push_str(&dir.display().to_string());
+            prompt.push(' ');
+            dirs.push(dir);
+        }
+
+        let found = out_of_repo_paths_in_prompt(&prompt, &repo, None);
+
+        assert_eq!(
+            found.len(),
+            MAX_WORKDIR_WARNING_CANDIDATES,
+            "must cap the scan at {MAX_WORKDIR_WARNING_CANDIDATES} candidates: {found:?}"
+        );
+        let last = std::fs::canonicalize(dirs.last().unwrap()).expect("canonicalize");
+        assert!(
+            !found.contains(&last),
+            "a candidate beyond the cap must never be checked: {found:?}"
+        );
+    }
+
+    /// Fix 6 (issue #249/#250 review): a path wrapped in backticks -- a
+    /// common way to set a path apart in prose -- must still be recognized
+    /// and flagged when it exists and resolves outside the repo. Before
+    /// this fix the leading backtick was never stripped, so `starts_with`
+    /// failed and the whole token was silently dropped as a candidate.
+    #[test]
+    fn out_of_repo_paths_in_prompt_warns_on_a_backtick_wrapped_path() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        let outside = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        std::fs::create_dir_all(&outside).expect("mkdir outside");
+
+        let prompt = format!("fix the bug described in `{}`", outside.display());
+        let found = out_of_repo_paths_in_prompt(&prompt, &repo, None);
+
+        assert_eq!(
+            found,
+            vec![std::fs::canonicalize(&outside).expect("canonicalize")],
+            "a backtick-wrapped existing path outside the repo must still be flagged: {found:?}"
+        );
+    }
+
+    /// The parenthesized shape from the same fix: `(/path)` must resolve to
+    /// the same candidate a bare `/path` would.
+    #[test]
+    fn out_of_repo_paths_in_prompt_warns_on_a_parenthesized_path() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        let outside = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        std::fs::create_dir_all(&outside).expect("mkdir outside");
+
+        let prompt = format!("see ({}) for context", outside.display());
+        let found = out_of_repo_paths_in_prompt(&prompt, &repo, None);
+
+        assert_eq!(
+            found,
+            vec![std::fs::canonicalize(&outside).expect("canonicalize")],
+            "a parenthesized existing path outside the repo must still be flagged: {found:?}"
+        );
+    }
+
+    /// Fix 6: the tokenizer/classifier alone (no filesystem, so Windows
+    /// shapes are covered on any host, not just a Windows CI runner) must
+    /// recognize a backtick- or paren-wrapped Unix path as a candidate.
+    #[test]
+    fn candidate_path_tokens_strips_wrapping_punctuation_from_both_ends() {
+        let found: Vec<&str> =
+            candidate_path_tokens("see `/tmp/one` and (/tmp/two) and plain/tmp/three").collect();
+        assert_eq!(
+            found,
+            vec!["/tmp/one", "/tmp/two"],
+            "wrapping backticks and parens must be stripped from both ends: {found:?}"
+        );
+    }
+
+    /// Fix 6: a Windows drive-letter absolute path (`C:\...` or `C:/...`)
+    /// must be recognized as a candidate token, purely by shape -- tested
+    /// separately from `out_of_repo_paths_in_prompt`'s own `exists()` gate
+    /// (a drive-relative path cannot exist on a non-Windows host) so this
+    /// coverage does not depend on the host platform.
+    #[test]
+    fn looks_like_absolute_path_token_recognizes_windows_drive_letter_paths() {
+        assert!(looks_like_absolute_path_token(r"C:\Users\jane\project"));
+        assert!(looks_like_absolute_path_token("C:/Users/jane/project"));
+        assert!(looks_like_absolute_path_token(r"d:\data"));
+        assert!(
+            !looks_like_absolute_path_token("C:notanabsolutepath"),
+            "a bare drive-relative token with no separator is not absolute"
+        );
+        assert!(
+            !looks_like_absolute_path_token("relative/path"),
+            "an ordinary relative path is still not a candidate"
+        );
+    }
+
+    /// Fix 6: a Windows UNC path (`\\server\share\...`) must also be
+    /// recognized as a candidate token.
+    #[test]
+    fn looks_like_absolute_path_token_recognizes_windows_unc_paths() {
+        assert!(looks_like_absolute_path_token(
+            r"\\server\share\project\file.txt"
+        ));
+        assert!(
+            !looks_like_absolute_path_token(r"\single\backslash"),
+            "a single leading backslash is not a UNC path"
+        );
+    }
+
+    /// Fix 6: a Windows-shaped token wrapped in backticks or parens must
+    /// also survive the wrapping-punctuation strip, the same as the Unix
+    /// shapes above.
+    #[test]
+    fn candidate_path_tokens_recognizes_a_wrapped_windows_drive_letter_path() {
+        let found: Vec<&str> =
+            candidate_path_tokens(r"see `C:\Users\jane\project` please").collect();
+        assert_eq!(found, vec![r"C:\Users\jane\project"], "got {found:?}");
+
+        let found: Vec<&str> =
+            candidate_path_tokens(r"see (\\server\share\project) please").collect();
+        assert_eq!(found, vec![r"\\server\share\project"], "got {found:?}");
+    }
+
     /// Issue #228, decision 1: a bad `--workdir` fails loudly, up front,
     /// before any spawn decision -- not as a confusing sandbox error deep
     /// inside a harness's own child process.
@@ -3629,6 +4054,126 @@ mod tests {
             record["work_group_id"].as_str(),
             Some(group_id.as_str()),
             "and the delegation is recorded inside that group, not as ungrouped: {record}"
+        );
+    }
+
+    /// Issue #249, design A: a headless `zirv agent` delegation's own child
+    /// carries `PARENT_SESSION_ENV`, set from the DELEGATING session's own
+    /// identity (`ZIRV_CTX_SESSION` on the process that ran `zirv agent`) --
+    /// end to end, through the real child process's own environment, read
+    /// back via the fixture's env log (mirrors `a_headless_coordinators_
+    /// child_inherits_the_group_it_was_bound_to`'s own proof shape).
+    #[test]
+    fn a_headless_delegations_child_carries_the_delegating_sessions_identity_as_its_parent() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state_dir = tmp.path().join("state");
+        let mut env = base_env(&state_dir);
+        env.insert("ZIRV_CTX_PACE".to_string(), "false".to_string());
+        env.insert(
+            crate::commands::ctx::adapters::SESSION_ENV.to_string(),
+            "orch0001-2222-4333-8444-555555555555".to_string(),
+        );
+        let parent_env_log = tmp.path().join("parent-env.log");
+
+        unsafe {
+            std::env::set_var("FAKE_AGENT_MODE", "healthy");
+            std::env::set_var("FAKE_AGENT_PARENT_ENV_LOG", &parent_env_log);
+        }
+        let args = args_for("claude", "do the work");
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE");
+            std::env::remove_var("FAKE_AGENT_PARENT_ENV_LOG");
+        }
+        assert_eq!(code.expect("runs"), 0);
+
+        let logged = std::fs::read_to_string(&parent_env_log).expect("the child logged its env");
+        assert_eq!(
+            logged.trim(),
+            "orch0001",
+            "the child must see the DELEGATING session's own short id as its parent"
+        );
+    }
+
+    /// The "never rely on inheritance" half of design A: this delegation's
+    /// OWN process env already carries a `PARENT_SESSION_ENV` (as if it were
+    /// itself a worker calling `zirv agent` again to spawn a further child).
+    /// The new child must see THIS session's own id, never the grandparent's
+    /// -- `parent_session_env`'s whole reason for never falling through.
+    #[test]
+    fn a_headless_delegations_child_never_inherits_a_grandparents_parent_session() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state_dir = tmp.path().join("state");
+        let mut env = base_env(&state_dir);
+        env.insert("ZIRV_CTX_PACE".to_string(), "false".to_string());
+        // This process's OWN identity -- what the new child's parent must
+        // become.
+        env.insert(
+            crate::commands::ctx::adapters::SESSION_ENV.to_string(),
+            "worker01-2222-4333-8444-555555555555".to_string(),
+        );
+        // A stray, already-inherited value from further up the chain -- must
+        // never leak through to the new child.
+        env.insert(PARENT_SESSION_ENV.to_string(), "grandpar".to_string());
+        let parent_env_log = tmp.path().join("parent-env.log");
+
+        unsafe {
+            std::env::set_var("FAKE_AGENT_MODE", "healthy");
+            std::env::set_var("FAKE_AGENT_PARENT_ENV_LOG", &parent_env_log);
+        }
+        let args = args_for("claude", "do the work");
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE");
+            std::env::remove_var("FAKE_AGENT_PARENT_ENV_LOG");
+        }
+        assert_eq!(code.expect("runs"), 0);
+
+        let logged = std::fs::read_to_string(&parent_env_log).expect("the child logged its env");
+        assert_eq!(
+            logged.trim(),
+            "worker01",
+            "the child must see THIS session's own id, never the inherited grandparent's"
+        );
+    }
+
+    /// No identified delegating session (an operator's own raw terminal, no
+    /// `ZIRV_CTX_SESSION` at all) means no parent -- the child's env carries
+    /// no `PARENT_SESSION_ENV` at all, not an empty or placeholder value.
+    #[test]
+    fn a_headless_delegation_with_no_identified_delegating_session_sets_no_parent_env() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state_dir = tmp.path().join("state");
+        let mut env = base_env(&state_dir);
+        env.insert("ZIRV_CTX_PACE".to_string(), "false".to_string());
+        let parent_env_log = tmp.path().join("parent-env.log");
+
+        unsafe {
+            std::env::set_var("FAKE_AGENT_MODE", "healthy");
+            std::env::set_var("FAKE_AGENT_PARENT_ENV_LOG", &parent_env_log);
+        }
+        let args = args_for("claude", "do the work");
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE");
+            std::env::remove_var("FAKE_AGENT_PARENT_ENV_LOG");
+        }
+        assert_eq!(code.expect("runs"), 0);
+
+        let logged = std::fs::read_to_string(&parent_env_log).expect("the child logged its env");
+        assert_eq!(
+            logged.trim(),
+            "",
+            "with no identified delegating session, the child gets no parent at all"
         );
     }
 
