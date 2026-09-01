@@ -446,6 +446,47 @@ pub fn changed_paths(repo: &Path) -> CtxResult<Vec<PathBuf>> {
     Ok(paths)
 }
 
+/// The operator's actual change surface since the workflow's own diff base
+/// (`review::default_base`: merge-base against origin/main, then main, then
+/// HEAD^, then HEAD) -- unlike `changed_paths` above, which is uncommitted-
+/// only against bare HEAD and therefore goes blind to a frontend change the
+/// moment an earlier workflow step commits it (#251). Union of the diff
+/// against that base, the uncommitted diff against HEAD (kept for
+/// resilience when `default_base` degrades to `HEAD` itself), and untracked
+/// not-ignored files; paths that no longer exist on disk are dropped, since
+/// nothing later can scan them.
+pub fn changed_paths_since_base(repo: &Path) -> CtxResult<Vec<PathBuf>> {
+    let root = git_root(repo);
+    let base = super::review::default_base(repo)
+        .map_err(|err| format!("cannot inspect changed paths: {err}"))?;
+    let mut paths = Vec::new();
+    for args in [
+        &["diff", "--name-only", base.as_str()][..],
+        &["diff", "--name-only", "HEAD"][..],
+        &["ls-files", "--others", "--exclude-standard", "--full-name"][..],
+    ] {
+        let output = git_at(&root).args(args).output()?;
+        if !output.status.success() {
+            return Err(format!(
+                "cannot inspect changed paths: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )
+            .into());
+        }
+        paths.extend(
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .map(PathBuf::from)
+                .filter(|path: &PathBuf| !super::classify::is_workflow_work_path(path)),
+        );
+    }
+    paths.retain(|path| root.join(path).exists());
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
+}
+
 pub fn change_fingerprint(repo: &Path) -> CtxResult<u64> {
     let root = git_root(repo);
     let head = git_at(&root).args(["rev-parse", "HEAD"]).output()?;
@@ -2105,6 +2146,79 @@ mod tests {
             change_fingerprint(repo.path()).unwrap(),
             before,
             "an ordinary untracked file must still move the fingerprint"
+        );
+    }
+
+    /// #251: after a workflow step commits its edits, `changed_paths`
+    /// (uncommitted-only against bare HEAD) goes blind to them, which is
+    /// exactly what let a whole-repository frontend detector scan run
+    /// against a clean working tree. `changed_paths_since_base` must still
+    /// see a change committed since the workflow's diff base, even with
+    /// nothing left uncommitted.
+    #[test]
+    fn changed_paths_since_base_sees_committed_changes_invisible_to_changed_paths() {
+        let repo = tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let status = Command::new("git")
+                .args([
+                    "-c",
+                    "user.email=t@example.com",
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(repo.path())
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q", "-b", "main"]);
+        std::fs::write(repo.path().join("README.md"), "base\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "base"]);
+        git(&["checkout", "-q", "-b", "feature"]);
+        std::fs::write(
+            repo.path().join("Component.tsx"),
+            "export const X = () => null;\n",
+        )
+        .unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "add component"]);
+
+        // Fully committed: the ordinary uncommitted-only view sees nothing.
+        assert!(changed_paths(repo.path()).unwrap().is_empty());
+
+        let since_base = changed_paths_since_base(repo.path()).unwrap();
+        assert_eq!(since_base, vec![PathBuf::from("Component.tsx")]);
+    }
+
+    /// The since-base set also covers untracked files and drops anything
+    /// that no longer exists on disk (a path git still reports for an
+    /// uncommitted deletion), since nothing downstream can scan a path that
+    /// is not there.
+    #[test]
+    fn changed_paths_since_base_includes_untracked_and_drops_deleted_paths() {
+        let repo = git_repo();
+        std::fs::write(repo.path().join("tracked.txt"), "removed-next\n").unwrap();
+        let status = Command::new("git")
+            .args(["rm", "-q", "--cached", "tracked.txt"])
+            .current_dir(repo.path())
+            .status()
+            .expect("git rm --cached");
+        assert!(status.success());
+        std::fs::remove_file(repo.path().join("tracked.txt")).unwrap();
+        std::fs::write(repo.path().join("new.tsx"), "export {};\n").unwrap();
+
+        let since_base = changed_paths_since_base(repo.path()).unwrap();
+        assert!(
+            !since_base.contains(&PathBuf::from("tracked.txt")),
+            "a path deleted from disk must be dropped: {since_base:?}"
+        );
+        assert!(
+            since_base.contains(&PathBuf::from("new.tsx")),
+            "an untracked file must be included: {since_base:?}"
         );
     }
 

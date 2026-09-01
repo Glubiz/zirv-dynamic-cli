@@ -291,6 +291,12 @@ pub struct ReviewPackage {
     pub existing_findings: Vec<ReviewFinding>,
     pub review_round: u8,
     pub max_review_rounds: u8,
+    /// Set when an operator has accepted this workflow's pre-existing
+    /// blocking frontend findings with `--accept-preexisting-findings`
+    /// (#251), so a reviewer sees the same acceptance `zirv workflow
+    /// status` reports rather than discovering it only via a passing gate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accepted_preexisting_findings: Option<engine::AcceptedPreexistingFindings>,
 }
 
 fn review_round(state: &WorkflowState, current_fingerprint: u64) -> u8 {
@@ -797,6 +803,7 @@ fn package_pull_request(
         existing_findings: state.review_findings.clone(),
         review_round: 1,
         max_review_rounds: MAX_FIX_REVIEW_ROUNDS,
+        accepted_preexisting_findings: state.accepted_preexisting_findings.clone(),
     })
 }
 
@@ -1368,6 +1375,7 @@ pub fn package(
         existing_findings: state.review_findings.clone(),
         review_round,
         max_review_rounds: MAX_FIX_REVIEW_ROUNDS,
+        accepted_preexisting_findings: state.accepted_preexisting_findings.clone(),
     })
 }
 
@@ -2435,6 +2443,13 @@ pub fn run(args: &ReviewArgs, writer: &mut impl Write) -> CtxResult<i32> {
                     writeln!(writer)?;
                 } else {
                     writeln!(writer, "verification: none")?;
+                }
+                if let Some(accepted) = &package.accepted_preexisting_findings {
+                    writeln!(
+                        writer,
+                        "accepted pre-existing frontend findings: {} blocking / {} total at {} ({})",
+                        accepted.blocking, accepted.total, accepted.step, accepted.at
+                    )?;
                 }
             }
         }

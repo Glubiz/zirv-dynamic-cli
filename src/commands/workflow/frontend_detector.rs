@@ -7,6 +7,7 @@
 use std::collections::BTreeSet;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::LazyLock;
 
 use clap::{Args, ValueEnum};
@@ -183,6 +184,15 @@ pub struct DetectorFinding {
     pub disposition: FindingDisposition,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub waiver: Option<WaiverProvenance>,
+    /// True when this finding's path was NOT in the workflow's since-base
+    /// change set at scan time -- a full-surface (Review/Verify) scan tags
+    /// every finding this way so the gate can fail closed on anything the
+    /// current change introduced while still surfacing (rather than
+    /// silently hiding) what was already there (#251). Always `false` for a
+    /// scan that never had a baseline to compare against, such as a bare
+    /// `zirv frontend check`.
+    #[serde(default)]
+    pub preexisting: bool,
 }
 
 impl DetectorFinding {
@@ -208,6 +218,12 @@ pub struct DetectorReport {
     pub waivers_loaded: usize,
     #[serde(default)]
     pub waivers_rejected: usize,
+    /// True for a report with zero analyzed files that neither failed nor
+    /// was truncated: "0 frontend files in scope" rather than "no evidence".
+    /// A workflow gate must treat this as a pass (#255), never as missing
+    /// evidence to fail closed on.
+    #[serde(default)]
+    pub not_applicable: bool,
 }
 
 impl DetectorReport {
@@ -219,6 +235,35 @@ impl DetectorReport {
         self.findings
             .iter()
             .filter(|finding| finding.blocks())
+            .count()
+    }
+
+    /// Blocking findings whose path was in the since-base change set (or
+    /// that were never tagged against one) -- these always fail a workflow
+    /// gate, regardless of `--accept-preexisting-findings` (#251).
+    pub fn introduced_blocking_count(&self) -> usize {
+        self.findings
+            .iter()
+            .filter(|finding| finding.blocks() && !finding.preexisting)
+            .count()
+    }
+
+    /// Blocking findings tagged `preexisting`: not introduced by the current
+    /// change, but present in the full-surface scope a Review/Verify gate
+    /// scans. An operator can accept these explicitly.
+    pub fn preexisting_blocking_count(&self) -> usize {
+        self.findings
+            .iter()
+            .filter(|finding| finding.blocks() && finding.preexisting)
+            .count()
+    }
+
+    /// Every pre-existing finding regardless of severity, for the "N
+    /// blocking / M total" acceptance record and status line.
+    pub fn preexisting_total_count(&self) -> usize {
+        self.findings
+            .iter()
+            .filter(|finding| finding.preexisting)
             .count()
     }
 }
@@ -338,9 +383,8 @@ pub fn detect(
     all: bool,
 ) -> CtxResult<DetectorReport> {
     let repo = repo.canonicalize().unwrap_or_else(|_| repo.to_path_buf());
-    let profile = super::frontend::ensure_profile(state, &repo)?;
     let mut truncated = false;
-    let (scope, mut paths) = if !requested.is_empty() {
+    let (scope, paths) = if !requested.is_empty() {
         (DetectorScope::Explicit, requested.to_vec())
     } else if all {
         let (paths, scan_truncated) = collect_all(&repo)?;
@@ -352,7 +396,63 @@ pub fn detect(
             super::verification::changed_paths(&repo)?,
         )
     };
-    paths.retain(|path| is_frontend_source(&repo, path));
+    detect_with_scope(state, &repo, scope, paths, truncated, None)
+}
+
+/// The workflow-facing entry point (#251/#255). Unlike the standalone
+/// `detect` above, this always measures the since-base change set
+/// (`verification::changed_paths_since_base`, which -- unlike
+/// `changed_paths` -- still sees a change once an earlier step has
+/// committed it) and uses it two ways:
+///
+/// - When `require_full_surface` is false (the Test-phase gate), scope is
+///   ALWAYS `Changed` over that since-base set -- never a whole-repository
+///   fallback, which used to fire the moment the change set went quiet
+///   after a commit and fail the gate on unrelated pre-existing findings.
+/// - When `require_full_surface` is true (Review/Verify), the scan still
+///   covers the whole repository, but every finding is tagged
+///   `preexisting` against the since-base set so the gate (and an operator
+///   reading the report) can tell a finding this change introduced from one
+///   that was already there.
+pub fn detect_for_workflow(
+    state: &StateDir,
+    repo: &Path,
+    require_full_surface: bool,
+) -> CtxResult<DetectorReport> {
+    let repo = repo.canonicalize().unwrap_or_else(|_| repo.to_path_buf());
+    let since_base = super::verification::changed_paths_since_base(&repo)?;
+    if require_full_surface {
+        let (paths, truncated) = collect_all(&repo)?;
+        detect_with_scope(
+            state,
+            &repo,
+            DetectorScope::All,
+            paths,
+            truncated,
+            Some(&since_base),
+        )
+    } else {
+        detect_with_scope(
+            state,
+            &repo,
+            DetectorScope::Changed,
+            since_base.clone(),
+            false,
+            Some(&since_base),
+        )
+    }
+}
+
+fn detect_with_scope(
+    state: &StateDir,
+    repo: &Path,
+    scope: DetectorScope,
+    mut paths: Vec<PathBuf>,
+    mut truncated: bool,
+    preexisting_baseline: Option<&[PathBuf]>,
+) -> CtxResult<DetectorReport> {
+    let profile = super::frontend::ensure_profile(state, repo)?;
+    paths.retain(|path| is_frontend_source(repo, path));
     paths.sort();
     paths.dedup();
     truncated |= paths.len() > MAX_FILES;
@@ -366,7 +466,7 @@ pub fn detect(
             truncated = true;
             break;
         }
-        let (relative, absolute) = resolve_file(&repo, &requested_path)?;
+        let (relative, absolute) = resolve_file(repo, &requested_path)?;
         if !absolute.exists() {
             continue;
         }
@@ -402,14 +502,20 @@ pub fn detect(
             .then(left.line.cmp(&right.line))
             .then(left.rule_id.cmp(&right.rule_id))
     });
-    let waivers = load_waivers(&repo)?;
+    if let Some(baseline) = preexisting_baseline {
+        for finding in &mut findings {
+            finding.preexisting = !baseline.contains(&finding.path);
+        }
+    }
+    let waivers = load_waivers(repo)?;
     let waivers_rejected = apply_waivers(&mut findings, &waivers);
+    let not_applicable = analyzed_files.is_empty() && !truncated;
 
-    let change_fingerprint = super::verification::change_fingerprint(&repo)?;
+    let change_fingerprint = super::verification::change_fingerprint(repo)?;
     let report = DetectorReport {
         schema_version: DETECTOR_REPORT_SCHEMA_VERSION,
         id: uuid::Uuid::new_v4().to_string(),
-        repo,
+        repo: repo.to_path_buf(),
         change_fingerprint,
         profile_fingerprint: profile.source_fingerprint,
         scope,
@@ -420,6 +526,7 @@ pub fn detect(
         findings,
         waivers_loaded: waivers.len(),
         waivers_rejected,
+        not_applicable,
     };
     save_report(state, &report)?;
     let mut event =
@@ -440,23 +547,6 @@ pub fn detect(
         &super::telemetry::TelemetryConfig::for_repo(&report.repo),
     );
     Ok(report)
-}
-
-pub fn detect_for_workflow(
-    state: &StateDir,
-    repo: &Path,
-    require_full_surface: bool,
-) -> CtxResult<DetectorReport> {
-    let changed = super::verification::changed_paths(repo)?;
-    let has_existing_frontend_change = changed
-        .iter()
-        .any(|path| repo.join(path).is_file() && is_frontend_source(repo, path));
-    detect(
-        state,
-        repo,
-        &[],
-        require_full_surface || !has_existing_frontend_change,
-    )
 }
 
 fn resolve_file(repo: &Path, requested: &Path) -> CtxResult<(PathBuf, PathBuf)> {
@@ -481,7 +571,79 @@ fn resolve_file(repo: &Path, requested: &Path) -> CtxResult<(PathBuf, PathBuf)> 
     Ok((relative, normalized))
 }
 
+/// Directory names never worth scanning: VCS internals, zirv's own state,
+/// and the usual dependency/build-output noise. Applied whether the
+/// candidate list comes from `git ls-files` or the hand-rolled walk below.
+const DENIED_DIR_NAMES: &[&str] = &[
+    ".git",
+    ".zirv",
+    "node_modules",
+    "target",
+    "dist",
+    "build",
+    ".next",
+    ".cache",
+    "vendor",
+];
+
+fn has_denied_component(path: &Path) -> bool {
+    path.components().any(|component| {
+        matches!(component, std::path::Component::Normal(name)
+            if DENIED_DIR_NAMES.iter().any(|denied| name.to_str() == Some(*denied)))
+    })
+}
+
+/// #251: the hand-rolled walk below does not honor `.gitignore`, so a
+/// generated build artifact directory a repository never bothered to add to
+/// the deny list above (`.gitlab-ci-local/builds/.docker` in the wild) still
+/// got scanned. When `repo` is a git work tree, ask git for the candidate
+/// list instead -- tracked plus untracked-not-ignored -- which is both
+/// `.gitignore`-aware and cheaper than a manual recursive walk.
+fn collect_all_via_git(repo: &Path) -> CtxResult<(Vec<PathBuf>, bool)> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args([
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+        ])
+        .output()?;
+    let mut paths: Vec<PathBuf> = output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| PathBuf::from(String::from_utf8_lossy(entry).into_owned()))
+        // `--cached` can list a file that was deleted from the working tree
+        // without `git rm`; nothing downstream can scan a path that is not
+        // actually there.
+        .filter(|path| !has_denied_component(path) && repo.join(path).is_file())
+        .filter(|path| is_frontend_source(repo, path))
+        .collect();
+    paths.sort();
+    paths.dedup();
+    let truncated = paths.len() > MAX_FILES;
+    paths.truncate(MAX_FILES);
+    Ok((paths, truncated))
+}
+
+fn is_git_work_tree(repo: &Path) -> bool {
+    Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .output()
+        .is_ok_and(|output| {
+            output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "true"
+        })
+}
+
 fn collect_all(repo: &Path) -> CtxResult<(Vec<PathBuf>, bool)> {
+    if is_git_work_tree(repo) {
+        return collect_all_via_git(repo);
+    }
     let mut paths = Vec::new();
     let mut entries = 0usize;
     let mut truncated = false;
@@ -516,20 +678,7 @@ fn collect_directory(
         }
         if metadata.is_dir() {
             let name = child.file_name();
-            if !matches!(
-                name.to_str(),
-                Some(
-                    ".git"
-                        | ".zirv"
-                        | "node_modules"
-                        | "target"
-                        | "dist"
-                        | "build"
-                        | ".next"
-                        | ".cache"
-                        | "vendor"
-                )
-            ) {
+            if !DENIED_DIR_NAMES.contains(&name.to_str().unwrap_or_default()) {
                 collect_directory(repo, &path, depth + 1, entries, paths, truncated)?;
             }
         } else if metadata.is_file() {
@@ -610,6 +759,7 @@ fn finding(
         evidence: String::new(),
         disposition: FindingDisposition::Active,
         waiver: None,
+        preexisting: false,
     });
 }
 
@@ -1475,6 +1625,20 @@ fn write_report(writer: &mut impl Write, report: &DetectorReport, json: bool) ->
         report.blocking_count(),
         report.findings.len()
     )?;
+    if report.not_applicable {
+        writeln!(
+            writer,
+            "frontend gate not applicable (0 frontend files in scope)"
+        )?;
+    }
+    if report.scope == DetectorScope::All {
+        writeln!(
+            writer,
+            "introduced {} blocking / pre-existing {} blocking",
+            report.introduced_blocking_count(),
+            report.preexisting_blocking_count()
+        )?;
+    }
     for finding in &report.findings {
         writeln!(
             writer,
@@ -1936,6 +2100,56 @@ mod tests {
         let outside = tempfile::NamedTempFile::new().expect("outside");
         let error = resolve_file(repo.path(), outside.path()).unwrap_err();
         assert!(error.to_string().contains("escapes repository"));
+    }
+
+    /// #251: the hand-rolled walk never honored `.gitignore`, so a build
+    /// artifact directory a repository never bothered to add to the
+    /// hardcoded deny list still got scanned. A git work tree must instead
+    /// enumerate via `git ls-files`, which is `.gitignore`-aware.
+    #[test]
+    fn collect_all_honors_gitignore_via_git_ls_files() {
+        let repo = tempfile::tempdir().expect("repo");
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.email=t@example.com",
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(repo.path())
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(repo.path().join(".gitignore"), "ignored/\n").unwrap();
+        std::fs::create_dir_all(repo.path().join("ignored")).unwrap();
+        std::fs::write(
+            repo.path().join("ignored/Bad.tsx"),
+            "export const Bad = () => <img src={x} />;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.path().join("Good.tsx"),
+            "export const Good = () => <img src={x} alt=\"\" />;\n",
+        )
+        .unwrap();
+        git(&["add", ".gitignore", "Good.tsx"]);
+        git(&["commit", "-q", "-m", "base"]);
+
+        let (paths, truncated) = collect_all(repo.path()).unwrap();
+        assert!(!truncated);
+        assert!(paths.contains(&PathBuf::from("Good.tsx")), "{paths:?}");
+        assert!(
+            !paths
+                .iter()
+                .any(|path| path.to_string_lossy().contains("ignored")),
+            "a gitignored directory must not be scanned: {paths:?}"
+        );
     }
 
     #[test]

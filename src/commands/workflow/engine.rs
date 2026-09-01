@@ -453,7 +453,7 @@ pub enum WorkflowStatus {
     Cancelled,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 pub enum WorkflowProfile {
     #[default]
@@ -470,26 +470,64 @@ impl WorkflowProfile {
     }
 }
 
+/// Whether a workflow's `profile` came from automatic classification or was
+/// later forced by an operator.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProfileSource {
+    #[default]
+    Classified,
+    OperatorOverride,
+}
+
+/// Recorded once an operator accepts a workflow's pre-existing blocking
+/// frontend findings with `--accept-preexisting-findings` (#251): pre-dating
+/// findings the detector's full-surface scan turned up that were not
+/// introduced by this change. `blocking`/`total` are the pre-existing counts
+/// at the moment of acceptance, not a live re-count.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcceptedPreexistingFindings {
+    pub step: String,
+    pub at: String,
+    pub blocking: usize,
+    pub total: usize,
+}
+
+/// Selects each step's skill for `profile`, in both directions: applying
+/// Frontend overlays the frontend-flavored skills, and applying Standard
+/// (used by `WorkflowState::set_profile`/`workflow reclassify` reverting a
+/// workflow away from Frontend) restores the same base names `materialize`
+/// assigns by default. Idempotent either way, so calling it from ordinary
+/// materialize with the freshly-derived profile is a no-op the first time.
 fn apply_profile(profile: WorkflowProfile, steps: &mut [WorkflowStep]) {
-    if profile != WorkflowProfile::Frontend {
-        return;
-    }
     for step in steps {
-        step.skill = match step.phase {
-            WorkflowPhase::Intent => continue,
-            WorkflowPhase::Design => "frontend-design",
-            WorkflowPhase::Plan => "frontend-plan",
-            WorkflowPhase::Implement => "frontend-implement",
-            WorkflowPhase::Debug => "frontend-debug",
-            WorkflowPhase::Test => "frontend-test",
-            WorkflowPhase::Review => "frontend-review",
-            WorkflowPhase::Verify => "frontend-verify",
-            WorkflowPhase::Deploy | WorkflowPhase::Delegate | WorkflowPhase::Present => continue,
+        step.skill = match (profile, step.phase) {
+            (_, WorkflowPhase::Intent) => continue,
+            (WorkflowProfile::Frontend, WorkflowPhase::Design) => "frontend-design",
+            (WorkflowProfile::Standard, WorkflowPhase::Design) => "design",
+            (WorkflowProfile::Frontend, WorkflowPhase::Plan) => "frontend-plan",
+            (WorkflowProfile::Standard, WorkflowPhase::Plan) => "plan",
+            (WorkflowProfile::Frontend, WorkflowPhase::Implement) => "frontend-implement",
+            (WorkflowProfile::Standard, WorkflowPhase::Implement) => "implement",
+            (WorkflowProfile::Frontend, WorkflowPhase::Debug) => "frontend-debug",
+            (WorkflowProfile::Standard, WorkflowPhase::Debug) => "systematic-debugging",
+            (WorkflowProfile::Frontend, WorkflowPhase::Test) => "frontend-test",
+            (WorkflowProfile::Standard, WorkflowPhase::Test) => "testing",
+            (WorkflowProfile::Frontend, WorkflowPhase::Review) => "frontend-review",
+            (WorkflowProfile::Standard, WorkflowPhase::Review) => "review",
+            (WorkflowProfile::Frontend, WorkflowPhase::Verify) => "frontend-verify",
+            (WorkflowProfile::Standard, WorkflowPhase::Verify) => "verify",
+            (_, WorkflowPhase::Deploy | WorkflowPhase::Delegate | WorkflowPhase::Present) => {
+                continue;
+            }
         }
         .into();
         // The agent owns routine visual decisions. The workflow still
         // enforces evidence gates; it never pauses for a theme vote.
-        if step.phase == WorkflowPhase::Design && step.artifact.is_none() {
+        if profile == WorkflowProfile::Frontend
+            && step.phase == WorkflowPhase::Design
+            && step.artifact.is_none()
+        {
             step.approval = false;
         }
     }
@@ -615,6 +653,19 @@ pub struct WorkflowState {
     /// the historical single-repo behavior of scanning `repo` itself.
     #[serde(default)]
     pub frontend_target_root: Option<PathBuf>,
+    /// Whether `profile` came from automatic classification or was later
+    /// forced by an operator (`--profile` at start, or `workflow
+    /// reclassify`). A state saved before this key existed defaults to
+    /// `Classified`, its historical-only behavior.
+    #[serde(default)]
+    pub profile_source: ProfileSource,
+    /// Set once an operator has accepted a workflow's pre-existing (not
+    /// newly introduced) blocking frontend findings via
+    /// `--accept-preexisting-findings`. Once present, pre-existing blocking
+    /// findings stop failing the frontend gate for the rest of this
+    /// workflow; newly introduced blocking findings always still fail.
+    #[serde(default)]
+    pub accepted_preexisting_findings: Option<AcceptedPreexistingFindings>,
     #[serde(default)]
     pub phase_started_at: u64,
     /// Whether the intent step (when present) uses `brainstorm` (interactive
@@ -673,12 +724,26 @@ impl WorkflowState {
             review_evidence: Vec::new(),
             usage_checkpoint: None,
             frontend_target_root: None,
+            profile_source: ProfileSource::Classified,
+            accepted_preexisting_findings: None,
             phase_started_at: now,
             brainstorm,
             status,
             created_at: now,
             updated_at: now,
         }
+    }
+
+    /// Forces this workflow's methodology overlay to `profile`, marks it an
+    /// operator override, and re-runs `apply_profile` over the current step
+    /// list so every not-yet-completed step picks up the new profile's
+    /// skills. Used by `--profile` at `workflow start` (applied after
+    /// classification has already materialized the default steps) and by
+    /// `workflow reclassify`.
+    pub(crate) fn set_profile(&mut self, profile: WorkflowProfile) {
+        self.profile = profile;
+        self.profile_source = ProfileSource::OperatorOverride;
+        apply_profile(profile, &mut self.steps);
     }
 }
 
@@ -1447,6 +1512,7 @@ pub fn advance_with_evidence(
     mut state: WorkflowState,
     outcome: StepOutcome,
     evidence: Option<&TransitionEvidence>,
+    accept_preexisting_findings: bool,
 ) -> CtxResult<WorkflowState> {
     refresh_deploy_tier(&mut state)?;
     if let Some(stage) = artifact_drift(&state)? {
@@ -1471,43 +1537,69 @@ pub fn advance_with_evidence(
         .ok_or("workflow has no current step")?;
     match outcome {
         StepOutcome::Success => {
-            let frontend_root = state
+            let frontend_root: PathBuf = state
                 .frontend_target_root
-                .as_deref()
-                .unwrap_or(state.repo.as_path());
+                .clone()
+                .unwrap_or_else(|| state.repo.clone());
             if state.profile == WorkflowProfile::Frontend
                 && matches!(
                     current.phase,
                     WorkflowPhase::Test | WorkflowPhase::Review | WorkflowPhase::Verify
                 )
-                && !super::frontend_detector::latest_is_fresh_and_passing(state_dir, frontend_root)?
+                && !super::frontend_detector::latest_is_fresh_and_passing(
+                    state_dir,
+                    &frontend_root,
+                )?
             {
                 let report = super::frontend_detector::detect_for_workflow(
                     state_dir,
-                    frontend_root,
+                    &frontend_root,
                     matches!(current.phase, WorkflowPhase::Review | WorkflowPhase::Verify),
                 )?;
-                if !report.passed() || report.truncated || report.analyzed_files.is_empty() {
+                let introduced = report.introduced_blocking_count();
+                let preexisting = report.preexisting_blocking_count();
+                let preexisting_already_accepted = state.accepted_preexisting_findings.is_some();
+                let preexisting_accepted =
+                    accept_preexisting_findings || preexisting_already_accepted;
+                if report.truncated || introduced > 0 || (preexisting > 0 && !preexisting_accepted)
+                {
+                    let accept_hint = if preexisting > 0 && !preexisting_accepted {
+                        format!(
+                            "; pass --accept-preexisting-findings to accept {preexisting} pre-existing blocking finding(s) and proceed"
+                        )
+                    } else {
+                        String::new()
+                    };
                     return Err(format!(
-                        "frontend step '{}' automatically ran the detector against '{}', but evidence did not pass ({} blocking, {} files, truncated={}); inspect with `zirv frontend check --all --repo {}`, or set `--frontend-root` if the frontend lives in a different repository",
+                        "frontend step '{}' automatically ran the detector against '{}', but evidence did not pass ({} introduced blocking, {} pre-existing blocking, {} files, truncated={}); inspect with `zirv frontend check --all --repo {}`{}, or set `--frontend-root` if the frontend lives in a different repository",
                         current.id,
                         frontend_root.display(),
-                        report.blocking_count(),
+                        introduced,
+                        preexisting,
                         report.analyzed_files.len(),
                         report.truncated,
-                        frontend_root.display()
+                        frontend_root.display(),
+                        accept_hint
                     )
                     .into());
+                }
+                if preexisting > 0 && accept_preexisting_findings && !preexisting_already_accepted {
+                    state.accepted_preexisting_findings = Some(AcceptedPreexistingFindings {
+                        step: current.id.clone(),
+                        at: rfc3339_now(),
+                        blocking: preexisting,
+                        total: report.preexisting_total_count(),
+                    });
                 }
             }
             if state.profile == WorkflowProfile::Frontend
                 && matches!(current.phase, WorkflowPhase::Review | WorkflowPhase::Verify)
                 && !super::frontend_render::latest_visual_is_fresh_and_passing(
                     state_dir,
-                    frontend_root,
+                    &frontend_root,
                 )?
             {
-                let render = super::frontend_render::render(state_dir, frontend_root)?;
+                let render = super::frontend_render::render(state_dir, &frontend_root)?;
                 if !render.passed() {
                     return Err(format!(
                         "frontend step '{}' could not collect automatic rendered evidence against '{}': {}; inspect with `zirv frontend render --repo {}`",
@@ -1520,7 +1612,7 @@ pub fn advance_with_evidence(
                 }
                 let review = super::frontend_render::review(
                     state_dir,
-                    frontend_root,
+                    &frontend_root,
                     &super::frontend_render::VisualReviewArgs {
                         repo: Some(frontend_root.to_path_buf()),
                         agent: None,
@@ -1773,6 +1865,42 @@ pub fn approve(state_dir: &StateDir, mut state: WorkflowState) -> CtxResult<Work
     Ok(state)
 }
 
+/// Forces a persisted workflow's methodology overlay (#255 recovery path: a
+/// misclassified profile previously could only be fixed by abandoning the
+/// workflow). A profile change never adds, removes, or reorders steps --
+/// `WorkflowState::set_profile` relabels skills on the existing step list in
+/// place -- so completed steps and accepted artifacts are structurally
+/// untouched; the state machine is never reset. (Unlike a risk increase,
+/// which can genuinely require a new gate, `rematerialize_after_risk_
+/// increase`'s known-step-id trimming would be a no-op here anyway, since
+/// the same classification always produces the same step ids.)
+pub fn reclassify(
+    state_dir: &StateDir,
+    mut state: WorkflowState,
+    profile: WorkflowProfile,
+) -> CtxResult<WorkflowState> {
+    if !matches!(
+        state.status,
+        WorkflowStatus::Running | WorkflowStatus::AwaitingApproval
+    ) {
+        return Err(format!("cannot reclassify workflow in {:?} state", state.status).into());
+    }
+    state.set_profile(profile);
+    sync_artifact_records(&mut state);
+    state.status = match state.current() {
+        None => WorkflowStatus::Completed,
+        Some(step) if step.approval => WorkflowStatus::AwaitingApproval,
+        Some(_) => WorkflowStatus::Running,
+    };
+    state.updated_at = now_secs();
+    let active = matches!(
+        state.status,
+        WorkflowStatus::Running | WorkflowStatus::AwaitingApproval
+    );
+    save(state_dir, &state, active)?;
+    Ok(state)
+}
+
 /// A headless worker must not answer `brainstorm`'s clarifying questions or
 /// write the intent artifact on the operator's behalf.
 const BRAINSTORM_HEADLESS_REFUSAL: &str = "This step needs an interactive operator. Do not answer the clarifying questions on their behalf or write the intent artifact; stop and report that the workflow is waiting for the operator.";
@@ -1921,6 +2049,9 @@ pub enum WorkflowSubcommand {
     Status(StatusArgs),
     /// Restore a running workflow as this repository's active workflow.
     Resume(StateIdArgs),
+    /// Force a persisted workflow's methodology overlay, preserving
+    /// completed steps and accepted artifacts (#255 recovery path).
+    Reclassify(ReclassifyArgs),
     /// Print only the current step's resolved skill context.
     Context(StatusArgs),
     /// Inspect committed workflow work-product artifacts and acceptance state.
@@ -1989,6 +2120,11 @@ pub struct StartArgs {
     /// Force the autonomous `write-intent` skill at the intent step.
     #[arg(long)]
     pub no_brainstorm: bool,
+    /// Force this workflow's methodology overlay instead of trusting
+    /// automatic classification (#255 recovery path: a misclassified
+    /// profile can otherwise only be fixed by abandoning the workflow).
+    #[arg(long, value_enum)]
+    pub profile: Option<WorkflowProfile>,
     #[arg(long)]
     pub json: bool,
 }
@@ -2019,6 +2155,17 @@ pub struct StateIdArgs {
     pub id: String,
     #[arg(long)]
     pub repo: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub struct ReclassifyArgs {
+    pub id: String,
+    #[arg(long)]
+    pub repo: Option<PathBuf>,
+    #[arg(long, value_enum)]
+    pub profile: WorkflowProfile,
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -2097,6 +2244,12 @@ pub struct AdvanceArgs {
     /// once it becomes clear the tracked repo isn't the one under test.
     #[arg(long)]
     pub frontend_root: Option<PathBuf>,
+    /// Accept the frontend detector's pre-existing (not newly introduced)
+    /// blocking findings so this advance can proceed; introduced blocking
+    /// findings always still fail. Recorded on the workflow and applies for
+    /// the rest of it once accepted.
+    #[arg(long)]
+    pub accept_preexisting_findings: bool,
 }
 
 fn resolve_repo(repo: Option<&Path>) -> CtxResult<PathBuf> {
@@ -2390,9 +2543,24 @@ fn write_state(writer: &mut impl Write, state: &WorkflowState, json: bool) -> Ct
     } else {
         writeln!(writer, "workflow: {}", state.id)?;
         writeln!(writer, "kind: {}", state.kind.as_str())?;
-        writeln!(writer, "profile: {:?}", state.profile)?;
+        writeln!(
+            writer,
+            "profile: {:?} ({})",
+            state.profile,
+            match state.profile_source {
+                ProfileSource::Classified => "classified",
+                ProfileSource::OperatorOverride => "operator override",
+            }
+        )?;
         if let Some(frontend_root) = &state.frontend_target_root {
             writeln!(writer, "frontend target root: {}", frontend_root.display())?;
+        }
+        if let Some(accepted) = &state.accepted_preexisting_findings {
+            writeln!(
+                writer,
+                "accepted pre-existing frontend findings: {} blocking / {} total at {} ({})",
+                accepted.blocking, accepted.total, accepted.step, accepted.at
+            )?;
         }
         writeln!(writer, "deploy tier: {}", state.deploy_tier)?;
         writeln!(writer, "status: {:?}", state.status)?;
@@ -2587,6 +2755,9 @@ pub fn run(args: &WorkflowArgs, writer: &mut impl Write) -> CtxResult<i32> {
                 state.brainstorm = brainstorm;
                 apply_brainstorm_selection(brainstorm, &mut state.steps);
             }
+            if let Some(forced_profile) = args.profile {
+                state.set_profile(forced_profile);
+            }
             apply_effective_deploy_tier(&mut state, deploy_tier);
             state.usage_checkpoint = usage_checkpoint(&state.repo);
             if let Some(frontend_root) = &args.frontend_root {
@@ -2640,6 +2811,12 @@ pub fn run(args: &WorkflowArgs, writer: &mut impl Write) -> CtxResult<i32> {
             ensure_current_artifact_template(&state)?;
             save(&state_dir, &state, true)?;
             write_state(writer, &state, false)?;
+        }
+        WorkflowSubcommand::Reclassify(args) => {
+            let repo = resolve_repo(args.repo.as_deref())?;
+            let state_dir = resolve_state()?;
+            let state = reclassify(&state_dir, load(&state_dir, &repo, &args.id)?, args.profile)?;
+            write_state(writer, &state, args.json)?;
         }
         WorkflowSubcommand::Context(args) => {
             let repo = resolve_repo(args.repo.as_deref())?;
@@ -2730,7 +2907,13 @@ pub fn run(args: &WorkflowArgs, writer: &mut impl Write) -> CtxResult<i32> {
                     ..Default::default()
                 },
             );
-            let state = advance_with_evidence(&state_dir, state, args.outcome, Some(&evidence))?;
+            let state = advance_with_evidence(
+                &state_dir,
+                state,
+                args.outcome,
+                Some(&evidence),
+                args.accept_preexisting_findings,
+            )?;
             write_state(writer, &state, args.json)?;
         }
         WorkflowSubcommand::Review(args) => {
@@ -3074,7 +3257,7 @@ mod tests {
         save(&state_dir, &state, true).unwrap();
 
         let advanced =
-            advance_with_evidence(&state_dir, state, StepOutcome::Success, None).unwrap();
+            advance_with_evidence(&state_dir, state, StepOutcome::Success, None, false).unwrap();
         assert_eq!(advanced.current().unwrap().phase, WorkflowPhase::Test);
 
         let events = crate::commands::workflow::telemetry::list(&state_dir, &advanced.repo)
@@ -3297,7 +3480,7 @@ mod tests {
         state.current_step = test_index;
         state.status = WorkflowStatus::Running;
 
-        let error = advance_with_evidence(&state_dir, state, StepOutcome::Success, None)
+        let error = advance_with_evidence(&state_dir, state, StepOutcome::Success, None, false)
             .unwrap_err()
             .to_string();
 
@@ -3335,13 +3518,22 @@ mod tests {
                 .expect("run git");
             assert!(status.success(), "git {args:?} failed in {}", dir.display());
         };
-        // Both repos are real (empty) git checkouts, so `changed_paths`
+        // Both repos are real git checkouts, so `changed_paths_since_base`
         // resolves cleanly instead of surfacing an unrelated "not a git
         // repository" error that would mask what this test is about.
         git(workflow_repo.path(), &["init", "-q"]);
         std::fs::write(workflow_repo.path().join("README.md"), "readme\n").unwrap();
         git(workflow_repo.path(), &["add", "."]);
         git(workflow_repo.path(), &["commit", "-q", "-m", "base"]);
+        // #255: an empty scan is now a pass ("not applicable"), so this repo
+        // needs a real, introduced blocking finding in scope -- not just an
+        // absence of frontend files -- to still demonstrate the wrong repo
+        // being scanned when `--frontend-root` is missing.
+        std::fs::write(
+            workflow_repo.path().join("Bad.tsx"),
+            "export const Bad = () => <img src={avatar} />;\n",
+        )
+        .unwrap();
 
         git(target_repo.path(), &["init", "-q"]);
         std::fs::write(target_repo.path().join("README.md"), "readme\n").unwrap();
@@ -3390,6 +3582,7 @@ mod tests {
             build_state(classification.clone()),
             StepOutcome::Success,
             None,
+            false,
         )
         .unwrap_err()
         .to_string();
@@ -3404,7 +3597,7 @@ mod tests {
         // recorded evidence for.
         let mut state = build_state(classification);
         state.frontend_target_root = Some(target_repo.path().canonicalize().unwrap());
-        let with_root = advance_with_evidence(&state_dir, state, StepOutcome::Success, None)
+        let with_root = advance_with_evidence(&state_dir, state, StepOutcome::Success, None, false)
             .unwrap_err()
             .to_string();
         assert!(
@@ -3415,6 +3608,96 @@ mod tests {
             with_root.contains("requires fresh passing evidence"),
             "{with_root}"
         );
+    }
+
+    /// #255: a repository with zero frontend-extension files in scope is
+    /// "frontend gate not applicable", not missing evidence to fail closed
+    /// on -- the old `report.analyzed_files.is_empty()` check made a
+    /// Frontend-profile workflow over a backend-only change unable to ever
+    /// pass its Test step.
+    #[test]
+    fn frontend_test_step_passes_with_zero_frontend_files_in_the_change_surface() {
+        let repo = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.email=t@example.com",
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(repo.path())
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(repo.path().join("README.md"), "hello\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "base"]);
+
+        let mut classification = low_classification();
+        classification.work_domain.domain = WorkDomain::Frontend;
+        classification.work_domain.score = 55;
+        let mut state = WorkflowState::start(
+            repo.path().to_path_buf(),
+            "build a frontend component".into(),
+            WorkflowKind::Feature,
+            None,
+            true,
+            classification,
+        );
+        let test_index = state
+            .steps
+            .iter()
+            .position(|step| step.phase == WorkflowPhase::Test)
+            .unwrap();
+        state.completed_steps = state.steps[..test_index]
+            .iter()
+            .map(|step| step.id.clone())
+            .collect();
+        state.current_step = test_index;
+        state.status = WorkflowStatus::Running;
+
+        // Seed passing general test evidence so the ONLY thing under test
+        // here is the frontend gate's handling of an empty (0 frontend
+        // files) scope, not the unrelated `zirv test changed` gate.
+        let fingerprint = super::super::verification::change_fingerprint(repo.path()).unwrap();
+        let evidence_report = super::super::verification::VerificationReport {
+            schema_version: super::super::verification::VERIFY_REPORT_SCHEMA_VERSION,
+            id: "seeded".into(),
+            mode: super::super::verification::VerificationMode::Changed,
+            source: "configured".into(),
+            repo: repo.path().to_path_buf(),
+            change_fingerprint: fingerprint,
+            changed_paths: vec![],
+            fallback_to_full: false,
+            narrowed_to: vec![],
+            notes: vec![],
+            started_at: 0,
+            finished_at: 0,
+            checks: vec![super::super::verification::CheckResult {
+                id: "unit".into(),
+                kind: super::super::verification::CheckKind::Unit,
+                command: "true".into(),
+                source: super::super::verification::CheckSource::DiscoveredToolchain,
+                status: super::super::verification::CheckStatus::Passed,
+                exit_code: Some(0),
+                duration_ms: 1,
+                failure_output: None,
+                failure_test_names: Vec::new(),
+            }],
+        };
+        super::super::verification::save_report(&state_dir, &evidence_report).unwrap();
+
+        let advanced = advance_with_evidence(&state_dir, state, StepOutcome::Success, None, false)
+            .expect("zero frontend files in scope must not fail the frontend gate");
+        assert_eq!(advanced.current().unwrap().phase, WorkflowPhase::Verify);
     }
 
     #[test]
@@ -3452,6 +3735,7 @@ mod tests {
                 output_tokens: None,
                 workers: 0,
                 frontend_root: Some(target_repo.path().to_path_buf()),
+                accept_preexisting_findings: false,
             }),
         };
         let mut out = Vec::new();
@@ -3520,6 +3804,7 @@ mod tests {
                 // `target_repo` is empty and has no detector evidence of its
                 // own, so the gate must still fail closed against it.
                 frontend_root: Some(target_repo.path().to_path_buf()),
+                accept_preexisting_findings: false,
             }),
         };
         let mut out = Vec::new();
@@ -3533,6 +3818,214 @@ mod tests {
         assert_eq!(
             reloaded.frontend_target_root,
             Some(target_repo.path().canonicalize().unwrap())
+        );
+    }
+
+    /// #255 recovery path (i): a task classified General/Standard (no
+    /// frontend text or path signal) can still be forced onto the Frontend
+    /// methodology overlay with `--profile`, applied after classification
+    /// materializes the default steps.
+    #[test]
+    fn start_profile_flag_overrides_automatic_classification() {
+        let repo = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let _state_dir_env = crate::commands::ctx::testenv::VarGuard::set(&[(
+            "ZIRV_CTX_STATE_DIR",
+            Some(root.path().to_str().expect("utf-8 tempdir path")),
+        )]);
+        let args = WorkflowArgs {
+            command: WorkflowSubcommand::Start(StartArgs {
+                kind: WorkflowKind::Bugfix,
+                task: "fix a database retry bug".into(),
+                agent: None,
+                built_in_only: true,
+                repo: Some(repo.path().to_path_buf()),
+                // Declared, so classification never needs a real git
+                // repository: this test is about `--profile`, not about
+                // git-measured risk.
+                paths: vec![PathBuf::from("src/commands/ctx/safety.rs")],
+                changed_lines: Some(40),
+                tests_changed: true,
+                complexity: None,
+                risk: None,
+                frontend_root: None,
+                brainstorm: false,
+                no_brainstorm: false,
+                profile: Some(WorkflowProfile::Frontend),
+                json: false,
+            }),
+        };
+        let mut out = Vec::new();
+        run(&args, &mut out).unwrap();
+
+        let state_dir = resolve_state().unwrap();
+        let state = load_active(&state_dir, repo.path()).unwrap().unwrap();
+        assert_eq!(
+            state.classification.work_domain.domain,
+            WorkDomain::General,
+            "the task/paths alone must not have classified this as Frontend"
+        );
+        assert_eq!(state.profile, WorkflowProfile::Frontend);
+        assert_eq!(state.profile_source, ProfileSource::OperatorOverride);
+        assert!(
+            state
+                .steps
+                .iter()
+                .any(|step| step.skill == "frontend-implement")
+        );
+    }
+
+    /// #255 recovery path (ii): `workflow reclassify` forces a persisted
+    /// workflow's profile without resetting the state machine -- completed
+    /// steps and already-accepted artifacts survive the change.
+    #[test]
+    fn reclassify_preserves_completed_steps_and_accepted_artifacts() {
+        let repo = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+        let mut classification = low_classification();
+        classification.complexity = Complexity::Substantial;
+        classification.risk = RiskBand::High;
+        let state = WorkflowState::start(
+            repo.path().to_path_buf(),
+            "substantial feature".into(),
+            WorkflowKind::Feature,
+            None,
+            true,
+            classification,
+        );
+        assert_eq!(state.status, WorkflowStatus::AwaitingApproval);
+        assert_eq!(state.current().unwrap().id, "intent");
+        ensure_current_artifact_template(&state).unwrap();
+        std::fs::write(
+            workflow_artifact_path(&state, ArtifactStage::Intent).unwrap(),
+            "# Intent\n\n## Problem\nConcrete problem\n\n## Desired outcome\nConcrete result\n",
+        )
+        .unwrap();
+        let state = approve(&state_dir, state).unwrap();
+        assert_eq!(state.current().unwrap().id, "spec");
+        ensure_current_artifact_template(&state).unwrap();
+        std::fs::write(
+            workflow_artifact_path(&state, ArtifactStage::Spec).unwrap(),
+            "# Specification\n\n## Context\nReal context\n\n## Goals\n- ship it\n",
+        )
+        .unwrap();
+        let state = approve(&state_dir, state).unwrap();
+        assert_eq!(state.current().unwrap().id, "plan");
+        assert_eq!(state.profile, WorkflowProfile::Standard);
+        let intent_hash_before = state.artifacts.get("intent").unwrap().accepted_hash.clone();
+        let spec_hash_before = state.artifacts.get("spec").unwrap().accepted_hash.clone();
+        assert!(intent_hash_before.is_some());
+        assert!(spec_hash_before.is_some());
+
+        let reclassified = reclassify(&state_dir, state, WorkflowProfile::Frontend).unwrap();
+
+        assert_eq!(reclassified.profile, WorkflowProfile::Frontend);
+        assert_eq!(reclassified.profile_source, ProfileSource::OperatorOverride);
+        assert_eq!(
+            reclassified.completed_steps,
+            vec!["intent".to_string(), "spec".to_string()],
+            "completed steps must survive reclassification"
+        );
+        assert_eq!(
+            reclassified.artifacts.get("intent").unwrap().accepted_hash,
+            intent_hash_before,
+            "the accepted intent artifact must survive reclassification"
+        );
+        assert_eq!(
+            reclassified.artifacts.get("spec").unwrap().accepted_hash,
+            spec_hash_before,
+            "the accepted spec artifact must survive reclassification"
+        );
+        assert_eq!(reclassified.current().unwrap().id, "plan");
+        assert_eq!(reclassified.current().unwrap().skill, "frontend-plan");
+
+        let reloaded = load(&state_dir, repo.path(), &reclassified.id).unwrap();
+        assert_eq!(reloaded.profile, WorkflowProfile::Frontend);
+    }
+
+    /// #251: a full-surface (Review/Verify) detector scan tags a finding
+    /// `preexisting` when its path was not part of the since-base change
+    /// set. Without `--accept-preexisting-findings` such a finding still
+    /// fails the gate and the error names the flag and the count; with the
+    /// flag, the gate accepts it, records the acceptance, and execution
+    /// reaches the next (render) gate instead.
+    #[test]
+    fn accept_preexisting_findings_flag_lets_the_review_gate_pass_pre_existing_blocking_findings() {
+        let repo = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.email=t@example.com",
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(repo.path())
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q", "-b", "main"]);
+        std::fs::write(
+            repo.path().join("Old.tsx"),
+            "export const Old = () => <img src={avatar} />;\n",
+        )
+        .unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "base"]);
+        git(&["checkout", "-q", "-b", "feature"]);
+        std::fs::write(
+            repo.path().join("style.css"),
+            ".card { color: rebeccapurple; }\n",
+        )
+        .unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "add clean style"]);
+
+        let mut classification = low_classification();
+        classification.risk = RiskBand::Medium;
+        classification.work_domain.domain = WorkDomain::Frontend;
+        classification.work_domain.score = 55;
+        let mut state = WorkflowState::start(
+            repo.path().to_path_buf(),
+            "review a frontend component".into(),
+            WorkflowKind::Review,
+            None,
+            true,
+            classification,
+        );
+        assert_eq!(state.current().unwrap().phase, WorkflowPhase::Review);
+        state.status = WorkflowStatus::Running;
+
+        let without_flag =
+            advance_with_evidence(&state_dir, state.clone(), StepOutcome::Success, None, false)
+                .unwrap_err()
+                .to_string();
+        assert!(
+            without_flag.contains("--accept-preexisting-findings"),
+            "{without_flag}"
+        );
+        assert!(
+            without_flag.contains("1 pre-existing blocking"),
+            "{without_flag}"
+        );
+        assert!(
+            without_flag.contains("0 introduced blocking"),
+            "{without_flag}"
+        );
+
+        let with_flag = advance_with_evidence(&state_dir, state, StepOutcome::Success, None, true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            !with_flag.contains("automatically ran the detector"),
+            "the flag must let the detector gate pass its pre-existing findings: {with_flag}"
         );
     }
 
@@ -3586,6 +4079,7 @@ mod tests {
             findings: Vec::new(),
             waivers_loaded: 0,
             waivers_rejected: 0,
+            not_applicable: false,
         };
         super::super::frontend_detector::save_report(&state_dir, &detector).unwrap();
         let mut classification = low_classification();
@@ -3606,7 +4100,7 @@ mod tests {
             .position(|step| step.phase == WorkflowPhase::Review)
             .unwrap();
 
-        let error = advance_with_evidence(&state_dir, state, StepOutcome::Success, None)
+        let error = advance_with_evidence(&state_dir, state, StepOutcome::Success, None, false)
             .unwrap_err()
             .to_string();
 
@@ -3675,6 +4169,7 @@ mod tests {
             findings: Vec::new(),
             waivers_loaded: 0,
             waivers_rejected: 0,
+            not_applicable: false,
         };
         super::super::frontend_detector::save_report(&state_dir, &detector).unwrap();
 
@@ -3697,7 +4192,7 @@ mod tests {
             .unwrap();
         state.frontend_target_root = Some(target_repo.path().canonicalize().unwrap());
 
-        let error = advance_with_evidence(&state_dir, state, StepOutcome::Success, None)
+        let error = advance_with_evidence(&state_dir, state, StepOutcome::Success, None, false)
             .unwrap_err()
             .to_string();
 
@@ -3743,7 +4238,8 @@ mod tests {
         assert_eq!(state.status, WorkflowStatus::AwaitingApproval);
         ensure_current_artifact_template(&state).unwrap();
         assert!(
-            advance_with_evidence(&state_dir, state.clone(), StepOutcome::Success, None).is_err()
+            advance_with_evidence(&state_dir, state.clone(), StepOutcome::Success, None, false)
+                .is_err()
         );
         assert!(
             approve(&state_dir, state.clone()).is_err(),
@@ -3907,8 +4403,8 @@ mod tests {
             "# Intent\n\n## Problem\nChanged after acceptance\n\n## Desired outcome\nB\n",
         )
         .unwrap();
-        let error =
-            advance_with_evidence(&state_dir, state, StepOutcome::Success, None).unwrap_err();
+        let error = advance_with_evidence(&state_dir, state, StepOutcome::Success, None, false)
+            .unwrap_err();
         assert!(error.to_string().contains("intent artifact changed"));
 
         let reopened = load_active(&state_dir, repo.path()).unwrap().unwrap();
@@ -4061,7 +4557,8 @@ mod tests {
             low_classification(),
         ));
         save(&state_dir, &state, true).unwrap();
-        state = advance_with_evidence(&state_dir, state, StepOutcome::Success, None).unwrap();
+        state =
+            advance_with_evidence(&state_dir, state, StepOutcome::Success, None, false).unwrap();
         let resumed = load(&state_dir, repo.path(), &state.id).unwrap();
         assert_eq!(resumed.completed_steps, vec!["intent", "implement"]);
         assert_eq!(resumed.current().unwrap().id, "test");
@@ -4082,7 +4579,8 @@ mod tests {
         ));
         save(&state_dir, &state, true).unwrap();
         for _ in 0..MAX_STEP_ATTEMPTS {
-            state = advance_with_evidence(&state_dir, state, StepOutcome::Failure, None).unwrap();
+            state = advance_with_evidence(&state_dir, state, StepOutcome::Failure, None, false)
+                .unwrap();
         }
         assert_eq!(state.status, WorkflowStatus::Failed);
         assert!(load_active(&state_dir, repo.path()).unwrap().is_none());
@@ -4572,8 +5070,8 @@ mod tests {
                 recommended_disposition: None,
                 created_at: now_secs(),
             });
-        let error =
-            advance_with_evidence(&state_dir, state, StepOutcome::Success, None).unwrap_err();
+        let error = advance_with_evidence(&state_dir, state, StepOutcome::Success, None, false)
+            .unwrap_err();
         assert!(error.to_string().contains("final disposition"));
     }
 
@@ -4592,8 +5090,8 @@ mod tests {
             true,
             classification,
         );
-        let error =
-            advance_with_evidence(&state_dir, state, StepOutcome::Success, None).unwrap_err();
+        let error = advance_with_evidence(&state_dir, state, StepOutcome::Success, None, false)
+            .unwrap_err();
         assert!(error.to_string().contains("independent review"));
     }
 }
