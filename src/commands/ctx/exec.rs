@@ -985,6 +985,12 @@ fn run_with_clock_inner<W: Write>(
         for (key, value) in turn_env_for(session) {
             command.env(key, value);
         }
+        // Issue #236: this module supervises only headless runs, so every
+        // child it spawns gets this marker, read by `engine::refusal_for` to
+        // refuse the interactive `brainstorm` skill. Scrubbed by
+        // `scrub_supervision_env_cmd` above first, so a nested headless
+        // launch never inherits a stale copy before this sets its own.
+        command.env(adapters::HEADLESS_ENV, "1");
     };
 
     // FIX B: on a Windows npm `.cmd` shim launch, `cmd.exe /c <shim>` reparses
@@ -1149,6 +1155,10 @@ fn run_with_clock_inner<W: Write>(
     // for the whole run rather than once per restart.
     let mut pace_flags = pace::PaceGateFlags::default();
     let http_poller = super::poll::HttpPoller::new(cfg.chrome.events);
+    // Issue #243 (review round, F3): owned across every cycle too, so a
+    // screening summary that has not changed since the last poll is
+    // announced once for the whole run, not once per restart.
+    let mut screening_announced: Option<String> = None;
 
     loop {
         pace::wait_for_window(
@@ -1223,6 +1233,8 @@ fn run_with_clock_inner<W: Write>(
             server.as_ref(),
             session.as_str(),
             &registry_short,
+            &announcer,
+            &mut screening_announced,
             &mut rotted,
             &mut progressed,
             &tap,
@@ -1608,7 +1620,7 @@ fn run_with_clock_inner<W: Write>(
                 cfg.supervise.max_nudges
             )?;
 
-            let combined = format!("{prompt_text}\n\n{}", note.to_markdown());
+            let combined = format!("{prompt_text}\n\n{}", handoff::labeled_for_injection(&note));
             let combined = super::prompt::task_prompt_with_composed_fallback(
                 &combined,
                 relaunch_system_prompt_supported,
@@ -1779,7 +1791,7 @@ fn run_with_clock_inner<W: Write>(
                 let prompt_text = prompt.clone().expect("route requires a known prompt");
                 let continuation = format!(
                     "{prompt_text}\n\nThe previous harness exhausted its usage window. Continue from this handoff without redoing completed work:\n\n{}",
-                    note.to_markdown()
+                    handoff::labeled_for_injection(&note)
                 );
                 let target = adapters::select(Some(&selected_agent), &[], &cfg)?;
                 let nested_args = ExecArgs {
@@ -2163,7 +2175,7 @@ fn run_with_clock_inner<W: Write>(
             composed.as_ref(),
             relaunch_system_prompt_supported,
         ));
-        let combined = format!("{prompt_text}\n\n{}", note.to_markdown());
+        let combined = format!("{prompt_text}\n\n{}", handoff::labeled_for_injection(&note));
         let combined = super::prompt::task_prompt_with_composed_fallback(
             &combined,
             relaunch_system_prompt_supported,
@@ -2328,6 +2340,13 @@ fn supervise_run(
     // restart mints a fresh session -- deriving it from `session` here meant
     // a nudge sent after the first restart was never claimed.
     registry_short: &str,
+    // Issue #243 (review round, F3): the same `Announcer` this run's other
+    // events already use, plus this run's own de-duplication memory --
+    // owned above the per-restart loop (like `registry_short`/`nudged_by`),
+    // so a screening summary that has not changed is announced once for
+    // the whole supervised run, not once per poll or once per restart.
+    announcer: &super::announce::Announcer,
+    screening_announced: &mut Option<String>,
     rotted: &mut bool,
     // C3: set when this session reported a turn boundary of its own.
     progressed: &mut bool,
@@ -2458,8 +2477,31 @@ fn supervise_run(
             Some(agent::BudgetState::SoftWarn { .. } | agent::BudgetState::Ok) | None => {}
         }
         // A scoring failure must never kill a healthy run.
-        match scorer.poll(adapter, score_cfg) {
-            Ok(Some(score)) if score.verdict == Verdict::Restart => {
+        let poll_result = scorer.poll(adapter, score_cfg);
+        // Issue #243 (review round, F3/F5): consumes the screening half of
+        // every poll that actually read new bytes -- persisted and, when
+        // it changed, announced -- through the same shared helper the Stop
+        // hook uses (`sessions::record_screening`), so a codex/wrap-
+        // supervised session (no Claude Stop hook at all) still gets a
+        // live-detected injection marker or credential shape surfaced, not
+        // only silently dropped. `Some(report)` only when bytes were
+        // genuinely consumed this poll (`IncrementalScorer::poll`'s own
+        // doc comment): an IDLE poll (`None`) must never reach
+        // `record_screening` at all, or its fabricated-clean default would
+        // clobber an already-persisted flagged summary and reset the
+        // de-dup memory, making a real finding vanish across every idle
+        // gap and then re-announce.
+        if let Ok((_, Some(report))) = &poll_result {
+            super::sessions::record_screening(
+                state,
+                registry_short,
+                report,
+                announcer,
+                screening_announced,
+            );
+        }
+        match poll_result {
+            Ok((Some(score), _)) if score.verdict == Verdict::Restart => {
                 *rotted = true;
                 Tick::Stop("rot")
             }

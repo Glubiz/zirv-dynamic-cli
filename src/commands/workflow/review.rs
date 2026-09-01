@@ -1127,7 +1127,10 @@ fn has_digit_and_letter(run: &[u8]) -> bool {
     run.iter().any(u8::is_ascii_digit) && run.iter().any(u8::is_ascii_alphabetic)
 }
 
-fn detect_high_entropy_run(text: &str) -> Option<String> {
+/// `pub(crate)`: reused by `ctx::screen` (issue #243) for mail-body
+/// screening, the same entropy check this module already applies to a
+/// review package's untracked-file bodies.
+pub(crate) fn detect_high_entropy_run(text: &str) -> Option<String> {
     let bytes = text.as_bytes();
     let mut index = 0usize;
     while index < bytes.len() {
@@ -1631,13 +1634,39 @@ struct ReviewerFinding {
 /// deserialized independently so one malformed entry (an empty summary, a
 /// field of the wrong type) is skipped with a warning to stderr instead of
 /// discarding every other finding the reviewer reported.
+///
+/// Returns the JSON payload after `REVIEW_RESULT_PREFIX` if `line`, once
+/// trimmed, is either the bare marker or exactly one whitespace-free
+/// bracketed tag followed by a single space and the marker; `None` otherwise.
+fn review_result_json(line: &str) -> Option<&str> {
+    let trimmed = line.trim();
+    if let Some(json) = trimmed.strip_prefix(REVIEW_RESULT_PREFIX) {
+        return Some(json);
+    }
+    let rest = trimmed.strip_prefix('[')?;
+    let close = rest.find(']')?;
+    let (tag, after_tag) = rest.split_at(close);
+    if tag.contains(char::is_whitespace) {
+        return None;
+    }
+    after_tag
+        .strip_prefix("] ")?
+        .strip_prefix(REVIEW_RESULT_PREFIX)
+}
+
+/// Issue #232 (review round): after trimming, at most one leading bracketed
+/// tag with no internal whitespace (e.g. `[zirv] `, from this repo's
+/// `UserPromptSubmit` hook) may precede `REVIEW_RESULT_PREFIX`; anything
+/// else ahead of the marker -- echoed text, a multi-word tag, a missing
+/// space -- rejects the line, so attacker-influenced output containing the
+/// marker is never mistaken for the structured result.
 fn parse_reviewer_output(output: &str) -> CtxResult<Vec<ReviewerFinding>> {
     if output.len() > MAX_REVIEW_OUTPUT_BYTES {
         return Err(format!("reviewer output exceeds {MAX_REVIEW_OUTPUT_BYTES} bytes").into());
     }
     let mut result: Option<serde_json::Value> = None;
     for line in output.lines() {
-        if let Some(json) = line.trim().strip_prefix(REVIEW_RESULT_PREFIX) {
+        if let Some(json) = review_result_json(line) {
             if result.is_some() {
                 return Err("reviewer emitted more than one structured result".into());
             }
@@ -1775,6 +1804,8 @@ pub(crate) fn reviewer_argv(
     agent: &str,
     repo: &Path,
     include_custom_agents: bool,
+    budget_tokens: Option<u64>,
+    max_tool_calls: Option<u32>,
 ) -> CtxResult<Vec<String>> {
     if agent.is_empty()
         || agent.len() > 64
@@ -1822,8 +1853,18 @@ pub(crate) fn reviewer_argv(
         agent.to_string(),
         "-".to_string(),
         "--headless".to_string(),
-        "--".to_string(),
     ];
+    // Must land before `--`: these are `zirv agent`'s own flags, not the
+    // adapter's passthrough.
+    if let Some(tokens) = budget_tokens {
+        argv.push("--budget-tokens".to_string());
+        argv.push(tokens.to_string());
+    }
+    if let Some(calls) = max_tool_calls {
+        argv.push("--max-tool-calls".to_string());
+        argv.push(calls.to_string());
+    }
+    argv.push("--".to_string());
     argv.extend(seat_args);
     Ok(argv)
 }
@@ -1934,11 +1975,43 @@ fn salvage_suffix(path: Option<&Path>) -> String {
     .unwrap_or_default()
 }
 
+/// Fallback tool-call guidance stated in the prompt when no worker budget is
+/// configured: `WorkerBudget`'s `HardStop` kills the child outright rather
+/// than letting it finish its turn, and `SoftWarn` prints only to zirv's own
+/// stderr, never to the reviewer's stdin -- so an unbounded reviewer has no
+/// other signal telling it to wrap up.
+const DEFAULT_REVIEWER_TOOL_CALL_GUIDANCE: u32 = 40;
+
 /// The prompt text sent to an independent reviewer for `package`, split out
 /// from `launch_reviewer` so its exact wording (in particular the #238
 /// baseline-waiver guidance) is unit-testable without spawning a real
 /// reviewer process.
-fn build_reviewer_prompt(package: &ReviewPackage) -> CtxResult<String> {
+fn build_reviewer_prompt(
+    package: &ReviewPackage,
+    budget_tokens: Option<u64>,
+    max_tool_calls: Option<u32>,
+) -> CtxResult<String> {
+    let bound_notice = match (budget_tokens, max_tool_calls) {
+        (None, None) => format!(
+            "This review worker has no configured spend ceiling, but a runaway review still \
+             gets killed outright with no chance to finish. Keep it within roughly {DEFAULT_REVIEWER_TOOL_CALL_GUIDANCE} \
+             tool calls and conclude with your confirmed findings well before that.\n\n"
+        ),
+        (tokens, calls) => {
+            let mut parts = Vec::new();
+            if let Some(tokens) = tokens {
+                parts.push(format!("a token budget of {tokens}"));
+            }
+            if let Some(calls) = calls {
+                parts.push(format!("a tool-call budget of {calls}"));
+            }
+            format!(
+                "This review worker runs under {}, enforced by killing the process outright, \
+                 not by pausing it. Conclude with your confirmed findings well before you hit it.\n\n",
+                parts.join(" and ")
+            )
+        }
+    };
     // A delta package must never read as a whole change: a reviewer told
     // "this is the whole diff" when it is only what changed since the last
     // reviewed commit will report false findings about code it cannot see.
@@ -1959,7 +2032,7 @@ fn build_reviewer_prompt(package: &ReviewPackage) -> CtxResult<String> {
     // `normalize_disposition`) is a safety net for this prompt, not a
     // substitute for it.
     Ok(format!(
-        "{delta_notice}Review the following compact Zirv review package. Do not modify files. \
+        "{bound_notice}{delta_notice}Review the following compact Zirv review package. Do not modify files. \
          In the package's `verification` field, `passed:false` together with \
          `passed_with_baseline_waiver:true` means every failing test is in the operator's \
          recorded baseline (`waived_failing_tests`) and the gate passed -- treat it as \
@@ -1983,9 +2056,29 @@ fn build_reviewer_prompt(package: &ReviewPackage) -> CtxResult<String> {
     ))
 }
 
+/// `workflow.review_worker_budget_tokens`/`review_worker_max_tool_calls` for
+/// this repository. A config that fails to load degrades to "no ceiling",
+/// the same fallback shape `TelemetryConfig::for_repo` uses.
+fn reviewer_worker_budget(repo: &Path) -> (Option<u64>, Option<u32>) {
+    match crate::commands::ctx::config::CtxConfig::load(repo, &|key| std::env::var(key).ok()) {
+        Ok(cfg) => (
+            cfg.workflow.review_worker_budget_tokens,
+            cfg.workflow.review_worker_max_tool_calls,
+        ),
+        Err(_) => (None, None),
+    }
+}
+
 fn launch_reviewer(agent: &str, package: &ReviewPackage) -> CtxResult<ReviewerRun> {
-    let argv = reviewer_argv(agent, &package.repo_root, package.include_custom_agents)?;
-    let prompt = build_reviewer_prompt(package)?;
+    let (budget_tokens, max_tool_calls) = reviewer_worker_budget(&package.repo_root);
+    let argv = reviewer_argv(
+        agent,
+        &package.repo_root,
+        package.include_custom_agents,
+        budget_tokens,
+        max_tool_calls,
+    )?;
+    let prompt = build_reviewer_prompt(package, budget_tokens, max_tool_calls)?;
     let mut child = Command::new(std::env::current_exe()?)
         .args(&argv)
         .stdin(Stdio::piped())
@@ -3064,7 +3157,7 @@ mod tests {
     #[test]
     fn a_reviewer_seat_is_always_pinned_read_only_or_refused() {
         let repo = tempdir().unwrap();
-        let claude = reviewer_argv("claude", repo.path(), false).unwrap();
+        let claude = reviewer_argv("claude", repo.path(), false, None, None).unwrap();
         assert_eq!(
             &claude[..5],
             ["agent", "claude", "-", "--headless", "--"],
@@ -3083,7 +3176,7 @@ mod tests {
             "the provider-neutral reviewer manifest must reach the harness system prompt"
         );
 
-        let codex = reviewer_argv("codex", repo.path(), false).unwrap();
+        let codex = reviewer_argv("codex", repo.path(), false, None, None).unwrap();
         assert_eq!(&codex[..5], ["agent", "codex", "-", "--headless", "--"]);
         assert!(
             codex
@@ -3096,7 +3189,7 @@ mod tests {
             "the same reviewer seat must be addressable through codex"
         );
 
-        let error = reviewer_argv("nope", repo.path(), false)
+        let error = reviewer_argv("nope", repo.path(), false, None, None)
             .unwrap_err()
             .to_string();
         assert!(
@@ -3104,9 +3197,45 @@ mod tests {
             "{error}"
         );
         assert!(
-            reviewer_argv("Claude", repo.path(), false).is_err(),
+            reviewer_argv("Claude", repo.path(), false, None, None).is_err(),
             "the adapter name is validated too"
         );
+    }
+
+    /// Budget flags must land before the `--` separator, and only when set.
+    #[test]
+    fn reviewer_argv_appends_worker_budget_flags_before_the_separator_only_when_set() {
+        let repo = tempdir().unwrap();
+        let unbounded = reviewer_argv("claude", repo.path(), false, None, None).unwrap();
+        assert!(
+            !unbounded.iter().any(|arg| arg == "--budget-tokens"),
+            "no budget configured must append no flag: {unbounded:?}"
+        );
+        assert!(
+            !unbounded.iter().any(|arg| arg == "--max-tool-calls"),
+            "no tool-call ceiling configured must append no flag: {unbounded:?}"
+        );
+
+        let bounded = reviewer_argv("claude", repo.path(), false, Some(50_000), Some(40)).unwrap();
+        let separator = bounded
+            .iter()
+            .position(|arg| arg == "--")
+            .expect("reviewer argv always has a flag separator");
+        let budget_at = bounded
+            .iter()
+            .position(|arg| arg == "--budget-tokens")
+            .expect("--budget-tokens must be present when a budget is configured");
+        let calls_at = bounded
+            .iter()
+            .position(|arg| arg == "--max-tool-calls")
+            .expect("--max-tool-calls must be present when a tool-call ceiling is configured");
+        assert!(
+            budget_at < separator && calls_at < separator,
+            "both budget flags must land before the `--` separator so `zirv agent` parses \
+             them as its own flags rather than passthrough harness argv: {bounded:?}"
+        );
+        assert_eq!(bounded[budget_at + 1], "50000");
+        assert_eq!(bounded[calls_at + 1], "40");
     }
 
     /// A reviewer that emits a non-UTF-8 byte used to end the relay early (a
@@ -3402,6 +3531,48 @@ checksum = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f80"
             "{REVIEW_RESULT_PREFIX}{{\"findings\":[]}}\n{REVIEW_RESULT_PREFIX}{{\"findings\":[]}}"
         ))
         .is_err());
+    }
+
+    /// Issue #232 (review round): this repo's own `UserPromptSubmit` hook
+    /// makes Claude answer every turn with a leading `[zirv]` health
+    /// marker, so a reviewer's final line reads `[zirv]
+    /// ZIRV_REVIEW_RESULT {...}`, not a bare `ZIRV_REVIEW_RESULT {...}` --
+    /// exactly one whitespace-free bracketed tag ahead of the marker must
+    /// still parse.
+    #[test]
+    fn a_leading_marker_before_the_review_result_prefix_still_parses() {
+        let output = format!("[zirv] {REVIEW_RESULT_PREFIX}{{\"findings\":[]}}");
+        let findings = parse_reviewer_output(&output).expect("structured result");
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn a_bare_review_result_prefix_still_parses() {
+        let output = format!("{REVIEW_RESULT_PREFIX}{{\"findings\":[]}}");
+        let findings = parse_reviewer_output(&output).expect("structured result");
+        assert!(findings.is_empty());
+    }
+
+    /// Issue #232 (review round, tightened): the marker must not be
+    /// accepted anywhere in the line -- only a bare marker or exactly one
+    /// whitespace-free bracketed tag may precede it. Otherwise a reviewer
+    /// echoing attacker-influenced text containing the marker would be
+    /// treated as the structured result.
+    #[test]
+    fn a_marker_preceded_by_anything_else_is_rejected() {
+        let echoed = format!("echoed text {REVIEW_RESULT_PREFIX}{{\"findings\":[]}}");
+        let error = parse_reviewer_output(&echoed).unwrap_err().to_string();
+        assert!(error.contains("did not emit a structured Zirv review result"));
+
+        let multi_word_tag = format!("[a b] {REVIEW_RESULT_PREFIX}{{\"findings\":[]}}");
+        let error = parse_reviewer_output(&multi_word_tag)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("did not emit a structured Zirv review result"));
+
+        let no_space = format!("[zirv]{REVIEW_RESULT_PREFIX}{{\"findings\":[]}}");
+        let error = parse_reviewer_output(&no_space).unwrap_err().to_string();
+        assert!(error.contains("did not emit a structured Zirv review result"));
     }
 
     /// #229: the claude reviewer emitted an extra `failure_scenario` key per
@@ -4045,11 +4216,39 @@ checksum = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f80"
         let state = running_review_state(repo.path(), "HEAD");
         let package = package(&state_dir, &state, None).expect("package");
 
-        let prompt = build_reviewer_prompt(&package).expect("prompt");
+        let prompt = build_reviewer_prompt(&package, None, None).expect("prompt");
         assert!(
             prompt.contains("passed_with_baseline_waiver")
                 && prompt.contains("operator-acknowledged"),
             "got: {prompt}"
+        );
+    }
+
+    /// Issue #235: `evaluate_worker_budget`'s `HardStop` kills the reviewer
+    /// outright rather than letting it wrap up, so the prompt must always
+    /// state a bound -- the configured ceiling when set, or the fixed
+    /// guidance when not, never neither.
+    #[test]
+    fn build_reviewer_prompt_always_states_a_bound() {
+        let repo = git_repo();
+        let state_dir = StateDir::from_root(tempdir().unwrap().path().to_path_buf());
+        let state = running_review_state(repo.path(), "HEAD");
+        let package = package(&state_dir, &state, None).expect("package");
+
+        let unbounded = build_reviewer_prompt(&package, None, None).expect("prompt");
+        assert!(
+            unbounded.contains("roughly 40 tool calls"),
+            "no configured budget must still state the fixed guidance: {unbounded}"
+        );
+
+        let bounded = build_reviewer_prompt(&package, Some(50_000), Some(40)).expect("prompt");
+        assert!(
+            bounded.contains("token budget of 50000") && bounded.contains("tool-call budget of 40"),
+            "got: {bounded}"
+        );
+        assert!(
+            bounded.contains("Conclude with your confirmed findings"),
+            "got: {bounded}"
         );
     }
 

@@ -46,20 +46,25 @@ pub fn short_id(session: &str) -> String {
 /// `SEAT_MODEL_ENV` rides along for the same reason: it names *this*
 /// session's seat, and a worker that inherits an orchestrator's copy would
 /// have its own subagent dispatches refused by a guard describing a seat it
-/// is not sitting in.
+/// is not sitting in. `HEADLESS_ENV` rides along for the mirror-image
+/// reason: it is proof THIS launch is a headless worker, and an interactive
+/// session (`wrap`, `chat`, a dashboard pane) that inherited it from
+/// whatever spawned it would wrongly refuse its own interactive `brainstorm`
+/// step.
 ///
 /// Issue #249: `PARENT_SESSION_ENV` rides along too -- it names the session
 /// THIS one's own env says spawned it, and a child that inherited a copy
 /// unscrubbed would see its grandparent's id instead of never having one of
 /// its own set at all (see `agent::parent_session_env`'s own doc comment for
 /// the same rule at the fold that sets it fresh).
-pub const SUPERVISION_ENV: [&str; 6] = [
+pub const SUPERVISION_ENV: [&str; 7] = [
     super::adapters::SESSION_ENV,
     super::adapters::SOCKET_ENV,
     super::adapters::SEAT_MODEL_ENV,
     super::wrap::TRANSCRIPT_ENV,
     super::adapters::LAUNCH_MODE_ENV,
     super::agent::PARENT_SESSION_ENV,
+    super::adapters::HEADLESS_ENV,
 ];
 
 /// `portable_pty::CommandBuilder::new` seeds itself from `std::env::vars_os`,
@@ -496,6 +501,106 @@ fn write_record(state: &StateDir, record: &Record) -> PathBuf {
     path
 }
 
+/// Issue #243 (review round, F1): `short`'s own screening-summary sibling
+/// file -- `record_path`'s exact directory, one file per session, kept
+/// entirely separate from the record itself so writing one can never touch
+/// the other. A deliberately bare, non-`.json` extension (mirroring
+/// `nudge_marker_path`'s own `.nudge`): `list()`'s own record scan matches
+/// on `path.extension() == Some("json")`, and `<short>.json` and
+/// `<short>.screening.json` would share that extension despite naming two
+/// different files, wastefully feeding this one through `Record`
+/// deserialization (where it would fail and be skipped) on every listing.
+///
+/// A screening write used to be a read-modify-write of the WHOLE registry
+/// record: `write_record` is a plain whole-file overwrite with no lock
+/// anywhere in this module, and `SessionGuard::refresh_session`/
+/// `adopt_child_pid` are exactly that kind of write, issued by the ONE
+/// process that holds the live guard. A hook (or a supervision loop
+/// reporting through this same seam, `record_screening` below) runs as an
+/// UNRELATED process; racing a guard's own write could restore stale
+/// `session`/`pid`/`start_time` data over it, and a stale dead `pid` could
+/// then make a perfectly live session vanish from the next `list()` sweep.
+/// A dedicated sibling file makes that impossible by construction: nothing
+/// in `set_last_screening`/`last_screening` ever opens `record_path`.
+fn screening_path(state: &StateDir, short: &str) -> PathBuf {
+    state.sessions().join(format!("{short}.screening"))
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ScreeningSummary {
+    summary: String,
+}
+
+/// Stores (or clears, on `None`/empty) `short`'s own screening summary in
+/// its sibling file (`screening_path`), atomically -- temp file then
+/// rename, via `state::write_private`, the identical primitive
+/// `write_record` itself uses -- and never opens the registry record at
+/// all. Best-effort, like every other piece of state-dir housekeeping here.
+pub fn set_last_screening(state: &StateDir, short: &str, summary: Option<String>) {
+    let path = screening_path(state, short);
+    match summary {
+        Some(summary) if !summary.is_empty() => {
+            let _ = super::state::create_private_dir_all(&state.sessions());
+            if let Ok(json) = serde_json::to_string(&ScreeningSummary { summary }) {
+                let _ = super::state::write_private(&path, &json);
+            }
+        }
+        _ => {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
+/// The screening summary `set_last_screening` last stored for `short`, if
+/// any -- `status.rs`'s own reader, consulted alongside the record `list`/
+/// `load_record` already read; `None` for a clean session, one with no
+/// screening cycle yet, or a summary this build could not parse back.
+pub fn last_screening(state: &StateDir, short: &str) -> Option<String> {
+    let text = std::fs::read_to_string(screening_path(state, short)).ok()?;
+    serde_json::from_str::<ScreeningSummary>(&text)
+        .ok()
+        .map(|s| s.summary)
+}
+
+/// Issue #243 (review round, F3/F4): the one place a scoring cycle's
+/// screening result becomes persisted session state (`set_last_screening`
+/// above) and, when it changed since the last call for this `short`, a
+/// `zirv \u{25b8}` announcement -- shared by the Stop hook and the `exec`/
+/// `loop` supervision loops so there is exactly one copy of this policy.
+///
+/// `last_announced` is the caller's own de-duplication memory: the two
+/// live supervision loops own one for the life of the whole supervised run
+/// (surviving restarts, since it lives above the per-restart scope, same
+/// as `registry_short` itself), so an unchanged flagged summary is
+/// reported once, not on every poll. The Stop hook is a fresh process
+/// every turn with nothing to compare against, so it passes a fresh
+/// `&mut None` and an `Announcer::silent()` -- it already has its own
+/// decision-log line for this; announcing again would just be a second
+/// copy of the same fact. Returns whether an announcement actually fired,
+/// which is what this function's own tests assert against rather than
+/// scraping the real announce channel.
+///
+/// `rot.rs` and the verdict are never touched by any of this -- screening
+/// is a pure side channel; see `screen.rs`'s own module doc.
+pub fn record_screening(
+    state: &StateDir,
+    short: &str,
+    report: &super::screen::ScreenReport,
+    announcer: &super::announce::Announcer,
+    last_announced: &mut Option<String>,
+) -> bool {
+    let summary = (!report.is_clean()).then(|| report.summary());
+    set_last_screening(state, short, summary.clone());
+    let announce = summary.is_some() && summary != *last_announced;
+    if announce {
+        announcer.emit(&super::announce::Event::Screening {
+            summary: summary.clone().unwrap_or_default(),
+        });
+    }
+    *last_announced = summary;
+    announce
+}
+
 /// Registered at spawn, best-effort, and removed when the supervisor exits.
 /// `Drop` covers a panic-free early return; `release()` is called explicitly
 /// in every arm that leaves the supervisor loop, the same explicit-arm
@@ -629,6 +734,12 @@ impl SessionGuard {
         }
         self.released = true;
         let _ = std::fs::remove_file(&self.path);
+        // Issue #243 (review round, F1): the screening sibling file
+        // (`screening_path`) is this record's own, so it goes with it --
+        // best-effort, like the record removal right above; a crashed
+        // supervisor's own leftover is still cleaned up by `list()`'s own
+        // `sweep_orphaned_screening_summaries`.
+        let _ = std::fs::remove_file(screening_path(&self.state, &self.record.short));
     }
 }
 
@@ -932,6 +1043,7 @@ pub fn list(state: &StateDir) -> Vec<(Record, Liveness)> {
     }
     sweep_orphaned_markers(state, &found);
     sweep_orphan_endpoints(state, &found);
+    sweep_orphaned_screening_summaries(state, &found);
     found
 }
 
@@ -996,6 +1108,34 @@ fn sweep_orphaned_markers(state: &StateDir, found: &[(Record, Liveness)]) {
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("nudge") {
+            continue;
+        }
+        let Some(short) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let has_live_record = found
+            .iter()
+            .any(|(record, liveness)| *liveness == Liveness::Live && record.short == short);
+        if !has_live_record {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
+/// Issue #243 (review round, F1): the same "no live record, so remove it"
+/// sweep `sweep_orphaned_markers` runs for `.nudge` files, for the
+/// screening-summary sibling `screening_path` writes. `SessionGuard::
+/// release` already removes its own on a clean exit; this is the crash
+/// path -- a supervisor that never released leaves both its record (swept
+/// by `list`'s own read-dir loop, right above) and this sibling behind, on
+/// the same read.
+fn sweep_orphaned_screening_summaries(state: &StateDir, found: &[(Record, Liveness)]) {
+    let Ok(entries) = std::fs::read_dir(state.sessions()) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("screening") {
             continue;
         }
         let Some(short) = path.file_stem().and_then(|s| s.to_str()) else {
@@ -1590,6 +1730,118 @@ mod tests {
 
     fn record_for(session: &str, repo: &Path, verb: Verb) -> Record {
         Record::new(session, "claude", repo, verb)
+    }
+
+    /// Issue #243 (review round, F1): the whole point of the sibling file --
+    /// a screening write must never open, let alone rewrite, `record_path`
+    /// at all. Proven at the strongest level available: the record's own
+    /// bytes on disk, byte for byte, before and after.
+    #[test]
+    fn set_last_screening_never_touches_the_record_bytes() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = state_in(tmp.path());
+        let repo = Path::new("/repo");
+        let record = record_for("11111111-2222-4333-8444-555555555555", repo, Verb::Wrap);
+        let short = record.short.clone();
+        let _guard = SessionGuard::register(&state, record);
+
+        let before = std::fs::read(record_path(&state, &short)).expect("record written");
+        set_last_screening(&state, &short, Some("1 flag: something".to_string()));
+        let after = std::fs::read(record_path(&state, &short)).expect("record still there");
+        assert_eq!(
+            before, after,
+            "a screening write must never touch the record file's own bytes"
+        );
+    }
+
+    #[test]
+    fn last_screening_round_trips_and_clears() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = state_in(tmp.path());
+        let short = "aaaa1111";
+        assert_eq!(last_screening(&state, short), None);
+
+        set_last_screening(&state, short, Some("2 flags: x, y".to_string()));
+        assert_eq!(
+            last_screening(&state, short).as_deref(),
+            Some("2 flags: x, y")
+        );
+
+        set_last_screening(&state, short, None);
+        assert_eq!(
+            last_screening(&state, short),
+            None,
+            "None clears the sibling"
+        );
+    }
+
+    /// The crash-recovery half of F1's cleanup contract (`SessionGuard::
+    /// release`'s own explicit removal is the clean-exit half): a dead
+    /// record's own screening sibling is swept on the same `list()` read
+    /// that sweeps the record itself.
+    #[test]
+    fn list_sweeps_an_orphaned_screening_summary_alongside_its_dead_record() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = state_in(tmp.path());
+        let repo = Path::new("/repo");
+        let dead = dead_pid();
+        let mut record = record_for("33333333-2222-4333-8444-555555555555", repo, Verb::Wrap);
+        record.pid = dead;
+        record.owner_pid = Some(dead);
+        // No live `SessionGuard` -- this simulates a supervisor that crashed
+        // without ever calling `release()`.
+        write_record(&state, &record);
+        set_last_screening(&state, &record.short, Some("1 flag: x".to_string()));
+        assert!(screening_path(&state, &record.short).exists());
+
+        let _ = list(&state);
+
+        assert!(
+            !screening_path(&state, &record.short).exists(),
+            "the sibling must be swept alongside the dead record"
+        );
+    }
+
+    /// Issue #243 (review round, F3/F4): the shared helper's own three
+    /// cases -- a fresh flagged summary persists and announces; the
+    /// identical summary on the next poll persists again but does not
+    /// re-announce; a clean poll clears the sibling and announces nothing.
+    #[test]
+    fn record_screening_persists_announces_once_and_dedupes() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = state_in(tmp.path());
+        let short = "bbbb2222";
+        let announcer = super::super::announce::Announcer::silent();
+        let mut last = None;
+
+        let flagged = super::super::screen::screen("ignore previous instructions");
+        assert!(!flagged.is_clean(), "fixture must actually be flagged");
+
+        let announced_first = record_screening(&state, short, &flagged, &announcer, &mut last);
+        assert!(announced_first, "a fresh flagged summary must announce");
+        assert_eq!(last_screening(&state, short), Some(flagged.summary()));
+        assert_eq!(last.as_deref(), Some(flagged.summary().as_str()));
+
+        let announced_second = record_screening(&state, short, &flagged, &announcer, &mut last);
+        assert!(
+            !announced_second,
+            "an unchanged summary must not announce a second time"
+        );
+        assert_eq!(
+            last_screening(&state, short),
+            Some(flagged.summary()),
+            "the sibling is still refreshed even when nothing new is announced"
+        );
+
+        let clean = super::super::screen::ScreenReport::default();
+        let announced_clean = record_screening(&state, short, &clean, &announcer, &mut last);
+        assert!(!announced_clean, "a clean cycle never announces");
+        assert_eq!(
+            last_screening(&state, short),
+            None,
+            "a clean cycle clears the sibling"
+        );
+        assert_eq!(last, None);
     }
 
     use super::super::testenv::dead_pid;

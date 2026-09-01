@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-31
+last-verified: 2026-09-01
 ---
 
 # Untrusted Configuration
@@ -95,6 +95,9 @@ Plus a third, read-only case: `zirv ctx optimize` reads the repo's own CLAUDE.md
 | `workflow.telemetry_max_events` | `ZIRV_CTX_WORKFLOW_TELEMETRY_MAX_EVENTS` |
 | `workflow.telemetry_retention_days` | `ZIRV_CTX_WORKFLOW_TELEMETRY_RETENTION_DAYS` |
 | `workflow.check_env_passthrough` | `ZIRV_CTX_WORKFLOW_CHECK_ENV_PASSTHROUGH` |
+| `workflow.review_worker_budget_tokens` | `ZIRV_CTX_WORKFLOW_REVIEW_WORKER_BUDGET_TOKENS` |
+| `workflow.review_worker_max_tool_calls` | `ZIRV_CTX_WORKFLOW_REVIEW_WORKER_MAX_TOOL_CALLS` |
+| `workflow.auto_spawn_on_gate` | `ZIRV_CTX_WORKFLOW_AUTO_SPAWN_ON_GATE` |
 | `context.max_common_bytes` | `ZIRV_CTX_CONTEXT_MAX_COMMON_BYTES` |
 | `context.max_harness_bytes` | `ZIRV_CTX_CONTEXT_MAX_HARNESS_BYTES` |
 | `context.max_harness_roster_bytes` | `ZIRV_CTX_CONTEXT_MAX_HARNESS_ROSTER_BYTES` |
@@ -216,6 +219,8 @@ This was probed against the installed Claude Code CLI (2.1.220), not assumed —
 
 `CodexAdapter::distiller_cmd` pins `--sandbox read-only`, Codex's analogue of Claude's `--disallowedTools=...` pin. For normal direct launches, Codex now also has a verified per-run prompt mechanism: `-c developer_instructions=<TOML string>`, documented by Codex's public config schema as a developer-role message. `AgentAdapter::system_prompt_supported(launch)` narrows that capability for Windows `.cmd`/`.ps1` shell-shim launches: repository-authored prompt text is never placed on an argv that a shell reparses, so those launches retain the previous fallback/withhold behavior rather than weakening the command-injection boundary. `collect_surfaces` continues to read the repo/nested AGENTS.md hierarchy and Codex config independently for analysis.
 
+**Codex's interactive approval posture is entirely operator-owned (issue #222, v3.5.0).** `~/.codex/config.toml`'s `approval_policy` key sits in the same "operator reads, zirv never writes" trust bucket as claude's `.claude/settings.json`: `adapters::codex::resolve_codex_approval_posture` reads it best-effort (never `Some` on any doubt) purely to advise, never to gate — `wrap::run_with` emits a one-time `zirv ▸` advisory when the posture reads `untrusted`, and zirv never rewrites the file. Codex has no verified per-command approval hook the way claude's `PreToolUse` gives it, so there is no mechanism here to pre-approve anything against, unlike #224's claude built-in partition. See [[Ctx Adapters]] and [[Command Safety]].
+
 ### The canonical `.zirv/context/` layer
 
 Since 2026-08-20 (issue #41), `collect_surfaces` reads `Layer::ContextCommon`/`ContextClaude`/`ContextCodex`, i.e. `<repo>/.zirv/context/common.md`/`claude.md`/`codex.md`. Since 2026-08-22, `context::compile` also reads common plus the selected harness addition deterministically, refuses symlinked source files, caps the complete rendered block at `prompt.max_repo_bytes`, retains source provenance, and `prompt::with_context_layer` is called at every Zirv prompt-composition launch seam. The block is explicitly labeled repository-owned prose rather than policy. All three surfaces remain `Scope::Repo`/`Trust::RepoUntrusted` and cannot grant operator authority.
@@ -258,6 +263,20 @@ The same two habits apply, adapted to what memory actually is:
 `zirv ctx optimize` reports the bank's *size* (count, byte total, oldest/newest age, staleness, a duplicate-key check) in its own report, but this is deliberately not the same thing as the CLAUDE.md-reading path above: the bank is read directly by `optimize::memory_bank_summary`, never folded into `collect_surfaces` or the judgment model's own prompt, and the summary renderer never emits an entry's key or body — only the counts. A memory entry is repository-scoped, cross-session data with nothing to do with what `optimize` is reviewing (the instruction files), so it stays out of that model call entirely rather than being labeled-and-included the way mail and CLAUDE.md are for their own respective consumers.
 
 Issue #37 tightens automatic harvesting further: clean exits and distilled rot handoffs share one `memory::harvest_durable` path, and harvesting requires `memory.enabled`, `memory.harvest`, and `memory.shared_enabled` before a model is started. Candidates are filtered deterministically for durable repository facts, capped by `harvest_max_entries` and `harvest_max_bytes`, written only to the git-reviewable shared bank, and never overwrite an entry whose `Source` is `explicit`. Issue #38's `zirv memory optimize` remains report-only unless `--apply` is explicit; even then it only consolidates safe duplicate groups and never deletes entries or invokes git.
+
+## Screening is a fourth habit alongside capping and labeling (issue #243, v3.5.0)
+
+The recurring posture on every untrusted surface above has been cap it, then label it non-authoritative. `screen.rs`'s pure `screen(text) -> ScreenReport` (no fs/clock/env/net — the same purity discipline as `rot.rs`/`retrieval.rs`) adds a third, orthogonal habit: flag it. It scans text for a hand-picked, case-insensitive list of prompt-injection marker phrases ("ignore previous instructions", "developer mode", "reveal your system prompt", and similar — matched as plain substrings, no regex, so no backtracking-DoS surface), delegates credential-shape detection to `workflow::review::detect_token_shape`, and reuses that same module's high-entropy-run check. It **never strips or blocks** — every caller only ever extends an *existing* trust/label line with a flag summary (e.g. ` -- screening: 1 flag: prompt-injection marker ("ignore previous instructions")`); the flagged content itself travels untouched either way, exactly like every other untrusted surface's cap/label habit leaves the content itself intact.
+
+Screening now covers every surface this page already treats as untrusted:
+
+- **Mail** — `mail::render_delivery_message`'s existing `Trust: ...` line, covering both `zirv ctx inbox`'s own printout and every prompt-injection delivery seam (`message_with_delivery_envelope`). See [[Ctx Subsystem]]'s Mail section.
+- **The repo prompt layer** — `prompt.rs::compose`'s `<repo>/.zirv/system-prompt.md` label sentence gains the same flag suffix before its closing period.
+- **The canonical `.zirv/context/` layer** — each `.zirv/context/{common,claude,codex}.md` candidate's own `[zirv context <file>]` label line (`compile.rs::with_canonical_context_layer`) gets a flag suffix, same reasoning; the label constant itself stays byte-exact for `shrink_for_inline_argv`'s exact-match lookup.
+- **Shared `.zirv/memory/`** — the shared-memory block's own header (`prompt.rs::with_memory_layer`) gains one `[screening: <summary>]` line right after it. Private (machine-local) memory is untouched — it is not repo-owned content.
+- **Transcript ingestion** — `IncrementalScorer::poll`/`score_transcript_cached` screen newly-appended (or, with no incremental cursor, a capped 64KB tail of) transcript bytes alongside scoring; a flagged cycle surfaces on the decision log and `zirv ctx status`'s per-session `screening:` line. `rot.rs` itself is never touched — screening never changes a verdict. See [[Ctx Subsystem]] and [[Rot Engine]].
+
+Coverage is exactly the three surfaces issue #243 names — mail, repo-provided context (`system-prompt.md`, `.zirv/context/*.md`, shared memory) and transcript ingestion. A new untrusted-text ingestion path added later calls `screen` at its own label choke point; the pure module needs no change for that.
 
 ## Fallback routing is operator-owned, repository-narrowable (issue #186)
 

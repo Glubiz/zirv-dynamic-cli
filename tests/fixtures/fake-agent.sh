@@ -21,6 +21,7 @@
 #                                           per run (issue #249), so a test
 #                                           can see which session the child
 #                                           was told is its own supervisor
+#   FAKE_AGENT_HEADLESS_ENV_LOG=<path>      append $ZIRV_CTX_HEADLESS per run
 #   FAKE_AGENT_ARGV_LOG=<path>              append the full argv of each run,
 #                                           so a test can assert on injected
 #                                           flags such as --append-system-prompt
@@ -89,6 +90,9 @@ if [ -n "${FAKE_AGENT_GROUP_ENV_LOG:-}" ]; then
 fi
 if [ -n "${FAKE_AGENT_PARENT_ENV_LOG:-}" ]; then
   printf '%s\n' "${ZIRV_CTX_PARENT_SESSION:-}" >> "$FAKE_AGENT_PARENT_ENV_LOG"
+fi
+if [ -n "${FAKE_AGENT_HEADLESS_ENV_LOG:-}" ]; then
+  printf '%s\n' "${ZIRV_CTX_HEADLESS:-}" >> "$FAKE_AGENT_HEADLESS_ENV_LOG"
 fi
 turns="${FAKE_AGENT_TURNS:-12}"
 

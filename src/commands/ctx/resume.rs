@@ -69,7 +69,7 @@ pub fn resume_prompt(handoff: &Handoff) -> String {
         "You are picking up work from a previous session that ran out of usable context. \
 Continue from the handoff below. Re-read the listed files before changing them, and do not \
 redo work marked as done.\n\n{}",
-        handoff.to_markdown()
+        super::handoff::labeled_for_injection(handoff)
     )
 }
 

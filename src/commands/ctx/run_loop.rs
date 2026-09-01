@@ -154,6 +154,10 @@ pub(crate) fn run_with_clock<W: Write>(
     // rather than once per cycle.
     let mut pace_flags = pace::PaceGateFlags::default();
     let http_poller = super::poll::HttpPoller::new(cfg.chrome.events);
+    // Issue #243 (review round, F4): owned across every cycle too, so a
+    // screening summary that has not changed since the last poll is
+    // announced once for the whole run, not once per cycle.
+    let mut screening_announced: Option<String> = None;
     loop {
         if let Some(limit) = args.cycles
             && cycle >= limit
@@ -480,8 +484,27 @@ pub(crate) fn run_with_clock<W: Write>(
                         disposition: super::announce::NudgeDisposition::NextCycle,
                     });
                 }
-                match scorer.poll(adapter.as_ref(), &cfg.score) {
-                    Ok(Some(score)) if score.verdict == Verdict::Restart => {
+                let poll_result = scorer.poll(adapter.as_ref(), &cfg.score);
+                // Issue #243 (review round, F4/F5): same shared helper the
+                // Stop hook and `exec`'s own supervision loop use -- a
+                // codex/wrap-supervised cycle (no Claude Stop hook at all)
+                // otherwise never surfaces a live-detected injection
+                // marker or credential shape. `Some(report)` only when
+                // this poll actually consumed new bytes -- an IDLE poll
+                // (`None`) must never reach `record_screening`, or its
+                // fabricated-clean default would clobber an already-
+                // persisted flagged summary on every idle gap.
+                if let Ok((_, Some(report))) = &poll_result {
+                    super::sessions::record_screening(
+                        &state,
+                        &nudge_address,
+                        report,
+                        &announcer,
+                        &mut screening_announced,
+                    );
+                }
+                match poll_result {
+                    Ok((Some(score), _)) if score.verdict == Verdict::Restart => {
                         rotted = true;
                         Tick::Stop("rot")
                     }
