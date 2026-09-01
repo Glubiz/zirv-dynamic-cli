@@ -4565,6 +4565,10 @@ mod tests {
             ),
             (adapters::SOCKET_ENV, Some("/tmp/outer.sock")),
             (TRANSCRIPT_ENV, Some("/tmp/outer.jsonl")),
+            // F4: a headless worker under a nested interactive relaunch (or
+            // an operator shell that inherited it) must never leave this
+            // interactive child looking headless too.
+            (adapters::HEADLESS_ENV, Some("1")),
         ]);
 
         // Sanity, and the reason the scrub has to be explicit: an untouched

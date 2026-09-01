@@ -11,16 +11,11 @@ use super::ctx;
 
 type SetupResult<T> = Result<T, Box<dyn Error>>;
 
-const HARNESS_HOOKS: [(&str, Option<&str>, &str); 5] = [
+const HARNESS_HOOKS: [(&str, Option<&str>, &str); 4] = [
     ("Stop", None, "zirv ctx hook stop"),
     ("UserPromptSubmit", None, "zirv ctx hook prompt"),
     ("PreCompact", None, "zirv ctx hook pre-compact"),
     ("PreToolUse", Some("Agent|Task"), "zirv ctx hook pretool"),
-    (
-        "SessionStart",
-        Some("resume|clear"),
-        "zirv ctx hook session-start",
-    ),
 ];
 
 /// Issue #83's command safety hook: `zirv ctx safety check`, matched on
@@ -45,11 +40,27 @@ const CLAUDE_SAFETY_HOOK: (&str, Option<&str>, &str) = (
     "zirv ctx safety check",
 );
 
+/// Issue #244's handoff-reinjection hook, matched on `source` values
+/// `resume|clear`. Claude-only, same reasoning as `CLAUDE_SAFETY_HOOK`
+/// above: codex has no verified `SessionStart` event at all (see
+/// `docs/design/2026-09-01-hook-surface-gap-analysis.md`'s own gap table),
+/// so wiring it into `install_codex_hooks` -- which shares `HARNESS_HOOKS`
+/// with the claude path -- would write a hook codex has no event to fire.
+const CLAUDE_SESSION_START_HOOK: (&str, Option<&str>, &str) = (
+    "SessionStart",
+    Some("resume|clear"),
+    "zirv ctx hook session-start",
+);
+
+/// Every claude-only hook (`install_claude_integration`), never wired into
+/// `install_codex_hooks`.
+const CLAUDE_ONLY_HOOKS: [(&str, Option<&str>, &str); 2] =
+    [CLAUDE_SAFETY_HOOK, CLAUDE_SESSION_START_HOOK];
+
 /// Total claude hooks `zirv setup` installs/reports on: `HARNESS_HOOKS`
-/// (shared with codex) plus `CLAUDE_SAFETY_HOOK` (claude-only, see its own
-/// doc comment above). Codex's own total stays `HARNESS_HOOKS.len()`
-/// unchanged -- the safety hook is not wired into `install_codex_hooks`.
-const CLAUDE_HOOKS_TOTAL: usize = HARNESS_HOOKS.len() + 1;
+/// (shared with codex) plus every entry in `CLAUDE_ONLY_HOOKS`. Codex's own
+/// total stays `HARNESS_HOOKS.len()` unchanged.
+const CLAUDE_HOOKS_TOTAL: usize = HARNESS_HOOKS.len() + CLAUDE_ONLY_HOOKS.len();
 
 #[derive(Debug, Parser)]
 #[command(
@@ -332,10 +343,10 @@ struct SetupStatus {
     shared_memory_entries: usize,
     claude_hooks_installed: usize,
     /// Total claude hooks `zirv setup apply` may install, i.e.
-    /// `CLAUDE_HOOKS_TOTAL` (issue #83 added a 5th, the safety hook, so this
-    /// is no longer always `HARNESS_HOOKS.len()`). Added alongside
-    /// `codex_hooks_total` in schema_version 2 so a JSON consumer never has
-    /// to hardcode the denominator itself.
+    /// `CLAUDE_HOOKS_TOTAL` (`HARNESS_HOOKS` plus every `CLAUDE_ONLY_HOOKS`
+    /// entry, so this is no longer always `HARNESS_HOOKS.len()`). Added
+    /// alongside `codex_hooks_total` in schema_version 2 so a JSON consumer
+    /// never has to hardcode the denominator itself.
     claude_hooks_total: usize,
     /// Issue #93: distinguishes "tee installed" from "tee wrapping a custom
     /// command" from "custom statusLine present, tee not installed" -- the
@@ -344,7 +355,7 @@ struct SetupStatus {
     claude_statusline: StatuslineStatus,
     codex_hooks_installed: usize,
     /// Total codex hooks `zirv setup apply` may install (`HARNESS_HOOKS.len()`
-    /// -- the safety hook is claude-only, see `CLAUDE_SAFETY_HOOK`'s doc
+    /// -- every `CLAUDE_ONLY_HOOKS` entry is claude-only, see its own doc
     /// comment). Schema_version 2, same as `claude_hooks_total`.
     codex_hooks_total: usize,
     profile: EffectiveProfileStatus,
@@ -601,9 +612,10 @@ fn install_claude_integration(home: &Path, dry_run: bool) -> SetupResult<(usize,
             hooks_added += 1;
         }
     }
-    let (safety_event, safety_matcher, safety_command) = CLAUDE_SAFETY_HOOK;
-    if ensure_harness_hook(&mut settings, safety_event, safety_matcher, safety_command)? {
-        hooks_added += 1;
+    for (event, matcher, command) in CLAUDE_ONLY_HOOKS {
+        if ensure_harness_hook(&mut settings, event, matcher, command)? {
+            hooks_added += 1;
+        }
     }
     let root = settings.as_object_mut().expect("validated object");
     let statusline_added = if root.contains_key("statusLine") {
@@ -2253,7 +2265,10 @@ fn status(repo: &Path) -> SetupResult<SetupStatus> {
         .iter()
         .filter(|(_, _, command)| contains_command(&claude_settings, command))
         .count()
-        + usize::from(contains_command(&claude_settings, CLAUDE_SAFETY_HOOK.2));
+        + CLAUDE_ONLY_HOOKS
+            .iter()
+            .filter(|(_, _, command)| contains_command(&claude_settings, command))
+            .count();
     let codex_hooks = load_json_object(&codex_dir.join("hooks.json")).unwrap_or_else(|_| json!({}));
     let codex_hooks_installed = HARNESS_HOOKS
         .iter()
@@ -4336,19 +4351,24 @@ mod tests {
         }
     }
 
-    /// Issue #83's safety hook (`CLAUDE_SAFETY_HOOK`) must count toward
-    /// claude's own installed/total, but never codex's -- codex has no
-    /// verified equivalent of claude's `PreToolUse` permission-decision
-    /// contract, so `install_codex_hooks` never writes it (see
-    /// `CLAUDE_SAFETY_HOOK`'s own doc comment).
+    /// Every `CLAUDE_ONLY_HOOKS` entry (the safety hook, the SessionStart
+    /// handoff hook) must count toward claude's own installed/total, but
+    /// never codex's -- codex has no verified equivalent of claude's
+    /// `PreToolUse` permission-decision contract, and no `SessionStart`
+    /// event at all, so `install_codex_hooks` never writes either (see
+    /// `CLAUDE_SAFETY_HOOK`'s and `CLAUDE_SESSION_START_HOOK`'s own doc
+    /// comments).
     #[test]
-    fn status_counts_the_safety_hook_toward_claude_only() {
+    fn status_counts_the_claude_only_hooks_toward_claude_only() {
         let repo = tempfile::tempdir().expect("repo");
         let home = tempfile::tempdir().expect("home");
         let _home = HomeGuard::set(home.path());
 
         let before = status(repo.path()).expect("status before apply");
-        assert_eq!(before.claude_hooks_total, HARNESS_HOOKS.len() + 1);
+        assert_eq!(
+            before.claude_hooks_total,
+            HARNESS_HOOKS.len() + CLAUDE_ONLY_HOOKS.len()
+        );
         assert_eq!(before.codex_hooks_total, HARNESS_HOOKS.len());
         assert_eq!(before.claude_hooks_installed, 0);
 
@@ -4356,9 +4376,28 @@ mod tests {
         let after = status(repo.path()).expect("status after apply");
         assert_eq!(
             after.claude_hooks_installed, after.claude_hooks_total,
-            "every claude hook, including the safety hook, is now installed"
+            "every claude hook, including the claude-only ones, is now installed"
         );
-        assert_eq!(after.claude_hooks_installed, HARNESS_HOOKS.len() + 1);
+        assert_eq!(
+            after.claude_hooks_installed,
+            HARNESS_HOOKS.len() + CLAUDE_ONLY_HOOKS.len()
+        );
+
+        // The SessionStart hook specifically must never reach codex's own
+        // hooks.json -- it shares `HARNESS_HOOKS`' install path with codex
+        // for every OTHER hook, but `CLAUDE_ONLY_HOOKS` is never wired into
+        // `install_codex_hooks`.
+        let codex_hooks_path = codex_config_dir(home.path()).join("hooks.json");
+        install_codex_hooks(home.path(), &codex_hooks_path, false).expect("install codex");
+        let codex_hooks = load_json_object(&codex_hooks_path).expect("load codex hooks");
+        assert!(
+            !contains_command(&codex_hooks, CLAUDE_SESSION_START_HOOK.2),
+            "SessionStart must not reach codex's hooks.json: {codex_hooks}"
+        );
+        assert!(
+            !contains_command(&codex_hooks, CLAUDE_SAFETY_HOOK.2),
+            "the safety hook must not reach codex's hooks.json either: {codex_hooks}"
+        );
     }
 
     /// `resolved_repo` canonicalizes, which on Windows yields a `\\?\`

@@ -962,8 +962,10 @@ fn run_with_clock_inner<W: Write>(
         }
         // Issue #236: this module supervises only headless runs, so every
         // child it spawns gets this marker, read by `engine::refusal_for` to
-        // refuse the interactive `brainstorm` skill.
-        command.env("ZIRV_CTX_HEADLESS", "1");
+        // refuse the interactive `brainstorm` skill. Scrubbed by
+        // `scrub_supervision_env_cmd` above first, so a nested headless
+        // launch never inherits a stale copy before this sets its own.
+        command.env(adapters::HEADLESS_ENV, "1");
     };
 
     // FIX B: on a Windows npm `.cmd` shim launch, `cmd.exe /c <shim>` reparses
