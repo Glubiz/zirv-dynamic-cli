@@ -495,6 +495,27 @@ fn apply_profile(profile: WorkflowProfile, steps: &mut [WorkflowStep]) {
     }
 }
 
+/// Default intent-step skill per kind, absent a `--brainstorm`/
+/// `--no-brainstorm` override: on for exploratory Feature/Spike, off for
+/// Bugfix/Refactor's autonomous default. `Review` has no intent step.
+fn default_brainstorm_for_kind(kind: WorkflowKind) -> bool {
+    matches!(kind, WorkflowKind::Feature | WorkflowKind::Spike)
+}
+
+/// Selects the intent step's skill, same shape as `apply_profile`.
+fn apply_brainstorm_selection(brainstorm: bool, steps: &mut [WorkflowStep]) {
+    for step in steps {
+        if step.phase == WorkflowPhase::Intent {
+            step.skill = if brainstorm {
+                "brainstorm"
+            } else {
+                "write-intent"
+            }
+            .into();
+        }
+    }
+}
+
 fn apply_deploy_tier(tier: DeployTier, steps: &mut Vec<WorkflowStep>) {
     if tier == DeployTier::Production
         && !steps.iter().any(|step| step.phase == WorkflowPhase::Review)
@@ -525,9 +546,11 @@ fn materialize(
     classification: &Classification,
     profile: WorkflowProfile,
     deploy_tier: DeployTier,
+    brainstorm: bool,
 ) -> Vec<WorkflowStep> {
     let mut steps = definition(kind).materialize(classification);
     apply_profile(profile, &mut steps);
+    apply_brainstorm_selection(brainstorm, &mut steps);
     apply_deploy_tier(deploy_tier, &mut steps);
     steps
 }
@@ -572,18 +595,8 @@ pub struct WorkflowState {
     pub current_step: usize,
     pub completed_steps: Vec<String>,
     pub attempts: BTreeMap<String, u8>,
-    /// Issue #235: wall-clock milliseconds each completed step actually took,
-    /// keyed by step id -- `now_secs() - phase_started_at` at the moment the
-    /// step is marked complete (`advance_with_evidence`/`approve`), the same
-    /// arithmetic `enrich_transition_evidence`'s own `duration_ms` fallback
-    /// uses. Read by `zirv workflow status` to render `completed: intent
-    /// (2m10s), spec (0m40s)` without a second source of truth: telemetry
-    /// events are the aggregate-over-time record (`zirv workflow stats`),
-    /// this is the per-workflow record that survives even when telemetry is
-    /// disabled (`workflow.telemetry_enabled = false`). A step re-attempted
-    /// after a failure overwrites its own entry with the latest attempt's
-    /// duration, matching how `completed_steps` itself only ever records one
-    /// entry per step id.
+    /// Wall-clock milliseconds each completed step took, keyed by step id.
+    /// Read by `zirv workflow status` to render `completed: intent (2m10s)`.
     #[serde(default)]
     pub step_durations_ms: BTreeMap<String, u64>,
     /// Version-controlled workflow work products. Acceptance authority remains
@@ -604,6 +617,11 @@ pub struct WorkflowState {
     pub frontend_target_root: Option<PathBuf>,
     #[serde(default)]
     pub phase_started_at: u64,
+    /// Whether the intent step (when present) uses `brainstorm` (interactive
+    /// Q&A) or `write-intent` (autonomous). A state saved before this key
+    /// existed defaults to interactive on load.
+    #[serde(default = "default_true")]
+    pub brainstorm: bool,
     pub status: WorkflowStatus,
     pub created_at: u64,
     pub updated_at: u64,
@@ -624,7 +642,8 @@ impl WorkflowState {
     ) -> Self {
         let profile = WorkflowProfile::for_classification(&classification);
         let deploy_tier = DeployTier::Development;
-        let steps = materialize(kind, &classification, profile, deploy_tier);
+        let brainstorm = default_brainstorm_for_kind(kind);
+        let steps = materialize(kind, &classification, profile, deploy_tier, brainstorm);
         let status = if steps.first().is_some_and(|step| step.approval) {
             WorkflowStatus::AwaitingApproval
         } else {
@@ -655,6 +674,7 @@ impl WorkflowState {
             usage_checkpoint: None,
             frontend_target_root: None,
             phase_started_at: now,
+            brainstorm,
             status,
             created_at: now,
             updated_at: now,
@@ -1345,6 +1365,7 @@ fn rematerialize_after_risk_increase(state: &mut WorkflowState) {
         &state.classification,
         state.profile,
         state.deploy_tier,
+        state.brainstorm,
     );
     let known: Vec<String> = state.steps.iter().map(|step| step.id.clone()).collect();
     let earliest_new = desired.iter().position(|step| {
@@ -1378,7 +1399,13 @@ fn rematerialize_after_risk_increase(state: &mut WorkflowState) {
 
 fn apply_effective_deploy_tier(state: &mut WorkflowState, effective: DeployTier) {
     let target = state.deploy_tier.max(effective);
-    let desired = materialize(state.kind, &state.classification, state.profile, target);
+    let desired = materialize(
+        state.kind,
+        &state.classification,
+        state.profile,
+        target,
+        state.brainstorm,
+    );
 
     let known: Vec<String> = state.steps.iter().map(|step| step.id.clone()).collect();
     let earliest_new = desired.iter().position(|step| !known.contains(&step.id));
@@ -1743,6 +1770,14 @@ pub fn approve(state_dir: &StateDir, mut state: WorkflowState) -> CtxResult<Work
     Ok(state)
 }
 
+/// A headless worker must not answer `brainstorm`'s clarifying questions or
+/// write the intent artifact on the operator's behalf.
+const BRAINSTORM_HEADLESS_REFUSAL: &str = "This step needs an interactive operator. Do not answer the clarifying questions on their behalf or write the intent artifact; stop and report that the workflow is waiting for the operator.";
+
+fn refusal_for(skill_id: &str, headless: bool) -> Option<&'static str> {
+    (headless && skill_id == "brainstorm").then_some(BRAINSTORM_HEADLESS_REFUSAL)
+}
+
 /// Current ephemeral skill context for the context compiler/session prompt.
 /// Completed steps are intentionally absent; the durable state remains in
 /// [`WorkflowState`] and is never accumulated into model context.
@@ -1804,18 +1839,18 @@ pub fn render_current_context(
         rendered.push_str(&super::frontend::render_profile(&profile));
         rendered.push('\n');
     }
+    let headless = std::env::var("ZIRV_CTX_HEADLESS").is_ok();
     let mut rendered_skill_ids = BTreeSet::new();
     for selected in step_skill_ids(step, &state.classification) {
         for skill in registry.resolve_stack(&selected)? {
             if !rendered_skill_ids.insert(skill.manifest.id.clone()) {
                 continue;
             }
+            let body = refusal_for(&skill.manifest.id, headless)
+                .unwrap_or_else(|| skill.manifest.instructions.trim());
             rendered.push_str(&format!(
                 "\n[skill {}@{}; source={}]\n{}\n",
-                skill.manifest.id,
-                skill.manifest.version,
-                skill.source,
-                skill.manifest.instructions.trim()
+                skill.manifest.id, skill.manifest.version, skill.source, body
             ));
         }
     }
@@ -1933,8 +1968,26 @@ pub struct StartArgs {
     /// lives in a sibling checkout).
     #[arg(long)]
     pub frontend_root: Option<PathBuf>,
+    /// Force the interactive `brainstorm` skill at the intent step.
+    #[arg(long, conflicts_with = "no_brainstorm")]
+    pub brainstorm: bool,
+    /// Force the autonomous `write-intent` skill at the intent step.
+    #[arg(long)]
+    pub no_brainstorm: bool,
     #[arg(long)]
     pub json: bool,
+}
+
+impl StartArgs {
+    pub(crate) fn brainstorm_override(&self) -> Option<bool> {
+        if self.brainstorm {
+            Some(true)
+        } else if self.no_brainstorm {
+            Some(false)
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Debug, Args)]
@@ -2063,13 +2116,8 @@ fn resolve_state() -> CtxResult<StateDir> {
     StateDir::resolve(&|key| std::env::var(key).ok())
 }
 
-/// Issue #235: records how long the step now completing actually took, using
-/// the same `now_secs() - phase_started_at` arithmetic
-/// `enrich_transition_evidence`'s own `duration_ms` fallback uses (see that
-/// function). Called immediately before a completing step id is pushed onto
-/// `completed_steps`, at both call sites that do so
-/// (`advance_with_evidence`/`approve`), so `phase_started_at` still names
-/// this step's own start rather than whatever comes next.
+/// Call before pushing `step_id` onto `completed_steps`, while
+/// `phase_started_at` still names its own start.
 fn record_step_duration_ms(state: &mut WorkflowState, step_id: &str) {
     let elapsed_ms = now_secs()
         .saturating_sub(state.phase_started_at)
@@ -2079,9 +2127,7 @@ fn record_step_duration_ms(state: &mut WorkflowState, step_id: &str) {
         .insert(step_id.to_string(), elapsed_ms);
 }
 
-/// Renders milliseconds as a compact `<minutes>m<seconds>s` wall-clock, e.g.
-/// `2m10s` or `0m40s` -- the shape issue #235 asks `zirv workflow status` to
-/// print next to each completed step.
+/// `<minutes>m<seconds>s`, e.g. `2m10s`.
 fn format_wall_clock(ms: u64) -> String {
     let total_secs = ms / 1000;
     format!("{}m{}s", total_secs / 60, total_secs % 60)
@@ -2112,6 +2158,21 @@ fn write_state(writer: &mut impl Write, state: &WorkflowState, json: bool) -> Ct
             &state.classification.risk_measurement
         {
             writeln!(writer, "risk measurement: unavailable ({reason})")?;
+        }
+        // Issue #236: only meaningful when this workflow actually has an
+        // intent step -- `Review` never does, and a Bugfix/Refactor whose
+        // classification did not gate one in has nothing for the flag to
+        // select between.
+        if state
+            .steps
+            .iter()
+            .any(|step| step.phase == WorkflowPhase::Intent)
+        {
+            writeln!(
+                writer,
+                "brainstorm: {}",
+                if state.brainstorm { "on" } else { "off" }
+            )?;
         }
         if let Some(step) = state.current() {
             writeln!(
@@ -2234,6 +2295,9 @@ pub fn run(args: &WorkflowArgs, writer: &mut impl Write) -> CtxResult<i32> {
             let definition = definition(args.kind);
             let profile = WorkflowProfile::for_classification(&classification);
             let deploy_tier = super::deploy::effective_tier(&repo)?;
+            let brainstorm = args
+                .brainstorm_override()
+                .unwrap_or_else(|| default_brainstorm_for_kind(args.kind));
             if let Some(agent) = &selected_agent {
                 let registry = SkillRegistry::load_for_repo(
                     &repo,
@@ -2246,7 +2310,13 @@ pub fn run(args: &WorkflowArgs, writer: &mut impl Write) -> CtxResult<i32> {
                     !args.built_in_only,
                 )?;
                 let report = super::capability::CapabilityReport::for_repo(agent, &repo)?;
-                for step in materialize(definition.kind, &classification, profile, deploy_tier) {
+                for step in materialize(
+                    definition.kind,
+                    &classification,
+                    profile,
+                    deploy_tier,
+                    brainstorm,
+                ) {
                     for skill in step_skill_ids(&step, &classification) {
                         registry.ensure_supported(&skill, &report)?;
                     }
@@ -2263,6 +2333,10 @@ pub fn run(args: &WorkflowArgs, writer: &mut impl Write) -> CtxResult<i32> {
                 !args.built_in_only,
                 classification,
             );
+            if brainstorm != state.brainstorm {
+                state.brainstorm = brainstorm;
+                apply_brainstorm_selection(brainstorm, &mut state.steps);
+            }
             apply_effective_deploy_tier(&mut state, deploy_tier);
             state.usage_checkpoint = usage_checkpoint(&state.repo);
             if let Some(frontend_root) = &args.frontend_root {
@@ -2516,6 +2590,7 @@ mod tests {
             &classification,
             profile,
             DeployTier::Development,
+            true,
         );
         let development_deploy = development
             .iter()
@@ -2533,6 +2608,7 @@ mod tests {
             &classification,
             profile,
             DeployTier::Staging,
+            true,
         );
         assert!(
             staging
@@ -2552,6 +2628,7 @@ mod tests {
             &classification,
             profile,
             DeployTier::Production,
+            true,
         );
         let review = production
             .iter()
@@ -2631,6 +2708,82 @@ mod tests {
                 .find(|step| step.phase == WorkflowPhase::Implement)
                 .is_some_and(|step| step.skill == "frontend-implement")
         );
+    }
+
+    #[test]
+    fn brainstorm_defaults_per_kind() {
+        assert!(default_brainstorm_for_kind(WorkflowKind::Feature));
+        assert!(default_brainstorm_for_kind(WorkflowKind::Spike));
+        assert!(!default_brainstorm_for_kind(WorkflowKind::Bugfix));
+        assert!(!default_brainstorm_for_kind(WorkflowKind::Refactor));
+        assert!(!default_brainstorm_for_kind(WorkflowKind::Review));
+    }
+
+    #[test]
+    fn brainstorm_flags_are_mutually_exclusive_and_resolve_to_an_override() {
+        use clap::Parser;
+        #[derive(clap::Parser)]
+        struct Cli {
+            #[command(flatten)]
+            args: StartArgs,
+        }
+        let plain =
+            Cli::try_parse_from(["zirv", "feature", "--task", "x"]).expect("no flags parses");
+        assert_eq!(plain.args.brainstorm_override(), None);
+
+        let on = Cli::try_parse_from(["zirv", "feature", "--task", "x", "--brainstorm"])
+            .expect("--brainstorm parses");
+        assert_eq!(on.args.brainstorm_override(), Some(true));
+
+        let off = Cli::try_parse_from(["zirv", "feature", "--task", "x", "--no-brainstorm"])
+            .expect("--no-brainstorm parses");
+        assert_eq!(off.args.brainstorm_override(), Some(false));
+
+        assert!(
+            Cli::try_parse_from([
+                "zirv",
+                "feature",
+                "--task",
+                "x",
+                "--brainstorm",
+                "--no-brainstorm",
+            ])
+            .is_err(),
+            "both flags together must be refused"
+        );
+    }
+
+    #[test]
+    fn brainstorm_selects_the_intent_step_skill_and_survives_an_explicit_override() {
+        let repo = tempdir().unwrap();
+        let feature = WorkflowState::start(
+            repo.path().to_path_buf(),
+            "small feature".into(),
+            WorkflowKind::Feature,
+            None,
+            true,
+            low_classification(),
+        );
+        assert_eq!(feature.current().unwrap().skill, "brainstorm");
+        assert!(feature.brainstorm);
+
+        let mut classification = low_classification();
+        classification.complexity = Complexity::Bounded;
+        classification.risk = RiskBand::Medium;
+        let bugfix = WorkflowState::start(
+            repo.path().to_path_buf(),
+            "small bugfix".into(),
+            WorkflowKind::Bugfix,
+            None,
+            true,
+            classification,
+        );
+        assert_eq!(bugfix.current().unwrap().skill, "write-intent");
+        assert!(!bugfix.brainstorm);
+
+        let mut overridden = bugfix;
+        apply_brainstorm_selection(true, &mut overridden.steps);
+        assert_eq!(overridden.current().unwrap().skill, "brainstorm");
     }
 
     #[test]
@@ -3366,12 +3519,8 @@ mod tests {
         assert!(statuses[0].drifted);
     }
 
-    /// Issue #235: `zirv workflow status` renders each completed step's
-    /// wall-clock next to its id, e.g. `completed: intent (2m10s), spec
-    /// (0m40s)`, sourced from `WorkflowState::step_durations_ms`. A step
-    /// completed by a zirv build from before this key existed has no entry
-    /// (`#[serde(default)]` leaves the map empty on load) and must still
-    /// render its bare id, exactly as before -- never a bogus "0m0s".
+    /// A step with no recorded duration (an older saved state) renders its
+    /// bare id, never a bogus "0m0s".
     #[test]
     fn write_state_renders_completed_step_wall_clock_only_when_known() {
         let repo = tempdir().unwrap();
@@ -3405,6 +3554,34 @@ mod tests {
         write_state(&mut out, &legacy, false).unwrap();
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("completed: intent, spec"), "got: {text}");
+    }
+
+    #[test]
+    fn write_state_renders_brainstorm_only_when_the_workflow_has_an_intent_step() {
+        let repo = tempdir().unwrap();
+        let feature = WorkflowState::start(
+            repo.path().to_path_buf(),
+            "small feature".into(),
+            WorkflowKind::Feature,
+            None,
+            true,
+            low_classification(),
+        );
+        let mut out = Vec::new();
+        write_state(&mut out, &feature, false).unwrap();
+        assert!(String::from_utf8(out).unwrap().contains("brainstorm: on"));
+
+        let review = WorkflowState::start(
+            repo.path().to_path_buf(),
+            "independent review".into(),
+            WorkflowKind::Review,
+            None,
+            true,
+            low_classification(),
+        );
+        let mut out = Vec::new();
+        write_state(&mut out, &review, false).unwrap();
+        assert!(!String::from_utf8(out).unwrap().contains("brainstorm:"));
     }
 
     /// `load` is the single choke point every id-resolving verb (`status`,
@@ -3856,6 +4033,41 @@ mod tests {
         assert!(context.contains("[skill implement@1"));
         assert!(!context.contains("[skill execute-plan@1"));
         assert!(!context.contains("[skill worktree@1"));
+    }
+
+    #[test]
+    fn refusal_for_only_fires_for_brainstorm_when_headless() {
+        assert_eq!(
+            refusal_for("brainstorm", true),
+            Some(BRAINSTORM_HEADLESS_REFUSAL)
+        );
+        assert_eq!(refusal_for("brainstorm", false), None);
+        assert_eq!(refusal_for("write-intent", true), None);
+    }
+
+    #[test]
+    fn a_headless_worker_refuses_the_brainstorm_step() {
+        let repo = tempdir().unwrap();
+        let state = WorkflowState::start(
+            repo.path().to_path_buf(),
+            "small feature".into(),
+            WorkflowKind::Feature,
+            None,
+            true,
+            low_classification(),
+        );
+        assert_eq!(state.current().unwrap().skill, "brainstorm");
+        // SAFETY: nextest runs one test per process.
+        unsafe {
+            std::env::set_var("ZIRV_CTX_HEADLESS", "1");
+        }
+        let context = render_current_context(&state, repo.path(), None).unwrap();
+        unsafe {
+            std::env::remove_var("ZIRV_CTX_HEADLESS");
+        }
+        let context = context.unwrap();
+        assert!(context.contains(BRAINSTORM_HEADLESS_REFUSAL));
+        assert!(!context.contains("Explore the repository"));
     }
 
     #[test]

@@ -3340,6 +3340,38 @@ mod tests {
         );
     }
 
+    /// Issue #236: every headless delegation sets `ZIRV_CTX_HEADLESS` on the
+    /// child, read by `engine::refusal_for` to refuse the `brainstorm` skill.
+    #[test]
+    fn a_headless_delegation_sets_the_headless_env_marker() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state_dir = tmp.path().join("state");
+        let mut env = base_env(&state_dir);
+        env.insert("ZIRV_CTX_PACE".to_string(), "false".to_string());
+        let headless_env_log = tmp.path().join("headless-env.log");
+
+        unsafe {
+            std::env::set_var("FAKE_AGENT_MODE", "healthy");
+            std::env::set_var("FAKE_AGENT_HEADLESS_ENV_LOG", &headless_env_log);
+        }
+        let args = args_for("claude", "do the work");
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE");
+            std::env::remove_var("FAKE_AGENT_HEADLESS_ENV_LOG");
+        }
+        assert_eq!(code.expect("runs"), 0);
+        assert_eq!(
+            std::fs::read_to_string(&headless_env_log)
+                .expect("the child logged its env")
+                .trim(),
+            "1"
+        );
+    }
+
     /// The other half of Finding 3, end to end: a child that inherits that
     /// exact environment -- a `zirv ctx agent` call with no `--group` of its
     /// own, run from inside a coordinator's harness -- resolves the SAME

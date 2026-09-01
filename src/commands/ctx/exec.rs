@@ -960,6 +960,10 @@ fn run_with_clock_inner<W: Write>(
         for (key, value) in turn_env_for(session) {
             command.env(key, value);
         }
+        // Issue #236: this module supervises only headless runs, so every
+        // child it spawns gets this marker, read by `engine::refusal_for` to
+        // refuse the interactive `brainstorm` skill.
+        command.env("ZIRV_CTX_HEADLESS", "1");
     };
 
     // FIX B: on a Windows npm `.cmd` shim launch, `cmd.exe /c <shim>` reparses
