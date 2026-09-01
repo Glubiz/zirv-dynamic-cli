@@ -1635,27 +1635,41 @@ struct ReviewerFinding {
 /// field of the wrong type) is skipped with a warning to stderr instead of
 /// discarding every other finding the reviewer reported.
 ///
-/// Issue #232 (review round): `REVIEW_RESULT_PREFIX` is matched anywhere in
-/// the trimmed line, not only at its very start -- a reviewer's own
-/// standing instructions can prepend a health marker of their own ahead of
-/// it (this repo's `UserPromptSubmit` hook makes Claude answer `[zirv]
-/// ZIRV_REVIEW_RESULT {...}`), and requiring the marker to lead the line
-/// rejected every such result outright. Everything from the FIRST match
-/// onward is parsed as the JSON payload; the "more than one structured
-/// result" guard still counts any line containing the marker, matching
-/// today's behaviour for a reviewer that genuinely emits two.
+/// Returns the JSON payload after `REVIEW_RESULT_PREFIX` if `line`, once
+/// trimmed, is either the bare marker or exactly one whitespace-free
+/// bracketed tag followed by a single space and the marker; `None` otherwise.
+fn review_result_json(line: &str) -> Option<&str> {
+    let trimmed = line.trim();
+    if let Some(json) = trimmed.strip_prefix(REVIEW_RESULT_PREFIX) {
+        return Some(json);
+    }
+    let rest = trimmed.strip_prefix('[')?;
+    let close = rest.find(']')?;
+    let (tag, after_tag) = rest.split_at(close);
+    if tag.contains(char::is_whitespace) {
+        return None;
+    }
+    after_tag
+        .strip_prefix("] ")?
+        .strip_prefix(REVIEW_RESULT_PREFIX)
+}
+
+/// Issue #232 (review round): after trimming, at most one leading bracketed
+/// tag with no internal whitespace (e.g. `[zirv] `, from this repo's
+/// `UserPromptSubmit` hook) may precede `REVIEW_RESULT_PREFIX`; anything
+/// else ahead of the marker -- echoed text, a multi-word tag, a missing
+/// space -- rejects the line, so attacker-influenced output containing the
+/// marker is never mistaken for the structured result.
 fn parse_reviewer_output(output: &str) -> CtxResult<Vec<ReviewerFinding>> {
     if output.len() > MAX_REVIEW_OUTPUT_BYTES {
         return Err(format!("reviewer output exceeds {MAX_REVIEW_OUTPUT_BYTES} bytes").into());
     }
     let mut result: Option<serde_json::Value> = None;
     for line in output.lines() {
-        let trimmed = line.trim();
-        if let Some(marker_at) = trimmed.find(REVIEW_RESULT_PREFIX) {
+        if let Some(json) = review_result_json(line) {
             if result.is_some() {
                 return Err("reviewer emitted more than one structured result".into());
             }
-            let json = &trimmed[marker_at + REVIEW_RESULT_PREFIX.len()..];
             result = Some(
                 serde_json::from_str::<serde_json::Value>(json)
                     .map_err(|error| format!("reviewer result is not valid JSON: {error}"))?,
@@ -3523,13 +3537,42 @@ checksum = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f80"
     /// makes Claude answer every turn with a leading `[zirv]` health
     /// marker, so a reviewer's final line reads `[zirv]
     /// ZIRV_REVIEW_RESULT {...}`, not a bare `ZIRV_REVIEW_RESULT {...}` --
-    /// the marker must be found anywhere in the line, not only at its
-    /// start.
+    /// exactly one whitespace-free bracketed tag ahead of the marker must
+    /// still parse.
     #[test]
     fn a_leading_marker_before_the_review_result_prefix_still_parses() {
         let output = format!("[zirv] {REVIEW_RESULT_PREFIX}{{\"findings\":[]}}");
         let findings = parse_reviewer_output(&output).expect("structured result");
         assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn a_bare_review_result_prefix_still_parses() {
+        let output = format!("{REVIEW_RESULT_PREFIX}{{\"findings\":[]}}");
+        let findings = parse_reviewer_output(&output).expect("structured result");
+        assert!(findings.is_empty());
+    }
+
+    /// Issue #232 (review round, tightened): the marker must not be
+    /// accepted anywhere in the line -- only a bare marker or exactly one
+    /// whitespace-free bracketed tag may precede it. Otherwise a reviewer
+    /// echoing attacker-influenced text containing the marker would be
+    /// treated as the structured result.
+    #[test]
+    fn a_marker_preceded_by_anything_else_is_rejected() {
+        let echoed = format!("echoed text {REVIEW_RESULT_PREFIX}{{\"findings\":[]}}");
+        let error = parse_reviewer_output(&echoed).unwrap_err().to_string();
+        assert!(error.contains("did not emit a structured Zirv review result"));
+
+        let multi_word_tag = format!("[a b] {REVIEW_RESULT_PREFIX}{{\"findings\":[]}}");
+        let error = parse_reviewer_output(&multi_word_tag)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("did not emit a structured Zirv review result"));
+
+        let no_space = format!("[zirv]{REVIEW_RESULT_PREFIX}{{\"findings\":[]}}");
+        let error = parse_reviewer_output(&no_space).unwrap_err().to_string();
+        assert!(error.contains("did not emit a structured Zirv review result"));
     }
 
     /// #229: the claude reviewer emitted an extra `failure_scenario` key per
