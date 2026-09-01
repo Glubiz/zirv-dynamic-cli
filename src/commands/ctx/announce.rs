@@ -241,6 +241,12 @@ pub enum Event {
     /// that prompts on ordinary commands (`codex::codex_approval_advisory`).
     /// `advisory` is pre-rendered by the caller.
     CodexApprovalAdvisory { advisory: String },
+    /// Issue #243 (review round, F3/F4): a live supervision loop's own
+    /// scoring cycle flagged something in the transcript bytes it just
+    /// ingested (`sessions::record_screening`, de-duplicated there so an
+    /// unchanged summary is announced once, not every poll). `summary` is
+    /// `screen::ScreenReport::summary`'s own text.
+    Screening { summary: String },
     /// A `zirv ctx handover` request was refused rather than acted on --
     /// most commonly "mid-turn, and no `--force` was given" (see
     /// `wrap::may_inject`, the same quiesce check every other injection
@@ -301,6 +307,7 @@ impl Event {
             ),
             Event::SandboxResidual { note } => format!("sandbox residual: {note}"),
             Event::CodexApprovalAdvisory { advisory } => advisory.clone(),
+            Event::Screening { summary } => format!("screening: {summary}"),
             Event::VerdictChanged { from, to, score } => {
                 format!(
                     "context health {} -> {} (score {score})",

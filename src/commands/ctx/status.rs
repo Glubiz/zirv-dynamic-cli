@@ -138,10 +138,15 @@ fn sessions_lines(
                     )
                 ));
             }
-            // Issue #243: the last scoring cycle's own screening
-            // finding, persisted onto the record itself -- see `hook.rs::
-            // run_stop` and `sessions::set_last_screening`.
-            if let Some(summary) = record.last_screening.as_deref().filter(|s| !s.is_empty()) {
+            // Issue #243 (review round, F1): the last scoring cycle's own
+            // screening finding -- its own sibling file next to the
+            // record, never a field on the record itself (see `sessions::
+            // last_screening`/`set_last_screening`'s own doc comments for
+            // why: an unlocked write onto the live record could clobber a
+            // concurrent `SessionGuard` write).
+            if let Some(summary) =
+                sessions::last_screening(state, &record.short).filter(|s| !s.is_empty())
+            {
                 line.push_str(&format!(
                     "  {}",
                     style::paint(&format!("screening: {summary}"), Tone::Warn, colour)
@@ -1794,15 +1799,21 @@ mod tests {
         std::fs::create_dir_all(&repo).expect("mkdir repo");
         let env = env_for(state.root());
 
-        let mut record = crate::commands::ctx::sessions::Record::new(
+        let record = crate::commands::ctx::sessions::Record::new(
             "cccc3333-2222-4333-8444-555555555555",
             "claude",
             &repo,
             crate::commands::ctx::sessions::Verb::Wrap,
         );
-        record.last_screening =
-            Some("1 flag: prompt-injection marker (\"ignore previous instructions\")".to_string());
+        let short = record.short.clone();
         let _guard = crate::commands::ctx::sessions::SessionGuard::register(&state, record);
+        // Issue #243 (review round, F1): the sibling-file store, never a
+        // field on the record itself.
+        crate::commands::ctx::sessions::set_last_screening(
+            &state,
+            &short,
+            Some("1 flag: prompt-injection marker (\"ignore previous instructions\")".to_string()),
+        );
 
         let mut out = Vec::new();
         run_with(

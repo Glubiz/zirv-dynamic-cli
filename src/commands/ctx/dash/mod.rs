@@ -8380,7 +8380,6 @@ mod tests {
             safety_policy_sha256: None,
             role: None,
             start_time: None,
-            last_screening: None,
         }
     }
 

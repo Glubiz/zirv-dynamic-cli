@@ -1129,6 +1129,10 @@ fn run_with_clock_inner<W: Write>(
     // for the whole run rather than once per restart.
     let mut pace_flags = pace::PaceGateFlags::default();
     let http_poller = super::poll::HttpPoller::new(cfg.chrome.events);
+    // Issue #243 (review round, F3): owned across every cycle too, so a
+    // screening summary that has not changed since the last poll is
+    // announced once for the whole run, not once per restart.
+    let mut screening_announced: Option<String> = None;
 
     loop {
         pace::wait_for_window(
@@ -1203,6 +1207,8 @@ fn run_with_clock_inner<W: Write>(
             server.as_ref(),
             session.as_str(),
             &registry_short,
+            &announcer,
+            &mut screening_announced,
             &mut rotted,
             &mut progressed,
             &tap,
@@ -2304,6 +2310,13 @@ fn supervise_run(
     // restart mints a fresh session -- deriving it from `session` here meant
     // a nudge sent after the first restart was never claimed.
     registry_short: &str,
+    // Issue #243 (review round, F3): the same `Announcer` this run's other
+    // events already use, plus this run's own de-duplication memory --
+    // owned above the per-restart loop (like `registry_short`/`nudged_by`),
+    // so a screening summary that has not changed is announced once for
+    // the whole supervised run, not once per poll or once per restart.
+    announcer: &super::announce::Announcer,
+    screening_announced: &mut Option<String>,
     rotted: &mut bool,
     // C3: set when this session reported a turn boundary of its own.
     progressed: &mut bool,
@@ -2434,7 +2447,24 @@ fn supervise_run(
             Some(agent::BudgetState::SoftWarn { .. } | agent::BudgetState::Ok) | None => {}
         }
         // A scoring failure must never kill a healthy run.
-        match scorer.poll(adapter, score_cfg) {
+        let poll_result = scorer.poll(adapter, score_cfg);
+        // Issue #243 (review round, F3): consumes the screening half of
+        // every successful poll -- persisted and, when it changed,
+        // announced -- through the same shared helper the Stop hook uses
+        // (`sessions::record_screening`), so a codex/wrap-supervised
+        // session (no Claude Stop hook at all) still gets a live-detected
+        // injection marker or credential shape surfaced, not only silently
+        // dropped.
+        if let Ok((_, report)) = &poll_result {
+            super::sessions::record_screening(
+                state,
+                registry_short,
+                report,
+                announcer,
+                screening_announced,
+            );
+        }
+        match poll_result {
             Ok((Some(score), _)) if score.verdict == Verdict::Restart => {
                 *rotted = true;
                 Tick::Stop("rot")
