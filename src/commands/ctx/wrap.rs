@@ -4971,7 +4971,7 @@ mod tests {
             "the user's own instruction must survive: {carried_text:?}"
         );
         assert!(
-            carried_text.contains("zirv session conventions"),
+            carried_text.contains("zirv engineering standard"),
             "zirv's own layer is still present: {carried_text:?}"
         );
 
@@ -5053,7 +5053,7 @@ mod tests {
             "the user's own instruction is not stripped: {seen:?}"
         );
         assert!(
-            !seen.contains("zirv session conventions"),
+            !seen.contains("zirv engineering standard"),
             "no-supervise is pure passthrough, no injection: {seen:?}"
         );
 

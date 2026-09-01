@@ -16,17 +16,8 @@ anything you need to keep.
 
 ## Verification
 
-Run all five yourself, in the foreground, to completion:
-
-    cargo build
-    cargo nextest run --no-fail-fast
-    cargo test --verbose -- --test-threads=1
-    cargo fmt -- --check
-    cargo clippy --all-targets -- -D warnings
-
-Report failures VERBATIM -- command, exit code, failing test names, the error
-text -- rather than summarizing them. Never claim a check passed that you did
-not actually finish running.
+Run the checks yourself, in the foreground, to completion, per the tiers in
+`.zirv/context/common.md`.
 
 ## Sandbox
 
@@ -47,9 +38,3 @@ contract, or architecture change, update the matching vault page (the trigger
 list is in `.zirv/context/common.md`) and bump its `last-verified` date; log
 new gotchas in Known Issues and non-obvious decisions in the Decision Log. Do
 not update docs for pure refactors, bug fixes, new tests, or CI-only changes.
-
-## Git
-
-Never commit or push to `main`/`master` -- branch first. Every PR must raise
-`Cargo.toml`'s version above its base branch or CD fails on a duplicate
-release. No "Co-Authored-By" lines.

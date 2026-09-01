@@ -1705,7 +1705,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let repo = tempfile::tempdir().expect("repo");
         let state = StateDir::from_root(dir.path().to_path_buf());
-        let transcript = transcript_with_edits(dir.path(), 6, 5);
+        let transcript = transcript_with_edits(dir.path(), 12, 12);
         let mut cfg = CtxConfig::default();
         cfg.workflow.adoption = AdoptionPolicy::Off;
 
@@ -1714,7 +1714,7 @@ mod tests {
             repo.path(),
             "sess-off",
             &cfg,
-            &score_with_turns(6),
+            &score_with_turns(12),
             &transcript,
             &|_| None,
         );
@@ -1732,7 +1732,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let repo = tempfile::tempdir().expect("repo");
         let state = StateDir::from_root(dir.path().to_path_buf());
-        let transcript = transcript_with_edits(dir.path(), 6, 5);
+        let transcript = transcript_with_edits(dir.path(), 12, 12);
         let mut cfg = CtxConfig::default();
         cfg.workflow.adoption = AdoptionPolicy::Nudge;
         let env: std::collections::HashMap<String, String> = [(
@@ -1746,14 +1746,14 @@ mod tests {
             repo.path(),
             "sess-worker",
             &cfg,
-            &score_with_turns(6),
+            &score_with_turns(12),
             &transcript,
             &|k| env.get(k).cloned(),
         );
         assert_eq!(text, None, "a delegated worker must never be nudged");
     }
 
-    /// Substantial work (>= 5 edit calls) with no active workflow, under
+    /// Substantial work (>= 12 edit calls) with no active workflow, under
     /// `nudge`: the first call nudges immediately and persists a record
     /// saying so; an unchanged follow-up call (no new turns) stays silent.
     #[test]
@@ -1761,7 +1761,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let repo = tempfile::tempdir().expect("repo");
         let state = StateDir::from_root(dir.path().to_path_buf());
-        let transcript = transcript_with_edits(dir.path(), 6, 5);
+        let transcript = transcript_with_edits(dir.path(), 12, 12);
         let mut cfg = CtxConfig::default();
         cfg.workflow.adoption = AdoptionPolicy::Nudge;
 
@@ -1770,12 +1770,12 @@ mod tests {
             repo.path(),
             "sess-nudge",
             &cfg,
-            &score_with_turns(6),
+            &score_with_turns(12),
             &transcript,
             &|_| None,
         )
         .expect("substantial work must nudge immediately");
-        assert!(first.contains("5 edit calls over 6 turns"), "{first}");
+        assert!(first.contains("12 edit calls over 12 turns"), "{first}");
         assert!(first.contains("zirv workflow start"), "{first}");
 
         // Same transcript, same turn count -- nothing new happened, so the
@@ -1785,7 +1785,7 @@ mod tests {
             repo.path(),
             "sess-nudge",
             &cfg,
-            &score_with_turns(6),
+            &score_with_turns(12),
             &transcript,
             &|_| None,
         );
@@ -1800,7 +1800,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let repo = tempfile::tempdir().expect("repo");
         let state = StateDir::from_root(dir.path().to_path_buf());
-        let transcript = transcript_with_edits(dir.path(), 6, 5);
+        let transcript = transcript_with_edits(dir.path(), 12, 12);
         let mut cfg = CtxConfig::default();
         cfg.workflow.adoption = AdoptionPolicy::Advise;
 
@@ -1809,7 +1809,7 @@ mod tests {
             repo.path(),
             "sess-advise",
             &cfg,
-            &score_with_turns(6),
+            &score_with_turns(12),
             &transcript,
             &|_| None,
         );
@@ -1820,7 +1820,7 @@ mod tests {
             repo.path(),
             "sess-advise",
             &cfg,
-            &score_with_turns(6),
+            &score_with_turns(12),
             &transcript,
             &|_| None,
         );
@@ -1834,7 +1834,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let repo = tempfile::tempdir().expect("repo");
         let state = StateDir::from_root(dir.path().to_path_buf());
-        let transcript = transcript_with_edits(dir.path(), 6, 5);
+        let transcript = transcript_with_edits(dir.path(), 12, 12);
         let mut cfg = CtxConfig::default();
         cfg.workflow.adoption = AdoptionPolicy::Enforce;
 
@@ -1843,7 +1843,7 @@ mod tests {
             repo.path(),
             "sess-enforce",
             &cfg,
-            &score_with_turns(6),
+            &score_with_turns(12),
             &transcript,
             &|_| None,
         )
@@ -1860,7 +1860,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let repo = tempfile::tempdir().expect("repo");
         let state = StateDir::from_root(dir.path().to_path_buf());
-        let transcript = transcript_with_edits(dir.path(), 6, 5);
+        let transcript = transcript_with_edits(dir.path(), 12, 12);
         crate::commands::workflow::engine::save(
             &state,
             &crate::commands::workflow::engine::WorkflowState::start(
@@ -1891,7 +1891,7 @@ mod tests {
             repo.path(),
             "sess-active",
             &cfg,
-            &score_with_turns(6),
+            &score_with_turns(12),
             &transcript,
             &|_| None,
         );
@@ -1913,7 +1913,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let repo = tempfile::tempdir().expect("repo");
         let state = StateDir::from_root(dir.path().to_path_buf());
-        let transcript = transcript_with_edits(dir.path(), 6, 5);
+        let transcript = transcript_with_edits(dir.path(), 12, 12);
         let mut cfg = CtxConfig::default();
         cfg.workflow.adoption = AdoptionPolicy::Nudge;
 
@@ -1922,7 +1922,7 @@ mod tests {
             repo.path(),
             "sess-recover",
             &cfg,
-            &score_with_turns(6),
+            &score_with_turns(12),
             &transcript,
             &|_| None,
         );
@@ -1961,7 +1961,7 @@ mod tests {
             repo.path(),
             "sess-recover",
             &cfg,
-            &score_with_turns(6),
+            &score_with_turns(12),
             &transcript,
             &|_| None,
         );

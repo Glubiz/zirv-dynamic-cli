@@ -24,6 +24,13 @@ last-verified: 2026-09-01
 
 ## Decisions
 
+### 2026-09-01 — Proportionality-first wrapper: engineering standard replaces process-first conventions
+**Context:** The wrapper's injected text was ~95% process and ~5% judgment, every rule absolute rather than sized, and review mandates (workflow gate, native review, codex cross-review, vault-keeper) stacked unconditionally on every diff — turning a two-minute fix into a dispatch plus four verification commands plus two reviews.
+**Decision:** `DEFAULT_PROMPT` becomes `zirv engineering standard (v3)` — one short judgment-first standard sizing every task trivial/bounded/substantial, reaching every role and harness. `HARNESS_PROMPT` (v15) and both adapters' `ORCHESTRATOR_PROMPT` size delegation, lifecycle, and review by that same tier; the workflow-adoption nudge and the engine's feature-kind `intent` gate follow suit. `.zirv/context/*.md` and the vault mirror the tiers.
+**Rejected:** Tuning individual thresholds in isolation (nudge cadence, review fan-out) — treats symptoms; the audit found the cause was structural (no sizing anywhere), so the fix had to be one standard applied consistently, not another absolute rule layered on top.
+**Consequences:** A trivial or bounded change no longer pays substantial-tier ceremony; substantial/risky work keeps every existing protection (model routing, fork ban, deny list, cross-harness review). Follow-ups (an over-verification rot signal, retiring duplicated machine-local memory entries) are tracked in the spec, not this PR.
+**Spec / link:** `docs/superpowers/specs/2026-09-01-wrapper-behaviour-redesign.md`.
+
 ### 2026-09-01 — The frontend Test gate scans only the since-base change set; pre-existing findings need an explicit operator flag (issue #251, v3.8.0)
 **Context:** The Test-phase frontend gate fell back to a whole-repository scan the moment `changed_paths` (uncommitted-only against bare HEAD) went quiet — which happened as soon as an earlier workflow step committed its own edits — and then failed closed on unrelated, pre-existing findings the current change never touched.
 **Decision:** New `verification::changed_paths_since_base` (merge-base diff, union of the uncommitted diff and untracked-not-ignored files) replaces `changed_paths` as the workflow detector's own scope source; the Test gate always scans that set directly, never a whole-repo fallback. Review/Verify still scan the whole repository but tag every finding `preexisting` against that same set, so `advance_with_evidence` can fail on anything introduced while letting an operator explicitly accept what predates the change via `--accept-preexisting-findings`, recorded once on the workflow and applied for its remainder.

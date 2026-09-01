@@ -3752,7 +3752,7 @@ mod tests {
 
         let argv = std::fs::read_to_string(&argv_log).expect("argv recorded");
         assert!(
-            argv.contains("zirv session conventions"),
+            argv.contains("zirv engineering standard"),
             "the shipped default layer proves injection happened: {argv}"
         );
         // Match the layer's version header, not the bare name: the adapter

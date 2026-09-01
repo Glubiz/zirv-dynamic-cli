@@ -576,7 +576,7 @@ pub fn builtin_manifests() -> CtxResult<Vec<SkillManifest>> {
             &[Cap::ShellExec, Cap::TestRun, Cap::NetworkAccess],
             &[Phase::Deploy],
             &["verify"],
-            "Inspect the final diff and require fresh final verification before proposing branch completion. Confirm the branch is based on the intended target, has no accidental or unrelated changes, and that durable workflow artifacts and review dispositions are current. Then prepare the branch and pull-request handoff required by the active deploy tier. Never bypass an approval, independent-review, or production gate; never merge merely because implementation is finished. If the adapter cannot perform a repository-host action, leave an exact handoff rather than inventing success.",
+            "Inspect the final diff. When the tree is unchanged since the verify step last ran, reuse that step's evidence instead of re-verifying from scratch; when it has changed since, re-run only the checks a later change could plausibly have affected. Confirm the branch is based on the intended target, has no accidental or unrelated changes, and that durable workflow artifacts and review dispositions are current. Then prepare the branch and pull-request handoff required by the active deploy tier. Never bypass an approval, independent-review, or production gate; never merge merely because implementation is finished. If the adapter cannot perform a repository-host action, leave an exact handoff rather than inventing success.",
         ),
         manifest(
             "design",

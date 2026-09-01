@@ -14,12 +14,14 @@
   sonnet reviewer.
 - Implementer briefs MUST mandate FOREGROUND test runs. Agents that background
   `cargo test` stall silently and have to be nudged.
-- Every substantive diff gets a codex cross-review round: `zirv agent codex
-  "..."`. codex-cli is installed at
+- Substantial or risky diffs get one codex cross-review worker inside the
+  single review round: `zirv agent codex "..."`. codex-cli is installed at
   `~/AppData/Local/Programs/OpenAI/Codex/bin` even when a roster line claims
-  it is not.
-- Run the `vault-keeper` agent before pushing; it enforces the doc-update
-  contract in `.zirv/context/common.md`.
+  it is not. Bounded diffs get the native sonnet review alone; trivial diffs
+  get none.
+- Run the `vault-keeper` agent before pushing a PR whose diff changes
+  behaviour, contract, or architecture; it enforces the doc-update contract
+  in `.zirv/context/common.md`.
 
 ## This Windows dev machine
 

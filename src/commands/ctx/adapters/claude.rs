@@ -35,50 +35,43 @@ use super::{AgentAdapter, ResolvedProgram, TurnSignalSetup};
 /// agent --role sub-orchestrator` is reserved for work that genuinely
 /// decomposes into multiple coherently-scoped areas or must run under zirv's
 /// own supervision independently of this seat.
+///
+/// Wrapper behaviour redesign (2026-09-01): rewritten so trivial and bounded
+/// changes stay on this seat instead of always delegating -- the prior text's
+/// "delegate every substantive piece of work" was absolute regardless of task
+/// size, one of the process rules the wrapper-behaviour audit found was
+/// turning small fixes into a full dispatch-and-review cycle. Model routing,
+/// the fork ban, self-contained briefs and the sub-orchestrator carve-out are
+/// unchanged. See
+/// `docs/superpowers/specs/2026-09-01-wrapper-behaviour-redesign.md`.
 pub const ORCHESTRATOR_PROMPT: &str = "\
 zirv orchestrator conventions (claude)
 
-You are an orchestrator. Coordination and judgment are the job, implementation is not: the \
-orchestrator model is reserved for this seat, so delegate every substantive piece of work \
-(codebase exploration, implementation, testing, review) to subagents via the Agent tool and keep \
-your own replies brief and decision-focused.
+This seat runs the most capable model; spend it on judgment -- sizing, design choices, \
+integration, the final call -- not on ceremony.
 
-- Size delegation to the job: native Agent-tool subagents (cheaper-model tier per the rule \
-above) are the default for every bounded task, however substantial. Reserve a sub-orchestrator \
-(`zirv ctx agent --role sub-orchestrator --scope \"<area>\"`) for work that splits into multiple \
-coherent areas each needing its own coordination, or that must run under zirv's own supervision \
-independently of this seat -- never for a single bounded task a worker could finish.
-- Bundle before you dispatch: never spawn an agent for one tiny task. Group small related tasks \
-(same file or area, or a natural sequence) into a single checklist brief per agent, with a \
-per-item output format. Split across agents only when tasks are independent and substantial, \
-then dispatch them together and prefer background dispatch so a slow worker blocks nothing. For \
-a small follow-up in an area a worker just handled, continue that worker instead of spawning a \
-fresh one.
-- Every Agent-tool dispatch MUST set the model parameter explicitly: haiku for mechanical and \
-bulk work, sonnet for ordinary exploration, implementation and test writing, opus only for hard \
-debugging and design exploration. Never omit it -- omission silently inherits this seat's own \
-expensive model -- never dispatch on this seat's model, and never use fork-type subagents from \
-this seat, which always inherit the seat model and ignore overrides. Agents in .claude/agents \
-that pin their own model are exempt; do not override those, except the review-model rule below, \
-which outranks this.
-- Write self-contained briefs: state the goal, constraints, relevant file paths and exact output \
-format, and nothing else -- subagents share none of your context. Every brief must itself tell \
-the worker to reply briefly with compact structured findings, never raw file dumps.
-- Decide rather than let a worker loop: choices between valid designs, architecture changes, and \
-anything a worker has failed at twice come back to you. Do not read large files or write code \
-yourself unless the change is trivial.
-- Hold implementers to this repository's standards: follow the patterns already there, look for \
-reusable code before adding new code, write a failing test first, keep diffs minimal, and run the \
-project's format, lint and test commands before reporting back.
-- Verify in batches: one independent reviewer gate per batch of related changes, not one per \
-micro-task. You own the final integration, so resolve conflicts between agent outputs and report \
-outcomes, including failures, plainly.
-- Before reporting development work done, run this harness's own /code-review over the full diff \
-at a single-reviewer effort level (low or medium), routed to the review model named in the \
-harness roster, never this seat's own model, and never a high-or-above fan-out, which forks \
-agents that inherit the seat's expensive model. If a `zirv workflow` review gate is active for \
-this change, that gate is the single source of truth and this native review does not run at all: \
-`zirv workflow review run` is the round.";
+- Trivial and bounded changes stay on this seat: a brief costs more than the fix. Delegate via \
+the Agent tool when the work is larger than its brief or can run in parallel; bundle small \
+related items into one checklist brief with a per-item output format, dispatch independent \
+substantial work together in the background, and continue a worker you already briefed for \
+follow-ups in its area instead of spawning a fresh one. Reserve a sub-orchestrator (`zirv ctx \
+agent --role sub-orchestrator --scope \"<area>\"`) for work that splits into several \
+coherently-scoped areas each needing its own coordination.
+- Every Agent dispatch sets `model` explicitly -- haiku for mechanical and bulk work, sonnet \
+for ordinary exploration, implementation, tests and review, opus only for hard debugging or \
+design -- because an omitted model inherits this seat. Never use `subagent_type: \"fork\"` \
+here; forks always inherit the seat model. Agents in .claude/agents that pin their own model \
+keep it, except that reviews always run on the roster's review model.
+- Briefs are self-contained -- goal, constraints, relevant paths, exact output format -- and \
+tell the worker to run tests in the FOREGROUND and reply with compact structured findings, \
+never raw file dumps. Subagents share none of your context.
+- Decide rather than let a worker loop: choices between valid designs, architecture changes, \
+and anything a worker has failed at twice come back to you. Hold implementers to the \
+repository's standards and to the engineering standard above: reuse before adding, minimal \
+diff, one focused test per behaviour change, format, lint and test before reporting back.
+- Reviews follow the meta-harness rule: in proportion, once. This harness's own /code-review \
+runs at low or medium effort on the roster's review model, never high or above (that forks \
+this seat's model), and never when a `zirv workflow` review gate covers the change.";
 
 /// Claude's own layer for a delegated **Worker** session (see
 /// `AgentAdapter::worker_system_prompt`), spliced in place of
@@ -3153,7 +3146,7 @@ mod tests {
         assert_eq!(layer, WORKER_PROMPT);
         assert!(layer.starts_with("zirv worker conventions"));
         assert!(
-            !layer.contains("Coordination and judgment are the job"),
+            !layer.contains("spend it on judgment"),
             "the worker layer must not carry the orchestrator's own coaching: {layer}"
         );
         for claim in ["never run `zirv agent`", "fork-type subagents"] {
@@ -3494,19 +3487,17 @@ mod tests {
     #[test]
     fn the_orchestrator_prompt_routes_review_to_the_rosters_configured_model() {
         assert!(
-            ORCHESTRATOR_PROMPT.contains(
-                "routed to the review model named in the harness roster, never this seat's own \
-                 model"
-            ),
+            ORCHESTRATOR_PROMPT.contains("roster's review model"),
             "got:\n{ORCHESTRATOR_PROMPT}"
         );
         assert!(
-            ORCHESTRATOR_PROMPT.contains("single-reviewer effort level (low or medium)"),
+            ORCHESTRATOR_PROMPT.contains("runs at low or medium effort"),
             "never a high-or-above fan-out from this seat: {ORCHESTRATOR_PROMPT}"
         );
         assert!(
             ORCHESTRATOR_PROMPT.contains(
-                "do not override those, except the review-model rule below, which outranks this"
+                "Agents in .claude/agents that pin their own model keep it, except that reviews \
+                 always run on the roster's review model"
             ),
             "the model-routing bullet's pin clause must carve out the review-model exception: \
              {ORCHESTRATOR_PROMPT}"
@@ -3536,7 +3527,7 @@ mod tests {
     #[test]
     fn the_orchestrator_prompt_encodes_model_routing_and_token_economy() {
         assert!(
-            ORCHESTRATOR_PROMPT.contains("MUST set the model parameter explicitly"),
+            ORCHESTRATOR_PROMPT.contains("Every Agent dispatch sets `model` explicitly"),
             "got:\n{ORCHESTRATOR_PROMPT}"
         );
         for tier in [
@@ -3550,21 +3541,17 @@ mod tests {
             );
         }
         assert!(
-            ORCHESTRATOR_PROMPT.contains("never dispatch on this seat's model"),
+            ORCHESTRATOR_PROMPT.contains("an omitted model inherits this seat"),
             "got:\n{ORCHESTRATOR_PROMPT}"
         );
         assert!(
-            ORCHESTRATOR_PROMPT.contains("never use fork-type subagents from this seat"),
+            ORCHESTRATOR_PROMPT.contains("Never use `subagent_type: \"fork\"` here"),
             "forks always inherit the seat model and ignore overrides: {ORCHESTRATOR_PROMPT}"
         );
         assert!(
-            ORCHESTRATOR_PROMPT.contains("keep your own replies brief and decision-focused"),
-            "got:\n{ORCHESTRATOR_PROMPT}"
-        );
-        assert!(
             ORCHESTRATOR_PROMPT.contains(
-                "tell the worker to reply briefly with compact \
-             structured findings, never raw file dumps"
+                "tell the worker to run tests in the FOREGROUND and reply with compact \
+                 structured findings, never raw file dumps"
             ),
             "got:\n{ORCHESTRATOR_PROMPT}"
         );
@@ -3579,25 +3566,21 @@ mod tests {
     #[test]
     fn the_orchestrator_prompt_sizes_delegation_between_subagents_and_sub_orchestrators() {
         assert!(
-            ORCHESTRATOR_PROMPT.contains("native Agent-tool subagents"),
-            "got:\n{ORCHESTRATOR_PROMPT}"
+            ORCHESTRATOR_PROMPT.contains("Trivial and bounded changes stay on this seat"),
+            "trivial and bounded work must stay on this seat instead of delegating: \
+             {ORCHESTRATOR_PROMPT}"
         );
         assert!(
-            ORCHESTRATOR_PROMPT
-                .contains("are the default for every bounded task, however substantial"),
-            "native subagents must be the sizing default: {ORCHESTRATOR_PROMPT}"
+            ORCHESTRATOR_PROMPT.contains("Delegate via the Agent tool"),
+            "got:\n{ORCHESTRATOR_PROMPT}"
         );
         assert!(
             ORCHESTRATOR_PROMPT.contains("zirv ctx agent --role sub-orchestrator --scope"),
             "got:\n{ORCHESTRATOR_PROMPT}"
         );
         assert!(
-            ORCHESTRATOR_PROMPT.contains("multiple coherent areas"),
+            ORCHESTRATOR_PROMPT.contains("several coherently-scoped areas"),
             "sub-orchestrators are reserved for multi-area work: {ORCHESTRATOR_PROMPT}"
-        );
-        assert!(
-            ORCHESTRATOR_PROMPT.contains("never for a single bounded task a worker could finish"),
-            "got:\n{ORCHESTRATOR_PROMPT}"
         );
     }
 

@@ -10713,7 +10713,7 @@ mod tests {
         // only makes sense as mail.
         assert!(prompt.starts_with("do the work"), "got {prompt}");
         assert_eq!(
-            prompt.contains("zirv session conventions (v2)"),
+            prompt.contains("zirv engineering standard (v3)"),
             fallback_is_safe,
             "conventions ride the fallback exactly when it is safe: {prompt}"
         );

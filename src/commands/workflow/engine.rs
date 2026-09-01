@@ -290,7 +290,16 @@ pub fn definitions() -> Vec<WorkflowDefinition> {
             kind: WorkflowKind::Feature,
             description: "Capture intent, design and plan proportionally, then implement, test and review.".into(),
             steps: vec![
-                artifact_step("intent", Phase::Intent, "brainstorm", Artifact::Intent, When::Always),
+                artifact_step(
+                    "intent",
+                    Phase::Intent,
+                    "brainstorm",
+                    Artifact::Intent,
+                    When::ComplexityOrRisk {
+                        complexity: C::Bounded,
+                        risk: R::Medium,
+                    },
+                ),
                 artifact_step(
                     "spec",
                     Phase::Design,
@@ -2598,9 +2607,9 @@ fn write_state(writer: &mut impl Write, state: &WorkflowState, json: bool) -> Ct
             writeln!(writer, "risk measurement: unavailable ({reason})")?;
         }
         // Issue #236: only meaningful when this workflow actually has an
-        // intent step -- `Review` never does, and a Bugfix/Refactor whose
-        // classification did not gate one in has nothing for the flag to
-        // select between.
+        // intent step -- `Review` never does, and a Feature/Bugfix/Refactor
+        // whose classification did not gate one in has nothing for the flag
+        // to select between.
         if state
             .steps
             .iter()
@@ -2969,6 +2978,30 @@ mod tests {
         }
     }
 
+    /// Prepends a synthetic, always-present intent step, for engine-internals
+    /// tests (resume, artifact status, deploy-tier tightening) that need a
+    /// leading artifact step regardless of classification -- Feature's own
+    /// intent step is conditional now (`ComplexityOrRisk{Bounded, Medium}`,
+    /// same as Bugfix), and that threshold overlaps Feature's existing plan
+    /// gate (`ComplexityOrRisk{Bounded, High}`) and review gate
+    /// (`RiskAtLeast(Medium)`), so no classification gates intent in alone
+    /// without also gating in plan or review, which these tests are not
+    /// about. `current_step` is already `0` on a freshly started state, so
+    /// inserting at the front needs no index adjustment.
+    fn with_synthetic_intent_step(mut state: WorkflowState) -> WorkflowState {
+        state.steps.insert(
+            0,
+            artifact_step(
+                "intent",
+                WorkflowPhase::Intent,
+                "brainstorm",
+                ArtifactStage::Intent,
+                StepCondition::Always,
+            ),
+        );
+        state
+    }
+
     fn skip_leading_artifact_steps(mut state: WorkflowState) -> WorkflowState {
         while state.current().is_some_and(|step| step.artifact.is_some()) {
             let id = state.current().unwrap().id.clone();
@@ -2984,15 +3017,27 @@ mod tests {
     }
 
     #[test]
-    fn low_risk_feature_uses_intent_fast_path_without_spec_plan_or_review() {
+    fn trivial_feature_skips_intent_spec_plan_and_review() {
+        // Feature's intent step now shares Bugfix's ComplexityOrRisk{Bounded,
+        // Medium} condition instead of `Always`, so a trivial/low-risk
+        // classification no longer stops at an approval-gated intent
+        // artifact.
         let steps = definition(WorkflowKind::Feature).materialize(&low_classification());
         assert_eq!(
             steps
                 .iter()
                 .map(|step| step.id.as_str())
                 .collect::<Vec<_>>(),
-            ["intent", "implement", "test", "verify", "deploy"]
+            ["implement", "test", "verify", "deploy"]
         );
+    }
+
+    #[test]
+    fn bounded_feature_keeps_the_intent_step() {
+        let mut classification = low_classification();
+        classification.complexity = Complexity::Bounded;
+        let steps = definition(WorkflowKind::Feature).materialize(&classification);
+        assert_eq!(steps.first().unwrap().id, "intent");
         assert_eq!(steps[0].artifact, Some(ArtifactStage::Intent));
         assert!(steps[0].approval);
     }
@@ -3292,15 +3337,24 @@ mod tests {
 
     #[test]
     fn tightening_to_production_rewinds_later_completed_evidence() {
+        // `apply_effective_deploy_tier` re-materializes `steps` straight from
+        // `state.classification`, so the leading artifact step below must
+        // survive that regeneration rather than being injected by hand.
+        // Bounded complexity gates Feature's own intent step in
+        // (`ComplexityOrRisk{Bounded, Medium}`) but also gates its plan step
+        // in (`ComplexityOrRisk{Bounded, High}`, the same `Bounded` bar), so
+        // both now precede implement.
+        let mut classification = low_classification();
+        classification.complexity = Complexity::Bounded;
         let mut state = WorkflowState::start(
             PathBuf::from("repo"),
             "small feature".into(),
             WorkflowKind::Feature,
             None,
             true,
-            low_classification(),
+            classification,
         );
-        state.completed_steps = vec!["intent", "implement", "test", "verify"]
+        state.completed_steps = vec!["intent", "plan", "implement", "test", "verify"]
             .into_iter()
             .map(str::to_string)
             .collect();
@@ -3317,7 +3371,7 @@ mod tests {
         assert_eq!(state.current().unwrap().phase, WorkflowPhase::Review);
         assert_eq!(
             state.completed_steps,
-            ["intent", "implement", "test"],
+            ["intent", "plan", "implement", "test"],
             "verify evidence after the inserted production review must be replayed"
         );
     }
@@ -3326,6 +3380,10 @@ mod tests {
     fn frontend_classification_selects_the_frontend_profile_automatically() {
         let repo = tempdir().unwrap();
         let mut classification = low_classification();
+        // Feature's intent step is now conditional (`ComplexityOrRisk{Bounded,
+        // Medium}`, same as Bugfix), so this needs a classification that
+        // still gates one in.
+        classification.complexity = Complexity::Bounded;
         classification.work_domain.domain = WorkDomain::Frontend;
         classification.work_domain.score = 55;
 
@@ -3399,13 +3457,18 @@ mod tests {
     #[test]
     fn brainstorm_selects_the_intent_step_skill_and_survives_an_explicit_override() {
         let repo = tempdir().unwrap();
+        // Feature's intent step is now conditional (`ComplexityOrRisk{Bounded,
+        // Medium}`, same as Bugfix), so this needs a classification that
+        // still gates one in.
+        let mut feature_classification = low_classification();
+        feature_classification.complexity = Complexity::Bounded;
         let feature = WorkflowState::start(
             repo.path().to_path_buf(),
             "small feature".into(),
             WorkflowKind::Feature,
             None,
             true,
-            low_classification(),
+            feature_classification,
         );
         assert_eq!(feature.current().unwrap().skill, "brainstorm");
         assert!(feature.brainstorm);
@@ -4555,13 +4618,22 @@ mod tests {
         let repo = tempdir().unwrap();
         let root = tempdir().unwrap();
         let state_dir = StateDir::from_root(root.path().to_path_buf());
+        // `approve` refreshes the deploy tier, which re-materializes `steps`
+        // straight from `state.classification` -- so this needs a
+        // classification that naturally keeps exactly one artifact step
+        // (intent) through that regeneration. Bugfix's plan gate is
+        // `ComplexityOrRisk{Substantial, High}` (unlike Feature's, which
+        // shares intent's own `Bounded` threshold), so Bounded complexity
+        // here gates intent in without also gating plan in.
+        let mut classification = low_classification();
+        classification.complexity = Complexity::Bounded;
         let state = WorkflowState::start(
             repo.path().to_path_buf(),
-            "small feature".into(),
-            WorkflowKind::Feature,
+            "small bugfix".into(),
+            WorkflowKind::Bugfix,
             None,
             true,
-            low_classification(),
+            classification,
         );
         ensure_current_artifact_template(&state).unwrap();
         let pending = workflow_artifact_statuses(&state).unwrap();
@@ -4625,13 +4697,18 @@ mod tests {
     #[test]
     fn write_state_renders_brainstorm_only_when_the_workflow_has_an_intent_step() {
         let repo = tempdir().unwrap();
+        // Feature's intent step is now conditional (`ComplexityOrRisk{Bounded,
+        // Medium}`, same as Bugfix), so this needs a classification that
+        // still gates one in.
+        let mut classification = low_classification();
+        classification.complexity = Complexity::Bounded;
         let feature = WorkflowState::start(
             repo.path().to_path_buf(),
             "small feature".into(),
             WorkflowKind::Feature,
             None,
             true,
-            low_classification(),
+            classification,
         );
         let mut out = Vec::new();
         write_state(&mut out, &feature, false).unwrap();
@@ -4678,14 +4755,15 @@ mod tests {
         let repo = tempdir().unwrap();
         let root = tempdir().unwrap();
         let state_dir = StateDir::from_root(root.path().to_path_buf());
-        let mut state = skip_leading_artifact_steps(WorkflowState::start(
-            repo.path().to_path_buf(),
-            "small feature".into(),
-            WorkflowKind::Feature,
-            None,
-            true,
-            low_classification(),
-        ));
+        let mut state =
+            skip_leading_artifact_steps(with_synthetic_intent_step(WorkflowState::start(
+                repo.path().to_path_buf(),
+                "small feature".into(),
+                WorkflowKind::Feature,
+                None,
+                true,
+                low_classification(),
+            )));
         save(&state_dir, &state, true).unwrap();
         state =
             advance_with_evidence(&state_dir, state, StepOutcome::Success, None, false).unwrap();
@@ -5128,13 +5206,18 @@ mod tests {
     #[test]
     fn a_headless_worker_refuses_the_brainstorm_step() {
         let repo = tempdir().unwrap();
+        // Feature's intent step is now conditional (`ComplexityOrRisk{Bounded,
+        // Medium}`, same as Bugfix), so this needs a classification that
+        // still gates one in to exercise the headless refusal at that step.
+        let mut classification = low_classification();
+        classification.complexity = Complexity::Bounded;
         let state = WorkflowState::start(
             repo.path().to_path_buf(),
             "small feature".into(),
             WorkflowKind::Feature,
             None,
             true,
-            low_classification(),
+            classification,
         );
         assert_eq!(state.current().unwrap().skill, "brainstorm");
         // SAFETY: nextest runs one test per process.
