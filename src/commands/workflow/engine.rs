@@ -1698,6 +1698,9 @@ pub fn advance_with_evidence(
             &super::telemetry::TelemetryConfig::for_repo(&state.repo),
         );
     }
+    if outcome == StepOutcome::Success {
+        try_auto_spawn(state_dir, &state);
+    }
     Ok(state)
 }
 
@@ -2131,6 +2134,145 @@ fn record_step_duration_ms(state: &mut WorkflowState, step_id: &str) {
 fn format_wall_clock(ms: u64) -> String {
     let total_secs = ms / 1000;
     format!("{}m{}s", total_secs / 60, total_secs % 60)
+}
+
+/// A bounded worker to auto-spawn after a gate transition.
+pub(crate) struct AutoSpawn {
+    pub phase: WorkflowPhase,
+    pub argv: Vec<String>,
+}
+
+/// Pure: whether a gate transition should auto-spawn a worker, and the argv
+/// for it. Never fires into `AwaitingApproval`, for a phase other than
+/// Review/Test/Verify, or for a Review step whose workflow has no adapter to
+/// run the reviewer as.
+pub(crate) fn auto_spawn_decision(
+    state: &WorkflowState,
+    enabled: bool,
+    permit_available: bool,
+) -> Option<AutoSpawn> {
+    if !enabled || !permit_available || state.status != WorkflowStatus::Running {
+        return None;
+    }
+    let phase = state.current()?.phase;
+    let repo = state.repo.display().to_string();
+    let argv = match phase {
+        WorkflowPhase::Review => vec![
+            "workflow".to_string(),
+            "review".to_string(),
+            "run".to_string(),
+            state.id.clone(),
+            "--agent".to_string(),
+            state.adapter.clone()?,
+            "--repo".to_string(),
+            repo,
+        ],
+        WorkflowPhase::Test => vec![
+            "test".to_string(),
+            "changed".to_string(),
+            "--repo".to_string(),
+            repo,
+        ],
+        WorkflowPhase::Verify => vec!["verify".to_string(), "--repo".to_string(), repo],
+        _ => return None,
+    };
+    Some(AutoSpawn { phase, argv })
+}
+
+#[cfg(unix)]
+fn detach(command: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt;
+    command.process_group(0);
+}
+
+#[cfg(windows)]
+fn detach(command: &mut std::process::Command) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    command.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
+}
+
+/// Issue #242: spawns `spawn.argv` detached and never fails `advance` --
+/// `test changed`/`verify`/`review run` govern no heavy-operation permit of
+/// their own, so this acquires one on their behalf and leaks it (the child
+/// outlives this call): `HeavyPermit::set_child_pid` plus `permit::live_
+/// records`' own dead-owner sweep is exactly the mechanism that frees the
+/// slot once the detached child exits, the same as a parent that dies while
+/// its child keeps running.
+fn spawn_auto_worker(
+    state_dir: &StateDir,
+    state: &WorkflowState,
+    cfg: &crate::commands::ctx::config::CtxConfig,
+    spawn: AutoSpawn,
+) {
+    use crate::commands::ctx::permit;
+
+    let Some(permit) = permit::acquire(
+        state_dir,
+        cfg.supervise.max_heavy_operations,
+        &format!("auto-spawn: {}", spawn.argv.join(" ")),
+    ) else {
+        return;
+    };
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let mut command = std::process::Command::new(exe);
+    command
+        .args(&spawn.argv)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    detach(&mut command);
+    let Ok(child) = command.spawn() else {
+        return;
+    };
+    permit.set_child_pid(child.id());
+    std::mem::forget(permit);
+
+    let mut event =
+        super::telemetry::TelemetryEvent::new(super::telemetry::TelemetryKind::AgentDispatched);
+    event.workflow_id = Some(state.id.clone());
+    event.phase = Some(spawn.phase);
+    event.intent = Some(state.classification.intent);
+    event.complexity = Some(state.classification.complexity);
+    event.risk = Some(state.classification.risk);
+    event.work_domain = Some(state.classification.work_domain.domain);
+    event.agent_id = Some(format!("auto-spawn:{}", spawn.phase));
+    let _ = super::telemetry::record(
+        state_dir,
+        &state.repo,
+        &event,
+        &super::telemetry::TelemetryConfig::for_repo(&state.repo),
+    );
+
+    crate::commands::ctx::announce::Announcer::new(cfg.chrome.events, false).emit(
+        &crate::commands::ctx::announce::Event::AutoSpawned {
+            phase: spawn.phase.to_string(),
+            command: spawn.argv.join(" "),
+        },
+    );
+}
+
+/// Thin I/O wrapper around [`auto_spawn_decision`]: resolves config and a
+/// permit peek, then hands off to [`spawn_auto_worker`]. Any failure along
+/// the way (config, permit, spawn) is silently degraded -- never propagated
+/// to `advance`'s own result.
+fn try_auto_spawn(state_dir: &StateDir, state: &WorkflowState) {
+    let cfg = match crate::commands::ctx::config::CtxConfig::load(&state.repo, &|key| {
+        std::env::var(key).ok()
+    }) {
+        Ok(cfg) => cfg,
+        Err(_) => return,
+    };
+    let permit_available =
+        crate::commands::ctx::permit::live_count(state_dir) < cfg.supervise.max_heavy_operations;
+    if let Some(spawn) =
+        auto_spawn_decision(state, cfg.workflow.auto_spawn_on_gate, permit_available)
+    {
+        spawn_auto_worker(state_dir, state, &cfg, spawn);
+    }
 }
 
 fn write_state(writer: &mut impl Write, state: &WorkflowState, json: bool) -> CtxResult<()> {
@@ -2645,6 +2787,141 @@ mod tests {
         assert!(review < verify && verify < deploy);
         assert!(production[review].agent.as_deref() == Some("reviewer"));
         assert!(production[deploy].approval);
+    }
+
+    fn at_phase(mut state: WorkflowState, phase: WorkflowPhase) -> WorkflowState {
+        state.current_step = state
+            .steps
+            .iter()
+            .position(|step| step.phase == phase)
+            .expect("phase present in this workflow's steps");
+        state.status = WorkflowStatus::Running;
+        state
+    }
+
+    fn production_feature_state(repo: &Path) -> WorkflowState {
+        let mut classification = low_classification();
+        classification.complexity = Complexity::Substantial;
+        classification.risk = RiskBand::High;
+        let mut state = WorkflowState::start(
+            repo.to_path_buf(),
+            "ship it".into(),
+            WorkflowKind::Feature,
+            Some("claude".to_string()),
+            true,
+            classification,
+        );
+        apply_effective_deploy_tier(&mut state, DeployTier::Production);
+        state
+    }
+
+    #[test]
+    fn auto_spawn_decision_truth_table() {
+        let repo = tempdir().unwrap();
+        let state = production_feature_state(repo.path());
+
+        assert!(
+            auto_spawn_decision(&at_phase(state.clone(), WorkflowPhase::Review), false, true)
+                .is_none(),
+            "disabled must never fire"
+        );
+        assert!(
+            auto_spawn_decision(&at_phase(state.clone(), WorkflowPhase::Review), true, false)
+                .is_none(),
+            "no permit must never fire"
+        );
+        assert!(
+            auto_spawn_decision(
+                &at_phase(state.clone(), WorkflowPhase::Implement),
+                true,
+                true
+            )
+            .is_none(),
+            "Implement must never fire"
+        );
+
+        let mut awaiting = at_phase(state.clone(), WorkflowPhase::Review);
+        awaiting.status = WorkflowStatus::AwaitingApproval;
+        assert!(
+            auto_spawn_decision(&awaiting, true, true).is_none(),
+            "AwaitingApproval must never fire"
+        );
+
+        let review =
+            auto_spawn_decision(&at_phase(state.clone(), WorkflowPhase::Review), true, true)
+                .expect("Review with an adapter fires");
+        assert_eq!(review.phase, WorkflowPhase::Review);
+        assert_eq!(
+            review.argv,
+            vec![
+                "workflow",
+                "review",
+                "run",
+                &state.id,
+                "--agent",
+                "claude",
+                "--repo",
+                &state.repo.display().to_string(),
+            ]
+        );
+
+        let mut no_adapter = at_phase(state.clone(), WorkflowPhase::Review);
+        no_adapter.adapter = None;
+        assert!(
+            auto_spawn_decision(&no_adapter, true, true).is_none(),
+            "Review with no adapter to run the reviewer as must not fire"
+        );
+
+        let test = auto_spawn_decision(&at_phase(state.clone(), WorkflowPhase::Test), true, true)
+            .expect("Test fires");
+        assert_eq!(test.phase, WorkflowPhase::Test);
+        assert_eq!(
+            test.argv,
+            vec![
+                "test",
+                "changed",
+                "--repo",
+                &state.repo.display().to_string()
+            ]
+        );
+
+        let verify =
+            auto_spawn_decision(&at_phase(state.clone(), WorkflowPhase::Verify), true, true)
+                .expect("Verify fires");
+        assert_eq!(verify.phase, WorkflowPhase::Verify);
+        assert_eq!(
+            verify.argv,
+            vec!["verify", "--repo", &state.repo.display().to_string()]
+        );
+    }
+
+    #[test]
+    fn advance_with_evidence_records_no_agent_dispatched_event_when_auto_spawn_is_disabled() {
+        let repo = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+        let state = skip_leading_artifact_steps(WorkflowState::start(
+            repo.path().to_path_buf(),
+            "small feature".into(),
+            WorkflowKind::Feature,
+            None,
+            true,
+            low_classification(),
+        ));
+        save(&state_dir, &state, true).unwrap();
+
+        let advanced =
+            advance_with_evidence(&state_dir, state, StepOutcome::Success, None).unwrap();
+        assert_eq!(advanced.current().unwrap().phase, WorkflowPhase::Test);
+
+        let events = crate::commands::workflow::telemetry::list(&state_dir, &advanced.repo)
+            .unwrap_or_default();
+        assert!(
+            !events.iter().any(|event| {
+                event.kind == crate::commands::workflow::telemetry::TelemetryKind::AgentDispatched
+            }),
+            "auto_spawn_on_gate defaults to false; advance must never record a dispatch"
+        );
     }
 
     #[test]

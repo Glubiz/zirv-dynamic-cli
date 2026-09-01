@@ -111,6 +111,9 @@ pub enum Event {
     /// used to disappear in silence (`.ok().flatten()`) -- leaving a session
     /// running with no methodology and no way to notice.
     WorkflowLayerSkipped { reason: String },
+    /// Issue #242: a gate transition auto-spawned a detached lifecycle
+    /// worker for `phase` (review/test/verify), naming the argv it ran.
+    AutoSpawned { phase: String, command: String },
     /// Context health is slipping (the rot advisory `wrap`'s pump used to
     /// build by hand as `advisory_line`).
     RotAdvisory { score: u32, tokens: u64 },
@@ -347,6 +350,9 @@ impl Event {
             ),
             Event::WorkflowLayerSkipped { reason } => {
                 format!("workflow step context skipped: {reason}")
+            }
+            Event::AutoSpawned { phase, command } => {
+                format!("auto-spawned {phase} worker: {command}")
             }
             Event::RotAdvisory { score, tokens } => format!(
                 "context health is slipping (score {score}, {tokens} tokens in context); a \

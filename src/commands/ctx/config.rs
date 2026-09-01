@@ -614,6 +614,11 @@ pub struct WorkflowConfig {
     /// `--max-tool-calls` appended to a reviewer worker's launch when set.
     /// `REPO_FORBIDDEN`, same reasoning as `review_worker_budget_tokens`.
     pub review_worker_max_tool_calls: Option<u32>,
+    /// Issue #242: auto-spawns a bounded `review run`/`test changed`/
+    /// `verify` worker when a gate transition lands the workflow on that
+    /// phase. Off by default. `REPO_FORBIDDEN`: a repo checkout must not be
+    /// able to make zirv spend on its own behalf.
+    pub auto_spawn_on_gate: bool,
 }
 
 impl Default for WorkflowConfig {
@@ -631,6 +636,7 @@ impl Default for WorkflowConfig {
             check_env_passthrough: Vec::new(),
             review_worker_budget_tokens: None,
             review_worker_max_tool_calls: None,
+            auto_spawn_on_gate: false,
         }
     }
 }
@@ -1507,6 +1513,11 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         &["workflow", "review_worker_max_tool_calls"],
         EnvKind::Int,
     ),
+    (
+        "ZIRV_CTX_WORKFLOW_AUTO_SPAWN_ON_GATE",
+        &["workflow", "auto_spawn_on_gate"],
+        EnvKind::Bool,
+    ),
     ("ZIRV_CTX_MEMORY", &["memory", "enabled"], EnvKind::Bool),
     (
         "ZIRV_CTX_MEMORY_HARVEST",
@@ -2009,6 +2020,10 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     (
         &["workflow", "review_worker_max_tool_calls"],
         "ZIRV_CTX_WORKFLOW_REVIEW_WORKER_MAX_TOOL_CALLS",
+    ),
+    (
+        &["workflow", "auto_spawn_on_gate"],
+        "ZIRV_CTX_WORKFLOW_AUTO_SPAWN_ON_GATE",
     ),
     // A repo checkout must not be able to switch either memory scope's own
     // gate on or off for itself, grow its cap, or turn on automatic
@@ -5095,6 +5110,30 @@ mod tests {
         );
     }
 
+    /// Issue #242: `workflow.auto_spawn_on_gate` is operator-only, same
+    /// asymmetry as `check_env_passthrough` above.
+    #[test]
+    fn repo_layer_cannot_set_workflow_auto_spawn_on_gate() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[workflow]\nauto_spawn_on_gate = true\n",
+        )
+        .expect("write");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let empty = env_map(&[]);
+        let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+            .expect_err("a repo may not turn on its own auto-spawn")
+            .to_string();
+        assert!(err.contains("workflow.auto_spawn_on_gate"), "got {err}");
+        assert!(
+            err.contains("ZIRV_CTX_WORKFLOW_AUTO_SPAWN_ON_GATE"),
+            "names the operator escape hatch: {err}"
+        );
+    }
+
     /// The operator's home layer and `ZIRV_CTX_*` env override still work,
     /// same as `check_env_passthrough`.
     #[test]
@@ -5855,6 +5894,7 @@ mod tests {
         ("workflow", "check_env_passthrough"),
         ("workflow", "review_worker_budget_tokens"),
         ("workflow", "review_worker_max_tool_calls"),
+        ("workflow", "auto_spawn_on_gate"),
         ("policy", "repo_fs_write"),
         ("policy", "outside_repo_fs_write"),
         ("policy", "shell_exec"),
