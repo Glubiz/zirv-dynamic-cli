@@ -1157,7 +1157,8 @@ fn launch_visual_reviewer(
     model: Option<&str>,
     prompt: String,
 ) -> CtxResult<String> {
-    let mut argv = super::review::reviewer_argv(agent, repo, true)?;
+    // Not the code-review seat's own worker budget; keeps no ceiling.
+    let mut argv = super::review::reviewer_argv(agent, repo, true, None, None)?;
     let separator = argv
         .iter()
         .position(|argument| argument == "--")

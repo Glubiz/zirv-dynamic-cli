@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-30
+last-verified: 2026-09-01
 ---
 
 # Rot Engine
@@ -109,3 +109,5 @@ Per the repo's CLAUDE.md: *"The rot engine is pure: no clock, no filesystem, no 
 - `scoring_is_deterministic` in `rot::tests` asserts this directly: the same event slice scored 20 times in a loop produces byte-identical `Score` values every time.
 
 No exceptions were found — the invariant as stated in CLAUDE.md holds exactly as written. All I/O (`std::fs::read_to_string`, checkpoint files, `std::process::id()`, `EnvLookup` closures) is confined to `score.rs`, one layer above the engine.
+
+**`screen.rs` (issue #243, v3.5.0) is a sibling pure module, not a `rot.rs` extension.** `IncrementalScorer::poll`/`score_transcript_cached` now screen newly-ingested transcript bytes alongside scoring — same `score.rs` I/O layer, same "read once, hand data down" shape — but `screen::screen` never touches `rot.rs`'s signals, score, or verdict, and `rot.rs` gained no new knowledge of it. Pinned by a dedicated test that screening never changes the score itself. See [[Ctx Subsystem]] and [[Untrusted Configuration]].

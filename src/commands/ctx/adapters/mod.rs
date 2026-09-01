@@ -71,6 +71,17 @@ pub const LAUNCH_MODE_ENV: &str = "ZIRV_CTX_LAUNCH_MODE";
 /// the fail-closed default, not a second, spoofable "false" value.
 pub const LAUNCH_MODE_INTERACTIVE_VALUE: &str = "interactive";
 
+/// Set to `"1"` on every child a headless supervisor (`exec::run_with`)
+/// spawns, read by `workflow::engine::refusal_for` to refuse the
+/// interactive `brainstorm` skill. Listed in `sessions::SUPERVISION_ENV` so
+/// an INTERACTIVE launch (`wrap`, `chat`, a dashboard pane) scrubs it rather
+/// than inheriting it from whatever spawned that session -- only the exact
+/// value `"1"` counts as headless (`engine::is_headless_env`), never mere
+/// presence. A distinct mechanism from [`LAUNCH_MODE_ENV`] above (which
+/// proves the opposite: that a launch IS interactive, for the safety-policy
+/// permission mode), not a duplicate of it.
+pub const HEADLESS_ENV: &str = "ZIRV_CTX_HEADLESS";
+
 /// The `(key, value)` pair a real interactive-launch seam pushes into its
 /// child's env vector -- `None` for [`LaunchMode::Headless`], so a headless
 /// launch adds nothing rather than a second, spoofable "not interactive"

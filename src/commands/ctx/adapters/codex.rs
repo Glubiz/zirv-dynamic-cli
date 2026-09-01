@@ -373,6 +373,53 @@ impl CodexAdapter {
     }
 }
 
+/// Issue #222: codex's own `approval_policy` posture, as read from
+/// `~/.codex/config.toml` (never rewritten by zirv -- see `policy_support`'s
+/// `CONFIG` constant). `Unknown` covers everything short of a confident read:
+/// no file, unparsable TOML, or a value this module does not recognize.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodexApprovalPosture {
+    Untrusted,
+    OnRequest,
+    Never,
+    Unknown,
+}
+
+/// Reads `home`'s own `~/.codex/config.toml` for `approval_policy`.
+/// Best-effort: any read/parse failure is `Unknown`, never a guess.
+pub fn resolve_codex_approval_posture(home: &Path) -> CodexApprovalPosture {
+    let Ok(text) = std::fs::read_to_string(home.join(".codex").join("config.toml")) else {
+        return CodexApprovalPosture::Unknown;
+    };
+    let Ok(value) = toml::from_str::<toml::Value>(&text) else {
+        return CodexApprovalPosture::Unknown;
+    };
+    match value.get("approval_policy").and_then(toml::Value::as_str) {
+        Some("untrusted") => CodexApprovalPosture::Untrusted,
+        Some("on-request") => CodexApprovalPosture::OnRequest,
+        Some("never") => CodexApprovalPosture::Never,
+        _ => CodexApprovalPosture::Unknown,
+    }
+}
+
+/// Issue #222: the interactive-launch advisory for `posture` -- `Some` only
+/// for `Untrusted`, the one posture that prompts on ordinary commands; codex
+/// has no per-command approval zirv can pre-clear the way #224 pre-approves
+/// reserved claude built-ins, so the fix is naming the config key that does.
+pub fn codex_approval_advisory(posture: CodexApprovalPosture) -> Option<String> {
+    match posture {
+        CodexApprovalPosture::Untrusted => Some(
+            "zirv built-ins will prompt for approval under codex's 'untrusted' posture; set \
+             approval_policy = \"on-request\" (or \"never\") in ~/.codex/config.toml to remove \
+             them"
+                .to_string(),
+        ),
+        CodexApprovalPosture::OnRequest
+        | CodexApprovalPosture::Never
+        | CodexApprovalPosture::Unknown => None,
+    }
+}
+
 /// Bounds the `codex exec --help` probe below: a hang here must never hang
 /// a distiller/reviewer spawn. Mirrors `claude.rs`'s own
 /// `HELP_PROBE_TIMEOUT`.
@@ -1491,6 +1538,51 @@ mod tests {
         let adapter = CodexAdapter::new(None);
         assert!(adapter.detect(&["/usr/local/bin/codex".to_string()]));
         assert!(!adapter.detect(&["/usr/local/bin/claude".to_string()]));
+    }
+
+    /// Issue #222: only `untrusted` -- the posture that prompts on ordinary
+    /// commands -- gets an advisory; `on-request`/`never`/`unknown` get none.
+    #[test]
+    fn codex_approval_advisory_only_fires_for_untrusted() {
+        let advisory =
+            codex_approval_advisory(CodexApprovalPosture::Untrusted).expect("must advise");
+        assert!(advisory.contains("approval_policy"));
+        assert!(advisory.contains("on-request"));
+
+        assert_eq!(
+            codex_approval_advisory(CodexApprovalPosture::OnRequest),
+            None
+        );
+        assert_eq!(codex_approval_advisory(CodexApprovalPosture::Never), None);
+        assert_eq!(codex_approval_advisory(CodexApprovalPosture::Unknown), None);
+    }
+
+    #[test]
+    fn resolve_codex_approval_posture_reads_the_config_key() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join(".codex")).expect("mkdir");
+        for (value, expected) in [
+            ("untrusted", CodexApprovalPosture::Untrusted),
+            ("on-request", CodexApprovalPosture::OnRequest),
+            ("never", CodexApprovalPosture::Never),
+            ("something-else", CodexApprovalPosture::Unknown),
+        ] {
+            std::fs::write(
+                dir.path().join(".codex/config.toml"),
+                format!("approval_policy = \"{value}\"\n"),
+            )
+            .expect("write");
+            assert_eq!(resolve_codex_approval_posture(dir.path()), expected);
+        }
+    }
+
+    #[test]
+    fn resolve_codex_approval_posture_is_unknown_with_no_config_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert_eq!(
+            resolve_codex_approval_posture(dir.path()),
+            CodexApprovalPosture::Unknown
+        );
     }
 
     #[test]

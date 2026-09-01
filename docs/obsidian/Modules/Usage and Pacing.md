@@ -180,6 +180,8 @@ flowchart TD
 
 Candidate harnesses are filtered through the normal enabled/readiness gate, `.settings.toml` capacity markers, the ordinary spawn gate, enforceable task budgets, and equivalent model-tier resolution. A candidate with no usable usage reading receives only the operator-configured conservative `fallback.unknown_headroom_pct` assumption (default 25%; 0 opts unknown seats out). Known-refused candidates are never selected. If no candidate qualifies, the existing refusal/park-and-wait behavior remains authoritative.
 
+**Issue #245 (usage-window-aware proactive routing) is this same mechanism, not new work.** The Ruflo evaluation's spike (e) asked for usage-window-aware proactive routing on every `zirv agent` dispatch; `fallback::route_new_delegation` (above) already does exactly that — live headroom routing on every dispatch, predictive steering at `fallback.predictive_headroom_pct`, reactive rerouting on an actual refusal, deterministic tie-break by `fallback.order`, and model translation via `handover::equivalent_model`. Issue #245 was closed citing this section rather than shipping new code; a usage-derived fallback *order* (reordering `fallback.order` itself by observed headroom, rather than routing against a fixed order) remains a follow-up if wanted.
+
 ## See Also
 
 - [[Ctx Subsystem]] — the hub page for the whole `zirv ctx` command tree and its config/state layering
