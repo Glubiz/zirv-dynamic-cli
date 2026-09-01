@@ -179,6 +179,8 @@ model = "fable"
 # telemetry_retention_days = 30      # REPO-FORBIDDEN (ZIRV_CTX_WORKFLOW_TELEMETRY_RETENTION_DAYS): how long an event is kept. Default: 30.
 # adoption = "nudge"                 # REPO-FORBIDDEN (ZIRV_CTX_WORKFLOW_ADOPTION): "off" | "advise" | "nudge" | "enforce" -- detects substantial edit work (>=5 edit calls, or >=1 over 12 turns) with no active zirv workflow. Default: "nudge".
 # check_env_passthrough = []         # REPO-FORBIDDEN (ZIRV_CTX_WORKFLOW_CHECK_ENV_PASSTHROUGH): extra environment variable names ADDED to the built-in verification-check allowlist (SSH_AUTH_SOCK, SSH_AGENT_PID, SSH_ASKPASS, GPG_TTY, GNUPGHOME), read from zirv's own environment and set on each check child. Default: [].
+# review_worker_budget_tokens = 0    # REPO-FORBIDDEN (ZIRV_CTX_WORKFLOW_REVIEW_WORKER_BUDGET_TOKENS): token ceiling appended to a workflow reviewer worker's launch as `--budget-tokens`, only when set. Default: unset (no flag appended).
+# review_worker_max_tool_calls = 0   # REPO-FORBIDDEN (ZIRV_CTX_WORKFLOW_REVIEW_WORKER_MAX_TOOL_CALLS): tool-call ceiling appended to a workflow reviewer worker's launch as `--max-tool-calls`, only when set. Default: unset (no flag appended).
 
 # [workflow.deploy]
 # tier = "development"               # REPO-FORBIDDEN (ZIRV_CTX_WORKFLOW_DEPLOY_TIER): development < staging < production. Operator env overrides all layers. Default: "development".

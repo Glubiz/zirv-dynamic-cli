@@ -572,6 +572,20 @@ pub struct WorkflowState {
     pub current_step: usize,
     pub completed_steps: Vec<String>,
     pub attempts: BTreeMap<String, u8>,
+    /// Issue #235: wall-clock milliseconds each completed step actually took,
+    /// keyed by step id -- `now_secs() - phase_started_at` at the moment the
+    /// step is marked complete (`advance_with_evidence`/`approve`), the same
+    /// arithmetic `enrich_transition_evidence`'s own `duration_ms` fallback
+    /// uses. Read by `zirv workflow status` to render `completed: intent
+    /// (2m10s), spec (0m40s)` without a second source of truth: telemetry
+    /// events are the aggregate-over-time record (`zirv workflow stats`),
+    /// this is the per-workflow record that survives even when telemetry is
+    /// disabled (`workflow.telemetry_enabled = false`). A step re-attempted
+    /// after a failure overwrites its own entry with the latest attempt's
+    /// duration, matching how `completed_steps` itself only ever records one
+    /// entry per step id.
+    #[serde(default)]
+    pub step_durations_ms: BTreeMap<String, u64>,
     /// Version-controlled workflow work products. Acceptance authority remains
     /// in this private state: repository markdown is never trusted as config.
     #[serde(default)]
@@ -634,6 +648,7 @@ impl WorkflowState {
             current_step: 0,
             completed_steps: Vec::new(),
             attempts: BTreeMap::new(),
+            step_durations_ms: BTreeMap::new(),
             artifacts,
             review_findings: Vec::new(),
             review_evidence: Vec::new(),
@@ -1569,6 +1584,7 @@ pub fn advance_with_evidence(
                     .into());
                 }
             }
+            record_step_duration_ms(&mut state, &current.id);
             state.completed_steps.push(current.id.clone());
             state.current_step += 1;
             reclassify_at_gate(&mut state);
@@ -1681,6 +1697,7 @@ pub fn approve(state_dir: &StateDir, mut state: WorkflowState) -> CtxResult<Work
         let completed = state.current().expect("artifact step exists").clone();
         let accepted = pin_current_artifact(&mut state)?;
         if !state.completed_steps.contains(&completed.id) {
+            record_step_duration_ms(&mut state, &completed.id);
             state.completed_steps.push(completed.id);
         }
         state.current_step += 1;
@@ -2046,6 +2063,30 @@ fn resolve_state() -> CtxResult<StateDir> {
     StateDir::resolve(&|key| std::env::var(key).ok())
 }
 
+/// Issue #235: records how long the step now completing actually took, using
+/// the same `now_secs() - phase_started_at` arithmetic
+/// `enrich_transition_evidence`'s own `duration_ms` fallback uses (see that
+/// function). Called immediately before a completing step id is pushed onto
+/// `completed_steps`, at both call sites that do so
+/// (`advance_with_evidence`/`approve`), so `phase_started_at` still names
+/// this step's own start rather than whatever comes next.
+fn record_step_duration_ms(state: &mut WorkflowState, step_id: &str) {
+    let elapsed_ms = now_secs()
+        .saturating_sub(state.phase_started_at)
+        .saturating_mul(1000);
+    state
+        .step_durations_ms
+        .insert(step_id.to_string(), elapsed_ms);
+}
+
+/// Renders milliseconds as a compact `<minutes>m<seconds>s` wall-clock, e.g.
+/// `2m10s` or `0m40s` -- the shape issue #235 asks `zirv workflow status` to
+/// print next to each completed step.
+fn format_wall_clock(ms: u64) -> String {
+    let total_secs = ms / 1000;
+    format!("{}m{}s", total_secs / 60, total_secs % 60)
+}
+
 fn write_state(writer: &mut impl Write, state: &WorkflowState, json: bool) -> CtxResult<()> {
     if json {
         serde_json::to_writer_pretty(&mut *writer, state)?;
@@ -2087,7 +2128,16 @@ fn write_state(writer: &mut impl Write, state: &WorkflowState, json: bool) -> Ct
         } else {
             writeln!(writer, "current: none")?;
         }
-        writeln!(writer, "completed: {}", state.completed_steps.join(", "))?;
+        let completed_rendered = state
+            .completed_steps
+            .iter()
+            .map(|id| match state.step_durations_ms.get(id) {
+                Some(&ms) => format!("{id} ({})", format_wall_clock(ms)),
+                None => id.clone(),
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        writeln!(writer, "completed: {completed_rendered}")?;
     }
     Ok(())
 }
@@ -3314,6 +3364,47 @@ mod tests {
         std::fs::write(&intent, "# Intent\nchanged\n").unwrap();
         let statuses = workflow_artifact_statuses(&accepted).unwrap();
         assert!(statuses[0].drifted);
+    }
+
+    /// Issue #235: `zirv workflow status` renders each completed step's
+    /// wall-clock next to its id, e.g. `completed: intent (2m10s), spec
+    /// (0m40s)`, sourced from `WorkflowState::step_durations_ms`. A step
+    /// completed by a zirv build from before this key existed has no entry
+    /// (`#[serde(default)]` leaves the map empty on load) and must still
+    /// render its bare id, exactly as before -- never a bogus "0m0s".
+    #[test]
+    fn write_state_renders_completed_step_wall_clock_only_when_known() {
+        let repo = tempdir().unwrap();
+        let mut state = WorkflowState::start(
+            repo.path().to_path_buf(),
+            "small feature".into(),
+            WorkflowKind::Feature,
+            None,
+            true,
+            low_classification(),
+        );
+        state.completed_steps = vec!["intent".to_string(), "spec".to_string()];
+        state
+            .step_durations_ms
+            .insert("intent".to_string(), 130_000);
+        state.step_durations_ms.insert("spec".to_string(), 40_000);
+        let mut out = Vec::new();
+        write_state(&mut out, &state, false).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("completed: intent (2m10s), spec (0m40s)"),
+            "got: {text}"
+        );
+
+        // No recorded duration for a step (an older schema, or a test
+        // fixture that only sets `completed_steps` directly): the bare id,
+        // not a fabricated duration.
+        let mut legacy = state.clone();
+        legacy.step_durations_ms.clear();
+        let mut out = Vec::new();
+        write_state(&mut out, &legacy, false).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("completed: intent, spec"), "got: {text}");
     }
 
     /// `load` is the single choke point every id-resolving verb (`status`,

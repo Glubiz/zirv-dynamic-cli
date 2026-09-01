@@ -1288,6 +1288,8 @@ checkout:
 | `workflow.telemetry_max_events` | `ZIRV_CTX_WORKFLOW_TELEMETRY_MAX_EVENTS` |
 | `workflow.telemetry_retention_days` | `ZIRV_CTX_WORKFLOW_TELEMETRY_RETENTION_DAYS` |
 | `workflow.check_env_passthrough` | `ZIRV_CTX_WORKFLOW_CHECK_ENV_PASSTHROUGH` |
+| `workflow.review_worker_budget_tokens` | `ZIRV_CTX_WORKFLOW_REVIEW_WORKER_BUDGET_TOKENS` |
+| `workflow.review_worker_max_tool_calls` | `ZIRV_CTX_WORKFLOW_REVIEW_WORKER_MAX_TOOL_CALLS` |
 
 The `mail.*`/`chrome.events` entries close the same hole `prompt.max_repo_bytes`
 does: mail is folded into a launched worker's prompt as its own layer, so a
