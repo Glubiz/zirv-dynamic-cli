@@ -11,11 +11,16 @@ use super::ctx;
 
 type SetupResult<T> = Result<T, Box<dyn Error>>;
 
-const HARNESS_HOOKS: [(&str, Option<&str>, &str); 4] = [
+const HARNESS_HOOKS: [(&str, Option<&str>, &str); 5] = [
     ("Stop", None, "zirv ctx hook stop"),
     ("UserPromptSubmit", None, "zirv ctx hook prompt"),
     ("PreCompact", None, "zirv ctx hook pre-compact"),
     ("PreToolUse", Some("Agent|Task"), "zirv ctx hook pretool"),
+    (
+        "SessionStart",
+        Some("resume|clear"),
+        "zirv ctx hook session-start",
+    ),
 ];
 
 /// Issue #83's command safety hook: `zirv ctx safety check`, matched on
