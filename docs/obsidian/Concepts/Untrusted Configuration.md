@@ -276,7 +276,7 @@ Screening now covers every surface this page already treats as untrusted:
 - **Shared `.zirv/memory/`** — the shared-memory block's own header (`prompt.rs::with_memory_layer`) gains one `[screening: <summary>]` line right after it. Private (machine-local) memory is untouched — it is not repo-owned content.
 - **Transcript ingestion** — `IncrementalScorer::poll`/`score_transcript_cached` screen newly-appended (or, with no incremental cursor, a capped 64KB tail of) transcript bytes alongside scoring; a flagged cycle surfaces on the decision log and `zirv ctx status`'s per-session `screening:` line. `rot.rs` itself is never touched — screening never changes a verdict. See [[Ctx Subsystem]] and [[Rot Engine]].
 
-This is deliberately a first slice, not full coverage: the repo-context and transcript surfaces above cover screening the *content zirv delivers*, not every conceivable untrusted-text ingestion path in the codebase — further surfaces are follow-up issues, not gaps in this one.
+Coverage is exactly the three surfaces issue #243 names — mail, repo-provided context (`system-prompt.md`, `.zirv/context/*.md`, shared memory) and transcript ingestion. A new untrusted-text ingestion path added later calls `screen` at its own label choke point; the pure module needs no change for that.
 
 ## Fallback routing is operator-owned, repository-narrowable (issue #186)
 
