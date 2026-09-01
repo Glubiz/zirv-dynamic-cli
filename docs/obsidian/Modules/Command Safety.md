@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-31
+last-verified: 2026-09-01
 ---
 
 # Command Safety
@@ -205,6 +205,10 @@ Hook decisions with a session id are appended best-effort to UTC-day JSONL bucke
 - **Claude interactive**: `--permission-mode default`; Design B ships, so there is no blanket native `Bash(*)` allow. Non-command allow rules and scratchpad paths are pre-approved, deny rules are natively disallowed, and ask rules are on neither list. The launch-attested `Bash|PowerShell` hook emits explicit allow/ask/deny and therefore carries everyday and unknown shell commands without making the finite native allow list a prompt surface.
 - **Claude headless**: unchanged fail-closed shape, `--permission-mode dontAsk`; allow rules are pre-approved and `deny ∪ ask` is disallowed because nobody can answer.
 - **Codex interactive/headless**: `--sandbox workspace-write` in both modes, with `--ask-for-approval on-request` only when the cached live probe confirms support, otherwise `never`; a second probe adds `--approve-for-me` interactively when the installed CLI advertises its native automatic reviewer. Headless always uses `never`. No `[safety]` rule reaches codex per command.
+
+**Codex has no per-command approval mechanism (issue #222, v3.5.0).** Claude gets #224's pre-approval of reserved zirv built-ins (`safety.rs::builtin_allow`, `adapters/claude.rs::launch_settings_value`) — a real, per-command decision zirv makes and attests. Codex has nothing symmetric: its own approval posture (`approval_policy` in `~/.codex/config.toml`) is a single operator-owned setting codex itself consults, not a per-command hook zirv can answer. Headless codex is already prompt-free (`--ask-for-approval never` on every headless launch, above). Interactive codex under an `untrusted` posture gets the honest substitute instead of a fabricated enforcement layer: a one-time `zirv ▸` advisory naming the `approval_policy` fix (`adapters::codex::codex_approval_advisory`, emitted by `wrap::run_with` — see [[Ctx Adapters]]), never a config rewrite. Item #230 item 3's degraded-capability warnings (below) are the general-purpose version of the same "tell the operator honestly, don't pretend to enforce" instinct, applied to every capability rather than just approval.
+
+**Prompt-injection/credential screening is a separate, orthogonal layer from this policy model (issue #243, v3.5.0).** `screen.rs`'s pure `screen(text) -> ScreenReport` flags prompt-injection marker phrases, credential shapes, and high-entropy runs in text reaching a session — mail, repo `system-prompt.md`/`.zirv/context/*.md`/shared `.zirv/memory/`, and transcript ingestion. It never blocks or narrows anything the way `[safety]`/`[policy]` do; it only extends an existing trust/label line with a flag summary. See [[Untrusted Configuration]]'s `screen.rs` subsection for the full surface list and [[Ctx Subsystem]] for the mail/status wiring.
 
 ## Permission audit (`permissions.rs`, issue #132, 2026-08-25)
 

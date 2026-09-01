@@ -901,8 +901,8 @@ and database/schema changes cannot be downgraded below High risk.
 zirv workflow list                              # built-in workflow definitions
 zirv workflow show feature                       # one definition's steps
 zirv workflow classify --task "..."               # classify without starting
-zirv workflow start feature --task "..." [--agent claude] [--built-in-only]
-zirv workflow status [id]                         # one instance, or the active one
+zirv workflow start feature --task "..." [--agent claude] [--built-in-only] [--brainstorm|--no-brainstorm]
+zirv workflow status [id]                         # one instance, or the active one; shows brainstorm: on|off and per-step wall-clock
 zirv workflow resume <id>                         # restore as the active workflow
 zirv workflow context [id]                        # the current step's resolved skill context
 zirv workflow artifacts <id> [--json]              # committed work-product state
@@ -1094,7 +1094,7 @@ including `score`, `handoff` and `status`, works on all three platforms.
 | `zirv ctx wrap -- claude` | Supervises an interactive TUI through a PTY |
 | `zirv ctx handoff --transcript <path>` | Distills a handoff and stores it |
 | `zirv ctx resume` | Starts a clean session with the latest handoff injected |
-| `zirv ctx hook <stop\|prompt\|pre-compact\|pretool\|notify>` | Agent hook entrypoints |
+| `zirv ctx hook <stop\|prompt\|pre-compact\|pretool\|notify\|session-start>` | Agent hook entrypoints |
 | `zirv ctx status` | Shows supervised sessions, the resolved chat agent, unread mail, recent decisions and handoffs |
 | `zirv ctx usage` | Shows usage-window state, or `usage tee` to collect it from the statusline |
 | `zirv ctx optimize` | Reports redundancy, contradictions and dead references in the files that steer your sessions |
@@ -1413,10 +1413,17 @@ Add to `~/.claude/settings.json`:
     "PreToolUse": [{
       "matcher": "Agent|Task",
       "hooks": [{ "type": "command", "command": "zirv ctx hook pretool" }]
+    }],
+    "SessionStart": [{
+      "matcher": "resume|clear",
+      "hooks": [{ "type": "command", "command": "zirv ctx hook session-start" }]
     }]
   }
 }
 ```
+
+`SessionStart` (issue #244) re-injects the latest stored handoff on `resume`/`clear` — a bare
+`claude --resume` or `/clear` sees it too, not only `zirv ctx resume`'s own explicit flow.
 
 The Stop hook forwards verdicts to a supervising `wrap` or `exec` when one owns
 the session, and otherwise prints a non-blocking advisory. It never blocks a
