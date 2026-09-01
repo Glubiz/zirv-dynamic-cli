@@ -77,7 +77,9 @@
   recursive destructive deletion, privilege escalation, and pipe-to-shell.
 - Preserve repository narrowing and all operator-owned override behavior; add
   no repository-settable or operator configuration keys.
-- Raise the crate version from 3.4.0 to 3.5.0.
+- Raise the crate version to 3.6.0 (the branch merges main's 3.5.0 release,
+  which closed the #222 issue number in a batch without shipping this
+  posture work).
 
 ## Non-goals
 
@@ -206,6 +208,15 @@ escape-sensitivity screen:
 - The command clears the same credential-path/root-scan screen
   `escape_allow_matches` already applies, reused, not reimplemented.
 
+Review round 1 (finding b1c244e2) added a shell-content screen to the
+escape-sensitivity screen: a segment invoking `sh`/`bash`/`zsh`/`dash` on a
+script file has the file's contents decomposed by the same shell-AST
+segmenter and every extracted segment must clear the deny-family/credential
+screen, failing closed on unreadable, non-regular, or oversized (>128 KiB)
+files; a `-c` inline string is screened the same way. This restores "deny
+families still deny" for the shell-file indirection an unsandboxed retry
+would otherwise smuggle past the text globs.
+
 A base verdict of `Ask` (or a mode-default `Ask`/`Deny`) keeps today's
 `<sandbox: unsandboxed retry>` escalation unchanged, and a semantic `Deny`
 is still preserved with its more specific explanation. The four existing
@@ -304,7 +315,10 @@ Write the regression tests before changing production behavior.
    - of a base-`Ask` command (e.g. a force push) and of every deny-family
      command is unchanged;
    - of a command naming a credential path fails the screen and keeps the
-     escalation.
+     escalation;
+   - of `bash <scratchpad>/script.sh` whose contents are benign allows
+     silently, while screened contents (`cat ~/.ssh/id_rsa`), a missing
+     file, and a screened `-c` inline string all keep the escalation.
 7. For the deny-shape corrections: `rm -rf <unrelated>; zirv frontend check
    --help` no longer trips the zirv-path deletion deny while `rm -rf
    <zirv path>` still does; `find … | xargs sh -c '…'` no longer trips
@@ -343,6 +357,15 @@ Write the regression tests before changing production behavior.
   the existing reordered/short-flag/refspec tests for push and exact dangerous
   `gh` families; add generated-settings tests but do not reimplement semantic
   parsing in the adapter.
+- **Opaque interpreter payloads on the retry path.** The shell-content
+  screen is text-level parity, not content proof: a nested `bash inner.sh`
+  line inside a screened script passes the glob layer exactly as it would
+  inline, and non-shell interpreters (`python`, `node`, `php` vendor
+  binaries) execute file contents shell deny globs cannot read. Screening
+  those would reintroduce the prompt classes the operator explicitly
+  ordered removed (phpunit/artisan runners were 10 of the 349 observed
+  prompts), so they retain silent Allow-verdict retries by explicit
+  operator tradeoff, recorded here.
 - **Ordinary mutating commands now run unsandboxed silently after a retry.**
   This is the deliberate product change (operator directive 2026-09-01: only
   truly harmful commands prompt). Mitigation: deny/ask families are evaluated

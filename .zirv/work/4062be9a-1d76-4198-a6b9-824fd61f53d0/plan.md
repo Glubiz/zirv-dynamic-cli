@@ -56,6 +56,7 @@ In `safety.rs`, retry branch of `run_check_hook_mode_with_env`:
   test/verify/frontend`, `zirv ctx exec`/`usage tee`, `zirv chat`,
   non-reserved scripts, base-`Ask` commands, deny families, and
   credential-path commands.
+- Review round 1 (finding b1c244e2): shell segments invoking a script file or `-c` string get their contents shell-AST-decomposed and deny/credential-screened, failing closed on unreadable/oversized files.
 - Implement the fallthrough rule after the four existing carve-outs: base
   verdict `Allow` + escape-sensitivity screen (no payload-carrying or
   subprocess-launching zirv segment; reuse `is_reserved_zirv_escape_safe`
@@ -76,7 +77,7 @@ In `safety.rs`, failing tests first per spec Testing 7:
 
 ## Task 6 — Version, docs, memory
 
-- Bump `Cargo.toml` (and `Cargo.lock` root entry) 3.4.0 → 3.5.0.
+- Bump `Cargo.toml` (and `Cargo.lock` root entry) to 3.6.0 (above the merged main's 3.5.0).
 - Obsidian vault updates are waived by operator ruling (2026-08-27: vault
   retired); instead record the new posture via `zirv ctx remember`
   (partition model, new retry rule tag, state-root allowWrite).

@@ -4972,6 +4972,44 @@ fn escape_allow_matches(escape_allow: &[Rule], command: &str) -> bool {
     })
 }
 
+/// Review fix (issue #222 round 1, finding b1c244e2): a shell interpreter
+/// argument names contents the command text cannot show, so an unsandboxed
+/// retry must screen WHAT runs, not only where the file lives. The text is
+/// decomposed by [`normalize_segments`] exactly like an inline compound and
+/// every extracted segment must clear [`command_fails_escape_screen`] --
+/// the same deny-family/credential/root patterns a direct spelling would
+/// hit. Unparseable text fails closed. This is deliberate text-level
+/// parity, not content proof: a nested `bash inner.sh` line passes the
+/// glob layer here just as it would inline, and non-shell interpreters
+/// stay out of scope because shell deny globs cannot read their syntax --
+/// both residuals are recorded in the workflow spec's risk table.
+fn shell_text_clears_escape_screen(text: &str) -> bool {
+    let segments = normalize_segments(text);
+    !segments.is_empty()
+        && segments
+            .iter()
+            .all(|segment| !command_fails_escape_screen(segment))
+}
+
+/// [`shell_text_clears_escape_screen`] over a script file's contents.
+/// Fail closed: an unreadable, non-regular, non-UTF-8, or oversized file
+/// never qualifies -- the retry then takes the ordinary ask/deny
+/// escalation instead of a silent pass.
+fn shell_script_contents_clear_escape_screen(script: &str) -> bool {
+    const MAX_SCREENED_SCRIPT_BYTES: u64 = 128 * 1024;
+    let path = std::path::Path::new(script);
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() || metadata.len() > MAX_SCREENED_SCRIPT_BYTES {
+        return false;
+    }
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    shell_text_clears_escape_screen(&contents)
+}
+
 /// Whether every executable segment of a base-allowed sandbox retry clears
 /// the existing credential/root/redirection screen and any Zirv invocation
 /// is one of [`is_reserved_zirv_escape_safe`]'s non-launching forms.
@@ -5011,6 +5049,24 @@ fn allow_verdict_retry_clears_escape_screen(command: &str, scratchpad_roots: &[S
             && !is_curl_or_wget_get_only(&tokens, scratchpad_roots)
         {
             return false;
+        }
+        if matches!(program.as_str(), "sh" | "bash" | "zsh" | "dash") {
+            if let Some(index) = tokens.iter().position(|token| token == "-c") {
+                let Some(inline) = tokens.get(index + 1) else {
+                    return false;
+                };
+                if !shell_text_clears_escape_screen(inline) {
+                    return false;
+                }
+            } else {
+                let Some(script) = tokens.iter().skip(1).find(|token| !token.starts_with('-'))
+                else {
+                    return false;
+                };
+                if !shell_script_contents_clear_escape_screen(script) {
+                    return false;
+                }
+            }
         }
         program != "zirv" || is_prompt_free_zirv_retry_safe(candidate)
     })
@@ -9901,6 +9957,14 @@ mod tests {
         let empty: HashMap<String, String> = HashMap::new();
         let cfg = CtxConfig::load(repo.path(), &|key| empty.get(key).cloned()).expect("loads");
         let scratchpad = scratchpad_write_root(&std::env::temp_dir());
+        // The script screen reads real contents (finding b1c244e2): a
+        // benign gate script must exist for its retry to stay silent.
+        std::fs::create_dir_all(&scratchpad).expect("scratchpad root");
+        std::fs::write(
+            std::path::Path::new(&scratchpad).join("script.sh"),
+            "#!/bin/bash\nset -e\n# run the exact CI phpstan\nphpstan analyse 2>&1 | tail -5\n",
+        )
+        .expect("benign script");
         let commands = [
             "cd /some/unknown/dir && git status --short".to_string(),
             "git checkout -- src/main.rs && git status --short".to_string(),
@@ -9926,6 +9990,48 @@ mod tests {
                     "{command} mode {mode}: {audit}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn a_scratchpad_script_with_screened_contents_escalates_on_retry() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = super::super::testenv::HomeGuard::set(home.path());
+        let empty: HashMap<String, String> = HashMap::new();
+        let cfg = CtxConfig::load(repo.path(), &|key| empty.get(key).cloned()).expect("loads");
+        let scratchpad = scratchpad_write_root(&std::env::temp_dir());
+        std::fs::create_dir_all(&scratchpad).expect("scratchpad root");
+        std::fs::write(
+            std::path::Path::new(&scratchpad).join("evil-screen.sh"),
+            "#!/bin/bash\ncat ~/.ssh/id_rsa\n",
+        )
+        .expect("screened script");
+        // Screened contents and an unreadable file both fail closed: the
+        // retry keeps the ordinary escalation instead of a silent pass.
+        // `bash -c 'cat ~/.ssh/id_rsa'` is already a semantic Deny (the
+        // `cat *.ssh*` glob matches the full text), so the `-c` case here
+        // uses a spelling only the inline-text screen catches.
+        let commands = [
+            format!("bash {scratchpad}/evil-screen.sh 2>&1 | tail -60"),
+            format!("bash {scratchpad}/does-not-exist.sh 2>&1 | tail -60"),
+            "bash -c 'openssl rsa -in ~/.ssh/id_rsa' | tail -1".to_string(),
+        ];
+
+        for command in commands {
+            let (output, audit) = audited_unsandboxed_retry(&cfg, &command, "default");
+            assert!(
+                output.contains(r#""permissionDecision":"ask""#),
+                "{command}: {output}"
+            );
+            assert!(audit.contains("<sandbox: unsandboxed retry>"), "{audit}");
+
+            let (output, audit) = audited_unsandboxed_retry(&cfg, &command, "dontAsk");
+            assert!(
+                output.contains(r#""permissionDecision":"deny""#),
+                "{command}: {output}"
+            );
+            assert!(audit.contains("<sandbox: unsandboxed retry>"), "{audit}");
         }
     }
 
