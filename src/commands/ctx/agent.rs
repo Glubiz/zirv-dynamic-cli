@@ -570,15 +570,11 @@ fn delegation_outcome(code: i32) -> &'static str {
     }
 }
 
-/// Issue #230 item 3: the same short `"<cap> (<mechanism>); ..."` rendering
-/// used by every surface that reports a delegated launch's capability
-/// warnings back to the DELEGATOR -- the headless stderr note below, and the
-/// report-back mail body -- so the three never phrase one launch's own
-/// degradation differently. `detail` (the requested-stance/support pairing)
-/// is left out of this short form on purpose: it is carried in full on the
-/// structured `PolicyReport::CapabilityWarning` value itself (the dashboard
-/// `SpawnAck`'s own field), and repeating it here would make an already
-/// multi-warning line hard to scan.
+/// Issue #230 item 3: the short `"<cap> (<mechanism>); ..."` rendering the
+/// report-back mail body uses for a launch's capability warnings. `detail`
+/// is left out of this one-line summary on purpose; it travels in full on
+/// the structured `CapabilityWarning` (the dashboard `SpawnAck` field) and on
+/// the per-warning stdout result lines.
 pub(crate) fn format_capability_warnings(warnings: &[policy::CapabilityWarning]) -> String {
     warnings
         .iter()
