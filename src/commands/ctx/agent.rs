@@ -595,8 +595,8 @@ pub(crate) fn format_capability_warnings(warnings: &[policy::CapabilityWarning])
 /// Issue #230 item 3: also carries the delegation's own capability warnings
 /// (`PolicyReport::degraded_capabilities`, computed once by the caller) when
 /// non-empty, so a requester who was not watching this delegation
-/// synchronously still learns its launch was not fully enforced -- exactly
-/// what the synchronous stderr note already tells a watching caller.
+/// synchronously still learns its launch was not fully enforced -- the same
+/// warnings a watching caller reads on the stdout result lines.
 fn report_back_message(
     code: i32,
     worker_session: &str,
@@ -660,11 +660,10 @@ pub const DASH_SPAWN_ACK_PREFIX: &str = "spawned in dashboard as ";
 fn answer_for_ack<W: Write>(ack: spawnreq::SpawnAck, w: &mut W) -> Option<CtxResult<i32>> {
     if ack.ok {
         let short = ack.short.unwrap_or_default();
-        // Issue #230 item 3 (F1, review round): same stdout-not-stderr
-        // result surface the headless fork prints to, at the identical
-        // "one line per warning, full detail" shape -- a delegator that
-        // happened to join a live dashboard sees exactly what a headless
-        // fork of the same request would have.
+        // Issue #230 item 3: the same stdout result surface the headless
+        // fork prints to, one line per warning with full detail, so a
+        // delegator that joined a live dashboard sees what a headless fork
+        // of the same request would have.
         for warning in &ack.capability_warnings {
             if let Err(e) = writeln!(
                 w,
@@ -1581,13 +1580,10 @@ pub fn run_with<W: Write>(
         );
     }
 
-    // Issue #230 item 3 (F1, review round): the delegator captures the
-    // synchronous RESULT of `zirv agent` on stdout, so a degraded
-    // capability rides here -- one line per warning, capability/mechanism/
-    // detail all included (the short stderr-only formatter used to drop
-    // `detail`), only when non-empty. No structured/JSON result form
-    // exists for `zirv agent` to also carry the full `CapabilityWarning`
-    // into.
+    // Issue #230 item 3: the delegator captures `zirv agent`'s synchronous
+    // stdout result, so each warning rides here with capability, mechanism
+    // and detail, only when non-empty. `zirv agent` has no structured/JSON
+    // result form to carry the full `CapabilityWarning` into.
     for warning in &capability_warnings {
         writeln!(
             w,
@@ -3016,11 +3012,9 @@ mod tests {
         );
     }
 
-    /// Issue #230 item 3 (F1, review round): the delegator captures the
-    /// synchronous RESULT of `zirv agent` on stdout, so a degraded
-    /// capability must show up in the captured `out`, full `detail`
-    /// included -- not only as a stderr advisory whose short formatter
-    /// drops it.
+    /// Issue #230 item 3: the delegator captures `zirv agent`'s synchronous
+    /// stdout result, so a degraded capability must appear in the captured
+    /// `out` with its full `detail`.
     #[test]
     fn a_headless_run_with_a_degraded_capability_reports_it_in_the_captured_result() {
         let tmp = crate::commands::ctx::testenv::repo();
@@ -3133,8 +3127,8 @@ mod tests {
     }
 
     /// Issue #230 item 3: when the delegation's own capability warnings are
-    /// non-empty, the report-back mail carries them as a second line, in the
-    /// same short `"<cap> (<mechanism>); ..."` form the stderr note uses.
+    /// non-empty, the report-back mail carries them as a second line, in
+    /// `format_capability_warnings`'s short `"<cap> (<mechanism>); ..."` form.
     #[test]
     fn report_back_message_carries_capability_warnings_when_present() {
         let warnings = vec![policy::CapabilityWarning {
