@@ -4470,14 +4470,19 @@ mod tests {
         let repo = tempdir().unwrap();
         let outside = tempdir().unwrap();
         std::fs::create_dir_all(repo.path().join(".zirv/work")).unwrap();
-        let state = with_synthetic_intent_step(WorkflowState::start(
+        // Bounded complexity gates Feature's (now conditional) intent step in,
+        // so `start` materializes the artifact record the template path needs.
+        let state = WorkflowState::start(
             repo.path().to_path_buf(),
             "small feature".into(),
             WorkflowKind::Feature,
             None,
             true,
-            low_classification(),
-        ));
+            Classification {
+                complexity: Complexity::Bounded,
+                ..low_classification()
+            },
+        );
         let workflow_dir = repo.path().join(".zirv/work").join(&state.id);
         symlink(outside.path(), &workflow_dir).unwrap();
 
@@ -4504,14 +4509,17 @@ mod tests {
         let outside = tempdir().unwrap();
         std::fs::create_dir_all(repo.path().join(".zirv")).unwrap();
         symlink(outside.path(), repo.path().join(".zirv/work")).unwrap();
-        let state = with_synthetic_intent_step(WorkflowState::start(
+        let state = WorkflowState::start(
             repo.path().to_path_buf(),
             "small feature".into(),
             WorkflowKind::Feature,
             None,
             true,
-            low_classification(),
-        ));
+            Classification {
+                complexity: Complexity::Bounded,
+                ..low_classification()
+            },
+        );
 
         let error = ensure_current_artifact_template(&state)
             .unwrap_err()
