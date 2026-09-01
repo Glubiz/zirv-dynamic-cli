@@ -1315,6 +1315,107 @@ mod tests {
         );
     }
 
+    /// Issue #253, exercised end to end through `compile` -- every real
+    /// launch path's own seam -- rather than only through `prompt::compose`
+    /// directly: a dispatched worker's compiled prompt must not carry the
+    /// active workflow step's guidance, while the orchestrator session
+    /// driving that same workflow still gets it.
+    ///
+    /// `prompt::compose`'s own `active_skill_context` call resolves its state
+    /// directory from the real process environment (`ZIRV_CTX_STATE_DIR`),
+    /// not from the `state: &StateDir` this test also passes to `compile`
+    /// itself -- see that function's own doc comment -- so both have to name
+    /// the same directory for the workflow saved here to be visible to it.
+    /// SAFETY: this suite runs single-threaded (`--test-threads=1`).
+    #[test]
+    fn a_dispatched_workers_compiled_prompt_omits_the_active_step_the_orchestrators_keeps() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let state_dir = tempfile::tempdir().expect("state tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+
+        let classification = crate::commands::workflow::classify::classify(
+            &crate::commands::workflow::classify::ClassificationInput {
+                task: String::new(),
+                paths: Vec::new(),
+                changed_lines: 0,
+                tests_changed: true,
+                intent_override: None,
+                complexity_override: None,
+                risk_override: None,
+            },
+        )
+        .expect("classify");
+        crate::commands::workflow::engine::save(
+            &state,
+            &crate::commands::workflow::engine::WorkflowState::start(
+                repo.path().to_path_buf(),
+                "run the database migration".into(),
+                crate::commands::workflow::engine::WorkflowKind::Feature,
+                None,
+                true,
+                classification,
+            ),
+            true,
+        )
+        .expect("save active workflow");
+
+        unsafe {
+            std::env::set_var(crate::commands::ctx::state::STATE_ENV, state_dir.path());
+        }
+        let cfg = CtxConfig::default();
+        let adapter = ClaudeAdapter::new(None);
+        let orchestrator_compiled = compile(
+            None,
+            repo.path(),
+            false,
+            &cfg,
+            &adapter,
+            PromptRole::Orchestrator,
+            &state,
+            now_secs(),
+            LaunchMode::Headless,
+            false,
+        );
+        let worker_compiled = compile(
+            None,
+            repo.path(),
+            false,
+            &cfg,
+            &adapter,
+            PromptRole::Worker,
+            &state,
+            now_secs(),
+            LaunchMode::Headless,
+            false,
+        );
+        unsafe {
+            std::env::remove_var(crate::commands::ctx::state::STATE_ENV);
+        }
+
+        let orchestrator_composed = orchestrator_compiled.composed.expect("composed");
+        assert!(
+            orchestrator_composed
+                .sources
+                .contains(&PromptSource::Workflow),
+            "the orchestrator's own compiled prompt must still carry the active step: {:?}",
+            orchestrator_composed.sources
+        );
+        assert!(
+            orchestrator_composed
+                .text
+                .contains("run the database migration")
+        );
+
+        let worker_composed = worker_compiled.composed.expect("composed");
+        assert!(
+            !worker_composed.sources.contains(&PromptSource::Workflow),
+            "a dispatched worker's compiled prompt must never carry the active step's guidance: \
+             {:?}",
+            worker_composed.sources
+        );
+        assert!(!worker_composed.text.contains("run the database migration"));
+    }
+
     /// Issue #46 follow-up: `context.max_harness_roster_bytes` is a real,
     /// enforced budget -- truncated in the actual composed prompt, not just
     /// reported against, and the compiler records that truncation the same

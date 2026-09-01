@@ -1261,21 +1261,26 @@ impl AgentAdapter for CodexAdapter {
     /// `-c/--config key=value` fact `approval_suppression_args`'s own doc
     /// comment cites.
     ///
-    /// The linked-worktree root is only added when `git_common_dir(cwd)`
-    /// resolves OUTSIDE `cwd` itself -- a main checkout's own `.git` already
-    /// sits inside `cwd`, and so inside `--sandbox workspace-write`'s own
-    /// root, without needing to be named again. `mail_dir` is always added:
-    /// it sits under the state root, always outside `cwd`, regardless of
-    /// worktree shape.
+    /// `git_common_dir(cwd)` is ALWAYS added, whether it resolves inside or
+    /// outside `cwd` -- issue #252. codex's own sandbox (seatbelt/landlock)
+    /// keeps `<root>/.git` read-only inside every writable root it is handed,
+    /// including `cwd` itself under `--sandbox workspace-write`; only naming
+    /// the git dir explicitly lifts that. This is true for a main checkout's
+    /// `<cwd>/.git` exactly as much as for a linked worktree's external
+    /// common dir -- the earlier doc comment's claim that a main checkout's
+    /// `.git` was "already covered" by the cwd root was the bug. `mail_dir`
+    /// is always added too: it sits under the state root, always outside
+    /// `cwd`, regardless of worktree shape.
     fn extra_writable_root_args(&self, cwd: &Path, mail_dir: &Path) -> Vec<String> {
         let cwd = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
         let mut roots: Vec<PathBuf> = Vec::new();
-        if let Some(git_dir) = super::git_common_dir(&cwd)
-            && !git_dir.starts_with(&cwd)
-        {
+        if let Some(git_dir) = super::git_common_dir(&cwd) {
             roots.push(git_dir);
         }
-        roots.push(mail_dir.to_path_buf());
+        let mail_dir = mail_dir.to_path_buf();
+        if !roots.contains(&mail_dir) {
+            roots.push(mail_dir);
+        }
 
         let quoted: Vec<String> = roots
             .iter()
@@ -2657,14 +2662,21 @@ mod tests {
         );
     }
 
-    /// Issue #119 + the mail report-back gap (2026-08-26): a launch inside a
-    /// PLAIN checkout (not a linked worktree) must still get the mail
-    /// subtree as a writable root -- `zirv ctx send` report-back always
-    /// needs it -- but must never name the state root itself: only the
-    /// invariant is asserted (some writable-root arg naming the mail dir),
-    /// never exact argv, since the config-override string this builds is an
-    /// internal choice a test must not lock in more tightly than the
-    /// mechanism itself is verified.
+    /// Issue #119 + the mail report-back gap (2026-08-26), extended by issue
+    /// #252 (2026-09-01): a launch inside a PLAIN checkout (not a linked
+    /// worktree) must still get the mail subtree as a writable root --
+    /// `zirv ctx send` report-back always needs it -- but must never name the
+    /// state root itself: only the invariant is asserted (some writable-root
+    /// arg naming the mail dir), never exact argv, since the config-override
+    /// string this builds is an internal choice a test must not lock in more
+    /// tightly than the mechanism itself is verified.
+    ///
+    /// #252: a main checkout's OWN `.git` common dir must now ALSO be named
+    /// explicitly, even though it resolves inside `cwd`. codex's sandbox
+    /// keeps `<root>/.git` read-only inside every writable root it is
+    /// handed, so `--sandbox workspace-write` alone never made `.git`
+    /// writable; only naming the git dir does. This regressed as a git
+    /// index.lock EPERM for every codex worker launched in a main checkout.
     ///
     /// A real bug found running this branch's own gates on Windows
     /// (2026-08-26): `toml_quoted_string`'s basic-string form embeds a
@@ -2677,7 +2689,8 @@ mod tests {
     /// `no_extra_writable_root_arg_ever_trips_the_cmd_shim_reparse_guard`
     /// below for the direct regression test.
     #[test]
-    fn extra_writable_root_args_always_includes_the_mail_dir_but_never_the_bare_state_root() {
+    fn extra_writable_root_args_always_includes_the_mail_dir_and_the_own_git_dir_but_never_the_bare_state_root()
+     {
         let repo = tempfile::tempdir().expect("tempdir");
         std::process::Command::new("git")
             .arg("init")
@@ -2707,9 +2720,16 @@ mod tests {
         // 2026-08-26, Windows dev machine).
         let quoted_mail = toml_quoted_string(&mail_dir.display().to_string());
         let quoted_state_root = toml_quoted_string(&state_root.path().display().to_string());
+        let expected_git_dir =
+            super::super::git_common_dir(repo.path()).expect("repo has a git common dir");
+        let quoted_git_dir = toml_quoted_string(&expected_git_dir.display().to_string());
         assert!(
             joined.contains(&quoted_mail),
             "must name the mail subtree: {args:?}"
+        );
+        assert!(
+            joined.contains(&quoted_git_dir),
+            "must name the main checkout's own git common dir (#252): {args:?}"
         );
         assert!(
             !joined.contains(&quoted_state_root),

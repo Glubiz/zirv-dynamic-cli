@@ -698,6 +698,30 @@ fn worker_launch_flags(
     out
 }
 
+/// Issue #252 (2026-09-01): appends the same extra writable-root argv
+/// `dash::worker_pane_extra_args` has always added unconditionally for a
+/// dashboard-spawned worker pane, to a headless `zirv agent` delegation's own
+/// launch flags -- see `AgentAdapter::extra_writable_root_args`'s own doc
+/// comment for the caller contract and why this needed a second call site.
+/// A separate, directly-testable function rather than folded into
+/// `worker_launch_flags` itself: that function is also called once, earlier
+/// in `run_with`, purely to resolve the requested model for a routing
+/// decision that has not committed to a real launch (and so has no
+/// `launch_repo`/`mail_dir` worth shelling out to git for yet) -- only the
+/// call feeding the actual launch below needs the extra roots.
+///
+/// No-op for every adapter but codex: the trait default returns an empty
+/// `Vec`, so a claude worker's headless flags are unchanged.
+fn with_headless_extra_writable_roots(
+    mut command: Vec<String>,
+    adapter: &dyn AgentAdapter,
+    launch_repo: &Path,
+    mail_dir: &Path,
+) -> Vec<String> {
+    command.extend(adapter.extra_writable_root_args(launch_repo, mail_dir));
+    command
+}
+
 /// `"-"` reads the whole of `stdin` (trimmed); anything else is the prompt
 /// text itself. `stdin` is a parameter rather than `std::io::stdin()` so this
 /// stays testable without touching the real process stream.
@@ -1553,7 +1577,20 @@ pub fn run_with<W: Write>(
     // only matters to `select` when `name` is `None`, and this call always
     // passes the delegation target explicitly.
     let adapter = adapters::select(Some(&args.name), &[], &cfg)?;
-    let command = worker_launch_flags(&cfg, &args.name, adapter.as_ref(), &args.flags);
+    // Issue #228: computed here, ahead of `command`, purely so the extra
+    // writable-root argv appended right below can name the WORKER's own cwd
+    // (an explicit `--workdir`, or `repo` otherwise) rather than this
+    // delegating session's own directory -- see `effective_launch_repo`'s own
+    // doc comment. The later, identically-computed `launch_repo` binding
+    // further down is what `exec::run_with_report` actually launches into;
+    // both reads are the same pure function over the same inputs.
+    let launch_repo = effective_launch_repo(args.workdir.as_deref(), repo);
+    let command = with_headless_extra_writable_roots(
+        worker_launch_flags(&cfg, &args.name, adapter.as_ref(), &args.flags),
+        adapter.as_ref(),
+        &launch_repo,
+        &state.mail(),
+    );
     // Read back out of the effective argv rather than re-deriving it: this
     // is whichever of the operator's own `--model`/`-m` passthrough or the
     // configured/default worker-model prepend actually won.
@@ -1618,8 +1655,8 @@ pub fn run_with<W: Write>(
     // `repo` is left untouched everywhere ELSE in this function (the spawn
     // gate's `cfg`, and `try_join_dashboard`'s own `SpawnRequest::cwd`,
     // which is the delegating session's own identity, not the worker's
-    // target): only the actual worker launch below reads `launch_repo`.
-    let launch_repo = effective_launch_repo(args.workdir.as_deref(), repo);
+    // target): only the actual worker launch reads `launch_repo`, computed
+    // above (ahead of `command`) rather than here.
 
     let exec_args = ExecArgs {
         agent: Some(args.name.clone()),
@@ -2614,6 +2651,59 @@ mod tests {
             worker_launch_flags(&opted_out, "claude", &claude, &[]),
             vec!["--model".to_string(), "sonnet".to_string()],
             "claude still gets its own worker-model default; only the sandbox prefix is gone"
+        );
+    }
+
+    /// Issue #252: `dash::worker_pane_extra_args` has always appended these
+    /// roots unconditionally for a dashboard-spawned worker pane; a headless
+    /// `zirv agent` delegation went through a completely different launch
+    /// seam and never got them, so a headless codex worker in a main
+    /// checkout could not write its own `.git` (index.lock EPERM) and could
+    /// never report back through `mail_dir` either. Exercised directly
+    /// against `with_headless_extra_writable_roots`, the function `run_with`
+    /// now calls right before building `ExecArgs::command` -- not the whole
+    /// argv, only the invariant: both roots are named somewhere in it.
+    #[test]
+    fn headless_codex_launch_flags_gain_the_own_git_dir_and_mail_dir_as_writable_roots() {
+        let repo = crate::commands::ctx::testenv::repo();
+        std::process::Command::new("git")
+            .arg("init")
+            .arg("-q")
+            .arg(repo.path())
+            .status()
+            .expect("git init");
+        let state_root = tempfile::tempdir().expect("tempdir");
+        let mail_dir = state_root.path().join("mail");
+        let expected_git_dir =
+            super::super::adapters::git_common_dir(repo.path()).expect("repo has a git common dir");
+
+        let codex = super::super::adapters::codex::CodexAdapter::new(None);
+        let out = with_headless_extra_writable_roots(Vec::new(), &codex, repo.path(), &mail_dir);
+        let joined = out.join(" ");
+        assert!(
+            joined.contains(&expected_git_dir.display().to_string()),
+            "must name the repo's own git common dir: {out:?}"
+        );
+        assert!(
+            joined.contains(&mail_dir.display().to_string()),
+            "must name the mail dir: {out:?}"
+        );
+    }
+
+    /// The other half of #252: the claude adapter's `extra_writable_root_
+    /// args` is the trait default (an empty `Vec`), so a headless claude
+    /// delegation's launch flags must be entirely unaffected by this seam.
+    #[test]
+    fn headless_claude_launch_flags_are_unchanged_by_the_extra_writable_root_seam() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let mail_dir = tempfile::tempdir().expect("tempdir").path().join("mail");
+        let claude = super::super::adapters::claude::ClaudeAdapter::new(None);
+
+        let base = vec!["--model".to_string(), "sonnet".to_string()];
+        let out = with_headless_extra_writable_roots(base.clone(), &claude, repo.path(), &mail_dir);
+        assert_eq!(
+            out, base,
+            "claude has no verified writable-root mechanism, so this seam must add nothing"
         );
     }
 
