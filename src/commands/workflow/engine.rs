@@ -499,7 +499,15 @@ pub struct AcceptedPreexistingFindings {
 /// workflow away from Frontend) restores the same base names `materialize`
 /// assigns by default. Idempotent either way, so calling it from ordinary
 /// materialize with the freshly-derived profile is a no-op the first time.
-fn apply_profile(profile: WorkflowProfile, steps: &mut [WorkflowStep]) {
+///
+/// `kind` is needed only to restore a Design step's approval requirement
+/// (see below) when reverting away from Frontend; it does not otherwise
+/// affect which skill each phase gets.
+fn apply_profile(kind: WorkflowKind, profile: WorkflowProfile, steps: &mut [WorkflowStep]) {
+    // The kind's own authored default approval, keyed by step id -- looked
+    // up (not recomputed) so a future kind whose default ever changes still
+    // round-trips correctly through Frontend and back.
+    let defaults = definition(kind).steps;
     for step in steps {
         step.skill = match (profile, step.phase) {
             (_, WorkflowPhase::Intent) => continue,
@@ -522,13 +530,18 @@ fn apply_profile(profile: WorkflowProfile, steps: &mut [WorkflowStep]) {
             }
         }
         .into();
-        // The agent owns routine visual decisions. The workflow still
-        // enforces evidence gates; it never pauses for a theme vote.
-        if profile == WorkflowProfile::Frontend
-            && step.phase == WorkflowPhase::Design
-            && step.artifact.is_none()
-        {
-            step.approval = false;
+        if step.phase == WorkflowPhase::Design && step.artifact.is_none() {
+            if profile == WorkflowProfile::Frontend {
+                // The agent owns routine visual decisions. The workflow
+                // still enforces evidence gates; it never pauses for a
+                // theme vote.
+                step.approval = false;
+            } else if let Some(default) = defaults.iter().find(|candidate| candidate.id == step.id)
+            {
+                // Reverting away from Frontend must not leave the kind's
+                // own approval requirement permanently overridden.
+                step.approval = default.approval;
+            }
         }
     }
 }
@@ -587,7 +600,7 @@ fn materialize(
     brainstorm: bool,
 ) -> Vec<WorkflowStep> {
     let mut steps = definition(kind).materialize(classification);
-    apply_profile(profile, &mut steps);
+    apply_profile(kind, profile, &mut steps);
     apply_brainstorm_selection(brainstorm, &mut steps);
     apply_deploy_tier(deploy_tier, &mut steps);
     steps
@@ -743,7 +756,7 @@ impl WorkflowState {
     pub(crate) fn set_profile(&mut self, profile: WorkflowProfile) {
         self.profile = profile;
         self.profile_source = ProfileSource::OperatorOverride;
-        apply_profile(profile, &mut self.steps);
+        apply_profile(self.kind, profile, &mut self.steps);
     }
 }
 
@@ -1398,7 +1411,7 @@ fn reclassify_at_gate(state: &mut WorkflowState) {
     {
         state.profile = WorkflowProfile::Frontend;
         state.classification.work_domain = measured.work_domain.clone();
-        apply_profile(state.profile, &mut state.steps);
+        apply_profile(state.kind, state.profile, &mut state.steps);
         state.classification.reasons.push(format!(
             "frontend workflow profile selected at step '{}'",
             step.id
@@ -1590,6 +1603,12 @@ pub fn advance_with_evidence(
                         blocking: preexisting,
                         total: report.preexisting_total_count(),
                     });
+                    // Persisted immediately, mirroring `--frontend-root`
+                    // below: a later gate in this same advance (render/
+                    // visual-review, or the general test-evidence gate)
+                    // can still fail closed, and the operator should not
+                    // have to pass the flag again on retry.
+                    save(state_dir, &state, true)?;
                 }
             }
             if state.profile == WorkflowProfile::Frontend
@@ -3452,6 +3471,41 @@ mod tests {
         );
     }
 
+    /// Reviewer finding: `apply_profile` forced a Design step's approval off
+    /// going *to* Frontend but never restored it going back to Standard, so
+    /// a `reclassify`/`set_profile` revert could leave the workflow with
+    /// Frontend's autonomous-design approval semantics while reporting
+    /// Standard. The restore must come from the kind's own authored
+    /// default, not merely "leave whatever value is currently set".
+    #[test]
+    fn apply_profile_restores_the_kind_default_design_approval_when_leaving_frontend() {
+        let mut steps = definition(WorkflowKind::Spike).materialize(&low_classification());
+        apply_profile(WorkflowKind::Spike, WorkflowProfile::Frontend, &mut steps);
+        let design = steps
+            .iter()
+            .find(|step| step.phase == WorkflowPhase::Design)
+            .expect("spike has a design step");
+        assert!(!design.approval, "Frontend forces design approval off");
+
+        // Simulate approval having drifted from the kind's own default for
+        // any reason, so the assertion below proves the Standard branch
+        // actively restores it rather than coincidentally leaving it alone.
+        for step in &mut steps {
+            if step.phase == WorkflowPhase::Design {
+                step.approval = true;
+            }
+        }
+        apply_profile(WorkflowKind::Spike, WorkflowProfile::Standard, &mut steps);
+        let design = steps
+            .iter()
+            .find(|step| step.phase == WorkflowPhase::Design)
+            .expect("spike has a design step");
+        assert!(
+            !design.approval,
+            "leaving Frontend must restore the kind's own authored approval default"
+        );
+    }
+
     #[test]
     fn frontend_test_step_fails_closed_without_detector_evidence() {
         let repo = tempdir().unwrap();
@@ -4026,6 +4080,81 @@ mod tests {
         assert!(
             !with_flag.contains("automatically ran the detector"),
             "the flag must let the detector gate pass its pre-existing findings: {with_flag}"
+        );
+    }
+
+    /// Reviewer finding: the acceptance was only mutated on the in-memory
+    /// `WorkflowState`, so if a LATER gate in this same `advance` call (the
+    /// render/visual-review gate, right after the detector gate) still
+    /// fails closed, the acceptance was lost -- the operator would have to
+    /// pass `--accept-preexisting-findings` again on the very next retry.
+    #[test]
+    fn accept_preexisting_findings_persists_even_when_a_later_gate_fails() {
+        let repo = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.email=t@example.com",
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(repo.path())
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q", "-b", "main"]);
+        std::fs::write(
+            repo.path().join("Old.tsx"),
+            "export const Old = () => <img src={avatar} />;\n",
+        )
+        .unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "base"]);
+        git(&["checkout", "-q", "-b", "feature"]);
+        std::fs::write(
+            repo.path().join("style.css"),
+            ".card { color: rebeccapurple; }\n",
+        )
+        .unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "add clean style"]);
+
+        let mut classification = low_classification();
+        classification.risk = RiskBand::Medium;
+        classification.work_domain.domain = WorkDomain::Frontend;
+        classification.work_domain.score = 55;
+        let mut state = WorkflowState::start(
+            repo.path().to_path_buf(),
+            "review a frontend component".into(),
+            WorkflowKind::Review,
+            None,
+            true,
+            classification,
+        );
+        assert_eq!(state.current().unwrap().phase, WorkflowPhase::Review);
+        state.status = WorkflowStatus::Running;
+        let id = state.id.clone();
+        save(&state_dir, &state, true).unwrap();
+
+        let error = advance_with_evidence(&state_dir, state, StepOutcome::Success, None, true)
+            .unwrap_err()
+            .to_string();
+        // The render gate fails closed in this test environment (no dev
+        // server/browser); confirm we actually got past the detector gate
+        // so this test is exercising the scenario it claims to.
+        assert!(!error.contains("automatically ran the detector"), "{error}");
+
+        let reloaded = load(&state_dir, repo.path(), &id).unwrap();
+        assert!(
+            reloaded.accepted_preexisting_findings.is_some(),
+            "the acceptance must survive a later gate failing closed in the same advance"
         );
     }
 
