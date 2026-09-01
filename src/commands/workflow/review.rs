@@ -1825,10 +1825,8 @@ pub(crate) fn reviewer_argv(
         "-".to_string(),
         "--headless".to_string(),
     ];
-    // Issue #235: `--budget-tokens`/`--max-tool-calls` are `zirv agent`'s own
-    // clap flags (`AgentArgs`), so they must land BEFORE the `--` separator
-    // that starts the underlying adapter's own passthrough flags -- appended
-    // after would be swallowed as harness argv instead of parsed here.
+    // Must land before `--`: these are `zirv agent`'s own flags, not the
+    // adapter's passthrough.
     if let Some(tokens) = budget_tokens {
         argv.push("--budget-tokens".to_string());
         argv.push(tokens.to_string());
@@ -1948,6 +1946,13 @@ fn salvage_suffix(path: Option<&Path>) -> String {
     .unwrap_or_default()
 }
 
+/// Fallback tool-call guidance stated in the prompt when no worker budget is
+/// configured: `WorkerBudget`'s `HardStop` kills the child outright rather
+/// than letting it finish its turn, and `SoftWarn` prints only to zirv's own
+/// stderr, never to the reviewer's stdin -- so an unbounded reviewer has no
+/// other signal telling it to wrap up.
+const DEFAULT_REVIEWER_TOOL_CALL_GUIDANCE: u32 = 40;
+
 /// The prompt text sent to an independent reviewer for `package`, split out
 /// from `launch_reviewer` so its exact wording (in particular the #238
 /// baseline-waiver guidance) is unit-testable without spawning a real
@@ -1957,12 +1962,12 @@ fn build_reviewer_prompt(
     budget_tokens: Option<u64>,
     max_tool_calls: Option<u32>,
 ) -> CtxResult<String> {
-    // Issue #235: when the operator has bounded this reviewer worker, say so
-    // in the prompt itself, or a reviewer that hits the ceiling mid-review
-    // stops with nothing usable at all rather than concluding early with
-    // whatever it has confirmed so far.
-    let budget_notice = match (budget_tokens, max_tool_calls) {
-        (None, None) => String::new(),
+    let bound_notice = match (budget_tokens, max_tool_calls) {
+        (None, None) => format!(
+            "This review worker has no configured spend ceiling, but a runaway review still \
+             gets killed outright with no chance to finish. Keep it within roughly {DEFAULT_REVIEWER_TOOL_CALL_GUIDANCE} \
+             tool calls and conclude with your confirmed findings well before that.\n\n"
+        ),
         (tokens, calls) => {
             let mut parts = Vec::new();
             if let Some(tokens) = tokens {
@@ -1972,7 +1977,8 @@ fn build_reviewer_prompt(
                 parts.push(format!("a tool-call budget of {calls}"));
             }
             format!(
-                "This review worker is running under {}. Conclude with your confirmed findings, as the result line specified below, before you run out of budget rather than leaving the review incomplete.\n\n",
+                "This review worker runs under {}, enforced by killing the process outright, \
+                 not by pausing it. Conclude with your confirmed findings well before you hit it.\n\n",
                 parts.join(" and ")
             )
         }
@@ -1997,7 +2003,7 @@ fn build_reviewer_prompt(
     // `normalize_disposition`) is a safety net for this prompt, not a
     // substitute for it.
     Ok(format!(
-        "{budget_notice}{delta_notice}Review the following compact Zirv review package. Do not modify files. \
+        "{bound_notice}{delta_notice}Review the following compact Zirv review package. Do not modify files. \
          In the package's `verification` field, `passed:false` together with \
          `passed_with_baseline_waiver:true` means every failing test is in the operator's \
          recorded baseline (`waived_failing_tests`) and the gate passed -- treat it as \
@@ -2021,13 +2027,9 @@ fn build_reviewer_prompt(
     ))
 }
 
-/// Issue #235: `workflow.review_worker_budget_tokens`/
-/// `review_worker_max_tool_calls`, resolved for the repository a review
-/// package was built against. A configuration that will not load at all
-/// (a repo setting a forbidden key, say) degrades to "no ceiling" -- the
-/// exact argv this reviewer would have gotten before these keys existed --
-/// rather than blocking the review outright, the same fallback shape
-/// `TelemetryConfig::for_repo` uses for its own optional feature.
+/// `workflow.review_worker_budget_tokens`/`review_worker_max_tool_calls` for
+/// this repository. A config that fails to load degrades to "no ceiling",
+/// the same fallback shape `TelemetryConfig::for_repo` uses.
 fn reviewer_worker_budget(repo: &Path) -> (Option<u64>, Option<u32>) {
     match crate::commands::ctx::config::CtxConfig::load(repo, &|key| std::env::var(key).ok()) {
         Ok(cfg) => (
@@ -3171,12 +3173,7 @@ mod tests {
         );
     }
 
-    /// Issue #235: `--budget-tokens`/`--max-tool-calls` are `zirv agent`'s own
-    /// clap flags (`AgentArgs`), so they must land BEFORE the `--` separator
-    /// that starts the adapter's own passthrough flags -- landing after would
-    /// be silently swallowed as harness argv instead of parsed by `zirv
-    /// agent` at all. Unset (the default) appends neither flag, the exact
-    /// argv shape from before these keys existed.
+    /// Budget flags must land before the `--` separator, and only when set.
     #[test]
     fn reviewer_argv_appends_worker_budget_flags_before_the_separator_only_when_set() {
         let repo = tempdir().unwrap();
@@ -4156,13 +4153,12 @@ checksum = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f80"
         );
     }
 
-    /// Issue #235: when a worker budget is configured, the reviewer prompt
-    /// must state the ceiling and tell the reviewer to conclude with
-    /// confirmed findings before running out, or a bounded reviewer that
-    /// hits the wall mid-review leaves nothing usable at all. Unset (the
-    /// pre-#235 default) must not add this text.
+    /// Issue #235: `evaluate_worker_budget`'s `HardStop` kills the reviewer
+    /// outright rather than letting it wrap up, so the prompt must always
+    /// state a bound -- the configured ceiling when set, or the fixed
+    /// guidance when not, never neither.
     #[test]
-    fn build_reviewer_prompt_states_the_worker_budget_only_when_configured() {
+    fn build_reviewer_prompt_always_states_a_bound() {
         let repo = git_repo();
         let state_dir = StateDir::from_root(tempdir().unwrap().path().to_path_buf());
         let state = running_review_state(repo.path(), "HEAD");
@@ -4170,8 +4166,8 @@ checksum = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f80"
 
         let unbounded = build_reviewer_prompt(&package, None, None).expect("prompt");
         assert!(
-            !unbounded.contains("token budget") && !unbounded.contains("tool-call budget"),
-            "no budget configured must add no budget notice: {unbounded}"
+            unbounded.contains("roughly 40 tool calls"),
+            "no configured budget must still state the fixed guidance: {unbounded}"
         );
 
         let bounded = build_reviewer_prompt(&package, Some(50_000), Some(40)).expect("prompt");

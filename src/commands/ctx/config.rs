@@ -608,18 +608,11 @@ pub struct WorkflowConfig {
     /// owns `verify.toml` must never be able to widen what its own checks
     /// can read from the operator's environment.
     pub check_env_passthrough: Vec<String>,
-    /// Issue #235: token ceiling appended to a reviewer worker's launch
-    /// (`zirv agent <adapter> ... --budget-tokens <n>`) via `reviewer_argv`'s
-    /// call site, only when set. `None` (the default) appends no flag,
-    /// exactly as before this key existed. `REPO_FORBIDDEN`: a repo checkout
-    /// must not be able to raise its own reviewer's spend ceiling, nor lower
-    /// it to starve a review the operator wants done properly.
+    /// `--budget-tokens` appended to a reviewer worker's launch when set.
+    /// `REPO_FORBIDDEN`: operator-only, like `check_env_passthrough` above.
     pub review_worker_budget_tokens: Option<u64>,
-    /// Issue #235: tool-call ceiling appended to a reviewer worker's launch
-    /// (`--max-tool-calls <n>`), independent of `review_worker_budget_tokens`
-    /// -- same shape and default as `WorkerBudget`'s own two independent
-    /// ceilings. `REPO_FORBIDDEN`, same reasoning as
-    /// `review_worker_budget_tokens`.
+    /// `--max-tool-calls` appended to a reviewer worker's launch when set.
+    /// `REPO_FORBIDDEN`, same reasoning as `review_worker_budget_tokens`.
     pub review_worker_max_tool_calls: Option<u32>,
 }
 
@@ -2009,10 +2002,6 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
         &["workflow", "check_env_passthrough"],
         "ZIRV_CTX_WORKFLOW_CHECK_ENV_PASSTHROUGH",
     ),
-    // Issue #235: a repo checkout must not be able to raise its own
-    // reviewer's spend ceiling (or starve it by lowering the ceiling the
-    // operator set), same trust asymmetry as every other REPO_FORBIDDEN
-    // entry in this table.
     (
         &["workflow", "review_worker_budget_tokens"],
         "ZIRV_CTX_WORKFLOW_REVIEW_WORKER_BUDGET_TOKENS",
@@ -5060,11 +5049,8 @@ mod tests {
     }
 
     /// Issue #235: `workflow.review_worker_budget_tokens`/
-    /// `review_worker_max_tool_calls` are operator-only, the identical
-    /// widening-only asymmetry `repo_layer_cannot_set_workflow_check_env_
-    /// passthrough` above pins -- a repo checkout raising (or lowering, to
-    /// starve) its own reviewer's spend ceiling would make the operator's own
-    /// value decorative.
+    /// `review_worker_max_tool_calls` are operator-only, same asymmetry as
+    /// `check_env_passthrough` above.
     #[test]
     fn repo_layer_cannot_set_workflow_review_worker_budget_keys() {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -5109,12 +5095,8 @@ mod tests {
         );
     }
 
-    /// The operator's own `~/.zirv/ctx.toml` may set
-    /// `workflow.review_worker_budget_tokens`/`review_worker_max_tool_calls`
-    /// (only `REPO_FORBIDDEN` blocks the repo layer), and the matching
-    /// `ZIRV_CTX_*` variables override them from the environment, the same
-    /// shape `the_operator_may_set_workflow_check_env_passthrough_from_home_
-    /// config_and_env` pins for `check_env_passthrough`.
+    /// The operator's home layer and `ZIRV_CTX_*` env override still work,
+    /// same as `check_env_passthrough`.
     #[test]
     fn the_operator_may_set_workflow_review_worker_budget_from_home_config_and_env() {
         let home = tempfile::tempdir().expect("tempdir");

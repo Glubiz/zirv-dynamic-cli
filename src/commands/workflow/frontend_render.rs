@@ -1157,11 +1157,7 @@ fn launch_visual_reviewer(
     model: Option<&str>,
     prompt: String,
 ) -> CtxResult<String> {
-    // Issue #235's reviewer worker budget (`workflow.review_worker_*`) is
-    // scoped to the independent code-review seat `workflow review run`
-    // dispatches; this visual-review helper is a separate feature with its
-    // own `--max-restarts 0` shape below, so it keeps the pre-#235 argv
-    // (no budget ceiling) unchanged.
+    // Not the code-review seat's own worker budget; keeps no ceiling.
     let mut argv = super::review::reviewer_argv(agent, repo, true, None, None)?;
     let separator = argv
         .iter()
