@@ -1930,6 +1930,18 @@ pub fn run_with(
             policy_extra.join(" ")
         },
     });
+    // Issue #222: codex has no per-command approval mechanism zirv can
+    // pre-clear the way #224 pre-approves reserved claude built-ins, so an
+    // interactive launch under a prompting posture gets a one-time advisory
+    // naming the config fix instead.
+    if !policy_skip && interactive_launch && adapter.name() == "codex" {
+        let posture = adapters::codex::resolve_codex_approval_posture(
+            &crate::utils::home_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+        );
+        if let Some(advisory) = adapters::codex::codex_approval_advisory(posture) {
+            announcer.emit(&super::announce::Event::CodexApprovalAdvisory { advisory });
+        }
+    }
 
     let mut supervision = InjectionState::new();
     supervision.degraded = args.no_supervise;

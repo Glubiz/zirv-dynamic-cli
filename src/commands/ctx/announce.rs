@@ -228,6 +228,10 @@ pub enum Event {
         to_model: String,
         stored: String,
     },
+    /// Issue #222: an interactive codex launch under an approval posture
+    /// that prompts on ordinary commands (`codex::codex_approval_advisory`).
+    /// `advisory` is pre-rendered by the caller.
+    CodexApprovalAdvisory { advisory: String },
     /// A `zirv ctx handover` request was refused rather than acted on --
     /// most commonly "mid-turn, and no `--force` was given" (see
     /// `wrap::may_inject`, the same quiesce check every other injection
@@ -287,6 +291,7 @@ impl Event {
                  {detail}"
             ),
             Event::SandboxResidual { note } => format!("sandbox residual: {note}"),
+            Event::CodexApprovalAdvisory { advisory } => advisory.clone(),
             Event::VerdictChanged { from, to, score } => {
                 format!(
                     "context health {} -> {} (score {score})",
