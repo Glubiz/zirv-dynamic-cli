@@ -30,6 +30,8 @@ pub enum HookEvent {
     /// Claude PreToolUse hook: refuse a subagent dispatch that would inherit
     /// this seat's expensive model.
     Pretool,
+    /// Claude SessionStart hook: re-inject the latest handoff on resume/clear.
+    SessionStart,
     /// Codex notify program: same role as Stop.
     Notify {
         /// Payload, when the agent passes it as an argument instead of stdin.
@@ -48,6 +50,8 @@ pub struct HookPayload {
     pub transcript_path: String,
     pub cwd: String,
     pub stop_hook_active: bool,
+    /// SessionStart only: `"startup" | "resume" | "clear" | "compact"`.
+    pub source: String,
 }
 
 impl HookPayload {
@@ -603,6 +607,44 @@ pub fn run_pre_compact<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> 
     Ok(0)
 }
 
+// -- SessionStart: re-inject the latest handoff on resume/clear ------------
+
+pub fn session_start_output(handoff_markdown: &str) -> String {
+    serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": "SessionStart",
+            "additionalContext": handoff_markdown
+        }
+    })
+    .to_string()
+}
+
+/// The latest stored handoff's markdown for `payload`'s repo, or `None` when
+/// the state dir cannot be resolved, no handoff exists, or the latest one is
+/// not usable (`Handoff::is_usable`). Read-only: repeated calls (repeated
+/// resumes) re-read the same file and re-inject the same text, never
+/// consuming or mutating anything -- idempotent by construction.
+fn latest_handoff_markdown(payload: &HookPayload, env: EnvLookup<'_>) -> Option<String> {
+    let state = StateDir::resolve(env).ok()?;
+    let (_, handoff) = super::handoff::latest_for_repo(&state, &payload.repo())
+        .ok()
+        .flatten()?;
+    handoff.is_usable().then(|| handoff.to_markdown())
+}
+
+/// `startup` (a fresh session) and `compact` (mid-session, not a restart)
+/// get no injection; only `resume`/`clear` -- a new context with no memory of
+/// the prior one -- can use a handoff.
+pub fn run_session_start<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResult<i32> {
+    let payload = HookPayload::parse(stdin).unwrap_or_default();
+    if matches!(payload.source.as_str(), "resume" | "clear")
+        && let Some(handoff_markdown) = latest_handoff_markdown(&payload, env)
+    {
+        let _ = writeln!(w, "{}", session_start_output(&handoff_markdown));
+    }
+    Ok(0)
+}
+
 // -- PreToolUse: the expensive-seat inheritance guard ----------------------
 
 /// Model-name fragments that mark a seat too expensive to inherit silently.
@@ -796,6 +838,7 @@ pub fn notify_payload_to_hook(raw: &str) -> CtxResult<HookPayload> {
         transcript_path,
         cwd: string_at("cwd"),
         stop_hook_active: false,
+        source: String::new(),
     })
 }
 
@@ -919,6 +962,7 @@ pub fn run<W: Write>(args: &HookArgs, w: &mut W) -> CtxResult<i32> {
         }
         HookEvent::PreCompact => run_pre_compact(w, &read_stdin(), &env),
         HookEvent::Pretool => run_pretool(w, &read_stdin(), &env),
+        HookEvent::SessionStart => run_session_start(w, &read_stdin(), &env),
         HookEvent::Notify { payload } => {
             let raw = match payload {
                 Some(text) => text.clone(),
@@ -940,6 +984,7 @@ mod tests {
             transcript_path: "/tmp/t.jsonl".to_string(),
             cwd: "/work/repo".to_string(),
             stop_hook_active: false,
+            source: String::new(),
         }
     }
 
@@ -971,6 +1016,102 @@ mod tests {
         .expect("parse");
         assert!(full.stop_hook_active);
         assert_eq!(full.cwd, "/c");
+    }
+
+    #[test]
+    fn session_start_output_envelope_shape() {
+        let json = session_start_output("## Task\ndo the thing\n");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid json");
+        assert_eq!(
+            parsed["hookSpecificOutput"]["hookEventName"],
+            "SessionStart"
+        );
+        assert_eq!(
+            parsed["hookSpecificOutput"]["additionalContext"],
+            "## Task\ndo the thing\n"
+        );
+    }
+
+    fn usable_handoff() -> crate::commands::ctx::handoff::Handoff {
+        crate::commands::ctx::handoff::Handoff {
+            task: "ship the thing".to_string(),
+            next_step: "run the tests".to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn session_start_payload(repo: &Path, source: &str) -> HookPayload {
+        HookPayload {
+            session_id: "sess-1".to_string(),
+            transcript_path: String::new(),
+            cwd: repo.display().to_string(),
+            stop_hook_active: false,
+            source: source.to_string(),
+        }
+    }
+
+    /// `source` gates everything: `resume`/`clear` inject a stored handoff,
+    /// `startup`/`compact` never do, even with one on disk.
+    #[test]
+    fn source_filtering_injects_only_on_resume_or_clear() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = tempfile::tempdir().expect("repo");
+        let state = StateDir::from_root(dir.path().to_path_buf());
+        crate::commands::ctx::handoff::store(&state, repo.path(), "sess-1", &usable_handoff())
+            .expect("store handoff");
+        let env = |key: &str| {
+            (key == crate::commands::ctx::state::STATE_ENV)
+                .then(|| dir.path().display().to_string())
+        };
+
+        for source in ["startup", "compact", ""] {
+            let mut out = Vec::new();
+            run_session_start(
+                &mut out,
+                &serde_json::to_string(&session_start_payload(repo.path(), source)).unwrap(),
+                &env,
+            )
+            .unwrap();
+            assert!(out.is_empty(), "source={source} must not inject: {out:?}");
+        }
+
+        for source in ["resume", "clear"] {
+            let mut out = Vec::new();
+            run_session_start(
+                &mut out,
+                &serde_json::to_string(&session_start_payload(repo.path(), source)).unwrap(),
+                &env,
+            )
+            .unwrap();
+            let text = String::from_utf8(out).unwrap();
+            assert!(
+                text.contains("ship the thing"),
+                "source={source} must inject: {text}"
+            );
+            let parsed: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
+            assert_eq!(
+                parsed["hookSpecificOutput"]["hookEventName"],
+                "SessionStart"
+            );
+        }
+    }
+
+    #[test]
+    fn resume_with_no_stored_handoff_is_a_no_op() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = tempfile::tempdir().expect("repo");
+        let env = |key: &str| {
+            (key == crate::commands::ctx::state::STATE_ENV)
+                .then(|| dir.path().display().to_string())
+        };
+        let mut out = Vec::new();
+        run_session_start(
+            &mut out,
+            &serde_json::to_string(&session_start_payload(repo.path(), "resume")).unwrap(),
+            &env,
+        )
+        .unwrap();
+        assert!(out.is_empty());
     }
 
     #[test]

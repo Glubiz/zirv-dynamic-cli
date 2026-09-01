@@ -1778,6 +1778,8 @@ pub(crate) fn reviewer_argv(
     agent: &str,
     repo: &Path,
     include_custom_agents: bool,
+    budget_tokens: Option<u64>,
+    max_tool_calls: Option<u32>,
 ) -> CtxResult<Vec<String>> {
     if agent.is_empty()
         || agent.len() > 64
@@ -1825,8 +1827,18 @@ pub(crate) fn reviewer_argv(
         agent.to_string(),
         "-".to_string(),
         "--headless".to_string(),
-        "--".to_string(),
     ];
+    // Must land before `--`: these are `zirv agent`'s own flags, not the
+    // adapter's passthrough.
+    if let Some(tokens) = budget_tokens {
+        argv.push("--budget-tokens".to_string());
+        argv.push(tokens.to_string());
+    }
+    if let Some(calls) = max_tool_calls {
+        argv.push("--max-tool-calls".to_string());
+        argv.push(calls.to_string());
+    }
+    argv.push("--".to_string());
     argv.extend(seat_args);
     Ok(argv)
 }
@@ -1937,11 +1949,43 @@ fn salvage_suffix(path: Option<&Path>) -> String {
     .unwrap_or_default()
 }
 
+/// Fallback tool-call guidance stated in the prompt when no worker budget is
+/// configured: `WorkerBudget`'s `HardStop` kills the child outright rather
+/// than letting it finish its turn, and `SoftWarn` prints only to zirv's own
+/// stderr, never to the reviewer's stdin -- so an unbounded reviewer has no
+/// other signal telling it to wrap up.
+const DEFAULT_REVIEWER_TOOL_CALL_GUIDANCE: u32 = 40;
+
 /// The prompt text sent to an independent reviewer for `package`, split out
 /// from `launch_reviewer` so its exact wording (in particular the #238
 /// baseline-waiver guidance) is unit-testable without spawning a real
 /// reviewer process.
-fn build_reviewer_prompt(package: &ReviewPackage) -> CtxResult<String> {
+fn build_reviewer_prompt(
+    package: &ReviewPackage,
+    budget_tokens: Option<u64>,
+    max_tool_calls: Option<u32>,
+) -> CtxResult<String> {
+    let bound_notice = match (budget_tokens, max_tool_calls) {
+        (None, None) => format!(
+            "This review worker has no configured spend ceiling, but a runaway review still \
+             gets killed outright with no chance to finish. Keep it within roughly {DEFAULT_REVIEWER_TOOL_CALL_GUIDANCE} \
+             tool calls and conclude with your confirmed findings well before that.\n\n"
+        ),
+        (tokens, calls) => {
+            let mut parts = Vec::new();
+            if let Some(tokens) = tokens {
+                parts.push(format!("a token budget of {tokens}"));
+            }
+            if let Some(calls) = calls {
+                parts.push(format!("a tool-call budget of {calls}"));
+            }
+            format!(
+                "This review worker runs under {}, enforced by killing the process outright, \
+                 not by pausing it. Conclude with your confirmed findings well before you hit it.\n\n",
+                parts.join(" and ")
+            )
+        }
+    };
     // A delta package must never read as a whole change: a reviewer told
     // "this is the whole diff" when it is only what changed since the last
     // reviewed commit will report false findings about code it cannot see.
@@ -1962,7 +2006,7 @@ fn build_reviewer_prompt(package: &ReviewPackage) -> CtxResult<String> {
     // `normalize_disposition`) is a safety net for this prompt, not a
     // substitute for it.
     Ok(format!(
-        "{delta_notice}Review the following compact Zirv review package. Do not modify files. \
+        "{bound_notice}{delta_notice}Review the following compact Zirv review package. Do not modify files. \
          In the package's `verification` field, `passed:false` together with \
          `passed_with_baseline_waiver:true` means every failing test is in the operator's \
          recorded baseline (`waived_failing_tests`) and the gate passed -- treat it as \
@@ -1986,9 +2030,29 @@ fn build_reviewer_prompt(package: &ReviewPackage) -> CtxResult<String> {
     ))
 }
 
+/// `workflow.review_worker_budget_tokens`/`review_worker_max_tool_calls` for
+/// this repository. A config that fails to load degrades to "no ceiling",
+/// the same fallback shape `TelemetryConfig::for_repo` uses.
+fn reviewer_worker_budget(repo: &Path) -> (Option<u64>, Option<u32>) {
+    match crate::commands::ctx::config::CtxConfig::load(repo, &|key| std::env::var(key).ok()) {
+        Ok(cfg) => (
+            cfg.workflow.review_worker_budget_tokens,
+            cfg.workflow.review_worker_max_tool_calls,
+        ),
+        Err(_) => (None, None),
+    }
+}
+
 fn launch_reviewer(agent: &str, package: &ReviewPackage) -> CtxResult<ReviewerRun> {
-    let argv = reviewer_argv(agent, &package.repo_root, package.include_custom_agents)?;
-    let prompt = build_reviewer_prompt(package)?;
+    let (budget_tokens, max_tool_calls) = reviewer_worker_budget(&package.repo_root);
+    let argv = reviewer_argv(
+        agent,
+        &package.repo_root,
+        package.include_custom_agents,
+        budget_tokens,
+        max_tool_calls,
+    )?;
+    let prompt = build_reviewer_prompt(package, budget_tokens, max_tool_calls)?;
     let mut child = Command::new(std::env::current_exe()?)
         .args(&argv)
         .stdin(Stdio::piped())
@@ -3067,7 +3131,7 @@ mod tests {
     #[test]
     fn a_reviewer_seat_is_always_pinned_read_only_or_refused() {
         let repo = tempdir().unwrap();
-        let claude = reviewer_argv("claude", repo.path(), false).unwrap();
+        let claude = reviewer_argv("claude", repo.path(), false, None, None).unwrap();
         assert_eq!(
             &claude[..5],
             ["agent", "claude", "-", "--headless", "--"],
@@ -3086,7 +3150,7 @@ mod tests {
             "the provider-neutral reviewer manifest must reach the harness system prompt"
         );
 
-        let codex = reviewer_argv("codex", repo.path(), false).unwrap();
+        let codex = reviewer_argv("codex", repo.path(), false, None, None).unwrap();
         assert_eq!(&codex[..5], ["agent", "codex", "-", "--headless", "--"]);
         assert!(
             codex
@@ -3099,7 +3163,7 @@ mod tests {
             "the same reviewer seat must be addressable through codex"
         );
 
-        let error = reviewer_argv("nope", repo.path(), false)
+        let error = reviewer_argv("nope", repo.path(), false, None, None)
             .unwrap_err()
             .to_string();
         assert!(
@@ -3107,9 +3171,45 @@ mod tests {
             "{error}"
         );
         assert!(
-            reviewer_argv("Claude", repo.path(), false).is_err(),
+            reviewer_argv("Claude", repo.path(), false, None, None).is_err(),
             "the adapter name is validated too"
         );
+    }
+
+    /// Budget flags must land before the `--` separator, and only when set.
+    #[test]
+    fn reviewer_argv_appends_worker_budget_flags_before_the_separator_only_when_set() {
+        let repo = tempdir().unwrap();
+        let unbounded = reviewer_argv("claude", repo.path(), false, None, None).unwrap();
+        assert!(
+            !unbounded.iter().any(|arg| arg == "--budget-tokens"),
+            "no budget configured must append no flag: {unbounded:?}"
+        );
+        assert!(
+            !unbounded.iter().any(|arg| arg == "--max-tool-calls"),
+            "no tool-call ceiling configured must append no flag: {unbounded:?}"
+        );
+
+        let bounded = reviewer_argv("claude", repo.path(), false, Some(50_000), Some(40)).unwrap();
+        let separator = bounded
+            .iter()
+            .position(|arg| arg == "--")
+            .expect("reviewer argv always has a flag separator");
+        let budget_at = bounded
+            .iter()
+            .position(|arg| arg == "--budget-tokens")
+            .expect("--budget-tokens must be present when a budget is configured");
+        let calls_at = bounded
+            .iter()
+            .position(|arg| arg == "--max-tool-calls")
+            .expect("--max-tool-calls must be present when a tool-call ceiling is configured");
+        assert!(
+            budget_at < separator && calls_at < separator,
+            "both budget flags must land before the `--` separator so `zirv agent` parses \
+             them as its own flags rather than passthrough harness argv: {bounded:?}"
+        );
+        assert_eq!(bounded[budget_at + 1], "50000");
+        assert_eq!(bounded[calls_at + 1], "40");
     }
 
     /// A reviewer that emits a non-UTF-8 byte used to end the relay early (a
@@ -4048,11 +4148,39 @@ checksum = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f80"
         let state = running_review_state(repo.path(), "HEAD");
         let package = package(&state_dir, &state, None).expect("package");
 
-        let prompt = build_reviewer_prompt(&package).expect("prompt");
+        let prompt = build_reviewer_prompt(&package, None, None).expect("prompt");
         assert!(
             prompt.contains("passed_with_baseline_waiver")
                 && prompt.contains("operator-acknowledged"),
             "got: {prompt}"
+        );
+    }
+
+    /// Issue #235: `evaluate_worker_budget`'s `HardStop` kills the reviewer
+    /// outright rather than letting it wrap up, so the prompt must always
+    /// state a bound -- the configured ceiling when set, or the fixed
+    /// guidance when not, never neither.
+    #[test]
+    fn build_reviewer_prompt_always_states_a_bound() {
+        let repo = git_repo();
+        let state_dir = StateDir::from_root(tempdir().unwrap().path().to_path_buf());
+        let state = running_review_state(repo.path(), "HEAD");
+        let package = package(&state_dir, &state, None).expect("package");
+
+        let unbounded = build_reviewer_prompt(&package, None, None).expect("prompt");
+        assert!(
+            unbounded.contains("roughly 40 tool calls"),
+            "no configured budget must still state the fixed guidance: {unbounded}"
+        );
+
+        let bounded = build_reviewer_prompt(&package, Some(50_000), Some(40)).expect("prompt");
+        assert!(
+            bounded.contains("token budget of 50000") && bounded.contains("tool-call budget of 40"),
+            "got: {bounded}"
+        );
+        assert!(
+            bounded.contains("Conclude with your confirmed findings"),
+            "got: {bounded}"
         );
     }
 

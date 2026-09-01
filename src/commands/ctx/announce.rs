@@ -111,6 +111,15 @@ pub enum Event {
     /// used to disappear in silence (`.ok().flatten()`) -- leaving a session
     /// running with no methodology and no way to notice.
     WorkflowLayerSkipped { reason: String },
+    /// Issue #242: a gate transition auto-spawned a detached lifecycle
+    /// worker for `phase` (review/test/verify), naming the argv it ran.
+    AutoSpawned { phase: String, command: String },
+    /// Issue #242: a gate transition was eligible for auto-spawn (the
+    /// operator turned the key on, the phase and workflow status matched)
+    /// but was skipped, naming why -- no free heavy-operation permit, or no
+    /// adapter to run a reviewer as. Never emitted for the ordinary case
+    /// (the feature disabled, or a phase it was never meant to touch).
+    AutoSpawnSkipped { phase: String, reason: String },
     /// Context health is slipping (the rot advisory `wrap`'s pump used to
     /// build by hand as `advisory_line`).
     RotAdvisory { score: u32, tokens: u64 },
@@ -353,6 +362,12 @@ impl Event {
             Event::WorkflowLayerSkipped { reason } => {
                 format!("workflow step context skipped: {reason}")
             }
+            Event::AutoSpawned { phase, command } => {
+                format!("auto-spawned {phase} worker: {command}")
+            }
+            Event::AutoSpawnSkipped { phase, reason } => {
+                format!("auto-spawn for {phase} skipped: {reason}")
+            }
             Event::RotAdvisory { score, tokens } => format!(
                 "context health is slipping (score {score}, {tokens} tokens in context); a \
                  /compact soon will keep instruction-following sharp"
@@ -577,6 +592,24 @@ mod tests {
         };
         assert!(
             event.line().contains("simple run or prompt disabled"),
+            "got {}",
+            event.line()
+        );
+    }
+
+    /// Issue #242 follow-up: an auto-spawn skip must name both the phase and
+    /// the reason -- an operator who turned `auto_spawn_on_gate` on and sees
+    /// nothing spawn needs to know why, not just that something didn't
+    /// happen.
+    #[test]
+    fn an_auto_spawn_skip_announcement_names_the_phase_and_reason() {
+        let event = Event::AutoSpawnSkipped {
+            phase: "review".to_string(),
+            reason: "no heavy-operation permit was free".to_string(),
+        };
+        assert!(event.line().contains("review"), "got {}", event.line());
+        assert!(
+            event.line().contains("no heavy-operation permit was free"),
             "got {}",
             event.line()
         );

@@ -608,6 +608,17 @@ pub struct WorkflowConfig {
     /// owns `verify.toml` must never be able to widen what its own checks
     /// can read from the operator's environment.
     pub check_env_passthrough: Vec<String>,
+    /// `--budget-tokens` appended to a reviewer worker's launch when set.
+    /// `REPO_FORBIDDEN`: operator-only, like `check_env_passthrough` above.
+    pub review_worker_budget_tokens: Option<u64>,
+    /// `--max-tool-calls` appended to a reviewer worker's launch when set.
+    /// `REPO_FORBIDDEN`, same reasoning as `review_worker_budget_tokens`.
+    pub review_worker_max_tool_calls: Option<u32>,
+    /// Issue #242: auto-spawns a bounded `review run`/`test changed`/
+    /// `verify` worker when a gate transition lands the workflow on that
+    /// phase. Off by default. `REPO_FORBIDDEN`: a repo checkout must not be
+    /// able to make zirv spend on its own behalf.
+    pub auto_spawn_on_gate: bool,
 }
 
 impl Default for WorkflowConfig {
@@ -623,6 +634,9 @@ impl Default for WorkflowConfig {
             telemetry_retention_days: 30,
             adoption: crate::commands::workflow::adoption::AdoptionPolicy::default(),
             check_env_passthrough: Vec::new(),
+            review_worker_budget_tokens: None,
+            review_worker_max_tool_calls: None,
+            auto_spawn_on_gate: false,
         }
     }
 }
@@ -1489,6 +1503,21 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         &["workflow", "telemetry_retention_days"],
         EnvKind::Int,
     ),
+    (
+        "ZIRV_CTX_WORKFLOW_REVIEW_WORKER_BUDGET_TOKENS",
+        &["workflow", "review_worker_budget_tokens"],
+        EnvKind::Int,
+    ),
+    (
+        "ZIRV_CTX_WORKFLOW_REVIEW_WORKER_MAX_TOOL_CALLS",
+        &["workflow", "review_worker_max_tool_calls"],
+        EnvKind::Int,
+    ),
+    (
+        "ZIRV_CTX_WORKFLOW_AUTO_SPAWN_ON_GATE",
+        &["workflow", "auto_spawn_on_gate"],
+        EnvKind::Bool,
+    ),
     ("ZIRV_CTX_MEMORY", &["memory", "enabled"], EnvKind::Bool),
     (
         "ZIRV_CTX_MEMORY_HARVEST",
@@ -1983,6 +2012,18 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     (
         &["workflow", "check_env_passthrough"],
         "ZIRV_CTX_WORKFLOW_CHECK_ENV_PASSTHROUGH",
+    ),
+    (
+        &["workflow", "review_worker_budget_tokens"],
+        "ZIRV_CTX_WORKFLOW_REVIEW_WORKER_BUDGET_TOKENS",
+    ),
+    (
+        &["workflow", "review_worker_max_tool_calls"],
+        "ZIRV_CTX_WORKFLOW_REVIEW_WORKER_MAX_TOOL_CALLS",
+    ),
+    (
+        &["workflow", "auto_spawn_on_gate"],
+        "ZIRV_CTX_WORKFLOW_AUTO_SPAWN_ON_GATE",
     ),
     // A repo checkout must not be able to switch either memory scope's own
     // gate on or off for itself, grow its cap, or turn on automatic
@@ -5022,6 +5063,106 @@ mod tests {
         );
     }
 
+    /// Issue #235: `workflow.review_worker_budget_tokens`/
+    /// `review_worker_max_tool_calls` are operator-only, same asymmetry as
+    /// `check_env_passthrough` above.
+    #[test]
+    fn repo_layer_cannot_set_workflow_review_worker_budget_keys() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[workflow]\nreview_worker_budget_tokens = 999999\n",
+        )
+        .expect("write");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let empty = env_map(&[]);
+        let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+            .expect_err("a repo may not set its own reviewer worker token budget")
+            .to_string();
+        assert!(
+            err.contains("workflow.review_worker_budget_tokens"),
+            "got {err}"
+        );
+        assert!(
+            err.contains("ZIRV_CTX_WORKFLOW_REVIEW_WORKER_BUDGET_TOKENS"),
+            "names the operator escape hatch: {err}"
+        );
+
+        let repo2 = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo2.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo2.path().join(".zirv/ctx.toml"),
+            "[workflow]\nreview_worker_max_tool_calls = 999\n",
+        )
+        .expect("write");
+        let err2 = CtxConfig::load(repo2.path(), &|k| empty.get(k).cloned())
+            .expect_err("a repo may not set its own reviewer worker tool-call ceiling")
+            .to_string();
+        assert!(
+            err2.contains("workflow.review_worker_max_tool_calls"),
+            "got {err2}"
+        );
+        assert!(
+            err2.contains("ZIRV_CTX_WORKFLOW_REVIEW_WORKER_MAX_TOOL_CALLS"),
+            "names the operator escape hatch: {err2}"
+        );
+    }
+
+    /// Issue #242: `workflow.auto_spawn_on_gate` is operator-only, same
+    /// asymmetry as `check_env_passthrough` above.
+    #[test]
+    fn repo_layer_cannot_set_workflow_auto_spawn_on_gate() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[workflow]\nauto_spawn_on_gate = true\n",
+        )
+        .expect("write");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let empty = env_map(&[]);
+        let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+            .expect_err("a repo may not turn on its own auto-spawn")
+            .to_string();
+        assert!(err.contains("workflow.auto_spawn_on_gate"), "got {err}");
+        assert!(
+            err.contains("ZIRV_CTX_WORKFLOW_AUTO_SPAWN_ON_GATE"),
+            "names the operator escape hatch: {err}"
+        );
+    }
+
+    /// The operator's home layer and `ZIRV_CTX_*` env override still work,
+    /// same as `check_env_passthrough`.
+    #[test]
+    fn the_operator_may_set_workflow_review_worker_budget_from_home_config_and_env() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".zirv/ctx.toml"),
+            "[workflow]\nreview_worker_budget_tokens = 75000\nreview_worker_max_tool_calls = 30\n",
+        )
+        .expect("write");
+        let repo = tempfile::tempdir().expect("tempdir");
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+            .expect("the operator's home layer may set these keys");
+        assert_eq!(cfg.workflow.review_worker_budget_tokens, Some(75_000));
+        assert_eq!(cfg.workflow.review_worker_max_tool_calls, Some(30));
+
+        let overridden = env_map(&[
+            ("ZIRV_CTX_WORKFLOW_REVIEW_WORKER_BUDGET_TOKENS", "120000"),
+            ("ZIRV_CTX_WORKFLOW_REVIEW_WORKER_MAX_TOOL_CALLS", "10"),
+        ]);
+        let cfg = CtxConfig::load(repo.path(), &|k| overridden.get(k).cloned())
+            .expect("the operator's env may override the home layer");
+        assert_eq!(cfg.workflow.review_worker_budget_tokens, Some(120_000));
+        assert_eq!(cfg.workflow.review_worker_max_tool_calls, Some(10));
+    }
+
     /// The operator's own `~/.zirv/ctx.toml` may set
     /// `workflow.check_env_passthrough` (only `REPO_FORBIDDEN` blocks the
     /// repo layer, never the home layer), and
@@ -5751,6 +5892,9 @@ mod tests {
         ("workflow", "telemetry_max_events"),
         ("workflow", "telemetry_retention_days"),
         ("workflow", "check_env_passthrough"),
+        ("workflow", "review_worker_budget_tokens"),
+        ("workflow", "review_worker_max_tool_calls"),
+        ("workflow", "auto_spawn_on_gate"),
         ("policy", "repo_fs_write"),
         ("policy", "outside_repo_fs_write"),
         ("policy", "shell_exec"),
