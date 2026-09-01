@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-31
+last-verified: 2026-09-01
 ---
 
 # _system-context
@@ -56,7 +56,7 @@ Every row's "vault page" is also the page whose "If changed" line names its own 
 | `handoff` | Distill a transcript into a stored handoff document. |
 | `resume` | Start a clean interactive session with the latest handoff injected. |
 | `hook` | Agent hook entrypoints (`Stop`, `Prompt`, `PreCompact`, `Notify`); must never exit non-zero on `Stop`. |
-| `status` | Show the session registry, the memory bank, unread mail, scores, and the decision-log tail. |
+| `status` | Show the session registry, the memory bank, unread mail, scores, and the decision-log tail. `--brief` collapses unbounded sections to totals; `--diff` (issue #246) prints only the sections changed since this session's own previous `--diff` call. |
 | `send` / `inbox` | Leave or read repo-scoped notes between sessions, optionally addressed to one live session (`--to-session`) or fanned out to every live session (`--all`, per-session read markers on one stored message, issue #94). |
 | `nudge` | Wake a live session early with a message, resolved against the session registry. |
 | `remember` / `recall` / `forget` | Read and write the repo-scoped memory bank of durable repository facts. Also reachable as the top-level, scope-aware `zirv memory status\|list\|recall\|remember\|forget\|verify` (`--shared` for the repository-owned bank), a sibling surface intercepted directly in `main.rs`, not a `zirv ctx` verb. |
@@ -143,7 +143,7 @@ Run all four before claiming a change is done. Full detail: [[Getting Started]],
 
 ## State Directory Layout
 
-`StateDir::resolve` roots at `ZIRV_CTX_STATE_DIR`, else the OS state dir, else the OS local-data dir, then `zirv/ctx`. Subpaths: `handoffs/<repo_slug>/` (stored handoff docs), `s/` (turn-signal sockets, short name for the unix path-length limit), `logs/decisions.jsonl` (append-only context decision log), `logs/safety-decisions/<UTC-day>.jsonl` (privacy-preserving command verdicts with command/policy SHA-256 identities, never raw command text), `usage.json` (single machine-wide file, merged across sessions), `scoring/` (per-transcript incremental-scoring checkpoints). Unix directories are `0700` and files `0600`; Windows has no equivalent and is a no-op there. See [[Ctx Subsystem]].
+`StateDir::resolve` roots at `ZIRV_CTX_STATE_DIR`, else the OS state dir, else the OS local-data dir, then `zirv/ctx`. Subpaths: `handoffs/<repo_slug>/` (stored handoff docs), `s/` (turn-signal sockets, short name for the unix path-length limit), `logs/decisions.jsonl` (append-only context decision log), `logs/safety-decisions/<UTC-day>.jsonl` (privacy-preserving command verdicts with command/policy SHA-256 identities, never raw command text), `usage.json` (single machine-wide file, merged across sessions), `scoring/` (per-transcript incremental-scoring checkpoints), `status-snapshots/` (issue #246 — one `StatusSnapshot` JSON per session, keyed by `input_hash(session)`, holding `zirv ctx status --diff`'s previous rendered sections). Unix directories are `0700` and files `0600`; Windows has no equivalent and is a no-op there. See [[Ctx Subsystem]].
 
 ## Documentation Contract
 

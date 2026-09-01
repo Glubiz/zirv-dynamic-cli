@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-31
+last-verified: 2026-09-01
 ---
 
 # Decision Log
@@ -23,6 +23,20 @@ last-verified: 2026-08-31
 - If the entry is longer than the cap, the "why" is a spec, not an ADR — write it under `docs/superpowers/specs/` and link to it.
 
 ## Decisions
+
+### 2026-09-01 — Review evidence carries the operator waiver from the gate's own evaluation, not a re-derivation (issue #238, v3.4.0)
+**Context:** `zirv workflow review package`'s `VerificationEvidence` reported a raw `passed:false` for a report the test/deploy gate (`latest_is_fresh_and_passing`) had already accepted via the operator's recorded baseline (issue #215) — every independent reviewer seat filed a false Critical "test verification failed" finding on it, three times on the #223/#225 gate and again on PR #247.
+**Decision:** Extracted `evaluate_against_operator_baseline(report, repo)` as the one seam both the gate and `VerificationEvidence::from_report` call — same baseline load, same subset-of-names evaluation, so the two can never disagree. `VerificationEvidence` gained `passed_with_baseline_waiver`/`waived_failing_tests`, both skipped from JSON when false/empty; the reviewer prompt states plainly that `passed:false` + `passed_with_baseline_waiver:true` is operator-acknowledged.
+**Rejected:** Persisting the waiver into `VerificationReport` itself — the baseline is operator state evaluated only at gate/package time, and a report must not carry a verdict that silently changes meaning when the baseline later changes. Adding blocking-name detail to a genuine (unwaived) failure's evidence — out of scope for this issue; reviewers already see the failed checks in the package's own `checks` list.
+**Consequences:** A future review-package field needing baseline awareness reuses this same seam rather than re-deriving it. The gate's own behavior is unchanged — only the review package's evidence gained the information the gate already had.
+**Spec / link:** `src/commands/workflow/{verification,review}.rs`; [[Workflows]]'s "Baseline-waivable test gate" section; issue #238.
+
+### 2026-09-01 — `status --diff` diffs rendered sections textually, keyed per session (issue #246, v3.4.0)
+**Context:** `HARNESS_PROMPT` tells a session to check `zirv ctx status --brief` at every natural checkpoint, so a session polling repeatedly pays the full `--brief` render even when nothing changed since its own last check.
+**Decision:** `status --diff` renders the report plain (colour off) into a buffer, splits it into sections with a pure `split_sections` (column-0 lines start a section, key = text before the first `:`, duplicates get `#2`/`#3`... ordinals), and diffs that against a small per-session `StatusSnapshot` at `<state>/status-snapshots/<hash of session>.json`, keyed by `ZIRV_CTX_SESSION`. A no-change call prints one line; a changed call prints the changed sections plus any removed keys. The snapshot is written unconditionally so `<age>` always means "since the previous `--diff` call."
+**Rejected:** A structured per-field snapshot — would have to enumerate every status section by hand and drift as sections are added/removed; textual sections cover every current and future section automatically with one diff function. Cross-session or cross-repo diffing — one session's checkpoint must never suppress another session's news. Coloured diff output — would require a second, differently-styled render of the same report just to preserve colour, for no benefit in a plain progress line.
+**Consequences:** A future `status` section needs no `--diff`-specific wiring — it is covered by `split_sections` automatically. A session with no `ZIRV_CTX_SESSION` set gets no diffing at all (falls back to the full report), which is the correct behavior for an unsupervised/manual invocation.
+**Spec / link:** `src/commands/ctx/status.rs`; [[Ctx Subsystem]]'s `status` verb entry; issue #246.
 
 ### 2026-08-31 — Ruflo evaluation: memory ranking, gate-triggered workers, screening, hook-gap analysis, and usage-aware routing adopted as spikes; consensus, persona catalog, neural layer, plugin marketplace, federation, and provenance witness rejected (issue #240)
 **Context:** Issue #240 asked whether ruvnet/ruflo (a TypeScript "AI swarm meta-harness," 70k stars) has ideas worth adopting into zirv. Every headline claim was checked against the actual repo and Ruflo's own internal docs rather than its marketing copy — the big numbers (100+ agents, 210+ MCP tools, 35 plugins, 27 hooks) don't survive that check, but a modest, tested TS coordination/memory core and one genuinely credible Rust security component (AIDefence, owned by the sibling `midstream` repo) do.

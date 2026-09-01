@@ -736,6 +736,7 @@ of their own) — the reason §6.1 defines the total as the real
 | --- | --- | --- | --- | --- | --- |
 | Per-turn hook context (`hook::prompt_output`) | 170 bytes | 89 bytes | 42 → 26 (Δ16, 38.1%) | every user turn, uncached | `hook.rs`'s own history (the sentence this issue replaced) vs. `commands::ctx::hook::tests::prompt_hook_context_stays_under_the_ninety_byte_steady_state_budget`, which pins the 89-byte figure directly on `per_turn_context_text("[zirv]")` |
 | `zirv ctx status` full vs. `--brief` | 2,113 bytes | 1,188 bytes | ~784 → ~371 (Δ~413, ~52.7%; ratio-calibrated, §6.6.3) | once per checkpoint (`HARNESS_PROMPT` names task start, after long steps, and before reporting done — not a fixed count this document can quote without inventing one) | `commands::ctx::status::tests::brief_status_is_smaller_than_full_status_for_the_same_fixture`, fixture: 5 delegations across 2 work groups, 3 live sessions |
+| `zirv ctx status --brief` vs. `--brief --diff` no-change | 1,188 bytes | ~51 bytes | ~371 → ~16 (Δ~355, ~95.7%; ratio-calibrated, §6.6.6) | per unchanged checkpoint call only (a call that finds a changed section still prints those sections in full) | `commands::ctx::status::tests::diff_second_call_with_no_change_prints_exactly_one_line` |
 | Context-layer dedupe (issue #155 Phase 3, made durable by §6.2.1) | 31,215 bytes | 23,789 bytes | 7,492 → 5,555 (Δ1,937, 25.9%, claude); 7,286 → 5,554 (Δ1,732, 23.8%, codex) | every session launch (cached after the first turn) | `zirv ctx compile --measure`, this repository at commit `009718b`, `context.dedupe_native` toggled false/true — §6.2.1 |
 | `.zirv/context/common.md` | — | 4,080 bytes (cap: `context.max_common_bytes` = 4,096) | not applicable — this row is the layer the dedupe row above already covers, cited for completeness | every session launch (cached after the first turn) | `zirv ctx compile --measure`'s own `canonical context: common` row, §6.2 — the integrator, not this change, is responsible for keeping this file under its shipped budget (`commands::ctx::compile::tests::this_repositorys_canonical_common_context_fits_the_shipped_budget`) |
 
@@ -910,3 +911,32 @@ first-turn prefix ingestion costs on this machine are large enough
 compiled prefix is a real but partial contributor to that total, not the
 whole of it — a scope distinction worth stating plainly rather than
 implying `--measure`'s total is "the" session-start cost.
+
+#### 6.6.6 `zirv ctx status --brief --diff` no-change (issue #246, v3.4.0)
+
+`--diff` prints a full `--brief` report only on the first call for a
+session (or when a section actually changed); an unchanged call prints one
+line instead: `status --diff: no change since <age> (<n> sections)`
+(`commands::ctx::status::tests::diff_second_call_with_no_change_prints_
+exactly_one_line` pins the exactly-one-line shape). Its literal example
+form, `status --diff: no change since 2m ago (12 sections)`, is 51 bytes.
+As with §6.6.4, this row is not a direct tokenization of a captured
+command run — reproducing the exact live line would need a second,
+already-registered session to diff against, out of scope for a docs-only
+measurement pass — so it applies §6.6.4's own real, observed `--brief`
+bytes/token ratio (3.202 bytes/token, from `762 bytes -> 238 tokens`) to
+this line's byte count instead:
+
+```
+51 bytes / 3.202 bytes/token ≈ 16 tokens (ratio-calibrated, §6.6.4's method)
+```
+
+Against §6.6.4's own calibrated 1,188-byte/371-token `--brief` figure, that
+is Δ≈355 tokens (~95.7%) — real-ratio-calibrated, the same weaker-evidence
+caveat §6.6.4 states applies here too. Critically, this saving is **per
+unchanged checkpoint call only**: a call that finds a changed section still
+prints those sections in full (plus a `<key>: (no longer reported)` line
+per removed section), so the saving accrues only on the (likely common, for
+a session polling at natural checkpoints per `HARNESS_PROMPT` v13) fraction
+of checkpoints where nothing in the report actually changed since the
+session's own previous `--diff` call.

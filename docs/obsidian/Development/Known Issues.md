@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-31
+last-verified: 2026-09-01
 ---
 
 # Known Issues
@@ -14,6 +14,7 @@ Each entry gets a changelog comment at the top of the file, newest first:
 <!-- Updated YYYY-MM-DD (branch, state): what changed -->
 ```
 
+<!-- Updated 2026-09-01 (feature/238-246-review-waiver-status-diff, v3.4.0): resolved issue #238 -- `zirv workflow review package`'s `VerificationEvidence` no longer reports a raw, waiver-blind `passed:false` for a run the test/deploy gate had already accepted via the operator's recorded baseline (issue #215); the gate and the review package now share one `evaluate_against_operator_baseline` seam. No new residuals found while implementing #246 (`zirv ctx status --diff`) -->
 <!-- Updated 2026-08-31 (feature/225-240-token-cost-ruflo, issue #225 measurement closeout): recorded that PowerShell's `>` redirection re-encodes captured stdout to UTF-16 (silently doubling byte counts) when capturing real command output for token measurement -- cmd.exe's `>` avoids it -->
 <!-- Updated 2026-08-31 (worktree-issues-223-225, v3.2.0, issues #223/#225): recorded that commands::ctx::supervise::tests::terminate_* SIGTERM tests flake under parallel `-j 8` load on this Windows dev machine (pass in isolation and under the required serial `--test-threads=1` run) -->
 <!-- Updated 2026-08-31 (fix/bug-batch-227-228-229-232-233, v3.1.0, review round 2): documented `sibling_root_for`'s filesystem/drive-root guard on the default parent-directory workdir root (a second claude finding, fixed), and recorded the codex finding that the default parent-directory root still grants a forged same-uid pane request implicit authority over sibling checkouts as a residual (explicit per-sibling allowlisting rejected -- defeats the sibling-delegation use case; #179 remains the real fix) -->

@@ -22,7 +22,7 @@ const VERIFY_CONFIG_SCHEMA_VERSION: u32 = 1;
 /// when `narrowed_to` was added: the field is `#[serde(default)]`, so a
 /// narrowed report written by an earlier build would otherwise deserialize as
 /// un-narrowed and satisfy the freshness gate it was supposed to fail.
-const VERIFY_REPORT_SCHEMA_VERSION: u32 = 2;
+pub(crate) const VERIFY_REPORT_SCHEMA_VERSION: u32 = 2;
 const MAX_CONFIG_BYTES: usize = 64 * 1024;
 const MAX_FAILURE_OUTPUT_BYTES: usize = 16 * 1024;
 /// Hard ceiling on a repository-supplied check's own timeout, independent of
@@ -1351,7 +1351,7 @@ fn report_filename(report: &VerificationReport) -> String {
 /// pruning always runs relative to *this* report's own `finished_at`, so the
 /// report being written can never be older than the cutoff computed from its
 /// own timestamp regardless.
-fn save_report(state: &StateDir, report: &VerificationReport) -> CtxResult<()> {
+pub(crate) fn save_report(state: &StateDir, report: &VerificationReport) -> CtxResult<()> {
     let dir = report_dir(state, &report.repo);
     create_private_dir_all(&dir)?;
     let body = serde_json::to_string_pretty(report)?;
@@ -1413,8 +1413,7 @@ pub fn latest_is_fresh_and_passing(
     // fails to load (never recorded, or a genuine read error) degrades to
     // "no baseline", which reproduces today's strict any-failure-closes-the-
     // gate behavior exactly.
-    let baseline = load_baseline(repo).unwrap_or(None);
-    let evaluation = report.evaluate_against_baseline(baseline.as_ref());
+    let evaluation = evaluate_against_operator_baseline(&report, repo);
     if evaluation.gate_passed && !evaluation.waived.is_empty() {
         crate::output::warn(format!(
             "test gate passed only because these failing test(s) are covered by the recorded \
@@ -1423,6 +1422,24 @@ pub fn latest_is_fresh_and_passing(
         ));
     }
     Ok(evaluation.gate_passed)
+}
+
+/// Weighs an already-failing `report` against the operator's recorded
+/// per-repository baseline (`zirv test baseline`), sharing this one code path
+/// between the step gate (`latest_is_fresh_and_passing`) and the review
+/// package's verification evidence (`review::VerificationEvidence`) -- see
+/// issue #238, where the review package previously had zero baseline
+/// awareness and so reported a raw, waiver-blind `passed:false` even when the
+/// gate itself had already passed via the baseline. A baseline file that
+/// fails to load (never recorded, or a genuine read error) degrades to "no
+/// baseline", reproducing the strict any-failure-closes-the-gate behavior
+/// exactly, just as it does on the gate path.
+pub fn evaluate_against_operator_baseline(
+    report: &VerificationReport,
+    repo: &Path,
+) -> BaselineEvaluation {
+    let baseline = load_baseline(repo).unwrap_or(None);
+    report.evaluate_against_baseline(baseline.as_ref())
 }
 
 fn run_mode(
@@ -2837,6 +2854,54 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; 
                 .unwrap()
                 .is_none()
         );
+    }
+
+    /// #238: `evaluate_against_operator_baseline` is the exact seam
+    /// `latest_is_fresh_and_passing` (the gate) and `review::package`'s
+    /// `VerificationEvidence` (the review package) now share -- a report
+    /// whose only failure is covered by the recorded baseline evaluates to
+    /// `gate_passed:true` with the sorted waived name(s).
+    #[test]
+    fn evaluate_against_operator_baseline_reports_sorted_waived_names_for_a_covered_failure() {
+        let repo = git_repo();
+        let home = tempdir().unwrap();
+        let _home_guard = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let output = "failures:\n    b::two\n    a::one\n\ntest result: FAILED. 0 passed; 2 \
+                       failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n";
+        let report =
+            report_with_checks(vec![unit_check("test", CheckStatus::Failed, Some(output))]);
+        save_baseline(
+            repo.path(),
+            std::collections::BTreeSet::from(["a::one".to_string(), "b::two".to_string()]),
+        )
+        .unwrap();
+
+        let evaluation = evaluate_against_operator_baseline(&report, repo.path());
+        assert!(evaluation.gate_passed);
+        assert_eq!(
+            evaluation.waived,
+            vec!["a::one".to_string(), "b::two".to_string()],
+            "waived names must be sorted"
+        );
+    }
+
+    /// #238: with no baseline recorded at all (or an unreadable one), this
+    /// must degrade to strict "no baseline" behavior -- identical to what the
+    /// gate has always done -- never a silent pass.
+    #[test]
+    fn evaluate_against_operator_baseline_is_strict_with_no_baseline_recorded() {
+        let repo = git_repo();
+        let home = tempdir().unwrap();
+        let _home_guard = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let report = report_with_checks(vec![unit_check(
+            "test",
+            CheckStatus::Failed,
+            Some(&cargo_failure_output("wrap::tests::a")),
+        )]);
+
+        let evaluation = evaluate_against_operator_baseline(&report, repo.path());
+        assert!(!evaluation.gate_passed);
+        assert!(evaluation.waived.is_empty());
     }
 
     /// End-to-end through the real gate seam (`latest_is_fresh_and_passing`,
