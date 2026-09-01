@@ -40,6 +40,7 @@ use super::adapters;
 use super::adapters::AgentAdapter;
 use super::config::{CtxConfig, EnvLookup, validate_model_str};
 use super::event::{SessionId, SessionRef};
+use super::policy;
 use super::state::StateDir;
 use super::term;
 use super::window;
@@ -3230,6 +3231,29 @@ fn worker_task_prompt(
     strip_leading_separator_for_an_empty_prompt(&req.prompt, text)
 }
 
+/// Issue #230 item 3: degraded/unsupported capabilities for a pane's launch,
+/// evaluated against the ORIGINALLY requested `agent_name`/`interactive` --
+/// not any cross-harness reroute `fulfill_spawn_request` applies internally,
+/// which is narrated separately (`push_error(..., "automatically routed
+/// ...")`). Not threaded out of that function's own `compose_worker_prompt`
+/// call (which builds a `PolicyReport` but returns a `ComposedWorkerPrompt`),
+/// so this is a second, cheap, pure `policy::evaluate` instead.
+fn pane_capability_warnings(
+    cfg: &CtxConfig,
+    agent_name: &str,
+    interactive: bool,
+) -> Vec<policy::CapabilityWarning> {
+    let Ok(adapter) = adapters::select(Some(agent_name), &[], cfg) else {
+        return Vec::new();
+    };
+    let mode = if interactive {
+        adapters::LaunchMode::Interactive
+    } else {
+        adapters::LaunchMode::Headless
+    };
+    policy::evaluate(&cfg.policy, adapter.as_ref(), mode).degraded_capabilities()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn fulfill_spawn_request(
     req: &spawnreq::SpawnRequest,
@@ -3905,6 +3929,7 @@ fn drain_one_channel(
                 short: Some(short),
                 reason: None,
                 retryable: false,
+                capability_warnings: pane_capability_warnings(cfg, &req.agent, req.interactive),
             },
             Err(refusal) => {
                 // R6: a refusal means no pane exists and none ever will, so
@@ -3920,6 +3945,7 @@ fn drain_one_channel(
                     short: None,
                     reason: Some(refusal.reason),
                     retryable: refusal.retryable,
+                    capability_warnings: Vec::new(),
                 }
             }
         };
@@ -8362,6 +8388,7 @@ mod tests {
             safety_policy_sha256: None,
             role: None,
             start_time: None,
+            last_screening: None,
         }
     }
 
