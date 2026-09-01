@@ -895,9 +895,21 @@ pub fn compose(
         }
     }
 
-    let workflow_context = crate::commands::workflow::engine::active_skill_context(repo)
-        .ok()
-        .flatten();
+    // Issue #253: gated on `role == PromptRole::Orchestrator`, the same as
+    // the harness layer above -- a `zirv agent`-dispatched Worker or
+    // SubOrchestrator must never hear about whatever workflow step happens
+    // to be active in `repo` at launch time, only the Orchestrator session
+    // driving that workflow does. Without this gate a step's guidance
+    // (written for the session that will read `zirv workflow ...` output
+    // and decide what to do next) hijacked every dispatched worker's own,
+    // self-contained brief regardless of what it was actually asked to do.
+    let workflow_context = if role == PromptRole::Orchestrator {
+        crate::commands::workflow::engine::active_skill_context(repo)
+            .ok()
+            .flatten()
+    } else {
+        None
+    };
     let base = with_workflow_layer(
         Some(ComposedPrompt {
             text,
@@ -5755,6 +5767,120 @@ mod tests {
         }
         let composed = composed.expect("composition still succeeds");
         assert_eq!(composed.sources, vec![PromptSource::Default]);
+    }
+
+    /// Sets up a real active workflow for `repo` under a fresh, isolated
+    /// `ZIRV_CTX_STATE_DIR` -- the same seam `active_skill_context` itself
+    /// resolves through (real process env, not `compose`'s own arguments),
+    /// so this is the only way to exercise the gate end to end through
+    /// `compose` rather than through `with_workflow_layer` directly.
+    /// SAFETY: this suite runs single-threaded (`--test-threads=1`).
+    fn with_active_workflow<R>(repo: &Path, f: impl FnOnce() -> R) -> R {
+        let state_dir = tempfile::tempdir().expect("state tempdir");
+        let state = crate::commands::ctx::state::StateDir::from_root(state_dir.path().to_path_buf());
+        let classification = crate::commands::workflow::classify::classify(
+            &crate::commands::workflow::classify::ClassificationInput {
+                task: String::new(),
+                paths: Vec::new(),
+                changed_lines: 0,
+                tests_changed: true,
+                intent_override: None,
+                complexity_override: None,
+                risk_override: None,
+            },
+        )
+        .expect("classify");
+        crate::commands::workflow::engine::save(
+            &state,
+            &crate::commands::workflow::engine::WorkflowState::start(
+                repo.to_path_buf(),
+                "run the database migration".into(),
+                crate::commands::workflow::engine::WorkflowKind::Feature,
+                None,
+                true,
+                classification,
+            ),
+            true,
+        )
+        .expect("save active workflow");
+        unsafe {
+            std::env::set_var(
+                crate::commands::ctx::state::STATE_ENV,
+                state_dir.path(),
+            );
+        }
+        let result = f();
+        unsafe {
+            std::env::remove_var(crate::commands::ctx::state::STATE_ENV);
+        }
+        result
+    }
+
+    /// Issue #253: `compose`'s workflow-step layer is gated on `role ==
+    /// PromptRole::Orchestrator`, the same way the harness layer already is
+    /// -- a `zirv agent`-dispatched Worker or SubOrchestrator must never
+    /// hear about whatever workflow step happens to be active in `repo`,
+    /// only the Orchestrator session driving that workflow does.
+    #[test]
+    fn the_workflow_step_layer_reaches_only_the_orchestrator_role() {
+        let (_tmp, home, repo) = tree();
+
+        let orchestrator = with_active_workflow(&repo, || {
+            compose(
+                Some(&home),
+                &repo,
+                false,
+                &PromptConfig::default(),
+                PromptRole::Orchestrator,
+                &[],
+                usize::MAX,
+            )
+            .expect("composed")
+        });
+        assert!(
+            orchestrator.sources.contains(&PromptSource::Workflow),
+            "the orchestrator must still see the active step: {:?}",
+            orchestrator.sources
+        );
+        assert!(orchestrator.text.contains("run the database migration"));
+
+        let worker = with_active_workflow(&repo, || {
+            compose(
+                Some(&home),
+                &repo,
+                false,
+                &PromptConfig::default(),
+                PromptRole::Worker,
+                &[],
+                usize::MAX,
+            )
+            .expect("composed")
+        });
+        assert!(
+            !worker.sources.contains(&PromptSource::Workflow),
+            "a dispatched worker must never receive the active step's guidance: {:?}",
+            worker.sources
+        );
+        assert!(!worker.text.contains("run the database migration"));
+
+        let sub_orchestrator = with_active_workflow(&repo, || {
+            compose(
+                Some(&home),
+                &repo,
+                false,
+                &PromptConfig::default(),
+                PromptRole::SubOrchestrator,
+                &[],
+                usize::MAX,
+            )
+            .expect("composed")
+        });
+        assert!(
+            !sub_orchestrator.sources.contains(&PromptSource::Workflow),
+            "a dispatched sub-orchestrator must never receive the active step's guidance either: \
+             {:?}",
+            sub_orchestrator.sources
+        );
     }
 
     // T7: mail delivered into a composed prompt, between the repo layer and
