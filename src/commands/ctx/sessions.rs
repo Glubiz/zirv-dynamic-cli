@@ -386,6 +386,12 @@ pub struct Record {
     /// back-compat pattern `owner_pid` already established.
     #[serde(default)]
     pub start_time: Option<u64>,
+    /// Issue #243 slice 2: the `screen::ScreenReport::summary` of the most
+    /// recent scoring cycle that flagged something in the transcript bytes it
+    /// ingested. `None` for a clean cycle, a record written before this field
+    /// existed, or no scoring cycle yet -- `status.rs`'s own reader.
+    #[serde(default)]
+    pub last_screening: Option<String>,
 }
 
 fn reachable_default() -> bool {
@@ -428,6 +434,7 @@ impl Record {
             // `process_start_secs` cannot tell, which callers other than
             // `record_is_alive` never need to know about.
             start_time: process_start_secs(std::process::id()),
+            last_screening: None,
         }
     }
 
@@ -487,6 +494,22 @@ fn write_record(state: &StateDir, record: &Record) -> PathBuf {
         let _ = super::state::write_private(&path, &json);
     }
     path
+}
+
+/// Issue #243 slice 2: read-modify-write of `short`'s own registry record
+/// with a fresh screening summary. Best-effort like every other registry
+/// write here -- a hook process is fresh every turn, never the supervisor
+/// that holds the live `SessionGuard`, so this is the only way to update a
+/// field on a record already on disk.
+pub fn set_last_screening(state: &StateDir, short: &str, summary: Option<String>) {
+    let Ok(text) = std::fs::read_to_string(record_path(state, short)) else {
+        return;
+    };
+    let Ok(mut record) = serde_json::from_str::<Record>(&text) else {
+        return;
+    };
+    record.last_screening = summary;
+    write_record(state, &record);
 }
 
 /// Registered at spawn, best-effort, and removed when the supervisor exits.

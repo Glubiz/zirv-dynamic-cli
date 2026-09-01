@@ -138,6 +138,15 @@ fn sessions_lines(
                     )
                 ));
             }
+            // Issue #243 slice 2: the last scoring cycle's own screening
+            // finding, persisted onto the record itself -- see `hook.rs::
+            // run_stop` and `sessions::set_last_screening`.
+            if let Some(summary) = record.last_screening.as_deref().filter(|s| !s.is_empty()) {
+                line.push_str(&format!(
+                    "  {}",
+                    style::paint(&format!("screening: {summary}"), Tone::Warn, colour)
+                ));
+            }
             let delivery = mail::session_delivery_metrics(state, &record.short, now);
             line.push_str(&format!(
                 "  {}",
@@ -1769,6 +1778,90 @@ mod tests {
             text.contains("relaunch to adopt"),
             "must name the remedy: {text}"
         );
+    }
+
+    /// Issue #243 slice 2: a session record carrying a screening summary
+    /// (`hook.rs::run_stop`'s own write) shows a `screening:` note on its
+    /// status line.
+    #[test]
+    fn a_session_with_a_flagged_screening_summary_shows_it_on_its_status_line() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        state.ensure().expect("ensure");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let env = env_for(state.root());
+
+        let mut record = crate::commands::ctx::sessions::Record::new(
+            "cccc3333-2222-4333-8444-555555555555",
+            "claude",
+            &repo,
+            crate::commands::ctx::sessions::Verb::Wrap,
+        );
+        record.last_screening =
+            Some("1 flag: prompt-injection marker (\"ignore previous instructions\")".to_string());
+        let _guard = crate::commands::ctx::sessions::SessionGuard::register(&state, record);
+
+        let mut out = Vec::new();
+        run_with(
+            &StatusArgs {
+                decisions: 5,
+                brief: false,
+                diff: false,
+            },
+            &mut out,
+            &repo,
+            &|k| env.get(k).cloned(),
+            false,
+        )
+        .expect("runs");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            text.contains("screening: 1 flag: prompt-injection marker"),
+            "got {text}"
+        );
+    }
+
+    /// The absent half: a session with no screening summary carries no
+    /// `screening:` note at all.
+    #[test]
+    fn a_session_with_no_screening_summary_shows_no_note() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        state.ensure().expect("ensure");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let env = env_for(state.root());
+
+        let _guard = crate::commands::ctx::sessions::SessionGuard::register(
+            &state,
+            crate::commands::ctx::sessions::Record::new(
+                "dddd4444-2222-4333-8444-555555555555",
+                "claude",
+                &repo,
+                crate::commands::ctx::sessions::Verb::Wrap,
+            ),
+        );
+
+        let mut out = Vec::new();
+        run_with(
+            &StatusArgs {
+                decisions: 5,
+                brief: false,
+                diff: false,
+            },
+            &mut out,
+            &repo,
+            &|k| env.get(k).cloned(),
+            false,
+        )
+        .expect("runs");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(!text.contains("screening:"), "got {text}");
     }
 
     /// The absent half: a session whose recorded fingerprint agrees with its

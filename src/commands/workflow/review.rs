@@ -1127,7 +1127,10 @@ fn has_digit_and_letter(run: &[u8]) -> bool {
     run.iter().any(u8::is_ascii_digit) && run.iter().any(u8::is_ascii_alphabetic)
 }
 
-fn detect_high_entropy_run(text: &str) -> Option<String> {
+/// `pub(crate)`: reused by `ctx::screen` (issue #243) for mail-body
+/// screening, the same entropy check this module already applies to a
+/// review package's untracked-file bodies.
+pub(crate) fn detect_high_entropy_run(text: &str) -> Option<String> {
     let bytes = text.as_bytes();
     let mut index = 0usize;
     while index < bytes.len() {

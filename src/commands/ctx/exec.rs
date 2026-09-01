@@ -2429,7 +2429,7 @@ fn supervise_run(
         }
         // A scoring failure must never kill a healthy run.
         match scorer.poll(adapter, score_cfg) {
-            Ok(Some(score)) if score.verdict == Verdict::Restart => {
+            Ok((Some(score), _)) if score.verdict == Verdict::Restart => {
                 *rotted = true;
                 Tick::Stop("rot")
             }

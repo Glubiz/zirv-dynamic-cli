@@ -465,7 +465,7 @@ pub(crate) fn run_with_clock<W: Write>(
                     });
                 }
                 match scorer.poll(adapter.as_ref(), &cfg.score) {
-                    Ok(Some(score)) if score.verdict == Verdict::Restart => {
+                    Ok((Some(score), _)) if score.verdict == Verdict::Restart => {
                         rotted = true;
                         Tick::Stop("rot")
                     }
