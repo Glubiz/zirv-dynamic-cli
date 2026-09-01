@@ -1634,16 +1634,28 @@ struct ReviewerFinding {
 /// deserialized independently so one malformed entry (an empty summary, a
 /// field of the wrong type) is skipped with a warning to stderr instead of
 /// discarding every other finding the reviewer reported.
+///
+/// Issue #232 (review round): `REVIEW_RESULT_PREFIX` is matched anywhere in
+/// the trimmed line, not only at its very start -- a reviewer's own
+/// standing instructions can prepend a health marker of their own ahead of
+/// it (this repo's `UserPromptSubmit` hook makes Claude answer `[zirv]
+/// ZIRV_REVIEW_RESULT {...}`), and requiring the marker to lead the line
+/// rejected every such result outright. Everything from the FIRST match
+/// onward is parsed as the JSON payload; the "more than one structured
+/// result" guard still counts any line containing the marker, matching
+/// today's behaviour for a reviewer that genuinely emits two.
 fn parse_reviewer_output(output: &str) -> CtxResult<Vec<ReviewerFinding>> {
     if output.len() > MAX_REVIEW_OUTPUT_BYTES {
         return Err(format!("reviewer output exceeds {MAX_REVIEW_OUTPUT_BYTES} bytes").into());
     }
     let mut result: Option<serde_json::Value> = None;
     for line in output.lines() {
-        if let Some(json) = line.trim().strip_prefix(REVIEW_RESULT_PREFIX) {
+        let trimmed = line.trim();
+        if let Some(marker_at) = trimmed.find(REVIEW_RESULT_PREFIX) {
             if result.is_some() {
                 return Err("reviewer emitted more than one structured result".into());
             }
+            let json = &trimmed[marker_at + REVIEW_RESULT_PREFIX.len()..];
             result = Some(
                 serde_json::from_str::<serde_json::Value>(json)
                     .map_err(|error| format!("reviewer result is not valid JSON: {error}"))?,
@@ -3505,6 +3517,19 @@ checksum = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f80"
             "{REVIEW_RESULT_PREFIX}{{\"findings\":[]}}\n{REVIEW_RESULT_PREFIX}{{\"findings\":[]}}"
         ))
         .is_err());
+    }
+
+    /// Issue #232 (review round): this repo's own `UserPromptSubmit` hook
+    /// makes Claude answer every turn with a leading `[zirv]` health
+    /// marker, so a reviewer's final line reads `[zirv]
+    /// ZIRV_REVIEW_RESULT {...}`, not a bare `ZIRV_REVIEW_RESULT {...}` --
+    /// the marker must be found anywhere in the line, not only at its
+    /// start.
+    #[test]
+    fn a_leading_marker_before_the_review_result_prefix_still_parses() {
+        let output = format!("[zirv] {REVIEW_RESULT_PREFIX}{{\"findings\":[]}}");
+        let findings = parse_reviewer_output(&output).expect("structured result");
+        assert!(findings.is_empty());
     }
 
     /// #229: the claude reviewer emitted an extra `failure_scenario` key per
