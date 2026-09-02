@@ -505,23 +505,36 @@ pub fn change_fingerprint(repo: &Path) -> CtxResult<u64> {
     for path in changed_paths(repo)? {
         input.push_str("\npath:");
         input.push_str(&path.to_string_lossy());
-        if std::fs::symlink_metadata(root.join(&path)).is_ok() {
-            let hashed = git_at(&root)
-                .args(["hash-object", "--no-filters", "--"])
-                .arg(&path)
-                .output()?;
-            if !hashed.status.success() {
-                return Err(format!(
-                    "cannot fingerprint '{}': {}",
-                    path.display(),
-                    String::from_utf8_lossy(&hashed.stderr).trim()
-                )
-                .into());
+        match std::fs::symlink_metadata(root.join(&path)) {
+            // #287: a symlink retargeted between two files with identical
+            // content must still move the fingerprint -- `git hash-object`
+            // below follows the link and hashes the *target's* content, so
+            // it cannot see a retarget alone. Record the link's own target
+            // instead of hashing through it.
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                let target = std::fs::read_link(root.join(&path))?;
+                input.push_str("\nsymlink:");
+                input.push_str(&target.to_string_lossy());
             }
-            input.push_str("\nhash:");
-            input.push_str(String::from_utf8_lossy(&hashed.stdout).trim());
-        } else {
-            input.push_str("\ndeleted");
+            Ok(_) => {
+                let hashed = git_at(&root)
+                    .args(["hash-object", "--no-filters", "--"])
+                    .arg(&path)
+                    .output()?;
+                if !hashed.status.success() {
+                    return Err(format!(
+                        "cannot fingerprint '{}': {}",
+                        path.display(),
+                        String::from_utf8_lossy(&hashed.stderr).trim()
+                    )
+                    .into());
+                }
+                input.push_str("\nhash:");
+                input.push_str(String::from_utf8_lossy(&hashed.stdout).trim());
+            }
+            Err(_) => {
+                input.push_str("\ndeleted");
+            }
         }
     }
     Ok(input_hash(&input))
@@ -659,6 +672,16 @@ pub enum GateOutcome {
     Pass,
     Fail,
     Inconclusive(InconclusiveReason),
+    /// Issue #287: the worktree is byte-identical (`change_fingerprint`) to
+    /// the one recorded by this step's previous *failing* report -- no check
+    /// was executed, since re-running would only reach the same verdict.
+    /// `since_attempt` is the attempt number this no-op turn counts as (the
+    /// step's `state.attempts`, one-indexed, after this outcome is recorded)
+    /// -- ported from Prime Agent's autonomous quality gates (see #279).
+    Unchanged {
+        fingerprint: u64,
+        since_attempt: u8,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1949,6 +1972,32 @@ pub fn load_latest(state: &StateDir, repo: &Path) -> CtxResult<Option<Verificati
     Ok(Some(report))
 }
 
+/// The `change_fingerprint` a step must see move before re-verifying is
+/// worth executing (issue #287) -- the latest persisted report's own
+/// fingerprint, but only when that report did not pass. `step_id` is
+/// accepted for the guard's own clarity at its call site but not consulted:
+/// reports are persisted one-per-repository (`report_dir`), never keyed by
+/// workflow step, so the repository's single `latest` report already IS the
+/// evidence for whichever step is currently running -- exactly the same
+/// simplification [`latest_is_fresh_and_passing`] relies on. A step
+/// transition can only ever happen once its own evidence has actually
+/// passed (see `engine.rs`'s `Test`/`Verify` gate), so a stale failing
+/// report from an earlier step can never survive into a later one's first
+/// check.
+pub fn last_failure_fingerprint(
+    state: &StateDir,
+    repo: &Path,
+    _step_id: &str,
+) -> CtxResult<Option<u64>> {
+    let Some(report) = load_latest(state, repo)? else {
+        return Ok(None);
+    };
+    if report.passed() {
+        return Ok(None);
+    }
+    Ok(Some(report.change_fingerprint))
+}
+
 /// The identity (`VerificationReport::id`, a fresh UUID minted by every
 /// `run_mode` call, see below) of whatever report `latest_is_fresh_and_passing`
 /// would currently read, or `None` if none is persisted yet for this repo.
@@ -2073,7 +2122,11 @@ pub fn gate_announcement(state: &StateDir, repo: &Path, final_only: bool) -> Str
              repeats, investigate before treating the change as verified",
             reason.as_str()
         ),
-        GateOutcome::Fail | GateOutcome::Pass => {
+        // `VerificationReport::outcome()` never produces `Unchanged` --
+        // that variant is only ever constructed by `engine.rs`'s no-op-turn
+        // guard, outside any report -- so it falls in here with `Fail`/
+        // `Pass` rather than needing its own arm.
+        GateOutcome::Fail | GateOutcome::Pass | GateOutcome::Unchanged { .. } => {
             // `outcome()` ranks `Fail` above `Inconclusive`, so a mixed
             // report (one check genuinely failed, another's runner
             // crashed) lands here -- the accompanying `Inconclusive`
@@ -4604,6 +4657,89 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; 
         // `Unit` check with parseable names.
         let evaluation = evaluate_against_operator_baseline(&report, repo.path());
         assert!(!evaluation.gate_passed);
+    }
+
+    #[test]
+    fn last_failure_fingerprint_is_none_with_no_persisted_report() {
+        let repo = git_repo();
+        let state_root = tempdir().unwrap();
+        let state = StateDir::from_root(state_root.path().to_path_buf());
+        assert_eq!(
+            last_failure_fingerprint(&state, repo.path(), "step-1").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn last_failure_fingerprint_is_none_for_a_passing_report() {
+        let repo = git_repo();
+        let state_root = tempdir().unwrap();
+        let state = StateDir::from_root(state_root.path().to_path_buf());
+        let fingerprint = change_fingerprint(repo.path()).unwrap();
+        let mut report = report_with_checks(vec![unit_check("test", CheckStatus::Passed, None)]);
+        report.repo = repo.path().to_path_buf();
+        report.change_fingerprint = fingerprint;
+        save_report(&state, &report).unwrap();
+        assert_eq!(
+            last_failure_fingerprint(&state, repo.path(), "step-1").unwrap(),
+            None,
+            "a passing report is not a failure to guard against"
+        );
+    }
+
+    /// The core #287 lookup: a failing report's own `change_fingerprint` is
+    /// what a re-verify of the same step is compared against.
+    #[test]
+    fn last_failure_fingerprint_returns_the_failing_reports_fingerprint() {
+        let repo = git_repo();
+        let state_root = tempdir().unwrap();
+        let state = StateDir::from_root(state_root.path().to_path_buf());
+        let fingerprint = change_fingerprint(repo.path()).unwrap();
+        let mut report = report_with_checks(vec![unit_check(
+            "test",
+            CheckStatus::Failed,
+            Some(&cargo_failure_output("wrap::tests::a")),
+        )]);
+        report.repo = repo.path().to_path_buf();
+        report.change_fingerprint = fingerprint;
+        save_report(&state, &report).unwrap();
+        assert_eq!(
+            last_failure_fingerprint(&state, repo.path(), "step-1").unwrap(),
+            Some(fingerprint)
+        );
+    }
+
+    /// #287: retargeting a symlink between two files with identical content
+    /// must still move `change_fingerprint` -- `git hash-object` alone
+    /// follows the link and would hash the same bytes either way.
+    #[test]
+    #[cfg(unix)]
+    fn change_fingerprint_moves_when_a_symlink_is_retargeted() {
+        use std::os::unix::fs::symlink;
+
+        let repo = git_repo();
+        std::fs::write(repo.path().join("target_a.txt"), "same content\n").unwrap();
+        std::fs::write(repo.path().join("target_b.txt"), "same content\n").unwrap();
+        symlink(
+            repo.path().join("target_a.txt"),
+            repo.path().join("link.txt"),
+        )
+        .unwrap();
+        let before = change_fingerprint(repo.path()).unwrap();
+
+        std::fs::remove_file(repo.path().join("link.txt")).unwrap();
+        symlink(
+            repo.path().join("target_b.txt"),
+            repo.path().join("link.txt"),
+        )
+        .unwrap();
+        let after = change_fingerprint(repo.path()).unwrap();
+
+        assert_ne!(
+            before, after,
+            "retargeting a symlink to different content of identical bytes must move the \
+             fingerprint"
+        );
     }
 
     /// The `proves:`/`fix:` announcement must name the reason and never
