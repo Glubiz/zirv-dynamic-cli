@@ -2548,6 +2548,14 @@ fn harness_roster_lines(
     let bin = cfg.agent_bin.as_deref();
     let mut lines: Vec<String> = Vec::new();
     let mut omitted_texts: Vec<String> = Vec::new();
+    // Issue #298 review follow-up: every name that earns its own per-adapter
+    // line above (ready-and-live, ready-and-unknown/fail-open, or ready()
+    // itself failed) -- never a disabled or confirmed-`Absent` one. Threaded
+    // into `review_roster_line` below so it never directs a review to a
+    // harness the roster above it just omitted, without a second probe: the
+    // liveness verdict already computed (and cached) in this same loop is
+    // reused, not recomputed, so the injected prefix stays byte-stable.
+    let mut roster_names: Vec<&str> = Vec::new();
     for (name, ctor) in ADAPTERS {
         let name: &str = name;
         let is_self = name == current_adapter;
@@ -2615,15 +2623,17 @@ fn harness_roster_lines(
                         "- {name}: enabled, ready{capacity_note} -- initiate with `zirv agent {name} \"<prompt>\"`{degraded}"
                     )
                 });
+                roster_names.push(name);
             }
             Err(err) => {
                 let reason = err.to_string();
                 let short = reason.lines().next().unwrap_or(&reason);
                 lines.push(format!("- {name}: installed? not ready ({short})"));
+                roster_names.push(name);
             }
         }
     }
-    if let Some(review_line) = review_roster_line(cfg) {
+    if let Some(review_line) = review_roster_line(cfg, &roster_names) {
         lines.push(review_line);
     }
     let omitted = omitted_texts.len();
@@ -2741,20 +2751,31 @@ pub fn policy_launch_args(
     out
 }
 
-/// The trailing "- code review: ..." line `harness_prompt_lines` appends
-/// after its per-harness lines: names every *enabled* harness's resolved
+/// The trailing "- code review: ..." line `harness_roster_lines` appends
+/// after its per-harness lines: names every *enabled, roster-listed*
+/// harness's resolved
 /// review model (an operator override or the ladder default, each marked as
 /// such) and states the rule that outranks any other model-routing guidance
 /// a session's own base prompt carries (see `ORCHESTRATOR_PROMPT`'s
 /// model-routing bullet in claude.rs, which now points back at this line).
-/// Returns `None` when no harness is enabled at all -- absence, not a line
-/// naming zero harnesses.
+/// Returns `None` when no harness is both enabled and roster-listed --
+/// absence, not a line naming zero harnesses.
 ///
 /// A disabled harness's entry is simply absent, the same "absence, not
-/// silence" rule its own per-harness line above follows -- readiness is
-/// deliberately not checked here (unlike the per-harness lines): the rule
-/// this line states applies to a harness the moment it is enabled, whether
-/// or not its binary happens to be on disk on this machine right now.
+/// silence" rule its own per-harness line above follows. Issue #298 review
+/// follow-up: so is a confirmed-`Absent` one -- `roster_names` is the set of
+/// adapter names that earned their own per-adapter line in this same pass
+/// (`harness_roster_lines`'s own liveness verdict, already computed and
+/// possibly cache-served, never re-probed here), and an entry is included
+/// only when it is both enabled *and* in that set. Before issue #298 this
+/// line checked only enablement -- "the rule applies to a harness the moment
+/// it is enabled, whether or not its binary happens to be on disk" -- but
+/// that reasoning stopped holding once the roster above it started omitting
+/// a confirmed-absent adapter's own line: naming a harness here that the
+/// roster never mentioned would send a review to something that cannot run.
+/// A harness that is merely not-ready (`adapter.ready()` failed) still gets
+/// its own "installed? not ready" line above, so it is still in
+/// `roster_names` and still named here -- unchanged from before.
 ///
 /// The rendered sentence must never be false for any entry. Two cases would
 /// otherwise make it false: a harness whose ladder default is already at
@@ -2776,13 +2797,13 @@ pub fn policy_launch_args(
 /// "never on an orchestrator seat's own model" to the weaker but always-true
 /// "never on a model above the named one" (the named model is by
 /// construction never ranked above the seat, so this holds in every case).
-fn review_roster_line(cfg: &CtxConfig) -> Option<String> {
+fn review_roster_line(cfg: &CtxConfig, roster_names: &[&str]) -> Option<String> {
     let bin = cfg.agent_bin.as_deref();
     let seat = cfg.chat.model.as_deref();
     let mut any_equals_seat = false;
     let entries: Vec<String> = ADAPTERS
         .iter()
-        .filter(|(name, _)| cfg.agents.is_enabled(name))
+        .filter(|(name, _)| cfg.agents.is_enabled(name) && roster_names.contains(name))
         .map(|(name, ctor)| {
             let adapter = if agent_bin_names_a_different_adapter(bin, name).is_some() {
                 ctor(None)
@@ -3669,6 +3690,75 @@ mod tests {
         );
     }
 
+    /// Review follow-up on issue #298: an adapter the roster above just
+    /// omitted for being confirmed `Absent` must not still be named in the
+    /// trailing review line either -- that would send a review to a harness
+    /// that cannot run, the one inconsistency the roster's own omission
+    /// rule exists to prevent. Claude stays live via a real stub on a `PATH`
+    /// that carries no `codex` binary and no known install root for it
+    /// either (an isolated `HOME`), so codex is confirmed absent, not
+    /// merely undetected.
+    #[test]
+    fn harness_prompt_lines_review_line_omits_a_confirmed_absent_adapter() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("claude"), "").expect("write stub");
+        let _path_guard = crate::commands::ctx::testenv::VarGuard::set(&[(
+            "PATH",
+            Some(dir.path().to_str().expect("utf8 tempdir path")),
+        )]);
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let lines = harness_prompt_lines(&permissive_cfg(), "");
+        let review_line = lines
+            .iter()
+            .find(|l| l.starts_with("- code review:"))
+            .expect("claude is live, so the review line must still exist");
+        assert!(review_line.contains("claude ->"), "got {review_line}");
+        assert!(
+            !review_line.contains("codex ->"),
+            "codex is confirmed absent, so it must not be named in the review line: \
+             {review_line}"
+        );
+    }
+
+    /// Positive case: with both adapters genuinely live, the liveness filter
+    /// above changes nothing -- the review line is exactly the text it
+    /// rendered before this fix existed (same substrings `harness_prompt_
+    /// lines_review_line_shows_computed_defaults_when_unset` already pins,
+    /// here with an explicit `PATH` stub so the claim holds independent of
+    /// whatever the machine running this suite happens to have installed).
+    #[test]
+    fn harness_prompt_lines_review_line_is_unchanged_when_both_adapters_are_live() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for (name, _) in ADAPTERS {
+            std::fs::write(dir.path().join(name), "").expect("write stub");
+        }
+        let _path_guard = crate::commands::ctx::testenv::VarGuard::set(&[(
+            "PATH",
+            Some(dir.path().to_str().expect("utf8 tempdir path")),
+        )]);
+
+        let lines = harness_prompt_lines(&permissive_cfg(), "");
+        let review_line = lines.last().expect("at least the review line");
+        assert!(
+            review_line.contains("claude -> \"opus\" (default: one tier below the seat)"),
+            "got {review_line}"
+        );
+        assert!(
+            review_line.contains("codex -> \"gpt-5.6-terra\" (default: one tier below the seat)"),
+            "got {review_line}"
+        );
+        assert!(
+            review_line.contains("never on an orchestrator seat's own model"),
+            "got {review_line}"
+        );
+        assert!(
+            review_line.ends_with("This outranks any other model-routing guidance."),
+            "got {review_line}"
+        );
+    }
+
     /// Normal case (no entry's resolved model equals the orchestrator seat):
     /// the strict "never on an orchestrator seat's own model" clause is
     /// true for every entry, so it stays.
@@ -3860,10 +3950,11 @@ mod tests {
     /// Bug A (harness/model parity), reframed for issue #298: two harnesses
     /// in the identical state -- here, both absent, behind the same missing
     /// `agent_bin` override -- must be treated identically. Pre-#298 that
-    /// meant "the same annotated template"; now it means "both omitted",
-    /// which this pins down behaviourally: neither adapter gets a line, and
-    /// only the review line (which does not check presence -- see `review_
-    /// roster_line`'s own doc comment) survives.
+    /// meant "the same annotated template"; now it means "both omitted".
+    /// Review follow-up: with neither adapter earning its own roster line,
+    /// the trailing review line must vanish too -- it would otherwise be the
+    /// one line left directing a review to a harness the roster just said
+    /// nothing about.
     #[test]
     fn harness_prompt_lines_omits_both_adapters_equally_in_the_same_state() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -3883,8 +3974,9 @@ mod tests {
             "codex must be equally absent: {lines:?}"
         );
         assert!(
-            lines.iter().any(|l| l.starts_with("- code review:")),
-            "the review line does not check presence, so it must still survive: {lines:?}"
+            lines.is_empty(),
+            "with both adapters confirmed absent, the review line must not survive as the one \
+             line still naming them: {lines:?}"
         );
     }
 
