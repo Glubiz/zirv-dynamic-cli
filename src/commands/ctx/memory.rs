@@ -1634,7 +1634,7 @@ answer in markdown, headings, or prose.\n\n\
 ### Gotchas learned\n{gotchas}\
 ### Files touched\n{files}{tool_errors_block}",
         gotchas = harvest_bullets(&handoff.gotchas),
-        files = harvest_bullets(&handoff.files_touched),
+        files = harvest_bullets(&handoff.files_modified),
         tool_errors_block = format_tool_errors_block(tool_errors),
     )
 }
@@ -2060,12 +2060,17 @@ pub fn harvest_at_session_end(
     if !cfg.memory.enabled || !cfg.memory.harvest || !cfg.memory.shared_enabled {
         return Ok(0);
     }
+    let previous = super::handoff::latest_for_repo(state, repo)
+        .ok()
+        .flatten()
+        .map(|(_, handoff)| handoff);
     let (note, source) = super::handoff::distill_or_structural(
         adapter,
         model,
         ctx,
         handoff_timeout,
         cfg.chrome.events,
+        previous.as_ref(),
     );
     if source != "distilled" {
         return Ok(0);
@@ -3833,7 +3838,7 @@ This should not appear in the body.\n";
             done: vec!["Added the route".to_string()],
             remaining: vec!["Signature verification".to_string()],
             next_step: "Add a failing test for an invalid signature".to_string(),
-            files_touched: vec!["src/routes/webhook.rs".to_string()],
+            files_modified: vec!["src/routes/webhook.rs".to_string()],
             gotchas: vec!["The provider sends two events per charge".to_string()],
             ..Default::default()
         }

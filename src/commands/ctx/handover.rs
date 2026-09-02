@@ -323,9 +323,12 @@ fn ack_timeout(cfg: &CtxConfig) -> Duration {
 /// The markdown packet plus a short header, for `--dry-run` and for the
 /// dashboard picker's own preview. Never mutates anything: it distills
 /// read-only off whatever the session has already written to its transcript.
+#[allow(clippy::too_many_arguments)]
 fn preview_packet<W: Write>(
     w: &mut W,
     cfg: &CtxConfig,
+    repo: &Path,
+    state: &StateDir,
     current_agent: &str,
     target_agent: &str,
     target_model: Option<&str>,
@@ -334,12 +337,17 @@ fn preview_packet<W: Write>(
     let current_adapter = adapters::select(Some(current_agent), &[], cfg)?;
     let jsonl = std::fs::read_to_string(transcript).unwrap_or_default();
     let ctx = current_adapter.structural_context(&jsonl, cfg.handoff.tail_items);
+    let previous = handoff::latest_for_repo(state, repo)
+        .ok()
+        .flatten()
+        .map(|(_, h)| h);
     let (packet, source) = handoff::distill_or_structural(
         current_adapter.as_ref(),
         &handoff::resolve_distiller_model(cfg.handoff.model.as_deref(), current_adapter.as_ref()),
         &ctx,
         Duration::from_secs(cfg.handoff.timeout_secs),
         cfg.chrome.events,
+        previous.as_ref(),
     );
     writeln!(w, "# zirv ctx handover --dry-run")?;
     writeln!(
@@ -400,6 +408,8 @@ pub fn run_with<W: Write>(
         preview_packet(
             w,
             &cfg,
+            repo,
+            &state,
             &current_agent,
             &target_agent,
             target_model.as_deref(),

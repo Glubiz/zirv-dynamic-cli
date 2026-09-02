@@ -1672,12 +1672,17 @@ fn run_with_clock_inner<W: Write>(
 
             let jsonl = std::fs::read_to_string(&transcript).unwrap_or_default();
             let ctx = adapter.structural_context(&jsonl, cfg.handoff.tail_items);
+            let previous = handoff::latest_for_repo(&state, repo)
+                .ok()
+                .flatten()
+                .map(|(_, h)| h);
             let (note, source) = handoff::distill_or_structural(
                 adapter.as_ref(),
                 &distiller_model,
                 &ctx,
                 Duration::from_secs(cfg.handoff.timeout_secs),
                 cfg.chrome.events,
+                previous.as_ref(),
             );
             let stored = handoff::store(&state, repo, session.as_str(), &note)?;
 
@@ -1952,12 +1957,17 @@ fn run_with_clock_inner<W: Write>(
             if let Some((selected_agent, selected_model, selection_detail)) = alternate {
                 let jsonl = std::fs::read_to_string(&transcript).unwrap_or_default();
                 let ctx = adapter.structural_context(&jsonl, cfg.handoff.tail_items);
+                let previous = handoff::latest_for_repo(&state, repo)
+                    .ok()
+                    .flatten()
+                    .map(|(_, h)| h);
                 let (note, source) = handoff::distill_or_structural(
                     adapter.as_ref(),
                     &distiller_model,
                     &ctx,
                     Duration::from_secs(cfg.handoff.timeout_secs),
                     cfg.chrome.events,
+                    previous.as_ref(),
                 );
                 let stored = handoff::store(&state, repo, session.as_str(), &note)?;
 
@@ -2330,12 +2340,17 @@ fn run_with_clock_inner<W: Write>(
 
         let jsonl = std::fs::read_to_string(&transcript).unwrap_or_default();
         let ctx = adapter.structural_context(&jsonl, cfg.handoff.tail_items);
+        let previous = handoff::latest_for_repo(&state, repo)
+            .ok()
+            .flatten()
+            .map(|(_, h)| h);
         let (note, source) = handoff::distill_or_structural(
             adapter.as_ref(),
             &distiller_model,
             &ctx,
             Duration::from_secs(cfg.handoff.timeout_secs),
             cfg.chrome.events,
+            previous.as_ref(),
         );
         let stored = handoff::store(&state, repo, session.as_str(), &note)?;
         // N6: opt-in (`cfg.memory.harvest`, default off) and only from a
