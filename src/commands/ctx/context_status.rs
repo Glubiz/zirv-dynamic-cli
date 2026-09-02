@@ -544,7 +544,11 @@ fn render_handoff_section<W: Write>(
     )?;
     match handoff::latest_for_repo(state, repo) {
         Ok(Some((path, handoff))) => {
-            let resume_bytes = resume::resume_prompt(&handoff).len();
+            // Issue #281: the non-consuming preview, not `resume_prompt`
+            // itself -- this is a "what would resuming inject" estimate, not
+            // an actual resume, and must never burn the one-shot crash
+            // witness marker a real resume would consume.
+            let resume_bytes = resume::resume_prompt_preview(state, repo, "status", &handoff).len();
             writeln!(
                 w,
                 "  {}",

@@ -1341,6 +1341,12 @@ fn run_with_clock_inner<W: Write>(
         // the child has been reaped, and again by every arm that returns.
         let (mut child, tap, _child_guard) =
             supervise::spawn_tapped(command, stdin_prompt.clone())?;
+        // Issue #281: this cycle's own work is now in flight -- cleared by
+        // `supervise_run`'s tick closure the instant it sees a turn signal
+        // for THIS session. Turn `0`: no turn signal has landed yet for this
+        // fresh child, so if it crashes before its first one, `0` honestly
+        // says nothing was confirmed complete.
+        session_guard.stamp_in_flight(super::sessions::Verb::Exec.as_str(), 0);
         // Item 3: the messages folded into the launch prompt are consumed
         // here, right after the spawn that actually carried them has
         // genuinely started -- not before pacing or the spawn itself, where
@@ -1387,6 +1393,7 @@ fn run_with_clock_inner<W: Write>(
             server.as_ref(),
             session.as_str(),
             &registry_short,
+            &mut session_guard,
             &announcer,
             &mut screening_announced,
             &mut rotted,
@@ -2590,6 +2597,11 @@ fn supervise_run(
     // restart mints a fresh session -- deriving it from `session` here meant
     // a nudge sent after the first restart was never claimed.
     registry_short: &str,
+    // Issue #281: cleared the instant the tick loop below sees a turn signal
+    // reported by THIS session -- the turn `stamp_in_flight` marked at this
+    // cycle's own spawn (the call site right before `supervise_run`) has now
+    // reached a clean boundary.
+    session_guard: &mut super::sessions::SessionGuard,
     // Issue #243 (review round, F3): the same `Announcer` this run's other
     // events already use, plus this run's own de-duplication memory --
     // owned above the per-restart loop (like `registry_short`/`nudged_by`),
@@ -2662,6 +2674,9 @@ fn supervise_run(
             if received.session_id == session {
                 *progressed = true;
                 compact_budget.observe_progress();
+                // Issue #281: this session's own turn just reached a clean
+                // boundary -- see this parameter's own doc comment.
+                session_guard.clear_in_flight();
             }
             match action_for_signal(adapter, &received, session) {
                 SignalAction::Stop => {

@@ -398,6 +398,37 @@ pub struct Record {
     /// back-compat pattern `owner_pid` already established.
     #[serde(default)]
     pub start_time: Option<u64>,
+    /// Issue #281: set while a turn is actively being worked, cleared once it
+    /// reaches a clean boundary -- see [`InFlight`]'s own doc comment. `None`
+    /// for a record written by an older build, the ordinary "idle between
+    /// turns" state, or once [`take_interrupted_in_flight`] has consumed it.
+    /// `#[serde(default)]` so an on-disk record from before this field
+    /// existed deserializes as `None`, the same back-compat pattern every
+    /// other optional field on this struct already follows.
+    #[serde(default)]
+    pub in_flight: Option<InFlight>,
+}
+
+/// Issue #281: the crash-interruption witness marker. Stamped by a
+/// supervisor ([`SessionGuard::stamp_in_flight`]) when a turn starts and
+/// cleared ([`SessionGuard::clear_in_flight`]) once that turn reaches a
+/// clean boundary -- a turn signal, for both `wrap.rs` and `exec.rs`. A
+/// record still carrying one after its own process has died
+/// ([`record_is_alive`] is `false`) means that process stopped mid-turn
+/// rather than at a clean boundary: [`take_interrupted_in_flight`] is what a
+/// resumed session's injection reads this through.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InFlight {
+    /// The supervisor verb doing the work (`Verb::as_str()` -- `"wrap"`,
+    /// `"exec"`, ...), not a per-tool label: this witness only ever needs to
+    /// say WHICH supervised run was interrupted, not what it was doing.
+    pub verb: String,
+    /// The turn number this supervisor last knew about when it stamped this
+    /// marker -- `InjectionState::last_turn + 1` for `wrap`, the transcript's
+    /// own turn count for `exec`. Display only, like `InjectionState::
+    /// last_turn` itself.
+    pub turn: u64,
+    pub since: u64,
 }
 
 fn reachable_default() -> bool {
@@ -440,6 +471,9 @@ impl Record {
             // `process_start_secs` cannot tell, which callers other than
             // `record_is_alive` never need to know about.
             start_time: process_start_secs(std::process::id()),
+            // Left unset here too: nothing is in flight until a supervisor's
+            // own `stamp_in_flight` call says otherwise.
+            in_flight: None,
         }
     }
 
@@ -640,12 +674,10 @@ impl SessionGuard {
         }
     }
 
-    // `list`/`resolve_prefix` and their supporting types below now have
-    // production call sites (`mail::run_send_with`'s `--to-session`,
-    // `sessions::run_nudge_with`'s own resolution). `record()` alone is
-    // still only exercised by this module's own tests -- nothing yet needs
-    // the whole `Record` back out of a live guard, only its side effects.
-    #[allow(dead_code)]
+    // Issue #281: `wrap.rs`'s pump loop reads `.verb` off this to label its
+    // `stamp_in_flight` calls with the actual verb this guard was
+    // registered under (`Wrap` or `Chat` -- `chat.rs` reuses `wrap::
+    // run_with`), rather than assuming `"wrap"` unconditionally.
     pub fn record(&self) -> &Record {
         &self.record
     }
@@ -713,6 +745,38 @@ impl SessionGuard {
         }
         self.record.pid = pid;
         self.record.start_time = process_start_secs(pid);
+        self.path = write_record(&self.state, &self.record);
+    }
+
+    /// Issue #281: stamps `Record::in_flight`, marking a turn as started.
+    /// Called from `wrap.rs`'s pty spawn/relaunch sites and its pump loop's
+    /// `PumpEvent::Input` arm, and from `exec.rs`'s per-cycle spawn -- the
+    /// existing edges each supervisor already observes for a turn beginning.
+    /// Best-effort, like every other registry write here: a failed write
+    /// costs a missed witness on a future crash, never this turn itself.
+    pub fn stamp_in_flight(&mut self, verb: &str, turn: u64) {
+        if self.released {
+            return;
+        }
+        self.record.in_flight = Some(InFlight {
+            verb: verb.to_string(),
+            turn,
+            since: super::state::now_secs(),
+        });
+        self.path = write_record(&self.state, &self.record);
+    }
+
+    /// The turn-boundary counterpart to `stamp_in_flight`: called from
+    /// `wrap.rs`'s turn-signal arm and `exec.rs`'s tick loop the instant a
+    /// turn signal lands, i.e. the moment a turn is known to have reached a
+    /// clean boundary. A no-op when nothing is stamped, so calling it on
+    /// every turn signal regardless of whether `stamp_in_flight` ran first is
+    /// always safe.
+    pub fn clear_in_flight(&mut self) {
+        if self.released || self.record.in_flight.is_none() {
+            return;
+        }
+        self.record.in_flight = None;
         self.path = write_record(&self.state, &self.record);
     }
 
@@ -991,6 +1055,57 @@ pub fn load_record(state: &StateDir, short: &str) -> Option<Record> {
     std::fs::read_to_string(record_path(state, short))
         .ok()
         .and_then(|contents| serde_json::from_str::<Record>(&contents).ok())
+}
+
+/// Issue #281: the crash-interruption witness lookup a resumed session's
+/// injection reads (`handoff::render_crash_witness`, called from
+/// `resume::resume_prompt` and `hook::run_session_start`). Scans every
+/// record for `repo` (matched by `repo_slug`, the same key `handoff::store`/
+/// `latest_for_repo` already use, rather than a raw `PathBuf` comparison
+/// that a differently-spelled but identical path would fail) whose OWN
+/// process is dead -- [`record_is_alive`], this module's only liveness
+/// check, reused rather than duplicated -- but whose `in_flight` marker is
+/// still set: that process stopped mid-turn, not at a clean boundary.
+///
+/// Deliberately narrower than [`list`]: `list` sweeps and removes every
+/// OTHER stale record, orphaned marker and orphaned socket endpoint on disk
+/// as a side effect of being called at all, which is more housekeeping than
+/// an injection-composition read should trigger. This only ever touches the
+/// one record it returns something for, and only clears its `in_flight`
+/// marker (never the whole record -- `list`'s own later sweep still cleans
+/// that up in its own time) -- consumed so a second call for the same crash
+/// (a second `resume`, a second SessionStart) never re-fires.
+///
+/// Best-effort throughout, matching every other piece of registry
+/// housekeeping in this module: an unreadable or malformed record is
+/// skipped, never an error, and a write that fails to clear the marker costs
+/// a possible second witness block, never a wrong one.
+pub fn take_interrupted_in_flight(state: &StateDir, repo: &Path) -> Option<InFlight> {
+    let repo_slug = super::state::repo_slug(repo);
+    let entries = std::fs::read_dir(state.sessions()).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(contents) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(mut record) = serde_json::from_str::<Record>(&contents) else {
+            continue;
+        };
+        if record.repo_slug != repo_slug || record_is_alive(&record) {
+            continue;
+        }
+        let Some(in_flight) = record.in_flight.take() else {
+            continue;
+        };
+        if let Ok(json) = serde_json::to_string_pretty(&record) {
+            let _ = super::state::write_private(&path, &json);
+        }
+        return Some(in_flight);
+    }
+    None
 }
 
 /// Every record currently on disk, alongside whether its own process is
@@ -3919,5 +4034,113 @@ mod tests {
         let err = run_kill_with(&args, &mut out, &|k| env.get(k).cloned())
             .expect_err("three characters is not enough to kill on");
         assert!(err.to_string().contains("prefix too short"), "got {err}");
+    }
+
+    // -- Issue #281: crash-interruption witness -------------------------
+
+    fn in_flight_record(repo: &Path, pid: u32, in_flight: Option<InFlight>) -> Record {
+        let mut record = record_for("eeeeeeee-2222-4333-8444-555555555555", repo, Verb::Wrap);
+        record.pid = pid;
+        record.owner_pid = Some(pid);
+        record.in_flight = in_flight;
+        record
+    }
+
+    fn sample_in_flight() -> InFlight {
+        InFlight {
+            verb: "wrap".to_string(),
+            turn: 3,
+            since: 1_700_000_000,
+        }
+    }
+
+    /// A dead pid with `in_flight` set is exactly the crash this witness
+    /// exists to catch: the process stopped mid-turn, never reaching the
+    /// clean boundary that would have cleared the marker.
+    #[test]
+    fn a_dead_pid_with_in_flight_set_is_reported_once() {
+        use super::super::testenv::dead_pid;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = state_in(tmp.path());
+        let repo = tmp.path().join("repo");
+        let record = in_flight_record(&repo, dead_pid(), Some(sample_in_flight()));
+        write_record(&state, &record);
+
+        let found = take_interrupted_in_flight(&state, &repo).expect("must report the crash");
+        assert_eq!(found.verb, "wrap");
+        assert_eq!(found.turn, 3);
+
+        assert!(
+            take_interrupted_in_flight(&state, &repo).is_none(),
+            "the marker was consumed -- a second call must find nothing"
+        );
+    }
+
+    /// A dead pid with no marker at all means a clean exit (or a record from
+    /// before this field existed): nothing to report.
+    #[test]
+    fn a_dead_pid_with_no_marker_reports_nothing() {
+        use super::super::testenv::dead_pid;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = state_in(tmp.path());
+        let repo = tmp.path().join("repo");
+        let record = in_flight_record(&repo, dead_pid(), None);
+        write_record(&state, &record);
+
+        assert!(take_interrupted_in_flight(&state, &repo).is_none());
+    }
+
+    /// A live process is never "interrupted", even if its own marker happens
+    /// to still be set (it just has not reached the next turn boundary yet).
+    #[test]
+    fn a_live_pid_with_in_flight_set_reports_nothing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = state_in(tmp.path());
+        let repo = tmp.path().join("repo");
+        let record = in_flight_record(&repo, std::process::id(), Some(sample_in_flight()));
+        write_record(&state, &record);
+
+        assert!(
+            take_interrupted_in_flight(&state, &repo).is_none(),
+            "a live session's own in-flight marker is not a crash"
+        );
+    }
+
+    /// A record for a DIFFERENT repository must never be reported, even if
+    /// it is a dead, in-flight one -- `repo_slug` is the match key, the same
+    /// one `handoff::store`/`latest_for_repo` already use.
+    #[test]
+    fn a_dead_in_flight_record_for_a_different_repo_is_not_reported() {
+        use super::super::testenv::dead_pid;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = state_in(tmp.path());
+        let this_repo = tmp.path().join("repo-a");
+        let other_repo = tmp.path().join("repo-b");
+        let record = in_flight_record(&other_repo, dead_pid(), Some(sample_in_flight()));
+        write_record(&state, &record);
+
+        assert!(take_interrupted_in_flight(&state, &this_repo).is_none());
+    }
+
+    /// Back-compat: a `Record` serialized by a build before this field
+    /// existed has no `in_flight` key at all in its JSON. It must still
+    /// deserialize, with `in_flight` defaulting to `None` -- never a parse
+    /// failure that would make the whole record (and therefore the session)
+    /// vanish from every listing.
+    #[test]
+    fn a_record_json_with_no_in_flight_field_deserializes_with_none() {
+        let json = r#"{
+            "session": "ffffffff-2222-4333-8444-555555555555",
+            "short": "ffffffff",
+            "agent": "claude",
+            "repo": "/repo",
+            "repo_slug": "repo",
+            "verb": "wrap",
+            "pid": 1,
+            "started_at": 0,
+            "reachable": true
+        }"#;
+        let record: Record = serde_json::from_str(json).expect("an older record still parses");
+        assert_eq!(record.in_flight, None);
     }
 }
