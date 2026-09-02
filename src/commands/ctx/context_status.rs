@@ -1351,6 +1351,7 @@ mod tests {
     /// environment, the same way an operator would actually set it.
     #[test]
     fn an_over_budget_harness_roster_is_flagged_truncated_in_the_report() {
+        let _live = crate::commands::ctx::testenv::stub_live_adapters_on_path();
         let fixture = Fixture::new();
         let mut env = fixture.env.clone();
         env.insert(

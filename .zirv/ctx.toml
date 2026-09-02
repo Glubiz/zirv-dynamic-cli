@@ -182,6 +182,7 @@ model = "fable"
 # review_worker_budget_tokens = 0    # REPO-FORBIDDEN (ZIRV_CTX_WORKFLOW_REVIEW_WORKER_BUDGET_TOKENS): token ceiling appended to a workflow reviewer worker's launch as `--budget-tokens`, only when set. Default: unset (no flag appended).
 # review_worker_max_tool_calls = 0   # REPO-FORBIDDEN (ZIRV_CTX_WORKFLOW_REVIEW_WORKER_MAX_TOOL_CALLS): tool-call ceiling appended to a workflow reviewer worker's launch as `--max-tool-calls`, only when set. Default: unset (no flag appended).
 # auto_spawn_on_gate = false         # REPO-FORBIDDEN (ZIRV_CTX_WORKFLOW_AUTO_SPAWN_ON_GATE): auto-spawns a bounded review run/test changed/verify worker when a gate transition lands the workflow on that phase. Default: false.
+# allow_empty_verify = false         # REPO-FORBIDDEN (ZIRV_CTX_WORKFLOW_ALLOW_EMPTY_VERIFY): lets zirv verify/zirv test report Passed instead of Inconclusive when zero verification checks are configured or discoverable. Default: false.
 
 # [workflow.deploy]
 # tier = "development"               # REPO-FORBIDDEN (ZIRV_CTX_WORKFLOW_DEPLOY_TIER): development < staging < production. Operator env overrides all layers. Default: "development".

@@ -1,0 +1,6 @@
+{"type":"user","message":{"content":"first turn"}}
+{"type":"assistant","message":{"model":"claude-opus-5","content":[{"type":"text","text":"[zirv] first"}],"usage":{"input_tokens":1000}}}
+{"type":"user","message":{"content":"second turn"}}
+{"type":"assistant","message":{"model":"claude-sonnet-5","content":[{"type":"text","text":"[zirv] second"}],"usage":{"input_tokens":2000}}}
+{"type":"assistant","isApiErrorMessage":true,"error":"rate_limit","message":{"model":"<synthetic>","content":[{"type":"text","text":"API Error: rate limit: prompt is too long"}],"usage":{"input_tokens":0,"output_tokens":0}}}
+{"type":"assistant","isApiErrorMessage":true,"error":"invalid_request","message":{"model":"<synthetic>","content":[{"type":"text","text":"API Error: prompt is too long: 210000 tokens > 200000 maximum"}],"usage":{"input_tokens":0,"output_tokens":0}}}

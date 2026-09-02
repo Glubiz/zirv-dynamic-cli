@@ -88,6 +88,13 @@ pub(crate) struct RepoGates {
     /// not even be read, same fail-closed posture as `checks`/`skills`/
     /// `agents` above.
     pub check_env_passthrough: Vec<String>,
+    /// Operator-owned `[workflow] allow_empty_verify` (REPO_FORBIDDEN,
+    /// `~/.zirv/ctx.toml`/`ZIRV_CTX_WORKFLOW_ALLOW_EMPTY_VERIFY`/flags only,
+    /// issue #268) -- lets `verification::run_mode` report `Passed` instead
+    /// of `Inconclusive` when zero checks are configured or discoverable.
+    /// `false` (the stricter, fail-closed reading) when the config could
+    /// not even be read, same posture as `checks`/`skills`/`agents` above.
+    pub allow_empty_verify: bool,
 }
 
 /// Resolves both gates, failing **closed** when the configuration cannot be
@@ -110,6 +117,7 @@ pub(crate) fn repo_gates(repo: &std::path::Path) -> RepoGates {
             skills: cfg.workflow.repo_skills_enabled,
             agents: cfg.workflow.repo_agents_enabled,
             check_env_passthrough: cfg.workflow.check_env_passthrough,
+            allow_empty_verify: cfg.workflow.allow_empty_verify,
         },
         Err(error) => {
             announce_unreadable_config(&error.to_string());
@@ -118,6 +126,7 @@ pub(crate) fn repo_gates(repo: &std::path::Path) -> RepoGates {
                 skills: false,
                 agents: false,
                 check_env_passthrough: Vec::new(),
+                allow_empty_verify: false,
             }
         }
     }

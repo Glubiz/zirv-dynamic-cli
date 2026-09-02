@@ -5212,9 +5212,11 @@ mod tests {
                 tool_failure_rate,
                 repetition_hits: 0,
                 max_repeat: 1,
+                provider_overflows: 0,
                 marker_miss_rate: None,
             },
             context_tokens: 120_000,
+            model_change: None,
         }
     }
 

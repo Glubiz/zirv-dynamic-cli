@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use super::adapters::AgentAdapter;
 use super::config::{CtxConfig, EnvLookup, ScoreConfig, env_from_process};
-use super::event::{SessionId, SessionRef, input_hash};
+use super::event::{ModelChange, NormalizedEvent, SessionId, SessionRef, input_hash};
 use super::rot::{self, RotState, Score};
 use super::screen::{self, ScreenReport};
 use super::state::StateDir;
@@ -20,6 +20,69 @@ pub struct ScoreArgs {
     /// Adapter name: claude or codex. Defaults to config, then claude.
     #[arg(long)]
     pub agent: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct ModelTracker {
+    turns: usize,
+    current: Option<String>,
+    latest_change: Option<TrackedModelChange>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct TrackedModelChange {
+    from: String,
+    to: String,
+    turn: usize,
+}
+
+impl ModelTracker {
+    fn feed_all(&mut self, events: &[NormalizedEvent]) {
+        for event in events {
+            match event {
+                NormalizedEvent::TurnStart => self.turns += 1,
+                NormalizedEvent::ModelId { id } => self.feed_model(id),
+                _ => {}
+            }
+        }
+    }
+
+    fn feed_model(&mut self, id: &str) {
+        let Some(from) = self.current.as_ref() else {
+            self.current = Some(id.to_string());
+            return;
+        };
+        if from.eq_ignore_ascii_case(id) {
+            return;
+        }
+        self.latest_change = Some(TrackedModelChange {
+            from: from.clone(),
+            to: id.to_string(),
+            turn: self.turns,
+        });
+        self.current = Some(id.to_string());
+    }
+
+    fn report(&self, adapter: &dyn AgentAdapter) -> Option<ModelChange> {
+        let change = self.latest_change.as_ref()?;
+        let mut report = ModelChange {
+            from: change.from.clone(),
+            to: change.to.clone(),
+            turns_ago: self.turns.saturating_sub(change.turn),
+            limit_pressure: false,
+        };
+        report.limit_pressure = super::pace::model_change_is_limit_pressure(adapter, &report);
+        Some(report)
+    }
+}
+
+fn attach_model_change(
+    mut score: Score,
+    tracker: &ModelTracker,
+    adapter: &dyn AgentAdapter,
+) -> Score {
+    score.model_change = tracker.report(adapter);
+    score
 }
 
 /// Read a whole transcript, parse it with the selected adapter, score it. The
@@ -54,8 +117,15 @@ fn full_score(
     // into `capabilities_for_model` rather than the conservative "unstated
     // model" default `capabilities()` always carries. A `[1m]` claude seat's
     // real 1M window now reaches rot's token gates on every full parse.
+    let events = adapter.parse_events(&jsonl);
     let caps = adapter.capabilities_for_model(adapter.model_hint(&jsonl).as_deref());
-    Ok(rot::score_events(&adapter.parse_events(&jsonl), caps, cfg))
+    let mut tracker = ModelTracker::default();
+    tracker.feed_all(&events);
+    Ok(attach_model_change(
+        rot::score_events(&events, caps, cfg),
+        &tracker,
+        adapter,
+    ))
 }
 
 /// One-shot scoring, used by the `score` verb itself: no state is kept, so the
@@ -69,6 +139,26 @@ pub fn score_transcript(
     let cfg = CtxConfig::load(repo, env)?;
     let adapter = adapters::select(agent.or(cfg.agent.as_deref()), &[], &cfg)?;
     full_score(adapter.as_ref(), transcript, &cfg.score)
+}
+
+/// Best-effort model-change lookup for one registered session. Status is the
+/// consumer: transcript resolution and reading stay at this I/O layer rather
+/// than leaking into the pure rot fold or the renderer.
+pub fn model_change_for_session(
+    agent: &str,
+    session_id: &str,
+    repo: &Path,
+    env: EnvLookup<'_>,
+) -> Option<ModelChange> {
+    let cfg = CtxConfig::load(repo, env).ok()?;
+    let adapter = adapters::select(Some(agent), &[], &cfg).ok()?;
+    let transcript = adapter.transcript_path(&SessionRef {
+        id: SessionId::parse(session_id),
+        cwd: repo.to_path_buf(),
+    });
+    full_score(adapter.as_ref(), &transcript, &cfg.score)
+        .ok()?
+        .model_change
 }
 
 /// Folds a growing transcript into a `RotState` so each pass costs the bytes
@@ -86,6 +176,8 @@ pub struct IncrementalScorer {
     /// not to mention a model (e.g. a lone tool-result line) must not read
     /// as "no model at all" -- it keeps whatever was last resolved.
     model: Option<String>,
+    model_tracker: ModelTracker,
+    provider_limit_hit: bool,
 }
 
 impl IncrementalScorer {
@@ -95,6 +187,8 @@ impl IncrementalScorer {
             transcript,
             state: None,
             model: None,
+            model_tracker: ModelTracker::default(),
+            provider_limit_hit: false,
         }
     }
 
@@ -105,12 +199,15 @@ impl IncrementalScorer {
         consumed: u64,
         state: RotState,
         model: Option<String>,
+        model_tracker: ModelTracker,
     ) -> Self {
         Self {
             watcher: Watcher::resuming(transcript.clone(), offset, consumed),
             transcript,
             state: Some(state),
             model,
+            model_tracker,
+            provider_limit_hit: false,
         }
     }
 
@@ -124,6 +221,10 @@ impl IncrementalScorer {
 
     fn model(&self) -> Option<&str> {
         self.model.as_deref()
+    }
+
+    pub fn provider_limit_hit(&self) -> bool {
+        self.provider_limit_hit
     }
 
     /// `None` when the transcript has not changed since the last poll, which
@@ -183,6 +284,7 @@ impl IncrementalScorer {
         adapter: &dyn AgentAdapter,
         cfg: &ScoreConfig,
     ) -> CtxResult<(Option<Score>, Option<ScreenReport>)> {
+        self.provider_limit_hit = false;
         if !adapter.capabilities().events {
             return Ok((None, None));
         }
@@ -204,6 +306,7 @@ impl IncrementalScorer {
             // different session entirely -- issue #155 D1 -- so a model
             // resolved off the old one must not linger past the rebuild.
             self.model = None;
+            self.model_tracker = ModelTracker::default();
         }
         // Issue #155 D1: resolved off the committed lines every poll, newest
         // wins, kept across polls (see the `model` field's own doc comment).
@@ -214,38 +317,48 @@ impl IncrementalScorer {
             self.model = Some(model);
         }
         let model = self.model.clone();
+        let events = adapter.parse_events(&appended.lines);
+        self.provider_limit_hit = super::pace::provider_events_hit_limit(&events);
+        self.model_tracker.feed_all(&events);
         let Some(state) = self.state.as_mut() else {
             // An unbounded window has no bounded state to fold into.
             let score = full_score(adapter, &self.transcript, cfg)?;
             return Ok((Some(score), screening));
         };
-        state.feed_all(&adapter.parse_events(&appended.lines));
+        state.feed_all(&events);
 
         // The line the agent is still writing counts towards this pass's score
         // -- a full parse would see it too -- but is never committed to the
         // state, because the next poll reads it again, complete.
         if appended.partial.is_empty() {
             let caps = adapter.capabilities_for_model(model.as_deref());
-            return Ok((state.score(caps, cfg), screening));
+            let score = state
+                .score(caps, cfg)
+                .map(|score| attach_model_change(score, &self.model_tracker, adapter));
+            return Ok((score, screening));
         }
+        let partial_events = adapter.parse_events(&appended.partial);
+        self.provider_limit_hit |= super::pace::provider_events_hit_limit(&partial_events);
         let mut with_partial = state.clone();
-        with_partial.feed_all(&adapter.parse_events(&appended.partial));
+        with_partial.feed_all(&partial_events);
+        let mut partial_tracker = self.model_tracker.clone();
+        partial_tracker.feed_all(&partial_events);
         // The partial line might be the only place a fresh model switch shows
         // up so far; it is never committed to `self.model` (mirroring
         // `state`/`with_partial` above), only used for this one score.
         let partial_model = adapter.model_hint(&appended.partial).or(model);
         let caps = adapter.capabilities_for_model(partial_model.as_deref());
-        Ok((with_partial.score(caps, cfg), screening))
+        let score = with_partial
+            .score(caps, cfg)
+            .map(|score| attach_model_change(score, &partial_tracker, adapter));
+        Ok((score, screening))
     }
 }
 
 /// Bumped whenever the checkpoint or `RotState` changes shape, so an older
-/// file is ignored and rebuilt instead of misread. Issue #155 D1: bumped to
-/// 2 for the new `model` field -- a checkpoint written before that field
-/// existed would otherwise resume with `model: None` until the next poll
-/// happens to carry a fresh assistant line, which is usually immediate but
-/// not guaranteed; the version bump forces one clean rebuild instead.
-const CHECKPOINT_VERSION: u32 = 2;
+/// file is ignored and rebuilt instead of misread. Version 3 adds the model
+/// history needed to report changes across fresh-process Stop-hook polls.
+const CHECKPOINT_VERSION: u32 = 3;
 
 /// What a fresh process needs to carry on folding where the last one stopped.
 #[derive(Debug, Serialize, Deserialize)]
@@ -268,6 +381,8 @@ struct Checkpoint {
     /// the version bump above.
     #[serde(default)]
     model: Option<String>,
+    #[serde(default)]
+    model_tracker: ModelTracker,
 }
 
 /// Everything outside the transcript that decides what the same bytes score
@@ -330,6 +445,7 @@ fn save_checkpoint(path: &Path, transcript: &Path, fingerprint: u64, scorer: &In
         consumed,
         state: state.clone(),
         model: scorer.model().map(str::to_string),
+        model_tracker: scorer.model_tracker.clone(),
     }) else {
         return;
     };
@@ -407,6 +523,7 @@ fn score_with_checkpoint(
             checkpoint.consumed,
             checkpoint.state,
             checkpoint.model,
+            checkpoint.model_tracker,
         ),
         None => IncrementalScorer::new(transcript.to_path_buf()),
     };
@@ -1067,6 +1184,45 @@ mod tests {
         );
     }
 
+    #[test]
+    fn score_reports_model_identity_drift_without_using_it_as_rot_evidence() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let transcript = fixture_path("claude-provider-errors-model-drift.jsonl");
+        let score =
+            score_transcript(&transcript, Some("claude"), dir.path(), &|_| None).expect("score");
+        let change = score.model_change.expect("model change");
+
+        assert_eq!(change.from, "claude-opus-5");
+        assert_eq!(change.to, "claude-sonnet-5");
+        assert_eq!(change.turns_ago, 0);
+        assert!(change.limit_pressure);
+        assert_eq!(score.score, 0, "model drift is not a weighted rot signal");
+        assert_eq!(
+            score.verdict,
+            rot::Verdict::Compact,
+            "overflow alone escalates"
+        );
+    }
+
+    #[test]
+    fn incremental_scoring_routes_a_provider_rate_limit_into_pace() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let transcript = dir.path().join("t.jsonl");
+        std::fs::write(
+            &transcript,
+            std::fs::read_to_string(fixture_path("claude-provider-errors-model-drift.jsonl"))
+                .expect("fixture"),
+        )
+        .expect("write transcript");
+        let adapter = super::adapters::claude::ClaudeAdapter::new(None);
+        let mut scorer = IncrementalScorer::new(transcript);
+
+        scorer
+            .poll(&adapter, &ScoreConfig::default())
+            .expect("poll");
+        assert!(scorer.provider_limit_hit());
+    }
+
     /// Issue #155 D1: `exec`/`loop`'s own rot-restart gate polls through
     /// `IncrementalScorer` directly, and most turns never restate a model --
     /// so a live model, once resolved, must not regress to the conservative
@@ -1287,6 +1443,43 @@ mod tests {
             read_offset("second pass") - bulk.len() as u64,
             turn.len() as u64,
             "the second pass folded in only the appended turn"
+        );
+    }
+
+    #[test]
+    fn a_pre_compaction_reset_checkpoint_without_new_rot_fields_still_loads() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let transcript = dir.path().join("session.jsonl");
+        std::fs::write(&transcript, "").expect("transcript");
+        let path = dir.path().join("checkpoint.json");
+        let cfg = ScoreConfig::default();
+        let adapter = super::adapters::claude::ClaudeAdapter::new(None);
+        let fingerprint = fingerprint(&adapter, &cfg);
+        let checkpoint = Checkpoint {
+            version: CHECKPOINT_VERSION,
+            transcript: transcript.display().to_string(),
+            fingerprint,
+            offset: 0,
+            consumed: 0,
+            state: RotState::new(&cfg).expect("bounded state"),
+            model: None,
+            model_tracker: ModelTracker::default(),
+        };
+        let mut json = serde_json::to_value(checkpoint).expect("serialize checkpoint");
+        let state = json["state"].as_object_mut().expect("state object");
+        state.remove("behavioral_closed_turns");
+        for segment in state["segments"].as_array_mut().expect("segments") {
+            segment
+                .as_object_mut()
+                .expect("segment object")
+                .remove("provider_overflows");
+        }
+        std::fs::write(&path, json.to_string()).expect("legacy checkpoint");
+
+        assert!(
+            load_checkpoint(&path, &transcript, fingerprint, &cfg).is_some(),
+            "a checkpoint written before the compaction-reset fields existed must deserialize \
+             with their zero defaults"
         );
     }
 

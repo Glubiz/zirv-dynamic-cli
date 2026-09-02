@@ -70,9 +70,11 @@ pub fn production_gate_satisfied(state_dir: &StateDir, state: &WorkflowState) ->
     }
 
     if !super::verification::latest_is_fresh_and_passing(state_dir, &state.repo, true)? {
-        return Err(
-            "production deploy requires fresh passing final verification; run `zirv verify`".into(),
-        );
+        let announcement = super::verification::gate_announcement(state_dir, &state.repo, true);
+        return Err(format!(
+            "production deploy requires fresh passing final verification; run `zirv verify`\n{announcement}"
+        )
+        .into());
     }
 
     Ok(())

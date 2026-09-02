@@ -47,7 +47,7 @@ use super::window;
 use super::{handoff, handover, mail, memory, prompt, score, sessions};
 use crate::commands::workflow;
 
-pub(crate) use pane::{Pane, PaneSpec, PaneState, ScrollOutcome};
+pub(crate) use pane::{Pane, PaneBudgetNotice, PaneSpec, PaneState, ScrollOutcome};
 
 /// The one dashboard prefix key, `Ctrl+A`. Not configurable in v1 (recorded
 /// as a deliberate spec deviation in the plan's self-review: YAGNI).
@@ -1216,6 +1216,73 @@ fn reap_fixup(removed: usize, focused: usize, selected: usize) -> (usize, usize)
     (focused, selected)
 }
 
+fn pane_transcript_usage(
+    pane: &Pane,
+    cfg: &CtxConfig,
+    repo: &Path,
+) -> Option<super::event::TranscriptUsage> {
+    let adapter = adapters::select(Some(pane.agent()), &[], cfg).ok()?;
+    let transcript = adapter.transcript_path(&SessionRef {
+        id: SessionId::parse(pane.session_id()),
+        cwd: repo.to_path_buf(),
+    });
+    let body = std::fs::read_to_string(transcript).ok()?;
+    adapter.transcript_usage(&body)
+}
+
+fn enforce_pane_token_budgets(
+    panes: &mut [Pane],
+    cfg: &CtxConfig,
+    repo: &Path,
+    errors: &mut Vec<String>,
+) {
+    for pane in panes {
+        if pane.budget_tokens().is_none() {
+            continue;
+        }
+        let Some(usage) = pane_transcript_usage(pane, cfg, repo) else {
+            continue;
+        };
+        let quit_sequence = adapters::select(Some(pane.agent()), &[], cfg)
+            .map(|adapter| adapter.quit_sequence().to_string())
+            .unwrap_or_default();
+        match pane.enforce_token_budget(&usage, &quit_sequence) {
+            Ok(Some(PaneBudgetNotice::SoftWarn { used, limit })) => push_error(
+                errors,
+                format!(
+                    "pane '{}' ({}) has spent {used}/{limit} tokens; wrap up and checkpoint soon",
+                    pane.title(),
+                    pane.short()
+                ),
+            ),
+            Ok(Some(PaneBudgetNotice::HardStop { used, limit })) => push_error(
+                errors,
+                format!(
+                    "pane '{}' ({}) token budget exhausted ({used}/{limit}); stopped with exit {}",
+                    pane.title(),
+                    pane.short(),
+                    super::exec::EXIT_BUDGET_EXHAUSTED
+                ),
+            ),
+            Ok(None) => {}
+            Err(e) => push_error(
+                errors,
+                format!("pane '{}' budget enforcement failed: {e}", pane.short()),
+            ),
+        }
+    }
+}
+
+fn account_reaped_pane_spend(pane: &Pane, cfg: &CtxConfig, state: &StateDir, repo: &Path) {
+    let Some(group_id) = pane.work_group_id() else {
+        return;
+    };
+    let Some(usage) = pane_transcript_usage(pane, cfg, repo) else {
+        return;
+    };
+    let _ = super::group::add_spent_tokens(state, group_id, super::agent::token_spend(&usage));
+}
+
 /// Pure: `selected` after `new_pane_count - old_pane_count` panes were
 /// appended to `panes`. `selected` indexes the combined sidebar (panes first,
 /// then view-only registry rows), so appending a pane pushes every view-only
@@ -1277,6 +1344,7 @@ fn reap_ended_panes(
     queues: &mut Vec<VecDeque<String>>,
     cfg: &CtxConfig,
     state: &StateDir,
+    repo: &Path,
     focused: &mut usize,
     selected: &mut usize,
     errors: &mut Vec<String>,
@@ -1297,6 +1365,7 @@ fn reap_ended_panes(
             push_error(errors, format!("reap {}: {e}", panes[index].short()));
         }
         let pane = panes.remove(index);
+        account_reaped_pane_spend(&pane, cfg, state, repo);
         close_claimed_group(&pane, state);
         if index < queues.len() {
             queues.remove(index);
@@ -1431,6 +1500,7 @@ fn on_quit(
             // Finding 6: and the group it belongs to, so the restore can put
             // it back inside the same one.
             work_group_id: pane.work_group_id().map(str::to_string),
+            budget_tokens: pane.budget_tokens(),
             // Issue #160 finding 1, review round (2026-08-28): the launch
             // mode this pane was ACTUALLY spawned with (`Pane::launch_mode`),
             // so a restore can relaunch it on the same terms rather than
@@ -2769,6 +2839,7 @@ const FILE_DROP_TRUSTED_INTERACTIVE: bool = false;
 pub(crate) struct SpawnRefusal {
     pub reason: String,
     pub retryable: bool,
+    pub budget_exhausted: bool,
 }
 
 impl SpawnRefusal {
@@ -2779,6 +2850,7 @@ impl SpawnRefusal {
         SpawnRefusal {
             reason: reason.into(),
             retryable: false,
+            budget_exhausted: false,
         }
     }
 
@@ -2789,6 +2861,15 @@ impl SpawnRefusal {
         SpawnRefusal {
             reason: reason.into(),
             retryable: true,
+            budget_exhausted: false,
+        }
+    }
+
+    fn budget_exhausted(reason: impl Into<String>) -> Self {
+        SpawnRefusal {
+            reason: reason.into(),
+            retryable: false,
+            budget_exhausted: true,
         }
     }
 }
@@ -3550,8 +3631,8 @@ fn fulfill_spawn_request(
         );
     }
 
-    // Issue #155 review finding D2: the pane-side admission choke point for
-    // `child_limit`. `agent::run_with`'s own headless choke point
+    // The pane-side admission choke point for the group's child, token, and
+    // deadline limits. `agent::run_with`'s own headless choke point
     // (`resolve_worker_budget`) never runs for a request that reaches here
     // -- `try_join_dashboard` is the fork point between the two forks of one
     // delegation -- so this is the ONLY place a pane spawn is counted
@@ -3559,11 +3640,22 @@ fn fulfill_spawn_request(
     // fallback would call the identical `admit_child` in `agent.rs` and get
     // refused there too, so falling back gains nothing and the requester
     // deserves the honest, non-retryable answer.
-    if let Some(group_id) = &req.work_group_id
-        && let Err(e) = super::group::admit_child(state, group_id)
-    {
-        return Err(SpawnRefusal::policy(e.to_string()));
-    }
+    let group_budget_tokens = if let Some(group_id) = &req.work_group_id {
+        match super::group::admit_child(state, group_id, now) {
+            Ok(group) => group
+                .token_budget
+                .map(|budget| budget.saturating_sub(group.spent_tokens)),
+            Err(e) if super::group::is_admission_exhausted(e.as_ref()) => {
+                return Err(SpawnRefusal::budget_exhausted(format!(
+                    "budget-exhausted: {e}"
+                )));
+            }
+            Err(e) => return Err(SpawnRefusal::policy(e.to_string())),
+        }
+    } else {
+        None
+    };
+    let budget_tokens = super::agent::resolve_budget_tokens(group_budget_tokens, req.budget_tokens);
     // Re-review (2026-08-27) finding 1: from here on, `req.work_group_id`
     // (if any) has genuinely been admitted -- every remaining fallible step
     // between here and the pane actually spawning must roll that admission
@@ -3816,6 +3908,7 @@ fn fulfill_spawn_request(
     pane.set_report_to(report_to_for(req, cfg));
     pane.set_intake_dir(pane_channel);
     pane.set_work_group_id(req.work_group_id.clone());
+    pane.set_budget_tokens(budget_tokens);
     // Issue #249: the same server-verified value just pushed into this
     // pane's own `turn_env` above, stored here too so this dashboard's own
     // in-process mail sweep (`sweep_one_pane`, which never spawns a new OS
@@ -3981,6 +4074,7 @@ fn drain_one_channel(
                 short: Some(short),
                 reason: None,
                 retryable: false,
+                budget_exhausted: false,
                 capability_warnings,
             },
             Err(refusal) => {
@@ -3997,6 +4091,7 @@ fn drain_one_channel(
                     short: None,
                     reason: Some(refusal.reason),
                     retryable: refusal.retryable,
+                    budget_exhausted: refusal.budget_exhausted,
                     capability_warnings: Vec::new(),
                 }
             }
@@ -4807,6 +4902,7 @@ fn spawn_restored_pane(
             }
             pane.set_intake_dir(pane_channel);
             pane.set_work_group_id(candidate.work_group_id.clone());
+            pane.set_budget_tokens(candidate.budget_tokens);
             // Issue #249/#250 review (Fix 4): restores this pane's own
             // dashboard-side parent lineage (mirrors `restored_pane_turn_
             // env`'s identical re-export into the restored child's own real
@@ -6059,6 +6155,7 @@ pub fn run_dashboard(
             }
             pane.on_turn_signal();
         }
+        enforce_pane_token_budgets(&mut panes, cfg, repo, &mut errors);
         // R2: an exited pane leaves here -- registry record released, socket
         // unpublished, nudge queue dropped -- rather than sitting in the
         // vector as a corpse for the rest of the session.
@@ -6067,6 +6164,7 @@ pub fn run_dashboard(
             &mut nudge_queues,
             cfg,
             state,
+            repo,
             &mut focused,
             &mut selected,
             &mut errors,
@@ -6316,6 +6414,7 @@ pub fn run_dashboard(
                                                     role: None,
                                                     parent_session: None,
                                                     work_group_id: None,
+                                                    budget_tokens: None,
                                                     // The Spawn overlay has no
                                                     // `--force` of its own (see
                                                     // `fulfill_spawn_request`'s
@@ -9582,6 +9681,7 @@ mod tests {
                 &mut queues,
                 &cfg,
                 &state,
+                &repo,
                 &mut focused,
                 &mut selected,
                 &mut errors,
@@ -9678,6 +9778,7 @@ mod tests {
                 &mut queues,
                 &cfg,
                 &state,
+                &repo,
                 &mut focused,
                 &mut selected,
                 &mut errors,
@@ -10406,6 +10507,7 @@ mod tests {
             role: None,
             parent_session: None,
             work_group_id: None,
+            budget_tokens: None,
             force: false,
             workdir: None,
         }
@@ -11743,6 +11845,7 @@ mod tests {
             scope: "test batch".to_string(),
             child_limit: 1,
             token_budget: None,
+            spent_tokens: 0,
             deadline_secs: None,
             completion_contract: String::new(),
             created_at: 0,
@@ -11789,6 +11892,172 @@ mod tests {
     }
 
     #[test]
+    fn fulfill_spawn_request_refuses_a_work_group_with_a_spent_token_budget() {
+        let repo = std::env::current_dir().expect("cwd");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let group = crate::commands::ctx::group::WorkGroup {
+            work_group_id: "wg-spent".to_string(),
+            parent_session_id: String::new(),
+            scope: "test batch".to_string(),
+            child_limit: 0,
+            token_budget: Some(400_000),
+            spent_tokens: 400_000,
+            deadline_secs: None,
+            completion_contract: String::new(),
+            created_at: 0,
+            closed_at: None,
+            admitted_children: 0,
+            sub_orchestrator_session: None,
+        };
+        crate::commands::ctx::group::create(&state, &group).expect("persist group");
+
+        let mut req = spawn_request("do the work", &repo);
+        req.work_group_id = Some("wg-spent".to_string());
+        let cfg = CtxConfig::default();
+        let mut panes = Vec::new();
+        let mut queues = Vec::new();
+        let mut errors = Vec::new();
+        let refusal = fulfill_spawn_request(
+            &req,
+            false,
+            None,
+            &mut panes,
+            &mut queues,
+            &cfg,
+            &state,
+            &repo,
+            (80, 24),
+            &tmp.path().join("requests"),
+            &mut errors,
+        )
+        .expect_err("the group budget is spent");
+
+        assert!(refusal.reason.contains("token budget"), "{refusal:?}");
+        assert!(refusal.budget_exhausted);
+        let group = crate::commands::ctx::group::load(&state, "wg-spent")
+            .expect("load")
+            .expect("present");
+        assert_eq!(group.admitted_children, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fulfill_spawn_request_applies_the_remaining_group_budget_to_the_pane() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().to_path_buf();
+        let group = crate::commands::ctx::group::WorkGroup {
+            work_group_id: "wg-pane-budget".to_string(),
+            parent_session_id: String::new(),
+            scope: "bounded pane".to_string(),
+            child_limit: 3,
+            token_budget: Some(400_000),
+            spent_tokens: 125_000,
+            deadline_secs: None,
+            completion_contract: String::new(),
+            created_at: crate::commands::ctx::state::now_secs(),
+            closed_at: None,
+            admitted_children: 0,
+            sub_orchestrator_session: None,
+        };
+        crate::commands::ctx::group::create(&state, &group).expect("create group");
+
+        let mut req = spawn_request("bounded work", &repo);
+        req.work_group_id = Some("wg-pane-budget".to_string());
+        req.budget_tokens = Some(300_000);
+        let cfg = CtxConfig {
+            agent_bin: Some("true".to_string()),
+            pace: crate::commands::ctx::config::PaceConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            ..CtxConfig::default()
+        };
+        let mut panes = Vec::new();
+        let mut queues = Vec::new();
+        let mut errors = Vec::new();
+
+        fulfill_spawn_request(
+            &req,
+            false,
+            None,
+            &mut panes,
+            &mut queues,
+            &cfg,
+            &state,
+            &repo,
+            (80, 24),
+            &tmp.path().join("requests"),
+            &mut errors,
+        )
+        .expect("spawn pane");
+
+        assert_eq!(panes.len(), 1, "pane spawned: {errors:?}");
+        assert_eq!(
+            panes[0].budget_tokens(),
+            Some(275_000),
+            "the group remainder tightens the request's own ceiling"
+        );
+        let _ = panes[0].finish_shutdown();
+    }
+
+    #[test]
+    fn fulfill_spawn_request_refuses_an_overdue_work_group() {
+        let repo = std::env::current_dir().expect("cwd");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let group = crate::commands::ctx::group::WorkGroup {
+            work_group_id: "wg-overdue".to_string(),
+            parent_session_id: String::new(),
+            scope: "test batch".to_string(),
+            child_limit: 0,
+            token_budget: None,
+            spent_tokens: 0,
+            deadline_secs: Some(1),
+            completion_contract: String::new(),
+            created_at: 1,
+            closed_at: None,
+            admitted_children: 0,
+            sub_orchestrator_session: None,
+        };
+        crate::commands::ctx::group::create(&state, &group).expect("create group");
+
+        let mut req = spawn_request("do the work", &repo);
+        req.work_group_id = Some("wg-overdue".to_string());
+        let cfg = CtxConfig::default();
+        let mut panes = Vec::new();
+        let mut queues = Vec::new();
+        let mut errors = Vec::new();
+        let refusal = fulfill_spawn_request(
+            &req,
+            false,
+            None,
+            &mut panes,
+            &mut queues,
+            &cfg,
+            &state,
+            &repo,
+            (80, 24),
+            &tmp.path().join("requests"),
+            &mut errors,
+        )
+        .expect_err("the group deadline elapsed");
+
+        assert!(refusal.reason.contains("deadline"), "{refusal:?}");
+        assert!(refusal.budget_exhausted);
+        assert_eq!(
+            crate::commands::ctx::group::load(&state, "wg-overdue")
+                .expect("load")
+                .expect("present")
+                .admitted_children,
+            0
+        );
+    }
+
+    #[test]
     fn dashboard_spawn_reroutes_an_exhausted_requested_harness_before_admission() {
         let repo = std::env::current_dir().expect("cwd");
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -11828,6 +12097,7 @@ mod tests {
             scope: "test batch".to_string(),
             child_limit: 0,
             token_budget: None,
+            spent_tokens: 0,
             deadline_secs: None,
             completion_contract: String::new(),
             created_at: 0,
@@ -12038,6 +12308,7 @@ mod tests {
             scope: "test batch".to_string(),
             child_limit: 3,
             token_budget: None,
+            spent_tokens: 0,
             deadline_secs: None,
             completion_contract: String::new(),
             created_at: 0,
@@ -13191,6 +13462,7 @@ mod tests {
             scope: "test batch".to_string(),
             child_limit: 3,
             token_budget: None,
+            spent_tokens: 0,
             deadline_secs: None,
             completion_contract: String::new(),
             created_at: 0,
@@ -14805,6 +15077,7 @@ mod tests {
                 &mut queues,
                 &cfg,
                 &state,
+                &repo,
                 &mut focused,
                 &mut selected,
                 &mut errors,
@@ -14853,6 +15126,172 @@ mod tests {
                 .any(|(record, _)| record.short == short),
             "so `zirv ctx sessions` no longer lists it at all"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reaping_a_grouped_pane_rolls_its_transcript_spend_into_the_group() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().to_path_buf();
+        let worker_cwd = tmp.path().join("worker-cwd");
+        std::fs::create_dir_all(&worker_cwd).expect("create worker cwd");
+        let group = crate::commands::ctx::group::WorkGroup {
+            work_group_id: "wg-reap-spend".to_string(),
+            parent_session_id: String::new(),
+            scope: "account a pane".to_string(),
+            child_limit: 3,
+            token_budget: Some(1_000),
+            spent_tokens: 10,
+            deadline_secs: None,
+            completion_contract: String::new(),
+            created_at: crate::commands::ctx::state::now_secs(),
+            closed_at: None,
+            admitted_children: 1,
+            sub_orchestrator_session: None,
+        };
+        crate::commands::ctx::group::create(&state, &group).expect("create group");
+
+        let session_id = "45454545-2222-4333-8444-555555555555";
+        let spec = PaneSpec {
+            agent_name: "claude".to_string(),
+            argv: trivial_argv(),
+            role: prompt::PromptRole::Worker,
+            verb: sessions::Verb::Dash,
+            session_id: session_id.to_string(),
+            title: "wrk claude".to_string(),
+        };
+        let mut pane = Pane::spawn(
+            spec,
+            &state,
+            &worker_cwd,
+            &repo,
+            (80, 24),
+            &[],
+            true,
+            pane::DEFAULT_IDLE_QUIET,
+        )
+        .expect("spawn");
+        pane.set_work_group_id(Some("wg-reap-spend".to_string()));
+
+        let cfg = CtxConfig::default();
+        let adapter = adapters::select(Some("claude"), &[], &cfg).expect("adapter");
+        let transcript = adapter.transcript_path(&SessionRef {
+            id: SessionId::parse(session_id),
+            cwd: worker_cwd,
+        });
+        std::fs::create_dir_all(transcript.parent().expect("transcript parent"))
+            .expect("create transcript dir");
+        std::fs::write(
+            &transcript,
+            r#"{"type":"assistant","message":{"usage":{"input_tokens":10,"cache_creation_input_tokens":20,"cache_read_input_tokens":30,"output_tokens":5}}}"#,
+        )
+        .expect("write transcript");
+
+        let mut panes = vec![pane];
+        let mut queues = vec![VecDeque::new()];
+        let mut errors = Vec::new();
+        let mut focused = 0;
+        let mut selected = 0;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline && !panes.is_empty() {
+            for pane in &mut panes {
+                pane.drain();
+            }
+            reap_ended_panes(
+                &mut panes,
+                &mut queues,
+                &cfg,
+                &state,
+                &repo,
+                &mut focused,
+                &mut selected,
+                &mut errors,
+                &mut Vec::new(),
+                &mut HashSet::new(),
+                &mut None,
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        assert!(panes.is_empty(), "pane was reaped: {errors:?}");
+        assert_eq!(
+            crate::commands::ctx::group::load(&state, "wg-reap-spend")
+                .expect("load")
+                .expect("group")
+                .spent_tokens,
+            75,
+            "10 existing + 10 input + 20 cache-create + 30 cache-read + 5 output"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dashboard_stops_a_pane_that_exhausts_its_token_budget() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().to_path_buf();
+        let session_id = "56565656-2222-4333-8444-555555555555";
+        let spec = PaneSpec {
+            agent_name: "claude".to_string(),
+            argv: vec!["sleep".to_string(), "30".to_string()],
+            role: prompt::PromptRole::Worker,
+            verb: sessions::Verb::Dash,
+            session_id: session_id.to_string(),
+            title: "wrk claude".to_string(),
+        };
+        let mut pane = Pane::spawn(
+            spec,
+            &state,
+            &repo,
+            &repo,
+            (80, 24),
+            &[],
+            true,
+            pane::DEFAULT_IDLE_QUIET,
+        )
+        .expect("spawn");
+        pane.set_budget_tokens(Some(50));
+
+        let cfg = CtxConfig::default();
+        let adapter = adapters::select(Some("claude"), &[], &cfg).expect("adapter");
+        let transcript = adapter.transcript_path(&SessionRef {
+            id: SessionId::parse(session_id),
+            cwd: repo.clone(),
+        });
+        std::fs::create_dir_all(transcript.parent().expect("transcript parent"))
+            .expect("create transcript dir");
+        std::fs::write(
+            &transcript,
+            r#"{"type":"assistant","message":{"usage":{"input_tokens":30,"cache_creation_input_tokens":10,"cache_read_input_tokens":5,"output_tokens":10}}}"#,
+        )
+        .expect("write transcript");
+
+        let mut panes = vec![pane];
+        let mut errors = Vec::new();
+        enforce_pane_token_budgets(&mut panes, &cfg, &repo, &mut errors);
+        assert!(
+            !matches!(panes[0].state(), PaneState::Ended(_)),
+            "the first hard-stop observation gives the same one-tick grace as exec"
+        );
+        enforce_pane_token_budgets(&mut panes, &cfg, &repo, &mut errors);
+
+        assert!(
+            matches!(
+                panes[0].state(),
+                PaneState::Ended(super::super::exec::EXIT_BUDGET_EXHAUSTED)
+            ),
+            "the pane must stop with the shared budget-exhausted exit"
+        );
+        assert!(
+            errors.iter().any(|e| e.contains("budget exhausted")),
+            "the dashboard should explain the stop: {errors:?}"
+        );
+        let _ = panes[0].finish_shutdown();
     }
 
     /// R4: the terminal-setup failure arms cannot be driven without a real
@@ -15758,6 +16197,7 @@ mod tests {
                 &mut queues,
                 &cfg,
                 &state,
+                &repo,
                 &mut focused,
                 &mut selected,
                 &mut errors,
