@@ -103,6 +103,13 @@ pub struct SpawnRequest {
     /// one-off delegation, which is every delegation before 2.35.0.
     #[serde(default)]
     pub work_group_id: Option<String>,
+    /// Token ceiling this pane must enforce. For a grouped request written
+    /// by `zirv agent`, this is already clamped to the group's remaining
+    /// budget; the dashboard clamps it again after serialized admission
+    /// because request files are untrusted and the group may have changed.
+    /// Older request files predate pane budgets and remain unbounded.
+    #[serde(default)]
+    pub budget_tokens: Option<u64>,
     /// Issue #155, Phase 6(c): whether the requester already accepted the
     /// spend at quota pressure (`agent.rs`'s own `--force`). `fulfill_spawn_
     /// request` applies the SAME `pace::spawn_gate` the requester's own
@@ -163,6 +170,11 @@ pub struct SpawnAck {
     pub reason: Option<String>,
     #[serde(default)]
     pub retryable: bool,
+    /// Whether a non-retryable admission refusal maps to zirv's existing
+    /// budget-exhausted process exit. Older acknowledgements default to the
+    /// existing generic failure.
+    #[serde(default)]
+    pub budget_exhausted: bool,
     /// Issue #230 item 3: the degraded/unsupported capabilities the spawned
     /// pane's own launch carries (`policy::PolicyReport::degraded_
     /// capabilities`), so a requester waiting on this exact ack
@@ -459,6 +471,7 @@ mod tests {
             role: None,
             parent_session: None,
             work_group_id: None,
+            budget_tokens: None,
             force: false,
             workdir: None,
         }
@@ -475,6 +488,7 @@ mod tests {
         assert_eq!(req.role, None);
         assert_eq!(req.parent_session, None);
         assert_eq!(req.work_group_id, None);
+        assert_eq!(req.budget_tokens, None);
         assert_eq!(
             req.workdir, None,
             "an unstated workdir must fall back to the accepted `cwd` (pre-#228 behaviour)"
@@ -599,6 +613,7 @@ mod tests {
             short: Some("bbbb2222".to_string()),
             reason: None,
             retryable: false,
+            budget_exhausted: false,
             capability_warnings: Vec::new(),
         };
         write_ack(&dir, &stem, &ack).expect("write_ack");
@@ -619,6 +634,7 @@ mod tests {
             short: Some("bbbb2222".to_string()),
             reason: None,
             retryable: false,
+            budget_exhausted: false,
             capability_warnings: vec![CapabilityWarning {
                 capability: "shell execution".to_string(),
                 mechanism: "no verified per-run mechanism".to_string(),
@@ -632,6 +648,26 @@ mod tests {
         let old = r#"{"ok":true,"short":"cccc3333","reason":null}"#;
         let parsed: SpawnAck = serde_json::from_str(old).expect("older acks still parse");
         assert!(parsed.capability_warnings.is_empty());
+        assert!(!parsed.budget_exhausted);
+    }
+
+    #[test]
+    fn an_acks_structured_exit_round_trips() {
+        let (_tmp, dir) = dir();
+        let ack = SpawnAck {
+            ok: false,
+            short: None,
+            reason: Some("budget-exhausted".to_string()),
+            retryable: false,
+            budget_exhausted: true,
+            capability_warnings: Vec::new(),
+        };
+
+        write_ack(&dir, "req-budget", &ack).expect("write_ack");
+        assert_eq!(
+            wait_for_ack(&dir, "req-budget", Duration::from_secs(1)),
+            Some(ack)
+        );
     }
 
     #[test]
@@ -754,6 +790,7 @@ mod tests {
                 short: Some("bbbb2222".to_string()),
                 reason: None,
                 retryable: false,
+                budget_exhausted: false,
                 capability_warnings: Vec::new(),
             },
         )

@@ -51,6 +51,12 @@ pub enum PaneState {
     Ended(i32),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaneBudgetNotice {
+    SoftWarn { used: u64, limit: u64 },
+    HardStop { used: u64, limit: u64 },
+}
+
 /// What `Pane::spawn` needs to launch and register a pane. `argv` is the
 /// full program-plus-arguments invocation -- built by the caller from an
 /// adapter's `interactive_cmd`/`build_launch`, prompt composition and
@@ -801,6 +807,12 @@ pub struct Pane {
     /// Also what `dash::mod::on_quit` persists into the restore roster, so a
     /// restored pane comes back inside the same group.
     work_group_id: Option<String>,
+    /// Per-child token ceiling carried by the spawn request. Evaluated from
+    /// this pane's transcript with the same `agent::budget_state` and
+    /// one-tick hard-stop grace as the headless exec supervisor.
+    budget_tokens: Option<u64>,
+    budget_soft_warned: bool,
+    budget_grace_given: bool,
     /// Issue #249: this pane's own server-verified supervising session
     /// (`dash::mod::fulfill_spawn_request`'s `verified_parent` -- the
     /// requester identity the per-pane intake-channel gate already proved,
@@ -1040,6 +1052,9 @@ impl Pane {
             report_to: None,
             intake_dir: None,
             work_group_id: None,
+            budget_tokens: None,
+            budget_soft_warned: false,
+            budget_grace_given: false,
             parent_session: None,
             report_reminder_sent: false,
             pending_submit: None,
@@ -1498,6 +1513,59 @@ impl Pane {
     /// The work group this pane belongs to, if any.
     pub fn work_group_id(&self) -> Option<&str> {
         self.work_group_id.as_deref()
+    }
+
+    pub fn set_budget_tokens(&mut self, budget: Option<u64>) {
+        self.budget_tokens = budget;
+        self.budget_soft_warned = false;
+        self.budget_grace_given = false;
+    }
+
+    pub fn budget_tokens(&self) -> Option<u64> {
+        self.budget_tokens
+    }
+
+    /// Applies the pane's transcript usage to the same budget state machine
+    /// as a headless worker. A naturally failed child keeps its own exit;
+    /// a clean child whose final transcript is over budget becomes exit 77.
+    pub fn enforce_token_budget(
+        &mut self,
+        usage: &super::super::event::TranscriptUsage,
+        quit_sequence: &str,
+    ) -> CtxResult<Option<PaneBudgetNotice>> {
+        let Some(limit) = self.budget_tokens else {
+            return Ok(None);
+        };
+        let budget = super::super::agent::WorkerBudget {
+            tokens: Some(limit),
+            tool_calls: None,
+        };
+        match super::super::agent::budget_state(&budget, usage, 0) {
+            super::super::agent::BudgetState::Ok => Ok(None),
+            super::super::agent::BudgetState::SoftWarn { used, limit } => {
+                if self.budget_soft_warned {
+                    return Ok(None);
+                }
+                self.budget_soft_warned = true;
+                Ok(Some(PaneBudgetNotice::SoftWarn { used, limit }))
+            }
+            super::super::agent::BudgetState::HardStop { used, limit } => {
+                if self.exit_code.is_some_and(|code| code != 0) {
+                    return Ok(None);
+                }
+                if self.exit_code == Some(0) {
+                    self.exit_code = Some(super::super::exec::EXIT_BUDGET_EXHAUSTED);
+                    return Ok(Some(PaneBudgetNotice::HardStop { used, limit }));
+                }
+                if !self.budget_grace_given {
+                    self.budget_grace_given = true;
+                    return Ok(None);
+                }
+                self.shutdown(quit_sequence)?;
+                self.exit_code = Some(super::super::exec::EXIT_BUDGET_EXHAUSTED);
+                Ok(Some(PaneBudgetNotice::HardStop { used, limit }))
+            }
+        }
     }
 
     /// Issue #249: records this pane's own server-verified supervising

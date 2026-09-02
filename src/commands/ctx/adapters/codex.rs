@@ -5,6 +5,8 @@ use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use serde_json::Value;
+
 use super::super::CtxResult;
 use super::super::event::{
     Capabilities, NormalizedEvent, SessionId, SessionRef, StructuralContext, TranscriptUsage,
@@ -1043,6 +1045,23 @@ impl AgentAdapter for CodexAdapter {
         }
     }
 
+    fn model_strength(&self, model: &str) -> Option<u8> {
+        let model = model.to_lowercase();
+        if model.contains("gpt-5.6-sol") {
+            return Some(4);
+        }
+        if model.contains("gpt-5.6-terra") {
+            return Some(3);
+        }
+        if model.contains("gpt-5.6-luna") {
+            return Some(2);
+        }
+        if model.contains("gpt-5.4-mini") {
+            return Some(1);
+        }
+        None
+    }
+
     /// Codex's descriptors come from the repo's **recorded** facts
     /// (docs/superpowers/notes/2026-07-31-codex-cli-facts.md, and the
     /// `distiller_cmd` notes above), not from a live CLI: codex is not
@@ -1439,8 +1458,54 @@ impl AgentAdapter for CodexAdapter {
                 }
                 _ => {}
             }
+            let Ok(row) = serde_json::from_str::<Value>(line.trim()) else {
+                continue;
+            };
+            match row.get("type").and_then(Value::as_str) {
+                Some("turn_context") => {
+                    if let Some(id) = row
+                        .get("payload")
+                        .and_then(|payload| payload.get("model"))
+                        .and_then(Value::as_str)
+                    {
+                        events.push(NormalizedEvent::ModelId { id: id.to_string() });
+                    }
+                }
+                Some("event_msg")
+                    if row
+                        .get("payload")
+                        .and_then(|payload| payload.get("type"))
+                        .and_then(Value::as_str)
+                        == Some("task_complete") =>
+                {
+                    if let Some(message) = row
+                        .get("payload")
+                        .and_then(|payload| payload.get("error"))
+                        .and_then(|error| error.get("message"))
+                        .and_then(Value::as_str)
+                    {
+                        events.push(NormalizedEvent::ProviderError {
+                            class: super::classify_provider_error(message),
+                        });
+                    }
+                }
+                _ => {}
+            }
         }
         events
+    }
+
+    fn model_hint(&self, jsonl: &str) -> Option<String> {
+        jsonl.lines().rev().find_map(|line| {
+            let row = serde_json::from_str::<Value>(line.trim()).ok()?;
+            if row.get("type").and_then(Value::as_str) != Some("turn_context") {
+                return None;
+            }
+            row.get("payload")?
+                .get("model")?
+                .as_str()
+                .map(str::to_string)
+        })
     }
 
     /// Only `assistant_texts` is populated, from verified
@@ -1746,8 +1811,53 @@ mod tests {
                     text: String::new(),
                     input_tokens: 3400,
                 },
+                NormalizedEvent::ProviderError {
+                    class: crate::commands::ctx::event::ProviderErrorClass::Other,
+                },
             ],
             "got {events:?}"
+        );
+    }
+
+    #[test]
+    fn provider_error_and_model_events_are_parsed_from_the_recorded_fixture() {
+        use crate::commands::ctx::event::ProviderErrorClass;
+
+        let jsonl = fixture("codex-provider-errors-model-drift.jsonl");
+        let events = CodexAdapter::new(None).parse_events(&jsonl);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    NormalizedEvent::ProviderError {
+                        class: ProviderErrorClass::Overflow
+                    }
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    NormalizedEvent::ProviderError {
+                        class: ProviderErrorClass::RateLimit
+                    }
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    NormalizedEvent::ModelId { id } => Some(id.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec!["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-terra"]
         );
     }
 

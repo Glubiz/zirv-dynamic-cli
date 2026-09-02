@@ -202,6 +202,14 @@ pub fn parse_events(jsonl: &str) -> Vec<NormalizedEvent> {
             continue;
         }
 
+        if row.get("isApiErrorMessage").and_then(Value::as_bool) == Some(true) {
+            let message = row.get("message").cloned().unwrap_or(Value::Null);
+            events.push(NormalizedEvent::ProviderError {
+                class: super::classify_provider_error(&text_of(&message)),
+            });
+            continue;
+        }
+
         match row.get("type").and_then(Value::as_str) {
             Some("user") => {
                 if row.get("isMeta").and_then(Value::as_bool) == Some(true) {
@@ -247,6 +255,9 @@ pub fn parse_events(jsonl: &str) -> Vec<NormalizedEvent> {
             }
             Some("assistant") => {
                 let message = row.get("message").cloned().unwrap_or(Value::Null);
+                if let Some(id) = message.get("model").and_then(Value::as_str) {
+                    events.push(NormalizedEvent::ModelId { id: id.to_string() });
+                }
                 let input_tokens = message.get("usage").map(context_tokens_of).unwrap_or(0);
                 events.push(NormalizedEvent::AssistantFinal {
                     text: text_of(&message),
@@ -967,6 +978,25 @@ impl AgentAdapter for ClaudeAdapter {
         cmd
     }
 
+    fn headless_resume_cmd(
+        &self,
+        prompt: Option<&str>,
+        session_id: &str,
+        extra: &[String],
+    ) -> Option<Command> {
+        let mut cmd = self.base();
+        cmd.arg("-p");
+        if let Some(prompt) = prompt {
+            cmd.arg(prompt);
+        }
+        cmd.arg("--resume").arg(session_id).args(extra);
+        Some(cmd)
+    }
+
+    fn supports_headless_compact(&self) -> bool {
+        true
+    }
+
     fn interactive_cmd(&self, initial_prompt: Option<&str>, extra: &[String]) -> Command {
         let mut cmd = self.base();
         if let Some(prompt) = initial_prompt {
@@ -1452,6 +1482,23 @@ impl AgentAdapter for ClaudeAdapter {
         }
     }
 
+    fn model_strength(&self, model: &str) -> Option<u8> {
+        let model = model.to_lowercase();
+        if model.contains("fable") || model.contains("mythos") {
+            return Some(4);
+        }
+        if model.contains("opus") {
+            return Some(3);
+        }
+        if model.contains("sonnet") {
+            return Some(2);
+        }
+        if model.contains("haiku") {
+            return Some(1);
+        }
+        None
+    }
+
     fn transcript_path(&self, session: &SessionRef) -> PathBuf {
         let projects = self.home_dir().join(".claude").join("projects");
         let computed = projects
@@ -1920,6 +1967,99 @@ mod tests {
     fn compact_boundary_becomes_a_compaction_event() {
         let jsonl = r#"{"type":"system","subtype":"compact_boundary","compactMetadata":{"trigger":"manual"}}"#;
         assert_eq!(parse_events(jsonl), vec![NormalizedEvent::Compaction]);
+    }
+
+    #[test]
+    fn api_error_classification_checks_exclusions_before_overflow_patterns() {
+        use crate::commands::ctx::event::ProviderErrorClass;
+
+        let cases = [
+            (
+                "API Error: prompt is too long: 213462 tokens > 200000 maximum",
+                ProviderErrorClass::Overflow,
+            ),
+            (
+                "API Error: 413 {\"error\":{\"type\":\"request_too_large\"}}",
+                ProviderErrorClass::Overflow,
+            ),
+            (
+                "Your input exceeds the context window of this model",
+                ProviderErrorClass::Overflow,
+            ),
+            (
+                "Requested token count exceeds the model's maximum context length of 131072 tokens",
+                ProviderErrorClass::Overflow,
+            ),
+            (
+                "Throttling error: Too many tokens, please wait before trying again",
+                ProviderErrorClass::RateLimit,
+            ),
+            (
+                "rate limit: prompt is too long",
+                ProviderErrorClass::RateLimit,
+            ),
+            (
+                "too many requests: request_too_large",
+                ProviderErrorClass::RateLimit,
+            ),
+            (
+                "Service unavailable: request_too_large",
+                ProviderErrorClass::Other,
+            ),
+            ("API Error: connection reset", ProviderErrorClass::Other),
+        ];
+
+        for (message, expected) in cases {
+            assert_eq!(
+                super::super::classify_provider_error(message),
+                expected,
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_error_and_model_events_are_parsed_from_the_recorded_fixture() {
+        use crate::commands::ctx::event::ProviderErrorClass;
+
+        let jsonl =
+            std::fs::read_to_string(fixture_path("claude-provider-errors-model-drift.jsonl"))
+                .expect("fixture");
+        let events = parse_events(&jsonl);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    NormalizedEvent::ProviderError {
+                        class: ProviderErrorClass::Overflow
+                    }
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    NormalizedEvent::ProviderError {
+                        class: ProviderErrorClass::RateLimit
+                    }
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    NormalizedEvent::ModelId { id } => Some(id.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec!["claude-opus-5", "claude-sonnet-5"]
+        );
     }
 
     #[test]

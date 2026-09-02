@@ -1771,8 +1771,10 @@ pub fn advance_with_evidence(
                     } else {
                         "zirv test changed"
                     };
+                    let announcement =
+                        super::verification::gate_announcement(state_dir, &state.repo, final_only);
                     return Err(format!(
-                        "step '{}' requires fresh passing evidence for the current change set; run `{command}`",
+                        "step '{}' requires fresh passing evidence for the current change set; run `{command}`\n{announcement}",
                         current.id
                     )
                     .into());
@@ -4141,6 +4143,7 @@ mod tests {
                 duration_ms: 1,
                 failure_output: None,
                 failure_test_names: Vec::new(),
+                inconclusive_reason: None,
             }],
         };
         super::super::verification::save_report(&state_dir, &evidence_report).unwrap();
@@ -4544,6 +4547,7 @@ mod tests {
                 duration_ms: 1,
                 failure_output: None,
                 failure_test_names: Vec::new(),
+                inconclusive_reason: None,
             }],
         };
         super::super::verification::save_report(&state_dir, &stale_passing_report).unwrap();

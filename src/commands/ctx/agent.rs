@@ -106,7 +106,7 @@ pub struct AgentArgs {
     pub workdir: Option<PathBuf>,
     /// Issue #228: forces the headless supervised path even from inside a
     /// dashboard pane, skipping `try_join_dashboard` entirely. Preserves the
-    /// pre-#228 capability of running with restart/timeout/budget ceilings
+    /// pre-#228 capability of running with restart/timeout/tool-call ceilings
     /// or arbitrary trailing flags from inside a dashboard -- but only on
     /// explicit request now, since any of those would otherwise hard-error
     /// rather than silently demote (see `try_join_dashboard`'s own doc
@@ -379,7 +379,7 @@ pub fn budget_state(
     usage: &TranscriptUsage,
     tool_calls: u32,
 ) -> BudgetState {
-    let spent = usage.context_total().saturating_add(usage.output_tokens);
+    let spent = token_spend(usage);
     let mut worst = BudgetState::Ok;
     let mut consider = |used: u64, limit: u64| {
         if limit == 0 {
@@ -404,6 +404,10 @@ pub fn budget_state(
         consider(u64::from(tool_calls), u64::from(limit));
     }
     worst
+}
+
+pub(crate) fn token_spend(usage: &TranscriptUsage) -> u64 {
+    usage.context_total().saturating_add(usage.output_tokens)
 }
 
 /// A group's own token budget is a ceiling its children may only TIGHTEN. An
@@ -594,15 +598,16 @@ pub(crate) fn spawn_blocked(gate: &pace::SpawnGate, force: bool) -> bool {
 }
 
 /// Resolves this delegation's [`WorkerBudget`] from `--budget-tokens`/
-/// `--max-tool-calls` and, when `--group` names one, that group's own token
-/// ceiling -- which `--budget-tokens` may only tighten (`resolve_budget_
-/// tokens`). An unknown or closed group is a hard error: silently ignoring
-/// it would let a mistyped `--group` run unbounded work a batch's own budget
-/// was meant to cap. `--max-tool-calls` has no group-level counterpart
-/// (`group::WorkGroup` carries no such field) and so is never clamped.
+/// `--max-tool-calls` and, when `--group` names one, that group's token
+/// budget's remaining ceiling -- which `--budget-tokens` may only tighten
+/// (`resolve_budget_tokens`). An unknown or closed group is a hard error:
+/// silently ignoring it would let a mistyped `--group` run unbounded work a
+/// batch's own budget was meant to cap. `--max-tool-calls` has no group-level
+/// counterpart (`group::WorkGroup` carries no such field) and so is never
+/// clamped.
 ///
-/// Issue #155 review finding D2: this is also the headless admission choke
-/// point for `child_limit` -- `group::admit_child` is called here, once,
+/// This is also the headless admission choke point for the group's child,
+/// token, and deadline limits -- `group::admit_child` is called here, once,
 /// only on the path that actually runs the delegation headlessly. The
 /// dashboard-pane fork of the same request (`agent::try_join_dashboard`,
 /// tried BEFORE this function is ever reached -- see `run_with`) never
@@ -613,14 +618,14 @@ fn resolve_worker_budget(env: EnvLookup<'_>, args: &AgentArgs) -> CtxResult<Work
     let group_token_budget = match &args.group {
         Some(id) => {
             let state = super::state::StateDir::resolve(env)?;
-            let group = super::group::load(&state, id)?.ok_or_else(|| {
-                format!("zirv ctx agent: no work group '{id}' -- create one with `zirv ctx group create`")
-            })?;
-            if group.closed_at.is_some() {
-                return Err(format!("zirv ctx agent: work group '{id}' is closed").into());
-            }
-            super::group::admit_child(&state, id).map_err(|e| format!("zirv ctx agent: {e}"))?;
-            group.token_budget
+            let group = match super::group::admit_child(&state, id, super::state::now_secs()) {
+                Ok(group) => group,
+                Err(e) if super::group::is_admission_exhausted(e.as_ref()) => return Err(e),
+                Err(e) => return Err(format!("zirv ctx agent: {e}").into()),
+            };
+            group
+                .token_budget
+                .map(|budget| budget.saturating_sub(group.spent_tokens))
         }
         None => None,
     };
@@ -628,6 +633,21 @@ fn resolve_worker_budget(env: EnvLookup<'_>, args: &AgentArgs) -> CtxResult<Work
         tokens: resolve_budget_tokens(group_token_budget, args.budget_tokens),
         tool_calls: args.max_tool_calls,
     })
+}
+
+/// Preview of the ceiling an honest dashboard request carries. The
+/// dashboard still performs serialized admission and clamps this value
+/// against the then-current group record, so a forged or stale request can
+/// never widen the group's remaining budget.
+fn dashboard_budget_tokens(env: EnvLookup<'_>, args: &AgentArgs) -> Option<u64> {
+    let group_tokens = args.group.as_deref().and_then(|id| {
+        let state = super::state::StateDir::resolve(env).ok()?;
+        let group = super::group::load(&state, id).ok()??;
+        group
+            .token_budget
+            .map(|budget| budget.saturating_sub(group.spent_tokens))
+    });
+    resolve_budget_tokens(group_tokens, args.budget_tokens)
 }
 
 /// Everything wrong with `flags` that can be seen without running anything.
@@ -1027,7 +1047,12 @@ fn answer_for_ack<W: Write>(ack: spawnreq::SpawnAck, w: &mut W) -> Option<CtxRes
         eprintln!("zirv ctx agent: {reason}; running headless");
         return None;
     }
-    Some(writeln!(w, "{reason}").map(|_| 1).map_err(|e| e.into()))
+    let code = if ack.budget_exhausted {
+        exec::EXIT_BUDGET_EXHAUSTED
+    } else {
+        1
+    };
+    Some(writeln!(w, "{reason}").map(|_| code).map_err(|e| e.into()))
 }
 
 /// O3: a request that was claimed but not acked within [`DASH_ACK_TIMEOUT`]
@@ -1098,7 +1123,7 @@ const EXIT_DASH_UNCONFIRMED: i32 = 1;
 /// task may run (O2).
 ///
 /// Issue #228: options a pane structurally cannot honour (`--max-restarts`/
-/// `--timeout-secs`/`--budget-tokens`/`--max-tool-calls`/`--flags` other
+/// `--timeout-secs`/`--max-tool-calls`/`--flags` other
 /// than a lone `--model` pin) USED TO print a notice and silently demote to
 /// headless (F9) -- an operator who was inside a dashboard specifically to
 /// get a pane could lose that without ever noticing. Now `Some(Err(_))`,
@@ -1137,15 +1162,9 @@ fn try_join_dashboard<W: Write>(
     // declines: honouring some of what the operator typed and dropping the
     // rest would be worse than not using the dashboard at all.
     let pinned_model = super::adapters::model_only_flags(&args.flags);
-    // Issue #155, Phase 5(d): `--budget-tokens`/`--max-tool-calls` join the
-    // same decline list as `--max-restarts`/`--timeout-secs`, for the same
-    // reason -- a pane is not a supervised headless run and `SpawnRequest`
-    // carries neither ceiling, so silently dropping one would be worse than
-    // not using the dashboard at all. `--role`/`--group` deliberately do
-    // NOT join this list: both ride in the request itself (`spawnreq::
-    // SpawnRequest::role`/`work_group_id`, below) and the dashboard's own
-    // `fulfill_spawn_request` re-validates both at the authority side, the
-    // same as every other field a pane can honour.
+    // `--max-tool-calls` remains unsupported because dashboard panes have no
+    // verified tool-call counter. Token ceilings do travel on the request
+    // and are enforced from the pane's transcript.
     // Issue #228: this used to print a notice and silently fall back to
     // headless (F9) -- an operator who explicitly asked for a pane-capable
     // run (by being inside a dashboard at all) got a demotion they might
@@ -1162,9 +1181,6 @@ fn try_join_dashboard<W: Write>(
     }
     if args.timeout_secs.is_some() {
         offending.push("--timeout-secs".to_string());
-    }
-    if args.budget_tokens.is_some() {
-        offending.push("--budget-tokens".to_string());
     }
     if args.max_tool_calls.is_some() {
         offending.push("--max-tool-calls".to_string());
@@ -1223,6 +1239,7 @@ fn try_join_dashboard<W: Write>(
         // from the same `ZIRV_CTX_SESSION` env var today.
         parent_session: super::mail::session_identity(env),
         work_group_id: args.group.clone(),
+        budget_tokens: dashboard_budget_tokens(env, args),
         // Issue #155, Phase 6(c): this process's own spawn gate (`run_with`,
         // above) already evaluated `--force` against the reading it had
         // before this request was ever written. Carrying it forward lets
@@ -1673,7 +1690,7 @@ pub fn run_with<W: Write>(
     // Issue #228: `--headless` skips the dashboard-join attempt entirely,
     // even from inside a live dashboard -- the one way to keep every option
     // `try_join_dashboard` would otherwise hard-error on (restart budget,
-    // wall-clock timeout, budget ceilings, arbitrary trailing flags) while
+    // wall-clock timeout, tool-call ceilings, arbitrary trailing flags) while
     // still asking for a pane-capable session to host the supervised run.
     if deferred_reset.is_none()
         && !args.headless
@@ -1798,6 +1815,11 @@ pub fn run_with<W: Write>(
             // Finding 4: nothing ran, so a group minted moments ago for this
             // delegation must not outlive it.
             discard_minted_group();
+            if super::group::is_admission_exhausted(e.as_ref()) {
+                let code = exec::EXIT_BUDGET_EXHAUSTED;
+                writeln!(w, "{}: {e}", delegation_outcome(code))?;
+                return Ok(code);
+            }
             return Err(e);
         }
     };
@@ -1858,10 +1880,9 @@ pub fn run_with<W: Write>(
         }
     };
     // Issue #170: this delegation's scope is done -- successfully or not --
-    // the moment its supervised run exits (completion contract and spend are
-    // both left for a reviewer to check against `zirv ctx group status`,
-    // never machine-verified -- see `WorkGroup::completion_contract`'s own
-    // doc comment). Closes the group only when THIS session is the one that
+    // the moment its supervised run exits. The free-text completion contract
+    // remains reviewer-checked; token spend is rolled up below. Closes the
+    // group only when THIS session is the one that
     // actually claimed it above, never a group some other, concurrent
     // claimant owns -- an operator's own shared `--group` across several
     // unrelated invocations must not be closed out from under whichever of
@@ -1925,6 +1946,9 @@ pub fn run_with<W: Write>(
             code,
             outcome,
         );
+        if let Some(id) = args.group.as_deref() {
+            let _ = super::group::add_spent_tokens(&state_dir, id, token_spend(&total));
+        }
         let route: Vec<String> = execution_report
             .segments
             .iter()
@@ -2574,6 +2598,7 @@ mod tests {
             scope: "test batch".to_string(),
             child_limit,
             token_budget: None,
+            spent_tokens: 0,
             deadline_secs: None,
             completion_contract: String::new(),
             created_at: 0,
@@ -2581,6 +2606,72 @@ mod tests {
             admitted_children: admitted,
             sub_orchestrator_session: None,
         }
+    }
+
+    fn create_work_group_with_spend(
+        state: &crate::commands::ctx::state::StateDir,
+        id: &str,
+        budget: u64,
+        spent: u64,
+    ) {
+        let mut group = sample_work_group(id, 3, 0);
+        group.token_budget = Some(budget);
+        group.spent_tokens = spent;
+        crate::commands::ctx::group::create(state, &group).expect("create group");
+    }
+
+    #[test]
+    fn resolve_worker_budget_uses_only_the_groups_remaining_tokens() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = crate::commands::ctx::state::StateDir::from_root(tmp.path().to_path_buf());
+        create_work_group_with_spend(&state, "wg-remaining", 400_000, 250_000);
+        create_work_group_with_spend(&state, "wg-tightened", 400_000, 250_000);
+        let env: HashMap<String, String> = [(
+            crate::commands::ctx::state::STATE_ENV.to_string(),
+            tmp.path().display().to_string(),
+        )]
+        .into();
+
+        let mut remaining = args_for("claude", "go");
+        remaining.group = Some("wg-remaining".to_string());
+        assert_eq!(
+            resolve_worker_budget(&|k| env.get(k).cloned(), &remaining)
+                .expect("resolve remaining budget")
+                .tokens,
+            Some(150_000)
+        );
+
+        let mut tightened = args_for("claude", "go");
+        tightened.group = Some("wg-tightened".to_string());
+        tightened.budget_tokens = Some(100_000);
+        assert_eq!(
+            resolve_worker_budget(&|k| env.get(k).cloned(), &tightened)
+                .expect("resolve tightened budget")
+                .tokens,
+            Some(100_000),
+            "an explicit child budget may still tighten the remaining group budget"
+        );
+    }
+
+    #[test]
+    fn exhausted_group_admission_returns_the_budget_exit_and_outcome() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state_path = tmp.path().join("state");
+        let state = crate::commands::ctx::state::StateDir::from_root(state_path.clone());
+        create_work_group_with_spend(&state, "wg-spent", 400_000, 400_000);
+        let mut env = base_env(&state_path);
+        env.insert("ZIRV_CTX_PACE".to_string(), "false".to_string());
+        let mut args = args_for("claude", "go");
+        args.group = Some("wg-spent".to_string());
+        let mut out = Vec::new();
+
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned())
+            .expect("budget exhaustion is a structured exit");
+
+        assert_eq!(code, exec::EXIT_BUDGET_EXHAUSTED);
+        assert_eq!(delegation_outcome(code), "budget-exhausted");
     }
 
     /// Issue #155 review finding D2: `resolve_worker_budget` is the headless
@@ -4240,6 +4331,47 @@ mod tests {
         assert!(rows.iter().any(|row| row.contains("gpt-5.6-terra")));
     }
 
+    #[test]
+    fn a_finished_child_rolls_its_spend_into_the_group_exactly_once() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state_path = tmp.path().join("state");
+        let state = crate::commands::ctx::state::StateDir::from_root(state_path.clone());
+        create_work_group_with_spend(&state, "wg-roll-up", 1_000_000, 10);
+        let mut env = base_env(&state_path);
+        env.insert("ZIRV_CTX_PACE".to_string(), "false".to_string());
+        let mut args = args_for("claude", "do the work");
+        args.group = Some("wg-roll-up".to_string());
+        unsafe {
+            std::env::set_var("FAKE_AGENT_MODE", "healthy");
+        }
+
+        let code = run_with(&args, &mut Vec::new(), tmp.path(), &|k| env.get(k).cloned());
+
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE");
+        }
+        assert_eq!(code.expect("runs"), 0);
+        let rows = crate::commands::ctx::log::read_delegations(&state, 10);
+        let child_spend = rows.iter().fold(0_u64, |total, row| {
+            total
+                .saturating_add(row.input_tokens)
+                .saturating_add(row.cache_creation_input_tokens)
+                .saturating_add(row.cache_read_input_tokens)
+                .saturating_add(row.output_tokens)
+        });
+        assert!(child_spend > 0, "fixture must report real usage");
+        assert_eq!(
+            crate::commands::ctx::group::load(&state, "wg-roll-up")
+                .expect("load")
+                .expect("present")
+                .spent_tokens,
+            10 + child_spend,
+            "the completion path must add the child's spend once"
+        );
+    }
+
     /// Issue #155, Phase 2: the end-to-end write, against a real
     /// `AgentAdapter` (`ClaudeAdapter`) and a real fake-agent transcript --
     /// not just `log.rs`'s own isolated `append_delegation`/`tail_
@@ -4846,11 +4978,8 @@ mod tests {
         );
     }
 
-    /// Issue #155, Phase 5(c): unlike `--budget-tokens`/`--max-tool-calls`
-    /// (which decline the dashboard join, see `options_a_pane_cannot_honour_
-    /// decline_the_dashboard_join`), `--role`/`--group` DO travel -- they
-    /// ride on the `SpawnRequest` itself, for `fulfill_spawn_request`'s own
-    /// depth cap and budget resolution to read on the fulfilment side.
+    /// Issue #155, Phase 5(c): `--role`/`--group` travel on the request for
+    /// the fulfilment side's depth cap and budget resolution.
     #[test]
     fn role_and_group_join_the_dashboard_and_travel_in_the_request() {
         let tmp = crate::commands::ctx::testenv::repo();
@@ -4888,6 +5017,50 @@ mod tests {
         );
     }
 
+    #[test]
+    fn dashboard_group_request_carries_only_the_remaining_token_budget() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let (requests_dir, env) = live_dashboard_dir(tmp.path());
+        let state = crate::commands::ctx::state::StateDir::from_root(tmp.path().join("state"));
+        let group = crate::commands::ctx::group::WorkGroup {
+            work_group_id: "wg-remaining".to_string(),
+            parent_session_id: String::new(),
+            scope: "bounded dashboard work".to_string(),
+            child_limit: 3,
+            token_budget: Some(400_000),
+            spent_tokens: 125_000,
+            deadline_secs: None,
+            completion_contract: String::new(),
+            created_at: crate::commands::ctx::state::now_secs(),
+            closed_at: None,
+            admitted_children: 0,
+            sub_orchestrator_session: None,
+        };
+        crate::commands::ctx::group::create(&state, &group).expect("create group");
+
+        let responder = std::thread::spawn({
+            let dir = requests_dir.clone();
+            move || respond_to_next_request(dir, r#"{"ok":true,"short":"abcd1234","reason":null}"#)
+        });
+
+        let mut args = joinable_args("claude", "bounded work");
+        args.group = Some("wg-remaining".to_string());
+        let code = run_with(&args, &mut Vec::new(), tmp.path(), &|k| env.get(k).cloned())
+            .expect("dashboard join runs");
+        let request_body = responder.join().expect("responder thread");
+
+        assert_eq!(code, 0);
+        let req: spawnreq::SpawnRequest =
+            serde_json::from_str(&request_body).expect("the request parses");
+        assert_eq!(
+            req.budget_tokens,
+            Some(275_000),
+            "the pane request must carry the group's remaining ceiling"
+        );
+    }
+
     /// A refusal ack (the dashboard's own `cfg.agents.refusal` gate, or an
     /// unknown/unready adapter) prints the reason and returns `Ok(1)` --
     /// still short-circuiting the headless path, since the dashboard already
@@ -4918,6 +5091,31 @@ mod tests {
         assert_eq!(code, 1);
         let output = String::from_utf8_lossy(&out);
         assert!(output.contains("disabled"), "got {output}");
+    }
+
+    #[test]
+    fn dashboard_budget_refusal_returns_the_budget_exhausted_exit() {
+        let mut out = Vec::new();
+        let result = answer_for_ack(
+            spawnreq::SpawnAck {
+                ok: false,
+                short: None,
+                reason: Some("budget-exhausted: work group budget is spent".to_string()),
+                retryable: false,
+                budget_exhausted: true,
+                capability_warnings: Vec::new(),
+            },
+            &mut out,
+        )
+        .expect("a policy refusal is final")
+        .expect("writes the result");
+
+        assert_eq!(result, exec::EXIT_BUDGET_EXHAUSTED);
+        assert!(
+            String::from_utf8(out)
+                .expect("utf8")
+                .contains("budget-exhausted")
+        );
     }
 
     /// Security review round 2 (Finding 4): `--scope` mints a group, and a
@@ -5030,7 +5228,7 @@ mod tests {
         );
     }
 
-    /// Issue #228: `--max-restarts`, `--timeout-secs`, either budget ceiling
+    /// Issue #228: `--max-restarts`, `--timeout-secs`, `--max-tool-calls`
     /// and trailing `-- flags` beyond a lone `--model` pin are all honoured
     /// by `exec::run_with` and carried by nothing in a `SpawnRequest`. This
     /// USED TO print a notice and silently fall back to headless (F9) --
@@ -5071,12 +5269,6 @@ mod tests {
                     ]
                 },
                 "--verbose",
-            ),
-            // Issue #155, Phase 5(d): a pane cannot honour either budget
-            // ceiling, same reasoning as `max_restarts`/`timeout_secs` above.
-            (
-                |a: &mut AgentArgs| a.budget_tokens = Some(100_000),
-                "--budget-tokens",
             ),
             (
                 |a: &mut AgentArgs| a.max_tool_calls = Some(50),

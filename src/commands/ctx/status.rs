@@ -28,6 +28,33 @@ fn label(colour: bool, title: &str) -> String {
     style::paint(title, Tone::Emphasis, colour)
 }
 
+/// Keep a transcript-derived model identifier on one terminal row.
+fn terminal_safe_model_id(raw: &str) -> String {
+    let mut safe = String::with_capacity(raw.len());
+    let mut in_control_run = false;
+    for character in raw.chars() {
+        if character.is_control() {
+            if !in_control_run {
+                safe.push(' ');
+                in_control_run = true;
+            }
+        } else {
+            safe.push(character);
+            in_control_run = false;
+        }
+    }
+    safe
+}
+
+fn model_change_status_text(change: &super::event::ModelChange) -> String {
+    format!(
+        "model changed mid-session {} turns ago: `{}` -> `{}`",
+        change.turns_ago,
+        terminal_safe_model_id(&change.from),
+        terminal_safe_model_id(&change.to)
+    )
+}
+
 /// Issue #139: whether `record`'s pinned launch-time safety-policy
 /// fingerprint (`sessions::Record::safety_policy_sha256`) differs from the
 /// fingerprint of the policy `record.repo` resolves to RIGHT NOW. Degrades
@@ -150,6 +177,17 @@ fn sessions_lines(
                 line.push_str(&format!(
                     "  {}",
                     style::paint(&format!("screening: {summary}"), Tone::Warn, colour)
+                ));
+            }
+            if let Some(change) = super::score::model_change_for_session(
+                &record.agent,
+                &record.session,
+                &record.repo,
+                env,
+            ) {
+                line.push_str(&format!(
+                    "  {}",
+                    style::paint(&model_change_status_text(&change), Tone::Warn, colour)
                 ));
             }
             let delivery = mail::session_delivery_metrics(state, &record.short, now);
@@ -3061,6 +3099,7 @@ mod tests {
             scope: scope.to_string(),
             child_limit: 3,
             token_budget: None,
+            spent_tokens: 0,
             deadline_secs: None,
             completion_contract: "report by mail".to_string(),
             created_at: 1_700_000_000,
@@ -3842,6 +3881,127 @@ mod tests {
         assert!(
             !text.contains("no supervised sessions"),
             "unrelated sections must not print: {text}"
+        );
+    }
+
+    #[test]
+    fn status_and_diff_report_model_identity_drift_with_turn_distance() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&home).expect("home");
+        std::fs::create_dir_all(&repo).expect("repo");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+
+        let state = StateDir::from_root(tmp.path().join("state"));
+        state.ensure().expect("state");
+        let session = "abcdef12-3456-4789-8abc-def012345678";
+        let record = crate::commands::ctx::sessions::Record::new(
+            session,
+            "claude",
+            &repo,
+            crate::commands::ctx::sessions::Verb::Exec,
+        );
+        let _guard = crate::commands::ctx::sessions::SessionGuard::register(&state, record);
+
+        let transcript_dir = home
+            .join(".claude/projects")
+            .join(crate::commands::ctx::adapters::claude::project_slug(&repo));
+        std::fs::create_dir_all(&transcript_dir).expect("transcript dir");
+        let transcript = transcript_dir.join(format!("{session}.jsonl"));
+        let first = concat!(
+            r#"{"type":"user","message":{"content":"one"}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"model":"claude-opus-5","content":[{"type":"text","text":"[zirv] one"}],"usage":{"input_tokens":1}}}"#,
+            "\n",
+        );
+        std::fs::write(&transcript, first).expect("first turn");
+
+        let mut env = env_for_session(state.root(), session);
+        env.insert("ZIRV_CTX_AGENT".to_string(), "claude".to_string());
+        let args = StatusArgs {
+            decisions: 10,
+            brief: false,
+            diff: true,
+        };
+        let mut first_out = Vec::new();
+        run_with(
+            &args,
+            &mut first_out,
+            &repo,
+            &|key| env.get(key).cloned(),
+            false,
+        )
+        .expect("initial snapshot");
+
+        let second = concat!(
+            r#"{"type":"user","message":{"content":"two"}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"model":"claude-sonnet-5","content":[{"type":"text","text":"[zirv] two"}],"usage":{"input_tokens":2}}}"#,
+            "\n",
+        );
+        std::fs::write(&transcript, format!("{first}{second}")).expect("second turn");
+
+        let mut status_out = Vec::new();
+        run_with(
+            &StatusArgs {
+                decisions: 10,
+                brief: false,
+                diff: false,
+            },
+            &mut status_out,
+            &repo,
+            &|key| env.get(key).cloned(),
+            false,
+        )
+        .expect("status");
+        let status_text = String::from_utf8(status_out).expect("utf8");
+        assert!(
+            status_text.contains(
+                "model changed mid-session 0 turns ago: `claude-opus-5` -> `claude-sonnet-5`"
+            ),
+            "got {status_text}"
+        );
+
+        let mut diff_out = Vec::new();
+        run_with(
+            &args,
+            &mut diff_out,
+            &repo,
+            &|key| env.get(key).cloned(),
+            false,
+        )
+        .expect("diff");
+        let text = String::from_utf8(diff_out).expect("utf8");
+        assert!(
+            text.contains(
+                "model changed mid-session 0 turns ago: `claude-opus-5` -> `claude-sonnet-5`"
+            ),
+            "got {text}"
+        );
+        assert!(
+            text.contains("sessions:"),
+            "the sessions section changed: {text}"
+        );
+    }
+
+    #[test]
+    fn model_identity_drift_text_cannot_forge_terminal_rows() {
+        let text = model_change_status_text(&crate::commands::ctx::event::ModelChange {
+            from: "claude-opus-5\nforged\u{1b}[31m".to_string(),
+            to: "claude-sonnet-5\nforged\u{1b}[2J".to_string(),
+            turns_ago: 2,
+            limit_pressure: true,
+        });
+
+        assert_eq!(
+            text,
+            "model changed mid-session 2 turns ago: `claude-opus-5 forged [31m` -> \
+             `claude-sonnet-5 forged [2J`"
+        );
+        assert!(
+            !text.chars().any(char::is_control),
+            "no transcript-derived control character may reach status output: {text:?}"
         );
     }
 

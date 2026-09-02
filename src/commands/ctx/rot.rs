@@ -4,7 +4,7 @@ use hashbrown::{HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 
 use super::config::ScoreConfig;
-use super::event::{Capabilities, NormalizedEvent};
+use super::event::{Capabilities, ModelChange, NormalizedEvent, ProviderErrorClass};
 
 /// Leading characters a model tends to put before a reply prefix. Ported from
 /// the shell canary's `^[ \t>*_`#~-]*` allowance.
@@ -47,6 +47,7 @@ pub struct Signals {
     /// since what repeats here is the ERROR, not the call. See
     /// `NormalizedEvent::ToolErrorText`.
     pub same_error_repeats: usize,
+    pub provider_overflows: usize,
     /// `None` means the signal is unavailable, not that it scored zero.
     pub marker_miss_rate: Option<f64>,
 }
@@ -78,6 +79,12 @@ pub fn turn_final_texts(events: &[NormalizedEvent]) -> Vec<String> {
             }
             NormalizedEvent::AssistantFinal { text, .. } if !text.trim().is_empty() => {
                 current = Some(text.clone());
+            }
+            NormalizedEvent::Compaction => {
+                if in_turn && let Some(text) = current.take() {
+                    finals.push(text);
+                }
+                in_turn = false;
             }
             _ => {}
         }
@@ -236,12 +243,18 @@ fn miss_rate(marked: &[bool]) -> f64 {
 }
 
 pub fn signals(events: &[NormalizedEvent], caps: Capabilities, cfg: &ScoreConfig) -> Signals {
-    let finals = turn_final_texts(events);
-    let turns = finals.len();
+    let turns = turn_final_texts(events).len();
+    let boundary = events
+        .iter()
+        .rposition(|event| matches!(event, NormalizedEvent::Compaction))
+        .map_or(events, |index| &events[index + 1..]);
+    let finals = turn_final_texts(boundary);
 
     let marker_ever = finals.iter().any(|t| has_marker(t, &cfg.marker));
-    let marker_active =
-        caps.marker_signal && !cfg.marker.is_empty() && marker_ever && turns >= cfg.min_turns;
+    let marker_active = caps.marker_signal
+        && !cfg.marker.is_empty()
+        && marker_ever
+        && finals.len() >= cfg.min_turns;
 
     let marker_miss_rate = marker_active.then(|| {
         let marked: Vec<bool> = last_window(&finals, cfg.window)
@@ -251,7 +264,7 @@ pub fn signals(events: &[NormalizedEvent], caps: Capabilities, cfg: &ScoreConfig
         miss_rate(&marked)
     });
 
-    let tail = events_in_last_turns(events, cfg.window);
+    let tail = events_in_last_turns(boundary, cfg.window);
 
     let tool_failure_rate = failure_rate(tail.iter().filter_map(|e| match e {
         NormalizedEvent::ToolResult { is_error } => Some(*is_error),
@@ -265,6 +278,17 @@ pub fn signals(events: &[NormalizedEvent], caps: Capabilities, cfg: &ScoreConfig
         }),
         cfg.repetition_threshold,
     );
+    let provider_overflows = tail
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                NormalizedEvent::ProviderError {
+                    class: ProviderErrorClass::Overflow
+                }
+            )
+        })
+        .count();
 
     let same_error_repeats = longest_same_error_run(result_error_entries(tail).into_iter());
 
@@ -274,6 +298,7 @@ pub fn signals(events: &[NormalizedEvent], caps: Capabilities, cfg: &ScoreConfig
         repetition_hits,
         max_repeat,
         same_error_repeats,
+        provider_overflows,
         marker_miss_rate,
     }
 }
@@ -291,6 +316,8 @@ struct Segment {
     /// `longest_same_error_run`'s own doc comment for why `None` has to be
     /// preserved rather than simply omitted.
     result_errors: Vec<Option<u64>>,
+    #[serde(default)]
+    provider_overflows: usize,
 }
 
 /// Exactly what `signals` and `context_tokens` read out of a full event
@@ -307,6 +334,9 @@ pub struct RotState {
     window: usize,
     /// Turn finals already closed by a later `TurnStart`.
     closed_turns: usize,
+    /// Closed turn finals since the latest compaction boundary.
+    #[serde(default)]
+    behavioral_closed_turns: usize,
     /// `has_marker` of the last `window` closed finals, oldest first.
     closed_markers: VecDeque<bool>,
     marker_seen: bool,
@@ -331,6 +361,7 @@ impl RotState {
             marker: cfg.marker.clone(),
             window: cfg.window,
             closed_turns: 0,
+            behavioral_closed_turns: 0,
             closed_markers: VecDeque::new(),
             marker_seen: false,
             in_turn: false,
@@ -401,17 +432,38 @@ impl RotState {
                     *last = Some(*hash);
                 }
             }
-            NormalizedEvent::Compaction => {}
+            NormalizedEvent::ProviderError {
+                class: ProviderErrorClass::Overflow,
+            } => {
+                if let Some(segment) = self.segments.back_mut() {
+                    segment.provider_overflows += 1;
+                }
+            }
+            NormalizedEvent::ProviderError { .. } | NormalizedEvent::ModelId { .. } => {}
+            NormalizedEvent::Compaction => self.reset_behavioral_window(),
         }
     }
 
     fn close_turn(&mut self, marked: bool) {
         self.closed_turns += 1;
+        self.behavioral_closed_turns += 1;
         self.marker_seen |= marked;
         self.closed_markers.push_back(marked);
         if self.closed_markers.len() > self.window {
             self.closed_markers.pop_front();
         }
+    }
+
+    fn reset_behavioral_window(&mut self) {
+        if self.in_turn && self.open_marker.is_some() {
+            self.closed_turns += 1;
+        }
+        self.behavioral_closed_turns = 0;
+        self.closed_markers.clear();
+        self.marker_seen = false;
+        self.in_turn = false;
+        self.open_marker = None;
+        self.segments = VecDeque::from([Segment::default()]);
     }
 
     /// `None` when `cfg` no longer matches the rules this state was folded
@@ -432,9 +484,13 @@ impl RotState {
         // The open turn's text is a turn final too: a full parse flushes it at
         // the end of the stream even though no later `TurnStart` closed it.
         let turns = self.closed_turns + usize::from(self.open_marker.is_some());
+        let behavioral_turns =
+            self.behavioral_closed_turns + usize::from(self.open_marker.is_some());
         let marker_ever = self.marker_seen || self.open_marker == Some(true);
-        let marker_active =
-            caps.marker_signal && !cfg.marker.is_empty() && marker_ever && turns >= cfg.min_turns;
+        let marker_active = caps.marker_signal
+            && !cfg.marker.is_empty()
+            && marker_ever
+            && behavioral_turns >= cfg.min_turns;
 
         let marker_miss_rate = marker_active.then(|| {
             let mut marked: Vec<bool> = self.closed_markers.iter().copied().collect();
@@ -458,6 +514,11 @@ impl RotState {
                 .iter()
                 .flat_map(|s| s.result_errors.iter().copied()),
         );
+        let provider_overflows = self
+            .segments
+            .iter()
+            .map(|segment| segment.provider_overflows)
+            .sum();
 
         Signals {
             turns,
@@ -465,6 +526,7 @@ impl RotState {
             repetition_hits,
             max_repeat,
             same_error_repeats,
+            provider_overflows,
             marker_miss_rate,
         }
     }
@@ -498,6 +560,8 @@ pub struct Score {
     pub verdict: Verdict,
     pub signals: Signals,
     pub context_tokens: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_change: Option<ModelChange>,
 }
 
 /// Zero below the threshold, then a linear ramp that saturates at
@@ -612,11 +676,18 @@ pub fn score_from(signals: Signals, tokens: u64, cfg: &ScoreConfig, caps: Capabi
             * repetition_component(signals.same_error_repeats, cfg.same_error_threshold);
     let score = raw.round().clamp(0.0, 100.0) as u32;
 
+    let overflow_verdict = match signals.provider_overflows {
+        0 => Verdict::Healthy,
+        1 => Verdict::Compact,
+        _ => Verdict::Restart,
+    };
+
     Score {
         score,
-        verdict: verdict_for(score, tokens, cfg, caps),
+        verdict: verdict_for(score, tokens, cfg, caps).max(overflow_verdict),
         signals,
         context_tokens: tokens,
+        model_change: None,
     }
 }
 
@@ -624,7 +695,9 @@ pub fn score_from(signals: Signals, tokens: u64, cfg: &ScoreConfig, caps: Capabi
 mod tests {
     use super::*;
     use crate::commands::ctx::config::ScoreConfig;
-    use crate::commands::ctx::event::{Capabilities, NormalizedEvent, input_hash};
+    use crate::commands::ctx::event::{
+        Capabilities, NormalizedEvent, ProviderErrorClass, input_hash,
+    };
 
     /// Issue #155, Phase 6(c): `rot.rs` stays pure -- no filesystem, clock,
     /// env, network, AND no visibility into quota/usage data (`pace`/
@@ -1197,6 +1270,7 @@ mod tests {
             repetition_hits: 0,
             max_repeat: 1,
             same_error_repeats: 0,
+            provider_overflows: 0,
             marker_miss_rate: Some(0.0),
         };
         let heavy_repeat = Signals {
@@ -1624,6 +1698,75 @@ mod tests {
         assert_eq!(result.verdict, Verdict::Healthy);
         assert_eq!(result.context_tokens, 0);
         assert_eq!(result.signals.turns, 0);
+    }
+
+    #[test]
+    fn provider_overflow_escalates_even_below_the_token_floor() {
+        let cfg = ScoreConfig::default();
+        let overflow = NormalizedEvent::ProviderError {
+            class: ProviderErrorClass::Overflow,
+        };
+
+        let once = score_events(std::slice::from_ref(&overflow), full_caps(), &cfg);
+        assert_eq!(once.score, 0);
+        assert_eq!(once.context_tokens, 0);
+        assert_eq!(once.signals.provider_overflows, 1);
+        assert_eq!(once.verdict, Verdict::Compact);
+
+        let twice = score_events(&[overflow.clone(), overflow], full_caps(), &cfg);
+        assert_eq!(twice.signals.provider_overflows, 2);
+        assert_eq!(twice.verdict, Verdict::Restart);
+    }
+
+    #[test]
+    fn non_overflow_provider_events_and_model_ids_do_not_change_the_verdict() {
+        let cfg = ScoreConfig::default();
+        let baseline = score_events(&[], full_caps(), &cfg);
+        let events = [
+            NormalizedEvent::ProviderError {
+                class: ProviderErrorClass::RateLimit,
+            },
+            NormalizedEvent::ProviderError {
+                class: ProviderErrorClass::Other,
+            },
+            NormalizedEvent::ModelId {
+                id: "claude-sonnet-5".to_string(),
+            },
+        ];
+
+        assert_eq!(score_events(&events, full_caps(), &cfg), baseline);
+    }
+
+    #[test]
+    fn compaction_clears_behavioral_state_but_preserves_lifetime_turns_and_tokens() {
+        let cfg = ScoreConfig::default();
+        let mut events = looping_turns(3, "", "[zirv] ok", true, 120_000);
+        events.extend([
+            NormalizedEvent::ProviderError {
+                class: ProviderErrorClass::Overflow,
+            },
+            NormalizedEvent::ProviderError {
+                class: ProviderErrorClass::Overflow,
+            },
+        ]);
+        let before = score_events(&events, full_caps(), &cfg);
+        assert_eq!(before.signals.turns, 3);
+        assert_eq!(before.signals.max_repeat, 3);
+        assert_eq!(before.signals.tool_failure_rate, 1.0);
+        assert_eq!(before.signals.provider_overflows, 2);
+
+        events.push(NormalizedEvent::Compaction);
+        let after = score_events(&events, full_caps(), &cfg);
+        assert_eq!(after.signals.turns, 3, "turn count is lifetime state");
+        assert_eq!(after.signals.max_repeat, 0);
+        assert_eq!(after.signals.tool_failure_rate, 0.0);
+        assert_eq!(after.signals.marker_miss_rate, None);
+        assert_eq!(after.signals.provider_overflows, 0);
+        assert_eq!(after.context_tokens, 120_000, "tokens self-correct later");
+
+        let mut state = RotState::new(&cfg).expect("bounded state");
+        state.feed_all(&events);
+        assert_eq!(state.score(full_caps(), &cfg), Some(after));
     }
 
     #[test]

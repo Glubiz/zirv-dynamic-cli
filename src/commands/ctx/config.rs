@@ -632,6 +632,13 @@ pub struct WorkflowConfig {
     /// phase. Off by default. `REPO_FORBIDDEN`: a repo checkout must not be
     /// able to make zirv spend on its own behalf.
     pub auto_spawn_on_gate: bool,
+    /// Issue #268: lets `zirv verify`/`zirv test` report `Passed` instead of
+    /// `Inconclusive` when zero verification checks are configured or
+    /// discoverable, rather than the degraded-gate ban's default of
+    /// treating "nothing to check" as proving nothing. Off by default.
+    /// `REPO_FORBIDDEN`: an untrusted checkout must not be able to declare
+    /// its own missing/empty `verify.toml` a pass.
+    pub allow_empty_verify: bool,
 }
 
 impl Default for WorkflowConfig {
@@ -650,6 +657,7 @@ impl Default for WorkflowConfig {
             review_worker_budget_tokens: None,
             review_worker_max_tool_calls: None,
             auto_spawn_on_gate: false,
+            allow_empty_verify: false,
         }
     }
 }
@@ -1531,6 +1539,11 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         &["workflow", "auto_spawn_on_gate"],
         EnvKind::Bool,
     ),
+    (
+        "ZIRV_CTX_WORKFLOW_ALLOW_EMPTY_VERIFY",
+        &["workflow", "allow_empty_verify"],
+        EnvKind::Bool,
+    ),
     ("ZIRV_CTX_MEMORY", &["memory", "enabled"], EnvKind::Bool),
     (
         "ZIRV_CTX_MEMORY_HARVEST",
@@ -2037,6 +2050,12 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     (
         &["workflow", "auto_spawn_on_gate"],
         "ZIRV_CTX_WORKFLOW_AUTO_SPAWN_ON_GATE",
+    ),
+    // Issue #268: a repo checkout must not be able to declare its own
+    // missing/empty `verify.toml` a pass by setting this itself.
+    (
+        &["workflow", "allow_empty_verify"],
+        "ZIRV_CTX_WORKFLOW_ALLOW_EMPTY_VERIFY",
     ),
     // A repo checkout must not be able to switch either memory scope's own
     // gate on or off for itself, grow its cap, or turn on automatic
@@ -5147,6 +5166,53 @@ mod tests {
         );
     }
 
+    /// Issue #268: `workflow.allow_empty_verify` is operator-only, same
+    /// asymmetry as `auto_spawn_on_gate` above -- a repo checkout must not
+    /// be able to declare its own missing/empty `verify.toml` a pass.
+    #[test]
+    fn repo_layer_cannot_set_workflow_allow_empty_verify() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[workflow]\nallow_empty_verify = true\n",
+        )
+        .expect("write");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let empty = env_map(&[]);
+        let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+            .expect_err("a repo may not declare its own empty verify.toml a pass")
+            .to_string();
+        assert!(err.contains("workflow.allow_empty_verify"), "got {err}");
+        assert!(
+            err.contains("ZIRV_CTX_WORKFLOW_ALLOW_EMPTY_VERIFY"),
+            "names the operator escape hatch: {err}"
+        );
+    }
+
+    /// The operator's home layer and `ZIRV_CTX_*` env override still work,
+    /// same as `auto_spawn_on_gate`.
+    #[test]
+    fn the_operator_may_set_workflow_allow_empty_verify_from_home_config_and_env() {
+        let home = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".zirv/ctx.toml"),
+            "[workflow]\nallow_empty_verify = true\n",
+        )
+        .expect("write");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tempfile::tempdir().expect("tempdir");
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert!(cfg.workflow.allow_empty_verify);
+
+        let env = env_map(&[("ZIRV_CTX_WORKFLOW_ALLOW_EMPTY_VERIFY", "false")]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert!(!cfg.workflow.allow_empty_verify);
+    }
+
     /// The operator's home layer and `ZIRV_CTX_*` env override still work,
     /// same as `check_env_passthrough`.
     #[test]
@@ -5910,6 +5976,7 @@ mod tests {
         ("workflow", "review_worker_budget_tokens"),
         ("workflow", "review_worker_max_tool_calls"),
         ("workflow", "auto_spawn_on_gate"),
+        ("workflow", "allow_empty_verify"),
         ("policy", "repo_fs_write"),
         ("policy", "outside_repo_fs_write"),
         ("policy", "shell_exec"),

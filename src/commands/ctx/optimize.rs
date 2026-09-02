@@ -5213,9 +5213,11 @@ mod tests {
                 repetition_hits: 0,
                 max_repeat: 1,
                 same_error_repeats: 0,
+                provider_overflows: 0,
                 marker_miss_rate: None,
             },
             context_tokens: 120_000,
+            model_change: None,
         }
     }
 

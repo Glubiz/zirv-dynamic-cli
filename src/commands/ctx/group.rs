@@ -10,7 +10,7 @@
 //! failing the whole read.
 
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -25,6 +25,10 @@ pub struct WorkGroup {
     pub child_limit: u32,
     #[serde(default)]
     pub token_budget: Option<u64>,
+    /// Completed child spend rolled up across this group's delegated work.
+    /// Older records predate the meter and therefore start at zero.
+    #[serde(default)]
+    pub spent_tokens: u64,
     #[serde(default)]
     pub deadline_secs: Option<u64>,
     /// Display-only (issue #155 review finding D2): the terms every child
@@ -60,6 +64,51 @@ pub struct WorkGroup {
 
 fn record_path(state: &StateDir, id: &str) -> PathBuf {
     state.groups().join(format!("{id}.json"))
+}
+
+fn lock_path(state: &StateDir, id: &str) -> PathBuf {
+    state.groups().join(format!("{id}.lock"))
+}
+
+#[cfg(unix)]
+fn open_lock_file(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn open_lock_file(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+}
+
+/// One advisory OS lock per group record. The file intentionally remains
+/// after release: deleting a lock path can split two contenders across old
+/// and new inodes, while an unlocked empty file is harmless and lets the OS
+/// release a crashed process's lock automatically.
+struct GroupLock(std::fs::File);
+
+impl Drop for GroupLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
+fn lock_group(state: &StateDir, id: &str) -> CtxResult<GroupLock> {
+    create_private_dir_all(&state.groups())?;
+    let file = open_lock_file(&lock_path(state, id))?;
+    file.lock()?;
+    Ok(GroupLock(file))
 }
 
 /// Writes a group's record. Matches `sessions::write_record`'s own
@@ -116,6 +165,7 @@ pub fn list(state: &StateDir) -> Vec<WorkGroup> {
 /// a closed group is evidence of what a batch was launched under, not a
 /// tombstone, and the first close time is the one that stands.
 pub fn close(state: &StateDir, id: &str, now: u64) -> CtxResult<()> {
+    let _lock = lock_group(state, id)?;
     let Some(mut group) = load(state, id)? else {
         return Err(format!("no work group '{id}'").into());
     };
@@ -126,25 +176,56 @@ pub fn close(state: &StateDir, id: &str, now: u64) -> CtxResult<()> {
     Ok(())
 }
 
-/// Issue #155 review finding D2: the sole place a child is admitted into a
-/// group. `Err` -- naming both the group and its limit -- once
-/// `admitted_children` has already reached `child_limit`; otherwise the
-/// count is incremented and saved. Called at both real admission choke
+#[derive(Debug)]
+struct AdmissionExhausted(String);
+
+impl std::fmt::Display for AdmissionExhausted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for AdmissionExhausted {}
+
+/// Whether an admission failed because the group's spend or deadline is
+/// exhausted. Callers map both to the existing budget-exhausted exit.
+pub fn is_admission_exhausted(error: &(dyn std::error::Error + 'static)) -> bool {
+    error.is::<AdmissionExhausted>()
+}
+
+/// The sole place a child is admitted into a group. Refuses exhausted token
+/// budgets, elapsed deadlines, and groups already at their child limit before
+/// incrementing the persisted count. Called at both real admission choke
 /// points: `agent::resolve_worker_budget` for a headless delegation, and
 /// `dash::fulfill_spawn_request` for a dashboard pane -- never both for the
 /// same request (a headless run that first tries to join a live dashboard
 /// admits nowhere in `agent.rs` itself; whichever side actually ends up
 /// spawning is the one that calls this).
 ///
-/// Load-modify-write, like every other mutation in this file
-/// (`close` above) -- not a distributed lock. zirv's own callers are
-/// mostly-sequential orchestrator activity, not a tight concurrent loop, so
-/// a lost update in a genuine race would at worst admit one child past the
-/// limit, never wrongly refuse legitimate work.
-pub fn admit_child(state: &StateDir, id: &str) -> CtxResult<()> {
+/// The complete read/check/increment/write transaction is serialized by the
+/// group's interprocess lock, as are every other mutation below it.
+pub fn admit_child(state: &StateDir, id: &str, now: u64) -> CtxResult<WorkGroup> {
+    let _lock = lock_group(state, id)?;
     let Some(mut group) = load(state, id)? else {
         return Err(format!("no work group '{id}'").into());
     };
+    if group.closed_at.is_some() {
+        return Err(format!("work group '{id}' is closed").into());
+    }
+    if group
+        .token_budget
+        .is_some_and(|budget| group.spent_tokens >= budget)
+    {
+        return Err(Box::new(AdmissionExhausted(format!(
+            "work group '{id}' token budget is exhausted ({} tokens spent)",
+            group.spent_tokens
+        ))));
+    }
+    if is_overdue(&group, now) {
+        return Err(Box::new(AdmissionExhausted(format!(
+            "work group '{id}' deadline has elapsed"
+        ))));
+    }
     if group.admitted_children >= group.child_limit {
         return Err(format!(
             "work group '{id}' already has its full {} children admitted",
@@ -154,7 +235,19 @@ pub fn admit_child(state: &StateDir, id: &str) -> CtxResult<()> {
     }
     group.admitted_children += 1;
     create(state, &group)?;
-    Ok(())
+    Ok(group)
+}
+
+/// Adds one completed child's token spend to its group. Best-effort callers
+/// may ignore an I/O failure, but arithmetic never wraps and the complete
+/// update is serialized with admission and the other group mutations.
+pub fn add_spent_tokens(state: &StateDir, id: &str, spent: u64) -> CtxResult<()> {
+    let _lock = lock_group(state, id)?;
+    let Some(mut group) = load(state, id)? else {
+        return Err(format!("no work group '{id}'").into());
+    };
+    group.spent_tokens = group.spent_tokens.saturating_add(spent);
+    create(state, &group)
 }
 
 /// Re-review (2026-08-27) finding 1: rolls back one admission granted by
@@ -168,11 +261,14 @@ pub fn admit_child(state: &StateDir, id: &str) -> CtxResult<()> {
 /// Best-effort, unlike `admit_child`: logs to stderr and returns rather than
 /// propagating a second error over the original spawn failure that triggered
 /// the rollback -- an operator who already sees a spawn error must not also
-/// see "the state file wouldn't decrement" stacked on top of it. Same
-/// load-modify-write, non-locking pattern as `admit_child`/`close`: losing a
-/// rollback to a race just leaves the count one high until the group is
-/// inspected, never wrongly grants an extra admission.
+/// see "the state file wouldn't decrement" stacked on top of it. The same
+/// per-group lock as `admit_child`/`close` keeps this rollback from losing a
+/// concurrent mutation.
 pub fn rollback_admission(state: &StateDir, id: &str) {
+    let Ok(_lock) = lock_group(state, id) else {
+        eprintln!("zirv ctx: failed to lock work group '{id}' for admission rollback");
+        return;
+    };
     match load(state, id) {
         Ok(Some(mut group)) => {
             group.admitted_children = group.admitted_children.saturating_sub(1);
@@ -204,6 +300,9 @@ pub fn rollback_admission(state: &StateDir, id: &str) {
 /// best-effort otherwise: the delegation being unwound is the caller's real
 /// news, never this.
 pub fn discard_if_unused(state: &StateDir, id: &str) -> bool {
+    let Ok(_lock) = lock_group(state, id) else {
+        return false;
+    };
     let Ok(Some(group)) = load(state, id) else {
         return false;
     };
@@ -216,12 +315,10 @@ pub fn discard_if_unused(state: &StateDir, id: &str) -> bool {
     std::fs::remove_file(record_path(state, id)).is_ok()
 }
 
-/// Issue #155 review finding D2: `deadline_secs` is surfaced as an overdue
-/// marker, never enforced -- nothing here kills a session or a group. `now`
-/// is a parameter, not `state::now_secs()`, for the same testability reason
-/// `run_create`/`run_close` already take one. A closed group is never
-/// overdue: it is evidence of what a batch finished under, not a still-
-/// running one a deadline can still be missed by.
+/// `now` is a parameter, not `state::now_secs()`, so both the status marker
+/// and admission gate stay deterministic in tests. A closed group is never
+/// overdue: it is evidence of what a batch finished under, not a still-running
+/// one a deadline can still be missed by.
 pub fn is_overdue(group: &WorkGroup, now: u64) -> bool {
     group.closed_at.is_none()
         && group
@@ -237,6 +334,7 @@ pub fn is_overdue(group: &WorkGroup, now: u64) -> bool {
 /// claimant simply never becomes the one `agent::run_with` auto-closes it
 /// for). Load-modify-write, like every other mutation in this file.
 pub fn claim_sub_orchestrator(state: &StateDir, id: &str, session: &str) -> CtxResult<()> {
+    let _lock = lock_group(state, id)?;
     let Some(mut group) = load(state, id)? else {
         return Err(format!("no work group '{id}'").into());
     };
@@ -332,6 +430,7 @@ pub fn run_create<W: Write>(
         scope: args.scope.clone(),
         child_limit: args.child_limit,
         token_budget: args.token_budget,
+        spent_tokens: 0,
         deadline_secs: args.deadline_secs,
         completion_contract: args.completion_contract.clone(),
         created_at: now,
@@ -383,8 +482,8 @@ fn print_group<W: Write>(
     if let Some(sub) = &group.sub_orchestrator_session {
         write!(w, " sub-orchestrator={sub}")?;
     }
-    // Issue #155 review finding D2: display-only -- see `is_overdue`'s own
-    // doc comment. Nothing here kills or restarts anything on account of it.
+    // Status only marks the elapsed deadline. Admission enforcement lives in
+    // `admit_child`; neither path kills or restarts running work.
     if is_overdue(group, now) {
         write!(w, " OVERDUE")?;
     }
@@ -468,6 +567,7 @@ mod tests {
             scope: "phase 5 implementation".to_string(),
             child_limit: 3,
             token_budget: Some(400_000),
+            spent_tokens: 0,
             deadline_secs: Some(3_600),
             completion_contract: "every child reports a compact result by mail".to_string(),
             created_at: 1_700_000_000,
@@ -492,6 +592,7 @@ mod tests {
             scope: "phase 5 implementation".to_string(),
             child_limit: 3,
             token_budget: Some(400_000),
+            spent_tokens: 0,
             deadline_secs: Some(3_600),
             completion_contract: "every child reports a compact result by mail".to_string(),
             created_at: 1_700_000_000,
@@ -508,6 +609,31 @@ mod tests {
             None,
             "unknown id is None, not an error"
         );
+    }
+
+    #[test]
+    fn a_pre_spend_work_group_record_defaults_spent_tokens_to_zero() {
+        let group = sample_group("wg-old");
+        let mut old_shape = serde_json::to_value(group).expect("serialize group");
+        old_shape
+            .as_object_mut()
+            .expect("object")
+            .remove("spent_tokens");
+        let restored: WorkGroup = serde_json::from_value(old_shape).expect("deserialize old shape");
+
+        assert_eq!(restored.spent_tokens, 0);
+    }
+
+    #[test]
+    fn spent_tokens_round_trips_with_the_work_group_record() {
+        let mut group = sample_group("wg-spent");
+        group.spent_tokens = 123_456;
+        let json = serde_json::to_value(group).expect("serialize group");
+
+        let restored: WorkGroup = serde_json::from_value(json).expect("deserialize group");
+        let restored = serde_json::to_value(restored).expect("serialize restored group");
+
+        assert_eq!(restored["spent_tokens"], 123_456);
     }
 
     /// Closing is idempotent and preserves the terms: a closed group is
@@ -579,11 +705,11 @@ mod tests {
         let state = StateDir::from_root(tmp.path().to_path_buf());
         create(&state, &sample_group("wg-1")).expect("create"); // child_limit: 3
 
-        admit_child(&state, "wg-1").expect("first child admitted");
+        admit_child(&state, "wg-1", 1_700_000_100).expect("first child admitted");
         let group = load(&state, "wg-1").expect("load").expect("present");
         assert_eq!(group.admitted_children, 1);
 
-        admit_child(&state, "wg-1").expect("second child admitted");
+        admit_child(&state, "wg-1", 1_700_000_100).expect("second child admitted");
         assert_eq!(
             load(&state, "wg-1")
                 .expect("load")
@@ -605,8 +731,8 @@ mod tests {
         group.child_limit = 1;
         create(&state, &group).expect("create");
 
-        admit_child(&state, "wg-1").expect("the one allowed child is admitted");
-        let err = admit_child(&state, "wg-1").expect_err("the limit is reached");
+        admit_child(&state, "wg-1", 1_700_000_100).expect("the one allowed child is admitted");
+        let err = admit_child(&state, "wg-1", 1_700_000_100).expect_err("the limit is reached");
         assert!(err.to_string().contains("wg-1"), "got {err}");
         assert!(err.to_string().contains('1'), "names the limit: {err}");
         assert_eq!(
@@ -615,6 +741,70 @@ mod tests {
                 .expect("present")
                 .admitted_children,
             1,
+            "a refused admission must not advance the count"
+        );
+    }
+
+    #[test]
+    fn admit_child_refuses_when_the_group_token_budget_is_spent() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let mut group = sample_group("wg-spent");
+        group.spent_tokens = 400_000;
+        create(&state, &group).expect("create");
+
+        let err =
+            admit_child(&state, "wg-spent", 1_700_000_100).expect_err("the token budget is spent");
+        assert!(err.to_string().contains("wg-spent"), "got {err}");
+        assert_eq!(
+            load(&state, "wg-spent")
+                .expect("load")
+                .expect("present")
+                .admitted_children,
+            0,
+            "a refused admission must not advance the count"
+        );
+    }
+
+    #[test]
+    fn admit_child_refuses_when_the_group_deadline_has_elapsed() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let mut group = sample_group("wg-overdue");
+        group.created_at = 100;
+        group.deadline_secs = Some(10);
+        create(&state, &group).expect("create");
+
+        let err = admit_child(&state, "wg-overdue", 111).expect_err("the deadline elapsed");
+        assert!(err.to_string().contains("wg-overdue"), "got {err}");
+        assert_eq!(
+            load(&state, "wg-overdue")
+                .expect("load")
+                .expect("present")
+                .admitted_children,
+            0,
+            "a refused admission must not advance the count"
+        );
+    }
+
+    #[test]
+    fn admit_child_refuses_a_closed_group_without_advancing_the_count() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let mut group = sample_group("wg-closed");
+        group.closed_at = Some(1_700_000_050);
+        create(&state, &group).expect("create");
+
+        let err = admit_child(&state, "wg-closed", 1_700_000_100)
+            .expect_err("a closed group cannot admit another child");
+
+        assert!(err.to_string().contains("closed"), "got {err}");
+        assert_eq!(
+            load(&state, "wg-closed")
+                .expect("load")
+                .expect("present")
+                .admitted_children,
+            0,
             "a refused admission must not advance the count"
         );
     }
@@ -628,8 +818,8 @@ mod tests {
         let state = StateDir::from_root(tmp.path().to_path_buf());
         create(&state, &sample_group("wg-1")).expect("create");
 
-        admit_child(&state, "wg-1").expect("first child admitted");
-        admit_child(&state, "wg-1").expect("second child admitted");
+        admit_child(&state, "wg-1", 1_700_000_100).expect("first child admitted");
+        admit_child(&state, "wg-1", 1_700_000_100).expect("second child admitted");
         assert_eq!(
             load(&state, "wg-1")
                 .expect("load")
@@ -670,6 +860,64 @@ mod tests {
         );
     }
 
+    #[test]
+    fn adding_group_spend_uses_saturating_arithmetic() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let mut group = sample_group("wg-saturating");
+        group.spent_tokens = u64::MAX - 5;
+        create(&state, &group).expect("persist group");
+
+        add_spent_tokens(&state, "wg-saturating", 10).expect("roll up spend");
+
+        let persisted =
+            std::fs::read_to_string(record_path(&state, "wg-saturating")).expect("read group");
+        let persisted: serde_json::Value = serde_json::from_str(&persisted).expect("json");
+        assert_eq!(persisted["spent_tokens"], u64::MAX);
+    }
+
+    #[test]
+    fn group_mutations_wait_for_the_same_interprocess_lock() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        create(&state, &sample_group("wg-locked")).expect("create");
+        let held = lock_group(&state, "wg-locked").expect("hold group lock");
+
+        let worker_state = state.clone();
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(0);
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(0);
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).expect("announce start");
+            let result =
+                add_spent_tokens(&worker_state, "wg-locked", 10).map_err(|e| e.to_string());
+            done_tx.send(result).expect("announce finish");
+        });
+
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("worker started");
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err(),
+            "the mutation must wait while another holder owns the group lock"
+        );
+
+        drop(held);
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("mutation finished after release")
+            .expect("mutation succeeded");
+        worker.join().expect("worker joins");
+        assert_eq!(
+            load(&state, "wg-locked")
+                .expect("load")
+                .expect("present")
+                .spent_tokens,
+            10
+        );
+    }
+
     /// Best-effort: a rollback naming an unknown group must not panic --
     /// `admit_child`'s own choke points call this from an error path that
     /// already has a real failure to report, and a second panic/error here
@@ -685,14 +933,14 @@ mod tests {
     fn admit_child_errors_on_an_unknown_group() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(tmp.path().to_path_buf());
-        let err = admit_child(&state, "nope").expect_err("no such group");
+        let err = admit_child(&state, "nope", 0).expect_err("no such group");
         assert!(err.to_string().contains("nope"), "got {err}");
     }
 
-    /// Issue #155 review finding D2: `deadline_secs` is a display-only
-    /// marker -- an open group past its deadline is overdue; the same group
-    /// before the deadline, or with none set at all, is not; and a CLOSED
-    /// group is never overdue no matter how long ago its deadline passed.
+    /// The same predicate drives both the status marker and admission gate:
+    /// an open group past its deadline is overdue; the same group before the
+    /// deadline, or with none set at all, is not; and a CLOSED group is never
+    /// overdue no matter how long ago its deadline passed.
     #[test]
     fn is_overdue_marks_only_an_open_group_past_its_deadline() {
         let mut group = sample_group("wg-1"); // created_at 1_700_000_000, deadline_secs 3_600
@@ -800,7 +1048,7 @@ mod tests {
         let state = StateDir::from_root(tmp.path().to_path_buf());
 
         create(&state, &sample_group("wg-admitted")).expect("create");
-        admit_child(&state, "wg-admitted").expect("admit");
+        admit_child(&state, "wg-admitted", 1_700_000_100).expect("admit");
         assert!(!discard_if_unused(&state, "wg-admitted"));
         assert!(load(&state, "wg-admitted").expect("load").is_some());
 

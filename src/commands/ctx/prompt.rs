@@ -722,6 +722,15 @@ pub struct HarnessRosterInjection {
     pub raw_bytes: usize,
     pub delivered_bytes: usize,
     pub truncated: bool,
+    /// Issue #298: adapter lines omitted for a confirmed-absent `Liveness`
+    /// (or a disabled adapter). Always `0` from `harness_roster_injection`
+    /// itself, which knows nothing about liveness -- `compile::compile_
+    /// with_harness_roster` fills this in from its own `adapters::
+    /// HarnessRosterReport` after calling this function.
+    pub omitted: usize,
+    /// Bytes the omitted lines would have cost had they still been
+    /// rendered the pre-#298 way. See `omitted`'s own doc comment.
+    pub omitted_bytes: usize,
 }
 
 /// Joins `lines` the same way `compose` always has (`"\n"`-separated) and
@@ -744,6 +753,8 @@ pub fn harness_roster_injection(lines: &[String], cap: usize) -> (String, Harnes
             raw_bytes,
             delivered_bytes,
             truncated: delivered_bytes < raw_bytes,
+            omitted: 0,
+            omitted_bytes: 0,
         },
     )
 }

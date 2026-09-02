@@ -1,5 +1,35 @@
 use super::config::PaceConfig;
+use super::event::{ModelChange, NormalizedEvent, ProviderErrorClass};
 use super::window::{FIVE_HOUR_SECS, SEVEN_DAY_SECS, UsageWindows, Window, age_secs};
+
+/// Provider rate limits found in transcript events enter the same park path as
+/// the established stdout wording scan. Overflow and other provider failures
+/// stay out: rot and ordinary failure handling own those respectively.
+pub fn provider_events_hit_limit(events: &[NormalizedEvent]) -> bool {
+    events.iter().any(|event| {
+        matches!(
+            event,
+            NormalizedEvent::ProviderError {
+                class: ProviderErrorClass::RateLimit
+            }
+        )
+    })
+}
+
+/// A downward move on the adapter's own verified ladder is limit-pressure
+/// context for reporting. Unknown ids and lateral/upward moves are not hints.
+pub fn model_change_is_limit_pressure(
+    adapter: &dyn super::adapters::AgentAdapter,
+    change: &ModelChange,
+) -> bool {
+    let Some(from) = adapter.model_strength(&change.from) else {
+        return false;
+    };
+    let Some(to) = adapter.model_strength(&change.to) else {
+        return false;
+    };
+    to < from
+}
 
 /// Which data layer the decision rests on. Ordered by authority.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2308,6 +2338,49 @@ mod tests {
         ] {
             assert!(!is_limit_hit(line), "false positive on {line:?}");
         }
+    }
+
+    #[test]
+    fn classified_provider_rate_limits_reach_the_existing_limit_path() {
+        use crate::commands::ctx::event::{NormalizedEvent, ProviderErrorClass};
+
+        let events = [
+            NormalizedEvent::ProviderError {
+                class: ProviderErrorClass::Other,
+            },
+            NormalizedEvent::ProviderError {
+                class: ProviderErrorClass::RateLimit,
+            },
+        ];
+        assert!(provider_events_hit_limit(&events));
+        assert!(!provider_events_hit_limit(&[
+            NormalizedEvent::ProviderError {
+                class: ProviderErrorClass::Overflow,
+            }
+        ]));
+    }
+
+    #[test]
+    fn only_a_model_downgrade_is_a_limit_pressure_hint() {
+        use crate::commands::ctx::adapters::claude::ClaudeAdapter;
+        use crate::commands::ctx::event::ModelChange;
+
+        let adapter = ClaudeAdapter::new(None);
+        let downgrade = ModelChange {
+            from: "claude-opus-5".to_string(),
+            to: "claude-sonnet-5".to_string(),
+            turns_ago: 0,
+            limit_pressure: false,
+        };
+        let upgrade = ModelChange {
+            from: "claude-sonnet-5".to_string(),
+            to: "claude-opus-5".to_string(),
+            turns_ago: 0,
+            limit_pressure: false,
+        };
+
+        assert!(model_change_is_limit_pressure(&adapter, &downgrade));
+        assert!(!model_change_is_limit_pressure(&adapter, &upgrade));
     }
 
     #[test]

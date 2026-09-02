@@ -117,9 +117,13 @@ impl VerificationConfig {
             )
             .into());
         }
-        if self.checks.is_empty() {
-            return Err("verification config has no checks".into());
-        }
+        // Issue #268: an explicitly empty `checks = []` used to hard-error
+        // here, which meant `zirv verify` on a checked-in but empty
+        // `.zirv/verify.toml` bricked the command outright instead of
+        // producing a report an operator could see. `run_mode` now turns
+        // zero resolved checks into an `Inconclusive` report (or a `Passed`
+        // one under the `workflow.allow_empty_verify` override) -- see its
+        // own doc comment.
         let mut ids = std::collections::BTreeSet::new();
         for check in &self.checks {
             check.validate()?;
@@ -322,11 +326,10 @@ fn load_or_discover_raw(repo: &Path) -> CtxResult<(VerificationConfig, &'static 
         schema_version: VERIFY_CONFIG_SCHEMA_VERSION,
         checks,
     };
-    config
-        .validate()
-        .map_err(|_| -> Box<dyn std::error::Error> {
-            "no verification checks configured or discoverable; add .zirv/verify.toml".into()
-        })?;
+    // Zero checks (neither a Cargo nor a recognized package.json project) is
+    // no longer a hard error here -- see issue #268 and `run_mode`'s own
+    // handling of `resolved.checks.is_empty()`.
+    config.validate()?;
     // `npm run <id>` executes a command body written in the repository's own
     // package.json: discovered by zirv, authored by the checkout, and gated
     // as such. The Cargo commands are zirv's own text.
@@ -542,6 +545,71 @@ pub enum CheckStatus {
     /// Selected and reported, but deliberately not executed -- today only
     /// because `workflow.repo_checks_enabled` is off. Never counts as passing.
     Skipped,
+    /// Issue #268: the check *proves nothing either way* -- a test runner
+    /// that crashed before printing a summary, an empty selection, a command
+    /// that could not be found, or (see `run_mode`) no checks at all being
+    /// configured or discoverable. Distinct from `Failed`: a `Failed` check
+    /// is evidence something is broken; `Inconclusive` is the absence of
+    /// evidence, which must block a gate exactly as hard as `Failed` (see
+    /// `VerificationReport::passed`/`evaluate_against_baseline`) but is
+    /// reported and, per `run_baseline`, never eligible for baselining.
+    Inconclusive,
+}
+
+/// Why one [`CheckResult`] came back `Inconclusive` (issue #268). Set only
+/// when `status == CheckStatus::Inconclusive`; see `CheckResult::
+/// inconclusive_reason`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum InconclusiveReason {
+    /// The check's command could not be spawned, or exited in a way that
+    /// looks like the shell never found it (`exit code 127`, or a
+    /// "command not found"/"not recognized" message) -- see
+    /// `looks_like_tool_missing`.
+    ToolMissing,
+    /// A `cargo test`/`cargo nextest run`-shaped `Unit` check exited
+    /// non-zero without printing a single parseable summary line -- the
+    /// STATUS_ACCESS_VIOLATION trap this issue exists to close: no
+    /// `test result:`/`Summary [...]` line means the runner never finished
+    /// reporting, not that nothing failed. See `classify_test_report`.
+    RunnerCrashed,
+    /// A `cargo test`/`cargo nextest run`-shaped `Unit` check's summary line
+    /// declared zero tests run with a successful exit -- an empty filter or
+    /// a selection that matched nothing, not evidence the change set is
+    /// clean.
+    NoTestsSelected,
+    /// A `cargo test`/`cargo nextest run`-shaped `Unit` check exited zero
+    /// but no summary line could be found at all -- reserved for a
+    /// well-formed-but-empty output that is neither a crash (exit succeeded)
+    /// nor a recognizable summary.
+    ReportUnparseable,
+    /// The check's own process-level timeout fired. Reserved for parity with
+    /// the design's reason list; `CheckStatus::TimedOut` already carries
+    /// this distinctly and continues to block every gate exactly like
+    /// `Inconclusive` does, so nothing in this module currently emits
+    /// `Inconclusive` with this reason.
+    Timeout,
+    /// `run_mode` found zero verification checks configured or
+    /// discoverable at all (an empty/absent `verify.toml` with nothing
+    /// else to fall back on) and no operator override
+    /// (`workflow.allow_empty_verify`) was set.
+    NoChecks,
+}
+
+impl InconclusiveReason {
+    /// The kebab-case spelling this reason serializes as -- reused for the
+    /// operator-facing `proves:`/`fix:` announcement (`gate_announcement`)
+    /// so the two never drift apart.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ToolMissing => "tool-missing",
+            Self::RunnerCrashed => "runner-crashed",
+            Self::NoTestsSelected => "no-tests-selected",
+            Self::ReportUnparseable => "report-unparseable",
+            Self::Timeout => "timeout",
+            Self::NoChecks => "no-checks",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -567,10 +635,30 @@ pub struct CheckResult {
     /// did before -- see `evaluate_against_baseline` and `run_baseline`.
     #[serde(default)]
     pub failure_test_names: Vec<String>,
+    /// Set exactly when `status == CheckStatus::Inconclusive` (issue #268).
+    /// `#[serde(default)]` so a report persisted before this field existed
+    /// still deserializes -- it never had an `Inconclusive` check to begin
+    /// with, so `None` is exactly right, not a lossy fallback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inconclusive_reason: Option<InconclusiveReason>,
 }
 
 fn default_check_source() -> CheckSource {
     CheckSource::RepoConfig
+}
+
+/// The three-valued verdict issue #268 asks for, everywhere a gate is
+/// evaluated: `Pass` only when every check in the report passed; `Fail` when
+/// at least one check is a genuine, evidenced failure; `Inconclusive` when
+/// at least one check proves nothing either way, which blocks a gate exactly
+/// like `Fail` (see `VerificationReport::passed`) but is announced
+/// differently (see `gate_announcement`) and is never eligible for baseline
+/// waiver or recording (see `evaluate_against_baseline`, `run_baseline`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateOutcome {
+    Pass,
+    Fail,
+    Inconclusive(InconclusiveReason),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -604,6 +692,43 @@ impl VerificationReport {
                 .checks
                 .iter()
                 .all(|check| check.status == CheckStatus::Passed)
+    }
+
+    /// The report's three-valued [`GateOutcome`] (issue #268), ranked with
+    /// `Fail` above `Inconclusive` above `Pass`: a genuinely `Failed` check
+    /// -- real evidence something is broken -- always wins over an
+    /// `Inconclusive` one on the same run, even though both block the gate
+    /// identically (see `passed`). A run that is *only* ever unreliable (no
+    /// `Failed` check at all) reports the first `Inconclusive` check's
+    /// reason; announcing that reason as if it were the *whole* story when
+    /// a real failure sits alongside it would say "proves nothing" about a
+    /// run that, in fact, proved something broke -- see `gate_announcement`,
+    /// which still lists any accompanying `Inconclusive` checks by id even
+    /// when the overall outcome is `Fail`.
+    pub fn outcome(&self) -> GateOutcome {
+        if self
+            .checks
+            .iter()
+            .any(|check| check.status == CheckStatus::Failed)
+        {
+            return GateOutcome::Fail;
+        }
+        if let Some(check) = self
+            .checks
+            .iter()
+            .find(|check| check.status == CheckStatus::Inconclusive)
+        {
+            return GateOutcome::Inconclusive(
+                check
+                    .inconclusive_reason
+                    .unwrap_or(InconclusiveReason::ReportUnparseable),
+            );
+        }
+        if self.passed() {
+            GateOutcome::Pass
+        } else {
+            GateOutcome::Fail
+        }
     }
 
     /// Whether this (already-failing) report's failures are covered by an
@@ -725,6 +850,197 @@ fn failure_names_for(check: &CheckResult) -> std::collections::BTreeSet<String> 
         .unwrap_or_default()
 }
 
+/// Whether `command` invokes one of the two test runners
+/// [`classify_test_report`] knows how to read a well-formedness verdict out
+/// of. Scoped deliberately narrow (issue #268): an arbitrary `Unit` check
+/// (`npm run test`, say) does not print either runner's summary shape, and
+/// misclassifying its ordinary output as `report-unparseable` would turn a
+/// real pass into a false `Inconclusive`.
+fn is_cargo_test_runner(command: &str) -> bool {
+    let command = command.trim_start();
+    command.starts_with("cargo test") || command.starts_with("cargo nextest")
+}
+
+/// A cheap, pure signal (issue #268's "degraded-gate ban") that a check's own
+/// command could not actually be run: the shell's own "command not found"
+/// convention (POSIX exit code 127) or message, or Windows `cmd.exe`'s own
+/// wording. Deliberately heuristic text matching -- there is no portable way
+/// to ask a shell why its child failed -- so it only ever *adds* an
+/// `Inconclusive` classification on top of what would otherwise have been
+/// `Failed`, never removes one.
+fn looks_like_tool_missing(exit_code: Option<i32>, output: &str) -> bool {
+    if exit_code == Some(127) {
+        return true;
+    }
+    let lower = output.to_ascii_lowercase();
+    lower.contains("command not found")
+        || lower.contains("is not recognized as an internal or external command")
+}
+
+/// Extracts the total test count declared by a `cargo test`/`cargo nextest
+/// run` summary line, if the output contains at least one well-formed one --
+/// the well-formedness check [`classify_test_report`] is built on. Sums
+/// across every such line found (a multi-binary `cargo test` run prints one
+/// `test result:` line per binary, never one combined total), so this is
+/// "how many test outcomes did the runner report finishing", not "how many
+/// binaries ran". `None` means no summary line was found at all.
+///
+/// `#[cfg(test)]`: production code (`run_check`) gets this same total from
+/// `FailureNameScanner`'s full-stream `summary_seen`/`summary_total`
+/// instead, never from a piece of already-capped display text -- see
+/// `classify_test_outcome`'s own doc comment for why. This function (and
+/// [`classify_test_report`] below) exist only so the decision table has a
+/// pure, fixture-driven entry point for tests.
+#[cfg(test)]
+fn extract_test_total(output: &str) -> Option<u64> {
+    let mut total = 0u64;
+    let mut found = false;
+    for line in output.lines() {
+        if let Some(count) = parse_cargo_test_result_line(line) {
+            total += count;
+            found = true;
+        } else if let Some(count) = parse_nextest_summary_line(line) {
+            total += count;
+            found = true;
+        }
+    }
+    found.then_some(total)
+}
+
+/// Parses `test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0
+/// filtered out; finished in 0.00s` (or the `FAILED` spelling) into
+/// `passed + failed`, the count of tests the binary actually reported an
+/// outcome for. `None` when the line is not this exact shape -- callers
+/// treat that as "not this kind of summary line", not as an error.
+fn parse_cargo_test_result_line(line: &str) -> Option<u64> {
+    let rest = line.trim().strip_prefix("test result: ")?;
+    let (_, after_dot) = rest.split_once(". ")?;
+    let mut fields = after_dot.split(';');
+    let passed = parse_count_field(fields.next()?, "passed")?;
+    let failed = parse_count_field(fields.next()?, "failed")?;
+    Some(passed + failed)
+}
+
+/// Parses one `; `-delimited field of a `cargo test` summary line, e.g.
+/// `" 3 passed"` with `label = "passed"`, into its leading count. `None` when
+/// the field's label does not match, which is how callers detect the line is
+/// not the shape they expected rather than mis-summing an unrelated number.
+fn parse_count_field(field: &str, label: &str) -> Option<u64> {
+    let (count, name) = field.trim().split_once(' ')?;
+    if name.trim() != label {
+        return None;
+    }
+    count.parse().ok()
+}
+
+/// Parses a `cargo nextest run` human-readable `Summary [   0.12s] 3 tests
+/// run: 3 passed, 0 skipped` line (or the zero-tests/failing spellings) into
+/// the leading "N tests run" count. `None` when the line is not this shape.
+fn parse_nextest_summary_line(line: &str) -> Option<u64> {
+    let trimmed = line.trim();
+    let after_summary = trimmed.strip_prefix("Summary ")?;
+    let close = after_summary.find(']')?;
+    let after_bracket = after_summary[close + 1..].trim_start();
+    let mut parts = after_bracket.split_whitespace();
+    let count = parts.next()?;
+    let next = parts.next()?;
+    if !next.starts_with("test") {
+        return None;
+    }
+    count.parse().ok()
+}
+
+/// The pure runner-report classifier issue #268 asks for: whether a
+/// `cargo test`/`cargo nextest run`-shaped `Unit` check's captured output is
+/// well-formed enough to trust `exit_success` and any parsed failure names
+/// at all. `None` means "well-formed, proceed with the ordinary exit-code
+/// verdict"; `Some(reason)` means the check must be reported `Inconclusive`
+/// instead, regardless of what its exit code said.
+///
+/// A summary line declaring zero tests run is `NoTestsSelected` on a
+/// successful exit (an empty filter or a selection matching nothing) but
+/// `RunnerCrashed` on a failing one (something died before selecting any
+/// test, which a `0 tests run` line does not normally accompany). No summary
+/// line at all is `RunnerCrashed` on a failing exit -- the
+/// STATUS_ACCESS_VIOLATION trap this issue exists to close, where a crashed
+/// runner leaves no `test result:`/`Summary [...]` line behind for
+/// [`parse_cargo_test_failure_names`] to find, and an empty failure-name set
+/// used to read as a clean pass -- or `ReportUnparseable` on a successful
+/// one.
+///
+/// `#[cfg(test)]`: exists so this decision table has a pure, text-in
+/// entry point fixture files can exercise directly. `run_check` calls
+/// [`classify_test_outcome`] instead, with a total taken from the check's
+/// complete, uncapped output -- text handed to *this* function can
+/// legitimately have lost its summary line to display-buffer capping (see
+/// `classify_test_outcome`'s own doc comment), which is exactly the bug a
+/// caller relying on this function for production classification would
+/// have reintroduced.
+#[cfg(test)]
+fn classify_test_report(output: &str, exit_success: bool) -> Option<InconclusiveReason> {
+    classify_test_outcome(extract_test_total(output), exit_success)
+}
+
+/// The actual decision table behind [`classify_test_report`], taking the
+/// already-extracted total directly rather than re-deriving it from text.
+/// `run_check` calls this with a total computed from the check's *complete*
+/// uncapped output (see `FailureNameScanner`'s `summary_total`/
+/// `summary_seen`, fed during capture exactly like failing test names
+/// already are) -- never from the capped *display* buffer, which two
+/// independent 16 KiB caps (`read_capped_tail_and_scan`'s own tail cap, then
+/// `run_check`'s second cap on the stdout+stderr concatenation) can leave
+/// with no summary line at all even though the runner printed one. Doing
+/// this classification against that doubly-capped text let a `cargo test
+/// --verbose` run's compiler noise alone misreport a real pass as
+/// `ReportUnparseable` or a real failure as `RunnerCrashed`, which the
+/// mandated `--verbose` gate made likely rather than theoretical.
+fn classify_test_outcome(total: Option<u64>, exit_success: bool) -> Option<InconclusiveReason> {
+    match total {
+        Some(0) if exit_success => Some(InconclusiveReason::NoTestsSelected),
+        Some(0) => Some(InconclusiveReason::RunnerCrashed),
+        Some(_) => None,
+        None if exit_success => Some(InconclusiveReason::ReportUnparseable),
+        None => Some(InconclusiveReason::RunnerCrashed),
+    }
+}
+
+/// Applies both of `run_check`'s post-hoc `Inconclusive` reclassifications
+/// (issue #268) to an otherwise-final `(status, exit_code)`: a tool the
+/// shell could not find, then -- only for a `cargo test`/`cargo nextest
+/// run`-shaped `Unit` check -- [`classify_test_outcome`], fed
+/// `test_summary_total` from the check's complete, uncapped output (see that
+/// function's own doc comment for why the capped display text must never be
+/// used here). `output` itself is only ever consulted for the tool-missing
+/// heuristic, which is fine against the capped text: a "command not
+/// found"/exit-127 signal shows up early and reliably, unlike a summary line
+/// a large enough later flood can push out of a capped tail. Never touches
+/// `CheckStatus::DryRun`/`Skipped`/`TimedOut`: a timeout already blocks every
+/// gate exactly as hard as `Inconclusive` does (see `CheckStatus::
+/// Inconclusive`'s own doc comment), and dry-run/skipped checks were never
+/// actually executed, so there is no output to classify.
+fn classify_gate_status(
+    status: CheckStatus,
+    exit_code: Option<i32>,
+    output: &str,
+    is_test_runner_check: bool,
+    test_summary_total: Option<u64>,
+) -> (CheckStatus, Option<InconclusiveReason>) {
+    if status == CheckStatus::Failed && looks_like_tool_missing(exit_code, output) {
+        return (
+            CheckStatus::Inconclusive,
+            Some(InconclusiveReason::ToolMissing),
+        );
+    }
+    if is_test_runner_check
+        && matches!(status, CheckStatus::Passed | CheckStatus::Failed)
+        && let Some(reason) =
+            classify_test_outcome(test_summary_total, status == CheckStatus::Passed)
+    {
+        return (CheckStatus::Inconclusive, Some(reason));
+    }
+    (status, None)
+}
+
 fn parse_cargo_test_failure_names(output: &str) -> std::collections::BTreeSet<String> {
     let lines: Vec<&str> = output.lines().collect();
     let mut names = std::collections::BTreeSet::new();
@@ -783,6 +1099,18 @@ fn parse_cargo_test_failure_names(output: &str) -> std::collections::BTreeSet<St
 /// ignorable up to its next newline, rather than buffering an unbounded
 /// amount of a single newline-less stream -- which would otherwise defeat
 /// the memory cap the capped *display* tail is meant to provide.
+///
+/// Also recognizes the `cargo test`/`cargo nextest run` summary line itself
+/// (`summary_seen`/`summary_total`, fed by `parse_cargo_test_result_line`/
+/// `parse_nextest_summary_line`, same as `extract_test_total`) -- for the
+/// identical reason names are recovered from the full stream rather than
+/// the capped display tail: `run_check` concatenates the stdout and stderr
+/// tails and caps the result a *second* time, and verbose compiler noise on
+/// either stream can push the entire summary line out of that second cap
+/// even though both per-stream tails individually held it. Classifying off
+/// that doubly-capped text let a real pass or failure misreport as
+/// `Inconclusive`; `classify_gate_status` now uses `summary_seen`/
+/// `summary_total` from this full-stream scan instead.
 #[derive(Default)]
 struct FailureNameScanner {
     names: std::collections::BTreeSet<String>,
@@ -790,6 +1118,8 @@ struct FailureNameScanner {
     partial: Vec<u8>,
     partial_overflowed: bool,
     saw_failures_header: bool,
+    summary_seen: bool,
+    summary_total: u64,
 }
 
 impl FailureNameScanner {
@@ -824,6 +1154,16 @@ impl FailureNameScanner {
     }
 
     fn observe_line(&mut self, line: &str) {
+        // Independent of the `failures:`/pending-name state machine below:
+        // a summary line is a summary line regardless of what surrounds it,
+        // so this never interferes with (and is never interfered with by)
+        // the existing name-recovery branches.
+        if let Some(count) =
+            parse_cargo_test_result_line(line).or_else(|| parse_nextest_summary_line(line))
+        {
+            self.summary_seen = true;
+            self.summary_total = self.summary_total.saturating_add(count);
+        }
         let trimmed = line.trim();
         if trimmed == "failures:" {
             self.pending.clear();
@@ -851,13 +1191,17 @@ impl FailureNameScanner {
     }
 
     /// Consumes the scanner, flushing any final unterminated line (a stream
-    /// that ends without a trailing newline) before returning the names.
-    fn finish(mut self) -> std::collections::BTreeSet<String> {
+    /// that ends without a trailing newline) before returning the names,
+    /// plus whether a summary line was seen anywhere in the full stream and
+    /// the running total it declared (summed across every such line found,
+    /// exactly like `extract_test_total` -- a multi-binary `cargo test` run
+    /// prints one `test result:` line per binary, never one combined total).
+    fn finish(mut self) -> (std::collections::BTreeSet<String>, bool, u64) {
         if !self.partial.is_empty() && !self.partial_overflowed {
             let line = String::from_utf8_lossy(&self.partial).into_owned();
             self.observe_line(line.trim_end_matches(['\n', '\r']));
         }
-        self.names
+        (self.names, self.summary_seen, self.summary_total)
     }
 }
 
@@ -877,9 +1221,26 @@ pub struct TestBaseline {
     #[serde(default)]
     pub failing_tests: Vec<String>,
     pub recorded_at: u64,
+    /// Issue #268's baseline hygiene: how many consecutive non-dry-run
+    /// evaluations in a row each still-baselined name has gone unseen among
+    /// this repository's own failures (see `update_baseline_after_run`).
+    /// Reset to 0 the moment a name is seen failing again; a name reaching
+    /// `PRUNE_AFTER_GREENS` becomes eligible for `zirv test baseline
+    /// --prune` (`run_baseline_prune`). `#[serde(default)]` so a baseline
+    /// recorded before this field existed still deserializes, with every
+    /// name starting at 0 greens rather than failing to load.
+    #[serde(default)]
+    pub green_streaks: std::collections::BTreeMap<String, u32>,
 }
 
 const TEST_BASELINE_SCHEMA_VERSION: u32 = 1;
+
+/// How many consecutive green evaluations a baselined name needs before
+/// `zirv test baseline --prune` will drop it. Not yet operator-configurable
+/// (the issue's own `test.prune_after_greens` key is left for a follow-up)
+/// -- a fixed default of 3, matching the issue's own default, until that
+/// lands.
+const PRUNE_AFTER_GREENS: u32 = 3;
 
 fn test_baseline_dir() -> CtxResult<PathBuf> {
     Ok(crate::utils::home_dir()?
@@ -924,17 +1285,108 @@ pub fn save_baseline(
     repo: &Path,
     failing_tests: std::collections::BTreeSet<String>,
 ) -> CtxResult<TestBaseline> {
+    // Carries forward each still-baselined name's own green streak (from
+    // ordinary `zirv test changed`/`zirv verify` evaluations, see
+    // `update_baseline_after_run`) rather than resetting it just because the
+    // operator re-ran `zirv test baseline` -- a fresh full recompute is not
+    // itself evidence the name regressed. A name absent from the previous
+    // baseline (newly recorded) starts at 0, same as before this field
+    // existed.
+    let previous = load_baseline(repo).unwrap_or(None);
+    let green_streaks = failing_tests
+        .iter()
+        .filter_map(|name| {
+            previous
+                .as_ref()
+                .and_then(|baseline| baseline.green_streaks.get(name))
+                .map(|streak| (name.clone(), *streak))
+        })
+        .collect();
     let baseline = TestBaseline {
         schema_version: TEST_BASELINE_SCHEMA_VERSION,
         failing_tests: failing_tests.into_iter().collect(),
         recorded_at: now_secs(),
+        green_streaks,
     };
+    write_baseline(repo, &baseline)?;
+    Ok(baseline)
+}
+
+fn write_baseline(repo: &Path, baseline: &TestBaseline) -> CtxResult<()> {
     create_private_dir_all(&test_baseline_dir()?)?;
     write_private(
         &test_baseline_path(repo)?,
-        &serde_json::to_string_pretty(&baseline)?,
+        &serde_json::to_string_pretty(baseline)?,
     )?;
-    Ok(baseline)
+    Ok(())
+}
+
+/// Issue #268's baseline-hygiene half: after every non-dry-run evaluation
+/// (`zirv test changed`/`zirv test all`/`zirv verify`, and `zirv test
+/// baseline` itself before it overwrites the file), advances each
+/// still-baselined name's `green_streaks` counter when this run's evidence
+/// says it is clean, or resets it to 0 the moment it is seen failing again --
+/// so a name only ever earns `zirv test baseline --prune` eligibility from
+/// repeated, real green evidence, never from a single lucky run or a run
+/// that never even exercised it.
+///
+/// Does nothing (returns `None`, touches no file) when there is no baseline
+/// yet, the baseline is empty, this run selected no `Unit`, non-repo-supplied
+/// check at all (so it has no opinion on any baselined name), or any such
+/// check came back `Inconclusive`/`TimedOut` -- an unreliable run must never
+/// advance a streak on a guess. Only ever ingests failing names from the
+/// same check sources `run_baseline` itself trusts (never `RepoConfig`/
+/// `DiscoveredScript`), so a repository-authored check can neither manufacture
+/// nor erase prune eligibility for a name it does not own.
+///
+/// Returns an operator-facing note naming how many entries just became
+/// prune-eligible, if any -- the `zirv test changed` hint the issue's design
+/// asks for.
+fn update_baseline_after_run(repo: &Path, report: &VerificationReport) -> Option<String> {
+    let mut baseline = load_baseline(repo).ok().flatten()?;
+    if baseline.failing_tests.is_empty() {
+        return None;
+    }
+    let unit_checks: Vec<&CheckResult> = report
+        .checks
+        .iter()
+        .filter(|check| check.kind == CheckKind::Unit && !check.source.repo_supplied())
+        .collect();
+    if unit_checks.is_empty()
+        || unit_checks.iter().any(|check| {
+            matches!(
+                check.status,
+                CheckStatus::Inconclusive | CheckStatus::TimedOut
+            )
+        })
+    {
+        return None;
+    }
+    let observed_failing: std::collections::BTreeSet<String> = unit_checks
+        .iter()
+        .filter(|check| check.status == CheckStatus::Failed)
+        .flat_map(|check| failure_names_for(check))
+        .collect();
+    let mut eligible = 0usize;
+    for name in &baseline.failing_tests {
+        let streak = baseline.green_streaks.entry(name.clone()).or_insert(0);
+        if observed_failing.contains(name) {
+            *streak = 0;
+        } else {
+            *streak = streak.saturating_add(1);
+        }
+        if *streak >= PRUNE_AFTER_GREENS {
+            eligible += 1;
+        }
+    }
+    write_baseline(repo, &baseline).ok()?;
+    (eligible > 0).then(|| {
+        let plural = if eligible == 1 { "y" } else { "ies" };
+        format!(
+            "baseline: {eligible} entr{plural} eligible for prune (run `zirv test baseline \
+             --prune`)"
+        )
+    })
 }
 
 fn command_for_shell(command: &str) -> Command {
@@ -954,16 +1406,18 @@ fn command_for_shell(command: &str) -> Command {
 
 /// The retained tail (whether the stream ended in a read error rather than
 /// at EOF is the second element -- an error read as a clean end silently
-/// turned a truncated failure log into a complete-looking one), plus the
-/// failing test names a [`FailureNameScanner`] recognized in the *full*,
-/// uncapped stream as it went by -- see that struct's doc comment for why
-/// this must happen during capture rather than against the capped tail
-/// alone. Every check's output goes through this path (`run_check`); only
-/// the retained-tail element is ever a display artifact.
+/// turned a truncated failure log into a complete-looking one), plus what a
+/// [`FailureNameScanner`] recognized in the *full*, uncapped stream as it
+/// went by -- the failing test names, whether a `test result:`/`Summary
+/// [...]` line was seen at all, and the total it declared -- see that
+/// struct's doc comment for why this must happen during capture rather than
+/// against the capped tail alone. Every check's output goes through this
+/// path (`run_check`); only the retained-tail element is ever a display
+/// artifact.
 fn read_capped_tail_and_scan(
     mut reader: impl Read,
     cap: usize,
-) -> (Vec<u8>, bool, std::collections::BTreeSet<String>) {
+) -> (Vec<u8>, bool, std::collections::BTreeSet<String>, bool, u64) {
     let mut kept = Vec::with_capacity(cap);
     let mut chunk = [0u8; 8192];
     let mut errored = false;
@@ -989,7 +1443,8 @@ fn read_capped_tail_and_scan(
         }
         kept.extend_from_slice(&chunk[..count]);
     }
-    (kept, errored, scanner.finish())
+    let (names, summary_seen, summary_total) = scanner.finish();
+    (kept, errored, names, summary_seen, summary_total)
 }
 
 /// The last `cap` bytes as text, on a char boundary. `utils::truncate_bytes`
@@ -1054,6 +1509,7 @@ fn check_result(check: &ResolvedCheck, status: CheckStatus) -> CheckResult {
         duration_ms: 0,
         failure_output: None,
         failure_test_names: Vec::new(),
+        inconclusive_reason: None,
     }
 }
 
@@ -1219,6 +1675,8 @@ fn run_check(
     }
     let check_source = check.source;
     let check = &check.spec;
+    let is_test_runner_check =
+        check.kind == CheckKind::Unit && is_cargo_test_runner(&check.command);
     let started = Instant::now();
     let mut command = command_for_shell(&check.command);
     super::isolate_process_tree(&mut command);
@@ -1249,13 +1707,17 @@ fn run_check(
         }
     }
     /// One check's raw run outcome: status, exit code, combined capped
-    /// output, and the failing test names a `FailureNameScanner` recognized
-    /// while that output streamed by.
+    /// output (display/storage only -- never classification, see
+    /// `FailureNameScanner`'s doc comment), the failing test names a
+    /// `FailureNameScanner` recognized while that output streamed by, and
+    /// whether/what total a `test result:`/`Summary [...]` line declared
+    /// anywhere in the *complete* stdout+stderr streams.
     type RawCheckOutcome = (
         CheckStatus,
         Option<i32>,
         Vec<u8>,
         std::collections::BTreeSet<String>,
+        Option<u64>,
     );
     let result = (|| -> CtxResult<RawCheckOutcome> {
         let mut child = command.spawn()?;
@@ -1294,29 +1756,53 @@ fn run_check(
             }
             std::thread::sleep(Duration::from_millis(25));
         };
-        let (mut output, mut errored, mut names) = stdout_thread.join().unwrap_or_default();
-        let (stderr_output, stderr_errored, stderr_names) =
-            stderr_thread.join().unwrap_or_default();
+        let (mut output, mut errored, mut names, stdout_summary_seen, stdout_summary_total) =
+            stdout_thread.join().unwrap_or_default();
+        let (
+            stderr_output,
+            stderr_errored,
+            stderr_names,
+            stderr_summary_seen,
+            stderr_summary_total,
+        ) = stderr_thread.join().unwrap_or_default();
         output.extend(stderr_output);
         errored |= stderr_errored;
         names.extend(stderr_names);
+        // Full-stream totals, never the capped `output` buffer below: a
+        // `cargo test`/`cargo nextest run` summary line survives here even
+        // when the doubly-capped display buffer (per-stream tail, then a
+        // second cap on the stdout+stderr concatenation) has lost it to a
+        // large enough flood of noise on either stream -- see
+        // `classify_test_outcome`'s own doc comment.
+        let summary_seen = stdout_summary_seen || stderr_summary_seen;
+        let summary_total =
+            summary_seen.then(|| stdout_summary_total.saturating_add(stderr_summary_total));
         if output.len() > MAX_FAILURE_OUTPUT_BYTES {
             output.drain(..output.len() - MAX_FAILURE_OUTPUT_BYTES);
         }
         if errored {
             output.extend_from_slice(b"\n[output stream ended in a read error]");
         }
-        Ok((status, code, output, names))
+        Ok((status, code, output, names, summary_total))
     })();
 
-    let (status, exit_code, output, failure_test_names) = result.unwrap_or_else(|err| {
-        (
-            CheckStatus::Failed,
-            None,
-            err.to_string().into_bytes(),
-            std::collections::BTreeSet::new(),
-        )
-    });
+    let (status, exit_code, output, failure_test_names, test_summary_total, spawn_tool_missing) =
+        match result {
+            Ok((status, code, output, names, summary_total)) => {
+                (status, code, output, names, summary_total, false)
+            }
+            Err(err) => {
+                let missing = is_spawn_not_found(err.as_ref());
+                (
+                    CheckStatus::Failed,
+                    None,
+                    err.to_string().into_bytes(),
+                    std::collections::BTreeSet::new(),
+                    None,
+                    missing,
+                )
+            }
+        };
     let failure_output = (status != CheckStatus::Passed)
         .then(|| scrub_output(&tail_text(&output, MAX_FAILURE_OUTPUT_BYTES)));
     // Scrubbed the same way `failure_output` is: a name recognized inside
@@ -1329,6 +1815,27 @@ fn run_check(
             .map(|name| scrub_line(&name))
             .collect()
     };
+    // Issue #268: never trust a bare exit code alone for a test runner. A
+    // literal spawn failure (the shell binary itself missing -- vanishingly
+    // rare) and a shell-reported "command not found" (the command inside it
+    // missing -- the realistic case for a misconfigured `verify.toml`) both
+    // become `Inconclusive`, and so does a `cargo test`/`cargo nextest
+    // run`-shaped `Unit` check whose own output never reached a well-formed
+    // summary line.
+    let (status, inconclusive_reason) = if spawn_tool_missing {
+        (
+            CheckStatus::Inconclusive,
+            Some(InconclusiveReason::ToolMissing),
+        )
+    } else {
+        classify_gate_status(
+            status,
+            exit_code,
+            &String::from_utf8_lossy(&output),
+            is_test_runner_check,
+            test_summary_total,
+        )
+    };
     CheckResult {
         id: check.id.clone(),
         kind: check.kind,
@@ -1339,7 +1846,21 @@ fn run_check(
         duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
         failure_output,
         failure_test_names,
+        inconclusive_reason,
     }
+}
+
+/// Whether `error` is (or wraps) an [`std::io::Error`] of
+/// [`std::io::ErrorKind::NotFound`] -- the kind [`std::process::Command::
+/// spawn`] returns when the program it was told to run does not exist.
+/// Distinct from a shell finding *itself* but failing to find the command
+/// named *inside* it (`looks_like_tool_missing`'s exit-127 case): this is
+/// the shell (`sh`/`cmd`) itself never starting, which in practice only
+/// happens in a badly broken environment.
+fn is_spawn_not_found(error: &(dyn std::error::Error + 'static)) -> bool {
+    error
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
 }
 
 fn report_dir(state: &StateDir, repo: &Path) -> PathBuf {
@@ -1529,6 +2050,55 @@ pub fn evaluate_against_operator_baseline(
     report.evaluate_against_baseline(baseline.as_ref())
 }
 
+/// The `proves:`/`fix:` announcement issue #268 asks for alongside a gate
+/// failure: an `Inconclusive` verdict is worded differently from an ordinary
+/// `Fail`, since a crashed runner or an empty selection proves nothing about
+/// the change set in either direction, whereas a real failure at least
+/// proves something is broken. Meant to be appended to the plain "run `zirv
+/// test changed`/`zirv verify`" message every `latest_is_fresh_and_passing`
+/// call site already produces on its own -- see `engine.rs`'s step gate and
+/// `deploy.rs`'s production gate.
+pub fn gate_announcement(state: &StateDir, repo: &Path, final_only: bool) -> String {
+    let command = if final_only {
+        "zirv verify"
+    } else {
+        "zirv test changed"
+    };
+    let Ok(Some(report)) = load_latest(state, repo) else {
+        return format!("proves: nothing (no verification evidence yet) · fix: run `{command}`");
+    };
+    match report.outcome() {
+        GateOutcome::Inconclusive(reason) => format!(
+            "gate: Inconclusive ({}) · proves: nothing · fix: re-run `{command}`; if it \
+             repeats, investigate before treating the change as verified",
+            reason.as_str()
+        ),
+        GateOutcome::Fail | GateOutcome::Pass => {
+            // `outcome()` ranks `Fail` above `Inconclusive`, so a mixed
+            // report (one check genuinely failed, another's runner
+            // crashed) lands here -- the accompanying `Inconclusive`
+            // check(s) are still worth naming, not silently absorbed into
+            // a plain "Fail" that implies every check produced real
+            // evidence.
+            let inconclusive_ids: Vec<&str> = report
+                .checks
+                .iter()
+                .filter(|check| check.status == CheckStatus::Inconclusive)
+                .map(|check| check.id.as_str())
+                .collect();
+            let suffix = if inconclusive_ids.is_empty() {
+                String::new()
+            } else {
+                format!(" (also inconclusive: {})", inconclusive_ids.join(", "))
+            };
+            format!(
+                "gate: Fail · proves: the current evidence does not cover this change set, or \
+                 has unwaived failures · fix: run `{command}`{suffix}"
+            )
+        }
+    }
+}
+
 fn run_mode(
     repo: &Path,
     mode: VerificationMode,
@@ -1542,6 +2112,55 @@ fn run_mode(
     let repo_gates = super::repo_gates(repo);
     let repo_checks_enabled = repo_gates.checks;
     let mut notes = resolved.notes;
+    // Issue #268's degraded-gate ban: zero checks configured or
+    // discoverable is reported, not silently treated as a pass and not a
+    // hard `Err` either (an empty/absent `verify.toml` must not brick `zirv
+    // test`/`zirv verify` outright -- same reasoning as the repo-gate note
+    // above). Only the operator-only `workflow.allow_empty_verify` override
+    // can make this a `Passed` run instead; the override's use is recorded
+    // in `notes` either way, so it is visible in the report.
+    if resolved.checks.is_empty() {
+        let allow_empty = repo_gates.allow_empty_verify;
+        notes.push(if allow_empty {
+            "no verification checks configured or discoverable; passing only because the \
+             operator override workflow.allow_empty_verify is set"
+                .to_string()
+        } else {
+            "no verification checks configured or discoverable; add .zirv/verify.toml (or set \
+             the operator override workflow.allow_empty_verify)"
+                .to_string()
+        });
+        return Ok(VerificationReport {
+            schema_version: VERIFY_REPORT_SCHEMA_VERSION,
+            id: uuid::Uuid::new_v4().to_string(),
+            mode,
+            source: resolved.origin.to_string(),
+            repo: repo.to_path_buf(),
+            change_fingerprint: change_fingerprint(repo)?,
+            changed_paths: Vec::new(),
+            fallback_to_full: false,
+            narrowed_to: only.to_vec(),
+            notes,
+            started_at: now_secs(),
+            finished_at: now_secs(),
+            checks: vec![CheckResult {
+                id: "no-checks".into(),
+                kind: CheckKind::Custom,
+                command: String::new(),
+                source: CheckSource::DiscoveredToolchain,
+                status: if allow_empty {
+                    CheckStatus::Passed
+                } else {
+                    CheckStatus::Inconclusive
+                },
+                exit_code: None,
+                duration_ms: 0,
+                failure_output: None,
+                failure_test_names: Vec::new(),
+                inconclusive_reason: (!allow_empty).then_some(InconclusiveReason::NoChecks),
+            }],
+        });
+    }
     let paths = changed_paths(repo)?;
     let mut fallback_to_full = false;
     let mut selected: Vec<&ResolvedCheck> = resolved
@@ -1730,7 +2349,12 @@ fn run_and_persist(
     args: &RunArgs,
     writer: &mut impl Write,
 ) -> CtxResult<(i32, VerificationReport)> {
-    let report = run_mode(repo, mode, &args.checks, args.dry_run)?;
+    let mut report = run_mode(repo, mode, &args.checks, args.dry_run)?;
+    if !args.dry_run
+        && let Some(note) = update_baseline_after_run(repo, &report)
+    {
+        report.notes.push(note);
+    }
     // `zirv verify | head` closes the pipe mid-report. Printing is the part
     // that failed, so the run's own results are still worth storing -- without
     // this, piping into a pager silently cost the workflow its evidence.
@@ -1786,10 +2410,25 @@ fn run_and_report(
 /// still fails the run and still blocks the gate -- it is simply never
 /// consulted for baseline *names*, exactly like any other unrecordable
 /// check.
-fn run_baseline(repo: &Path, args: &RunArgs, writer: &mut impl Write) -> CtxResult<i32> {
-    let (code, report) = run_and_persist(repo, VerificationMode::All, args, writer)?;
-    if args.dry_run {
+fn run_baseline(repo: &Path, args: &BaselineArgs, writer: &mut impl Write) -> CtxResult<i32> {
+    if args.prune {
+        return run_baseline_prune(repo, writer);
+    }
+    let (code, report) = run_and_persist(repo, VerificationMode::All, &args.run, writer)?;
+    if args.run.dry_run {
         return Ok(code);
+    }
+    // Issue #268's degraded-gate ban: a run that proves nothing either way
+    // must never be recorded as evidence a set of tests is exactly this
+    // repository's known-bad list -- that is what let a crashed runner (or
+    // an empty selection) silently become "the baseline says this is fine".
+    if let GateOutcome::Inconclusive(reason) = report.outcome() {
+        crate::output::warn(format!(
+            "baseline not recorded: this run was inconclusive ({}) -- re-run once the runner \
+             produces a well-formed result",
+            reason.as_str()
+        ));
+        return Ok(1);
     }
     let mut failing = std::collections::BTreeSet::new();
     let mut unrecordable = Vec::new();
@@ -1836,6 +2475,51 @@ fn run_baseline(repo: &Path, args: &RunArgs, writer: &mut impl Write) -> CtxResu
     Ok(0)
 }
 
+/// `zirv test baseline --prune`: removes exactly the baseline entries that
+/// have reached `PRUNE_AFTER_GREENS` consecutive green evaluations (see
+/// `update_baseline_after_run`), without re-running any check -- pruning is a
+/// maintenance action over evidence already accumulated by ordinary `zirv
+/// test changed`/`zirv verify` runs, not a fresh recording.
+fn run_baseline_prune(repo: &Path, writer: &mut impl Write) -> CtxResult<i32> {
+    let Some(mut baseline) = load_baseline(repo)? else {
+        writeln!(
+            writer,
+            "no recorded baseline for {}; nothing to prune",
+            scrub_line(&repo_slug(repo))
+        )?;
+        return Ok(0);
+    };
+    let eligible: Vec<String> = baseline
+        .failing_tests
+        .iter()
+        .filter(|name| {
+            baseline.green_streaks.get(*name).copied().unwrap_or(0) >= PRUNE_AFTER_GREENS
+        })
+        .cloned()
+        .collect();
+    if eligible.is_empty() {
+        writeln!(
+            writer,
+            "no baseline entries have reached {PRUNE_AFTER_GREENS} consecutive green runs yet"
+        )?;
+        return Ok(0);
+    }
+    baseline
+        .failing_tests
+        .retain(|name| !eligible.contains(name));
+    for name in &eligible {
+        baseline.green_streaks.remove(name);
+    }
+    write_baseline(repo, &baseline)?;
+    writeln!(
+        writer,
+        "pruned {} baseline entry(ies): {}",
+        eligible.len(),
+        scrub_line(&eligible.join(", "))
+    )?;
+    Ok(0)
+}
+
 #[derive(Debug, Args)]
 pub struct RunArgs {
     #[arg(long)]
@@ -1847,6 +2531,17 @@ pub struct RunArgs {
     pub dry_run: bool,
     #[arg(long)]
     pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct BaselineArgs {
+    #[command(flatten)]
+    pub run: RunArgs,
+    /// Remove baseline entries that have reached `PRUNE_AFTER_GREENS`
+    /// consecutive green evaluations, instead of running every check and
+    /// recording a fresh baseline (issue #268).
+    #[arg(long)]
+    pub prune: bool,
 }
 
 #[derive(Debug, Args)]
@@ -1864,8 +2559,10 @@ pub enum TestCommand {
     /// Run every check and record its failing test names as this
     /// repository's operator-owned baseline (issue #215), so a later step
     /// gate may waive exactly these pre-existing failures instead of
-    /// blocking on them forever. Always an explicit operator action.
-    Baseline(RunArgs),
+    /// blocking on them forever. Always an explicit operator action. Never
+    /// records from an `Inconclusive` run (issue #268); `--prune` instead
+    /// removes matured entries without re-running anything.
+    Baseline(BaselineArgs),
 }
 
 #[derive(Debug, Args)]
@@ -1945,7 +2642,7 @@ pub fn run_test(args: &TestArgs, writer: &mut impl Write) -> CtxResult<i32> {
             writer,
         ),
         TestCommand::Baseline(args) => {
-            run_baseline(&resolved_repo(args.repo.as_deref())?, args, writer)
+            run_baseline(&resolved_repo(args.run.repo.as_deref())?, args, writer)
         }
     }
 }
@@ -2554,6 +3251,7 @@ mod tests {
                 duration_ms: 1,
                 failure_output: None,
                 failure_test_names: Vec::new(),
+                inconclusive_reason: None,
             }],
         };
         save_report(&state, &report).unwrap();
@@ -2635,6 +3333,7 @@ mod tests {
                 duration_ms: 1,
                 failure_output: None,
                 failure_test_names: Vec::new(),
+                inconclusive_reason: None,
             }],
             started_at: 0,
             finished_at: 0,
@@ -2691,6 +3390,7 @@ mod tests {
                 duration_ms: 1,
                 failure_output: None,
                 failure_test_names: Vec::new(),
+                inconclusive_reason: None,
             }],
         }
     }
@@ -2770,7 +3470,7 @@ mod tests {
         let input: Vec<u8> = (0..MAX_FAILURE_OUTPUT_BYTES + 4096)
             .map(|index| (index % 251) as u8)
             .collect();
-        let (retained, errored, _names) =
+        let (retained, errored, _names, _summary_seen, _summary_total) =
             read_capped_tail_and_scan(std::io::Cursor::new(&input), MAX_FAILURE_OUTPUT_BYTES);
         assert!(!errored);
         assert_eq!(retained.len(), MAX_FAILURE_OUTPUT_BYTES);
@@ -3105,6 +3805,7 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; 
             duration_ms: 1,
             failure_output: failure_output.map(str::to_string),
             failure_test_names: Vec::new(),
+            inconclusive_reason: None,
         }
     }
 
@@ -3138,6 +3839,7 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; 
             schema_version: TEST_BASELINE_SCHEMA_VERSION,
             failing_tests: names.iter().map(|name| name.to_string()).collect(),
             recorded_at: 0,
+            green_streaks: std::collections::BTreeMap::new(),
         }
     }
 
@@ -3213,6 +3915,7 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; 
             duration_ms: 1,
             failure_output: Some("warning: unused variable".into()),
             failure_test_names: Vec::new(),
+            inconclusive_reason: None,
         }]);
         // Even a baseline that happens to contain the exact failure text must
         // not waive a check that names no individual tests at all.
@@ -3407,7 +4110,7 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; 
             input.extend_from_slice(b"[17:08:14] zirv \xe2\x96\xb8 sandbox posture noise\r\n");
         }
 
-        let (retained, errored, names) =
+        let (retained, errored, names, _summary_seen, _summary_total) =
             read_capped_tail_and_scan(std::io::Cursor::new(&input), MAX_FAILURE_OUTPUT_BYTES);
         assert!(!errored);
         let retained_text = String::from_utf8_lossy(&retained);
@@ -3434,6 +4137,7 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; 
             duration_ms: 1,
             failure_output: Some(retained_text.into_owned()),
             failure_test_names: names.into_iter().collect(),
+            inconclusive_reason: None,
         };
         assert!(
             failure_names_for(&check).contains(real_name),
@@ -3471,11 +4175,14 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; 
         with_state(state_root.path(), || {
             run_baseline(
                 repo.path(),
-                &RunArgs {
-                    repo: None,
-                    checks: vec![],
-                    dry_run: false,
-                    json: false,
+                &BaselineArgs {
+                    run: RunArgs {
+                        repo: None,
+                        checks: vec![],
+                        dry_run: false,
+                        json: false,
+                    },
+                    prune: false,
                 },
                 &mut out,
             )
@@ -3514,7 +4221,7 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; 
             );
         }
         // Fed 128 * 4096 = 512 KiB total with never a single newline.
-        let names = scanner.finish();
+        let (names, _summary_seen, _summary_total) = scanner.finish();
         assert!(
             names.is_empty(),
             "a newline-less flood can never contain a real failing test name: {names:?}"
@@ -3537,7 +4244,7 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; 
             b"test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; \
               finished in 0.01s\n",
         );
-        let names = scanner.finish();
+        let (names, _summary_seen, _summary_total) = scanner.finish();
         assert!(
             names.is_empty(),
             "a `test result: FAILED` with no preceding `failures:` header must yield no names: \
@@ -3565,7 +4272,7 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; 
         scanner.feed(b"failures:\n");
         scanner.feed(b"    crate_b::tests::second_failure\n");
         scanner.feed(b"test result: FAILED. 0 passed; 1 failed\n");
-        let names = scanner.finish();
+        let (names, _summary_seen, _summary_total) = scanner.finish();
         assert_eq!(
             names,
             std::collections::BTreeSet::from([
@@ -3573,6 +4280,700 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; 
                 "crate_b::tests::second_failure".to_string(),
             ]),
             "each binary's block must be judged independently by its own header: {names:?}"
+        );
+    }
+
+    // -- Issue #268: three-valued gate outcomes -----------------------------
+
+    /// The STATUS_ACCESS_VIOLATION trap this issue exists to close: a
+    /// crashed `cargo test` run leaves partial per-test lines but never
+    /// reaches its own `test result:` summary, and exits non-zero. A bare
+    /// exit-code check reads this exactly like an empty (i.e. clean) failure
+    /// set; `classify_test_report` must call it `Inconclusive`, never `None`
+    /// (which would let `run_check` leave it `Passed`/`Failed` off the raw
+    /// exit code alone).
+    #[test]
+    fn a_captured_status_access_violation_transcript_classifies_as_runner_crashed() {
+        let output = include_str!("../../../tests/fixtures/test-reports/cargo-test-crash.txt");
+        assert_eq!(
+            classify_test_report(output, false),
+            Some(InconclusiveReason::RunnerCrashed)
+        );
+    }
+
+    /// An empty nextest filter -- `0 tests run` with a *successful* exit --
+    /// must never read as "the change set is clean"; it read nothing at
+    /// all.
+    #[test]
+    fn an_empty_nextest_filter_classifies_as_no_tests_selected() {
+        let output = include_str!("../../../tests/fixtures/test-reports/nextest-empty-filter.txt");
+        assert_eq!(
+            classify_test_report(output, true),
+            Some(InconclusiveReason::NoTestsSelected)
+        );
+    }
+
+    /// The same zero-tests summary with a *failing* exit is not "empty
+    /// selection" -- nothing selected does not normally fail -- it is
+    /// treated as a crash instead.
+    #[test]
+    fn a_zero_tests_summary_with_a_failing_exit_is_runner_crashed_not_no_tests_selected() {
+        let output = include_str!("../../../tests/fixtures/test-reports/nextest-empty-filter.txt");
+        assert_eq!(
+            classify_test_report(output, false),
+            Some(InconclusiveReason::RunnerCrashed)
+        );
+    }
+
+    /// A well-formed clean run (either runner) is never `Inconclusive`: a
+    /// real summary declaring at least one test run must defer entirely to
+    /// the ordinary exit-code verdict.
+    #[test]
+    fn well_formed_reports_with_a_real_summary_are_never_inconclusive() {
+        let cargo_clean = include_str!("../../../tests/fixtures/test-reports/cargo-test-clean.txt");
+        assert_eq!(classify_test_report(cargo_clean, true), None);
+
+        let cargo_failed =
+            include_str!("../../../tests/fixtures/test-reports/cargo-test-failure.txt");
+        assert_eq!(classify_test_report(cargo_failed, false), None);
+
+        let nextest_clean = include_str!("../../../tests/fixtures/test-reports/nextest-clean.txt");
+        assert_eq!(classify_test_report(nextest_clean, true), None);
+    }
+
+    /// A successful exit with no summary line at all (neither a crash --
+    /// exit succeeded -- nor a recognizable empty-selection summary) is the
+    /// residual `ReportUnparseable` case.
+    #[test]
+    fn a_successful_exit_with_no_summary_at_all_is_report_unparseable() {
+        assert_eq!(
+            classify_test_report("nothing recognizable here\n", true),
+            Some(InconclusiveReason::ReportUnparseable)
+        );
+    }
+
+    #[test]
+    fn is_cargo_test_runner_matches_both_known_runners_and_nothing_else() {
+        assert!(is_cargo_test_runner("cargo test --verbose"));
+        assert!(is_cargo_test_runner("cargo nextest run --no-fail-fast"));
+        assert!(!is_cargo_test_runner("npm run test"));
+        assert!(!is_cargo_test_runner("cargo build"));
+    }
+
+    #[test]
+    fn looks_like_tool_missing_matches_exit_127_and_shell_messages() {
+        assert!(looks_like_tool_missing(Some(127), ""));
+        assert!(looks_like_tool_missing(
+            Some(1),
+            "sh: some-tool: command not found"
+        ));
+        assert!(looks_like_tool_missing(
+            Some(1),
+            "'some-tool' is not recognized as an internal or external command"
+        ));
+        assert!(!looks_like_tool_missing(Some(1), "assertion failed"));
+    }
+
+    /// `classify_gate_status` is the seam `run_check` actually calls: a
+    /// non-runner `Unit` check (`npm run test`, say) must never be
+    /// reclassified by `classify_test_report` at all, even if its output
+    /// happens to contain no cargo-shaped summary -- only `cargo test`/
+    /// `cargo nextest run` commands are in scope (`is_cargo_test_runner`).
+    #[test]
+    fn classify_gate_status_never_touches_a_non_runner_unit_check() {
+        let (status, reason) = classify_gate_status(
+            CheckStatus::Passed,
+            Some(0),
+            "jest output, no cargo shape",
+            false,
+            None,
+        );
+        assert_eq!(status, CheckStatus::Passed);
+        assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn classify_gate_status_reclassifies_a_crashed_test_runner_check() {
+        let output = include_str!("../../../tests/fixtures/test-reports/cargo-test-crash.txt");
+        let total = extract_test_total(output);
+        let (status, reason) =
+            classify_gate_status(CheckStatus::Failed, Some(1), output, true, total);
+        assert_eq!(status, CheckStatus::Inconclusive);
+        assert_eq!(reason, Some(InconclusiveReason::RunnerCrashed));
+    }
+
+    #[test]
+    fn classify_gate_status_reclassifies_exit_127_regardless_of_check_kind() {
+        let (status, reason) =
+            classify_gate_status(CheckStatus::Failed, Some(127), "", false, None);
+        assert_eq!(status, CheckStatus::Inconclusive);
+        assert_eq!(reason, Some(InconclusiveReason::ToolMissing));
+    }
+
+    /// `classify_gate_status` must classify off the total the full,
+    /// uncapped stream declared, not off `output`'s own (possibly
+    /// summary-less) capped display text -- a doubly-capped `output`
+    /// buffer that lost its summary line entirely to noise must not, on its
+    /// own, produce `Inconclusive` once the real full-stream total is
+    /// supplied. See `a_late_output_flood_cannot_evict_the_earlier_
+    /// summary_line_from_capture` below for the actual capping/eviction
+    /// this seam is exercised against in `run_check`.
+    #[test]
+    fn classify_gate_status_is_immune_to_the_capped_display_text_losing_the_summary() {
+        let output_with_no_summary: String = "noisy compiler output\n".repeat(50);
+        assert_eq!(extract_test_total(&output_with_no_summary), None);
+
+        let (passed_status, passed_reason) = classify_gate_status(
+            CheckStatus::Passed,
+            Some(0),
+            &output_with_no_summary,
+            true,
+            Some(3),
+        );
+        assert_eq!(passed_status, CheckStatus::Passed, "{passed_reason:?}");
+        assert_eq!(passed_reason, None);
+
+        let (failed_status, failed_reason) = classify_gate_status(
+            CheckStatus::Failed,
+            Some(101),
+            &output_with_no_summary,
+            true,
+            Some(2),
+        );
+        assert_eq!(failed_status, CheckStatus::Failed, "{failed_reason:?}");
+        assert_eq!(failed_reason, None);
+    }
+
+    /// The actual bug this issue's review caught: `run_check` capped each
+    /// stream's own tail to `MAX_FAILURE_OUTPUT_BYTES`, concatenated
+    /// stdout-then-stderr, then capped the result a *second* time from the
+    /// front -- so more than `MAX_FAILURE_OUTPUT_BYTES` of noise on either
+    /// stream *ahead of* a valid summary line could evict the summary from
+    /// the final display buffer entirely, exactly like
+    /// `a_late_output_flood_cannot_evict_the_earlier_failing_name_from_
+    /// capture` already proved for failing test names. `FailureNameScanner`
+    /// must recover the summary the identical way: from the full,
+    /// pre-capping stream as it is fed in, immune to the capped tail's own
+    /// eviction.
+    #[test]
+    fn a_late_output_flood_cannot_evict_the_earlier_summary_line_from_capture() {
+        let mut input = Vec::new();
+        input.extend_from_slice(
+            b"running 3 tests\ntest tests::a ... ok\ntest tests::b ... ok\ntest tests::c ... ok\n\n",
+        );
+        input.extend_from_slice(
+            b"test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; \
+              finished in 0.01s\n",
+        );
+        let after_summary = input.len();
+        while input.len() - after_summary <= MAX_FAILURE_OUTPUT_BYTES {
+            input.extend_from_slice(b"[compiler] warning: unused import noise\n");
+        }
+
+        let (retained, errored, _names, summary_seen, summary_total) =
+            read_capped_tail_and_scan(std::io::Cursor::new(&input), MAX_FAILURE_OUTPUT_BYTES);
+        assert!(!errored);
+        let retained_text = String::from_utf8_lossy(&retained);
+        assert!(
+            !retained_text.contains("test result:"),
+            "sanity check: the capped display tail must actually have evicted the summary, \
+             reproducing the real bug -- got {retained_text:?}"
+        );
+        assert!(
+            summary_seen,
+            "the streaming scan must recover the summary even though the display tail lost it"
+        );
+        assert_eq!(summary_total, 3);
+        assert_eq!(
+            classify_test_outcome(Some(summary_total), true),
+            None,
+            "a recovered real summary must never classify as Inconclusive"
+        );
+    }
+
+    /// `VerificationReport::outcome`: a genuinely `Failed` check always wins
+    /// over an `Inconclusive` one on the same run -- real evidence something
+    /// broke must never be reported as "proves nothing" just because another
+    /// check on the same run happened to be inconclusive.
+    #[test]
+    fn report_outcome_prefers_fail_over_inconclusive_in_a_mixed_report() {
+        let report = report_with_checks(vec![
+            unit_check("clippy-ish", CheckStatus::Failed, None),
+            CheckResult {
+                id: "test".into(),
+                kind: CheckKind::Unit,
+                command: "cargo test".into(),
+                source: CheckSource::DiscoveredToolchain,
+                status: CheckStatus::Inconclusive,
+                exit_code: None,
+                duration_ms: 1,
+                failure_output: None,
+                failure_test_names: Vec::new(),
+                inconclusive_reason: Some(InconclusiveReason::RunnerCrashed),
+            },
+        ]);
+        assert_eq!(report.outcome(), GateOutcome::Fail);
+    }
+
+    /// A report with no genuine `Failed` check but at least one
+    /// `Inconclusive` one is still `Inconclusive`, not `Fail` -- the ranking
+    /// only promotes `Fail` above `Inconclusive` when a real failure is
+    /// actually present.
+    #[test]
+    fn report_outcome_is_inconclusive_with_no_failed_check_present() {
+        let report = report_with_checks(vec![
+            unit_check("format", CheckStatus::Passed, None),
+            CheckResult {
+                id: "test".into(),
+                kind: CheckKind::Unit,
+                command: "cargo test".into(),
+                source: CheckSource::DiscoveredToolchain,
+                status: CheckStatus::Inconclusive,
+                exit_code: None,
+                duration_ms: 1,
+                failure_output: None,
+                failure_test_names: Vec::new(),
+                inconclusive_reason: Some(InconclusiveReason::NoTestsSelected),
+            },
+        ]);
+        assert_eq!(
+            report.outcome(),
+            GateOutcome::Inconclusive(InconclusiveReason::NoTestsSelected)
+        );
+    }
+
+    #[test]
+    fn report_outcome_is_pass_only_when_every_check_passed() {
+        let passing = report_with_checks(vec![unit_check("test", CheckStatus::Passed, None)]);
+        assert_eq!(passing.outcome(), GateOutcome::Pass);
+
+        let failing = report_with_checks(vec![unit_check(
+            "test",
+            CheckStatus::Failed,
+            Some(&cargo_failure_output("wrap::tests::a")),
+        )]);
+        assert_eq!(failing.outcome(), GateOutcome::Fail);
+    }
+
+    /// The core acceptance criterion: `latest_is_fresh_and_passing` must
+    /// return `false` for a fresh, un-narrowed report whose only check is
+    /// `Inconclusive` -- it must never be read as passing just because
+    /// `evaluate_against_baseline`'s existing waiver path only knows how to
+    /// waive a `Failed` `Unit` check, not an `Inconclusive` one.
+    #[test]
+    fn latest_is_fresh_and_passing_returns_false_for_an_inconclusive_report() {
+        let repo = git_repo();
+        let state_root = tempdir().unwrap();
+        let state = StateDir::from_root(state_root.path().to_path_buf());
+        let fingerprint = change_fingerprint(repo.path()).unwrap();
+        let report = VerificationReport {
+            schema_version: VERIFY_REPORT_SCHEMA_VERSION,
+            id: "inconclusive".into(),
+            mode: VerificationMode::Final,
+            source: "configured".into(),
+            repo: repo.path().to_path_buf(),
+            change_fingerprint: fingerprint,
+            changed_paths: vec![],
+            fallback_to_full: false,
+            narrowed_to: vec![],
+            notes: vec![],
+            started_at: 0,
+            finished_at: 0,
+            checks: vec![CheckResult {
+                id: "test".into(),
+                kind: CheckKind::Unit,
+                command: "cargo test".into(),
+                source: CheckSource::DiscoveredToolchain,
+                status: CheckStatus::Inconclusive,
+                exit_code: Some(1),
+                duration_ms: 1,
+                failure_output: None,
+                failure_test_names: Vec::new(),
+                inconclusive_reason: Some(InconclusiveReason::RunnerCrashed),
+            }],
+        };
+        save_report(&state, &report).unwrap();
+        assert!(
+            !latest_is_fresh_and_passing(&state, repo.path(), true).unwrap(),
+            "an Inconclusive report must never satisfy the gate"
+        );
+
+        // Even with the exact same failing (absent) names as a recorded
+        // baseline would waive, `Inconclusive` is never eligible for that
+        // waiver -- `evaluate_against_baseline` only ever waives a `Failed`
+        // `Unit` check with parseable names.
+        let evaluation = evaluate_against_operator_baseline(&report, repo.path());
+        assert!(!evaluation.gate_passed);
+    }
+
+    /// The `proves:`/`fix:` announcement must name the reason and never
+    /// claim the run proved anything.
+    #[test]
+    fn gate_announcement_names_the_inconclusive_reason() {
+        let repo = git_repo();
+        let state_root = tempdir().unwrap();
+        let state = StateDir::from_root(state_root.path().to_path_buf());
+        let fingerprint = change_fingerprint(repo.path()).unwrap();
+        let report = VerificationReport {
+            schema_version: VERIFY_REPORT_SCHEMA_VERSION,
+            id: "inconclusive".into(),
+            mode: VerificationMode::Final,
+            source: "configured".into(),
+            repo: repo.path().to_path_buf(),
+            change_fingerprint: fingerprint,
+            changed_paths: vec![],
+            fallback_to_full: false,
+            narrowed_to: vec![],
+            notes: vec![],
+            started_at: 0,
+            finished_at: 0,
+            checks: vec![CheckResult {
+                id: "test".into(),
+                kind: CheckKind::Unit,
+                command: "cargo test".into(),
+                source: CheckSource::DiscoveredToolchain,
+                status: CheckStatus::Inconclusive,
+                exit_code: Some(1),
+                duration_ms: 1,
+                failure_output: None,
+                failure_test_names: Vec::new(),
+                inconclusive_reason: Some(InconclusiveReason::RunnerCrashed),
+            }],
+        };
+        save_report(&state, &report).unwrap();
+        let announcement = gate_announcement(&state, repo.path(), true);
+        assert!(announcement.contains("proves: nothing"), "{announcement}");
+        assert!(announcement.contains("runner-crashed"), "{announcement}");
+        assert!(announcement.contains("fix:"), "{announcement}");
+    }
+
+    /// A mixed run (one check genuinely failed, another's runner crashed)
+    /// announces `Fail`, not `Inconclusive` -- but must still name the
+    /// inconclusive check by id rather than silently dropping it, since a
+    /// plain "Fail" alone would wrongly imply every check produced real
+    /// evidence.
+    #[test]
+    fn gate_announcement_lists_inconclusive_checks_alongside_a_real_failure() {
+        let repo = git_repo();
+        let state_root = tempdir().unwrap();
+        let state = StateDir::from_root(state_root.path().to_path_buf());
+        let fingerprint = change_fingerprint(repo.path()).unwrap();
+        let report = VerificationReport {
+            schema_version: VERIFY_REPORT_SCHEMA_VERSION,
+            id: "mixed".into(),
+            mode: VerificationMode::Final,
+            source: "configured".into(),
+            repo: repo.path().to_path_buf(),
+            change_fingerprint: fingerprint,
+            changed_paths: vec![],
+            fallback_to_full: false,
+            narrowed_to: vec![],
+            notes: vec![],
+            started_at: 0,
+            finished_at: 0,
+            checks: vec![
+                unit_check("clippy", CheckStatus::Failed, Some("warning: unused")),
+                CheckResult {
+                    id: "test".into(),
+                    kind: CheckKind::Unit,
+                    command: "cargo test".into(),
+                    source: CheckSource::DiscoveredToolchain,
+                    status: CheckStatus::Inconclusive,
+                    exit_code: Some(1),
+                    duration_ms: 1,
+                    failure_output: None,
+                    failure_test_names: Vec::new(),
+                    inconclusive_reason: Some(InconclusiveReason::RunnerCrashed),
+                },
+            ],
+        };
+        save_report(&state, &report).unwrap();
+        let announcement = gate_announcement(&state, repo.path(), true);
+        assert!(announcement.contains("gate: Fail"), "{announcement}");
+        assert!(
+            announcement.contains("also inconclusive") && announcement.contains("test"),
+            "must still name the inconclusive check: {announcement}"
+        );
+    }
+
+    /// An operator-recorded baseline written before `green_streaks` existed
+    /// must still load, with every name starting at 0 greens rather than
+    /// failing to deserialize outright.
+    #[test]
+    fn a_pre_268_baseline_file_without_green_streaks_still_loads() {
+        let home = tempdir().unwrap();
+        let _home_guard = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = PathBuf::from("/some/old/repo");
+        let dir = home.path().join(".zirv").join("test-baseline");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(format!("{}.json", repo_slug(&repo))),
+            r#"{"schema_version":1,"failing_tests":["a::one","b::two"],"recorded_at":123}"#,
+        )
+        .unwrap();
+
+        let loaded = load_baseline(&repo).expect("load").expect("exists");
+        assert_eq!(loaded.failing_tests, vec!["a::one", "b::two"]);
+        assert!(loaded.green_streaks.is_empty());
+    }
+
+    /// Baseline hygiene end to end: three consecutive runs in which a
+    /// baselined name does not appear among the observed failures advance
+    /// its streak to the prune threshold; `--prune` removes exactly that
+    /// name (leaving an untouched one behind), and a run where it *does*
+    /// fail again resets the streak to 0.
+    #[test]
+    fn three_green_runs_make_a_name_prune_eligible_and_prune_removes_exactly_it() {
+        let repo = git_repo();
+        let home = tempdir().unwrap();
+        let _home_guard = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        save_baseline(
+            repo.path(),
+            std::collections::BTreeSet::from([
+                "wrap::tests::a".to_string(),
+                "wrap::tests::b".to_string(),
+            ]),
+        )
+        .unwrap();
+
+        // A clean `Unit` run: neither baselined name appears among this
+        // run's failures, so both should be advancing.
+        let clean_report = report_with_checks(vec![unit_check("test", CheckStatus::Passed, None)]);
+        for _ in 0..PRUNE_AFTER_GREENS {
+            update_baseline_after_run(repo.path(), &clean_report);
+        }
+        let baseline = load_baseline(repo.path()).unwrap().unwrap();
+        assert_eq!(
+            baseline.green_streaks.get("wrap::tests::a").copied(),
+            Some(PRUNE_AFTER_GREENS)
+        );
+        assert_eq!(
+            baseline.green_streaks.get("wrap::tests::b").copied(),
+            Some(PRUNE_AFTER_GREENS)
+        );
+
+        let mut out = Vec::new();
+        run_baseline_prune(repo.path(), &mut out).unwrap();
+        let pruned = String::from_utf8(out).unwrap();
+        assert!(pruned.contains("wrap::tests::a"));
+        assert!(pruned.contains("wrap::tests::b"));
+        let baseline = load_baseline(repo.path()).unwrap().unwrap();
+        assert!(
+            baseline.failing_tests.is_empty(),
+            "both matured entries must be gone: {:?}",
+            baseline.failing_tests
+        );
+    }
+
+    /// One red run resets the streak to 0, so an intermittently-green name
+    /// never quietly matures for pruning.
+    #[test]
+    fn a_red_run_resets_the_green_streak() {
+        let repo = git_repo();
+        let home = tempdir().unwrap();
+        let _home_guard = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        save_baseline(
+            repo.path(),
+            std::collections::BTreeSet::from(["wrap::tests::a".to_string()]),
+        )
+        .unwrap();
+
+        let clean_report = report_with_checks(vec![unit_check("test", CheckStatus::Passed, None)]);
+        update_baseline_after_run(repo.path(), &clean_report);
+        update_baseline_after_run(repo.path(), &clean_report);
+        assert_eq!(
+            load_baseline(repo.path())
+                .unwrap()
+                .unwrap()
+                .green_streaks
+                .get("wrap::tests::a")
+                .copied(),
+            Some(2)
+        );
+
+        let red_report = report_with_checks(vec![unit_check(
+            "test",
+            CheckStatus::Failed,
+            Some(&cargo_failure_output("wrap::tests::a")),
+        )]);
+        update_baseline_after_run(repo.path(), &red_report);
+        assert_eq!(
+            load_baseline(repo.path())
+                .unwrap()
+                .unwrap()
+                .green_streaks
+                .get("wrap::tests::a")
+                .copied(),
+            Some(0)
+        );
+    }
+
+    /// An `Inconclusive`/`TimedOut` `Unit` check's own run must never
+    /// advance (or reset) any baselined name's streak -- an unreliable run
+    /// has no opinion on whether a name is actually clean.
+    #[test]
+    fn an_inconclusive_run_never_advances_any_green_streak() {
+        let repo = git_repo();
+        let home = tempdir().unwrap();
+        let _home_guard = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        save_baseline(
+            repo.path(),
+            std::collections::BTreeSet::from(["wrap::tests::a".to_string()]),
+        )
+        .unwrap();
+
+        let inconclusive_report = report_with_checks(vec![CheckResult {
+            id: "test".into(),
+            kind: CheckKind::Unit,
+            command: "cargo test".into(),
+            source: CheckSource::DiscoveredToolchain,
+            status: CheckStatus::Inconclusive,
+            exit_code: Some(1),
+            duration_ms: 1,
+            failure_output: None,
+            failure_test_names: Vec::new(),
+            inconclusive_reason: Some(InconclusiveReason::RunnerCrashed),
+        }]);
+        assert!(update_baseline_after_run(repo.path(), &inconclusive_report).is_none());
+        assert_eq!(
+            load_baseline(repo.path())
+                .unwrap()
+                .unwrap()
+                .green_streaks
+                .get("wrap::tests::a")
+                .copied(),
+            None,
+            "an inconclusive run must leave the streak untouched"
+        );
+    }
+
+    /// `zirv test baseline` must refuse to record from an `Inconclusive`
+    /// run rather than silently treating "proves nothing" as "everything
+    /// currently failing".
+    #[test]
+    fn run_baseline_refuses_to_record_from_an_inconclusive_run() {
+        // A repo with none of the recognized project shapes (no Cargo.toml,
+        // no package.json) and no `.zirv/verify.toml` resolves zero checks,
+        // which `run_mode` now reports as `Inconclusive { NoChecks }` rather
+        // than erroring outright.
+        let repo = git_repo();
+        let state_root = tempdir().unwrap();
+        let home = tempdir().unwrap();
+        let _home_guard = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let mut out = Vec::new();
+        let code = with_state(state_root.path(), || {
+            run_baseline(
+                repo.path(),
+                &BaselineArgs {
+                    run: RunArgs {
+                        repo: None,
+                        checks: vec![],
+                        dry_run: false,
+                        json: false,
+                    },
+                    prune: false,
+                },
+                &mut out,
+            )
+            .expect("must not hard-error")
+        });
+        assert_eq!(code, 1, "an inconclusive run must not exit 0");
+        assert!(
+            load_baseline(repo.path()).unwrap().is_none(),
+            "nothing must be recorded from an inconclusive run"
+        );
+    }
+
+    /// Issue #268's degraded-gate ban: zero checks configured or
+    /// discoverable is `Inconclusive`, not a silent pass and not a hard
+    /// `Err` that would brick `zirv verify` outright.
+    #[test]
+    fn zero_checks_is_inconclusive_not_a_silent_pass_or_a_hard_error() {
+        let repo = git_repo();
+        let report =
+            run_mode(repo.path(), VerificationMode::Final, &[], false).expect("must not error");
+        assert_eq!(report.checks.len(), 1);
+        assert_eq!(report.checks[0].status, CheckStatus::Inconclusive);
+        assert_eq!(
+            report.checks[0].inconclusive_reason,
+            Some(InconclusiveReason::NoChecks)
+        );
+        assert!(!report.passed());
+    }
+
+    /// The operator-only override makes the same zero-checks run `Passed`
+    /// instead, with the override's use visible in the report's notes.
+    #[test]
+    fn the_allow_empty_verify_override_makes_zero_checks_pass_and_says_so() {
+        let repo = git_repo();
+        // SAFETY: single-threaded suite (`--test-threads=1`).
+        unsafe {
+            std::env::set_var("ZIRV_CTX_WORKFLOW_ALLOW_EMPTY_VERIFY", "true");
+        }
+        let report = run_mode(repo.path(), VerificationMode::Final, &[], false);
+        unsafe {
+            std::env::remove_var("ZIRV_CTX_WORKFLOW_ALLOW_EMPTY_VERIFY");
+        }
+        let report = report.expect("must not error");
+        assert_eq!(report.checks.len(), 1);
+        assert_eq!(report.checks[0].status, CheckStatus::Passed);
+        assert!(report.passed());
+        assert!(
+            report
+                .notes
+                .iter()
+                .any(|note| note.contains("allow_empty_verify")),
+            "the override's use must be visible in the report: {:?}",
+            report.notes
+        );
+    }
+
+    /// A repository's own `.zirv/ctx.toml` must never be able to set this
+    /// override for itself -- `workflow.allow_empty_verify` is
+    /// `REPO_FORBIDDEN` (see `config.rs`'s
+    /// `repo_layer_cannot_set_workflow_allow_empty_verify`), so `CtxConfig::
+    /// load` hard-errors on it exactly like `auto_spawn_on_gate`/
+    /// `check_env_passthrough`, and `repo_gates` degrades that to its usual
+    /// fail-closed default (`false`) rather than letting the repo's own
+    /// attempt flip the gate.
+    #[test]
+    fn a_repo_ctx_toml_cannot_set_the_allow_empty_verify_override() {
+        let repo = git_repo();
+        std::fs::create_dir_all(repo.path().join(".zirv")).unwrap();
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[workflow]\nallow_empty_verify = true\n",
+        )
+        .unwrap();
+        let report =
+            run_mode(repo.path(), VerificationMode::Final, &[], false).expect("must not error");
+        assert_eq!(
+            report.checks[0].status,
+            CheckStatus::Inconclusive,
+            "a repo-forbidden key set from the repo's own ctx.toml must fail closed, not flip \
+             the override"
+        );
+    }
+
+    /// A genuinely missing tool (not a cargo/nextest shape at all) reclassifies
+    /// through the real `run_check` seam, not just the pure classifier --
+    /// exercising `is_spawn_not_found`/`looks_like_tool_missing` end to end.
+    #[test]
+    fn a_missing_command_is_inconclusive_through_the_real_run_check_seam() {
+        let repo = git_repo();
+        let state_root = tempdir().unwrap();
+        write_verify_toml(
+            repo.path(),
+            "schema_version=1\n[[checks]]\nid='missing'\nkind='custom'\ncommand='zirv-268-does-not-exist-cmd'\n",
+        );
+        let report = with_state(state_root.path(), || {
+            run_mode(repo.path(), VerificationMode::Final, &[], false).expect("must not error")
+        });
+        assert_eq!(report.checks.len(), 1);
+        assert_eq!(report.checks[0].status, CheckStatus::Inconclusive);
+        assert_eq!(
+            report.checks[0].inconclusive_reason,
+            Some(InconclusiveReason::ToolMissing)
         );
     }
 }

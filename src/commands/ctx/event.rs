@@ -151,6 +151,21 @@ impl TranscriptUsage {
 /// messages. The marker signal groups by turn and takes the last non-empty
 /// text; the token gate takes the most recent event's `input_tokens`
 /// regardless of text, so mid-turn token growth is visible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderErrorClass {
+    Overflow,
+    RateLimit,
+    Other,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ModelChange {
+    pub from: String,
+    pub to: String,
+    pub turns_ago: usize,
+    pub limit_pressure: bool,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum NormalizedEvent {
     TurnStart,
@@ -176,6 +191,12 @@ pub enum NormalizedEvent {
     /// already has. Feeds `rot::Signals::same_error_repeats`.
     ToolErrorText {
         hash: u64,
+    },
+    ProviderError {
+        class: ProviderErrorClass,
+    },
+    ModelId {
+        id: String,
     },
     Compaction,
 }
