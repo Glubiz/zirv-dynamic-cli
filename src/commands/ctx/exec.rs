@@ -337,10 +337,13 @@ pub enum SignalAction {
     Stop,
 }
 
-pub(crate) fn action_for_verdict(verdict: Verdict) -> SignalAction {
+pub(crate) fn action_for_verdict(
+    adapter: &dyn adapters::AgentAdapter,
+    verdict: Verdict,
+) -> SignalAction {
     match verdict {
-        Verdict::Compact => SignalAction::Compact,
-        Verdict::Restart => SignalAction::Stop,
+        Verdict::Compact if adapter.supports_headless_compact() => SignalAction::Compact,
+        Verdict::Compact | Verdict::Restart => SignalAction::Stop,
         Verdict::Healthy | Verdict::Advise => SignalAction::Ignore,
     }
 }
@@ -348,11 +351,15 @@ pub(crate) fn action_for_verdict(verdict: Verdict) -> SignalAction {
 /// Maps a turn signal to an action only when it belongs to this supervisor's
 /// current session. The socket name is short enough that a stale hook can
 /// reach it, so ownership remains the first and non-negotiable gate.
-pub fn action_for_signal(signal: &TurnSignal, session: &str) -> SignalAction {
+pub fn action_for_signal(
+    adapter: &dyn adapters::AgentAdapter,
+    signal: &TurnSignal,
+    session: &str,
+) -> SignalAction {
     if signal.session_id != session {
         return SignalAction::Ignore;
     }
-    action_for_verdict(signal.verdict)
+    action_for_verdict(adapter, signal.verdict)
 }
 
 /// One bounded in-place attempt per cooldown window, and never another until
@@ -381,6 +388,14 @@ impl CompactBudget {
             self.progressed_after_attempt = true;
         }
     }
+}
+
+/// A provider-limit notice discovered by the final output drain outranks a
+/// compaction requested by the preceding supervision tick. The limit path
+/// parks or hands over; compacting and continuing here would discard that
+/// evidence and immediately spend the exhausted seat again.
+pub(crate) fn should_attempt_compact(compact_requested: bool, limit_hit: bool) -> bool {
+    compact_requested && !limit_hit
 }
 
 #[derive(Debug)]
@@ -1513,7 +1528,7 @@ fn run_with_clock_inner<W: Write>(
             return Ok(EXIT_ACCOUNT_EXHAUSTED);
         }
 
-        if compact_requested {
+        if should_attempt_compact(compact_requested, limit_hit) {
             let extra: Vec<String> = policy_extra
                 .iter()
                 .cloned()
@@ -2648,7 +2663,7 @@ fn supervise_run(
                 *progressed = true;
                 compact_budget.observe_progress();
             }
-            match action_for_signal(&received, session) {
+            match action_for_signal(adapter, &received, session) {
                 SignalAction::Stop => {
                     *rotted = true;
                     return Tick::Stop("rot");
@@ -2752,7 +2767,7 @@ fn supervise_run(
             return Tick::Stop("limit");
         }
         match poll_result {
-            Ok((Some(score), _)) => match action_for_verdict(score.verdict) {
+            Ok((Some(score), _)) => match action_for_verdict(adapter, score.verdict) {
                 SignalAction::Stop => {
                     *rotted = true;
                     Tick::Stop("rot")
@@ -4079,22 +4094,39 @@ mod tests {
 
     #[test]
     fn signal_actions_cover_restart_compact_and_ignore() {
+        let claude = crate::commands::ctx::adapters::claude::ClaudeAdapter::new(None);
         assert_eq!(
-            action_for_signal(&signal_with(Verdict::Restart, 95), "s"),
+            action_for_signal(&claude, &signal_with(Verdict::Restart, 95), "s"),
             SignalAction::Stop
         );
         assert_eq!(
-            action_for_signal(&signal_with(Verdict::Compact, 65), "s"),
+            action_for_signal(&claude, &signal_with(Verdict::Compact, 65), "s"),
             SignalAction::Compact
         );
         assert_eq!(
-            action_for_signal(&signal_with(Verdict::Advise, 45), "s"),
+            action_for_signal(&claude, &signal_with(Verdict::Advise, 45), "s"),
             SignalAction::Ignore
         );
         assert_eq!(
-            action_for_signal(&signal_with(Verdict::Healthy, 0), "s"),
+            action_for_signal(&claude, &signal_with(Verdict::Healthy, 0), "s"),
             SignalAction::Ignore
         );
+    }
+
+    #[test]
+    fn codex_compact_verdict_restarts_without_arming_the_compact_budget() {
+        let codex = crate::commands::ctx::adapters::codex::CodexAdapter::new(None);
+        let now = Instant::now();
+        let window = Duration::from_secs(60);
+        let mut budget = CompactBudget::default();
+
+        let action = action_for_verdict(&codex, Verdict::Compact);
+        if action == SignalAction::Compact && budget.ready(now, window) {
+            budget.arm(now);
+        }
+
+        assert_eq!(action, SignalAction::Stop);
+        assert!(budget.attempted_at.is_none());
     }
 
     /// The socket path is derived from the first eight hex characters of a
@@ -4102,12 +4134,21 @@ mod tests {
     /// a healthy child on someone else's verdict is the failure to avoid.
     #[test]
     fn a_verdict_about_another_session_is_ignored() {
+        let claude = crate::commands::ctx::adapters::claude::ClaudeAdapter::new(None);
         assert_eq!(
-            action_for_signal(&signal_with(Verdict::Restart, 95), "a-different-session"),
+            action_for_signal(
+                &claude,
+                &signal_with(Verdict::Restart, 95),
+                "a-different-session",
+            ),
             SignalAction::Ignore
         );
         assert_eq!(
-            action_for_signal(&signal_with(Verdict::Compact, 65), "a-different-session"),
+            action_for_signal(
+                &claude,
+                &signal_with(Verdict::Compact, 65),
+                "a-different-session",
+            ),
             SignalAction::Ignore
         );
     }
@@ -4162,6 +4203,13 @@ mod tests {
         budget.observe_progress();
         assert!(!budget.ready(now + Duration::from_secs(59), window));
         assert!(budget.ready(now + window, window));
+    }
+
+    #[test]
+    fn a_final_drain_limit_preempts_an_already_requested_compaction() {
+        assert!(!should_attempt_compact(true, true));
+        assert!(should_attempt_compact(true, false));
+        assert!(!should_attempt_compact(false, false));
     }
 
     #[test]

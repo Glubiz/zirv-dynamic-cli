@@ -943,6 +943,10 @@ impl AgentAdapter for ClaudeAdapter {
         Some(cmd)
     }
 
+    fn supports_headless_compact(&self) -> bool {
+        true
+    }
+
     fn interactive_cmd(&self, initial_prompt: Option<&str>, extra: &[String]) -> Command {
         let mut cmd = self.base();
         if let Some(prompt) = initial_prompt {
