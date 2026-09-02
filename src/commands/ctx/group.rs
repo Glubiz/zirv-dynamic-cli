@@ -29,6 +29,18 @@ pub struct WorkGroup {
     /// Older records predate the meter and therefore start at zero.
     #[serde(default)]
     pub spent_tokens: u64,
+    /// Issue #301: token ceilings promised to admitted children whose spend
+    /// has not yet rolled up into `spent_tokens` -- reserved atomically by
+    /// [`admit_child`] in the same locked transaction as the admission
+    /// itself, and later either rolled into `spent_tokens` by
+    /// [`settle_reservation`] or released by [`rollback_admission`]. Without
+    /// this, two children admitted concurrently could each be handed the
+    /// group's entire remaining budget (`token_budget - spent_tokens`),
+    /// since neither's spend had rolled up when the other was admitted.
+    /// `#[serde(default)]`: an older record predates the reservation and so
+    /// has nothing outstanding.
+    #[serde(default)]
+    pub reserved_tokens: u64,
     #[serde(default)]
     pub deadline_secs: Option<u64>,
     /// Display-only (issue #155 review finding D2): the terms every child
@@ -202,9 +214,29 @@ pub fn is_admission_exhausted(error: &(dyn std::error::Error + 'static)) -> bool
 /// admits nowhere in `agent.rs` itself; whichever side actually ends up
 /// spawning is the one that calls this).
 ///
-/// The complete read/check/increment/write transaction is serialized by the
-/// group's interprocess lock, as are every other mutation below it.
-pub fn admit_child(state: &StateDir, id: &str, now: u64) -> CtxResult<WorkGroup> {
+/// Issue #301: also resolves and reserves this child's own token ceiling, in
+/// the SAME locked transaction as the admission itself -- the group's
+/// `token_budget` minus what has already been spent AND what is already
+/// reserved for other admitted-but-not-yet-settled children, further
+/// tightened by `explicit_budget_tokens` (an operator's own `--budget-tokens`
+/// override) exactly as `agent::resolve_budget_tokens` already tightens a
+/// group ceiling outside admission. Returned as the second tuple element,
+/// `None` only when neither the group nor the caller impose any ceiling at
+/// all. Without reserving this atomically here, two children admitted
+/// concurrently could each be handed the group's entire remaining budget,
+/// since neither's spend had rolled up when the other was admitted. The
+/// caller settles this exact amount later via [`settle_reservation`], or
+/// releases it via [`rollback_admission`] if the spawn it was granted for
+/// never actually happens.
+///
+/// The complete read/check/increment/reserve/write transaction is serialized
+/// by the group's interprocess lock, as are every other mutation below it.
+pub fn admit_child(
+    state: &StateDir,
+    id: &str,
+    now: u64,
+    explicit_budget_tokens: Option<u64>,
+) -> CtxResult<(WorkGroup, Option<u64>)> {
     let _lock = lock_group(state, id)?;
     let Some(mut group) = load(state, id)? else {
         return Err(format!("no work group '{id}'").into());
@@ -233,20 +265,36 @@ pub fn admit_child(state: &StateDir, id: &str, now: u64) -> CtxResult<WorkGroup>
         )
         .into());
     }
+    let group_ceiling = group.token_budget.map(|budget| {
+        let remaining = budget
+            .saturating_sub(group.spent_tokens)
+            .saturating_sub(group.reserved_tokens);
+        explicit_budget_tokens.map_or(remaining, |explicit| remaining.min(explicit))
+    });
+    if let Some(ceiling) = group_ceiling {
+        group.reserved_tokens = group.reserved_tokens.saturating_add(ceiling);
+    }
+    let ceiling = group_ceiling.or(explicit_budget_tokens);
     group.admitted_children += 1;
     create(state, &group)?;
-    Ok(group)
+    Ok((group, ceiling))
 }
 
-/// Adds one completed child's token spend to its group. Best-effort callers
-/// may ignore an I/O failure, but arithmetic never wraps and the complete
-/// update is serialized with admission and the other group mutations.
-pub fn add_spent_tokens(state: &StateDir, id: &str, spent: u64) -> CtxResult<()> {
+/// Completes one child's reservation (issue #301): releases the ceiling
+/// [`admit_child`] reserved for it and rolls its actual spend into the
+/// group's completed total, in the same locked transaction so no concurrent
+/// admission can observe a state where neither figure yet reflects this
+/// child's completion. `reserved` is `0` for a delegation that reserved
+/// nothing (no group-level token budget and no explicit override), which
+/// degrades to a plain spend roll-up. Best-effort callers may ignore an I/O
+/// failure, but arithmetic never wraps.
+pub fn settle_reservation(state: &StateDir, id: &str, reserved: u64, actual: u64) -> CtxResult<()> {
     let _lock = lock_group(state, id)?;
     let Some(mut group) = load(state, id)? else {
         return Err(format!("no work group '{id}'").into());
     };
-    group.spent_tokens = group.spent_tokens.saturating_add(spent);
+    group.reserved_tokens = group.reserved_tokens.saturating_sub(reserved);
+    group.spent_tokens = group.spent_tokens.saturating_add(actual);
     create(state, &group)
 }
 
@@ -256,7 +304,9 @@ pub fn add_spent_tokens(state: &StateDir, id: &str, spent: u64) -> CtxResult<()>
 /// (`agent::run_with`'s headless path, `dash::fulfill_spawn_request`'s pane
 /// path) call this on every failure between a successful `admit_child` and
 /// the point the child is definitely running. Saturating-decrements
-/// `admitted_children`, never below zero.
+/// `admitted_children`, never below zero, and releases `reserved` (issue
+/// #301: the exact ceiling `admit_child` reserved for this admission, `0`
+/// when it reserved nothing) from `reserved_tokens` the same way.
 ///
 /// Best-effort, unlike `admit_child`: logs to stderr and returns rather than
 /// propagating a second error over the original spawn failure that triggered
@@ -264,7 +314,7 @@ pub fn add_spent_tokens(state: &StateDir, id: &str, spent: u64) -> CtxResult<()>
 /// see "the state file wouldn't decrement" stacked on top of it. The same
 /// per-group lock as `admit_child`/`close` keeps this rollback from losing a
 /// concurrent mutation.
-pub fn rollback_admission(state: &StateDir, id: &str) {
+pub fn rollback_admission(state: &StateDir, id: &str, reserved: u64) {
     let Ok(_lock) = lock_group(state, id) else {
         eprintln!("zirv ctx: failed to lock work group '{id}' for admission rollback");
         return;
@@ -272,6 +322,7 @@ pub fn rollback_admission(state: &StateDir, id: &str) {
     match load(state, id) {
         Ok(Some(mut group)) => {
             group.admitted_children = group.admitted_children.saturating_sub(1);
+            group.reserved_tokens = group.reserved_tokens.saturating_sub(reserved);
             if let Err(e) = create(state, &group) {
                 eprintln!("zirv ctx: failed to roll back admission for work group '{id}': {e}");
             }
@@ -431,6 +482,7 @@ pub fn run_create<W: Write>(
         child_limit: args.child_limit,
         token_budget: args.token_budget,
         spent_tokens: 0,
+        reserved_tokens: 0,
         deadline_secs: args.deadline_secs,
         completion_contract: args.completion_contract.clone(),
         created_at: now,
@@ -568,6 +620,7 @@ mod tests {
             child_limit: 3,
             token_budget: Some(400_000),
             spent_tokens: 0,
+            reserved_tokens: 0,
             deadline_secs: Some(3_600),
             completion_contract: "every child reports a compact result by mail".to_string(),
             created_at: 1_700_000_000,
@@ -593,6 +646,7 @@ mod tests {
             child_limit: 3,
             token_budget: Some(400_000),
             spent_tokens: 0,
+            reserved_tokens: 0,
             deadline_secs: Some(3_600),
             completion_contract: "every child reports a compact result by mail".to_string(),
             created_at: 1_700_000_000,
@@ -634,6 +688,34 @@ mod tests {
         let restored = serde_json::to_value(restored).expect("serialize restored group");
 
         assert_eq!(restored["spent_tokens"], 123_456);
+    }
+
+    /// Issue #301: a group record written before `reserved_tokens` existed
+    /// has nothing outstanding -- defaults to zero rather than failing to
+    /// deserialize.
+    #[test]
+    fn a_pre_reservation_work_group_record_defaults_reserved_tokens_to_zero() {
+        let group = sample_group("wg-old");
+        let mut old_shape = serde_json::to_value(group).expect("serialize group");
+        old_shape
+            .as_object_mut()
+            .expect("object")
+            .remove("reserved_tokens");
+        let restored: WorkGroup = serde_json::from_value(old_shape).expect("deserialize old shape");
+
+        assert_eq!(restored.reserved_tokens, 0);
+    }
+
+    #[test]
+    fn reserved_tokens_round_trips_with_the_work_group_record() {
+        let mut group = sample_group("wg-reserved");
+        group.reserved_tokens = 65_536;
+        let json = serde_json::to_value(group).expect("serialize group");
+
+        let restored: WorkGroup = serde_json::from_value(json).expect("deserialize group");
+        let restored = serde_json::to_value(restored).expect("serialize restored group");
+
+        assert_eq!(restored["reserved_tokens"], 65_536);
     }
 
     /// Closing is idempotent and preserves the terms: a closed group is
@@ -705,17 +787,87 @@ mod tests {
         let state = StateDir::from_root(tmp.path().to_path_buf());
         create(&state, &sample_group("wg-1")).expect("create"); // child_limit: 3
 
-        admit_child(&state, "wg-1", 1_700_000_100).expect("first child admitted");
+        admit_child(&state, "wg-1", 1_700_000_100, None).expect("first child admitted");
         let group = load(&state, "wg-1").expect("load").expect("present");
         assert_eq!(group.admitted_children, 1);
 
-        admit_child(&state, "wg-1", 1_700_000_100).expect("second child admitted");
+        admit_child(&state, "wg-1", 1_700_000_100, None).expect("second child admitted");
         assert_eq!(
             load(&state, "wg-1")
                 .expect("load")
                 .expect("present")
                 .admitted_children,
             2
+        );
+    }
+
+    /// Issue #301, the core acceptance criterion: two children admitted
+    /// concurrently under one budget must not both be handed the group's
+    /// entire remaining budget -- the second admission's ceiling reflects
+    /// the first's reservation, not just its (still-zero) spend.
+    #[test]
+    fn two_admissions_under_one_budget_do_not_both_get_the_full_remainder() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let mut group = sample_group("wg-1"); // token_budget: Some(400_000)
+        group.child_limit = 2;
+        create(&state, &group).expect("create");
+
+        let (_, first_ceiling) =
+            admit_child(&state, "wg-1", 1_700_000_100, None).expect("first child admitted");
+        assert_eq!(
+            first_ceiling,
+            Some(400_000),
+            "the first admission still sees the whole budget"
+        );
+
+        let (group_after_second, second_ceiling) =
+            admit_child(&state, "wg-1", 1_700_000_100, None).expect("second child admitted");
+        assert_ne!(
+            second_ceiling, first_ceiling,
+            "the second admission must not receive the same full remainder"
+        );
+        assert_eq!(
+            second_ceiling,
+            Some(0),
+            "nothing is left unreserved once the first admission claimed it all"
+        );
+        assert_eq!(group_after_second.reserved_tokens, 400_000);
+    }
+
+    /// The reserved ceiling is further tightened by an explicit
+    /// `--budget-tokens` override, exactly as `agent::resolve_budget_tokens`
+    /// tightens it outside admission -- and only the tightened amount is
+    /// reserved, not the wider group remainder.
+    #[test]
+    fn admit_child_reserves_the_explicit_override_when_it_is_tighter() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        create(&state, &sample_group("wg-1")).expect("create"); // token_budget: Some(400_000)
+
+        let (group, ceiling) = admit_child(&state, "wg-1", 1_700_000_100, Some(100_000))
+            .expect("first child admitted");
+        assert_eq!(ceiling, Some(100_000));
+        assert_eq!(group.reserved_tokens, 100_000);
+    }
+
+    /// A group with no `token_budget` at all reserves nothing -- there is no
+    /// ceiling to protect -- but an explicit per-call override still comes
+    /// through unchanged.
+    #[test]
+    fn admit_child_reserves_nothing_for_an_unbudgeted_group() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let mut group = sample_group("wg-1");
+        group.token_budget = None;
+        create(&state, &group).expect("create");
+
+        let (group, ceiling) =
+            admit_child(&state, "wg-1", 1_700_000_100, Some(50_000)).expect("admit");
+        assert_eq!(ceiling, Some(50_000));
+        assert_eq!(
+            group.reserved_tokens, 0,
+            "nothing to reserve against an unbudgeted group"
         );
     }
 
@@ -731,8 +883,10 @@ mod tests {
         group.child_limit = 1;
         create(&state, &group).expect("create");
 
-        admit_child(&state, "wg-1", 1_700_000_100).expect("the one allowed child is admitted");
-        let err = admit_child(&state, "wg-1", 1_700_000_100).expect_err("the limit is reached");
+        admit_child(&state, "wg-1", 1_700_000_100, None)
+            .expect("the one allowed child is admitted");
+        let err =
+            admit_child(&state, "wg-1", 1_700_000_100, None).expect_err("the limit is reached");
         assert!(err.to_string().contains("wg-1"), "got {err}");
         assert!(err.to_string().contains('1'), "names the limit: {err}");
         assert_eq!(
@@ -753,8 +907,8 @@ mod tests {
         group.spent_tokens = 400_000;
         create(&state, &group).expect("create");
 
-        let err =
-            admit_child(&state, "wg-spent", 1_700_000_100).expect_err("the token budget is spent");
+        let err = admit_child(&state, "wg-spent", 1_700_000_100, None)
+            .expect_err("the token budget is spent");
         assert!(err.to_string().contains("wg-spent"), "got {err}");
         assert_eq!(
             load(&state, "wg-spent")
@@ -775,7 +929,7 @@ mod tests {
         group.deadline_secs = Some(10);
         create(&state, &group).expect("create");
 
-        let err = admit_child(&state, "wg-overdue", 111).expect_err("the deadline elapsed");
+        let err = admit_child(&state, "wg-overdue", 111, None).expect_err("the deadline elapsed");
         assert!(err.to_string().contains("wg-overdue"), "got {err}");
         assert_eq!(
             load(&state, "wg-overdue")
@@ -795,7 +949,7 @@ mod tests {
         group.closed_at = Some(1_700_000_050);
         create(&state, &group).expect("create");
 
-        let err = admit_child(&state, "wg-closed", 1_700_000_100)
+        let err = admit_child(&state, "wg-closed", 1_700_000_100, None)
             .expect_err("a closed group cannot admit another child");
 
         assert!(err.to_string().contains("closed"), "got {err}");
@@ -818,8 +972,8 @@ mod tests {
         let state = StateDir::from_root(tmp.path().to_path_buf());
         create(&state, &sample_group("wg-1")).expect("create");
 
-        admit_child(&state, "wg-1", 1_700_000_100).expect("first child admitted");
-        admit_child(&state, "wg-1", 1_700_000_100).expect("second child admitted");
+        admit_child(&state, "wg-1", 1_700_000_100, None).expect("first child admitted");
+        admit_child(&state, "wg-1", 1_700_000_100, None).expect("second child admitted");
         assert_eq!(
             load(&state, "wg-1")
                 .expect("load")
@@ -828,7 +982,7 @@ mod tests {
             2
         );
 
-        rollback_admission(&state, "wg-1");
+        rollback_admission(&state, "wg-1", 0);
         assert_eq!(
             load(&state, "wg-1")
                 .expect("load")
@@ -840,40 +994,67 @@ mod tests {
     }
 
     /// Never underflows: a rollback with nothing to undo (already at zero)
-    /// must saturate rather than wrap `u32::MAX`, since it is called
-    /// best-effort on failure paths that cannot prove an admission actually
-    /// happened moments earlier.
+    /// must saturate rather than wrap `u32::MAX`/`u64::MAX`, since it is
+    /// called best-effort on failure paths that cannot prove an admission
+    /// actually happened moments earlier. Issue #301: `reserved_tokens`
+    /// saturates the same way.
     #[test]
     fn rollback_admission_saturates_at_zero() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(tmp.path().to_path_buf());
         create(&state, &sample_group("wg-1")).expect("create"); // admitted_children: 0
 
-        rollback_admission(&state, "wg-1");
+        rollback_admission(&state, "wg-1", 999);
+        let group = load(&state, "wg-1").expect("load").expect("present");
         assert_eq!(
-            load(&state, "wg-1")
-                .expect("load")
-                .expect("present")
-                .admitted_children,
-            0,
+            group.admitted_children, 0,
             "must saturate at zero, not underflow"
+        );
+        assert_eq!(
+            group.reserved_tokens, 0,
+            "reserved_tokens must saturate at zero too"
         );
     }
 
     #[test]
-    fn adding_group_spend_uses_saturating_arithmetic() {
+    fn settling_a_reservation_adds_actual_spend_with_saturating_arithmetic() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(tmp.path().to_path_buf());
         let mut group = sample_group("wg-saturating");
         group.spent_tokens = u64::MAX - 5;
         create(&state, &group).expect("persist group");
 
-        add_spent_tokens(&state, "wg-saturating", 10).expect("roll up spend");
+        settle_reservation(&state, "wg-saturating", 0, 10).expect("roll up spend");
 
         let persisted =
             std::fs::read_to_string(record_path(&state, "wg-saturating")).expect("read group");
         let persisted: serde_json::Value = serde_json::from_str(&persisted).expect("json");
         assert_eq!(persisted["spent_tokens"], u64::MAX);
+    }
+
+    /// Issue #301: settlement releases exactly the reserved amount and rolls
+    /// the actual spend in, never wrapping below zero even if `reserved`
+    /// overstates what remains outstanding (a stale caller-supplied value).
+    #[test]
+    fn settling_a_reservation_releases_it_and_saturates() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let mut group = sample_group("wg-settle");
+        group.reserved_tokens = 5_000;
+        create(&state, &group).expect("persist group");
+
+        settle_reservation(&state, "wg-settle", 5_000, 4_200).expect("settle");
+        let settled = load(&state, "wg-settle").expect("load").expect("present");
+        assert_eq!(settled.reserved_tokens, 0);
+        assert_eq!(settled.spent_tokens, 4_200);
+
+        settle_reservation(&state, "wg-settle", 999, 100).expect("settle again");
+        let over_released = load(&state, "wg-settle").expect("load").expect("present");
+        assert_eq!(
+            over_released.reserved_tokens, 0,
+            "must saturate at zero, not underflow"
+        );
+        assert_eq!(over_released.spent_tokens, 4_300);
     }
 
     #[test]
@@ -889,7 +1070,7 @@ mod tests {
         let worker = std::thread::spawn(move || {
             started_tx.send(()).expect("announce start");
             let result =
-                add_spent_tokens(&worker_state, "wg-locked", 10).map_err(|e| e.to_string());
+                settle_reservation(&worker_state, "wg-locked", 0, 10).map_err(|e| e.to_string());
             done_tx.send(result).expect("announce finish");
         });
 
@@ -926,14 +1107,14 @@ mod tests {
     fn rollback_admission_on_an_unknown_group_does_not_panic() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(tmp.path().to_path_buf());
-        rollback_admission(&state, "nope");
+        rollback_admission(&state, "nope", 0);
     }
 
     #[test]
     fn admit_child_errors_on_an_unknown_group() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(tmp.path().to_path_buf());
-        let err = admit_child(&state, "nope", 0).expect_err("no such group");
+        let err = admit_child(&state, "nope", 0, None).expect_err("no such group");
         assert!(err.to_string().contains("nope"), "got {err}");
     }
 
@@ -1048,7 +1229,7 @@ mod tests {
         let state = StateDir::from_root(tmp.path().to_path_buf());
 
         create(&state, &sample_group("wg-admitted")).expect("create");
-        admit_child(&state, "wg-admitted", 1_700_000_100).expect("admit");
+        admit_child(&state, "wg-admitted", 1_700_000_100, None).expect("admit");
         assert!(!discard_if_unused(&state, "wg-admitted"));
         assert!(load(&state, "wg-admitted").expect("load").is_some());
 
