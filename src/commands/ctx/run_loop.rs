@@ -7,7 +7,7 @@ use super::event::{SessionId, SessionRef};
 use super::pace;
 use super::state::{StateDir, now_secs};
 use super::supervise::{self, Outcome, Tick};
-use super::{CtxResult, adapters, log, score};
+use super::{CtxResult, adapters, log, objective, score};
 
 /// Repeated cycle failures, escalated to the caller.
 pub const EXIT_FAILED: i32 = 75;
@@ -48,6 +48,11 @@ pub struct LoopArgs {
     /// default. Supervision, pacing and hooks still apply.
     #[arg(long, default_value_t = false)]
     pub simple: bool,
+    /// Sets (or replaces) this repository's durable objective (issue #285)
+    /// before the loop starts -- a shorthand for `zirv ctx objective set`.
+    /// Its own soft budget defaults from `[pace] run_budget_tokens`.
+    #[arg(long)]
+    pub objective: Option<String>,
 }
 
 pub fn resolve_prompt(args: &LoopArgs) -> CtxResult<String> {
@@ -126,6 +131,27 @@ pub(crate) fn run_with_clock<W: Write>(
     // Issue #249: this loop's own supervising session, if any -- resolved
     // once, from `env` alone, and reused for every cycle's mail rendering.
     let parent_short = super::agent::parent_identity(env);
+
+    // Issue #285: `--objective` sets (or replaces) this repository's durable
+    // objective once, before the first cycle -- a shorthand for `zirv ctx
+    // objective set`. Set here, outside the `loop {}` below, so a long run
+    // does not reset `spent_tokens` to zero on every cycle: each cycle's own
+    // `compile::compile` call (further down) reloads the SAME durable
+    // record fresh from disk, which is how the objective layer's live
+    // counters reach every cycle without this needing to re-set anything.
+    if let Some(text) = &args.objective {
+        let key = super::state::repo_slug(repo);
+        let record = objective::Objective {
+            schema_version: objective::SCHEMA_VERSION,
+            objective: text.clone(),
+            budget_tokens: cfg.pace.run_budget_tokens,
+            deadline_secs: None,
+            spent_tokens: 0,
+            started_at: now_fn(),
+            status: objective::Status::Active,
+        };
+        objective::store(&state, &key, &record)?;
+    }
 
     let interval = Duration::from_secs(args.interval_secs.unwrap_or(cfg.supervise.interval_secs));
     let max_cycle =
@@ -857,6 +883,7 @@ mod tests {
             cycles: Some(cycles),
             extra: Vec::new(),
             simple: false,
+            objective: None,
         }
     }
 
@@ -1375,6 +1402,61 @@ mod tests {
 
         let log = std::fs::read_to_string(state.join("logs/decisions.jsonl")).expect("log");
         assert!(log.contains("\"action\":\"prompt-injected\""), "got {log}");
+    }
+
+    /// Issue #285, the core acceptance criterion: `loop` re-injects the
+    /// durable objective layer on every cycle, since each cycle mints a
+    /// fresh session and calls `compile::compile` fresh -- no restart-
+    /// specific machinery needed here, unlike `exec`'s own rot/timeout
+    /// restart (see `exec.rs`'s own `objective_layer_for_restart`).
+    #[test]
+    fn a_loop_re_injects_the_objective_layer_every_cycle() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let state_dir = tmp.path().join("state");
+        let state = StateDir::from_root(state_dir.clone());
+        let argv_log = tmp.path().join("argv.log");
+        let mut env = base_env(&state_dir);
+        env.insert("ZIRV_CTX_PACE".to_string(), "false".to_string());
+
+        objective::store(
+            &state,
+            &crate::commands::ctx::state::repo_slug(tmp.path()),
+            &objective::Objective {
+                schema_version: objective::SCHEMA_VERSION,
+                objective: "keep re-injecting me".to_string(),
+                budget_tokens: None,
+                deadline_secs: None,
+                spent_tokens: 0,
+                started_at: now_secs(),
+                status: objective::Status::Active,
+            },
+        )
+        .expect("store objective");
+
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        unsafe {
+            std::env::set_var("FAKE_AGENT_MODE", "healthy");
+            std::env::set_var("FAKE_AGENT_TURNS", "1");
+            std::env::set_var("FAKE_AGENT_ARGV_LOG", &argv_log);
+        }
+        let mut out = Vec::new();
+        let mut args = args_for(2);
+        args.simple = false;
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE");
+            std::env::remove_var("FAKE_AGENT_TURNS");
+            std::env::remove_var("FAKE_AGENT_ARGV_LOG");
+        }
+        assert_eq!(code.expect("runs"), 0);
+
+        let argv = std::fs::read_to_string(&argv_log).expect("argv recorded");
+        let occurrences = argv.matches("keep re-injecting me").count();
+        assert_eq!(
+            occurrences, 2,
+            "the objective layer must be re-injected on every cycle, not just the first: {argv}"
+        );
     }
 
     /// Bug B seam coverage (2026-08-22, fix round 3): `run_loop.rs` is one

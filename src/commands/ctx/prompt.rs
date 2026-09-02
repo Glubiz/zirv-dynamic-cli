@@ -62,7 +62,13 @@ use super::config::PromptConfig;
 /// and `with_workflow_layer` itself, between `with_canonical_context_layer`
 /// and `with_memory_layer`, so the layer now sits after `Context` and
 /// immediately before `Memory`.
-pub const DEFAULT_PROMPT_VERSION: &str = "v9";
+///
+/// v10 (issue #285): the durable objective layer joined the composed shape.
+/// Its own counters (spend, status) are at least as volatile as memory's own
+/// retrieval half, so `compile_with_harness_roster` folds it in last of
+/// everything, after `with_memory_layer` -- see `PromptSource::Objective`'s
+/// own doc comment.
+pub const DEFAULT_PROMPT_VERSION: &str = "v10";
 pub const PROMPT_FILE: &str = "system-prompt.md";
 /// The user layer's own Worker-role file, read from `~/.zirv/` in place of
 /// [`PROMPT_FILE`] for a `PromptRole::Worker` session: an operator's standing
@@ -429,6 +435,20 @@ pub enum PromptSource {
     /// `PromptSource` variant so `describe()` can name it" shape `Mail` and
     /// `ReportBack` already have.
     Context,
+    /// The durable objective's own live counters (`objective::layer_text`,
+    /// issue #285) -- spend, budget, deadline, status, swapping to a fixed
+    /// wrap-up instruction once a soft ceiling is crossed. Sits LAST of
+    /// everything `compile::compile` composes deterministically, after
+    /// `Memory`: its own status/spend are at least as volatile as memory's
+    /// retrieval half (recomputed on every restart, not just every
+    /// recompose), so putting it as late as possible keeps everything ahead
+    /// of it in the provider's cacheable prefix. Folded in by
+    /// `compile::compile` after `compose` returns, not by `compose` itself
+    /// -- the same "a caller adds this layer, but it still gets a
+    /// `PromptSource` variant so `describe()` can name it" shape `Context`,
+    /// `Mail` and `ReportBack` already have. `None` while no objective is set
+    /// for the repository, or once it is `Closed`.
+    Objective,
     /// Unread mail delivered from `mail::list`. Sits after the repo layer
     /// and before the command-line layer; see `with_mail_layer`.
     Mail,
@@ -450,6 +470,7 @@ impl PromptSource {
             PromptSource::Workflow => "workflow (current step)",
             PromptSource::Memory => "memory",
             PromptSource::Context => "canonical context",
+            PromptSource::Objective => "objective",
             PromptSource::User => "user",
             PromptSource::Repo => "repo",
             PromptSource::Mail => "mail",
@@ -1104,6 +1125,27 @@ pub fn with_workflow_layer(
     composed.text.push_str(WORKFLOW_LAYER_HEADER);
     composed.text.push_str(current_step);
     composed.sources.push(PromptSource::Workflow);
+    Some(composed)
+}
+
+/// Adds the durable objective's own live-counters block (issue #285),
+/// rendered by the caller (`objective::layer_text`) and passed in as data,
+/// the same "renderer takes text, caller resolves state" shape `with_
+/// workflow_layer` uses. `None` in means `None` out: no objective set for
+/// the repository, or one that is `Closed`, both render nothing. Called by
+/// `compile::compile` after `with_memory_layer`, last of everything the
+/// compiler composes deterministically -- see `PromptSource::Objective`'s
+/// own doc comment for why it sits that late.
+pub fn with_objective_layer(
+    composed: Option<ComposedPrompt>,
+    objective_text: Option<&str>,
+) -> Option<ComposedPrompt> {
+    let mut composed = composed?;
+    let Some(text) = objective_text.map(str::trim).filter(|t| !t.is_empty()) else {
+        return Some(composed);
+    };
+    composed.text.push_str(text);
+    composed.sources.push(PromptSource::Objective);
     Some(composed)
 }
 
@@ -5783,6 +5825,55 @@ mod tests {
         );
         assert_eq!(
             with_workflow_layer(None, Some("anything")),
+            None,
+            "no composed prompt in, no composed prompt out"
+        );
+    }
+
+    /// Issue #285: the objective layer is a real layer with its own label
+    /// and source, and no objective set (or a closed one, which `compile.rs`
+    /// renders as `None` here) adds nothing at all.
+    #[test]
+    fn the_objective_layer_is_present_only_while_an_objective_is_set() {
+        let base = || {
+            Some(ComposedPrompt {
+                text: String::from("base"),
+                sources: vec![PromptSource::Default],
+                version: DEFAULT_PROMPT_VERSION,
+            })
+        };
+        let inactive = with_objective_layer(base(), None).expect("composed");
+        assert_eq!(inactive.sources, vec![PromptSource::Default]);
+        assert_eq!(inactive.text, "base");
+        assert_eq!(
+            with_objective_layer(base(), Some("   \n "))
+                .expect("composed")
+                .text,
+            "base",
+            "an empty objective layer is not a layer"
+        );
+
+        use crate::commands::ctx::objective::{Objective, SCHEMA_VERSION, Status, layer_text};
+        let active = with_objective_layer(
+            base(),
+            Some(&layer_text(&Objective {
+                schema_version: SCHEMA_VERSION,
+                objective: "ship issue #285".to_string(),
+                budget_tokens: Some(1_000),
+                deadline_secs: None,
+                spent_tokens: 10,
+                started_at: 1,
+                status: Status::Active,
+            })),
+        )
+        .expect("composed");
+        assert_eq!(
+            active.sources,
+            vec![PromptSource::Default, PromptSource::Objective]
+        );
+        assert!(active.text.contains("ship issue #285"));
+        assert_eq!(
+            with_objective_layer(None, Some("anything")),
             None,
             "no composed prompt in, no composed prompt out"
         );
