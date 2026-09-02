@@ -1446,6 +1446,43 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_pre_compaction_reset_checkpoint_without_new_rot_fields_still_loads() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let transcript = dir.path().join("session.jsonl");
+        std::fs::write(&transcript, "").expect("transcript");
+        let path = dir.path().join("checkpoint.json");
+        let cfg = ScoreConfig::default();
+        let adapter = super::adapters::claude::ClaudeAdapter::new(None);
+        let fingerprint = fingerprint(&adapter, &cfg);
+        let checkpoint = Checkpoint {
+            version: CHECKPOINT_VERSION,
+            transcript: transcript.display().to_string(),
+            fingerprint,
+            offset: 0,
+            consumed: 0,
+            state: RotState::new(&cfg).expect("bounded state"),
+            model: None,
+            model_tracker: ModelTracker::default(),
+        };
+        let mut json = serde_json::to_value(checkpoint).expect("serialize checkpoint");
+        let state = json["state"].as_object_mut().expect("state object");
+        state.remove("behavioral_closed_turns");
+        for segment in state["segments"].as_array_mut().expect("segments") {
+            segment
+                .as_object_mut()
+                .expect("segment object")
+                .remove("provider_overflows");
+        }
+        std::fs::write(&path, json.to_string()).expect("legacy checkpoint");
+
+        assert!(
+            load_checkpoint(&path, &transcript, fingerprint, &cfg).is_some(),
+            "a checkpoint written before the compaction-reset fields existed must deserialize \
+             with their zero defaults"
+        );
+    }
+
     /// Every way a checkpoint can stop describing the file it was written for.
     /// All of them have to land on the full-parse answer, silently.
     #[test]

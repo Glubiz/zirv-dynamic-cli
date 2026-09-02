@@ -28,6 +28,33 @@ fn label(colour: bool, title: &str) -> String {
     style::paint(title, Tone::Emphasis, colour)
 }
 
+/// Keep a transcript-derived model identifier on one terminal row.
+fn terminal_safe_model_id(raw: &str) -> String {
+    let mut safe = String::with_capacity(raw.len());
+    let mut in_control_run = false;
+    for character in raw.chars() {
+        if character.is_control() {
+            if !in_control_run {
+                safe.push(' ');
+                in_control_run = true;
+            }
+        } else {
+            safe.push(character);
+            in_control_run = false;
+        }
+    }
+    safe
+}
+
+fn model_change_status_text(change: &super::event::ModelChange) -> String {
+    format!(
+        "model changed mid-session {} turns ago: `{}` -> `{}`",
+        change.turns_ago,
+        terminal_safe_model_id(&change.from),
+        terminal_safe_model_id(&change.to)
+    )
+}
+
 /// Issue #139: whether `record`'s pinned launch-time safety-policy
 /// fingerprint (`sessions::Record::safety_policy_sha256`) differs from the
 /// fingerprint of the policy `record.repo` resolves to RIGHT NOW. Degrades
@@ -160,14 +187,7 @@ fn sessions_lines(
             ) {
                 line.push_str(&format!(
                     "  {}",
-                    style::paint(
-                        &format!(
-                            "model changed mid-session {} turns ago: `{}` -> `{}`",
-                            change.turns_ago, change.from, change.to
-                        ),
-                        Tone::Warn,
-                        colour
-                    )
+                    style::paint(&model_change_status_text(&change), Tone::Warn, colour)
                 ));
             }
             let delivery = mail::session_delivery_metrics(state, &record.short, now);
@@ -3961,6 +3981,26 @@ mod tests {
         assert!(
             text.contains("sessions:"),
             "the sessions section changed: {text}"
+        );
+    }
+
+    #[test]
+    fn model_identity_drift_text_cannot_forge_terminal_rows() {
+        let text = model_change_status_text(&crate::commands::ctx::event::ModelChange {
+            from: "claude-opus-5\nforged\u{1b}[31m".to_string(),
+            to: "claude-sonnet-5\nforged\u{1b}[2J".to_string(),
+            turns_ago: 2,
+            limit_pressure: true,
+        });
+
+        assert_eq!(
+            text,
+            "model changed mid-session 2 turns ago: `claude-opus-5 forged [31m` -> \
+             `claude-sonnet-5 forged [2J`"
+        );
+        assert!(
+            !text.chars().any(char::is_control),
+            "no transcript-derived control character may reach status output: {text:?}"
         );
     }
 
