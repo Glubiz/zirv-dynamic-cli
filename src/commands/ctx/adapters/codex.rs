@@ -1512,8 +1512,9 @@ impl AgentAdapter for CodexAdapter {
     /// `task_complete.last_agent_message` lines -- the one piece of real
     /// transcript content the rollout format gives a verified shape for
     /// (see `parse_events`'s own doc comment).
-    /// `user_messages`/`files_touched`/`tool_errors` stay empty: no
-    /// verified rollout shape carries them, and inventing one would be
+    /// `user_messages`/`files_read`/`files_modified`/`tool_errors` stay
+    /// empty: no verified rollout shape carries them, and inventing one
+    /// would be
     /// exactly the fabricated-content class `handoff.rs`'s own eventless
     /// guard exists to prevent -- this is a real, if partial, structural
     /// context now, not the permanent empty stub it used to be.
@@ -1900,9 +1901,28 @@ mod tests {
         );
         assert!(
             ctx.user_messages.is_empty()
-                && ctx.files_touched.is_empty()
+                && ctx.files_read.is_empty()
+                && ctx.files_modified.is_empty()
                 && ctx.tool_errors.is_empty(),
             "no verified rollout shape backs these fields yet: {ctx:?}"
+        );
+    }
+
+    /// Issue #280's read-vs-modified classification is a no-op for codex
+    /// today: `structural_context` (above) never emits `ToolCall`/
+    /// `ToolResult` at all -- there is no verified rollout shape for a
+    /// codex tool call (an `apply_patch`/`write`-style file edit included)
+    /// to classify in the first place, so `files_read`/`files_modified`
+    /// both stay empty for a transcript that a real codex session would
+    /// have touched files in.
+    #[test]
+    fn structural_context_has_no_file_classification_for_codex_yet() {
+        let jsonl = fixture("codex-rollout-turn-events.jsonl");
+        let adapter = CodexAdapter::new(None);
+        let ctx = adapter.structural_context(&jsonl, 10);
+        assert!(
+            ctx.files_read.is_empty() && ctx.files_modified.is_empty(),
+            "documents the pre-existing gap, not a regression: {ctx:?}"
         );
     }
 

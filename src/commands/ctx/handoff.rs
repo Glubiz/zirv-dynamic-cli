@@ -12,28 +12,55 @@ use super::state::{StateDir, now_secs, repo_slug};
 use super::{adapters, log};
 use crate::commands::workflow::engine;
 
-pub const SECTIONS: [&str; 7] = [
+pub const SECTIONS: [&str; 11] = [
     "Task",
+    "Constraints",
     "Done",
     "Remaining",
+    "Blocked",
+    "Key decisions",
     "Verification",
     "Next step",
-    "Files touched",
+    "Files read",
+    "Files modified",
     "Gotchas learned",
 ];
+
+/// Heading a v2 (pre-#280) handoff on disk used for what this version splits
+/// into `files_read`/`files_modified`. Not itself a member of [`SECTIONS`] --
+/// a fresh handoff never writes it -- but [`parse_markdown`] still recognises
+/// it, mapped into `files_modified`, so a handoff stored by an older build
+/// stays injectable.
+const LEGACY_FILES_TOUCHED_HEADING: &str = "Files touched";
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Handoff {
     pub task: String,
+    /// Operator-stated constraints for this task: things the session was
+    /// told to do, avoid, or work within. A fresh session most often
+    /// re-litigates or violates exactly this, so it survives an iterative
+    /// re-distillation the same way `key_decisions` does (issue #280).
+    pub constraints: Vec<String>,
     pub done: Vec<String>,
     pub remaining: Vec<String>,
+    /// What is blocking further progress right now, distinct from
+    /// `remaining`: an item here is not simply not-yet-done, it is stuck on
+    /// something (a missing credential, an unanswered question, an
+    /// unresolved external dependency).
+    pub blocked: Vec<String>,
+    /// Decisions already made in this task and the rationale behind them --
+    /// the other thing a fresh session most often re-litigates.
+    pub key_decisions: Vec<String>,
     /// Whether the session's last build/test/lint run passed, in one line
     /// (`render_verification`'s output): `"none recorded"` when no verified
     /// run was found. A single line like `task`/`next_step`, never a bullet
     /// list.
     pub verification: String,
     pub next_step: String,
-    pub files_touched: Vec<String>,
+    /// Paths the session read but did not modify.
+    pub files_read: Vec<String>,
+    /// Paths the session actually modified.
+    pub files_modified: Vec<String>,
     pub gotchas: Vec<String>,
 }
 
@@ -56,11 +83,15 @@ impl Handoff {
     pub fn to_markdown(&self) -> String {
         let mut out = String::new();
         out.push_str(&format!("## Task\n{}\n\n", self.task));
+        write_list(&mut out, "Constraints", &self.constraints);
         write_list(&mut out, "Done", &self.done);
         write_list(&mut out, "Remaining", &self.remaining);
+        write_list(&mut out, "Blocked", &self.blocked);
+        write_list(&mut out, "Key decisions", &self.key_decisions);
         out.push_str(&format!("## Verification\n{}\n\n", self.verification));
         out.push_str(&format!("## Next step\n{}\n\n", self.next_step));
-        write_list(&mut out, "Files touched", &self.files_touched);
+        write_list(&mut out, "Files read", &self.files_read);
+        write_list(&mut out, "Files modified", &self.files_modified);
         write_list(&mut out, "Gotchas learned", &self.gotchas);
         out
     }
@@ -488,7 +519,11 @@ pub fn parse_markdown(md: &str) -> Handoff {
             section = SECTIONS
                 .iter()
                 .find(|s| s.eq_ignore_ascii_case(name))
-                .copied();
+                .copied()
+                .or_else(|| {
+                    name.eq_ignore_ascii_case(LEGACY_FILES_TOUCHED_HEADING)
+                        .then_some(LEGACY_FILES_TOUCHED_HEADING)
+                });
             continue;
         }
         let Some(current) = section else { continue };
@@ -511,9 +546,21 @@ pub fn parse_markdown(md: &str) -> Handoff {
                     handoff.next_step = bullet.unwrap_or_else(|| plain.to_string());
                 }
             }
+            "Constraints" => handoff.constraints.extend(bullet),
             "Done" => handoff.done.extend(bullet),
             "Remaining" => handoff.remaining.extend(bullet),
-            "Files touched" => handoff.files_touched.extend(bullet),
+            "Blocked" => handoff.blocked.extend(bullet),
+            "Key decisions" => handoff.key_decisions.extend(bullet),
+            "Files read" => handoff.files_read.extend(bullet),
+            // A v2 file's "Files touched" heading is the pre-#280 union of
+            // both: `files_modified` rather than `files_read` because the
+            // conservative direction (issue #280) never claims a file was
+            // NOT modified without evidence, and `files_modified` is what
+            // every existing reader of a handoff (`resume`, memory harvest)
+            // actually cares about.
+            "Files modified" | LEGACY_FILES_TOUCHED_HEADING => {
+                handoff.files_modified.extend(bullet)
+            }
             "Gotchas learned" => handoff.gotchas.extend(bullet),
             _ => {}
         }
@@ -631,16 +678,20 @@ pub fn structural(ctx: &StructuralContext) -> Handoff {
 
     Handoff {
         task,
+        constraints: Vec::new(),
         done,
         remaining,
+        blocked: Vec::new(),
+        key_decisions: Vec::new(),
         verification: render_verification(ctx.last_verification.as_ref()),
         next_step: "Re-read the files listed below, then continue the task above from where the previous session stopped.".to_string(),
-        files_touched: ctx.files_touched.clone(),
+        files_read: ctx.files_read.clone(),
+        files_modified: ctx.files_modified.clone(),
         gotchas: vec!["This handoff was extracted mechanically, so it may be incomplete.".to_string()],
     }
 }
 
-pub const DISTILL_PROMPT_VERSION: &str = "v2";
+pub const DISTILL_PROMPT_VERSION: &str = "v3";
 
 fn bullets(items: &[String]) -> String {
     if items.is_empty() {
@@ -649,22 +700,63 @@ fn bullets(items: &[String]) -> String {
     items.iter().map(|i| format!("- {i}\n")).collect()
 }
 
-pub fn distill_prompt(ctx: &StructuralContext) -> String {
+/// Unions two already-bounded file lists -- previous first, then current,
+/// deduplicated -- then caps the result back down to the larger of the two
+/// input lengths. Since each input is already at most as long as whatever
+/// `keep_last` cap produced it (the current context's own tail-item bound,
+/// or -- recursively -- the same bound applied when the previous handoff was
+/// itself distilled), the result never exceeds that bound either: the same
+/// argv-length invariant `claude::structural_context`'s own `keep_last`
+/// protects within one transcript, carried forward across a restart instead
+/// (issue #280).
+fn union_capped(previous: &[String], current: &[String]) -> Vec<String> {
+    let cap = previous.len().max(current.len());
+    let mut out: Vec<String> = previous.to_vec();
+    for item in current {
+        if !out.iter().any(|p| p == item) {
+            out.push(item.clone());
+        }
+    }
+    if out.len() > cap {
+        out.drain(..out.len() - cap);
+    }
+    out
+}
+
+/// Prime's own preserve/update rules (see this module's file-level design
+/// notes), restated for zirv's section set: shown only when a previous
+/// handoff exists to preserve anything from.
+const PRESERVE_UPDATE_RULES: &str = "Preserve everything above that is still true. Move a \
+Remaining item to Done only when the context below actually shows it happened. Preserve exact \
+file paths, commands, and error text verbatim, never paraphrased. Drop only what the context \
+below demonstrably shows is no longer relevant.";
+
+pub fn distill_prompt(ctx: &StructuralContext, previous: Option<&Handoff>) -> String {
+    let previous_block = match previous {
+        Some(prev) => format!(
+            "### Previous handoff\n{}\n{PRESERVE_UPDATE_RULES}\n\n",
+            prev.to_markdown()
+        ),
+        None => String::new(),
+    };
     format!(
         "You are writing a handoff note ({DISTILL_PROMPT_VERSION}) so a fresh session can \
 continue this work with no other context. Answer with markdown only, using exactly these \
 sections in this order: {sections}. Use `## ` headings. Task, Verification, and Next step are \
 single lines; the rest are bullet lists. Be concrete: real file paths, real commands, real error \
 text. Do not invent progress that is not evidenced below.\n\n\
+{previous_block}\
 ### Recent user requests\n{requests}\n\
 ### Recent assistant replies\n{replies}\n\
-### Files the session touched\n{files}\n\
+### Files the session read\n{files_read}\n\
+### Files the session modified\n{files_modified}\n\
 ### Unresolved tool errors\n{errors}\n\
 ### Last verification run\n{verification}\n",
         sections = SECTIONS.join(", "),
         requests = bullets(&ctx.user_messages),
         replies = bullets(&ctx.assistant_texts),
-        files = bullets(&ctx.files_touched),
+        files_read = bullets(&ctx.files_read),
+        files_modified = bullets(&ctx.files_modified),
         errors = bullets(&ctx.tool_errors),
         verification = render_verification(ctx.last_verification.as_ref()),
     )
@@ -872,11 +964,20 @@ pub fn run_model(
 /// the fabricated-verdict class `full_score`'s own guard exists to prevent.
 /// Refusing here, before the child is ever spawned, is what `distill_or_
 /// structural` below relies on to report the honest `"no data"` instead.
+///
+/// `previous`, when `Some`, is the repo's latest stored handoff: `distill_
+/// prompt` renders it under a `### Previous handoff` block with Prime's
+/// preserve/update rules, and `files_read`/`files_modified` on the returned
+/// `Handoff` are deterministically the union of `previous`'s and `ctx`'s (see
+/// `union_capped`) rather than whatever the model itself wrote for those two
+/// sections -- this specific guarantee does not depend on the model copying
+/// its input faithfully.
 pub fn distill(
     adapter: &dyn AgentAdapter,
     model: &str,
     ctx: &StructuralContext,
     timeout: Duration,
+    previous: Option<&Handoff>,
 ) -> CtxResult<Handoff> {
     if !adapter.capabilities().events {
         return Err(format!(
@@ -885,11 +986,19 @@ pub fn distill(
         )
         .into());
     }
-    let answer = run_model(adapter, model, &distill_prompt(ctx), timeout)?;
-    let handoff = parse_markdown(&answer);
+    let answer = run_model(adapter, model, &distill_prompt(ctx, previous), timeout)?;
+    let mut handoff = parse_markdown(&answer);
     if !handoff.is_usable() {
         return Err("distiller produced no usable Task and Next step".into());
     }
+    handoff.files_read = union_capped(
+        previous.map(|p| p.files_read.as_slice()).unwrap_or(&[]),
+        &ctx.files_read,
+    );
+    handoff.files_modified = union_capped(
+        previous.map(|p| p.files_modified.as_slice()).unwrap_or(&[]),
+        &ctx.files_modified,
+    );
     Ok(handoff)
 }
 
@@ -910,21 +1019,45 @@ pub fn distill(
 /// handover_pane`, `handover::preview_packet`) had silently omitted it
 /// altogether before this fold. See `adapters::announce_sandbox_residual_
 /// once`'s own one-time latch semantics, unchanged by this move.
+///
+/// `previous` (the repo's latest stored handoff, when one exists) is threaded
+/// into `distill` unchanged. On either mechanical-fallback path below, it is
+/// never re-derived from `ctx` -- `structural(ctx)` has no way to reconstruct
+/// `constraints`/`key_decisions`, so they are instead carried over from
+/// `previous` verbatim, mechanically, with no model call.
 pub fn distill_or_structural(
     adapter: &dyn AgentAdapter,
     model: &str,
     ctx: &StructuralContext,
     timeout: Duration,
     chrome_events_enabled: bool,
+    previous: Option<&Handoff>,
 ) -> (Handoff, &'static str) {
     if !adapter.capabilities().events {
-        return (structural(ctx), "no data");
+        return (
+            carry_forward_undistillable(structural(ctx), previous),
+            "no data",
+        );
     }
     adapters::announce_sandbox_residual_once(adapter, chrome_events_enabled);
-    match distill(adapter, model, ctx, timeout) {
+    match distill(adapter, model, ctx, timeout, previous) {
         Ok(handoff) => (handoff, "distilled"),
-        Err(_) => (structural(ctx), "structural"),
+        Err(_) => (
+            carry_forward_undistillable(structural(ctx), previous),
+            "structural",
+        ),
     }
+}
+
+/// Copies `constraints`/`key_decisions` from `previous` onto a mechanically
+/// extracted `Handoff` -- the two sections `structural`'s ctx-only extraction
+/// can never populate, but which a real previous handoff already has.
+fn carry_forward_undistillable(mut handoff: Handoff, previous: Option<&Handoff>) -> Handoff {
+    if let Some(prev) = previous {
+        handoff.constraints = prev.constraints.clone();
+        handoff.key_decisions = prev.key_decisions.clone();
+    }
+    handoff
 }
 
 #[derive(Debug, clap::Args)]
@@ -997,6 +1130,12 @@ pub fn run_with<W: Write>(
         .map_err(|e| format!("{}: {e}", args.transcript.display()))?;
     let ctx = adapter.structural_context(&jsonl, cfg.handoff.tail_items);
 
+    let state = StateDir::resolve(env)?;
+    let previous = latest_for_repo(&state, repo)
+        .ok()
+        .flatten()
+        .map(|(_, handoff)| handoff);
+
     // Low 6: the eventless check wins regardless of `--no-model`. For an
     // adapter with no verified event parsing (`capabilities().events ==
     // false`), `ctx` above has nothing real in it, so labelling it
@@ -1006,9 +1145,15 @@ pub fn run_with<W: Write>(
     // already closed for the non-`--no-model` path. `structural` is now
     // reserved for an adapter whose `ctx` came from a real transcript.
     let (handoff, source) = if !adapter.capabilities().events {
-        (structural(&ctx), "no data")
+        (
+            carry_forward_undistillable(structural(&ctx), previous.as_ref()),
+            "no data",
+        )
     } else if args.no_model {
-        (structural(&ctx), "structural")
+        (
+            carry_forward_undistillable(structural(&ctx), previous.as_ref()),
+            "structural",
+        )
     } else {
         distill_or_structural(
             adapter.as_ref(),
@@ -1016,6 +1161,7 @@ pub fn run_with<W: Write>(
             &ctx,
             Duration::from_secs(cfg.handoff.timeout_secs),
             cfg.chrome.events,
+            previous.as_ref(),
         )
     };
 
@@ -1024,7 +1170,6 @@ pub fn run_with<W: Write>(
         return Ok(0);
     }
 
-    let state = StateDir::resolve(env)?;
     let session = args
         .session_id
         .clone()
@@ -1079,9 +1224,28 @@ mod tests {
         StructuralContext {
             user_messages: vec!["ship the webhook".to_string()],
             assistant_texts: vec!["[zirv] wrote the route".to_string()],
-            files_touched: vec!["src/routes/webhook.rs".to_string()],
+            files_read: vec!["src/routes/schema.rs".to_string()],
+            files_modified: vec![
+                "src/config.rs".to_string(),
+                "src/routes/webhook.rs".to_string(),
+            ],
             tool_errors: vec!["401 from the provider".to_string()],
             ..StructuralContext::default()
+        }
+    }
+
+    fn previous_sample() -> Handoff {
+        Handoff {
+            task: "Wire the payments webhook".to_string(),
+            constraints: vec!["Must stay backwards compatible with v1 clients".to_string()],
+            key_decisions: vec![
+                "Chose HMAC over a shared secret because that is what the provider signs with"
+                    .to_string(),
+            ],
+            files_read: vec!["src/routes/schema.rs".to_string()],
+            files_modified: vec!["src/config.rs".to_string()],
+            next_step: "Add a failing test for an invalid signature".to_string(),
+            ..Handoff::default()
         }
     }
 
@@ -1124,7 +1288,7 @@ mod tests {
 
     #[test]
     fn the_prompt_carries_the_context_and_asks_for_the_documented_sections() {
-        let prompt = distill_prompt(&ctx_sample());
+        let prompt = distill_prompt(&ctx_sample(), None);
         for section in SECTIONS {
             assert!(
                 prompt.contains(section),
@@ -1132,18 +1296,47 @@ mod tests {
             );
         }
         assert!(prompt.contains("ship the webhook"));
+        assert!(prompt.contains("src/routes/schema.rs"));
         assert!(prompt.contains("src/routes/webhook.rs"));
         assert!(prompt.contains("401 from the provider"));
         assert!(
             prompt.contains(DISTILL_PROMPT_VERSION),
             "version the template"
         );
+        assert!(
+            !prompt.contains("Previous handoff"),
+            "no previous handoff was given: {prompt}"
+        );
+    }
+
+    /// Issue #280: with a previous handoff in hand, the prompt renders it
+    /// under its own block plus Prime's preserve/update rules restated for
+    /// zirv's section set.
+    #[test]
+    fn the_prompt_renders_the_previous_handoff_and_the_preserve_update_rules() {
+        let prompt = distill_prompt(&ctx_sample(), Some(&previous_sample()));
+        assert!(prompt.contains("### Previous handoff"), "got {prompt}");
+        assert!(
+            prompt.contains("Must stay backwards compatible with v1 clients"),
+            "the previous handoff's own markdown must be rendered verbatim: {prompt}"
+        );
+        assert!(
+            prompt.contains("Chose HMAC over a shared secret"),
+            "got {prompt}"
+        );
+        for needle in ["preserve", "move", "drop"] {
+            assert!(
+                prompt.to_lowercase().contains(needle),
+                "preserve/update rules should mention '{needle}': {prompt}"
+            );
+        }
     }
 
     #[test]
     fn distillation_parses_a_well_formed_answer() {
         let adapter = fake_model_adapter();
-        let handoff = distill(&adapter, "haiku", &ctx_sample(), TEST_TIMEOUT).expect("distills");
+        let handoff =
+            distill(&adapter, "haiku", &ctx_sample(), TEST_TIMEOUT, None).expect("distills");
         assert_eq!(handoff.task, "Ship the webhook");
         assert_eq!(
             handoff.next_step,
@@ -1163,10 +1356,51 @@ mod tests {
             log.path().to_str(),
         )]);
         let adapter = fake_model_adapter();
-        distill(&adapter, "haiku", &ctx_sample(), TEST_TIMEOUT).expect("distills");
+        distill(&adapter, "haiku", &ctx_sample(), TEST_TIMEOUT, None).expect("distills");
 
         let seen = std::fs::read_to_string(log.path()).expect("log");
         assert!(seen.contains("ship the webhook"), "got: {seen}");
+    }
+
+    /// Issue #280: `files_read`/`files_modified` on a distilled `Handoff` are
+    /// the deterministic union of the previous handoff's and the current
+    /// context's, deduplicated -- regardless of what the fake model itself
+    /// wrote for those two sections.
+    #[test]
+    fn distillation_unions_files_read_and_modified_with_the_previous_handoff() {
+        let adapter = fake_model_adapter();
+        let handoff = distill(
+            &adapter,
+            "haiku",
+            &ctx_sample(),
+            TEST_TIMEOUT,
+            Some(&previous_sample()),
+        )
+        .expect("distills");
+        assert_eq!(
+            handoff.files_read,
+            vec!["src/routes/schema.rs"],
+            "deduplicated: both previous and current named it"
+        );
+        assert_eq!(
+            handoff.files_modified,
+            vec!["src/config.rs", "src/routes/webhook.rs"],
+            "previous first, then current"
+        );
+    }
+
+    /// Issue #280: the union never grows past the larger of its two already-
+    /// bounded inputs -- the invariant that keeps the list bounded across an
+    /// entire restart chain, not just within one transcript.
+    #[test]
+    fn union_capped_never_exceeds_the_larger_input_length() {
+        let previous = vec!["a.rs".to_string(), "b.rs".to_string(), "c.rs".to_string()];
+        let current = vec!["d.rs".to_string(), "e.rs".to_string()];
+        let union = union_capped(&previous, &current);
+        assert_eq!(union.len(), 3, "capped to the larger input: {union:?}");
+        // Drained from the front (oldest previous entries first), so the
+        // most recently added (current) survive.
+        assert_eq!(union, vec!["c.rs", "d.rs", "e.rs"]);
     }
 
     #[test]
@@ -1175,7 +1409,7 @@ mod tests {
             std::env::set_var("FAKE_MODEL_MODE", "fail");
         }
         let adapter = fake_model_adapter();
-        let result = distill(&adapter, "haiku", &ctx_sample(), TEST_TIMEOUT);
+        let result = distill(&adapter, "haiku", &ctx_sample(), TEST_TIMEOUT, None);
         unsafe {
             std::env::remove_var("FAKE_MODEL_MODE");
         }
@@ -1190,7 +1424,7 @@ mod tests {
                 std::env::set_var("FAKE_MODEL_MODE", mode);
             }
             let adapter = fake_model_adapter();
-            let result = distill(&adapter, "haiku", &ctx_sample(), TEST_TIMEOUT);
+            let result = distill(&adapter, "haiku", &ctx_sample(), TEST_TIMEOUT, None);
             unsafe {
                 std::env::remove_var("FAKE_MODEL_MODE");
             }
@@ -1205,7 +1439,7 @@ mod tests {
     fn distill_or_structural_falls_back_and_reports_which_path_it_took() {
         let adapter = fake_model_adapter();
         let (handoff, source) =
-            distill_or_structural(&adapter, "haiku", &ctx_sample(), TEST_TIMEOUT, false);
+            distill_or_structural(&adapter, "haiku", &ctx_sample(), TEST_TIMEOUT, false, None);
         assert_eq!(source, "distilled");
         assert_eq!(handoff.task, "Ship the webhook");
 
@@ -1213,7 +1447,7 @@ mod tests {
             std::env::set_var("FAKE_MODEL_MODE", "garbage");
         }
         let (handoff, source) =
-            distill_or_structural(&adapter, "haiku", &ctx_sample(), TEST_TIMEOUT, false);
+            distill_or_structural(&adapter, "haiku", &ctx_sample(), TEST_TIMEOUT, false, None);
         unsafe {
             std::env::remove_var("FAKE_MODEL_MODE");
         }
@@ -1223,6 +1457,37 @@ mod tests {
             "from the last user prompt"
         );
         assert!(handoff.is_usable());
+    }
+
+    /// Issue #280: the structural (mechanical) fallback can never
+    /// reconstruct `constraints`/`key_decisions` from `ctx` alone -- they are
+    /// instead carried over from `previous` verbatim, with no model call.
+    #[test]
+    fn structural_fallback_carries_constraints_and_key_decisions_over_from_previous() {
+        unsafe {
+            std::env::set_var("FAKE_MODEL_MODE", "garbage");
+        }
+        let adapter = fake_model_adapter();
+        let (handoff, source) = distill_or_structural(
+            &adapter,
+            "haiku",
+            &ctx_sample(),
+            TEST_TIMEOUT,
+            false,
+            Some(&previous_sample()),
+        );
+        unsafe {
+            std::env::remove_var("FAKE_MODEL_MODE");
+        }
+        assert_eq!(source, "structural");
+        assert_eq!(
+            handoff.constraints,
+            vec!["Must stay backwards compatible with v1 clients"]
+        );
+        assert_eq!(
+            handoff.key_decisions,
+            vec!["Chose HMAC over a shared secret because that is what the provider signs with"]
+        );
     }
 
     /// Finding #5: the sandbox-residual announce (issue #89) now lives
@@ -1251,7 +1516,7 @@ mod tests {
             "the test adapter must actually have a residual to report"
         );
         let (handoff, source) =
-            distill_or_structural(&adapter, "gpt", &ctx_sample(), TEST_TIMEOUT, false);
+            distill_or_structural(&adapter, "gpt", &ctx_sample(), TEST_TIMEOUT, false, None);
         assert_eq!(
             source, "structural",
             "a missing distiller binary falls back"
@@ -1379,6 +1644,7 @@ mod tests {
             "definitely-not-a-real-model-binary",
             &ctx_sample(),
             TEST_TIMEOUT,
+            None,
         )
         .expect_err("no event parsing means nothing to distill");
         assert!(
@@ -1392,6 +1658,7 @@ mod tests {
             &ctx_sample(),
             TEST_TIMEOUT,
             false,
+            None,
         );
         assert_eq!(
             source, "no data",
@@ -1409,7 +1676,13 @@ mod tests {
         }
         let adapter = fake_model_adapter();
         let started = Instant::now();
-        let result = distill(&adapter, "haiku", &ctx_sample(), Duration::from_millis(300));
+        let result = distill(
+            &adapter,
+            "haiku",
+            &ctx_sample(),
+            Duration::from_millis(300),
+            None,
+        );
         let elapsed = started.elapsed();
         unsafe {
             std::env::remove_var("FAKE_MODEL_MODE");
@@ -1438,6 +1711,7 @@ mod tests {
             &ctx_sample(),
             Duration::from_millis(300),
             false,
+            None,
         );
         unsafe {
             std::env::remove_var("FAKE_MODEL_MODE");
@@ -1576,7 +1850,7 @@ mod tests {
     fn a_missing_distiller_binary_falls_back_instead_of_panicking() {
         let adapter = ClaudeAdapter::new(Some("/nonexistent/model-binary"));
         let (handoff, source) =
-            distill_or_structural(&adapter, "haiku", &ctx_sample(), TEST_TIMEOUT, false);
+            distill_or_structural(&adapter, "haiku", &ctx_sample(), TEST_TIMEOUT, false, None);
         assert_eq!(source, "structural");
         assert!(handoff.is_usable());
     }
@@ -1584,14 +1858,21 @@ mod tests {
     fn sample() -> Handoff {
         Handoff {
             task: "Wire the payments webhook".to_string(),
+            constraints: vec!["Must stay backwards compatible with v1 clients".to_string()],
             done: vec![
                 "Added the route".to_string(),
                 "Wrote the parser".to_string(),
             ],
             remaining: vec!["Signature verification".to_string()],
+            blocked: vec!["Waiting on the provider's sandbox credentials".to_string()],
+            key_decisions: vec![
+                "Chose HMAC over a shared secret because that is what the provider signs with"
+                    .to_string(),
+            ],
             verification: "last run (`cargo test`) passed".to_string(),
             next_step: "Add a failing test for an invalid signature".to_string(),
-            files_touched: vec!["src/routes/webhook.rs".to_string()],
+            files_read: vec!["src/routes/schema.rs".to_string()],
+            files_modified: vec!["src/routes/webhook.rs".to_string()],
             gotchas: vec!["The provider sends two events per charge".to_string()],
         }
     }
@@ -1634,6 +1915,29 @@ mod tests {
         assert_eq!(parse_markdown(md).done, vec!["first", "second", "third"]);
     }
 
+    /// Issue #280: a handoff a pre-#280 build stored on disk still parses
+    /// into a usable v3 `Handoff` -- its `## Files touched` heading (v2's own
+    /// name for the union `files_read`/`files_modified` now split into) maps
+    /// into `files_modified`, and every new v3-only section is simply empty.
+    #[test]
+    fn parsing_a_v2_file_maps_files_touched_into_files_modified() {
+        let v2 = "## Task\nShip the webhook\n\n\
+## Done\n- wrote the route\n\n\
+## Remaining\n- signature verification\n\n\
+## Verification\nnone recorded\n\n\
+## Next step\nAdd a failing test\n\n\
+## Files touched\n- src/routes/webhook.rs\n\n\
+## Gotchas learned\n- the provider sends two events per charge\n";
+        let parsed = parse_markdown(v2);
+        assert_eq!(parsed.task, "Ship the webhook");
+        assert_eq!(parsed.files_modified, vec!["src/routes/webhook.rs"]);
+        assert!(parsed.files_read.is_empty());
+        assert!(parsed.constraints.is_empty());
+        assert!(parsed.blocked.is_empty());
+        assert!(parsed.key_decisions.is_empty());
+        assert!(parsed.is_usable());
+    }
+
     #[test]
     fn is_usable_requires_a_task_and_a_next_step() {
         assert!(sample().is_usable());
@@ -1653,13 +1957,13 @@ mod tests {
         let ctx = StructuralContext {
             user_messages: vec!["old request".to_string(), "fix the flaky test".to_string()],
             assistant_texts: vec!["[zirv] narrowed it to the timer".to_string()],
-            files_touched: vec!["src/timer.rs".to_string()],
+            files_modified: vec!["src/timer.rs".to_string()],
             tool_errors: vec!["assertion failed: expected 3".to_string()],
             ..StructuralContext::default()
         };
         let handoff = structural(&ctx);
         assert_eq!(handoff.task, "fix the flaky test");
-        assert_eq!(handoff.files_touched, vec!["src/timer.rs"]);
+        assert_eq!(handoff.files_modified, vec!["src/timer.rs"]);
         assert!(handoff.done.iter().any(|d| d.contains("narrowed it")));
         assert!(
             handoff

@@ -2798,12 +2798,17 @@ fn perform_handover_swap(
         .map(|path| std::fs::read_to_string(path).unwrap_or_default())
         .unwrap_or_default();
     let ctx = adapter.structural_context(&jsonl, tail_items);
+    let previous = handoff::latest_for_repo(state_dir, repo)
+        .ok()
+        .flatten()
+        .map(|(_, h)| h);
     let (note, source) = handoff::distill_or_structural(
         adapter.as_ref(),
         distiller_model.as_str(),
         &ctx,
         distiller_timeout,
         announcer.enabled,
+        previous.as_ref(),
     );
     let stored = handoff::store(state_dir, repo, session.as_str(), &note);
     // N6: same rule the ordinary restart arm follows -- opt-in, and only
@@ -3356,12 +3361,17 @@ fn pump(
                     .map(|path| std::fs::read_to_string(path).unwrap_or_default())
                     .unwrap_or_default();
                 let ctx = adapter.structural_context(&jsonl, tail_items);
+                let previous = handoff::latest_for_repo(state_dir, repo)
+                    .ok()
+                    .flatten()
+                    .map(|(_, h)| h);
                 let (note, source) = handoff::distill_or_structural(
                     adapter.as_ref(),
                     distiller_model.as_str(),
                     &ctx,
                     distiller_timeout,
                     announcer.enabled,
+                    previous.as_ref(),
                 );
                 let stored = handoff::store(state_dir, repo, session.as_str(), &note);
                 // N6: opt-in (`cfg.memory.harvest`, default off) and only
@@ -6420,13 +6430,25 @@ mod tests {
 
     #[test]
     fn the_focus_text_names_what_to_preserve() {
-        for needle in ["task", "file", "error", "next step"] {
+        for needle in [
+            "task",
+            "constraint",
+            "file",
+            "decision",
+            "reasoning",
+            "error",
+            "next step",
+        ] {
             assert!(
                 COMPACT_FOCUS.to_lowercase().contains(needle),
                 "focus text should mention {needle}: {COMPACT_FOCUS}"
             );
         }
         assert!(!COMPACT_FOCUS.contains('\u{2014}'));
+        assert!(
+            !COMPACT_FOCUS.contains('\n'),
+            "typed into a single TUI line: {COMPACT_FOCUS}"
+        );
     }
 
     #[test]

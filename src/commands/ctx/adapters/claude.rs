@@ -373,6 +373,12 @@ pub fn sidechain_transcript_usage(jsonl: &str) -> Option<TranscriptUsage> {
 }
 
 const FILE_KEYS: &[&str] = &["file_path", "notebook_path", "path"];
+/// Tool names whose file-key argument is a modification, not a read (issue
+/// #280). Anything else -- `Read`/`Grep`/`Glob`, or a tool this codebase does
+/// not recognise -- lands in `files_read` instead, the conservative
+/// direction: claiming a file was edited when it was not is the damaging
+/// error, never the reverse.
+const MODIFICATION_TOOLS: &[&str] = &["Edit", "Write", "MultiEdit", "NotebookEdit"];
 const ERROR_SNIPPET: usize = 200;
 
 /// Conservative context window (issue #155) for a Claude model id this
@@ -471,17 +477,23 @@ pub fn structural_context(jsonl: &str, last_n: usize) -> StructuralContext {
                     let Some(input) = block.get("input") else {
                         continue;
                     };
+                    let tool_name = block.get("name").and_then(Value::as_str).unwrap_or("");
+                    let is_modification = MODIFICATION_TOOLS
+                        .iter()
+                        .any(|t| tool_name.eq_ignore_ascii_case(t));
+                    let target = if is_modification {
+                        &mut out.files_modified
+                    } else {
+                        &mut out.files_read
+                    };
                     for key in FILE_KEYS {
                         if let Some(path) = input.get(*key).and_then(Value::as_str)
-                            && !out.files_touched.iter().any(|p| p == path)
+                            && !target.iter().any(|p| p == path)
                         {
-                            out.files_touched.push(path.to_string());
+                            target.push(path.to_string());
                         }
                     }
-                    let is_bash = block
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .is_some_and(|n| n.eq_ignore_ascii_case("Bash"));
+                    let is_bash = tool_name.eq_ignore_ascii_case("Bash");
                     if is_bash
                         && let (Some(id), Some(command)) = (
                             block.get("id").and_then(Value::as_str),
@@ -501,12 +513,13 @@ pub fn structural_context(jsonl: &str, last_n: usize) -> StructuralContext {
     keep_last(&mut out.user_messages, last_n);
     keep_last(&mut out.assistant_texts, last_n);
     keep_last(&mut out.tool_errors, last_n);
-    // Capped with everything else rather than left to accumulate: this is a
-    // deduplicated list of every path the whole session ever named, and it
-    // leaves as a single argv token in a handoff. Windows caps a command line
-    // at 32,767 characters, so an uncapped list is a long session that can no
-    // longer relaunch at all.
-    keep_last(&mut out.files_touched, last_n);
+    // Capped with everything else rather than left to accumulate: each is a
+    // deduplicated list of every path the whole session ever named that way,
+    // and it leaves as a single argv token in a handoff. Windows caps a
+    // command line at 32,767 characters, so an uncapped list is a long
+    // session that can no longer relaunch at all.
+    keep_last(&mut out.files_read, last_n);
+    keep_last(&mut out.files_modified, last_n);
     out
 }
 
@@ -3203,9 +3216,39 @@ mod tests {
         let ctx = structural_context(jsonl, 5);
         assert_eq!(ctx.user_messages, vec!["first prompt", "second prompt"]);
         assert_eq!(ctx.assistant_texts, vec!["[zirv] fixed it"]);
-        assert_eq!(ctx.files_touched, vec!["/work/src/lib.rs"]);
+        assert_eq!(ctx.files_read, vec!["/work/src/lib.rs"]);
+        assert!(ctx.files_modified.is_empty(), "a Read is never a write");
         assert_eq!(ctx.tool_errors.len(), 1);
         assert!(ctx.tool_errors[0].contains("boom"));
+    }
+
+    /// Issue #280: `Edit`/`Write`/`MultiEdit`/`NotebookEdit` land in
+    /// `files_modified`; `Read`/`Grep`/`Glob` and an unrecognised tool with a
+    /// file key land in `files_read` -- the conservative direction.
+    #[test]
+    fn structural_context_classifies_files_read_vs_modified_by_tool_name() {
+        let jsonl = concat!(
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"a","name":"Read","input":{"file_path":"/a.rs"}}],"usage":{}}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"b","name":"Grep","input":{"path":"/b.rs"}}],"usage":{}}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"c","name":"Edit","input":{"file_path":"/c.rs"}}],"usage":{}}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"d","name":"Write","input":{"file_path":"/d.rs"}}],"usage":{}}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"e","name":"MultiEdit","input":{"file_path":"/e.rs"}}],"usage":{}}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"f","name":"NotebookEdit","input":{"notebook_path":"/f.ipynb"}}],"usage":{}}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"g","name":"SomeThirdPartyTool","input":{"file_path":"/g.rs"}}],"usage":{}}}"#,
+            "\n",
+        );
+        let ctx = structural_context(jsonl, 10);
+        assert_eq!(ctx.files_read, vec!["/a.rs", "/b.rs", "/g.rs"]);
+        assert_eq!(
+            ctx.files_modified,
+            vec!["/c.rs", "/d.rs", "/e.rs", "/f.ipynb"]
+        );
     }
 
     /// T2: `last_verification` reflects the LAST Bash invocation whose
@@ -3273,7 +3316,7 @@ mod tests {
         }
         let ctx = structural_context(&jsonl, 2);
         assert_eq!(ctx.user_messages, vec!["p4", "p5"]);
-        assert_eq!(ctx.files_touched, vec!["/same.rs"]);
+        assert_eq!(ctx.files_read, vec!["/same.rs"]);
     }
 
     #[test]
@@ -3702,26 +3745,28 @@ mod tests {
         )
         .expect("valid json");
         let recorded = expected["files_touched_min"].as_u64().unwrap_or(0);
+        let touched = structural_context(&jsonl, 1_000);
         assert!(
-            structural_context(&jsonl, 1_000).files_touched.len() as u64 >= recorded,
-            "files_touched should find at least the recorded count"
+            (touched.files_read.len() + touched.files_modified.len()) as u64 >= recorded,
+            "files_read + files_modified should find at least the recorded count"
         );
 
         let ctx = structural_context(&jsonl, 5);
         assert!(ctx.user_messages.len() <= 5);
         assert!(
-            ctx.files_touched.len() <= 5,
-            "and then keep only the tail, like every other field: {}",
-            ctx.files_touched.len()
+            ctx.files_read.len() <= 5 && ctx.files_modified.len() <= 5,
+            "and then keep only the tail, like every other field: {} read, {} modified",
+            ctx.files_read.len(),
+            ctx.files_modified.len()
         );
     }
 
     /// A handoff leaves as a single argv token, and Windows caps a command
-    /// line at 32,767 characters. `files_touched` accumulated every unique
-    /// path of the whole session while its neighbours were capped, so a long
-    /// enough session could no longer relaunch at all.
+    /// line at 32,767 characters. `files_read`/`files_modified` accumulated
+    /// every unique path of the whole session while its neighbours were
+    /// capped, so a long enough session could no longer relaunch at all.
     #[test]
-    fn structural_context_caps_files_touched_like_every_other_field() {
+    fn structural_context_caps_files_read_like_every_other_field() {
         let mut jsonl = String::new();
         for index in 0..40 {
             jsonl.push_str(&format!(
@@ -3731,7 +3776,7 @@ mod tests {
 
         let ctx = structural_context(&jsonl, 5);
         assert_eq!(
-            ctx.files_touched,
+            ctx.files_read,
             vec![
                 "/src/file-35.rs",
                 "/src/file-36.rs",

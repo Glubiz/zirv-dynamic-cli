@@ -715,7 +715,7 @@ mod tests {
             done: vec!["Added the route".to_string()],
             remaining: vec!["Signature verification".to_string()],
             next_step: "Add a failing test for an invalid signature".to_string(),
-            files_touched: vec!["src/routes/webhook.rs".to_string()],
+            files_modified: vec!["src/routes/webhook.rs".to_string()],
             gotchas: vec![],
             ..Handoff::default()
         }
