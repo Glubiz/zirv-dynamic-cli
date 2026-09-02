@@ -1280,7 +1280,17 @@ fn account_reaped_pane_spend(pane: &Pane, cfg: &CtxConfig, state: &StateDir, rep
     let Some(usage) = pane_transcript_usage(pane, cfg, repo) else {
         return;
     };
-    let _ = super::group::add_spent_tokens(state, group_id, super::agent::token_spend(&usage));
+    // Issue #301: `pane.budget_tokens()` is exactly the ceiling `admit_child`
+    // reserved for this pane at spawn time (`fulfill_spawn_request` sets
+    // both from the same `admit_child` result), so settling here always
+    // releases exactly what was reserved.
+    let reserved = pane.budget_tokens().unwrap_or(0);
+    let _ = super::group::settle_reservation(
+        state,
+        group_id,
+        reserved,
+        super::agent::token_spend(&usage),
+    );
 }
 
 /// Pure: `selected` after `new_pane_count - old_pane_count` panes were
@@ -3665,11 +3675,15 @@ fn fulfill_spawn_request(
     // fallback would call the identical `admit_child` in `agent.rs` and get
     // refused there too, so falling back gains nothing and the requester
     // deserves the honest, non-retryable answer.
-    let group_budget_tokens = if let Some(group_id) = &req.work_group_id {
-        match super::group::admit_child(state, group_id, now) {
-            Ok(group) => group
-                .token_budget
-                .map(|budget| budget.saturating_sub(group.spent_tokens)),
+    // Issue #301: `admit_child` resolves AND reserves this pane's own token
+    // ceiling atomically inside the group's admission lock -- the group's
+    // remaining, unreserved budget, already tightened by `req.budget_tokens`
+    // exactly as `agent::resolve_budget_tokens` used to tighten it here
+    // afterward. Without that reservation, two panes admitted concurrently
+    // could each be handed the group's entire remaining budget.
+    let budget_tokens = if let Some(group_id) = &req.work_group_id {
+        match super::group::admit_child(state, group_id, now, req.budget_tokens) {
+            Ok((_, ceiling)) => ceiling,
             Err(e) if super::group::is_admission_exhausted(e.as_ref()) => {
                 return Err(SpawnRefusal::budget_exhausted(format!(
                     "budget-exhausted: {e}"
@@ -3678,20 +3692,21 @@ fn fulfill_spawn_request(
             Err(e) => return Err(SpawnRefusal::policy(e.to_string())),
         }
     } else {
-        None
+        req.budget_tokens
     };
-    let budget_tokens = super::agent::resolve_budget_tokens(group_budget_tokens, req.budget_tokens);
     // Re-review (2026-08-27) finding 1: from here on, `req.work_group_id`
     // (if any) has genuinely been admitted -- every remaining fallible step
     // between here and the pane actually spawning must roll that admission
     // back on its way out, or a post-admission failure (prompt composition,
     // the interactive pace gate, the pty spawn itself) permanently burns a
-    // `child_limit` slot for a child that never ran. Best-effort, like
-    // `rollback_admission` itself: never shadows the real refusal being
-    // returned.
+    // `child_limit` slot for a child that never ran, and (issue #301) leaks
+    // its reservation forever. Best-effort, like `rollback_admission`
+    // itself: never shadows the real refusal being returned. `budget_tokens`
+    // is exactly the ceiling `admit_child` just reserved (or `None` if it
+    // reserved nothing), so releasing it here always matches.
     let rollback_admission = || {
         if let Some(group_id) = &req.work_group_id {
-            super::group::rollback_admission(state, group_id);
+            super::group::rollback_admission(state, group_id, budget_tokens.unwrap_or(0));
         }
     };
 
@@ -11961,6 +11976,7 @@ mod tests {
             child_limit: 1,
             token_budget: None,
             spent_tokens: 0,
+            reserved_tokens: 0,
             deadline_secs: None,
             completion_contract: String::new(),
             created_at: 0,
@@ -12018,6 +12034,7 @@ mod tests {
             child_limit: 0,
             token_budget: Some(400_000),
             spent_tokens: 400_000,
+            reserved_tokens: 0,
             deadline_secs: None,
             completion_contract: String::new(),
             created_at: 0,
@@ -12071,6 +12088,7 @@ mod tests {
             child_limit: 3,
             token_budget: Some(400_000),
             spent_tokens: 125_000,
+            reserved_tokens: 0,
             deadline_secs: None,
             completion_contract: String::new(),
             created_at: crate::commands::ctx::state::now_secs(),
@@ -12131,6 +12149,7 @@ mod tests {
             child_limit: 0,
             token_budget: None,
             spent_tokens: 0,
+            reserved_tokens: 0,
             deadline_secs: Some(1),
             completion_contract: String::new(),
             created_at: 1,
@@ -12213,6 +12232,7 @@ mod tests {
             child_limit: 0,
             token_budget: None,
             spent_tokens: 0,
+            reserved_tokens: 0,
             deadline_secs: None,
             completion_contract: String::new(),
             created_at: 0,
@@ -12422,8 +12442,12 @@ mod tests {
             parent_session_id: String::new(),
             scope: "test batch".to_string(),
             child_limit: 3,
-            token_budget: None,
+            // Issue #301: a token budget so the admission this test rolls
+            // back also reserved something -- proving the rollback releases
+            // that reservation too, not just the admitted-child slot.
+            token_budget: Some(100_000),
             spent_tokens: 0,
+            reserved_tokens: 0,
             deadline_secs: None,
             completion_contract: String::new(),
             created_at: 0,
@@ -12479,13 +12503,16 @@ mod tests {
         assert!(!refusal.retryable, "not a channel failure -- policy");
         assert!(panes.is_empty(), "no pane was ever spawned");
 
+        let after_rollback = crate::commands::ctx::group::load(&state, "wg-1")
+            .expect("load")
+            .expect("present");
         assert_eq!(
-            crate::commands::ctx::group::load(&state, "wg-1")
-                .expect("load")
-                .expect("present")
-                .admitted_children,
-            0,
+            after_rollback.admitted_children, 0,
             "the admission granted before the later refusal must be rolled back"
+        );
+        assert_eq!(
+            after_rollback.reserved_tokens, 0,
+            "issue #301: the reservation granted before the later refusal must be released too"
         );
     }
 
@@ -13578,6 +13605,7 @@ mod tests {
             child_limit: 3,
             token_budget: None,
             spent_tokens: 0,
+            reserved_tokens: 0,
             deadline_secs: None,
             completion_contract: String::new(),
             created_at: 0,
@@ -15260,6 +15288,7 @@ mod tests {
             child_limit: 3,
             token_budget: Some(1_000),
             spent_tokens: 10,
+            reserved_tokens: 0,
             deadline_secs: None,
             completion_contract: String::new(),
             created_at: crate::commands::ctx::state::now_secs(),
@@ -15339,6 +15368,118 @@ mod tests {
                 .spent_tokens,
             75,
             "10 existing + 10 input + 20 cache-create + 30 cache-read + 5 output"
+        );
+    }
+
+    /// Issue #301: reaping a pane that carries a token ceiling (set at
+    /// admission via `fulfill_spawn_request`'s own `pane.set_budget_tokens`)
+    /// releases exactly that reservation and rolls the pane's ACTUAL spend
+    /// in -- not the ceiling it was reserved under, which is very rarely the
+    /// same number.
+    #[cfg(unix)]
+    #[test]
+    fn reaping_a_grouped_pane_settles_its_reservation_exactly_once() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().to_path_buf();
+        let worker_cwd = tmp.path().join("worker-cwd");
+        std::fs::create_dir_all(&worker_cwd).expect("create worker cwd");
+        let group = crate::commands::ctx::group::WorkGroup {
+            work_group_id: "wg-settle".to_string(),
+            parent_session_id: String::new(),
+            scope: "settle a reservation".to_string(),
+            child_limit: 3,
+            token_budget: Some(1_000),
+            spent_tokens: 0,
+            // What `admit_child` would have reserved for this pane's own
+            // ceiling below (500) -- set up directly, rather than through a
+            // real admission, so this test isolates settlement alone.
+            reserved_tokens: 500,
+            deadline_secs: None,
+            completion_contract: String::new(),
+            created_at: crate::commands::ctx::state::now_secs(),
+            closed_at: None,
+            admitted_children: 1,
+            sub_orchestrator_session: None,
+        };
+        crate::commands::ctx::group::create(&state, &group).expect("create group");
+
+        let session_id = "46464646-2222-4333-8444-555555555555";
+        let spec = PaneSpec {
+            agent_name: "claude".to_string(),
+            argv: trivial_argv(),
+            role: prompt::PromptRole::Worker,
+            verb: sessions::Verb::Dash,
+            session_id: session_id.to_string(),
+            title: "wrk claude".to_string(),
+        };
+        let mut pane = Pane::spawn(
+            spec,
+            &state,
+            &worker_cwd,
+            &repo,
+            (80, 24),
+            &[],
+            true,
+            pane::DEFAULT_IDLE_QUIET,
+        )
+        .expect("spawn");
+        pane.set_work_group_id(Some("wg-settle".to_string()));
+        pane.set_budget_tokens(Some(500));
+
+        let cfg = CtxConfig::default();
+        let adapter = adapters::select(Some("claude"), &[], &cfg).expect("adapter");
+        let transcript = adapter.transcript_path(&SessionRef {
+            id: SessionId::parse(session_id),
+            cwd: worker_cwd,
+        });
+        std::fs::create_dir_all(transcript.parent().expect("transcript parent"))
+            .expect("create transcript dir");
+        std::fs::write(
+            &transcript,
+            r#"{"type":"assistant","message":{"usage":{"input_tokens":40,"output_tokens":5}}}"#,
+        )
+        .expect("write transcript");
+
+        let mut panes = vec![pane];
+        let mut queues = vec![VecDeque::new()];
+        let mut errors = Vec::new();
+        let mut focused = 0;
+        let mut selected = 0;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline && !panes.is_empty() {
+            for pane in &mut panes {
+                pane.drain();
+            }
+            reap_ended_panes(
+                &mut panes,
+                &mut queues,
+                &cfg,
+                &state,
+                &repo,
+                &mut focused,
+                &mut selected,
+                &mut errors,
+                &mut Vec::new(),
+                &mut HashSet::new(),
+                &mut None,
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        assert!(panes.is_empty(), "pane was reaped: {errors:?}");
+        let settled = crate::commands::ctx::group::load(&state, "wg-settle")
+            .expect("load")
+            .expect("group");
+        assert_eq!(
+            settled.reserved_tokens, 0,
+            "settlement must release the full reservation, not just what was actually spent"
+        );
+        assert_eq!(
+            settled.spent_tokens, 45,
+            "spend must reflect ACTUAL usage (40 input + 5 output), never the reserved ceiling"
         );
     }
 

@@ -599,12 +599,12 @@ pub(crate) fn spawn_blocked(gate: &pace::SpawnGate, force: bool) -> bool {
 
 /// Resolves this delegation's [`WorkerBudget`] from `--budget-tokens`/
 /// `--max-tool-calls` and, when `--group` names one, that group's token
-/// budget's remaining ceiling -- which `--budget-tokens` may only tighten
-/// (`resolve_budget_tokens`). An unknown or closed group is a hard error:
-/// silently ignoring it would let a mistyped `--group` run unbounded work a
-/// batch's own budget was meant to cap. `--max-tool-calls` has no group-level
-/// counterpart (`group::WorkGroup` carries no such field) and so is never
-/// clamped.
+/// budget's remaining, unreserved ceiling (`group::admit_child` already
+/// tightens it by `--budget-tokens` itself, issue #301). An unknown or
+/// closed group is a hard error: silently ignoring it would let a mistyped
+/// `--group` run unbounded work a batch's own budget was meant to cap.
+/// `--max-tool-calls` has no group-level counterpart (`group::WorkGroup`
+/// carries no such field) and so is never clamped.
 ///
 /// This is also the headless admission choke point for the group's child,
 /// token, and deadline limits -- `group::admit_child` is called here, once,
@@ -614,25 +614,41 @@ pub(crate) fn spawn_blocked(gate: &pace::SpawnGate, force: bool) -> bool {
 /// admits here; `dash::fulfill_spawn_request` admits on that side instead,
 /// so a single `zirv ctx agent --group` invocation is counted exactly once
 /// regardless of which fork actually spawns.
-fn resolve_worker_budget(env: EnvLookup<'_>, args: &AgentArgs) -> CtxResult<WorkerBudget> {
-    let group_token_budget = match &args.group {
+///
+/// The second return value is the exact token ceiling `admit_child` reserved
+/// in the group's own ledger for this admission (`None` for no `--group`, or
+/// a `--group` with no `token_budget` and no `--budget-tokens` override) --
+/// `run_with` carries it forward to release it via `group::rollback_
+/// admission` on a spawn that never happens, or settle it via `group::
+/// settle_reservation` once the delegation actually completes.
+fn resolve_worker_budget(
+    env: EnvLookup<'_>,
+    args: &AgentArgs,
+) -> CtxResult<(WorkerBudget, Option<u64>)> {
+    let (tokens, reserved) = match &args.group {
         Some(id) => {
             let state = super::state::StateDir::resolve(env)?;
-            let group = match super::group::admit_child(&state, id, super::state::now_secs()) {
-                Ok(group) => group,
+            let (_, ceiling) = match super::group::admit_child(
+                &state,
+                id,
+                super::state::now_secs(),
+                args.budget_tokens,
+            ) {
+                Ok(result) => result,
                 Err(e) if super::group::is_admission_exhausted(e.as_ref()) => return Err(e),
                 Err(e) => return Err(format!("zirv ctx agent: {e}").into()),
             };
-            group
-                .token_budget
-                .map(|budget| budget.saturating_sub(group.spent_tokens))
+            (ceiling, ceiling)
         }
-        None => None,
+        None => (args.budget_tokens, None),
     };
-    Ok(WorkerBudget {
-        tokens: resolve_budget_tokens(group_token_budget, args.budget_tokens),
-        tool_calls: args.max_tool_calls,
-    })
+    Ok((
+        WorkerBudget {
+            tokens,
+            tool_calls: args.max_tool_calls,
+        },
+        reserved,
+    ))
 }
 
 /// Preview of the ceiling an honest dashboard request carries. The
@@ -643,9 +659,11 @@ fn dashboard_budget_tokens(env: EnvLookup<'_>, args: &AgentArgs) -> Option<u64> 
     let group_tokens = args.group.as_deref().and_then(|id| {
         let state = super::state::StateDir::resolve(env).ok()?;
         let group = super::group::load(&state, id).ok()??;
-        group
-            .token_budget
-            .map(|budget| budget.saturating_sub(group.spent_tokens))
+        group.token_budget.map(|budget| {
+            budget
+                .saturating_sub(group.spent_tokens)
+                .saturating_sub(group.reserved_tokens)
+        })
     });
     resolve_budget_tokens(group_tokens, args.budget_tokens)
 }
@@ -1809,8 +1827,8 @@ pub fn run_with<W: Write>(
     // Issue #155, Phase 5(d): resolved before the launch, not inside
     // `exec::run_with` -- an unknown or closed `--group` must fail this
     // delegation outright rather than silently running it unbounded.
-    let worker_budget = match resolve_worker_budget(&env, args) {
-        Ok(budget) => budget,
+    let (worker_budget, reserved_ceiling) = match resolve_worker_budget(&env, args) {
+        Ok(result) => result,
         Err(e) => {
             // Finding 4: nothing ran, so a group minted moments ago for this
             // delegation must not outlive it.
@@ -1870,7 +1888,7 @@ pub fn run_with<W: Write>(
         Ok(result) => result,
         Err(e) => {
             if let Some(id) = &args.group {
-                super::group::rollback_admission(&state, id);
+                super::group::rollback_admission(&state, id, reserved_ceiling.unwrap_or(0));
             }
             // Finding 4: with the admission rolled back the group is pristine
             // again, so a group this invocation minted for a launch that
@@ -1947,7 +1965,12 @@ pub fn run_with<W: Write>(
             outcome,
         );
         if let Some(id) = args.group.as_deref() {
-            let _ = super::group::add_spent_tokens(&state_dir, id, token_spend(&total));
+            let _ = super::group::settle_reservation(
+                &state_dir,
+                id,
+                reserved_ceiling.unwrap_or(0),
+                token_spend(&total),
+            );
         }
         let route: Vec<String> = execution_report
             .segments
@@ -2599,6 +2622,7 @@ mod tests {
             child_limit,
             token_budget: None,
             spent_tokens: 0,
+            reserved_tokens: 0,
             deadline_secs: None,
             completion_contract: String::new(),
             created_at: 0,
@@ -2637,6 +2661,7 @@ mod tests {
         assert_eq!(
             resolve_worker_budget(&|k| env.get(k).cloned(), &remaining)
                 .expect("resolve remaining budget")
+                .0
                 .tokens,
             Some(150_000)
         );
@@ -2647,9 +2672,43 @@ mod tests {
         assert_eq!(
             resolve_worker_budget(&|k| env.get(k).cloned(), &tightened)
                 .expect("resolve tightened budget")
+                .0
                 .tokens,
             Some(100_000),
             "an explicit child budget may still tighten the remaining group budget"
+        );
+    }
+
+    /// Issue #301: two admissions under the same group must not both be
+    /// handed the whole remainder -- the second sees the first's ceiling
+    /// already subtracted, via `reserved_tokens`, not just its (still-zero)
+    /// spend.
+    #[test]
+    fn resolve_worker_budget_reserves_the_ceiling_so_a_concurrent_admission_cannot_double_spend() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = crate::commands::ctx::state::StateDir::from_root(tmp.path().to_path_buf());
+        create_work_group_with_spend(&state, "wg-concurrent", 400_000, 0);
+        let mut env = HashMap::new();
+        env.insert(
+            crate::commands::ctx::state::STATE_ENV.to_string(),
+            tmp.path().display().to_string(),
+        );
+
+        let mut first = args_for("claude", "go");
+        first.group = Some("wg-concurrent".to_string());
+        let (first_budget, first_reserved) =
+            resolve_worker_budget(&|k| env.get(k).cloned(), &first).expect("first admission");
+        assert_eq!(first_budget.tokens, Some(400_000));
+        assert_eq!(first_reserved, Some(400_000));
+
+        let mut second = args_for("claude", "go");
+        second.group = Some("wg-concurrent".to_string());
+        let (second_budget, _) =
+            resolve_worker_budget(&|k| env.get(k).cloned(), &second).expect("second admission");
+        assert_eq!(
+            second_budget.tokens,
+            Some(0),
+            "nothing is left unreserved for a second concurrent admission"
         );
     }
 
@@ -5031,6 +5090,7 @@ mod tests {
             child_limit: 3,
             token_budget: Some(400_000),
             spent_tokens: 125_000,
+            reserved_tokens: 0,
             deadline_secs: None,
             completion_contract: String::new(),
             created_at: crate::commands::ctx::state::now_secs(),
