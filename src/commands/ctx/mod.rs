@@ -196,6 +196,33 @@ pub(crate) mod testenv {
         }
     }
 
+    /// Stubs an executable-named file for every entry in
+    /// [`super::adapters::ADAPTERS`] on a fresh, otherwise-empty `PATH`, so
+    /// issue #298's liveness probe (`adapters::liveness_probe`) confirms
+    /// every registered adapter `Live` no matter what the host running the
+    /// test actually has installed. Without this, any test that needs a
+    /// non-empty harness roster is really asserting on the developer
+    /// machine's own `PATH` -- true where `claude`/`codex` happen to be
+    /// installed, false on a CI runner that carries neither, which is
+    /// exactly the split issue #298 introduced (see its own roster-omission
+    /// tests earlier in `adapters::tests` for the pattern this factors out).
+    ///
+    /// Returns both guards: the `TempDir` must outlive the `VarGuard` (drop
+    /// order matters only in that dropping the directory first would delete
+    /// the stub files while `PATH` still names it), so bind the whole tuple
+    /// for the caller's scope rather than discarding either half.
+    pub(crate) fn stub_live_adapters_on_path() -> (tempfile::TempDir, VarGuard) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for (name, _) in super::adapters::ADAPTERS {
+            std::fs::write(dir.path().join(name), "").expect("write stub");
+        }
+        let guard = VarGuard::set(&[(
+            "PATH",
+            Some(dir.path().to_str().expect("utf8 tempdir path")),
+        )]);
+        (dir, guard)
+    }
+
     /// Enters `dir` and returns to the previous working directory on drop --
     /// including on a panicking assertion, which is the whole point.
     ///

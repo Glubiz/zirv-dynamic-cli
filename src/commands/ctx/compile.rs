@@ -1451,6 +1451,7 @@ mod tests {
     /// canonical layer.
     #[test]
     fn an_over_budget_harness_roster_is_truncated_and_recorded() {
+        let _live = crate::commands::ctx::testenv::stub_live_adapters_on_path();
         let repo = tempfile::tempdir().expect("tempdir");
         let cfg = CtxConfig {
             context: crate::commands::ctx::config::ContextConfig {
@@ -1491,6 +1492,7 @@ mod tests {
     /// prompt's roster section is unaffected.
     #[test]
     fn a_harness_roster_under_budget_is_not_marked_truncated() {
+        let _live = crate::commands::ctx::testenv::stub_live_adapters_on_path();
         let repo = tempfile::tempdir().expect("tempdir");
         let cfg = CtxConfig::default(); // context.max_harness_roster_bytes = 4096
         let adapter = ClaudeAdapter::new(None);
