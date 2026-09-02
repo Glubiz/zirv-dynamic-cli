@@ -754,8 +754,16 @@ impl SessionGuard {
     /// existing edges each supervisor already observes for a turn beginning.
     /// Best-effort, like every other registry write here: a failed write
     /// costs a missed witness on a future crash, never this turn itself.
+    /// Idempotent per turn: `wrap`'s `Input` arm fires on every keystroke
+    /// chunk, so only the first chunk of a turn touches the disk.
     pub fn stamp_in_flight(&mut self, verb: &str, turn: u64) {
-        if self.released {
+        if self.released
+            || self
+                .record
+                .in_flight
+                .as_ref()
+                .is_some_and(|f| f.turn == turn && f.verb == verb)
+        {
             return;
         }
         self.record.in_flight = Some(InFlight {
@@ -4142,5 +4150,28 @@ mod tests {
         }"#;
         let record: Record = serde_json::from_str(json).expect("an older record still parses");
         assert_eq!(record.in_flight, None);
+    }
+
+    /// `wrap`'s `Input` arm calls `stamp_in_flight` on every keystroke chunk,
+    /// so a repeat stamp for the turn already marked must not rewrite the
+    /// record: the original `since` survives, and a new turn replaces it.
+    #[test]
+    fn stamping_the_same_turn_again_does_not_rewrite_the_marker() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = state_in(tmp.path());
+        let repo = tmp.path().join("repo");
+        let record = in_flight_record(&repo, std::process::id(), None);
+        let mut guard = SessionGuard::register(&state, record);
+
+        guard.stamp_in_flight("wrap", 2);
+        guard.record.in_flight.as_mut().expect("stamped").since = 5;
+        guard.stamp_in_flight("wrap", 2);
+        assert_eq!(guard.record().in_flight.as_ref().map(|f| f.since), Some(5));
+
+        guard.stamp_in_flight("wrap", 3);
+        let stamped = guard.record().in_flight.as_ref().expect("restamped");
+        assert_eq!(stamped.turn, 3);
+        assert_ne!(stamped.since, 5);
+        guard.release();
     }
 }

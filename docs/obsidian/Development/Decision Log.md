@@ -24,6 +24,41 @@ last-verified: 2026-09-02
 
 ## Decisions
 
+### 2026-09-02 -- Handoff v3 carries constraints/decisions across restarts, splits files touched
+**Context:** A restart chain (rot restart, nudge relaunch, handover) distilled each handoff only from the current transcript tail, so an operator constraint or design decision made two restarts ago could silently drop once it aged out.
+**Decision:** `distill`/`distill_or_structural` now take the repo's latest stored handoff as `previous: Option<&Handoff>`; the prompt renders a `### Previous handoff` block with preserve/update rules. `Handoff::SECTIONS` grows 7 -> 11 (Constraints/Blocked/Key decisions added, Files touched split into Files read/Files modified). `DISTILL_PROMPT_VERSION` v2 -> v3.
+**Rejected:** Re-deriving constraints from the full transcript at every restart -- defeats the point of a handoff, which exists to avoid re-reading a growing transcript.
+**Consequences:** The structural (no-model) fallback carries constraints/key_decisions forward mechanically. A v2 handoff file still parses (`## Files touched` maps to Files modified).
+**Spec / link:** [[Ctx Subsystem]], [[Ctx Adapters]].
+
+### 2026-09-02 -- Resume injection adds a host-verified working-set manifest; status preview must not consume the interrupted witness
+**Context:** A distilled handoff's file/progress claims are the model's own account and can be stale; a resumed session had no independent on-disk check, and a crash mid-turn left no record for the next start to explain.
+**Decision:** `resume` and the `SessionStart` hook append a bounded, zirv-verified manifest (`.zirv/work/<id>/` artifacts plus git-changed paths, capped) beside the handoff. `sessions::Record` gains `in_flight`, stamped by `wrap`/`exec` and cleared on the first turn signal; a dead-pid record still carrying it yields one `<zirv_interrupted>` block on the next start, then the marker is consumed. `resume_prompt` takes `(state, repo, session, handoff)`; a non-consuming `resume_prompt_preview` keeps `zirv ctx status` from burning the one-shot marker.
+**Rejected:** Trusting the handoff's own file-touched claims instead of re-verifying on disk -- that is exactly the stale signal this closes.
+**Consequences:** `exec`'s witness is coarser than `wrap`'s (per-cycle, not per-keystroke) -- a crash right after an in-pump relaunch before the next keystroke shows no witness, a documented limitation. No new config key.
+**Spec / link:** [[Ctx Subsystem]], [[Ctx Supervisors]].
+
+### 2026-09-02 -- A repeated verification attempt against an unchanged worktree stops re-running checks
+**Context:** `zirv workflow advance --run-checks` against a worktree byte-identical to the last failing attempt re-ran the whole suite for no new information.
+**Decision:** `GateOutcome` gains `Unchanged { fingerprint, since_attempt }`: when `change_fingerprint` equals the last failing report's, no check executes and the operator is told to edit source/tests or record a blocker. The attempt still counts toward `MAX_STEP_ATTEMPTS`; `TelemetryEvent.verification_unchanged` records it.
+**Rejected:** Skipping the attempt-count increment on Unchanged -- would let a stuck step sit forever re-issuing `--run-checks` with no forcing function.
+**Consequences:** `change_fingerprint` now records `symlink:<target>` instead of hashing through a symlink.
+**Spec / link:** [[Workflows]].
+
+### 2026-09-02 -- Work-group token budgets are reserved atomically at admission, not spent after the fact
+**Context:** A group's token budget was checked and debited only after a child completed, so two children admitted concurrently could both see the full remaining budget and both be granted it.
+**Decision:** `WorkGroup.reserved_tokens` tracks budget committed to admitted-but-unsettled children; `admit_child` reserves each child's ceiling (`budget - spent - reserved`) atomically under the group lock. `add_spent_tokens` is replaced by `settle_reservation(state, id, reserved, actual)` at completion; `rollback_admission` releases the reservation on a failed spawn.
+**Rejected:** A lock held across the whole delegation lifecycle -- a headless worker can run long, and that would serialize every admission in the group.
+**Consequences:** Two concurrent admissions can no longer both receive the full remainder.
+**Spec / link:** [[Ctx Subsystem]].
+
+### 2026-09-02 -- A durable, repo-scoped objective survives restarts and never self-certifies completion
+**Context:** An orchestrator's task/budget/deadline lived only in the running session's own context -- a restart, handover, or nudge relaunch had no durable record of it.
+**Decision:** New `zirv ctx objective set|show|close` plus `--objective <text>` on `exec`/`loop` persist one record per repo (`<state>/objective/<repo_slug>.json`: text, budget_tokens, deadline_secs, spent_tokens, status). A `PromptSource::Objective` layer folds in last, after Memory; `loop` re-injects every cycle, `exec` reloads/advances at every restart. Crossing budget/deadline flips status and swaps in a fixed wrap-up instruction rather than killing the run. `objective close` refuses unless `workflow::verification::latest_is_fresh_and_passing` holds.
+**Rejected:** Letting the session declare completion on its own say-so -- the same reason workflow-close/artifact acceptance already require independent on-disk evidence.
+**Consequences:** `DEFAULT_PROMPT_VERSION` v9 -> v10. New operator-only `[pace] run_budget_tokens` (`REPO_FORBIDDEN`). A closed objective is never injected or reseeded.
+**Spec / link:** [[Ctx Subsystem]], [[Context Management]].
+
 ### 2026-09-01 — Proportionality-first wrapper: engineering standard replaces process-first conventions
 **Context:** The wrapper's injected text was ~95% process and ~5% judgment, every rule absolute rather than sized, and review mandates (workflow gate, native review, codex cross-review, vault-keeper) stacked unconditionally on every diff — turning a two-minute fix into a dispatch plus four verification commands plus two reviews.
 **Decision:** `DEFAULT_PROMPT` becomes `zirv engineering standard (v3)` — one short judgment-first standard sizing every task trivial/bounded/substantial, reaching every role and harness. `HARNESS_PROMPT` (v15) and both adapters' `ORCHESTRATOR_PROMPT` size delegation, lifecycle, and review by that same tier; the workflow-adoption nudge and the engine's feature-kind `intent` gate follow suit. `.zirv/context/*.md` and the vault mirror the tiers.
@@ -365,7 +400,6 @@ last-verified: 2026-09-02
 **Rejected:** Interrupting a live child as its passive usage reading approaches a threshold — the reading can be stale and there is no safe response-boundary proof. Treating every unknown model as `standard` — could silently downgrade an operator-selected model. Forwarding arbitrary passthrough flags across CLIs — vendor flag semantics are not portable.
 **Consequences:** Unknown usage can still participate only through the operator's explicit conservative assumption (0 opts out); visited-harness tracking prevents ping-pong after consecutive vendor limits. If no alternate is safe, existing refusal/park-until-reset behavior remains in control.
 **Spec / link:** `src/commands/ctx/fallback.rs`, `agent.rs`, `exec.rs`, `handover.rs`; [[Usage and Pacing]]; [[Ctx Supervisors]]; [[Untrusted Configuration]]; issue #186.
-
 
 ### 2026-08-28 — `permissions propose` is disabled by default and structurally unable to be enabled by a repository (issue #178, v2.35.0)
 **Context:** `zirv ctx permissions propose` auto-files public GitHub issues from transcript evidence. Reusing `ctx.toml`'s `REPO_FORBIDDEN` table would only reject a repo-set key, not prevent the key from being read at all — a weaker boundary than the "never even consulted" property `[github].token` (issue #176) already established for the adjacent GitHub-credential surface.
@@ -761,7 +795,6 @@ last-verified: 2026-09-02
 **Consequences:** An operator with a broken config gets a degraded but working workflow subsystem and a notice, not a hard stop. `repo_checks_enabled` stays default-true on purpose: executing a repository's own checks is the feature, the same posture as executing its `.zirv/` scripts, with the key as a `mail.enabled`-style kill-switch.
 **Spec / link:** [[Workflows]], [[Untrusted Configuration]], PR #59.
 
-
 ### 2026-08-21 — Repository-authored checks and skills answer to operator-only `[workflow]` keys
 **Context:** PR #59's review found the workflow subsystem's untrusted-input handling weaker than the rest of the codebase's: `.zirv/verify.toml` commands and `package.json` scripts reached `sh -c` with repo-chosen timeouts up to 24h and no operator switch, a repo skill silently replaced a built-in's methodology text by id, and telemetry retention came from plain `ZIRV_WORKFLOW_TELEMETRY*` environment reads any repo script could set for itself.
 **Decision:** A new `[workflow]` config section, `REPO_FORBIDDEN` per key, mirroring `mail.enabled`: `repo_checks_enabled` (off = repo-supplied checks listed with a skip line, never executed, never passing evidence), `repo_skills_enabled`, and three `telemetry_*` keys. Caps that hold regardless of the gate: repo timeouts clamped to 900s, repo checks truncated to 32, both noted in the report; every check records its source (`repo-config`, `discovered-script`, `discovered-toolchain`). A repo skill may only add ids; a collision is ignored and warned.
@@ -866,7 +899,6 @@ last-verified: 2026-09-02
 **Decision:** The usage verb now gates its `maybe_poll` call on `cfg.pace.enabled` directly — pacing disabled means zirv sends no proactive vendor request from any surface (`wait_for_window` already returned early). The missing failed-poll announcement is recorded in [[Known Issues]] as a deliberate deviation instead of a rushed patch: doing it right wants `maybe_poll` to distinguish "did not poll" from "polled and failed", plus a mockable transport to test it.
 **Rejected:** Announcing from inside `poll.rs` via a process-global — the announcer lives with the callers, and a global latch bypasses the per-run `PaceGateFlags` discipline every other announcement follows.
 **Spec / link:** [[Usage and Pacing]], [[Known Issues]]; `docs/superpowers/specs/2026-08-16-usage-credits-throttle-design.md`.
-
 
 ### 2026-08-16 — Hybrid usage source: passive collector primary, active HTTP poll fallback-only; `ureq` is this crate's first HTTP dependency
 **Context:** The passive collector (statusline tee for claude, rollout-file scan for codex) can go stale between observations — nothing refreshes it if a session is idle, or if the statusline was never wired up at all. A real vendor usage API exists for both providers, but calling it proactively on every gate check would spend a network round-trip (and the operator's own OAuth token) on every supervised cycle, including the overwhelming majority where the passive reading is already fresh.
