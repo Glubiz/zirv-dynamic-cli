@@ -152,6 +152,24 @@ fn sessions_lines(
                     style::paint(&format!("screening: {summary}"), Tone::Warn, colour)
                 ));
             }
+            if let Some(change) = super::score::model_change_for_session(
+                &record.agent,
+                &record.session,
+                &record.repo,
+                env,
+            ) {
+                line.push_str(&format!(
+                    "  {}",
+                    style::paint(
+                        &format!(
+                            "model changed mid-session {} turns ago: `{}` -> `{}`",
+                            change.turns_ago, change.from, change.to
+                        ),
+                        Tone::Warn,
+                        colour
+                    )
+                ));
+            }
             let delivery = mail::session_delivery_metrics(state, &record.short, now);
             line.push_str(&format!(
                 "  {}",
@@ -3843,6 +3861,107 @@ mod tests {
         assert!(
             !text.contains("no supervised sessions"),
             "unrelated sections must not print: {text}"
+        );
+    }
+
+    #[test]
+    fn status_and_diff_report_model_identity_drift_with_turn_distance() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&home).expect("home");
+        std::fs::create_dir_all(&repo).expect("repo");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+
+        let state = StateDir::from_root(tmp.path().join("state"));
+        state.ensure().expect("state");
+        let session = "abcdef12-3456-4789-8abc-def012345678";
+        let record = crate::commands::ctx::sessions::Record::new(
+            session,
+            "claude",
+            &repo,
+            crate::commands::ctx::sessions::Verb::Exec,
+        );
+        let _guard = crate::commands::ctx::sessions::SessionGuard::register(&state, record);
+
+        let transcript_dir = home
+            .join(".claude/projects")
+            .join(crate::commands::ctx::adapters::claude::project_slug(&repo));
+        std::fs::create_dir_all(&transcript_dir).expect("transcript dir");
+        let transcript = transcript_dir.join(format!("{session}.jsonl"));
+        let first = concat!(
+            r#"{"type":"user","message":{"content":"one"}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"model":"claude-opus-5","content":[{"type":"text","text":"[zirv] one"}],"usage":{"input_tokens":1}}}"#,
+            "\n",
+        );
+        std::fs::write(&transcript, first).expect("first turn");
+
+        let mut env = env_for_session(state.root(), session);
+        env.insert("ZIRV_CTX_AGENT".to_string(), "claude".to_string());
+        let args = StatusArgs {
+            decisions: 10,
+            brief: false,
+            diff: true,
+        };
+        let mut first_out = Vec::new();
+        run_with(
+            &args,
+            &mut first_out,
+            &repo,
+            &|key| env.get(key).cloned(),
+            false,
+        )
+        .expect("initial snapshot");
+
+        let second = concat!(
+            r#"{"type":"user","message":{"content":"two"}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"model":"claude-sonnet-5","content":[{"type":"text","text":"[zirv] two"}],"usage":{"input_tokens":2}}}"#,
+            "\n",
+        );
+        std::fs::write(&transcript, format!("{first}{second}")).expect("second turn");
+
+        let mut status_out = Vec::new();
+        run_with(
+            &StatusArgs {
+                decisions: 10,
+                brief: false,
+                diff: false,
+            },
+            &mut status_out,
+            &repo,
+            &|key| env.get(key).cloned(),
+            false,
+        )
+        .expect("status");
+        let status_text = String::from_utf8(status_out).expect("utf8");
+        assert!(
+            status_text.contains(
+                "model changed mid-session 0 turns ago: `claude-opus-5` -> `claude-sonnet-5`"
+            ),
+            "got {status_text}"
+        );
+
+        let mut diff_out = Vec::new();
+        run_with(
+            &args,
+            &mut diff_out,
+            &repo,
+            &|key| env.get(key).cloned(),
+            false,
+        )
+        .expect("diff");
+        let text = String::from_utf8(diff_out).expect("utf8");
+        assert!(
+            text.contains(
+                "model changed mid-session 0 turns ago: `claude-opus-5` -> `claude-sonnet-5`"
+            ),
+            "got {text}"
+        );
+        assert!(
+            text.contains("sessions:"),
+            "the sessions section changed: {text}"
         );
     }
 

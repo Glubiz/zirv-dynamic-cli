@@ -2500,6 +2500,10 @@ fn supervise_run(
                 screening_announced,
             );
         }
+        if scorer.provider_limit_hit() {
+            *limit_hit = true;
+            return Tick::Stop("limit");
+        }
         match poll_result {
             Ok((Some(score), _)) if score.verdict == Verdict::Restart => {
                 *rotted = true;
@@ -2509,6 +2513,15 @@ fn supervise_run(
         }
     };
     let outcome = supervise::supervise_child(child, deadline, poll, &mut tick)?;
+
+    // A fast API-error exit can land its provider event after the final live
+    // tick, just like the tapped-output race closed by the caller's final
+    // drain. Give the transcript one last incremental read before deciding
+    // whether this was an ordinary exit.
+    if !*limit_hit {
+        let _ = scorer.poll(adapter, score_cfg);
+        *limit_hit = scorer.provider_limit_hit();
+    }
 
     // C1 (issue #155 review finding): `supervise_child` checks `try_wait`
     // for a completed child *before* ever calling the tick above, so a

@@ -7,8 +7,52 @@ pub mod codex;
 use super::CtxResult;
 use super::config::CtxConfig;
 use super::event::{
-    Capabilities, NormalizedEvent, SessionId, SessionRef, StructuralContext, TranscriptUsage,
+    Capabilities, NormalizedEvent, ProviderErrorClass, SessionId, SessionRef, StructuralContext,
+    TranscriptUsage,
 };
+
+/// Empirical overflow wording for the two provider families zirv supervises.
+/// These are the Anthropic and OpenAI entries from pi's live-provider table;
+/// broader provider entries stay out until zirv can observe those providers.
+const PROVIDER_OVERFLOW_PATTERNS: &[&str] = &[
+    "prompt is too long",
+    "request_too_large",
+    "exceeds the context window",
+    "maximum context length",
+];
+
+/// Checked before overflow wording. In particular, Bedrock throttling can say
+/// "too many tokens", while a rate-limit response can quote the rejected
+/// request, so a later overflow-shaped fragment must never win.
+const PROVIDER_RATE_LIMIT_PREFIXES: &[&str] = &["throttling error:"];
+const PROVIDER_RATE_LIMIT_PATTERNS: &[&str] = &["rate limit", "too many requests"];
+const PROVIDER_OTHER_PREFIXES: &[&str] = &["service unavailable:"];
+
+pub(crate) fn classify_provider_error(message: &str) -> ProviderErrorClass {
+    let lowered = message.trim_start().to_lowercase();
+    if PROVIDER_RATE_LIMIT_PREFIXES
+        .iter()
+        .any(|prefix| lowered.starts_with(prefix))
+        || PROVIDER_RATE_LIMIT_PATTERNS
+            .iter()
+            .any(|pattern| lowered.contains(pattern))
+    {
+        return ProviderErrorClass::RateLimit;
+    }
+    if PROVIDER_OTHER_PREFIXES
+        .iter()
+        .any(|prefix| lowered.starts_with(prefix))
+    {
+        return ProviderErrorClass::Other;
+    }
+    if PROVIDER_OVERFLOW_PATTERNS
+        .iter()
+        .any(|pattern| lowered.contains(pattern))
+    {
+        return ProviderErrorClass::Overflow;
+    }
+    ProviderErrorClass::Other
+}
 
 /// How an adapter arranges for turn-boundary events to reach a supervisor's
 /// socket. `env` is injected into the launched agent so the hook that runs
@@ -1047,6 +1091,13 @@ pub trait AgentAdapter: std::fmt::Debug {
     fn review_model_below(&self, seat: Option<&str>) -> &'static str {
         let _ = seat;
         ""
+    }
+
+    /// Adapter-owned ordering for model-change pacing hints. Larger means a
+    /// stronger rung; `None` keeps unknown ids informational only.
+    fn model_strength(&self, model: &str) -> Option<u8> {
+        let _ = model;
+        None
     }
 
     /// This adapter's own hard-coded model for a delegated headless worker

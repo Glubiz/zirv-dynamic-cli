@@ -1030,9 +1030,11 @@ mod tests {
                 tool_failure_rate: 1.0,
                 repetition_hits: 0,
                 max_repeat: 1,
+                provider_overflows: 0,
                 marker_miss_rate: Some(1.0),
             },
             context_tokens: 170_000,
+            model_change: None,
         }
     }
 
@@ -1693,8 +1695,10 @@ mod tests {
                 tool_failure_rate: 0.0,
                 repetition_hits: 0,
                 max_repeat: 0,
+                provider_overflows: 0,
                 marker_miss_rate: None,
             },
+            model_change: None,
         }
     }
 
