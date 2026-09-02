@@ -103,6 +103,13 @@ pub struct SpawnRequest {
     /// one-off delegation, which is every delegation before 2.35.0.
     #[serde(default)]
     pub work_group_id: Option<String>,
+    /// Token ceiling this pane must enforce. For a grouped request written
+    /// by `zirv agent`, this is already clamped to the group's remaining
+    /// budget; the dashboard clamps it again after serialized admission
+    /// because request files are untrusted and the group may have changed.
+    /// Older request files predate pane budgets and remain unbounded.
+    #[serde(default)]
+    pub budget_tokens: Option<u64>,
     /// Issue #155, Phase 6(c): whether the requester already accepted the
     /// spend at quota pressure (`agent.rs`'s own `--force`). `fulfill_spawn_
     /// request` applies the SAME `pace::spawn_gate` the requester's own
@@ -464,6 +471,7 @@ mod tests {
             role: None,
             parent_session: None,
             work_group_id: None,
+            budget_tokens: None,
             force: false,
             workdir: None,
         }
@@ -480,6 +488,7 @@ mod tests {
         assert_eq!(req.role, None);
         assert_eq!(req.parent_session, None);
         assert_eq!(req.work_group_id, None);
+        assert_eq!(req.budget_tokens, None);
         assert_eq!(
             req.workdir, None,
             "an unstated workdir must fall back to the accepted `cwd` (pre-#228 behaviour)"

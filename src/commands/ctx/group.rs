@@ -10,7 +10,7 @@
 //! failing the whole read.
 
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -64,6 +64,51 @@ pub struct WorkGroup {
 
 fn record_path(state: &StateDir, id: &str) -> PathBuf {
     state.groups().join(format!("{id}.json"))
+}
+
+fn lock_path(state: &StateDir, id: &str) -> PathBuf {
+    state.groups().join(format!("{id}.lock"))
+}
+
+#[cfg(unix)]
+fn open_lock_file(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn open_lock_file(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+}
+
+/// One advisory OS lock per group record. The file intentionally remains
+/// after release: deleting a lock path can split two contenders across old
+/// and new inodes, while an unlocked empty file is harmless and lets the OS
+/// release a crashed process's lock automatically.
+struct GroupLock(std::fs::File);
+
+impl Drop for GroupLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
+fn lock_group(state: &StateDir, id: &str) -> CtxResult<GroupLock> {
+    create_private_dir_all(&state.groups())?;
+    let file = open_lock_file(&lock_path(state, id))?;
+    file.lock()?;
+    Ok(GroupLock(file))
 }
 
 /// Writes a group's record. Matches `sessions::write_record`'s own
@@ -120,6 +165,7 @@ pub fn list(state: &StateDir) -> Vec<WorkGroup> {
 /// a closed group is evidence of what a batch was launched under, not a
 /// tombstone, and the first close time is the one that stands.
 pub fn close(state: &StateDir, id: &str, now: u64) -> CtxResult<()> {
+    let _lock = lock_group(state, id)?;
     let Some(mut group) = load(state, id)? else {
         return Err(format!("no work group '{id}'").into());
     };
@@ -156,15 +202,16 @@ pub fn is_admission_exhausted(error: &(dyn std::error::Error + 'static)) -> bool
 /// admits nowhere in `agent.rs` itself; whichever side actually ends up
 /// spawning is the one that calls this).
 ///
-/// Load-modify-write, like every other mutation in this file
-/// (`close` above) -- not a distributed lock. zirv's own callers are
-/// mostly-sequential orchestrator activity, not a tight concurrent loop, so
-/// a lost update in a genuine race would at worst admit one child past the
-/// limit, never wrongly refuse legitimate work.
-pub fn admit_child(state: &StateDir, id: &str, now: u64) -> CtxResult<()> {
+/// The complete read/check/increment/write transaction is serialized by the
+/// group's interprocess lock, as are every other mutation below it.
+pub fn admit_child(state: &StateDir, id: &str, now: u64) -> CtxResult<WorkGroup> {
+    let _lock = lock_group(state, id)?;
     let Some(mut group) = load(state, id)? else {
         return Err(format!("no work group '{id}'").into());
     };
+    if group.closed_at.is_some() {
+        return Err(format!("work group '{id}' is closed").into());
+    }
     if group
         .token_budget
         .is_some_and(|budget| group.spent_tokens >= budget)
@@ -188,13 +235,14 @@ pub fn admit_child(state: &StateDir, id: &str, now: u64) -> CtxResult<()> {
     }
     group.admitted_children += 1;
     create(state, &group)?;
-    Ok(())
+    Ok(group)
 }
 
 /// Adds one completed child's token spend to its group. Best-effort callers
-/// may ignore an I/O failure, but arithmetic never wraps and the same
-/// load-modify-write race trade-off as admission applies.
+/// may ignore an I/O failure, but arithmetic never wraps and the complete
+/// update is serialized with admission and the other group mutations.
 pub fn add_spent_tokens(state: &StateDir, id: &str, spent: u64) -> CtxResult<()> {
+    let _lock = lock_group(state, id)?;
     let Some(mut group) = load(state, id)? else {
         return Err(format!("no work group '{id}'").into());
     };
@@ -213,11 +261,14 @@ pub fn add_spent_tokens(state: &StateDir, id: &str, spent: u64) -> CtxResult<()>
 /// Best-effort, unlike `admit_child`: logs to stderr and returns rather than
 /// propagating a second error over the original spawn failure that triggered
 /// the rollback -- an operator who already sees a spawn error must not also
-/// see "the state file wouldn't decrement" stacked on top of it. Same
-/// load-modify-write, non-locking pattern as `admit_child`/`close`: losing a
-/// rollback to a race just leaves the count one high until the group is
-/// inspected, never wrongly grants an extra admission.
+/// see "the state file wouldn't decrement" stacked on top of it. The same
+/// per-group lock as `admit_child`/`close` keeps this rollback from losing a
+/// concurrent mutation.
 pub fn rollback_admission(state: &StateDir, id: &str) {
+    let Ok(_lock) = lock_group(state, id) else {
+        eprintln!("zirv ctx: failed to lock work group '{id}' for admission rollback");
+        return;
+    };
     match load(state, id) {
         Ok(Some(mut group)) => {
             group.admitted_children = group.admitted_children.saturating_sub(1);
@@ -249,6 +300,9 @@ pub fn rollback_admission(state: &StateDir, id: &str) {
 /// best-effort otherwise: the delegation being unwound is the caller's real
 /// news, never this.
 pub fn discard_if_unused(state: &StateDir, id: &str) -> bool {
+    let Ok(_lock) = lock_group(state, id) else {
+        return false;
+    };
     let Ok(Some(group)) = load(state, id) else {
         return false;
     };
@@ -280,6 +334,7 @@ pub fn is_overdue(group: &WorkGroup, now: u64) -> bool {
 /// claimant simply never becomes the one `agent::run_with` auto-closes it
 /// for). Load-modify-write, like every other mutation in this file.
 pub fn claim_sub_orchestrator(state: &StateDir, id: &str, session: &str) -> CtxResult<()> {
+    let _lock = lock_group(state, id)?;
     let Some(mut group) = load(state, id)? else {
         return Err(format!("no work group '{id}'").into());
     };
@@ -732,6 +787,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn admit_child_refuses_a_closed_group_without_advancing_the_count() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let mut group = sample_group("wg-closed");
+        group.closed_at = Some(1_700_000_050);
+        create(&state, &group).expect("create");
+
+        let err = admit_child(&state, "wg-closed", 1_700_000_100)
+            .expect_err("a closed group cannot admit another child");
+
+        assert!(err.to_string().contains("closed"), "got {err}");
+        assert_eq!(
+            load(&state, "wg-closed")
+                .expect("load")
+                .expect("present")
+                .admitted_children,
+            0,
+            "a refused admission must not advance the count"
+        );
+    }
+
     /// Re-review (2026-08-27) finding 1: a rollback after a real admission
     /// restores exactly the slot it undoes, leaving any other admissions on
     /// the group untouched.
@@ -797,6 +874,48 @@ mod tests {
             std::fs::read_to_string(record_path(&state, "wg-saturating")).expect("read group");
         let persisted: serde_json::Value = serde_json::from_str(&persisted).expect("json");
         assert_eq!(persisted["spent_tokens"], u64::MAX);
+    }
+
+    #[test]
+    fn group_mutations_wait_for_the_same_interprocess_lock() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        create(&state, &sample_group("wg-locked")).expect("create");
+        let held = lock_group(&state, "wg-locked").expect("hold group lock");
+
+        let worker_state = state.clone();
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(0);
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(0);
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).expect("announce start");
+            let result =
+                add_spent_tokens(&worker_state, "wg-locked", 10).map_err(|e| e.to_string());
+            done_tx.send(result).expect("announce finish");
+        });
+
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("worker started");
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err(),
+            "the mutation must wait while another holder owns the group lock"
+        );
+
+        drop(held);
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("mutation finished after release")
+            .expect("mutation succeeded");
+        worker.join().expect("worker joins");
+        assert_eq!(
+            load(&state, "wg-locked")
+                .expect("load")
+                .expect("present")
+                .spent_tokens,
+            10
+        );
     }
 
     /// Best-effort: a rollback naming an unknown group must not panic --
