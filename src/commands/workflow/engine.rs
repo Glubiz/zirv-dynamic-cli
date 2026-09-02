@@ -459,7 +459,12 @@ pub enum WorkflowStatus {
     AwaitingApproval,
     Failed,
     Completed,
-    Cancelled,
+    /// Explicitly closed via `zirv workflow close` -- typically a workflow
+    /// whose review/fix loop hit `MAX_FIX_REVIEW_ROUNDS` (review.rs) and
+    /// would otherwise stay `Running` forever, still reported as this
+    /// repository's active workflow by `load_active`. Terminal, like
+    /// `Failed`/`Completed`: `resume` refuses to re-activate it.
+    Closed,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
@@ -696,6 +701,14 @@ pub struct WorkflowState {
     #[serde(default = "default_true")]
     pub brainstorm: bool,
     pub status: WorkflowStatus,
+    /// Operator-supplied reason recorded by `zirv workflow close --reason`.
+    /// A state saved before `close` existed defaults to `None`.
+    #[serde(default)]
+    pub closed_reason: Option<String>,
+    /// When this workflow was closed (`WorkflowStatus::Closed`), `now_secs()`
+    /// at that moment. `None` for a workflow never closed.
+    #[serde(default)]
+    pub closed_at: Option<u64>,
     pub created_at: u64,
     pub updated_at: u64,
 }
@@ -751,6 +764,8 @@ impl WorkflowState {
             phase_started_at: now,
             brainstorm,
             status,
+            closed_reason: None,
+            closed_at: None,
             created_at: now,
             updated_at: now,
         }
@@ -1925,6 +1940,62 @@ pub fn approve(state_dir: &StateDir, mut state: WorkflowState) -> CtxResult<Work
     Ok(state)
 }
 
+/// Closes a workflow that will not reach `Completed` -- typically one whose
+/// review/fix loop hit `MAX_FIX_REVIEW_ROUNDS` (review.rs) and would
+/// otherwise stay `Running` forever, still reported as this repository's
+/// active workflow by `load_active`. Refuses (fail closed) while any review
+/// finding is still `Open` -- residual dispositions must be recorded first,
+/// via `workflow review dispose` -- or while the workflow is
+/// `AwaitingApproval`, since approval is itself a pending decision on the
+/// current step. Otherwise sets `status: Closed`, records `closed_reason`/
+/// `closed_at`, and persists with `active: false` so `load_active`,
+/// `status`, and `context` stop reporting it.
+pub fn close(
+    state_dir: &StateDir,
+    mut state: WorkflowState,
+    reason: Option<String>,
+) -> CtxResult<WorkflowState> {
+    let open_findings = state
+        .review_findings
+        .iter()
+        .filter(|finding| finding.disposition == super::review::FindingDisposition::Open)
+        .count();
+    if open_findings > 0 {
+        return Err(format!(
+            "cannot close workflow: {open_findings} open review finding(s) remain; record \
+             dispositions first (see `zirv workflow review dispose`)"
+        )
+        .into());
+    }
+    if state.status == WorkflowStatus::AwaitingApproval {
+        return Err(
+            "cannot close workflow while awaiting approval; approve or reject the current step \
+             first"
+                .into(),
+        );
+    }
+    let now = now_secs();
+    state.status = WorkflowStatus::Closed;
+    state.closed_reason = reason;
+    state.closed_at = Some(now);
+    state.updated_at = now;
+    save(state_dir, &state, false)?;
+
+    let mut event = super::telemetry::TelemetryEvent::new(super::telemetry::TelemetryKind::Closed);
+    event.workflow_id = Some(state.id.clone());
+    event.intent = Some(state.classification.intent);
+    event.complexity = Some(state.classification.complexity);
+    event.risk = Some(state.classification.risk);
+    event.work_domain = Some(state.classification.work_domain.domain);
+    let _ = super::telemetry::record(
+        state_dir,
+        &state.repo,
+        &event,
+        &super::telemetry::TelemetryConfig::for_repo(&state.repo),
+    );
+    Ok(state)
+}
+
 /// What became of one open review finding when its own
 /// `recommended_disposition` was applied in bulk -- see
 /// [`apply_recommended_dispositions`].
@@ -2201,6 +2272,12 @@ pub enum WorkflowSubcommand {
     Approve(StateIdArgs),
     /// Record a step result and transition the state machine.
     Advance(AdvanceArgs),
+    /// Close a workflow that will not reach `Completed` (for example one
+    /// whose review/fix loop hit `MAX_FIX_REVIEW_ROUNDS`), recording residual
+    /// dispositions first. Refuses while any review finding is `Open` or the
+    /// workflow is `AwaitingApproval`; clears it as this repository's active
+    /// workflow.
+    Close(CloseArgs),
     /// Build compact review packages and persist finding dispositions,
     /// including `review dispose --apply-recommended` -- see
     /// [`apply_recommended_dispositions`]'s own doc comment.
@@ -2296,6 +2373,19 @@ pub struct StateIdArgs {
     pub id: String,
     #[arg(long)]
     pub repo: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub struct CloseArgs {
+    pub id: String,
+    #[arg(long)]
+    pub repo: Option<PathBuf>,
+    /// Operator-supplied reason for closing without reaching `Completed`,
+    /// recorded on the workflow state.
+    #[arg(long)]
+    pub reason: Option<String>,
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -2798,6 +2888,9 @@ fn write_state(writer: &mut impl Write, state: &WorkflowState, json: bool) -> Ct
         }
         writeln!(writer, "deploy tier: {}", state.deploy_tier)?;
         writeln!(writer, "status: {:?}", state.status)?;
+        if let Some(reason) = &state.closed_reason {
+            writeln!(writer, "closed reason: {reason}")?;
+        }
         writeln!(
             writer,
             "classification: {:?}/{:?} risk={} ({:?})",
@@ -3035,13 +3128,18 @@ pub fn run(args: &WorkflowArgs, writer: &mut impl Write) -> CtxResult<i32> {
             let repo = resolve_repo(args.repo.as_deref())?;
             let state_dir = resolve_state()?;
             let mut state = load(&state_dir, &repo, &args.id)?;
-            refresh_deploy_tier(&mut state)?;
+            // Checked against the as-loaded status, before `refresh_deploy_tier`:
+            // `apply_effective_deploy_tier` unconditionally recomputes `status`
+            // from the current step's position, which would otherwise silently
+            // revive a terminal `Failed`/`Completed`/`Closed` workflow back to
+            // `Running`/`AwaitingApproval`.
             if !matches!(
                 state.status,
                 WorkflowStatus::Running | WorkflowStatus::AwaitingApproval
             ) {
                 return Err(format!("cannot resume workflow in {:?} state", state.status).into());
             }
+            refresh_deploy_tier(&mut state)?;
             ensure_current_artifact_template(&state)?;
             save(&state_dir, &state, true)?;
             write_state(writer, &state, false)?;
@@ -3166,6 +3264,16 @@ pub fn run(args: &WorkflowArgs, writer: &mut impl Write) -> CtxResult<i32> {
                 outcome,
                 Some(&evidence),
                 args.accept_preexisting_findings,
+            )?;
+            write_state(writer, &state, args.json)?;
+        }
+        WorkflowSubcommand::Close(args) => {
+            let repo = resolve_repo(args.repo.as_deref())?;
+            let state_dir = resolve_state()?;
+            let state = close(
+                &state_dir,
+                load(&state_dir, &repo, &args.id)?,
+                args.reason.clone(),
             )?;
             write_state(writer, &state, args.json)?;
         }
@@ -6240,6 +6348,153 @@ mod tests {
         let error = advance_with_evidence(&state_dir, state, StepOutcome::Success, None, false)
             .unwrap_err();
         assert!(error.to_string().contains("final disposition"));
+    }
+
+    #[test]
+    fn close_refuses_with_an_open_review_finding() {
+        let repo = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+        let mut state = WorkflowState::start(
+            repo.path().to_path_buf(),
+            "small feature".into(),
+            WorkflowKind::Feature,
+            None,
+            true,
+            low_classification(),
+        );
+        state.review_findings.push(review_finding(
+            "finding-1",
+            super::super::review::FindingDisposition::Open,
+            None,
+        ));
+        save(&state_dir, &state, true).unwrap();
+
+        let error = close(&state_dir, state, None).unwrap_err();
+        assert!(error.to_string().contains("open review finding"), "{error}");
+    }
+
+    #[test]
+    fn close_refuses_while_awaiting_approval() {
+        let repo = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+        let mut state = WorkflowState::start(
+            repo.path().to_path_buf(),
+            "small feature".into(),
+            WorkflowKind::Feature,
+            None,
+            true,
+            low_classification(),
+        );
+        state.status = WorkflowStatus::AwaitingApproval;
+        save(&state_dir, &state, true).unwrap();
+
+        let error = close(&state_dir, state, None).unwrap_err();
+        assert!(error.to_string().contains("awaiting approval"), "{error}");
+    }
+
+    #[test]
+    fn close_succeeds_after_residual_dispositions_and_clears_active() {
+        let repo = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+        let mut state = WorkflowState::start(
+            repo.path().to_path_buf(),
+            "small feature".into(),
+            WorkflowKind::Feature,
+            None,
+            true,
+            low_classification(),
+        );
+        // Reached MAX_FIX_REVIEW_ROUNDS: every finding has a residual (or
+        // otherwise resolved) disposition, none left Open.
+        state.review_findings.push(review_finding(
+            "finding-1",
+            super::super::review::FindingDisposition::Residual,
+            None,
+        ));
+        save(&state_dir, &state, true).unwrap();
+        assert!(
+            load_active(&state_dir, repo.path())
+                .unwrap()
+                .is_some_and(|active| active.id == state.id)
+        );
+
+        let closed = close(&state_dir, state, Some("hit MAX_FIX_REVIEW_ROUNDS".into())).unwrap();
+        assert_eq!(closed.status, WorkflowStatus::Closed);
+        assert_eq!(
+            closed.closed_reason.as_deref(),
+            Some("hit MAX_FIX_REVIEW_ROUNDS")
+        );
+        assert!(closed.closed_at.is_some());
+
+        assert!(load_active(&state_dir, repo.path()).unwrap().is_none());
+        // The state itself is still readable by id, just no longer active.
+        let reloaded = load(&state_dir, repo.path(), &closed.id).unwrap();
+        assert_eq!(reloaded.status, WorkflowStatus::Closed);
+    }
+
+    #[test]
+    fn close_records_a_telemetry_event() {
+        let repo = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+        let state = WorkflowState::start(
+            repo.path().to_path_buf(),
+            "small feature".into(),
+            WorkflowKind::Feature,
+            None,
+            true,
+            low_classification(),
+        );
+        save(&state_dir, &state, true).unwrap();
+        let workflow_id = state.id.clone();
+
+        close(&state_dir, state, None).unwrap();
+
+        let events = super::super::telemetry::list(&state_dir, repo.path()).unwrap();
+        assert!(
+            events.iter().any(
+                |event| event.kind == super::super::telemetry::TelemetryKind::Closed
+                    && event.workflow_id.as_deref() == Some(workflow_id.as_str())
+            ),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn resume_refuses_a_closed_workflow() {
+        let repo = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+        let state = WorkflowState::start(
+            repo.path().to_path_buf(),
+            "small feature".into(),
+            WorkflowKind::Feature,
+            None,
+            true,
+            low_classification(),
+        );
+        save(&state_dir, &state, true).unwrap();
+        let closed = close(&state_dir, state, None).unwrap();
+
+        let _state_dir_env = crate::commands::ctx::testenv::VarGuard::set(&[(
+            "ZIRV_CTX_STATE_DIR",
+            Some(root.path().to_str().expect("utf-8 tempdir path")),
+        )]);
+        let args = WorkflowArgs {
+            command: WorkflowSubcommand::Resume(StateIdArgs {
+                id: closed.id.clone(),
+                repo: Some(repo.path().to_path_buf()),
+            }),
+        };
+        let mut out = Vec::new();
+        let error = run(&args, &mut out).unwrap_err().to_string();
+        assert!(
+            error.contains("cannot resume") && error.contains("Closed"),
+            "{error}"
+        );
     }
 
     #[test]

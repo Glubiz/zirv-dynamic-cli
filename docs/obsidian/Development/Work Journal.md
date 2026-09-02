@@ -25,6 +25,11 @@ last-verified: 2026-09-02
 **Key changes:** `src/commands/ctx/{hook,compile,memory,retrieval,prompt,rot,event,config,score,handoff,adapters/claude}.rs`, `src/commands/workflow/{review,verification,engine}.rs`, `.zirv/ctx.toml`.
 **Follow-up:** Deferred items (reviewer model by risk, codex idle heuristic, `--attach-artifact`, harvest from failures/findings, artifact re-injection dedupe) tracked in `docs/superpowers/specs/2026-09-01-wrapper-behaviour-redesign.md`'s "Round 3" section and [[Active Work]].
 
+### 2026-09-02: harness iteration round 2 -- close verb, verification tri-state, --attach-artifact, tool-error harvest
+**What:** Four of round 3's own deferred items landed: `zirv workflow close <id> [--reason]` gives a review-capped workflow an explicit terminal exit (`WorkflowStatus::Closed`, replacing the never-constructed `Cancelled`) and fixes a `resume` bug that silently revived closed/failed workflows; `VerificationOutcome.status` is now `Passed|Failed|Unknown`, closing round 3's residual finding F1 (a compound command like `cargo test || true` no longer reads as a pass), plus F2 (`write_list` now normalizes every handoff list item); `zirv ctx agent --attach-artifact <intent|spec|plan>` appends a repo's accepted artifact to a delegated worker's task prompt, capped and labeled untrusted; `durable_harvest_prompt` gains a deduped "Repeated tool errors" block at session end.
+**Key changes:** `src/commands/workflow/{engine,telemetry}.rs`, `src/commands/ctx/{event,handoff,agent,memory}.rs`.
+**Follow-up:** Still deferred (reviewer model by risk, codex idle heuristic, memory-bank harvest from failures/findings, artifact re-injection dedupe across steps) — see `docs/superpowers/specs/2026-09-01-wrapper-behaviour-redesign.md`'s "Round 4" section and [[Active Work]].
+
 ### 2026-09-01: wrapper behaviour redesign -- proportionality-first prompts, tiered docs/verify
 **What:** Non-Rust half of the wrapper redesign (`docs/superpowers/specs/2026-09-01-wrapper-behaviour-redesign.md`): `.zirv/context/{common,claude,codex}.md` gained a tiered verify/review/vault-keeper structure and the codex honesty clause moved to common; `CLAUDE.md`/`AGENTS.md` regenerated via `zirv context sync --generate`.
 **Key changes:** `.zirv/context/*.md`, `CLAUDE.md`, `AGENTS.md`, `Cargo.toml`/`Cargo.lock` (3.9.0), vault pages below.

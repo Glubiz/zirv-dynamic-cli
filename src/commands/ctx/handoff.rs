@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use super::CtxResult;
 use super::adapters::AgentAdapter;
 use super::config::{CtxConfig, EnvLookup, env_from_process};
-use super::event::{StructuralContext, VerificationOutcome};
+use super::event::{StructuralContext, VerificationOutcome, VerificationStatus};
 use super::state::{StateDir, now_secs, repo_slug};
 use super::{adapters, log};
 
@@ -35,10 +35,17 @@ pub struct Handoff {
     pub gotchas: Vec<String>,
 }
 
+/// F2: every list item is run through [`normalize_rendered_line`] first, the
+/// same normalization the `Verification` line already applied only to
+/// itself -- an unnormalized `Done`/`Remaining`/`Files touched`/`Gotchas`
+/// item is exactly as capable of injecting a stray `## ` heading or growing
+/// the handoff unboundedly as an unnormalized verification command was
+/// (review finding F1's fix), and nothing about being a plain list item
+/// instead of the `Verification` line made that any less true.
 fn write_list(out: &mut String, heading: &str, items: &[String]) {
     out.push_str(&format!("## {heading}\n"));
     for item in items {
-        out.push_str(&format!("- {item}\n"));
+        out.push_str(&format!("- {}\n", normalize_rendered_line(item)));
     }
     out.push('\n');
 }
@@ -147,19 +154,22 @@ pub fn parse_markdown(md: &str) -> Handoff {
     handoff
 }
 
-/// Bound on a single rendered line (a command, or an error-excerpt line) in
-/// the `Verification` section: long enough to show a real invocation or
-/// error, short enough that a pathological command or error line (a 5 KB
-/// argument, say) cannot make the handoff arbitrarily large.
+/// Bound on a single rendered line -- a `Verification` command or
+/// error-excerpt line (F1), or any `Done`/`Remaining`/`Files touched`/
+/// `Gotchas` list item (F2): long enough to show a real invocation, error, or
+/// note, short enough that a pathological one (a 5 KB argument, say) cannot
+/// make the handoff arbitrarily large.
 const VERIFICATION_LINE_CHAR_CAP: usize = 200;
 
-/// Collapses arbitrary (possibly multi-line, possibly huge) text into the
-/// single, bounded line the `Verification` section renders. Rendered raw, a
-/// multiline `VerificationOutcome::command` or error-excerpt line could
-/// inject extra Markdown headings into the handoff, or make it arbitrarily
-/// large (review finding F1). Every run of whitespace -- including newlines
-/// -- collapses to one space; the result is then capped to
-/// [`VERIFICATION_LINE_CHAR_CAP`] characters with a trailing `...`.
+/// Collapses arbitrary (possibly multi-line, possibly huge) text into a
+/// single, bounded rendered line -- used for the `Verification` section
+/// (review finding F1) and every plain list item (`write_list`, review
+/// finding F2). Rendered raw, a multiline `VerificationOutcome::command`,
+/// error-excerpt line, or list item could inject extra Markdown headings
+/// into the handoff, or make it arbitrarily large. Every run of whitespace
+/// -- including newlines -- collapses to one space; the result is then
+/// capped to [`VERIFICATION_LINE_CHAR_CAP`] characters with a trailing
+/// `...`.
 fn normalize_rendered_line(text: &str) -> String {
     let mut collapsed = String::with_capacity(text.len().min(VERIFICATION_LINE_CHAR_CAP + 3));
     let mut last_was_space = false;
@@ -188,7 +198,13 @@ fn normalize_rendered_line(text: &str) -> String {
 /// Renders a `StructuralContext::last_verification` outcome as the single
 /// line the `Verification` section holds: `"none recorded"` when the
 /// transcript never ran anything recognizable as a build/test/lint command,
-/// a pass note, or a fail note carrying up to two error-excerpt lines.
+/// a pass note, a fail note carrying up to two error-excerpt lines, or --
+/// when the command's own exit status could not be attributed to the
+/// verification segment specifically (review finding F1: `cargo test ||
+/// true`, `cargo test; echo done`, `cargo test | tee out.log`, and the
+/// like) -- an explicit "outcome unknown" note. `Unknown` is deliberately
+/// never rendered as a pass: a successor session must not read a compound
+/// command's unrelated success as "the tests passed".
 ///
 /// The command and every error-excerpt line are run through
 /// [`normalize_rendered_line`] first (review finding F1), and the command is
@@ -201,18 +217,23 @@ fn render_verification(outcome: Option<&VerificationOutcome>) -> String {
         None => "none recorded".to_string(),
         Some(v) => {
             let command = normalize_rendered_line(&v.command);
-            if !v.errored {
-                format!("last run (command: `{command}`) passed")
-            } else if v.error_excerpt.is_empty() {
-                format!("last run (command: `{command}`) FAILED")
-            } else {
-                let excerpt = v
-                    .error_excerpt
-                    .iter()
-                    .map(|line| normalize_rendered_line(line))
-                    .collect::<Vec<_>>()
-                    .join(" / ");
-                format!("last run (command: `{command}`) FAILED: {excerpt}")
+            match v.status {
+                VerificationStatus::Passed => format!("last run (command: `{command}`) passed"),
+                VerificationStatus::Failed if v.error_excerpt.is_empty() => {
+                    format!("last run (command: `{command}`) FAILED")
+                }
+                VerificationStatus::Failed => {
+                    let excerpt = v
+                        .error_excerpt
+                        .iter()
+                        .map(|line| normalize_rendered_line(line))
+                        .collect::<Vec<_>>()
+                        .join(" / ");
+                    format!("last run (command: `{command}`) FAILED: {excerpt}")
+                }
+                VerificationStatus::Unknown => {
+                    format!("last run (command: `{command}`) outcome unknown (compound command)")
+                }
             }
         }
     }
@@ -1312,7 +1333,7 @@ mod tests {
         let ctx = StructuralContext {
             last_verification: Some(VerificationOutcome {
                 command: "cargo test".to_string(),
-                errored: false,
+                status: VerificationStatus::Passed,
                 error_excerpt: Vec::new(),
             }),
             ..StructuralContext::default()
@@ -1331,7 +1352,7 @@ mod tests {
         let ctx = StructuralContext {
             last_verification: Some(VerificationOutcome {
                 command: "cargo nextest run rot::".to_string(),
-                errored: true,
+                status: VerificationStatus::Failed,
                 error_excerpt: vec![
                     "assertion failed: `(left == right)`".to_string(),
                     "left: 40, right: 70".to_string(),
@@ -1355,7 +1376,7 @@ mod tests {
         let ctx = StructuralContext {
             last_verification: Some(VerificationOutcome {
                 command: "cargo test\n## Injected\necho pwned".to_string(),
-                errored: false,
+                status: VerificationStatus::Passed,
                 error_excerpt: Vec::new(),
             }),
             ..StructuralContext::default()
@@ -1386,7 +1407,7 @@ mod tests {
         let ctx = StructuralContext {
             last_verification: Some(VerificationOutcome {
                 command: huge,
-                errored: false,
+                status: VerificationStatus::Passed,
                 error_excerpt: Vec::new(),
             }),
             ..StructuralContext::default()
@@ -1413,7 +1434,7 @@ mod tests {
         let ctx = StructuralContext {
             last_verification: Some(VerificationOutcome {
                 command: "cargo test".to_string(),
-                errored: true,
+                status: VerificationStatus::Failed,
                 error_excerpt: vec![huge],
             }),
             ..StructuralContext::default()
@@ -1429,6 +1450,101 @@ mod tests {
             "got {}",
             handoff.verification
         );
+    }
+
+    /// Review finding F1: the renderer must show an explicit "outcome
+    /// unknown" note -- never a silent pass -- for each of the three
+    /// unattributable compound-command shapes the fix covers, driven through
+    /// the real `event::last_verification_run` path (not a hand-built
+    /// `VerificationOutcome`) so this also proves the two modules agree.
+    #[test]
+    fn render_verification_reports_outcome_unknown_for_unattributable_commands() {
+        use crate::commands::ctx::event::ToolInvocation;
+
+        for command in [
+            "cargo test || true",
+            "cargo test; echo done",
+            "true || cargo test",
+            "cargo test | tee out.log",
+        ] {
+            let invocations = vec![ToolInvocation {
+                command: command.to_string(),
+                is_error: false,
+                error_text: String::new(),
+            }];
+            let outcome = crate::commands::ctx::event::last_verification_run(&invocations)
+                .unwrap_or_else(|| panic!("{command} should still be verification-shaped"));
+            let rendered = render_verification(Some(&outcome));
+            assert!(
+                rendered.contains("outcome unknown"),
+                "command {command} got: {rendered}"
+            );
+            assert!(
+                !rendered.contains("passed"),
+                "must never render an unattributable command as a pass: {rendered}"
+            );
+            assert!(
+                !rendered.contains("FAILED"),
+                "must never render an unattributable command as a fail: {rendered}"
+            );
+        }
+    }
+
+    /// Review finding F1: a `&&` chain ending in the verification segment is
+    /// still attributed normally -- this is the control case proving the
+    /// fix did not become "any compound command is unknown".
+    #[test]
+    fn render_verification_still_attributes_a_trailing_and_chain() {
+        use crate::commands::ctx::event::ToolInvocation;
+
+        let invocations = vec![ToolInvocation {
+            command: "cd x && cargo test".to_string(),
+            is_error: true,
+            error_text: "boom".to_string(),
+        }];
+        let outcome = crate::commands::ctx::event::last_verification_run(&invocations)
+            .expect("verification-shaped");
+        let rendered = render_verification(Some(&outcome));
+        assert!(rendered.contains("FAILED"), "got: {rendered}");
+        assert!(rendered.contains("cd x && cargo test"), "got: {rendered}");
+    }
+
+    /// Review finding F2: `write_list` must run every item through the same
+    /// normalization the `Verification` line already got -- a list item is
+    /// exactly as capable of injecting a stray heading or growing the
+    /// handoff unboundedly.
+    #[test]
+    fn write_list_normalizes_each_item_onto_one_line_with_no_injected_heading() {
+        let handoff = Handoff {
+            task: "Ship it".to_string(),
+            done: vec!["fine\n## Injected\nmore".to_string()],
+            next_step: "Continue".to_string(),
+            ..Handoff::default()
+        };
+        let md = handoff.to_markdown();
+        let heading_count = md.lines().filter(|l| l.starts_with("## ")).count();
+        assert_eq!(
+            heading_count,
+            SECTIONS.len(),
+            "no extra heading may be injected: {md}"
+        );
+        assert!(md.contains("fine ## Injected more"), "got: {md}");
+    }
+
+    /// Review finding F2: a 5 KB list item must be capped like every other
+    /// rendered line, not stored (and re-injected) verbatim.
+    #[test]
+    fn write_list_caps_a_very_large_item() {
+        let huge = "z".repeat(5_000);
+        let handoff = Handoff {
+            task: "Ship it".to_string(),
+            gotchas: vec![huge],
+            next_step: "Continue".to_string(),
+            ..Handoff::default()
+        };
+        let md = handoff.to_markdown();
+        assert!(md.len() < 1_000, "got len {}: {md}", md.len());
+        assert!(md.contains("..."), "got: {md}");
     }
 
     #[test]

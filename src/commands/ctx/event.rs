@@ -252,14 +252,32 @@ pub struct ToolInvocation {
     pub error_text: String,
 }
 
+/// Whether a [`VerificationOutcome`]'s status could actually be attributed
+/// to its command, or merely could not be (review finding F1): a shell's
+/// reported exit status describes the LAST simple command it ran, so a
+/// verification marker that is not in that position (`cargo test; echo
+/// done`, `cargo test | tee out.log`) or that only ran conditionally
+/// (`true || cargo test`, which never even ran the test) tells us nothing
+/// about whether the verification itself passed or failed. `Unknown` is
+/// deliberately its own state rather than a bare `Option<bool>` collapsing
+/// into `errored: false`, because "the wrapper reported success" and "we
+/// have no idea what the wrapper's status even measured" must never render
+/// the same way to a successor session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerificationStatus {
+    Passed,
+    Failed,
+    Unknown,
+}
+
 /// What a fresh session most needs to know about the LAST build/test/lint
 /// run before it does anything else: whether it passed, and if not, why.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerificationOutcome {
     pub command: String,
-    pub errored: bool,
-    /// The first 1-2 non-blank lines of the error text. Empty when
-    /// `errored` is `false`.
+    pub status: VerificationStatus,
+    /// The first 1-2 non-blank lines of the error text. Empty unless
+    /// `status` is [`VerificationStatus::Failed`].
     pub error_excerpt: Vec<String>,
 }
 
@@ -356,26 +374,64 @@ fn strip_leading_wrappers<'a>(words: &'a [&'a str]) -> &'a [&'a str] {
 /// and `cat Makefile` do not count as a `make` run (earlier review finding).
 pub fn looks_like_verification(command: &str) -> bool {
     let lower = command.to_lowercase();
-    split_into_segments(&lower).iter().any(|segment| {
-        let words: Vec<&str> = segment.split_whitespace().collect();
-        let words = strip_leading_wrappers(&words);
-        VERIFICATION_MARKERS.iter().any(|marker| {
-            let marker_words: Vec<&str> = marker.split_whitespace().collect();
-            if words.len() < marker_words.len() {
-                return false;
-            }
-            words[..marker_words.len()]
-                .iter()
-                .zip(&marker_words)
-                .all(|(word, marker)| {
-                    // `npm run test:unit` still counts as `npm run test`.
-                    *word == *marker
-                        || word
-                            .strip_prefix(marker)
-                            .is_some_and(|rest| rest.starts_with(':'))
-                })
-        })
+    split_into_segments(&lower)
+        .iter()
+        .any(|segment| segment_matches_verification_marker(segment))
+}
+
+/// Whether a single (already-lowercased) shell segment starts with a known
+/// verification marker, after stripping its leading wrapper words/
+/// assignments. Factored out of [`looks_like_verification`] so the
+/// attribution check below ([`verification_segment_is_attributable`]) can
+/// apply the exact same "is this segment a verification command" test to
+/// just the LAST segment, rather than "any segment", which is all
+/// `looks_like_verification` itself needs.
+fn segment_matches_verification_marker(segment: &str) -> bool {
+    let words: Vec<&str> = segment.split_whitespace().collect();
+    let words = strip_leading_wrappers(&words);
+    VERIFICATION_MARKERS.iter().any(|marker| {
+        let marker_words: Vec<&str> = marker.split_whitespace().collect();
+        if words.len() < marker_words.len() {
+            return false;
+        }
+        words[..marker_words.len()]
+            .iter()
+            .zip(&marker_words)
+            .all(|(word, marker)| {
+                // `npm run test:unit` still counts as `npm run test`.
+                *word == *marker
+                    || word
+                        .strip_prefix(marker)
+                        .is_some_and(|rest| rest.starts_with(':'))
+            })
     })
+}
+
+/// Whether `command`'s reported exit status can actually be attributed to
+/// its LAST verification-marker segment (review finding F1). A shell's exit
+/// status is always the LAST simple command's, so:
+/// - a `&&` chain ending in the verification segment is fine (`cd x &&
+///   cargo test`) -- attributable;
+/// - any `||` anywhere in the command makes it unattributable, since `a ||
+///   cargo test` only runs the test when `a` fails, and `cargo test ||
+///   true` reports `true`'s status regardless of the test;
+/// - a `;`, newline, or trailing `|` after the verification segment
+///   (`cargo test; echo done`, `cargo test | tee out.log`) is
+///   unattributable too, since the reported status is whatever ran last.
+///
+/// Implemented as "the LAST segment (after lowercasing) matches a
+/// verification marker, and the command contains no `||`" -- deliberately
+/// simple, like every other check in this module: a fingerprint, not a
+/// shell parser.
+fn verification_segment_is_attributable(command: &str) -> bool {
+    let lower = command.to_lowercase();
+    if lower.contains("||") {
+        return false;
+    }
+    match split_into_segments(&lower).last() {
+        Some(last) => segment_matches_verification_marker(last),
+        None => false,
+    }
 }
 
 /// The most recent (last) invocation in `invocations` whose command text
@@ -386,7 +442,20 @@ pub fn last_verification_run(invocations: &[ToolInvocation]) -> Option<Verificat
         .iter()
         .rev()
         .find(|inv| looks_like_verification(&inv.command))?;
-    let error_excerpt = if last.is_error {
+
+    // F1: the invocation's own recorded `is_error` is only trustworthy when
+    // the verification command's exit status is what the whole compound
+    // command actually reported -- see `verification_segment_is_
+    // attributable`'s own doc comment for the cases this excludes.
+    let status = if !verification_segment_is_attributable(&last.command) {
+        VerificationStatus::Unknown
+    } else if last.is_error {
+        VerificationStatus::Failed
+    } else {
+        VerificationStatus::Passed
+    };
+
+    let error_excerpt = if status == VerificationStatus::Failed {
         last.error_text
             .lines()
             .map(str::trim)
@@ -399,7 +468,7 @@ pub fn last_verification_run(invocations: &[ToolInvocation]) -> Option<Verificat
     };
     Some(VerificationOutcome {
         command: last.command.clone(),
-        errored: last.is_error,
+        status,
         error_excerpt,
     })
 }
@@ -564,7 +633,7 @@ mod tests {
         ];
         let outcome = last_verification_run(&invocations).expect("a verification run exists");
         assert_eq!(outcome.command, "cargo nextest run");
-        assert!(!outcome.errored);
+        assert_eq!(outcome.status, VerificationStatus::Passed);
         assert!(outcome.error_excerpt.is_empty());
     }
 
@@ -576,7 +645,7 @@ mod tests {
             "\nassertion failed: `(left == right)`\n  left: 40\n  right: 70\nmore noise\n",
         )];
         let outcome = last_verification_run(&invocations).expect("exists");
-        assert!(outcome.errored);
+        assert_eq!(outcome.status, VerificationStatus::Failed);
         assert_eq!(outcome.error_excerpt.len(), 2);
         assert_eq!(
             outcome.error_excerpt[0],
@@ -589,6 +658,56 @@ mod tests {
     fn last_verification_run_is_none_when_nothing_matches() {
         let invocations = vec![invocation("git status", false, "")];
         assert!(last_verification_run(&invocations).is_none());
+    }
+
+    /// Review finding F1: the harness's own recorded `is_error` for the
+    /// WHOLE command is only trustworthy when the compound command's exit
+    /// status can be attributed to the verification segment specifically.
+    /// These four shapes must all report `Unknown`, regardless of the
+    /// recorded `is_error`.
+    #[test]
+    fn last_verification_run_reports_unknown_for_unattributable_compound_commands() {
+        for (command, is_error) in [
+            ("cargo test || true", false),
+            ("cargo test; echo done", false),
+            ("true || cargo test", false),
+            ("cargo test | tee out.log", false),
+            // Even a recorded failure must not be attributed to the test
+            // when the status cannot be trusted.
+            ("cargo test || true", true),
+        ] {
+            let invocations = vec![invocation(command, is_error, "some error text")];
+            let outcome = last_verification_run(&invocations).unwrap_or_else(|| {
+                panic!("{command} should still be recognized as verification-shaped")
+            });
+            assert_eq!(
+                outcome.status,
+                VerificationStatus::Unknown,
+                "command: {command}"
+            );
+            assert!(
+                outcome.error_excerpt.is_empty(),
+                "an unknown outcome carries no error excerpt: {command}"
+            );
+        }
+    }
+
+    /// Review finding F1: a `&&` chain ending in the verification segment is
+    /// fine -- the shell's own exit status IS the last command's.
+    #[test]
+    fn last_verification_run_attributes_a_trailing_and_chain() {
+        let invocations = vec![invocation("cd x && cargo test", true, "boom")];
+        let outcome = last_verification_run(&invocations).expect("exists");
+        assert_eq!(outcome.status, VerificationStatus::Failed);
+        assert_eq!(outcome.error_excerpt, vec!["boom".to_string()]);
+    }
+
+    /// Review finding F1: a leading assignment does not defeat attribution.
+    #[test]
+    fn last_verification_run_attributes_through_a_leading_assignment() {
+        let invocations = vec![invocation("RUST_LOG=debug cargo test", false, "")];
+        let outcome = last_verification_run(&invocations).expect("exists");
+        assert_eq!(outcome.status, VerificationStatus::Passed);
     }
 
     #[test]

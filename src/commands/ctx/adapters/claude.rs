@@ -3089,7 +3089,11 @@ mod tests {
             .last_verification
             .expect("a verification run was recorded");
         assert_eq!(outcome.command, "cargo test");
-        assert!(!outcome.errored, "the second run passed");
+        assert_eq!(
+            outcome.status,
+            crate::commands::ctx::event::VerificationStatus::Passed,
+            "the second run passed"
+        );
         assert!(outcome.error_excerpt.is_empty());
     }
 
@@ -3109,7 +3113,10 @@ mod tests {
             .last_verification
             .expect("a verification run was recorded");
         assert_eq!(outcome.command, "cargo test");
-        assert!(outcome.errored);
+        assert_eq!(
+            outcome.status,
+            crate::commands::ctx::event::VerificationStatus::Failed
+        );
         assert_eq!(outcome.error_excerpt, vec!["boom: it failed".to_string()]);
     }
 

@@ -538,6 +538,52 @@ fn markdown_sections(text: &str) -> Vec<(String, String)> {
     sections
 }
 
+/// Reorders `body`'s markdown sections so any heading in
+/// `PRIORITY_EXCERPT_HEADINGS` comes first (`markdown_sections`), then caps
+/// the result at `cap_bytes` on a char boundary (`crate::utils::
+/// truncate_bytes`). An excerpt that already fits `cap_bytes` is returned
+/// byte-for-byte with no marker, matching every other bounded-excerpt layer
+/// this module composes.
+///
+/// `truncation_marker`, when given, is appended whenever the cap actually
+/// cut something -- with the marker itself counted against `cap_bytes`, so
+/// the total never exceeds the budget -- for a caller (`ctx::agent`'s
+/// `--attach-artifact`) that wants a reader to see the excerpt was cut
+/// rather than believe it ended there. `None` reproduces this module's own
+/// `accepted_spec_excerpt` behaviour, which has never added one.
+///
+/// Shared (S1) by `accepted_artifact_excerpt` below and `ctx::agent`'s
+/// `--attach-artifact` excerpt: both reorder-then-cap an accepted workflow
+/// artifact the same way, and used to carry two copies of this logic before
+/// this helper existed.
+pub(crate) fn prioritized_excerpt(
+    body: &str,
+    cap_bytes: usize,
+    truncation_marker: Option<&str>,
+) -> String {
+    let (priority, rest): (Vec<_>, Vec<_>) = markdown_sections(body)
+        .into_iter()
+        .partition(|(heading, _)| PRIORITY_EXCERPT_HEADINGS.contains(&heading.as_str()));
+    let mut reordered = String::new();
+    for (_, section) in priority.into_iter().chain(rest) {
+        reordered.push_str(&section);
+    }
+    let trimmed = reordered.trim();
+    if trimmed.len() <= cap_bytes {
+        return trimmed.to_string();
+    }
+    match truncation_marker {
+        Some(marker) => {
+            let marker_room = cap_bytes.saturating_sub(marker.len());
+            format!(
+                "{}{marker}",
+                crate::utils::truncate_bytes(trimmed.to_string(), Some(marker_room))
+            )
+        }
+        None => crate::utils::truncate_bytes(trimmed.to_string(), Some(cap_bytes)),
+    }
+}
+
 /// T3: a bounded excerpt of whichever accepted spec/intent/plan artifact
 /// exists for `state`, for a reviewer to judge the change against instead of
 /// only the operator's one-line `task` description. `None` when nothing is
@@ -568,21 +614,11 @@ fn accepted_artifact_excerpt(state: &WorkflowState) -> Option<String> {
             return None;
         }
     };
-    let (priority, rest): (Vec<_>, Vec<_>) = markdown_sections(&text)
-        .into_iter()
-        .partition(|(heading, _)| PRIORITY_EXCERPT_HEADINGS.contains(&heading.as_str()));
-    let mut reordered = String::new();
-    for (_, body) in priority.into_iter().chain(rest) {
-        reordered.push_str(&body);
-    }
-    let trimmed = reordered.trim();
-    if trimmed.is_empty() {
+    let excerpt = prioritized_excerpt(&text, MAX_ACCEPTED_ARTIFACT_EXCERPT_BYTES, None);
+    if excerpt.is_empty() {
         return None;
     }
-    Some(crate::utils::truncate_bytes(
-        trimmed.to_string(),
-        Some(MAX_ACCEPTED_ARTIFACT_EXCERPT_BYTES),
-    ))
+    Some(excerpt)
 }
 
 fn git(repo: &Path, args: &[&str]) -> CtxResult<String> {
