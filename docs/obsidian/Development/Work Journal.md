@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-09-01
+last-verified: 2026-09-02
 ---
 
 # Work Journal
@@ -19,6 +19,11 @@ last-verified: 2026-09-01
 **Follow-up:** anything unfinished (optional).
 
 ## Entries
+
+### 2026-09-02: harness iteration round 1 -- cache-stable workflow layer, single-pass session start, review deltas, verify reuse, same-error signal
+**What:** Three audits (cost, speed, intelligence) of the wrapper's own hot paths, workflow 263cb162, same PR #261. Shipped: `corrections_in` is now incremental (`CorrectionCheckpoint`); session start reads memory/context files once instead of twice (`load_both_scopes`, `read_context_layer_text`); the workflow-step prompt layer moves after Context and before Memory (`DEFAULT_PROMPT_VERSION` v8 -> v9); review packages send only new/changed findings on a delta round plus an accepted-spec excerpt (schema 2 -> 4); `zirv verify` reuses fresh `zirv test` evidence for an unchanged fingerprint; `workflow advance --run-checks` and `workflow review dispose --apply-recommended`; a same-error rot signal (`same_error_weight` default 0, but its own Stop-hook advisory clause fires once `same_error_repeats` crosses `same_error_threshold`); a handoff `Verification` section.
+**Key changes:** `src/commands/ctx/{hook,compile,memory,retrieval,prompt,rot,event,config,score,handoff,adapters/claude}.rs`, `src/commands/workflow/{review,verification,engine}.rs`, `.zirv/ctx.toml`.
+**Follow-up:** Deferred items (reviewer model by risk, codex idle heuristic, `--attach-artifact`, harvest from failures/findings, artifact re-injection dedupe) tracked in `docs/superpowers/specs/2026-09-01-wrapper-behaviour-redesign.md`'s "Round 3" section and [[Active Work]].
 
 ### 2026-09-01: wrapper behaviour redesign -- proportionality-first prompts, tiered docs/verify
 **What:** Non-Rust half of the wrapper redesign (`docs/superpowers/specs/2026-09-01-wrapper-behaviour-redesign.md`): `.zirv/context/{common,claude,codex}.md` gained a tiered verify/review/vault-keeper structure and the codex honesty clause moved to common; `CLAUDE.md`/`AGENTS.md` regenerated via `zirv context sync --generate`.

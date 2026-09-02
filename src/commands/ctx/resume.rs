@@ -270,6 +270,7 @@ mod tests {
             next_step: "Add a failing test for an invalid signature".to_string(),
             files_touched: vec!["src/routes/webhook.rs".to_string()],
             gotchas: vec![],
+            ..Handoff::default()
         }
     }
 

@@ -245,7 +245,19 @@ impl IncrementalScorer {
 /// existed would otherwise resume with `model: None` until the next poll
 /// happens to carry a fresh assistant line, which is usually immediate but
 /// not guaranteed; the version bump forces one clean rebuild instead.
-const CHECKPOINT_VERSION: u32 = 2;
+/// Bumped to 3 for `rot::Segment`'s new `error_hashes` field (same-error
+/// repetition, `rot::Signals::same_error_repeats`): an older checkpoint
+/// simply fails to deserialize without this bump too (`load_checkpoint`
+/// degrades to `None` on any doubt), but the version bump makes that a
+/// clean, immediate rebuild rather than depending on a lenient decode.
+/// Bumped to 4 for review finding F1: `error_hashes: Vec<u64>` was replaced
+/// by `result_errors: Vec<Option<u64>>` (one entry per `ToolResult`, not just
+/// per erroring one with extractable text) so a successful result -- or a
+/// textless error -- can interrupt a same-error streak instead of being
+/// invisible to it. A checkpoint written under the old field name would fail
+/// to deserialize on its own, but the bump forces a clean rebuild rather than
+/// depending on that.
+const CHECKPOINT_VERSION: u32 = 4;
 
 /// What a fresh process needs to carry on folding where the last one stopped.
 #[derive(Debug, Serialize, Deserialize)]

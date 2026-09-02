@@ -463,6 +463,36 @@ pub fn list_scoped(
     read_entries(&dir)
 }
 
+/// Both scopes' entries, read from disk exactly once each. `render_for_prompt`
+/// and `retrieval::candidates_for_repo` each scan the identical private+shared
+/// bank on their own; a caller that needs both (`compile::gather_memory`, the
+/// launch-time context compiler) used to trigger the whole bank being read
+/// twice -- once per consumer -- for every single session launch. Loading it
+/// once here and handing the same in-memory entries to both consumers
+/// (`render_for_prompt_from_loaded`/`retrieval::candidates_from_loaded`)
+/// removes that duplication without changing what either one selects.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct LoadedMemory {
+    pub(crate) private: Vec<(PathBuf, Entry)>,
+    pub(crate) shared: Vec<(PathBuf, Entry)>,
+}
+
+/// Reads both scopes for `slug`, each gated exactly the way `list_scoped`
+/// already gates it (`scope.enabled(cfg)`, plus `Shared`'s own
+/// `safe_shared_dir` check) -- a disabled or unsafe scope contributes an
+/// empty list, never an error, same as every other memory read.
+pub(crate) fn load_both_scopes(
+    repo: &Path,
+    state: &StateDir,
+    slug: &str,
+    cfg: &CtxConfig,
+) -> LoadedMemory {
+    LoadedMemory {
+        private: list_scoped(MemoryScope::Private, repo, state, slug, cfg).unwrap_or_default(),
+        shared: list_scoped(MemoryScope::Shared, repo, state, slug, cfg).unwrap_or_default(),
+    }
+}
+
 /// UNGATED sibling of `list_scoped`: ignores `scope.enabled(cfg)` entirely,
 /// reading whatever the scope's directory actually holds. Exists only for
 /// `zirv memory status` (`memory_cli.rs`), so a disabled scope still
@@ -1387,20 +1417,27 @@ pub fn render_for_prompt(
     slug: &str,
     cfg: &CtxConfig,
 ) -> Vec<super::prompt::MemoryLine> {
-    let mut lines: Vec<super::prompt::MemoryLine> = if cfg.memory.enabled {
-        list(state, slug)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|(_, entry)| render_prompt_line(entry, false))
-            .collect()
-    } else {
-        Vec::new()
-    };
+    render_for_prompt_from_loaded(&load_both_scopes(repo, state, slug, cfg))
+}
+
+/// The same rendering `render_for_prompt` does, over entries a caller already
+/// loaded via [`load_both_scopes`] -- see that function's own doc comment for
+/// why this split exists (`compile::gather_memory` needs the identical bank
+/// for the retrieval layer too, and must not read every file a second time to
+/// get it).
+pub(crate) fn render_for_prompt_from_loaded(
+    loaded: &LoadedMemory,
+) -> Vec<super::prompt::MemoryLine> {
+    let mut lines: Vec<super::prompt::MemoryLine> = loaded
+        .private
+        .iter()
+        .map(|(_, entry)| render_prompt_line(entry.clone(), false))
+        .collect();
     lines.extend(
-        list_scoped(MemoryScope::Shared, repo, state, slug, cfg)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|(_, entry)| render_prompt_line(entry, true)),
+        loaded
+            .shared
+            .iter()
+            .map(|(_, entry)| render_prompt_line(entry.clone(), true)),
     );
     lines
 }
@@ -3672,6 +3709,7 @@ This should not appear in the body.\n";
             next_step: "Add a failing test for an invalid signature".to_string(),
             files_touched: vec!["src/routes/webhook.rs".to_string()],
             gotchas: vec!["The provider sends two events per charge".to_string()],
+            ..Default::default()
         }
     }
 

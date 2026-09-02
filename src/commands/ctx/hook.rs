@@ -1,5 +1,5 @@
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -92,12 +92,26 @@ fn optimize_hint(reason: super::optimize::RecommendReason) -> &'static str {
 /// edit work with no active `zirv workflow`, so it is folded into both the
 /// healthy-session hint path and the ordinary advisory below, not gated
 /// behind either.
+///
+/// `same_error_threshold` is `ScoreConfig::same_error_threshold` (default
+/// `3`): when `score.signals.same_error_repeats` meets or exceeds it, the
+/// advisory gets its own clause alongside the repetition one above -- a
+/// stuck same-error loop is a distinct failure mode from over-verification
+/// (the same tool call repeated with no edit in between): the fix is not
+/// landing at all, not merely re-checked. A threshold of `0` is how an
+/// operator disables the signal outright, so the clause also requires
+/// `same_error_threshold > 0` -- otherwise `repeats >= 0` is trivially true
+/// and the "disabled" signal would still print on every non-healthy advisory
+/// (review finding F2). `stop_output` itself takes no `ScoreConfig` --
+/// `run_stop`, its only production caller, already loads one and passes just
+/// the threshold through.
 pub fn stop_output(
     payload: &HookPayload,
     score: &Score,
     socket: Option<&Path>,
     optimize_recommended: Option<super::optimize::RecommendReason>,
     adoption_nudge: Option<&str>,
+    same_error_threshold: usize,
 ) -> Option<String> {
     if payload.stop_hook_active {
         return None;
@@ -147,6 +161,21 @@ pub fn stop_output(
             score.signals.max_repeat
         ));
     }
+    // Same-error loop: the longest run of consecutive identical (normalized)
+    // tool-result errors within the window met or crossed the operator's own
+    // threshold -- a distinct failure mode from the repetition clause above,
+    // which fires on an unchanged tool call rather than a recurring error.
+    // `same_error_threshold > 0` is required too: a threshold of zero is how
+    // an operator disables the signal, and `repeats >= 0` is trivially true,
+    // so without this guard a disabled signal would still fire on every
+    // non-healthy advisory (review finding F2).
+    if same_error_threshold > 0 && score.signals.same_error_repeats >= same_error_threshold {
+        advisory.push(' ');
+        advisory.push_str(&format!(
+            "Same error {}x in a row across different attempts: the fix isn't landing, try a different approach.",
+            score.signals.same_error_repeats
+        ));
+    }
     if let Some(reason) = optimize_recommended {
         advisory.push(' ');
         advisory.push_str(optimize_hint(reason));
@@ -164,19 +193,129 @@ fn read_stdin() -> String {
     buffer
 }
 
+/// Bumped whenever this file's shape changes, mirroring `score.rs`'s own
+/// `CHECKPOINT_VERSION` pattern: an older file is discarded and rebuilt once
+/// from scratch rather than misread.
+const CORRECTION_CHECKPOINT_VERSION: u32 = 1;
+
+/// Incremental cursor + running total for `corrections_in`, one file per
+/// transcript (mirrors `score.rs`'s own per-transcript `checkpoint_path`).
+///
+/// `corrections_in` used to `read_to_string` and re-`structural_context` the
+/// WHOLE transcript on every Stop hook call once a session passed the
+/// correction-recommendation gate (`optimize::recommendation_possible`) --
+/// O(session) per turn, O(n^2) over a session, exactly the cost the cached
+/// score above already pays once to avoid for the rot score itself. This is
+/// kept as its own small checkpoint rather than folded into `score.rs`'s
+/// `Checkpoint` (a lower-level, adapter-agnostic scoring cursor that should
+/// not grow an optimize-specific concept) or into `AdoptionRecord` above
+/// (whose fold only runs when workflow-adoption policy is not `Off` and the
+/// session is not a delegated worker -- neither gate has anything to do with
+/// whether an optimize recommendation is due, and folding in there would
+/// stop counting corrections for exactly the sessions where adoption nudges
+/// are turned off).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct CorrectionCheckpoint {
+    #[serde(default)]
+    version: u32,
+    transcript: String,
+    adapter: String,
+    corrections: usize,
+    offset: u64,
+    consumed: u64,
+}
+
+fn correction_checkpoint_path(state: &StateDir, transcript: &Path) -> PathBuf {
+    // Reuses `score.rs`'s own scoring directory (a different file per
+    // transcript, distinguished by the `-corrections` suffix) rather than a
+    // new state-dir root just for this.
+    state.scoring().join(format!(
+        "{:016x}-corrections.json",
+        input_hash(&transcript.display().to_string())
+    ))
+}
+
+/// `None` on any doubt at all -- unreadable, corrupt, a different schema
+/// version, a different transcript, a different adapter, or an offset that no
+/// longer fits the file -- which sends the caller back to a fresh fold from
+/// byte zero, mirroring `score.rs::load_checkpoint`'s own guard.
+fn load_correction_checkpoint(
+    path: &Path,
+    transcript: &Path,
+    adapter_name: &str,
+) -> Option<CorrectionCheckpoint> {
+    let checkpoint: CorrectionCheckpoint =
+        serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+    let usable = checkpoint.version == CORRECTION_CHECKPOINT_VERSION
+        && checkpoint.transcript == transcript.display().to_string()
+        && checkpoint.adapter == adapter_name
+        && checkpoint.offset <= std::fs::metadata(transcript).ok()?.len();
+    usable.then_some(checkpoint)
+}
+
+/// Best-effort, like `score.rs::save_checkpoint`: a checkpoint that fails to
+/// write costs the next Stop hook call a full re-fold, never a hook failure.
+fn save_correction_checkpoint(path: &Path, checkpoint: &CorrectionCheckpoint) {
+    let Ok(json) = serde_json::to_string(checkpoint) else {
+        return;
+    };
+    if let Some(dir) = path.parent() {
+        let _ = super::state::create_private_dir_all(dir);
+    }
+    let _ = super::state::write_private(path, &json);
+}
+
 /// Corrections in `transcript`, read through the same adapter selection
 /// `score_transcript` uses to score it (`cfg.agent`/`cfg.agent_bin`), not a
 /// hardcoded claude parser (item 1). `adapters::select` failing (an unready
 /// adapter, e.g. codex today) degrades to zero corrections rather than
 /// panicking: an optimize recommendation is advisory, and a hook may never
 /// fail loudly.
-fn corrections_in(transcript: &Path, cfg: &CtxConfig) -> usize {
+///
+/// Incremental (see `CorrectionCheckpoint`'s own doc comment): only the bytes
+/// appended to `transcript` since the last call are folded into the running
+/// total, via the same `Watcher` cursor `fold_adoption_delta` above already
+/// uses for `edit_like_calls`. Every adapter's `structural_context` parses
+/// each JSONL line independently with no cross-line state (a line's own
+/// `isSidechain`/`isMeta` flags decide its fate, nothing carried from an
+/// earlier line), so folding a chunk of newly appended lines finds exactly
+/// the correction-phrased user messages a full parse would have attributed
+/// to those same lines -- the same property that already lets
+/// `fold_adoption_delta` treat `adapter.parse_events` incrementally.
+fn corrections_in(state: &StateDir, transcript: &Path, cfg: &CtxConfig) -> usize {
     let Ok(adapter) = adapters::select(cfg.agent.as_deref(), &[], cfg) else {
         return 0;
     };
-    std::fs::read_to_string(transcript)
-        .map(|jsonl| super::optimize::count_corrections(adapter.as_ref(), &jsonl))
-        .unwrap_or(0)
+    let path = correction_checkpoint_path(state, transcript);
+    let mut checkpoint = load_correction_checkpoint(&path, transcript, adapter.name())
+        .unwrap_or_else(|| CorrectionCheckpoint {
+            version: CORRECTION_CHECKPOINT_VERSION,
+            transcript: transcript.display().to_string(),
+            adapter: adapter.name().to_string(),
+            corrections: 0,
+            offset: 0,
+            consumed: 0,
+        });
+
+    let mut watcher = Watcher::resuming(
+        transcript.to_path_buf(),
+        checkpoint.offset,
+        checkpoint.consumed,
+    );
+    let Ok(Some(appended)) = watcher.read_appended() else {
+        // Nothing new to read (or the transcript vanished): the last
+        // computed total still stands.
+        return checkpoint.corrections;
+    };
+    if appended.restarted {
+        checkpoint.corrections = 0;
+    }
+    checkpoint.corrections += super::optimize::count_corrections(adapter.as_ref(), &appended.lines);
+    let (offset, consumed) = watcher.position();
+    checkpoint.offset = offset;
+    checkpoint.consumed = consumed;
+    save_correction_checkpoint(&path, &checkpoint);
+    checkpoint.corrections
 }
 
 /// `CtxConfig::load`'s degrade-on-error fallback used by the Stop hook's
@@ -461,6 +600,10 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
         );
     }
 
+    // Loaded once, outside the `state`-gated block below, so `stop_output`
+    // can read `cfg.score.same_error_threshold` after that block ends
+    // without a second config load.
+    let cfg = cfg_or_operator_only_gate(&repo, env);
     let mut optimize_recommended = None;
     let mut adoption_nudge = None;
     if let Ok(state) = StateDir::resolve(env) {
@@ -534,10 +677,9 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
         // transcript -- so it is paid for only once the free gates say it
         // could matter. Without that ordering every turn re-parses the whole
         // session, which is precisely what the cached score above removes.
-        let cfg = cfg_or_operator_only_gate(&repo, env);
         let now = now_secs();
         if super::optimize::recommendation_possible(&state, &score, &cfg.optimize, now) {
-            let corrections = corrections_in(transcript, &cfg);
+            let corrections = corrections_in(&state, transcript, &cfg);
             optimize_recommended = super::optimize::queue_recommendation(
                 &state,
                 &session,
@@ -558,6 +700,7 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
         socket.as_deref(),
         optimize_recommended,
         adoption_nudge.as_deref(),
+        cfg.score.same_error_threshold,
     ) {
         let _ = writeln!(w, "{line}");
     }
@@ -1033,6 +1176,12 @@ mod tests {
         }
     }
 
+    /// Matches `ScoreConfig::default().same_error_threshold` -- every test
+    /// below that doesn't care about the same-error clause passes this so a
+    /// quiet `same_error_repeats: 0` (`score_of`'s own default) never trips
+    /// it by accident.
+    const SAME_ERROR_THRESHOLD: usize = 3;
+
     fn score_of(verdict: Verdict, score: u32) -> Score {
         Score {
             score,
@@ -1042,6 +1191,7 @@ mod tests {
                 tool_failure_rate: 1.0,
                 repetition_hits: 0,
                 max_repeat: 1,
+                same_error_repeats: 0,
                 marker_miss_rate: Some(1.0),
             },
             context_tokens: 170_000,
@@ -1235,7 +1385,8 @@ mod tests {
                 &score_of(Verdict::Healthy, 10),
                 None,
                 None,
-                None
+                None,
+                SAME_ERROR_THRESHOLD,
             ),
             None
         );
@@ -1243,8 +1394,15 @@ mod tests {
 
     #[test]
     fn an_advisory_verdict_prints_a_non_blocking_system_message() {
-        let out = stop_output(&payload(), &score_of(Verdict::Advise, 45), None, None, None)
-            .expect("advisory expected");
+        let out = stop_output(
+            &payload(),
+            &score_of(Verdict::Advise, 45),
+            None,
+            None,
+            None,
+            SAME_ERROR_THRESHOLD,
+        )
+        .expect("advisory expected");
         let parsed: serde_json::Value = serde_json::from_str(&out).expect("valid json");
         assert!(parsed["systemMessage"].is_string());
         assert!(
@@ -1261,6 +1419,10 @@ mod tests {
             !text.contains("repeated"),
             "no repetition clause when repetition did not drive the verdict: {text}"
         );
+        assert!(
+            !text.contains("Same error"),
+            "no same-error clause when signals are quiet: {text}"
+        );
     }
 
     /// The over-verification clause only fires when `repetition_hits > 0` --
@@ -1271,7 +1433,8 @@ mod tests {
         let mut score = score_of(Verdict::Advise, 45);
         score.signals.repetition_hits = 1;
         score.signals.max_repeat = 4;
-        let out = stop_output(&payload(), &score, None, None, None).expect("advisory expected");
+        let out = stop_output(&payload(), &score, None, None, None, SAME_ERROR_THRESHOLD)
+            .expect("advisory expected");
         let parsed: serde_json::Value = serde_json::from_str(&out).expect("valid json");
         let text = parsed["systemMessage"].as_str().unwrap_or_default();
         assert!(
@@ -1292,6 +1455,7 @@ mod tests {
             None,
             None,
             None,
+            SAME_ERROR_THRESHOLD,
         )
         .expect("advisory expected");
         let parsed: serde_json::Value = serde_json::from_str(&out).expect("valid json");
@@ -1311,6 +1475,7 @@ mod tests {
             Some(std::path::Path::new("/tmp/s/ab.sock")),
             None,
             None,
+            SAME_ERROR_THRESHOLD,
         );
         assert_eq!(out, None, "the supervisor intervenes, not the hook");
     }
@@ -1321,8 +1486,74 @@ mod tests {
         let mut p = payload();
         p.stop_hook_active = true;
         assert_eq!(
-            stop_output(&p, &score_of(Verdict::Restart, 95), None, None, None),
+            stop_output(
+                &p,
+                &score_of(Verdict::Restart, 95),
+                None,
+                None,
+                None,
+                SAME_ERROR_THRESHOLD,
+            ),
             None
+        );
+    }
+
+    /// Issue #hook-same-error (wrapper proportionality audit follow-through):
+    /// `rot::Signals::same_error_repeats` meeting or crossing the operator's
+    /// own `same_error_threshold` gets its own clause, distinct from the
+    /// repetition clause above -- a stuck same-error loop across different
+    /// attempts is not the same failure as an unchanged tool call repeated
+    /// with no edit in between.
+    #[test]
+    fn a_same_error_streak_at_the_threshold_gets_its_own_clause() {
+        let mut score = score_of(Verdict::Advise, 45);
+        score.signals.same_error_repeats = SAME_ERROR_THRESHOLD;
+        let out = stop_output(&payload(), &score, None, None, None, SAME_ERROR_THRESHOLD)
+            .expect("advisory expected");
+        let parsed: serde_json::Value = serde_json::from_str(&out).expect("valid json");
+        let text = parsed["systemMessage"].as_str().unwrap_or_default();
+        assert!(
+            text.contains(&format!(
+                "Same error {SAME_ERROR_THRESHOLD}x in a row across different attempts"
+            )),
+            "same-error clause should be named at the threshold: {text}"
+        );
+        assert!(
+            !text.contains('\u{2014}'),
+            "no em dashes in user-facing copy"
+        );
+    }
+
+    /// Below the threshold, no clause -- the signal must genuinely cross the
+    /// operator's own configured value, not merely be non-zero.
+    #[test]
+    fn a_same_error_streak_below_the_threshold_gets_no_clause() {
+        let mut score = score_of(Verdict::Advise, 45);
+        score.signals.same_error_repeats = SAME_ERROR_THRESHOLD - 1;
+        let out = stop_output(&payload(), &score, None, None, None, SAME_ERROR_THRESHOLD)
+            .expect("advisory expected");
+        let parsed: serde_json::Value = serde_json::from_str(&out).expect("valid json");
+        let text = parsed["systemMessage"].as_str().unwrap_or_default();
+        assert!(
+            !text.contains("Same error"),
+            "no same-error clause below the threshold: {text}"
+        );
+    }
+
+    /// Review finding F2: a threshold of 0 is how an operator disables the
+    /// same-error signal outright. Without the `> 0` guard, `repeats >= 0`
+    /// is trivially true and the clause fires on every non-healthy advisory
+    /// even though the operator asked for it to never fire.
+    #[test]
+    fn a_zero_threshold_disables_the_same_error_clause_even_with_repeats() {
+        let mut score = score_of(Verdict::Advise, 45);
+        score.signals.same_error_repeats = 5;
+        let out = stop_output(&payload(), &score, None, None, None, 0).expect("advisory expected");
+        let parsed: serde_json::Value = serde_json::from_str(&out).expect("valid json");
+        let text = parsed["systemMessage"].as_str().unwrap_or_default();
+        assert!(
+            !text.contains("Same error"),
+            "threshold 0 must disable the clause even with repeats: {text}"
         );
     }
 
@@ -1730,6 +1961,7 @@ mod tests {
                 tool_failure_rate: 0.0,
                 repetition_hits: 0,
                 max_repeat: 0,
+                same_error_repeats: 0,
                 marker_miss_rate: None,
             },
         }
@@ -2082,6 +2314,7 @@ mod tests {
             None,
             None,
             Some("[zirv workflow] substantial work detected"),
+            SAME_ERROR_THRESHOLD,
         )
         .expect("a healthy session with a due nudge must still print");
         let parsed: serde_json::Value = serde_json::from_str(&out).expect("valid json");
@@ -2099,6 +2332,7 @@ mod tests {
             None,
             None,
             Some("[zirv workflow] substantial work detected"),
+            SAME_ERROR_THRESHOLD,
         )
         .expect("advisory expected");
         let parsed: serde_json::Value = serde_json::from_str(&out).expect("valid json");
@@ -2209,8 +2443,9 @@ mod tests {
     fn corrections_are_computed_through_the_configured_adapter() {
         let dir = tempfile::tempdir().expect("tempdir");
         let transcript = correction_heavy_transcript(dir.path());
+        let state = StateDir::from_root(dir.path().join("state"));
         let cfg = CtxConfig::default();
-        assert_eq!(corrections_in(&transcript, &cfg), 5);
+        assert_eq!(corrections_in(&state, &transcript, &cfg), 5);
     }
 
     /// An adapter with no event parsing wired up (codex today -- out of
@@ -2223,12 +2458,13 @@ mod tests {
     fn corrections_are_zero_for_an_adapter_with_no_event_parsing() {
         let dir = tempfile::tempdir().expect("tempdir");
         let transcript = correction_heavy_transcript(dir.path());
+        let state = StateDir::from_root(dir.path().join("state"));
         let cfg = CtxConfig {
             agent: Some("codex".to_string()),
             ..CtxConfig::default()
         };
         assert_eq!(
-            corrections_in(&transcript, &cfg),
+            corrections_in(&state, &transcript, &cfg),
             0,
             "an adapter with no parsing degrades to zero corrections, not a panic"
         );
@@ -2325,11 +2561,85 @@ mod tests {
         let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
         let empty: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        let state = StateDir::from_root(dir.path().join("state"));
 
         assert_eq!(
-            corrections_in(&transcript, &cfg),
+            corrections_in(&state, &transcript, &cfg),
             0,
             "a refused fallback (repo may narrow, not select) still degrades to zero, not a panic"
+        );
+    }
+
+    /// Guards the O(n^2) `corrections_in` fix: once a checkpoint exists for a
+    /// transcript, a later call must fold only the bytes appended since then,
+    /// never re-read the whole file. Proven by corrupting the entire
+    /// already-consumed region with non-UTF-8 garbage -- well clear of the
+    /// small head/tail window `Watcher`'s own restart fingerprint samples, so
+    /// the checkpoint stays valid -- which `std::fs::read_to_string` (the old,
+    /// every-call whole-file implementation) chokes on outright. Only an
+    /// implementation that truly never rereads the corrupted bytes can still
+    /// find the second correction appended after them.
+    #[test]
+    fn a_second_call_after_a_checkpoint_never_rereads_the_consumed_region() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let transcript = dir.path().join("t.jsonl");
+        let state = StateDir::from_root(dir.path().join("state"));
+        let cfg = CtxConfig::default();
+
+        // One correction, then enough filler lines that the consumed region
+        // comfortably clears the watcher's head+tail fingerprint window (4096
+        // + 256 bytes) with plenty of room in the middle to corrupt.
+        let mut text = String::new();
+        text.push_str("{\"type\":\"user\",\"message\":{\"content\":\"no, not like that\"}}\n");
+        for _ in 0..400 {
+            text.push_str(&format!(
+                "{{\"type\":\"assistant\",\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"{}\"}}]}}}}\n",
+                "filler line padding out the transcript ".repeat(2)
+            ));
+        }
+        std::fs::write(&transcript, &text).expect("write");
+
+        assert_eq!(
+            corrections_in(&state, &transcript, &cfg),
+            1,
+            "first pass finds the one correction"
+        );
+
+        let consumed_len = text.len();
+        assert!(
+            consumed_len > 8000,
+            "the consumed region must comfortably clear the watcher's head+tail fingerprint window, got {consumed_len}"
+        );
+
+        // Corrupt the middle of the already-consumed region -- well past the
+        // first 4096 bytes and well before the last 256 -- with invalid
+        // UTF-8. A full `read_to_string` re-parse of the whole file would
+        // hard error on this; the incremental fold must never touch it again.
+        let mut bytes = std::fs::read(&transcript).expect("read bytes");
+        let corrupt_start = 5000;
+        let corrupt_end = bytes.len() - 1000;
+        for b in &mut bytes[corrupt_start..corrupt_end] {
+            *b = 0xFF;
+        }
+        // Append a second correction after the corrupted region, growing the
+        // file so the watcher reads this as an append, not a same-length
+        // rewrite.
+        bytes.extend_from_slice(
+            b"{\"type\":\"user\",\"message\":{\"content\":\"no, still wrong\"}}\n",
+        );
+        std::fs::write(&transcript, &bytes).expect("write corrupted+appended");
+
+        // Sanity: the old whole-file approach really would choke on this, or
+        // this test proves nothing.
+        assert!(
+            std::fs::read_to_string(&transcript).is_err(),
+            "the corrupted region must actually be invalid UTF-8"
+        );
+
+        assert_eq!(
+            corrections_in(&state, &transcript, &cfg),
+            2,
+            "the second correction must still be found even though the whole file is now unreadable as a string -- proof the consumed region was never reread"
         );
     }
 

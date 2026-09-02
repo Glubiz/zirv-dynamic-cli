@@ -1428,6 +1428,22 @@ pub fn load_latest(state: &StateDir, repo: &Path) -> CtxResult<Option<Verificati
     Ok(Some(report))
 }
 
+/// The identity (`VerificationReport::id`, a fresh UUID minted by every
+/// `run_mode` call, see below) of whatever report `latest_is_fresh_and_passing`
+/// would currently read, or `None` if none is persisted yet for this repo.
+///
+/// `run_required_checks` (in `engine.rs`) snapshots this before running a
+/// check and again afterwards: an unchanged identity means the run's own
+/// report was never persisted -- `run_and_persist`'s `persist` failure is
+/// swallowed into a warning, not an error, specifically so the run's printed
+/// results survive a transient IO failure -- and the gate must not then fall
+/// back to silently re-evaluating whatever older, still-fingerprint-fresh
+/// report happened to precede it (that would let a genuinely failing run
+/// advance a step on stale evidence).
+pub(crate) fn latest_report_id(state: &StateDir, repo: &Path) -> CtxResult<Option<String>> {
+    Ok(load_latest(state, repo)?.map(|report| report.id))
+}
+
 pub fn latest_is_fresh_and_passing(
     state: &StateDir,
     repo: &Path,
@@ -1463,6 +1479,36 @@ pub fn latest_is_fresh_and_passing(
         ));
     }
     Ok(evaluation.gate_passed)
+}
+
+/// Evidence a `Final`-mode run (`zirv verify`) can reuse instead of
+/// re-executing a check: the latest persisted report, when it is itself a
+/// `Changed`/`All`-mode run (i.e. what `zirv test changed`/`zirv test all`
+/// write), covers the whole changed-check surface (`narrowed_to` empty --
+/// same guard [`latest_is_fresh_and_passing`] applies, since a `--check`
+/// narrowed run is evidence about the checks it ran, not the change set),
+/// and matches the current change fingerprint exactly. A stale, narrowed, or
+/// missing report yields `None`, which callers treat as "nothing to reuse"
+/// rather than an error -- exactly like `latest_is_fresh_and_passing` treats
+/// an unreadable/absent report as "not fresh".
+fn reusable_test_evidence(
+    state: &StateDir,
+    repo: &Path,
+    fingerprint: u64,
+) -> CtxResult<Option<VerificationReport>> {
+    let Some(report) = load_latest(state, repo)? else {
+        return Ok(None);
+    };
+    if matches!(
+        report.mode,
+        VerificationMode::Changed | VerificationMode::All
+    ) && report.narrowed_to.is_empty()
+        && report.change_fingerprint == fingerprint
+    {
+        Ok(Some(report))
+    } else {
+        Ok(None)
+    }
 }
 
 /// Weighs an already-failing `report` against the operator's recorded
@@ -1544,6 +1590,18 @@ fn run_mode(
     // Before the checks, not after: a fingerprint taken afterwards records
     // edits made *during* a long suite as if they had been tested.
     let change_fingerprint = change_fingerprint(repo)?;
+    // A `zirv verify` (Final) run reuses `zirv test changed`/`zirv test all`'s
+    // own fresh, un-narrowed evidence for this exact fingerprint rather than
+    // re-executing every check it already ran. `dry_run` never reuses: it
+    // exists to preview what would run, not to report history in its place.
+    let reusable = if mode == VerificationMode::Final && !dry_run {
+        StateDir::resolve(&|key| std::env::var(key).ok())
+            .ok()
+            .and_then(|state| reusable_test_evidence(&state, repo, change_fingerprint).ok())
+            .flatten()
+    } else {
+        None
+    };
     let mut checks = Vec::with_capacity(selected.len());
     // The per-check clamp bounds one command; 32 clamped commands still add up
     // to eight hours, so the repo-supplied set gets one shared wall-clock
@@ -1551,9 +1609,28 @@ fn run_mode(
     // quietly dropped.
     let mut repo_spent = Duration::ZERO;
     let mut budget_noted = false;
+    let mut reused_ids = Vec::new();
     for check in selected {
+        // The operator's current repo-check gate is applied before any evidence
+        // reuse: the gate lives in global configuration, outside the change
+        // fingerprint, so a repo-supplied check that passed while the gate was
+        // on must report `Skipped` now, not a reused `Passed` (review finding).
         if !repo_checks_enabled && check.source.repo_supplied() {
             checks.push(check_result(check, CheckStatus::Skipped));
+            continue;
+        }
+        if let Some(source) = &reusable
+            && let Some(prior) = source.checks.iter().find(|prior| {
+                prior.id == check.spec.id
+                    && !matches!(prior.status, CheckStatus::Skipped | CheckStatus::DryRun)
+            })
+        {
+            // Never a `Skipped`/`DryRun` prior result: neither actually ran,
+            // so reusing one would carry a stale non-answer forward instead
+            // of letting this run evaluate the check for real -- e.g.
+            // `workflow.repo_checks_enabled` toggled on between the two runs.
+            reused_ids.push(check.spec.id.clone());
+            checks.push(prior.clone());
             continue;
         }
         if check.source.repo_supplied() && repo_spent >= MAX_REPO_TOTAL_TIME {
@@ -1572,6 +1649,17 @@ fn run_mode(
             repo_spent = repo_spent.saturating_add(Duration::from_millis(result.duration_ms));
         }
         checks.push(result);
+    }
+    if let Some(source) = &reusable
+        && !reused_ids.is_empty()
+    {
+        notes.push(format!(
+            "reused test evidence from report {} (fingerprint {:016x}, finished_at {}) for: {}",
+            source.id,
+            source.change_fingerprint,
+            source.finished_at,
+            reused_ids.join(", ")
+        ));
     }
     Ok(VerificationReport {
         schema_version: VERIFY_REPORT_SCHEMA_VERSION,
@@ -2056,6 +2144,219 @@ mod tests {
             report.notes
         );
         assert!(!report.passed(), "a skipped check is not a passing check");
+    }
+
+    /// A command that appends a marker to `path` (outside the repo) each time
+    /// it actually executes -- unlike `marker_command`, which only ever
+    /// proves a single execution, this lets a test count how many times a
+    /// check ran. The marker file must live outside the repo: a repo-relative
+    /// marker would itself become a new untracked path the next time
+    /// `change_fingerprint` is computed, moving the very fingerprint the
+    /// reuse gate is keyed on.
+    fn counting_command(path: &Path) -> String {
+        format!("echo x >> {}", path.display())
+    }
+
+    fn ran_count(path: &Path) -> usize {
+        std::fs::read_to_string(path)
+            .map(|text| text.lines().count())
+            .unwrap_or(0)
+    }
+
+    /// #260-adjacent: `zirv verify` (Final) must reuse a `zirv test changed`
+    /// report's own check results for the current change fingerprint instead
+    /// of re-executing them -- the whole point of this feature is fewer
+    /// redundant cargo invocations in the workflow gates.
+    #[test]
+    fn verify_reuses_fresh_test_evidence_for_the_same_fingerprint() {
+        let repo = git_repo();
+        let state_root = tempdir().unwrap();
+        let marker_dir = tempdir().unwrap();
+        let marker = marker_dir.path().join("unit.marker");
+        write_verify_toml(
+            repo.path(),
+            &format!(
+                "schema_version=1\n[[checks]]\nid='unit'\nkind='unit'\ncommand='{}'\n",
+                counting_command(&marker)
+            ),
+        );
+        with_state(state_root.path(), || {
+            let changed = run_mode(repo.path(), VerificationMode::Changed, &[], false).unwrap();
+            persist(&changed, repo.path(), VerificationMode::Changed).unwrap();
+            assert_eq!(ran_count(&marker), 1, "the changed run must execute once");
+            assert_eq!(changed.checks[0].status, CheckStatus::Passed);
+
+            let verify = run_mode(repo.path(), VerificationMode::Final, &[], false).unwrap();
+            assert_eq!(
+                ran_count(&marker),
+                1,
+                "verify must reuse the changed run's evidence instead of re-executing"
+            );
+            assert_eq!(verify.checks.len(), 1);
+            assert_eq!(verify.checks[0].status, CheckStatus::Passed);
+            assert!(
+                verify
+                    .notes
+                    .iter()
+                    .any(|note| note.contains("reused test evidence")
+                        && note.contains(&changed.id)
+                        && note.contains("unit")),
+                "got {:?}",
+                verify.notes
+            );
+        });
+    }
+
+    /// The mirror of the above: once the tree changes, the fingerprint moves
+    /// and the prior evidence no longer applies -- `verify` must fall back to
+    /// actually re-running the check rather than trusting stale results.
+    #[test]
+    fn verify_reruns_when_the_fingerprint_has_moved() {
+        let repo = git_repo();
+        let state_root = tempdir().unwrap();
+        let marker_dir = tempdir().unwrap();
+        let marker = marker_dir.path().join("unit.marker");
+        write_verify_toml(
+            repo.path(),
+            &format!(
+                "schema_version=1\n[[checks]]\nid='unit'\nkind='unit'\ncommand='{}'\n",
+                counting_command(&marker)
+            ),
+        );
+        with_state(state_root.path(), || {
+            let changed = run_mode(repo.path(), VerificationMode::Changed, &[], false).unwrap();
+            persist(&changed, repo.path(), VerificationMode::Changed).unwrap();
+            assert_eq!(ran_count(&marker), 1);
+
+            std::fs::write(repo.path().join("tracked.txt"), "two\n").unwrap();
+            let verify = run_mode(repo.path(), VerificationMode::Final, &[], false).unwrap();
+            assert_eq!(
+                ran_count(&marker),
+                2,
+                "a moved fingerprint must force a real rerun"
+            );
+            assert!(
+                !verify
+                    .notes
+                    .iter()
+                    .any(|note| note.contains("reused test evidence")),
+                "got {:?}",
+                verify.notes
+            );
+        });
+    }
+
+    /// Reuse is per-check, by id: a check the changed run never selected
+    /// (here, `final_check`-only) must still execute during `verify`, even
+    /// though the fingerprint matches and a sibling check is reused.
+    #[test]
+    fn verify_still_runs_checks_the_test_gate_did_not_cover() {
+        let repo = git_repo();
+        let state_root = tempdir().unwrap();
+        let marker_dir = tempdir().unwrap();
+        let unit_marker = marker_dir.path().join("unit.marker");
+        let fmt_marker = marker_dir.path().join("fmt.marker");
+        write_verify_toml(
+            repo.path(),
+            &format!(
+                "schema_version=1\n[[checks]]\nid='unit'\nkind='unit'\ncommand='{}'\n\n[[checks]]\nid='fmt'\nkind='format'\ncommand='{}'\nchanged=false\n",
+                counting_command(&unit_marker),
+                counting_command(&fmt_marker)
+            ),
+        );
+        with_state(state_root.path(), || {
+            let changed = run_mode(repo.path(), VerificationMode::Changed, &[], false).unwrap();
+            assert_eq!(
+                changed.checks.len(),
+                1,
+                "the changed run must not select the final-only check"
+            );
+            persist(&changed, repo.path(), VerificationMode::Changed).unwrap();
+            assert_eq!(ran_count(&unit_marker), 1);
+            assert_eq!(ran_count(&fmt_marker), 0);
+
+            let verify = run_mode(repo.path(), VerificationMode::Final, &[], false).unwrap();
+            assert_eq!(verify.checks.len(), 2);
+            assert_eq!(
+                ran_count(&unit_marker),
+                1,
+                "the reused check must not execute again"
+            );
+            assert_eq!(
+                ran_count(&fmt_marker),
+                1,
+                "the final-only check must still execute even though the fingerprint matches"
+            );
+            let note = verify
+                .notes
+                .iter()
+                .find(|note| note.contains("reused test evidence"))
+                .unwrap_or_else(|| panic!("got {:?}", verify.notes));
+            assert!(note.contains("unit") && !note.contains("fmt"), "got {note}");
+        });
+    }
+
+    /// The operator's `workflow.repo_checks_enabled` gate must be applied
+    /// *before* the fresh-test-evidence reuse lookup, not after: a
+    /// repo-supplied check that passed in a prior `zirv test` run for this
+    /// exact fingerprint must report `Skipped` -- never a reused `Passed`
+    /// -- once the operator has since disabled the gate. It must also stay
+    /// out of the reused-ids note, and a skipped check must not let the
+    /// report pass on its account.
+    #[test]
+    fn verify_does_not_reuse_a_repo_check_the_operator_has_since_disabled() {
+        let repo = git_repo();
+        let state_root = tempdir().unwrap();
+        let marker_dir = tempdir().unwrap();
+        let marker = marker_dir.path().join("unit.marker");
+        write_verify_toml(
+            repo.path(),
+            &format!(
+                "schema_version=1\n[[checks]]\nid='unit'\nkind='unit'\ncommand='{}'\n",
+                counting_command(&marker)
+            ),
+        );
+        with_state(state_root.path(), || {
+            let changed = run_mode(repo.path(), VerificationMode::Changed, &[], false).unwrap();
+            persist(&changed, repo.path(), VerificationMode::Changed).unwrap();
+            assert_eq!(ran_count(&marker), 1, "the changed run must execute once");
+            assert_eq!(changed.checks[0].status, CheckStatus::Passed);
+            assert_eq!(changed.checks[0].source, CheckSource::RepoConfig);
+
+            // SAFETY: single-threaded suite.
+            unsafe {
+                std::env::set_var("ZIRV_CTX_WORKFLOW_REPO_CHECKS", "false");
+            }
+            let verify = run_mode(repo.path(), VerificationMode::Final, &[], false);
+            unsafe {
+                std::env::remove_var("ZIRV_CTX_WORKFLOW_REPO_CHECKS");
+            }
+            let verify = verify.expect("a disabled gate is not an error");
+
+            assert_eq!(
+                ran_count(&marker),
+                1,
+                "the now-disabled check must not execute again either"
+            );
+            assert_eq!(verify.checks.len(), 1);
+            assert_eq!(
+                verify.checks[0].status,
+                CheckStatus::Skipped,
+                "a disabled repo check must report Skipped, not a reused Passed"
+            );
+            assert!(
+                !verify
+                    .notes
+                    .iter()
+                    .any(|note| note.contains("reused test evidence")),
+                "a disabled repo check must never be reported via the reuse note: {:?}",
+                verify.notes
+            );
+            assert!(
+                !verify.passed(),
+                "a skipped check must not let the report pass on its account"
+            );
+        });
     }
 
     /// A plain TOML *syntax* error in the repo's `ctx.toml` must not brick

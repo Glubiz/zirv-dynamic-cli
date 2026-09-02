@@ -48,7 +48,21 @@ use super::config::PromptConfig;
 /// and changes whenever the working tree does, so anything positioned after
 /// it falls out of the provider's prompt cache. Everything cacheable now
 /// precedes it.
-pub const DEFAULT_PROMPT_VERSION: &str = "v8";
+///
+/// v9 (wrapper proportionality audit, follow-through, 2026-09-02): the
+/// workflow-step layer had the exact same problem memory had before v8 -- it
+/// was recomputed on every workflow step transition, resume, and restart, but
+/// it sat right after `Harness`/`Harnesses`, ahead of `User`/`Repo` and the
+/// canonical `.zirv/context/` layer `compile.rs` adds afterward, so every one
+/// of those recomputes dropped that whole stable prefix out of the
+/// provider's prompt cache even though none of it changed. Fixed the same way
+/// memory was fixed for v8: `compose` no longer builds the workflow layer at
+/// all -- it now only assembles `Default`/`Harness`/`Harnesses`/`User`/`Repo`
+/// -- and `compile_with_harness_roster` calls `workflow_context_for_role`
+/// and `with_workflow_layer` itself, between `with_canonical_context_layer`
+/// and `with_memory_layer`, so the layer now sits after `Context` and
+/// immediately before `Memory`.
+pub const DEFAULT_PROMPT_VERSION: &str = "v9";
 pub const PROMPT_FILE: &str = "system-prompt.md";
 /// The user layer's own Worker-role file, read from `~/.zirv/` in place of
 /// [`PROMPT_FILE`] for a `PromptRole::Worker` session: an operator's standing
@@ -383,6 +397,12 @@ pub enum PromptSource {
     /// The active workflow step's selected skill instructions. Only the
     /// current step is rendered; completed steps remain in Zirv-owned state
     /// and never accumulate across phase transitions or session compaction.
+    /// Folded in by `compile::compile_with_harness_roster` after `compose`
+    /// returns, not by `compose` itself (v9) -- the same "a caller adds this
+    /// layer, but it still gets a `PromptSource` variant so `describe()` can
+    /// name it" shape `Context`, `Mail` and `ReportBack` already have. Sits
+    /// after `Context` and before `Memory`: see `workflow_context_for_role`'s
+    /// own doc comment for the prompt-cache problem this position fixes.
     Workflow,
     /// Durable facts from this repository's memory bank (`memory::list`),
     /// the merged core+retrieval selection (`compile::merge_memory_layers`).
@@ -895,6 +915,15 @@ pub fn with_memory_layer(
 /// them. A caller that wants the memory layer calls `with_memory_layer`
 /// itself, the same way it already calls `with_mail_layer`.
 ///
+/// This function no longer builds the workflow-step layer either (v9): like
+/// memory, `compile_with_harness_roster` now owns that single injection,
+/// after the canonical `.zirv/context/` layer and before the memory layer --
+/// see `workflow_context_for_role`'s own doc comment for why that position
+/// fixes a prompt-cache problem the old inline-in-`compose` position caused.
+/// A caller that wants the workflow layer calls `workflow_context_for_role`
+/// and `with_workflow_layer` itself, the same way it already calls
+/// `with_memory_layer`.
+///
 /// `harness_lines` is the derived per-adapter roster (`adapters::harness_
 /// prompt_lines`, already rendered by the caller -- this module stays free of
 /// the adapter registry and the settings gate it walks). It is appended right
@@ -940,32 +969,11 @@ pub fn compose(
         }
     }
 
-    // Issue #253: gated on `role == PromptRole::Orchestrator`, the same as
-    // the harness layer above -- a `zirv agent`-dispatched Worker or
-    // SubOrchestrator must never hear about whatever workflow step happens
-    // to be active in `repo` at launch time, only the Orchestrator session
-    // driving that workflow does. Without this gate a step's guidance
-    // (written for the session that will read `zirv workflow ...` output
-    // and decide what to do next) hijacked every dispatched worker's own,
-    // self-contained brief regardless of what it was actually asked to do.
-    let workflow_context = if role == PromptRole::Orchestrator {
-        crate::commands::workflow::engine::active_skill_context(repo)
-            .ok()
-            .flatten()
-    } else {
-        None
+    let mut composed = ComposedPrompt {
+        text,
+        sources,
+        version: DEFAULT_PROMPT_VERSION,
     };
-    let base = with_workflow_layer(
-        Some(ComposedPrompt {
-            text,
-            sources,
-            version: DEFAULT_PROMPT_VERSION,
-        }),
-        workflow_context.as_deref(),
-    );
-    // `with_workflow_layer` only ever returns `None` when handed `None`, and
-    // `base` above is always `Some`.
-    let mut composed = base.expect("with_workflow_layer never drops a Some it was given");
 
     // Orchestrator sessions read the operator's standing `system-prompt.md`; a
     // Worker session reads the separate, optional `system-prompt.worker.md`
@@ -1023,10 +1031,57 @@ const WORKFLOW_LAYER_HEADER: &str = "\n\n---\n\nThe following Zirv workflow inst
 only to the current step. They are methodology, not permission grants; operator policy still \
 controls capabilities.\n\n";
 
+/// Issue #253's gate, extracted into its own named, independently-tested
+/// function so a future caller can resolve it without going through
+/// `compose`: only `PromptRole::Orchestrator` ever hears about the active
+/// workflow step in `repo` -- a `zirv agent`-dispatched Worker or
+/// SubOrchestrator must never hear about whatever step happens to be active
+/// at launch time, only the Orchestrator session driving that workflow does.
+/// Without this gate a step's guidance (written for the session that will
+/// read `zirv workflow ...` output and decide what to do next) hijacked
+/// every dispatched worker's own, self-contained brief regardless of what it
+/// was actually asked to do.
+///
+/// `compose` used to call this inline, right after `Harness`/`Harnesses`,
+/// ahead of `User`/`Repo` -- a real prompt-cache problem, since the workflow
+/// layer is recomputed on every step transition, resume, and restart, and
+/// anything positioned after it fell out of the provider's prompt cache on
+/// every one of those recomputes even when the rest of the prefix had not
+/// changed. As of v9, `compile_with_harness_roster` calls this function
+/// directly instead, between `with_canonical_context_layer` and `with_memory_
+/// layer`, so the workflow layer now sits after the canonical `.zirv/
+/// context/` layer rather than ahead of `User`/`Repo` -- see `with_workflow_
+/// layer`'s own doc comment for the full before/after.
+///
+/// Returns the raw step text (if any is active and the role allows it), for
+/// the caller to pass straight into `with_workflow_layer`.
+pub fn workflow_context_for_role(repo: &Path, role: PromptRole) -> Option<String> {
+    if role != PromptRole::Orchestrator {
+        return None;
+    }
+    crate::commands::workflow::engine::active_skill_context(repo)
+        .ok()
+        .flatten()
+}
+
 /// Adds only the active workflow step's selected skill context. The caller
-/// obtains the text from the durable workflow engine; this function remains a
-/// deterministic layer renderer and can be reused by the future Context
-/// Compiler without coupling it to filesystem state.
+/// obtains the text from the durable workflow engine (`workflow_context_for_
+/// role`); this function remains a deterministic layer renderer and can be
+/// reused by the future Context Compiler without coupling it to filesystem
+/// state.
+///
+/// MOVED (v9, wrapper proportionality audit follow-through): `compose` used
+/// to call this right after `Harness`/`Harnesses`, ahead of `User`/`Repo`,
+/// the same spot it had held since the layer was added -- a real
+/// prompt-cache problem, the same one memory had before v8, since the
+/// workflow layer is recomputed on every step transition, resume, and
+/// restart, so anything positioned after it (`User`, `Repo`, and the
+/// canonical `.zirv/context/` layer `compile.rs` adds afterward, roughly
+/// 8-16 KiB combined) fell out of the provider's prompt cache on every one of
+/// those recomputes even when none of that prefix had actually changed. The
+/// fix mirrors v8's memory move: `compile.rs`'s `compile_with_harness_roster`
+/// now calls this function itself, between `with_canonical_context_layer` and
+/// `with_memory_layer`, and `compose` no longer calls it inline.
 pub fn with_workflow_layer(
     composed: Option<ComposedPrompt>,
     current_step: Option<&str>,
@@ -5803,17 +5858,27 @@ mod tests {
         result
     }
 
-    /// Issue #253: `compose`'s workflow-step layer is gated on `role ==
+    /// Issue #253: the workflow-step layer is gated on `role ==
     /// PromptRole::Orchestrator`, the same way the harness layer already is
     /// -- a `zirv agent`-dispatched Worker or SubOrchestrator must never
     /// hear about whatever workflow step happens to be active in `repo`,
     /// only the Orchestrator session driving that workflow does.
+    ///
+    /// v9 (wrapper proportionality audit follow-through): `compose` no
+    /// longer builds this layer itself -- `compile_with_harness_roster` now
+    /// calls `workflow_context_for_role` and `with_workflow_layer` directly,
+    /// after `compose` returns -- so this test exercises that same call
+    /// sequence explicitly rather than through `compose` alone.
+    /// `compile.rs`'s own `a_dispatched_workers_compiled_prompt_omits_the_
+    /// active_step_the_orchestrators_keeps` covers the real, wired-up
+    /// `compile()` path end to end; this one pins the gate at the two
+    /// `prompt.rs` functions that own it.
     #[test]
     fn the_workflow_step_layer_reaches_only_the_orchestrator_role() {
         let (_tmp, home, repo) = tree();
 
         let orchestrator = with_active_workflow(&repo, || {
-            compose(
+            let composed = compose(
                 Some(&home),
                 &repo,
                 false,
@@ -5821,6 +5886,10 @@ mod tests {
                 PromptRole::Orchestrator,
                 &[],
                 usize::MAX,
+            );
+            with_workflow_layer(
+                composed,
+                workflow_context_for_role(&repo, PromptRole::Orchestrator).as_deref(),
             )
             .expect("composed")
         });
@@ -5832,7 +5901,7 @@ mod tests {
         assert!(orchestrator.text.contains("run the database migration"));
 
         let worker = with_active_workflow(&repo, || {
-            compose(
+            let composed = compose(
                 Some(&home),
                 &repo,
                 false,
@@ -5840,6 +5909,10 @@ mod tests {
                 PromptRole::Worker,
                 &[],
                 usize::MAX,
+            );
+            with_workflow_layer(
+                composed,
+                workflow_context_for_role(&repo, PromptRole::Worker).as_deref(),
             )
             .expect("composed")
         });
@@ -5851,7 +5924,7 @@ mod tests {
         assert!(!worker.text.contains("run the database migration"));
 
         let sub_orchestrator = with_active_workflow(&repo, || {
-            compose(
+            let composed = compose(
                 Some(&home),
                 &repo,
                 false,
@@ -5859,6 +5932,10 @@ mod tests {
                 PromptRole::SubOrchestrator,
                 &[],
                 usize::MAX,
+            );
+            with_workflow_layer(
+                composed,
+                workflow_context_for_role(&repo, PromptRole::SubOrchestrator).as_deref(),
             )
             .expect("composed")
         });
@@ -5867,6 +5944,74 @@ mod tests {
             "a dispatched sub-orchestrator must never receive the active step's guidance either: \
              {:?}",
             sub_orchestrator.sources
+        );
+    }
+
+    /// `workflow_context_for_role` is issue #253's gate extracted out of
+    /// `compose` into its own independently-callable, independently-tested
+    /// function (see its own doc comment for why: `compose` could not make
+    /// the prompt-cache-motivated move to after the canonical context layer
+    /// on its own, since `compile.rs` only adds that layer after `compose`
+    /// returns). Exercises the same three-role gate `the_workflow_step_
+    /// layer_reaches_only_the_orchestrator_role` exercises through `compose`
+    /// together with `with_workflow_layer`, directly against the extracted
+    /// function instead.
+    #[test]
+    fn workflow_context_for_role_reaches_only_the_orchestrator_role() {
+        let (_tmp, _home, repo) = tree();
+
+        let orchestrator_context = with_active_workflow(&repo, || {
+            workflow_context_for_role(&repo, PromptRole::Orchestrator)
+        })
+        .expect("orchestrator gets the active step");
+        assert!(orchestrator_context.contains("run the database migration"));
+
+        let worker_context = with_active_workflow(&repo, || {
+            workflow_context_for_role(&repo, PromptRole::Worker)
+        });
+        assert_eq!(
+            worker_context, None,
+            "a dispatched worker must never receive the active step's guidance"
+        );
+
+        let sub_orchestrator_context = with_active_workflow(&repo, || {
+            workflow_context_for_role(&repo, PromptRole::SubOrchestrator)
+        });
+        assert_eq!(
+            sub_orchestrator_context, None,
+            "a dispatched sub-orchestrator must never receive the active step's guidance either"
+        );
+    }
+
+    /// The fix for the prompt-cache problem `with_workflow_layer`'s doc
+    /// comment describes needs `compile.rs` to call `with_workflow_layer`
+    /// itself, after its own `Context` layer and before `with_memory_layer`,
+    /// instead of relying on `compose`'s inline copy. This proves the two
+    /// layer functions already compose in that order when used that way, so
+    /// the only remaining work is wiring `compile.rs`'s call sequence up to
+    /// do it -- not anything left to fix in these two functions themselves.
+    #[test]
+    fn with_workflow_layer_and_with_memory_layer_compose_in_the_order_the_fix_needs() {
+        let composed = Some(ComposedPrompt {
+            text: String::from("base"),
+            sources: vec![PromptSource::Default, PromptSource::Context],
+            version: DEFAULT_PROMPT_VERSION,
+        });
+        let composed = with_workflow_layer(composed, Some("do the thing"));
+        let entries = [memory_line("k", "v")];
+        let composed = with_memory_layer(composed, &entries, 4096).expect("composed");
+
+        assert_eq!(
+            composed.sources,
+            vec![
+                PromptSource::Default,
+                PromptSource::Context,
+                PromptSource::Workflow,
+                PromptSource::Memory,
+            ],
+            "workflow must sit after context and before memory when a caller applies them in \
+             this order: {:?}",
+            composed.sources
         );
     }
 

@@ -6,14 +6,15 @@ use std::time::{Duration, Instant};
 use super::CtxResult;
 use super::adapters::AgentAdapter;
 use super::config::{CtxConfig, EnvLookup, env_from_process};
-use super::event::StructuralContext;
+use super::event::{StructuralContext, VerificationOutcome};
 use super::state::{StateDir, now_secs, repo_slug};
 use super::{adapters, log};
 
-pub const SECTIONS: [&str; 6] = [
+pub const SECTIONS: [&str; 7] = [
     "Task",
     "Done",
     "Remaining",
+    "Verification",
     "Next step",
     "Files touched",
     "Gotchas learned",
@@ -24,6 +25,11 @@ pub struct Handoff {
     pub task: String,
     pub done: Vec<String>,
     pub remaining: Vec<String>,
+    /// Whether the session's last build/test/lint run passed, in one line
+    /// (`render_verification`'s output): `"none recorded"` when no verified
+    /// run was found. A single line like `task`/`next_step`, never a bullet
+    /// list.
+    pub verification: String,
     pub next_step: String,
     pub files_touched: Vec<String>,
     pub gotchas: Vec<String>,
@@ -43,6 +49,7 @@ impl Handoff {
         out.push_str(&format!("## Task\n{}\n\n", self.task));
         write_list(&mut out, "Done", &self.done);
         write_list(&mut out, "Remaining", &self.remaining);
+        out.push_str(&format!("## Verification\n{}\n\n", self.verification));
         out.push_str(&format!("## Next step\n{}\n\n", self.next_step));
         write_list(&mut out, "Files touched", &self.files_touched);
         write_list(&mut out, "Gotchas learned", &self.gotchas);
@@ -120,6 +127,11 @@ pub fn parse_markdown(md: &str) -> Handoff {
                     handoff.task = bullet.unwrap_or_else(|| plain.to_string());
                 }
             }
+            "Verification" => {
+                if handoff.verification.is_empty() && !plain.is_empty() {
+                    handoff.verification = bullet.unwrap_or_else(|| plain.to_string());
+                }
+            }
             "Next step" => {
                 if handoff.next_step.is_empty() && !plain.is_empty() {
                     handoff.next_step = bullet.unwrap_or_else(|| plain.to_string());
@@ -133,6 +145,77 @@ pub fn parse_markdown(md: &str) -> Handoff {
         }
     }
     handoff
+}
+
+/// Bound on a single rendered line (a command, or an error-excerpt line) in
+/// the `Verification` section: long enough to show a real invocation or
+/// error, short enough that a pathological command or error line (a 5 KB
+/// argument, say) cannot make the handoff arbitrarily large.
+const VERIFICATION_LINE_CHAR_CAP: usize = 200;
+
+/// Collapses arbitrary (possibly multi-line, possibly huge) text into the
+/// single, bounded line the `Verification` section renders. Rendered raw, a
+/// multiline `VerificationOutcome::command` or error-excerpt line could
+/// inject extra Markdown headings into the handoff, or make it arbitrarily
+/// large (review finding F1). Every run of whitespace -- including newlines
+/// -- collapses to one space; the result is then capped to
+/// [`VERIFICATION_LINE_CHAR_CAP`] characters with a trailing `...`.
+fn normalize_rendered_line(text: &str) -> String {
+    let mut collapsed = String::with_capacity(text.len().min(VERIFICATION_LINE_CHAR_CAP + 3));
+    let mut last_was_space = false;
+    for c in text.chars() {
+        if c.is_whitespace() {
+            if !collapsed.is_empty() {
+                last_was_space = true;
+            }
+        } else {
+            if last_was_space {
+                collapsed.push(' ');
+            }
+            collapsed.push(c);
+            last_was_space = false;
+        }
+    }
+    let chars: Vec<char> = collapsed.chars().collect();
+    if chars.len() > VERIFICATION_LINE_CHAR_CAP {
+        let truncated: String = chars[..VERIFICATION_LINE_CHAR_CAP].iter().collect();
+        format!("{truncated}...")
+    } else {
+        collapsed
+    }
+}
+
+/// Renders a `StructuralContext::last_verification` outcome as the single
+/// line the `Verification` section holds: `"none recorded"` when the
+/// transcript never ran anything recognizable as a build/test/lint command,
+/// a pass note, or a fail note carrying up to two error-excerpt lines.
+///
+/// The command and every error-excerpt line are run through
+/// [`normalize_rendered_line`] first (review finding F1), and the command is
+/// rendered behind a fixed `command: ` label inside its own backticks: even
+/// though collapsing already guarantees a single line, the label means the
+/// rendered command text can never itself open the line, so it can never be
+/// mistaken for a Markdown heading.
+fn render_verification(outcome: Option<&VerificationOutcome>) -> String {
+    match outcome {
+        None => "none recorded".to_string(),
+        Some(v) => {
+            let command = normalize_rendered_line(&v.command);
+            if !v.errored {
+                format!("last run (command: `{command}`) passed")
+            } else if v.error_excerpt.is_empty() {
+                format!("last run (command: `{command}`) FAILED")
+            } else {
+                let excerpt = v
+                    .error_excerpt
+                    .iter()
+                    .map(|line| normalize_rendered_line(line))
+                    .collect::<Vec<_>>()
+                    .join(" / ");
+                format!("last run (command: `{command}`) FAILED: {excerpt}")
+            }
+        }
+    }
 }
 
 /// Mechanical extraction used when the distiller is unavailable or unusable.
@@ -162,13 +245,14 @@ pub fn structural(ctx: &StructuralContext) -> Handoff {
         task,
         done,
         remaining,
+        verification: render_verification(ctx.last_verification.as_ref()),
         next_step: "Re-read the files listed below, then continue the task above from where the previous session stopped.".to_string(),
         files_touched: ctx.files_touched.clone(),
         gotchas: vec!["This handoff was extracted mechanically, so it may be incomplete.".to_string()],
     }
 }
 
-pub const DISTILL_PROMPT_VERSION: &str = "v1";
+pub const DISTILL_PROMPT_VERSION: &str = "v2";
 
 fn bullets(items: &[String]) -> String {
     if items.is_empty() {
@@ -181,18 +265,20 @@ pub fn distill_prompt(ctx: &StructuralContext) -> String {
     format!(
         "You are writing a handoff note ({DISTILL_PROMPT_VERSION}) so a fresh session can \
 continue this work with no other context. Answer with markdown only, using exactly these \
-sections in this order: {sections}. Use `## ` headings. Task and Next step are single lines; \
-the rest are bullet lists. Be concrete: real file paths, real commands, real error text. Do \
-not invent progress that is not evidenced below.\n\n\
+sections in this order: {sections}. Use `## ` headings. Task, Verification, and Next step are \
+single lines; the rest are bullet lists. Be concrete: real file paths, real commands, real error \
+text. Do not invent progress that is not evidenced below.\n\n\
 ### Recent user requests\n{requests}\n\
 ### Recent assistant replies\n{replies}\n\
 ### Files the session touched\n{files}\n\
-### Unresolved tool errors\n{errors}",
+### Unresolved tool errors\n{errors}\n\
+### Last verification run\n{verification}\n",
         sections = SECTIONS.join(", "),
         requests = bullets(&ctx.user_messages),
         replies = bullets(&ctx.assistant_texts),
         files = bullets(&ctx.files_touched),
         errors = bullets(&ctx.tool_errors),
+        verification = render_verification(ctx.last_verification.as_ref()),
     )
 }
 
@@ -607,6 +693,7 @@ mod tests {
             assistant_texts: vec!["[zirv] wrote the route".to_string()],
             files_touched: vec!["src/routes/webhook.rs".to_string()],
             tool_errors: vec!["401 from the provider".to_string()],
+            ..StructuralContext::default()
         }
     }
 
@@ -1114,6 +1201,7 @@ mod tests {
                 "Wrote the parser".to_string(),
             ],
             remaining: vec!["Signature verification".to_string()],
+            verification: "last run (`cargo test`) passed".to_string(),
             next_step: "Add a failing test for an invalid signature".to_string(),
             files_touched: vec!["src/routes/webhook.rs".to_string()],
             gotchas: vec!["The provider sends two events per charge".to_string()],
@@ -1179,6 +1267,7 @@ mod tests {
             assistant_texts: vec!["[zirv] narrowed it to the timer".to_string()],
             files_touched: vec!["src/timer.rs".to_string()],
             tool_errors: vec!["assertion failed: expected 3".to_string()],
+            ..StructuralContext::default()
         };
         let handoff = structural(&ctx);
         assert_eq!(handoff.task, "fix the flaky test");
@@ -1202,6 +1291,144 @@ mod tests {
             "a restart must always have something to stand on"
         );
         assert!(handoff.to_markdown().contains("## Task"));
+    }
+
+    /// T2: a successor session restarted into a task cannot tell whether the
+    /// last build/tests were green from anything else in the handoff, so
+    /// this has to be its own, always-present section.
+    #[test]
+    fn structural_reports_no_verification_run_when_none_was_recorded() {
+        let handoff = structural(&StructuralContext::default());
+        assert_eq!(handoff.verification, "none recorded");
+        assert!(
+            handoff
+                .to_markdown()
+                .contains("## Verification\nnone recorded")
+        );
+    }
+
+    #[test]
+    fn structural_reports_a_passing_verification_run() {
+        let ctx = StructuralContext {
+            last_verification: Some(VerificationOutcome {
+                command: "cargo test".to_string(),
+                errored: false,
+                error_excerpt: Vec::new(),
+            }),
+            ..StructuralContext::default()
+        };
+        let handoff = structural(&ctx);
+        assert!(
+            handoff.verification.contains("cargo test"),
+            "got {}",
+            handoff.verification
+        );
+        assert!(handoff.verification.to_lowercase().contains("passed"));
+    }
+
+    #[test]
+    fn structural_reports_a_failing_verification_run_with_its_error_excerpt() {
+        let ctx = StructuralContext {
+            last_verification: Some(VerificationOutcome {
+                command: "cargo nextest run rot::".to_string(),
+                errored: true,
+                error_excerpt: vec![
+                    "assertion failed: `(left == right)`".to_string(),
+                    "left: 40, right: 70".to_string(),
+                ],
+            }),
+            ..StructuralContext::default()
+        };
+        let handoff = structural(&ctx);
+        assert!(handoff.verification.contains("cargo nextest run rot::"));
+        assert!(handoff.verification.contains("FAILED"));
+        assert!(handoff.verification.contains("assertion failed"));
+        assert!(handoff.verification.contains("left: 40, right: 70"));
+    }
+
+    /// Review finding F1: a multiline command (with an embedded heading,
+    /// here) must render on a single line, with no injected `## ` heading
+    /// anywhere in the finished markdown beyond the documented `SECTIONS`.
+    #[test]
+    fn verification_command_with_an_embedded_heading_renders_on_one_line_with_no_injected_heading()
+    {
+        let ctx = StructuralContext {
+            last_verification: Some(VerificationOutcome {
+                command: "cargo test\n## Injected\necho pwned".to_string(),
+                errored: false,
+                error_excerpt: Vec::new(),
+            }),
+            ..StructuralContext::default()
+        };
+        let handoff = structural(&ctx);
+        assert_eq!(
+            handoff.verification.lines().count(),
+            1,
+            "must render as a single line: {}",
+            handoff.verification
+        );
+        assert!(handoff.verification.contains("cargo test"));
+
+        let md = handoff.to_markdown();
+        let heading_count = md.lines().filter(|l| l.starts_with("## ")).count();
+        assert_eq!(
+            heading_count,
+            SECTIONS.len(),
+            "no extra heading may be injected: {md}"
+        );
+    }
+
+    /// Review finding F1: a very large command must be capped, not rendered
+    /// (and stored) verbatim.
+    #[test]
+    fn a_very_large_verification_command_is_capped() {
+        let huge = "x".repeat(5_000);
+        let ctx = StructuralContext {
+            last_verification: Some(VerificationOutcome {
+                command: huge,
+                errored: false,
+                error_excerpt: Vec::new(),
+            }),
+            ..StructuralContext::default()
+        };
+        let handoff = structural(&ctx);
+        assert!(
+            handoff.verification.len() < 1_000,
+            "got len {}: {}",
+            handoff.verification.len(),
+            handoff.verification
+        );
+        assert!(
+            handoff.verification.contains("...`) passed"),
+            "got {}",
+            handoff.verification
+        );
+    }
+
+    /// Review finding F1: an unbounded error-excerpt line must also be
+    /// capped, not just the command.
+    #[test]
+    fn a_very_large_error_excerpt_line_is_capped() {
+        let huge = "y".repeat(5_000);
+        let ctx = StructuralContext {
+            last_verification: Some(VerificationOutcome {
+                command: "cargo test".to_string(),
+                errored: true,
+                error_excerpt: vec![huge],
+            }),
+            ..StructuralContext::default()
+        };
+        let handoff = structural(&ctx);
+        assert!(
+            handoff.verification.len() < 1_000,
+            "got len {}",
+            handoff.verification.len()
+        );
+        assert!(
+            handoff.verification.ends_with("..."),
+            "got {}",
+            handoff.verification
+        );
     }
 
     #[test]

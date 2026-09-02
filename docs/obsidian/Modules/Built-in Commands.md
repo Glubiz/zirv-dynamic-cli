@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-09-01
+last-verified: 2026-09-02
 ---
 
 # Built-in Commands
@@ -99,6 +99,8 @@ The top-level `workflow` tree now includes committed work-product inspection, pr
 **`--accept-preexisting-findings` on `workflow advance` (issue #251, v3.8.0).** A Frontend-profile workflow's Review/Verify frontend-detector gate scans the whole repository and tags every finding `preexisting` when its path was outside the workflow's own since-base change set (see [[Workflows]]'s frontend-gate-scoping section). A blocking finding this change actually introduced always fails `advance`; a pre-existing one can be accepted with this flag, which records `accepted_preexisting_findings {step, at, blocking, total}` on the workflow and waives pre-existing blocking findings for the rest of it — introduced findings are never waived by it. Without the flag, the failure message names the flag and the pre-existing blocking count. `zirv workflow status` and a review package both print `accepted pre-existing frontend findings: N blocking / M total at <step> (<rfc3339>)` once accepted.
 
 **`--profile <standard|frontend>` on `workflow start`, and the new `zirv workflow reclassify <id> --profile <standard|frontend>` (issue #255, v3.8.0).** `--profile` forces a workflow's methodology overlay past automatic classification at start time; `reclassify` forces a *persisted* workflow's profile the same way, without resetting the state machine — completed steps and accepted artifacts survive. Both are recorded as `profile_source: operator override`, shown by `zirv workflow status`'s `profile: <P> (classified|operator override)` line, distinct from the default `classified` source. See [[Workflows]] for the classification threshold change this recovery path exists alongside.
+
+**`workflow advance --run-checks`, and `workflow review dispose --apply-recommended` (harness iteration round 1, 2026-09-02).** `--run-checks` runs a `Test`/`Verify` step's own required evidence command in-process (`zirv test changed`/`zirv verify`) and advances on a pass, printing the evidence summary either way; `--outcome` (previously required) is now optional and mutually exclusive with `--run-checks`. `review dispose --apply-recommended` applies every open review finding's own recommended disposition in one call instead of one `dispose <finding_id> --disposition <d>` per finding — a resolved finding is left alone, an open finding with no recommendation stays open and is still reported. See [[Workflows]]'s Review section for both, and the reviewed-package schema bump (2 -> 4: delta rounds, an accepted-spec excerpt) that landed the same round.
 
 ### `report` (`commands/report.rs`)
 

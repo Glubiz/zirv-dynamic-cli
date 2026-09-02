@@ -896,7 +896,7 @@ fn hash_bytes(bytes: &[u8]) -> String {
     out
 }
 
-fn artifact_hash(path: &Path) -> CtxResult<String> {
+pub(crate) fn artifact_hash(path: &Path) -> CtxResult<String> {
     Ok(hash_bytes(&std::fs::read(path)?))
 }
 
@@ -1028,6 +1028,37 @@ fn append_accepted_artifacts(state: &WorkflowState, rendered: &mut String) -> Ct
         }
     }
     Ok(())
+}
+
+/// Validated read of the accepted `stage` artifact for `state`, for a caller
+/// (the review package excerpt in `review.rs`, most notably) that wants its
+/// text without duplicating the symlink/path-validity checks every other
+/// artifact reader in this module already funnels through
+/// (`workflow_artifact_path`). `Ok(None)` when `stage` has no accepted
+/// artifact yet, or its file has since disappeared; `Err` only for a genuine
+/// validation failure (a symlinked path component, an invalid `rel_path`, an
+/// io error reading the file). Callers that must never let an unreadable or
+/// untrusted artifact block their own work -- unlike `pin_current_artifact`
+/// or `artifact_drift`, which should fail loudly -- MUST treat `Err` here as
+/// "skip it", never surface it as a hard failure.
+pub(crate) fn read_accepted_artifact(
+    state: &WorkflowState,
+    stage: ArtifactStage,
+) -> CtxResult<Option<String>> {
+    let Some(record) = state.artifacts.get(stage.key()) else {
+        return Ok(None);
+    };
+    let Some(accepted) = record.accepted_hash.as_deref() else {
+        return Ok(None);
+    };
+    let path = workflow_artifact_path(state, stage)?;
+    // Same drift rule as `append_accepted_artifacts`: a file whose bytes no
+    // longer hash to the accepted value is not the accepted artifact, so it
+    // is never handed on as accepted content (review finding).
+    if !path.exists() || artifact_hash(&path)? != accepted {
+        return Ok(None);
+    }
+    Ok(Some(std::fs::read_to_string(path)?))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1894,6 +1925,85 @@ pub fn approve(state_dir: &StateDir, mut state: WorkflowState) -> CtxResult<Work
     Ok(state)
 }
 
+/// What became of one open review finding when its own
+/// `recommended_disposition` was applied in bulk -- see
+/// [`apply_recommended_dispositions`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppliedDisposition {
+    pub finding_id: String,
+    /// `Some` when the finding carried a recommendation and was moved to it;
+    /// `None` when it had none and was left `Open`.
+    pub applied: Option<super::review::FindingDisposition>,
+}
+
+/// Applies every *open* review finding's own `recommended_disposition` in one
+/// call, collapsing the per-finding turn cost of `zirv workflow review
+/// dispose` for the common case where a reviewer already recommended a
+/// disposition (review.rs stores it as `ReviewFinding::recommended_
+/// disposition`, read here through that existing field rather than any new
+/// accessor). A finding that is not `Open` (already `Accepted`/`Dismissed`/
+/// `Fixed`/`Residual`) is left untouched and not reported at all -- this is
+/// additive over the single-finding dispose, never a way to revisit a
+/// decision already made. An open finding with no recommendation is left
+/// `Open` and still reported, so the caller can see it was considered and
+/// skipped rather than silently missed.
+///
+/// Called directly by `zirv workflow review dispose --apply-recommended`
+/// (`review::ReviewCommand::Dispose`'s handler): the flag lives on the same
+/// `dispose` verb the single-finding form uses -- a standalone
+/// `DisposeRecommended` subcommand was the stopgap spelling before that flag
+/// was wired up. Mirrors `review.rs`'s own single-finding arm otherwise: the
+/// same load/mutate/save/telemetry shape (its `record_finding_update` is
+/// private to that module, so the telemetry recording is reimplemented here
+/// rather than exposed solely for this one caller), just applied to every
+/// eligible finding instead of one named by id.
+pub fn apply_recommended_dispositions(
+    state_dir: &StateDir,
+    mut state: WorkflowState,
+) -> CtxResult<(WorkflowState, Vec<AppliedDisposition>)> {
+    let mut results = Vec::new();
+    for finding in &mut state.review_findings {
+        if finding.disposition != super::review::FindingDisposition::Open {
+            continue;
+        }
+        results.push(AppliedDisposition {
+            finding_id: finding.id.clone(),
+            applied: finding.recommended_disposition,
+        });
+        if let Some(recommended) = finding.recommended_disposition {
+            finding.disposition = recommended;
+        }
+    }
+    state.updated_at = now_secs();
+    let active = matches!(
+        state.status,
+        WorkflowStatus::Running | WorkflowStatus::AwaitingApproval
+    );
+    save(state_dir, &state, active)?;
+
+    let (findings_total, findings_meaningful, findings_dismissed) =
+        super::telemetry::finding_counts(&state.review_findings);
+    let mut event =
+        super::telemetry::TelemetryEvent::new(super::telemetry::TelemetryKind::FindingUpdated);
+    event.workflow_id = Some(state.id.clone());
+    event.phase = Some(WorkflowPhase::Review);
+    event.intent = Some(state.classification.intent);
+    event.complexity = Some(state.classification.complexity);
+    event.risk = Some(state.classification.risk);
+    event.work_domain = Some(state.classification.work_domain.domain);
+    event.findings_total = findings_total;
+    event.findings_meaningful = findings_meaningful;
+    event.findings_dismissed = findings_dismissed;
+    let _ = super::telemetry::record(
+        state_dir,
+        &state.repo,
+        &event,
+        &super::telemetry::TelemetryConfig::for_repo(&state.repo),
+    );
+
+    Ok((state, results))
+}
+
 /// Forces a persisted workflow's methodology overlay (#255 recovery path: a
 /// misclassified profile previously could only be fixed by abandoning the
 /// workflow). A profile change never adds, removes, or reorders steps --
@@ -2091,7 +2201,9 @@ pub enum WorkflowSubcommand {
     Approve(StateIdArgs),
     /// Record a step result and transition the state machine.
     Advance(AdvanceArgs),
-    /// Build compact review packages and persist finding dispositions.
+    /// Build compact review packages and persist finding dispositions,
+    /// including `review dispose --apply-recommended` -- see
+    /// [`apply_recommended_dispositions`]'s own doc comment.
     Review(super::review::ReviewArgs),
     /// Run deterministic operator-configured maintenance detectors.
     Maintain(super::maintain::MaintainArgs),
@@ -2248,8 +2360,18 @@ fn workflow_artifact_statuses(state: &WorkflowState) -> CtxResult<Vec<WorkflowAr
 #[derive(Debug, Args)]
 pub struct AdvanceArgs {
     pub id: String,
-    #[arg(long, value_enum)]
-    pub outcome: StepOutcome,
+    /// Required unless `--run-checks` is set, which determines the outcome
+    /// itself from the evidence command's own result.
+    #[arg(long, value_enum, required_unless_present = "run_checks")]
+    pub outcome: Option<StepOutcome>,
+    /// For a `Test`/`Verify` step, run the step's own required evidence
+    /// command in-process (`zirv test changed` for `Test`, `zirv verify` for
+    /// `Verify`) and advance on success, printing the evidence summary; on
+    /// failure, print it and do not advance. Collapses "run the gate, then
+    /// advance" into one call. Conflicts with `--outcome`, which the checks'
+    /// own result determines instead.
+    #[arg(long, conflicts_with = "outcome")]
+    pub run_checks: bool,
     #[arg(long)]
     pub repo: Option<PathBuf>,
     #[arg(long)]
@@ -2311,6 +2433,89 @@ fn resolve_frontend_root(path: &Path) -> CtxResult<PathBuf> {
 
 fn resolve_state() -> CtxResult<StateDir> {
     StateDir::resolve(&|key| std::env::var(key).ok())
+}
+
+/// Runs the evidence command a `Test`/`Verify` step itself requires --
+/// `zirv test changed` for `Test`, `zirv verify` for `Verify` -- through the
+/// same in-process function the CLI verb itself calls (never a subprocess),
+/// printing its evidence summary to `writer`. Returns whether it passed.
+/// Backs `zirv workflow advance --run-checks`, which collapses "run the
+/// gate, then advance" into a single call. Any other phase is not something
+/// `--run-checks` knows how to satisfy, so it errors rather than silently
+/// treating the step as passed.
+///
+/// Pass/fail is decided by [`super::verification::latest_is_fresh_and_passing`]
+/// against the report the run above just persisted -- the exact same
+/// baseline-aware gate the plain `zirv workflow advance --outcome success`
+/// path applies to a report from an out-of-process `zirv test changed`/`zirv
+/// verify` run (see the `Test`/`Verify` arm of `advance_with_evidence`).
+/// `run_test`/`run_verify`'s own raw exit code is deliberately not used here:
+/// it reflects the run's unwaived pass/fail, so a report whose only failures
+/// are covered by the operator's recorded baseline (`zirv test baseline`)
+/// exits non-zero even though the same report satisfies the gate -- see the
+/// dogfooding bug where `--run-checks` printed "checks failed" immediately
+/// before a follow-up `--outcome success` against the identical report
+/// advanced with the baseline warning.
+///
+/// Before running, and again after, this snapshots
+/// [`super::verification::latest_report_id`] -- the persisted report's own
+/// identity (a fresh UUID every run). `run_and_persist` swallows a `persist`
+/// failure into a warning so the run's printed results survive a transient
+/// IO error, which means the report `latest_is_fresh_and_passing` would read
+/// afterwards can still be whatever older report preceded this run. If the
+/// identity did not change, no fresh report exists to gate on at all -- so
+/// this fails the step outright rather than falling back to evaluating that
+/// stale report (which could easily still be fresh-and-passing against the
+/// unchanged fingerprint, silently advancing a step whose check just
+/// genuinely failed).
+fn run_required_checks(
+    state_dir: &StateDir,
+    repo: &Path,
+    phase: WorkflowPhase,
+    step_id: &str,
+    writer: &mut impl Write,
+) -> CtxResult<bool> {
+    let before = super::verification::latest_report_id(state_dir, repo)?;
+    let run_args = super::verification::RunArgs {
+        repo: Some(repo.to_path_buf()),
+        checks: Vec::new(),
+        dry_run: false,
+        json: false,
+    };
+    let final_only = match phase {
+        WorkflowPhase::Test => {
+            super::verification::run_test(
+                &super::verification::TestArgs {
+                    command: super::verification::TestCommand::Changed(run_args),
+                },
+                writer,
+            )?;
+            false
+        }
+        WorkflowPhase::Verify => {
+            super::verification::run_verify(
+                &super::verification::VerifyArgs { run: run_args },
+                writer,
+            )?;
+            true
+        }
+        other => {
+            return Err(format!(
+                "--run-checks only applies to Test/Verify steps; the current step is {other:?} -- \
+                 pass --outcome instead"
+            )
+            .into());
+        }
+    };
+    let after = super::verification::latest_report_id(state_dir, repo)?;
+    if after == before {
+        writeln!(
+            writer,
+            "checks ran but no fresh report was persisted; step '{step_id}' was not advanced"
+        )?;
+        return Ok(false);
+    }
+    super::verification::latest_is_fresh_and_passing(state_dir, repo, final_only)
 }
 
 /// Call before pushing `step_id` onto `completed_steps`, while
@@ -2920,6 +3125,25 @@ pub fn run(args: &WorkflowArgs, writer: &mut impl Write) -> CtxResult<i32> {
                 );
                 save(&state_dir, &state, active)?;
             }
+            let outcome = if args.run_checks {
+                let current = state
+                    .current()
+                    .cloned()
+                    .ok_or("workflow has no current step")?;
+                if run_required_checks(&state_dir, &repo, current.phase, &current.id, writer)? {
+                    StepOutcome::Success
+                } else {
+                    writeln!(
+                        writer,
+                        "checks failed; step '{}' was not advanced",
+                        current.id
+                    )?;
+                    return Ok(1);
+                }
+            } else {
+                args.outcome
+                    .ok_or("--outcome is required unless --run-checks is set")?
+            };
             let evidence = enrich_transition_evidence(
                 &mut state,
                 TransitionEvidence {
@@ -2939,7 +3163,7 @@ pub fn run(args: &WorkflowArgs, writer: &mut impl Write) -> CtxResult<i32> {
             let state = advance_with_evidence(
                 &state_dir,
                 state,
-                args.outcome,
+                outcome,
                 Some(&evidence),
                 args.accept_preexisting_findings,
             )?;
@@ -3818,6 +4042,638 @@ mod tests {
         assert_eq!(advanced.current().unwrap().phase, WorkflowPhase::Verify);
     }
 
+    /// #260-adjacent: `zirv workflow advance --run-checks` collapses "run
+    /// the gate, then advance" into one call -- a passing check must both
+    /// print the evidence summary and advance past the `Test` step.
+    #[test]
+    fn advance_run_checks_runs_the_test_gate_and_advances_on_success() {
+        let repo = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.email=t@example.com",
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(repo.path())
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(repo.path().join("README.md"), "readme\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "base"]);
+
+        std::fs::create_dir_all(repo.path().join(".zirv")).unwrap();
+        let passing = if cfg!(windows) { "exit /b 0" } else { "exit 0" };
+        std::fs::write(
+            repo.path().join(".zirv/verify.toml"),
+            format!("schema_version=1\n[[checks]]\nid='unit'\nkind='unit'\ncommand='{passing}'\n"),
+        )
+        .unwrap();
+
+        let mut state = WorkflowState::start(
+            repo.path().to_path_buf(),
+            "small feature".into(),
+            WorkflowKind::Feature,
+            None,
+            true,
+            low_classification(),
+        );
+        let test_index = state
+            .steps
+            .iter()
+            .position(|step| step.phase == WorkflowPhase::Test)
+            .unwrap();
+        state.completed_steps = state.steps[..test_index]
+            .iter()
+            .map(|step| step.id.clone())
+            .collect();
+        state.current_step = test_index;
+        state.status = WorkflowStatus::Running;
+        let id = state.id.clone();
+        save(&state_dir, &state, true).unwrap();
+
+        let _state_dir_env = crate::commands::ctx::testenv::VarGuard::set(&[(
+            "ZIRV_CTX_STATE_DIR",
+            Some(root.path().to_str().expect("utf-8 tempdir path")),
+        )]);
+        let args = WorkflowArgs {
+            command: WorkflowSubcommand::Advance(AdvanceArgs {
+                id: id.clone(),
+                outcome: None,
+                run_checks: true,
+                repo: Some(repo.path().to_path_buf()),
+                json: false,
+                duration_ms: None,
+                agent: None,
+                model: None,
+                role: None,
+                input_tokens: None,
+                output_tokens: None,
+                workers: 0,
+                frontend_root: None,
+                accept_preexisting_findings: false,
+            }),
+        };
+        let mut out = Vec::new();
+        let code = run(&args, &mut out).unwrap();
+        assert_eq!(code, 0, "a passing check must advance");
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("verification"),
+            "expected the evidence summary to be printed, got {text}"
+        );
+
+        let reloaded = load(&state_dir, repo.path(), &id).unwrap();
+        assert_eq!(
+            reloaded.current().unwrap().phase,
+            WorkflowPhase::Verify,
+            "the test step must have advanced"
+        );
+    }
+
+    /// The mirror of the above: a failing check must print the failure and
+    /// leave the workflow exactly where it was, rather than advancing on
+    /// bad evidence.
+    #[test]
+    fn advance_run_checks_does_not_advance_on_failure() {
+        let repo = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.email=t@example.com",
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(repo.path())
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(repo.path().join("README.md"), "readme\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "base"]);
+
+        std::fs::create_dir_all(repo.path().join(".zirv")).unwrap();
+        let failing = if cfg!(windows) { "exit /b 1" } else { "exit 1" };
+        std::fs::write(
+            repo.path().join(".zirv/verify.toml"),
+            format!("schema_version=1\n[[checks]]\nid='unit'\nkind='unit'\ncommand='{failing}'\n"),
+        )
+        .unwrap();
+
+        let mut state = WorkflowState::start(
+            repo.path().to_path_buf(),
+            "small feature".into(),
+            WorkflowKind::Feature,
+            None,
+            true,
+            low_classification(),
+        );
+        let test_index = state
+            .steps
+            .iter()
+            .position(|step| step.phase == WorkflowPhase::Test)
+            .unwrap();
+        state.completed_steps = state.steps[..test_index]
+            .iter()
+            .map(|step| step.id.clone())
+            .collect();
+        state.current_step = test_index;
+        state.status = WorkflowStatus::Running;
+        let id = state.id.clone();
+        save(&state_dir, &state, true).unwrap();
+
+        let _state_dir_env = crate::commands::ctx::testenv::VarGuard::set(&[(
+            "ZIRV_CTX_STATE_DIR",
+            Some(root.path().to_str().expect("utf-8 tempdir path")),
+        )]);
+        let args = WorkflowArgs {
+            command: WorkflowSubcommand::Advance(AdvanceArgs {
+                id: id.clone(),
+                outcome: None,
+                run_checks: true,
+                repo: Some(repo.path().to_path_buf()),
+                json: false,
+                duration_ms: None,
+                agent: None,
+                model: None,
+                role: None,
+                input_tokens: None,
+                output_tokens: None,
+                workers: 0,
+                frontend_root: None,
+                accept_preexisting_findings: false,
+            }),
+        };
+        let mut out = Vec::new();
+        let code = run(&args, &mut out).unwrap();
+        assert_eq!(code, 1, "a failing check must not advance");
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("was not advanced"),
+            "expected the failure to be reported, got {text}"
+        );
+
+        let reloaded = load(&state_dir, repo.path(), &id).unwrap();
+        assert_eq!(
+            reloaded.current().unwrap().phase,
+            WorkflowPhase::Test,
+            "a failing check must leave the workflow on the test step"
+        );
+    }
+
+    /// Dogfooding regression: on a repository with a recorded test baseline
+    /// (`zirv test baseline`), `--run-checks` used to decide pass/fail from
+    /// `run_test`/`run_verify`'s own raw exit code, which reflects the
+    /// unwaived result -- non-zero even when the only failure is already
+    /// covered by the baseline. The very next `--outcome success` against the
+    /// identical persisted report advanced fine, because that path (and the
+    /// gate `--run-checks` now shares) reads the report back through
+    /// `latest_is_fresh_and_passing`, which is baseline-aware. This proves
+    /// `--run-checks` advances in that exact situation instead of reporting
+    /// "checks failed".
+    #[test]
+    fn advance_run_checks_advances_when_the_only_failure_is_baselined() {
+        let repo = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let home = tempdir().unwrap();
+        let _home_guard = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.email=t@example.com",
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(repo.path())
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(repo.path().join("README.md"), "readme\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "base"]);
+
+        super::super::verification::save_baseline(
+            repo.path(),
+            BTreeSet::from(["wrap::tests::a".to_string()]),
+        )
+        .unwrap();
+
+        std::fs::create_dir_all(repo.path().join(".zirv")).unwrap();
+        // A `unit`-kind check whose output has the exact shape
+        // `parse_cargo_test_failure_names`/`FailureNameScanner` recognize --
+        // a `failures:` header naming `wrap::tests::a`, immediately followed
+        // by a `test result: FAILED` line -- and a non-zero exit, so the
+        // check itself is genuinely `Failed`; only the recorded baseline
+        // makes the gate pass.
+        let baselined_failure = if cfg!(windows) {
+            "echo failures: & echo wrap::tests::a & echo test result: FAILED. 0 passed; 1 failed; \
+             0 ignored; 0 measured; 0 filtered out; finished in 0.00s & exit /b 101"
+        } else {
+            "printf \"failures:\\nwrap::tests::a\\ntest result: FAILED. 0 passed; 1 failed; 0 \
+             ignored; 0 measured; 0 filtered out; finished in 0.00s\\n\"; exit 101"
+        };
+        std::fs::write(
+            repo.path().join(".zirv/verify.toml"),
+            format!("schema_version=1\n[[checks]]\nid='unit'\nkind='unit'\ncommand='{baselined_failure}'\n"),
+        )
+        .unwrap();
+
+        let mut state = WorkflowState::start(
+            repo.path().to_path_buf(),
+            "small feature".into(),
+            WorkflowKind::Feature,
+            None,
+            true,
+            low_classification(),
+        );
+        let test_index = state
+            .steps
+            .iter()
+            .position(|step| step.phase == WorkflowPhase::Test)
+            .unwrap();
+        state.completed_steps = state.steps[..test_index]
+            .iter()
+            .map(|step| step.id.clone())
+            .collect();
+        state.current_step = test_index;
+        state.status = WorkflowStatus::Running;
+        let id = state.id.clone();
+        save(&state_dir, &state, true).unwrap();
+
+        let _state_dir_env = crate::commands::ctx::testenv::VarGuard::set(&[(
+            "ZIRV_CTX_STATE_DIR",
+            Some(root.path().to_str().expect("utf-8 tempdir path")),
+        )]);
+        let args = WorkflowArgs {
+            command: WorkflowSubcommand::Advance(AdvanceArgs {
+                id: id.clone(),
+                outcome: None,
+                run_checks: true,
+                repo: Some(repo.path().to_path_buf()),
+                json: false,
+                duration_ms: None,
+                agent: None,
+                model: None,
+                role: None,
+                input_tokens: None,
+                output_tokens: None,
+                workers: 0,
+                frontend_root: None,
+                accept_preexisting_findings: false,
+            }),
+        };
+        let mut out = Vec::new();
+        let code = run(&args, &mut out).unwrap();
+        assert_eq!(
+            code, 0,
+            "a failure fully covered by the recorded baseline must still advance"
+        );
+
+        let reloaded = load(&state_dir, repo.path(), &id).unwrap();
+        assert_eq!(
+            reloaded.current().unwrap().phase,
+            WorkflowPhase::Verify,
+            "the test step must have advanced on the baselined report"
+        );
+    }
+
+    /// Fail-open regression: a stale, still-fingerprint-fresh PASSING report
+    /// already sits at `latest` (fingerprint unchanged since -- nothing in
+    /// the tree moved). The run this `--run-checks` call actually performs
+    /// FAILS, but persisting its report is made to fail too (`latest`'s
+    /// pointer file is read-only, so `run_and_persist`'s `persist` call hits
+    /// a genuine IO error -- swallowed into a warning, never an error, so
+    /// the run's own printed results survive). Before the identity check,
+    /// `latest_is_fresh_and_passing` would still read the untouched stale
+    /// PASSING report and the gate would incorrectly advance. It must not:
+    /// the identity of `latest` is unchanged, so no fresh report exists to
+    /// gate on, and the step must stay put.
+    #[test]
+    fn advance_run_checks_does_not_advance_when_persistence_silently_fails() {
+        let repo = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.email=t@example.com",
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(repo.path())
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(repo.path().join("README.md"), "readme\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "base"]);
+
+        std::fs::create_dir_all(repo.path().join(".zirv")).unwrap();
+        let failing = if cfg!(windows) { "exit /b 1" } else { "exit 1" };
+        std::fs::write(
+            repo.path().join(".zirv/verify.toml"),
+            format!("schema_version=1\n[[checks]]\nid='unit'\nkind='unit'\ncommand='{failing}'\n"),
+        )
+        .unwrap();
+
+        // Seed a stale but still fingerprint-fresh PASSING report at
+        // `latest`, matching the exact tree state above.
+        let fingerprint = super::super::verification::change_fingerprint(repo.path()).unwrap();
+        let stale_passing_report = super::super::verification::VerificationReport {
+            schema_version: super::super::verification::VERIFY_REPORT_SCHEMA_VERSION,
+            id: "stale-pass".into(),
+            mode: super::super::verification::VerificationMode::Changed,
+            source: "configured".into(),
+            repo: repo.path().to_path_buf(),
+            change_fingerprint: fingerprint,
+            changed_paths: vec![],
+            fallback_to_full: false,
+            narrowed_to: vec![],
+            notes: vec![],
+            started_at: 0,
+            finished_at: 0,
+            checks: vec![super::super::verification::CheckResult {
+                id: "unit".into(),
+                kind: super::super::verification::CheckKind::Unit,
+                command: "true".into(),
+                source: super::super::verification::CheckSource::DiscoveredToolchain,
+                status: super::super::verification::CheckStatus::Passed,
+                exit_code: Some(0),
+                duration_ms: 1,
+                failure_output: None,
+                failure_test_names: Vec::new(),
+            }],
+        };
+        super::super::verification::save_report(&state_dir, &stale_passing_report).unwrap();
+
+        // Make the next persist's `latest`-pointer write fail: `write_private`
+        // writes a temp sibling then `rename`s it over `latest`, and on
+        // Windows that rename hits ERROR_ACCESS_DENIED when the destination
+        // is read-only -- confirmed against `std::fs::rename` directly before
+        // writing this test, since the production write path uses exactly
+        // that call.
+        let latest_pointer = state_dir
+            .verification()
+            .join(repo_slug(repo.path()))
+            .join("latest");
+        let original_perms = std::fs::metadata(&latest_pointer).unwrap().permissions();
+        let mut readonly_perms = original_perms.clone();
+        readonly_perms.set_readonly(true);
+        std::fs::set_permissions(&latest_pointer, readonly_perms).unwrap();
+
+        let mut state = WorkflowState::start(
+            repo.path().to_path_buf(),
+            "small feature".into(),
+            WorkflowKind::Feature,
+            None,
+            true,
+            low_classification(),
+        );
+        let test_index = state
+            .steps
+            .iter()
+            .position(|step| step.phase == WorkflowPhase::Test)
+            .unwrap();
+        state.completed_steps = state.steps[..test_index]
+            .iter()
+            .map(|step| step.id.clone())
+            .collect();
+        state.current_step = test_index;
+        state.status = WorkflowStatus::Running;
+        let id = state.id.clone();
+        save(&state_dir, &state, true).unwrap();
+
+        let _state_dir_env = crate::commands::ctx::testenv::VarGuard::set(&[(
+            "ZIRV_CTX_STATE_DIR",
+            Some(root.path().to_str().expect("utf-8 tempdir path")),
+        )]);
+        let args = WorkflowArgs {
+            command: WorkflowSubcommand::Advance(AdvanceArgs {
+                id: id.clone(),
+                outcome: None,
+                run_checks: true,
+                repo: Some(repo.path().to_path_buf()),
+                json: false,
+                duration_ms: None,
+                agent: None,
+                model: None,
+                role: None,
+                input_tokens: None,
+                output_tokens: None,
+                workers: 0,
+                frontend_root: None,
+                accept_preexisting_findings: false,
+            }),
+        };
+        let mut out = Vec::new();
+        let result = run(&args, &mut out);
+
+        // Cleanup before any assertion panics, so the tempdir can still be
+        // removed on drop even if an assertion below fails. Restores the
+        // exact original permissions rather than `set_readonly(false)`,
+        // which clippy flags as leaving the file world-writable on Unix.
+        std::fs::set_permissions(&latest_pointer, original_perms).unwrap();
+
+        let code = result.unwrap();
+        assert_eq!(
+            code, 1,
+            "a genuinely failing run whose report could not be persisted must not advance on a \
+             stale prior report"
+        );
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("no fresh report was persisted"),
+            "expected the persistence-failure reason to be reported, got {text}"
+        );
+
+        let reloaded = load(&state_dir, repo.path(), &id).unwrap();
+        assert_eq!(
+            reloaded.current().unwrap().phase,
+            WorkflowPhase::Test,
+            "the step must not advance on stale evidence when the fresh report never persisted"
+        );
+    }
+
+    /// `--run-checks` only knows how to satisfy a `Test`/`Verify` step's own
+    /// evidence gate; any other current step must fail loudly rather than
+    /// silently treating itself as satisfied.
+    #[test]
+    fn advance_run_checks_rejects_a_non_test_verify_step() {
+        let repo = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+        let state = skip_leading_artifact_steps(WorkflowState::start(
+            repo.path().to_path_buf(),
+            "small feature".into(),
+            WorkflowKind::Feature,
+            None,
+            true,
+            low_classification(),
+        ));
+        assert_eq!(state.current().unwrap().phase, WorkflowPhase::Implement);
+        let id = state.id.clone();
+        save(&state_dir, &state, true).unwrap();
+
+        let _state_dir_env = crate::commands::ctx::testenv::VarGuard::set(&[(
+            "ZIRV_CTX_STATE_DIR",
+            Some(root.path().to_str().expect("utf-8 tempdir path")),
+        )]);
+        let args = WorkflowArgs {
+            command: WorkflowSubcommand::Advance(AdvanceArgs {
+                id: id.clone(),
+                outcome: None,
+                run_checks: true,
+                repo: Some(repo.path().to_path_buf()),
+                json: false,
+                duration_ms: None,
+                agent: None,
+                model: None,
+                role: None,
+                input_tokens: None,
+                output_tokens: None,
+                workers: 0,
+                frontend_root: None,
+                accept_preexisting_findings: false,
+            }),
+        };
+        let mut out = Vec::new();
+        let error = run(&args, &mut out).unwrap_err().to_string();
+        assert!(
+            error.contains("--run-checks") && error.contains("--outcome instead"),
+            "{error}"
+        );
+    }
+
+    fn review_finding(
+        id: &str,
+        disposition: super::super::review::FindingDisposition,
+        recommended: Option<super::super::review::FindingDisposition>,
+    ) -> super::super::review::ReviewFinding {
+        super::super::review::ReviewFinding {
+            id: id.into(),
+            severity: super::super::review::FindingSeverity::Major,
+            summary: "summary".into(),
+            path: None,
+            line: None,
+            disposition,
+            recommended_disposition: recommended,
+            created_at: 0,
+        }
+    }
+
+    /// #260-adjacent (T3, bulk dispose): three open findings with mixed
+    /// recommendations must each land on their own recommended disposition
+    /// in one call; a finding with no recommendation stays `Open` and is
+    /// still reported (not silently dropped); an already-resolved finding is
+    /// left alone and not reported at all.
+    #[test]
+    fn apply_recommended_dispositions_applies_each_open_findings_own_recommendation() {
+        use super::super::review::FindingDisposition as Disposition;
+        let repo = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+        let mut state = WorkflowState::start(
+            repo.path().to_path_buf(),
+            "small feature".into(),
+            WorkflowKind::Feature,
+            None,
+            true,
+            low_classification(),
+        );
+        state.review_findings = vec![
+            review_finding("a", Disposition::Open, Some(Disposition::Fixed)),
+            review_finding("b", Disposition::Open, Some(Disposition::Dismissed)),
+            review_finding("c", Disposition::Open, None),
+            review_finding("d", Disposition::Accepted, Some(Disposition::Fixed)),
+        ];
+        let id = state.id.clone();
+        save(&state_dir, &state, true).unwrap();
+
+        let (state, results) = apply_recommended_dispositions(&state_dir, state).unwrap();
+
+        assert_eq!(
+            results.len(),
+            3,
+            "only the open findings are considered: {results:?}"
+        );
+        let by_id: std::collections::BTreeMap<_, _> = results
+            .iter()
+            .map(|result| (result.finding_id.clone(), result.applied))
+            .collect();
+        assert_eq!(by_id["a"], Some(Disposition::Fixed));
+        assert_eq!(by_id["b"], Some(Disposition::Dismissed));
+        assert_eq!(
+            by_id["c"], None,
+            "no recommendation must be reported as such"
+        );
+
+        let finding = |needle: &str| {
+            state
+                .review_findings
+                .iter()
+                .find(|finding| finding.id == needle)
+                .unwrap()
+        };
+        assert_eq!(finding("a").disposition, Disposition::Fixed);
+        assert_eq!(finding("b").disposition, Disposition::Dismissed);
+        assert_eq!(
+            finding("c").disposition,
+            Disposition::Open,
+            "no recommendation must leave the finding open"
+        );
+        assert_eq!(
+            finding("d").disposition,
+            Disposition::Accepted,
+            "an already-resolved finding must never be revisited"
+        );
+
+        let reloaded = load(&state_dir, repo.path(), &id).unwrap();
+        assert_eq!(
+            reloaded
+                .review_findings
+                .iter()
+                .find(|finding| finding.id == "a")
+                .unwrap()
+                .disposition,
+            Disposition::Fixed,
+            "the applied disposition must persist"
+        );
+    }
+
     #[test]
     fn advance_frontend_root_flag_persists_into_state() {
         let repo = tempdir().unwrap();
@@ -3842,7 +4698,8 @@ mod tests {
         let args = WorkflowArgs {
             command: WorkflowSubcommand::Advance(AdvanceArgs {
                 id: id.clone(),
-                outcome: StepOutcome::Failure,
+                outcome: Some(StepOutcome::Failure),
+                run_checks: false,
                 repo: Some(repo.path().to_path_buf()),
                 json: false,
                 duration_ms: None,
@@ -3909,7 +4766,8 @@ mod tests {
         let args = WorkflowArgs {
             command: WorkflowSubcommand::Advance(AdvanceArgs {
                 id: id.clone(),
-                outcome: StepOutcome::Success,
+                outcome: Some(StepOutcome::Success),
+                run_checks: false,
                 repo: Some(workflow_repo.path().to_path_buf()),
                 json: false,
                 duration_ms: None,
@@ -4525,6 +5383,89 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("symlinked"), "{error}");
+    }
+
+    /// `read_accepted_artifact` is the validated read `review.rs`'s
+    /// `accepted_artifact_excerpt` funnels through instead of opening a
+    /// `WorkflowArtifactRecord.rel_path` directly -- after acceptance, a
+    /// repository writer replacing the accepted artifact file with a symlink
+    /// to an arbitrary local file must be refused, not have its target's
+    /// contents read and handed to an external review worker. Same
+    /// `#[cfg(unix)]` rationale as the two tests above: a real symlink needs
+    /// elevated privileges on Windows.
+    #[cfg(unix)]
+    #[test]
+    fn read_accepted_artifact_refuses_a_symlinked_artifact_file() {
+        use std::os::unix::fs::symlink;
+        let repo = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let secret = outside.path().join("secret.txt");
+        std::fs::write(&secret, "top secret, not for the review worker").unwrap();
+
+        let mut state = WorkflowState::start(
+            repo.path().to_path_buf(),
+            "small feature".into(),
+            WorkflowKind::Feature,
+            None,
+            true,
+            Classification {
+                complexity: Complexity::Bounded,
+                ..low_classification()
+            },
+        );
+        ensure_current_artifact_template(&state).unwrap();
+        let intent_path = workflow_artifact_path(&state, ArtifactStage::Intent).unwrap();
+        std::fs::remove_file(&intent_path).unwrap();
+        symlink(&secret, &intent_path).unwrap();
+        state
+            .artifacts
+            .get_mut(ArtifactStage::Intent.key())
+            .unwrap()
+            .accepted_hash = Some("deadbeef".to_string());
+
+        let error = read_accepted_artifact(&state, ArtifactStage::Intent)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("symlinked"), "{error}");
+    }
+
+    /// Review finding: an accepted artifact whose bytes no longer hash to the
+    /// accepted value is not the accepted artifact, so the validated read
+    /// yields `None` for it -- the same drift rule `append_accepted_artifacts`
+    /// applies -- while an unmodified one still reads back.
+    #[test]
+    fn read_accepted_artifact_rejects_hash_drift_and_accepts_the_pinned_bytes() {
+        let repo = tempdir().unwrap();
+        let mut state = WorkflowState::start(
+            repo.path().to_path_buf(),
+            "small feature".into(),
+            WorkflowKind::Feature,
+            None,
+            true,
+            Classification {
+                complexity: Complexity::Bounded,
+                ..low_classification()
+            },
+        );
+        ensure_current_artifact_template(&state).unwrap();
+        let intent_path = workflow_artifact_path(&state, ArtifactStage::Intent).unwrap();
+        std::fs::write(&intent_path, "# Intent\n\naccepted body\n").unwrap();
+        let pinned = artifact_hash(&intent_path).unwrap();
+        state
+            .artifacts
+            .get_mut(ArtifactStage::Intent.key())
+            .unwrap()
+            .accepted_hash = Some(pinned);
+
+        let body = read_accepted_artifact(&state, ArtifactStage::Intent).unwrap();
+        assert_eq!(body.as_deref(), Some("# Intent\n\naccepted body\n"));
+
+        std::fs::write(&intent_path, "# Intent\n\nedited after acceptance\n").unwrap();
+        assert_eq!(
+            read_accepted_artifact(&state, ArtifactStage::Intent).unwrap(),
+            None,
+            "drifted bytes must never be handed on as the accepted artifact"
+        );
     }
 
     /// Design spec risk-section commitment: `workflow start` warns (does not

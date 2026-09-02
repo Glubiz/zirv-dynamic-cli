@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-09-01
+last-verified: 2026-09-02
 ---
 
 # Decision Log
@@ -51,6 +51,27 @@ last-verified: 2026-09-01
 **Rejected:** Silently ignoring pre-existing findings on a full-surface scan — would hide real accessibility defects from an operator who never asked to waive them. Making the Test gate scan the whole repository like Review/Verify — the Test step's own contract is "does this change pass," not "does the whole repository."
 **Consequences:** A workflow can no longer get stuck failing its own Test gate on a change the current diff never touched; a Review/Verify gate's acceptance is explicit, recorded, and visible in `workflow status`/the review package, never silent.
 **Spec / link:** `src/commands/workflow/{verification,frontend_detector,engine}.rs`; [[Workflows]]'s frontend-gate-scoping paragraph; issue #251.
+
+### 2026-09-02 — The workflow-step prompt layer moves after Context, for cache stability (harness iteration round 1)
+**Context:** `compose` built the workflow-step layer inline, right after `Harness`/`Harnesses` and ahead of `User`/`Repo` and the canonical `.zirv/context/` layer `compile.rs` adds afterward. That layer is recomputed on every workflow step transition, resume, and restart — the same problem memory had before v8 — so every recompute dropped the whole stable prefix after it out of the provider's prompt cache even though none of it had changed.
+**Decision:** `compose` no longer builds a workflow layer at all. `prompt::workflow_context_for_role` (issue #253's Orchestrator-only gate, extracted into its own function) and `prompt::with_workflow_layer` are now called directly by `compile::compile_with_harness_roster`, positioned after the canonical context layer and before the memory layer. `DEFAULT_PROMPT_VERSION` bumped v8 -> v9.
+**Rejected:** Leaving the layer where it was and accepting the cache cost — the whole point of v8's memory move was a cache-stable prefix across a session's turns; leaving one recomputed layer ahead of that prefix undid most of that win for any session running an active workflow.
+**Consequences:** A workflow-driving session's prompt prefix (default/adapter/harness/context) now stays cache-stable across step transitions the same way memory already made it stable across working-tree churn.
+**Spec / link:** `docs/superpowers/specs/2026-09-01-wrapper-behaviour-redesign.md`'s "Round 3" section; [[Ctx Subsystem]]'s Context Compiler section; `src/commands/ctx/{prompt,compile}.rs`.
+
+### 2026-09-02 — The same-error rot signal ships with a zero weight (harness iteration round 1)
+**Context:** `repetition_hits`/`max_repeat` key on `(tool, input_hash)`, so three different fixes that all re-trigger the identical compiler/test error look like unrelated calls rather than a stuck loop. A new signal, `Signals.same_error_repeats` (longest run of consecutive identical normalized tool-error texts), catches that case — but rot signals move real verdicts, and a new one landing live would change existing sessions' behavior with no operator decision involved.
+**Decision:** `same_error_weight` defaults to `0.0` and `same_error_threshold` to `3`, both documented commented-out in `.zirv/ctx.toml`. The signal is computed and scored (`raw += same_error_weight * repetition_component(...)`) but contributes nothing to `score` until an operator raises the weight deliberately.
+**Rejected:** Shipping a nonzero default weight — would change verdicts for every session with a repeated-error pattern the moment this build was installed, with no operator having chosen that; the same "prove it first, opt in second" posture round 2's repetition fix already established was kept rather than relitigated.
+**Consequences:** No existing verdict fixture moves on this build. An operator who wants the signal live raises `same_error_weight` themselves; no `hook.rs::stop_output` advisory clause exists for it yet either — that is a deferred follow-up, not part of this round.
+**Spec / link:** `docs/superpowers/specs/2026-09-01-wrapper-behaviour-redesign.md`'s "Round 3" section; [[Rot Engine]]'s same-error paragraph; `src/commands/ctx/{rot,event,config}.rs`.
+
+### 2026-09-02 — `zirv verify` reuses `zirv test`'s own evidence for an unchanged fingerprint (harness iteration round 1)
+**Context:** A workflow's Test step and Verify step run independently, but Verify usually follows Test with no further edits — every check `zirv test changed` had just run then ran again, unchanged, inside `zirv verify` moments later.
+**Decision:** `reusable_test_evidence` lets a `Final`-mode run reuse a fresh, un-narrowed `Changed`/`All`-mode report's per-check results for the identical change fingerprint, per check by id — a check the Test run never selected still executes for real. Reuse is noted inline in the Verify report (`"reused test evidence from report <id> ..."`), never silent.
+**Rejected:** Reusing across a `--check`-narrowed prior run — a narrowed run is evidence about the checks it ran, not the change set, the same guard `latest_is_fresh_and_passing` already applies; extending trust to it would let a partial run stand in for a full one.
+**Consequences:** A workflow's Verify gate costs noticeably less wall-clock time when nothing changed between Test and Verify, with no loosening of what evidence a step gate accepts — a moved fingerprint still forces a real rerun of everything.
+**Spec / link:** `docs/superpowers/specs/2026-09-01-wrapper-behaviour-redesign.md`'s "Round 3" section; [[Workflows]]'s verify-reuse paragraph; `src/commands/workflow/verification.rs`.
 
 ### 2026-09-01 — Task text alone can no longer select the Frontend profile (issue #255, v3.8.0)
 **Context:** `infer_work_domain` gave task language mentioning "frontend" language a +55 score, above the 45 selection threshold on its own — so a task merely *discussing* something named "frontend" (a permission family, a CLI flag) with entirely backend-facing changed paths still classified as Frontend and pulled in the whole frontend methodology overlay and its evidence gates.

@@ -1,6 +1,6 @@
 //! Compact independent-review packages and inspectable finding disposition.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -11,7 +11,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 use super::classify::RiskBand;
-use super::engine::{self, WorkflowState, WorkflowStatus};
+use super::engine::{self, ArtifactStage, WorkflowState, WorkflowStatus};
 use super::verification::{self, VerificationReport};
 use crate::commands::ctx::CtxResult;
 use crate::commands::ctx::state::{StateDir, now_secs};
@@ -171,10 +171,35 @@ pub struct ReviewRunEvidence {
     pub review_round: u8,
     pub completed_at: u64,
     /// The HEAD sha this reviewer actually reviewed. `None` for evidence
-    /// written before this field existed -- an older zirv -- which
-    /// `delta_base` reads as a broken chain and falls back to the full diff.
+    /// written before this field existed -- an older zirv. T4: no longer read
+    /// by `delta_base` -- a commit sha alone cannot reconstruct the staged,
+    /// unstaged and untracked content layered on top of it that the reviewer
+    /// actually saw, which is exactly the staleness bug T4 fixes (see
+    /// `reviewed_tree_sha` below). Kept purely for display/debugging and as
+    /// the PR-review "did the PR head move" comparison's sibling concept.
     #[serde(default)]
     pub head_sha: Option<String>,
+    /// T4: a git tree object representing the EXACT worktree this reviewer
+    /// reviewed -- `head_sha`'s commit plus every staged/unstaged change to a
+    /// tracked file plus every untracked file the package included, built by
+    /// `compute_reviewed_tree_sha`. `None` for evidence written before this
+    /// field existed (an older zirv, same degrade-gracefully shape `head_sha`
+    /// already has) -- `delta_base` then reads the chain as broken and falls
+    /// back to a full package rather than delta against a commit sha that
+    /// cannot represent the reviewed worktree.
+    #[serde(default)]
+    pub reviewed_tree_sha: Option<String>,
+    /// Every finding's `id` -> `disposition` as of this round's completion
+    /// (after the reviewer's own findings were merged in). T2: the snapshot
+    /// a later round's `package()` diffs the CURRENT `state.review_findings`
+    /// against to decide which findings actually changed since the previous
+    /// round -- see `delta_existing_findings`. Empty for evidence written
+    /// before this field existed (an older zirv, same `#[serde(default)]`
+    /// degrade-gracefully shape `head_sha` already has): every current
+    /// finding then reads as "not in the snapshot", so it is treated as
+    /// changed and resent in full rather than silently dropped.
+    #[serde(default)]
+    pub finding_dispositions: BTreeMap<String, FindingDisposition>,
 }
 
 pub fn depth_for_risk(risk: RiskBand) -> ReviewDepth {
@@ -258,13 +283,55 @@ pub struct PullRequestReference {
     pub url: Option<String>,
 }
 
+/// What kind of git object `ReviewPackage::diff_base_sha` names. T4: added
+/// alongside `reviewed_tree_sha` so a reader can tell the two apart --
+/// notably, `git diff A...B` (triple-dot, merge-base) syntax requires a
+/// commit-ish and will not accept a bare tree object, unlike the plain
+/// `git diff A` this module itself always uses to build the package.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DiffBaseKind {
+    /// `diff_base_sha` is a commit: round 1, a PR review (always round 1),
+    /// or any round whose evidence chain is broken and fell back to the full
+    /// diff against the workflow's `base_sha`.
+    Commit,
+    /// `diff_base_sha` is a git tree object -- the previous round's
+    /// `ReviewRunEvidence::reviewed_tree_sha`, the exact worktree that
+    /// round's reviewer saw, not merely the commit it was built from.
+    Tree,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ReviewPackage {
+    /// This type never round-trips back through zirv itself (`Serialize`
+    /// only, no `Deserialize`) -- a reviewer process is the only reader, so
+    /// this exists purely so it can tell an old package from a new one. 1:
+    /// original shape. 2: added `diff_is_delta`/`diff_base_sha`. 3 (T2):
+    /// `changed_paths`/`existing_findings` became deltas on an intact-chain
+    /// round instead of always resending everything since `base_sha`, and
+    /// `unchanged_existing_findings` was added. 4 (T3): added
+    /// `accepted_spec_excerpt`. 5 (T4): added `diff_base_kind`; a delta
+    /// round's `diff_base_sha` is now the previous round's reviewed git TREE
+    /// (`reviewed_tree_sha`), not its `head_sha` commit -- a commit sha alone
+    /// could not represent the staged/unstaged/untracked content layered on
+    /// top of it, so a fix landing without an intervening commit used to
+    /// silently resend content the previous round already reviewed while
+    /// still labelling the package a delta.
     pub schema_version: u32,
     #[serde(skip)]
     pub repo_root: PathBuf,
     #[serde(skip)]
     pub include_custom_agents: bool,
+    /// T4: the exact worktree THIS package describes, so a later round's
+    /// `delta_base` can diff from it instead of from `head_sha`'s commit.
+    /// Carried on the package (rather than computed again at evidence-write
+    /// time) because the reviewer seat is always read-only -- the worktree
+    /// cannot change between packaging and evidence recording. Never sent to
+    /// the reviewer: `#[serde(skip)]`, exactly like `repo_root` above.
+    /// `None` only for a PR package, which is always round 1 and never
+    /// becomes local review evidence.
+    #[serde(skip)]
+    pub reviewed_tree_sha: Option<String>,
     pub workflow_id: String,
     pub task: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -277,18 +344,38 @@ pub struct ReviewPackage {
     pub head_sha: String,
     /// The sha the packaged `diff` is actually computed against: `base_sha`
     /// on round 1 or whenever the evidence chain is broken, otherwise the
-    /// sha the previous round's reviewer actually reviewed.
+    /// previous round's reviewed tree (see `diff_base_kind`).
     pub diff_base_sha: String,
+    /// What kind of object `diff_base_sha` is -- see `DiffBaseKind`.
+    pub diff_base_kind: DiffBaseKind,
     /// Whether `diff` is a delta since `diff_base_sha` rather than the full
     /// change since `base_sha`. A reviewer must never mistake one for the
     /// other.
     pub diff_is_delta: bool,
     pub change_fingerprint: u64,
+    /// T2: on round 1, or any round whose diff fell back to the full change
+    /// (`!diff_is_delta`), every path changed since `base_sha` -- unchanged
+    /// from before this field's delta behavior existed. On an intact-chain
+    /// delta round, only paths changed since `diff_base_sha`: paths a
+    /// previous round already sent and that have not changed further since
+    /// are left out, the same "not already sent" contract `diff` itself
+    /// already applies.
     pub changed_paths: Vec<PathBuf>,
     pub diff: String,
     pub diff_truncated: bool,
     pub verification: Option<VerificationEvidence>,
+    /// T2: on round 1, or any round whose diff fell back to the full change
+    /// (`!diff_is_delta`), every recorded finding -- unchanged from before
+    /// this field's delta behavior existed. On an intact-chain delta round,
+    /// only findings that are new or whose disposition changed since the
+    /// previous round (`delta_existing_findings`); how many were left out
+    /// because nothing about them changed is `unchanged_existing_findings`.
     pub existing_findings: Vec<ReviewFinding>,
+    /// How many of this workflow's recorded findings were left out of
+    /// `existing_findings` because neither they nor their disposition
+    /// changed since the previous round. Always `0` on round 1 or a
+    /// non-delta round, where `existing_findings` already holds everything.
+    pub unchanged_existing_findings: usize,
     pub review_round: u8,
     pub max_review_rounds: u8,
     /// Set when an operator has accepted this workflow's pre-existing
@@ -297,6 +384,14 @@ pub struct ReviewPackage {
     /// status` reports rather than discovering it only via a passing gate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub accepted_preexisting_findings: Option<engine::AcceptedPreexistingFindings>,
+    /// T3: a bounded excerpt (`accepted_artifact_excerpt`, capped at
+    /// `MAX_ACCEPTED_ARTIFACT_EXCERPT_BYTES`) of whichever accepted spec,
+    /// intent, or plan artifact exists for this workflow, spec preferred --
+    /// so a reviewer judges the diff against what the operator actually
+    /// accepted, not only the one-line `task` description above. `None`
+    /// when nothing has been accepted yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accepted_spec_excerpt: Option<String>,
 }
 
 fn review_round(state: &WorkflowState, current_fingerprint: u64) -> u8 {
@@ -322,39 +417,172 @@ fn review_round(state: &WorkflowState, current_fingerprint: u64) -> u8 {
     evidence_round.max(attempt_round)
 }
 
-/// The sha a later review round should diff FROM: the HEAD the most recent
-/// completed reviewer actually reviewed.
+/// The most recently completed review round's evidence, if any: the same
+/// "latest round, then latest completion within it" selection `delta_base`
+/// has always used to pick the sha a later round diffs from. Factored out
+/// (T2) so `delta_existing_findings` can read the SAME round's `finding_
+/// dispositions` snapshot that `delta_base` reads `head_sha` from, rather
+/// than risking the two ever disagreeing about which round is "the previous
+/// one".
+fn previous_round_evidence(state: &WorkflowState) -> Option<&ReviewRunEvidence> {
+    state
+        .review_evidence
+        .iter()
+        .max_by_key(|evidence| (evidence.review_round, evidence.completed_at))
+}
+
+/// The git tree object a later review round should diff FROM: the EXACT
+/// worktree the most recent completed reviewer actually reviewed, not merely
+/// the commit it was built on top of.
 ///
 /// `None` -- meaning "send the full diff against the workflow's base_sha,
 /// exactly as before" -- whenever the chain cannot be proven intact: round 1,
-/// no evidence at all, evidence written before `head_sha` existed, or a
-/// recorded sha that no longer resolves in this repository (a rebase, a
-/// reset, a fresh clone). A reviewer that silently receives LESS than the
-/// change it is judging is a worse outcome than an expensive review, so
-/// every ambiguous case falls back.
+/// no evidence at all, evidence written before `reviewed_tree_sha` existed
+/// (T4: an old `head_sha`-only record no longer drives a delta at all -- a
+/// commit sha cannot reconstruct the staged/unstaged/untracked content the
+/// previous package layered on top of it, which is exactly the staleness bug
+/// T4 fixes), or a recorded tree that no longer resolves in this repository
+/// (a rebase, a reset, a fresh clone). A reviewer that silently receives LESS
+/// than the change it is judging is a worse outcome than an expensive
+/// review, so every ambiguous case falls back to a full package.
 fn delta_base(state: &WorkflowState, repo: &Path, review_round: u8) -> Option<String> {
     if review_round <= 1 {
         return None;
     }
-    let sha = state
-        .review_evidence
-        .iter()
-        .max_by_key(|evidence| (evidence.review_round, evidence.completed_at))?
-        .head_sha
-        .clone()?;
-    // Must still resolve to a commit in THIS repository, or the diff below
-    // would fail outright rather than degrade.
-    git(
-        repo,
-        &[
-            "rev-parse",
-            "--verify",
-            "--end-of-options",
-            &format!("{sha}^{{commit}}"),
-        ],
-    )
-    .ok()?;
-    Some(sha)
+    let tree_sha = previous_round_evidence(state)?.reviewed_tree_sha.clone()?;
+    // Must still resolve to a tree object in THIS repository, or the diff
+    // below would fail outright rather than degrade.
+    git(repo, &["cat-file", "-e", &format!("{tree_sha}^{{tree}}")]).ok()?;
+    Some(tree_sha)
+}
+
+/// T2: which of `state.review_findings` a reviewer needs to see again on a
+/// delta round, plus how many were left out because nothing about them
+/// changed. Compares each current finding's disposition against the snapshot
+/// `previous_round_evidence` recorded when the previous round completed --
+/// new (no entry in that snapshot) or disposition-changed (a different
+/// entry) findings are returned; everything else is only counted.
+///
+/// Caller's responsibility, not this function's: only call this on a round
+/// that is actually a delta (`diff_is_delta`); round 1 and any round with a
+/// broken evidence chain must send every finding in full, the same
+/// unconditional way they always have, and this function has no way to
+/// distinguish "genuinely no previous round" from "previous round's snapshot
+/// was empty" -- both look identical here (every finding treated as
+/// changed), which is the correct, safe answer for the first but a needless
+/// full resend for the second when the caller already knows better.
+fn delta_existing_findings(state: &WorkflowState) -> (Vec<ReviewFinding>, usize) {
+    let previous = previous_round_evidence(state)
+        .map(|evidence| &evidence.finding_dispositions)
+        .cloned()
+        .unwrap_or_default();
+    let mut changed = Vec::new();
+    let mut unchanged = 0usize;
+    for finding in &state.review_findings {
+        if previous.get(&finding.id) == Some(&finding.disposition) {
+            unchanged += 1;
+        } else {
+            changed.push(finding.clone());
+        }
+    }
+    (changed, unchanged)
+}
+
+/// T3: which accepted artifact `accepted_artifact_excerpt` prefers when more
+/// than one is accepted -- spec is the most concrete statement of what must
+/// actually be true of the change, intent the next most concrete, plan the
+/// least (it says how, not what "done" means).
+const ACCEPTED_ARTIFACT_PRIORITY: [ArtifactStage; 3] = [
+    ArtifactStage::Spec,
+    ArtifactStage::Intent,
+    ArtifactStage::Plan,
+];
+
+/// Markdown heading text (lowercased, leading `#`s and surrounding whitespace
+/// stripped) pulled to the front of `accepted_artifact_excerpt`'s output --
+/// what `SPEC_TEMPLATE`/`INTENT_TEMPLATE` (`engine.rs`) call the sections
+/// that state what a change must actually satisfy, as opposed to background
+/// or design prose that a bounded excerpt would otherwise spend its budget
+/// on first.
+const PRIORITY_EXCERPT_HEADINGS: &[&str] = &["acceptance criteria", "goals"];
+
+/// T3: the excerpt cap. Bounded so a reviewer's judging context grows by a
+/// fixed, small amount regardless of how long the accepted artifact is --
+/// the same "cap it, don't just trust the source not to be huge" discipline
+/// every other injected section in a review package already follows.
+const MAX_ACCEPTED_ARTIFACT_EXCERPT_BYTES: usize = 2 * 1024;
+
+/// Splits markdown `text` at each ATX heading line (one or more leading `#`)
+/// into (lowercased heading text, block text including the heading line
+/// itself and everything under it up to the next heading) pairs. Any text
+/// before the first heading becomes one leading pair with an empty heading
+/// key -- never matched by `PRIORITY_EXCERPT_HEADINGS`, so it always sorts
+/// into the non-priority group.
+fn markdown_sections(text: &str) -> Vec<(String, String)> {
+    let mut sections: Vec<(String, String)> = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('#') {
+            let heading = trimmed.trim_start_matches('#').trim().to_ascii_lowercase();
+            sections.push((heading, format!("{line}\n")));
+            continue;
+        }
+        match sections.last_mut() {
+            Some((_, body)) => {
+                body.push_str(line);
+                body.push('\n');
+            }
+            None => sections.push((String::new(), format!("{line}\n"))),
+        }
+    }
+    sections
+}
+
+/// T3: a bounded excerpt of whichever accepted spec/intent/plan artifact
+/// exists for `state`, for a reviewer to judge the change against instead of
+/// only the operator's one-line `task` description. `None` when nothing is
+/// accepted yet, matching every other optional layer in this package.
+///
+/// Reads through `engine::read_accepted_artifact`, the same validated,
+/// symlink-checked path every other artifact reader in the workflow engine
+/// funnels through (`workflow_artifact_path` / `refuse_symlinked_artifact_
+/// path`) -- a repo-owned artifact record's `rel_path` is untrusted (see
+/// `CLAUDE.md`'s "repo-owned surfaces" rule), and a writer who replaces an
+/// already-accepted artifact with a symlink after acceptance must not be
+/// able to smuggle an arbitrary local file into a review package excerpt.
+/// A validation failure (or any other read failure) is never a hard error
+/// here: it degrades to `None`, exactly like "nothing accepted yet", after
+/// logging a warning so the skip is visible without blocking packaging.
+fn accepted_artifact_excerpt(state: &WorkflowState) -> Option<String> {
+    let stage = ACCEPTED_ARTIFACT_PRIORITY.iter().copied().find(|stage| {
+        state
+            .artifacts
+            .values()
+            .any(|record| record.stage == *stage && record.accepted_hash.is_some())
+    })?;
+    let text = match engine::read_accepted_artifact(state, stage) {
+        Ok(Some(text)) => text,
+        Ok(None) => return None,
+        Err(error) => {
+            eprintln!("warning: skipping accepted {stage} artifact excerpt: {error}");
+            return None;
+        }
+    };
+    let (priority, rest): (Vec<_>, Vec<_>) = markdown_sections(&text)
+        .into_iter()
+        .partition(|(heading, _)| PRIORITY_EXCERPT_HEADINGS.contains(&heading.as_str()));
+    let mut reordered = String::new();
+    for (_, body) in priority.into_iter().chain(rest) {
+        reordered.push_str(&body);
+    }
+    let trimmed = reordered.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(crate::utils::truncate_bytes(
+        trimmed.to_string(),
+        Some(MAX_ACCEPTED_ARTIFACT_EXCERPT_BYTES),
+    ))
 }
 
 fn git(repo: &Path, args: &[&str]) -> CtxResult<String> {
@@ -372,6 +600,80 @@ fn git(repo: &Path, args: &[&str]) -> CtxResult<String> {
         .into());
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Same contract as `git`, but the child runs against a throwaway
+/// `GIT_INDEX_FILE` rather than the repository's real index -- used only by
+/// `compute_reviewed_tree_sha` to build a tree object without ever staging
+/// anything in the real working copy.
+fn git_with_index(repo: &Path, index: &Path, args: &[&str]) -> CtxResult<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .env("GIT_INDEX_FILE", index)
+        .args(args)
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// A throwaway git index file path under the OS temp directory, deleted on
+/// drop regardless of how the scope holding it exits -- so a git failure
+/// partway through building `compute_reviewed_tree_sha`'s tree never leaves a
+/// stray index file behind. Deliberately not `tempfile::NamedTempFile`:
+/// `tempfile` is a dev-dependency only, and this runs in production code.
+struct TempIndex(PathBuf);
+
+impl TempIndex {
+    fn new() -> Self {
+        Self(std::env::temp_dir().join(format!("zirv-review-tree-{}.idx", uuid::Uuid::new_v4())))
+    }
+}
+
+impl Drop for TempIndex {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// T4: builds a git tree object representing the EXACT worktree a review
+/// package's `diff` and untracked-file section describe -- `HEAD` plus every
+/// staged/unstaged change to a tracked file (the same content a plain
+/// `git diff <commit>` already exposes), plus every untracked file the
+/// package itself would include, respecting `.gitignore` and excluding
+/// `.zirv/work/**` workflow bookkeeping the same way `package()`'s own
+/// untracked scan already does (`super::classify::is_workflow_work_path`).
+///
+/// Built entirely through a throwaway index file (`GIT_INDEX_FILE`) so the
+/// repository's REAL index is never staged, touched, or left dirty by this
+/// read-only operation -- verified by
+/// `computing_the_reviewed_tree_sha_leaves_the_real_index_untouched`.
+fn compute_reviewed_tree_sha(repo: &Path) -> CtxResult<String> {
+    let index = TempIndex::new();
+    git_with_index(repo, &index.0, &["read-tree", "HEAD"])?;
+    git_with_index(repo, &index.0, &["add", "-A"])?;
+    // `--ignore-unmatch` makes a repository with no `.zirv/work` path at all
+    // (the common case) a normal, successful no-op rather than an error.
+    git_with_index(
+        repo,
+        &index.0,
+        &[
+            "rm",
+            "--cached",
+            "-r",
+            "--ignore-unmatch",
+            "--",
+            ".zirv/work",
+        ],
+    )?;
+    git_with_index(repo, &index.0, &["write-tree"])
 }
 
 /// The diff base both this module and `classify` measure against, so the two
@@ -766,9 +1068,13 @@ fn package_pull_request(
     let change_fingerprint = pr_fingerprint(&view.head_ref_oid)?;
     let required_reviews = required_independent_reviews_for(state);
     Ok(ReviewPackage {
-        schema_version: 2,
+        schema_version: 5,
         repo_root: state.repo.clone(),
         include_custom_agents: state.include_custom_skills,
+        // A PR review is inspection-only and never becomes local review
+        // evidence (see the caller's own comment on that), so there is no
+        // worktree to snapshot here.
+        reviewed_tree_sha: None,
         workflow_id: state.id.clone(),
         task: state.task.clone(),
         pull_request: Some(PullRequestReference {
@@ -790,6 +1096,7 @@ fn package_pull_request(
         base_sha: view.base_ref_oid.clone(),
         head_sha: view.head_ref_oid.clone(),
         diff_base_sha: view.base_ref_oid,
+        diff_base_kind: DiffBaseKind::Commit,
         diff_is_delta: false,
         change_fingerprint,
         changed_paths: view
@@ -800,10 +1107,15 @@ fn package_pull_request(
         diff,
         diff_truncated,
         verification: None,
+        // A PR review is always packaged as round 1 (see `review_round: 1`
+        // just below), so this stays the full list -- never a delta -- the
+        // same "round 1 is never a delta" rule `package()` follows.
         existing_findings: state.review_findings.clone(),
+        unchanged_existing_findings: 0,
         review_round: 1,
         max_review_rounds: MAX_FIX_REVIEW_ROUNDS,
         accepted_preexisting_findings: state.accepted_preexisting_findings.clone(),
+        accepted_spec_excerpt: accepted_artifact_excerpt(state),
     })
 }
 
@@ -1303,12 +1615,16 @@ pub fn package(
     }
     // Round 1, or any break in the evidence chain, packages the full diff
     // against `base_sha` exactly as before. A later round with an intact
-    // chain packages only what changed since the last reviewed sha -- the
-    // reviewer still gets `changed_paths` (against `base_sha`, below) and
-    // `existing_findings` for full context.
-    let diff_base_sha =
-        delta_base(state, &state.repo, review_round).unwrap_or_else(|| base_sha.clone());
-    let diff_is_delta = diff_base_sha != base_sha;
+    // chain packages only what changed since the last reviewed TREE -- T2:
+    // `changed_paths` (below) and `existing_findings` now follow the same
+    // delta shape, rather than resending everything a previous round already
+    // sent. T4: the base is a tree object (the exact worktree the previous
+    // round reviewed), never a commit -- see `delta_base`.
+    let (diff_base_sha, diff_base_kind) = match delta_base(state, &state.repo, review_round) {
+        Some(tree_sha) => (tree_sha, DiffBaseKind::Tree),
+        None => (base_sha.clone(), DiffBaseKind::Commit),
+    };
+    let diff_is_delta = matches!(diff_base_kind, DiffBaseKind::Tree);
     // `git diff <base>` includes committed branch changes plus current staged
     // and unstaged edits. Git omits untracked files, so include bounded file
     // bodies for those explicitly and union them into the changed path list.
@@ -1330,11 +1646,20 @@ pub fn package(
             .filter(|path| !super::classify::is_workflow_work_path(path))
             .collect();
     append_untracked(&mut diff, &mut diff_truncated, &state.repo, &untracked)?;
-    // Always the full set of files touched since `base_sha`, never just the
-    // delta -- a reviewer holding a partial diff still needs to know the
-    // complete surface this change reaches.
+    // T2: computed against `diff_base_sha`, not always `base_sha` -- on
+    // round 1, or any round whose diff fell back to the full change,
+    // `diff_base_sha == base_sha` (see above), so this is still every file
+    // touched since the workflow's base, unchanged from before this existed.
+    // On an intact-chain delta round it is only what changed since the last
+    // reviewed sha, the same base the packaged `diff` itself is already
+    // scoped to -- a path a previous round already sent, and that has not
+    // changed further since, is left out. Untracked files have no sha to
+    // diff against either way, so they are always included in full: there is
+    // no cheap way to know whether a previous round already reported a given
+    // untracked path without persisting that set, and an untracked file is
+    // rare enough that resending it is not the cost this field exists to cut.
     let mut changed_paths: BTreeSet<PathBuf> =
-        git(&state.repo, &["diff", "--name-only", &base_sha])?
+        git(&state.repo, &["diff", "--name-only", &diff_base_sha])?
             .lines()
             .filter(|line| !line.is_empty())
             .map(PathBuf::from)
@@ -1342,14 +1667,25 @@ pub fn package(
             .collect();
     changed_paths.extend(untracked);
     let changed_paths = changed_paths.into_iter().collect();
+    let (existing_findings, unchanged_existing_findings) = if diff_is_delta {
+        delta_existing_findings(state)
+    } else {
+        (state.review_findings.clone(), 0)
+    };
     let verification = verification::load_latest(state_dir, &state.repo)?
         .map(|report| VerificationEvidence::from_report(report, current_fingerprint, &state.repo));
     let required_reviews = required_independent_reviews_for(state);
     let escalated = required_reviews > required_independent_reviews(state.classification.risk);
+    // T4: snapshotted for THIS package so a later round's `delta_base` can
+    // diff against exactly what this reviewer is about to see -- the
+    // reviewer seat is always read-only, so nothing can change this worktree
+    // between now and when the evidence for this round gets recorded.
+    let reviewed_tree_sha = compute_reviewed_tree_sha(&state.repo)?;
     Ok(ReviewPackage {
-        schema_version: 2,
+        schema_version: 5,
         repo_root: state.repo.clone(),
         include_custom_agents: state.include_custom_skills,
+        reviewed_tree_sha: Some(reviewed_tree_sha),
         workflow_id: state.id.clone(),
         task: state.task.clone(),
         pull_request: None,
@@ -1366,16 +1702,19 @@ pub fn package(
         base_sha,
         head_sha,
         diff_base_sha,
+        diff_base_kind,
         diff_is_delta,
         change_fingerprint: current_fingerprint,
         changed_paths,
         diff,
         diff_truncated,
         verification,
-        existing_findings: state.review_findings.clone(),
+        existing_findings,
+        unchanged_existing_findings,
         review_round,
         max_review_rounds: MAX_FIX_REVIEW_ROUNDS,
         accepted_preexisting_findings: state.accepted_preexisting_findings.clone(),
+        accepted_spec_excerpt: accepted_artifact_excerpt(state),
     })
 }
 
@@ -1470,9 +1809,19 @@ pub struct AddFindingArgs {
 #[derive(Debug, Args)]
 pub struct DisposeFindingArgs {
     pub workflow_id: String,
-    pub finding_id: String,
-    #[arg(long, value_enum)]
-    pub disposition: FindingDisposition,
+    /// Required unless `--apply-recommended` is set, which disposes every
+    /// open finding via its own recommendation instead of naming one.
+    #[arg(required_unless_present = "apply_recommended")]
+    pub finding_id: Option<String>,
+    /// Required unless `--apply-recommended` is set; see `finding_id`.
+    #[arg(long, value_enum, required_unless_present = "apply_recommended")]
+    pub disposition: Option<FindingDisposition>,
+    /// Apply every *open* finding's own `recommended_disposition` in one
+    /// call (`engine::apply_recommended_dispositions`) instead of naming one
+    /// finding/disposition pair. Conflicts with `finding_id`/`disposition`:
+    /// this is one shape or the other, never both in the same invocation.
+    #[arg(long, conflicts_with_all = ["finding_id", "disposition"])]
+    pub apply_recommended: bool,
     #[arg(long)]
     pub repo: Option<PathBuf>,
 }
@@ -2025,11 +2374,30 @@ fn build_reviewer_prompt(
     // reviewed commit will report false findings about code it cannot see.
     let delta_notice = if package.diff_is_delta {
         format!(
-            "This `diff` covers only what changed since the previously reviewed commit {}; it is NOT the full change. `changed_paths` lists every file this change touches, and `existing_findings` lists what earlier rounds already recorded -- consult those instead of assuming this diff is complete.\n\n",
-            package.diff_base_sha
+            "This `diff` covers only what changed since the previously reviewed commit {}; it is NOT the full change. `changed_paths` lists only paths touched since that commit, not every path this change has ever touched. `existing_findings` lists only findings that are new or whose disposition changed since the previous round -- {} earlier finding{} unchanged since then and omitted here (see `unchanged_existing_findings`); do not assume this diff, `changed_paths`, or `existing_findings` is complete on its own.\n\n",
+            package.diff_base_sha,
+            package.unchanged_existing_findings,
+            if package.unchanged_existing_findings == 1 {
+                " is"
+            } else {
+                "s are"
+            }
         )
     } else {
         String::new()
+    };
+    // T3: `task` is only ever the operator's one-line description; when a
+    // more concrete accepted artifact exists, a reviewer that judges the
+    // diff against `task` alone can pass a change that satisfies the
+    // one-liner but misses acceptance criteria or goals the operator
+    // actually signed off on.
+    let accepted_spec_notice = if package.accepted_spec_excerpt.is_some() {
+        "The package's `accepted_spec_excerpt` field holds a bounded excerpt of this workflow's \
+         accepted spec, intent, or plan artifact. Judge the diff against what it actually \
+         requires -- acceptance criteria, goals, explicit non-goals -- not only the one-line \
+         `task` description below.\n\n"
+    } else {
+        ""
     };
     // #229/#232: earlier prompt text showed one example value per field and
     // left the reviewer to guess the rest of the enum, which produced
@@ -2040,7 +2408,7 @@ fn build_reviewer_prompt(
     // `normalize_disposition`) is a safety net for this prompt, not a
     // substitute for it.
     Ok(format!(
-        "{bound_notice}{delta_notice}Review the following compact Zirv review package. Do not modify files. \
+        "{bound_notice}{delta_notice}{accepted_spec_notice}Review the following compact Zirv review package. Do not modify files. \
          In the package's `verification` field, `passed:false` together with \
          `passed_with_baseline_waiver:true` means every failing test is in the operator's \
          recorded baseline (`waived_failing_tests`) and the gate passed -- treat it as \
@@ -2319,6 +2687,15 @@ fn run_independent_review(
         // happen on a converged round: convergence is a stopping rule, not a
         // skip. What changes is only whether another round is demanded.
         append_reviewer_findings(&mut state, incoming_findings)?;
+        // T2: snapshotted AFTER the merge above, so a later round's
+        // `delta_existing_findings` compares against every finding this
+        // round actually ended with -- including the ones this very
+        // reviewer just added -- not a stale pre-merge view.
+        let finding_dispositions = state
+            .review_findings
+            .iter()
+            .map(|finding| (finding.id.clone(), finding.disposition))
+            .collect();
         state.review_evidence.push(ReviewRunEvidence {
             id: uuid::Uuid::new_v4().to_string(),
             change_fingerprint: package.change_fingerprint,
@@ -2326,6 +2703,10 @@ fn run_independent_review(
             review_round: package.review_round,
             completed_at: now_secs(),
             head_sha: Some(package.head_sha.clone()),
+            // T4: the worktree this local package computed at packaging
+            // time, always `Some` for a local (non-PR) package.
+            reviewed_tree_sha: package.reviewed_tree_sha.clone(),
+            finding_dispositions,
         });
         let overflow = state
             .review_evidence
@@ -2417,6 +2798,20 @@ pub fn run(args: &ReviewArgs, writer: &mut impl Write) -> CtxResult<i32> {
                 }
                 writeln!(writer, "depth: {:?}", package.review_depth)?;
                 writeln!(writer, "changed paths: {}", package.changed_paths.len())?;
+                if package.unchanged_existing_findings > 0 {
+                    writeln!(
+                        writer,
+                        "existing findings: {} ({} unchanged, omitted)",
+                        package.existing_findings.len(),
+                        package.unchanged_existing_findings
+                    )?;
+                } else {
+                    writeln!(
+                        writer,
+                        "existing findings: {}",
+                        package.existing_findings.len()
+                    )?;
+                }
                 writeln!(
                     writer,
                     "diff bytes: {}{}",
@@ -2511,17 +2906,50 @@ pub fn run(args: &ReviewArgs, writer: &mut impl Write) -> CtxResult<i32> {
             writeln!(writer, "{}", finding.id)?;
         }
         ReviewCommand::Dispose(args) => {
-            let (state_dir, mut state) = state_and_repo(args.repo.as_deref(), &args.workflow_id)?;
-            let finding = state
-                .review_findings
-                .iter_mut()
-                .find(|finding| finding.id == args.finding_id)
-                .ok_or("review finding not found")?;
-            finding.disposition = args.disposition;
-            state.updated_at = now_secs();
-            save_state(&state_dir, &state)?;
-            record_finding_update(&state_dir, &state);
-            writeln!(writer, "{}: {:?}", args.finding_id, args.disposition)?;
+            let (state_dir, state) = state_and_repo(args.repo.as_deref(), &args.workflow_id)?;
+            if args.apply_recommended {
+                // `--apply-recommended`: every *open* finding's own
+                // `recommended_disposition` at once (`engine::
+                // apply_recommended_dispositions`'s own doc comment), one
+                // line per finding -- applied dispositions and open findings
+                // with no recommendation alike, so an operator sees every
+                // finding was considered rather than only the ones that
+                // moved.
+                let (_, results) = engine::apply_recommended_dispositions(&state_dir, state)?;
+                for result in &results {
+                    match result.applied {
+                        Some(disposition) => {
+                            writeln!(writer, "{}: {:?}", result.finding_id, disposition)?
+                        }
+                        None => {
+                            writeln!(writer, "{}: open (no recommendation)", result.finding_id)?
+                        }
+                    }
+                }
+            } else {
+                // Clap's `required_unless_present`/`conflicts_with_all` on
+                // `DisposeFindingArgs` guarantee both are `Some` here; the
+                // `ok_or` guards this arm against a future caller that
+                // constructs the args directly rather than through clap.
+                let finding_id = args
+                    .finding_id
+                    .as_deref()
+                    .ok_or("finding_id is required unless --apply-recommended is set")?;
+                let disposition = args
+                    .disposition
+                    .ok_or("--disposition is required unless --apply-recommended is set")?;
+                let mut state = state;
+                let finding = state
+                    .review_findings
+                    .iter_mut()
+                    .find(|finding| finding.id == finding_id)
+                    .ok_or("review finding not found")?;
+                finding.disposition = disposition;
+                state.updated_at = now_secs();
+                save_state(&state_dir, &state)?;
+                record_finding_update(&state_dir, &state);
+                writeln!(writer, "{finding_id}: {disposition:?}")?;
+            }
         }
         ReviewCommand::List(args) => {
             let (_, state) = state_and_repo(args.repo.as_deref(), &args.id)?;
@@ -2600,6 +3028,20 @@ mod tests {
             .filter(|line| !line.is_empty())
             .map(str::to_string)
             .collect()
+    }
+
+    /// The tree object a commit points at -- what a test uses as a fixture's
+    /// `reviewed_tree_sha` when the state it is simulating had nothing
+    /// uncommitted at the time that round "reviewed", so `commit^{tree}` and
+    /// `compute_reviewed_tree_sha`'s own output at that point coincide.
+    fn tree_sha_of(repo: &Path, commit_sha: &str) -> String {
+        let output = Command::new("git")
+            .args(["rev-parse", &format!("{commit_sha}^{{tree}}")])
+            .current_dir(repo)
+            .output()
+            .expect("run git rev-parse");
+        assert!(output.status.success(), "git rev-parse ^{{tree}} failed");
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
     }
 
     /// A `WorkflowState` at `WorkflowStatus::Running` on a
@@ -3913,6 +4355,8 @@ checksum = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f80"
             review_round: 1,
             completed_at: now_secs(),
             head_sha: None,
+            reviewed_tree_sha: None,
+            finding_dispositions: BTreeMap::new(),
         });
         assert_eq!(review_round(&state, 10), 1);
         assert_eq!(review_round(&state, 11), 2);
@@ -3923,6 +4367,8 @@ checksum = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f80"
             review_round: 2,
             completed_at: now_secs(),
             head_sha: None,
+            reviewed_tree_sha: None,
+            finding_dispositions: BTreeMap::new(),
         });
         assert_eq!(review_round(&state, 12), 3);
     }
@@ -3930,11 +4376,13 @@ checksum = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f80"
     /// Issue #155, Phase 4(b): round 2 of a fix loop re-sent every byte round
     /// 1 already sent -- the full diff against the workflow's fixed base_sha,
     /// to every reviewer, every round, capped at 96 KiB (~24k tokens). Round
-    /// 2 onward diffs from the sha the LAST reviewer actually reviewed.
+    /// 2 onward diffs from the TREE the LAST reviewer actually reviewed (T4:
+    /// no longer the commit sha alone -- see `reviewed_tree_sha`).
     #[test]
     fn a_later_round_diffs_from_the_last_reviewed_sha_not_the_workflow_base() {
         let repo = git_repo_with_commits(&["base", "first change", "fix after review"]);
         let shas = git_log_shas(repo.path()); // oldest first
+        let reviewed_tree = tree_sha_of(repo.path(), &shas[1]);
         let mut state = running_review_state(repo.path(), &shas[0]);
         state.review_evidence.push(ReviewRunEvidence {
             id: "ev-1".to_string(),
@@ -3943,10 +4391,12 @@ checksum = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f80"
             review_round: 1,
             completed_at: 10,
             head_sha: Some(shas[1].clone()),
+            reviewed_tree_sha: Some(reviewed_tree.clone()),
+            finding_dispositions: BTreeMap::new(),
         });
 
         let base = delta_base(&state, repo.path(), 2).expect("a delta base for round 2");
-        assert_eq!(base, shas[1], "the sha round 1 actually reviewed");
+        assert_eq!(base, reviewed_tree, "the tree round 1 actually reviewed");
         assert_eq!(
             delta_base(&state, repo.path(), 1),
             None,
@@ -3963,19 +4413,24 @@ checksum = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f80"
         let shas = git_log_shas(repo.path());
         let base_state = running_review_state(repo.path(), &shas[0]);
 
-        // (1) evidence with no recorded sha -- written by an older zirv.
-        let mut no_sha = base_state.clone();
-        no_sha.review_evidence.push(ReviewRunEvidence {
+        // (1) evidence with no recorded tree sha -- written by an older zirv
+        // (T4: `head_sha` alone no longer drives a delta; see
+        // `old_evidence_without_a_reviewed_tree_sha_forces_a_full_package_not_a_stale_delta`
+        // for the full-package assertion this leads to).
+        let mut no_tree = base_state.clone();
+        no_tree.review_evidence.push(ReviewRunEvidence {
             id: "ev-1".to_string(),
             change_fingerprint: 1,
             adapter: "codex".to_string(),
             review_round: 1,
             completed_at: 10,
-            head_sha: None,
+            head_sha: Some(shas[1].clone()),
+            reviewed_tree_sha: None,
+            finding_dispositions: BTreeMap::new(),
         });
-        assert_eq!(delta_base(&no_sha, repo.path(), 2), None);
+        assert_eq!(delta_base(&no_tree, repo.path(), 2), None);
 
-        // (2) a recorded sha that no longer resolves -- a rebase or a reset.
+        // (2) a recorded tree that no longer resolves -- a rebase or a reset.
         let mut gone = base_state.clone();
         gone.review_evidence.push(ReviewRunEvidence {
             id: "ev-1".to_string(),
@@ -3983,12 +4438,91 @@ checksum = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f80"
             adapter: "codex".to_string(),
             review_round: 1,
             completed_at: 10,
-            head_sha: Some("0".repeat(40)),
+            head_sha: Some(shas[1].clone()),
+            reviewed_tree_sha: Some("0".repeat(40)),
+            finding_dispositions: BTreeMap::new(),
         });
         assert_eq!(delta_base(&gone, repo.path(), 2), None);
 
         // (3) no evidence at all.
         assert_eq!(delta_base(&base_state, repo.path(), 2), None);
+    }
+
+    /// T4, test (2) of the fix: old evidence that only ever recorded a
+    /// `head_sha` (written before `reviewed_tree_sha` existed) must send a
+    /// FULL package, not a delta against that commit -- a commit sha alone
+    /// cannot reconstruct the staged/unstaged/untracked content the previous
+    /// round actually reviewed on top of it.
+    #[test]
+    fn old_evidence_without_a_reviewed_tree_sha_forces_a_full_package_not_a_stale_delta() {
+        let repo = git_repo_with_commits(&["base", "first change"]);
+        let shas = git_log_shas(repo.path());
+        let mut state = running_review_state(repo.path(), &shas[0]);
+        state.review_evidence.push(ReviewRunEvidence {
+            id: "ev-1".to_string(),
+            change_fingerprint: 1,
+            adapter: "codex".to_string(),
+            review_round: 1,
+            completed_at: 10,
+            head_sha: Some(shas[1].clone()),
+            reviewed_tree_sha: None,
+            finding_dispositions: BTreeMap::new(),
+        });
+        let state_dir =
+            StateDir::from_root(tempfile::tempdir().expect("tempdir").path().to_path_buf());
+
+        let package = package(&state_dir, &state, Some(&shas[0])).expect("package");
+
+        assert!(
+            !package.diff_is_delta,
+            "old head_sha-only evidence must never produce a delta"
+        );
+        assert_eq!(package.diff_base_kind, DiffBaseKind::Commit);
+        assert_eq!(package.diff_base_sha, package.base_sha);
+    }
+
+    /// T4, test (3) of the fix: `compute_reviewed_tree_sha` builds its tree
+    /// through a throwaway `GIT_INDEX_FILE`, so the repository's REAL index
+    /// must come out exactly as it went in -- `git status --porcelain`
+    /// reports identically before and after, however busy the working tree
+    /// is (a staged file, an unstaged edit to a tracked file, and an
+    /// untracked file, all present at once).
+    #[test]
+    fn computing_the_reviewed_tree_sha_leaves_the_real_index_untouched() {
+        let repo = git_repo();
+        // Unstaged edit to the already-tracked file.
+        std::fs::write(repo.path().join("tracked.txt"), "unstaged edit\n").unwrap();
+        // A second tracked file, staged but not committed.
+        std::fs::write(repo.path().join("staged.txt"), "staged content\n").unwrap();
+        let status = Command::new("git")
+            .args(["add", "staged.txt"])
+            .current_dir(repo.path())
+            .status()
+            .expect("run git add");
+        assert!(status.success(), "git add failed");
+        // An untracked file.
+        std::fs::write(repo.path().join("untracked.txt"), "untracked content\n").unwrap();
+
+        fn porcelain(repo: &Path) -> String {
+            let output = Command::new("git")
+                .args(["status", "--porcelain"])
+                .current_dir(repo)
+                .output()
+                .expect("run git status");
+            assert!(output.status.success(), "git status failed");
+            String::from_utf8_lossy(&output.stdout).into_owned()
+        }
+
+        let before = porcelain(repo.path());
+        let tree_sha = compute_reviewed_tree_sha(repo.path()).expect("compute reviewed tree sha");
+        let after = porcelain(repo.path());
+
+        assert_eq!(tree_sha.len(), 40, "a real tree object sha");
+        assert_eq!(
+            before, after,
+            "the real index/working tree status must be byte-identical before and after -- \
+             compute_reviewed_tree_sha must never touch it"
+        );
     }
 
     /// The package states plainly which diff a reviewer is holding. A
@@ -4004,8 +4538,14 @@ checksum = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f80"
 
         let package = package(&state_dir, &state, Some(&shas[0])).expect("package");
         assert!(!package.diff_is_delta, "round 1 is never a delta");
+        assert_eq!(package.diff_base_kind, DiffBaseKind::Commit);
         assert_eq!(package.diff_base_sha, package.base_sha);
         assert_eq!(package.head_sha.len(), 40);
+        assert_eq!(
+            package.reviewed_tree_sha.as_deref().map(str::len),
+            Some(40),
+            "a local package always snapshots the worktree it packaged"
+        );
     }
 
     /// A `Unit`-kind check whose only recorded failure is `name`, matching
@@ -4315,6 +4855,10 @@ checksum = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f80"
         git(&["commit", "-q", "-m", "fix after review"]);
 
         let shas = git_log_shas(repo.path()); // [base, first change, fix after review]
+        // Nothing was uncommitted when round 1 "reviewed", so the tree it
+        // reviewed is exactly `shas[1]`'s own tree -- what a real
+        // `compute_reviewed_tree_sha` run would have produced at that point.
+        let reviewed_tree = tree_sha_of(repo.path(), &shas[1]);
         let mut state = running_review_state(repo.path(), &shas[0]);
         state.review_evidence.push(ReviewRunEvidence {
             id: "ev-1".to_string(),
@@ -4323,6 +4867,8 @@ checksum = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f80"
             review_round: 1,
             completed_at: 10,
             head_sha: Some(shas[1].clone()),
+            reviewed_tree_sha: Some(reviewed_tree.clone()),
+            finding_dispositions: BTreeMap::new(),
         });
         let state_dir =
             StateDir::from_root(tempfile::tempdir().expect("tempdir").path().to_path_buf());
@@ -4333,9 +4879,10 @@ checksum = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f80"
             package.diff_is_delta,
             "round 2 with an intact evidence chain is a delta"
         );
+        assert_eq!(package.diff_base_kind, DiffBaseKind::Tree);
         assert_eq!(
-            package.diff_base_sha, shas[1],
-            "diffs from the sha round 1 actually reviewed, not the workflow base"
+            package.diff_base_sha, reviewed_tree,
+            "diffs from the tree round 1 actually reviewed, not the workflow base"
         );
         assert!(
             package.diff.contains("fix after review"),
@@ -4347,6 +4894,488 @@ checksum = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f80"
             "the delta must NOT contain round 1's already-reviewed change -- \
              that would mean the reviewer is silently under- or over-reviewing; got {:?}",
             package.diff
+        );
+        // T2: `changed_paths` follows the same delta shape as `diff` -- only
+        // the path touched since round 1's reviewed sha, not `file_a.txt`,
+        // which round 1 already sent and which has not changed since.
+        assert_eq!(
+            package.changed_paths,
+            vec![PathBuf::from("file_b.txt")],
+            "changed_paths must not resend file_a.txt, already sent and unchanged since round 1"
+        );
+    }
+
+    /// T4, test (1) of the fix: the CONFIRMED bug. Round 1 reviews an
+    /// UNCOMMITTED change (never `git commit`ed), and round 2's fix also
+    /// lands with no intervening commit -- `head_sha` alone (the commit HEAD
+    /// sat at through both rounds) could never distinguish "already
+    /// reviewed" from "new since round 1" in that case, so the old
+    /// head_sha-based delta would resend round 1's uncommitted content while
+    /// still labelling the package a delta. `reviewed_tree_sha` captures the
+    /// worktree itself, not just the commit under it, so this must not
+    /// happen any more.
+    ///
+    /// Round 1's change and round 2's fix live in separate files (the same
+    /// reason `package_with_an_intact_chain_diffs_only_the_post_round_one_
+    /// change` above does): an unchanged tracked file produces no diff hunk
+    /// at all, so this is the only way to prove round 1's content is truly
+    /// ABSENT rather than merely absent from a `+` line while still present
+    /// as unified-diff context.
+    #[test]
+    fn a_fix_landing_without_an_intervening_commit_still_diffs_only_the_new_change() {
+        let repo = git_repo();
+        let shas = git_log_shas(repo.path());
+        let mut state = running_review_state(repo.path(), &shas[0]);
+        let state_dir =
+            StateDir::from_root(tempfile::tempdir().expect("tempdir").path().to_path_buf());
+
+        // Round 1 reviews an uncommitted change to the already-tracked file.
+        std::fs::write(
+            repo.path().join("tracked.txt"),
+            "round one's uncommitted change\n",
+        )
+        .unwrap();
+        let round_one = package(&state_dir, &state, Some(&shas[0])).expect("round 1 package");
+        assert!(!round_one.diff_is_delta, "round 1 is never a delta");
+        let round_one_tree = round_one
+            .reviewed_tree_sha
+            .clone()
+            .expect("a local package always snapshots its worktree");
+
+        // Round 1's evidence, exactly as `run_independent_review` records it:
+        // HEAD is still the base commit (nothing was committed), plus the
+        // tree round 1 actually reviewed.
+        state.review_evidence.push(ReviewRunEvidence {
+            id: "ev-1".to_string(),
+            change_fingerprint: round_one.change_fingerprint,
+            adapter: "codex".to_string(),
+            review_round: 1,
+            completed_at: 10,
+            head_sha: Some(round_one.head_sha.clone()),
+            reviewed_tree_sha: Some(round_one_tree.clone()),
+            finding_dispositions: BTreeMap::new(),
+        });
+
+        // Round 2's fix: a NEW untracked file, ALSO uncommitted, with
+        // `tracked.txt` left exactly as round 1 left it -- the "fix lands
+        // without an intervening commit" scenario the confirmed bug named.
+        std::fs::write(repo.path().join("new_file.txt"), "round two's fix\n").unwrap();
+
+        let round_two = package(&state_dir, &state, Some(&shas[0])).expect("round 2 package");
+        assert_eq!(round_two.review_round, 2);
+        assert!(
+            round_two.diff_is_delta,
+            "round 2 with an intact tree-based chain is a delta"
+        );
+        assert_eq!(round_two.diff_base_kind, DiffBaseKind::Tree);
+        assert_eq!(
+            round_two.diff_base_sha, round_one_tree,
+            "diffs from the TREE round 1 actually reviewed, not HEAD's commit -- \
+             the commit never moved between rounds"
+        );
+        assert_eq!(
+            round_two.changed_paths,
+            vec![PathBuf::from("new_file.txt")],
+            "tracked.txt did not change since round 1's reviewed tree and must not be resent"
+        );
+        assert!(
+            round_two.diff.contains("round two's fix"),
+            "the delta must contain round 2's new change; got {:?}",
+            round_two.diff
+        );
+        assert!(
+            !round_two.diff.contains("round one's uncommitted change"),
+            "the delta must NOT resend round 1's already-reviewed uncommitted content -- \
+             that is the confirmed bug this test guards against; got {:?}",
+            round_two.diff
+        );
+    }
+
+    /// T2, round 1 half: with no prior evidence, `package()` behaves exactly
+    /// as it always has -- every recorded finding goes out in full, and
+    /// nothing is reported as omitted.
+    #[test]
+    fn round_one_sends_every_existing_finding_in_full() {
+        let repo = git_repo();
+        let shas = git_log_shas(repo.path());
+        let mut state = running_review_state(repo.path(), &shas[0]);
+        state
+            .review_findings
+            .push(finding_at("src/a.rs", 1, "note one"));
+        state
+            .review_findings
+            .push(finding_at("src/b.rs", 2, "note two"));
+        let state_dir =
+            StateDir::from_root(tempfile::tempdir().expect("tempdir").path().to_path_buf());
+
+        let package = package(&state_dir, &state, Some(&shas[0])).expect("package");
+
+        assert!(!package.diff_is_delta, "round 1 is never a delta");
+        assert_eq!(package.existing_findings.len(), 2);
+        assert_eq!(
+            package.unchanged_existing_findings, 0,
+            "round 1 has no previous round to omit anything relative to"
+        );
+    }
+
+    /// T2, round 2 half: a finding whose disposition changed since the
+    /// previous round is resent; one that did not is left out of `existing_
+    /// findings` entirely (not merely deduplicated) and only counted in
+    /// `unchanged_existing_findings`.
+    #[test]
+    fn a_delta_round_omits_unchanged_existing_findings_and_repeats_none() {
+        let repo = git_repo_with_commits(&["base", "first change", "fix after review"]);
+        let shas = git_log_shas(repo.path());
+        let mut state = running_review_state(repo.path(), &shas[0]);
+        state.review_findings.push(ReviewFinding {
+            id: "keep-open".into(),
+            severity: FindingSeverity::Minor,
+            summary: "still open".into(),
+            path: None,
+            line: None,
+            disposition: FindingDisposition::Open,
+            recommended_disposition: None,
+            created_at: 1,
+        });
+        state.review_findings.push(ReviewFinding {
+            id: "now-fixed".into(),
+            severity: FindingSeverity::Major,
+            summary: "will be fixed".into(),
+            path: None,
+            line: None,
+            disposition: FindingDisposition::Open,
+            recommended_disposition: None,
+            created_at: 1,
+        });
+        // Round 1's evidence snapshots BOTH findings as they stood when that
+        // round completed -- both still `Open`.
+        let finding_dispositions = state
+            .review_findings
+            .iter()
+            .map(|finding| (finding.id.clone(), finding.disposition))
+            .collect();
+        state.review_evidence.push(ReviewRunEvidence {
+            id: "ev-1".to_string(),
+            change_fingerprint: 1,
+            adapter: "codex".to_string(),
+            review_round: 1,
+            completed_at: 10,
+            head_sha: Some(shas[1].clone()),
+            reviewed_tree_sha: Some(tree_sha_of(repo.path(), &shas[1])),
+            finding_dispositions,
+        });
+        // Between round 1 and round 2 the operator fixes "now-fixed" but
+        // leaves "keep-open" exactly as it was.
+        state.review_findings[1].disposition = FindingDisposition::Fixed;
+
+        let state_dir =
+            StateDir::from_root(tempfile::tempdir().expect("tempdir").path().to_path_buf());
+        let package = package(&state_dir, &state, Some(&shas[0])).expect("package");
+
+        assert!(
+            package.diff_is_delta,
+            "round 2 with an intact evidence chain is a delta"
+        );
+        assert_eq!(
+            package
+                .existing_findings
+                .iter()
+                .map(|finding| finding.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["now-fixed"],
+            "only the changed finding is resent, and the unchanged one is never repeated: {:?}",
+            package.existing_findings
+        );
+        assert_eq!(
+            package.unchanged_existing_findings, 1,
+            "the unchanged finding is only counted, not resent"
+        );
+    }
+
+    /// T3: with no accepted spec/intent/plan artifact at all, the package
+    /// carries no excerpt -- a workflow that never reached an accepted
+    /// artifact stage must not error or fabricate one.
+    #[test]
+    fn accepted_spec_excerpt_is_none_without_an_accepted_artifact() {
+        let repo = git_repo();
+        let shas = git_log_shas(repo.path());
+        let state = running_review_state(repo.path(), &shas[0]);
+        let state_dir =
+            StateDir::from_root(tempfile::tempdir().expect("tempdir").path().to_path_buf());
+
+        let package = package(&state_dir, &state, Some(&shas[0])).expect("package");
+
+        assert_eq!(package.accepted_spec_excerpt, None);
+    }
+
+    /// T3: an accepted spec artifact is excerpted, capped, and its `## Goals`
+    /// section is kept even though a much larger `## Context` section
+    /// precedes it in the document -- proving both the cap and the
+    /// section-priority reordering, not just that something non-empty came
+    /// back.
+    #[test]
+    fn accepted_spec_excerpt_is_present_and_bounded_when_a_spec_is_accepted() {
+        let repo = git_repo();
+        let shas = git_log_shas(repo.path());
+        let mut state = running_review_state(repo.path(), &shas[0]);
+
+        let spec_rel_path = format!(".zirv/work/{}/spec.md", state.id);
+        let spec_dir = repo.path().join(".zirv/work").join(&state.id);
+        std::fs::create_dir_all(&spec_dir).unwrap();
+        let mut spec = String::from("# Specification\n\n## Context\n\n");
+        // Comfortably over the 2 KiB excerpt cap on its own, so the cap can
+        // only be respected by cutting this section, not by the whole
+        // document happening to already fit.
+        spec.push_str(&"background prose that does not matter. ".repeat(200));
+        spec.push_str("\n\n## Goals\n\n- Ship the widget correctly.\n");
+        let spec_path = repo.path().join(&spec_rel_path);
+        std::fs::write(&spec_path, &spec).unwrap();
+        // The accepted hash must be the file's real hash: the validated read
+        // rejects drift, so a placeholder would (correctly) yield no excerpt.
+        let accepted_hash = engine::artifact_hash(&spec_path).unwrap();
+        state.artifacts.insert(
+            "spec".to_string(),
+            engine::WorkflowArtifactRecord {
+                stage: ArtifactStage::Spec,
+                rel_path: spec_rel_path,
+                accepted_hash: Some(accepted_hash),
+                accepted_at: Some("2024-01-01T00:00:00Z".to_string()),
+            },
+        );
+
+        let state_dir =
+            StateDir::from_root(tempfile::tempdir().expect("tempdir").path().to_path_buf());
+        let package = package(&state_dir, &state, Some(&shas[0])).expect("package");
+
+        let excerpt = package
+            .accepted_spec_excerpt
+            .as_deref()
+            .expect("an accepted spec produces an excerpt");
+        assert!(
+            excerpt.len() <= 2 * 1024,
+            "excerpt must respect the cap: {} bytes",
+            excerpt.len()
+        );
+        assert!(
+            excerpt.contains("Ship the widget correctly"),
+            "the Goals section must survive truncation by being reordered first: {excerpt:?}"
+        );
+    }
+
+    /// Same defense as `engine::read_accepted_artifact_refuses_a_symlinked_
+    /// artifact_file`, exercised through the review package: a repository
+    /// writer who replaces an already-accepted artifact file with a symlink
+    /// to an arbitrary local file (its target here holds a value a review
+    /// worker must never see) must not have that file's contents surface in
+    /// `accepted_spec_excerpt`. `#[cfg(unix)]` -- a real symlink needs
+    /// elevated privileges on Windows.
+    #[cfg(unix)]
+    #[test]
+    fn accepted_spec_excerpt_is_none_when_the_accepted_artifact_is_a_symlink() {
+        use std::os::unix::fs::symlink;
+        let repo = git_repo();
+        let shas = git_log_shas(repo.path());
+        let mut state = running_review_state(repo.path(), &shas[0]);
+
+        let outside = tempdir().unwrap();
+        let secret = outside.path().join("secret.txt");
+        std::fs::write(&secret, "top secret, not for the review worker").unwrap();
+
+        let spec_rel_path = format!(".zirv/work/{}/spec.md", state.id);
+        let spec_dir = repo.path().join(".zirv/work").join(&state.id);
+        std::fs::create_dir_all(&spec_dir).unwrap();
+        symlink(&secret, repo.path().join(&spec_rel_path)).unwrap();
+        state.artifacts.insert(
+            "spec".to_string(),
+            engine::WorkflowArtifactRecord {
+                stage: ArtifactStage::Spec,
+                rel_path: spec_rel_path,
+                accepted_hash: Some("deadbeef".to_string()),
+                accepted_at: Some("2024-01-01T00:00:00Z".to_string()),
+            },
+        );
+
+        let state_dir =
+            StateDir::from_root(tempfile::tempdir().expect("tempdir").path().to_path_buf());
+        let package = package(&state_dir, &state, Some(&shas[0])).expect("package");
+
+        assert_eq!(
+            package.accepted_spec_excerpt, None,
+            "a symlinked accepted artifact must never be excerpted into a review package"
+        );
+    }
+
+    /// Cross-platform companion to the symlink test above: the validated
+    /// read path (`engine::workflow_artifact_path`, via `engine::read_
+    /// accepted_artifact`) also refuses a `rel_path` that does not match the
+    /// exact `.zirv/work/<id>/<stage file>` convention for this workflow, so
+    /// a rewritten record pointing at a file outside the workflow's own
+    /// artifact directory -- no symlink involved, just a path that escapes
+    /// -- is refused the same way. Needs no real symlink, so it runs on
+    /// every platform, including Windows.
+    #[test]
+    fn accepted_spec_excerpt_is_none_when_the_accepted_artifact_path_escapes_the_workflow_dir() {
+        let repo = git_repo();
+        let shas = git_log_shas(repo.path());
+        let mut state = running_review_state(repo.path(), &shas[0]);
+
+        let secret_rel_path = "secret-outside-work.md";
+        std::fs::write(
+            repo.path().join(secret_rel_path),
+            "top secret, not for the review worker",
+        )
+        .unwrap();
+        state.artifacts.insert(
+            "spec".to_string(),
+            engine::WorkflowArtifactRecord {
+                stage: ArtifactStage::Spec,
+                rel_path: secret_rel_path.to_string(),
+                accepted_hash: Some("deadbeef".to_string()),
+                accepted_at: Some("2024-01-01T00:00:00Z".to_string()),
+            },
+        );
+
+        let state_dir =
+            StateDir::from_root(tempfile::tempdir().expect("tempdir").path().to_path_buf());
+        let package = package(&state_dir, &state, Some(&shas[0])).expect("package");
+
+        assert_eq!(
+            package.accepted_spec_excerpt, None,
+            "an accepted artifact record whose rel_path escapes .zirv/work/<id>/ must never be excerpted"
+        );
+    }
+
+    /// `zirv workflow review dispose <id> <finding> --disposition <d>`: the
+    /// single-finding shape, run through `run()` end to end rather than only
+    /// against the finding-mutation code directly.
+    #[test]
+    fn dispose_sets_the_named_findings_disposition() {
+        let repo = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        // SAFETY: this suite runs single-threaded (`--test-threads=1`).
+        unsafe {
+            std::env::set_var(crate::commands::ctx::state::STATE_ENV, root.path());
+        }
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+        let mut state = running_review_state(repo.path(), "HEAD");
+        state.review_findings.push(ReviewFinding {
+            id: "f1".into(),
+            severity: FindingSeverity::Minor,
+            summary: "cosmetic".into(),
+            path: None,
+            line: None,
+            disposition: FindingDisposition::Open,
+            recommended_disposition: None,
+            created_at: now_secs(),
+        });
+        let id = state.id.clone();
+        engine::save(&state_dir, &state, true).unwrap();
+
+        let args = ReviewArgs {
+            command: ReviewCommand::Dispose(DisposeFindingArgs {
+                workflow_id: id.clone(),
+                finding_id: Some("f1".to_string()),
+                disposition: Some(FindingDisposition::Dismissed),
+                apply_recommended: false,
+                repo: Some(repo.path().to_path_buf()),
+            }),
+        };
+        let mut out = Vec::new();
+        let code = run(&args, &mut out).unwrap();
+        unsafe {
+            std::env::remove_var(crate::commands::ctx::state::STATE_ENV);
+        }
+        assert_eq!(code, 0);
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("f1: Dismissed"), "got: {text}");
+
+        let reloaded = engine::load(&state_dir, repo.path(), &id).unwrap();
+        assert_eq!(
+            reloaded.review_findings[0].disposition,
+            FindingDisposition::Dismissed
+        );
+    }
+
+    /// `zirv workflow review dispose <id> --apply-recommended`: the bulk
+    /// shape (the intended spelling for what shipped as the standalone
+    /// `dispose-recommended` verb), run through `run()` end to end. One
+    /// finding carries a recommendation and is moved to it; the other has
+    /// none and is left `Open` but still reported.
+    #[test]
+    fn dispose_apply_recommended_bulk_disposes_through_run() {
+        let repo = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        // SAFETY: this suite runs single-threaded (`--test-threads=1`).
+        unsafe {
+            std::env::set_var(crate::commands::ctx::state::STATE_ENV, root.path());
+        }
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+        let mut state = running_review_state(repo.path(), "HEAD");
+        state.review_findings = vec![
+            ReviewFinding {
+                id: "has-recommendation".into(),
+                severity: FindingSeverity::Major,
+                summary: "real defect".into(),
+                path: None,
+                line: None,
+                disposition: FindingDisposition::Open,
+                recommended_disposition: Some(FindingDisposition::Fixed),
+                created_at: now_secs(),
+            },
+            ReviewFinding {
+                id: "no-recommendation".into(),
+                severity: FindingSeverity::Minor,
+                summary: "unclear".into(),
+                path: None,
+                line: None,
+                disposition: FindingDisposition::Open,
+                recommended_disposition: None,
+                created_at: now_secs(),
+            },
+        ];
+        let id = state.id.clone();
+        engine::save(&state_dir, &state, true).unwrap();
+
+        let args = ReviewArgs {
+            command: ReviewCommand::Dispose(DisposeFindingArgs {
+                workflow_id: id.clone(),
+                finding_id: None,
+                disposition: None,
+                apply_recommended: true,
+                repo: Some(repo.path().to_path_buf()),
+            }),
+        };
+        let mut out = Vec::new();
+        let code = run(&args, &mut out).unwrap();
+        unsafe {
+            std::env::remove_var(crate::commands::ctx::state::STATE_ENV);
+        }
+        assert_eq!(code, 0);
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("has-recommendation: Fixed"),
+            "applied finding should be named: {text}"
+        );
+        assert!(
+            text.contains("no-recommendation: open (no recommendation)"),
+            "an open finding with no recommendation must still be listed: {text}"
+        );
+
+        let reloaded = engine::load(&state_dir, repo.path(), &id).unwrap();
+        let finding = |needle: &str| {
+            reloaded
+                .review_findings
+                .iter()
+                .find(|finding| finding.id == needle)
+                .unwrap()
+        };
+        assert_eq!(
+            finding("has-recommendation").disposition,
+            FindingDisposition::Fixed
+        );
+        assert_eq!(
+            finding("no-recommendation").disposition,
+            FindingDisposition::Open
         );
     }
 }

@@ -49,7 +49,18 @@ pub struct ScoreConfig {
     pub weight_tool_failure: f64,
     pub weight_repetition: f64,
     pub weight_marker: f64,
+    /// Score weight for a stuck same-error loop -- the longest run of
+    /// consecutive identical (normalized) tool-result error texts within
+    /// the window (`rot::Signals::same_error_repeats`). Default `0.0`: this
+    /// signal ships inert so it never moves an existing verdict fixture
+    /// until an operator opts in deliberately by raising it.
+    pub same_error_weight: f64,
     pub repetition_threshold: usize,
+    /// Repeat count of the SAME normalized error text before the
+    /// same-error signal trips, ramped the same way `repetition_threshold`
+    /// ramps `weight_repetition` (via `rot::repetition_component`). Default
+    /// `3`.
+    pub same_error_threshold: usize,
     pub advise_at: u32,
     pub compact_at: u32,
     pub restart_at: u32,
@@ -69,7 +80,9 @@ impl Default for ScoreConfig {
             weight_tool_failure: 40.0,
             weight_repetition: 30.0,
             weight_marker: 30.0,
+            same_error_weight: 0.0,
             repetition_threshold: 3,
+            same_error_threshold: 3,
             advise_at: 40,
             compact_at: 60,
             restart_at: 80,
@@ -5797,7 +5810,9 @@ mod tests {
         ("score", "weight_tool_failure"),
         ("score", "weight_repetition"),
         ("score", "weight_marker"),
+        ("score", "same_error_weight"),
         ("score", "repetition_threshold"),
+        ("score", "same_error_threshold"),
         ("score", "advise_at"),
         ("score", "compact_at"),
         ("score", "restart_at"),

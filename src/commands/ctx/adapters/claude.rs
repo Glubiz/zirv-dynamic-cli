@@ -11,7 +11,8 @@ use serde_json::Value;
 use super::super::CtxResult;
 use super::super::event::input_hash;
 use super::super::event::{
-    Capabilities, NormalizedEvent, SessionId, SessionRef, StructuralContext, TranscriptUsage,
+    Capabilities, NormalizedEvent, SessionId, SessionRef, StructuralContext, ToolInvocation,
+    TranscriptUsage, error_text_hash, last_verification_run,
 };
 use super::{AgentAdapter, ResolvedProgram, TurnSignalSetup};
 
@@ -131,6 +132,24 @@ write code yourself unless the change is trivial.
 - When every child you dispatched is done, report ONE integrated result against your work group's \
 completion contract -- not each child's own outcome individually -- including any failures.";
 
+/// The raw text of a `tool_result` block's `content`, falling back to a
+/// JSON-stringified form for a non-string (array/object) content shape.
+/// Shared by `parse_events` (which only needs it long enough to hash it for
+/// `NormalizedEvent::ToolErrorText`) and `structural_context` (which keeps a
+/// human-readable snippet of it).
+fn tool_result_text(block: &Value) -> String {
+    block
+        .get("content")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            block
+                .get("content")
+                .map(Value::to_string)
+                .unwrap_or_default()
+        })
+}
+
 fn text_of(message: &Value) -> String {
     message
         .get("content")
@@ -207,12 +226,23 @@ pub fn parse_events(jsonl: &str) -> Vec<NormalizedEvent> {
                     continue;
                 }
                 for block in results {
-                    events.push(NormalizedEvent::ToolResult {
-                        is_error: block
-                            .get("is_error")
-                            .and_then(Value::as_bool)
-                            .unwrap_or(false),
-                    });
+                    let is_error = block
+                        .get("is_error")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    events.push(NormalizedEvent::ToolResult { is_error });
+                    // Same-error repetition (issue: `rot::Signals::
+                    // same_error_repeats`): a sibling event, never a new
+                    // field on `ToolResult` -- see that variant's own doc
+                    // comment for why.
+                    if is_error {
+                        let detail = tool_result_text(block);
+                        if !detail.is_empty() {
+                            events.push(NormalizedEvent::ToolErrorText {
+                                hash: error_text_hash(&detail),
+                            });
+                        }
+                    }
                 }
             }
             Some("assistant") => {
@@ -348,6 +378,15 @@ const LONG_CONTEXT_WINDOW_TOKENS: u64 = 1_000_000;
 
 pub fn structural_context(jsonl: &str, last_n: usize) -> StructuralContext {
     let mut out = StructuralContext::default();
+    // Handoff verification section: every Bash invocation's command text,
+    // captured verbatim, keyed by its `tool_use` block id so the paired
+    // `tool_result` (matched by `tool_use_id`, however many other tool
+    // calls fall between them) is attributed to the right command rather
+    // than whichever result happens to come next. Never exposed on
+    // `StructuralContext` itself -- only the derived
+    // `event::last_verification_run` over it is.
+    let mut pending_bash: HashMap<String, String> = HashMap::new();
+    let mut invocations: Vec<ToolInvocation> = Vec::new();
 
     for line in jsonl.lines() {
         let line = line.trim();
@@ -382,21 +421,25 @@ pub fn structural_context(jsonl: &str, last_n: usize) -> StructuralContext {
                                 out.user_messages.push(text.to_string());
                             }
                         }
-                        Some("tool_result")
-                            if block.get("is_error").and_then(Value::as_bool) == Some(true) =>
-                        {
-                            let detail = block
-                                .get("content")
+                        Some("tool_result") => {
+                            let is_error =
+                                block.get("is_error").and_then(Value::as_bool) == Some(true);
+                            let detail = tool_result_text(block);
+                            if is_error {
+                                out.tool_errors
+                                    .push(detail.chars().take(ERROR_SNIPPET).collect());
+                            }
+                            if let Some(command) = block
+                                .get("tool_use_id")
                                 .and_then(Value::as_str)
-                                .map(str::to_string)
-                                .unwrap_or_else(|| {
-                                    block
-                                        .get("content")
-                                        .map(Value::to_string)
-                                        .unwrap_or_default()
+                                .and_then(|id| pending_bash.remove(id))
+                            {
+                                invocations.push(ToolInvocation {
+                                    command,
+                                    is_error,
+                                    error_text: if is_error { detail } else { String::new() },
                                 });
-                            out.tool_errors
-                                .push(detail.chars().take(ERROR_SNIPPET).collect());
+                            }
                         }
                         _ => {}
                     }
@@ -424,11 +467,25 @@ pub fn structural_context(jsonl: &str, last_n: usize) -> StructuralContext {
                             out.files_touched.push(path.to_string());
                         }
                     }
+                    let is_bash = block
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .is_some_and(|n| n.eq_ignore_ascii_case("Bash"));
+                    if is_bash
+                        && let (Some(id), Some(command)) = (
+                            block.get("id").and_then(Value::as_str),
+                            input.get("command").and_then(Value::as_str),
+                        )
+                    {
+                        pending_bash.insert(id.to_string(), command.to_string());
+                    }
                 }
             }
             _ => {}
         }
     }
+
+    out.last_verification = last_verification_run(&invocations);
 
     keep_last(&mut out.user_messages, last_n);
     keep_last(&mut out.assistant_texts, last_n);
@@ -1792,6 +1849,35 @@ mod tests {
         );
     }
 
+    /// Same-error repetition (`rot::Signals::same_error_repeats`): an
+    /// erroring tool result with extractable text emits a `ToolErrorText`
+    /// carrying its normalized hash right after the `ToolResult` -- never in
+    /// place of it.
+    #[test]
+    fn an_erroring_tool_result_emits_its_normalized_error_hash() {
+        let jsonl = r#"{"type":"user","message":{"content":[{"type":"tool_result","content":"boom: file missing","is_error":true}]}}"#;
+        assert_eq!(
+            parse_events(jsonl),
+            vec![
+                NormalizedEvent::ToolResult { is_error: true },
+                NormalizedEvent::ToolErrorText {
+                    hash: error_text_hash("boom: file missing"),
+                },
+            ]
+        );
+    }
+
+    /// A successful tool result never gets a `ToolErrorText` sibling, even
+    /// when it carries text.
+    #[test]
+    fn a_successful_tool_result_never_emits_an_error_hash() {
+        let jsonl = r#"{"type":"user","message":{"content":[{"type":"tool_result","content":"all good"}]}}"#;
+        assert_eq!(
+            parse_events(jsonl),
+            vec![NormalizedEvent::ToolResult { is_error: false }]
+        );
+    }
+
     #[test]
     fn assistant_yields_text_tokens_and_tool_calls() {
         let jsonl = concat!(
@@ -2980,6 +3066,51 @@ mod tests {
         assert_eq!(ctx.files_touched, vec!["/work/src/lib.rs"]);
         assert_eq!(ctx.tool_errors.len(), 1);
         assert!(ctx.tool_errors[0].contains("boom"));
+    }
+
+    /// T2: `last_verification` reflects the LAST Bash invocation whose
+    /// command looks like a build/test/lint run, correlated by
+    /// `id`/`tool_use_id` -- here the second `cargo test` succeeds after
+    /// the first one failed, so the handoff must report green.
+    #[test]
+    fn structural_context_reports_the_last_verification_run() {
+        let jsonl = concat!(
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"b1","name":"Bash","input":{"command":"cargo test"}}],"usage":{}}}"#,
+            "\n",
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"b1","is_error":true,"content":"assertion failed: left 1, right 2"}]}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"b2","name":"Bash","input":{"command":"cargo test"}}],"usage":{}}}"#,
+            "\n",
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"b2","is_error":false,"content":"test result: ok"}]}}"#,
+            "\n",
+        );
+        let ctx = structural_context(jsonl, 5);
+        let outcome = ctx
+            .last_verification
+            .expect("a verification run was recorded");
+        assert_eq!(outcome.command, "cargo test");
+        assert!(!outcome.errored, "the second run passed");
+        assert!(outcome.error_excerpt.is_empty());
+    }
+
+    /// An unrelated tool result (a `Read`) landing between a `Bash` call and
+    /// its own result must not be mistaken for that `Bash` call's result:
+    /// correlation is by `id`/`tool_use_id`, not by call order.
+    #[test]
+    fn structural_context_correlates_bash_results_by_id_not_by_order() {
+        let jsonl = concat!(
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"r1","name":"Read","input":{"file_path":"/a.rs"}},{"type":"tool_use","id":"b1","name":"Bash","input":{"command":"cargo test"}}],"usage":{}}}"#,
+            "\n",
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"r1","is_error":false,"content":"file contents"},{"type":"tool_result","tool_use_id":"b1","is_error":true,"content":"boom: it failed"}]}}"#,
+            "\n",
+        );
+        let ctx = structural_context(jsonl, 5);
+        let outcome = ctx
+            .last_verification
+            .expect("a verification run was recorded");
+        assert_eq!(outcome.command, "cargo test");
+        assert!(outcome.errored);
+        assert_eq!(outcome.error_excerpt, vec!["boom: it failed".to_string()]);
     }
 
     #[test]
