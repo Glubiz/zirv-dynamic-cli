@@ -4441,19 +4441,24 @@ mod tests {
         super::super::verification::save_report(&state_dir, &stale_passing_report).unwrap();
 
         // Make the next persist's `latest`-pointer write fail: `write_private`
-        // writes a temp sibling then `rename`s it over `latest`, and on
-        // Windows that rename hits ERROR_ACCESS_DENIED when the destination
-        // is read-only -- confirmed against `std::fs::rename` directly before
-        // writing this test, since the production write path uses exactly
-        // that call.
+        // writes a temp sibling then `rename`s it over `latest`.
         let latest_pointer = state_dir
             .verification()
             .join(repo_slug(repo.path()))
             .join("latest");
-        let original_perms = std::fs::metadata(&latest_pointer).unwrap().permissions();
+        // On Unix a rename over a read-only FILE succeeds (the directory's
+        // write bit governs), so there the directory holding `latest` is
+        // what gets locked; on Windows the read-only destination file itself
+        // makes the rename fail with ERROR_ACCESS_DENIED.
+        let lock_target = if cfg!(unix) {
+            latest_pointer.parent().unwrap().to_path_buf()
+        } else {
+            latest_pointer.clone()
+        };
+        let original_perms = std::fs::metadata(&lock_target).unwrap().permissions();
         let mut readonly_perms = original_perms.clone();
         readonly_perms.set_readonly(true);
-        std::fs::set_permissions(&latest_pointer, readonly_perms).unwrap();
+        std::fs::set_permissions(&lock_target, readonly_perms).unwrap();
 
         let mut state = WorkflowState::start(
             repo.path().to_path_buf(),
@@ -4506,7 +4511,7 @@ mod tests {
         // removed on drop even if an assertion below fails. Restores the
         // exact original permissions rather than `set_readonly(false)`,
         // which clippy flags as leaving the file world-writable on Unix.
-        std::fs::set_permissions(&latest_pointer, original_perms).unwrap();
+        std::fs::set_permissions(&lock_target, original_perms).unwrap();
 
         let code = result.unwrap();
         assert_eq!(
