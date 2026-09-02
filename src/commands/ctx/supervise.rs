@@ -5,7 +5,18 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use super::CtxResult;
+use super::adapters::AgentAdapter;
+use super::event::NormalizedEvent;
 use super::sessions::is_alive;
+
+/// Sent beside an adapter's compaction command. PreCompact hooks cannot add
+/// instructions to a compaction, so both interactive and headless supervisors
+/// use this one composition seam.
+pub const COMPACT_FOCUS: &str = "Preserve the current task and its acceptance criteria, the file paths touched so far, any unresolved errors or failing tests, and the exact next step. Drop resolved tangents and full file dumps.";
+
+pub fn compact_prompt(compact_command: &str) -> String {
+    format!("{compact_command} {COMPACT_FOCUS}")
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tick {
@@ -665,6 +676,28 @@ impl Watcher {
         self.consumed = consumed_fingerprint(&mut file, self.offset)?;
         Ok(Some(appended))
     }
+}
+
+/// Watches only transcript bytes appended after `watcher` was primed. There
+/// are no blind retries: either the adapter records a compaction event before
+/// the deadline or the caller must use its heavier fallback.
+pub fn verify_compaction(
+    watcher: &mut Watcher,
+    adapter: &dyn AgentAdapter,
+    deadline: Instant,
+) -> CtxResult<bool> {
+    while Instant::now() < deadline {
+        if let Some(appended) = watcher.read_appended()?
+            && adapter
+                .parse_events(&appended.lines)
+                .iter()
+                .any(|event| matches!(event, NormalizedEvent::Compaction))
+        {
+            return Ok(true);
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    Ok(false)
 }
 
 /// Runs an `on_failure` hook the way the script runner runs commands.

@@ -917,6 +917,21 @@ impl AgentAdapter for ClaudeAdapter {
         cmd
     }
 
+    fn headless_resume_cmd(
+        &self,
+        prompt: Option<&str>,
+        session_id: &str,
+        extra: &[String],
+    ) -> Option<Command> {
+        let mut cmd = self.base();
+        cmd.arg("-p");
+        if let Some(prompt) = prompt {
+            cmd.arg(prompt);
+        }
+        cmd.arg("--resume").arg(session_id).args(extra);
+        Some(cmd)
+    }
+
     fn interactive_cmd(&self, initial_prompt: Option<&str>, extra: &[String]) -> Command {
         let mut cmd = self.base();
         if let Some(prompt) = initial_prompt {

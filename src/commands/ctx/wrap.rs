@@ -39,14 +39,15 @@ use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use super::adapters::AgentAdapter;
 use super::announce::{Announcer, Event};
 use super::config::{CtxConfig, EnvLookup, env_from_process};
-use super::event::NormalizedEvent;
 use super::handoff::{self, Handoff};
 use super::pace;
 use super::prompt::PromptRole;
 use super::rot::Verdict;
 use super::signal::TurnSignal;
 use super::state::StateDir;
-use super::supervise::Watcher;
+#[cfg(test)]
+use super::supervise::COMPACT_FOCUS;
+use super::supervise::{Watcher, compact_prompt, verify_compaction};
 use super::term::{RawGuard, STDIN_FD, window_size};
 use super::{CtxResult, INJECTION_SUBMIT_DELAY, adapters};
 
@@ -605,10 +606,6 @@ pub fn mail_inject_ready(
         signal_less_mail_ready(state, now, idle_quiet)
     }
 }
-
-/// Sent as arguments to the adapter's compaction command. PreCompact hooks
-/// cannot add instructions to a compaction, so this is the only channel for them.
-pub const COMPACT_FOCUS: &str = "Preserve the current task and its acceptance criteria, the file paths touched so far, any unresolved errors or failing tests, and the exact next step. Drop resolved tangents and full file dumps.";
 
 pub const TRANSCRIPT_ENV: &str = "ZIRV_CTX_TRANSCRIPT";
 
@@ -1229,7 +1226,7 @@ pub fn inject_compact(sink: &mut dyn Write, compact_command: &str, defer: bool) 
     // directly on a generic sink can fragment one format string across
     // several `write_all` calls, which would blur the phase boundary this
     // function depends on.
-    let text = format!("{compact_command} {COMPACT_FOCUS}");
+    let text = compact_prompt(compact_command);
     if !defer {
         sink.write_all(format!("{text}\r").as_bytes())?;
         sink.flush()?;
@@ -1245,27 +1242,6 @@ pub fn inject_compact(sink: &mut dyn Write, compact_command: &str, defer: bool) 
     sink.write_all(b"\r")?;
     sink.flush()?;
     Ok(())
-}
-
-/// Watches the transcript for the compaction the injection was supposed to
-/// cause. No blind keystroke retries: either it is recorded or wrap retreats.
-pub fn verify_compaction(
-    watcher: &mut Watcher,
-    adapter: &dyn AgentAdapter,
-    deadline: Instant,
-) -> CtxResult<bool> {
-    while Instant::now() < deadline {
-        if let Some(appended) = watcher.read_appended()?
-            && adapter
-                .parse_events(&appended.lines)
-                .iter()
-                .any(|event| matches!(event, NormalizedEvent::Compaction))
-        {
-            return Ok(true);
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    Ok(false)
 }
 
 pub fn restart_prompt(handoff: &Handoff) -> String {
