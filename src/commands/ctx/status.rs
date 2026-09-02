@@ -3061,6 +3061,7 @@ mod tests {
             scope: scope.to_string(),
             child_limit: 3,
             token_budget: None,
+            spent_tokens: 0,
             deadline_secs: None,
             completion_contract: "report by mail".to_string(),
             created_at: 1_700_000_000,

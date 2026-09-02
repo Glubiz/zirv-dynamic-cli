@@ -2769,6 +2769,7 @@ const FILE_DROP_TRUSTED_INTERACTIVE: bool = false;
 pub(crate) struct SpawnRefusal {
     pub reason: String,
     pub retryable: bool,
+    pub budget_exhausted: bool,
 }
 
 impl SpawnRefusal {
@@ -2779,6 +2780,7 @@ impl SpawnRefusal {
         SpawnRefusal {
             reason: reason.into(),
             retryable: false,
+            budget_exhausted: false,
         }
     }
 
@@ -2789,6 +2791,15 @@ impl SpawnRefusal {
         SpawnRefusal {
             reason: reason.into(),
             retryable: true,
+            budget_exhausted: false,
+        }
+    }
+
+    fn budget_exhausted(reason: impl Into<String>) -> Self {
+        SpawnRefusal {
+            reason: reason.into(),
+            retryable: false,
+            budget_exhausted: true,
         }
     }
 }
@@ -3550,8 +3561,8 @@ fn fulfill_spawn_request(
         );
     }
 
-    // Issue #155 review finding D2: the pane-side admission choke point for
-    // `child_limit`. `agent::run_with`'s own headless choke point
+    // The pane-side admission choke point for the group's child, token, and
+    // deadline limits. `agent::run_with`'s own headless choke point
     // (`resolve_worker_budget`) never runs for a request that reaches here
     // -- `try_join_dashboard` is the fork point between the two forks of one
     // delegation -- so this is the ONLY place a pane spawn is counted
@@ -3560,8 +3571,13 @@ fn fulfill_spawn_request(
     // refused there too, so falling back gains nothing and the requester
     // deserves the honest, non-retryable answer.
     if let Some(group_id) = &req.work_group_id
-        && let Err(e) = super::group::admit_child(state, group_id)
+        && let Err(e) = super::group::admit_child(state, group_id, now)
     {
+        if super::group::is_admission_exhausted(e.as_ref()) {
+            return Err(SpawnRefusal::budget_exhausted(format!(
+                "budget-exhausted: {e}"
+            )));
+        }
         return Err(SpawnRefusal::policy(e.to_string()));
     }
     // Re-review (2026-08-27) finding 1: from here on, `req.work_group_id`
@@ -3981,6 +3997,7 @@ fn drain_one_channel(
                 short: Some(short),
                 reason: None,
                 retryable: false,
+                budget_exhausted: false,
                 capability_warnings,
             },
             Err(refusal) => {
@@ -3997,6 +4014,7 @@ fn drain_one_channel(
                     short: None,
                     reason: Some(refusal.reason),
                     retryable: refusal.retryable,
+                    budget_exhausted: refusal.budget_exhausted,
                     capability_warnings: Vec::new(),
                 }
             }
@@ -11743,6 +11761,7 @@ mod tests {
             scope: "test batch".to_string(),
             child_limit: 1,
             token_budget: None,
+            spent_tokens: 0,
             deadline_secs: None,
             completion_contract: String::new(),
             created_at: 0,
@@ -11789,6 +11808,109 @@ mod tests {
     }
 
     #[test]
+    fn fulfill_spawn_request_refuses_a_work_group_with_a_spent_token_budget() {
+        let repo = std::env::current_dir().expect("cwd");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let group = crate::commands::ctx::group::WorkGroup {
+            work_group_id: "wg-spent".to_string(),
+            parent_session_id: String::new(),
+            scope: "test batch".to_string(),
+            child_limit: 0,
+            token_budget: Some(400_000),
+            spent_tokens: 400_000,
+            deadline_secs: None,
+            completion_contract: String::new(),
+            created_at: 0,
+            closed_at: None,
+            admitted_children: 0,
+            sub_orchestrator_session: None,
+        };
+        crate::commands::ctx::group::create(&state, &group).expect("persist group");
+
+        let mut req = spawn_request("do the work", &repo);
+        req.work_group_id = Some("wg-spent".to_string());
+        let cfg = CtxConfig::default();
+        let mut panes = Vec::new();
+        let mut queues = Vec::new();
+        let mut errors = Vec::new();
+        let refusal = fulfill_spawn_request(
+            &req,
+            false,
+            None,
+            &mut panes,
+            &mut queues,
+            &cfg,
+            &state,
+            &repo,
+            (80, 24),
+            &tmp.path().join("requests"),
+            &mut errors,
+        )
+        .expect_err("the group budget is spent");
+
+        assert!(refusal.reason.contains("token budget"), "{refusal:?}");
+        assert!(refusal.budget_exhausted);
+        let group = crate::commands::ctx::group::load(&state, "wg-spent")
+            .expect("load")
+            .expect("present");
+        assert_eq!(group.admitted_children, 0);
+    }
+
+    #[test]
+    fn fulfill_spawn_request_refuses_an_overdue_work_group() {
+        let repo = std::env::current_dir().expect("cwd");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let group = crate::commands::ctx::group::WorkGroup {
+            work_group_id: "wg-overdue".to_string(),
+            parent_session_id: String::new(),
+            scope: "test batch".to_string(),
+            child_limit: 0,
+            token_budget: None,
+            spent_tokens: 0,
+            deadline_secs: Some(1),
+            completion_contract: String::new(),
+            created_at: 1,
+            closed_at: None,
+            admitted_children: 0,
+            sub_orchestrator_session: None,
+        };
+        crate::commands::ctx::group::create(&state, &group).expect("create group");
+
+        let mut req = spawn_request("do the work", &repo);
+        req.work_group_id = Some("wg-overdue".to_string());
+        let cfg = CtxConfig::default();
+        let mut panes = Vec::new();
+        let mut queues = Vec::new();
+        let mut errors = Vec::new();
+        let refusal = fulfill_spawn_request(
+            &req,
+            false,
+            None,
+            &mut panes,
+            &mut queues,
+            &cfg,
+            &state,
+            &repo,
+            (80, 24),
+            &tmp.path().join("requests"),
+            &mut errors,
+        )
+        .expect_err("the group deadline elapsed");
+
+        assert!(refusal.reason.contains("deadline"), "{refusal:?}");
+        assert!(refusal.budget_exhausted);
+        assert_eq!(
+            crate::commands::ctx::group::load(&state, "wg-overdue")
+                .expect("load")
+                .expect("present")
+                .admitted_children,
+            0
+        );
+    }
+
+    #[test]
     fn dashboard_spawn_reroutes_an_exhausted_requested_harness_before_admission() {
         let repo = std::env::current_dir().expect("cwd");
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -11828,6 +11950,7 @@ mod tests {
             scope: "test batch".to_string(),
             child_limit: 0,
             token_budget: None,
+            spent_tokens: 0,
             deadline_secs: None,
             completion_contract: String::new(),
             created_at: 0,
@@ -12038,6 +12161,7 @@ mod tests {
             scope: "test batch".to_string(),
             child_limit: 3,
             token_budget: None,
+            spent_tokens: 0,
             deadline_secs: None,
             completion_contract: String::new(),
             created_at: 0,
@@ -13191,6 +13315,7 @@ mod tests {
             scope: "test batch".to_string(),
             child_limit: 3,
             token_budget: None,
+            spent_tokens: 0,
             deadline_secs: None,
             completion_contract: String::new(),
             created_at: 0,

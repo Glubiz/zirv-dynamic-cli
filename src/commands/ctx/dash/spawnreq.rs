@@ -163,6 +163,11 @@ pub struct SpawnAck {
     pub reason: Option<String>,
     #[serde(default)]
     pub retryable: bool,
+    /// Whether a non-retryable admission refusal maps to zirv's existing
+    /// budget-exhausted process exit. Older acknowledgements default to the
+    /// existing generic failure.
+    #[serde(default)]
+    pub budget_exhausted: bool,
     /// Issue #230 item 3: the degraded/unsupported capabilities the spawned
     /// pane's own launch carries (`policy::PolicyReport::degraded_
     /// capabilities`), so a requester waiting on this exact ack
@@ -599,6 +604,7 @@ mod tests {
             short: Some("bbbb2222".to_string()),
             reason: None,
             retryable: false,
+            budget_exhausted: false,
             capability_warnings: Vec::new(),
         };
         write_ack(&dir, &stem, &ack).expect("write_ack");
@@ -619,6 +625,7 @@ mod tests {
             short: Some("bbbb2222".to_string()),
             reason: None,
             retryable: false,
+            budget_exhausted: false,
             capability_warnings: vec![CapabilityWarning {
                 capability: "shell execution".to_string(),
                 mechanism: "no verified per-run mechanism".to_string(),
@@ -632,6 +639,26 @@ mod tests {
         let old = r#"{"ok":true,"short":"cccc3333","reason":null}"#;
         let parsed: SpawnAck = serde_json::from_str(old).expect("older acks still parse");
         assert!(parsed.capability_warnings.is_empty());
+        assert!(!parsed.budget_exhausted);
+    }
+
+    #[test]
+    fn an_acks_structured_exit_round_trips() {
+        let (_tmp, dir) = dir();
+        let ack = SpawnAck {
+            ok: false,
+            short: None,
+            reason: Some("budget-exhausted".to_string()),
+            retryable: false,
+            budget_exhausted: true,
+            capability_warnings: Vec::new(),
+        };
+
+        write_ack(&dir, "req-budget", &ack).expect("write_ack");
+        assert_eq!(
+            wait_for_ack(&dir, "req-budget", Duration::from_secs(1)),
+            Some(ack)
+        );
     }
 
     #[test]
@@ -754,6 +781,7 @@ mod tests {
                 short: Some("bbbb2222".to_string()),
                 reason: None,
                 retryable: false,
+                budget_exhausted: false,
                 capability_warnings: Vec::new(),
             },
         )
