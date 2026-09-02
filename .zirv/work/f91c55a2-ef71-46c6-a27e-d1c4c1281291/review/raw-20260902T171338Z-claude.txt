@@ -1,0 +1,3 @@
+zirv ctx exec: compact command timed out; falling back to restart with handoff
+zirv ctx exec: rot detected, restarting (1/2) with a structural handoff
+ZIRV_REVIEW_RESULT {"findings":[]}
