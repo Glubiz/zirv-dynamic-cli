@@ -441,7 +441,7 @@ fn builtin_manifests() -> CtxResult<Vec<AgentManifest>> {
             read_only: true,
             required_capabilities: &[Cap::RepoRead],
             optional_capabilities: &[],
-            instructions: "Review the supplied requirement, accepted artifacts, diff, verification evidence, and existing findings independently. Do not modify files. Report only concrete correctness, security, compatibility, data-loss, or missing-test findings with actionable locations and reasoning.",
+            instructions: "Review the supplied requirement, accepted artifacts, diff, verification evidence, and existing findings independently. Do not modify files. Report only concrete correctness, security, compatibility, data-loss, or missing-test findings with actionable locations and reasoning. Every finding must name a concrete failure scenario -- an input or state and the wrong result it produces -- at a location you actually read; no finding is better than a weak one, so omit style preferences, speculation, and restatements of the diff. Findings scale with the change: a trivial diff usually has none.",
         }),
         manifest(BuiltinAgentSpec {
             id: "doc-keeper",
@@ -700,6 +700,31 @@ mod tests {
             }
             agent.validate().unwrap();
         }
+    }
+
+    #[test]
+    fn reviewer_agent_requires_concrete_failure_scenarios_and_scales_with_change_size() {
+        let agents = builtin_manifests().unwrap();
+        let reviewer = agents
+            .iter()
+            .find(|agent| agent.id == "reviewer")
+            .expect("reviewer agent exists");
+        assert!(
+            reviewer.instructions.contains("concrete failure scenario"),
+            "reviewer agent should require findings to name a concrete failure scenario"
+        );
+        assert!(
+            reviewer
+                .instructions
+                .contains("no finding is better than a weak one"),
+            "reviewer agent should say a weak finding is worse than none"
+        );
+        assert!(
+            reviewer
+                .instructions
+                .contains("a trivial diff usually has none"),
+            "reviewer agent should say findings scale with the change"
+        );
     }
 
     #[test]

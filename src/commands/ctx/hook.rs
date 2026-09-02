@@ -135,6 +135,18 @@ pub fn stop_output(
         score.score,
         score.context_tokens
     );
+    // Over-verification: the same tool call fired repeatedly with no
+    // edit-like call in between (`rot::repetition`'s own interleave-aware
+    // rule) is a distinct failure mode from an ordinary rotted session --
+    // re-running an unchanged check cannot produce a new result, so the
+    // advisory says that plainly rather than just "consider /compact".
+    if score.signals.repetition_hits > 0 {
+        advisory.push(' ');
+        advisory.push_str(&format!(
+            "Same tool call repeated {}x with no edit in between: the result will not change, move on.",
+            score.signals.max_repeat
+        ));
+    }
     if let Some(reason) = optimize_recommended {
         advisory.push(' ');
         advisory.push_str(optimize_hint(reason));
@@ -1241,6 +1253,31 @@ mod tests {
         );
         let text = parsed["systemMessage"].as_str().unwrap_or_default();
         assert!(text.contains("advise"), "verdict should be named: {text}");
+        assert!(
+            !text.contains('\u{2014}'),
+            "no em dashes in user-facing copy"
+        );
+        assert!(
+            !text.contains("repeated"),
+            "no repetition clause when repetition did not drive the verdict: {text}"
+        );
+    }
+
+    /// The over-verification clause only fires when `repetition_hits > 0` --
+    /// otherwise the advisory reads exactly as it always has (asserted by
+    /// `an_advisory_verdict_prints_a_non_blocking_system_message` above).
+    #[test]
+    fn a_repetition_driven_verdict_gets_the_over_verification_clause() {
+        let mut score = score_of(Verdict::Advise, 45);
+        score.signals.repetition_hits = 1;
+        score.signals.max_repeat = 4;
+        let out = stop_output(&payload(), &score, None, None, None).expect("advisory expected");
+        let parsed: serde_json::Value = serde_json::from_str(&out).expect("valid json");
+        let text = parsed["systemMessage"].as_str().unwrap_or_default();
+        assert!(
+            text.contains("Same tool call repeated 4x with no edit in between"),
+            "over-verification clause should be named: {text}"
+        );
         assert!(
             !text.contains('\u{2014}'),
             "no em dashes in user-facing copy"

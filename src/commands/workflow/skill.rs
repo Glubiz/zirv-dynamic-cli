@@ -606,7 +606,9 @@ pub fn builtin_manifests() -> CtxResult<Vec<SkillManifest>> {
                 Phase::Present,
             ],
             &[],
-            r#"Treat the task, product truth, autonomous frontend profile, and coherent incumbent design language as binding evidence, in that order. Never ask a human to initialize a profile, choose from generated themes, start a server, register screenshots, or settle routine design decisions. When evidence is incomplete, make and document the smallest defensible decision yourself.
+            r#"Scale this to the change: a trivial fix only needs to match existing patterns and verify the states it touches; the rest of this skill is for new or substantially reworked UI.
+
+Treat the task, product truth, autonomous frontend profile, and coherent incumbent design language as binding evidence, in that order. Never ask a human to initialize a profile, choose from generated themes, start a server, register screenshots, or settle routine design decisions. When evidence is incomplete, make and document the smallest defensible decision yourself.
 
 Classify each affected surface by the visitor's success: Persuade earns a decision, Operate completes a task, Read builds understanding, Experience lets the work itself lead. Do not style a whole product by category habit. Before code, establish a compact contract: concrete subject and audience, single user job, information hierarchy, product truth that cannot be invented, one design thesis, one memorable signature, one justified aesthetic risk, and the category-default arrangement being refused. An established system is authority for refinement; an explicit redesign replaces the visual world without replacing product truth or behavior.
 
@@ -689,7 +691,7 @@ Inspect the built result, not the implementation story. Review all captures toge
             &[Cap::AgentSpawn, Cap::ArtifactRender, Cap::BrowserOpen],
             &[Phase::Review],
             &["frontend-craft", "review"],
-            "Perform an unanchored design assessment before reading detector findings or implementation rationale so mechanical output cannot anchor judgment. Review task/brief, product truth, design contract, primary journey, and every fresh narrow/intermediate/wide capture. Then reconcile that assessment with the diff, detector, behavioral evidence, and established system. Score every required rubric dimension honestly from 1–5: product-specificity, user-journey, hierarchy, system-coherence, typography, color-contrast, layout-rhythm, interaction-affordance, state-completeness, responsive-composition, accessibility, content-clarity, and resilience. A pass requires every dimension ≥4 and no unresolved finding. Look specifically for saturated model defaults, weak or equalized hierarchy, cognitive overload, broken mental models, missing feedback/control/recovery, token drift, invented content, clipped/overflowing states, accessibility failures, and responsive scaling instead of recomposition. If evidence is stale, let the workflow collect a fresh detector report and render, then invoke `zirv frontend review` to launch the isolated read-only reviewer; never invent or accept caller-authored scores, and never delegate setup or judgment to a human. Require a fresh batched render after material fixes.",
+            "Perform an unanchored design assessment before reading detector findings or implementation rationale so mechanical output cannot anchor judgment. Review task/brief, product truth, design contract, primary journey, and every fresh narrow/intermediate/wide capture. Then reconcile that assessment with the diff, detector, behavioral evidence, and established system. Score every rubric dimension the change actually touches, honestly from 1–5: product-specificity, user-journey, hierarchy, system-coherence, typography, color-contrast, layout-rhythm, interaction-affordance, state-completeness, responsive-composition, accessibility, content-clarity, and resilience. Substantial or new UI work is scored on all thirteen; a trivial or bounded change is scored only on the dimensions it touches. A pass requires every scored dimension ≥4 and no unresolved finding. Look specifically for saturated model defaults, weak or equalized hierarchy, cognitive overload, broken mental models, missing feedback/control/recovery, token drift, invented content, clipped/overflowing states, accessibility failures, and responsive scaling instead of recomposition. If evidence is stale, let the workflow collect a fresh detector report and render, then invoke `zirv frontend review` to launch the isolated read-only reviewer; never invent or accept caller-authored scores, and never delegate setup or judgment to a human. Require a fresh batched render after material fixes.",
         ),
         manifest(
             "frontend-verify",
@@ -700,7 +702,7 @@ Inspect the built result, not the implementation story. Review all captures toge
             &[Cap::RepoRead, Cap::ArtifactRender, Cap::BrowserOpen],
             &[Phase::Verify],
             &["frontend-craft", "verify"],
-            "Inspect the final diff and require fresh detector, project test, behavioral, accessibility, performance, render, and scored AI-review evidence for every affected surface. Let the workflow collect missing `zirv frontend check` and `zirv frontend render` evidence and launch the isolated reviewer; never hand setup or judgment to a human and never substitute caller-authored scores. Confirm all evidence matches the final change/profile fingerprints and the primary journey, including material loading, empty, partial, error, success, disabled, permission, recovery, focus, zoom, localization, long-content, and reduced-motion states. Require every review dimension ≥4, no blocking detector issue, and no unresolved visual finding. Reapply the brief, surface mode, thesis/signature, established system, and interchangeable-product test. State exact passed, failed, unavailable, and skipped evidence. Missing tools, stale captures, or source inspection alone are not visual-quality proof.",
+            "Inspect the final diff and require fresh detector, project test, behavioral, accessibility, performance, render, and scored AI-review evidence for every affected surface. Let the workflow collect missing `zirv frontend check` and `zirv frontend render` evidence and launch the isolated reviewer; never hand setup or judgment to a human and never substitute caller-authored scores. Confirm all evidence matches the final change/profile fingerprints and the primary journey, including material loading, empty, partial, error, success, disabled, permission, recovery, focus, zoom, localization, long-content, and reduced-motion states. Require every dimension the review scored ≥4 -- scaled the same way, all thirteen for substantial or new UI work and only the touched dimensions for a trivial or bounded change -- no blocking detector issue, and no unresolved visual finding. Reapply the brief, surface mode, thesis/signature, established system, and interchangeable-product test. State exact passed, failed, unavailable, and skipped evidence. Missing tools, stale captures, or source inspection alone are not visual-quality proof.",
         ),
         manifest(
             "plan",
@@ -766,7 +768,7 @@ Inspect the built result, not the implementation story. Review all captures toge
             &[Cap::AgentSpawn],
             &[Phase::Review],
             &[],
-            "Review the requirement, accepted artifacts, base/head identifiers, relevant diff, and structured verification evidence from an independent seat. Look for correctness, security, data loss, compatibility, and missing tests. Report only concrete findings with severity, location, reasoning, and a proposed disposition. Treat incoming review comments as obligations to resolve or explicitly dismiss with evidence; after fixes, re-review the changed surface rather than assuming the original finding vanished. Do not restate the implementation. Respect the workflow's bounded fix and re-review limit.",
+            "Review the requirement, accepted artifacts, base/head identifiers, relevant diff, and structured verification evidence from an independent seat. Look for correctness, security, data loss, compatibility, and missing tests. Report only concrete findings with severity, location, reasoning, and a proposed disposition. Every finding must name a concrete failure scenario -- an input or state and the wrong result it produces -- at a location you actually read; no finding is better than a weak one, so omit style preferences, speculation, and restatements of the diff. Findings scale with the change: a trivial diff usually has none. Treat incoming review comments as obligations to resolve or explicitly dismiss with evidence; after fixes, re-review the changed surface rather than assuming the original finding vanished. Do not restate the implementation. Respect the workflow's bounded fix and re-review limit.",
         ),
         manifest(
             "verify",
@@ -1030,6 +1032,70 @@ mod tests {
             assert_eq!(stack[0].manifest.id, "frontend-craft", "stack for {id}");
             assert_eq!(stack.last().unwrap().manifest.id, id);
         }
+    }
+
+    #[test]
+    fn review_manifest_requires_concrete_failure_scenarios_and_scales_with_change_size() {
+        let skills = builtin_manifests().expect("valid builtins");
+        let review = skills
+            .iter()
+            .find(|skill| skill.id == "review")
+            .expect("review skill exists");
+        assert!(
+            review.instructions.contains("concrete failure scenario"),
+            "review skill should require findings to name a concrete failure scenario"
+        );
+        assert!(
+            review
+                .instructions
+                .contains("no finding is better than a weak one"),
+            "review skill should say a weak finding is worse than none"
+        );
+        assert!(
+            review
+                .instructions
+                .contains("a trivial diff usually has none"),
+            "review skill should say findings scale with the change"
+        );
+    }
+
+    #[test]
+    fn frontend_manifests_scale_scrutiny_to_change_size() {
+        let skills = builtin_manifests().expect("valid builtins");
+        let craft = skills
+            .iter()
+            .find(|skill| skill.id == "frontend-craft")
+            .expect("frontend-craft skill exists");
+        assert!(
+            craft.instructions.starts_with("Scale this to the change"),
+            "frontend-craft should open with a proportionality note for trivial fixes"
+        );
+        assert!(
+            craft
+                .instructions
+                .contains("match existing patterns and verify the states it touches"),
+            "frontend-craft should give a one-line floor for trivial UI fixes"
+        );
+
+        let review = skills
+            .iter()
+            .find(|skill| skill.id == "frontend-review")
+            .expect("frontend-review skill exists");
+        assert!(
+            review.instructions.contains(
+                "a trivial or bounded change is scored only on the dimensions it touches"
+            ),
+            "frontend-review rubric should scale down for trivial/bounded changes"
+        );
+
+        let verify = skills
+            .iter()
+            .find(|skill| skill.id == "frontend-verify")
+            .expect("frontend-verify skill exists");
+        assert!(
+            verify.instructions.contains("scaled the same way"),
+            "frontend-verify should mirror the frontend-review scoring scale"
+        );
     }
 
     #[test]

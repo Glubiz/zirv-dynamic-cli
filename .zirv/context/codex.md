@@ -1,8 +1,5 @@
 # zirv -- Codex-specific working instructions
 
-You are a codex worker under zirv. You have NO subagents: do every step
-yourself, in the foreground, and never delegate further.
-
 ## How your context arrives
 
 Codex has no system-prompt injection on a shell-shim launch (a Windows npm
@@ -30,11 +27,5 @@ glob only), say so explicitly in your report, and let the caller decide.
 `--ignore-rules` and `--ignore-user-config` exist only on codex-cli 0.146 and
 later; npm publishes 0.105.0, which errors on them.
 
-## Documentation duties
-
-Read `docs/obsidian/_system-context.md` first, then Active Work, the last 2-3
-Work Journal entries, Known Issues, and the Decision Log. After a behavior,
-contract, or architecture change, update the matching vault page (the trigger
-list is in `.zirv/context/common.md`) and bump its `last-verified` date; log
-new gotchas in Known Issues and non-obvious decisions in the Decision Log. Do
-not update docs for pure refactors, bug fixes, new tests, or CI-only changes.
+Documentation duties (which vault pages to update and when) are covered by
+`.zirv/context/common.md`.

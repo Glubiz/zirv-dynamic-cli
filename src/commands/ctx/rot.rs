@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 
-use hashbrown::HashMap;
+use hashbrown::{HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 
 use super::config::ScoreConfig;
@@ -9,6 +9,29 @@ use super::event::{Capabilities, NormalizedEvent};
 /// Leading characters a model tends to put before a reply prefix. Ported from
 /// the shell canary's `^[ \t>*_`#~-]*` allowance.
 const MARKER_LEAD: [char; 10] = [' ', '\t', '\n', '\r', '>', '*', '_', '`', '#', '~'];
+
+/// Edit-like tool names, matched case-insensitively: Claude Code's own edit
+/// tools plus codex's `apply_patch` (`src/commands/ctx/adapters/claude.rs`
+/// passes tool-use block names through verbatim, so the real spelling is
+/// exactly Claude's own tool names -- `"Edit"`, `"Write"`, `"MultiEdit"`,
+/// `"NotebookEdit"` -- while `codex.rs`'s `parse_events` never emits
+/// `ToolCall` at all today, so `"apply_patch"` is future-proofing, not yet
+/// reachable). This is a deliberate, independent COPY of
+/// `workflow::adoption::EDIT_LIKE_TOOLS`
+/// (`src/commands/workflow/adoption.rs:13`), not a shared import: importing
+/// from `workflow` would give this pure, fs/clock/env/net-free module a
+/// dependency on a much less constrained module for a five-item list. Keep
+/// the two lists in sync by hand; `adoption::EDIT_LIKE_TOOLS` is private to
+/// its module, which is why this can only be a comment pointing at it rather
+/// than a same-file cross-check test.
+const EDIT_LIKE_TOOLS: &[&str] = &["edit", "write", "multiedit", "notebookedit", "apply_patch"];
+
+/// Whether `name` is one of [`EDIT_LIKE_TOOLS`], case-insensitively.
+fn is_edit_like(name: &str) -> bool {
+    EDIT_LIKE_TOOLS
+        .iter()
+        .any(|tool| name.eq_ignore_ascii_case(tool))
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Signals {
@@ -106,18 +129,41 @@ fn failure_rate<I: Iterator<Item = bool>>(results: I) -> f64 {
     errors as f64 / total as f64
 }
 
-/// `(repetition_hits, max_repeat)` over identical `(tool, input)` pairs.
+/// `(repetition_hits, max_repeat)` over identical `(tool, input)` pairs,
+/// interleave-aware: a repeat of `(name, input_hash)` only extends its streak
+/// when no edit-like call (`is_edit_like`) happened since the previous
+/// occurrence of that exact pair. This is what tells a healthy
+/// edit -> rerun -> edit -> rerun TDD loop apart from a stuck agent
+/// re-running the same passing check with nothing changed in between: the
+/// TDD loop always has an edit between reruns, so it never builds a streak.
+///
+/// An edit-like call breaks EVERY key's in-flight streak at once, not just
+/// the key it happens to share a name with: it sits between any pair of
+/// calls made before and after it, for every key, so clearing every streak
+/// on an edit is exactly the per-key rule applied uniformly. Edit-like calls
+/// are themselves never tracked as a repeated call -- they are the healthy
+/// action this signal exists to stop penalising, never the over-verification
+/// it exists to catch.
 fn repetition<'a, I: Iterator<Item = (&'a str, u64)>>(
     calls: I,
     threshold: usize,
 ) -> (usize, usize) {
-    let mut counts: HashMap<(&str, u64), usize> = HashMap::new();
-    for key in calls {
-        *counts.entry(key).or_insert(0) += 1;
+    let mut streaks: HashMap<(&str, u64), usize> = HashMap::new();
+    let mut hit: HashSet<(&str, u64)> = HashSet::new();
+    let mut max_repeat = 0usize;
+    for (name, hash) in calls {
+        if is_edit_like(name) {
+            streaks.clear();
+            continue;
+        }
+        let count = streaks.entry((name, hash)).or_insert(0);
+        *count += 1;
+        max_repeat = max_repeat.max(*count);
+        if *count >= threshold {
+            hit.insert((name, hash));
+        }
     }
-    let max_repeat = counts.values().copied().max().unwrap_or(0);
-    let hits = counts.values().filter(|count| **count >= threshold).count();
-    (hits, max_repeat)
+    (hit.len(), max_repeat)
 }
 
 /// Share of the already-windowed turn finals that are missing the marker.
@@ -832,6 +878,74 @@ mod tests {
         ];
         let s = signals(&events, full_caps(), &ScoreConfig::default());
         assert_eq!(s.max_repeat, 1);
+    }
+
+    /// A repeat separated by an edit-like call is exactly the healthy
+    /// edit -> rerun -> edit -> rerun TDD loop, not over-verification: it
+    /// must never build a streak.
+    #[test]
+    fn a_repeat_interrupted_by_an_edit_like_call_does_not_count() {
+        let cfg = ScoreConfig::default(); // repetition_threshold: 3
+        let mut events = vec![NormalizedEvent::TurnStart];
+        for _ in 0..4 {
+            events.push(tool("Bash", "{\"command\":\"cargo test\"}"));
+            events.push(tool("Edit", "{\"file_path\":\"/a.rs\"}"));
+        }
+        let s = signals(&events, full_caps(), &cfg);
+        assert_eq!(
+            s.max_repeat, 1,
+            "an edit between every pair of reruns breaks the streak each time"
+        );
+        assert_eq!(s.repetition_hits, 0);
+    }
+
+    /// A non-edit-like call between repeats (a Read, or a Bash with a
+    /// different command) never breaks the streak: only edit-like calls do.
+    #[test]
+    fn a_repeat_interleaved_with_only_non_edit_calls_still_counts() {
+        let cfg = ScoreConfig::default(); // repetition_threshold: 3
+        let mut events = vec![NormalizedEvent::TurnStart];
+        for i in 0..4 {
+            events.push(tool("Bash", "{\"command\":\"cargo test\"}"));
+            // Distinct each time, so only the Bash repetition is under test.
+            events.push(tool("Read", &format!("{{\"file_path\":\"/a{i}.rs\"}}")));
+        }
+        let s = signals(&events, full_caps(), &cfg);
+        assert_eq!(
+            s.max_repeat, 4,
+            "non-edit-like calls between reruns do not interrupt the streak"
+        );
+        assert_eq!(s.repetition_hits, 1);
+    }
+
+    /// Edit-like calls are never themselves tracked as a repeated call, even
+    /// when the exact same edit is made twice with nothing else in between --
+    /// they are the healthy action this signal exists to stop penalising.
+    #[test]
+    fn edit_like_calls_are_never_tracked_as_a_repetition_themselves() {
+        let cfg = ScoreConfig::default();
+        let mut events = vec![NormalizedEvent::TurnStart];
+        for _ in 0..5 {
+            events.push(tool("Edit", "{\"file_path\":\"/a.rs\"}"));
+        }
+        let s = signals(&events, full_caps(), &cfg);
+        assert_eq!(s.max_repeat, 0);
+        assert_eq!(s.repetition_hits, 0);
+    }
+
+    /// Tool names normalize case-sensitively off the wire (Claude Code's
+    /// block names pass through verbatim), but the classification into
+    /// edit-like must not care about casing.
+    #[test]
+    fn edit_like_matching_is_case_insensitive() {
+        assert!(is_edit_like("Edit"));
+        assert!(is_edit_like("EDIT"));
+        assert!(is_edit_like("write"));
+        assert!(is_edit_like("MultiEdit"));
+        assert!(is_edit_like("NotebookEdit"));
+        assert!(is_edit_like("apply_patch"));
+        assert!(!is_edit_like("Bash"));
+        assert!(!is_edit_like("Read"));
     }
 
     #[test]

@@ -82,41 +82,68 @@ pub const SUB_ORCHESTRATOR_PROMPT_FILE: &str = "system-prompt.sub-orchestrator.m
 /// wrapper-behaviour audit found was causing wrapped agents to
 /// over-complicate and over-verify small, mundane tasks. See
 /// `docs/superpowers/specs/2026-09-01-wrapper-behaviour-redesign.md`.
+///
+/// v4 (wrapper behaviour redesign round 2, 2026-09-01): a second audit found
+/// v3 covered proportionality and scope but said nothing about *how* to read
+/// unfamiliar code, debug a failure, recover from being stuck, or close out
+/// a task -- gaps that let a wrapped agent touch files it didn't need to,
+/// paper over a failing check instead of fixing it, retry the same broken
+/// approach indefinitely, or hand back half-finished work. v4 adds
+/// read-before-you-write, debugging discipline, a stuck-twice circuit
+/// breaker, finish-the-whole-task, and no-flattery bullets; folds
+/// assumption-logging into the ambiguity bullet, concrete QA prompts into
+/// the QA bullet, and orphan-cleanup hygiene into the no-slop bullet; and
+/// generalises "match the existing patterns" out of the UI-only bullet since
+/// it now applies to every change. See
+/// `docs/superpowers/specs/2026-09-01-wrapper-behaviour-redesign.md`.
 pub const DEFAULT_PROMPT: &str = "\
-zirv engineering standard (v3)
+zirv engineering standard (v4)
 
 Work the way a top-tier engineer works: judgment first, process in proportion, nothing wasted.
 
 - Size the task first and let the size set everything else. Trivial (a few lines, an obvious \
-fix, a doc or comment): do it directly now, run the one check that could catch a mistake, \
-report in a sentence. Bounded (one area, one intent): read what you need once, make the \
-change, run the tests that cover it. Substantial (several areas, real design choices, or \
-elevated risk): plan briefly, then work in verifiable steps. Never apply a heavier tier's \
-ceremony to a lighter tier's task.
+fix, a doc or comment): do it directly, run the one check that could catch a mistake, report \
+in a sentence. Bounded (one area, one intent): read what you need once, make the change, run \
+the tests that cover it. Substantial (several areas, real design choices, or elevated risk): \
+plan briefly, then work in verifiable steps. Never apply a heavier tier's ceremony to a \
+lighter tier's task.
+- Read before you write: understand the code you're changing and mirror its naming, \
+structure and style. Touch only what the task needs.
 - Choose the simplest design that fully meets the requirement. Reuse before adding; prefer \
 deleting to adding; no speculative abstractions, flags, options, config, or future-proofing \
 nobody asked for. When two designs both work, take the one with less code and fewer moving \
 parts.
 - Deliver exactly what was asked: no quiet narrowing, no bonus refactors, no drive-by \
 improvements. Mention further ideas in one line instead of building them.
-- Decide routine ambiguity yourself, the way a careful colleague would. Ask only when the \
-readings would lead to materially different work, and then ask one precise question.
+- Decide routine ambiguity yourself. Ask only when the readings would lead to materially \
+different work, with one precise question; if you proceed on an assumption instead, name it \
+in your report.
+- Debug by evidence: reproduce first, fix the root cause not the symptom, one change at a \
+time, re-checking as you go. Never make a failing check pass by weakening, deleting, or \
+silencing it (`allow`, `skip`, a loosened assertion).
+- Stuck twice on the same error: stop retrying variants. Step back, re-read the evidence, \
+change approach, or ask one precise question.
 - Verify with evidence, once. Run the check that would catch the failure this change could \
 cause, read its result, and trust it: do not re-run a passing suite, re-read a file you \
 already read, or re-check a fact already established this session unless something has \
 changed it.
 - No slop: no filler or narration, no comments that restate the code, no defensive code for \
-impossible states, no redundant docs, no hedging, no recap of what you just did. Every line \
-you add must earn its place.
-- Think like QA on every change: what could this break, which edge case is uncovered, what \
-would a regression look like? Test behaviour, not implementation -- one focused test per \
-behaviour change, none for a change that cannot alter behaviour.
-- When a change touches a user interface, think like a designer: match the existing patterns, \
-take the fewest steps to the goal, cover loading, empty and error states, keep keyboard and \
-screen-reader basics -- and never redesign what wasn't asked.
+impossible states, no redundant docs or hedging, no recap of what you just did. Delete \
+whatever it orphans -- code, imports, tests, docs -- and rename what no longer fits.
+- Think like QA: what could this break, which edge case is uncovered -- empty or null input, \
+a boundary, partial failure, concurrency, the unhappy path? Test behaviour, not \
+implementation -- one focused test per behaviour change, none for a change that cannot alter \
+behaviour.
+- When a change touches a user interface, think like a designer: take the fewest steps to \
+the goal, cover loading, empty and error states, keep keyboard and screen-reader basics -- \
+never redesign what wasn't asked.
 - Follow the repository's own conventions, style, test layout and commit format; a repository \
 instruction file wins over these defaults. Run the exact command you were given and read its \
 result instead of assuming it worked.
+- Finish the whole task: never hand back partial work for the user to finish. If genuinely \
+blocked, finish the rest and say exactly what's left and why.
+- No flattery, no agreeing to be agreeable: when the user or a reviewer is wrong, say so with \
+evidence, then do what they decide.
 - Report honestly and briefly: lead with the outcome. If a command failed, a test did not \
 pass, or a step was skipped, say so and show the output. Never call unverified work done.";
 
@@ -1153,51 +1180,17 @@ pub fn with_mail_layer(
     Some(composed)
 }
 
-/// The agent-agnostic-layer fallback for zirv's own engineering standard
-/// (`DEFAULT_PROMPT`), mirroring [`task_prompt_with_mail_fallback`] exactly:
-/// for an adapter with no system-prompt injection mechanism (`AgentAdapter::
-/// capabilities().system_prompt == false`, e.g. codex today), `compose`
-/// folding `DEFAULT_PROMPT` into a `ComposedPrompt` that `injection_args_for_
-/// session` then turns into an empty argv is a silent no-op: such a worker
-/// never hears "verify with evidence, once" or "deliver exactly what was
-/// asked" at all, even though `compose` itself unconditionally starts every
-/// composed text with this layer.
-///
-/// The task prompt text itself is the one channel such an adapter has (an
-/// argv token, or -- on a Windows `cmd.exe` shim launch -- stdin), the same
-/// reasoning `task_prompt_with_mail_fallback`'s own doc comment gives.
-/// Applied first among the task-prompt fallbacks, ahead of mail and
-/// report-back, so the final order on that channel is: task text ->
-/// conventions -> mail -> report-back (see the call sites in `exec.rs`,
-/// `run_loop.rs`, `dash/mod.rs`).
-///
-/// A no-op (returns `prompt_text` unchanged) whenever `system_prompt_
-/// supported` is true, so a capable adapter's launch is byte-for-byte
-/// unaffected -- that path still gets `DEFAULT_PROMPT` through the normal
-/// `compose` -> `injection_args_for_session` route.
-///
-/// Unlike `task_prompt_with_mail_fallback` and `task_prompt_with_report_
-/// back_fallback`, this has no "empty input" case to skip: `DEFAULT_PROMPT`
-/// is a fixed, always-non-empty constant, so the only gate is `system_
-/// prompt_supported`. Callers still apply it only when a composed prompt
-/// exists for this run (mirroring `compose`'s own `simple`/`cfg.enabled`
-/// gate), so a `--simple` run or a disabled prompt appends nothing here
-/// either, exactly as it composes nothing for a capable adapter.
-pub fn task_prompt_with_conventions_fallback(
-    prompt_text: &str,
-    system_prompt_supported: bool,
-) -> String {
-    if system_prompt_supported {
-        return prompt_text.to_string();
-    }
-    format!(
-        "{prompt_text}\n\n---\n\nThe following section is from zirv, the harness that started \
-         this session.\n\n{DEFAULT_PROMPT}"
-    )
-}
-
 /// Delivers the complete compiler result through the task-prompt channel
-/// when a launch shape cannot safely carry system-prompt argv.
+/// when a launch shape cannot safely carry system-prompt argv. Applied
+/// first among the task-prompt fallbacks, ahead of mail and report-back, so
+/// the final order on that channel is: task text -> composed conventions ->
+/// mail -> report-back (see the call sites in `exec.rs`, `run_loop.rs`,
+/// `dash/mod.rs`). Superseded `task_prompt_with_conventions_fallback`
+/// (removed: it appended only the bare `DEFAULT_PROMPT` constant and
+/// ignored `composed` entirely, so an adapter with its own base layer --
+/// e.g. codex's `WORKER_PROMPT`/`SUB_ORCHESTRATOR_PROMPT` -- never heard it
+/// on that path even though `compose` had already folded it into
+/// `composed.text`).
 pub fn task_prompt_with_composed_fallback(
     prompt_text: &str,
     system_prompt_supported: bool,
@@ -2649,7 +2642,7 @@ mod tests {
     #[test]
     fn the_shipped_default_is_short_and_plain() {
         assert!(
-            DEFAULT_PROMPT.len() < 3000,
+            DEFAULT_PROMPT.len() < 3500,
             "a floor, not a policy engine: {} bytes",
             DEFAULT_PROMPT.len()
         );
@@ -3495,9 +3488,12 @@ mod tests {
     /// substantive piece of work" coaching -- exactly the claude-side
     /// invariant `a_worker_session_gets_the_worker_layer_instead_of_the_
     /// orchestrator_one` already covers, mirrored for codex now that it has
-    /// an orchestrator layer of its own to withhold.
+    /// an orchestrator layer of its own to withhold. Wrapper behaviour
+    /// redesign round 2: codex now also has its own worker layer
+    /// (`adapters::codex::WORKER_PROMPT`), so this splices in place of the
+    /// orchestrator layer instead of leaving the adapter slot empty.
     #[test]
-    fn a_codex_worker_session_does_not_get_the_orchestrator_layer() {
+    fn a_codex_worker_session_gets_the_worker_layer_instead_of_the_orchestrator_one() {
         let adapter = CodexAdapter::new(None);
         let (_tmp, home, repo) = tree();
         let composed = compose(
@@ -3522,8 +3518,13 @@ mod tests {
         let merged = merged.expect("composed");
         assert_eq!(
             merged.sources,
-            vec![PromptSource::Default],
-            "codex contributes no worker layer of its own, so only the default ships"
+            vec![PromptSource::Default, PromptSource::Adapter],
+            "a codex worker still gets an adapter layer, just its own one"
+        );
+        assert!(
+            merged.text.contains("zirv worker conventions (codex)"),
+            "the codex worker layer is spliced in:\n{}",
+            merged.text
         );
         assert!(!merged.text.contains("spend it on judgment"));
     }
@@ -6296,11 +6297,13 @@ mod tests {
 
     // Engineering standard v3: the judgment-first rewrite (wrapper behaviour
     // redesign), and the codex worker fallback that mirrors the mail fallback.
+    // v4 (round 2, same day): read-before-write, debugging discipline,
+    // stuck-twice, finish-the-whole-task and no-flattery bullets.
 
     #[test]
-    fn the_default_prompt_carries_the_v3_marker_and_new_wording() {
+    fn the_default_prompt_carries_the_v4_marker_and_new_wording() {
         assert!(
-            DEFAULT_PROMPT.contains("zirv engineering standard (v3)"),
+            DEFAULT_PROMPT.contains("zirv engineering standard (v4)"),
             "got {DEFAULT_PROMPT}"
         );
         assert!(
@@ -6314,7 +6317,7 @@ mod tests {
     }
 
     #[test]
-    fn a_composed_prompt_carries_the_v3_marker_and_new_wording() {
+    fn a_composed_prompt_carries_the_v4_marker_and_new_wording() {
         let (_tmp, home, repo) = tree();
         let composed = compose(
             Some(&home),
@@ -6328,7 +6331,7 @@ mod tests {
         .expect("composed");
 
         assert!(
-            composed.text.contains("zirv engineering standard (v3)"),
+            composed.text.contains("zirv engineering standard (v4)"),
             "got {}",
             composed.text
         );
@@ -6345,37 +6348,6 @@ mod tests {
         assert_eq!(
             composed.version, DEFAULT_PROMPT_VERSION,
             "rewording a layer's own text does not move the composed-shape marker"
-        );
-    }
-
-    /// A capable adapter (claude) gets no fallback: the task prompt text is
-    /// untouched, since it already gets `DEFAULT_PROMPT` through the normal
-    /// `compose` -> `injection_args_for_session` route. This is what keeps
-    /// claude's launch byte-for-byte unaffected by the codex-only fallback.
-    #[test]
-    fn task_prompt_with_conventions_fallback_is_a_noop_when_the_adapter_can_be_injected() {
-        assert_eq!(
-            task_prompt_with_conventions_fallback("do the work", true),
-            "do the work",
-            "a capable adapter must not get conventions appended to its task prompt"
-        );
-    }
-
-    /// An adapter with no system-prompt mechanism (codex) still has to
-    /// receive the session conventions somehow, or a worker on that harness
-    /// never hears them: this is what makes the task prompt text itself the
-    /// delivery channel.
-    #[test]
-    fn task_prompt_with_conventions_fallback_appends_default_prompt_for_an_uninjectable_adapter() {
-        let out = task_prompt_with_conventions_fallback("do the work", false);
-        assert!(out.starts_with("do the work"), "got {out}");
-        assert!(
-            out.contains(DEFAULT_PROMPT),
-            "DEFAULT_PROMPT is appended verbatim: {out}"
-        );
-        assert!(
-            out.contains("zirv, the harness that started this session"),
-            "labeled as zirv's own plumbing: {out}"
         );
     }
 
@@ -6409,25 +6381,31 @@ mod tests {
         );
     }
 
-    /// Ordering on the codex task-prompt channel: task text -> conventions
-    /// -> mail -> report-back. Applying the conventions fallback first, then
-    /// the mail fallback, must put the conventions block before the mail
-    /// block.
+    /// Ordering on the codex task-prompt channel: task text -> composed
+    /// conventions -> mail -> report-back. Applying the composed fallback
+    /// first, then the mail fallback, must put the composed block before the
+    /// mail block.
     #[test]
-    fn conventions_fallback_precedes_mail_fallback_on_the_task_prompt_channel() {
+    fn composed_fallback_precedes_mail_fallback_on_the_task_prompt_channel() {
         let messages = vec![mail_msg("claude", "heads up: schema changed")];
-        let with_conventions = task_prompt_with_conventions_fallback("do the work", false);
-        let out = task_prompt_with_mail_fallback(&with_conventions, false, &messages, 4096, None);
+        let composed = ComposedPrompt {
+            text: "compiled conventions".to_string(),
+            sources: vec![PromptSource::Default],
+            version: DEFAULT_PROMPT_VERSION,
+        };
+        let with_composed =
+            task_prompt_with_composed_fallback("do the work", false, Some(&composed));
+        let out = task_prompt_with_mail_fallback(&with_composed, false, &messages, 4096, None);
 
-        let conventions_at = out
-            .find("zirv, the harness that started this session")
-            .expect("conventions block present");
+        let composed_at = out
+            .find("compiled conventions")
+            .expect("composed block present");
         let mail_at = out
             .find("heads up: schema changed")
             .expect("mail block present");
         assert!(
-            conventions_at < mail_at,
-            "conventions must precede mail on the codex channel:\n{out}"
+            composed_at < mail_at,
+            "composed conventions must precede mail on the codex channel:\n{out}"
         );
     }
 
