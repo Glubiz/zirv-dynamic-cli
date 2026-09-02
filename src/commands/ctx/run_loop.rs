@@ -5,7 +5,6 @@ use std::time::{Duration, Instant};
 use super::config::{CtxConfig, EnvLookup, env_from_process};
 use super::event::{SessionId, SessionRef};
 use super::pace;
-use super::rot::Verdict;
 use super::state::{StateDir, now_secs};
 use super::supervise::{self, Outcome, Tick};
 use super::{CtxResult, adapters, log, score};
@@ -399,7 +398,7 @@ pub(crate) fn run_with_clock<W: Write>(
         // path). Probed the same way exec.rs now does: the real headless
         // launcher prefix, no prompt token yet, checked with `launch_
         // reparses_through_shim`, which covers both forms.
-        let (mut command, stdin_prompt) =
+        let (mut command, mut stdin_prompt) =
             if prompt_delivery_via_stdin(adapter.as_ref(), &session, &extra) {
                 match adapter.headless_cmd_stdin(&session, &extra) {
                     Some(command) => (command, Some(prompt.clone())),
@@ -415,47 +414,50 @@ pub(crate) fn run_with_clock<W: Write>(
         // agent's session inherited that session's `ZIRV_CTX_SESSION` and
         // `ZIRV_CTX_SOCKET` and reported its own turn boundaries into the
         // outer supervisor's rot engine.
-        super::sessions::scrub_supervision_env_cmd(&mut command);
-        // Names the same fact `ctx.toml`'s own `agent` key would, so a nested
-        // `zirv ctx ...` call inside this cycle's own child processes
-        // defaults to this cycle's harness rather than re-resolving from
-        // scratch.
-        command.env(super::adapters::AGENT_ENV, adapter.name());
+        let apply_session_env = |command: &mut std::process::Command| {
+            super::sessions::scrub_supervision_env_cmd(command);
+            // Names the same fact `ctx.toml`'s own `agent` key would, so a
+            // nested `zirv ctx ...` call inside this cycle's own child
+            // processes defaults to this cycle's harness rather than
+            // re-resolving from scratch.
+            command.env(super::adapters::AGENT_ENV, adapter.name());
+        };
+        apply_session_env(&mut command);
 
         writeln!(w, "zirv ctx loop: cycle {cycle} session {session}")?;
-        // P2/P3: see the matching comment in `exec.rs` -- this cycle's child
-        // is registered for the console-close sweep and held in a
-        // kill-on-close job for as long as `_child_guard` is in scope, which
-        // is this cycle.
-        let (mut child, tap, _child_guard) = supervise::spawn_tapped(command, stdin_prompt)?;
-        // Item 3: consumed right after this cycle's own spawn has actually
-        // succeeded, so the next cycle's fresh `mail::list` does not pick
-        // the same message up again -- but a launch that never got this far
-        // (spawn_tapped failed, or `?` above already returned) leaves it
-        // unread. A failed consume must not stop the cycle: the mail has
-        // already reached the prompt either way, and housekeeping failures
-        // are best-effort throughout the state dir.
-        for (path, _) in mail_entries.drain(..) {
-            let _ = super::mail::consume_and_log(
-                &state,
-                &mail_slug,
-                &path,
-                &session_short,
-                "loop",
-                "loop:cycle-prompt",
-            );
-        }
-        let mut scorer = score::IncrementalScorer::new(transcript.clone());
-        let mut rotted = false;
-        let mut limit_hit = false;
         // C7: the stable registry address this run answers to, resolved once
-        // per cycle so the tick closure below borrows a plain `String`
-        // rather than the `Option` the loop keeps mutating.
+        // per cycle so each tick closure below borrows a plain `String`
+        // rather than the `Option` the outer loop keeps mutating.
         let nudge_address = registry_short
             .clone()
             .unwrap_or_else(|| session_short.clone());
+        let prompt_via_stdin = prompt_delivery_via_stdin(adapter.as_ref(), &session, &extra);
+        let mut compact_budget = super::exec::CompactBudget::default();
+        let compact_window = Duration::from_secs(cfg.supervise.interval_secs);
 
-        let outcome = {
+        let (outcome, rotted, limit_hit) = loop {
+            // P2/P3: see the matching comment in `exec.rs` -- each child in
+            // this cycle is registered for the console-close sweep and held
+            // in a kill-on-close job for exactly that child's life.
+            let (mut child, tap, _child_guard) =
+                supervise::spawn_tapped(command, stdin_prompt.clone())?;
+            // Item 3: consumed right after the first spawn that actually
+            // carried this cycle's prompt. The drain makes every in-place
+            // continuation a no-op here.
+            for (path, _) in mail_entries.drain(..) {
+                let _ = super::mail::consume_and_log(
+                    &state,
+                    &mail_slug,
+                    &path,
+                    &session_short,
+                    "loop",
+                    "loop:cycle-prompt",
+                );
+            }
+            let mut scorer = score::IncrementalScorer::new(transcript.clone());
+            let mut rotted = false;
+            let mut compact_requested = false;
+            let mut limit_hit = false;
             let mut tick = || {
                 if pace::scan_for_limit(
                     &tap.try_lines(),
@@ -508,35 +510,135 @@ pub(crate) fn run_with_clock<W: Write>(
                     return Tick::Stop("limit");
                 }
                 match poll_result {
-                    Ok((Some(score), _)) if score.verdict == Verdict::Restart => {
-                        rotted = true;
-                        Tick::Stop("rot")
-                    }
+                    Ok((Some(score), _)) => match super::exec::action_for_verdict(score.verdict) {
+                        super::exec::SignalAction::Stop => {
+                            rotted = true;
+                            Tick::Stop("rot")
+                        }
+                        super::exec::SignalAction::Compact
+                            if compact_budget.ready(Instant::now(), compact_window) =>
+                        {
+                            compact_budget.arm(Instant::now());
+                            compact_requested = true;
+                            Tick::Stop("compact")
+                        }
+                        super::exec::SignalAction::Compact => Tick::Continue,
+                        super::exec::SignalAction::Ignore => {
+                            compact_budget.observe_progress();
+                            Tick::Continue
+                        }
+                    },
                     _ => Tick::Continue,
                 }
             };
-            supervise::supervise_child(&mut child, Instant::now() + max_cycle, poll, &mut tick)?
+            let outcome = supervise::supervise_child(
+                &mut child,
+                Instant::now() + max_cycle,
+                poll,
+                &mut tick,
+            )?;
+
+            if !limit_hit {
+                let _ = scorer.poll(adapter.as_ref(), &cfg.score);
+                limit_hit = scorer.provider_limit_hit();
+            }
+
+            // See the matching comment in exec.rs: supervise_child checks
+            // exit before the tick, so final output needs one bounded drain.
+            if !limit_hit {
+                limit_hit = pace::scan_for_limit(
+                    &tap.drain_to_eof(supervise::FINAL_DRAIN_BUDGET),
+                    &state,
+                    session.as_str(),
+                    "loop",
+                    &mut std::io::stderr(),
+                );
+            }
+
+            if compact_requested {
+                let compact_result = super::exec::compact_in_place(
+                    adapter.as_ref(),
+                    Some(&transcript),
+                    Duration::from_millis(cfg.wrap.inject_timeout_ms),
+                    poll,
+                    |compact_prompt| {
+                        let (mut compact, stdin_prompt) = super::exec::headless_resume_launch(
+                            adapter.as_ref(),
+                            compact_prompt,
+                            &session,
+                            &extra,
+                            prompt_via_stdin,
+                        )?;
+                        compact.current_dir(repo);
+                        apply_session_env(&mut compact);
+                        Some((compact, stdin_prompt))
+                    },
+                )
+                .and_then(|()| {
+                    let continuation = format!(
+                        "{prompt}\n\nContinue the same loop cycle after the verified in-place \
+                         compaction without redoing completed work."
+                    );
+                    let (mut continued, stdin_prompt) = super::exec::headless_resume_launch(
+                        adapter.as_ref(),
+                        &continuation,
+                        &session,
+                        &extra,
+                        prompt_via_stdin,
+                    )
+                    .ok_or_else(|| {
+                        format!(
+                            "adapter '{}' cannot resume a headless session in place",
+                            adapter.name()
+                        )
+                    })?;
+                    continued.current_dir(repo);
+                    apply_session_env(&mut continued);
+                    Ok((continued, stdin_prompt))
+                });
+                let verified = compact_result.is_ok();
+                announcer.emit(&super::announce::Event::Compact { verified });
+                match compact_result {
+                    Ok((continued, continued_stdin)) => {
+                        let _ = log::append(
+                            &state,
+                            &log::Decision {
+                                ts: now_secs(),
+                                session: session.as_str(),
+                                verb: "loop",
+                                verdict: "compact",
+                                score: 0,
+                                action: "compact",
+                                detail: &transcript.display().to_string(),
+                            },
+                        );
+                        command = continued;
+                        stdin_prompt = continued_stdin;
+                        continue;
+                    }
+                    Err(reason) => {
+                        let _ = log::append(
+                            &state,
+                            &log::Decision {
+                                ts: now_secs(),
+                                session: session.as_str(),
+                                verb: "loop",
+                                verdict: "compact",
+                                score: 0,
+                                action: "compact-failed",
+                                detail: &reason,
+                            },
+                        );
+                        writeln!(
+                            w,
+                            "zirv ctx loop: {reason}; falling back to the next fresh cycle"
+                        )?;
+                        rotted = true;
+                    }
+                }
+            }
+            break (outcome, rotted, limit_hit);
         };
-
-        if !limit_hit {
-            let _ = scorer.poll(adapter.as_ref(), &cfg.score);
-            limit_hit = scorer.provider_limit_hit();
-        }
-
-        // See the matching comment in exec.rs: supervise_child checks the
-        // child's exit status before calling the tick, so a fast limit-hit
-        // exit can race past the last tick that would have caught it.
-        // `drain_to_eof`, not `try_lines`: see `supervise.rs`'s own doc
-        // comment on it for why `try_lines` alone does not close this race.
-        if !limit_hit {
-            limit_hit = pace::scan_for_limit(
-                &tap.drain_to_eof(supervise::FINAL_DRAIN_BUDGET),
-                &state,
-                session.as_str(),
-                "loop",
-                &mut std::io::stderr(),
-            );
-        }
 
         let (action, failed) = match outcome {
             // A usage limit is the window's fault, not the cycle's: park and
@@ -883,6 +985,51 @@ mod tests {
             }
         }
         found
+    }
+
+    #[test]
+    fn a_compact_tier_loop_cycle_compacts_and_continues_the_same_session() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let state = tmp.path().join("state");
+        let modes = tmp.path().join("modes.txt");
+        let argv_log = tmp.path().join("argv.log");
+        std::fs::write(&modes, "compact-tier\nhealthy\n").expect("write modes");
+        let mut env = base_env(&state);
+        env.insert("ZIRV_CTX_INJECT_TIMEOUT_MS".to_string(), "2000".to_string());
+        env.insert("ZIRV_CTX_INTERVAL_SECS".to_string(), "0".to_string());
+
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let _fake_agent = crate::commands::ctx::testenv::VarGuard::set(&[
+            ("FAKE_AGENT_MODE_FILE", modes.to_str()),
+            ("FAKE_AGENT_SLEEP", Some("3")),
+            ("FAKE_AGENT_ARGV_LOG", argv_log.to_str()),
+        ]);
+        let mut out = Vec::new();
+        let code = run_with(&args_for(1), &mut out, tmp.path(), &|key| {
+            env.get(key).cloned()
+        });
+        assert_eq!(code.expect("runs"), 0);
+
+        let argv = std::fs::read_to_string(&argv_log).expect("argv log");
+        assert!(
+            argv.contains("/compact"),
+            "compact command was launched: {argv}"
+        );
+        assert!(
+            argv.contains("--resume"),
+            "the same session was resumed: {argv}"
+        );
+        let log = std::fs::read_to_string(state.join("logs/decisions.jsonl")).expect("log");
+        assert!(
+            log.contains("\"verb\":\"loop\"") && log.contains("\"action\":\"compact\""),
+            "{log}"
+        );
+        assert_eq!(
+            transcripts_in(&home).len(),
+            1,
+            "in-place continuation keeps the cycle's session id"
+        );
     }
 
     #[test]

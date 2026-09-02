@@ -960,6 +960,19 @@ pub trait AgentAdapter: std::fmt::Debug {
     fn detect(&self, command: &[String]) -> bool;
 
     fn headless_cmd(&self, prompt: &str, session: &SessionId, extra: &[String]) -> Command;
+    /// Builds a headless prompt against an existing conversation. `prompt`
+    /// is `None` when the caller will deliver it on stdin. The default is an
+    /// honest refusal: adapters must not guess a resume flag or claim stdin
+    /// support they have not verified.
+    fn headless_resume_cmd(
+        &self,
+        prompt: Option<&str>,
+        session_id: &str,
+        extra: &[String],
+    ) -> Option<Command> {
+        let _ = (prompt, session_id, extra);
+        None
+    }
     fn interactive_cmd(&self, initial_prompt: Option<&str>, extra: &[String]) -> Command;
     /// Builds the judgment/distiller model child's command. `model` is empty
     /// when neither the operator's own config (`handoff.model`/`optimize.

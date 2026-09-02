@@ -330,12 +330,148 @@ pub fn nudges_after(used: u32, progressed: bool) -> u32 {
     if progressed { 0 } else { used }
 }
 
-/// Compaction of a headless run is pointless (there is no TUI to type into), so
-/// only a restart verdict acts, and only for the session this supervisor owns:
-/// the socket is named after eight hex characters of a session id, so a stale
-/// hook can reach it and must not be able to kill a healthy child.
-pub fn should_stop_for_signal(signal: &TurnSignal, session: &str) -> bool {
-    signal.session_id == session && signal.verdict == Verdict::Restart
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignalAction {
+    Ignore,
+    Compact,
+    Stop,
+}
+
+pub(crate) fn action_for_verdict(verdict: Verdict) -> SignalAction {
+    match verdict {
+        Verdict::Compact => SignalAction::Compact,
+        Verdict::Restart => SignalAction::Stop,
+        Verdict::Healthy | Verdict::Advise => SignalAction::Ignore,
+    }
+}
+
+/// Maps a turn signal to an action only when it belongs to this supervisor's
+/// current session. The socket name is short enough that a stale hook can
+/// reach it, so ownership remains the first and non-negotiable gate.
+pub fn action_for_signal(signal: &TurnSignal, session: &str) -> SignalAction {
+    if signal.session_id != session {
+        return SignalAction::Ignore;
+    }
+    action_for_verdict(signal.verdict)
+}
+
+/// One bounded in-place attempt per cooldown window, and never another until
+/// the resumed conversation has reported progress after the previous attempt.
+#[derive(Debug, Default)]
+pub(crate) struct CompactBudget {
+    attempted_at: Option<Instant>,
+    progressed_after_attempt: bool,
+}
+
+impl CompactBudget {
+    pub(crate) fn ready(&self, now: Instant, window: Duration) -> bool {
+        let Some(attempted_at) = self.attempted_at else {
+            return true;
+        };
+        self.progressed_after_attempt && now.saturating_duration_since(attempted_at) >= window
+    }
+
+    pub(crate) fn arm(&mut self, now: Instant) {
+        self.attempted_at = Some(now);
+        self.progressed_after_attempt = false;
+    }
+
+    pub(crate) fn observe_progress(&mut self) {
+        if self.attempted_at.is_some() {
+            self.progressed_after_attempt = true;
+        }
+    }
+}
+
+#[derive(Debug)]
+struct CompactPlan<'a> {
+    prompt: String,
+    transcript: &'a Path,
+}
+
+fn compact_plan<'a>(
+    adapter: &dyn adapters::AgentAdapter,
+    transcript: Option<&'a Path>,
+) -> Result<CompactPlan<'a>, String> {
+    let command = adapter.compact_command().ok_or_else(|| {
+        format!(
+            "adapter '{}' does not support in-place compaction",
+            adapter.name()
+        )
+    })?;
+    let transcript = transcript
+        .filter(|path| path.is_file())
+        .ok_or_else(|| "no transcript reported, compaction unverifiable".to_string())?;
+    Ok(CompactPlan {
+        prompt: supervise::compact_prompt(command),
+        transcript,
+    })
+}
+
+pub(crate) fn headless_resume_launch(
+    adapter: &dyn adapters::AgentAdapter,
+    prompt: &str,
+    session: &SessionId,
+    extra: &[String],
+    prompt_via_stdin: bool,
+) -> Option<(Command, Option<String>)> {
+    let probe = adapter.headless_resume_cmd(Some(prompt), session.as_str(), extra)?;
+    let argv_total_len = headless_argv_len(&probe);
+    if headless_prompt_via_stdin(prompt_via_stdin, argv_total_len)
+        && let Some(command) = adapter.headless_resume_cmd(None, session.as_str(), extra)
+    {
+        return Some((command, Some(prompt.to_string())));
+    }
+    Some((probe, None))
+}
+
+pub(crate) fn compact_in_place<F>(
+    adapter: &dyn adapters::AgentAdapter,
+    transcript: Option<&Path>,
+    timeout: Duration,
+    poll: Duration,
+    build: F,
+) -> Result<(), String>
+where
+    F: FnOnce(&str) -> Option<(Command, Option<String>)>,
+{
+    let plan = compact_plan(adapter, transcript)?;
+    let mut watcher = supervise::Watcher::new(plan.transcript.to_path_buf());
+    watcher
+        .read_appended()
+        .map_err(|error| format!("compaction verification failed: {error}"))?;
+
+    let (command, stdin_prompt) = build(&plan.prompt).ok_or_else(|| {
+        format!(
+            "adapter '{}' cannot resume a headless session in place",
+            adapter.name()
+        )
+    })?;
+    let (mut child, tap, _child_guard) = supervise::spawn_tapped(command, stdin_prompt)
+        .map_err(|error| format!("compact command failed to start: {error}"))?;
+    let outcome = supervise::supervise_child(
+        &mut child,
+        Instant::now() + timeout,
+        poll.max(Duration::from_millis(10)),
+        &mut || Tick::Continue,
+    )
+    .map_err(|error| format!("compact command failed: {error}"))?;
+    let _ = tap.drain_to_eof(supervise::FINAL_DRAIN_BUDGET);
+    match outcome {
+        Outcome::Exited(0) => {}
+        Outcome::Exited(code) => return Err(format!("compact command exited with code {code}")),
+        Outcome::TimedOut => return Err("compact command timed out".to_string()),
+        Outcome::StoppedByTick(reason) => {
+            return Err(format!("compact command stopped unexpectedly: {reason}"));
+        }
+    }
+
+    let verified = supervise::verify_compaction(&mut watcher, adapter, Instant::now() + timeout)
+        .map_err(|error| format!("compaction verification failed: {error}"))?;
+    if !verified {
+        return Err("compaction not verified".to_string());
+    }
+    Ok(())
 }
 
 fn build_command(command: &[String], repo: &Path) -> CtxResult<Command> {
@@ -1159,6 +1295,8 @@ fn run_with_clock_inner<W: Write>(
     // screening summary that has not changed since the last poll is
     // announced once for the whole run, not once per restart.
     let mut screening_announced: Option<String> = None;
+    let mut compact_budget = CompactBudget::default();
+    let compact_window = Duration::from_secs(cfg.supervise.interval_secs);
 
     loop {
         pace::wait_for_window(
@@ -1211,6 +1349,7 @@ fn run_with_clock_inner<W: Write>(
         // Fresh scorer per iteration, over the current session's transcript.
         let mut scorer = score::IncrementalScorer::new(transcript.clone());
         let mut rotted = false;
+        let mut compact_requested = false;
         let mut limit_hit = false;
         let mut nudged_by: Option<String> = None;
         // Issue #155, Phase 5(d): fresh per iteration too -- the child a
@@ -1236,6 +1375,9 @@ fn run_with_clock_inner<W: Write>(
             &announcer,
             &mut screening_announced,
             &mut rotted,
+            &mut compact_requested,
+            &mut compact_budget,
+            compact_window,
             &mut progressed,
             &tap,
             &mut limit_hit,
@@ -1369,6 +1511,99 @@ fn run_with_clock_inner<W: Write>(
             );
             session_guard.release();
             return Ok(EXIT_ACCOUNT_EXHAUSTED);
+        }
+
+        if compact_requested {
+            let extra: Vec<String> = policy_extra
+                .iter()
+                .cloned()
+                .chain(user_extra.iter().cloned())
+                .chain(prompt_args.iter().cloned())
+                .collect();
+            let compact_result = compact_in_place(
+                adapter.as_ref(),
+                Some(&transcript),
+                Duration::from_millis(cfg.wrap.inject_timeout_ms),
+                poll,
+                |compact_prompt| {
+                    let (mut compact, stdin_prompt) = headless_resume_launch(
+                        adapter.as_ref(),
+                        compact_prompt,
+                        &session,
+                        &extra,
+                        prompt_via_stdin,
+                    )?;
+                    compact.current_dir(repo);
+                    apply_session_env(&mut compact, &session);
+                    Some((compact, stdin_prompt))
+                },
+            )
+            .and_then(|()| {
+                let prompt_text = prompt
+                    .as_deref()
+                    .ok_or_else(|| "no prompt available for continuation".to_string())?;
+                let continuation = format!(
+                    "{prompt_text}\n\nContinue the same task after the verified in-place \
+                     compaction without redoing completed work."
+                );
+                let (mut command, stdin_prompt) = headless_resume_launch(
+                    adapter.as_ref(),
+                    &continuation,
+                    &session,
+                    &extra,
+                    prompt_via_stdin,
+                )
+                .ok_or_else(|| {
+                    format!(
+                        "adapter '{}' cannot resume a headless session in place",
+                        adapter.name()
+                    )
+                })?;
+                command.current_dir(repo);
+                apply_session_env(&mut command, &session);
+                Ok((command, stdin_prompt))
+            });
+
+            let verified = compact_result.is_ok();
+            announcer.emit(&super::announce::Event::Compact { verified });
+            match compact_result {
+                Ok((continued, continued_stdin)) => {
+                    let _ = log::append(
+                        &state,
+                        &log::Decision {
+                            ts: now_secs(),
+                            session: session.as_str(),
+                            verb: "exec",
+                            verdict: "compact",
+                            score: 0,
+                            action: "compact",
+                            detail: &transcript.display().to_string(),
+                        },
+                    );
+                    command = continued;
+                    stdin_prompt = continued_stdin;
+                    continue;
+                }
+                Err(reason) => {
+                    let _ = log::append(
+                        &state,
+                        &log::Decision {
+                            ts: now_secs(),
+                            session: session.as_str(),
+                            verb: "exec",
+                            verdict: "compact",
+                            score: 0,
+                            action: "compact-failed",
+                            detail: &reason,
+                        },
+                    );
+                    writeln!(
+                        w,
+                        "zirv ctx exec: {reason}; falling back to restart with handoff"
+                    )?;
+                    rotted = true;
+                }
+            }
         }
 
         match outcome {
@@ -2348,6 +2583,9 @@ fn supervise_run(
     announcer: &super::announce::Announcer,
     screening_announced: &mut Option<String>,
     rotted: &mut bool,
+    compact_requested: &mut bool,
+    compact_budget: &mut CompactBudget,
+    compact_window: Duration,
     // C3: set when this session reported a turn boundary of its own.
     progressed: &mut bool,
     tap: &supervise::OutputTap,
@@ -2408,10 +2646,19 @@ fn supervise_run(
             // just below: the session still did a turn's work.
             if received.session_id == session {
                 *progressed = true;
+                compact_budget.observe_progress();
             }
-            if should_stop_for_signal(&received, session) {
-                *rotted = true;
-                return Tick::Stop("rot");
+            match action_for_signal(&received, session) {
+                SignalAction::Stop => {
+                    *rotted = true;
+                    return Tick::Stop("rot");
+                }
+                SignalAction::Compact if compact_budget.ready(Instant::now(), compact_window) => {
+                    compact_budget.arm(Instant::now());
+                    *compact_requested = true;
+                    return Tick::Stop("compact");
+                }
+                SignalAction::Compact | SignalAction::Ignore => {}
             }
         }
         // N4: claiming the marker is atomic (`remove_file`), so exactly one
@@ -2505,10 +2752,22 @@ fn supervise_run(
             return Tick::Stop("limit");
         }
         match poll_result {
-            Ok((Some(score), _)) if score.verdict == Verdict::Restart => {
-                *rotted = true;
-                Tick::Stop("rot")
-            }
+            Ok((Some(score), _)) => match action_for_verdict(score.verdict) {
+                SignalAction::Stop => {
+                    *rotted = true;
+                    Tick::Stop("rot")
+                }
+                SignalAction::Compact if compact_budget.ready(Instant::now(), compact_window) => {
+                    compact_budget.arm(Instant::now());
+                    *compact_requested = true;
+                    Tick::Stop("compact")
+                }
+                SignalAction::Compact => Tick::Continue,
+                SignalAction::Ignore => {
+                    compact_budget.observe_progress();
+                    Tick::Continue
+                }
+            },
             _ => Tick::Continue,
         }
     };
@@ -3819,23 +4078,23 @@ mod tests {
     }
 
     #[test]
-    fn only_a_restart_signal_stops_the_run() {
-        assert!(should_stop_for_signal(
-            &signal_with(Verdict::Restart, 95),
-            "s"
-        ));
-        assert!(!should_stop_for_signal(
-            &signal_with(Verdict::Compact, 65),
-            "s"
-        ));
-        assert!(!should_stop_for_signal(
-            &signal_with(Verdict::Advise, 45),
-            "s"
-        ));
-        assert!(!should_stop_for_signal(
-            &signal_with(Verdict::Healthy, 0),
-            "s"
-        ));
+    fn signal_actions_cover_restart_compact_and_ignore() {
+        assert_eq!(
+            action_for_signal(&signal_with(Verdict::Restart, 95), "s"),
+            SignalAction::Stop
+        );
+        assert_eq!(
+            action_for_signal(&signal_with(Verdict::Compact, 65), "s"),
+            SignalAction::Compact
+        );
+        assert_eq!(
+            action_for_signal(&signal_with(Verdict::Advise, 45), "s"),
+            SignalAction::Ignore
+        );
+        assert_eq!(
+            action_for_signal(&signal_with(Verdict::Healthy, 0), "s"),
+            SignalAction::Ignore
+        );
     }
 
     /// The socket path is derived from the first eight hex characters of a
@@ -3843,10 +4102,178 @@ mod tests {
     /// a healthy child on someone else's verdict is the failure to avoid.
     #[test]
     fn a_verdict_about_another_session_is_ignored() {
-        assert!(!should_stop_for_signal(
-            &signal_with(Verdict::Restart, 95),
-            "a-different-session"
-        ));
+        assert_eq!(
+            action_for_signal(&signal_with(Verdict::Restart, 95), "a-different-session"),
+            SignalAction::Ignore
+        );
+        assert_eq!(
+            action_for_signal(&signal_with(Verdict::Compact, 65), "a-different-session"),
+            SignalAction::Ignore
+        );
+    }
+
+    #[test]
+    fn compact_gate_rejects_an_adapter_without_a_command_and_a_missing_transcript() {
+        use std::cell::Cell;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let transcript = dir.path().join("t.jsonl");
+        std::fs::write(&transcript, "{}\n").expect("write transcript");
+        let codex = crate::commands::ctx::adapters::codex::CodexAdapter::new(None);
+        let attempts = Cell::new(0);
+        assert_eq!(
+            compact_in_place(
+                &codex,
+                Some(&transcript),
+                Duration::ZERO,
+                Duration::ZERO,
+                |_| {
+                    attempts.set(attempts.get() + 1);
+                    None
+                },
+            )
+            .expect_err("codex cannot compact"),
+            "adapter 'codex' does not support in-place compaction"
+        );
+        assert_eq!(attempts.get(), 0, "unsupported adapter must not launch");
+
+        let claude = crate::commands::ctx::adapters::claude::ClaudeAdapter::new(None);
+        let attempts = Cell::new(0);
+        assert_eq!(
+            compact_in_place(&claude, None, Duration::ZERO, Duration::ZERO, |_| {
+                attempts.set(attempts.get() + 1);
+                None
+            },)
+            .expect_err("missing transcript must fail closed"),
+            "no transcript reported, compaction unverifiable"
+        );
+        assert_eq!(attempts.get(), 0, "missing transcript must not launch");
+    }
+
+    #[test]
+    fn compact_budget_arms_before_an_attempt_and_resets_only_after_progress_and_the_window() {
+        let now = Instant::now();
+        let window = Duration::from_secs(60);
+        let mut budget = CompactBudget::default();
+        assert!(budget.ready(now, window));
+
+        budget.arm(now);
+        assert!(!budget.ready(now, window));
+        budget.observe_progress();
+        assert!(!budget.ready(now + Duration::from_secs(59), window));
+        assert!(budget.ready(now + window, window));
+    }
+
+    #[test]
+    fn a_verified_compaction_resumes_and_continues_the_same_session() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let state = tmp.path().join("state");
+        let session = "abababab-2222-4333-8444-555555555555";
+        let modes = tmp.path().join("modes.txt");
+        let argv_log = tmp.path().join("argv.log");
+        std::fs::write(&modes, "compact-tier\nhealthy\n").expect("write modes");
+        let mut env = base_env(&state);
+        env.insert("ZIRV_CTX_INJECT_TIMEOUT_MS".to_string(), "2000".to_string());
+        env.insert("ZIRV_CTX_INTERVAL_SECS".to_string(), "0".to_string());
+
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let _fake_agent = crate::commands::ctx::testenv::VarGuard::set(&[
+            ("FAKE_AGENT_MODE_FILE", modes.to_str()),
+            ("FAKE_AGENT_SLEEP", Some("30")),
+            ("FAKE_AGENT_ARGV_LOG", argv_log.to_str()),
+        ]);
+        let args = ExecArgs {
+            agent: Some("claude".to_string()),
+            session_id: Some(session.to_string()),
+            transcript: Some(transcript_for(&home, tmp.path(), session)),
+            prompt: Some("do the work".to_string()),
+            max_restarts: Some(0),
+            budget_tokens: None,
+            max_tool_calls: None,
+            timeout_secs: Some(60),
+            simple: false,
+            command: fake_agent_command(session),
+        };
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|key| env.get(key).cloned());
+        assert_eq!(code.expect("runs"), 0);
+
+        let argv = std::fs::read_to_string(&argv_log).expect("argv log");
+        assert!(
+            argv.contains(&format!(
+                "/compact {} --resume {session}",
+                supervise::COMPACT_FOCUS
+            )),
+            "the compact command must resume the existing session: {argv}"
+        );
+        assert!(
+            argv.contains(&format!(
+                "Continue the same task after the verified in-place compaction without redoing \
+                 completed work. --resume {session}"
+            )),
+            "the continuation must resume the same session: {argv}"
+        );
+        assert_eq!(
+            argv.matches(&format!("--resume {session}")).count(),
+            2,
+            "exactly the compact and continuation launches resume: {argv}"
+        );
+        let log = std::fs::read_to_string(state.join("logs/decisions.jsonl")).expect("log");
+        assert!(log.contains("\"verdict\":\"compact\"") && log.contains("\"action\":\"compact\""));
+        assert!(!log.contains("\"action\":\"restart\""), "{log}");
+        assert_eq!(
+            transcripts_in(&home).len(),
+            1,
+            "same session, same transcript"
+        );
+    }
+
+    #[test]
+    fn an_unverified_compaction_falls_through_to_restart_with_the_reason() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let state = tmp.path().join("state");
+        let session = "acacacac-2222-4333-8444-555555555555";
+        let modes = tmp.path().join("modes.txt");
+        std::fs::write(&modes, "compact-tier\nhealthy\n").expect("write modes");
+        let mut env = base_env(&state);
+        env.insert("ZIRV_CTX_INJECT_TIMEOUT_MS".to_string(), "300".to_string());
+        env.insert("ZIRV_CTX_INTERVAL_SECS".to_string(), "0".to_string());
+
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let _fake_agent = crate::commands::ctx::testenv::VarGuard::set(&[
+            ("FAKE_AGENT_MODE_FILE", modes.to_str()),
+            ("FAKE_AGENT_SLEEP", Some("30")),
+            ("FAKE_AGENT_COMPACTION_EVENT", Some("0")),
+        ]);
+        let args = ExecArgs {
+            agent: Some("claude".to_string()),
+            session_id: Some(session.to_string()),
+            transcript: Some(transcript_for(&home, tmp.path(), session)),
+            prompt: Some("do the work".to_string()),
+            max_restarts: Some(1),
+            budget_tokens: None,
+            max_tool_calls: None,
+            timeout_secs: Some(60),
+            simple: false,
+            command: fake_agent_command(session),
+        };
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|key| env.get(key).cloned());
+        assert_eq!(code.expect("runs"), 0);
+
+        let log = std::fs::read_to_string(state.join("logs/decisions.jsonl")).expect("log");
+        assert!(
+            log.contains("\"action\":\"compact-failed\"")
+                && log.contains("\"detail\":\"compaction not verified\"")
+        );
+        assert!(log.contains("\"action\":\"restart\""), "{log}");
+        assert_eq!(
+            transcripts_in(&home).len(),
+            2,
+            "restart mints a new session"
+        );
     }
 
     /// Every restart is a new session, and the hook inside it reports whatever
