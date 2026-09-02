@@ -213,7 +213,12 @@ pub fn resolve_initial_prompt<W: Write>(
         return Ok(None);
     }
     match handoff::latest_for_repo(state, repo)? {
-        Some((_path, found)) => Ok(Some(resume::resume_prompt(&found))),
+        // Issue #281: no session id has been minted for this launch yet at
+        // this point in `chat`'s own flow (unlike `resume::run_with`, which
+        // now mints its session before composing this same prompt) --
+        // `resume_prompt`'s `session` parameter is unused by `working_set`
+        // today, so an empty string costs nothing real.
+        Some((_path, found)) => Ok(Some(resume::resume_prompt(state, repo, "", &found))),
         None => {
             writeln!(
                 w,
@@ -1592,7 +1597,7 @@ mod tests {
         assert!(prompt.contains("Wire the payments webhook"), "got {prompt}");
         assert_eq!(
             prompt,
-            resume::resume_prompt(&handoff()),
+            resume::resume_prompt(&state, tmp.path(), "", &handoff()),
             "chat must fold the handoff the same way `zirv ctx resume` does"
         );
         assert!(

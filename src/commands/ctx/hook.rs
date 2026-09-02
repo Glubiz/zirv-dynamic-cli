@@ -804,20 +804,36 @@ pub fn session_start_output(additional_context: &str) -> String {
 }
 
 /// The latest stored handoff for `payload`'s repo, labeled and screened for
-/// injection (`handoff::labeled_for_injection` -- the same helper
-/// `resume::resume_prompt` uses, so the two paths cannot drift), or `None`
-/// when the state dir cannot be resolved, no handoff exists, or the latest
-/// one is not usable (`Handoff::is_usable`). Read-only: repeated calls
-/// (repeated resumes) re-read the same file and re-inject the same text,
-/// never consuming or mutating anything -- idempotent by construction.
+/// injection (`handoff::labeled_for_injection_with_working_set` -- the same
+/// shared assembly helper `resume::resume_prompt` uses, so the two paths
+/// cannot drift), or `None` when the state dir cannot be resolved, no
+/// handoff exists, or the latest one is not usable (`Handoff::is_usable`).
+///
+/// Issue #281: no longer purely read-only. The base handoff read is still
+/// idempotent (repeated resumes re-read the same file and re-inject the
+/// same text), but the working-set manifest folded in alongside it is
+/// re-collected fresh every call (`handoff::working_set` does its own I/O,
+/// never cached), and the crash-interruption witness, when present, is
+/// CONSUMED by `sessions::take_interrupted_in_flight` -- it clears the
+/// marker it read, so a second call for the same crash reports the base
+/// handoff and manifest again but never re-emits the witness block.
 fn latest_handoff_for_injection(payload: &HookPayload, env: EnvLookup<'_>) -> Option<String> {
     let state = StateDir::resolve(env).ok()?;
-    let (_, handoff) = super::handoff::latest_for_repo(&state, &payload.repo())
+    let repo = payload.repo();
+    let (_, handoff) = super::handoff::latest_for_repo(&state, &repo)
         .ok()
         .flatten()?;
-    handoff
-        .is_usable()
-        .then(|| super::handoff::labeled_for_injection(&handoff))
+    if !handoff.is_usable() {
+        return None;
+    }
+    let working_set = super::handoff::working_set(&state, &repo, &payload.session_id);
+    let crash_witness = super::sessions::take_interrupted_in_flight(&state, &repo)
+        .map(|in_flight| super::handoff::render_crash_witness(&in_flight));
+    Some(super::handoff::labeled_for_injection_with_working_set(
+        &handoff,
+        Some(&working_set),
+        crash_witness.as_deref(),
+    ))
 }
 
 /// `startup` (a fresh session) and `compact` (mid-session, not a restart)
