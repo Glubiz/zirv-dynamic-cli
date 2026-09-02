@@ -4048,6 +4048,7 @@ checksum = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f80"
                     names.len()
                 )),
                 failure_test_names: Vec::new(),
+                inconclusive_reason: None,
             }],
         }
     }
