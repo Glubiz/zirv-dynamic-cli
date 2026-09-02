@@ -503,6 +503,10 @@ pub(crate) fn run_with_clock<W: Write>(
                         &mut screening_announced,
                     );
                 }
+                if scorer.provider_limit_hit() {
+                    limit_hit = true;
+                    return Tick::Stop("limit");
+                }
                 match poll_result {
                     Ok((Some(score), _)) if score.verdict == Verdict::Restart => {
                         rotted = true;
@@ -513,6 +517,11 @@ pub(crate) fn run_with_clock<W: Write>(
             };
             supervise::supervise_child(&mut child, Instant::now() + max_cycle, poll, &mut tick)?
         };
+
+        if !limit_hit {
+            let _ = scorer.poll(adapter.as_ref(), &cfg.score);
+            limit_hit = scorer.provider_limit_hit();
+        }
 
         // See the matching comment in exec.rs: supervise_child checks the
         // child's exit status before calling the tick, so a fast limit-hit

@@ -1,0 +1,9 @@
+{"timestamp":"2026-09-02T10:00:00.000Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}
+{"timestamp":"2026-09-02T10:00:00.100Z","type":"turn_context","payload":{"turn_id":"turn-1","model":"gpt-5.6-sol"}}
+{"timestamp":"2026-09-02T10:00:01.000Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","last_agent_message":"done"}}
+{"timestamp":"2026-09-02T10:01:00.000Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-2"}}
+{"timestamp":"2026-09-02T10:01:00.100Z","type":"turn_context","payload":{"turn_id":"turn-2","model":"gpt-5.6-terra"}}
+{"timestamp":"2026-09-02T10:01:01.000Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-2","last_agent_message":null,"error":{"message":"rate limit: too many requests while request_too_large was retried","codex_error_info":"other"}}}
+{"timestamp":"2026-09-02T10:02:00.000Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-3"}}
+{"timestamp":"2026-09-02T10:02:00.100Z","type":"turn_context","payload":{"turn_id":"turn-3","model":"gpt-5.6-terra"}}
+{"timestamp":"2026-09-02T10:02:01.000Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-3","last_agent_message":null,"error":{"message":"Your input exceeds the context window of this model","codex_error_info":"other"}}}
