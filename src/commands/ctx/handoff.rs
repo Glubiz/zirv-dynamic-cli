@@ -2790,7 +2790,7 @@ mod tests {
         use std::os::unix::fs::symlink;
         let tmp = tempfile::tempdir().expect("tempdir");
         let repo = tmp.path().join("repo");
-        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        std::fs::create_dir_all(repo.join(".zirv")).expect("mkdir repo");
         let outside = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(outside.path().join("wf1")).expect("mkdir");
         std::fs::write(outside.path().join("wf1").join("intent.md"), "secret").expect("write");

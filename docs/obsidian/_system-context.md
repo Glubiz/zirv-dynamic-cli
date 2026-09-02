@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-09-01
+last-verified: 2026-09-02
 ---
 
 # _system-context
@@ -69,6 +69,7 @@ Every row's "vault page" is also the page whose "If changed" line names its own 
 | `permissions audit` | Transcript-backed audit of recent escalated/denied command-permission requests, grouped by normalized command family (issue #132). |
 | `handover` | Swap the orchestrator seat's model or harness in place, same registry short id (issue #84). |
 | `group` | `create`/`status`/`close` a work group: persisted scope/child-limit/token-budget/deadline/contract for a batch of delegated work (issue #155). |
+| `objective` | `set`/`show`/`close` a durable, repo-scoped objective (text, token budget, deadline) that survives restarts; also `--objective <text>` on `exec`/`loop` (issue #285). |
 
 ## Key Flows
 
@@ -143,7 +144,7 @@ Run all four before claiming a change is done. Full detail: [[Getting Started]],
 
 ## State Directory Layout
 
-`StateDir::resolve` roots at `ZIRV_CTX_STATE_DIR`, else the OS state dir, else the OS local-data dir, then `zirv/ctx`. Subpaths: `handoffs/<repo_slug>/` (stored handoff docs), `s/` (turn-signal sockets, short name for the unix path-length limit), `logs/decisions.jsonl` (append-only context decision log), `logs/safety-decisions/<UTC-day>.jsonl` (privacy-preserving command verdicts with command/policy SHA-256 identities, never raw command text), `usage.json` (single machine-wide file, merged across sessions), `scoring/` (per-transcript incremental-scoring checkpoints), `status-snapshots/` (issue #246 — one `StatusSnapshot` JSON per session, keyed by `input_hash(session)`, holding `zirv ctx status --diff`'s previous rendered sections). Unix directories are `0700` and files `0600`; Windows has no equivalent and is a no-op there. See [[Ctx Subsystem]].
+`StateDir::resolve` roots at `ZIRV_CTX_STATE_DIR`, else the OS state dir, else the OS local-data dir, then `zirv/ctx`. Subpaths: `handoffs/<repo_slug>/` (stored handoff docs), `s/` (turn-signal sockets, short name for the unix path-length limit), `logs/decisions.jsonl` (append-only context decision log), `logs/safety-decisions/<UTC-day>.jsonl` (privacy-preserving command verdicts with command/policy SHA-256 identities, never raw command text), `usage.json` (single machine-wide file, merged across sessions), `scoring/` (per-transcript incremental-scoring checkpoints), `status-snapshots/` (issue #246  --  one `StatusSnapshot` JSON per session, keyed by `input_hash(session)`, holding `zirv ctx status --diff`'s previous rendered sections), `objective/<repo_slug>.json` (issue #285  --  one durable objective record per repo). Unix directories are `0700` and files `0600`; Windows has no equivalent and is a no-op there. See [[Ctx Subsystem]].
 
 ## Documentation Contract
 

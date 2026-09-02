@@ -20,6 +20,14 @@ last-verified: 2026-09-02
 
 ## Entries
 
+### 2026-09-02: release 3.11.0 -- handoff v3, resume trust manifest, verification no-progress guard, group reservation, durable objective
+
+**What:** Five-issue batch (`release/3.11.0-harness-batch`). #280: handoff `SECTIONS` grows 7 -> 11 (Constraints/Blocked/Key decisions added, Files touched split into Files read/Files modified), `DISTILL_PROMPT_VERSION` v2 -> v3, distillation now takes the repo's own previous handoff so a restart chain carries decisions/constraints forward instead of dropping them once they age out of the transcript tail. #281: `resume`/`SessionStart` append a host-verified working-set manifest (existing `.zirv/work/<id>/` artifacts, git-changed paths) beside the handoff; `sessions::Record.in_flight` (stamped by `wrap` per keystroke, `exec` per cycle) lets a dead-pid record surface a mid-turn crash as one `<zirv_interrupted>` block on the next start; `resume_prompt_preview` keeps `zirv ctx status` from consuming the one-shot marker. #287: `GateOutcome::Unchanged` stops `--run-checks` from re-executing checks against a worktree byte-identical to the last failing attempt, still burning a step attempt. #301: `WorkGroup.reserved_tokens` + `settle_reservation` (replacing `add_spent_tokens`) make token-budget admission atomic, closing a race where two concurrent children could both see the full remaining budget. #285: new `zirv ctx objective set|show|close` plus `--objective` on `exec`/`loop` persists a durable per-repo objective as its own `PromptSource::Objective` prompt layer (`DEFAULT_PROMPT_VERSION` v9 -> v10); `objective close` refuses without fresh passing verification, so completion is never model-asserted. Rejected: #303 (`codex exec resume <id> "/compact"` as a compaction trigger) -- verified on codex-cli 0.147.0 that it sends the text as a plain user message and records no compaction at all.
+
+**Key changes:** `src/commands/ctx/{handoff,event,adapters/claude,resume,hook,sessions,wrap,exec,group,agent,dash/mod,prompt,compile,config,mod,state}.rs`, `src/commands/ctx/objective.rs` (new), `src/commands/workflow/{verification,engine,telemetry}.rs`. `Cargo.toml` bumped to 3.11.0.
+
+**Follow-up:** PR pending. See [[Active Work]]'s matching entry and the 2026-09-02 [[Decision Log]] entries.
+
 ### 2026-09-02: harness iteration round 3 -- review model enforced, review dispositions to memory, loop stops
 **What:** A fourth audit round against workflow af4ed8ec's own deferred list shipped two narrow items: `reviewer_argv` now enforces the roster's resolved review model on the reviewer's own launch argv instead of only advising it (opus becomes the real default with `chat.model` unset); a settled `Fixed`/`Residual` review finding now writes one durable memory entry under its own `review-finding-<id>` bank. The round rejected size-aware review count, an active-pointer lock, artifact re-injection dedupe, and a codex idle heuristic, each for a concrete structural reason, and the iteration loop stops here.
 **Key changes:** `src/commands/ctx/adapters/mod.rs`, `src/commands/workflow/review.rs`, `src/commands/ctx/status.rs` (unrelated test hermeticity fix, same branch).
@@ -140,7 +148,6 @@ last-verified: 2026-09-02
 **What:** Connected usage windows, the enabled/capacity roster, model-tier mapping, delegation routing, and `exec` handoffs so exhausted/low-headroom new work can land on another harness and a vendor-limit-blocked supervised prompt can resume there instead of idling.
 **Key changes:** new `commands/ctx/fallback.rs`; trusted repo-narrow-only `[fallback]` config; `pace::spawn_headroom`; exact cross-vendor tier mapping; `agent` predictive/exhausted rerouting; `exec` handoff + remaining-budget continuation + visited-harness loop guard; `ctx status` policy/headroom disclosure; decision-log actions `harness-reroute`/`harness-handover`; v2.36.0 bump and regression tests for trust/model/bounded-capacity rules.
 **Follow-up:** Finish CI (build/tests/fmt/clippy/Windows target) and move draft PR #189 to review-ready once all gates are green.
-
 
 ### 2026-08-28: Reliable messaging — completed and review-hardened (`release/2.35.0`, issue #177, draft PR #185)
 **What:** Added a compiling, additive delivery-sidecar implementation around the legacy Markdown mailbox: UUID/thread/reply metadata, per-recipient receipts, TTL/dead-letter state, explicit claim-once, role fan-out, sender status, automatic post-write wake markers, a cross-harness information-not-instruction envelope, and status metrics.
