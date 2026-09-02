@@ -294,6 +294,17 @@ pub struct PaceConfig {
     /// ::force` carrying that same choice into a pane spawn).
     /// `REPO_FORBIDDEN`, same reasoning as `spawn_soft_pct`.
     pub spawn_hard_pct: f64,
+    /// Issue #285: the operator's own default soft token budget for a
+    /// durable objective (`zirv ctx objective set`) that does not pass its
+    /// own `--budget-tokens`. `None` means no default -- an objective set
+    /// with no explicit budget stays unbounded, same as today. Distinct from
+    /// `exec`'s own `--budget-tokens` hard stop (`EXIT_BUDGET_EXHAUSTED`):
+    /// this ceiling only flips the objective's status and swaps the injected
+    /// layer to the wrap-up instruction, it never kills the run.
+    /// `REPO_FORBIDDEN`: a repo checkout must not be able to raise its own
+    /// spend ceiling, same reasoning as `spawn_soft_pct`/`spawn_hard_pct`
+    /// above.
+    pub run_budget_tokens: Option<u64>,
 }
 
 impl Default for PaceConfig {
@@ -317,6 +328,7 @@ impl Default for PaceConfig {
             blind_delay_secs: 60,
             spawn_soft_pct: 80.0,
             spawn_hard_pct: 95.0,
+            run_budget_tokens: None,
         }
     }
 }
@@ -1384,6 +1396,11 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         EnvKind::Float,
     ),
     (
+        "ZIRV_CTX_PACE_RUN_BUDGET_TOKENS",
+        &["pace", "run_budget_tokens"],
+        EnvKind::Int,
+    ),
+    (
         "ZIRV_CTX_PACE_USE_CREDITS_CLAUDE",
         &["pace", "use_credits", "claude"],
         EnvKind::Bool,
@@ -2189,6 +2206,14 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     // threshold instead of a byte cap or a switch.
     (&["pace", "spawn_soft_pct"], "ZIRV_CTX_PACE_SPAWN_SOFT_PCT"),
     (&["pace", "spawn_hard_pct"], "ZIRV_CTX_PACE_SPAWN_HARD_PCT"),
+    // Issue #285: the default soft budget `zirv ctx objective set` applies
+    // when the operator's own `--budget-tokens` is omitted -- a spend
+    // ceiling, so it gets the same "checkout is not the operator" treatment
+    // as every other budget key in this list.
+    (
+        &["pace", "run_budget_tokens"],
+        "ZIRV_CTX_PACE_RUN_BUDGET_TOKENS",
+    ),
     // `chat.model` is deliberately ABSENT from this list. See `ChatConfig`'s
     // own doc comment and the spec's "Orchestrator model" section
     // (docs/superpowers/specs/2026-08-13-zirv-dashboard-design.md): unlike
@@ -3612,6 +3637,11 @@ mod tests {
         assert_eq!(cfg.spawn_hard_pct, 95.0);
     }
 
+    #[test]
+    fn pace_run_budget_tokens_defaults_to_unset() {
+        assert_eq!(PaceConfig::default().run_budget_tokens, None);
+    }
+
     /// Issue #155, Phase 6(c): unlike `pace.enabled`/`max_percent`/
     /// `soft_percent` (which a repo may repo-narrow -- see `a_repo_layer_
     /// may_only_narrow_pace_enabled_max_percent_and_soft_percent` below),
@@ -3644,6 +3674,31 @@ mod tests {
                 "must be a security refusal for {repo_toml}: {err}"
             );
         }
+    }
+
+    /// Issue #285: `run_budget_tokens` is the default soft budget `zirv ctx
+    /// objective set` applies when the operator's own `--budget-tokens` is
+    /// omitted -- a spend ceiling, so a repo checkout must not be able to
+    /// raise it, the same trust asymmetry every other budget key in
+    /// `REPO_FORBIDDEN` enforces.
+    #[test]
+    fn a_repo_ctx_toml_cannot_set_pace_run_budget_tokens() {
+        let repo = tempfile::tempdir().expect("repo");
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[pace]\nrun_budget_tokens = 1000000\n",
+        )
+        .expect("write");
+        let empty: HashMap<String, String> = HashMap::new();
+        let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+            .expect_err("a repo may not set pace.run_budget_tokens");
+        assert!(
+            is_repo_forbidden(err.as_ref()),
+            "must be a security refusal: {err}"
+        );
     }
 
     #[test]
@@ -5915,6 +5970,7 @@ mod tests {
         ("pace", "blind_delay_secs"),
         ("pace", "spawn_soft_pct"),
         ("pace", "spawn_hard_pct"),
+        ("pace", "run_budget_tokens"),
         ("pace.use_credits", "claude"),
         ("pace.use_credits", "codex"),
         ("optimize", "enabled"),

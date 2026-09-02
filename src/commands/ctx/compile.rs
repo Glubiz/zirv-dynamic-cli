@@ -875,6 +875,19 @@ pub fn compile_with_harness_roster(
             .core_max_bytes
             .saturating_add(cfg.memory.retrieval_max_bytes),
     );
+    // Issue #285: the durable objective layer, folded in last of everything
+    // this compiler composes deterministically -- its own spend/status is at
+    // least as volatile as memory's own retrieval half (a rot restart can
+    // update it without a full recompose, see `exec.rs`), so it sits behind
+    // even `Memory` in the cacheable prefix. Read fresh from disk every call,
+    // never reseeded once `Closed` -- rendered as `None` here, the same
+    // "nothing to inject" a missing objective gets.
+    let objective_text = super::objective::load(state, &slug)
+        .ok()
+        .flatten()
+        .filter(|record| record.status != super::objective::Status::Closed)
+        .map(|record| super::objective::layer_text(&record));
+    let composed = prompt::with_objective_layer(composed, objective_text.as_deref());
 
     // Computed from `cfg.policy` alone, never from `composed`'s text: the
     // canonical context layer's prose can steer a session, but it cannot
@@ -1673,6 +1686,139 @@ mod tests {
             worker_composed.sources
         );
         assert!(!worker_composed.text.contains("run the database migration"));
+    }
+
+    /// Issue #285, the core acceptance criterion: `compile::compile` emits
+    /// exactly one objective layer, and it sits after `Context` -- in fact
+    /// after `Memory` too, last of everything the compiler composes
+    /// deterministically (see `PromptSource::Objective`'s own doc comment).
+    #[test]
+    fn compile_emits_exactly_one_objective_layer_after_context_and_memory() {
+        let repo = repo_with_context_files(&[("common.md", "Shared instruction for every step.")]);
+        let state_dir = tempfile::tempdir().expect("state tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+        let cfg = CtxConfig::default();
+        let slug = super::super::state::repo_slug(repo.path());
+        let now = now_secs();
+        super::super::objective::store(
+            &state,
+            &slug,
+            &super::super::objective::Objective {
+                schema_version: super::super::objective::SCHEMA_VERSION,
+                objective: "ship the durable objective layer".to_string(),
+                budget_tokens: Some(100_000),
+                deadline_secs: None,
+                spent_tokens: 500,
+                started_at: now,
+                status: super::super::objective::Status::Active,
+            },
+        )
+        .expect("store objective");
+
+        let adapter = ClaudeAdapter::new(None);
+        let composed = compile(
+            None,
+            repo.path(),
+            false,
+            &cfg,
+            &adapter,
+            PromptRole::Worker,
+            &state,
+            now,
+            LaunchMode::Headless,
+            false,
+        )
+        .composed
+        .expect("composed");
+
+        let objective_count = composed
+            .sources
+            .iter()
+            .filter(|s| **s == PromptSource::Objective)
+            .count();
+        assert_eq!(
+            objective_count, 1,
+            "exactly one objective layer: {:?}",
+            composed.sources
+        );
+        let context_at = composed
+            .sources
+            .iter()
+            .position(|s| *s == PromptSource::Context)
+            .expect("context layer present");
+        let memory_at = composed
+            .sources
+            .iter()
+            .position(|s| *s == PromptSource::Memory);
+        let objective_at = composed
+            .sources
+            .iter()
+            .position(|s| *s == PromptSource::Objective)
+            .expect("objective layer present");
+        assert!(
+            context_at < objective_at,
+            "objective must sit after Context: {:?}",
+            composed.sources
+        );
+        if let Some(memory_at) = memory_at {
+            assert!(
+                memory_at < objective_at,
+                "objective must sit after Memory too: {:?}",
+                composed.sources
+            );
+        }
+        assert!(composed.text.contains("ship the durable objective layer"));
+        assert!(composed.text.contains("500"));
+    }
+
+    /// A closed objective is never reseeded into the composed prompt: once
+    /// `zirv ctx objective close` has run, nothing routes it back into a
+    /// live session's context.
+    #[test]
+    fn compile_omits_the_objective_layer_once_it_is_closed() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let state_dir = tempfile::tempdir().expect("state tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+        let cfg = CtxConfig::default();
+        let slug = super::super::state::repo_slug(repo.path());
+        let now = now_secs();
+        super::super::objective::store(
+            &state,
+            &slug,
+            &super::super::objective::Objective {
+                schema_version: super::super::objective::SCHEMA_VERSION,
+                objective: "already finished".to_string(),
+                budget_tokens: None,
+                deadline_secs: None,
+                spent_tokens: 0,
+                started_at: now,
+                status: super::super::objective::Status::Closed,
+            },
+        )
+        .expect("store objective");
+
+        let adapter = ClaudeAdapter::new(None);
+        let composed = compile(
+            None,
+            repo.path(),
+            false,
+            &cfg,
+            &adapter,
+            PromptRole::Worker,
+            &state,
+            now,
+            LaunchMode::Headless,
+            false,
+        )
+        .composed
+        .expect("composed");
+
+        assert!(
+            !composed.sources.contains(&PromptSource::Objective),
+            "a closed objective must never be reseeded: {:?}",
+            composed.sources
+        );
+        assert!(!composed.text.contains("already finished"));
     }
 
     /// Issue #46 follow-up: `context.max_harness_roster_bytes` is a real,
@@ -2521,7 +2667,7 @@ mod tests {
         );
 
         let described = composed.describe();
-        assert!(described.starts_with("v9 "), "got {described}");
+        assert!(described.starts_with("v10 "), "got {described}");
         assert_eq!(
             described.matches("memory").count(),
             1,

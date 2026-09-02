@@ -188,6 +188,11 @@ fn run_supervised(agent: &str, prompt: &str, flags: &[String], repo: &Path) -> R
         // unbounded behaviour this step always had.
         budget_tokens: None,
         max_tool_calls: None,
+        // No `--objective` knob on a script `agent:` step either (issue
+        // #285 scoped it to `exec`/`loop`); the repository's own durable
+        // objective, if any, still reaches this session via `compile::
+        // compile`.
+        objective: None,
         command: flags.to_vec(),
         simple: false,
     };

@@ -26,7 +26,7 @@ use super::rot::Verdict;
 use super::signal::{self, TurnSignal};
 use super::state::{StateDir, now_secs};
 use super::supervise::{self, Outcome, Tick};
-use super::{CtxResult, adapters, agent, handoff, log, score};
+use super::{CtxResult, adapters, agent, handoff, log, objective, score};
 
 /// The restart budget is spent and the session is still rotting. Callers apply
 /// their own policy from here.
@@ -117,6 +117,13 @@ pub struct ExecArgs {
     /// Tool-call ceiling for this run, independent of `budget_tokens`.
     #[arg(long)]
     pub max_tool_calls: Option<u32>,
+    /// Sets (or replaces) this repository's durable objective (issue #285)
+    /// before the run starts -- a shorthand for `zirv ctx objective set`.
+    /// Its own soft budget defaults from `[pace] run_budget_tokens`; use
+    /// `zirv ctx objective set --budget-tokens`/`--deadline-secs` directly
+    /// for a per-run ceiling.
+    #[arg(long)]
+    pub objective: Option<String>,
     /// The headless agent command, after `--`.
     #[arg(allow_hyphen_values = true, last = true)]
     pub command: Vec<String>,
@@ -690,6 +697,28 @@ fn run_with_clock_inner<W: Write>(
     // (the launch-time delivery and every relaunch arm), never re-derived
     // from anything a message itself carries.
     let parent_short = agent::parent_identity(env);
+
+    // Issue #285: `--objective` sets (or replaces) this repository's durable
+    // objective once, before the first launch below, so it is picked up by
+    // the very first `compile::compile` call. A shorthand for `zirv ctx
+    // objective set`; its own soft budget defaults from `[pace] run_budget_
+    // tokens`, the same fallback `objective::run_set` applies. Never re-run
+    // on a nudge/rot/park/harness-handover restart within this same call --
+    // those reload the SAME durable record (see `objective_layer_for_
+    // restart` below) rather than resetting it.
+    if let Some(text) = &args.objective {
+        let key = super::state::repo_slug(repo);
+        let record = objective::Objective {
+            schema_version: objective::SCHEMA_VERSION,
+            objective: text.clone(),
+            budget_tokens: cfg.pace.run_budget_tokens,
+            deadline_secs: None,
+            spent_tokens: 0,
+            started_at: now_fn(),
+            status: objective::Status::Active,
+        };
+        objective::store(&state, &key, &record)?;
+    }
 
     // A wrapped command that matches no adapter (no explicit `--agent`,
     // detection came up empty) is not actually the agent whose flags we would
@@ -1694,6 +1723,19 @@ fn run_with_clock_inner<W: Write>(
             session_guard.refresh_session(session.as_str());
             transcript = derive_transcript(&session);
 
+            // Issue #285: advances and persists the durable objective (if
+            // any) against the spend just harvested, purely for the side
+            // effect -- the `compile::compile` call right below reloads the
+            // SAME record fresh from disk, so it already carries the updated
+            // counters. No separate raw-text injection needed here, unlike
+            // the rot/timeout restart further down: this branch recomposes.
+            let _ = objective_layer_for_restart(
+                &state,
+                repo,
+                now_fn(),
+                agent::token_spend(&prior_usage),
+            );
+
             // Recompose fresh -- unlike an ordinary restart, which reuses
             // the launch-time `composed`/`prompt_args` untouched (see this
             // module's own doc comment), a nudge relaunch is explicitly the
@@ -2015,6 +2057,13 @@ fn run_with_clock_inner<W: Write>(
                     return Ok(EXIT_BUDGET_EXHAUSTED);
                 }
 
+                // Issue #285: side effect only -- the nested `run_with_clock_
+                // inner` call below starts its own launch, which reloads
+                // this SAME durable objective (keyed by repository, not by
+                // these args) fresh via its own first `compile::compile`
+                // call.
+                let _ = objective_layer_for_restart(&state, repo, now_fn(), spent_tokens);
+
                 let detail = format!(
                     "{}; {} handoff at {}",
                     selection_detail,
@@ -2053,6 +2102,12 @@ fn run_with_clock_inner<W: Write>(
                     timeout_secs: args.timeout_secs,
                     budget_tokens: remaining_tokens,
                     max_tool_calls: remaining_tool_calls,
+                    // Not re-set: the objective is durable per repository
+                    // (keyed by `state::repo_slug`, not by these args), so
+                    // the nested `run_with_clock_inner` call picks up the
+                    // same record via `compile::compile` on its own. Setting
+                    // it again here would reset `spent_tokens` to zero.
+                    objective: None,
                     command: target.model_args(&selected_model),
                     simple: args.simple,
                 };
@@ -2399,6 +2454,15 @@ fn run_with_clock_inner<W: Write>(
             &mut prior_usage,
             &mut prior_tool_calls,
         );
+        // Issue #285: reloads and advances the durable objective (if any)
+        // against the spend just harvested. Unlike a nudge relaunch, this
+        // restart reuses the launch-time `composed` untouched (see this
+        // module's own doc comment), so `composed`'s own objective layer --
+        // if it has one at all -- is stale; appended beside the handoff
+        // below, the one channel that stays live across a rot/timeout/
+        // capacity restart.
+        let objective_block =
+            objective_layer_for_restart(&state, repo, now_fn(), agent::token_spend(&prior_usage));
         session = SessionId::new_v4();
         session_guard.refresh_session(session.as_str());
         // The new session writes somewhere new, so the next iteration's watcher
@@ -2426,6 +2490,10 @@ fn run_with_clock_inner<W: Write>(
             relaunch_system_prompt_supported,
         ));
         let combined = format!("{prompt_text}\n\n{}", handoff::labeled_for_injection(&note));
+        let combined = match &objective_block {
+            Some(text) => format!("{combined}{text}"),
+            None => combined,
+        };
         let combined = super::prompt::task_prompt_with_composed_fallback(
             &combined,
             relaunch_system_prompt_supported,
@@ -2537,6 +2605,33 @@ fn harvest_spend(
         *prior_usage = add_usage(prior_usage, &usage);
         *prior_tool_calls = prior_tool_calls.saturating_add(tool_calls);
     }
+}
+
+/// Issue #285: reloads this repository's durable objective (if any),
+/// advances its status against `now`/`spent` (`objective::advance`),
+/// persists the update, and renders the layer text to append beside the
+/// handoff at a restart -- the one channel its own volatile counters (spend
+/// changes every restart, not just every recompose) can reach. `None` for no
+/// objective set, or one already `Closed`: a closed objective is never
+/// reseeded, and reloading it here must not be the thing that reopens it.
+///
+/// Unlike `composed` (built once at launch and reused across a nudge/rot/
+/// timeout/park restart -- see this module's own doc comment), this cannot
+/// reuse a launch-time snapshot: the objective's status can flip mid-run.
+fn objective_layer_for_restart(
+    state: &StateDir,
+    repo: &Path,
+    now: u64,
+    spent: u64,
+) -> Option<String> {
+    let key = super::state::repo_slug(repo);
+    let record = objective::load(state, &key).ok().flatten()?;
+    if record.status == objective::Status::Closed {
+        return None;
+    }
+    let record = objective::advance(record, now, spent);
+    let _ = objective::store(state, &key, &record);
+    Some(objective::layer_text(&record))
 }
 
 /// Reads `transcript` fresh and evaluates `budget` against it PLUS every
@@ -3536,6 +3631,7 @@ mod tests {
             max_restarts: Some(0),
             budget_tokens: None,
             max_tool_calls: None,
+            objective: None,
             timeout_secs: Some(60),
             simple: true,
             command,
@@ -3571,6 +3667,7 @@ mod tests {
             max_restarts: Some(2),
             budget_tokens: None,
             max_tool_calls: None,
+            objective: None,
             timeout_secs: Some(60),
             simple: false,
             command: fake_agent_command(session),
@@ -3617,6 +3714,7 @@ mod tests {
             max_restarts: Some(2),
             budget_tokens: None,
             max_tool_calls: None,
+            objective: None,
             timeout_secs: Some(60),
             simple: false,
             command: fake_agent_command(session),
@@ -3663,6 +3761,7 @@ mod tests {
             max_restarts: Some(0),
             budget_tokens: None,
             max_tool_calls: None,
+            objective: None,
             timeout_secs: Some(60),
             simple: false,
             command: fake_agent_command(session),
@@ -3698,6 +3797,7 @@ mod tests {
             max_restarts: Some(1),
             budget_tokens: None,
             max_tool_calls: None,
+            objective: None,
             timeout_secs: Some(60),
             simple: false,
             command: fake_agent_command(session),
@@ -3759,6 +3859,7 @@ mod tests {
             max_restarts: Some(0),
             budget_tokens: None,
             max_tool_calls: None,
+            objective: None,
             timeout_secs: Some(60),
             simple: false,
             command: fake_agent_command(session),
@@ -3843,6 +3944,7 @@ mod tests {
             max_restarts: Some(1),
             budget_tokens: None,
             max_tool_calls: None,
+            objective: None,
             timeout_secs: Some(60),
             simple: false,
             command: fake_agent_command(session),
@@ -3897,6 +3999,7 @@ mod tests {
             max_restarts: Some(2),
             budget_tokens: None,
             max_tool_calls: None,
+            objective: None,
             timeout_secs: Some(60),
             simple: false,
             command,
@@ -3950,6 +4053,7 @@ mod tests {
             max_restarts: Some(2),
             budget_tokens: None,
             max_tool_calls: None,
+            objective: None,
             timeout_secs: Some(60),
             simple: false,
             command,
@@ -3998,6 +4102,7 @@ mod tests {
             max_restarts: Some(2),
             budget_tokens: None,
             max_tool_calls: None,
+            objective: None,
             timeout_secs: Some(60),
             simple: false,
             command,
@@ -4032,6 +4137,7 @@ mod tests {
             max_restarts: None,
             budget_tokens: None,
             max_tool_calls: None,
+            objective: None,
             timeout_secs: None,
             simple: false,
             command: Vec::new(),
@@ -4065,6 +4171,7 @@ mod tests {
             max_restarts: None,
             budget_tokens: None,
             max_tool_calls: None,
+            objective: None,
             timeout_secs: None,
             simple: false,
             command: vec!["true".to_string()],
@@ -4239,6 +4346,7 @@ mod tests {
             max_restarts: Some(0),
             budget_tokens: None,
             max_tool_calls: None,
+            objective: None,
             timeout_secs: Some(60),
             simple: false,
             command: fake_agent_command(session),
@@ -4303,6 +4411,7 @@ mod tests {
             max_restarts: Some(1),
             budget_tokens: None,
             max_tool_calls: None,
+            objective: None,
             timeout_secs: Some(60),
             simple: false,
             command: fake_agent_command(session),
@@ -4353,6 +4462,7 @@ mod tests {
             max_restarts: Some(1),
             budget_tokens: None,
             max_tool_calls: None,
+            objective: None,
             timeout_secs: Some(60),
             simple: false,
             command: fake_agent_command(session),
@@ -4410,6 +4520,7 @@ mod tests {
             max_restarts: Some(0),
             budget_tokens: None,
             max_tool_calls: None,
+            objective: None,
             timeout_secs: Some(1),
             simple: false,
             command: fake_agent_command(session),
@@ -4462,6 +4573,7 @@ mod tests {
             // totals (24 assistant events x 20_000 cache-read tokens each).
             budget_tokens: Some(10_000),
             max_tool_calls: None,
+            objective: None,
             timeout_secs: Some(30),
             simple: false,
             command: fake_agent_command(session),
@@ -4517,6 +4629,7 @@ mod tests {
             // restart.
             budget_tokens: Some(10_000),
             max_tool_calls: None,
+            objective: None,
             timeout_secs: Some(30),
             simple: false,
             command: fake_agent_command(session),
@@ -4560,6 +4673,7 @@ mod tests {
             // Comfortably above `healthy` mode's fixed 480_000-token total.
             budget_tokens: Some(1_000_000),
             max_tool_calls: None,
+            objective: None,
             timeout_secs: Some(30),
             simple: false,
             command: fake_agent_command(session),
@@ -4601,6 +4715,7 @@ mod tests {
             max_restarts: Some(0),
             budget_tokens: Some(10_000),
             max_tool_calls: None,
+            objective: None,
             timeout_secs: Some(30),
             simple: false,
             command: fake_agent_command(session),
@@ -4640,6 +4755,7 @@ mod tests {
             max_restarts: Some(0),
             budget_tokens: None,
             max_tool_calls: Some(5),
+            objective: None,
             timeout_secs: Some(30),
             simple: false,
             command: vec!["codex".to_string(), "exec".to_string()],
@@ -4678,6 +4794,7 @@ mod tests {
             // either, but the point here is that the flag is accepted at
             // all, not rejected before the child ever runs).
             max_tool_calls: Some(1_000),
+            objective: None,
             timeout_secs: Some(30),
             simple: false,
             command: fake_agent_command(session),
@@ -4720,6 +4837,7 @@ mod tests {
             max_restarts: Some(0),
             budget_tokens: None,
             max_tool_calls: None,
+            objective: None,
             timeout_secs: Some(30),
             simple: false,
             command,
@@ -4754,6 +4872,7 @@ mod tests {
             max_restarts: Some(0),
             budget_tokens: None,
             max_tool_calls: None,
+            objective: None,
             timeout_secs: Some(30),
             simple: false,
             command: fake_agent_command(session),
@@ -4819,6 +4938,7 @@ mod tests {
             max_restarts: Some(0),
             budget_tokens: None,
             max_tool_calls: None,
+            objective: None,
             timeout_secs: Some(30),
             simple: false,
             command: Vec::new(),
@@ -4878,6 +4998,7 @@ mod tests {
             max_restarts: Some(0),
             budget_tokens: None,
             max_tool_calls: None,
+            objective: None,
             timeout_secs: Some(60),
             simple: false,
             command: fake_agent_command(session),
@@ -4930,6 +5051,7 @@ mod tests {
             max_restarts: Some(0),
             budget_tokens: None,
             max_tool_calls: None,
+            objective: None,
             timeout_secs: Some(60),
             simple: false,
             command: fake_agent_command(session),
@@ -4983,6 +5105,7 @@ mod tests {
             max_restarts: Some(1),
             budget_tokens: None,
             max_tool_calls: None,
+            objective: None,
             timeout_secs: Some(60),
             simple: false,
             command: fake_agent_command(session),
@@ -5056,6 +5179,7 @@ mod tests {
             max_restarts: Some(0),
             budget_tokens: None,
             max_tool_calls: None,
+            objective: None,
             timeout_secs: Some(60),
             simple: false,
             command: fake_agent_command(session),
@@ -5113,6 +5237,7 @@ mod tests {
             max_restarts: Some(5),
             budget_tokens: None,
             max_tool_calls: None,
+            objective: None,
             timeout_secs: Some(60),
             simple: false,
             command: fake_agent_command(session),
@@ -5168,6 +5293,7 @@ mod tests {
             max_restarts: Some(0),
             budget_tokens: None,
             max_tool_calls: None,
+            objective: None,
             timeout_secs: Some(60),
             simple: false,
             command: fake_agent_command(session),
@@ -5217,6 +5343,7 @@ mod tests {
             max_restarts: Some(0),
             budget_tokens: None,
             max_tool_calls: None,
+            objective: None,
             timeout_secs: Some(60),
             simple: false,
             command: fake_agent_command(session),
@@ -5266,6 +5393,7 @@ mod tests {
             max_restarts: Some(1),
             budget_tokens: None,
             max_tool_calls: None,
+            objective: None,
             timeout_secs: Some(60),
             simple: false,
             command: fake_agent_command(session),
@@ -5284,6 +5412,92 @@ mod tests {
             argv.contains("--append-system-prompt"),
             "the restarted child must carry the prompt too: {argv}"
         );
+    }
+
+    /// Issue #285, the core acceptance criterion: `exec` reloads the durable
+    /// objective across a rot restart -- it is not part of the launch-time
+    /// `composed` prompt this restart path reuses untouched (see this
+    /// module's own doc comment), so it has to be carried by hand, beside the
+    /// handoff. `rot` mode reports 170k cache-read tokens on its very first
+    /// turn, well past the tiny budget set below, so by the time the restart
+    /// fires the objective has already crossed its soft budget and the
+    /// injected text has switched to the fixed wrap-up instruction.
+    #[test]
+    fn exec_carries_the_objective_across_a_rot_restart_and_swaps_in_the_wrap_up_text() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let state_dir = tmp.path().join("state");
+        let state = StateDir::from_root(state_dir.clone());
+        let argv_log = tmp.path().join("argv.log");
+        let session = "dddddddd-2222-4333-8444-555555555555";
+        let mut env = base_env(&state_dir);
+        env.insert("ZIRV_CTX_PACE".to_string(), "false".to_string());
+
+        objective::store(
+            &state,
+            &super::super::state::repo_slug(tmp.path()),
+            &objective::Objective {
+                schema_version: objective::SCHEMA_VERSION,
+                objective: "carry me across the restart".to_string(),
+                budget_tokens: Some(50_000),
+                deadline_secs: None,
+                spent_tokens: 0,
+                started_at: now_secs(),
+                status: objective::Status::Active,
+            },
+        )
+        .expect("store objective");
+
+        let modes = tmp.path().join("modes.txt");
+        std::fs::write(&modes, "rot\nhealthy\n").expect("write modes");
+
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        unsafe {
+            std::env::set_var("FAKE_AGENT_MODE_FILE", &modes);
+            std::env::set_var("FAKE_AGENT_SLEEP", "30");
+            std::env::set_var("FAKE_AGENT_ARGV_LOG", &argv_log);
+        }
+        let args = ExecArgs {
+            agent: Some("claude".to_string()),
+            session_id: Some(session.to_string()),
+            transcript: Some(transcript_for(&home, tmp.path(), session)),
+            prompt: Some("do the work".to_string()),
+            max_restarts: Some(1),
+            budget_tokens: None,
+            max_tool_calls: None,
+            objective: None,
+            timeout_secs: Some(60),
+            simple: false,
+            command: fake_agent_command(session),
+        };
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE_FILE");
+            std::env::remove_var("FAKE_AGENT_SLEEP");
+            std::env::remove_var("FAKE_AGENT_ARGV_LOG");
+        }
+        assert_eq!(code.expect("runs"), 0);
+
+        let argv = std::fs::read_to_string(&argv_log).expect("argv recorded");
+        assert!(
+            argv.contains("carry me across the restart"),
+            "the restarted child must carry the same objective: {argv}"
+        );
+        assert!(
+            argv.contains("Do not start new substantive work"),
+            "crossing the budget must swap in the wrap-up instruction: {argv}"
+        );
+
+        let record = objective::load(&state, &super::super::state::repo_slug(tmp.path()))
+            .expect("load")
+            .expect("still present");
+        assert_eq!(
+            record.status,
+            objective::Status::BudgetLimited,
+            "the persisted record itself must carry the flip, not just the injected text"
+        );
+        assert!(record.spent_tokens >= 50_000, "got {}", record.spent_tokens);
     }
 
     /// M8: a restart used to rebuild the headless command from scratch with
@@ -5322,6 +5536,7 @@ mod tests {
             max_restarts: Some(1),
             budget_tokens: None,
             max_tool_calls: None,
+            objective: None,
             timeout_secs: Some(60),
             simple: false,
             command,
@@ -5382,6 +5597,7 @@ mod tests {
             max_restarts: Some(1),
             budget_tokens: None,
             max_tool_calls: None,
+            objective: None,
             timeout_secs: Some(60),
             simple: false,
             command: fake_agent_command(session),
@@ -5458,6 +5674,7 @@ mod tests {
             max_restarts: Some(0),
             budget_tokens: None,
             max_tool_calls: None,
+            objective: None,
             timeout_secs: Some(60),
             simple: false,
             command: fake_agent_command(session),
@@ -5541,6 +5758,7 @@ mod tests {
             max_restarts: Some(0),
             budget_tokens: None,
             max_tool_calls: None,
+            objective: None,
             timeout_secs: Some(60),
             simple: false,
             command: fake_agent_command(session),
@@ -5626,6 +5844,7 @@ mod tests {
             max_restarts: Some(0),
             budget_tokens: None,
             max_tool_calls: None,
+            objective: None,
             timeout_secs: Some(60),
             simple: false,
             // No trailing command: zirv builds the launch itself
@@ -5718,6 +5937,7 @@ mod tests {
             max_restarts: Some(0),
             budget_tokens: None,
             max_tool_calls: None,
+            objective: None,
             timeout_secs: Some(60),
             simple: true,
             command: Vec::new(),
@@ -5789,6 +6009,7 @@ mod tests {
             max_restarts: Some(0),
             budget_tokens: None,
             max_tool_calls: None,
+            objective: None,
             timeout_secs: Some(60),
             simple: false,
             command: vec![
@@ -5884,6 +6105,7 @@ mod tests {
             max_restarts: Some(0),
             budget_tokens: None,
             max_tool_calls: None,
+            objective: None,
             timeout_secs: Some(30),
             simple: false,
             command: vec![
@@ -5991,6 +6213,7 @@ mod tests {
             max_restarts: Some(0),
             budget_tokens: None,
             max_tool_calls: None,
+            objective: None,
             timeout_secs: Some(30),
             simple: false,
             command: vec![
@@ -6069,6 +6292,7 @@ mod tests {
             max_restarts: Some(0),
             budget_tokens: None,
             max_tool_calls: None,
+            objective: None,
             timeout_secs: Some(30),
             simple: true,
             command: Vec::new(),
@@ -6137,6 +6361,7 @@ mod tests {
             max_restarts: Some(0),
             budget_tokens: None,
             max_tool_calls: None,
+            objective: None,
             timeout_secs: Some(30),
             simple: true,
             command: Vec::new(),
@@ -6288,6 +6513,7 @@ mod tests {
             max_restarts: Some(0),
             budget_tokens: None,
             max_tool_calls: None,
+            objective: None,
             timeout_secs: Some(30),
             simple: false,
             command: Vec::new(),
@@ -6358,6 +6584,7 @@ mod tests {
             max_restarts: Some(0),
             budget_tokens: None,
             max_tool_calls: None,
+            objective: None,
             timeout_secs: Some(60),
             simple: false,
             command: fake_agent_command(session),
@@ -6430,6 +6657,7 @@ mod tests {
             max_restarts: Some(0),
             budget_tokens: None,
             max_tool_calls: None,
+            objective: None,
             timeout_secs: Some(60),
             simple: false,
             command: fake_agent_command(session1),
@@ -6459,6 +6687,7 @@ mod tests {
             max_restarts: Some(0),
             budget_tokens: None,
             max_tool_calls: None,
+            objective: None,
             timeout_secs: Some(60),
             simple: false,
             command: fake_agent_command(session2),
@@ -6522,6 +6751,7 @@ mod tests {
             max_restarts: Some(0),
             budget_tokens: None,
             max_tool_calls: None,
+            objective: None,
             timeout_secs: Some(60),
             simple: false,
             command: fake_agent_command(session),
@@ -6580,6 +6810,7 @@ mod tests {
             max_restarts: Some(0),
             budget_tokens: None,
             max_tool_calls: None,
+            objective: None,
             timeout_secs: Some(60),
             simple: false,
             // `adapters::select` still resolves and readies "claude" (via
@@ -6655,6 +6886,7 @@ mod tests {
             max_restarts: Some(0),
             budget_tokens: None,
             max_tool_calls: None,
+            objective: None,
             timeout_secs: Some(60),
             simple: false,
             command: fake_agent_command(session),
@@ -6702,6 +6934,7 @@ mod tests {
             max_restarts: Some(1),
             budget_tokens: None,
             max_tool_calls: None,
+            objective: None,
             timeout_secs: Some(60),
             simple: false,
             command,
@@ -6762,6 +6995,7 @@ mod tests {
             max_restarts: Some(0),
             budget_tokens: None,
             max_tool_calls: None,
+            objective: None,
             timeout_secs: Some(60),
             simple: false,
             command: fake_agent_command(session),
@@ -6967,6 +7201,7 @@ mod tests {
             max_restarts: Some(0),
             budget_tokens: None,
             max_tool_calls: None,
+            objective: None,
             timeout_secs: Some(30),
             simple: false,
             command: fake_agent_command(session),
@@ -7051,6 +7286,7 @@ mod tests {
             max_restarts: Some(0),
             budget_tokens: None,
             max_tool_calls: None,
+            objective: None,
             timeout_secs: Some(30),
             simple: false,
             command: fake_agent_command(session),
@@ -7127,6 +7363,7 @@ mod tests {
             max_restarts: Some(0),
             budget_tokens: None,
             max_tool_calls: None,
+            objective: None,
             timeout_secs: Some(30),
             simple: false,
             command: fake_agent_command(session),
@@ -7225,6 +7462,7 @@ mod tests {
             // reading, only the accumulated total does.
             budget_tokens: Some(60_000),
             max_tool_calls: None,
+            objective: None,
             timeout_secs: Some(30),
             simple: false,
             command: fake_agent_command(session),
@@ -7327,6 +7565,7 @@ mod tests {
             max_restarts: Some(0),
             budget_tokens: None,
             max_tool_calls: None,
+            objective: None,
             // Short enough that the second (ignored-nudge) hang ends the
             // run on its own once the cap has been proven, rather than
             // hanging the test forever.

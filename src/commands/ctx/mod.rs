@@ -24,6 +24,7 @@ pub mod mail;
 pub mod memory;
 pub mod memory_cli;
 pub mod memory_optimize;
+pub mod objective;
 pub mod optimize;
 pub mod pace;
 pub mod permissions;
@@ -432,6 +433,8 @@ pub enum CtxVerb {
     /// Compose the session prompt for the current repo/role/harness -- print
     /// it, or measure its per-layer byte/token cost with `--measure`.
     Compile(compile::CompileArgs),
+    /// Set, show or close this repository's durable objective (issue #285).
+    Objective(objective::ObjectiveArgs),
 }
 
 /// What a clap parse failure costs, which is not the same for every verb.
@@ -523,6 +526,7 @@ pub fn dispatch(args: &[String]) -> i32 {
         CtxVerb::Permissions(a) => permissions::run(a, &mut out),
         CtxVerb::Group(a) => group::run(a, &mut out),
         CtxVerb::Compile(a) => compile::run(a, &mut out),
+        CtxVerb::Objective(a) => objective::run(a, &mut out),
     };
 
     match result {
@@ -643,6 +647,40 @@ mod tests {
         let cli = CtxCli::try_parse_from(["zirv ctx", "loop", "--prompt", "go"])
             .expect("loop should parse");
         assert!(matches!(cli.verb, CtxVerb::Loop(_)));
+    }
+
+    /// Issue #285: `zirv ctx objective set|show|close` all parse.
+    #[test]
+    fn objective_verb_parses_set_show_and_close() {
+        let cli = CtxCli::try_parse_from(["zirv ctx", "objective", "set", "ship the thing"])
+            .expect("objective set should parse");
+        match cli.verb {
+            CtxVerb::Objective(a) => match a.command {
+                objective::ObjectiveVerb::Set(set) => {
+                    assert_eq!(set.objective, "ship the thing");
+                }
+                other => panic!("expected Set, got {other:?}"),
+            },
+            other => panic!("expected Objective, got {other:?}"),
+        }
+
+        let cli = CtxCli::try_parse_from(["zirv ctx", "objective", "show"])
+            .expect("objective show should parse");
+        assert!(matches!(
+            cli.verb,
+            CtxVerb::Objective(objective::ObjectiveArgs {
+                command: objective::ObjectiveVerb::Show(_)
+            })
+        ));
+
+        let cli = CtxCli::try_parse_from(["zirv ctx", "objective", "close"])
+            .expect("objective close should parse");
+        assert!(matches!(
+            cli.verb,
+            CtxVerb::Objective(objective::ObjectiveArgs {
+                command: objective::ObjectiveVerb::Close(_)
+            })
+        ));
     }
 
     /// `exec`'s own flags come before `--`, the headless agent command after.
