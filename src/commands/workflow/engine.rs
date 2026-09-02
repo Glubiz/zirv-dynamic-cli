@@ -1198,6 +1198,11 @@ pub struct TransitionEvidence {
     pub sidechain_cache_read_input_tokens: Option<u64>,
     pub sidechain_output_tokens: Option<u64>,
     pub session_id: Option<String>,
+    /// Issue #287: set when this `StepOutcome::Failure` is the no-progress
+    /// guard's `GateOutcome::Unchanged` -- carried onto the resulting
+    /// `TelemetryEvent` so the pathology is distinguishable from a genuinely
+    /// re-evaluated failure. Never set for any other transition.
+    pub verification_unchanged: bool,
 }
 
 fn session_identity() -> Option<(String, String)> {
@@ -1856,6 +1861,7 @@ pub fn advance_with_evidence(
     event.sidechain_cache_read_input_tokens = evidence.sidechain_cache_read_input_tokens;
     event.sidechain_output_tokens = evidence.sidechain_output_tokens;
     event.session_id = evidence.session_id;
+    event.verification_unchanged = evidence.verification_unchanged;
     event.succeeded = Some(outcome == StepOutcome::Success);
     event.findings_total = findings_total;
     event.findings_meaningful = findings_meaningful;
@@ -2567,24 +2573,35 @@ fn resolve_state() -> CtxResult<StateDir> {
 /// Runs the evidence command a `Test`/`Verify` step itself requires --
 /// `zirv test changed` for `Test`, `zirv verify` for `Verify` -- through the
 /// same in-process function the CLI verb itself calls (never a subprocess),
-/// printing its evidence summary to `writer`. Returns whether it passed.
-/// Backs `zirv workflow advance --run-checks`, which collapses "run the
-/// gate, then advance" into a single call. Any other phase is not something
-/// `--run-checks` knows how to satisfy, so it errors rather than silently
-/// treating the step as passed.
+/// printing its evidence summary to `writer`. Returns the resolved
+/// [`super::verification::GateOutcome`]. Backs `zirv workflow advance
+/// --run-checks`, which collapses "run the gate, then advance" into a single
+/// call. Any other phase is not something `--run-checks` knows how to
+/// satisfy, so it errors rather than silently treating the step as passed.
 ///
-/// Pass/fail is decided by [`super::verification::latest_is_fresh_and_passing`]
-/// against the report the run above just persisted -- the exact same
-/// baseline-aware gate the plain `zirv workflow advance --outcome success`
-/// path applies to a report from an out-of-process `zirv test changed`/`zirv
-/// verify` run (see the `Test`/`Verify` arm of `advance_with_evidence`).
-/// `run_test`/`run_verify`'s own raw exit code is deliberately not used here:
-/// it reflects the run's unwaived pass/fail, so a report whose only failures
-/// are covered by the operator's recorded baseline (`zirv test baseline`)
-/// exits non-zero even though the same report satisfies the gate -- see the
-/// dogfooding bug where `--run-checks` printed "checks failed" immediately
-/// before a follow-up `--outcome success` against the identical report
-/// advanced with the baseline warning.
+/// Issue #287: before running anything, checks whether the worktree is
+/// byte-identical to the fingerprint recorded by this step's own previous
+/// *failing* report ([`super::verification::last_failure_fingerprint`]) --
+/// a no-op turn since that attempt can only reach the same verdict, so no
+/// check is executed at all and `GateOutcome::Unchanged` is returned
+/// directly.
+///
+/// Otherwise, pass/fail is decided by
+/// [`super::verification::latest_is_fresh_and_passing`] against the report
+/// the run just persisted -- the exact same baseline-aware gate the plain
+/// `zirv workflow advance --outcome success` path applies to a report from
+/// an out-of-process `zirv test changed`/`zirv verify` run (see the
+/// `Test`/`Verify` arm of `advance_with_evidence`). `run_test`/`run_verify`'s
+/// own raw exit code is deliberately not used here: it reflects the run's
+/// unwaived pass/fail, so a report whose only failures are covered by the
+/// operator's recorded baseline (`zirv test baseline`) exits non-zero even
+/// though the same report satisfies the gate -- see the dogfooding bug where
+/// `--run-checks` printed "checks failed" immediately before a follow-up
+/// `--outcome success` against the identical report advanced with the
+/// baseline warning. Collapsed to `GateOutcome::Fail` here regardless of
+/// which of `Fail`/`Inconclusive` the report's own outcome would name -- the
+/// caller only ever distinguished pass from fail before this issue, and
+/// still only needs to distinguish `Unchanged` from everything else.
 ///
 /// Before running, and again after, this snapshots
 /// [`super::verification::latest_report_id`] -- the persisted report's own
@@ -2602,8 +2619,26 @@ fn run_required_checks(
     repo: &Path,
     phase: WorkflowPhase,
     step_id: &str,
+    attempts_so_far: u8,
     writer: &mut impl Write,
-) -> CtxResult<bool> {
+) -> CtxResult<super::verification::GateOutcome> {
+    if !matches!(phase, WorkflowPhase::Test | WorkflowPhase::Verify) {
+        return Err(format!(
+            "--run-checks only applies to Test/Verify steps; the current step is {phase:?} -- \
+             pass --outcome instead"
+        )
+        .into());
+    }
+    let fingerprint = super::verification::change_fingerprint(repo)?;
+    if let Some(last_failure) =
+        super::verification::last_failure_fingerprint(state_dir, repo, step_id)?
+        && last_failure == fingerprint
+    {
+        return Ok(super::verification::GateOutcome::Unchanged {
+            fingerprint,
+            since_attempt: attempts_so_far.saturating_add(1),
+        });
+    }
     let before = super::verification::latest_report_id(state_dir, repo)?;
     let run_args = super::verification::RunArgs {
         repo: Some(repo.to_path_buf()),
@@ -2628,13 +2663,7 @@ fn run_required_checks(
             )?;
             true
         }
-        other => {
-            return Err(format!(
-                "--run-checks only applies to Test/Verify steps; the current step is {other:?} -- \
-                 pass --outcome instead"
-            )
-            .into());
-        }
+        _ => unreachable!("non-Test/Verify phases returned above"),
     };
     let after = super::verification::latest_report_id(state_dir, repo)?;
     if after == before {
@@ -2642,9 +2671,13 @@ fn run_required_checks(
             writer,
             "checks ran but no fresh report was persisted; step '{step_id}' was not advanced"
         )?;
-        return Ok(false);
+        return Ok(super::verification::GateOutcome::Fail);
     }
-    super::verification::latest_is_fresh_and_passing(state_dir, repo, final_only)
+    if super::verification::latest_is_fresh_and_passing(state_dir, repo, final_only)? {
+        Ok(super::verification::GateOutcome::Pass)
+    } else {
+        Ok(super::verification::GateOutcome::Fail)
+    }
 }
 
 /// Call before pushing `step_id` onto `completed_steps`, while
@@ -3267,15 +3300,50 @@ pub fn run(args: &WorkflowArgs, writer: &mut impl Write) -> CtxResult<i32> {
                     .current()
                     .cloned()
                     .ok_or("workflow has no current step")?;
-                if run_required_checks(&state_dir, &repo, current.phase, &current.id, writer)? {
-                    StepOutcome::Success
-                } else {
-                    writeln!(
-                        writer,
-                        "checks failed; step '{}' was not advanced",
-                        current.id
-                    )?;
-                    return Ok(1);
+                let attempts_so_far = state.attempts.get(&current.id).copied().unwrap_or(0);
+                match run_required_checks(
+                    &state_dir,
+                    &repo,
+                    current.phase,
+                    &current.id,
+                    attempts_so_far,
+                    writer,
+                )? {
+                    super::verification::GateOutcome::Pass => StepOutcome::Success,
+                    super::verification::GateOutcome::Unchanged { since_attempt, .. } => {
+                        writeln!(
+                            writer,
+                            "verification not re-run: the worktree is byte-identical to the \
+                             previous failed attempt (attempt {since_attempt}/{}). Edit source, \
+                             tests, or record a blocker artifact before verifying again.",
+                            current.max_attempts
+                        )?;
+                        let evidence = enrich_transition_evidence(
+                            &mut state,
+                            TransitionEvidence {
+                                verification_unchanged: true,
+                                ..Default::default()
+                            },
+                        );
+                        let state = advance_with_evidence(
+                            &state_dir,
+                            state,
+                            StepOutcome::Failure,
+                            Some(&evidence),
+                            args.accept_preexisting_findings,
+                        )?;
+                        write_state(writer, &state, args.json)?;
+                        return Ok(1);
+                    }
+                    super::verification::GateOutcome::Fail
+                    | super::verification::GateOutcome::Inconclusive(_) => {
+                        writeln!(
+                            writer,
+                            "checks failed; step '{}' was not advanced",
+                            current.id
+                        )?;
+                        return Ok(1);
+                    }
                 }
             } else {
                 args.outcome
@@ -4385,6 +4453,188 @@ mod tests {
             reloaded.current().unwrap().phase,
             WorkflowPhase::Test,
             "a failing check must leave the workflow on the test step"
+        );
+    }
+
+    /// #287: a second `--run-checks` verify of the same step, with the
+    /// worktree byte-identical to the previous failed attempt, must not
+    /// execute any check at all -- the model is told to make progress
+    /// instead of burning wall-clock on a run that can only reach the same
+    /// verdict. Three such no-op turns still terminate the step at
+    /// `MAX_STEP_ATTEMPTS`. The check's own marker file lives outside the
+    /// repository (`root`, not `repo`) so writing it never perturbs
+    /// `change_fingerprint` itself.
+    #[test]
+    fn advance_run_checks_skips_a_re_verify_of_an_unchanged_worktree() {
+        let repo = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.email=t@example.com",
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(repo.path())
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(repo.path().join("README.md"), "readme\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "base"]);
+
+        std::fs::create_dir_all(repo.path().join(".zirv")).unwrap();
+        let ran_count = root.path().join("ran_count.txt");
+        let failing = if cfg!(windows) {
+            format!("echo x>>{} & exit /b 1", ran_count.display())
+        } else {
+            format!("echo x >> {}; exit 1", ran_count.display())
+        };
+        std::fs::write(
+            repo.path().join(".zirv/verify.toml"),
+            format!("schema_version=1\n[[checks]]\nid='unit'\nkind='unit'\ncommand='{failing}'\n"),
+        )
+        .unwrap();
+
+        let mut state = WorkflowState::start(
+            repo.path().to_path_buf(),
+            "small feature".into(),
+            WorkflowKind::Feature,
+            None,
+            true,
+            low_classification(),
+        );
+        let test_index = state
+            .steps
+            .iter()
+            .position(|step| step.phase == WorkflowPhase::Test)
+            .unwrap();
+        state.completed_steps = state.steps[..test_index]
+            .iter()
+            .map(|step| step.id.clone())
+            .collect();
+        state.current_step = test_index;
+        state.status = WorkflowStatus::Running;
+        let step_id = state.steps[test_index].id.clone();
+        let id = state.id.clone();
+        save(&state_dir, &state, true).unwrap();
+
+        let _state_dir_env = crate::commands::ctx::testenv::VarGuard::set(&[(
+            "ZIRV_CTX_STATE_DIR",
+            Some(root.path().to_str().expect("utf-8 tempdir path")),
+        )]);
+        let run_advance = || {
+            let args = WorkflowArgs {
+                command: WorkflowSubcommand::Advance(AdvanceArgs {
+                    id: id.clone(),
+                    outcome: None,
+                    run_checks: true,
+                    repo: Some(repo.path().to_path_buf()),
+                    json: false,
+                    duration_ms: None,
+                    agent: None,
+                    model: None,
+                    role: None,
+                    input_tokens: None,
+                    output_tokens: None,
+                    workers: 0,
+                    frontend_root: None,
+                    accept_preexisting_findings: false,
+                }),
+            };
+            let mut out = Vec::new();
+            let code = run(&args, &mut out).unwrap();
+            (code, String::from_utf8(out).unwrap())
+        };
+        let ran_executions = || {
+            std::fs::read_to_string(&ran_count)
+                .map(|body| body.lines().count())
+                .unwrap_or(0)
+        };
+        let attempts_of = |id: &str| {
+            load(&state_dir, repo.path(), id)
+                .unwrap()
+                .attempts
+                .get(&step_id)
+                .copied()
+                .unwrap_or(0)
+        };
+
+        // First call: the worktree has never been verified before, so the
+        // check actually executes and fails. An ordinary failed run-checks
+        // call does not itself burn an attempt.
+        let (code, text) = run_advance();
+        assert_eq!(code, 1);
+        assert!(text.contains("was not advanced"), "{text}");
+        assert_eq!(
+            ran_executions(),
+            1,
+            "the first verify must execute the check"
+        );
+        assert_eq!(attempts_of(&id), 0);
+
+        // Second call: nothing moved -- the guard must skip execution
+        // entirely and name the attempt.
+        let (code, text) = run_advance();
+        assert_eq!(code, 1);
+        assert!(
+            text.contains(
+                "verification not re-run: the worktree is byte-identical to the previous \
+                 failed attempt (attempt 1/3). Edit source, tests, or record a blocker \
+                 artifact before verifying again."
+            ),
+            "{text}"
+        );
+        assert_eq!(
+            ran_executions(),
+            1,
+            "an unchanged re-verify must not execute the check a second time"
+        );
+        assert_eq!(attempts_of(&id), 1);
+        assert_eq!(
+            load(&state_dir, repo.path(), &id).unwrap().status,
+            WorkflowStatus::Running
+        );
+        let events = super::super::telemetry::list(&state_dir, repo.path()).unwrap();
+        assert!(
+            events.iter().any(|event| event.kind
+                == super::super::telemetry::TelemetryKind::PhaseFailed
+                && event.verification_unchanged),
+            "expected a PhaseFailed event marked verification_unchanged, got {events:?}"
+        );
+
+        // Third call: still unchanged.
+        let (code, _) = run_advance();
+        assert_eq!(code, 1);
+        assert_eq!(ran_executions(), 1);
+        assert_eq!(attempts_of(&id), 2);
+        assert_eq!(
+            load(&state_dir, repo.path(), &id).unwrap().status,
+            WorkflowStatus::Running
+        );
+
+        // Fourth call: the third unchanged attempt reaches
+        // `MAX_STEP_ATTEMPTS` and fails the step outright.
+        let (code, text) = run_advance();
+        assert_eq!(code, 1);
+        assert!(text.contains("attempt 3/3"), "{text}");
+        assert_eq!(
+            ran_executions(),
+            1,
+            "none of the unchanged re-verifies ever executed the check"
+        );
+        assert_eq!(attempts_of(&id), 3);
+        assert_eq!(
+            load(&state_dir, repo.path(), &id).unwrap().status,
+            WorkflowStatus::Failed
         );
     }
 

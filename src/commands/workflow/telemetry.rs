@@ -177,6 +177,14 @@ pub struct TelemetryEvent {
     /// every event file written before this field existed still deserializes.
     #[serde(default)]
     pub workflow_active: Option<bool>,
+    /// Issue #287: set on a `PhaseFailed` event raised by the no-progress
+    /// guard -- the worktree was byte-identical to the step's previous
+    /// failed attempt, so no check was actually executed. Distinguishes a
+    /// genuinely re-evaluated failure from a no-op turn that only burned an
+    /// attempt. `#[serde(default)]` so every event file written before this
+    /// field existed still deserializes, correctly, as `false`.
+    #[serde(default)]
+    pub verification_unchanged: bool,
 }
 
 impl TelemetryEvent {
@@ -219,6 +227,7 @@ impl TelemetryEvent {
             deploy_tier: None,
             agent_id: None,
             workflow_active: None,
+            verification_unchanged: false,
         }
     }
 
