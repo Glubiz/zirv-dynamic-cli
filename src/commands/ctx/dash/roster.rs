@@ -70,6 +70,11 @@ pub struct RosterPane {
     /// same reasoning as `report_to`.
     #[serde(default)]
     pub work_group_id: Option<String>,
+    /// Per-child token ceiling for this pane. A restore resumes the same
+    /// logical worker, so dropping its ceiling would let a dashboard restart
+    /// turn bounded work into unbounded work. Older rosters remain unbounded.
+    #[serde(default)]
+    pub budget_tokens: Option<u64>,
     /// Issue #160 finding 1, review round (2026-08-28): whether this pane
     /// carried the durable interactive-launch pin (`adapters::LAUNCH_MODE_
     /// ENV`/`LaunchMode::Interactive`) at quit time -- `dash::mod::on_quit`
@@ -249,6 +254,7 @@ mod tests {
                     report_to: None,
                     report_reminder_sent: false,
                     work_group_id: None,
+                    budget_tokens: None,
                     interactive: true,
                     parent_session: None,
                 },
@@ -261,6 +267,7 @@ mod tests {
                     report_to: Some("aaaa1111".to_string()),
                     report_reminder_sent: true,
                     work_group_id: Some("wg-1".to_string()),
+                    budget_tokens: Some(200_000),
                     interactive: false,
                     parent_session: Some("orch0001".to_string()),
                 },
@@ -308,6 +315,10 @@ mod tests {
     /// covers `parent_session` -- a build that predates it wrote no such key
     /// either, and `#[serde(default)]` must read that absence as `None`
     /// (peer trust, the fail-safe side), not a fabricated parent.
+    ///
+    /// Issue #286: `budget_tokens` follows the same compatibility rule. An
+    /// old entry restores with no per-pane ceiling rather than failing the
+    /// entire roster parse.
     #[test]
     fn an_old_style_roster_entry_with_no_report_back_fields_loads_with_none_and_false() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -333,6 +344,7 @@ mod tests {
         assert_eq!(got.panes.len(), 1);
         assert_eq!(got.panes[0].report_to, None);
         assert!(!got.panes[0].report_reminder_sent);
+        assert_eq!(got.panes[0].budget_tokens, None);
         assert!(
             !got.panes[0].interactive,
             "an old-format entry with no `interactive` key must default to fail-closed \
