@@ -1291,6 +1291,7 @@ checkout:
 | `workflow.review_worker_budget_tokens` | `ZIRV_CTX_WORKFLOW_REVIEW_WORKER_BUDGET_TOKENS` |
 | `workflow.review_worker_max_tool_calls` | `ZIRV_CTX_WORKFLOW_REVIEW_WORKER_MAX_TOOL_CALLS` |
 | `workflow.auto_spawn_on_gate` | `ZIRV_CTX_WORKFLOW_AUTO_SPAWN_ON_GATE` |
+| `workflow.allow_empty_verify` | `ZIRV_CTX_WORKFLOW_ALLOW_EMPTY_VERIFY` |
 
 The `mail.*`/`chrome.events` entries close the same hole `prompt.max_repo_bytes`
 does: mail is folded into a launched worker's prompt as its own layer, so a

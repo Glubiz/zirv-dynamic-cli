@@ -1,0 +1,3 @@
+running 12 tests
+test tests::a ... ok
+test tests::b ... ok

@@ -1,0 +1,5 @@
+    Starting 3 tests across 1 binary
+        PASS [   0.003s] zirv tests::a
+        PASS [   0.003s] zirv tests::b
+        PASS [   0.004s] zirv tests::c
+     Summary [   0.010s] 3 tests run: 3 passed, 0 skipped
