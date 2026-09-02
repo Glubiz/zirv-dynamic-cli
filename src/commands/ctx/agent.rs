@@ -1868,6 +1868,11 @@ pub fn run_with<W: Write>(
         timeout_secs: args.timeout_secs,
         budget_tokens: worker_budget.tokens,
         max_tool_calls: worker_budget.tool_calls,
+        // Not exposed on `zirv ctx agent` (issue #285 scoped `--objective`
+        // to `exec`/`loop`): a delegated worker's own repository picks up
+        // whatever durable objective is already set for it, if any, via
+        // `compile::compile` on its own.
+        objective: None,
         command,
         simple: false,
     };

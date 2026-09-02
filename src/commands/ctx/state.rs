@@ -426,6 +426,14 @@ impl StateDir {
         self.0.join("groups")
     }
 
+    /// `<state>/objective` -- one JSON file per repository's durable
+    /// objective (issue #285), keyed by `state::repo_slug`. Outlives any one
+    /// `exec`/`loop` session or restart the way `groups()` outlives any one
+    /// delegated worker.
+    pub fn objective(&self) -> PathBuf {
+        self.0.join("objective")
+    }
+
     /// Issue #178: captured operator-approved permission prompts, ready for
     /// `permissions::propose`'s safe-list classifier -- `<state>/approvals/
     /// *.jsonl`, one file per day (see `log::append_safety`'s own doc
@@ -905,5 +913,12 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(tmp.path().to_path_buf());
         assert_eq!(state.dash(), tmp.path().join("dash"));
+    }
+
+    #[test]
+    fn the_objective_dir_hangs_off_the_state_root() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        assert_eq!(state.objective(), tmp.path().join("objective"));
     }
 }
