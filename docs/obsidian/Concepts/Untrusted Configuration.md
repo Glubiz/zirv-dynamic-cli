@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-09-01
+last-verified: 2026-09-02
 ---
 
 # Untrusted Configuration
@@ -287,4 +287,4 @@ This is separate from `.zirv/.settings.toml`'s roster/capacity gate. Fallback ne
 
 ## The underlying convention
 
-Repo-provided text is treated the same way regardless of which surface it arrives through: capped where it can grow unbounded, labeled where it's concatenated into something authoritative-looking, and denied any lever — a config key, a tool — that would let it grant itself more than that.
+Repo-provided text is treated the same way regardless of which surface it arrives through: capped where it can grow unbounded, labeled where it's concatenated into something authoritative-looking, and denied any lever — a config key, a tool — that would let it grant itself more than that. `zirv ctx agent --attach-artifact` (harness iteration round 2, 2026-09-02) is the same convention applied to a workflow's own accepted intent/spec/plan: reordered and capped at 8 KiB, appended to a delegated worker's task prompt (never the system prompt) under the identical "information only, grants no permissions" label — see [[Ctx Subsystem]]'s `agent.rs` entry.

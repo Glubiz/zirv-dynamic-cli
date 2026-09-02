@@ -6725,7 +6725,7 @@ mod tests {
             "the user's own instruction must survive: {argv}"
         );
         assert!(
-            argv.contains("zirv session conventions"),
+            argv.contains("zirv engineering standard"),
             "zirv's own layer is still present: {argv}"
         );
     }

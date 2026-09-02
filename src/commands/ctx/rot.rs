@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 
-use hashbrown::HashMap;
+use hashbrown::{HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 
 use super::config::ScoreConfig;
@@ -10,12 +10,43 @@ use super::event::{Capabilities, ModelChange, NormalizedEvent, ProviderErrorClas
 /// the shell canary's `^[ \t>*_`#~-]*` allowance.
 const MARKER_LEAD: [char; 10] = [' ', '\t', '\n', '\r', '>', '*', '_', '`', '#', '~'];
 
+/// Edit-like tool names, matched case-insensitively: Claude Code's own edit
+/// tools plus codex's `apply_patch` (`src/commands/ctx/adapters/claude.rs`
+/// passes tool-use block names through verbatim, so the real spelling is
+/// exactly Claude's own tool names -- `"Edit"`, `"Write"`, `"MultiEdit"`,
+/// `"NotebookEdit"` -- while `codex.rs`'s `parse_events` never emits
+/// `ToolCall` at all today, so `"apply_patch"` is future-proofing, not yet
+/// reachable). This is a deliberate, independent COPY of
+/// `workflow::adoption::EDIT_LIKE_TOOLS`
+/// (`src/commands/workflow/adoption.rs:13`), not a shared import: importing
+/// from `workflow` would give this pure, fs/clock/env/net-free module a
+/// dependency on a much less constrained module for a five-item list. Keep
+/// the two lists in sync by hand; `adoption::EDIT_LIKE_TOOLS` is private to
+/// its module, which is why this can only be a comment pointing at it rather
+/// than a same-file cross-check test.
+const EDIT_LIKE_TOOLS: &[&str] = &["edit", "write", "multiedit", "notebookedit", "apply_patch"];
+
+/// Whether `name` is one of [`EDIT_LIKE_TOOLS`], case-insensitively.
+fn is_edit_like(name: &str) -> bool {
+    EDIT_LIKE_TOOLS
+        .iter()
+        .any(|tool| name.eq_ignore_ascii_case(tool))
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Signals {
     pub turns: usize,
     pub tool_failure_rate: f64,
     pub repetition_hits: usize,
     pub max_repeat: usize,
+    /// The longest run of consecutive identical (normalized) tool-result
+    /// error texts within the window: three different fixes that all hit
+    /// the SAME compiler/test error, not three attempts at different ones.
+    /// Unlike `repetition_hits`/`max_repeat` (which key on `(tool,
+    /// input_hash)`), this fires even though every attempt's input differs,
+    /// since what repeats here is the ERROR, not the call. See
+    /// `NormalizedEvent::ToolErrorText`.
+    pub same_error_repeats: usize,
     pub provider_overflows: usize,
     /// `None` means the signal is unavailable, not that it scored zero.
     pub marker_miss_rate: Option<f64>,
@@ -113,18 +144,95 @@ fn failure_rate<I: Iterator<Item = bool>>(results: I) -> f64 {
     errors as f64 / total as f64
 }
 
-/// `(repetition_hits, max_repeat)` over identical `(tool, input)` pairs.
+/// `(repetition_hits, max_repeat)` over identical `(tool, input)` pairs,
+/// interleave-aware: a repeat of `(name, input_hash)` only extends its streak
+/// when no edit-like call (`is_edit_like`) happened since the previous
+/// occurrence of that exact pair. This is what tells a healthy
+/// edit -> rerun -> edit -> rerun TDD loop apart from a stuck agent
+/// re-running the same passing check with nothing changed in between: the
+/// TDD loop always has an edit between reruns, so it never builds a streak.
+///
+/// An edit-like call breaks EVERY key's in-flight streak at once, not just
+/// the key it happens to share a name with: it sits between any pair of
+/// calls made before and after it, for every key, so clearing every streak
+/// on an edit is exactly the per-key rule applied uniformly. Edit-like calls
+/// are themselves never tracked as a repeated call -- they are the healthy
+/// action this signal exists to stop penalising, never the over-verification
+/// it exists to catch.
 fn repetition<'a, I: Iterator<Item = (&'a str, u64)>>(
     calls: I,
     threshold: usize,
 ) -> (usize, usize) {
-    let mut counts: HashMap<(&str, u64), usize> = HashMap::new();
-    for key in calls {
-        *counts.entry(key).or_insert(0) += 1;
+    let mut streaks: HashMap<(&str, u64), usize> = HashMap::new();
+    let mut hit: HashSet<(&str, u64)> = HashSet::new();
+    let mut max_repeat = 0usize;
+    for (name, hash) in calls {
+        if is_edit_like(name) {
+            streaks.clear();
+            continue;
+        }
+        let count = streaks.entry((name, hash)).or_insert(0);
+        *count += 1;
+        max_repeat = max_repeat.max(*count);
+        if *count >= threshold {
+            hit.insert((name, hash));
+        }
     }
-    let max_repeat = counts.values().copied().max().unwrap_or(0);
-    let hits = counts.values().filter(|count| **count >= threshold).count();
-    (hits, max_repeat)
+    (hit.len(), max_repeat)
+}
+
+/// The longest run of consecutive identical hashes among `entries`, in
+/// transcript order. `entries` carries one slot per `NormalizedEvent::
+/// ToolResult`, in order: `Some(hash)` when that result was erroring and
+/// immediately followed by its `ToolErrorText`, `None` for a successful
+/// result or an erroring one with no extractable text (`result_error_entries`
+/// is what builds this). A `None` DOES interrupt the streak -- a successful
+/// result (or an error result whose text could not be extracted) between two
+/// occurrences of the SAME error is a genuine break, unlike `repetition`'s
+/// edit-interruption rule, which only edit-like tool CALLS reset. Only two
+/// adjacent `Some` entries carrying the SAME hash extend a run; a `Some` with
+/// a DIFFERENT hash resets it just like a `None` does.
+fn longest_same_error_run<I: Iterator<Item = Option<u64>>>(entries: I) -> usize {
+    let mut longest = 0usize;
+    let mut current = 0usize;
+    let mut last: Option<u64> = None;
+    for entry in entries {
+        match entry {
+            Some(hash) if last == Some(hash) => current += 1,
+            Some(hash) => {
+                current = 1;
+                last = Some(hash);
+            }
+            None => {
+                current = 0;
+                last = None;
+            }
+        }
+        longest = longest.max(current);
+    }
+    longest
+}
+
+/// Pairs every `NormalizedEvent::ToolResult` in `events` with the
+/// `ToolErrorText` hash that immediately follows it, if any -- one entry per
+/// result, in order. `ToolErrorText` is only ever emitted directly after the
+/// `ToolResult` it describes (see that variant's own doc comment), so
+/// setting the LAST pushed entry is always setting the entry for the result
+/// it belongs to, never an earlier one.
+fn result_error_entries(events: &[NormalizedEvent]) -> Vec<Option<u64>> {
+    let mut entries: Vec<Option<u64>> = Vec::new();
+    for event in events {
+        match event {
+            NormalizedEvent::ToolResult { .. } => entries.push(None),
+            NormalizedEvent::ToolErrorText { hash } => {
+                if let Some(last) = entries.last_mut() {
+                    *last = Some(*hash);
+                }
+            }
+            _ => {}
+        }
+    }
+    entries
 }
 
 /// Share of the already-windowed turn finals that are missing the marker.
@@ -182,11 +290,14 @@ pub fn signals(events: &[NormalizedEvent], caps: Capabilities, cfg: &ScoreConfig
         })
         .count();
 
+    let same_error_repeats = longest_same_error_run(result_error_entries(tail).into_iter());
+
     Signals {
         turns,
         tool_failure_rate,
         repetition_hits,
         max_repeat,
+        same_error_repeats,
         provider_overflows,
         marker_miss_rate,
     }
@@ -198,6 +309,13 @@ pub fn signals(events: &[NormalizedEvent], caps: Capabilities, cfg: &ScoreConfig
 struct Segment {
     calls: Vec<(String, u64)>,
     results: Vec<bool>,
+    /// One entry per `NormalizedEvent::ToolResult` in this segment, in
+    /// order, for `same_error_repeats`: `Some(hash)` when that result was
+    /// erroring and immediately followed by its `ToolErrorText`, `None` for a
+    /// successful result or an erroring one with no extractable text. See
+    /// `longest_same_error_run`'s own doc comment for why `None` has to be
+    /// preserved rather than simply omitted.
+    result_errors: Vec<Option<u64>>,
     #[serde(default)]
     provider_overflows: usize,
 }
@@ -301,6 +419,17 @@ impl RotState {
             NormalizedEvent::ToolResult { is_error } => {
                 if let Some(segment) = self.segments.back_mut() {
                     segment.results.push(*is_error);
+                    // Placeholder until (and unless) the sibling
+                    // `ToolErrorText` for THIS result arrives -- see
+                    // `Segment::result_errors`'s own doc comment.
+                    segment.result_errors.push(None);
+                }
+            }
+            NormalizedEvent::ToolErrorText { hash } => {
+                if let Some(segment) = self.segments.back_mut()
+                    && let Some(last) = segment.result_errors.last_mut()
+                {
+                    *last = Some(*hash);
                 }
             }
             NormalizedEvent::ProviderError {
@@ -380,6 +509,11 @@ impl RotState {
                 .flat_map(|s| s.calls.iter().map(|(name, hash)| (name.as_str(), *hash))),
             cfg.repetition_threshold,
         );
+        let same_error_repeats = longest_same_error_run(
+            self.segments
+                .iter()
+                .flat_map(|s| s.result_errors.iter().copied()),
+        );
         let provider_overflows = self
             .segments
             .iter()
@@ -391,6 +525,7 @@ impl RotState {
             tool_failure_rate,
             repetition_hits,
             max_repeat,
+            same_error_repeats,
             provider_overflows,
             marker_miss_rate,
         }
@@ -536,7 +671,9 @@ pub fn score_from(signals: Signals, tokens: u64, cfg: &ScoreConfig, caps: Capabi
     let raw = cfg.weight_tool_failure * signals.tool_failure_rate
         + cfg.weight_repetition
             * repetition_component(signals.max_repeat, cfg.repetition_threshold)
-        + cfg.weight_marker * signals.marker_miss_rate.unwrap_or(0.0);
+        + cfg.weight_marker * signals.marker_miss_rate.unwrap_or(0.0)
+        + cfg.same_error_weight
+            * repetition_component(signals.same_error_repeats, cfg.same_error_threshold);
     let score = raw.round().clamp(0.0, 100.0) as u32;
 
     let overflow_verdict = match signals.provider_overflows {
@@ -716,6 +853,23 @@ mod tests {
         open_turn.push(NormalizedEvent::TurnStart);
         open_turn.push(assistant("still working", 130_000));
 
+        // Review finding F1: a successful result, and separately a textless
+        // error result, must each break a same-error streak the same way for
+        // the incremental fold as for a full parse.
+        let mut same_error_interrupted_by_success = vec![NormalizedEvent::TurnStart];
+        same_error_interrupted_by_success.extend(erroring_tool_result("error A"));
+        same_error_interrupted_by_success.push(NormalizedEvent::ToolResult { is_error: false });
+        same_error_interrupted_by_success.extend(erroring_tool_result("error A"));
+        same_error_interrupted_by_success.extend(erroring_tool_result("error A"));
+        same_error_interrupted_by_success.extend(turns(3, "", "[zirv] ok", false, 120_000));
+
+        let mut same_error_interrupted_by_textless_error = vec![NormalizedEvent::TurnStart];
+        same_error_interrupted_by_textless_error.extend(erroring_tool_result("error A"));
+        same_error_interrupted_by_textless_error
+            .push(NormalizedEvent::ToolResult { is_error: true });
+        same_error_interrupted_by_textless_error.extend(erroring_tool_result("error A"));
+        same_error_interrupted_by_textless_error.extend(turns(3, "", "[zirv] ok", false, 120_000));
+
         vec![
             ("empty", Vec::new()),
             ("short", turns(3, "", "[zirv] ok", false, 120_000)),
@@ -724,6 +878,14 @@ mod tests {
             ("events before the first turn", before_first_turn),
             ("an open final turn", open_turn),
             ("no turn starts at all", vec![assistant("[zirv] hi", 9)]),
+            (
+                "same error interrupted by a success",
+                same_error_interrupted_by_success,
+            ),
+            (
+                "same error interrupted by a textless error",
+                same_error_interrupted_by_textless_error,
+            ),
         ]
     }
 
@@ -905,6 +1067,253 @@ mod tests {
         ];
         let s = signals(&events, full_caps(), &ScoreConfig::default());
         assert_eq!(s.max_repeat, 1);
+    }
+
+    /// A repeat separated by an edit-like call is exactly the healthy
+    /// edit -> rerun -> edit -> rerun TDD loop, not over-verification: it
+    /// must never build a streak.
+    #[test]
+    fn a_repeat_interrupted_by_an_edit_like_call_does_not_count() {
+        let cfg = ScoreConfig::default(); // repetition_threshold: 3
+        let mut events = vec![NormalizedEvent::TurnStart];
+        for _ in 0..4 {
+            events.push(tool("Bash", "{\"command\":\"cargo test\"}"));
+            events.push(tool("Edit", "{\"file_path\":\"/a.rs\"}"));
+        }
+        let s = signals(&events, full_caps(), &cfg);
+        assert_eq!(
+            s.max_repeat, 1,
+            "an edit between every pair of reruns breaks the streak each time"
+        );
+        assert_eq!(s.repetition_hits, 0);
+    }
+
+    /// A non-edit-like call between repeats (a Read, or a Bash with a
+    /// different command) never breaks the streak: only edit-like calls do.
+    #[test]
+    fn a_repeat_interleaved_with_only_non_edit_calls_still_counts() {
+        let cfg = ScoreConfig::default(); // repetition_threshold: 3
+        let mut events = vec![NormalizedEvent::TurnStart];
+        for i in 0..4 {
+            events.push(tool("Bash", "{\"command\":\"cargo test\"}"));
+            // Distinct each time, so only the Bash repetition is under test.
+            events.push(tool("Read", &format!("{{\"file_path\":\"/a{i}.rs\"}}")));
+        }
+        let s = signals(&events, full_caps(), &cfg);
+        assert_eq!(
+            s.max_repeat, 4,
+            "non-edit-like calls between reruns do not interrupt the streak"
+        );
+        assert_eq!(s.repetition_hits, 1);
+    }
+
+    /// Edit-like calls are never themselves tracked as a repeated call, even
+    /// when the exact same edit is made twice with nothing else in between --
+    /// they are the healthy action this signal exists to stop penalising.
+    #[test]
+    fn edit_like_calls_are_never_tracked_as_a_repetition_themselves() {
+        let cfg = ScoreConfig::default();
+        let mut events = vec![NormalizedEvent::TurnStart];
+        for _ in 0..5 {
+            events.push(tool("Edit", "{\"file_path\":\"/a.rs\"}"));
+        }
+        let s = signals(&events, full_caps(), &cfg);
+        assert_eq!(s.max_repeat, 0);
+        assert_eq!(s.repetition_hits, 0);
+    }
+
+    /// Tool names normalize case-sensitively off the wire (Claude Code's
+    /// block names pass through verbatim), but the classification into
+    /// edit-like must not care about casing.
+    #[test]
+    fn edit_like_matching_is_case_insensitive() {
+        assert!(is_edit_like("Edit"));
+        assert!(is_edit_like("EDIT"));
+        assert!(is_edit_like("write"));
+        assert!(is_edit_like("MultiEdit"));
+        assert!(is_edit_like("NotebookEdit"));
+        assert!(is_edit_like("apply_patch"));
+        assert!(!is_edit_like("Bash"));
+        assert!(!is_edit_like("Read"));
+    }
+
+    /// `ToolResult { is_error: true }` immediately followed by the hashed,
+    /// normalized error text -- exactly what `ClaudeAdapter::parse_events`
+    /// emits for an erroring tool result it can extract text from.
+    fn erroring_tool_result(error_text: &str) -> Vec<NormalizedEvent> {
+        vec![
+            NormalizedEvent::ToolResult { is_error: true },
+            NormalizedEvent::ToolErrorText {
+                hash: crate::commands::ctx::event::error_text_hash(error_text),
+            },
+        ]
+    }
+
+    /// Three different fixes (different tool inputs each time), same
+    /// underlying error every time: `same_error_repeats` must fire even
+    /// though `max_repeat`/`repetition_hits` -- keyed on `(tool,
+    /// input_hash)` -- do not.
+    #[test]
+    fn identical_error_text_across_different_tool_inputs_builds_a_streak() {
+        let cfg = ScoreConfig::default();
+        let mut events = vec![NormalizedEvent::TurnStart];
+        for i in 0..4 {
+            events.push(tool(
+                "Bash",
+                &format!("{{\"command\":\"cargo test mod{i}\"}}"),
+            ));
+            events.extend(erroring_tool_result(
+                "error[E0433]: failed to resolve at src/foo.rs:42",
+            ));
+            events.push(tool("Edit", &format!("{{\"file_path\":\"/a{i}.rs\"}}")));
+        }
+        let s = signals(&events, full_caps(), &cfg);
+        assert_eq!(s.same_error_repeats, 4, "same normalized error every time");
+        assert_eq!(
+            s.max_repeat, 1,
+            "distinct tool inputs must not trip the ordinary repetition signal"
+        );
+    }
+
+    #[test]
+    fn a_different_error_resets_the_same_error_streak() {
+        let cfg = ScoreConfig::default();
+        let mut events = vec![NormalizedEvent::TurnStart];
+        events.extend(erroring_tool_result("error A"));
+        events.extend(erroring_tool_result("error A"));
+        events.extend(erroring_tool_result("error B"));
+        let s = signals(&events, full_caps(), &cfg);
+        assert_eq!(
+            s.same_error_repeats, 2,
+            "the run resets at the different error"
+        );
+    }
+
+    /// Review finding F1: a successful tool result between two occurrences of
+    /// the SAME error must interrupt the streak -- "error A, success, error
+    /// A, error A" is a run of 2, not 3, because the intervening success
+    /// proves the fix landed at least once.
+    #[test]
+    fn a_successful_result_between_same_errors_breaks_the_streak() {
+        let cfg = ScoreConfig::default();
+        let mut events = vec![NormalizedEvent::TurnStart];
+        events.extend(erroring_tool_result("error A"));
+        events.push(NormalizedEvent::ToolResult { is_error: false });
+        events.extend(erroring_tool_result("error A"));
+        events.extend(erroring_tool_result("error A"));
+        let s = signals(&events, full_caps(), &cfg);
+        assert_eq!(
+            s.same_error_repeats, 2,
+            "the successful result in between breaks the streak"
+        );
+    }
+
+    /// Review finding F1: an erroring result with no extractable text (a
+    /// `ToolResult { is_error: true }` never followed by `ToolErrorText`)
+    /// also interrupts the streak -- it is a result boundary, not simply
+    /// absent from the stream the way it was before this fix.
+    #[test]
+    fn an_error_with_no_extractable_text_breaks_the_streak() {
+        let cfg = ScoreConfig::default();
+        let mut events = vec![NormalizedEvent::TurnStart];
+        events.extend(erroring_tool_result("error A"));
+        events.push(NormalizedEvent::ToolResult { is_error: true });
+        events.extend(erroring_tool_result("error A"));
+        let s = signals(&events, full_caps(), &cfg);
+        assert_eq!(
+            s.same_error_repeats, 1,
+            "an error result with no extractable text still breaks the streak"
+        );
+    }
+
+    /// Three occurrences of the same error with no intervening result at all
+    /// still build a run of three -- this fix must not regress the ordinary
+    /// case.
+    #[test]
+    fn three_same_errors_with_no_intervening_results_run_three() {
+        let cfg = ScoreConfig::default();
+        let mut events = vec![NormalizedEvent::TurnStart];
+        events.extend(erroring_tool_result("error A"));
+        events.extend(erroring_tool_result("error A"));
+        events.extend(erroring_tool_result("error A"));
+        let s = signals(&events, full_caps(), &cfg);
+        assert_eq!(s.same_error_repeats, 3);
+    }
+
+    #[test]
+    fn same_error_repeats_normalizes_digits_and_paths_that_differ_between_attempts() {
+        let cfg = ScoreConfig::default();
+        let mut events = vec![NormalizedEvent::TurnStart];
+        events.extend(erroring_tool_result(
+            "error[E0433]: failed to resolve at /tmp/build123/src/foo.rs:42:10",
+        ));
+        events.extend(erroring_tool_result(
+            "error[E0433]: failed to resolve at /tmp/build987/src/foo.rs:57:3",
+        ));
+        let s = signals(&events, full_caps(), &cfg);
+        assert_eq!(
+            s.same_error_repeats, 2,
+            "a randomized temp dir and differing line/col must not defeat the match"
+        );
+    }
+
+    /// The shipped default weight is 0: this signal must never move an
+    /// existing verdict fixture until an operator raises it deliberately.
+    #[test]
+    fn default_same_error_weight_is_zero_and_does_not_move_the_score() {
+        let cfg = ScoreConfig::default();
+        assert_eq!(cfg.same_error_weight, 0.0, "shipped default");
+
+        let base = Signals {
+            turns: 12,
+            tool_failure_rate: 0.0,
+            repetition_hits: 0,
+            max_repeat: 1,
+            same_error_repeats: 0,
+            provider_overflows: 0,
+            marker_miss_rate: Some(0.0),
+        };
+        let heavy_repeat = Signals {
+            same_error_repeats: 50,
+            ..base.clone()
+        };
+
+        let a = score_from(base, 120_000, &cfg, full_caps());
+        let b = score_from(heavy_repeat, 120_000, &cfg, full_caps());
+        assert_eq!(
+            a.score, b.score,
+            "same_error_repeats must not move the score until an operator sets a weight"
+        );
+    }
+
+    /// The incremental fold has to agree with a full parse on the new
+    /// signal too, across turn boundaries and chunk sizes -- the same
+    /// contract `folding_events_in_chunks_matches_a_full_parse` already
+    /// holds for every other signal.
+    #[test]
+    fn same_error_repeats_folds_incrementally_the_same_as_a_full_parse() {
+        let cfg = ScoreConfig::default();
+        let mut events = vec![NormalizedEvent::TurnStart];
+        for i in 0..5 {
+            events.push(tool(
+                "Bash",
+                &format!("{{\"command\":\"cargo test mod{i}\"}}"),
+            ));
+            events.extend(erroring_tool_result("error[E0433]: unresolved import"));
+            events.push(NormalizedEvent::TurnStart);
+        }
+        let expected = score_events(&events, full_caps(), &cfg);
+        for chunk in [1, 3, 7] {
+            let mut state = RotState::new(&cfg).expect("bounded window");
+            for part in events.chunks(chunk) {
+                state.feed_all(part);
+            }
+            assert_eq!(
+                state.score(full_caps(), &cfg),
+                Some(expected.clone()),
+                "chunks of {chunk}"
+            );
+        }
     }
 
     #[test]

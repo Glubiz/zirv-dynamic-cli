@@ -31,7 +31,7 @@ use std::path::Path;
 
 use super::CtxResult;
 use super::config::CtxConfig;
-use super::memory::{Entry, MemoryScope};
+use super::memory::{Entry, LoadedMemory, MemoryScope};
 use super::state::StateDir;
 
 /// One memory entry as input to ranking, tagged with scope and with
@@ -433,17 +433,24 @@ pub fn candidates_for_scope(
     let entries = super::memory::list_scoped(scope, repo, state, slug, cfg)?;
     Ok(entries
         .into_iter()
-        .map(|(_, entry)| {
-            let verified_age_days = now.saturating_sub(entry.verified) / 86_400;
-            let lifecycle = classify_lifecycle(&entry, verified_age_days);
-            RetrievalCandidate {
-                shared: scope == MemoryScope::Shared,
-                verified_age_days,
-                lifecycle,
-                entry,
-            }
-        })
+        .map(|(_, entry)| to_candidate(entry, scope == MemoryScope::Shared, now))
         .collect())
+}
+
+/// The `RetrievalCandidate` one entry becomes: `verified_age_days`/
+/// `lifecycle` are both derived, never stored, so this is the one place that
+/// does it -- shared by `candidates_for_scope` (which reads its own entries)
+/// and `candidates_from_loaded` (which is handed entries a caller already
+/// read).
+fn to_candidate(entry: Entry, shared: bool, now: u64) -> RetrievalCandidate {
+    let verified_age_days = now.saturating_sub(entry.verified) / 86_400;
+    let lifecycle = classify_lifecycle(&entry, verified_age_days);
+    RetrievalCandidate {
+        shared,
+        verified_age_days,
+        lifecycle,
+        entry,
+    }
 }
 
 /// Gathers BOTH scopes as retrieval candidates, for session-startup
@@ -452,19 +459,22 @@ pub fn candidates_for_scope(
 /// to empty rather than erroring (`list_scoped`'s existing contract), so a
 /// disabled scope simply contributes nothing.
 ///
-/// Used by the launch-time context compiler to build the independent
-/// context-ranked retrieval layer on top of core memory.
-pub fn candidates_for_repo(
-    state: &StateDir,
-    repo: &Path,
-    slug: &str,
-    cfg: &CtxConfig,
-    now: u64,
-) -> Vec<RetrievalCandidate> {
-    let mut candidates =
-        candidates_for_scope(MemoryScope::Private, repo, state, slug, cfg, now).unwrap_or_default();
+/// Takes already-loaded entries (`memory::load_both_scopes`) rather than
+/// reading the bank itself: the one caller, the launch-time context
+/// compiler's `gather_memory`, also needs the identical bank for the core
+/// prompt layer (`memory::render_for_prompt_from_loaded`) and must read
+/// every memory-bank file once, not once per consumer.
+pub(crate) fn candidates_from_loaded(loaded: &LoadedMemory, now: u64) -> Vec<RetrievalCandidate> {
+    let mut candidates: Vec<RetrievalCandidate> = loaded
+        .private
+        .iter()
+        .map(|(_, entry)| to_candidate(entry.clone(), false, now))
+        .collect();
     candidates.extend(
-        candidates_for_scope(MemoryScope::Shared, repo, state, slug, cfg, now).unwrap_or_default(),
+        loaded
+            .shared
+            .iter()
+            .map(|(_, entry)| to_candidate(entry.clone(), true, now)),
     );
     candidates
 }
@@ -826,7 +836,7 @@ mod tests {
     }
 
     #[test]
-    fn candidates_for_repo_merges_both_scopes() {
+    fn candidates_from_loaded_merges_both_scopes() {
         let repo = crate::commands::ctx::testenv::repo();
         let state = StateDir::from_root(repo.path().join("state"));
         let cfg = CtxConfig::default();
@@ -869,8 +879,9 @@ mod tests {
         )
         .expect("write shared");
 
-        let candidates =
-            candidates_for_repo(&state, repo.path(), "-work-repo", &cfg, 1_700_000_000);
+        let loaded =
+            super::super::memory::load_both_scopes(repo.path(), &state, "-work-repo", &cfg);
+        let candidates = candidates_from_loaded(&loaded, 1_700_000_000);
         assert_eq!(candidates.len(), 2);
         assert!(
             candidates

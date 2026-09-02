@@ -3281,14 +3281,21 @@ fn strip_leading_separator_for_an_empty_prompt(req_prompt: &str, text: String) -
 
 /// The text passed positionally to `interactive_cmd` for a freshly spawned
 /// worker pane: `req.prompt` as written for an adapter with real
-/// system-prompt injection (its mail and report-back instruction already
-/// rode `compose_worker_prompt`'s `composed` above), or -- for one without --
-/// the same two blocks appended onto the task prompt text instead, unless
-/// even that channel is unsafe on this launch (`task_prompt_fallback_is_
-/// safe`, I), in which case the bare requester prompt is returned unchanged
-/// and the caller (`fulfill_spawn_request`) is responsible for not treating
-/// `mail_messages` as delivered. Split out of `fulfill_spawn_request` for
-/// the same testability reason `compose_worker_prompt` was.
+/// system-prompt injection (its composed conventions, mail and report-back
+/// instruction already rode `compose_worker_prompt`'s `composed` above), or
+/// -- for one without -- the same, now three, blocks appended onto the task
+/// prompt text instead: the complete compiled `composed` text (bug fix,
+/// review finding -- this used to be only the bare `DEFAULT_PROMPT`
+/// constant via `task_prompt_with_conventions_fallback`, so an adapter with
+/// its own worker/sub-orchestrator layer, e.g. codex's `WORKER_PROMPT`/
+/// `SUB_ORCHESTRATOR_PROMPT`, never heard it on this path even though it was
+/// already sitting in `composed.text`), then mail, then the report-back
+/// instruction -- unless even that channel is unsafe on this launch
+/// (`task_prompt_fallback_is_safe`, I), in which case the bare requester
+/// prompt is returned unchanged and the caller (`fulfill_spawn_request`) is
+/// responsible for not treating `mail_messages` as delivered. Split out of
+/// `fulfill_spawn_request` for the same testability reason `compose_worker_
+/// prompt` was.
 ///
 /// Low 12: `fallback_is_safe` is `task_prompt_fallback_is_safe(adapter)`'s
 /// own answer, computed once by the caller and passed in rather than
@@ -3301,6 +3308,16 @@ fn worker_task_prompt(
     req: &spawnreq::SpawnRequest,
     mail_messages: &[mail::Message],
     cfg: &CtxConfig,
+    // Bug fix (review finding): this pane's own composed prompt, from
+    // `compose_worker_prompt` -- already carries the adapter's own worker/
+    // sub-orchestrator layer (codex's `WORKER_PROMPT`/`SUB_ORCHESTRATOR_
+    // PROMPT`, folded in by `compose` regardless of injection capability)
+    // ahead of the bare `DEFAULT_PROMPT` constant this fallback used to
+    // append on its own. Delivered through `task_prompt_with_composed_
+    // fallback`, the same channel `exec.rs`/`run_loop.rs` use for a headless
+    // launch, so a dashboard-spawned codex worker hears exactly what a
+    // headless one does.
+    composed: Option<&prompt::ComposedPrompt>,
     system_prompt_supported: bool,
     fallback_is_safe: bool,
     // Issue #249: this pane's own server-verified parent -- see
@@ -3311,15 +3328,23 @@ fn worker_task_prompt(
         return req.prompt.clone();
     }
     // Session conventions first, ahead of mail and report-back: task text ->
-    // conventions -> mail -> report-back. Gated identically to composition --
-    // `compose_worker_prompt` always calls `prompt::compose` with `simple:
-    // false`, so "a composed prompt exists for this run" reduces to `cfg.
-    // prompt.enabled` alone.
-    let with_conventions = if cfg.prompt.enabled {
-        prompt::task_prompt_with_conventions_fallback(&req.prompt, system_prompt_supported)
-    } else {
-        req.prompt.clone()
-    };
+    // composed conventions -> mail -> report-back. A no-op whenever `composed`
+    // is `None` (nothing was compiled for this run -- `--simple`, a disabled
+    // prompt, or a failed compile), exactly like `exec.rs`'s identical call.
+    let with_conventions =
+        prompt::task_prompt_with_composed_fallback(&req.prompt, system_prompt_supported, composed);
+    // Unlike `exec.rs`'s own relaunch call sites, `worker_task_prompt` is
+    // called exactly once per spawn, with the same `system_prompt_supported`
+    // `compose_worker_prompt` itself already used (both read `adapter.
+    // system_prompt_supported(&[])` moments apart in `fulfill_spawn_
+    // request`) -- there is no later relaunch reusing an earlier `composed`
+    // against a since-changed capability flag, the scenario `exec.rs`'s own
+    // `mail_in_composed` OR-guard exists for. `compose_worker_prompt` only
+    // ever folds mail into `composed` when `system_prompt_supported` is
+    // true, so the plain flag alone already tells this call everything
+    // `mail_in_composed` would: true means mail (if any) already rode the
+    // real injection channel and this call must no-op; false means it did
+    // not and belongs here instead.
     let with_mail = prompt::task_prompt_with_mail_fallback(
         &with_conventions,
         system_prompt_supported,
@@ -3768,6 +3793,7 @@ fn fulfill_spawn_request(
         req,
         &mail_messages,
         cfg,
+        composed.as_ref(),
         system_prompt_supported,
         fallback_is_safe,
         verified_parent.as_deref(),
@@ -10709,6 +10735,7 @@ mod tests {
             &req,
             &[a_mail_message()],
             &cfg,
+            None,
             true,
             fallback_is_safe,
             None,
@@ -10735,6 +10762,7 @@ mod tests {
             &req,
             &[a_mail_message()],
             &cfg,
+            None,
             false,
             fallback_is_safe,
             None,
@@ -10762,21 +10790,95 @@ mod tests {
         );
     }
 
+    /// Bug fix (review finding): `compose_worker_prompt` composes codex's
+    /// own `WORKER_PROMPT` layer into `composed` regardless of adapter
+    /// capability (`compile::compile`/`prompt::compose` fold in every
+    /// adapter's base layer unconditionally; only *delivery* differs by
+    /// capability), so a codex worker pane's `composed` already carries the
+    /// "do not delegate onward" instructions no other layer gives. Before
+    /// this fix, `worker_task_prompt` reached for `task_prompt_with_
+    /// conventions_fallback`, which appends only the bare `DEFAULT_PROMPT`
+    /// constant and ignores `composed` entirely -- a dashboard-spawned codex
+    /// worker never heard its own adapter layer at all. This exercises the
+    /// fixed path (`task_prompt_with_composed_fallback`), the same delivery
+    /// `exec.rs`/`run_loop.rs` already use for a headless launch.
+    #[test]
+    fn worker_task_prompt_delivers_the_composed_prompt_including_the_codex_worker_layer() {
+        let req = spawn_request("do the work", Path::new("/repo"));
+        let adapter = super::super::adapters::codex::CodexAdapter::new(Some("/tmp/fake-codex"));
+        let cfg = CtxConfig::default();
+        let fallback_is_safe = task_prompt_fallback_is_safe(&adapter);
+        let composed = prompt::ComposedPrompt {
+            text: format!(
+                "{}\n\n{}",
+                prompt::DEFAULT_PROMPT,
+                super::super::adapters::codex::WORKER_PROMPT
+            ),
+            sources: vec![prompt::PromptSource::Default, prompt::PromptSource::Adapter],
+            version: prompt::DEFAULT_PROMPT_VERSION,
+        };
+        let prompt = worker_task_prompt(
+            &req,
+            &[a_mail_message()],
+            &cfg,
+            Some(&composed),
+            false,
+            fallback_is_safe,
+            None,
+        );
+
+        assert!(
+            prompt.contains("zirv worker conventions (codex)"),
+            "codex's own worker layer (WORKER_PROMPT) must reach the pane, not just \
+             DEFAULT_PROMPT: {prompt}"
+        );
+        assert_eq!(
+            prompt.matches("zirv engineering standard (v4)").count(),
+            1,
+            "DEFAULT_PROMPT's header must appear exactly once, carried by the composed text \
+             rather than a second time from task_prompt_with_conventions_fallback: {prompt}"
+        );
+        assert_eq!(
+            prompt.matches("heads up: the webhook route moved").count(),
+            1,
+            "mail must be delivered exactly once: {prompt}"
+        );
+        assert_eq!(
+            prompt
+                .matches("zirv ctx send --to-session aaaa1111 --message '<summary>'")
+                .count(),
+            1,
+            "the report-back instruction must be delivered exactly once: {prompt}"
+        );
+    }
+
     /// Low 7 (fix): an empty/whitespace `req.prompt` has no task text above
     /// the fallback's own `"\n\n---\n\n"` separator to set apart from, so
     /// the resulting argv token used to start with `---` -- flag-like, and
     /// confusing regardless. The stripped result must start with the
     /// fallback's own labeled content instead.
+    ///
+    /// Updated for the composed-fallback fix: the leading block is now
+    /// `task_prompt_with_composed_fallback`'s own label ("...complete
+    /// session context compiled by zirv"), not `task_prompt_with_
+    /// conventions_fallback`'s ("...from zirv, the harness that started
+    /// this session") -- the latter no longer runs on this path.
     #[test]
     fn worker_task_prompt_strips_the_leading_separator_for_an_empty_prompt() {
         let req = spawn_request("   ", Path::new("/repo"));
         let adapter = super::super::adapters::codex::CodexAdapter::new(Some("/tmp/fake-codex"));
         let cfg = CtxConfig::default();
         let fallback_is_safe = task_prompt_fallback_is_safe(&adapter);
+        let composed = prompt::ComposedPrompt {
+            text: prompt::DEFAULT_PROMPT.to_string(),
+            sources: vec![prompt::PromptSource::Default],
+            version: prompt::DEFAULT_PROMPT_VERSION,
+        };
         let prompt = worker_task_prompt(
             &req,
             &[a_mail_message()],
             &cfg,
+            Some(&composed),
             false,
             fallback_is_safe,
             None,
@@ -10787,8 +10889,8 @@ mod tests {
             "must not start with the bare separator: {prompt:?}"
         );
         assert!(
-            prompt.starts_with("The following section is from zirv, the harness that started"),
-            "must start with the fallback's own labeled content instead: {prompt:?}"
+            prompt.starts_with("The following section is the complete session context compiled by"),
+            "must start with the composed fallback's own labeled content instead: {prompt:?}"
         );
         assert!(
             prompt.contains("heads up: the webhook route moved"),
@@ -10806,18 +10908,31 @@ mod tests {
         let mut cfg = CtxConfig::default();
         cfg.mail.enabled = false;
         let fallback_is_safe = task_prompt_fallback_is_safe(&adapter);
-        let prompt = worker_task_prompt(&req, &[], &cfg, false, fallback_is_safe, None);
-        // The conventions layer still rides along when the fallback channel
-        // is safe (it is gated on the prompt config and the shim guard, not
-        // on mail) -- `fallback_is_safe` is platform-dependent: false on a
-        // Windows cmd-shim resolution, true on a plain binary. What disabled
-        // mail must omit either way is the report-back instruction, which
-        // only makes sense as mail.
+        let composed = prompt::ComposedPrompt {
+            text: prompt::DEFAULT_PROMPT.to_string(),
+            sources: vec![prompt::PromptSource::Default],
+            version: prompt::DEFAULT_PROMPT_VERSION,
+        };
+        let prompt = worker_task_prompt(
+            &req,
+            &[],
+            &cfg,
+            Some(&composed),
+            false,
+            fallback_is_safe,
+            None,
+        );
+        // The composed conventions layer still rides along when the
+        // fallback channel is safe (it is gated on the prompt config and
+        // the shim guard, not on mail) -- `fallback_is_safe` is
+        // platform-dependent: false on a Windows cmd-shim resolution, true
+        // on a plain binary. What disabled mail must omit either way is the
+        // report-back instruction, which only makes sense as mail.
         assert!(prompt.starts_with("do the work"), "got {prompt}");
         assert_eq!(
-            prompt.contains("zirv session conventions (v2)"),
+            prompt.contains("zirv engineering standard (v4)"),
             fallback_is_safe,
-            "conventions ride the fallback exactly when it is safe: {prompt}"
+            "the composed conventions ride the fallback exactly when it is safe: {prompt}"
         );
         assert!(
             !prompt.contains("--to-session"),

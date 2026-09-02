@@ -11,6 +11,78 @@ pub fn input_hash(input: &str) -> u64 {
     hash
 }
 
+/// How much of a tool result's error text [`normalize_error_text`] keeps
+/// before capping: enough to distinguish genuinely different errors, short
+/// enough that a pathological transcript (a megabyte stack trace) costs
+/// nothing to hash.
+const ERROR_TEXT_CHAR_CAP: usize = 400;
+
+/// Normalizes tool-result error text into a fuzzy fingerprint for "looks
+/// like the same error", feeding `rot::Signals::same_error_repeats`: a hex
+/// literal (`0x...`) collapses to `0x#`, a run of decimal digits collapses
+/// to a single `#` (which also folds most line numbers and randomized
+/// temp-path segments), and a run of whitespace collapses to a single
+/// space, before the result is capped to [`ERROR_TEXT_CHAR_CAP`] characters.
+/// Deliberately small, like `rot::MARKER_LEAD`'s own hand-rolled approach:
+/// this is a fingerprint for "same error, different attempt", not a lexer,
+/// so it never tries to fully canonicalize a filesystem path.
+pub fn normalize_error_text(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(chars.len().min(ERROR_TEXT_CHAR_CAP));
+    let mut out_len = 0usize;
+    let mut i = 0usize;
+    let mut last_was_space = false;
+
+    while i < chars.len() && out_len < ERROR_TEXT_CHAR_CAP {
+        let c = chars[i];
+        if c == '0'
+            && chars.get(i + 1) == Some(&'x')
+            && chars.get(i + 2).is_some_and(char::is_ascii_hexdigit)
+        {
+            let mut j = i + 2;
+            while j < chars.len() && chars[j].is_ascii_hexdigit() {
+                j += 1;
+            }
+            out.push_str("0x#");
+            out_len += 3;
+            i = j;
+            last_was_space = false;
+            continue;
+        }
+        if c.is_ascii_digit() {
+            let mut j = i + 1;
+            while j < chars.len() && chars[j].is_ascii_digit() {
+                j += 1;
+            }
+            out.push('#');
+            out_len += 1;
+            i = j;
+            last_was_space = false;
+            continue;
+        }
+        if c.is_whitespace() {
+            if !last_was_space {
+                out.push(' ');
+                out_len += 1;
+            }
+            last_was_space = true;
+            i += 1;
+            continue;
+        }
+        out.push(c);
+        out_len += 1;
+        last_was_space = false;
+        i += 1;
+    }
+    out.trim().to_string()
+}
+
+/// [`input_hash`] of [`normalize_error_text`]'s output -- the fingerprint
+/// `rot::Signals::same_error_repeats` actually compares.
+pub fn error_text_hash(text: &str) -> u64 {
+    input_hash(&normalize_error_text(text))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SessionId(String);
 
@@ -97,11 +169,35 @@ pub struct ModelChange {
 #[derive(Debug, Clone, PartialEq)]
 pub enum NormalizedEvent {
     TurnStart,
-    AssistantFinal { text: String, input_tokens: u64 },
-    ToolCall { name: String, input_hash: u64 },
-    ToolResult { is_error: bool },
-    ProviderError { class: ProviderErrorClass },
-    ModelId { id: String },
+    AssistantFinal {
+        text: String,
+        input_tokens: u64,
+    },
+    ToolCall {
+        name: String,
+        input_hash: u64,
+    },
+    ToolResult {
+        is_error: bool,
+    },
+    /// The normalized, hashed error text of the immediately preceding
+    /// `ToolResult { is_error: true }`, emitted right after it -- never in
+    /// place of it -- whenever the adapter could extract error text.
+    /// Deliberately a SEPARATE variant rather than a new field on
+    /// `ToolResult`: `ToolResult` is matched with exhaustive field patterns
+    /// (no `..`) in several places across the crate, and a fielded addition
+    /// there would have broken every one of them, whereas a new variant
+    /// only ever needs the `_ => {}` fallthrough every one of those matches
+    /// already has. Feeds `rot::Signals::same_error_repeats`.
+    ToolErrorText {
+        hash: u64,
+    },
+    ProviderError {
+        class: ProviderErrorClass,
+    },
+    ModelId {
+        id: String,
+    },
     Compaction,
 }
 
@@ -153,6 +249,249 @@ pub struct StructuralContext {
     pub assistant_texts: Vec<String>,
     pub files_touched: Vec<String>,
     pub tool_errors: Vec<String>,
+    /// The session's last build/test/lint run, when an adapter could
+    /// identify one ([`last_verification_run`]). `None` means no verified
+    /// invocation looked like one -- distinct from one the adapter saw and
+    /// confirmed passed. Rendered by `handoff::structural`'s `Verification`
+    /// section.
+    pub last_verification: Option<VerificationOutcome>,
+}
+
+/// One command-shaped tool invocation and whether its result errored,
+/// captured with its raw command text -- unlike `NormalizedEvent::ToolCall`,
+/// which only ever carries a hash of the input, this exists purely for
+/// [`last_verification_run`]'s command-text heuristic and is never fed into
+/// the rot engine. An adapter builds these locally while parsing (they are
+/// never stored on [`StructuralContext`] themselves) for every invocation
+/// whose command and result it can verify, not only failing ones, so a
+/// session's last build/test run is visible even when it was green.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolInvocation {
+    pub command: String,
+    pub is_error: bool,
+    /// The result's error text. Empty when `is_error` is `false`.
+    pub error_text: String,
+}
+
+/// Whether a [`VerificationOutcome`]'s status could actually be attributed
+/// to its command, or merely could not be (review finding F1): a shell's
+/// reported exit status describes the LAST simple command it ran, so a
+/// verification marker that is not in that position (`cargo test; echo
+/// done`, `cargo test | tee out.log`) or that only ran conditionally
+/// (`true || cargo test`, which never even ran the test) tells us nothing
+/// about whether the verification itself passed or failed. `Unknown` is
+/// deliberately its own state rather than a bare `Option<bool>` collapsing
+/// into `errored: false`, because "the wrapper reported success" and "we
+/// have no idea what the wrapper's status even measured" must never render
+/// the same way to a successor session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerificationStatus {
+    Passed,
+    Failed,
+    Unknown,
+}
+
+/// What a fresh session most needs to know about the LAST build/test/lint
+/// run before it does anything else: whether it passed, and if not, why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerificationOutcome {
+    pub command: String,
+    pub status: VerificationStatus,
+    /// The first 1-2 non-blank lines of the error text. Empty unless
+    /// `status` is [`VerificationStatus::Failed`].
+    pub error_excerpt: Vec<String>,
+}
+
+/// Command-text substrings (matched case-insensitively) that mark a tool
+/// invocation as a build/test/lint run rather than an ordinary command.
+/// Deliberately small and literal, like [`ERROR_TEXT_CHAR_CAP`]'s own
+/// normalizer: a fuzzy "looks like verification" fingerprint, not a shell
+/// parser.
+const VERIFICATION_MARKERS: &[&str] = &[
+    "cargo test",
+    "cargo nextest",
+    "cargo build",
+    "cargo clippy",
+    "cargo fmt",
+    "npm test",
+    "npm run test",
+    "pytest",
+    "go test",
+    "make",
+];
+
+/// Splits a (lowercased) shell command into simple-command segments on the
+/// separators a marker must never straddle: `&&`, `||`, `;`, `|`, newline,
+/// `(`, `)`. A bare `&` (background job) is deliberately NOT a separator --
+/// only the doubled `&&` is -- so a segment like `cd crate && make test`
+/// splits into `cd crate` and ` make test`, each checked independently.
+fn split_into_segments(command: &str) -> Vec<String> {
+    let mut segments = Vec::new();
+    let mut current = String::new();
+    let chars: Vec<char> = command.chars().collect();
+    let mut i = 0usize;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '&' && chars.get(i + 1) == Some(&'&') {
+            segments.push(std::mem::take(&mut current));
+            i += 2;
+            continue;
+        }
+        if matches!(c, ';' | '|' | '\n' | '(' | ')') {
+            segments.push(std::mem::take(&mut current));
+            i += 1;
+            continue;
+        }
+        current.push(c);
+        i += 1;
+    }
+    segments.push(current);
+    segments
+}
+
+/// Wrapper words that can prefix a real verification command without
+/// changing what it is: `sudo make check`, `time pytest -q`. Deliberately
+/// small and literal, like [`VERIFICATION_MARKERS`] itself.
+const COMMAND_WRAPPER_WORDS: &[&str] = &["sudo", "time", "nice", "nohup", "exec", "env"];
+
+/// Whether `word` is a shell `NAME=value` assignment prefix (`RUST_LOG=debug
+/// cargo test`), recognized the same way a POSIX shell would: a leading
+/// name made of ASCII letters/digits/underscore, not starting with a digit,
+/// followed by `=`.
+fn is_assignment_word(word: &str) -> bool {
+    match word.split_once('=') {
+        Some((name, _)) if !name.is_empty() => {
+            let mut chars = name.chars();
+            let first_ok = chars
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_');
+            first_ok && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+        }
+        _ => false,
+    }
+}
+
+/// Strips leading wrapper words (`sudo`, `time`, ...) and `NAME=value`
+/// assignments from the front of a segment's words, so the marker check
+/// below sees the real command that follows them.
+fn strip_leading_wrappers<'a>(words: &'a [&'a str]) -> &'a [&'a str] {
+    let mut idx = 0usize;
+    while idx < words.len()
+        && (COMMAND_WRAPPER_WORDS.contains(&words[idx]) || is_assignment_word(words[idx]))
+    {
+        idx += 1;
+    }
+    &words[idx..]
+}
+
+/// Whether `command`'s text looks like a build/test/lint run. A marker must
+/// match at the START of a shell segment (after stripping leading wrapper
+/// words/assignments), not merely appear anywhere in the command -- so
+/// `echo cargo test`, `rg "cargo test"`, and `git grep cargo test` do not
+/// count as a `cargo test` run, while `sudo make check`, `RUST_LOG=debug
+/// cargo test`, `(cargo test) | tee out.log`, and `cd crate && make test`
+/// still do (review finding). Markers still match at word boundaries within
+/// that leading position, so `cmake --build .`, `chmod +x make_release.sh`,
+/// and `cat Makefile` do not count as a `make` run (earlier review finding).
+pub fn looks_like_verification(command: &str) -> bool {
+    let lower = command.to_lowercase();
+    split_into_segments(&lower)
+        .iter()
+        .any(|segment| segment_matches_verification_marker(segment))
+}
+
+/// Whether a single (already-lowercased) shell segment starts with a known
+/// verification marker, after stripping its leading wrapper words/
+/// assignments. Factored out of [`looks_like_verification`] so the
+/// attribution check below ([`verification_segment_is_attributable`]) can
+/// apply the exact same "is this segment a verification command" test to
+/// just the LAST segment, rather than "any segment", which is all
+/// `looks_like_verification` itself needs.
+fn segment_matches_verification_marker(segment: &str) -> bool {
+    let words: Vec<&str> = segment.split_whitespace().collect();
+    let words = strip_leading_wrappers(&words);
+    VERIFICATION_MARKERS.iter().any(|marker| {
+        let marker_words: Vec<&str> = marker.split_whitespace().collect();
+        if words.len() < marker_words.len() {
+            return false;
+        }
+        words[..marker_words.len()]
+            .iter()
+            .zip(&marker_words)
+            .all(|(word, marker)| {
+                // `npm run test:unit` still counts as `npm run test`.
+                *word == *marker
+                    || word
+                        .strip_prefix(marker)
+                        .is_some_and(|rest| rest.starts_with(':'))
+            })
+    })
+}
+
+/// Whether `command`'s reported exit status can actually be attributed to
+/// its LAST verification-marker segment (review finding F1). A shell's exit
+/// status is always the LAST simple command's, so:
+/// - a `&&` chain ending in the verification segment is fine (`cd x &&
+///   cargo test`) -- attributable;
+/// - any `||` anywhere in the command makes it unattributable, since `a ||
+///   cargo test` only runs the test when `a` fails, and `cargo test ||
+///   true` reports `true`'s status regardless of the test;
+/// - a `;`, newline, or trailing `|` after the verification segment
+///   (`cargo test; echo done`, `cargo test | tee out.log`) is
+///   unattributable too, since the reported status is whatever ran last.
+///
+/// Implemented as "the LAST segment (after lowercasing) matches a
+/// verification marker, and the command contains no `||`" -- deliberately
+/// simple, like every other check in this module: a fingerprint, not a
+/// shell parser.
+fn verification_segment_is_attributable(command: &str) -> bool {
+    let lower = command.to_lowercase();
+    if lower.contains("||") {
+        return false;
+    }
+    match split_into_segments(&lower).last() {
+        Some(last) => segment_matches_verification_marker(last),
+        None => false,
+    }
+}
+
+/// The most recent (last) invocation in `invocations` whose command text
+/// looks like a verification run, or `None` when none does. Pure: a
+/// straight reverse scan, no fs/clock/env/net.
+pub fn last_verification_run(invocations: &[ToolInvocation]) -> Option<VerificationOutcome> {
+    let last = invocations
+        .iter()
+        .rev()
+        .find(|inv| looks_like_verification(&inv.command))?;
+
+    // F1: the invocation's own recorded `is_error` is only trustworthy when
+    // the verification command's exit status is what the whole compound
+    // command actually reported -- see `verification_segment_is_
+    // attributable`'s own doc comment for the cases this excludes.
+    let status = if !verification_segment_is_attributable(&last.command) {
+        VerificationStatus::Unknown
+    } else if last.is_error {
+        VerificationStatus::Failed
+    } else {
+        VerificationStatus::Passed
+    };
+
+    let error_excerpt = if status == VerificationStatus::Failed {
+        last.error_text
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .take(2)
+            .map(str::to_string)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    Some(VerificationOutcome {
+        command: last.command.clone(),
+        status,
+        error_excerpt,
+    })
 }
 
 #[cfg(test)]
@@ -198,6 +537,198 @@ mod tests {
     #[test]
     fn capabilities_default_to_an_unknown_context_window() {
         assert_eq!(Capabilities::default().context_window_tokens, None);
+    }
+
+    #[test]
+    fn normalize_error_text_collapses_digits_hex_and_whitespace_the_same_way() {
+        let a = normalize_error_text("error at line 42, addr 0x1a2b3c\tin  file");
+        let b = normalize_error_text("error at line 999, addr 0x9f9f9f\tin  file");
+        assert_eq!(a, b, "differing digits/hex must normalize identically");
+        assert!(a.contains("0x#"), "got {a}");
+        assert!(a.contains("line #"), "got {a}");
+    }
+
+    #[test]
+    fn normalize_error_text_folds_a_randomized_temp_path_and_line_number() {
+        let a = normalize_error_text("failed to resolve at /tmp/build123/src/foo.rs:42:10");
+        let b = normalize_error_text("failed to resolve at /tmp/build987/src/foo.rs:57:3");
+        assert_eq!(
+            a, b,
+            "a randomized temp dir and differing line/col must not defeat this"
+        );
+    }
+
+    #[test]
+    fn normalize_error_text_caps_length() {
+        let long = "x".repeat(2_000);
+        assert!(normalize_error_text(&long).chars().count() <= ERROR_TEXT_CHAR_CAP);
+    }
+
+    #[test]
+    fn error_text_hash_matches_for_normalized_equal_text_and_differs_otherwise() {
+        assert_eq!(
+            error_text_hash("failed at /tmp/build123/foo.rs:42"),
+            error_text_hash("failed at /tmp/build987/foo.rs:57"),
+        );
+        assert_ne!(error_text_hash("error A"), error_text_hash("error B"));
+    }
+
+    #[test]
+    fn looks_like_verification_matches_known_command_markers() {
+        for cmd in [
+            "cargo test",
+            "cargo nextest run rot::",
+            "cargo build --release",
+            "cargo clippy --all-targets -- -D warnings",
+            "cargo fmt -- --check",
+            "npm test",
+            "npm run test:unit",
+            "pytest -q",
+            "go test ./...",
+            "make check",
+        ] {
+            assert!(looks_like_verification(cmd), "should match: {cmd}");
+        }
+        assert!(!looks_like_verification("ls -la"));
+        assert!(!looks_like_verification("git status"));
+    }
+
+    /// Review finding: markers match whole words, so commands that merely
+    /// contain `make` as a substring are not verification runs.
+    #[test]
+    fn looks_like_verification_does_not_match_marker_substrings() {
+        for cmd in [
+            "cmake --build .",
+            "chmod +x make_release.sh",
+            "cat Makefile",
+            "echo pytest-style",
+        ] {
+            assert!(!looks_like_verification(cmd), "should not match: {cmd}");
+        }
+        assert!(looks_like_verification("cd crate && make test"));
+        assert!(looks_like_verification("(cargo test) | tee out.log"));
+    }
+
+    /// Review finding (F2): a marker must match at the START of a shell
+    /// segment, not merely appear anywhere in the command -- so a command
+    /// that only mentions a marker as an argument to something else (`echo`,
+    /// `rg`, `git grep`) is not a verification run.
+    #[test]
+    fn looks_like_verification_does_not_match_markers_used_as_mere_arguments() {
+        for cmd in [
+            "echo cargo test",
+            "rg \"cargo test\"",
+            "git grep cargo test",
+        ] {
+            assert!(!looks_like_verification(cmd), "should not match: {cmd}");
+        }
+    }
+
+    /// Review finding (F2): wrapper words and leading shell-variable
+    /// assignments must not defeat the marker check.
+    #[test]
+    fn looks_like_verification_matches_through_wrapper_words_and_assignments() {
+        for cmd in [
+            "sudo make check",
+            "RUST_LOG=debug cargo test",
+            "time pytest -q",
+        ] {
+            assert!(looks_like_verification(cmd), "should match: {cmd}");
+        }
+    }
+
+    fn invocation(command: &str, is_error: bool, error_text: &str) -> ToolInvocation {
+        ToolInvocation {
+            command: command.to_string(),
+            is_error,
+            error_text: error_text.to_string(),
+        }
+    }
+
+    #[test]
+    fn last_verification_run_picks_the_most_recent_matching_invocation() {
+        let invocations = vec![
+            invocation("cargo test", true, "assertion failed\nleft: 1\n"),
+            invocation("git status", false, ""),
+            invocation("cargo nextest run", false, ""),
+        ];
+        let outcome = last_verification_run(&invocations).expect("a verification run exists");
+        assert_eq!(outcome.command, "cargo nextest run");
+        assert_eq!(outcome.status, VerificationStatus::Passed);
+        assert!(outcome.error_excerpt.is_empty());
+    }
+
+    #[test]
+    fn last_verification_run_carries_a_short_error_excerpt_when_red() {
+        let invocations = vec![invocation(
+            "cargo test",
+            true,
+            "\nassertion failed: `(left == right)`\n  left: 40\n  right: 70\nmore noise\n",
+        )];
+        let outcome = last_verification_run(&invocations).expect("exists");
+        assert_eq!(outcome.status, VerificationStatus::Failed);
+        assert_eq!(outcome.error_excerpt.len(), 2);
+        assert_eq!(
+            outcome.error_excerpt[0],
+            "assertion failed: `(left == right)`"
+        );
+        assert_eq!(outcome.error_excerpt[1], "left: 40");
+    }
+
+    #[test]
+    fn last_verification_run_is_none_when_nothing_matches() {
+        let invocations = vec![invocation("git status", false, "")];
+        assert!(last_verification_run(&invocations).is_none());
+    }
+
+    /// Review finding F1: the harness's own recorded `is_error` for the
+    /// WHOLE command is only trustworthy when the compound command's exit
+    /// status can be attributed to the verification segment specifically.
+    /// These four shapes must all report `Unknown`, regardless of the
+    /// recorded `is_error`.
+    #[test]
+    fn last_verification_run_reports_unknown_for_unattributable_compound_commands() {
+        for (command, is_error) in [
+            ("cargo test || true", false),
+            ("cargo test; echo done", false),
+            ("true || cargo test", false),
+            ("cargo test | tee out.log", false),
+            // Even a recorded failure must not be attributed to the test
+            // when the status cannot be trusted.
+            ("cargo test || true", true),
+        ] {
+            let invocations = vec![invocation(command, is_error, "some error text")];
+            let outcome = last_verification_run(&invocations).unwrap_or_else(|| {
+                panic!("{command} should still be recognized as verification-shaped")
+            });
+            assert_eq!(
+                outcome.status,
+                VerificationStatus::Unknown,
+                "command: {command}"
+            );
+            assert!(
+                outcome.error_excerpt.is_empty(),
+                "an unknown outcome carries no error excerpt: {command}"
+            );
+        }
+    }
+
+    /// Review finding F1: a `&&` chain ending in the verification segment is
+    /// fine -- the shell's own exit status IS the last command's.
+    #[test]
+    fn last_verification_run_attributes_a_trailing_and_chain() {
+        let invocations = vec![invocation("cd x && cargo test", true, "boom")];
+        let outcome = last_verification_run(&invocations).expect("exists");
+        assert_eq!(outcome.status, VerificationStatus::Failed);
+        assert_eq!(outcome.error_excerpt, vec!["boom".to_string()]);
+    }
+
+    /// Review finding F1: a leading assignment does not defeat attribution.
+    #[test]
+    fn last_verification_run_attributes_through_a_leading_assignment() {
+        let invocations = vec![invocation("RUST_LOG=debug cargo test", false, "")];
+        let outcome = last_verification_run(&invocations).expect("exists");
+        assert_eq!(outcome.status, VerificationStatus::Passed);
     }
 
     #[test]

@@ -1,8 +1,5 @@
 # zirv -- Codex-specific working instructions
 
-You are a codex worker under zirv. You have NO subagents: do every step
-yourself, in the foreground, and never delegate further.
-
 ## How your context arrives
 
 Codex has no system-prompt injection on a shell-shim launch (a Windows npm
@@ -16,17 +13,8 @@ anything you need to keep.
 
 ## Verification
 
-Run all five yourself, in the foreground, to completion:
-
-    cargo build
-    cargo nextest run --no-fail-fast
-    cargo test --verbose -- --test-threads=1
-    cargo fmt -- --check
-    cargo clippy --all-targets -- -D warnings
-
-Report failures VERBATIM -- command, exit code, failing test names, the error
-text -- rather than summarizing them. Never claim a check passed that you did
-not actually finish running.
+Run the checks yourself, in the foreground, to completion, per the tiers in
+`.zirv/context/common.md`.
 
 ## Sandbox
 
@@ -39,17 +27,5 @@ glob only), say so explicitly in your report, and let the caller decide.
 `--ignore-rules` and `--ignore-user-config` exist only on codex-cli 0.146 and
 later; npm publishes 0.105.0, which errors on them.
 
-## Documentation duties
-
-Read `docs/obsidian/_system-context.md` first, then Active Work, the last 2-3
-Work Journal entries, Known Issues, and the Decision Log. After a behavior,
-contract, or architecture change, update the matching vault page (the trigger
-list is in `.zirv/context/common.md`) and bump its `last-verified` date; log
-new gotchas in Known Issues and non-obvious decisions in the Decision Log. Do
-not update docs for pure refactors, bug fixes, new tests, or CI-only changes.
-
-## Git
-
-Never commit or push to `main`/`master` -- branch first. Every PR must raise
-`Cargo.toml`'s version above its base branch or CD fails on a duplicate
-release. No "Co-Authored-By" lines.
+Documentation duties (which vault pages to update and when) are covered by
+`.zirv/context/common.md`.

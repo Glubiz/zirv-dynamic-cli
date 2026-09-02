@@ -2621,6 +2621,7 @@ mod tests {
     #[test]
     fn status_shows_no_usage_source_for_a_codex_configured_repo_rather_than_anthropic_numbers() {
         let tmp = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(tmp.path());
         let state = StateDir::from_root(tmp.path().join("state"));
         state.ensure().expect("ensure");
         let mut env = env_for(state.root());

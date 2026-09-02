@@ -1371,7 +1371,7 @@ mod tests {
 
         let argv = std::fs::read_to_string(&argv_log).expect("argv recorded");
         assert!(argv.contains("--append-system-prompt"), "got {argv}");
-        assert!(argv.contains("zirv session conventions"), "got {argv}");
+        assert!(argv.contains("zirv engineering standard"), "got {argv}");
 
         let log = std::fs::read_to_string(state.join("logs/decisions.jsonl")).expect("log");
         assert!(log.contains("\"action\":\"prompt-injected\""), "got {log}");
@@ -1508,7 +1508,7 @@ mod tests {
             "the user's own instruction must survive: {argv}"
         );
         assert!(
-            argv.contains("zirv session conventions"),
+            argv.contains("zirv engineering standard"),
             "zirv's own layer is still present: {argv}"
         );
     }
@@ -1545,7 +1545,7 @@ mod tests {
 
         let argv = std::fs::read_to_string(&argv_log).expect("argv recorded");
         assert!(!argv.contains("--append-system-prompt"), "got {argv}");
-        assert!(!argv.contains("zirv session conventions"), "got {argv}");
+        assert!(!argv.contains("zirv engineering standard"), "got {argv}");
 
         let log = std::fs::read_to_string(state.join("logs/decisions.jsonl")).expect("log");
         assert!(log.contains("\"action\":\"prompt-skipped\""), "got {log}");

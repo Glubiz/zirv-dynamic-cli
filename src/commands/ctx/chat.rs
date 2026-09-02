@@ -712,6 +712,7 @@ mod tests {
             next_step: "Add a failing test for an invalid signature".to_string(),
             files_touched: vec!["src/routes/webhook.rs".to_string()],
             gotchas: vec![],
+            ..Handoff::default()
         }
     }
 
@@ -846,7 +847,7 @@ mod tests {
         )
         .expect("an unsupported adapter still gets a fallback prompt");
         assert!(
-            text.contains("zirv session conventions"),
+            text.contains("zirv engineering standard"),
             "the shipped default layer must reach the fallback: {text}"
         );
         assert!(
@@ -873,7 +874,7 @@ mod tests {
             "the caller's own prompt text must lead: {with_resume}"
         );
         assert!(
-            with_resume.contains("zirv session conventions"),
+            with_resume.contains("zirv engineering standard"),
             "and the composed context must still follow it: {with_resume}"
         );
     }
@@ -981,7 +982,7 @@ mod tests {
 
         let argv = pane.argv.join(" ");
         assert!(
-            argv.contains("zirv session conventions"),
+            argv.contains("zirv engineering standard"),
             "the shipped default layer proves injection happened: {argv}"
         );
         assert!(

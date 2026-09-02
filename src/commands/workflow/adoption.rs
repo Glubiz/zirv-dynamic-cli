@@ -13,9 +13,18 @@ use crate::commands::ctx::event::NormalizedEvent;
 const EDIT_LIKE_TOOLS: &[&str] = &["edit", "write", "multiedit", "notebookedit", "apply_patch"];
 
 /// Edit-call count at or above which work counts as substantial on its own.
-pub const SUBSTANTIAL_EDIT_CALLS: usize = 5;
+///
+/// Wrapper behaviour redesign (2026-09-01): raised from 5 to 12. The prior
+/// threshold fired the nudge -- the only steering text zirv ever types into a
+/// live session -- on ordinary bounded work well short of "substantial",
+/// pushing toward more process regardless of diff size. See
+/// `docs/superpowers/specs/2026-09-01-wrapper-behaviour-redesign.md`.
+pub const SUBSTANTIAL_EDIT_CALLS: usize = 12;
 /// Turn count above which even a single edit call counts as substantial.
-pub const SUBSTANTIAL_TURNS: usize = 12;
+///
+/// Wrapper behaviour redesign (2026-09-01): raised from 12 to 25, alongside
+/// [`SUBSTANTIAL_EDIT_CALLS`], for the same proportionality reason.
+pub const SUBSTANTIAL_TURNS: usize = 25;
 /// Minimum turn gap between one nudge and the next.
 pub const NUDGE_EVERY_TURNS: usize = 5;
 
@@ -117,11 +126,19 @@ pub fn nudge_due(
 /// falls back to `"feature"`); under [`AdoptionPolicy::Enforce`] an extra
 /// sentence names the delegation gate this policy also applies
 /// (`ctx::agent::run_with`).
+///
+/// Wrapper behaviour redesign (2026-09-01): the wording is now proportional
+/// -- it names a workflow as something to start "if it spans several areas
+/// or carries real risk" and says outright that a bounded change may finish
+/// without one, rather than unconditionally telling the session to start one
+/// now. See `docs/superpowers/specs/2026-09-01-wrapper-behaviour-redesign.md`.
 pub fn nudge_text(signals: &AdoptionSignals, kind: Option<&str>, policy: AdoptionPolicy) -> String {
     let kind = kind.unwrap_or("feature");
     let mut text = format!(
-        "[zirv workflow] substantial work detected ({} edit calls over {} turns) with no active \
-         zirv workflow. Start one now: zirv workflow start {kind} --task \"<summary>\"",
+        "[zirv workflow] this has grown into substantial work ({} edit calls over {} turns) \
+         with no active zirv workflow. If it spans several areas or carries real risk, start \
+         one now: zirv workflow start {kind} --task \"<summary>\". A bounded change may finish \
+         without one.",
         signals.edit_like_calls, signals.turns
     );
     if policy == AdoptionPolicy::Enforce {
@@ -274,6 +291,35 @@ mod tests {
         };
         let text = nudge_text(&s, None, AdoptionPolicy::Advise);
         assert!(text.contains("zirv workflow start feature"), "{text}");
+    }
+
+    #[test]
+    fn nudge_does_not_fire_at_old_thresholds_but_does_at_new_ones() {
+        // Old thresholds (5 edits / 12 turns) no longer count as substantial.
+        let old = AdoptionSignals {
+            edit_like_calls: 5,
+            turns: 12,
+        };
+        assert!(!is_substantial(&old));
+        assert!(!nudge_due(
+            AdoptionPolicy::Nudge,
+            is_substantial(&old),
+            false,
+            12,
+            None
+        ));
+
+        // New thresholds (12 edits / 25 turns) do.
+        let new_by_edits = AdoptionSignals {
+            edit_like_calls: SUBSTANTIAL_EDIT_CALLS,
+            turns: 1,
+        };
+        assert!(is_substantial(&new_by_edits));
+        let new_by_turns = AdoptionSignals {
+            edit_like_calls: 1,
+            turns: SUBSTANTIAL_TURNS,
+        };
+        assert!(is_substantial(&new_by_turns));
     }
 
     #[test]

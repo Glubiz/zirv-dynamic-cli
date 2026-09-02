@@ -5212,6 +5212,7 @@ mod tests {
                 tool_failure_rate,
                 repetition_hits: 0,
                 max_repeat: 1,
+                same_error_repeats: 0,
                 provider_overflows: 0,
                 marker_miss_rate: None,
             },

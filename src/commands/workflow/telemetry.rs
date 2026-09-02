@@ -92,6 +92,10 @@ pub enum TelemetryKind {
     /// Issue #223: a session recorded as `AdoptionDetected` with no active
     /// workflow later has one active. Recorded at most once per session.
     AdoptionRecovered,
+    /// `zirv workflow close`: a workflow that will not reach `Completed`
+    /// (for example one whose review/fix loop hit `MAX_FIX_REVIEW_ROUNDS`)
+    /// was explicitly closed instead of staying `Running` forever.
+    Closed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

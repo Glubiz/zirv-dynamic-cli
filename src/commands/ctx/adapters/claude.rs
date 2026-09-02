@@ -11,7 +11,8 @@ use serde_json::Value;
 use super::super::CtxResult;
 use super::super::event::input_hash;
 use super::super::event::{
-    Capabilities, NormalizedEvent, SessionId, SessionRef, StructuralContext, TranscriptUsage,
+    Capabilities, NormalizedEvent, SessionId, SessionRef, StructuralContext, ToolInvocation,
+    TranscriptUsage, error_text_hash, last_verification_run,
 };
 use super::{AgentAdapter, ResolvedProgram, TurnSignalSetup};
 
@@ -35,50 +36,43 @@ use super::{AgentAdapter, ResolvedProgram, TurnSignalSetup};
 /// agent --role sub-orchestrator` is reserved for work that genuinely
 /// decomposes into multiple coherently-scoped areas or must run under zirv's
 /// own supervision independently of this seat.
+///
+/// Wrapper behaviour redesign (2026-09-01): rewritten so trivial and bounded
+/// changes stay on this seat instead of always delegating -- the prior text's
+/// "delegate every substantive piece of work" was absolute regardless of task
+/// size, one of the process rules the wrapper-behaviour audit found was
+/// turning small fixes into a full dispatch-and-review cycle. Model routing,
+/// the fork ban, self-contained briefs and the sub-orchestrator carve-out are
+/// unchanged. See
+/// `docs/superpowers/specs/2026-09-01-wrapper-behaviour-redesign.md`.
 pub const ORCHESTRATOR_PROMPT: &str = "\
 zirv orchestrator conventions (claude)
 
-You are an orchestrator. Coordination and judgment are the job, implementation is not: the \
-orchestrator model is reserved for this seat, so delegate every substantive piece of work \
-(codebase exploration, implementation, testing, review) to subagents via the Agent tool and keep \
-your own replies brief and decision-focused.
+This seat runs the most capable model; spend it on judgment -- sizing, design choices, \
+integration, the final call -- not on ceremony.
 
-- Size delegation to the job: native Agent-tool subagents (cheaper-model tier per the rule \
-above) are the default for every bounded task, however substantial. Reserve a sub-orchestrator \
-(`zirv ctx agent --role sub-orchestrator --scope \"<area>\"`) for work that splits into multiple \
-coherent areas each needing its own coordination, or that must run under zirv's own supervision \
-independently of this seat -- never for a single bounded task a worker could finish.
-- Bundle before you dispatch: never spawn an agent for one tiny task. Group small related tasks \
-(same file or area, or a natural sequence) into a single checklist brief per agent, with a \
-per-item output format. Split across agents only when tasks are independent and substantial, \
-then dispatch them together and prefer background dispatch so a slow worker blocks nothing. For \
-a small follow-up in an area a worker just handled, continue that worker instead of spawning a \
-fresh one.
-- Every Agent-tool dispatch MUST set the model parameter explicitly: haiku for mechanical and \
-bulk work, sonnet for ordinary exploration, implementation and test writing, opus only for hard \
-debugging and design exploration. Never omit it -- omission silently inherits this seat's own \
-expensive model -- never dispatch on this seat's model, and never use fork-type subagents from \
-this seat, which always inherit the seat model and ignore overrides. Agents in .claude/agents \
-that pin their own model are exempt; do not override those, except the review-model rule below, \
-which outranks this.
-- Write self-contained briefs: state the goal, constraints, relevant file paths and exact output \
-format, and nothing else -- subagents share none of your context. Every brief must itself tell \
-the worker to reply briefly with compact structured findings, never raw file dumps.
-- Decide rather than let a worker loop: choices between valid designs, architecture changes, and \
-anything a worker has failed at twice come back to you. Do not read large files or write code \
-yourself unless the change is trivial.
-- Hold implementers to this repository's standards: follow the patterns already there, look for \
-reusable code before adding new code, write a failing test first, keep diffs minimal, and run the \
-project's format, lint and test commands before reporting back.
-- Verify in batches: one independent reviewer gate per batch of related changes, not one per \
-micro-task. You own the final integration, so resolve conflicts between agent outputs and report \
-outcomes, including failures, plainly.
-- Before reporting development work done, run this harness's own /code-review over the full diff \
-at a single-reviewer effort level (low or medium), routed to the review model named in the \
-harness roster, never this seat's own model, and never a high-or-above fan-out, which forks \
-agents that inherit the seat's expensive model. If a `zirv workflow` review gate is active for \
-this change, that gate is the single source of truth and this native review does not run at all: \
-`zirv workflow review run` is the round.";
+- Trivial and bounded changes stay on this seat: a brief costs more than the fix. Delegate via \
+the Agent tool when the work is larger than its brief or can run in parallel; bundle small \
+related items into one checklist brief with a per-item output format, dispatch independent \
+substantial work together in the background, and continue a worker you already briefed for \
+follow-ups in its area instead of spawning a fresh one. Reserve a sub-orchestrator (`zirv ctx \
+agent --role sub-orchestrator --scope \"<area>\"`) for work that splits into several \
+coherently-scoped areas each needing its own coordination.
+- Every Agent dispatch sets `model` explicitly -- haiku for mechanical and bulk work, sonnet \
+for ordinary exploration, implementation, tests and review, opus only for hard debugging or \
+design -- because an omitted model inherits this seat. Never use `subagent_type: \"fork\"` \
+here; forks always inherit the seat model. Agents in .claude/agents that pin their own model \
+keep it, except that reviews always run on the roster's review model.
+- Briefs are self-contained -- goal, constraints, relevant paths, exact output format -- and \
+tell the worker to run tests in the FOREGROUND and reply with compact structured findings, \
+never raw file dumps. Subagents share none of your context.
+- Decide rather than let a worker loop: choices between valid designs, architecture changes, \
+and anything a worker has failed at twice come back to you. Hold implementers to the \
+repository's standards and to the engineering standard above: reuse before adding, minimal \
+diff, one focused test per behaviour change, format, lint and test before reporting back.
+- Reviews follow the meta-harness rule: in proportion, once. This harness's own /code-review \
+runs at low or medium effort on the roster's review model, never high or above (that forks \
+this seat's model), and never when a `zirv workflow` review gate covers the change.";
 
 /// Claude's own layer for a delegated **Worker** session (see
 /// `AgentAdapter::worker_system_prompt`), spliced in place of
@@ -137,6 +131,24 @@ automatically, with no `--group` of its own to remember.
 write code yourself unless the change is trivial.
 - When every child you dispatched is done, report ONE integrated result against your work group's \
 completion contract -- not each child's own outcome individually -- including any failures.";
+
+/// The raw text of a `tool_result` block's `content`, falling back to a
+/// JSON-stringified form for a non-string (array/object) content shape.
+/// Shared by `parse_events` (which only needs it long enough to hash it for
+/// `NormalizedEvent::ToolErrorText`) and `structural_context` (which keeps a
+/// human-readable snippet of it).
+fn tool_result_text(block: &Value) -> String {
+    block
+        .get("content")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            block
+                .get("content")
+                .map(Value::to_string)
+                .unwrap_or_default()
+        })
+}
 
 fn text_of(message: &Value) -> String {
     message
@@ -222,12 +234,23 @@ pub fn parse_events(jsonl: &str) -> Vec<NormalizedEvent> {
                     continue;
                 }
                 for block in results {
-                    events.push(NormalizedEvent::ToolResult {
-                        is_error: block
-                            .get("is_error")
-                            .and_then(Value::as_bool)
-                            .unwrap_or(false),
-                    });
+                    let is_error = block
+                        .get("is_error")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    events.push(NormalizedEvent::ToolResult { is_error });
+                    // Same-error repetition (issue: `rot::Signals::
+                    // same_error_repeats`): a sibling event, never a new
+                    // field on `ToolResult` -- see that variant's own doc
+                    // comment for why.
+                    if is_error {
+                        let detail = tool_result_text(block);
+                        if !detail.is_empty() {
+                            events.push(NormalizedEvent::ToolErrorText {
+                                hash: error_text_hash(&detail),
+                            });
+                        }
+                    }
                 }
             }
             Some("assistant") => {
@@ -366,6 +389,15 @@ const LONG_CONTEXT_WINDOW_TOKENS: u64 = 1_000_000;
 
 pub fn structural_context(jsonl: &str, last_n: usize) -> StructuralContext {
     let mut out = StructuralContext::default();
+    // Handoff verification section: every Bash invocation's command text,
+    // captured verbatim, keyed by its `tool_use` block id so the paired
+    // `tool_result` (matched by `tool_use_id`, however many other tool
+    // calls fall between them) is attributed to the right command rather
+    // than whichever result happens to come next. Never exposed on
+    // `StructuralContext` itself -- only the derived
+    // `event::last_verification_run` over it is.
+    let mut pending_bash: HashMap<String, String> = HashMap::new();
+    let mut invocations: Vec<ToolInvocation> = Vec::new();
 
     for line in jsonl.lines() {
         let line = line.trim();
@@ -400,21 +432,25 @@ pub fn structural_context(jsonl: &str, last_n: usize) -> StructuralContext {
                                 out.user_messages.push(text.to_string());
                             }
                         }
-                        Some("tool_result")
-                            if block.get("is_error").and_then(Value::as_bool) == Some(true) =>
-                        {
-                            let detail = block
-                                .get("content")
+                        Some("tool_result") => {
+                            let is_error =
+                                block.get("is_error").and_then(Value::as_bool) == Some(true);
+                            let detail = tool_result_text(block);
+                            if is_error {
+                                out.tool_errors
+                                    .push(detail.chars().take(ERROR_SNIPPET).collect());
+                            }
+                            if let Some(command) = block
+                                .get("tool_use_id")
                                 .and_then(Value::as_str)
-                                .map(str::to_string)
-                                .unwrap_or_else(|| {
-                                    block
-                                        .get("content")
-                                        .map(Value::to_string)
-                                        .unwrap_or_default()
+                                .and_then(|id| pending_bash.remove(id))
+                            {
+                                invocations.push(ToolInvocation {
+                                    command,
+                                    is_error,
+                                    error_text: if is_error { detail } else { String::new() },
                                 });
-                            out.tool_errors
-                                .push(detail.chars().take(ERROR_SNIPPET).collect());
+                            }
                         }
                         _ => {}
                     }
@@ -442,11 +478,25 @@ pub fn structural_context(jsonl: &str, last_n: usize) -> StructuralContext {
                             out.files_touched.push(path.to_string());
                         }
                     }
+                    let is_bash = block
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .is_some_and(|n| n.eq_ignore_ascii_case("Bash"));
+                    if is_bash
+                        && let (Some(id), Some(command)) = (
+                            block.get("id").and_then(Value::as_str),
+                            input.get("command").and_then(Value::as_str),
+                        )
+                    {
+                        pending_bash.insert(id.to_string(), command.to_string());
+                    }
                 }
             }
             _ => {}
         }
     }
+
+    out.last_verification = last_verification_run(&invocations);
 
     keep_last(&mut out.user_messages, last_n);
     keep_last(&mut out.assistant_texts, last_n);
@@ -1846,6 +1896,35 @@ mod tests {
         );
     }
 
+    /// Same-error repetition (`rot::Signals::same_error_repeats`): an
+    /// erroring tool result with extractable text emits a `ToolErrorText`
+    /// carrying its normalized hash right after the `ToolResult` -- never in
+    /// place of it.
+    #[test]
+    fn an_erroring_tool_result_emits_its_normalized_error_hash() {
+        let jsonl = r#"{"type":"user","message":{"content":[{"type":"tool_result","content":"boom: file missing","is_error":true}]}}"#;
+        assert_eq!(
+            parse_events(jsonl),
+            vec![
+                NormalizedEvent::ToolResult { is_error: true },
+                NormalizedEvent::ToolErrorText {
+                    hash: error_text_hash("boom: file missing"),
+                },
+            ]
+        );
+    }
+
+    /// A successful tool result never gets a `ToolErrorText` sibling, even
+    /// when it carries text.
+    #[test]
+    fn a_successful_tool_result_never_emits_an_error_hash() {
+        let jsonl = r#"{"type":"user","message":{"content":[{"type":"tool_result","content":"all good"}]}}"#;
+        assert_eq!(
+            parse_events(jsonl),
+            vec![NormalizedEvent::ToolResult { is_error: false }]
+        );
+    }
+
     #[test]
     fn assistant_yields_text_tokens_and_tool_calls() {
         let jsonl = concat!(
@@ -3129,6 +3208,58 @@ mod tests {
         assert!(ctx.tool_errors[0].contains("boom"));
     }
 
+    /// T2: `last_verification` reflects the LAST Bash invocation whose
+    /// command looks like a build/test/lint run, correlated by
+    /// `id`/`tool_use_id` -- here the second `cargo test` succeeds after
+    /// the first one failed, so the handoff must report green.
+    #[test]
+    fn structural_context_reports_the_last_verification_run() {
+        let jsonl = concat!(
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"b1","name":"Bash","input":{"command":"cargo test"}}],"usage":{}}}"#,
+            "\n",
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"b1","is_error":true,"content":"assertion failed: left 1, right 2"}]}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"b2","name":"Bash","input":{"command":"cargo test"}}],"usage":{}}}"#,
+            "\n",
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"b2","is_error":false,"content":"test result: ok"}]}}"#,
+            "\n",
+        );
+        let ctx = structural_context(jsonl, 5);
+        let outcome = ctx
+            .last_verification
+            .expect("a verification run was recorded");
+        assert_eq!(outcome.command, "cargo test");
+        assert_eq!(
+            outcome.status,
+            crate::commands::ctx::event::VerificationStatus::Passed,
+            "the second run passed"
+        );
+        assert!(outcome.error_excerpt.is_empty());
+    }
+
+    /// An unrelated tool result (a `Read`) landing between a `Bash` call and
+    /// its own result must not be mistaken for that `Bash` call's result:
+    /// correlation is by `id`/`tool_use_id`, not by call order.
+    #[test]
+    fn structural_context_correlates_bash_results_by_id_not_by_order() {
+        let jsonl = concat!(
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"r1","name":"Read","input":{"file_path":"/a.rs"}},{"type":"tool_use","id":"b1","name":"Bash","input":{"command":"cargo test"}}],"usage":{}}}"#,
+            "\n",
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"r1","is_error":false,"content":"file contents"},{"type":"tool_result","tool_use_id":"b1","is_error":true,"content":"boom: it failed"}]}}"#,
+            "\n",
+        );
+        let ctx = structural_context(jsonl, 5);
+        let outcome = ctx
+            .last_verification
+            .expect("a verification run was recorded");
+        assert_eq!(outcome.command, "cargo test");
+        assert_eq!(
+            outcome.status,
+            crate::commands::ctx::event::VerificationStatus::Failed
+        );
+        assert_eq!(outcome.error_excerpt, vec!["boom: it failed".to_string()]);
+    }
+
     #[test]
     fn structural_context_keeps_only_the_last_n_and_dedupes_files() {
         let mut jsonl = String::new();
@@ -3293,7 +3424,7 @@ mod tests {
         assert_eq!(layer, WORKER_PROMPT);
         assert!(layer.starts_with("zirv worker conventions"));
         assert!(
-            !layer.contains("Coordination and judgment are the job"),
+            !layer.contains("spend it on judgment"),
             "the worker layer must not carry the orchestrator's own coaching: {layer}"
         );
         for claim in ["never run `zirv agent`", "fork-type subagents"] {
@@ -3634,19 +3765,17 @@ mod tests {
     #[test]
     fn the_orchestrator_prompt_routes_review_to_the_rosters_configured_model() {
         assert!(
-            ORCHESTRATOR_PROMPT.contains(
-                "routed to the review model named in the harness roster, never this seat's own \
-                 model"
-            ),
+            ORCHESTRATOR_PROMPT.contains("roster's review model"),
             "got:\n{ORCHESTRATOR_PROMPT}"
         );
         assert!(
-            ORCHESTRATOR_PROMPT.contains("single-reviewer effort level (low or medium)"),
+            ORCHESTRATOR_PROMPT.contains("runs at low or medium effort"),
             "never a high-or-above fan-out from this seat: {ORCHESTRATOR_PROMPT}"
         );
         assert!(
             ORCHESTRATOR_PROMPT.contains(
-                "do not override those, except the review-model rule below, which outranks this"
+                "Agents in .claude/agents that pin their own model keep it, except that reviews \
+                 always run on the roster's review model"
             ),
             "the model-routing bullet's pin clause must carve out the review-model exception: \
              {ORCHESTRATOR_PROMPT}"
@@ -3676,7 +3805,7 @@ mod tests {
     #[test]
     fn the_orchestrator_prompt_encodes_model_routing_and_token_economy() {
         assert!(
-            ORCHESTRATOR_PROMPT.contains("MUST set the model parameter explicitly"),
+            ORCHESTRATOR_PROMPT.contains("Every Agent dispatch sets `model` explicitly"),
             "got:\n{ORCHESTRATOR_PROMPT}"
         );
         for tier in [
@@ -3690,21 +3819,17 @@ mod tests {
             );
         }
         assert!(
-            ORCHESTRATOR_PROMPT.contains("never dispatch on this seat's model"),
+            ORCHESTRATOR_PROMPT.contains("an omitted model inherits this seat"),
             "got:\n{ORCHESTRATOR_PROMPT}"
         );
         assert!(
-            ORCHESTRATOR_PROMPT.contains("never use fork-type subagents from this seat"),
+            ORCHESTRATOR_PROMPT.contains("Never use `subagent_type: \"fork\"` here"),
             "forks always inherit the seat model and ignore overrides: {ORCHESTRATOR_PROMPT}"
         );
         assert!(
-            ORCHESTRATOR_PROMPT.contains("keep your own replies brief and decision-focused"),
-            "got:\n{ORCHESTRATOR_PROMPT}"
-        );
-        assert!(
             ORCHESTRATOR_PROMPT.contains(
-                "tell the worker to reply briefly with compact \
-             structured findings, never raw file dumps"
+                "tell the worker to run tests in the FOREGROUND and reply with compact \
+                 structured findings, never raw file dumps"
             ),
             "got:\n{ORCHESTRATOR_PROMPT}"
         );
@@ -3719,25 +3844,21 @@ mod tests {
     #[test]
     fn the_orchestrator_prompt_sizes_delegation_between_subagents_and_sub_orchestrators() {
         assert!(
-            ORCHESTRATOR_PROMPT.contains("native Agent-tool subagents"),
-            "got:\n{ORCHESTRATOR_PROMPT}"
+            ORCHESTRATOR_PROMPT.contains("Trivial and bounded changes stay on this seat"),
+            "trivial and bounded work must stay on this seat instead of delegating: \
+             {ORCHESTRATOR_PROMPT}"
         );
         assert!(
-            ORCHESTRATOR_PROMPT
-                .contains("are the default for every bounded task, however substantial"),
-            "native subagents must be the sizing default: {ORCHESTRATOR_PROMPT}"
+            ORCHESTRATOR_PROMPT.contains("Delegate via the Agent tool"),
+            "got:\n{ORCHESTRATOR_PROMPT}"
         );
         assert!(
             ORCHESTRATOR_PROMPT.contains("zirv ctx agent --role sub-orchestrator --scope"),
             "got:\n{ORCHESTRATOR_PROMPT}"
         );
         assert!(
-            ORCHESTRATOR_PROMPT.contains("multiple coherent areas"),
+            ORCHESTRATOR_PROMPT.contains("several coherently-scoped areas"),
             "sub-orchestrators are reserved for multi-area work: {ORCHESTRATOR_PROMPT}"
-        );
-        assert!(
-            ORCHESTRATOR_PROMPT.contains("never for a single bounded task a worker could finish"),
-            "got:\n{ORCHESTRATOR_PROMPT}"
         );
     }
 

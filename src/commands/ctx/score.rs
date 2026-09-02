@@ -356,9 +356,31 @@ impl IncrementalScorer {
 }
 
 /// Bumped whenever the checkpoint or `RotState` changes shape, so an older
-/// file is ignored and rebuilt instead of misread. Version 3 adds the model
-/// history needed to report changes across fresh-process Stop-hook polls.
-const CHECKPOINT_VERSION: u32 = 3;
+/// file is ignored and rebuilt instead of misread. Issue #155 D1: bumped to
+/// 2 for the new `model` field -- a checkpoint written before that field
+/// existed would otherwise resume with `model: None` until the next poll
+/// happens to carry a fresh assistant line, which is usually immediate but
+/// not guaranteed; the version bump forces one clean rebuild instead.
+/// Bumped to 3 for `rot::Segment`'s new `error_hashes` field (same-error
+/// repetition, `rot::Signals::same_error_repeats`), and independently (main,
+/// same version number before the two lines merged) for the model history
+/// needed to report changes across fresh-process Stop-hook polls: an older
+/// checkpoint simply fails to deserialize without this bump too
+/// (`load_checkpoint` degrades to `None` on any doubt), but the version bump
+/// makes that a clean, immediate rebuild rather than depending on a lenient
+/// decode.
+/// Bumped to 4 for review finding F1: `error_hashes: Vec<u64>` was replaced
+/// by `result_errors: Vec<Option<u64>>` (one entry per `ToolResult`, not just
+/// per erroring one with extractable text) so a successful result -- or a
+/// textless error -- can interrupt a same-error streak instead of being
+/// invisible to it. A checkpoint written under the old field name would fail
+/// to deserialize on its own, but the bump forces a clean rebuild rather than
+/// depending on that.
+/// Bumped to 5 for `rot::Signals`/`Segment`'s new `provider_overflows` field
+/// (provider-error/model-drift handling): same rationale as every bump
+/// above -- a checkpoint written before this field existed must rebuild
+/// clean rather than resume with a silently-zeroed count.
+const CHECKPOINT_VERSION: u32 = 5;
 
 /// What a fresh process needs to carry on folding where the last one stopped.
 #[derive(Debug, Serialize, Deserialize)]

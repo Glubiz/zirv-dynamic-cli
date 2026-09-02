@@ -66,48 +66,94 @@ use super::{AgentAdapter, ResolvedProgram, TurnSignalSetup};
 /// ctx agent --role sub-orchestrator` is reserved for work that genuinely
 /// decomposes into multiple coherently-scoped areas or must run under
 /// zirv's own supervision independently of this seat.
+///
+/// Wrapper behaviour redesign (2026-09-01): rewritten so trivial and bounded
+/// changes stay on this seat instead of always delegating, mirroring the
+/// same fix applied to `claude::ORCHESTRATOR_PROMPT` -- the prior "delegate
+/// every substantive piece of work" framing was one of the absolute process
+/// rules the wrapper-behaviour audit found was inflating small tasks.
+/// Native-subagent-first framing, model-tier discipline and the
+/// sub-orchestrator carve-out are unchanged. See
+/// `docs/superpowers/specs/2026-09-01-wrapper-behaviour-redesign.md`.
 pub const ORCHESTRATOR_PROMPT: &str = "\
 zirv orchestrator conventions (codex)
 
-You are an orchestrator. Coordination and judgment are the job, implementation is not: this \
-seat's own model is reserved for orchestration, hard debugging, and design, so delegate every \
-substantive piece of work (codebase exploration, implementation, testing, review) and keep your \
-own replies brief and decision-focused.
+This seat runs the top tier; spend it on judgment -- sizing, design choices, integration, the \
+final call -- not on ceremony.
 
-- Native codex subagent threads (worker/explorer roles) are the primary delegation path for work \
-inside this repo: spawn one per substantive piece of work, pinning each to the cheapest fitting \
-tier -- the smallest, fastest tier for mechanical and bulk work (currently gpt-5.6-luna), a mid \
-tier for ordinary exploration, implementation and test writing (currently gpt-5.6-terra), and \
-this seat's own top tier reserved for orchestration, hard debugging and design decisions. Never \
-spawn a subagent without an explicit cheaper model, unless the operator's own `[agents] default_\
-subagent_model` already names one -- an omitted model otherwise inherits this seat's own model \
-instead of a cheaper tier.
-- `zirv agent <name> \"<prompt>\" -- --model <m>` remains the delegation route for cross-harness \
-work (handing a task to a different harness, such as claude) and the fallback whenever native \
-subagents are unavailable or turned off (`[agents] enabled = false`); name an explicit --model \
-there too, for the same reason.
-- Size delegation to the job: native codex subagent threads (cheaper-tier pinned per the rule \
-above) are the default for every bounded task, however substantial. Reserve a sub-orchestrator \
-(`zirv ctx agent --role sub-orchestrator --scope \"<area>\"`) for work that splits into multiple \
-coherent areas each needing its own coordination, or that must run under zirv's own supervision \
-independently of this seat -- never for a single bounded task a worker could finish.
-- Bundle before you dispatch: never spawn a worker for one tiny task. Group small related tasks \
-(same file or area, or a natural sequence) into a single checklist brief per worker, with a \
-per-item output format. A small or trivial change -- a one-line fix, a single obvious edit -- \
-stays on this seat; delegate only substantive, independent work.
-- Write self-contained briefs: state the goal, constraints, relevant file paths and exact output \
-format, and nothing else -- a delegated worker shares none of your context. Every brief must \
-itself tell the worker not to delegate further and to reply briefly with compact structured \
-findings, never raw file dumps.
-- Decide rather than let a worker loop: choices between valid designs, architecture changes, and \
-anything a worker has failed at twice come back to you. Do not read large files or write code \
-yourself unless the change is trivial.
-- Hold implementers to this repository's standards: follow the patterns already there, look for \
-reusable code before adding new code, write a failing test first, keep diffs minimal, and run the \
-project's format, lint and test commands before reporting back.
-- Verify in batches: one independent reviewer gate per batch of related changes, not one per \
-micro-task. You own the final integration, so resolve conflicts between worker outputs and report \
-outcomes, including failures, plainly.";
+- Trivial and bounded changes stay on this seat: a brief costs more than the fix. Delegate when \
+the work is larger than its brief or can run in parallel. Native codex subagent threads \
+(worker/explorer roles) are the primary path inside this repo, each pinned to the cheapest \
+fitting tier -- the smallest tier for mechanical and bulk work (currently gpt-5.6-luna), a mid \
+tier for ordinary exploration, implementation and tests (currently gpt-5.6-terra), this seat's \
+own tier only for hard debugging and design. Never spawn a subagent without an explicit cheaper \
+model unless the operator's `[agents] default_subagent_model` names one; an omitted model \
+inherits this seat. `zirv agent <name> \"<prompt>\" -- --model <m>` is the route for \
+cross-harness work and the fallback when native subagents are unavailable or off (`[agents] \
+enabled = false`). Reserve a sub-orchestrator (`zirv ctx agent --role sub-orchestrator --scope \
+\"<area>\"`) for work that splits into several coherently-scoped areas each needing its own \
+coordination.
+- Bundle small related items into one checklist brief with a per-item output format; continue a \
+worker you already briefed for follow-ups in its area instead of spawning a fresh one.
+- Briefs are self-contained -- goal, constraints, relevant paths, exact output format -- and \
+tell the worker not to delegate further and to reply with compact structured findings, never \
+raw file dumps. A delegated worker shares none of your context.
+- Decide rather than let a worker loop: choices between valid designs, architecture changes, \
+and anything a worker has failed at twice come back to you. Hold implementers to the \
+repository's standards and to the engineering standard above: reuse before adding, minimal \
+diff, one focused test per behaviour change, format, lint and test before reporting back.
+- Reviews follow the meta-harness rule: in proportion, once. You own the final integration: \
+resolve conflicts between worker outputs and report outcomes, including failures, plainly.";
+
+/// Codex's own layer for a delegated **Worker** session (see
+/// `AgentAdapter::worker_system_prompt`), spliced in place of
+/// [`ORCHESTRATOR_PROMPT`] for `PromptRole::Worker`, mirroring
+/// `claude::WORKER_PROMPT`. [`ORCHESTRATOR_PROMPT`] above teaches native
+/// codex subagent threads (worker/explorer roles) as the primary in-repo
+/// delegation path -- but that is the seat that owns the scope deciding how
+/// to split it, not the delegated unit it splits work into. A worker session
+/// IS that delegated unit: it does not run `zirv agent`, and it does not
+/// fan out into a native subagent thread of its own either, because that
+/// would be exactly the unbounded delegation tree the role boundary exists
+/// to prevent. It does every step of its own brief itself, in the
+/// foreground, and reports compactly rather than dumping raw files.
+pub const WORKER_PROMPT: &str = "\
+zirv worker conventions (codex)
+
+You are a delegated worker session. Execute your brief directly and completely, then report \
+compact results.
+
+- Do not delegate onward: never run `zirv agent`, and do not spawn a native subagent thread of \
+your own. This task was already routed to you -- do every step of your brief yourself, in the \
+foreground.
+- Run code-review or verification passes only when your brief asks for them; the orchestrator \
+that spawned you owns review rounds.
+- Your final message is your report: lead with the outcome, keep it self-contained, and never \
+dump raw file contents into it.";
+
+/// Codex's own layer for a `PromptRole::SubOrchestrator` session (see
+/// `AgentAdapter::sub_orchestrator_system_prompt`), spliced in place of
+/// [`ORCHESTRATOR_PROMPT`] and [`WORKER_PROMPT`] for that role, mirroring
+/// `claude::SUB_ORCHESTRATOR_PROMPT`: it owns one scope end to end and may
+/// dispatch further Workers via `zirv agent`, but never another coordinator.
+pub const SUB_ORCHESTRATOR_PROMPT: &str = "\
+zirv sub-orchestrator conventions (codex)
+
+You are a sub-orchestrator: you own ONE scope end to end, handed to you by an orchestrator as \
+a work group with its own budget and completion contract. You do not decide which harnesses \
+run.
+
+- Split your scope into worker briefs and dispatch each with `zirv agent <name> \"<prompt>\" \
+-- --model <m>`, naming the cheapest tier that can do that one brief -- not uniformly the same \
+model for every child.
+- Spawn only Workers. Do not spawn another sub-orchestrator or a dashboard coordinator: \
+delegation stops at one level below you, and every child you dispatch inherits your own work \
+group automatically, with no `--group` of its own to remember.
+- Keep your own replies to decisions and outcomes, not implementation: do not read large files \
+or write code yourself unless the change is trivial.
+- When every child you dispatched is done, report ONE integrated result against your work \
+group's completion contract -- not each child's own outcome individually -- including any \
+failures.";
 
 /// Verified facts backing this adapter live in
 /// `docs/superpowers/notes/2026-07-31-codex-cli-facts.md`. Current Codex
@@ -861,6 +907,22 @@ impl AgentAdapter for CodexAdapter {
     /// lives in `prompt::with_adapter_layer`, not here.
     fn base_system_prompt(&self) -> Option<&'static str> {
         Some(ORCHESTRATOR_PROMPT)
+    }
+
+    /// See [`WORKER_PROMPT`]'s own doc comment for why this differs from
+    /// [`base_system_prompt`](Self::base_system_prompt): a delegated worker
+    /// gets no native-subagent-fan-out coaching, unlike the orchestrator seat
+    /// above it.
+    fn worker_system_prompt(&self) -> Option<&'static str> {
+        Some(WORKER_PROMPT)
+    }
+
+    /// See [`SUB_ORCHESTRATOR_PROMPT`]: mirrors `claude::ClaudeAdapter`'s
+    /// own override rather than falling back to [`worker_system_prompt`]
+    /// (Self::worker_system_prompt)'s trait default, since a sub-orchestrator
+    /// may dispatch further Workers, unlike a Worker itself.
+    fn sub_orchestrator_system_prompt(&self) -> Option<&'static str> {
+        Some(SUB_ORCHESTRATOR_PROMPT)
     }
 
     /// Verified via `codex exec --help` (quoted verbatim in the notes file):
@@ -1988,15 +2050,58 @@ mod tests {
         assert_eq!(CodexAdapter::new(None).default_worker_model(), None);
     }
 
-    /// Unlike the orchestrator layer (issue #167, `ORCHESTRATOR_PROMPT`),
-    /// codex still contributes no **worker** layer of its own: a delegated
-    /// worker session (`PromptRole::Worker`) must never be taught to
-    /// delegate onward, and there is nothing else codex-specific worth
-    /// saying to it yet, so `prompt::with_adapter_layer` splices nothing in
-    /// for that role.
+    /// Wrapper behaviour redesign round 2 (2026-09-01): codex now has its own
+    /// **worker** layer too (`WORKER_PROMPT`, this module), mirroring
+    /// `claude::WORKER_PROMPT` -- a delegated worker session must never be
+    /// taught to delegate onward, whether via `zirv agent` or a native codex
+    /// subagent thread, and it must not carry the orchestrator layer's own
+    /// "spend it on judgment"/delegation-sizing coaching.
     #[test]
-    fn codex_contributes_no_worker_layer_of_its_own() {
-        assert_eq!(CodexAdapter::new(None).worker_system_prompt(), None);
+    fn codex_has_its_own_worker_layer_distinct_from_the_orchestrator_layer() {
+        let layer = CodexAdapter::new(None)
+            .worker_system_prompt()
+            .expect("codex has a worker layer");
+        assert_eq!(layer, WORKER_PROMPT);
+        assert!(layer.starts_with("zirv worker conventions"));
+        assert!(
+            !layer.contains("spend it on judgment"),
+            "the worker layer must not carry the orchestrator's own coaching: {layer}"
+        );
+        for claim in ["never run `zirv agent`", "in the foreground"] {
+            assert!(
+                layer.contains(claim),
+                "the worker layer must say '{claim}': {layer}"
+            );
+        }
+    }
+
+    /// Mirrors claude's `the_sub_orchestrator_layer_is_short_and_forbids_
+    /// spawning_coordinators`: the trimmed coordination layer is real text,
+    /// materially shorter than the orchestrator layer, and must never coach
+    /// onward coordinator spawning.
+    #[test]
+    fn the_codex_sub_orchestrator_layer_is_short_and_forbids_spawning_coordinators() {
+        assert!(SUB_ORCHESTRATOR_PROMPT.len() < ORCHESTRATOR_PROMPT.len());
+        assert!(SUB_ORCHESTRATOR_PROMPT.contains("zirv agent"));
+        assert!(
+            SUB_ORCHESTRATOR_PROMPT.contains("sub-orchestrator"),
+            "must name what it must not spawn"
+        );
+    }
+
+    /// Mirrors claude's `claude_has_its_own_sub_orchestrator_layer_distinct_
+    /// from_the_other_two`: codex actually wires `SUB_ORCHESTRATOR_PROMPT`
+    /// into the adapter trait rather than leaving the const unused and
+    /// falling back to the worker default -- the three role layers must all
+    /// be distinct texts.
+    #[test]
+    fn codex_has_its_own_sub_orchestrator_layer_distinct_from_the_other_two() {
+        let layer = CodexAdapter::new(None)
+            .sub_orchestrator_system_prompt()
+            .expect("codex has a sub-orchestrator layer");
+        assert_eq!(layer, SUB_ORCHESTRATOR_PROMPT);
+        assert_ne!(layer, WORKER_PROMPT);
+        assert_ne!(layer, ORCHESTRATOR_PROMPT);
     }
 
     /// Issue #167: codex's own base layer is no longer `None` -- an
@@ -2026,7 +2131,7 @@ mod tests {
         );
         assert!(!ORCHESTRATOR_PROMPT.contains('\u{2014}'), "no em dashes");
         assert!(
-            ORCHESTRATOR_PROMPT.contains("You are an orchestrator"),
+            ORCHESTRATOR_PROMPT.starts_with("zirv orchestrator conventions (codex)"),
             "got:\n{ORCHESTRATOR_PROMPT}"
         );
         assert!(
@@ -2072,7 +2177,7 @@ mod tests {
              {ORCHESTRATOR_PROMPT}"
         );
         assert!(
-            ORCHESTRATOR_PROMPT.contains("small or trivial change"),
+            ORCHESTRATOR_PROMPT.contains("Trivial and bounded changes stay on this seat"),
             "small/trivial tasks must be exempt from forced delegation: {ORCHESTRATOR_PROMPT}"
         );
         assert!(
@@ -2090,38 +2195,37 @@ mod tests {
     #[test]
     fn the_orchestrator_prompt_sizes_delegation_between_subagents_and_sub_orchestrators() {
         assert!(
-            ORCHESTRATOR_PROMPT.contains("native codex subagent threads"),
+            ORCHESTRATOR_PROMPT.contains("Native codex subagent threads"),
             "got:\n{ORCHESTRATOR_PROMPT}"
         );
         assert!(
-            ORCHESTRATOR_PROMPT
-                .contains("are the default for every bounded task, however substantial"),
-            "native subagent threads must be the sizing default: {ORCHESTRATOR_PROMPT}"
+            ORCHESTRATOR_PROMPT.contains("Trivial and bounded changes stay on this seat"),
+            "trivial and bounded work must stay on this seat instead of delegating: \
+             {ORCHESTRATOR_PROMPT}"
         );
         assert!(
             ORCHESTRATOR_PROMPT.contains("zirv ctx agent --role sub-orchestrator --scope"),
             "got:\n{ORCHESTRATOR_PROMPT}"
         );
         assert!(
-            ORCHESTRATOR_PROMPT.contains("multiple coherent areas"),
+            ORCHESTRATOR_PROMPT.contains("several coherently-scoped areas"),
             "sub-orchestrators are reserved for multi-area work: {ORCHESTRATOR_PROMPT}"
-        );
-        assert!(
-            ORCHESTRATOR_PROMPT.contains("never for a single bounded task a worker could finish"),
-            "got:\n{ORCHESTRATOR_PROMPT}"
         );
     }
 
-    /// The sizing rule is orchestrator-only vocabulary. Codex contributes no
-    /// worker layer and falls back to `worker_system_prompt` (`None`) for a
-    /// sub-orchestrator role too (see `codex_contributes_no_worker_layer_of_
-    /// its_own`), so neither delegated role has any text to gain this bullet
-    /// in the first place.
+    /// Mirrors claude's `the_worker_and_sub_orchestrator_layers_do_not_gain_
+    /// the_sizing_rule`: the sizing rule is orchestrator-only vocabulary. A
+    /// worker never decides delegation shape at all, and a sub-orchestrator's
+    /// own delegation is already capped to Workers by `SUB_ORCHESTRATOR_
+    /// PROMPT` itself, so neither codex layer needs or gets this bullet.
     #[test]
-    fn the_codex_worker_and_sub_orchestrator_roles_carry_no_layer_to_gain_the_sizing_rule() {
-        let adapter = CodexAdapter::new(None);
-        assert_eq!(adapter.worker_system_prompt(), None);
-        assert_eq!(adapter.sub_orchestrator_system_prompt(), None);
+    fn the_codex_worker_and_sub_orchestrator_layers_do_not_gain_the_sizing_rule() {
+        for layer in [WORKER_PROMPT, SUB_ORCHESTRATOR_PROMPT] {
+            assert!(
+                !layer.contains("Trivial and bounded changes stay on this seat"),
+                "only the orchestrator layer decides delegation shape: {layer}"
+            );
+        }
     }
 
     /// The codex ladder, top to bottom: `gpt-5.6-sol` (the default when no
