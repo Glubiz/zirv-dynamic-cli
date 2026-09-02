@@ -1104,15 +1104,37 @@ fn active_path(state: &StateDir, repo: &Path) -> PathBuf {
     repo_dir(state, repo).join("active")
 }
 
-pub(crate) fn save(state_dir: &StateDir, state: &WorkflowState, active: bool) -> CtxResult<()> {
+fn write_state_file(state_dir: &StateDir, state: &WorkflowState) -> CtxResult<()> {
     let dir = repo_dir(state_dir, &state.repo);
     create_private_dir_all(&dir)?;
     let json = serde_json::to_string_pretty(state)?;
     write_private(&state_path(state_dir, &state.repo, &state.id)?, &json)?;
+    Ok(())
+}
+
+pub(crate) fn save(state_dir: &StateDir, state: &WorkflowState, active: bool) -> CtxResult<()> {
+    write_state_file(state_dir, state)?;
     if active {
         write_private(&active_path(state_dir, &state.repo), &state.id)?;
     } else if active_path(state_dir, &state.repo).exists() {
         std::fs::remove_file(active_path(state_dir, &state.repo))?;
+    }
+    Ok(())
+}
+
+/// Persists `state` and clears this repository's active pointer only when it
+/// currently names `state.id` -- unlike `save(state_dir, state, false)`,
+/// which clears the pointer unconditionally regardless of which workflow it
+/// names. Used by [`close`] so closing an older, non-active workflow never
+/// deactivates a different, currently-running workflow for the same repo.
+fn save_inactive_if_active(state_dir: &StateDir, state: &WorkflowState) -> CtxResult<()> {
+    write_state_file(state_dir, state)?;
+    let pointer = active_path(state_dir, &state.repo);
+    if pointer.exists() {
+        let current = std::fs::read_to_string(&pointer)?;
+        if current.trim() == state.id {
+            std::fs::remove_file(&pointer)?;
+        }
     }
     Ok(())
 }
@@ -1945,18 +1967,33 @@ pub fn approve(state_dir: &StateDir, mut state: WorkflowState) -> CtxResult<Work
 /// Closes a workflow that will not reach `Completed` -- typically one whose
 /// review/fix loop hit `MAX_FIX_REVIEW_ROUNDS` (review.rs) and would
 /// otherwise stay `Running` forever, still reported as this repository's
-/// active workflow by `load_active`. Refuses (fail closed) while any review
+/// active workflow by `load_active`. Refuses (fail closed) when the
+/// workflow's status is already terminal (`Completed`/`Failed`/`Closed`) --
+/// `close` only applies to a workflow still in flight -- while any review
 /// finding is still `Open` -- residual dispositions must be recorded first,
 /// via `workflow review dispose` -- or while the workflow is
 /// `AwaitingApproval`, since approval is itself a pending decision on the
 /// current step. Otherwise sets `status: Closed`, records `closed_reason`/
-/// `closed_at`, and persists with `active: false` so `load_active`,
-/// `status`, and `context` stop reporting it.
+/// `closed_at`, and persists via `save_inactive_if_active`, which clears
+/// this repository's active pointer only when it currently names THIS
+/// workflow -- closing an older, non-active workflow must never deactivate a
+/// different, currently-running one for the same repo.
 pub fn close(
     state_dir: &StateDir,
     mut state: WorkflowState,
     reason: Option<String>,
 ) -> CtxResult<WorkflowState> {
+    if matches!(
+        state.status,
+        WorkflowStatus::Completed | WorkflowStatus::Failed | WorkflowStatus::Closed
+    ) {
+        return Err(format!(
+            "cannot close workflow: already {:?}; close only applies to a workflow that will \
+             not reach Completed on its own",
+            state.status
+        )
+        .into());
+    }
     let open_findings = state
         .review_findings
         .iter()
@@ -1981,7 +2018,7 @@ pub fn close(
     state.closed_reason = reason;
     state.closed_at = Some(now);
     state.updated_at = now;
-    save(state_dir, &state, false)?;
+    save_inactive_if_active(state_dir, &state)?;
 
     let mut event = super::telemetry::TelemetryEvent::new(super::telemetry::TelemetryKind::Closed);
     event.workflow_id = Some(state.id.clone());
@@ -6465,6 +6502,120 @@ mod tests {
             ),
             "{events:?}"
         );
+    }
+
+    #[test]
+    fn close_leaves_a_different_active_workflows_pointer_intact() {
+        let repo = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+
+        let active_state = WorkflowState::start(
+            repo.path().to_path_buf(),
+            "active feature".into(),
+            WorkflowKind::Feature,
+            None,
+            true,
+            low_classification(),
+        );
+        let other_state = WorkflowState::start(
+            repo.path().to_path_buf(),
+            "other feature".into(),
+            WorkflowKind::Feature,
+            None,
+            true,
+            low_classification(),
+        );
+        // Persist both workflow files, then make sure the active pointer
+        // ends up naming `active_state`: write `other_state` first (so its
+        // own file exists on disk), then re-save `active_state` as active,
+        // which repoints the pointer without touching `other_state`'s file.
+        save(&state_dir, &other_state, true).unwrap();
+        save(&state_dir, &active_state, true).unwrap();
+        assert!(
+            load_active(&state_dir, repo.path())
+                .unwrap()
+                .is_some_and(|state| state.id == active_state.id)
+        );
+
+        // `other_state` is Running but is NOT this repo's active workflow.
+        let closed = close(&state_dir, other_state.clone(), None).unwrap();
+        assert_eq!(closed.status, WorkflowStatus::Closed);
+
+        let active = load_active(&state_dir, repo.path()).unwrap();
+        assert!(
+            active.is_some_and(|state| state.id == active_state.id),
+            "closing a non-active workflow cleared a different workflow's active pointer"
+        );
+    }
+
+    #[test]
+    fn close_refuses_an_already_completed_workflow() {
+        let repo = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+        let mut state = WorkflowState::start(
+            repo.path().to_path_buf(),
+            "small feature".into(),
+            WorkflowKind::Feature,
+            None,
+            true,
+            low_classification(),
+        );
+        state.status = WorkflowStatus::Completed;
+        save(&state_dir, &state, false).unwrap();
+
+        let error = close(&state_dir, state.clone(), None).unwrap_err();
+        assert!(error.to_string().contains("Completed"), "{error}");
+
+        let reloaded = load(&state_dir, repo.path(), &state.id).unwrap();
+        assert_eq!(reloaded.status, WorkflowStatus::Completed);
+    }
+
+    #[test]
+    fn close_refuses_an_already_failed_workflow() {
+        let repo = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+        let mut state = WorkflowState::start(
+            repo.path().to_path_buf(),
+            "small feature".into(),
+            WorkflowKind::Feature,
+            None,
+            true,
+            low_classification(),
+        );
+        state.status = WorkflowStatus::Failed;
+        save(&state_dir, &state, false).unwrap();
+
+        let error = close(&state_dir, state.clone(), None).unwrap_err();
+        assert!(error.to_string().contains("Failed"), "{error}");
+
+        let reloaded = load(&state_dir, repo.path(), &state.id).unwrap();
+        assert_eq!(reloaded.status, WorkflowStatus::Failed);
+    }
+
+    #[test]
+    fn close_refuses_an_already_closed_workflow() {
+        let repo = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+        let state = WorkflowState::start(
+            repo.path().to_path_buf(),
+            "small feature".into(),
+            WorkflowKind::Feature,
+            None,
+            true,
+            low_classification(),
+        );
+        save(&state_dir, &state, true).unwrap();
+        let closed = close(&state_dir, state, None).unwrap();
+
+        let error = close(&state_dir, closed.clone(), None).unwrap_err();
+        assert!(error.to_string().contains("Closed"), "{error}");
+
+        let reloaded = load(&state_dir, repo.path(), &closed.id).unwrap();
+        assert_eq!(reloaded.status, WorkflowStatus::Closed);
     }
 
     #[test]
