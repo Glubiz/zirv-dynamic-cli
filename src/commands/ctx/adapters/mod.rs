@@ -929,6 +929,13 @@ pub trait AgentAdapter: std::fmt::Debug {
         let _ = (prompt, session_id, extra);
         None
     }
+    /// Whether this adapter can compact and then resume the same headless
+    /// conversation. False unless an adapter has verified both halves of the
+    /// operation; headless supervisors use this before spending a compact
+    /// attempt or stopping the child for one.
+    fn supports_headless_compact(&self) -> bool {
+        false
+    }
     fn interactive_cmd(&self, initial_prompt: Option<&str>, extra: &[String]) -> Command;
     /// Builds the judgment/distiller model child's command. `model` is empty
     /// when neither the operator's own config (`handoff.model`/`optimize.

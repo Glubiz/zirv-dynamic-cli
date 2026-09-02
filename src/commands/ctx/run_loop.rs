@@ -506,24 +506,26 @@ pub(crate) fn run_with_clock<W: Write>(
                     );
                 }
                 match poll_result {
-                    Ok((Some(score), _)) => match super::exec::action_for_verdict(score.verdict) {
-                        super::exec::SignalAction::Stop => {
-                            rotted = true;
-                            Tick::Stop("rot")
+                    Ok((Some(score), _)) => {
+                        match super::exec::action_for_verdict(adapter.as_ref(), score.verdict) {
+                            super::exec::SignalAction::Stop => {
+                                rotted = true;
+                                Tick::Stop("rot")
+                            }
+                            super::exec::SignalAction::Compact
+                                if compact_budget.ready(Instant::now(), compact_window) =>
+                            {
+                                compact_budget.arm(Instant::now());
+                                compact_requested = true;
+                                Tick::Stop("compact")
+                            }
+                            super::exec::SignalAction::Compact => Tick::Continue,
+                            super::exec::SignalAction::Ignore => {
+                                compact_budget.observe_progress();
+                                Tick::Continue
+                            }
                         }
-                        super::exec::SignalAction::Compact
-                            if compact_budget.ready(Instant::now(), compact_window) =>
-                        {
-                            compact_budget.arm(Instant::now());
-                            compact_requested = true;
-                            Tick::Stop("compact")
-                        }
-                        super::exec::SignalAction::Compact => Tick::Continue,
-                        super::exec::SignalAction::Ignore => {
-                            compact_budget.observe_progress();
-                            Tick::Continue
-                        }
-                    },
+                    }
                     _ => Tick::Continue,
                 }
             };
@@ -546,7 +548,7 @@ pub(crate) fn run_with_clock<W: Write>(
                 );
             }
 
-            if compact_requested {
+            if super::exec::should_attempt_compact(compact_requested, limit_hit) {
                 let compact_result = super::exec::compact_in_place(
                     adapter.as_ref(),
                     Some(&transcript),
