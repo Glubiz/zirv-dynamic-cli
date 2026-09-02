@@ -198,6 +198,7 @@ pub fn signals(events: &[NormalizedEvent], caps: Capabilities, cfg: &ScoreConfig
 struct Segment {
     calls: Vec<(String, u64)>,
     results: Vec<bool>,
+    #[serde(default)]
     provider_overflows: usize,
 }
 
@@ -216,6 +217,7 @@ pub struct RotState {
     /// Turn finals already closed by a later `TurnStart`.
     closed_turns: usize,
     /// Closed turn finals since the latest compaction boundary.
+    #[serde(default)]
     behavioral_closed_turns: usize,
     /// `has_marker` of the last `window` closed finals, oldest first.
     closed_markers: VecDeque<bool>,
