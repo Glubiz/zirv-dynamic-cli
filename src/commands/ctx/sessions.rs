@@ -1089,6 +1089,17 @@ pub fn load_record(state: &StateDir, short: &str) -> Option<Record> {
 /// skipped, never an error, and a write that fails to clear the marker costs
 /// a possible second witness block, never a wrong one.
 pub fn take_interrupted_in_flight(state: &StateDir, repo: &Path) -> Option<InFlight> {
+    interrupted_in_flight(state, repo, true)
+}
+
+/// The non-consuming counterpart to [`take_interrupted_in_flight`], for a
+/// dry run (`resume --print-prompt`) that must show what a real resume would
+/// inject without spending the one-shot marker on it.
+pub fn peek_interrupted_in_flight(state: &StateDir, repo: &Path) -> Option<InFlight> {
+    interrupted_in_flight(state, repo, false)
+}
+
+fn interrupted_in_flight(state: &StateDir, repo: &Path, consume: bool) -> Option<InFlight> {
     let repo_slug = super::state::repo_slug(repo);
     let entries = std::fs::read_dir(state.sessions()).ok()?;
     for entry in entries.flatten() {
@@ -1108,7 +1119,7 @@ pub fn take_interrupted_in_flight(state: &StateDir, repo: &Path) -> Option<InFli
         let Some(in_flight) = record.in_flight.take() else {
             continue;
         };
-        if let Ok(json) = serde_json::to_string_pretty(&record) {
+        if consume && let Ok(json) = serde_json::to_string_pretty(&record) {
             let _ = super::state::write_private(&path, &json);
         }
         return Some(in_flight);
@@ -4082,6 +4093,31 @@ mod tests {
             take_interrupted_in_flight(&state, &repo).is_none(),
             "the marker was consumed -- a second call must find nothing"
         );
+    }
+
+    /// `resume --print-prompt` peeks: the witness is shown, and the marker is
+    /// still there for the real resume that follows.
+    #[test]
+    fn peeking_leaves_the_marker_for_the_real_resume_to_take() {
+        use super::super::testenv::dead_pid;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = state_in(tmp.path());
+        let repo = tmp.path().join("repo");
+        write_record(
+            &state,
+            &in_flight_record(&repo, dead_pid(), Some(sample_in_flight())),
+        );
+
+        assert_eq!(
+            peek_interrupted_in_flight(&state, &repo).map(|f| f.turn),
+            Some(3)
+        );
+        assert_eq!(
+            take_interrupted_in_flight(&state, &repo).map(|f| f.turn),
+            Some(3),
+            "a peek must not have consumed the marker"
+        );
+        assert!(take_interrupted_in_flight(&state, &repo).is_none());
     }
 
     /// A dead pid with no marker at all means a clean exit (or a record from

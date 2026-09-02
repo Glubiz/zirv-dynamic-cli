@@ -104,6 +104,21 @@ pub fn advance(mut record: Objective, now: u64, spent: u64) -> Objective {
     record
 }
 
+/// Rolls one finished cycle's spend into the stored record and re-runs
+/// [`advance`] against the new total, so `loop` -- which never restarts in
+/// place and therefore has no restart hook to advance from, unlike `exec` --
+/// still trips its soft budget. A missing or `Closed` record is left alone.
+pub fn roll_up_spend(state: &StateDir, key: &str, delta: u64, now: u64) {
+    let Ok(Some(record)) = load(state, key) else {
+        return;
+    };
+    if record.status == Status::Closed {
+        return;
+    }
+    let spent = record.spent_tokens.saturating_add(delta);
+    let _ = store(state, key, &advance(record, now, spent));
+}
+
 fn status_label(status: Status) -> &'static str {
     match status {
         Status::Active => "active",
