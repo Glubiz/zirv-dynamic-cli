@@ -736,11 +736,22 @@ pub fn compile_with_harness_roster(
     let core_memory = prompt::memory_injection_summary(&memory_entries, cfg.memory.core_max_bytes);
     let retrieved_memory_summary =
         prompt::memory_injection_summary(&retrieved_memory, cfg.memory.retrieval_max_bytes);
-    let harness_lines = if include_harness_roster {
-        super::adapters::harness_prompt_lines(cfg, adapter.name())
+    // Issue #298: probe verdicts are cached per repository (`ProbeCache`'s
+    // own doc comment explains why not per session), so a second compile
+    // for this repo within the cache's TTL performs no new filesystem
+    // probe.
+    let mut probe_cache = super::adapters::ProbeCache::load(state, &slug, now);
+    let harness_report = if include_harness_roster {
+        super::adapters::harness_prompt_lines_cached(cfg, adapter.name(), &mut probe_cache)
     } else {
-        Vec::new()
+        super::adapters::HarnessRosterReport {
+            lines: Vec::new(),
+            omitted: 0,
+            omitted_bytes: 0,
+        }
     };
+    probe_cache.save();
+    let harness_lines = harness_report.lines;
 
     let composed = prompt::compose(
         home,
@@ -761,8 +772,10 @@ pub fn compile_with_harness_roster(
         && cfg.prompt.harnesses
         && !harness_lines.is_empty()
     {
-        let (_, injection) =
+        let (_, mut injection) =
             prompt::harness_roster_injection(&harness_lines, cfg.context.max_harness_roster_bytes);
+        injection.omitted = harness_report.omitted;
+        injection.omitted_bytes = harness_report.omitted_bytes;
         Some(injection)
     } else {
         None
@@ -877,12 +890,27 @@ fn render_measure_table(compiled: &CompiledContext, cfg: &CtxConfig, role: Promp
     }
 
     if let Some(roster) = &compiled.harness_roster {
-        let note = if roster.truncated {
-            format!("truncated to {}", cfg.context.max_harness_roster_bytes)
-        } else {
-            String::new()
-        };
-        rows.push(measure_row("harness roster", roster.delivered_bytes, &note));
+        let mut notes: Vec<String> = Vec::new();
+        if roster.truncated {
+            notes.push(format!(
+                "truncated to {}",
+                cfg.context.max_harness_roster_bytes
+            ));
+        }
+        // Issue #298's own success metric: how many adapter/review-line
+        // candidates were omitted for not being live, and the bytes that
+        // saved versus the pre-#298 behavior of emitting every one of them.
+        if roster.omitted > 0 {
+            notes.push(format!(
+                "{} omitted (not live), -{} bytes vs. emitting all lines",
+                roster.omitted, roster.omitted_bytes
+            ));
+        }
+        rows.push(measure_row(
+            "harness roster",
+            roster.delivered_bytes,
+            &notes.join("; "),
+        ));
     }
 
     for entry in &compiled.provenance {

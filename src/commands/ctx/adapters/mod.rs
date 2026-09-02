@@ -1934,6 +1934,293 @@ pub fn program_is_present(program: &str) -> bool {
     }
 }
 
+/// Issue #298 ("capability-gated injection"): a cheap, filesystem/config-only
+/// verdict on whether a capability can actually be exercised right now -- no
+/// process spawn, no network call, no more than a few `stat`s. Only `Live`
+/// earns a line in the injected harness roster: `Absent` costs the session
+/// zero prompt bytes rather than annotating a capability it cannot use, and
+/// `Unknown` still renders the line, because a probe that could not decide
+/// must never cost a session a capability it might actually have -- the same
+/// fail-open discipline [`program_is_present`]'s own doc comment already
+/// holds `resolve_program`/`ready()` to.
+///
+/// Never assert absence in injected text: an omitted line is honest, but a
+/// rendered "not installed" claim can be wrong (see [`program_is_present`]'s
+/// own doc comment -- codex's real install root on this repo's own dev
+/// machine is one a plain `PATH` walk never reaches). `Absent`'s `String` is
+/// a diagnostic reason for an operator-facing surface (`compile --measure`'s
+/// own note column) only; nothing in this module ever prints it into a
+/// session's own prompt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Liveness {
+    Live,
+    Absent(String),
+    Unknown(String),
+}
+
+impl Liveness {
+    /// `Live` and `Unknown` both earn a line (fail-open); only a confirmed
+    /// `Absent` is omitted. See this type's own doc comment.
+    fn emits_line(&self) -> bool {
+        !matches!(self, Liveness::Absent(_))
+    }
+}
+
+/// `~/rest` -> the operator's real home directory joined with `rest`, using
+/// [`crate::utils::home_dir`] (`HOME`/`USERPROFILE`) -- deliberately the
+/// *operator's* environment, never anything a repo checkout can name (see
+/// [`known_install_roots`]'s own doc comment). Any other shape (no leading
+/// `~/`, or a home dir that cannot be resolved) is returned unchanged.
+fn expand_home(path: &str) -> PathBuf {
+    match path.strip_prefix("~/") {
+        Some(rest) => crate::utils::home_dir()
+            .map(|home| home.join(rest))
+            .unwrap_or_else(|_| PathBuf::from(path)),
+        None => PathBuf::from(path),
+    }
+}
+
+/// Extra install roots the issue #298 liveness probe consults for
+/// `adapter_name` after `PATH` and any `agent_bin` override come up empty --
+/// codex-cli on this repo's own dev machine lives at a real, working install
+/// outside `PATH` (see CLAUDE.md's "This Windows dev machine" section),
+/// which [`program_is_present`]'s plain `PATH` walk alone reports as absent.
+///
+/// A fixed Rust table, never a config read: repo-owned surfaces may only
+/// *narrow* what a probe can conclude (see `context.rs`'s own trust model),
+/// and an operator who wants a *different* install location already has
+/// `agent_bin` (itself `REPO_FORBIDDEN`) for that -- widening the search is
+/// the one thing a repo checkout must never be able to do on its own, so
+/// this function takes no `CtxConfig`/repo path at all, which is what keeps
+/// the acceptance criterion "a repo-layer config change cannot flip an
+/// adapter from `Absent` to `Live`" true by construction.
+fn known_install_roots(adapter_name: &str) -> &'static [&'static str] {
+    match adapter_name {
+        "codex" => &["~/AppData/Local/Programs/OpenAI/Codex/bin"],
+        _ => &[],
+    }
+}
+
+/// Every directory the widened liveness probe checks for `adapter_name`'s
+/// `program`: `PATH`, then [`known_install_roots`]. Empty when `program`
+/// already names a directory (an absolute/relative path, or an `agent_bin`
+/// override) -- matching [`program_is_present`]'s own convention that such a
+/// program is checked only at that one exact path.
+fn liveness_search_dirs(adapter_name: &str, program: &str) -> Vec<PathBuf> {
+    if program.is_empty() || program.contains('/') || program.contains('\\') {
+        return Vec::new();
+    }
+    let mut dirs: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).collect())
+        .unwrap_or_default();
+    dirs.extend(
+        known_install_roots(adapter_name)
+            .iter()
+            .map(|root| expand_home(root)),
+    );
+    dirs
+}
+
+/// [`program_is_present`], widened with [`known_install_roots`]: reuses
+/// `program_is_present`'s own PATHEXT-aware Windows resolution and plain
+/// Unix file check unchanged -- handing it a full candidate path exercises
+/// exactly the same code path an absolute `agent_bin` override already does
+/// -- so widening only ever adds candidate *directories*; it never changes
+/// how a program name or an explicit override is resolved.
+fn program_is_present_widened(adapter_name: &str, program: &str) -> bool {
+    if program_is_present(program) {
+        return true;
+    }
+    liveness_search_dirs(adapter_name, program)
+        .iter()
+        .any(|dir| program_is_present(dir.join(program).to_string_lossy().as_ref()))
+}
+
+/// Whether any directory [`liveness_search_dirs`] walked for `program` could
+/// not be checked for a reason other than a clean "not found" -- permission
+/// denied, a `PATH` entry that turns out to be a plain file rather than a
+/// directory, or similar. Only ever consulted after
+/// [`program_is_present_widened`] has already come up empty: a probe this
+/// inconclusive must never be reported as a confirmed absence. Approximate
+/// by design (it stats the bare program name, not every `PATHEXT`
+/// candidate) -- this is a fail-open safety net, not the presence check
+/// itself.
+fn inconclusive_reason(adapter_name: &str, program: &str) -> Option<String> {
+    liveness_search_dirs(adapter_name, program)
+        .into_iter()
+        .find_map(|dir| {
+            let candidate = dir.join(program);
+            match std::fs::metadata(&candidate) {
+                Ok(_) => None,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(e) => Some(format!("could not check '{}': {e}", candidate.display())),
+            }
+        })
+}
+
+/// The full issue #298 probe: `Live` when [`program_is_present_widened`]
+/// finds `program`, `Unknown` when the search could not reach a confident
+/// verdict (fail-open -- see [`Liveness`]'s own doc comment), `Absent`
+/// otherwise.
+fn liveness_probe(adapter_name: &str, program: &str) -> Liveness {
+    if program.is_empty() {
+        return Liveness::Absent("no program name".to_string());
+    }
+    if program_is_present_widened(adapter_name, program) {
+        return Liveness::Live;
+    }
+    match inconclusive_reason(adapter_name, program) {
+        Some(reason) => Liveness::Unknown(reason),
+        None => Liveness::Absent(format!("no '{program}' found")),
+    }
+}
+
+/// One cached liveness verdict, keyed by [`ProbeCache::key`] (adapter name,
+/// program, resolved `agent_bin` override). `checked_at` is a plain
+/// `now_secs()`-style timestamp the caller supplies -- this module reads no
+/// clock itself, the same discipline `compile.rs`/`memory::render_for_prompt`
+/// already hold to.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct CachedProbe {
+    checked_at: u64,
+    live: bool,
+    reason: String,
+}
+
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct ProbeCacheFile {
+    #[serde(default)]
+    version: u32,
+    #[serde(default)]
+    entries: std::collections::BTreeMap<String, CachedProbe>,
+}
+
+const PROBE_CACHE_VERSION: u32 = 1;
+
+/// How long a cached `Live`/`Absent` verdict is trusted before [`ProbeCache`]
+/// re-probes. Issue #298 pairs this cache with issue 20 in the same batch (a
+/// byte-stable injected prefix across a session's turns, which upstream
+/// prompt caching depends on): a strictly per-`SessionId` cache would give
+/// zero reuse to the one launch path that most needs it (`run_loop` mints a
+/// fresh `SessionId` every cycle -- see `StateDir::adoption`'s own doc
+/// comment), so this cache is scoped per repository instead (see
+/// `StateDir::probes`) and self-corrects on this TTL rather than never at
+/// all.
+const PROBE_CACHE_TTL_SECS: u64 = 3600;
+
+/// A per-repository cache of [`Liveness`] probe verdicts, backed by one JSON
+/// file under the state dir (`StateDir::probes`). Missing or unparseable
+/// (including a version mismatch) reads back empty, never an error: a cache
+/// miss just means the next probe is a real one, exactly as if the cache did
+/// not exist. A failed *write* is silently ignored for the same reason
+/// `score.rs::save_checkpoint` already is -- a cache that cannot be written
+/// costs the next call a real probe, which is exactly what would happen
+/// without a cache at all.
+pub struct ProbeCache {
+    path: Option<PathBuf>,
+    now: u64,
+    file: ProbeCacheFile,
+    dirty: bool,
+}
+
+impl ProbeCache {
+    /// Reads `<state>/probes/<repo_slug>.json`. `now` is stored for TTL
+    /// comparisons and for stamping any entry this instance goes on to
+    /// (re)probe.
+    pub fn load(state: &super::state::StateDir, repo_slug: &str, now: u64) -> Self {
+        let path = state.probes().join(format!("{repo_slug}.json"));
+        let file = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<ProbeCacheFile>(&text).ok())
+            .filter(|file| file.version == PROBE_CACHE_VERSION)
+            .unwrap_or_default();
+        Self {
+            path: Some(path),
+            now,
+            file,
+            dirty: false,
+        }
+    }
+
+    fn key(name: &str, program: &str, bin: Option<&str>) -> String {
+        format!("{name}\u{1}{program}\u{1}{}", bin.unwrap_or(""))
+    }
+
+    /// The cached verdict for `key` when both present and inside
+    /// `PROBE_CACHE_TTL_SECS`; otherwise runs `probe`, records the result
+    /// (unless it is `Unknown` -- an inconclusive probe is never frozen into
+    /// the cache, so the very next call gets a fresh look rather than a
+    /// stale guess), and returns it.
+    fn get_or_probe(&mut self, key: &str, probe: impl FnOnce() -> Liveness) -> Liveness {
+        if let Some(cached) = self.file.entries.get(key)
+            && self.now.saturating_sub(cached.checked_at) <= PROBE_CACHE_TTL_SECS
+        {
+            return if cached.live {
+                Liveness::Live
+            } else {
+                Liveness::Absent(cached.reason.clone())
+            };
+        }
+        let verdict = probe();
+        match &verdict {
+            Liveness::Live => {
+                self.file.entries.insert(
+                    key.to_string(),
+                    CachedProbe {
+                        checked_at: self.now,
+                        live: true,
+                        reason: String::new(),
+                    },
+                );
+                self.dirty = true;
+            }
+            Liveness::Absent(reason) => {
+                self.file.entries.insert(
+                    key.to_string(),
+                    CachedProbe {
+                        checked_at: self.now,
+                        live: false,
+                        reason: reason.clone(),
+                    },
+                );
+                self.dirty = true;
+            }
+            Liveness::Unknown(_) => {}
+        }
+        verdict
+    }
+
+    /// Best-effort, the same shape `score.rs::save_checkpoint` already uses:
+    /// write to a process-unique temp file, then rename into place, so a
+    /// process killed mid-write leaves the previous cache file intact rather
+    /// than a truncated one. A no-op when nothing changed (`load` alone
+    /// never dirties the cache) or when this instance has no backing path
+    /// (`ProbeCache::disabled`).
+    pub fn save(&self) {
+        if !self.dirty {
+            return;
+        }
+        let Some(path) = &self.path else {
+            return;
+        };
+        let file = ProbeCacheFile {
+            version: PROBE_CACHE_VERSION,
+            entries: self.file.entries.clone(),
+        };
+        let Ok(json) = serde_json::to_string(&file) else {
+            return;
+        };
+        let Some(dir) = path.parent() else {
+            return;
+        };
+        let _ = super::state::create_private_dir_all(dir);
+        let staged = dir.join(format!("{}.tmp", std::process::id()));
+        if super::state::write_private(&staged, &json).is_ok() {
+            let _ = std::fs::rename(&staged, path);
+        }
+    }
+}
+
 /// An adapter constructor: the same shape `ClaudeAdapter::new` and
 /// `CodexAdapter::new` already share, named so `ADAPTERS` reads as a table
 /// rather than a wall of type punctuation.
@@ -2186,17 +2473,24 @@ pub fn available_adapter_names(cfg: &CtxConfig) -> Vec<&'static str> {
 ///
 /// Walks `ADAPTERS` in registry order, same as `readiness_note`, but reports
 /// per-adapter gate state too (`readiness_note` only ever speaks about
-/// installed-but-not-ready or degraded adapters, never a disabled one): a
-/// disabled adapter gets its own line naming where the disable came from
-/// (`AgentState::location`) rather than silently vanishing from the roster,
-/// so an operator reading the prompt can tell "not offered because disabled
-/// in .zirv/.settings.toml" from "not offered because not installed".
+/// installed-but-not-ready or degraded adapters, never a disabled one).
+///
+/// Issue #298 ("capability-gated injection"): a disabled adapter, or one
+/// whose [`liveness_probe`] comes back confirmed [`Liveness::Absent`], gets
+/// no line at all -- omission, never an annotated "disabled"/"not
+/// installed" claim spending prompt bytes on a capability that cannot run
+/// (and, for "not installed" specifically, a claim [`program_is_present`]'s
+/// own doc comment already admits can be wrong). `Liveness::Unknown` still
+/// renders the normal "ready" line (fail-open: a probe that cannot decide
+/// must never cost the session a capability it might actually have). The
+/// trailing "- code review: ..." line is unaffected -- see `review_roster_
+/// line`'s own doc comment for why it deliberately does not check presence.
 ///
 /// `ready()` alone is fail-open for a binary that simply is not there (see
-/// [`program_is_present`]'s own doc comment), so a `ready()`-Ok adapter is
-/// checked again against the real filesystem before its line may claim
-/// "ready" and hand out the `zirv agent` invitation -- otherwise it reads as
-/// "not installed" instead, exactly like a genuinely unready one.
+/// [`program_is_present`]'s own doc comment), so a `ready()`-Ok adapter's
+/// [`Liveness`] is checked again against the real filesystem (widened with
+/// [`known_install_roots`]) before its line may claim "ready" and hand out
+/// the `zirv agent` invitation.
 ///
 /// `cfg.agent_bin` is one global override (see `agent_bin_names_a_different_
 /// adapter`'s own doc comment), so it is never handed to an adapter whose own
@@ -2205,79 +2499,140 @@ pub fn available_adapter_names(cfg: &CtxConfig) -> Vec<&'static str> {
 /// binary's presence verdict onto codex's line (and vice versa) whenever an
 /// operator's `agent_bin` named one specific agent -- either wrongly
 /// advertising `zirv agent codex` on the strength of claude's binary, or, for
-/// a not-yet-real wrapper path, wrongly marking every *other* adapter "not
-/// installed" too. `agent_bin_names_a_different_adapter` returning `Some`
-/// means `bin`'s basename names a *different* registered adapter than the one
+/// a not-yet-real wrapper path, wrongly omitting every *other* adapter's
+/// line too. `agent_bin_names_a_different_adapter` returning `Some` means
+/// `bin`'s basename names a *different* registered adapter than the one
 /// about to be built, so that adapter is built with `None` instead and its
 /// presence is judged from its own default program name, exactly as if no
 /// override were configured at all.
+///
+/// Test-only: every production caller has a `StateDir` in hand and goes
+/// through [`harness_prompt_lines_cached`] instead (`compile::compile_with_
+/// harness_roster`'s only real call site), so this uncached, `Vec<String>`-
+/// returning shape now exists purely as the simpler entry point the bulk of
+/// this module's own tests were written against before the cache existed.
+#[cfg(test)]
 pub fn harness_prompt_lines(cfg: &CtxConfig, current_adapter: &str) -> Vec<String> {
-    let bin = cfg.agent_bin.as_deref();
-    let mut lines: Vec<String> = ADAPTERS
-        .iter()
-        .map(|(name, ctor)| {
-            let name: &str = name;
-            let is_self = name == current_adapter;
-            let (enabled, location) = cfg
-                .agents
-                .states()
-                .find(|(n, _)| *n == name)
-                .map(|(_, s)| (s.enabled, s.location()))
-                .unwrap_or((true, "default".to_string()));
-            if !enabled {
-                return format!("- {name}: disabled ({location})");
-            }
+    harness_roster_lines(cfg, current_adapter, None).lines
+}
 
-            let adapter = if agent_bin_names_a_different_adapter(bin, name).is_some() {
-                ctor(None)
-            } else {
-                ctor(bin)
-            };
-            match adapter.ready() {
-                Ok(()) => {
-                    let program = adapter.program();
-                    if !program_is_present(program) {
-                        return format!("- {name}: not installed (no '{program}' found)");
+/// As [`harness_prompt_lines`], but reusing (and updating) `cache`'s probe
+/// verdicts instead of probing fresh on every call -- `compile::compile_
+/// with_harness_roster`'s own entry point. See [`ProbeCache`]'s own doc
+/// comment for the scope/TTL it substitutes for a literal per-session cache.
+pub fn harness_prompt_lines_cached(
+    cfg: &CtxConfig,
+    current_adapter: &str,
+    cache: &mut ProbeCache,
+) -> HarnessRosterReport {
+    harness_roster_lines(cfg, current_adapter, Some(cache))
+}
+
+/// The per-adapter roster lines both entry points above share, plus issue
+/// #298's own measurement data: how many adapter lines were omitted for a
+/// confirmed-`Absent` `Liveness` (or a disabled adapter), and how many bytes
+/// those lines would have cost had they still been rendered the pre-#298 way
+/// (`"- name: disabled (...)"` / `"- name: not installed (...)"`) -- the
+/// success metric `zirv ctx compile --measure` reports.
+pub struct HarnessRosterReport {
+    pub lines: Vec<String>,
+    pub omitted: usize,
+    pub omitted_bytes: usize,
+}
+
+fn harness_roster_lines(
+    cfg: &CtxConfig,
+    current_adapter: &str,
+    mut cache: Option<&mut ProbeCache>,
+) -> HarnessRosterReport {
+    let bin = cfg.agent_bin.as_deref();
+    let mut lines: Vec<String> = Vec::new();
+    let mut omitted_texts: Vec<String> = Vec::new();
+    for (name, ctor) in ADAPTERS {
+        let name: &str = name;
+        let is_self = name == current_adapter;
+        let (enabled, location) = cfg
+            .agents
+            .states()
+            .find(|(n, _)| *n == name)
+            .map(|(_, s)| (s.enabled, s.location()))
+            .unwrap_or((true, "default".to_string()));
+        if !enabled {
+            // Issue #298: absence, not annotation -- `location` is recorded
+            // only for `compile --measure`'s own note column, never for a
+            // session's own prompt.
+            omitted_texts.push(format!("- {name}: disabled ({location})"));
+            continue;
+        }
+
+        let names_other = agent_bin_names_a_different_adapter(bin, name).is_some();
+        let adapter = if names_other { ctor(None) } else { ctor(bin) };
+        match adapter.ready() {
+            Ok(()) => {
+                let program = adapter.program();
+                let resolved_bin = if names_other { None } else { bin };
+                let verdict = match cache.as_deref_mut() {
+                    Some(cache) => {
+                        let key = ProbeCache::key(name, program, resolved_bin);
+                        cache.get_or_probe(&key, || liveness_probe(name, program))
                     }
-                    let missing = missing_capability_labels(adapter.capabilities());
-                    let degraded = if missing.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" (degraded: no {})", join_with_or(&missing))
-                    };
-                    // Repo `.settings.toml` (or the operator, or the
-                    // environment) may mark a harness capacity-limited; the
-                    // roster line carries that forward so an orchestrator
-                    // routes only small, bounded briefs its way -- both for
-                    // reviews and for `zirv agent` delegations (see
-                    // `HARNESS_PROMPT`'s final paragraph).
-                    let capacity_note = if cfg.agents.is_capacity_small(name) {
-                        " -- small tasks only"
-                    } else {
-                        ""
-                    };
-                    if is_self {
-                        format!(
-                            "- {name}: enabled, ready{capacity_note} (this session's harness){degraded}"
-                        )
-                    } else {
-                        format!(
-                            "- {name}: enabled, ready{capacity_note} -- initiate with `zirv agent {name} \"<prompt>\"`{degraded}"
-                        )
-                    }
+                    None => liveness_probe(name, program),
+                };
+                if let Liveness::Unknown(reason) = &verdict {
+                    eprintln!(
+                        "zirv ctx: liveness probe for '{name}' inconclusive ({reason}); \
+                         treating it as live rather than costing the session a capability \
+                         it might actually have"
+                    );
                 }
-                Err(err) => {
-                    let reason = err.to_string();
-                    let short = reason.lines().next().unwrap_or(&reason);
-                    format!("- {name}: installed? not ready ({short})")
+                if !verdict.emits_line() {
+                    omitted_texts.push(format!("- {name}: not installed (no '{program}' found)"));
+                    continue;
                 }
+                let missing = missing_capability_labels(adapter.capabilities());
+                let degraded = if missing.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (degraded: no {})", join_with_or(&missing))
+                };
+                // Repo `.settings.toml` (or the operator, or the
+                // environment) may mark a harness capacity-limited; the
+                // roster line carries that forward so an orchestrator
+                // routes only small, bounded briefs its way -- both for
+                // reviews and for `zirv agent` delegations (see
+                // `HARNESS_PROMPT`'s final paragraph).
+                let capacity_note = if cfg.agents.is_capacity_small(name) {
+                    " -- small tasks only"
+                } else {
+                    ""
+                };
+                lines.push(if is_self {
+                    format!(
+                        "- {name}: enabled, ready{capacity_note} (this session's harness){degraded}"
+                    )
+                } else {
+                    format!(
+                        "- {name}: enabled, ready{capacity_note} -- initiate with `zirv agent {name} \"<prompt>\"`{degraded}"
+                    )
+                });
             }
-        })
-        .collect();
+            Err(err) => {
+                let reason = err.to_string();
+                let short = reason.lines().next().unwrap_or(&reason);
+                lines.push(format!("- {name}: installed? not ready ({short})"));
+            }
+        }
+    }
     if let Some(review_line) = review_roster_line(cfg) {
         lines.push(review_line);
     }
-    lines
+    let omitted = omitted_texts.len();
+    let omitted_bytes = omitted_texts.iter().map(|line| line.len() + 1).sum();
+    HarnessRosterReport {
+        lines,
+        omitted,
+        omitted_bytes,
+    }
 }
 
 /// The resolved review-model choice for one enabled harness: either the
@@ -3211,8 +3566,24 @@ mod tests {
         );
     }
 
+    /// Issue #298: a `Live` adapter (its own default program name genuinely
+    /// present, here via a restricted `PATH` carrying a stub for each --
+    /// `permissive_cfg`/`CtxConfig::default` alone says nothing about the
+    /// real machine's `PATH`, so this test must not depend on it) earns a
+    /// line; an `Absent` one would not, so pinning "one line per adapter" to
+    /// mean anything under this issue's omission rule requires every
+    /// adapter to be genuinely live first.
     #[test]
     fn harness_prompt_lines_returns_one_line_per_registered_adapter() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for (name, _) in ADAPTERS {
+            std::fs::write(dir.path().join(name), "").expect("write stub");
+        }
+        let _path_guard = crate::commands::ctx::testenv::VarGuard::set(&[(
+            "PATH",
+            Some(dir.path().to_str().expect("utf8 tempdir path")),
+        )]);
+
         let lines = harness_prompt_lines(&permissive_cfg(), "");
         // One line per adapter, plus one trailing "- code review: ..." line
         // naming every enabled harness's resolved review model.
@@ -3395,8 +3766,15 @@ mod tests {
 
     /// No enabled harness at all: `review_roster_line` must not emit a
     /// line naming zero harnesses -- absence, not an empty-handed line.
+    /// Issue #298 widens the claim to the whole roster: with both adapters
+    /// disabled (so their own per-adapter lines are omitted too, the same
+    /// "absence, not annotation" rule as an absent binary), `harness_prompt_
+    /// lines` returns a genuinely empty vec -- the precondition `prompt::
+    /// compose`'s own `!harness_lines.is_empty()` gate relies on to skip the
+    /// whole "zirv harness roster (session)" header rather than render one
+    /// with nothing under it.
     #[test]
-    fn harness_prompt_lines_omits_the_review_line_when_no_harness_is_enabled() {
+    fn harness_prompt_lines_returns_nothing_when_no_harness_is_enabled() {
         let repo = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
         std::fs::write(
@@ -3414,17 +3792,19 @@ mod tests {
         };
         let lines = harness_prompt_lines(&cfg, "");
         assert!(
-            !lines.iter().any(|l| l.starts_with("- code review:")),
-            "no harness enabled: there must be no review line at all: {lines:?}"
+            lines.is_empty(),
+            "no harness enabled: the whole roster must be empty, not just the review line: \
+             {lines:?}"
         );
     }
 
     /// The one call site (`prompt::compose` for an Orchestrator session) must
-    /// never learn about a disabled adapter as if it were offered for
-    /// delegation: a disabled line names where the disable came from and
-    /// never the `zirv agent <name>` invitation.
+    /// never learn about a disabled adapter at all, whether as an annotated
+    /// "disabled" line or as the `zirv agent <name>` invitation -- issue
+    /// #298: absence, not annotation, the same rule an absent binary gets
+    /// below.
     #[test]
-    fn harness_prompt_lines_names_the_disabled_adapter_and_its_location() {
+    fn harness_prompt_lines_omits_the_disabled_adapter_entirely() {
         let repo = tempfile::tempdir().expect("tempdir");
         let home = tempfile::tempdir().expect("tempdir");
         let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
@@ -3439,29 +3819,26 @@ mod tests {
         };
 
         let lines = harness_prompt_lines(&cfg, "");
-        let codex_line = lines
-            .iter()
-            .find(|l| l.starts_with("- codex:"))
-            .expect("codex line present");
-        assert!(codex_line.contains("disabled"), "got {codex_line}");
         assert!(
-            codex_line.contains("ZIRV_AGENT_CODEX_ENABLED"),
-            "names the environment source: {codex_line}"
+            !lines.iter().any(|l| l.starts_with("- codex:")),
+            "a disabled adapter must contribute no line at all: {lines:?}"
         );
         assert!(
-            !codex_line.contains("zirv agent codex"),
-            "a disabled adapter is never offered for delegation: {codex_line}"
+            !lines.iter().any(|l| l.contains("zirv agent codex")),
+            "a disabled adapter is never offered for delegation: {lines:?}"
         );
     }
 
-    /// Finding 1: `ready()` alone is fail-open for a program that simply is
-    /// not on disk anywhere -- `resolve_program` deliberately returns `Ok`
-    /// for it (see its own doc comment), and several other call sites lean on
-    /// that. `harness_prompt_lines` must not repeat the same fail-open claim
-    /// in a roster line an orchestrator can act on immediately: a name that
-    /// resolves to nothing must read as not installed, not ready.
+    /// Finding 1 (pre-#298): `ready()` alone is fail-open for a program that
+    /// simply is not on disk anywhere -- `resolve_program` deliberately
+    /// returns `Ok` for it (see its own doc comment), and several other call
+    /// sites lean on that. Issue #298 changes what a resolved-but-absent
+    /// program earns from "not installed" annotation to no line at all: a
+    /// name that resolves to nothing must cost the session zero bytes, not
+    /// spend them on a claim `program_is_present`'s own doc comment already
+    /// admits can be wrong.
     #[test]
-    fn harness_prompt_lines_reports_not_installed_when_the_resolved_program_is_absent() {
+    fn harness_prompt_lines_omits_the_line_when_the_resolved_program_is_absent() {
         let dir = tempfile::tempdir().expect("tempdir");
         let missing = dir.path().join("nonexistent-agent-binary");
         let cfg = CtxConfig {
@@ -3470,26 +3847,25 @@ mod tests {
         };
 
         let lines = harness_prompt_lines(&cfg, "");
-        let claude_line = lines
-            .iter()
-            .find(|l| l.starts_with("- claude:"))
-            .expect("claude line present");
-        assert!(claude_line.contains("not installed"), "got {claude_line}");
         assert!(
-            !claude_line.contains("zirv agent"),
-            "a binary that is not there must never be offered for delegation: {claude_line}"
+            !lines.iter().any(|l| l.starts_with("- claude:")),
+            "an absent binary must contribute no line at all: {lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("zirv agent")),
+            "a binary that is not there must never be offered for delegation: {lines:?}"
         );
     }
 
-    /// Bug A (harness/model parity): two harnesses in the identical state --
-    /// here, both absent, behind the same missing `agent_bin` override --
-    /// must render the identical templated line, differing only by their own
-    /// name. No adapter may get softer or harsher wording than another for
-    /// the same underlying fact; `harness_prompt_lines` renders every entry
-    /// through one shared format, never an adapter-specific one, and this
-    /// pins that down behaviourally rather than only by code inspection.
+    /// Bug A (harness/model parity), reframed for issue #298: two harnesses
+    /// in the identical state -- here, both absent, behind the same missing
+    /// `agent_bin` override -- must be treated identically. Pre-#298 that
+    /// meant "the same annotated template"; now it means "both omitted",
+    /// which this pins down behaviourally: neither adapter gets a line, and
+    /// only the review line (which does not check presence -- see `review_
+    /// roster_line`'s own doc comment) survives.
     #[test]
-    fn harness_prompt_lines_render_the_same_template_for_two_adapters_in_the_same_state() {
+    fn harness_prompt_lines_omits_both_adapters_equally_in_the_same_state() {
         let dir = tempfile::tempdir().expect("tempdir");
         let missing = dir.path().join("nonexistent-agent-binary");
         let cfg = CtxConfig {
@@ -3498,21 +3874,17 @@ mod tests {
         };
 
         let lines = harness_prompt_lines(&cfg, "");
-        let claude_line = lines
-            .iter()
-            .find(|l| l.starts_with("- claude:"))
-            .expect("claude line present");
-        let codex_line = lines
-            .iter()
-            .find(|l| l.starts_with("- codex:"))
-            .expect("codex line present");
-
-        let normalize = |line: &str, name: &str| line.replacen(name, "{name}", 1);
-        assert_eq!(
-            normalize(claude_line, "claude"),
-            normalize(codex_line, "codex"),
-            "both adapters are equally absent and must render the identical template, \
-             differing only by name:\nclaude: {claude_line}\ncodex: {codex_line}"
+        assert!(
+            !lines.iter().any(|l| l.starts_with("- claude:")),
+            "claude must be equally absent: {lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.starts_with("- codex:")),
+            "codex must be equally absent: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.starts_with("- code review:")),
+            "the review line does not check presence, so it must still survive: {lines:?}"
         );
     }
 
@@ -3595,17 +3967,304 @@ mod tests {
             "claude's own named override is present: {claude_line}"
         );
 
-        let codex_line = lines
-            .iter()
-            .find(|l| l.starts_with("- codex:"))
-            .expect("codex line present");
         assert!(
-            !codex_line.contains("zirv agent codex"),
-            "agent_bin naming claude must never make codex's line claim delegable: {codex_line}"
+            !lines.iter().any(|l| l.starts_with("- codex:")),
+            "codex is judged on its own (absent) binary, not claude's override, so issue #298 \
+             omits its line entirely rather than claiming 'not installed': {lines:?}"
         );
         assert!(
-            codex_line.contains("not installed"),
-            "codex is judged on its own (absent) binary, not claude's override: {codex_line}"
+            !lines.iter().any(|l| l.contains("zirv agent codex")),
+            "agent_bin naming claude must never make codex's line claim delegable: {lines:?}"
+        );
+    }
+
+    // -- issue #298 ("capability-gated injection"): the Liveness predicate,
+    // the widened install-root probe, and the per-repository ProbeCache --
+
+    #[test]
+    fn liveness_emits_line_for_live_and_unknown_but_not_absent() {
+        assert!(Liveness::Live.emits_line());
+        assert!(Liveness::Unknown("inconclusive".to_string()).emits_line());
+        assert!(!Liveness::Absent("no such binary".to_string()).emits_line());
+    }
+
+    /// The widened probe finds codex's real Windows install root even
+    /// though it is nowhere on `PATH` -- CLAUDE.md's own "This Windows dev
+    /// machine" note: `program_is_present` alone reports absent, but
+    /// `program_is_present_widened`/`liveness_probe` widen the search and
+    /// report `Live`.
+    #[test]
+    fn liveness_probe_finds_codex_via_its_known_install_root_when_absent_from_path() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let root = home.path().join("AppData/Local/Programs/OpenAI/Codex/bin");
+        std::fs::create_dir_all(&root).expect("mkdir");
+        std::fs::write(root.join("codex"), "").expect("write stub");
+        let empty_path_dir = tempfile::tempdir().expect("tempdir");
+        let _path_guard = crate::commands::ctx::testenv::VarGuard::set(&[(
+            "PATH",
+            Some(empty_path_dir.path().to_str().expect("utf8 path")),
+        )]);
+
+        assert!(
+            !program_is_present("codex"),
+            "the plain PATH-only check must not see it"
+        );
+        assert_eq!(liveness_probe("codex", "codex"), Liveness::Live);
+        assert!(
+            known_install_roots("claude").is_empty(),
+            "claude has no known install root of its own, so this stub must not leak into it"
+        );
+    }
+
+    /// A `PATH` entry that turns out to be a plain file, not a directory,
+    /// makes the probe genuinely unable to tell -- `Unknown`, never a
+    /// confirmed `Absent`.
+    #[test]
+    fn liveness_probe_is_unknown_when_a_path_entry_is_not_a_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let not_a_directory = dir.path().join("not-a-directory-file");
+        std::fs::write(&not_a_directory, "").expect("write");
+        let _path_guard = crate::commands::ctx::testenv::VarGuard::set(&[(
+            "PATH",
+            Some(not_a_directory.to_str().expect("utf8 path")),
+        )]);
+
+        let verdict = liveness_probe("claude", "claude");
+        assert!(
+            matches!(verdict, Liveness::Unknown(_)),
+            "an inconclusive PATH entry must never be reported as a confirmed absence: \
+             {verdict:?}"
+        );
+    }
+
+    /// Acceptance criterion: a repo-layer config change cannot flip an
+    /// adapter from `Absent` to `Live`. True by construction --
+    /// `known_install_roots`/`liveness_probe` take no `CtxConfig`/repo path
+    /// at all -- pinned down behaviourally: codex's line is identical
+    /// whether the repo carries no `.zirv/.settings.toml` or a real,
+    /// non-empty one, as long as its known install root holds a stub.
+    #[test]
+    fn known_install_root_liveness_does_not_depend_on_any_repo_config() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let root = home.path().join("AppData/Local/Programs/OpenAI/Codex/bin");
+        std::fs::create_dir_all(&root).expect("mkdir");
+        std::fs::write(root.join("codex"), "").expect("write stub");
+        let empty_path_dir = tempfile::tempdir().expect("tempdir");
+        let _path_guard = crate::commands::ctx::testenv::VarGuard::set(&[(
+            "PATH",
+            Some(empty_path_dir.path().to_str().expect("utf8 path")),
+        )]);
+
+        let plain_repo = tempfile::tempdir().expect("tempdir");
+        let configured_repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(configured_repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            configured_repo.path().join(".zirv/.settings.toml"),
+            "[agents.claude]\ncapacity = \"small\"\n",
+        )
+        .expect("write");
+        let empty: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+
+        for repo in [plain_repo.path(), configured_repo.path()] {
+            let cfg = CtxConfig {
+                agents: crate::settings::AgentGate::load(repo, &|k| empty.get(k).cloned())
+                    .expect("load"),
+                ..CtxConfig::default()
+            };
+            let lines = harness_prompt_lines(&cfg, "");
+            assert!(
+                lines
+                    .iter()
+                    .any(|l| l.starts_with("- codex:") && l.contains("zirv agent codex")),
+                "codex must be live via its known install root regardless of repo config \
+                 ({}): {lines:?}",
+                repo.display()
+            );
+        }
+    }
+
+    #[test]
+    fn probe_cache_get_or_probe_reuses_a_cached_verdict_without_reprobing() {
+        let mut cache = ProbeCache {
+            path: None,
+            now: 1_000,
+            file: ProbeCacheFile::default(),
+            dirty: false,
+        };
+        let calls = std::cell::Cell::new(0);
+        let first = cache.get_or_probe("k", || {
+            calls.set(calls.get() + 1);
+            Liveness::Live
+        });
+        assert_eq!(first, Liveness::Live);
+        assert_eq!(calls.get(), 1);
+
+        let second = cache.get_or_probe("k", || {
+            calls.set(calls.get() + 1);
+            Liveness::Absent("should not run".to_string())
+        });
+        assert_eq!(
+            second,
+            Liveness::Live,
+            "the cached verdict must be reused, not a fresh probe"
+        );
+        assert_eq!(
+            calls.get(),
+            1,
+            "a second call within the TTL must not re-probe"
+        );
+    }
+
+    #[test]
+    fn probe_cache_reprobes_after_the_ttl_elapses() {
+        let mut cache = ProbeCache {
+            path: None,
+            now: 1_000,
+            file: ProbeCacheFile::default(),
+            dirty: false,
+        };
+        let _ = cache.get_or_probe("k", || Liveness::Live);
+
+        cache.now += PROBE_CACHE_TTL_SECS + 1;
+        let calls = std::cell::Cell::new(0);
+        let verdict = cache.get_or_probe("k", || {
+            calls.set(calls.get() + 1);
+            Liveness::Absent("gone".to_string())
+        });
+        assert_eq!(calls.get(), 1, "past the TTL, get_or_probe must re-probe");
+        assert_eq!(verdict, Liveness::Absent("gone".to_string()));
+    }
+
+    /// An inconclusive probe must never be frozen into the cache: the very
+    /// next call gets a fresh look rather than a stale guess.
+    #[test]
+    fn probe_cache_never_freezes_an_unknown_verdict() {
+        let mut cache = ProbeCache {
+            path: None,
+            now: 1_000,
+            file: ProbeCacheFile::default(),
+            dirty: false,
+        };
+        let first = cache.get_or_probe("k", || Liveness::Unknown("inconclusive".to_string()));
+        assert_eq!(first, Liveness::Unknown("inconclusive".to_string()));
+        assert!(
+            !cache.dirty,
+            "an Unknown verdict must never be written to the cache"
+        );
+
+        let calls = std::cell::Cell::new(0);
+        let second = cache.get_or_probe("k", || {
+            calls.set(calls.get() + 1);
+            Liveness::Live
+        });
+        assert_eq!(
+            calls.get(),
+            1,
+            "an Unknown verdict must not be cached, so the next call re-probes"
+        );
+        assert_eq!(second, Liveness::Live);
+    }
+
+    #[test]
+    fn probe_cache_save_and_load_round_trips_a_live_verdict() {
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state =
+            crate::commands::ctx::state::StateDir::from_root(state_dir.path().to_path_buf());
+
+        let mut cache = ProbeCache::load(&state, "some-repo", 1_000);
+        let first = cache.get_or_probe("k", || Liveness::Live);
+        assert_eq!(first, Liveness::Live);
+        cache.save();
+
+        let mut reloaded = ProbeCache::load(&state, "some-repo", 1_000);
+        let calls = std::cell::Cell::new(0);
+        let second = reloaded.get_or_probe("k", || {
+            calls.set(calls.get() + 1);
+            Liveness::Absent("should not run".to_string())
+        });
+        assert_eq!(
+            second,
+            Liveness::Live,
+            "a saved verdict must be read back on the next load"
+        );
+        assert_eq!(calls.get(), 0, "a warm cache must not re-probe");
+    }
+
+    #[test]
+    fn probe_cache_load_with_no_file_yet_probes_fresh() {
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state =
+            crate::commands::ctx::state::StateDir::from_root(state_dir.path().to_path_buf());
+
+        let mut cache = ProbeCache::load(&state, "never-seen-repo", 1_000);
+        let calls = std::cell::Cell::new(0);
+        let verdict = cache.get_or_probe("k", || {
+            calls.set(calls.get() + 1);
+            Liveness::Live
+        });
+        assert_eq!(calls.get(), 1);
+        assert_eq!(verdict, Liveness::Live);
+    }
+
+    /// A cache file that is not valid JSON (or not this version) must read
+    /// back empty, never error: a cache miss is exactly as if the cache did
+    /// not exist.
+    #[test]
+    fn probe_cache_load_ignores_an_unparseable_file() {
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state =
+            crate::commands::ctx::state::StateDir::from_root(state_dir.path().to_path_buf());
+        std::fs::create_dir_all(state.probes()).expect("mkdir");
+        std::fs::write(state.probes().join("repo.json"), "not json").expect("write");
+
+        let mut cache = ProbeCache::load(&state, "repo", 1_000);
+        let calls = std::cell::Cell::new(0);
+        let verdict = cache.get_or_probe("k", || {
+            calls.set(calls.get() + 1);
+            Liveness::Live
+        });
+        assert_eq!(
+            calls.get(),
+            1,
+            "an unparseable cache file must not error out, just re-probe"
+        );
+        assert_eq!(verdict, Liveness::Live);
+    }
+
+    /// The success metric the issue's own probe cache exists for: a second
+    /// `harness_prompt_lines_cached` call against the same cache must
+    /// deliver byte-identical lines even after the underlying filesystem
+    /// truth changes mid-session -- the injected prompt prefix stays stable
+    /// across a session's turns.
+    #[test]
+    fn harness_prompt_lines_cached_survives_a_mid_session_filesystem_change() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for (name, _) in ADAPTERS {
+            std::fs::write(dir.path().join(name), "").expect("write stub");
+        }
+        let _path_guard = crate::commands::ctx::testenv::VarGuard::set(&[(
+            "PATH",
+            Some(dir.path().to_str().expect("utf8 tempdir path")),
+        )]);
+        let cfg = permissive_cfg();
+        let mut cache = ProbeCache {
+            path: None,
+            now: 1_000,
+            file: ProbeCacheFile::default(),
+            dirty: false,
+        };
+
+        let first = harness_prompt_lines_cached(&cfg, "", &mut cache).lines;
+        for (name, _) in ADAPTERS {
+            std::fs::remove_file(dir.path().join(name)).expect("remove stub");
+        }
+        let second = harness_prompt_lines_cached(&cfg, "", &mut cache).lines;
+        assert_eq!(
+            first, second,
+            "a cached verdict must survive a mid-session change on disk, not flap the roster: \
+             first={first:?} second={second:?}"
         );
     }
 

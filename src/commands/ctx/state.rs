@@ -438,6 +438,19 @@ impl StateDir {
         self.0.join("approvals")
     }
 
+    /// Issue #298: cached harness-liveness probe verdicts, one file per
+    /// repository slug (`<state>/probes/<repo-slug>.json`). Keyed by repo
+    /// rather than by session id, unlike `adoption()`/`status_snapshots()`
+    /// above: a session id is minted fresh per harness process (see
+    /// `adoption()`'s own doc comment), and `run_loop` in particular mints a
+    /// new one every cycle, so a strictly per-session file would never be
+    /// read back by the one launch path that most needs reuse. See
+    /// `adapters::ProbeCache`'s own doc comment for the TTL that keeps a
+    /// repo-scoped cache from going stale forever instead.
+    pub fn probes(&self) -> PathBuf {
+        self.0.join("probes")
+    }
+
     /// First 8 hex characters of the session id keep the socket path short.
     pub fn socket_for(&self, session: &str) -> PathBuf {
         let short: String = session
