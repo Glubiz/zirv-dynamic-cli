@@ -2722,12 +2722,15 @@ fn harness_roster_lines(
 /// orchestrator seat (`cfg.chat.model`, or the top tier when unset). This is
 /// the one place both halves are combined -- `review_roster_line` below is
 /// its only caller.
-struct ReviewModelChoice {
-    model: String,
-    configured: bool,
+pub(crate) struct ReviewModelChoice {
+    pub(crate) model: String,
+    pub(crate) configured: bool,
 }
 
-fn resolve_review_model(
+/// `pub(crate)`: also the seam `reviewer_argv` (`workflow::review`) uses to
+/// enforce the same resolved model on the reviewer's own launch, not just to
+/// advise it in the roster line below.
+pub(crate) fn resolve_review_model(
     cfg: &CtxConfig,
     name: &str,
     adapter: &dyn AgentAdapter,

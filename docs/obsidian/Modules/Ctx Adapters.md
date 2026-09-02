@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-09-01
+last-verified: 2026-09-02
 ---
 
 # Ctx Adapters
@@ -109,6 +109,8 @@ The caller renders the lines and hands them to `prompt::compose` as data (`compo
 ### The review-routing line (`review_roster_line`, 2026-08-18)
 
 `harness_prompt_lines` appends one trailing line after its per-adapter lines, naming which model runs code review for every *enabled* harness: `resolve_review_model(cfg, name, adapter)` picks the operator's own `cfg.review.claude`/`cfg.review.codex` when set (`REPO_FORBIDDEN` — see [[Untrusted Configuration]]), else `adapter.review_model_below(cfg.chat.model.as_deref())`. Each entry renders as `{name} -> "{model}" ({note})`, and the whole line states the routing rule: "run every code review on the named model, never on an orchestrator seat's own model" — softened to "never on a model above the named one" whenever any entry's resolved model text equals the seat's, case-insensitively (`equals_seat`). That equality happens two ways, both legitimate: a harness's ladder default is already at its floor tier (seat `"haiku"` resolves claude's own default to `"haiku"` too — the note reads "floor tier: the seat is already at the bottom rung" instead of "default: one tier below the seat"), or the operator explicitly configured `review.<agent>` equal to the seat (their call — the note reads `(configured)`). A disabled harness has no entry at all (absence, not silence, matching the per-harness line's own convention), and `review_roster_line` returns `None` — no line, not an empty one — when no harness is enabled. Claude's `ORCHESTRATOR_PROMPT` review bullet and its `.claude/agents pin their own models` clause were reworded to point at this line and carve out the one exception that outranks it (see below).
+
+**`resolve_review_model` is now also the reviewer's own launch-time enforcement seam, not just this advisory line's source (`pub(crate)`, harness iteration round 3, 2026-09-02).** Before, an operator or a wrapped session could read the roster's routing line and still have the automated reviewer run on whatever model the adapter's bare CLI happened to default to — the line was advisory text, never enforced. `workflow::review::reviewer_argv` now calls `resolve_review_model` directly and appends `adapter.model_args(&review_model)` to the reviewer's own launch argv, before the read-only floor so no later argument can weaken it — see [[Workflows]]'s "Bounded reviewer workers" section for the launch-side detail. Practical consequence: with `chat.model` unset, a fresh install's automated reviewers now literally launch on the ladder's top tier (`opus` for claude) rather than an unpinned CLI default — an operator decision surfaced, not a new default invented — see the 2026-09-02 [[Decision Log]] entry.
 
 ### The delegated-worker model default (`worker_model_args`, 2026-08-18)
 

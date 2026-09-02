@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-09-01
+last-verified: 2026-09-02
 ---
 
 # Known Issues
@@ -14,6 +14,7 @@ Each entry gets a changelog comment at the top of the file, newest first:
 <!-- Updated YYYY-MM-DD (branch, state): what changed -->
 ```
 
+<!-- Updated 2026-09-02 (feat/wrapper-proportionality, harness iteration round 3): resolved a status.rs test hermeticity gap -- status_shows_no_usage_source_for_a_codex_configured_repo_rather_than_anthropic_numbers read the real ~/.zirv/ctx.toml with no HomeGuard, so a machine with operator config touching usage/agent resolution could flip the assertion; root cause of an intermittent CI flake -->
 <!-- Updated 2026-09-01 (feature/238-246-review-waiver-status-diff, v3.4.0): resolved issue #238 -- `zirv workflow review package`'s `VerificationEvidence` no longer reports a raw, waiver-blind `passed:false` for a run the test/deploy gate had already accepted via the operator's recorded baseline (issue #215); the gate and the review package now share one `evaluate_against_operator_baseline` seam. No new residuals found while implementing #246 (`zirv ctx status --diff`) -->
 <!-- Updated 2026-08-31 (feature/225-240-token-cost-ruflo, issue #225 measurement closeout): recorded that PowerShell's `>` redirection re-encodes captured stdout to UTF-16 (silently doubling byte counts) when capturing real command output for token measurement -- cmd.exe's `>` avoids it -->
 <!-- Updated 2026-08-31 (worktree-issues-223-225, v3.2.0, issues #223/#225): recorded that commands::ctx::supervise::tests::terminate_* SIGTERM tests flake under parallel `-j 8` load on this Windows dev machine (pass in isolation and under the required serial `--test-threads=1` run) -->
@@ -80,6 +81,10 @@ Each entry gets a changelog comment at the top of the file, newest first:
 <!-- Updated 2026-08-13 (feat/dashboard, docs sweep): dashboard panes carry no rot score yet -->
 <!-- Updated 2026-08-13 (feat/agent-coordination, review round): markdown header absorption; registry short is a stable address; supervision env scrubbed on every spawn -->
 <!-- Updated 2026-08-13 (feat/agent-coordination, console-safety round): portable-pty do_kill inversion; ConPTY control-byte broadcast; empty nudge prefixes -->
+
+## A `status.rs` test read the real `~/.zirv/ctx.toml`, an intermittent CI flake root cause
+
+**Resolved 2026-09-02 (`feat/wrapper-proportionality`, harness iteration round 3).** `status_shows_no_usage_source_for_a_codex_configured_repo_rather_than_anthropic_numbers` set `ZIRV_CTX_AGENT=codex` and asserted on `run_with`'s output with no `testenv::HomeGuard` in place, so `CtxConfig::load` inside `run_with` resolved the real operator/CI-runner `~/.zirv/ctx.toml` rather than an isolated one — the same real-`$HOME`-leak class the "Test-suite hermeticity gaps" entry below closed for other tests in this same file's siblings, missed here. On any machine or CI runner whose home config touches usage/agent resolution, the test's assumption about which provider's numbers should be absent could be silently wrong. Fixed by binding a `HomeGuard` for the test's duration, the same fix pattern already used across this suite.
 
 ## PowerShell's `>` redirection re-encodes captured stdout to UTF-16, silently doubling byte counts
 
