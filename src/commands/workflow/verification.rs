@@ -694,13 +694,25 @@ impl VerificationReport {
                 .all(|check| check.status == CheckStatus::Passed)
     }
 
-    /// The report's three-valued [`GateOutcome`] (issue #268). The first
-    /// `Inconclusive` check wins the reported reason -- there is exactly one
-    /// gate verdict to announce, and `Inconclusive` already blocks a gate no
-    /// less than `Fail` does (see `passed`), so which of possibly several
-    /// non-provative checks gets named is a display choice, not a policy
-    /// one.
+    /// The report's three-valued [`GateOutcome`] (issue #268), ranked with
+    /// `Fail` above `Inconclusive` above `Pass`: a genuinely `Failed` check
+    /// -- real evidence something is broken -- always wins over an
+    /// `Inconclusive` one on the same run, even though both block the gate
+    /// identically (see `passed`). A run that is *only* ever unreliable (no
+    /// `Failed` check at all) reports the first `Inconclusive` check's
+    /// reason; announcing that reason as if it were the *whole* story when
+    /// a real failure sits alongside it would say "proves nothing" about a
+    /// run that, in fact, proved something broke -- see `gate_announcement`,
+    /// which still lists any accompanying `Inconclusive` checks by id even
+    /// when the overall outcome is `Fail`.
     pub fn outcome(&self) -> GateOutcome {
+        if self
+            .checks
+            .iter()
+            .any(|check| check.status == CheckStatus::Failed)
+        {
+            return GateOutcome::Fail;
+        }
         if let Some(check) = self
             .checks
             .iter()
@@ -872,6 +884,14 @@ fn looks_like_tool_missing(exit_code: Option<i32>, output: &str) -> bool {
 /// `test result:` line per binary, never one combined total), so this is
 /// "how many test outcomes did the runner report finishing", not "how many
 /// binaries ran". `None` means no summary line was found at all.
+///
+/// `#[cfg(test)]`: production code (`run_check`) gets this same total from
+/// `FailureNameScanner`'s full-stream `summary_seen`/`summary_total`
+/// instead, never from a piece of already-capped display text -- see
+/// `classify_test_outcome`'s own doc comment for why. This function (and
+/// [`classify_test_report`] below) exist only so the decision table has a
+/// pure, fixture-driven entry point for tests.
+#[cfg(test)]
 fn extract_test_total(output: &str) -> Option<u64> {
     let mut total = 0u64;
     let mut found = false;
@@ -946,11 +966,36 @@ fn parse_nextest_summary_line(line: &str) -> Option<u64> {
 /// runner leaves no `test result:`/`Summary [...]` line behind for
 /// [`parse_cargo_test_failure_names`] to find, and an empty failure-name set
 /// used to read as a clean pass -- or `ReportUnparseable` on a successful
-/// one (a well-formed pass always prints its summary; the tail-capping this
-/// module already applies keeps the *end* of the stream, so a genuine
-/// summary line essentially never falls victim to it).
+/// one.
+///
+/// `#[cfg(test)]`: exists so this decision table has a pure, text-in
+/// entry point fixture files can exercise directly. `run_check` calls
+/// [`classify_test_outcome`] instead, with a total taken from the check's
+/// complete, uncapped output -- text handed to *this* function can
+/// legitimately have lost its summary line to display-buffer capping (see
+/// `classify_test_outcome`'s own doc comment), which is exactly the bug a
+/// caller relying on this function for production classification would
+/// have reintroduced.
+#[cfg(test)]
 fn classify_test_report(output: &str, exit_success: bool) -> Option<InconclusiveReason> {
-    match extract_test_total(output) {
+    classify_test_outcome(extract_test_total(output), exit_success)
+}
+
+/// The actual decision table behind [`classify_test_report`], taking the
+/// already-extracted total directly rather than re-deriving it from text.
+/// `run_check` calls this with a total computed from the check's *complete*
+/// uncapped output (see `FailureNameScanner`'s `summary_total`/
+/// `summary_seen`, fed during capture exactly like failing test names
+/// already are) -- never from the capped *display* buffer, which two
+/// independent 16 KiB caps (`read_capped_tail_and_scan`'s own tail cap, then
+/// `run_check`'s second cap on the stdout+stderr concatenation) can leave
+/// with no summary line at all even though the runner printed one. Doing
+/// this classification against that doubly-capped text let a `cargo test
+/// --verbose` run's compiler noise alone misreport a real pass as
+/// `ReportUnparseable` or a real failure as `RunnerCrashed`, which the
+/// mandated `--verbose` gate made likely rather than theoretical.
+fn classify_test_outcome(total: Option<u64>, exit_success: bool) -> Option<InconclusiveReason> {
+    match total {
         Some(0) if exit_success => Some(InconclusiveReason::NoTestsSelected),
         Some(0) => Some(InconclusiveReason::RunnerCrashed),
         Some(_) => None,
@@ -962,7 +1007,13 @@ fn classify_test_report(output: &str, exit_success: bool) -> Option<Inconclusive
 /// Applies both of `run_check`'s post-hoc `Inconclusive` reclassifications
 /// (issue #268) to an otherwise-final `(status, exit_code)`: a tool the
 /// shell could not find, then -- only for a `cargo test`/`cargo nextest
-/// run`-shaped `Unit` check -- [`classify_test_report`]. Never touches
+/// run`-shaped `Unit` check -- [`classify_test_outcome`], fed
+/// `test_summary_total` from the check's complete, uncapped output (see that
+/// function's own doc comment for why the capped display text must never be
+/// used here). `output` itself is only ever consulted for the tool-missing
+/// heuristic, which is fine against the capped text: a "command not
+/// found"/exit-127 signal shows up early and reliably, unlike a summary line
+/// a large enough later flood can push out of a capped tail. Never touches
 /// `CheckStatus::DryRun`/`Skipped`/`TimedOut`: a timeout already blocks every
 /// gate exactly as hard as `Inconclusive` does (see `CheckStatus::
 /// Inconclusive`'s own doc comment), and dry-run/skipped checks were never
@@ -972,6 +1023,7 @@ fn classify_gate_status(
     exit_code: Option<i32>,
     output: &str,
     is_test_runner_check: bool,
+    test_summary_total: Option<u64>,
 ) -> (CheckStatus, Option<InconclusiveReason>) {
     if status == CheckStatus::Failed && looks_like_tool_missing(exit_code, output) {
         return (
@@ -981,7 +1033,8 @@ fn classify_gate_status(
     }
     if is_test_runner_check
         && matches!(status, CheckStatus::Passed | CheckStatus::Failed)
-        && let Some(reason) = classify_test_report(output, status == CheckStatus::Passed)
+        && let Some(reason) =
+            classify_test_outcome(test_summary_total, status == CheckStatus::Passed)
     {
         return (CheckStatus::Inconclusive, Some(reason));
     }
@@ -1046,6 +1099,18 @@ fn parse_cargo_test_failure_names(output: &str) -> std::collections::BTreeSet<St
 /// ignorable up to its next newline, rather than buffering an unbounded
 /// amount of a single newline-less stream -- which would otherwise defeat
 /// the memory cap the capped *display* tail is meant to provide.
+///
+/// Also recognizes the `cargo test`/`cargo nextest run` summary line itself
+/// (`summary_seen`/`summary_total`, fed by `parse_cargo_test_result_line`/
+/// `parse_nextest_summary_line`, same as `extract_test_total`) -- for the
+/// identical reason names are recovered from the full stream rather than
+/// the capped display tail: `run_check` concatenates the stdout and stderr
+/// tails and caps the result a *second* time, and verbose compiler noise on
+/// either stream can push the entire summary line out of that second cap
+/// even though both per-stream tails individually held it. Classifying off
+/// that doubly-capped text let a real pass or failure misreport as
+/// `Inconclusive`; `classify_gate_status` now uses `summary_seen`/
+/// `summary_total` from this full-stream scan instead.
 #[derive(Default)]
 struct FailureNameScanner {
     names: std::collections::BTreeSet<String>,
@@ -1053,6 +1118,8 @@ struct FailureNameScanner {
     partial: Vec<u8>,
     partial_overflowed: bool,
     saw_failures_header: bool,
+    summary_seen: bool,
+    summary_total: u64,
 }
 
 impl FailureNameScanner {
@@ -1087,6 +1154,16 @@ impl FailureNameScanner {
     }
 
     fn observe_line(&mut self, line: &str) {
+        // Independent of the `failures:`/pending-name state machine below:
+        // a summary line is a summary line regardless of what surrounds it,
+        // so this never interferes with (and is never interfered with by)
+        // the existing name-recovery branches.
+        if let Some(count) =
+            parse_cargo_test_result_line(line).or_else(|| parse_nextest_summary_line(line))
+        {
+            self.summary_seen = true;
+            self.summary_total = self.summary_total.saturating_add(count);
+        }
         let trimmed = line.trim();
         if trimmed == "failures:" {
             self.pending.clear();
@@ -1114,13 +1191,17 @@ impl FailureNameScanner {
     }
 
     /// Consumes the scanner, flushing any final unterminated line (a stream
-    /// that ends without a trailing newline) before returning the names.
-    fn finish(mut self) -> std::collections::BTreeSet<String> {
+    /// that ends without a trailing newline) before returning the names,
+    /// plus whether a summary line was seen anywhere in the full stream and
+    /// the running total it declared (summed across every such line found,
+    /// exactly like `extract_test_total` -- a multi-binary `cargo test` run
+    /// prints one `test result:` line per binary, never one combined total).
+    fn finish(mut self) -> (std::collections::BTreeSet<String>, bool, u64) {
         if !self.partial.is_empty() && !self.partial_overflowed {
             let line = String::from_utf8_lossy(&self.partial).into_owned();
             self.observe_line(line.trim_end_matches(['\n', '\r']));
         }
-        self.names
+        (self.names, self.summary_seen, self.summary_total)
     }
 }
 
@@ -1325,16 +1406,18 @@ fn command_for_shell(command: &str) -> Command {
 
 /// The retained tail (whether the stream ended in a read error rather than
 /// at EOF is the second element -- an error read as a clean end silently
-/// turned a truncated failure log into a complete-looking one), plus the
-/// failing test names a [`FailureNameScanner`] recognized in the *full*,
-/// uncapped stream as it went by -- see that struct's doc comment for why
-/// this must happen during capture rather than against the capped tail
-/// alone. Every check's output goes through this path (`run_check`); only
-/// the retained-tail element is ever a display artifact.
+/// turned a truncated failure log into a complete-looking one), plus what a
+/// [`FailureNameScanner`] recognized in the *full*, uncapped stream as it
+/// went by -- the failing test names, whether a `test result:`/`Summary
+/// [...]` line was seen at all, and the total it declared -- see that
+/// struct's doc comment for why this must happen during capture rather than
+/// against the capped tail alone. Every check's output goes through this
+/// path (`run_check`); only the retained-tail element is ever a display
+/// artifact.
 fn read_capped_tail_and_scan(
     mut reader: impl Read,
     cap: usize,
-) -> (Vec<u8>, bool, std::collections::BTreeSet<String>) {
+) -> (Vec<u8>, bool, std::collections::BTreeSet<String>, bool, u64) {
     let mut kept = Vec::with_capacity(cap);
     let mut chunk = [0u8; 8192];
     let mut errored = false;
@@ -1360,7 +1443,8 @@ fn read_capped_tail_and_scan(
         }
         kept.extend_from_slice(&chunk[..count]);
     }
-    (kept, errored, scanner.finish())
+    let (names, summary_seen, summary_total) = scanner.finish();
+    (kept, errored, names, summary_seen, summary_total)
 }
 
 /// The last `cap` bytes as text, on a char boundary. `utils::truncate_bytes`
@@ -1623,13 +1707,17 @@ fn run_check(
         }
     }
     /// One check's raw run outcome: status, exit code, combined capped
-    /// output, and the failing test names a `FailureNameScanner` recognized
-    /// while that output streamed by.
+    /// output (display/storage only -- never classification, see
+    /// `FailureNameScanner`'s doc comment), the failing test names a
+    /// `FailureNameScanner` recognized while that output streamed by, and
+    /// whether/what total a `test result:`/`Summary [...]` line declared
+    /// anywhere in the *complete* stdout+stderr streams.
     type RawCheckOutcome = (
         CheckStatus,
         Option<i32>,
         Vec<u8>,
         std::collections::BTreeSet<String>,
+        Option<u64>,
     );
     let result = (|| -> CtxResult<RawCheckOutcome> {
         let mut child = command.spawn()?;
@@ -1668,34 +1756,53 @@ fn run_check(
             }
             std::thread::sleep(Duration::from_millis(25));
         };
-        let (mut output, mut errored, mut names) = stdout_thread.join().unwrap_or_default();
-        let (stderr_output, stderr_errored, stderr_names) =
-            stderr_thread.join().unwrap_or_default();
+        let (mut output, mut errored, mut names, stdout_summary_seen, stdout_summary_total) =
+            stdout_thread.join().unwrap_or_default();
+        let (
+            stderr_output,
+            stderr_errored,
+            stderr_names,
+            stderr_summary_seen,
+            stderr_summary_total,
+        ) = stderr_thread.join().unwrap_or_default();
         output.extend(stderr_output);
         errored |= stderr_errored;
         names.extend(stderr_names);
+        // Full-stream totals, never the capped `output` buffer below: a
+        // `cargo test`/`cargo nextest run` summary line survives here even
+        // when the doubly-capped display buffer (per-stream tail, then a
+        // second cap on the stdout+stderr concatenation) has lost it to a
+        // large enough flood of noise on either stream -- see
+        // `classify_test_outcome`'s own doc comment.
+        let summary_seen = stdout_summary_seen || stderr_summary_seen;
+        let summary_total =
+            summary_seen.then(|| stdout_summary_total.saturating_add(stderr_summary_total));
         if output.len() > MAX_FAILURE_OUTPUT_BYTES {
             output.drain(..output.len() - MAX_FAILURE_OUTPUT_BYTES);
         }
         if errored {
             output.extend_from_slice(b"\n[output stream ended in a read error]");
         }
-        Ok((status, code, output, names))
+        Ok((status, code, output, names, summary_total))
     })();
 
-    let (status, exit_code, output, failure_test_names, spawn_tool_missing) = match result {
-        Ok((status, code, output, names)) => (status, code, output, names, false),
-        Err(err) => {
-            let missing = is_spawn_not_found(err.as_ref());
-            (
-                CheckStatus::Failed,
-                None,
-                err.to_string().into_bytes(),
-                std::collections::BTreeSet::new(),
-                missing,
-            )
-        }
-    };
+    let (status, exit_code, output, failure_test_names, test_summary_total, spawn_tool_missing) =
+        match result {
+            Ok((status, code, output, names, summary_total)) => {
+                (status, code, output, names, summary_total, false)
+            }
+            Err(err) => {
+                let missing = is_spawn_not_found(err.as_ref());
+                (
+                    CheckStatus::Failed,
+                    None,
+                    err.to_string().into_bytes(),
+                    std::collections::BTreeSet::new(),
+                    None,
+                    missing,
+                )
+            }
+        };
     let failure_output = (status != CheckStatus::Passed)
         .then(|| scrub_output(&tail_text(&output, MAX_FAILURE_OUTPUT_BYTES)));
     // Scrubbed the same way `failure_output` is: a name recognized inside
@@ -1726,6 +1833,7 @@ fn run_check(
             exit_code,
             &String::from_utf8_lossy(&output),
             is_test_runner_check,
+            test_summary_total,
         )
     };
     CheckResult {
@@ -1919,10 +2027,29 @@ pub fn gate_announcement(state: &StateDir, repo: &Path, final_only: bool) -> Str
              repeats, investigate before treating the change as verified",
             reason.as_str()
         ),
-        GateOutcome::Fail | GateOutcome::Pass => format!(
-            "gate: Fail · proves: the current evidence does not cover this change set, or has \
-             unwaived failures · fix: run `{command}`"
-        ),
+        GateOutcome::Fail | GateOutcome::Pass => {
+            // `outcome()` ranks `Fail` above `Inconclusive`, so a mixed
+            // report (one check genuinely failed, another's runner
+            // crashed) lands here -- the accompanying `Inconclusive`
+            // check(s) are still worth naming, not silently absorbed into
+            // a plain "Fail" that implies every check produced real
+            // evidence.
+            let inconclusive_ids: Vec<&str> = report
+                .checks
+                .iter()
+                .filter(|check| check.status == CheckStatus::Inconclusive)
+                .map(|check| check.id.as_str())
+                .collect();
+            let suffix = if inconclusive_ids.is_empty() {
+                String::new()
+            } else {
+                format!(" (also inconclusive: {})", inconclusive_ids.join(", "))
+            };
+            format!(
+                "gate: Fail · proves: the current evidence does not cover this change set, or \
+                 has unwaived failures · fix: run `{command}`{suffix}"
+            )
+        }
     }
 }
 
@@ -3042,7 +3169,7 @@ mod tests {
         let input: Vec<u8> = (0..MAX_FAILURE_OUTPUT_BYTES + 4096)
             .map(|index| (index % 251) as u8)
             .collect();
-        let (retained, errored, _names) =
+        let (retained, errored, _names, _summary_seen, _summary_total) =
             read_capped_tail_and_scan(std::io::Cursor::new(&input), MAX_FAILURE_OUTPUT_BYTES);
         assert!(!errored);
         assert_eq!(retained.len(), MAX_FAILURE_OUTPUT_BYTES);
@@ -3682,7 +3809,7 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; 
             input.extend_from_slice(b"[17:08:14] zirv \xe2\x96\xb8 sandbox posture noise\r\n");
         }
 
-        let (retained, errored, names) =
+        let (retained, errored, names, _summary_seen, _summary_total) =
             read_capped_tail_and_scan(std::io::Cursor::new(&input), MAX_FAILURE_OUTPUT_BYTES);
         assert!(!errored);
         let retained_text = String::from_utf8_lossy(&retained);
@@ -3793,7 +3920,7 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; 
             );
         }
         // Fed 128 * 4096 = 512 KiB total with never a single newline.
-        let names = scanner.finish();
+        let (names, _summary_seen, _summary_total) = scanner.finish();
         assert!(
             names.is_empty(),
             "a newline-less flood can never contain a real failing test name: {names:?}"
@@ -3816,7 +3943,7 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; 
             b"test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; \
               finished in 0.01s\n",
         );
-        let names = scanner.finish();
+        let (names, _summary_seen, _summary_total) = scanner.finish();
         assert!(
             names.is_empty(),
             "a `test result: FAILED` with no preceding `failures:` header must yield no names: \
@@ -3844,7 +3971,7 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; 
         scanner.feed(b"failures:\n");
         scanner.feed(b"    crate_b::tests::second_failure\n");
         scanner.feed(b"test result: FAILED. 0 passed; 1 failed\n");
-        let names = scanner.finish();
+        let (names, _summary_seen, _summary_total) = scanner.finish();
         assert_eq!(
             names,
             std::collections::BTreeSet::from([
@@ -3958,6 +4085,7 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; 
             Some(0),
             "jest output, no cargo shape",
             false,
+            None,
         );
         assert_eq!(status, CheckStatus::Passed);
         assert_eq!(reason, None);
@@ -3966,23 +4094,108 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; 
     #[test]
     fn classify_gate_status_reclassifies_a_crashed_test_runner_check() {
         let output = include_str!("../../../tests/fixtures/test-reports/cargo-test-crash.txt");
-        let (status, reason) = classify_gate_status(CheckStatus::Failed, Some(1), output, true);
+        let total = extract_test_total(output);
+        let (status, reason) =
+            classify_gate_status(CheckStatus::Failed, Some(1), output, true, total);
         assert_eq!(status, CheckStatus::Inconclusive);
         assert_eq!(reason, Some(InconclusiveReason::RunnerCrashed));
     }
 
     #[test]
     fn classify_gate_status_reclassifies_exit_127_regardless_of_check_kind() {
-        let (status, reason) = classify_gate_status(CheckStatus::Failed, Some(127), "", false);
+        let (status, reason) =
+            classify_gate_status(CheckStatus::Failed, Some(127), "", false, None);
         assert_eq!(status, CheckStatus::Inconclusive);
         assert_eq!(reason, Some(InconclusiveReason::ToolMissing));
     }
 
-    /// `VerificationReport::outcome`: `Inconclusive` wins over `Fail` (it
-    /// blocks the gate no less, but is announced differently), and a report
-    /// with only passing checks is `Pass`.
+    /// `classify_gate_status` must classify off the total the full,
+    /// uncapped stream declared, not off `output`'s own (possibly
+    /// summary-less) capped display text -- a doubly-capped `output`
+    /// buffer that lost its summary line entirely to noise must not, on its
+    /// own, produce `Inconclusive` once the real full-stream total is
+    /// supplied. See `a_late_output_flood_cannot_evict_the_earlier_
+    /// summary_line_from_capture` below for the actual capping/eviction
+    /// this seam is exercised against in `run_check`.
     #[test]
-    fn report_outcome_prefers_inconclusive_over_a_plain_fail() {
+    fn classify_gate_status_is_immune_to_the_capped_display_text_losing_the_summary() {
+        let output_with_no_summary: String = "noisy compiler output\n".repeat(50);
+        assert_eq!(extract_test_total(&output_with_no_summary), None);
+
+        let (passed_status, passed_reason) = classify_gate_status(
+            CheckStatus::Passed,
+            Some(0),
+            &output_with_no_summary,
+            true,
+            Some(3),
+        );
+        assert_eq!(passed_status, CheckStatus::Passed, "{passed_reason:?}");
+        assert_eq!(passed_reason, None);
+
+        let (failed_status, failed_reason) = classify_gate_status(
+            CheckStatus::Failed,
+            Some(101),
+            &output_with_no_summary,
+            true,
+            Some(2),
+        );
+        assert_eq!(failed_status, CheckStatus::Failed, "{failed_reason:?}");
+        assert_eq!(failed_reason, None);
+    }
+
+    /// The actual bug this issue's review caught: `run_check` capped each
+    /// stream's own tail to `MAX_FAILURE_OUTPUT_BYTES`, concatenated
+    /// stdout-then-stderr, then capped the result a *second* time from the
+    /// front -- so more than `MAX_FAILURE_OUTPUT_BYTES` of noise on either
+    /// stream *ahead of* a valid summary line could evict the summary from
+    /// the final display buffer entirely, exactly like
+    /// `a_late_output_flood_cannot_evict_the_earlier_failing_name_from_
+    /// capture` already proved for failing test names. `FailureNameScanner`
+    /// must recover the summary the identical way: from the full,
+    /// pre-capping stream as it is fed in, immune to the capped tail's own
+    /// eviction.
+    #[test]
+    fn a_late_output_flood_cannot_evict_the_earlier_summary_line_from_capture() {
+        let mut input = Vec::new();
+        input.extend_from_slice(
+            b"running 3 tests\ntest tests::a ... ok\ntest tests::b ... ok\ntest tests::c ... ok\n\n",
+        );
+        input.extend_from_slice(
+            b"test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; \
+              finished in 0.01s\n",
+        );
+        let after_summary = input.len();
+        while input.len() - after_summary <= MAX_FAILURE_OUTPUT_BYTES {
+            input.extend_from_slice(b"[compiler] warning: unused import noise\n");
+        }
+
+        let (retained, errored, _names, summary_seen, summary_total) =
+            read_capped_tail_and_scan(std::io::Cursor::new(&input), MAX_FAILURE_OUTPUT_BYTES);
+        assert!(!errored);
+        let retained_text = String::from_utf8_lossy(&retained);
+        assert!(
+            !retained_text.contains("test result:"),
+            "sanity check: the capped display tail must actually have evicted the summary, \
+             reproducing the real bug -- got {retained_text:?}"
+        );
+        assert!(
+            summary_seen,
+            "the streaming scan must recover the summary even though the display tail lost it"
+        );
+        assert_eq!(summary_total, 3);
+        assert_eq!(
+            classify_test_outcome(Some(summary_total), true),
+            None,
+            "a recovered real summary must never classify as Inconclusive"
+        );
+    }
+
+    /// `VerificationReport::outcome`: a genuinely `Failed` check always wins
+    /// over an `Inconclusive` one on the same run -- real evidence something
+    /// broke must never be reported as "proves nothing" just because another
+    /// check on the same run happened to be inconclusive.
+    #[test]
+    fn report_outcome_prefers_fail_over_inconclusive_in_a_mixed_report() {
         let report = report_with_checks(vec![
             unit_check("clippy-ish", CheckStatus::Failed, None),
             CheckResult {
@@ -3998,9 +4211,33 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; 
                 inconclusive_reason: Some(InconclusiveReason::RunnerCrashed),
             },
         ]);
+        assert_eq!(report.outcome(), GateOutcome::Fail);
+    }
+
+    /// A report with no genuine `Failed` check but at least one
+    /// `Inconclusive` one is still `Inconclusive`, not `Fail` -- the ranking
+    /// only promotes `Fail` above `Inconclusive` when a real failure is
+    /// actually present.
+    #[test]
+    fn report_outcome_is_inconclusive_with_no_failed_check_present() {
+        let report = report_with_checks(vec![
+            unit_check("format", CheckStatus::Passed, None),
+            CheckResult {
+                id: "test".into(),
+                kind: CheckKind::Unit,
+                command: "cargo test".into(),
+                source: CheckSource::DiscoveredToolchain,
+                status: CheckStatus::Inconclusive,
+                exit_code: None,
+                duration_ms: 1,
+                failure_output: None,
+                failure_test_names: Vec::new(),
+                inconclusive_reason: Some(InconclusiveReason::NoTestsSelected),
+            },
+        ]);
         assert_eq!(
             report.outcome(),
-            GateOutcome::Inconclusive(InconclusiveReason::RunnerCrashed)
+            GateOutcome::Inconclusive(InconclusiveReason::NoTestsSelected)
         );
     }
 
@@ -4107,6 +4344,55 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; 
         assert!(announcement.contains("proves: nothing"), "{announcement}");
         assert!(announcement.contains("runner-crashed"), "{announcement}");
         assert!(announcement.contains("fix:"), "{announcement}");
+    }
+
+    /// A mixed run (one check genuinely failed, another's runner crashed)
+    /// announces `Fail`, not `Inconclusive` -- but must still name the
+    /// inconclusive check by id rather than silently dropping it, since a
+    /// plain "Fail" alone would wrongly imply every check produced real
+    /// evidence.
+    #[test]
+    fn gate_announcement_lists_inconclusive_checks_alongside_a_real_failure() {
+        let repo = git_repo();
+        let state_root = tempdir().unwrap();
+        let state = StateDir::from_root(state_root.path().to_path_buf());
+        let fingerprint = change_fingerprint(repo.path()).unwrap();
+        let report = VerificationReport {
+            schema_version: VERIFY_REPORT_SCHEMA_VERSION,
+            id: "mixed".into(),
+            mode: VerificationMode::Final,
+            source: "configured".into(),
+            repo: repo.path().to_path_buf(),
+            change_fingerprint: fingerprint,
+            changed_paths: vec![],
+            fallback_to_full: false,
+            narrowed_to: vec![],
+            notes: vec![],
+            started_at: 0,
+            finished_at: 0,
+            checks: vec![
+                unit_check("clippy", CheckStatus::Failed, Some("warning: unused")),
+                CheckResult {
+                    id: "test".into(),
+                    kind: CheckKind::Unit,
+                    command: "cargo test".into(),
+                    source: CheckSource::DiscoveredToolchain,
+                    status: CheckStatus::Inconclusive,
+                    exit_code: Some(1),
+                    duration_ms: 1,
+                    failure_output: None,
+                    failure_test_names: Vec::new(),
+                    inconclusive_reason: Some(InconclusiveReason::RunnerCrashed),
+                },
+            ],
+        };
+        save_report(&state, &report).unwrap();
+        let announcement = gate_announcement(&state, repo.path(), true);
+        assert!(announcement.contains("gate: Fail"), "{announcement}");
+        assert!(
+            announcement.contains("also inconclusive") && announcement.contains("test"),
+            "must still name the inconclusive check: {announcement}"
+        );
     }
 
     /// An operator-recorded baseline written before `green_streaks` existed
