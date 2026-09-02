@@ -695,6 +695,20 @@ pub(crate) fn run_with_clock<W: Write>(
             },
         );
 
+        // Issue #285 (review): fold this cycle's spend into the durable
+        // objective so its soft budget can trip; the next cycle's own
+        // `compile::compile` reloads the record and renders the wrap-up.
+        if let Ok(body) = std::fs::read_to_string(&transcript)
+            && let Some(usage) = adapter.transcript_usage(&body)
+        {
+            objective::roll_up_spend(
+                &state,
+                &super::state::repo_slug(repo),
+                super::agent::token_spend(&usage),
+                now_fn(),
+            );
+        }
+
         if limit_hit {
             pace::wait_for_window(
                 w,
@@ -1402,6 +1416,68 @@ mod tests {
 
         let log = std::fs::read_to_string(state.join("logs/decisions.jsonl")).expect("log");
         assert!(log.contains("\"action\":\"prompt-injected\""), "got {log}");
+    }
+
+    /// Review finding (#285): every finished cycle rolls its transcript
+    /// spend into the durable objective, so a one-token soft budget is
+    /// tripped by the first cycle and the second cycle is handed the wrap-up
+    /// instruction instead of an `active` objective forever.
+    #[test]
+    fn a_loop_rolls_each_cycles_spend_into_the_objective_and_trips_its_budget() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let state_dir = tmp.path().join("state");
+        let state = StateDir::from_root(state_dir.clone());
+        let argv_log = tmp.path().join("argv.log");
+        let mut env = base_env(&state_dir);
+        env.insert("ZIRV_CTX_PACE".to_string(), "false".to_string());
+        let key = crate::commands::ctx::state::repo_slug(tmp.path());
+
+        objective::store(
+            &state,
+            &key,
+            &objective::Objective {
+                schema_version: objective::SCHEMA_VERSION,
+                objective: "trip me".to_string(),
+                budget_tokens: Some(1),
+                deadline_secs: None,
+                spent_tokens: 0,
+                started_at: now_secs(),
+                status: objective::Status::Active,
+            },
+        )
+        .expect("store objective");
+
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        unsafe {
+            std::env::set_var("FAKE_AGENT_MODE", "healthy");
+            std::env::set_var("FAKE_AGENT_TURNS", "1");
+            std::env::set_var("FAKE_AGENT_ARGV_LOG", &argv_log);
+        }
+        let mut out = Vec::new();
+        let mut args = args_for(2);
+        args.simple = false;
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE");
+            std::env::remove_var("FAKE_AGENT_TURNS");
+            std::env::remove_var("FAKE_AGENT_ARGV_LOG");
+        }
+        assert_eq!(code.expect("runs"), 0);
+
+        let record = objective::load(&state, &key)
+            .expect("load")
+            .expect("still stored");
+        assert!(
+            record.spent_tokens > 0,
+            "cycle spend was rolled up: {record:?}"
+        );
+        assert_eq!(record.status, objective::Status::BudgetLimited);
+        let argv = std::fs::read_to_string(&argv_log).expect("argv recorded");
+        assert!(
+            argv.contains("soft budget has been reached"),
+            "the second cycle must carry the wrap-up instruction: {argv}"
+        );
     }
 
     /// Issue #285, the core acceptance criterion: `loop` re-injects the

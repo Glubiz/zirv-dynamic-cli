@@ -85,9 +85,32 @@ redo work marked as done.\n\n{injected}"
 /// inject" estimate calls [`resume_prompt_preview`] instead, precisely to
 /// avoid burning the one-shot marker on a caller that never actually resumes.
 pub fn resume_prompt(state: &StateDir, repo: &Path, session: &str, handoff: &Handoff) -> String {
+    let witness = super::sessions::take_interrupted_in_flight(state, repo);
+    compose_resume_prompt(state, repo, session, handoff, witness)
+}
+
+/// `--print-prompt`'s counterpart: exactly what [`resume_prompt`] would inject,
+/// crash witness included, but through the non-consuming peek so a dry run
+/// never spends the one-shot marker the real resume needs.
+pub fn resume_prompt_dry_run(
+    state: &StateDir,
+    repo: &Path,
+    session: &str,
+    handoff: &Handoff,
+) -> String {
+    let witness = super::sessions::peek_interrupted_in_flight(state, repo);
+    compose_resume_prompt(state, repo, session, handoff, witness)
+}
+
+fn compose_resume_prompt(
+    state: &StateDir,
+    repo: &Path,
+    session: &str,
+    handoff: &Handoff,
+    witness: Option<super::sessions::InFlight>,
+) -> String {
     let working_set = super::handoff::working_set(state, repo, session);
-    let crash_witness = super::sessions::take_interrupted_in_flight(state, repo)
-        .map(|in_flight| super::handoff::render_crash_witness(&in_flight));
+    let crash_witness = witness.map(|in_flight| super::handoff::render_crash_witness(&in_flight));
     wrap_resume_prompt(&super::handoff::labeled_for_injection_with_working_set(
         handoff,
         Some(&working_set),
@@ -108,12 +131,7 @@ pub fn resume_prompt_preview(
     session: &str,
     handoff: &Handoff,
 ) -> String {
-    let working_set = super::handoff::working_set(state, repo, session);
-    wrap_resume_prompt(&super::handoff::labeled_for_injection_with_working_set(
-        handoff,
-        Some(&working_set),
-        None,
-    ))
+    compose_resume_prompt(state, repo, session, handoff, None)
 }
 
 /// Composes the system prompt and merges the operator's own command-line
@@ -217,11 +235,12 @@ pub fn run_with<W: Write>(
     // `--print-prompt` run sees exactly the identity a real launch would have
     // used, even though it never actually registers or launches anything.
     let session = SessionId::new_v4();
-    let prompt = resume_prompt(&state, repo, session.as_str(), &handoff);
     if args.print_prompt {
+        let prompt = resume_prompt_dry_run(&state, repo, session.as_str(), &handoff);
         writeln!(w, "{prompt}")?;
         return Ok(0);
     }
+    let prompt = resume_prompt(&state, repo, session.as_str(), &handoff);
 
     let adapter = adapters::select(args.agent.as_deref().or(cfg.agent.as_deref()), &[], &cfg)?;
 
