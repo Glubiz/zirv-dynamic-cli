@@ -3701,6 +3701,7 @@ mod tests {
     /// seat / outranks-other-routing rule.
     #[test]
     fn harness_prompt_lines_review_line_shows_computed_defaults_when_unset() {
+        let _live = crate::commands::ctx::testenv::stub_live_adapters_on_path();
         let lines = harness_prompt_lines(&permissive_cfg(), "");
         let review_line = lines.last().expect("at least the review line");
         assert!(
@@ -3725,6 +3726,7 @@ mod tests {
     /// and is marked `(configured)` rather than `(default: ...)`.
     #[test]
     fn harness_prompt_lines_review_line_uses_the_operators_configured_model() {
+        let _live = crate::commands::ctx::testenv::stub_live_adapters_on_path();
         let cfg = CtxConfig {
             review: crate::commands::ctx::config::ReviewConfig {
                 claude: Some("custom-review-model".to_string()),
@@ -3748,6 +3750,7 @@ mod tests {
     /// absence-not-silence rule its own per-harness line above follows.
     #[test]
     fn harness_prompt_lines_review_line_omits_a_disabled_harnesses_entry() {
+        let _live = crate::commands::ctx::testenv::stub_live_adapters_on_path();
         let cfg = cfg_disabling("codex");
         let lines = harness_prompt_lines(&cfg, "");
         let review_line = lines.last().expect("at least the review line");
@@ -3835,6 +3838,7 @@ mod tests {
     /// true for every entry, so it stays.
     #[test]
     fn review_roster_line_normal_case_keeps_the_strict_clause() {
+        let _live = crate::commands::ctx::testenv::stub_live_adapters_on_path();
         let lines = harness_prompt_lines(&permissive_cfg(), "");
         let review_line = lines.last().expect("at least the review line");
         assert!(
@@ -3854,6 +3858,7 @@ mod tests {
     /// to stay honest.
     #[test]
     fn review_roster_line_floor_seat_case_is_not_contradictory() {
+        let _live = crate::commands::ctx::testenv::stub_live_adapters_on_path();
         let cfg = CtxConfig {
             chat: crate::commands::ctx::config::ChatConfig {
                 model: Some("haiku".to_string()),
@@ -3884,6 +3889,7 @@ mod tests {
     /// soften to something that stays true.
     #[test]
     fn review_roster_line_configured_equals_seat_case_is_not_contradictory() {
+        let _live = crate::commands::ctx::testenv::stub_live_adapters_on_path();
         let cfg = CtxConfig {
             chat: crate::commands::ctx::config::ChatConfig {
                 model: Some("opus".to_string()),
@@ -3911,6 +3917,7 @@ mod tests {
     /// default to "haiku" (one tier below sonnet).
     #[test]
     fn harness_prompt_lines_review_line_threads_the_seat_for_claude() {
+        let _live = crate::commands::ctx::testenv::stub_live_adapters_on_path();
         let cfg = CtxConfig {
             chat: crate::commands::ctx::config::ChatConfig {
                 model: Some("sonnet".to_string()),
