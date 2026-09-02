@@ -2155,6 +2155,12 @@ pub fn run_with(
     if let Some(child_pid) = child.process_id() {
         session_guard.adopt_child_pid(child_pid);
     }
+    // Issue #281: the launch prompt is baked into this spawn's own argv, not
+    // typed as pty input, so it never reaches the `PumpEvent::Input` arm
+    // `pump` stamps a turn's start from -- this is the only edge that
+    // observes the FIRST turn beginning. Turn 1: the very first thing this
+    // session does.
+    session_guard.stamp_in_flight(verb.as_str(), 1);
 
     let reader = pair.master.try_clone_reader()?;
     let (tx, rx) = mpsc::channel::<PumpEvent>();
@@ -3017,6 +3023,18 @@ fn pump(
                 );
                 return Ok(code);
             }
+            // Issue #281: the operator's own keystroke reaching this pty is
+            // the one edge that reliably means a fresh turn is starting for
+            // every turn after the first (the first is stamped once, above
+            // this loop, since it never goes through `Input` at all -- see
+            // that call site's own comment). `supervision.last_turn` is
+            // still the PREVIOUS completed turn's number here (`on_event`
+            // below runs after this), so `+ 1` names the turn this input is
+            // about to start.
+            if matches!(event, PumpEvent::Input(_)) {
+                let verb = session_guard.record().verb.as_str();
+                session_guard.stamp_in_flight(verb, supervision.last_turn + 1);
+            }
             supervision.on_event(event, Instant::now());
         }
 
@@ -3026,6 +3044,12 @@ fn pump(
             transcript.adopt(signal.transcript_path.as_deref());
             let previous_verdict = supervision.verdict;
             supervision.on_turn(&signal);
+            // Issue #281: the turn just reported by `signal` has reached its
+            // clean boundary -- clear the marker `stamp_in_flight` set for
+            // it, so a crash from this point until the NEXT turn's own start
+            // (the next `Input`, or a fresh spawn on restart) is correctly
+            // read as "idle between turns", not "interrupted mid-turn".
+            session_guard.clear_in_flight();
             if let Some(event) =
                 super::announce::verdict_change(previous_verdict, supervision.verdict, signal.score)
             {

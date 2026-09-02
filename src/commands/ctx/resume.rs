@@ -64,13 +64,56 @@ fn launch_command(
     command
 }
 
-pub fn resume_prompt(handoff: &Handoff) -> String {
+fn wrap_resume_prompt(injected: &str) -> String {
     format!(
         "You are picking up work from a previous session that ran out of usable context. \
 Continue from the handoff below. Re-read the listed files before changing them, and do not \
-redo work marked as done.\n\n{}",
-        super::handoff::labeled_for_injection(handoff)
+redo work marked as done.\n\n{injected}"
     )
+}
+
+/// Issue #281: `state`/`repo`/`session` feed the host-verified working-set
+/// manifest (`handoff::working_set`) and the crash-interruption witness
+/// (`sessions::take_interrupted_in_flight`), both folded in through the one
+/// shared assembly helper `hook::run_session_start`'s own injection also
+/// goes through (`handoff::labeled_for_injection_with_working_set`), so the
+/// two paths cannot drift.
+///
+/// `take_interrupted_in_flight` CONSUMES the crash witness it finds -- this
+/// must therefore only ever be called by a real resume, never by a preview.
+/// `context_status::render_handoff_section`'s own "what would resuming
+/// inject" estimate calls [`resume_prompt_preview`] instead, precisely to
+/// avoid burning the one-shot marker on a caller that never actually resumes.
+pub fn resume_prompt(state: &StateDir, repo: &Path, session: &str, handoff: &Handoff) -> String {
+    let working_set = super::handoff::working_set(state, repo, session);
+    let crash_witness = super::sessions::take_interrupted_in_flight(state, repo)
+        .map(|in_flight| super::handoff::render_crash_witness(&in_flight));
+    wrap_resume_prompt(&super::handoff::labeled_for_injection_with_working_set(
+        handoff,
+        Some(&working_set),
+        crash_witness.as_deref(),
+    ))
+}
+
+/// The non-consuming counterpart to [`resume_prompt`]: the same composition,
+/// minus the crash witness, for a caller that only wants to ESTIMATE what a
+/// real resume would inject (`zirv ctx status`'s own handoff section) without
+/// the side effect a real resume has. Always omits the crash witness -- a
+/// peek must never have the one-shot consumption a real resume does, so it
+/// can never show one either; the estimate is a slight, acceptable
+/// undercount on the rare turn a witness would actually fire.
+pub fn resume_prompt_preview(
+    state: &StateDir,
+    repo: &Path,
+    session: &str,
+    handoff: &Handoff,
+) -> String {
+    let working_set = super::handoff::working_set(state, repo, session);
+    wrap_resume_prompt(&super::handoff::labeled_for_injection_with_working_set(
+        handoff,
+        Some(&working_set),
+        None,
+    ))
 }
 
 /// Composes the system prompt and merges the operator's own command-line
@@ -164,7 +207,17 @@ pub fn run_with<W: Write>(
         )
     })?;
 
-    let prompt = resume_prompt(&handoff);
+    // M2: attribution is logged per session, not once per verb. A resumed run
+    // is interactive, so the agent mints its own transcript id and this one is
+    // zirv's; exporting it is what makes the two meet, because the hook inside
+    // the session reports under it (the same env var the supervisors set).
+    //
+    // Minted before the prompt itself (issue #281): `resume_prompt` reads the
+    // working-set manifest and crash witness through this same id, so a
+    // `--print-prompt` run sees exactly the identity a real launch would have
+    // used, even though it never actually registers or launches anything.
+    let session = SessionId::new_v4();
+    let prompt = resume_prompt(&state, repo, session.as_str(), &handoff);
     if args.print_prompt {
         writeln!(w, "{prompt}")?;
         return Ok(0);
@@ -182,11 +235,6 @@ pub fn run_with<W: Write>(
         super::state::now_secs(),
         &args.extra,
     );
-    // M2: attribution is logged per session, not once per verb. A resumed run
-    // is interactive, so the agent mints its own transcript id and this one is
-    // zirv's; exporting it is what makes the two meet, because the hook inside
-    // the session reports under it (the same env var the supervisors set).
-    let session = SessionId::new_v4();
     // M7: the composed prompt goes through a private file rather than argv,
     // where `ps` would show it to every other user on the machine. The adapter
     // builds this launch itself, so the probe gets an empty argv.
@@ -276,7 +324,10 @@ mod tests {
 
     #[test]
     fn the_prompt_frames_the_handoff_as_continuation_work() {
-        let prompt = resume_prompt(&handoff());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        let prompt = resume_prompt(&state, &repo, "sess", &handoff());
         assert!(prompt.contains("Wire the payments webhook"));
         assert!(prompt.contains("Add a failing test"));
         assert!(prompt.contains("src/routes/webhook.rs"));
