@@ -247,7 +247,14 @@ pub struct Capabilities {
 pub struct StructuralContext {
     pub user_messages: Vec<String>,
     pub assistant_texts: Vec<String>,
-    pub files_touched: Vec<String>,
+    /// Paths seen only through a read-shaped tool (`Read`/`Grep`/`Glob`, or
+    /// an unrecognised tool carrying a file key -- the conservative
+    /// direction, since claiming a file was edited when it was not is the
+    /// damaging error).
+    pub files_read: Vec<String>,
+    /// Paths seen through a modification-shaped tool (`Edit`/`Write`/
+    /// `MultiEdit`/`NotebookEdit`, and the codex equivalents).
+    pub files_modified: Vec<String>,
     pub tool_errors: Vec<String>,
     /// The session's last build/test/lint run, when an adapter could
     /// identify one ([`last_verification_run`]). `None` means no verified

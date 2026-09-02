@@ -12,7 +12,7 @@ use super::sessions::is_alive;
 /// Sent beside an adapter's compaction command. PreCompact hooks cannot add
 /// instructions to a compaction, so both interactive and headless supervisors
 /// use this one composition seam.
-pub const COMPACT_FOCUS: &str = "Preserve the current task and its acceptance criteria, the file paths touched so far, any unresolved errors or failing tests, and the exact next step. Drop resolved tangents and full file dumps.";
+pub const COMPACT_FOCUS: &str = "Preserve the current task and its acceptance criteria, any constraints the operator stated, the file paths touched so far, decisions already made and the reasoning behind them, any unresolved errors or failing tests, and the exact next step. Drop resolved tangents and full file dumps.";
 
 pub fn compact_prompt(compact_command: &str) -> String {
     format!("{compact_command} {COMPACT_FOCUS}")

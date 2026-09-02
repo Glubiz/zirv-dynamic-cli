@@ -1615,6 +1615,7 @@ fn handover_pane(
     target_model: &str,
     cfg: &CtxConfig,
     repo: &Path,
+    state: &StateDir,
     errors: &mut Vec<String>,
 ) {
     let old_agent_name = pane.agent().to_string();
@@ -1633,12 +1634,17 @@ fn handover_pane(
     let ctx = old_adapter.structural_context(&jsonl, cfg.handoff.tail_items);
     let distiller_model =
         handoff::resolve_distiller_model(cfg.handoff.model.as_deref(), old_adapter.as_ref());
+    let previous = handoff::latest_for_repo(state, repo)
+        .ok()
+        .flatten()
+        .map(|(_, h)| h);
     let (note, _source) = handoff::distill_or_structural(
         old_adapter.as_ref(),
         &distiller_model,
         &ctx,
         Duration::from_secs(cfg.handoff.timeout_secs),
         cfg.chrome.events,
+        previous.as_ref(),
     );
 
     let req = handover::HandoverRequest {
@@ -6685,6 +6691,7 @@ pub fn run_dashboard(
                                                         &target_model,
                                                         cfg,
                                                         repo,
+                                                        state,
                                                         &mut errors,
                                                     );
                                                 }
