@@ -360,12 +360,13 @@ fn self_healed_evaluation(
     current_fingerprint: String,
     launch_fingerprint: Option<String>,
     snapshot_path: Option<&str>,
+    scratchpad_roots: &[String],
 ) -> AttestedEvaluation {
     if let Some(path) = snapshot_path {
         let _ = rematerialize_policy_snapshot(path, current);
     }
     AttestedEvaluation {
-        outcome: evaluate(current, command, mode),
+        outcome: evaluate_with_scratchpad_roots(current, command, mode, scratchpad_roots),
         current_fingerprint,
         launch_fingerprint,
         status: "self-healed",
@@ -394,6 +395,7 @@ fn evaluate_with_attestation_evidence(
     command: &str,
     mode: super::adapters::LaunchMode,
     env: EnvLookup<'_>,
+    scratchpad_roots: &[String],
 ) -> AttestedEvaluation {
     let current_fingerprint =
         policy_fingerprint(current).unwrap_or_else(|_| "unavailable".to_string());
@@ -401,7 +403,12 @@ fn evaluate_with_attestation_evidence(
         match (env(POLICY_FINGERPRINT_ENV), env(POLICY_SNAPSHOT_ENV)) {
             (None, None) => {
                 return AttestedEvaluation {
-                    outcome: evaluate(current, command, mode),
+                    outcome: evaluate_with_scratchpad_roots(
+                        current,
+                        command,
+                        mode,
+                        scratchpad_roots,
+                    ),
                     current_fingerprint,
                     launch_fingerprint: None,
                     status: "not-present",
@@ -417,6 +424,7 @@ fn evaluate_with_attestation_evidence(
                     current_fingerprint,
                     fingerprint,
                     None,
+                    scratchpad_roots,
                 );
             }
         };
@@ -432,6 +440,7 @@ fn evaluate_with_attestation_evidence(
             current_fingerprint,
             Some(expected_fingerprint),
             Some(snapshot_path.as_str()),
+            scratchpad_roots,
         );
     };
     if policy_fingerprint(&launch).ok().as_deref() != Some(expected_fingerprint.as_str()) {
@@ -442,11 +451,12 @@ fn evaluate_with_attestation_evidence(
             current_fingerprint,
             Some(expected_fingerprint),
             Some(snapshot_path.as_str()),
+            scratchpad_roots,
         );
     }
 
-    let current_outcome = evaluate(current, command, mode);
-    let launch_outcome = evaluate(&launch, command, mode);
+    let current_outcome = evaluate_with_scratchpad_roots(current, command, mode, scratchpad_roots);
+    let launch_outcome = evaluate_with_scratchpad_roots(&launch, command, mode, scratchpad_roots);
     let divergence = if verdict_rank(launch_outcome.verdict) > verdict_rank(current_outcome.verdict)
     {
         SnapshotDivergence::SnapshotStricter {
@@ -962,13 +972,14 @@ fn evaluate_candidate_outcome(
     policy: &SafetyPolicy,
     candidate: &str,
     fallback: Verdict,
+    scratchpad_roots: &[String],
 ) -> Outcome {
     let base = evaluate_single(policy, candidate, fallback);
     let outcome = apply_sql_outcome(policy, candidate, base);
     let outcome = apply_credential_outcome(candidate, outcome);
     let outcome = apply_network_outcome(candidate, outcome);
     let outcome = apply_recursive_delete_outcome(candidate, outcome);
-    let outcome = apply_vcs_outcome(candidate, outcome);
+    let outcome = apply_vcs_outcome(candidate, outcome, scratchpad_roots);
     let outcome = apply_distribution_outcome(candidate, outcome);
     let outcome = apply_orchestrator_outcome(candidate, outcome);
     let outcome = apply_pipe_to_shell_outcome(candidate, outcome);
@@ -991,6 +1002,7 @@ fn evaluate_candidates(
     command: &str,
     fallback: Verdict,
     mode: super::adapters::LaunchMode,
+    scratchpad_roots: &[String],
 ) -> Outcome {
     let candidates = normalize_segments(command);
     let explicit_match = |rules: &[Rule]| {
@@ -1029,7 +1041,7 @@ fn evaluate_candidates(
 
     let mut worst: Option<(u8, Outcome)> = None;
     for candidate in candidates {
-        let outcome = evaluate_candidate_outcome(policy, &candidate, fallback);
+        let outcome = evaluate_candidate_outcome(policy, &candidate, fallback, scratchpad_roots);
         let rank = verdict_rank(outcome.verdict);
         let is_worse = match &worst {
             Some((best_rank, _)) => rank > *best_rank,
@@ -1372,8 +1384,8 @@ fn apply_find_exec_outcome(command: &str, base: Outcome) -> Outcome {
     }
 }
 
-fn apply_vcs_outcome(command: &str, base: Outcome) -> Outcome {
-    if !is_destructive_vcs_action(command) || base.verdict != Verdict::Allow {
+fn apply_vcs_outcome(command: &str, base: Outcome, scratchpad_roots: &[String]) -> Outcome {
+    if !is_destructive_vcs_action(command, scratchpad_roots) || base.verdict != Verdict::Allow {
         return base;
     }
     Outcome {
@@ -1425,7 +1437,29 @@ pub fn evaluate(
     command: &str,
     mode: super::adapters::LaunchMode,
 ) -> Outcome {
-    evaluate_candidates(policy, command, policy.default_verdict(mode), mode)
+    evaluate_with_scratchpad_roots(policy, command, mode, &[])
+}
+
+/// Same as [`evaluate`], but also threads `scratchpad_roots` down into the
+/// VCS classifier so a `git worktree remove --force` targeting the session's
+/// own scratchpad root (`target_is_confined`) can be recognized as agent-
+/// scoped cleanup rather than a destructive action on someone else's
+/// worktree. Callers that already compute `scratchpad_roots` for other
+/// analyzers in the same hook evaluation (`run_check_hook_mode_with_env`,
+/// `run_explain`) use this instead of `evaluate` so the two stay consistent.
+pub(crate) fn evaluate_with_scratchpad_roots(
+    policy: &SafetyPolicy,
+    command: &str,
+    mode: super::adapters::LaunchMode,
+    scratchpad_roots: &[String],
+) -> Outcome {
+    evaluate_candidates(
+        policy,
+        command,
+        policy.default_verdict(mode),
+        mode,
+        scratchpad_roots,
+    )
 }
 
 /// Collapses runs of ASCII/Unicode whitespace to a single space and trims
@@ -2808,7 +2842,32 @@ fn git_action(tokens: &[String]) -> Option<(usize, &str)> {
     None
 }
 
-fn is_destructive_vcs_action(command: &str) -> bool {
+/// Issue #306: a `checkout`/`restore` path operand that names one concrete
+/// tracked file or directory rather than the whole tree -- not `.` or `:/`
+/// (git's own "everything from here"/"everything from the repo root"
+/// pathspecs) or a bare `*`, and carrying none of `* ? [` (a glob that could
+/// expand to an unknown, possibly tree-wide, set of paths). Text-only, like
+/// [`target_is_confined`]: this classifier cannot know what a glob expands
+/// to, so it never treats one as concrete.
+fn is_concrete_vcs_path(path: &str) -> bool {
+    !matches!(path, "." | ":/" | "*") && !path.contains(['*', '?', '['])
+}
+
+/// Issue #306: `path` (a `git worktree remove --force` target) lexically
+/// contains a `.claude/worktrees/` or `.zirv/worktrees/` path component --
+/// zirv's own and Claude Code's own agent-worktree roots -- either as a
+/// leading component of a relative path or anywhere in an absolute one.
+fn is_agent_worktree_root(path: &str) -> bool {
+    let normalized = path.replace('\\', "/");
+    for marker in [".claude/worktrees/", ".zirv/worktrees/"] {
+        if normalized.starts_with(marker) || normalized.contains(&format!("/{marker}")) {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_destructive_vcs_action(command: &str, scratchpad_roots: &[String]) -> bool {
     let Some(tokens) = sql_tokens(&collapse_whitespace(command)) else {
         return false;
     };
@@ -2837,7 +2896,13 @@ fn is_destructive_vcs_action(command: &str) -> bool {
                 || token.starts_with('+')
         }),
         "reset" => lower.iter().any(|token| token == "--hard"),
-        "rebase" | "filter-branch" => true,
+        "filter-branch" => true,
+        // Issue #306: non-interactive rebase is local and reflog-recoverable
+        // -- only `-i`/`--interactive` (which can rewrite history in ways an
+        // unattended runner cannot review) keeps the Ask.
+        "rebase" => lower
+            .iter()
+            .any(|token| token == "-i" || token == "--interactive"),
         "clean" => {
             let dry_run = lower
                 .iter()
@@ -2846,7 +2911,18 @@ fn is_destructive_vcs_action(command: &str) -> bool {
                 token == "--force"
                     || (token.starts_with('-') && !token.starts_with("--") && token.contains('f'))
             });
-            force && !dry_run
+            // Issue #306: `-x`/`-X` (or a combined short flag containing
+            // either) also removes gitignored files, which are not
+            // recoverable from git history the way a tracked/untracked
+            // build artifact is -- that keeps the Ask regardless of an
+            // explicit path. Without `-x`/`-X`, at least one explicit path
+            // operand narrows a bare, tree-wide `clean -f` down to Allow.
+            let excludes_ignored = lower.iter().any(|token| {
+                token == "-x"
+                    || (token.starts_with('-') && !token.starts_with("--") && token.contains('x'))
+            });
+            let has_path = args.iter().any(|token| !token.starts_with('-'));
+            force && !dry_run && (excludes_ignored || !has_path)
         }
         "branch" => {
             args.iter().any(|token| token == "-D")
@@ -2865,18 +2941,45 @@ fn is_destructive_vcs_action(command: &str) -> bool {
         "restore" => {
             let staged = lower.iter().any(|token| token == "--staged");
             let worktree = lower.iter().any(|token| token == "--worktree");
-            let has_target = args.iter().any(|token| !token.starts_with('-'));
-            has_target && (!staged || worktree)
+            let paths: Vec<&String> = args
+                .iter()
+                .filter(|token| !token.starts_with('-'))
+                .collect();
+            let has_target = !paths.is_empty();
+            let would_be_destructive = has_target && (!staged || worktree);
+            // Issue #306: every path operand naming one concrete tracked
+            // file or directory narrows to Allow; a tree-wide pathspec
+            // (`.`, `:/`) or a glob keeps the Ask.
+            would_be_destructive && !paths.iter().all(|path| is_concrete_vcs_path(path))
         }
-        "checkout" => args
-            .iter()
-            .position(|token| token == "--")
-            .is_some_and(|separator| separator + 1 < args.len()),
+        "checkout" => match args.iter().position(|token| token == "--") {
+            Some(separator) => {
+                let paths = &args[separator + 1..];
+                // Issue #306: same narrowing as `restore` above -- concrete
+                // tracked-file targets are Allow, tree-wide/glob targets
+                // keep the Ask.
+                !paths.is_empty() && !paths.iter().all(|path| is_concrete_vcs_path(path))
+            }
+            None => false,
+        },
         "worktree" => {
-            lower
+            let is_remove = lower
                 .first()
-                .is_some_and(|subcommand| subcommand == "remove")
-                && lower.iter().any(|token| token == "--force")
+                .is_some_and(|subcommand| subcommand == "remove");
+            let force = lower.iter().any(|token| token == "--force");
+            if !is_remove || !force {
+                return false;
+            }
+            // Issue #306: the target of an agent's own worktree cleanup --
+            // a path under a `.claude/worktrees/`/`.zirv/worktrees/` root,
+            // or one confined to a scratchpad root -- narrows to Allow;
+            // any other `--force` target keeps the Ask.
+            match args.iter().skip(1).find(|token| !token.starts_with('-')) {
+                Some(path) => {
+                    !(is_agent_worktree_root(path) || target_is_confined(path, scratchpad_roots))
+                }
+                None => true,
+            }
         }
         _ => false,
     }
@@ -4451,13 +4554,14 @@ fn every_segment_is_allow_or_unmatched_default(
     policy: &SafetyPolicy,
     command: &str,
     fallback: Verdict,
+    scratchpad_roots: &[String],
 ) -> bool {
     let candidates = normalize_segments(command);
     if candidates.is_empty() {
         return false;
     }
     candidates.iter().all(|candidate| {
-        let outcome = evaluate_candidate_outcome(policy, candidate, fallback);
+        let outcome = evaluate_candidate_outcome(policy, candidate, fallback, scratchpad_roots);
         outcome.verdict == Verdict::Allow
             || (outcome.verdict == fallback && outcome.matched.is_none())
     })
@@ -5239,7 +5343,8 @@ fn retry_has_allow_verdict(
     let mut saw_checkout = false;
     let mut saw_scaffolding = false;
     for candidate in candidates {
-        let candidate_outcome = evaluate_candidate_outcome(policy, &candidate, Verdict::Ask);
+        let candidate_outcome =
+            evaluate_candidate_outcome(policy, &candidate, Verdict::Ask, scratchpad_roots);
         if candidate_outcome.verdict == Verdict::Allow {
             saw_allow = true;
             continue;
@@ -5645,7 +5750,13 @@ fn run_check_hook_mode_with_env<W: Write>(
     let effective_command =
         strip_known_root_cd_prefix(command, &cd_roots).unwrap_or_else(|| command.to_string());
 
-    let evidence = evaluate_with_attestation_evidence(&cfg.safety, &effective_command, mode, env);
+    let evidence = evaluate_with_attestation_evidence(
+        &cfg.safety,
+        &effective_command,
+        mode,
+        env,
+        &scratchpad_roots,
+    );
     let mut outcome = evidence.outcome.clone();
     // Issue #168, design decision (d): a compound whose every write target
     // is confined to the session scratchpad is treated as `Allow` even when
@@ -5658,6 +5769,7 @@ fn run_check_hook_mode_with_env<W: Write>(
             &cfg.safety,
             &effective_command,
             cfg.safety.default_verdict(mode),
+            &scratchpad_roots,
         )
         && write_targets_confined(&effective_command, &scratchpad_roots) == Some(true)
     {
@@ -5857,7 +5969,17 @@ pub fn run_list<W: Write>(args: &ListArgs, w: &mut W, env: EnvLookup<'_>) -> Ctx
 pub fn run_explain<W: Write>(args: &ExplainArgs, w: &mut W, env: EnvLookup<'_>) -> CtxResult<i32> {
     let cfg = CtxConfig::load(&args.repo, env)?;
     let command = args.command.join(" ");
-    let evidence = evaluate_with_attestation_evidence(&cfg.safety, &command, args.mode, env);
+    // Same scratchpad root the hook computes (`run_check_hook_mode_with_
+    // env`), so this command's VCS narrowing (issue #306) agrees with what
+    // the hook actually decided for the identical command.
+    let scratchpad_roots = vec![scratchpad_write_root(&std::env::temp_dir())];
+    let evidence = evaluate_with_attestation_evidence(
+        &cfg.safety,
+        &command,
+        args.mode,
+        env,
+        &scratchpad_roots,
+    );
     writeln!(
         w,
         "{}",
@@ -5951,9 +6073,9 @@ mod tests {
             ("rm -rf /home/user/zirv", Verdict::Deny),
             ("some-totally-unknown-tool --flag", Verdict::Ask),
         ] {
-            let direct = evaluate_candidate_outcome(&policy, command, Verdict::Ask);
+            let direct = evaluate_candidate_outcome(&policy, command, Verdict::Ask, &[]);
             let via_evaluate_candidates =
-                evaluate_candidates(&policy, command, Verdict::Ask, LaunchMode::Headless);
+                evaluate_candidates(&policy, command, Verdict::Ask, LaunchMode::Headless, &[]);
             assert_eq!(direct.verdict, expected, "{command}");
             assert_eq!(
                 direct.verdict, via_evaluate_candidates.verdict,
@@ -7047,9 +7169,13 @@ mod tests {
             (LaunchMode::Headless, "rm -rf /", Verdict::Ask),
         ] {
             std::fs::write(&snapshot, "{}").expect("tamper snapshot");
-            let evidence = evaluate_with_attestation_evidence(&current, command, mode, &|k| {
-                env.get(k).cloned()
-            });
+            let evidence = evaluate_with_attestation_evidence(
+                &current,
+                command,
+                mode,
+                &|k| env.get(k).cloned(),
+                &[],
+            );
             assert_eq!(
                 evidence.outcome.verdict, expected,
                 "{mode:?} {command}: {evidence:?}"
@@ -7084,6 +7210,7 @@ mod tests {
             "terraform destroy",
             LaunchMode::Interactive,
             &|k| env.get(k).cloned(),
+            &[],
         );
         assert_eq!(evidence.outcome.verdict, Verdict::Deny);
         assert_eq!(evidence.status, "self-healed");
@@ -7106,6 +7233,7 @@ mod tests {
             "cargo test",
             LaunchMode::Headless,
             &|k| env.get(k).cloned(),
+            &[],
         );
         assert_eq!(first.status, "self-healed");
         assert!(snapshot.exists(), "the snapshot file must be rewritten");
@@ -7128,6 +7256,7 @@ mod tests {
             "cargo test",
             LaunchMode::Interactive,
             &|k| env.get(k).cloned(),
+            &[],
         );
         assert_eq!(evidence.status, "self-healed");
         assert_eq!(evidence.outcome.verdict, Verdict::Allow);
@@ -7246,6 +7375,7 @@ mod tests {
             "some-tool-zirv-has-never-heard-of",
             LaunchMode::Interactive,
             &|key| env.get(key).cloned(),
+            &[],
         );
         assert_eq!(evidence.outcome.verdict, Verdict::Ask, "{evidence:?}");
         assert_eq!(
@@ -7281,6 +7411,7 @@ mod tests {
             "cargo build",
             LaunchMode::Interactive,
             &|key| env.get(key).cloned(),
+            &[],
         );
         assert_eq!(evidence.divergence, SnapshotDivergence::Unchanged);
     }
@@ -8384,9 +8515,7 @@ mod tests {
             "git stash clear",
             "git reflog expire --expire=now --all",
             "git gc --prune=now",
-            "git restore src/main.rs",
             "git restore --staged --worktree .",
-            "git checkout -- src/main.rs",
             "git worktree remove ../feature --force",
         ] {
             assert_eq!(
@@ -8404,12 +8533,203 @@ mod tests {
             "git restore --staged src/main.rs",
             "git checkout feature",
             "git worktree list",
+            // Issue #306: a `checkout`/`restore` naming one concrete
+            // tracked file (not the whole tree) only discards that file's
+            // own uncommitted changes -- recoverable from git's own
+            // history/index, unlike a tree-wide `-- .`/`.` form.
+            "git restore src/main.rs",
+            "git checkout -- src/main.rs",
         ] {
             assert_eq!(
                 evaluate(&policy, command, LaunchMode::Interactive).verdict,
                 Verdict::Allow,
-                "read-only or staging-only Git work stays silent: {command}"
+                "read-only, staging-only, or single-tracked-file Git work stays silent: {command}"
             );
+        }
+    }
+
+    /// Issue #306: the built-in `<vcs: destructive local or remote action>`
+    /// classifier prompted the operator four times in one orchestration
+    /// session (2026-09-02/03) on routine, local, agent-scoped git work --
+    /// a scratchpad worktree removal, a workflow artifact `clean`, and two
+    /// tracked-file `checkout`s. This locks in the narrowing: still-Ask
+    /// forms (tree-wide/glob paths, ignored-file `clean`, an unconfined
+    /// `--force` worktree target, interactive `rebase`) next to the
+    /// newly-Allow forms (concrete-path `checkout`/`restore`, a pathed
+    /// non-`-x` `clean`, an agent-owned or scratchpad-confined worktree
+    /// removal, a non-interactive `rebase`) -- everything else in the
+    /// classifier (force/delete push, `reset --hard`, `branch -D`, `stash
+    /// drop`/`clear`, `reflog expire`/`delete`, `gc --prune=now`/`all`) is
+    /// unchanged.
+    #[test]
+    fn issue_306_narrows_the_vcs_classifier_to_agent_scoped_local_work() {
+        let policy = SafetyPolicy::default();
+        let scratchpad_roots = vec!["/tmp/zirv-scratch".to_string()];
+
+        let still_ask = [
+            "git clean -fdx",
+            "git clean -fd",
+            "git clean -f -x .zirv/work/x",
+            "git checkout -- .",
+            "git restore .",
+            "git worktree remove ../feature --force",
+            "git push --force",
+            "git reset --hard",
+            "git rebase -i HEAD~3",
+            "git filter-branch --all",
+        ];
+        for command in still_ask {
+            let outcome = evaluate_with_scratchpad_roots(
+                &policy,
+                command,
+                LaunchMode::Headless,
+                &scratchpad_roots,
+            );
+            assert_eq!(outcome.verdict, Verdict::Ask, "{command}: {outcome:?}");
+            let outcome = evaluate_with_scratchpad_roots(
+                &policy,
+                command,
+                LaunchMode::Interactive,
+                &scratchpad_roots,
+            );
+            assert_eq!(
+                outcome.verdict,
+                Verdict::Ask,
+                "{command} (interactive): {outcome:?}"
+            );
+        }
+
+        let now_allow = [
+            "git checkout HEAD -- Cargo.toml Cargo.lock",
+            "git checkout -- src/main.rs",
+            "git restore src/main.rs",
+            "git clean -fdq .zirv/work/abc",
+            "git worktree remove D:/x/.claude/worktrees/agent-1 --force",
+            "git worktree remove /tmp/zirv-scratch/main-wt --force",
+            "git rebase main",
+        ];
+        for command in now_allow {
+            let outcome = evaluate_with_scratchpad_roots(
+                &policy,
+                command,
+                LaunchMode::Headless,
+                &scratchpad_roots,
+            );
+            assert_eq!(outcome.verdict, Verdict::Allow, "{command}: {outcome:?}");
+            let outcome = evaluate_with_scratchpad_roots(
+                &policy,
+                command,
+                LaunchMode::Interactive,
+                &scratchpad_roots,
+            );
+            assert_eq!(
+                outcome.verdict,
+                Verdict::Allow,
+                "{command} (interactive): {outcome:?}"
+            );
+        }
+
+        // Without a scratchpad root supplied (`evaluate`'s own public,
+        // 3-arg signature), the `.claude/worktrees/` marker alone still
+        // narrows, but a plain scratchpad path with no root to compare
+        // against does not -- there is nothing to prove it confined to.
+        assert_eq!(
+            evaluate(
+                &policy,
+                "git worktree remove D:/x/.claude/worktrees/agent-1 --force",
+                LaunchMode::Headless
+            )
+            .verdict,
+            Verdict::Allow
+        );
+        assert_eq!(
+            evaluate(
+                &policy,
+                "git worktree remove /tmp/zirv-scratch/main-wt --force",
+                LaunchMode::Headless
+            )
+            .verdict,
+            Verdict::Ask,
+            "no scratchpad root supplied: nothing proves this target confined"
+        );
+
+        // Everything else in the classifier is unchanged.
+        for command in [
+            "git push --force origin main",
+            "git push --delete origin old",
+            "git reset --hard HEAD~1",
+            "git branch -D feature",
+            "git stash drop",
+            "git stash clear",
+            "git reflog expire --expire=now --all",
+            "git reflog delete HEAD@{0}",
+            "git gc --prune=now",
+            "git gc --prune=all",
+        ] {
+            assert_eq!(
+                evaluate(&policy, command, LaunchMode::Headless).verdict,
+                Verdict::Ask,
+                "{command}: unchanged families must still ask"
+            );
+        }
+    }
+
+    /// Issue #306, acceptance: the four REAL commands the operator was
+    /// prompted for (2026-09-02/03), reconstructed as the whole compound the
+    /// hook actually receives -- a leading `cd <known-root>;` (stripped by
+    /// `strip_known_root_cd_prefix`, exactly as production sends it) and a
+    /// trailing `2>&1 | tail -N` -- not just the bare git segment, so this
+    /// also exercises segment extraction across `;`/`&&`/`|`. Checked both
+    /// interactively (`"default"`) and headlessly (`"auto"`, which -- unlike
+    /// `"dontAsk"` -- still states an explicit `permissionDecision` for an
+    /// Allow, so a regression shows up as text instead of silence).
+    #[test]
+    fn issue_306_the_four_real_operator_prompts_now_allow_in_both_modes() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = super::super::testenv::HomeGuard::set(home.path());
+        let empty: HashMap<String, String> = HashMap::new();
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("loads");
+        let scratchpad = scratchpad_write_root(&std::env::temp_dir());
+
+        let commands = [
+            // #1: removing a scratch worktree the agent itself created.
+            format!(
+                "cd {scratchpad}; git worktree remove {scratchpad}/main-wt --force && git status --short 2>&1 | tail -3; git worktree list"
+            ),
+            // #2: deleting one workflow artifact directory zirv itself
+            // created (`rm -rf` on it is a built-in Deny, so `git clean`
+            // was the only remaining way).
+            format!(
+                "cd {scratchpad}; git clean -fdq .zirv/work/6e07db72-d20b-4ed9-9716-18cc83e78588 2>&1 | tail -3"
+            ),
+            // #3: dropping a worker's version bump from a merge -- two
+            // named tracked files.
+            format!(
+                "cd {scratchpad}; git merge --no-ff --no-commit release/track-a; git checkout HEAD -- Cargo.toml Cargo.lock && git commit -m \"chore: drop version bump\" 2>&1 | tail -3"
+            ),
+            // #4: same shape as #3, for the next track.
+            format!(
+                "cd {scratchpad}; git merge --no-ff --no-commit release/track-b; git checkout HEAD -- Cargo.toml Cargo.lock && git commit -m \"chore: drop version bump\" 2>&1 | tail -3"
+            ),
+        ];
+
+        for command in &commands {
+            for permission_mode in ["default", "auto"] {
+                let stdin = serde_json::json!({
+                    "tool_name": "Bash",
+                    "tool_input": {"command": command},
+                    "permission_mode": permission_mode,
+                })
+                .to_string();
+                let mut out = Vec::new();
+                run_check_hook_mode(&cfg, &mut out, &stdin).expect("runs");
+                let text = String::from_utf8(out).expect("utf8");
+                assert!(
+                    text.contains(r#""permissionDecision":"allow""#),
+                    "{permission_mode}: {command}: got {text}"
+                );
+            }
         }
     }
 
