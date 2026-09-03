@@ -648,7 +648,11 @@ impl ClaudeAdapter {
     /// Zirv home. The write is atomic and private on Unix; if either step
     /// fails, the caller deliberately falls back to Claude's native prompt
     /// flow without adding a blanket Bash allow.
-    fn launch_settings_path(&self, safety: &super::super::safety::SafetyPolicy) -> Option<PathBuf> {
+    fn launch_settings_path(
+        &self,
+        sandbox: &super::super::config::SandboxConfig,
+        safety: &super::super::safety::SafetyPolicy,
+    ) -> Option<PathBuf> {
         #[cfg(test)]
         if let Some(forced) = &self.forced_launch_settings {
             return forced.clone();
@@ -659,7 +663,8 @@ impl ClaudeAdapter {
         let policy_dir = dir.join("policies");
         let policy_path = policy_dir.join(format!("{fingerprint}.json"));
         let path = dir.join(format!("claude-launch-settings-{fingerprint}.json"));
-        let launch_environment = LaunchEnvironment::resolve();
+        let mut launch_environment = LaunchEnvironment::resolve();
+        launch_environment.scrub_subprocess_env = sandbox.scrub_subprocess_env;
         let result = (|| -> std::io::Result<()> {
             super::super::state::create_private_dir_all(&dir)?;
             super::super::state::create_private_dir_all(&policy_dir)?;
@@ -720,6 +725,16 @@ const PROMPT_FREE_COMMAND_FAMILIES: &[CommandFamilyProjection] = &[
         pattern: "gh *",
         sandbox_excluded: true,
     },
+    // Issue #329: a GitLab-first shop routes every review through `glab`, and
+    // the forge CLI needs its own credential config plus network egress the
+    // sandbox denies -- exactly the `gh` situation, so it gets the identical
+    // treatment. The classifier still denies the destructive `glab` forms
+    // (`safety::publish_or_destructive_action`) ahead of this native family,
+    // the same way it narrows `gh *`.
+    CommandFamilyProjection {
+        pattern: "glab *",
+        sandbox_excluded: true,
+    },
     CommandFamilyProjection {
         pattern: "git push *",
         sandbox_excluded: true,
@@ -729,6 +744,21 @@ const PROMPT_FREE_COMMAND_FAMILIES: &[CommandFamilyProjection] = &[
         sandbox_excluded: false,
     },
 ];
+
+/// Issue #329: `denyRead` blanks all of `~/.ssh`, which also hid the two
+/// NON-secret files ssh must read to work at all -- `known_hosts` (host
+/// verification) and `config` (host aliases, `IdentityAgent`). A sandboxed
+/// `git fetch/push` therefore could not verify a host and died before it
+/// ever reached authentication. Claude resolves overlapping read rules by
+/// specificity ("the more specific path wins"), so naming these two files in
+/// `allowRead` re-opens exactly them while every private key under `~/.ssh`
+/// stays denied by the broader `denyRead` entry.
+///
+/// Deliberately NOT added to `safety::SANDBOX_DENY_READ_HOME_PATHS`'s own
+/// derived credential screen: that screen guards what an UNSANDBOXED retry
+/// may read, and these two files are not secrets.
+#[cfg_attr(windows, allow(dead_code))]
+const SSH_NON_SECRET_READ_PATHS: &[&str] = &["~/.ssh/known_hosts", "~/.ssh/config"];
 
 #[derive(Debug, Default)]
 struct LaunchEnvironment {
@@ -740,6 +770,22 @@ struct LaunchEnvironment {
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     unix_sockets: Vec<String>,
     ssh_auth_sock: Option<String>,
+    /// Issue #329: the launch repository's own linked worktrees, then its
+    /// sibling checkouts and theirs ([`sibling_repo_roots`]). Worktrees were
+    /// already handed to Claude as `--add-dir` working directories, but a
+    /// working directory is not a WRITE grant: the OS sandbox still refused
+    /// every write under them, so ordinary gates in a worktree (`git status`
+    /// writing `.git/FETCH_HEAD`, a test runner's cache, a commit) failed
+    /// with `Operation not permitted` and had to be retried unsandboxed.
+    /// Emitted into BOTH `sandbox.filesystem.allowWrite` and
+    /// `permissions.additionalDirectories` as literal paths -- never globs,
+    /// since `additionalDirectories` does not support them on any platform
+    /// and `allowWrite` silently drops glob entries on Linux/WSL2.
+    #[cfg_attr(windows, allow(dead_code))]
+    workspace_write_roots: Vec<String>,
+    /// `[sandbox] scrub_subprocess_env` -- see `SandboxConfig`'s doc comment
+    /// for what the upstream switch does and why it is off by default.
+    scrub_subprocess_env: bool,
 }
 
 impl LaunchEnvironment {
@@ -759,13 +805,164 @@ impl LaunchEnvironment {
         {
             unix_sockets.push(socket.clone());
         }
+        #[cfg(not(test))]
+        let workspace_write_roots = std::env::current_dir()
+            .ok()
+            .and_then(|repo| std::fs::canonicalize(repo).ok())
+            .map(|repo| {
+                let mut roots = linked_worktree_roots(&repo);
+                let home = crate::utils::home_dir().ok();
+                for root in sibling_repo_roots(&repo, home.as_deref()) {
+                    if !roots.contains(&root) {
+                        roots.push(root);
+                    }
+                }
+                roots
+            })
+            .unwrap_or_default()
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect();
+        #[cfg(test)]
+        let workspace_write_roots = Vec::new();
+
         Self {
             state_write_root,
             scratchpad_roots,
             unix_sockets,
             ssh_auth_sock,
+            workspace_write_roots,
+            scrub_subprocess_env: false,
         }
     }
+}
+
+const MAX_SIBLING_REPOS: usize = 32;
+
+/// Issue #329 item 2 (the biggest single source of prompts in that report,
+/// 9 of 21): the launch repository's sibling checkouts -- every direct child
+/// of the repo's parent directory that is itself a git checkout (a `.git`
+/// directory, or the `.git` file of a linked worktree) -- followed by each
+/// sibling's own linked worktrees. A cross-repo change (`crm` plus the
+/// `marketing-automation-client` library it calls, plus a worktree of the
+/// service that serves it) is ordinary work in a services directory, and
+/// every gate in the other two checkouts failed `Operation not permitted`
+/// under the sandbox until the operator retried it unsandboxed.
+///
+/// Scope, deliberately narrow: only git checkouts, never the parent itself
+/// (a non-repo directory next to the launch repo stays untouched); nothing
+/// when the parent is a filesystem root (`/workspace/repo`, `C:\repo` -- the
+/// container/CI layout, where "siblings" would mean every path on the
+/// machine) or the home directory (`~/repo` -- "never the whole home", and
+/// its children are not a workspace). Capped at [`MAX_SIBLING_REPOS`] in
+/// sorted order, [`MAX_LINKED_WORKTREES`] per sibling.
+///
+/// A sibling's worktrees come from `<sibling>/.git/worktrees/*/gitdir` --
+/// the file git itself keeps, naming `<worktree>/.git` -- rather than one
+/// `git worktree list` per sibling: a services directory can hold dozens of
+/// checkouts, and this runs on every launch. A stale entry whose worktree
+/// is gone no longer canonicalises and is skipped, the same way `git
+/// worktree prune` would drop it.
+///
+/// Trust boundary (codex review on #329): a sibling checkout is repo-owned,
+/// so nothing it can write may widen the grant beyond itself. A `gitdir`
+/// file is only believed when the named worktree's own `.git` file points
+/// BACK at that exact `.git/worktrees/<name>` entry -- the mutual link git
+/// maintains -- so a sibling cannot nominate `~` or `/` as its "worktree".
+/// A sibling reached through a symlink is skipped (its canonical path must
+/// be a direct child of the parent), so a `link -> ~` entry with a `.git`
+/// inside cannot grant the whole home. Every root additionally passes
+/// [`is_grantable_root`]: never a filesystem root, never the home directory
+/// or an ancestor of it, never the launch repo or an ancestor of it. Without
+/// a resolvable home directory nothing is granted at all (fail closed).
+///
+/// Siblings are write grants and `additionalDirectories` only, never
+/// `--add-dir`: `--add-dir` also loads that directory's own `.claude/`
+/// hooks and skills, and another checkout's repo-owned hooks must not run
+/// in this session (the launch repo's own worktrees keep `--add-dir`, since
+/// they share its `.claude/`).
+fn sibling_repo_roots(canonical_repo: &Path, home: Option<&Path>) -> Vec<PathBuf> {
+    let Some(parent) = canonical_repo.parent() else {
+        return Vec::new();
+    };
+    let Some(home) = home else {
+        return Vec::new();
+    };
+    let home = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
+    if parent.parent().is_none() || home == parent {
+        return Vec::new();
+    }
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return Vec::new();
+    };
+    let mut siblings: Vec<PathBuf> = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.join(".git").exists())
+        .filter_map(|path| std::fs::canonicalize(path).ok())
+        .filter(|path| path.parent() == Some(parent))
+        .filter(|path| is_grantable_root(path, canonical_repo, &home))
+        .collect();
+    siblings.sort();
+    siblings.dedup();
+    siblings.truncate(MAX_SIBLING_REPOS);
+
+    let mut roots: Vec<PathBuf> = Vec::new();
+    for sibling in siblings {
+        let worktrees = linked_worktrees_from_git_dir(&sibling);
+        if !roots.contains(&sibling) {
+            roots.push(sibling);
+        }
+        for worktree in worktrees {
+            if is_grantable_root(&worktree, canonical_repo, &home) && !roots.contains(&worktree) {
+                roots.push(worktree);
+            }
+        }
+    }
+    roots
+}
+
+/// Whether `candidate` (canonical) may become a sandbox write root on the
+/// launch repo's behalf: not a filesystem root, not the home directory or
+/// any ancestor of it, and neither the launch repo, one of its ancestors,
+/// nor a path inside it (those are covered -- or deliberately not -- by the
+/// repo's own grant).
+fn is_grantable_root(candidate: &Path, canonical_repo: &Path, canonical_home: &Path) -> bool {
+    candidate.parent().is_some()
+        && !canonical_home.starts_with(candidate)
+        && !canonical_repo.starts_with(candidate)
+        && !candidate.starts_with(canonical_repo)
+}
+
+/// The linked worktrees of `repo` as git records them, without a process:
+/// each `<repo>/.git/worktrees/<name>/gitdir` holds the absolute path of
+/// that worktree's `.git` file, whose parent is the worktree root. A checkout
+/// that is itself a linked worktree (`.git` is a file) has no such directory
+/// and yields nothing; its main checkout, if it is a sibling too, carries
+/// the list. An entry counts only when the worktree's `.git` file names
+/// this same `<repo>/.git/worktrees/<name>` directory back (see
+/// [`sibling_repo_roots`]).
+fn linked_worktrees_from_git_dir(repo: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(repo.join(".git").join("worktrees")) else {
+        return Vec::new();
+    };
+    let mut worktrees: Vec<PathBuf> = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let entry_dir = std::fs::canonicalize(entry.path()).ok()?;
+            let gitdir = std::fs::read_to_string(entry_dir.join("gitdir")).ok()?;
+            let root = std::fs::canonicalize(Path::new(gitdir.trim()).parent()?).ok()?;
+            let back_link = std::fs::read_to_string(root.join(".git")).ok()?;
+            let back_link = back_link.trim().strip_prefix("gitdir:")?.trim();
+            let back_link = std::fs::canonicalize(root.join(back_link)).ok()?;
+            (back_link == entry_dir).then_some(root)
+        })
+        .filter(|root| !root.starts_with(repo))
+        .collect();
+    worktrees.sort();
+    worktrees.dedup();
+    worktrees.truncate(MAX_LINKED_WORKTREES);
+    worktrees
 }
 
 fn resolve_docker_socket_paths(docker_socket: &Path, docker_host: Option<&str>) -> Vec<String> {
@@ -870,15 +1067,25 @@ fn launch_settings_value(
             ]
         },
         "env": {
-            "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB": "1",
             super::super::safety::POLICY_FINGERPRINT_ENV: fingerprint,
             super::super::safety::POLICY_SNAPSHOT_ENV: policy_path.display().to_string()
         }
     });
+    // Operator opt-in only (`[sandbox] scrub_subprocess_env`): the upstream
+    // switch strips `SSH_AUTH_SOCK` and its kin from every subprocess and
+    // forces the permission mode to `default` -- see `SandboxConfig`.
+    if launch_environment.scrub_subprocess_env {
+        settings["env"]["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"] = serde_json::json!("1");
+    }
 
-    if !launch_environment.scratchpad_roots.is_empty() {
+    let additional_directories: Vec<&String> = launch_environment
+        .scratchpad_roots
+        .iter()
+        .chain(launch_environment.workspace_write_roots.iter())
+        .collect();
+    if !additional_directories.is_empty() {
         settings["permissions"]["additionalDirectories"] =
-            serde_json::json!(&launch_environment.scratchpad_roots);
+            serde_json::json!(additional_directories);
     }
     if let Some(socket) = &launch_environment.ssh_auth_sock {
         settings["env"]["SSH_AUTH_SOCK"] = serde_json::json!(socket);
@@ -893,13 +1100,20 @@ fn launch_settings_value(
     #[cfg(not(windows))]
     if let Some(object) = settings.as_object_mut() {
         let mut filesystem = serde_json::json!({
-            "denyRead": super::super::safety::SANDBOX_DENY_READ_HOME_PATHS
+            "denyRead": super::super::safety::SANDBOX_DENY_READ_HOME_PATHS,
+            "allowRead": SSH_NON_SECRET_READ_PATHS
         });
         // Sandbox-confined Zirv built-ins need the exact platform state root;
         // the immutable policy snapshot is operator-owned launch state and is
         // not added separately by this rule.
-        if let Some(state_root) = &launch_environment.state_write_root {
-            filesystem["allowWrite"] = serde_json::json!([state_root.display().to_string()]);
+        let allow_write: Vec<String> = launch_environment
+            .state_write_root
+            .iter()
+            .map(|root| root.display().to_string())
+            .chain(launch_environment.workspace_write_roots.iter().cloned())
+            .collect();
+        if !allow_write.is_empty() {
+            filesystem["allowWrite"] = serde_json::json!(allow_write);
         }
         #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
         let mut sandbox = serde_json::json!({
@@ -945,24 +1159,39 @@ fn parse_worktree_porcelain(output: &str) -> Vec<PathBuf> {
         .collect()
 }
 
-fn additional_worktree_args(
+/// The external, capped worktree set shared by the `--add-dir` projection
+/// and (issue #329) the launch settings' own write grants, so a worktree can
+/// never be a working directory Claude may read but not write.
+fn additional_worktree_roots(
     canonical_repo: &Path,
     canonical_worktrees: impl IntoIterator<Item = PathBuf>,
-) -> Vec<String> {
+) -> Vec<PathBuf> {
     canonical_worktrees
         .into_iter()
         .filter(|path| !path.starts_with(canonical_repo))
         .take(MAX_LINKED_WORKTREES)
-        .flat_map(|path| ["--add-dir".to_string(), path.display().to_string()])
         .collect()
 }
 
 /// Adds linked worktrees belonging to the launch repository to Claude's
-/// working-directory set. Other repositories remain out of scope; callers
-/// use `zirv agent --workdir` when a cross-repository target is intentional.
-/// Discovery is best-effort, bounded, and never invokes a shell.
+/// working-directory set. Other repositories stay out of `--add-dir` (it
+/// would load their own `.claude/` hooks); sibling checkouts get sandbox
+/// write grants and `additionalDirectories` instead, via
+/// [`sibling_repo_roots`] (issue #329). Discovery is best-effort, bounded,
+/// and never invokes a shell.
 #[cfg(not(test))]
 fn linked_worktree_args(repo: &Path) -> Vec<String> {
+    linked_worktree_roots(repo)
+        .into_iter()
+        .flat_map(|path| ["--add-dir".to_string(), path.display().to_string()])
+        .collect()
+}
+
+/// The discovery half of [`linked_worktree_args`], shared with
+/// [`LaunchEnvironment::resolve`] so the same bounded set that becomes a
+/// working directory also becomes a sandbox write grant (issue #329).
+#[cfg(not(test))]
+fn linked_worktree_roots(repo: &Path) -> Vec<PathBuf> {
     let Ok(canonical_repo) = std::fs::canonicalize(repo) else {
         return Vec::new();
     };
@@ -998,7 +1227,7 @@ fn linked_worktree_args(repo: &Path) -> Vec<String> {
                 let worktrees = parse_worktree_porcelain(&output)
                     .into_iter()
                     .filter_map(|path| std::fs::canonicalize(path).ok());
-                return additional_worktree_args(&canonical_repo, worktrees);
+                return additional_worktree_roots(&canonical_repo, worktrees);
             }
             Ok(Some(_)) => return Vec::new(),
             Ok(None) => std::thread::sleep(Duration::from_millis(20)),
@@ -1654,7 +1883,7 @@ impl AgentAdapter for ClaudeAdapter {
             format!("--allowedTools={allow}"),
             format!("--disallowedTools={deny}"),
         ];
-        if let Some(path) = self.launch_settings_path(safety) {
+        if let Some(path) = self.launch_settings_path(sandbox, safety) {
             args.push("--settings".to_string());
             args.push(path.display().to_string());
         }
@@ -2740,7 +2969,146 @@ mod tests {
                     .contains(&serde_json::json!("Bash(dangerouslyDisableSandbox:true)"))),
             "the native ask rule must be gone -- it silently defeated every hook-side allow: {settings}"
         );
+        assert!(settings["env"]["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"].is_null());
+    }
+
+    /// Issue #329: `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB` strips `SSH_AUTH_SOCK`
+    /// (and every other tool-config variable on Claude's fixed list) from
+    /// each Bash subprocess and forces the permission mode to `default`, so
+    /// it is emitted only when the operator opts in via `[sandbox]
+    /// scrub_subprocess_env`.
+    #[test]
+    fn launch_settings_emit_the_subprocess_env_scrub_only_on_operator_opt_in() {
+        let policy = super::super::super::safety::SafetyPolicy::default();
+        let policy_path = Path::new("zirv-test-safety-policy.json");
+        let settings = launch_settings_value(
+            &policy,
+            policy_path,
+            &LaunchEnvironment {
+                scrub_subprocess_env: true,
+                ..LaunchEnvironment::default()
+            },
+        )
+        .expect("settings");
         assert_eq!(settings["env"]["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"], "1");
+
+        let settings = launch_settings_value(&policy, policy_path, &LaunchEnvironment::default())
+            .expect("settings");
+        assert!(settings["env"]["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"].is_null());
+        assert!(settings["env"][super::super::super::safety::POLICY_FINGERPRINT_ENV].is_string());
+    }
+
+    /// Writes the mutual link git keeps between `<repo>/.git/worktrees/
+    /// <name>` and `<worktree>/.git`; `back_link` lets a test forge a
+    /// worktree whose `.git` file points somewhere else.
+    fn link_worktree(repo: &Path, name: &str, worktree: &Path, back_link: Option<&Path>) {
+        let entry = repo.join(".git").join("worktrees").join(name);
+        std::fs::create_dir_all(&entry).expect("mkdir");
+        std::fs::create_dir_all(worktree).expect("mkdir");
+        std::fs::write(
+            entry.join("gitdir"),
+            format!("{}\n", worktree.join(".git").display()),
+        )
+        .expect("gitdir");
+        std::fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", back_link.unwrap_or(&entry).display()),
+        )
+        .expect("back link");
+    }
+
+    /// Issue #329 item 2: sibling checkouts of the launch repo -- and their
+    /// linked worktrees, read from `.git/worktrees/*/gitdir` -- become write
+    /// roots; a non-repo neighbour, the launch repo itself, a worktree whose
+    /// directory is gone, and a home-directory parent do not. Codex review:
+    /// a `gitdir` naming a directory that does not link back (the home
+    /// directory, the launch repo's parent, a worktree whose `.git` points
+    /// at another entry) grants nothing, a worktree shared by two siblings
+    /// appears once, and no home means no siblings at all.
+    #[test]
+    fn sibling_repo_roots_cover_neighbouring_checkouts_and_their_worktrees() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let services = home.join("services");
+        let repo = services.join("crm");
+        let client = services.join("client");
+        let service = services.join("service");
+        let plain = services.join("notes");
+        let worktree = home.join("worktrees").join("markau-107");
+        for dir in [repo.join(".git"), client.join(".git"), plain.clone()] {
+            std::fs::create_dir_all(dir).expect("mkdir");
+        }
+        link_worktree(&service, "markau-107", &worktree, None);
+        // The same worktree recorded by a second sibling too: once.
+        link_worktree(&client, "shared", &worktree, None);
+        // Stale entry: the worktree directory is gone.
+        std::fs::create_dir_all(service.join(".git/worktrees/gone")).expect("mkdir");
+        std::fs::write(
+            service.join(".git/worktrees/gone/gitdir"),
+            format!("{}\n", tmp.path().join("missing").join(".git").display()),
+        )
+        .expect("gitdir");
+        // Forged entries: `gitdir` names the home directory (no `.git` file
+        // there), a real-looking worktree whose own `.git` points at a
+        // different entry, and the launch repo's parent (links back, but is
+        // an ancestor of the repo and of nothing else grantable).
+        std::fs::create_dir_all(service.join(".git/worktrees/home")).expect("mkdir");
+        std::fs::write(
+            service.join(".git/worktrees/home/gitdir"),
+            format!("{}\n", home.join(".git").display()),
+        )
+        .expect("gitdir");
+        let forged = home.join("forged");
+        link_worktree(
+            &service,
+            "forged",
+            &forged,
+            Some(&client.join(".git/worktrees/elsewhere")),
+        );
+        link_worktree(&service, "parent", &services, None);
+        // A linked worktree of the launch repo itself, next to it: `.git`
+        // is a file, still a checkout.
+        let linked = services.join("crm-wt");
+        std::fs::create_dir_all(&linked).expect("mkdir");
+        std::fs::write(linked.join(".git"), "gitdir: ../crm/.git/worktrees/wt\n").expect("git");
+
+        let canonical_repo = std::fs::canonicalize(&repo).expect("canonical");
+        let roots = sibling_repo_roots(&canonical_repo, Some(&home));
+        // Discovery order: siblings sorted, each followed by its worktrees
+        // (`client` records the shared worktree first).
+        let expected: Vec<PathBuf> = [&client, &worktree, &linked, &service]
+            .into_iter()
+            .map(|path| std::fs::canonicalize(path).expect("canonical"))
+            .collect();
+        assert_eq!(roots, expected);
+        assert!(!roots.contains(&canonical_repo));
+
+        // The parent IS the home directory: never widened to its children.
+        assert!(sibling_repo_roots(&canonical_repo, Some(&services)).is_empty());
+        // No resolvable home: fail closed.
+        assert!(sibling_repo_roots(&canonical_repo, None).is_empty());
+    }
+
+    #[test]
+    fn grantable_roots_exclude_home_its_ancestors_the_repo_and_filesystem_roots() {
+        let home = Path::new("/home/dev");
+        let repo = Path::new("/home/dev/services/crm");
+        for (candidate, expected) in [
+            ("/home/dev/services/client", true),
+            ("/home/dev/worktrees/wt", true),
+            ("/home/dev", false),
+            ("/home", false),
+            ("/", false),
+            ("/home/dev/services", false),
+            ("/home/dev/services/crm", false),
+            ("/home/dev/services/crm/vendor", false),
+        ] {
+            assert_eq!(
+                is_grantable_root(Path::new(candidate), repo, home),
+                expected,
+                "{candidate}"
+            );
+        }
     }
 
     #[test]
@@ -2804,7 +3172,10 @@ mod tests {
         )
         .expect("settings");
         assert_eq!(settings["env"]["SSH_AUTH_SOCK"], "/tmp/ssh-agent.sock");
-        assert_eq!(settings["env"]["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"], "1");
+        assert!(
+            settings["env"]["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"].is_null(),
+            "the scrub would strip the very SSH_AUTH_SOCK exported above (issue #329)"
+        );
         assert!(settings["env"][super::super::super::safety::POLICY_FINGERPRINT_ENV].is_string());
         assert_eq!(
             settings["env"][super::super::super::safety::POLICY_SNAPSHOT_ENV],
@@ -3050,17 +3421,89 @@ mod tests {
         }
 
         let paths = parse_worktree_porcelain(&porcelain);
-        let args = additional_worktree_args(Path::new("/repo"), paths);
-        assert_eq!(args.len(), 16 * 2);
+        let roots = additional_worktree_roots(Path::new("/repo"), paths);
+        assert_eq!(roots.len(), 16);
         assert_eq!(
-            &args[..4],
-            &["--add-dir", "/repo-other", "--add-dir", "/outside-0"]
+            &roots[..2],
+            &[PathBuf::from("/repo-other"), PathBuf::from("/outside-0")]
         );
-        assert_eq!(&args[args.len() - 2..], &["--add-dir", "/outside-14"]);
+        assert_eq!(roots[roots.len() - 1], PathBuf::from("/outside-14"));
         assert!(
-            args.iter()
-                .all(|arg| arg != "/repo" && arg != "/repo/nested")
+            roots
+                .iter()
+                .all(|root| root != Path::new("/repo") && root != Path::new("/repo/nested"))
         );
+    }
+
+    /// Issue #329: ssh needs `known_hosts`/`config` to verify a host, but
+    /// every private key under `~/.ssh` must stay denied.
+    #[cfg(not(windows))]
+    #[test]
+    fn launch_settings_reopen_only_the_non_secret_ssh_files_inside_the_denied_home() {
+        let policy = super::super::super::safety::SafetyPolicy::default();
+        let policy_path = Path::new("zirv-test-safety-policy.json");
+        let settings = launch_settings_value(&policy, policy_path, &LaunchEnvironment::default())
+            .expect("settings");
+
+        let allow_read = settings["sandbox"]["filesystem"]["allowRead"]
+            .as_array()
+            .expect("allowRead must be present")
+            .iter()
+            .map(|v| v.as_str().unwrap_or_default().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(allow_read, vec!["~/.ssh/known_hosts", "~/.ssh/config"]);
+
+        // The broad deny stays, so anything else under ~/.ssh (every private
+        // key) remains blocked by the less specific rule.
+        let deny_read = settings["sandbox"]["filesystem"]["denyRead"]
+            .as_array()
+            .expect("denyRead must be present")
+            .iter()
+            .map(|v| v.as_str().unwrap_or_default().to_string())
+            .collect::<Vec<_>>();
+        assert!(deny_read.contains(&"~/.ssh".to_string()));
+        assert!(
+            !allow_read.iter().any(|p| p == "~/.ssh" || p.contains('*')),
+            "no wildcard may re-open the whole key directory: {allow_read:?}"
+        );
+    }
+
+    /// Issue #329: a linked worktree Claude may `cd` into must also be
+    /// writable, or ordinary gates there fail with `Operation not permitted`
+    /// and force an unsandboxed retry. The roots land in BOTH grants, as
+    /// literal paths (neither key supports globs portably).
+    #[cfg(not(windows))]
+    #[test]
+    fn launch_settings_grant_writes_and_working_directories_to_linked_worktrees() {
+        let policy = super::super::super::safety::SafetyPolicy::default();
+        let policy_path = Path::new("zirv-test-safety-policy.json");
+        let worktrees = vec!["/work/wt-a".to_string(), "/work/wt-b".to_string()];
+        let settings = launch_settings_value(
+            &policy,
+            policy_path,
+            &LaunchEnvironment {
+                state_write_root: Some(PathBuf::from("/state/zirv")),
+                scratchpad_roots: vec!["/tmp/claude-501".to_string()],
+                workspace_write_roots: worktrees.clone(),
+                ..LaunchEnvironment::default()
+            },
+        )
+        .expect("settings");
+
+        assert_eq!(
+            settings["permissions"]["additionalDirectories"],
+            serde_json::json!(["/tmp/claude-501", "/work/wt-a", "/work/wt-b"])
+        );
+        assert_eq!(
+            settings["sandbox"]["filesystem"]["allowWrite"],
+            serde_json::json!(["/state/zirv", "/work/wt-a", "/work/wt-b"])
+        );
+        for root in &worktrees {
+            assert!(
+                !root.contains('*'),
+                "worktree grants must be literal paths: {root}"
+            );
+        }
     }
 
     #[test]
@@ -3095,7 +3538,7 @@ mod tests {
         let fingerprint =
             super::super::super::safety::policy_fingerprint(&policy).expect("fingerprint");
         let path = adapter
-            .launch_settings_path(&policy)
+            .launch_settings_path(&Default::default(), &policy)
             .expect("settings materialized");
         assert_eq!(
             path,
@@ -3114,18 +3557,22 @@ mod tests {
             &std::fs::read_to_string(path).expect("read materialized settings"),
         )
         .expect("valid settings JSON");
-        assert_eq!(
-            written["sandbox"]["filesystem"]["allowWrite"],
-            serde_json::json!([state.path().display().to_string()]),
-            "the materialized settings must allow the exact resolved state root"
-        );
-        assert!(
-            !written["sandbox"]["filesystem"]["allowWrite"]
-                .as_array()
-                .is_some_and(|entries| entries
-                    .contains(&serde_json::json!(policy_path.display().to_string()))),
-            "the immutable policy snapshot must not be separately allow-listed"
-        );
+        // The sandbox block is compiled out on native Windows (no OS sandbox).
+        #[cfg(not(windows))]
+        {
+            assert_eq!(
+                written["sandbox"]["filesystem"]["allowWrite"],
+                serde_json::json!([state.path().display().to_string()]),
+                "the materialized settings must allow the exact resolved state root"
+            );
+            assert!(
+                !written["sandbox"]["filesystem"]["allowWrite"]
+                    .as_array()
+                    .is_some_and(|entries| entries
+                        .contains(&serde_json::json!(policy_path.display().to_string()))),
+                "the immutable policy snapshot must not be separately allow-listed"
+            );
+        }
         assert_eq!(
             written,
             launch_settings_value(&policy, &policy_path, &LaunchEnvironment::resolve())
@@ -3413,6 +3860,7 @@ mod tests {
             enabled: true,
             extra_allow: vec!["Bash(just test *)".to_string()],
             extra_deny: vec!["Bash(terraform apply *)".to_string()],
+            scrub_subprocess_env: false,
         };
         let args = adapter.default_sandbox_args(
             &sandbox,
