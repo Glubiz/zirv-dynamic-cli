@@ -289,6 +289,82 @@ fn allocate_worktree(repo: &Path) -> CtxResult<PathBuf> {
     validate_workdir(&path)
 }
 
+/// The result of one [`reclaim_worktree`] attempt -- every non-[`Removed`]
+/// variant is best-effort: printed as a single stderr line by the caller,
+/// never turned into a delegation failure or a nonzero exit code.
+///
+/// [`Removed`]: ReclaimOutcome::Removed
+#[derive(Debug, PartialEq, Eq)]
+enum ReclaimOutcome {
+    /// `git status --porcelain` reported a clean tree and `git worktree
+    /// remove` (no `--force`) succeeded -- the directory is gone, but the
+    /// branch `git worktree add` minted alongside it (named after the
+    /// worktree's own short id) survives untouched.
+    Removed,
+    /// The worktree has uncommitted or untracked changes -- left in place,
+    /// never force-removed, so the operator can inspect or recover them.
+    Dirty,
+    /// `git status --porcelain` or `git worktree remove` itself could not be
+    /// run, or `remove` refused for some other reason (e.g. a stray lock) --
+    /// left in place either way.
+    Failed(String),
+}
+
+/// Review finding (2026-09): `allocate_worktree`'s own `<repo>/.zirv/
+/// worktrees/<short>` had no matching cleanup -- called once, best-effort,
+/// after a `--worktree` worker's child has exited. `repo` is the delegating
+/// session's own directory (`git worktree add`'s target in `allocate_
+/// worktree` above), `path` the allocated worktree to consider reclaiming.
+///
+/// Deliberately conservative: a dirty tree (anything `git status
+/// --porcelain` reports) is left exactly as-is, `--force` is never passed to
+/// `git worktree remove`, and any I/O failure along the way also leaves the
+/// tree in place rather than risk losing work the caller cannot see.
+fn reclaim_worktree(repo: &Path, path: &Path) -> ReclaimOutcome {
+    let status = std::process::Command::new("git")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .arg("-C")
+        .arg(path)
+        .arg("status")
+        .arg("--porcelain")
+        .output();
+    let status = match status {
+        Ok(output) if output.status.success() => output,
+        Ok(output) => {
+            return ReclaimOutcome::Failed(format!(
+                "git status --porcelain: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        Err(e) => return ReclaimOutcome::Failed(format!("git status --porcelain: {e}")),
+    };
+    if !String::from_utf8_lossy(&status.stdout).trim().is_empty() {
+        return ReclaimOutcome::Dirty;
+    }
+    let removed = std::process::Command::new("git")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .arg("-C")
+        .arg(repo)
+        .arg("worktree")
+        .arg("remove")
+        .arg(path)
+        .output();
+    match removed {
+        Ok(output) if output.status.success() => ReclaimOutcome::Removed,
+        Ok(output) => ReclaimOutcome::Failed(format!(
+            "git worktree remove: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )),
+        Err(e) => ReclaimOutcome::Failed(format!("git worktree remove: {e}")),
+    }
+}
+
 /// Issue #228: the directory a headless spawn's child process cwd and
 /// per-harness sandbox actually derive from -- `workdir` when the operator
 /// gave one (by the time this is called in `run_with`, already validated
@@ -2063,6 +2139,40 @@ pub fn run_with<W: Write>(
     // whenever this whole function happens to return -- the accounting/mail
     // bookkeeping below needs no exclusive hold on the checkout.
     drop(writer_permit);
+    // Review finding (2026-09): `--worktree` allocated a linked worktree at
+    // `<repo>/.zirv/worktrees/<short>` (see `allocate_worktree`) but nothing
+    // ever removed it -- best-effort reclamation here, after the worker's
+    // child has exited, so a clean tree does not pile up on disk forever. A
+    // dirty tree (uncommitted/untracked changes) is left in place -- never
+    // `--force`d clean -- for the operator to inspect. Failures here never
+    // change this delegation's own exit code; only a single stderr line
+    // either way.
+    if args.worktree
+        && let Some(path) = canonical_workdir.as_deref()
+    {
+        let short = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("?");
+        match reclaim_worktree(repo, path) {
+            ReclaimOutcome::Removed => {
+                eprintln!(
+                    "--worktree {}: clean, reclaimed; branch {short} keeps the worker's commits",
+                    path.display()
+                );
+            }
+            ReclaimOutcome::Dirty => {
+                eprintln!(
+                    "--worktree {}: left in place (uncommitted changes); inspect and remove \
+                     manually",
+                    path.display()
+                );
+            }
+            ReclaimOutcome::Failed(reason) => {
+                eprintln!("--worktree {}: left in place ({reason})", path.display());
+            }
+        }
+    }
     // Issue #170: this delegation's scope is done -- successfully or not --
     // the moment its supervised run exits. The free-text completion contract
     // remains reviewer-checked; token spend is rolled up below. Closes the
@@ -3784,6 +3894,110 @@ mod tests {
         let first = allocate_worktree(&repo).expect("first allocation");
         let second = allocate_worktree(&repo).expect("second allocation");
         assert_ne!(first, second, "each --worktree call must get its own tree");
+    }
+
+    /// Review finding (2026-09), acceptance: a clean allocated worktree is
+    /// removed by `reclaim_worktree`, and the branch `git worktree add`
+    /// minted for it survives -- the worker's own commits are never lost.
+    #[test]
+    fn reclaim_worktree_removes_a_clean_tree_and_keeps_its_branch() {
+        if !git_available() {
+            eprintln!("skipping: git not found on PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("session-base");
+        std::fs::create_dir_all(&repo).expect("mkdir");
+        assert!(git_init(&repo), "git init");
+        let run = |dir: &Path, args: &[&str]| -> bool {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        };
+        assert!(run(&repo, &["config", "user.email", "test@example.com"]));
+        assert!(run(&repo, &["config", "user.name", "test"]));
+        std::fs::write(repo.join("README.md"), "hello\n").expect("write");
+        assert!(run(&repo, &["add", "README.md"]));
+        assert!(run(&repo, &["commit", "-q", "-m", "initial"]));
+
+        let worktree = allocate_worktree(&repo).expect("allocate a fresh worktree");
+        let short = worktree
+            .file_name()
+            .and_then(|n| n.to_str())
+            .expect("short id")
+            .to_string();
+
+        // The worker committed something in its own worktree -- the whole
+        // point of keeping the branch around after reclamation.
+        std::fs::write(worktree.join("worker-output.txt"), "done\n").expect("write");
+        assert!(run(&worktree, &["add", "worker-output.txt"]));
+        assert!(run(&worktree, &["commit", "-q", "-m", "worker commit"]));
+
+        let outcome = reclaim_worktree(&repo, &worktree);
+        assert_eq!(outcome, ReclaimOutcome::Removed);
+        assert!(
+            !worktree.exists(),
+            "the worktree directory must be gone after reclamation"
+        );
+
+        let branches = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .arg("branch")
+            .arg("--list")
+            .arg(&short)
+            .output()
+            .expect("git branch --list");
+        assert!(
+            !String::from_utf8_lossy(&branches.stdout).trim().is_empty(),
+            "the branch {short} must survive reclamation with the worker's commits"
+        );
+    }
+
+    /// Review finding (2026-09): a dirty allocated worktree (here, an
+    /// untracked file) is left in place by `reclaim_worktree` -- never
+    /// force-removed.
+    #[test]
+    fn reclaim_worktree_leaves_a_dirty_tree_in_place() {
+        if !git_available() {
+            eprintln!("skipping: git not found on PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("session-base");
+        std::fs::create_dir_all(&repo).expect("mkdir");
+        assert!(git_init(&repo), "git init");
+        let run = |dir: &Path, args: &[&str]| -> bool {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        };
+        assert!(run(&repo, &["config", "user.email", "test@example.com"]));
+        assert!(run(&repo, &["config", "user.name", "test"]));
+        std::fs::write(repo.join("README.md"), "hello\n").expect("write");
+        assert!(run(&repo, &["add", "README.md"]));
+        assert!(run(&repo, &["commit", "-q", "-m", "initial"]));
+
+        let worktree = allocate_worktree(&repo).expect("allocate a fresh worktree");
+        // An untracked file is enough to make `git status --porcelain`
+        // non-empty -- no commit needed to be "dirty".
+        std::fs::write(worktree.join("scratch.txt"), "not committed\n").expect("write");
+
+        let outcome = reclaim_worktree(&repo, &worktree);
+        assert_eq!(outcome, ReclaimOutcome::Dirty);
+        assert!(
+            worktree.exists(),
+            "a dirty worktree must be left in place, never force-removed"
+        );
+        assert!(worktree.join("scratch.txt").exists());
     }
 
     #[test]

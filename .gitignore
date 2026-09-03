@@ -12,3 +12,8 @@ docs/obsidian/.obsidian/workspace*.json
 
 # Session scratch from agent harnesses
 .superpowers/
+
+# `zirv ctx agent --worktree`'s own linked worktrees (issue #306 follow-up):
+# removed by the reclamation step in agent.rs when clean, left in place
+# (still ignored) when dirty for the operator to inspect.
+.zirv/worktrees/

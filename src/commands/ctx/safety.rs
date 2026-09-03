@@ -2915,14 +2915,21 @@ fn is_destructive_vcs_action(command: &str, scratchpad_roots: &[String]) -> bool
             // either) also removes gitignored files, which are not
             // recoverable from git history the way a tracked/untracked
             // build artifact is -- that keeps the Ask regardless of an
-            // explicit path. Without `-x`/`-X`, at least one explicit path
-            // operand narrows a bare, tree-wide `clean -f` down to Allow.
+            // explicit path. Without `-x`/`-X`, every path operand naming
+            // one concrete tracked/untracked file or directory narrows a
+            // bare, tree-wide `clean -f` down to Allow; a tree-wide
+            // pathspec (`.`, `:/`) or a glob keeps the Ask.
             let excludes_ignored = lower.iter().any(|token| {
                 token == "-x"
                     || (token.starts_with('-') && !token.starts_with("--") && token.contains('x'))
             });
-            let has_path = args.iter().any(|token| !token.starts_with('-'));
-            force && !dry_run && (excludes_ignored || !has_path)
+            let paths: Vec<&String> = args
+                .iter()
+                .filter(|token| !token.starts_with('-'))
+                .collect();
+            let has_concrete_paths =
+                !paths.is_empty() && paths.iter().all(|path| is_concrete_vcs_path(path));
+            force && !dry_run && (excludes_ignored || !has_concrete_paths)
         }
         "branch" => {
             args.iter().any(|token| token == "-D")
@@ -8670,6 +8677,37 @@ mod tests {
                 evaluate(&policy, command, LaunchMode::Headless).verdict,
                 Verdict::Ask,
                 "{command}: unchanged families must still ask"
+            );
+        }
+    }
+
+    /// Review finding (2026-09): `git clean`'s path-operand narrowing must
+    /// require every operand to be a *concrete* tracked/untracked path
+    /// (`is_concrete_vcs_path`, the same classifier `checkout`/`restore`
+    /// use) -- not just "any non-flag token". `-fd .`, `-f :/`, and `-f *`
+    /// are all tree-wide-equivalent pathspecs/globs and must Ask exactly
+    /// like a bare `-f` with no path at all; a command mixing one concrete
+    /// path with one tree-wide pathspec must also Ask. Concrete paths keep
+    /// the existing Allow narrowing.
+    #[test]
+    fn git_clean_only_narrows_for_concrete_path_operands() {
+        let policy = SafetyPolicy::default();
+
+        let verdict_table: &[(&str, Verdict)] = &[
+            ("git clean -fd .", Verdict::Ask),
+            ("git clean -f :/", Verdict::Ask),
+            ("git clean -f *", Verdict::Ask),
+            ("git clean -fd src .", Verdict::Ask),
+            ("git clean -fdq .zirv/work/abc", Verdict::Allow),
+            ("git clean -f src/generated", Verdict::Allow),
+        ];
+        for (command, expected) in verdict_table {
+            let outcome = evaluate(&policy, command, LaunchMode::Headless);
+            assert_eq!(outcome.verdict, *expected, "{command}: {outcome:?}");
+            let outcome = evaluate(&policy, command, LaunchMode::Interactive);
+            assert_eq!(
+                outcome.verdict, *expected,
+                "{command} (interactive): {outcome:?}"
             );
         }
     }

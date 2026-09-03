@@ -226,11 +226,20 @@ fn create_new_private(path: &Path, contents: &str) -> std::io::Result<()> {
 #[derive(Debug)]
 pub struct HeavyPermit {
     path: PathBuf,
+    /// Review finding (2026-09): the writer pool's own per-tree exclusivity
+    /// claim (see [`claim_tree`]), taken BEFORE this permit's pool slot and
+    /// released WITH it -- `None` for every heavy-pool permit ([`acquire`]
+    /// never has a tree to claim) and set by [`acquire_writer`] once its own
+    /// pool-slot claim (via [`acquire_record`]) actually succeeds.
+    tree_claim: Option<PathBuf>,
 }
 
 impl Drop for HeavyPermit {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
+        if let Some(tree_claim) = &self.tree_claim {
+            let _ = std::fs::remove_file(tree_claim);
+        }
     }
 }
 
@@ -441,7 +450,10 @@ fn acquire_record(dir: &Path, limit: usize, record: PermitRecord) -> Option<Heav
     for _ in 0..CLAIM_VERIFY_ATTEMPTS {
         let path = claim_any_slot(dir, limit, &json)?;
         if claim_is_verified(&path, own_pid) {
-            return Some(HeavyPermit { path });
+            return Some(HeavyPermit {
+                path,
+                tree_claim: None,
+            });
         }
         // The file this claim just wrote is gone (swept) or holds a record
         // this call never wrote (clobbered) -- never proceed with a phantom
@@ -504,21 +516,128 @@ pub enum WriterRefusal {
     PoolExhausted,
 }
 
+/// `<state>/permits/writers/trees/`: a subdirectory of the writer pool's own
+/// slot directory, deliberately separate from the `slot-<n>.json` files
+/// [`live_records_in`] scans there -- a tree claim (see [`claim_tree`]) is
+/// not a pool slot, and [`live_writer_records`]/[`live_writer_count`] must
+/// keep counting exactly the slots they always did (`std::fs::read_dir` is
+/// not recursive, so this subdirectory's files never appear in that
+/// listing).
+fn tree_claims_dir(state: &StateDir) -> PathBuf {
+    writer_permits_dir(state).join("trees")
+}
+
+/// A stable (same input, same output, same running binary), filesystem-safe
+/// name for `key` (already [`tree_key`]-normalised) -- a raw path cannot
+/// double as a filename directly (a Windows drive path's own `:`, arbitrary
+/// length, separators), so this hashes it instead. `DefaultHasher` is not
+/// guaranteed stable across Rust versions/toolchains, but every process
+/// racing for the same tree here is running the identical compiled binary,
+/// which is the only stability this needs.
+fn tree_claim_hash(key: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    key.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+/// `<dir>/tree-<hash>.json` -- the one file a given tree's exclusivity claim
+/// lives at, shared between [`claim_tree`] (which contends on it) and tests.
+fn tree_claim_path(dir: &Path, key: &str) -> PathBuf {
+    dir.join(format!("tree-{}.json", tree_claim_hash(key)))
+}
+
+/// Review finding (2026-09): makes "is another live writer already holding
+/// this tree?" and "claim it" ONE atomic filesystem operation, closing a
+/// race the former read-then-create check in [`acquire_writer`] left open --
+/// with `supervise.max_writers > 1`, two concurrent [`acquire_writer`] calls
+/// for the SAME tree could both pass a `live_records_in` scan (neither's
+/// record had been written yet) and then both go on to claim a DIFFERENT
+/// pool slot, defeating "one writer per tree" even though the pool itself
+/// had room for both.
+///
+/// `record` is the exact [`PermitRecord`] [`acquire_writer`] is about to try
+/// to write to the pool as well -- same `pid`/`label`/`tree`, so this claim
+/// file is swept by the identical dead-owner rule every other permit file
+/// in this module already gets, rather than a second, independently-drifting
+/// copy of that logic. [`CLAIM_VERIFY_ATTEMPTS`] only matters when the claim
+/// this call is racing against belongs to a dead owner or is still mid-write
+/// (finding 2a's own grace window, reused here); ordinary contention for a
+/// genuinely live tree resolves to [`WriterRefusal::TreeBusy`] on the very
+/// first attempt.
+fn claim_tree(dir: &Path, key: &str, record: &PermitRecord) -> Result<PathBuf, WriterRefusal> {
+    let _ = state::create_private_dir_all(dir);
+    let path = tree_claim_path(dir, key);
+    let Ok(json) = serde_json::to_string_pretty(record) else {
+        return Err(WriterRefusal::PoolExhausted);
+    };
+    for _ in 0..CLAIM_VERIFY_ATTEMPTS {
+        match create_new_private(&path, &json) {
+            Ok(()) => return Ok(path),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                // The file this call just lost the race for may already be
+                // gone again by the time this reads it (freed concurrently)
+                // -- that case falls through and simply retries.
+                if let Ok(contents) = std::fs::read_to_string(&path) {
+                    match serde_json::from_str::<PermitRecord>(&contents) {
+                        Ok(existing) => {
+                            let alive =
+                                is_alive(existing.pid) || existing.child_pid.is_some_and(is_alive);
+                            if alive {
+                                return Err(WriterRefusal::TreeBusy {
+                                    holder_label: existing.label,
+                                });
+                            }
+                            // The recorded owner is dead -- sweep the stale
+                            // claim and retry, the same dead-owner discipline
+                            // every other permit file in this module already
+                            // applies.
+                            let _ = std::fs::remove_file(&path);
+                        }
+                        Err(_) => {
+                            // Finding 2a's own unparseable-file grace window,
+                            // reused here: only remove it once it is old
+                            // enough that a write genuinely still in progress
+                            // is implausible.
+                            if slot_file_is_stale(&path, UNPARSEABLE_SLOT_GRACE_SECS) {
+                                let _ = std::fs::remove_file(&path);
+                            }
+                        }
+                    }
+                }
+            }
+            // Any other I/O error is not fatal to the whole attempt -- retry,
+            // same discipline as `claim_any_slot`.
+            Err(_) => {}
+        }
+    }
+    // Every retry exhausted without ever confirming the tree free. The only
+    // way this happens is persistent contention (another live claim, or a
+    // dead one this call keeps losing the sweep race for) -- either way,
+    // refusing is the one outcome that can never let two writers share a
+    // tree, so this reports the same refusal ordinary contention would.
+    Err(WriterRefusal::TreeBusy {
+        holder_label: "(unknown -- contended claim)".to_string(),
+    })
+}
+
 /// Issue #267: grants a writer permit for `tree` -- one checkout a `--mode
 /// writing` delegated worker holds exclusively for its whole lifetime,
 /// never only for the duration of one heavy command the way a heavy permit
-/// is. Two independent refusals, checked in this order:
+/// is. Two independent refusals:
 ///
 /// 1. [`WriterRefusal::TreeBusy`] -- some other LIVE writer permit already
-///    names the same [`tree_key`], regardless of whether the pool itself
-///    has a free slot. This is the "never two writers in one worktree"
-///    rule (design section 3); `--worktree` sidesteps it entirely by
-///    naming a fresh, never-before-seen tree.
+///    holds [`tree_key`]'s own claim on this tree (enforced atomically by
+///    [`claim_tree`], taken before anything else below). This is the "never
+///    two writers in one worktree" rule (design section 3); `--worktree`
+///    sidesteps it entirely by naming a fresh, never-before-seen tree.
 /// 2. [`WriterRefusal::PoolExhausted`] -- every one of `limit` slots is
 ///    already claimed (by writers in OTHER trees), the same bounded-pool
-///    refusal [`acquire`] already gives the heavy pool.
+///    refusal [`acquire`] already gives the heavy pool. A tree claim taken
+///    just above but not backed by a pool slot is released immediately, so
+///    a refused request never wedges the tree for one that never launched.
 ///
-/// Reuses [`acquire_record`] for the actual claim, so a writer permit
+/// Reuses [`acquire_record`] for the pool-slot claim, so a writer permit
 /// survives a crash and is swept exactly like a heavy one (same
 /// `create_new` contention files, same dead-owner sweep) -- just under
 /// [`writer_permits_dir`] instead of [`permits_dir`].
@@ -530,14 +649,6 @@ pub fn acquire_writer(
 ) -> Result<HeavyPermit, WriterRefusal> {
     let dir = writer_permits_dir(state);
     let key = tree_key(tree);
-    if let Some(holder) = live_records_in(&dir)
-        .into_iter()
-        .find(|r| r.tree.as_deref().is_some_and(|t| tree_key(t) == key))
-    {
-        return Err(WriterRefusal::TreeBusy {
-            holder_label: holder.label,
-        });
-    }
     let record = PermitRecord {
         pid: std::process::id(),
         child_pid: None,
@@ -546,7 +657,19 @@ pub fn acquire_writer(
         kind: PermitKind::Writer,
         tree: Some(tree.to_path_buf()),
     };
-    acquire_record(&dir, limit, record).ok_or(WriterRefusal::PoolExhausted)
+    let claim_path = claim_tree(&tree_claims_dir(state), &key, &record)?;
+    match acquire_record(&dir, limit, record) {
+        Some(mut permit) => {
+            permit.tree_claim = Some(claim_path);
+            Ok(permit)
+        }
+        None => {
+            // Nothing was actually granted -- release the tree claim taken
+            // above so it never outlives the request that never launched.
+            let _ = std::fs::remove_file(&claim_path);
+            Err(WriterRefusal::PoolExhausted)
+        }
+    }
 }
 
 /// One pass over every slot index, returning the path this call manages to
@@ -1104,6 +1227,118 @@ mod tests {
         assert!(
             acquire_writer(&state, 1, "worker-b", &tree).is_ok(),
             "the tree is free again once the dead owner's permit is swept"
+        );
+    }
+
+    /// Review finding (2026-09): with `max_writers = 2` (room in the pool for
+    /// both), a second `acquire_writer` for the SAME tree must still be
+    /// refused as `TreeBusy` -- before the fix, the tree-exclusivity check
+    /// was a plain read-then-create with no atomicity of its own, so two
+    /// concurrent callers could each see no live writer for the tree yet and
+    /// both go on to claim a different (free) pool slot.
+    #[test]
+    fn two_writers_for_the_same_tree_never_both_succeed_even_with_a_free_slot() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let tree = tmp.path().join("repo");
+        std::fs::create_dir_all(&tree).expect("mkdir");
+
+        let _first = acquire_writer(&state, 2, "worker-a", &tree).expect("first writer granted");
+        let err = acquire_writer(&state, 2, "worker-b", &tree)
+            .expect_err("a second writer for the same tree must be refused");
+        assert_eq!(
+            err,
+            WriterRefusal::TreeBusy {
+                holder_label: "worker-a".to_string()
+            },
+            "the free slot must not let a second writer share the tree"
+        );
+    }
+
+    /// The atomic tree claim must not regress the existing "different trees
+    /// never block each other" rule.
+    #[test]
+    fn different_trees_still_both_succeed_under_the_atomic_claim() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let tree_a = tmp.path().join("repo-a");
+        let tree_b = tmp.path().join("repo-b");
+        std::fs::create_dir_all(&tree_a).expect("mkdir");
+        std::fs::create_dir_all(&tree_b).expect("mkdir");
+
+        let _a = acquire_writer(&state, 2, "worker-a", &tree_a).expect("granted");
+        let _b = acquire_writer(&state, 2, "worker-b", &tree_b).expect("granted");
+    }
+
+    /// Dropping the first writer frees the tree claim for a third caller --
+    /// the permit guard must release both the pool slot AND the tree claim
+    /// together, or the tree would stay wedged after the slot alone freed.
+    #[test]
+    fn dropping_a_writer_frees_the_tree_for_a_new_caller() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let tree = tmp.path().join("repo");
+        std::fs::create_dir_all(&tree).expect("mkdir");
+
+        let first = acquire_writer(&state, 2, "worker-a", &tree).expect("first writer granted");
+        assert!(acquire_writer(&state, 2, "worker-b", &tree).is_err());
+
+        drop(first);
+
+        let third = acquire_writer(&state, 2, "worker-c", &tree)
+            .expect("dropping the first writer must free the tree claim too, not just the slot");
+        drop(third);
+    }
+
+    /// A stale tree claim left by a dead process must not wedge its tree
+    /// forever -- mirrors `a_writer_permit_left_by_a_dead_process_is_swept`,
+    /// but targets the NEW per-tree claim file directly rather than a slot
+    /// file, proving `claim_tree`'s own dead-owner sweep (not just the pool
+    /// slot's) reclaims it.
+    #[test]
+    fn a_stale_tree_claim_from_a_dead_pid_is_swept() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let tree = tmp.path().join("repo");
+        std::fs::create_dir_all(&tree).expect("mkdir");
+        let dead_pid = crate::commands::ctx::testenv::dead_pid();
+
+        let key = tree_key(&tree);
+        let dir = tree_claims_dir(&state);
+        state::create_private_dir_all(&dir).expect("mkdir");
+        let record = PermitRecord {
+            pid: dead_pid,
+            child_pid: None,
+            label: "worker-a".to_string(),
+            acquired_at: state::now_secs(),
+            kind: PermitKind::Writer,
+            tree: Some(tree.clone()),
+        };
+        let json = serde_json::to_string_pretty(&record).expect("serialize");
+        create_new_private(&tree_claim_path(&dir, &key), &json).expect("write stale claim");
+
+        assert!(
+            acquire_writer(&state, 1, "worker-b", &tree).is_ok(),
+            "a dead owner's tree claim must be swept, freeing the tree"
+        );
+    }
+
+    /// `live_writer_records`/`live_writer_count` must keep counting exactly
+    /// the pool slots they always did -- a tree claim (living under its own
+    /// `writers/trees/` subdirectory) must never be double-counted as a
+    /// second writer.
+    #[test]
+    fn live_writer_count_counts_slots_not_tree_claims() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let tree = tmp.path().join("repo");
+        std::fs::create_dir_all(&tree).expect("mkdir");
+
+        let _held = acquire_writer(&state, 2, "worker-a", &tree).expect("granted");
+        assert_eq!(
+            live_writer_count(&state),
+            1,
+            "one writer holds one slot -- the tree claim file must not also be counted"
         );
     }
 }
