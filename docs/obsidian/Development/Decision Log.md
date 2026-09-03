@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-09-02
+last-verified: 2026-09-03
 ---
 
 # Decision Log
@@ -51,6 +51,41 @@ last-verified: 2026-09-02
 **Rejected:** A lock held across the whole delegation lifecycle -- a headless worker can run long, and that would serialize every admission in the group.
 **Consequences:** Two concurrent admissions can no longer both receive the full remainder.
 **Spec / link:** [[Ctx Subsystem]].
+
+### 2026-09-02 -- Writer concurrency gets its own permit pool, mirroring the heavy-operation pool's file scheme
+**Context:** Two delegated workers writing the same tree concurrently (or a single-writer policy an operator actually wants) had no enforcement mechanism -- `supervise.max_heavy_operations` gates classified heavy *commands*, not "is any other writer already touching this tree."
+**Decision:** `permit.rs` gains a second, independent pool under `<state>/permits/writers/` (separate from `<state>/permits/` for heavy operations), reusing the identical `create_new` atomic-claim + dead-owner-sweep idiom via generic helpers factored out of the heavy pool's own functions. `zirv ctx agent --mode read-only|writing` (default `writing`) and `--worktree` (an isolated `git worktree add` sibling, mutually exclusive with `--workdir`) are the operator surface; `supervise.max_writers` (default 1, `REPO_FORBIDDEN`) is the pool size; a refusal is a new retryable exit code, `EXIT_WRITER_BUSY` (80).
+**Rejected:** Folding writers into the existing heavy-operation pool -- that pool's slots are freed the moment a classified command finishes, while a writer permit must be held for a whole delegation's lifetime; conflating the two would make heavy-operation slot math depend on delegation duration.
+**Consequences:** A dashboard pane spawn needed its own `acquire_writer` call (`fulfill_spawn_request`) to close the same gate the headless fork gates -- landed as a same-release residual once the gap was noticed, not in the first cut. `log::Delegation`/`SpawnRequest` both gained `mode` fields.
+**Spec / link:** [[Ctx Subsystem]], [[Ctx Supervisors]].
+
+### 2026-09-02 -- Delegation and telemetry schemas evolve additive-only, never breaking an on-disk row
+**Context:** `delegations.jsonl` and `workflow_telemetry`'s event files are append-only logs an operator may have months of on disk; #264 (`Delegation.mode`/`task_class`), #267 (`Delegation.mode`, `SpawnRequest.mode`), and #293 (`TelemetryEvent`'s four speed fields) all needed to add fields to those same long-lived shapes in the same release.
+**Decision:** Every new field on `Delegation`/`DelegationRow`/`SpawnRequest`/`TelemetryEvent` is `Option<T>` (or has a concrete zero value) under `#[serde(default)]`, so a row/request written by a pre-3.12.0 binary still deserializes, reading the new field back as `None`/its documented default rather than failing to parse or silently guessing a value.
+**Rejected:** A schema-version bump requiring a migration pass over existing `.jsonl` files -- these logs can be large and are append-only by design; forcing a rewrite on upgrade would be surprising and risks corrupting a file an active session is still appending to.
+**Consequences:** A reader (`zirv ctx spend`, `zirv workflow stats`) must treat `None` as "unclassified/unpriced," never as zero -- e.g. an unpriced delegation contributes to `runs`/`unpriced_runs` but never a phantom `$0.00`.
+**Spec / link:** [[Ctx Subsystem]], [[Workflows]], [[Usage and Pacing]].
+
+### 2026-09-02 -- Speed metrics ride as timestamp-tagged event data, never touch `rot.rs`
+**Context:** Issue #293 wanted turn-latency/TTFT telemetry for `zirv workflow stats`, but the repo's own rule is that `rot.rs` reads no clock and must produce an identical verdict for identical events -- a wall-clock-derived signal is exactly the kind of thing that rule exists to keep out.
+**Decision:** Timestamps travel as plain data on `NormalizedEvent` (`at_ms: Option<u64>` on existing variants, plus two new sibling variants, `AssistantFirstText`/`ToolResultTimestamp`, carrying only a timestamp) -- inert values `rot.rs`'s exhaustive matches pass through as no-ops. All actual latency/TTFT computation (`derive_speed_metrics`) lives in `score.rs`, one layer above the pure engine, exactly where every other impure concern (transcript reads, checkpoints, clock/env lookups) already lives.
+**Rejected:** Computing speed metrics inside `rot.rs` alongside the existing signals -- would require passing wall-clock data into the one module the codebase guarantees never sees it, breaking the purity invariant for a feature that doesn't change any verdict anyway.
+**Consequences:** A dedicated test (`timestamps_never_move_a_verdict`) pins that stamping a fixture with real timestamps produces byte-identical verdicts to the unstamped stream -- a regression here is a test failure, not a design review catching it later.
+**Spec / link:** [[Rot Engine]], [[Ctx Adapters]].
+
+### 2026-09-02 -- Cost pricing is an operator-only, additive ledger layer -- never a spend gate
+**Context:** Issue #264 wanted dollar-cost visibility (`zirv ctx spend`, cost lines on `status`/`workflow stats`/the dashboard) without touching the existing token-budget/rate-limit pacing machinery, which already has its own operator-only trust boundary.
+**Decision:** `price.rs` is pure (`price(model, usage, table) -> Option<Micros>`, never `0` for an unrecognised model) and reads a built-in table an operator may override wholesale via `~/.zirv/prices.toml`/`price.table_path`; both that path and `price.stale_after_days` are `REPO_FORBIDDEN` -- a repo checkout must not be able to substitute its own numbers for the operator's real spend, or widen how stale a table may get before every figure is marked `~`. Pricing never feeds `pace::decide`/`spawn_gate`: a spawn is never throttled or refused on a dollar figure, only on the existing token/window signals.
+**Rejected:** Letting a repo `ctx.toml` narrow (lower) `price.stale_after_days` -- looked safe (narrowing usually is) but the resulting asymmetry would still let a checkout force every figure to read stale/`~`-prefixed for its own reasons; simpler to forbid the whole key outright like the path.
+**Consequences:** An unpriced model degrades every cost figure to `no data`/`unpriced_runs`, never a manufactured `$0.00`. Budget enforcement in dollars stays an explicit non-goal.
+**Spec / link:** [[Usage and Pacing]], [[Untrusted Configuration]].
+
+### 2026-09-03 -- The VCS safety classifier narrows to agent-scoped local work, not local-vs-remote
+**Context:** The built-in git/VCS `ask` rules were originally split on reversibility (a hard reset asks, a remote force-push denies), but four of them --  `checkout`/`restore`, `clean -f`, `worktree remove --force`, non-interactive `rebase` -- were asking even for an agent's own routine, local, scoped cleanup (restoring one named file, removing its own scratch worktree), with no glob shape able to see the arguments that judgment needs.
+**Decision:** `safety::is_destructive_vcs_action` (not a blanket `Bash(...)` glob) now silences these four specifically when the action is provably agent-scoped and local: `checkout`/`restore` only for a concrete tracked path (never a tree-wide or glob pathspec), `clean -f` only without `-x`/`-X` and with an explicit path, `worktree remove --force` only under a confined root (`.claude/worktrees/`, `.zirv/worktrees/`, or the session scratchpad), and `rebase` only non-interactive. `Bash(git rebase *)`/`Bash(git clean *)` are removed from `SHIPPED_POSTURE_ASK` since the narrower judgment fully replaces them.
+**Rejected:** Narrowing via a smarter glob pattern -- a glob cannot see "is this path confined to a known scratch root" or "is this pathspec concrete vs. tree-wide," which is exactly the judgment this narrowing needs.
+**Consequences:** An agent's own scoped, local git hygiene (its own worktree, one named file) no longer interrupts with a prompt; anything outside that scope -- a tree-wide checkout, an unconfined worktree removal, `-i` rebase -- still asks exactly as before.
+**Spec / link:** [[Command Safety]].
 
 ### 2026-09-02 -- A durable, repo-scoped objective survives restarts and never self-certifies completion
 **Context:** An orchestrator's task/budget/deadline lived only in the running session's own context -- a restart, handover, or nudge relaunch had no durable record of it.
