@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-09-02
+last-verified: 2026-09-03
 ---
 
 # Work Journal
@@ -19,6 +19,14 @@ last-verified: 2026-09-02
 **Follow-up:** anything unfinished (optional).
 
 ## Entries
+
+### 2026-09-02/03: release 3.12.0 -- writer-permit governance, context lint, cost ledger, speed telemetry, prefix-stability harness, narrowed VCS classifier
+
+**What:** Six-issue batch (`release/3.12.0-harness-batch-2`). #267: `zirv ctx agent --mode read-only|writing` (default writing) plus `--worktree` gate a new writer-permit pool (`<state>/permits/writers/`, `supervise.max_writers` default 1, `REPO_FORBIDDEN`), refusing with a new retryable `EXIT_WRITER_BUSY` (80); auto-spawned review/test/verify workers are classified read-only; `zirv ctx status` gains `writers: N of M slots in use`. #275: `zirv context lint [--json] [--budget] [--fix-plan]` adds five pure findings (CTX001-CTX005: budget headroom, cross-layer duplicates, contradiction candidates, proportionality, dedupe leak), discovered as a verify-gate `CheckKind::ContextLint` whenever `.zirv/context/` exists and folded into `zirv context sync --report`. #264: `zirv ctx spend` aggregates `delegations.jsonl` by harness/model/task-class/worker, priced by a new operator-only `price.rs` table (`~/.zirv/prices.toml` override, both `price.table_path`/`stale_after_days` `REPO_FORBIDDEN`); cost lines land on `status`, `workflow stats`, and the dashboard's new aggregate row. #293: `NormalizedEvent` gains `at_ms` timestamps plus two inert sibling variants (`AssistantFirstText`/`ToolResultTimestamp`); `score::derive_speed_metrics` (turn p50/max latency, TTFT p50, tool-error rate) feeds a `workflow stats` speed line -- verified never to move a rot verdict. #299: a prompt-prefix stability test harness (`FAKE_AGENT_PROMPT_LOG`, `compile::layers_of`/`emitted_layers`) asserts a state change perturbs only its own declared prompt layer, protecting the provider cache-hit rate this release's cost/speed telemetry now makes visible. #306: the built-in VCS safety classifier narrows four ask rules (`checkout`/`restore`, `clean -f`, `worktree remove --force`, `rebase`) to fire only outside agent-scoped local work (a concrete path, a confined scratch worktree, non-interactive), removing their old blanket `Bash(git rebase *)`/`Bash(git clean *)` glob entries.
+
+**Key changes:** `src/commands/ctx/{agent,exec,permit,config,status,log,context_lint (new),context_cli,mod,price (new),spend (new),event,window,score,safety,adapters/claude,adapters/codex,dash/mod,dash/spawnreq,dash/ui}.rs`, `src/commands/workflow/{engine,telemetry,verification}.rs`, `tests/fixtures/fake-agent.sh`. `Cargo.toml` bumped to 3.12.0.
+
+**Follow-up:** A same-release residual was closed in-branch: a dashboard pane spawn did not originally enforce the writer-permit pool the headless fork already did (`SpawnRequest.mode` was data-parity only) -- `fulfill_spawn_request` now calls the identical `acquire_writer` gate. Still-open, not fixed here: `workflow::engine::auto_spawn_decision`'s `AutoSpawn.mode` correctly classifies Review/Test/Verify as read-only but isn't yet threaded into an actual permit acquisition, since `spawn_auto_worker` launches those as a direct subprocess rather than through `zirv ctx agent`. See [[Active Work]]'s matching entry and the 2026-09-02/03 [[Decision Log]] entries.
 
 ### 2026-09-02: release 3.11.0 -- handoff v3, resume trust manifest, verification no-progress guard, group reservation, durable objective
 
