@@ -233,6 +233,37 @@ pub fn parse_iso8601_utc(ts: &str) -> Option<u64> {
     u64::try_from(total).ok()
 }
 
+/// Millisecond-precision sibling of [`parse_iso8601_utc`] (issue #293):
+/// reuses that parser's own date/time bounds for the whole-second part
+/// (which stays untouched, still returning whole unix seconds for every
+/// existing caller), then reads a fractional-seconds component when one
+/// follows the seconds field as `.` plus digits -- optional, so
+/// `2026-07-31T14:15:15Z` and `2026-07-31T14:15:15.968Z` both parse. Only
+/// the first three fractional digits become milliseconds (more are still
+/// accepted, just truncated, the same way the whole-second parser already
+/// ignores anything past the seconds field); fewer than three are
+/// right-padded with zeros (`.5` -> 500ms). `None` for exactly the inputs
+/// [`parse_iso8601_utc`] itself rejects.
+pub fn parse_iso8601_utc_ms(ts: &str) -> Option<u64> {
+    let secs = parse_iso8601_utc(ts)?;
+    let millis = if ts.as_bytes().get(19) == Some(&b'.') {
+        let mut digits: Vec<char> = ts[20..].chars().take_while(char::is_ascii_digit).collect();
+        if digits.is_empty() {
+            0
+        } else {
+            digits.truncate(3);
+            while digits.len() < 3 {
+                digits.push('0');
+            }
+            let ms_str: String = digits.into_iter().collect();
+            ms_str.parse::<u64>().unwrap_or(0)
+        }
+    } else {
+        0
+    };
+    secs.checked_mul(1000)?.checked_add(millis)
+}
+
 /// Cache reads are excluded by default: they are the dominant class in a cached
 /// session and are discounted by the API, and the notes file records that the
 /// limiter's real weighting is undocumented.
@@ -1399,6 +1430,57 @@ mod tests {
         assert_eq!(parse_iso8601_utc("yesterday"), None);
         assert_eq!(parse_iso8601_utc("2026-13-01T00:00:00Z"), None);
         assert_eq!(parse_iso8601_utc("2026-07-31"), None);
+    }
+
+    /// Issue #293: the millisecond variant keeps the same whole-second value
+    /// the existing parser already returns, just scaled and with the
+    /// fractional component folded in.
+    #[test]
+    fn ms_parser_matches_the_seconds_parser_scaled_up() {
+        assert_eq!(
+            parse_iso8601_utc_ms("2026-07-31T14:15:15.968Z"),
+            Some(1_785_507_315_968)
+        );
+        assert_eq!(parse_iso8601_utc_ms("1970-01-01T00:00:00.000Z"), Some(0));
+        assert_eq!(
+            parse_iso8601_utc_ms("1970-01-02T00:00:01.000Z"),
+            Some(86_401_000)
+        );
+    }
+
+    /// Fractional seconds are optional -- a claude-shaped timestamp always
+    /// has them, but a codex rollout `timestamp` field does not.
+    #[test]
+    fn ms_parser_treats_a_missing_fractional_part_as_zero_milliseconds() {
+        assert_eq!(
+            parse_iso8601_utc_ms("2026-07-31T14:15:15Z"),
+            Some(1_785_507_315_000)
+        );
+    }
+
+    /// Fewer than three fractional digits are right-padded; more than three
+    /// are truncated, not rounded -- matching the whole-second parser's own
+    /// "ignore anything past what it understands" stance.
+    #[test]
+    fn ms_parser_pads_short_and_truncates_long_fractional_digits() {
+        assert_eq!(
+            parse_iso8601_utc_ms("2026-07-31T14:15:15.5Z"),
+            Some(1_785_507_315_500)
+        );
+        assert_eq!(
+            parse_iso8601_utc_ms("2026-07-31T14:15:15.9681234Z"),
+            Some(1_785_507_315_968)
+        );
+    }
+
+    /// Every input the seconds parser rejects, the ms parser rejects too --
+    /// never a guess.
+    #[test]
+    fn ms_parser_rejects_exactly_what_the_seconds_parser_rejects() {
+        assert_eq!(parse_iso8601_utc_ms(""), None);
+        assert_eq!(parse_iso8601_utc_ms("yesterday"), None);
+        assert_eq!(parse_iso8601_utc_ms("2026-13-01T00:00:00Z"), None);
+        assert_eq!(parse_iso8601_utc_ms("2026-07-31"), None);
     }
 
     #[test]

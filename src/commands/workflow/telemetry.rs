@@ -96,9 +96,20 @@ pub enum TelemetryKind {
     /// (for example one whose review/fix loop hit `MAX_FIX_REVIEW_ROUNDS`)
     /// was explicitly closed instead of staying `Running` forever.
     Closed,
+    /// Issue #293: one speed-axis sample -- `turn_p50_ms`/`turn_max_ms`/
+    /// `ttft_p50_ms`/`tool_error_rate` -- recorded where `score.rs` computes
+    /// a `Score` for a live session (`ctx::hook::run_stop`), once per
+    /// scoring pass rather than once per poll. `workflow_id` stays `None`
+    /// (a session-level fact, like `AdoptionDetected`); `session_id` names
+    /// the session.
+    TurnLatencySampled,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// Issue #293: `Eq` dropped -- `tool_error_rate: Option<f64>` cannot
+// implement it (`f64` has no total order). Every existing/new consumer only
+// ever needed `PartialEq` (`assert_eq!`, `==`); nothing in this crate keys a
+// `HashSet`/`BTreeSet`/map on a whole `TelemetryEvent`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TelemetryEvent {
     pub schema_version: u32,
     pub id: String,
@@ -185,6 +196,17 @@ pub struct TelemetryEvent {
     /// field existed still deserializes, correctly, as `false`.
     #[serde(default)]
     pub verification_unchanged: bool,
+    /// Issue #293, `TurnLatencySampled` only. Additive schema (no
+    /// `TELEMETRY_SCHEMA_VERSION` bump): a legacy event file simply
+    /// deserializes every one of these as `None`.
+    #[serde(default)]
+    pub turn_p50_ms: Option<u64>,
+    #[serde(default)]
+    pub turn_max_ms: Option<u64>,
+    #[serde(default)]
+    pub ttft_p50_ms: Option<u64>,
+    #[serde(default)]
+    pub tool_error_rate: Option<f64>,
 }
 
 impl TelemetryEvent {
@@ -228,6 +250,10 @@ impl TelemetryEvent {
             agent_id: None,
             workflow_active: None,
             verification_unchanged: false,
+            turn_p50_ms: None,
+            turn_max_ms: None,
+            ttft_p50_ms: None,
+            tool_error_rate: None,
         }
     }
 
@@ -479,6 +505,24 @@ pub struct WorkflowStats {
 /// being underway. Derived from `AdoptionDetected`/`AdoptionRecovered`
 /// events, each recorded at most once per session (`ctx::hook`'s own
 /// `detected_recorded`/`recovered_recorded` guards).
+/// Issue #293: the speed axis's aggregate, built from every
+/// `TurnLatencySampled` event -- one sample per live-session scoring pass
+/// (`ctx::hook::run_stop`, via `score::derive_speed_metrics`). `samples ==
+/// 0` is "no data" (`zirv workflow stats`' own "no data" speed block), never
+/// a manufactured zero-latency reading. The per-sample p50s are themselves
+/// averaged across samples here (a lightweight aggregate, not a true
+/// percentile of the underlying per-turn population); `turn_max_ms` is the
+/// true max across every sample instead, since a worst-case-latency
+/// question wants the single slowest turn observed, not an averaged one.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
+pub struct SpeedStats {
+    pub samples: usize,
+    pub turn_p50_ms_avg: Option<u64>,
+    pub turn_max_ms: Option<u64>,
+    pub ttft_p50_ms_avg: Option<u64>,
+    pub tool_error_rate_avg: Option<f64>,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
 pub struct AdoptionStats {
     pub substantial_sessions: usize,
@@ -558,6 +602,9 @@ pub struct StatsReport {
     /// comment for why this is never a manufactured 0%.
     #[serde(default)]
     pub overall_cache_hit_ratio: Option<f64>,
+    /// Issue #293.
+    #[serde(default)]
+    pub speed: SpeedStats,
     /// Issue #223. Always last -- see `run_stats`'s own ordering comment.
     pub adoption: AdoptionStats,
 }
@@ -587,6 +634,14 @@ pub fn aggregate(events: &[TelemetryEvent]) -> StatsReport {
     let mut overall_input_tokens = 0u64;
     let mut overall_cache_read_input_tokens = 0u64;
     let mut overall_cache_events = 0usize;
+    let mut speed_samples = 0usize;
+    let mut turn_p50_sum = 0u64;
+    let mut turn_p50_count = 0usize;
+    let mut turn_max_ms: Option<u64> = None;
+    let mut ttft_p50_sum = 0u64;
+    let mut ttft_p50_count = 0usize;
+    let mut tool_error_rate_sum = 0.0f64;
+    let mut tool_error_rate_count = 0usize;
     for event in events {
         overall_input_tokens = overall_input_tokens.saturating_add(event.input_tokens.unwrap_or(0));
         // `TelemetryEvent::cache_hit_ratio()`'s own "no data, no ratio"
@@ -719,6 +774,24 @@ pub fn aggregate(events: &[TelemetryEvent]) -> StatsReport {
                 }
             }
             TelemetryKind::AdoptionRecovered => adoption.recovered_after_nudge += 1,
+            TelemetryKind::TurnLatencySampled => {
+                speed_samples += 1;
+                if let Some(v) = event.turn_p50_ms {
+                    turn_p50_sum = turn_p50_sum.saturating_add(v);
+                    turn_p50_count += 1;
+                }
+                if let Some(v) = event.turn_max_ms {
+                    turn_max_ms = Some(turn_max_ms.map_or(v, |current| current.max(v)));
+                }
+                if let Some(v) = event.ttft_p50_ms {
+                    ttft_p50_sum = ttft_p50_sum.saturating_add(v);
+                    ttft_p50_count += 1;
+                }
+                if let Some(v) = event.tool_error_rate {
+                    tool_error_rate_sum += v;
+                    tool_error_rate_count += 1;
+                }
+            }
             _ => {}
         }
         if let Some(workflow_id) = &event.workflow_id
@@ -789,6 +862,14 @@ pub fn aggregate(events: &[TelemetryEvent]) -> StatsReport {
     );
     let review_defect_rate =
         (review_runs > 0).then(|| findings_meaningful as f64 / review_runs as f64);
+    let speed = SpeedStats {
+        samples: speed_samples,
+        turn_p50_ms_avg: (turn_p50_count > 0).then(|| turn_p50_sum / turn_p50_count as u64),
+        turn_max_ms,
+        ttft_p50_ms_avg: (ttft_p50_count > 0).then(|| ttft_p50_sum / ttft_p50_count as u64),
+        tool_error_rate_avg: (tool_error_rate_count > 0)
+            .then(|| tool_error_rate_sum / tool_error_rate_count as f64),
+    };
     let slowest_phase = phases
         .iter()
         .max_by_key(|(_, stats)| stats.duration_ms)
@@ -829,6 +910,7 @@ pub fn aggregate(events: &[TelemetryEvent]) -> StatsReport {
         overall_cache_read_input_tokens,
         overall_cache_events,
         overall_cache_hit_ratio,
+        speed,
         adoption,
     }
 }
@@ -1027,10 +1109,34 @@ pub fn run_stats(args: &StatsArgs, writer: &mut impl Write) -> CtxResult<i32> {
             report.maintenance_scans,
             report.maintenance_breaches
         )?;
+        writeln!(writer, "{}", render_speed_line(&report.speed))?;
         // Issue #223: deliberately the LAST line of the report.
         writeln!(writer, "{}", render_adoption_line(&report.adoption))?;
     }
     Ok(0)
+}
+
+/// `speed: no data` when no `TurnLatencySampled` event has ever been
+/// recorded; otherwise `speed: N samples, turn p50 ~Xms (max Yms), ttft p50
+/// ~Zms, tool error rate ~W%` -- any of the three rate/latency clauses
+/// itself reads `n/a` when that particular field never had a sample (a
+/// session with no timestamps at all still contributes a sample with every
+/// field `None`, see `score::derive_speed_metrics`'s own "empty" contract).
+fn render_speed_line(stats: &SpeedStats) -> String {
+    if stats.samples == 0 {
+        return "speed: no data".to_string();
+    }
+    let ms_or_na = |v: Option<u64>| v.map_or_else(|| "n/a".to_string(), |v| format!("{v}ms"));
+    let rate_or_na =
+        |v: Option<f64>| v.map_or_else(|| "n/a".to_string(), |v| format!("{:.1}%", v * 100.0));
+    format!(
+        "speed: {} samples, turn p50 ~{} (max {}), ttft p50 ~{}, tool error rate ~{}",
+        stats.samples,
+        ms_or_na(stats.turn_p50_ms_avg),
+        ms_or_na(stats.turn_max_ms),
+        ms_or_na(stats.ttft_p50_ms_avg),
+        rate_or_na(stats.tool_error_rate_avg)
+    )
 }
 
 /// `adoption: no substantial sessions observed` when nothing has crossed the
@@ -1558,6 +1664,103 @@ mod tests {
         assert!(
             json.contains("\"overall_cache_hit_ratio\":0.5"),
             "got {json}"
+        );
+    }
+
+    // -- Issue #293: speed axis telemetry --
+
+    #[test]
+    fn a_turn_latency_sampled_event_round_trips_through_json() {
+        let mut event = TelemetryEvent::new(TelemetryKind::TurnLatencySampled);
+        event.session_id = Some("sess-1".to_string());
+        event.turn_p50_ms = Some(420);
+        event.turn_max_ms = Some(1_800);
+        event.ttft_p50_ms = Some(180);
+        event.tool_error_rate = Some(0.25);
+
+        let json = serde_json::to_string(&event).expect("serialize");
+        let back: TelemetryEvent = serde_json::from_str(&json).expect("round-trip");
+        assert_eq!(back, event);
+    }
+
+    /// The acceptance criterion, literally: `TELEMETRY_SCHEMA_VERSION` was
+    /// NOT bumped for this feature, so an event file written before it
+    /// existed (no `turn_p50_ms`/`turn_max_ms`/`ttft_p50_ms`/
+    /// `tool_error_rate` keys at all, same schema_version this crate still
+    /// writes) must still deserialize, with every new field reading `None`.
+    #[test]
+    fn a_legacy_event_file_with_no_speed_fields_still_deserialises() {
+        let old = format!(
+            r#"{{"schema_version":{TELEMETRY_SCHEMA_VERSION},"id":"e1","timestamp":10,
+            "workflow_id":null,"kind":"phase-completed","phase":null,"intent":null,
+            "complexity":null,"risk":null,"duration_ms":null,"adapter":null,"model":null,
+            "role":null,"input_tokens":7,"output_tokens":3,"succeeded":true,
+            "findings_total":0,"findings_meaningful":0,"findings_dismissed":0,"fix_round":0,
+            "artifact_count":0,"worker_count":0}}"#
+        );
+        let event: TelemetryEvent = serde_json::from_str(&old).expect("old events still parse");
+        assert_eq!(event.turn_p50_ms, None);
+        assert_eq!(event.turn_max_ms, None);
+        assert_eq!(event.ttft_p50_ms, None);
+        assert_eq!(event.tool_error_rate, None);
+    }
+
+    /// A state dir with only pre-change events (none of them
+    /// `TurnLatencySampled`) prints the speed block as "no data".
+    #[test]
+    fn a_report_with_no_turn_latency_samples_has_no_data() {
+        let event = TelemetryEvent::new(TelemetryKind::PhaseCompleted);
+        let report = aggregate(&[event]);
+        assert_eq!(report.speed.samples, 0);
+        assert_eq!(render_speed_line(&report.speed), "speed: no data");
+    }
+
+    #[test]
+    fn the_speed_block_averages_p50s_and_takes_the_true_max_across_samples() {
+        let mut a = TelemetryEvent::new(TelemetryKind::TurnLatencySampled);
+        a.turn_p50_ms = Some(200);
+        a.turn_max_ms = Some(500);
+        a.ttft_p50_ms = Some(100);
+        a.tool_error_rate = Some(0.0);
+
+        let mut b = TelemetryEvent::new(TelemetryKind::TurnLatencySampled);
+        b.turn_p50_ms = Some(400);
+        b.turn_max_ms = Some(300);
+        b.ttft_p50_ms = Some(200);
+        b.tool_error_rate = Some(1.0);
+
+        let report = aggregate(&[a, b]);
+        assert_eq!(report.speed.samples, 2);
+        assert_eq!(report.speed.turn_p50_ms_avg, Some(300));
+        assert_eq!(
+            report.speed.turn_max_ms,
+            Some(500),
+            "the true max, not averaged"
+        );
+        assert_eq!(report.speed.ttft_p50_ms_avg, Some(150));
+        assert!((report.speed.tool_error_rate_avg.unwrap() - 0.5).abs() < 1e-9);
+        assert_eq!(
+            render_speed_line(&report.speed),
+            "speed: 2 samples, turn p50 ~300ms (max 500ms), ttft p50 ~150ms, tool error rate \
+             ~50.0%"
+        );
+    }
+
+    /// A sample whose adapter had no timestamps at all (every field `None`)
+    /// still counts as a sample, but contributes to none of the averages --
+    /// `n/a`, never a manufactured number.
+    #[test]
+    fn a_sample_with_no_usable_fields_counts_but_contributes_no_data() {
+        let empty = TelemetryEvent::new(TelemetryKind::TurnLatencySampled);
+        let report = aggregate(&[empty]);
+        assert_eq!(report.speed.samples, 1);
+        assert_eq!(report.speed.turn_p50_ms_avg, None);
+        assert_eq!(report.speed.turn_max_ms, None);
+        assert_eq!(report.speed.ttft_p50_ms_avg, None);
+        assert_eq!(report.speed.tool_error_rate_avg, None);
+        assert_eq!(
+            render_speed_line(&report.speed),
+            "speed: 1 samples, turn p50 ~n/a (max n/a), ttft p50 ~n/a, tool error rate ~n/a"
         );
     }
 }
