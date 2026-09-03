@@ -864,6 +864,18 @@ const MAX_SIBLING_REPOS: usize = 32;
 /// is gone no longer canonicalises and is skipped, the same way `git
 /// worktree prune` would drop it.
 ///
+/// Trust boundary (codex review on #329): a sibling checkout is repo-owned,
+/// so nothing it can write may widen the grant beyond itself. A `gitdir`
+/// file is only believed when the named worktree's own `.git` file points
+/// BACK at that exact `.git/worktrees/<name>` entry -- the mutual link git
+/// maintains -- so a sibling cannot nominate `~` or `/` as its "worktree".
+/// A sibling reached through a symlink is skipped (its canonical path must
+/// be a direct child of the parent), so a `link -> ~` entry with a `.git`
+/// inside cannot grant the whole home. Every root additionally passes
+/// [`is_grantable_root`]: never a filesystem root, never the home directory
+/// or an ancestor of it, never the launch repo or an ancestor of it. Without
+/// a resolvable home directory nothing is granted at all (fail closed).
+///
 /// Siblings are write grants and `additionalDirectories` only, never
 /// `--add-dir`: `--add-dir` also loads that directory's own `.claude/`
 /// hooks and skills, and another checkout's repo-owned hooks must not run
@@ -873,7 +885,11 @@ fn sibling_repo_roots(canonical_repo: &Path, home: Option<&Path>) -> Vec<PathBuf
     let Some(parent) = canonical_repo.parent() else {
         return Vec::new();
     };
-    if parent.parent().is_none() || home.is_some_and(|home| same_directory(home, parent)) {
+    let Some(home) = home else {
+        return Vec::new();
+    };
+    let home = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
+    if parent.parent().is_none() || home == parent {
         return Vec::new();
     }
     let Ok(entries) = std::fs::read_dir(parent) else {
@@ -884,7 +900,8 @@ fn sibling_repo_roots(canonical_repo: &Path, home: Option<&Path>) -> Vec<PathBuf
         .map(|entry| entry.path())
         .filter(|path| path.join(".git").exists())
         .filter_map(|path| std::fs::canonicalize(path).ok())
-        .filter(|path| path != canonical_repo)
+        .filter(|path| path.parent() == Some(parent))
+        .filter(|path| is_grantable_root(path, canonical_repo, &home))
         .collect();
     siblings.sort();
     siblings.dedup();
@@ -893,9 +910,11 @@ fn sibling_repo_roots(canonical_repo: &Path, home: Option<&Path>) -> Vec<PathBuf
     let mut roots: Vec<PathBuf> = Vec::new();
     for sibling in siblings {
         let worktrees = linked_worktrees_from_git_dir(&sibling);
-        roots.push(sibling);
+        if !roots.contains(&sibling) {
+            roots.push(sibling);
+        }
         for worktree in worktrees {
-            if !worktree.starts_with(canonical_repo) && !roots.contains(&worktree) {
+            if is_grantable_root(&worktree, canonical_repo, &home) && !roots.contains(&worktree) {
                 roots.push(worktree);
             }
         }
@@ -903,32 +922,47 @@ fn sibling_repo_roots(canonical_repo: &Path, home: Option<&Path>) -> Vec<PathBuf
     roots
 }
 
+/// Whether `candidate` (canonical) may become a sandbox write root on the
+/// launch repo's behalf: not a filesystem root, not the home directory or
+/// any ancestor of it, and neither the launch repo, one of its ancestors,
+/// nor a path inside it (those are covered -- or deliberately not -- by the
+/// repo's own grant).
+fn is_grantable_root(candidate: &Path, canonical_repo: &Path, canonical_home: &Path) -> bool {
+    candidate.parent().is_some()
+        && !canonical_home.starts_with(candidate)
+        && !canonical_repo.starts_with(candidate)
+        && !candidate.starts_with(canonical_repo)
+}
+
 /// The linked worktrees of `repo` as git records them, without a process:
 /// each `<repo>/.git/worktrees/<name>/gitdir` holds the absolute path of
 /// that worktree's `.git` file, whose parent is the worktree root. A checkout
 /// that is itself a linked worktree (`.git` is a file) has no such directory
 /// and yields nothing; its main checkout, if it is a sibling too, carries
-/// the list.
+/// the list. An entry counts only when the worktree's `.git` file names
+/// this same `<repo>/.git/worktrees/<name>` directory back (see
+/// [`sibling_repo_roots`]).
 fn linked_worktrees_from_git_dir(repo: &Path) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(repo.join(".git").join("worktrees")) else {
         return Vec::new();
     };
     let mut worktrees: Vec<PathBuf> = entries
         .filter_map(Result::ok)
-        .filter_map(|entry| std::fs::read_to_string(entry.path().join("gitdir")).ok())
-        .filter_map(|gitdir| Path::new(gitdir.trim()).parent().map(Path::to_path_buf))
-        .filter_map(|root| std::fs::canonicalize(root).ok())
+        .filter_map(|entry| {
+            let entry_dir = std::fs::canonicalize(entry.path()).ok()?;
+            let gitdir = std::fs::read_to_string(entry_dir.join("gitdir")).ok()?;
+            let root = std::fs::canonicalize(Path::new(gitdir.trim()).parent()?).ok()?;
+            let back_link = std::fs::read_to_string(root.join(".git")).ok()?;
+            let back_link = back_link.trim().strip_prefix("gitdir:")?.trim();
+            let back_link = std::fs::canonicalize(root.join(back_link)).ok()?;
+            (back_link == entry_dir).then_some(root)
+        })
         .filter(|root| !root.starts_with(repo))
         .collect();
     worktrees.sort();
     worktrees.dedup();
     worktrees.truncate(MAX_LINKED_WORKTREES);
     worktrees
-}
-
-fn same_directory(a: &Path, b: &Path) -> bool {
-    let canon = |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    canon(a) == canon(b)
 }
 
 fn resolve_docker_socket_paths(docker_socket: &Path, docker_host: Option<&str>) -> Vec<String> {
@@ -2964,39 +2998,74 @@ mod tests {
         assert!(settings["env"][super::super::super::safety::POLICY_FINGERPRINT_ENV].is_string());
     }
 
+    /// Writes the mutual link git keeps between `<repo>/.git/worktrees/
+    /// <name>` and `<worktree>/.git`; `back_link` lets a test forge a
+    /// worktree whose `.git` file points somewhere else.
+    fn link_worktree(repo: &Path, name: &str, worktree: &Path, back_link: Option<&Path>) {
+        let entry = repo.join(".git").join("worktrees").join(name);
+        std::fs::create_dir_all(&entry).expect("mkdir");
+        std::fs::create_dir_all(worktree).expect("mkdir");
+        std::fs::write(
+            entry.join("gitdir"),
+            format!("{}\n", worktree.join(".git").display()),
+        )
+        .expect("gitdir");
+        std::fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", back_link.unwrap_or(&entry).display()),
+        )
+        .expect("back link");
+    }
+
     /// Issue #329 item 2: sibling checkouts of the launch repo -- and their
     /// linked worktrees, read from `.git/worktrees/*/gitdir` -- become write
     /// roots; a non-repo neighbour, the launch repo itself, a worktree whose
-    /// directory is gone, and a home-directory parent do not.
+    /// directory is gone, and a home-directory parent do not. Codex review:
+    /// a `gitdir` naming a directory that does not link back (the home
+    /// directory, the launch repo's parent, a worktree whose `.git` points
+    /// at another entry) grants nothing, a worktree shared by two siblings
+    /// appears once, and no home means no siblings at all.
     #[test]
     fn sibling_repo_roots_cover_neighbouring_checkouts_and_their_worktrees() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let services = tmp.path().join("services");
+        let home = tmp.path().join("home");
+        let services = home.join("services");
         let repo = services.join("crm");
         let client = services.join("client");
         let service = services.join("service");
         let plain = services.join("notes");
-        let worktree = tmp.path().join("worktrees").join("markau-107");
-        for dir in [
-            repo.join(".git"),
-            client.join(".git"),
-            service.join(".git").join("worktrees").join("markau-107"),
-            service.join(".git").join("worktrees").join("gone"),
-            plain.clone(),
-            worktree.clone(),
-        ] {
+        let worktree = home.join("worktrees").join("markau-107");
+        for dir in [repo.join(".git"), client.join(".git"), plain.clone()] {
             std::fs::create_dir_all(dir).expect("mkdir");
         }
-        std::fs::write(
-            service.join(".git/worktrees/markau-107/gitdir"),
-            format!("{}\n", worktree.join(".git").display()),
-        )
-        .expect("gitdir");
+        link_worktree(&service, "markau-107", &worktree, None);
+        // The same worktree recorded by a second sibling too: once.
+        link_worktree(&client, "shared", &worktree, None);
+        // Stale entry: the worktree directory is gone.
+        std::fs::create_dir_all(service.join(".git/worktrees/gone")).expect("mkdir");
         std::fs::write(
             service.join(".git/worktrees/gone/gitdir"),
             format!("{}\n", tmp.path().join("missing").join(".git").display()),
         )
         .expect("gitdir");
+        // Forged entries: `gitdir` names the home directory (no `.git` file
+        // there), a real-looking worktree whose own `.git` points at a
+        // different entry, and the launch repo's parent (links back, but is
+        // an ancestor of the repo and of nothing else grantable).
+        std::fs::create_dir_all(service.join(".git/worktrees/home")).expect("mkdir");
+        std::fs::write(
+            service.join(".git/worktrees/home/gitdir"),
+            format!("{}\n", home.join(".git").display()),
+        )
+        .expect("gitdir");
+        let forged = home.join("forged");
+        link_worktree(
+            &service,
+            "forged",
+            &forged,
+            Some(&client.join(".git/worktrees/elsewhere")),
+        );
+        link_worktree(&service, "parent", &services, None);
         // A linked worktree of the launch repo itself, next to it: `.git`
         // is a file, still a checkout.
         let linked = services.join("crm-wt");
@@ -3004,8 +3073,10 @@ mod tests {
         std::fs::write(linked.join(".git"), "gitdir: ../crm/.git/worktrees/wt\n").expect("git");
 
         let canonical_repo = std::fs::canonicalize(&repo).expect("canonical");
-        let roots = sibling_repo_roots(&canonical_repo, Some(tmp.path()));
-        let expected: Vec<PathBuf> = [&client, &linked, &service, &worktree]
+        let roots = sibling_repo_roots(&canonical_repo, Some(&home));
+        // Discovery order: siblings sorted, each followed by its worktrees
+        // (`client` records the shared worktree first).
+        let expected: Vec<PathBuf> = [&client, &worktree, &linked, &service]
             .into_iter()
             .map(|path| std::fs::canonicalize(path).expect("canonical"))
             .collect();
@@ -3013,8 +3084,31 @@ mod tests {
         assert!(!roots.contains(&canonical_repo));
 
         // The parent IS the home directory: never widened to its children.
-        let canonical_services = std::fs::canonicalize(&services).expect("canonical");
-        assert!(sibling_repo_roots(&canonical_repo, Some(&canonical_services)).is_empty());
+        assert!(sibling_repo_roots(&canonical_repo, Some(&services)).is_empty());
+        // No resolvable home: fail closed.
+        assert!(sibling_repo_roots(&canonical_repo, None).is_empty());
+    }
+
+    #[test]
+    fn grantable_roots_exclude_home_its_ancestors_the_repo_and_filesystem_roots() {
+        let home = Path::new("/home/dev");
+        let repo = Path::new("/home/dev/services/crm");
+        for (candidate, expected) in [
+            ("/home/dev/services/client", true),
+            ("/home/dev/worktrees/wt", true),
+            ("/home/dev", false),
+            ("/home", false),
+            ("/", false),
+            ("/home/dev/services", false),
+            ("/home/dev/services/crm", false),
+            ("/home/dev/services/crm/vendor", false),
+        ] {
+            assert_eq!(
+                is_grantable_root(Path::new(candidate), repo, home),
+                expected,
+                "{candidate}"
+            );
+        }
     }
 
     #[test]

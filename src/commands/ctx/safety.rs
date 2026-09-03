@@ -2859,11 +2859,26 @@ fn is_irreversible_distribution_action(command: &str) -> bool {
         // Issue #329: `glab` is GitLab's equivalent forge CLI to `gh` and
         // shares the same destructive `<noun> delete`/`api ... DELETE`
         // spellings, so it shares this arm rather than forking a near-
-        // identical copy -- `gh`'s own behaviour stays byte-identical.
+        // identical copy. Codex review on #329: both CLIs spell every
+        // server-side removal as a positional `delete` verb (`variable`,
+        // `secret`, `issue`, `label`, `cache`, `ssh-key`, `ci` ...), so the
+        // arm matches `delete` in ANY positional slot before the first flag
+        // rather than an enumerated `repo`/`release` pair -- a new noun is
+        // covered by default. `search <kind> delete` is a query for the word,
+        // not a removal, and a `delete` after a flag (`--label delete`) is
+        // that flag's value.
         "gh" | "glab" => {
-            let named_delete = lower
-                .windows(2)
-                .any(|pair| matches!(pair[0].as_str(), "repo" | "release") && pair[1] == "delete");
+            let positionals: Vec<&String> = lower
+                .iter()
+                .take_while(|token| !token.starts_with('-'))
+                .collect();
+            let named_delete = positionals
+                .first()
+                .is_some_and(|noun| noun.as_str() != "search" && noun.as_str() != "api")
+                && positionals
+                    .iter()
+                    .skip(1)
+                    .any(|token| token.as_str() == "delete");
             let api_delete = lower.first().is_some_and(|token| token == "api")
                 && lower.iter().any(|token| {
                     matches!(token.as_str(), "delete" | "-xdelete" | "--method=delete")
@@ -4851,6 +4866,14 @@ fn is_kubectl_read_only(tokens: &[String]) -> bool {
 /// gate, exactly like [`escape_allow_matches`] -- a single disqualifying
 /// segment fails the whole command. Never applied when the base verdict is
 /// already `Deny` (see the call site).
+///
+/// Contract note (review on #329): the zirv acceptor imports [`ZIRV_CTX_
+/// ESCAPE_SAFE_VERBS`]' standard, which is "spawns no caller-controlled
+/// subprocess", not "read-only": `send`, `remember`, `forget` and `nudge`
+/// mutate zirv's own mail/memory stores and have qualified for the
+/// unsandboxed retry since issue #168. This function therefore answers
+/// "is every segment safe to retry outside the sandbox", of which read-only
+/// is the common case, not the definition.
 pub(crate) fn is_read_only_escape_safe(command: &str, scratchpad_roots: &[String]) -> bool {
     let candidates = normalize_segments(command);
     if candidates.is_empty() {
@@ -4999,11 +5022,15 @@ fn is_reserved_zirv_escape_safe_segment(candidate: &str) -> bool {
             }
             // `usage`'s own `tee` subcommand runs an arbitrary trailing
             // statusline command -- the one escape-safe verb with a
-            // subprocess-launching subcommand of its own.
+            // subprocess-launching subcommand of its own. Codex review on
+            // #329: clap accepts the verb's flags BEFORE the subcommand
+            // (`zirv ctx usage --json tee -- <cmd>`), so any `tee` token
+            // after the verb disqualifies, not only the fourth slot.
             !(verb == "usage"
                 && tokens
-                    .get(3)
-                    .is_some_and(|sub| sub.eq_ignore_ascii_case("tee")))
+                    .iter()
+                    .skip(3)
+                    .any(|token| token.eq_ignore_ascii_case("tee")))
         }
         "help" | "h" | "version" | "v" | "memory" | "context" => tokens.len() == 2,
         "report" => true,
@@ -6634,6 +6661,7 @@ mod tests {
         for command in [
             "zirv ctx exec -- rm -rf /",
             "zirv ctx usage tee -- rm -rf /",
+            "zirv ctx usage --json tee -- rm -rf /",
             "zirv ctx wrap -- claude",
             "zirv ctx resume",
             "zirv ctx loop --prompt x",
@@ -8002,6 +8030,7 @@ mod tests {
             "zirv ctx agent codex \"do the thing\"",
             "zirv ctx handover",
             "zirv ctx usage tee -- rm -rf /",
+            "zirv ctx usage --json tee -- rm -rf /",
             "ZIRV CTX EXEC -- rm -rf /",
         ] {
             let outcome = evaluate(&policy, command, LaunchMode::Headless);
@@ -8359,6 +8388,18 @@ mod tests {
             ("glab api -X DELETE projects/1/repository", true),
             ("gh api --method=delete /repos/owner/repo", true),
             ("glab api --method=delete projects/1/repository", true),
+            // Codex review on #329: every positional `delete`, not only
+            // `repo`/`release`.
+            ("gh variable delete TOKEN", true),
+            ("gh secret delete TOKEN --repo o/r", true),
+            ("gh issue delete 12 --yes", true),
+            ("gh repo deploy-key delete 7", true),
+            ("gh cache delete --all", true),
+            ("glab variable delete TOKEN", true),
+            ("glab ci delete 4242", true),
+            ("glab issue delete 12", true),
+            ("gh search issues delete --repo o/r", false),
+            ("gh issue list --label delete", false),
             ("gh pr view 12", false),
             ("glab mr view 12", false),
             ("gh pr create --fill", false),
