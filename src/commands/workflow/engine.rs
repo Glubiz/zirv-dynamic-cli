@@ -1861,6 +1861,16 @@ pub fn advance_with_evidence(
     event.sidechain_cache_read_input_tokens = evidence.sidechain_cache_read_input_tokens;
     event.sidechain_output_tokens = evidence.sidechain_output_tokens;
     event.session_id = evidence.session_id;
+    // Issue #264: this process's own supervising session, if the delegated
+    // worker running this workflow step was told one (`agent::PARENT_
+    // SESSION_ENV`, set by `agent::run_with`/`dash::mod::fulfill_spawn_
+    // request` at spawn time) -- what makes a delegation tree's cost
+    // attributable up the chain, not just down to the leaf that ran it.
+    // `None` for an orchestrator running this step directly (no parent to
+    // report), the same "read fresh from this process's own env, never
+    // cached" discipline `agent::parent_identity`'s own doc comment holds.
+    event.parent_session_id =
+        crate::commands::ctx::agent::parent_identity(&|key| std::env::var(key).ok());
     event.verification_unchanged = evidence.verification_unchanged;
     event.succeeded = Some(outcome == StepOutcome::Success);
     event.findings_total = findings_total;
@@ -1868,6 +1878,13 @@ pub fn advance_with_evidence(
     event.findings_dismissed = findings_dismissed;
     event.fix_round = state.attempts.get(&current.id).copied().unwrap_or(0);
     event.worker_count = evidence.worker_count;
+    // Issue #264: best-effort -- a config load failure here must never fail
+    // `advance` itself, so it degrades to the built-in price table (no
+    // operator override) rather than propagating the error.
+    let price_cfg =
+        crate::commands::ctx::config::CtxConfig::load(&state.repo, &|key| std::env::var(key).ok())
+            .unwrap_or_default();
+    event.apply_price(&crate::commands::ctx::price::resolve_table(&price_cfg));
     let _ = super::telemetry::record(
         state_dir,
         &state.repo,
@@ -2710,6 +2727,14 @@ pub(crate) struct AutoSpawn {
     /// WorkerMode`]'s own default, so this field only ever needs to name the
     /// exception, not the rule.
     pub mode: crate::commands::ctx::permit::WorkerMode,
+    /// Issue #264: the task class this auto-spawn's own work is, alongside
+    /// `mode` above -- for a future caller that threads it onto the
+    /// delegation this ultimately becomes (`zirv ctx agent --task-class`).
+    /// Not yet consumed by `spawn_auto_worker` itself (this call spawns a
+    /// `zirv workflow review run`/`test changed`/`verify` subprocess
+    /// directly, not `zirv ctx agent`), the same not-yet-wired parity `mode`
+    /// already holds for this exact call.
+    pub task_class: crate::commands::ctx::log::TaskClass,
 }
 
 /// Why a gate transition that WOULD otherwise be eligible (right phase,
@@ -2785,6 +2810,15 @@ pub(crate) fn auto_spawn_decision(
         phase,
         argv,
         mode: crate::commands::ctx::permit::WorkerMode::ReadOnly,
+        // Issue #264: Review is its own class; Test and Verify are both
+        // "did the checkout pass" work, so both map to `TaskClass::Test`.
+        task_class: match phase {
+            WorkflowPhase::Review => crate::commands::ctx::log::TaskClass::Review,
+            WorkflowPhase::Test | WorkflowPhase::Verify => {
+                crate::commands::ctx::log::TaskClass::Test
+            }
+            _ => unreachable!("filtered above"),
+        },
     })
 }
 
@@ -3682,6 +3716,11 @@ mod tests {
             "issue #267: a review spawn is read-only"
         );
         assert_eq!(
+            review.task_class,
+            crate::commands::ctx::log::TaskClass::Review,
+            "issue #264: a review-phase auto-spawn is classified as review"
+        );
+        assert_eq!(
             review.argv,
             vec![
                 "workflow",
@@ -3735,6 +3774,11 @@ mod tests {
             "issue #267: a test spawn is read-only"
         );
         assert_eq!(
+            test.task_class,
+            crate::commands::ctx::log::TaskClass::Test,
+            "issue #264: a test-phase auto-spawn is classified as test"
+        );
+        assert_eq!(
             test.argv,
             vec![
                 "test",
@@ -3758,6 +3802,11 @@ mod tests {
             "issue #267: a verify spawn is read-only"
         );
         assert_eq!(
+            verify.task_class,
+            crate::commands::ctx::log::TaskClass::Test,
+            "issue #264: a verify-phase auto-spawn is classified as test"
+        );
+        assert_eq!(
             verify.argv,
             vec!["verify", "--repo", &state.repo.display().to_string()]
         );
@@ -3772,6 +3821,65 @@ mod tests {
         assert_eq!(auto_spawn_skip_reason(AutoSpawnSkip::Quiet), None);
         assert!(auto_spawn_skip_reason(AutoSpawnSkip::NoPermit).is_some());
         assert!(auto_spawn_skip_reason(AutoSpawnSkip::NoAgent).is_some());
+    }
+
+    /// Issue #264: `advance_with_evidence`'s own `PhaseCompleted` event
+    /// carries `parent_session_id` (read fresh from `agent::PARENT_SESSION_
+    /// ENV`, never invented) and `cost_micros`/`price_as_of` (priced from
+    /// `evidence.model` plus its token counts) -- the two attribution fields
+    /// the cost ledger needs to answer "who spent this, and how much".
+    #[test]
+    fn advance_with_evidence_records_parent_session_and_cost_on_its_telemetry_event() {
+        let repo = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+        let _vars = crate::commands::ctx::testenv::VarGuard::set(&[(
+            crate::commands::ctx::agent::PARENT_SESSION_ENV,
+            Some("aaaa1111"),
+        )]);
+        let state = skip_leading_artifact_steps(WorkflowState::start(
+            repo.path().to_path_buf(),
+            "small feature".into(),
+            WorkflowKind::Feature,
+            None,
+            true,
+            low_classification(),
+        ));
+        save(&state_dir, &state, true).unwrap();
+
+        let evidence = TransitionEvidence {
+            model: Some("sonnet".to_string()),
+            // Combined context total 1_000_000 = 1_000_000 raw input, no
+            // cache -- 1_000_000 tokens @ $3/M (sonnet) = $3.00 = 3_000_000
+            // micros.
+            input_tokens: Some(1_000_000),
+            output_tokens: Some(0),
+            ..Default::default()
+        };
+        let advanced = advance_with_evidence(
+            &state_dir,
+            state,
+            StepOutcome::Success,
+            Some(&evidence),
+            false,
+        )
+        .unwrap();
+
+        let events = crate::commands::workflow::telemetry::list(&state_dir, &advanced.repo)
+            .unwrap_or_default();
+        let phase_completed = events
+            .iter()
+            .find(|event| {
+                event.kind == crate::commands::workflow::telemetry::TelemetryKind::PhaseCompleted
+            })
+            .expect("a PhaseCompleted event was recorded");
+        assert_eq!(
+            phase_completed.parent_session_id.as_deref(),
+            Some("aaaa1111"),
+            "parent_session_id must be read from PARENT_SESSION_ENV, never left None when set"
+        );
+        assert_eq!(phase_completed.cost_micros, Some(3_000_000));
+        assert!(phase_completed.price_as_of.is_some());
     }
 
     #[test]

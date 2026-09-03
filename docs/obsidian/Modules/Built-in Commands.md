@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-09-02
+last-verified: 2026-09-03
 ---
 
 # Built-in Commands
@@ -155,6 +155,10 @@ A zirv-managed native `CLAUDE.md`/`AGENTS.md` (a verbatim render of canonical co
 ### `zirv ctx objective set|show|close`, and `--objective` on `exec`/`loop` (issue #285, v3.11.0)
 
 A new `zirv ctx objective` verb tree persists a durable, repo-scoped objective independent of any one running session -- `set <text> [--budget-tokens N] [--deadline-secs N]`, `show`, `close`. `--objective <text>` on `zirv ctx exec`/`zirv ctx loop` sets it inline at launch. The record (one per repo, at `<state>/objective/<repo_slug>.json`) is folded into the composed prompt as its own layer on every launch and restart, so it survives a rot restart, a handover, or a nudge relaunch -- see [[Ctx Subsystem]]'s `objective` verb entry, [[Ctx Supervisors]] for the re-injection cadence, and [[Context Management]] for the layer itself. `objective close` refuses unless the repo's latest verification evidence is fresh and passing -- an objective is never marked complete on a session's own say-so.
+
+### `zirv ctx spend`, and cost lines on `status`/`workflow stats`/the dashboard (issue #264, v3.12.0)
+
+A new read-only `zirv ctx spend [--session <short>] [--group <id>] [--since <24h|30m|7d|Ns>] [--by harness|model|task-class|worker] [--json]` verb aggregates `delegations.jsonl` -- `runs · ok · failed · input · cache-read · cache-write · output · wall · cost` per group plus a totals row, cost-descending then name-ascending, deterministic regardless of on-disk row order; `--json` carries a versioned `"schema": 1`. Cost is priced (`price::price`, integer micro-USD, never a float) from a built-in per-model table an operator can override wholesale via `~/.zirv/prices.toml` (or `[price] table_path`), both `REPO_FORBIDDEN` alongside `[price] stale_after_days` -- a stale table prefixes every cost figure with `~`. `zirv ctx status` gains one `spend: $x this session · $y this 5h window (prices as of ...)` line (`--brief` output unchanged in byte size otherwise); `zirv workflow stats` gains a `cost: ...` line per phase, per workflow, and overall, printing `no data` rather than a manufactured `$0.00` when nothing in that group ever priced; the dashboard gains an aggregate row above its own roster, `workers N running · M failed · $x · five_hour P%`, where a cell with no live source renders `--`, never a default number. `Delegation`/`DelegationRow` also gained an optional `task_class` (`review`/`test`/`implement`/`research`/`other`), settable via `zirv ctx agent --task-class` or derived automatically for the workflow engine's own auto-spawned review/test/verify workers. See [[Ctx Subsystem]]'s `spend` verb entry, [[Usage and Pacing]]'s "Cost ledger" section, and [[Ctx Supervisors]] for the dashboard's own aggregate row.
 
 ### `zirv chat`/bare `zirv` default to the dashboard on a capable terminal
 
