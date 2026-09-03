@@ -1211,8 +1211,8 @@ enough to change what zirv executes. `<repo>/.zirv/ctx.toml` may not set
 `optimize.model`, `sandbox.enabled`, `prompt.enabled`, `prompt.repo_layer`,
 `prompt.max_repo_bytes`, `prompt.harnesses`, `prompt.codex_orchestrator`, `mail.enabled`,
 `mail.max_delivered_bytes`, `chrome.events`, any `memory.*` key, any
-`dash.*` key, any `pace.*` key, `review`, `worker`, `handover`, or any of the
-five keys that feed the token gate (`score.token_floor`,
+`dash.*` key, any `pace.*` key, any `price.*` key, `review`, `worker`,
+`handover`, or any of the five keys that feed the token gate (`score.token_floor`,
 `score.token_ceiling`, `score.token_floor_ratio`, `score.token_ceiling_ratio`,
 `score.model_context_tokens`); doing so is an error
 that names the key. Set those in `~/.zirv/ctx.toml`, or with the matching
@@ -1295,6 +1295,8 @@ checkout:
 | `workflow.review_worker_max_tool_calls` | `ZIRV_CTX_WORKFLOW_REVIEW_WORKER_MAX_TOOL_CALLS` |
 | `workflow.auto_spawn_on_gate` | `ZIRV_CTX_WORKFLOW_AUTO_SPAWN_ON_GATE` |
 | `workflow.allow_empty_verify` | `ZIRV_CTX_WORKFLOW_ALLOW_EMPTY_VERIFY` |
+| `price.stale_after_days` | `ZIRV_CTX_PRICE_STALE_AFTER_DAYS` |
+| `price.table_path` | `ZIRV_CTX_PRICE_TABLE_PATH` |
 
 The `mail.*`/`chrome.events` entries close the same hole `prompt.max_repo_bytes`
 does: mail is folded into a launched worker's prompt as its own layer, so a
