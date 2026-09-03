@@ -187,14 +187,15 @@ pub struct CompiledContext {
 /// Built entirely from data [`CompiledContext`] already holds and the exact
 /// literal header constants `prompt.rs`'s own `with_*_layer` functions write
 /// (`CONTEXT_LAYER_HEADER`, `HARNESS_ROSTER_LAYER_HEADER`, `WORKFLOW_LAYER_
-/// HEADER`, `MEMORY_PRIVATE_LAYER_HEADER`/`MEMORY_SHARED_LAYER_HEADER`) --
-/// **no file is read again** to build this list, only `composed.text` and
-/// `composed.sources`, both already in memory. Issue #275 (`zirv context
-/// lint`) is the first consumer (CTX004 proportionality over the built-in
-/// `Default`/`Harness` blocks, sliced straight out of an already-compiled
-/// prompt); issue #299 (prefix-stability tests) is expected to reuse this
-/// same accessor rather than re-deriving layer boundaries its own way --
-/// name/shape changes here should keep both in mind.
+/// HEADER`, `MEMORY_PRIVATE_LAYER_HEADER`/`MEMORY_SHARED_LAYER_HEADER`,
+/// `PEER_MAIL_HEADER`/`PARENT_MAIL_HEADER`) -- **no file is read again** to
+/// build this list, only `composed.text` and `composed.sources`, both
+/// already in memory. Issue #275 (`zirv context lint`) is the first consumer
+/// (CTX004 proportionality over the built-in `Default`/`Harness` blocks,
+/// sliced straight out of an already-compiled prompt); issue #299 (prefix-
+/// stability tests) is the second, and is what the `Mail` arm below exists
+/// for -- `layers_of`'s original five anchors did not cover it, extended
+/// here rather than kept as a second, parallel walk.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EmittedLayer {
     pub source: PromptSource,
@@ -205,8 +206,8 @@ pub struct EmittedLayer {
     /// `Harness` are fixed built-in text with no operator knob; `Context`'s
     /// two sub-budgets (`context.max_common_bytes`/`max_harness_bytes`) are
     /// already reported per-file by `CompiledContext::provenance` instead of
-    /// once for the combined block; `Workflow`/`Memory`/`Objective` are
-    /// uncapped or capped by a sum of two keys, not one.
+    /// once for the combined block; `Workflow`/`Memory`/`Mail`/`Objective`
+    /// are uncapped or capped by a sum of two keys, not one.
     pub budget_key: Option<&'static str>,
 }
 
@@ -267,7 +268,7 @@ impl CompiledContext {
                 // sub-budgets are already reported per-file by `provenance`,
                 // so this range covers the whole block with no single budget
                 // key of its own -- its end is resolved in the second pass,
-                // like `Workflow`/`Memory` below.
+                // like `Workflow`/`Memory`/`Mail` below.
                 PromptSource::Context => find_after(text, cursor, CONTEXT_LAYER_HEADER)
                     .map(|header_at| (header_at + CONTEXT_LAYER_HEADER.len(), None, None)),
                 PromptSource::Workflow => find_after(text, cursor, prompt::WORKFLOW_LAYER_HEADER)
@@ -285,6 +286,21 @@ impl CompiledContext {
                         })
                         .map(|start| (start, None, None))
                 }
+                // Issue #299: the one extension `layers_of`'s original five
+                // anchors did not need yet. A peer message gets `PEER_MAIL_
+                // HEADER`; a solitary message from this session's own
+                // supervisor instead gets `PARENT_MAIL_HEADER` (`with_mail_
+                // layer`'s own doc comment) -- try both, in the order `with_
+                // mail_layer` itself would ever actually write one, the same
+                // pattern `Memory` above already uses for its own two
+                // possible headers.
+                PromptSource::Mail => find_after(text, cursor, prompt::PEER_MAIL_HEADER)
+                    .map(|at| at + prompt::PEER_MAIL_HEADER.len())
+                    .or_else(|| {
+                        find_after(text, cursor, prompt::PARENT_MAIL_HEADER)
+                            .map(|at| at + prompt::PARENT_MAIL_HEADER.len())
+                    })
+                    .map(|start| (start, None, None)),
                 // `with_objective_layer` writes no separator/header of its
                 // own (unlike every layer above), so it has no literal to
                 // search for -- but it is documented (see `PromptSource::
@@ -338,7 +354,6 @@ impl CompiledContext {
 fn find_after(haystack: &str, from: usize, needle: &str) -> Option<usize> {
     haystack[from..].find(needle).map(|at| from + at)
 }
-
 /// Gathers the always-present core memory layer and the independent,
 /// context-ranked retrieval layer. Core selection remains private-first and
 /// capped by `core_max_bytes`; retrieval uses changed repository paths as its
@@ -1263,8 +1278,185 @@ pub fn run<W: std::io::Write>(args: &CompileArgs, w: &mut W) -> CtxResult<i32> {
     run_with(args, w, &repo, &env)
 }
 
+/// Issue #299 (prompt-prefix stability harness): the comparison/offset
+/// helper the assertion half of the harness needs, shared between this
+/// module's own tests and `prompt.rs`'s (`crate::commands::ctx::compile::
+/// test_support::prefix_diff`) -- a plain module rather than nested inside
+/// `mod tests` below, since a private `mod tests` is not visible outside
+/// this file and `prompt.rs`'s tests need to call this too.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::fmt::Write as _;
+
+    /// Bytes either side of a diverging offset this module's failure
+    /// messages render -- "prefix drifted" with no offset and no context is
+    /// not actionable (issue #299's own design).
+    const CONTEXT_RADIUS: usize = 32;
+
+    /// One byte-exact place two prompts diverge: the first differing byte
+    /// offset, plus [`CONTEXT_RADIUS`] bytes either side of it from both
+    /// inputs, rendered as escaped bytes so a non-printable or non-UTF-8
+    /// byte can still be read out of a panic message.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) struct PrefixDiff {
+        pub(crate) offset: usize,
+        pub(crate) context_a: String,
+        pub(crate) context_b: String,
+    }
+
+    fn escape_window(bytes: &[u8], at: usize) -> String {
+        let start = at.saturating_sub(CONTEXT_RADIUS);
+        let end = (at + CONTEXT_RADIUS).min(bytes.len());
+        let mut out = String::new();
+        for &b in &bytes[start..end] {
+            match b {
+                b'\n' => out.push_str("\\n"),
+                b'\r' => out.push_str("\\r"),
+                b'\t' => out.push_str("\\t"),
+                0x20..=0x7e => out.push(b as char),
+                other => {
+                    let _ = write!(out, "\\x{other:02x}");
+                }
+            }
+        }
+        out
+    }
+
+    /// The first byte offset at which `a` and `b` diverge -- `None` when the
+    /// two are byte-identical. A shared length prefix followed by one input
+    /// simply ending (one is a strict prefix of the other) also counts as a
+    /// divergence, at the shorter input's own length: bytes that only one
+    /// side ever sent are still a broken prefix guarantee, not a match.
+    ///
+    /// No normalisation of any kind: this compares the exact bytes handed
+    /// in, which is the whole point of a byte-exact stability harness.
+    pub(crate) fn prefix_diff(a: &[u8], b: &[u8]) -> Option<PrefixDiff> {
+        let offset = match a.iter().zip(b.iter()).position(|(x, y)| x != y) {
+            Some(i) => i,
+            None if a.len() != b.len() => a.len().min(b.len()),
+            None => return None,
+        };
+        Some(PrefixDiff {
+            offset,
+            context_a: escape_window(a, offset),
+            context_b: escape_window(b, offset),
+        })
+    }
+
+    #[test]
+    fn identical_slices_have_no_prefix_diff() {
+        assert_eq!(prefix_diff(b"same bytes", b"same bytes"), None);
+    }
+
+    #[test]
+    fn a_one_byte_difference_is_found_at_its_exact_offset() {
+        let a = b"the quick brown fox";
+        let b = b"the quick brOwn fox";
+        let diff = prefix_diff(a, b).expect("must find the divergence");
+        assert_eq!(diff.offset, 12);
+        assert!(diff.context_a.contains('b'));
+        assert!(diff.context_b.contains('O'));
+    }
+
+    #[test]
+    fn one_input_ending_early_is_a_divergence_at_its_own_length() {
+        let a = b"prefix";
+        let b = b"prefix and more";
+        let diff = prefix_diff(a, b).expect("a strict prefix still diverges");
+        assert_eq!(diff.offset, a.len());
+    }
+
+    #[test]
+    fn non_utf8_bytes_are_rendered_escaped_rather_than_panicking() {
+        let a = [b'x', 0xff, b'y'];
+        let b = [b'x', 0xfe, b'y'];
+        let diff = prefix_diff(&a, &b).expect("must find the divergence");
+        assert_eq!(diff.offset, 1);
+        assert!(diff.context_a.contains("\\xff"));
+        assert!(diff.context_b.contains("\\xfe"));
+    }
+
+    /// Issue #299's "declared suffix" gate: a state change (memory harvest,
+    /// roster refresh, mail arrival) may perturb its OWN emitted layer and
+    /// everything after it, but must never move a byte ahead of that layer's
+    /// own declared start in the 'before' compose. Panics with the first
+    /// differing byte offset, escaped context either side, and the layer's
+    /// own declared start when a change reaches further back than that --
+    /// "prefix drifted" with no offset is not actionable (this module's own
+    /// design note).
+    pub(crate) fn assert_change_confined_to_layer(
+        before: &str,
+        after: &str,
+        source: super::PromptSource,
+        layers_before: &[super::EmittedLayer],
+    ) {
+        let layer = layers_before
+            .iter()
+            .find(|l| l.source == source)
+            .unwrap_or_else(|| {
+                panic!("expected an emitted {source:?} layer in the 'before' compose: {layers_before:?}")
+            });
+        match prefix_diff(before.as_bytes(), after.as_bytes()) {
+            None => panic!(
+                "expected the {source:?} layer to actually change between before/after, but the \
+                 two composed prompts are byte-identical"
+            ),
+            Some(diff) => assert!(
+                diff.offset >= layer.range.start,
+                "{source:?} change moved the declared prefix boundary: first differing byte at \
+                 offset {}, but {source:?} does not start until byte {} -- before: {:?}  \
+                 after: {:?}",
+                diff.offset,
+                layer.range.start,
+                diff.context_a,
+                diff.context_b
+            ),
+        }
+    }
+
+    /// Wraps a bare `ComposedPrompt` (built directly by `prompt::compose`/
+    /// `with_mail_layer`, the way `prompt.rs`'s own tests already build one,
+    /// with no full compile pipeline to hand) into the minimal `CompiledContext`
+    /// `CompiledContext::emitted_layers` needs -- so a test that only wants
+    /// layer attribution over a hand-built prompt does not have to drive a
+    /// real `compile`/`compile_with_harness_roster` call (adapter probing,
+    /// memory bank, state dir) just to get one. `policy`/`provenance`/
+    /// `core_memory`/`retrieved_memory` are throwaway values no attribution
+    /// test reads; `harness_roster` is the one field `emitted_layers` itself
+    /// actually consults (for the `Harnesses` layer's own end/budget key), so
+    /// it is the one real parameter here.
+    pub(crate) fn compiled_for_layers(
+        composed: Option<super::ComposedPrompt>,
+        harness_roster: Option<super::prompt::HarnessRosterInjection>,
+    ) -> super::CompiledContext {
+        super::CompiledContext {
+            composed,
+            policy: super::PolicyReport {
+                adapter: "test",
+                mode: super::adapters::LaunchMode::Headless,
+                outcomes: Vec::new(),
+            },
+            provenance: Vec::new(),
+            core_memory: super::prompt::MemoryInjectionSummary {
+                total_entries: 0,
+                selected_entries: 0,
+                injected_bytes: 0,
+                omitted_entries: 0,
+            },
+            retrieved_memory: super::prompt::MemoryInjectionSummary {
+                total_entries: 0,
+                selected_entries: 0,
+                injected_bytes: 0,
+                omitted_entries: 0,
+            },
+            harness_roster,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::test_support::{self, prefix_diff};
     use super::*;
     use crate::commands::ctx::adapters::LaunchMode;
     use crate::commands::ctx::adapters::claude::ClaudeAdapter;
@@ -3171,6 +3363,365 @@ mod tests {
             table.contains(&measure_row("total (session prefix)", total, "")),
             "got:\n{table}"
         );
+    }
+
+    // -- Issue #299: prompt-prefix stability harness ------------------------
+
+    /// Acceptance criterion 1/criterion "prefix identity": across N turns of
+    /// one session with identical inputs, the composed prompt is byte
+    /// identical every time. `compiling_twice_with_identical_inputs_is_
+    /// deterministic` above already proves this for two calls; this pins the
+    /// same property across three, using the issue's own comparison helper
+    /// (`prefix_diff`) so a regression names the exact diverging byte rather
+    /// than just failing an `assert_eq!`.
+    #[test]
+    fn the_composed_prompt_is_byte_identical_across_repeated_compiles_of_one_session() {
+        let repo = repo_with_context_files(&[
+            (
+                "common.md",
+                "Always run the full test suite before committing.\n",
+            ),
+            (
+                "claude.md",
+                "Prefer the native tool-use loop over shell escapes.\n",
+            ),
+        ]);
+        let cfg = CtxConfig::default();
+        let adapter = ClaudeAdapter::new(None);
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+        let now = now_secs();
+
+        let turns: Vec<String> = (0..3)
+            .map(|_| {
+                compile(
+                    None,
+                    repo.path(),
+                    false,
+                    &cfg,
+                    &adapter,
+                    PromptRole::Worker,
+                    &state,
+                    now,
+                    LaunchMode::Headless,
+                    false,
+                )
+                .composed
+                .expect("composed")
+                .text
+            })
+            .collect();
+
+        for (i, pair) in turns.windows(2).enumerate() {
+            if let Some(diff) = prefix_diff(pair[0].as_bytes(), pair[1].as_bytes()) {
+                panic!(
+                    "turn {} and turn {} of one session diverge at byte offset {}: \
+                     before {:?}  after {:?}",
+                    i + 1,
+                    i + 2,
+                    diff.offset,
+                    diff.context_a,
+                    diff.context_b
+                );
+            }
+        }
+    }
+
+    /// Acceptance criterion: "`common.md` exceeding 4096 bytes fails a test,
+    /// not just the truncator." `context.max_common_bytes` defaults to 4096
+    /// (`config.rs`) and today's truncator (`cap_context_layer`) only cuts
+    /// silently at injection time; this makes the budget a build-time gate
+    /// too, printing the exact headroom (positive when under budget, negative
+    /// when over it) so a change that pushes the file over the line is
+    /// obvious from the failure message alone. `CARGO_MANIFEST_DIR`-relative,
+    /// like the issue asks, so this runs the same from any working directory.
+    #[test]
+    fn common_md_stays_under_its_injection_budget() {
+        const MAX_COMMON_BYTES: usize = 4096;
+        let common = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/.zirv/context/common.md"
+        ));
+        let len = common.len();
+        let headroom = MAX_COMMON_BYTES as i64 - len as i64;
+        assert!(
+            len < MAX_COMMON_BYTES,
+            "'.zirv/context/common.md' is {len} bytes, at or over the {MAX_COMMON_BYTES}-byte \
+             context.max_common_bytes injection budget ({headroom} bytes of headroom) -- the \
+             truncator would silently cut it at runtime; shorten the file instead of relying on \
+             that."
+        );
+    }
+
+    /// Acceptance criterion: "A memory harvest between turns perturbs the
+    /// suffix only; a test proves it." One private memory entry is present
+    /// for both compiles (so the Memory layer's own declared start is
+    /// locatable in the 'before' compose via `emitted_layers`); harvesting a
+    /// second entry between them changes the Memory layer's own content but
+    /// must not move a single byte ahead of its declared start.
+    #[test]
+    fn a_memory_harvest_between_compiles_perturbs_only_the_declared_suffix() {
+        let repo = repo_with_context_files(&[("common.md", "Shared instruction.\n")]);
+        let cfg = CtxConfig::default();
+        let adapter = ClaudeAdapter::new(None);
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+        let slug = super::super::state::repo_slug(repo.path());
+        let now = 1_700_000_000;
+
+        let seed_entry = |key: &str, body: &str, written: u64| memory::Entry {
+            key: key.to_string(),
+            written_by: "test".to_string(),
+            written,
+            verified: written,
+            source: "explicit".to_string(),
+            body: body.to_string(),
+            importance: None,
+            confidence: None,
+            tags: Vec::new(),
+            paths: Vec::new(),
+        };
+        memory::upsert_scoped(
+            memory::MemoryScope::Private,
+            repo.path(),
+            &state,
+            &slug,
+            &cfg,
+            &seed_entry("deploy-cmd", "zirv deploy", now),
+        )
+        .expect("seed remember");
+
+        // `compile` directly, not `compile_for`: that helper mints its own
+        // fresh, throwaway `StateDir` per call, so the memory this test
+        // seeds into its own `state` above would never be read back.
+        let before = compile(
+            None,
+            repo.path(),
+            false,
+            &cfg,
+            &adapter,
+            PromptRole::Worker,
+            &state,
+            now,
+            LaunchMode::Headless,
+            false,
+        );
+        let before_text = before.composed.as_ref().expect("composed").text.clone();
+        let before_layers = before.emitted_layers();
+
+        // The harvest: a second private entry lands between two compiles of
+        // the same session.
+        memory::upsert_scoped(
+            memory::MemoryScope::Private,
+            repo.path(),
+            &state,
+            &slug,
+            &cfg,
+            &seed_entry("test-cmd", "cargo nextest run", now + 1),
+        )
+        .expect("harvest remember");
+
+        let after = compile(
+            None,
+            repo.path(),
+            false,
+            &cfg,
+            &adapter,
+            PromptRole::Worker,
+            &state,
+            now + 1,
+            LaunchMode::Headless,
+            false,
+        );
+        let after_text = after.composed.as_ref().expect("composed").text.clone();
+
+        test_support::assert_change_confined_to_layer(
+            &before_text,
+            &after_text,
+            PromptSource::Memory,
+            &before_layers,
+        );
+    }
+
+    /// Splits a `FAKE_AGENT_PROMPT_LOG` file into its framed per-run records:
+    /// each frame is `\x1e<turn-index>\x1e<raw payload bytes>`, payload
+    /// running until the next frame's leading `\x1e` or end of file.
+    #[cfg(unix)]
+    fn parse_framed_prompt_log(bytes: &[u8]) -> Vec<Vec<u8>> {
+        const RS: u8 = 0x1e;
+        let mut records = Vec::new();
+        let mut i = 0usize;
+        while i < bytes.len() {
+            assert_eq!(
+                bytes[i], RS,
+                "expected a record-separator frame at byte {i}: {bytes:?}"
+            );
+            i += 1;
+            let idx_end = bytes[i..]
+                .iter()
+                .position(|&b| b == RS)
+                .unwrap_or_else(|| panic!("frame missing its closing separator: {bytes:?}"))
+                + i;
+            i = idx_end + 1;
+            let payload_end = bytes[i..]
+                .iter()
+                .position(|&b| b == RS)
+                .map(|p| p + i)
+                .unwrap_or(bytes.len());
+            records.push(bytes[i..payload_end].to_vec());
+            i = payload_end;
+        }
+        records
+    }
+
+    #[cfg(unix)]
+    fn fixture_path(name: &str) -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join(name)
+    }
+
+    /// Acceptance criterion: "fixture-driven: two turns through the fake
+    /// agent produce two framed records whose prefixes match." Real
+    /// production code end to end: `compile` builds the composed prompt,
+    /// `prompt::injection_args_for_session` turns it into the exact argv
+    /// zirv would hand the real `claude` binary
+    /// (`--append-system-prompt <text>`, forced off the file path via the
+    /// adapter's own test seam so this test does not depend on a real
+    /// `claude --help` probe), and `fake-agent.sh` -- the same fixture the
+    /// rest of this suite's `#[cfg(unix)]` tests already drive -- logs the
+    /// bytes it was actually hands. Two identical-input launches must
+    /// produce two byte-identical records.
+    #[cfg(unix)]
+    #[test]
+    fn two_turns_through_the_fake_agent_produce_matching_prefixes() {
+        let repo = repo_with_context_files(&[("common.md", "Stable canonical instruction.\n")]);
+        let cfg = CtxConfig::default();
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+        let now = now_secs();
+        let program = format!("sh {}", fixture_path("fake-agent.sh").display());
+        let adapter = ClaudeAdapter::new(Some(program.as_str())).with_file_support_forced(false);
+
+        let home = tempfile::tempdir().expect("home");
+        let prompt_log = home.path().join("prompt.log");
+
+        for _ in 0..2 {
+            let compiled = compile(
+                None,
+                repo.path(),
+                false,
+                &cfg,
+                &adapter,
+                PromptRole::Worker,
+                &state,
+                now,
+                LaunchMode::Headless,
+                false,
+            );
+            let composed = compiled.composed.as_ref().expect("composed");
+            let extra = crate::commands::ctx::prompt::injection_args_for_session(
+                &adapter,
+                &[],
+                Some(composed),
+                &state,
+                "sess-1",
+            )
+            .expect("injection args");
+
+            let output = std::process::Command::new("sh")
+                .arg(fixture_path("fake-agent.sh"))
+                .arg("-p")
+                .arg("do the thing")
+                .arg("--session-id")
+                .arg("11111111-2222-4333-8444-555555555555")
+                .args(&extra)
+                .env("HOME", home.path())
+                .env("FAKE_AGENT_PROMPT_LOG", &prompt_log)
+                .env("FAKE_AGENT_TURNS", "1")
+                .output()
+                .expect("spawn fake agent");
+            assert!(
+                output.status.success(),
+                "fake agent exited {:?}: stdout={} stderr={}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        let log = std::fs::read(&prompt_log).expect("read prompt log");
+        let records = parse_framed_prompt_log(&log);
+        assert_eq!(records.len(), 2, "expected two framed records: {log:?}");
+        if let Some(diff) = prefix_diff(&records[0], &records[1]) {
+            panic!(
+                "turn 1 and turn 2 fake-agent prompt records diverge at byte offset {}: \
+                 before {:?}  after {:?}",
+                diff.offset, diff.context_a, diff.context_b
+            );
+        }
+    }
+
+    /// Acceptance criterion: "A deliberately injected one-byte prefix change
+    /// fails with the correct first-differing offset and owning layer."
+    /// Directly exercises `prefix_diff` and `emitted_layers` -- the pure
+    /// comparison/offset helper and the layer-attribution accessor a real
+    /// assertion helper (`test_support::assert_change_confined_to_layer`
+    /// above) builds its failure message from -- rather than asserting on a
+    /// panic message string.
+    #[test]
+    fn a_one_byte_prefix_change_reports_the_exact_offset_and_owning_layer() {
+        let repo_a = repo_with_context_files(&[("common.md", "Common instruction Alpha.\n")]);
+        let repo_b = repo_with_context_files(&[("common.md", "Common instruction Blpha.\n")]);
+        let cfg = CtxConfig::default();
+        let adapter = ClaudeAdapter::new(None);
+
+        let compiled_a = compile_for(repo_a.path(), &cfg, &adapter, PromptRole::Worker);
+        let compiled_b = compile_for(repo_b.path(), &cfg, &adapter, PromptRole::Worker);
+        let text_a = compiled_a.composed.as_ref().expect("composed").text.clone();
+        let text_b = compiled_b.composed.as_ref().expect("composed").text.clone();
+
+        let diff = prefix_diff(text_a.as_bytes(), text_b.as_bytes())
+            .expect("the injected byte must be found as a divergence");
+        assert!(
+            diff.context_a.contains("Alpha"),
+            "context around the offset must show the original byte: {:?}",
+            diff.context_a
+        );
+        assert!(
+            diff.context_b.contains("Blpha"),
+            "context around the offset must show the injected byte: {:?}",
+            diff.context_b
+        );
+
+        let layers = compiled_a.emitted_layers();
+        let owner = layers
+            .iter()
+            .find(|l| l.range.contains(&diff.offset))
+            .unwrap_or_else(|| {
+                panic!(
+                    "offset {} not covered by any emitted layer: {layers:?}",
+                    diff.offset
+                )
+            });
+        assert_eq!(
+            owner.source,
+            PromptSource::Context,
+            "the injected byte sits inside common.md's own canonical-context layer, not {:?}",
+            owner.source
+        );
+
+        // The failure message an assertion helper would actually print.
+        let message = format!(
+            "prefix drifted at byte offset {}, owning layer: {}\n  before: {:?}\n  after:  {:?}",
+            diff.offset,
+            owner.source.label(),
+            diff.context_a,
+            diff.context_b
+        );
+        assert!(message.contains(&diff.offset.to_string()));
+        assert!(message.contains("canonical context"));
     }
 
     // -- `CompiledContext::emitted_layers` (issue #275) ----------------------
