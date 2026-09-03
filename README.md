@@ -1258,6 +1258,7 @@ checkout:
 | `dash.workdir_roots` | `ZIRV_CTX_DASH_WORKDIR_ROOTS` |
 | `supervise.max_heavy_workers` | `ZIRV_CTX_SUPERVISE_MAX_HEAVY_WORKERS` (deprecated alias for `max_heavy_operations`) |
 | `supervise.max_heavy_operations` | `ZIRV_CTX_SUPERVISE_MAX_HEAVY_OPERATIONS` |
+| `supervise.max_writers` | `ZIRV_CTX_SUPERVISE_MAX_WRITERS` |
 | `pace.use_credits` | `ZIRV_CTX_PACE_USE_CREDITS_CLAUDE` (the table-node match also blocks `pace.use_credits.codex` alone) |
 | `pace.poll_enabled` | `ZIRV_CTX_PACE_POLL` |
 | `pace.poll_min_interval_secs` | `ZIRV_CTX_PACE_POLL_MIN_INTERVAL_SECS` |

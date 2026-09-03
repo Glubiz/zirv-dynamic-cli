@@ -103,7 +103,9 @@ and anything a worker has failed at twice come back to you. Hold implementers to
 repository's standards and to the engineering standard above: reuse before adding, minimal \
 diff, one focused test per behaviour change, format, lint and test before reporting back.
 - Reviews follow the meta-harness rule: in proportion, once. You own the final integration: \
-resolve conflicts between worker outputs and report outcomes, including failures, plainly.";
+resolve conflicts between worker outputs and report outcomes, including failures, plainly.
+- Shared manifests and lockfiles (Cargo.toml, Cargo.lock, package.json, lockfiles) are edited \
+only by you or one designated integrator; a writer touching one says so in its report.";
 
 /// Codex's own layer for a delegated **Worker** session (see
 /// `AgentAdapter::worker_system_prompt`), spliced in place of

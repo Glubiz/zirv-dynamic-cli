@@ -716,6 +716,60 @@ mod tests {
         }
     }
 
+    /// Issue #267: `--mode` unstated defaults to `Writing` -- a wrong
+    /// `read-only` silently drops real edits, which is worse than a wrong
+    /// `writing` holding a writer-permit slot it did not need.
+    #[test]
+    fn agent_verb_mode_defaults_to_writing() {
+        let cli = CtxCli::try_parse_from(["zirv ctx", "agent", "claude", "go"])
+            .expect("agent should parse with no --mode at all");
+        match cli.verb {
+            CtxVerb::Agent(args) => {
+                assert_eq!(args.mode, permit::WorkerMode::Writing);
+                assert!(!args.worktree);
+            }
+            other => panic!("expected Agent, got {other:?}"),
+        }
+    }
+
+    /// `--mode read-only` and `--worktree` both parse as ordinary flags
+    /// ahead of the trailing `-- <flags>` separator, the same as every
+    /// other `AgentArgs` flag.
+    #[test]
+    fn agent_verb_parses_mode_and_worktree() {
+        let cli = CtxCli::try_parse_from([
+            "zirv ctx",
+            "agent",
+            "claude",
+            "go",
+            "--mode",
+            "read-only",
+            "--worktree",
+        ])
+        .expect("agent should parse --mode and --worktree");
+        match cli.verb {
+            CtxVerb::Agent(args) => {
+                assert_eq!(args.mode, permit::WorkerMode::ReadOnly);
+                assert!(args.worktree);
+            }
+            other => panic!("expected Agent, got {other:?}"),
+        }
+    }
+
+    /// An unrecognised `--mode` value is a clap parse error, not a silent
+    /// fallback to the default -- the same discipline every other `value_
+    /// enum` flag in this codebase holds.
+    #[test]
+    fn agent_verb_rejects_an_unknown_mode() {
+        let err =
+            CtxCli::try_parse_from(["zirv ctx", "agent", "claude", "go", "--mode", "readonly"])
+                .expect_err("an unrecognised --mode spelling must not silently parse");
+        assert!(
+            err.to_string().contains("mode"),
+            "the error should name the offending flag: {err}"
+        );
+    }
+
     /// The trailing command can itself contain flag-shaped tokens (`--session-id`,
     /// `-p`) that must land in `command` verbatim, not be consumed as `exec`'s
     /// own flags: they appear after the `--` separator.

@@ -1001,6 +1001,44 @@ fn render_report<W: Write>(
                 )?;
             }
         }
+
+        // Issue #267: the writer-permit pool's own occupancy, the exact
+        // same shape as the heavy-operations block right above -- a live
+        // writer permit names the tree it holds, so `--worktree`'s own
+        // allocation is visible here too.
+        let live_writers = permit::live_writer_records(&state);
+        writeln!(
+            w,
+            "{} {}",
+            label(colour, "writers:"),
+            style::paint(
+                &format!(
+                    "{} of {} slots in use",
+                    live_writers.len(),
+                    cfg.supervise.max_writers
+                ),
+                Tone::Muted,
+                colour
+            )
+        )?;
+        if !args.brief {
+            for record in &live_writers {
+                let tree = record
+                    .tree
+                    .as_deref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "(unknown tree)".to_string());
+                writeln!(
+                    w,
+                    "  {}",
+                    style::paint(
+                        &format!("pid {} -- {} -- {tree}", record.pid, record.label),
+                        Tone::Muted,
+                        colour
+                    )
+                )?;
+            }
+        }
     }
 
     // Issue #155, Phase 5(f): the work-group tree, right after the
@@ -2288,6 +2326,52 @@ mod tests {
         drop(held);
     }
 
+    /// Issue #267, acceptance criterion: a `--worktree` allocation's writer
+    /// permit is listed by `zirv ctx status`, naming the tree it holds --
+    /// the writer-pool counterpart of `status_reports_the_heavy_operations_
+    /// budget_occupancy` right above.
+    #[test]
+    fn status_reports_the_writer_pool_occupancy_and_its_tree() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        state.ensure().expect("ensure");
+        let mut env = env_for(state.root());
+        env.insert(
+            "ZIRV_CTX_SUPERVISE_MAX_WRITERS".to_string(),
+            "2".to_string(),
+        );
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let tree = tmp.path().join("worktree-repo");
+        std::fs::create_dir_all(&tree).expect("mkdir");
+        let held = permit::acquire_writer(&state, 2, "session ab12cd34: claude", &tree)
+            .expect("writer permit granted");
+
+        let mut out = Vec::new();
+        run_with(
+            &StatusArgs {
+                decisions: 5,
+                brief: false,
+                diff: false,
+            },
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            false,
+        )
+        .expect("runs");
+        let text = String::from_utf8(out).expect("utf8");
+
+        assert!(text.contains("writers: 1 of 2 slots in use"), "got {text}");
+        assert!(
+            text.contains(&tree.display().to_string()),
+            "the held tree must be named: got {text}"
+        );
+
+        drop(held);
+    }
+
     /// A `REPO_FORBIDDEN` config rejection must not add a second failure
     /// mode on top of the `CONFIG REJECTED` line already reported above --
     /// the heavy-operations line is simply omitted, degrading silently the
@@ -3133,6 +3217,7 @@ mod tests {
             wall_ms: 5_000,
             exit_code: 0,
             outcome: "ok".to_string(),
+            mode: None,
         }
     }
 
@@ -3337,6 +3422,7 @@ mod tests {
                 wall_ms: 42_000,
                 exit_code: 0,
                 outcome: "ok",
+                mode: None,
             },
         )
         .expect("append");
@@ -3399,6 +3485,7 @@ mod tests {
                 wall_ms: 1_000,
                 exit_code: 0,
                 outcome: "ok",
+                mode: None,
             },
         )
         .expect("append");
@@ -3450,6 +3537,7 @@ mod tests {
                 wall_ms: 100,
                 exit_code: 0,
                 outcome: "ok",
+                mode: None,
             },
         )
         .expect("append");
@@ -3569,6 +3657,7 @@ mod tests {
                     wall_ms: row.wall_ms,
                     exit_code: row.exit_code,
                     outcome: &row.outcome,
+                    mode: row.mode,
                 },
             )
             .expect("append");

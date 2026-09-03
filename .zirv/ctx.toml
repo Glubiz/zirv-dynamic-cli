@@ -83,6 +83,7 @@ model = "fable"
 # max_nudges = 3                     # consecutive nudge-driven restarts tolerated before nudges are ignored
 # max_heavy_operations = 1           # REPO-FORBIDDEN (ZIRV_CTX_SUPERVISE_MAX_HEAVY_OPERATIONS): machine-wide cap on concurrent heavy commands (issue #155, replacing #133's max_heavy_workers)
 # max_heavy_workers = 1              # DEPRECATED alias for max_heavy_operations. REPO-FORBIDDEN (ZIRV_CTX_SUPERVISE_MAX_HEAVY_WORKERS)
+# max_writers = 1                    # REPO-FORBIDDEN (ZIRV_CTX_SUPERVISE_MAX_WRITERS): machine-wide cap on concurrent writing-mode delegated workers, one per checkout (issue #267)
 
 # [handoff]
 # model = "haiku"                    # REPO-FORBIDDEN (ZIRV_CTX_MODEL): distiller/judgment model override. Default: unset (adapter decides).

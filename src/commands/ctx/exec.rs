@@ -48,6 +48,14 @@ pub const EXIT_CAPACITY_EXHAUSTED: i32 = 78;
 /// retryable condition. Never follows a restart: burning the budget cannot
 /// fix a billing problem, so this fires on the very first occurrence.
 pub const EXIT_ACCOUNT_EXHAUSTED: i32 = 79;
+/// Issue #267: a `--mode writing` delegation was refused before it ever
+/// launched, because the tree it would write to already has a live writer
+/// permit and `--worktree` was not given to allocate an isolated one
+/// instead. Never follows a restart -- like `EXIT_BUDGET_EXHAUSTED`, this
+/// stops the run before it starts, not mid-flight -- and unlike every other
+/// code above it IS retryable: the same delegation typically succeeds once
+/// the other writer finishes, or immediately with `--worktree`.
+pub const EXIT_WRITER_BUSY: i32 = 80;
 
 /// The supervisor reports its own outcomes through the same `i32` an agent's
 /// exit code arrives on, so "exited with code 75" reads as something the
@@ -69,6 +77,11 @@ pub fn describe_exit(code: i32) -> String {
         EXIT_ACCOUNT_EXHAUSTED => {
             "the provider account is out of usable credits/quota; restarting cannot fix a \
              billing problem"
+                .to_string()
+        }
+        EXIT_WRITER_BUSY => {
+            "another writing worker already holds this checkout; retry once it finishes, or \
+             pass --worktree for an isolated one"
                 .to_string()
         }
         other => format!("exited with code {other}"),

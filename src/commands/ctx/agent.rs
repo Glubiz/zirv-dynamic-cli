@@ -25,6 +25,7 @@ use super::dash::spawnreq;
 use super::event::{SessionId, TranscriptUsage};
 use super::exec::{self, ExecArgs};
 use super::pace;
+use super::permit::{self, WorkerMode, WriterRefusal};
 use super::policy;
 
 #[derive(Debug, Clone, clap::Args)]
@@ -104,6 +105,30 @@ pub struct AgentArgs {
     /// policy to, once re-validated there.
     #[arg(long)]
     pub workdir: Option<PathBuf>,
+    /// Issue #267: whether this worker may write to its checkout. Default
+    /// `writing` -- a wrong `read-only` silently drops real edits, which is
+    /// worse than a wrong `writing` holding a writer-permit slot it did not
+    /// need. `writing` holds a writer permit ([`permit::acquire_writer`])
+    /// for the worker's whole lifetime, exclusive per checkout (see
+    /// `--worktree` below); `read-only` never takes one. Travels on the
+    /// `Delegation` row this run logs (`log::Delegation::mode`); the
+    /// workflow engine's own auto-spawned review/test/verify workers are
+    /// always `read-only` (`workflow::engine::auto_spawn_decision`).
+    #[arg(long, value_enum, default_value_t = WorkerMode::Writing)]
+    pub mode: WorkerMode,
+    /// Issue #267: allocates a fresh `git worktree add` sibling of `repo` at
+    /// `<repo>/.zirv/worktrees/<short>` and uses it as this worker's own
+    /// `--workdir` -- the escape hatch from `--mode writing`'s per-tree
+    /// exclusivity, for a second writing worker that genuinely needs to run
+    /// concurrently with one already holding `repo` (or another tree).
+    /// Mutually exclusive with an explicit `--workdir`: allocating a fresh
+    /// tree and being told to use a specific existing one are two different
+    /// requests, and honouring one over the other silently would surprise
+    /// whichever the operator actually meant. Meaningless -- and never
+    /// consulted -- for `--mode read-only`, which takes no writer permit and
+    /// so has no tree to isolate.
+    #[arg(long, default_value_t = false)]
+    pub worktree: bool,
     /// Issue #228: forces the headless supervised path even from inside a
     /// dashboard pane, skipping `try_join_dashboard` entirely. Preserves the
     /// pre-#228 capability of running with restart/timeout/tool-call ceilings
@@ -200,6 +225,58 @@ pub(crate) fn validate_workdir(dir: &Path) -> CtxResult<PathBuf> {
         .into());
     }
     Ok(canon)
+}
+
+/// Issue #267: `--worktree`'s own allocation -- a fresh linked `git worktree
+/// add` sibling of `repo` at `<repo>/.zirv/worktrees/<short>`, returned
+/// through [`validate_workdir`] so it is held to the identical contract
+/// every other `--workdir` value is (canonicalised, confirmed a real
+/// directory inside a git repository) before this delegation ever reads it
+/// as one.
+///
+/// `short` is a fresh v4 UUID's own [`super::sessions::short_id`] -- the
+/// same 8-character derivation a session id gets, reused here purely for a
+/// short, collision-resistant directory name, not because this names a
+/// session.
+///
+/// `git worktree add <path>` (no explicit branch) is deliberate: git's own
+/// convenience behaviour mints a new branch named after the target
+/// directory's own basename when no branch of that name already exists,
+/// which `short`'s fresh UUID prefix guarantees here -- so this never
+/// collides with a branch the operator already has checked out elsewhere.
+///
+/// Best-effort I/O, but NOT best-effort failure handling: unlike most of
+/// this module's state-dir housekeeping, a `--worktree` that fails to
+/// allocate has no honest fallback (running the worker in `repo` instead
+/// would silently defeat the very isolation the operator asked for), so
+/// this fails the delegation outright rather than degrading.
+fn allocate_worktree(repo: &Path) -> CtxResult<PathBuf> {
+    let root = repo.join(crate::utils::SCRIPT_DIR_NAME).join("worktrees");
+    std::fs::create_dir_all(&root)
+        .map_err(|e| format!("--worktree: could not create {}: {e}", root.display()))?;
+    let short = super::sessions::short_id(&SessionId::new_v4().to_string());
+    let path = root.join(&short);
+    let output = std::process::Command::new("git")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .arg("-C")
+        .arg(repo)
+        .arg("worktree")
+        .arg("add")
+        .arg(&path)
+        .output()
+        .map_err(|e| format!("--worktree: could not run `git worktree add`: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "--worktree: `git worktree add {}` failed: {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into());
+    }
+    validate_workdir(&path)
 }
 
 /// Issue #228: the directory a headless spawn's child process cwd and
@@ -928,6 +1005,7 @@ pub fn exit_note(code: i32) -> Option<String> {
             | exec::EXIT_BUDGET_EXHAUSTED
             | exec::EXIT_CAPACITY_EXHAUSTED
             | exec::EXIT_ACCOUNT_EXHAUSTED
+            | exec::EXIT_WRITER_BUSY
     )
     .then(|| exec::describe_exit(code))
 }
@@ -945,6 +1023,8 @@ fn delegation_outcome(code: i32) -> &'static str {
         // Issue #227.
         exec::EXIT_CAPACITY_EXHAUSTED => "capacity-exhausted",
         exec::EXIT_ACCOUNT_EXHAUSTED => "account-exhausted",
+        // Issue #267.
+        exec::EXIT_WRITER_BUSY => "writer-busy",
         _ => "failed",
     }
 }
@@ -1265,6 +1345,11 @@ fn try_join_dashboard<W: Write>(
         // re-litigating it blind and refusing a spawn the requester already
         // chose to force -- see `SpawnRequest::force`'s own doc comment.
         force: args.force,
+        // Issue #267: carried for parity with the headless path's own
+        // `Delegation::mode` and for a future dashboard-side writer-pool
+        // enforcement (`SpawnRequest::mode`'s own doc comment) -- a pane
+        // spawn does not yet enforce the writer-permit pool itself.
+        mode: args.mode,
     };
     let path = match spawnreq::write_request(&dir, &req) {
         Ok(path) => path,
@@ -1512,13 +1597,28 @@ pub fn run_with<W: Write>(
 ) -> CtxResult<i32> {
     validate_flags(&args.flags)?;
     validate_role(&args.role)?;
+    // Issue #267: allocating a fresh tree and being told to use a specific
+    // existing one are two different requests -- honouring one over the
+    // other silently would surprise whichever the operator actually meant.
+    if args.worktree && args.workdir.is_some() {
+        return Err("--worktree and --workdir are mutually exclusive".into());
+    }
     // Issue #228: validated and canonicalised before anything else in this
     // delegation runs -- a bad `--workdir` must fail loudly, up front, not
     // surface as a confusing sandbox error deep inside a harness's own
     // child process. The canonical form (not the operator's raw spelling)
     // is what every downstream use of `args.workdir` below actually reads,
     // via `routed_args`/`args`'s own overwrite a few lines down.
-    let canonical_workdir = args.workdir.as_deref().map(validate_workdir).transpose()?;
+    //
+    // Issue #267: `--worktree` resolves to the SAME `canonical_workdir`
+    // binding an explicit `--workdir` would -- allocated once, here, before
+    // either fork of this delegation (a live dashboard pane, or the
+    // headless fallback) reads it, so both see the identical tree.
+    let canonical_workdir = if args.worktree {
+        Some(allocate_worktree(repo)?)
+    } else {
+        args.workdir.as_deref().map(validate_workdir).transpose()?
+    };
     let prompt = resolve_prompt(&args.prompt, &mut std::io::stdin())?;
 
     // Issue #250: no `--workdir` means the worker stays confined to `repo`
@@ -1842,6 +1942,53 @@ pub fn run_with<W: Write>(
         }
     };
 
+    // Issue #267: a `writing` worker holds a writer permit for its WHOLE
+    // lifetime, refused up front -- before any child ever launches -- when
+    // another live writer already holds `launch_repo`'s own tree. A
+    // `read-only` worker never takes one. Held in `writer_permit` for the
+    // rest of this function; dropped explicitly right after the run
+    // finishes (below), rather than waiting for this function's own return,
+    // so the tree frees the moment the work is actually done.
+    let writer_permit = if args.mode == WorkerMode::Writing {
+        let tree = std::fs::canonicalize(&launch_repo).unwrap_or_else(|_| launch_repo.clone());
+        match permit::acquire_writer(
+            &state,
+            cfg.supervise.max_writers,
+            &format!(
+                "session {}: {}",
+                super::sessions::short_id(&worker_session),
+                args.name
+            ),
+            &tree,
+        ) {
+            Ok(writer_permit) => Some(writer_permit),
+            Err(refusal) => {
+                // Nothing ran, so a group minted moments ago for this
+                // delegation must not outlive it -- same discipline as
+                // every other pre-launch refusal above.
+                discard_minted_group();
+                let reason = match refusal {
+                    WriterRefusal::TreeBusy { holder_label } => format!(
+                        "another writing worker already holds {} ({holder_label}); retry once \
+                         it finishes, or pass --worktree for an isolated checkout",
+                        tree.display()
+                    ),
+                    WriterRefusal::PoolExhausted => format!(
+                        "the writer-permit pool ({} of {} in use) is full; retry once a writer \
+                         finishes",
+                        permit::live_writer_count(&state),
+                        cfg.supervise.max_writers
+                    ),
+                };
+                let code = exec::EXIT_WRITER_BUSY;
+                writeln!(w, "{}: {reason}", delegation_outcome(code))?;
+                return Ok(code);
+            }
+        }
+    } else {
+        None
+    };
+
     // Issue #228: the ONLY place this delegation's headless launch stops
     // deriving its child process cwd and per-harness sandbox from `repo`
     // (the delegating session's own directory) and starts deriving them
@@ -1902,6 +2049,10 @@ pub fn run_with<W: Write>(
             return Err(e);
         }
     };
+    // Issue #267: the tree frees the moment the run is actually done, not
+    // whenever this whole function happens to return -- the accounting/mail
+    // bookkeeping below needs no exclusive hold on the checkout.
+    drop(writer_permit);
     // Issue #170: this delegation's scope is done -- successfully or not --
     // the moment its supervised run exits. The free-text completion contract
     // remains reviewer-checked; token spend is rolled up below. Closes the
@@ -1968,6 +2119,7 @@ pub fn run_with<W: Write>(
             args.group.as_deref(),
             code,
             outcome,
+            args.mode,
         );
         if let Some(id) = args.group.as_deref() {
             let _ = super::group::settle_reservation(
@@ -2040,6 +2192,7 @@ fn append_execution_segments(
     work_group_id: Option<&str>,
     exit_code: i32,
     outcome: &'static str,
+    mode: WorkerMode,
 ) -> TranscriptUsage {
     let mut total = TranscriptUsage::default();
     for segment in &report.segments {
@@ -2071,6 +2224,7 @@ fn append_execution_segments(
                 wall_ms: segment.wall_ms,
                 exit_code,
                 outcome,
+                mode: Some(mode),
             },
         );
     }
@@ -3420,6 +3574,8 @@ mod tests {
             max_tool_calls: None,
             force: false,
             workdir: None,
+            mode: WorkerMode::Writing,
+            worktree: false,
             headless: false,
             attach_artifact: None,
             workflow: None,
@@ -3519,6 +3675,94 @@ mod tests {
         assert!(git_init(&repo), "git init");
         let canon = validate_workdir(&repo).expect("a real repo checkout is fine");
         assert_eq!(canon, std::fs::canonicalize(&repo).expect("canonicalize"));
+    }
+
+    /// Issue #267, acceptance criterion: `--worktree` allocates
+    /// `<repo>/.zirv/worktrees/<short>` via `git worktree add` from the
+    /// session's base -- a real linked worktree, not merely a directory
+    /// that happens to sit at that path.
+    #[test]
+    fn allocate_worktree_creates_a_real_linked_worktree_under_the_repo() {
+        if !git_available() {
+            eprintln!("skipping: git not found on PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("session-base");
+        std::fs::create_dir_all(&repo).expect("mkdir");
+        assert!(git_init(&repo), "git init");
+        let run = |args: &[&str]| -> bool {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        };
+        assert!(run(&["config", "user.email", "test@example.com"]));
+        assert!(run(&["config", "user.name", "test"]));
+        std::fs::write(repo.join("README.md"), "hello\n").expect("write");
+        assert!(run(&["add", "README.md"]));
+        assert!(run(&["commit", "-q", "-m", "initial"]));
+
+        let worktree = allocate_worktree(&repo).expect("allocate a fresh worktree");
+
+        assert!(
+            worktree.starts_with(
+                std::fs::canonicalize(&repo)
+                    .expect("canonicalize")
+                    .join(crate::utils::SCRIPT_DIR_NAME)
+                    .join("worktrees")
+            ),
+            "must live under <repo>/.zirv/worktrees/: {}",
+            worktree.display()
+        );
+        assert!(
+            worktree.is_dir(),
+            "the worktree must actually exist on disk"
+        );
+        assert!(
+            adapters::git_common_dir(&worktree).is_some(),
+            "the allocated path must be a real git working tree"
+        );
+        assert_eq!(
+            adapters::git_common_dir(&worktree),
+            adapters::git_common_dir(&repo),
+            "the linked worktree must share the session base's own .git"
+        );
+    }
+
+    /// A second `--worktree` allocation from the same session base must
+    /// never collide with the first -- each gets its own fresh short id.
+    #[test]
+    fn allocate_worktree_never_collides_across_two_calls() {
+        if !git_available() {
+            eprintln!("skipping: git not found on PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("session-base");
+        std::fs::create_dir_all(&repo).expect("mkdir");
+        assert!(git_init(&repo), "git init");
+        let run = |args: &[&str]| -> bool {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        };
+        assert!(run(&["config", "user.email", "test@example.com"]));
+        assert!(run(&["config", "user.name", "test"]));
+        std::fs::write(repo.join("README.md"), "hello\n").expect("write");
+        assert!(run(&["add", "README.md"]));
+        assert!(run(&["commit", "-q", "-m", "initial"]));
+
+        let first = allocate_worktree(&repo).expect("first allocation");
+        let second = allocate_worktree(&repo).expect("second allocation");
+        assert_ne!(first, second, "each --worktree call must get its own tree");
     }
 
     #[test]
@@ -3769,6 +4013,25 @@ mod tests {
         assert_eq!(found, vec![r"\\server\share\project"], "got {found:?}");
     }
 
+    /// Issue #267: allocating a fresh tree and being told to use a specific
+    /// existing one are two different requests -- `run_with` must refuse
+    /// the ambiguous combination up front rather than silently picking one.
+    #[test]
+    fn run_with_rejects_worktree_and_workdir_together() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let env = base_env(&tmp.path().join("state"));
+
+        let mut args = args_for("claude", "go");
+        args.worktree = true;
+        args.workdir = Some(tmp.path().to_path_buf());
+        let mut out = Vec::new();
+        let err = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned())
+            .expect_err("--worktree and --workdir together must be refused");
+        assert!(err.to_string().contains("mutually exclusive"), "got {err}");
+    }
+
     /// Issue #228, decision 1: a bad `--workdir` fails loudly, up front,
     /// before any spawn decision -- not as a confusing sandbox error deep
     /// inside a harness's own child process.
@@ -3816,6 +4079,76 @@ mod tests {
             ),
             "got {msg}"
         );
+    }
+
+    /// Issue #267, acceptance criterion: a second `--mode writing` worker
+    /// dispatched into a tree that already has a live writer permit is
+    /// refused with a one-line, retryable reason -- before any adapter is
+    /// ever launched (`code == exec::EXIT_WRITER_BUSY`, not an `Err`, the
+    /// same structured-exit discipline `EXIT_BUDGET_EXHAUSTED` already
+    /// uses).
+    #[test]
+    fn run_with_refuses_a_second_writing_worker_into_a_tree_with_a_live_writer() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state_path = tmp.path().join("state");
+        let env = base_env(&state_path);
+        let state = StateDir::from_root(state_path);
+
+        // The SAME canonicalisation `run_with`'s own writer-permit check
+        // applies to `launch_repo` (here, `repo` itself -- no `--workdir`).
+        let tree = std::fs::canonicalize(tmp.path()).expect("canonicalize");
+        let held = permit::acquire_writer(&state, 1, "worker-a", &tree)
+            .expect("writer permit pre-held for the test");
+
+        let args = args_for("claude", "go");
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned())
+            .expect("a writer-busy refusal is a structured exit, not an Err");
+        assert_eq!(code, exec::EXIT_WRITER_BUSY);
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            text.contains("writer-busy"),
+            "the outcome must be structured, not just \"failed\": got {text}"
+        );
+        assert!(
+            text.contains("worker-a"),
+            "the busy holder's own label must be named: got {text}"
+        );
+
+        drop(held);
+    }
+
+    /// The other half: a `--mode read-only` worker never takes a writer
+    /// permit, so it must never be refused by another tree's live writer --
+    /// exercised through `run_with` itself, not just `permit::
+    /// acquire_writer` in isolation.
+    #[test]
+    fn run_with_never_refuses_a_read_only_worker_for_writer_contention() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state_path = tmp.path().join("state");
+        let env = base_env(&state_path);
+        let state = StateDir::from_root(state_path);
+
+        let tree = std::fs::canonicalize(tmp.path()).expect("canonicalize");
+        let held = permit::acquire_writer(&state, 1, "worker-a", &tree)
+            .expect("writer permit pre-held for the test");
+
+        let mut args = args_for("claude", "go");
+        args.mode = WorkerMode::ReadOnly;
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned())
+            .expect("a read-only worker must never hit the writer-busy refusal");
+        assert_ne!(
+            code,
+            exec::EXIT_WRITER_BUSY,
+            "read-only must never take a writer permit"
+        );
+
+        drop(held);
     }
 
     /// Issue #228, decision 2, the core of the feature: a headless
@@ -4382,7 +4715,15 @@ mod tests {
             ],
         };
 
-        let total = append_execution_segments(&state, &report, "parent", Some("wg-1"), 0, "ok");
+        let total = append_execution_segments(
+            &state,
+            &report,
+            "parent",
+            Some("wg-1"),
+            0,
+            "ok",
+            WorkerMode::Writing,
+        );
         assert_eq!(total.input_tokens, 11);
         assert_eq!(total.cache_creation_input_tokens, 22);
         assert_eq!(total.cache_read_input_tokens, 33);

@@ -160,6 +160,26 @@ pub struct SuperviseConfig {
     /// `agents_in_ctx_toml_is_rejected_so_the_two_files_stay_distinct`) --
     /// this is a `[supervise]` key like every other cap in this struct.
     pub max_heavy_operations: usize,
+    /// Issue #267: how many `--mode writing` delegated workers may hold a
+    /// WRITER permit at once, machine-wide -- a second, independent pool
+    /// from `max_heavy_operations` above: a writer permit is held for a
+    /// worker's WHOLE LIFETIME (`agent::run_with`), not only while it runs
+    /// one classified heavy command, and additionally never lets two
+    /// writers hold the SAME checkout at once (`permit::acquire_writer`'s
+    /// own per-tree exclusivity, which this count alone does not express).
+    /// A `--mode read-only` worker never takes a writer permit and does not
+    /// count against this.
+    ///
+    /// Defaults to 1, the same "never two writers in one worktree" posture
+    /// Ruflo's own CLAUDE.md conventions this issue is modeled on already
+    /// enforce by hand -- an operator who has verified their own workflow
+    /// can take more raises this explicitly.
+    ///
+    /// `REPO_FORBIDDEN`, same reasoning as `max_heavy_operations` right
+    /// above: a checked-out repo raising the machine-wide writer-concurrency
+    /// budget is exactly the corrupted-diff failure this cap exists to
+    /// prevent.
+    pub max_writers: usize,
     /// Extra command patterns an operator classifies as heavy on their own
     /// machine, ADDED to the built-in set (`permit::BUILTIN_HEAVY_PATTERNS`),
     /// never replacing it -- `permit::is_heavy` always checks the built-ins
@@ -184,6 +204,7 @@ impl Default for SuperviseConfig {
             on_failure: None,
             max_nudges: 3,
             max_heavy_operations: 1,
+            max_writers: 1,
             heavy_command_patterns: Vec::new(),
         }
     }
@@ -1323,6 +1344,11 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         &["supervise", "max_heavy_operations"],
         EnvKind::Int,
     ),
+    (
+        "ZIRV_CTX_SUPERVISE_MAX_WRITERS",
+        &["supervise", "max_writers"],
+        EnvKind::Int,
+    ),
     ("ZIRV_CTX_MODEL", &["handoff", "model"], EnvKind::Str),
     (
         "ZIRV_CTX_HANDOFF_TIMEOUT_SECS",
@@ -2160,6 +2186,15 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     (
         &["supervise", "max_heavy_operations"],
         "ZIRV_CTX_SUPERVISE_MAX_HEAVY_OPERATIONS",
+    ),
+    // Issue #267: same trust asymmetry as `max_heavy_operations` right
+    // above -- a repo checkout must not be able to raise the machine-wide
+    // writer-concurrency budget, which is exactly the corrupted-diff
+    // failure this cap exists to prevent (see `SuperviseConfig::
+    // max_writers`'s own doc comment).
+    (
+        &["supervise", "max_writers"],
+        "ZIRV_CTX_SUPERVISE_MAX_WRITERS",
     ),
     // Mouse capture takes over the terminal's own text selection, so which
     // way that trade goes is the operator's call about their own terminal,
@@ -3133,6 +3168,11 @@ mod tests {
             SuperviseConfig::default().max_heavy_operations,
             1,
             "issue #133: a single heavy operation at a time is the safe default"
+        );
+        assert_eq!(
+            SuperviseConfig::default().max_writers,
+            1,
+            "issue #267: never two writers in one worktree is the safe default"
         );
         assert_eq!(
             SuperviseConfig::default().heavy_command_patterns,
@@ -4791,6 +4831,34 @@ mod tests {
         }
     }
 
+    /// Issue #267: the writer pool's own cap reads from its own env var
+    /// like every other `supervise.*` key.
+    #[test]
+    fn max_writers_env_override_sets_the_key() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let env = env_map(&[("ZIRV_CTX_SUPERVISE_MAX_WRITERS", "3")]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert_eq!(cfg.supervise.max_writers, 3);
+    }
+
+    /// Issue #267: `max_writers` is `REPO_FORBIDDEN`, same reasoning as
+    /// `max_heavy_operations` -- a checked-out repo must not be able to
+    /// raise the machine-wide writer-concurrency budget.
+    #[test]
+    fn max_writers_may_not_come_from_a_repo_layer() {
+        let repo = tempfile::tempdir().expect("repo");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv").join(CTX_CONFIG_FILE),
+            "[supervise]\nmax_writers = 8\n",
+        )
+        .expect("write");
+        let empty: HashMap<String, String> = HashMap::new();
+        let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+            .expect_err("a repo layer must be rejected");
+        assert!(err.to_string().contains("max_writers"), "got {err}");
+    }
+
     /// Unlike `max_heavy_operations`, `heavy_command_patterns` is not
     /// `REPO_FORBIDDEN`: a repo may ADD a pattern (only ever narrowing, per
     /// the field's own doc comment), but a plain deep merge would let a
@@ -5950,6 +6018,7 @@ mod tests {
         ("supervise", "max_nudges"),
         ("supervise", "max_heavy_operations"),
         ("supervise", "max_heavy_workers"),
+        ("supervise", "max_writers"),
         ("handoff", "model"),
         ("handoff", "tail_items"),
         ("handoff", "timeout_secs"),
