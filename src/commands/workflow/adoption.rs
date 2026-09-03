@@ -42,7 +42,7 @@ pub fn signals(events: &[NormalizedEvent]) -> AdoptionSignals {
     let mut turns = 0usize;
     for event in events {
         match event {
-            NormalizedEvent::TurnStart => turns += 1,
+            NormalizedEvent::TurnStart { .. } => turns += 1,
             NormalizedEvent::ToolCall { name, .. }
                 if EDIT_LIKE_TOOLS
                     .iter()
@@ -164,6 +164,7 @@ mod tests {
         NormalizedEvent::ToolCall {
             name: name.to_string(),
             input_hash: 0,
+            at_ms: None,
         }
     }
 
@@ -186,15 +187,16 @@ mod tests {
     #[test]
     fn signals_ignore_non_tool_events_and_count_turns() {
         let events = vec![
-            NormalizedEvent::TurnStart,
+            NormalizedEvent::TurnStart { at_ms: None },
             tool("Edit"),
             NormalizedEvent::AssistantFinal {
                 text: String::new(),
                 input_tokens: 0,
+                at_ms: None,
             },
             NormalizedEvent::ToolResult { is_error: false },
             NormalizedEvent::Compaction,
-            NormalizedEvent::TurnStart,
+            NormalizedEvent::TurnStart { at_ms: None },
         ];
         let s = signals(&events);
         assert_eq!(s.edit_like_calls, 1);
