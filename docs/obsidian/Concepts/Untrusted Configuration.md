@@ -50,6 +50,7 @@ Plus a third, read-only case: `zirv ctx optimize` reads the repo's own CLAUDE.md
 | `optimize.model` | `ZIRV_CTX_OPTIMIZE_MODEL` |
 | `sandbox.enabled` | `ZIRV_CTX_SANDBOX` |
 | `sandbox.extra_allow` | `ZIRV_CTX_SANDBOX_EXTRA_ALLOW` |
+| `sandbox.scrub_subprocess_env` | `ZIRV_CTX_SANDBOX_SCRUB_SUBPROCESS_ENV` |
 | `prompt.enabled` | `ZIRV_CTX_PROMPT` |
 | `prompt.repo_layer` | `ZIRV_CTX_PROMPT_REPO` |
 | `prompt.max_repo_bytes` | `ZIRV_CTX_PROMPT_MAX_REPO_BYTES` |
