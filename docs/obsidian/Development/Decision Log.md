@@ -24,6 +24,13 @@ last-verified: 2026-09-03
 
 ## Decisions
 
+### 2026-09-03 -- Stop hook nudges the stale-gate command instead of auto-running verification (issue #309)
+**Context:** A session can end a turn with code modified since the last passing `zirv test`/`zirv verify` run, and nothing told the operator or the next turn that the evidence was stale.
+**Decision:** A new `[verify_on_stop]` section (`enabled`, `max_nudges`, narrow-only fold like `pace.enabled`, default on/cap 2 per session) makes the Stop hook append one advisory line naming the exact stale-gate command (`zirv test changed` or `zirv verify`) once a session-scoped modification checkpoint (`ModificationCheckpoint`) shows an edit-like tool call and `verification::latest_is_fresh_and_passing` says the last report no longer covers the change set. Suppressed for a doc-only change set and while the active workflow step is itself a Test/Verify gate (which already prints the same message). `zirv ctx status` gains a presentation-only `gates: fresh`/`gates: stale (edits after the last passing run)` line off the same check.
+**Rejected:** Auto-running the check on Stop -- a hook has no budget/consent to launch an arbitrary, potentially slow verification run on every turn; a nudge lets the operator or next turn decide.
+**Consequences:** The nudge is capped per session, so a persistently stale session goes quiet after `max_nudges` rather than nagging forever; a repo layer may only disable it or lower the cap, never widen it.
+**Spec / link:** [[Ctx Subsystem]], [[Untrusted Configuration]].
+
 ### 2026-09-03 -- Sibling-repository permissions posture is zirv's to control, not out of scope
 **Context:** `linked_worktree_args`'s own doc comment previously stated "other repositories remain out of scope; callers use `zirv agent --workdir`" — but issue #329's production evidence (9 of 21 sampled prompts) showed cross-repo work (a service plus the library it calls, plus a worktree of a third repo) is ordinary work in a services directory, and every gate in a sibling checkout failed `Operation not permitted` under the sandbox until retried unsandboxed.
 **Decision:** Operator ruling (2026-09-03): the launch repository's sibling checkouts under the same parent directory, and each sibling's own linked worktrees (read from `.git/worktrees/*/gitdir`, no process spawn), get sandbox write grants (`allowWrite`/`additionalDirectories`) — never `--add-dir`, since that would also load a sibling's own `.claude/` hooks into this session. Never the parent directory itself; nothing when the parent is a filesystem root or the home directory; capped at 32 siblings, 16 worktrees per repo.

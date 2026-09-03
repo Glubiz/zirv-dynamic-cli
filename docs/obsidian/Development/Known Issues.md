@@ -745,6 +745,20 @@ how it was first noticed.
 
 If either parser grows a new header field, keep the terminator rule intact.
 
+**Fixed 2026-09-03, a sibling gap (issue #326, v3.15.0): a `## ` heading
+inside the body used to re-close the header too.** `mail::parse_markdown`
+re-checked every line starting with `## ` for the `## Message` heading
+regardless of where parsing already stood, so once the header block above
+correctly ended at the first blank line, a body whose own second paragraph
+happened to be a markdown heading (`## Summary`, `## Findings` -- the
+ordinary shape of a worker's own multi-section report) flipped `in_message`
+back to `false` and silently dropped everything after it (the bug's own
+evidence: a stored payload of 24 bytes against an original 9115). Heading
+recognition now gates on a `header_seen` flag that fires exactly once, on
+the FIRST such heading -- once true, no later line is ever inspected as a
+heading again, not even a literal `## Message` inside the body, so neither
+this gap nor the header-reopen gap above can recur through a heading.
+
 ## A supervisor's registry short id is a stable address, not its session id
 
 `Record.short` is minted once at `SessionGuard::register` and deliberately

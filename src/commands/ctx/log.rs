@@ -9,6 +9,7 @@ use super::state::StateDir;
 pub const LOG_FILE: &str = "decisions.jsonl";
 pub const SAFETY_LOG_DIR: &str = "safety-decisions";
 pub const DELEGATION_FILE: &str = "delegations.jsonl";
+pub const PERMISSION_PROMPTS_FILE: &str = "permission-prompts.jsonl";
 
 /// `Decision::action` for the one-line marker written into the MAIN decision
 /// log alongside every delegation record.
@@ -159,6 +160,58 @@ pub struct DelegationRow {
     /// grouping.
     #[serde(default)]
     pub task_class: Option<TaskClass>,
+}
+
+/// The owned, deserializable counterpart of `hook::PermissionPromptRow`
+/// (which borrows and is serialize-only) -- what `permissions.rs`'s own
+/// audit (issue #307/#320/#321) parses one logged `permission-prompts.jsonl`
+/// line back into. Field names/shape mirror `PermissionPromptRow` exactly:
+/// for Read/Edit/Write/MultiEdit/NotebookEdit, `family` is the file's parent
+/// directory; for Bash/PowerShell, it is `program subcommand` with the full
+/// command kept only as `command_sha256`, never in clear. Nothing here
+/// screens for secrets beyond that, the same trust boundary `SafetyDecision`'s
+/// own doc comment already draws for the command-policy log next to it.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PermissionPromptRecord {
+    /// Kept for parity with every field `PermissionPromptRow` writes; no
+    /// reader has needed a permission prompt's own timestamp yet, the same
+    /// kept-for-parity-not-yet-read pattern `SafetyDecisionRecord::mode`
+    /// already uses.
+    #[allow(dead_code)]
+    pub ts: u64,
+    pub session: String,
+    /// `"PermissionRequest"` or `"PermissionDenied"` (the hook's own
+    /// `hook_event_name` field, carried through verbatim).
+    pub event: String,
+    pub tool: String,
+    pub family: String,
+    /// Kept for parity; `permissions.rs`'s own audit groups Bash/PowerShell
+    /// prompts by event only (never by directory), so it does not read the
+    /// command hash today.
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub command_sha256: Option<String>,
+    #[allow(dead_code)]
+    pub cwd: String,
+    #[allow(dead_code)]
+    pub permission_mode: String,
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// Reads every parseable line in `permission-prompts.jsonl`, oldest first --
+/// a missing file is an empty list, not an error, and a corrupt line is
+/// skipped rather than fatal, the same best-effort contract `read_
+/// delegations` gives its own file.
+pub fn read_permission_prompts(state: &StateDir) -> Vec<PermissionPromptRecord> {
+    let path = state.logs().join(PERMISSION_PROMPTS_FILE);
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect()
 }
 
 pub fn append(state: &StateDir, decision: &Decision<'_>) -> CtxResult<()> {
@@ -693,5 +746,103 @@ mod tests {
         assert!(text.contains("\"command_sha256\":\"0123456789abcdef\""));
         assert!(text.contains("\"policy_sha256\":\"fedcba9876543210\""));
         assert!(!text.contains("secret-value-from-command"));
+    }
+
+    /// Writes one raw `permission-prompts.jsonl` line matching `hook::
+    /// PermissionPromptRow`'s own field shape -- there is no writer in this
+    /// module (the hook writes the file directly), so tests seed it by hand.
+    fn write_permission_prompt_line(
+        state: &StateDir,
+        ts: u64,
+        session: &str,
+        event: &str,
+        tool: &str,
+        family: &str,
+    ) {
+        let dir = state.logs();
+        super::super::state::create_private_dir_all(&dir).expect("mkdir logs");
+        let mut file = super::super::state::open_private_append(&dir.join(PERMISSION_PROMPTS_FILE))
+            .expect("open");
+        let line = serde_json::json!({
+            "ts": ts,
+            "session": session,
+            "event": event,
+            "tool": tool,
+            "family": family,
+            "cwd": "/work/repo",
+            "permission_mode": "default",
+        });
+        writeln!(file, "{line}").expect("write line");
+    }
+
+    /// Issue #321: every field of one logged `permission-prompts.jsonl` line
+    /// round-trips back through `read_permission_prompts`.
+    #[test]
+    fn permission_prompts_append_as_jsonl_and_round_trip() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+
+        write_permission_prompt_line(
+            &state,
+            1_700_000_000,
+            "sess-1",
+            "PermissionRequest",
+            "Read",
+            "/work/repo/src",
+        );
+        write_permission_prompt_line(
+            &state,
+            1_700_000_100,
+            "sess-1",
+            "PermissionDenied",
+            "Bash",
+            "echo hi",
+        );
+
+        let records = read_permission_prompts(&state);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].session, "sess-1");
+        assert_eq!(records[0].event, "PermissionRequest");
+        assert_eq!(records[0].tool, "Read");
+        assert_eq!(records[0].family, "/work/repo/src");
+        assert_eq!(records[1].event, "PermissionDenied");
+        assert_eq!(records[1].tool, "Bash");
+    }
+
+    /// No file at all is an empty list, not an error -- no `PermissionRequest`/
+    /// `PermissionDenied` hook has fired yet on this machine.
+    #[test]
+    fn read_permission_prompts_before_any_exist_is_empty_not_an_error() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        assert!(read_permission_prompts(&state).is_empty());
+    }
+
+    /// A corrupt line landing in the middle of a concurrent write is
+    /// skipped, not fatal -- the same tolerance `read_delegations` and
+    /// `read_safety_decisions` already give their own on-disk state.
+    #[test]
+    fn read_permission_prompts_skips_a_corrupt_line() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        write_permission_prompt_line(
+            &state,
+            1_700_000_000,
+            "sess-1",
+            "PermissionRequest",
+            "Edit",
+            "/work/repo",
+        );
+        {
+            let mut file = super::super::state::open_private_append(
+                &state.logs().join(PERMISSION_PROMPTS_FILE),
+            )
+            .expect("open");
+            writeln!(file, "not json").expect("write corrupt line");
+        }
+
+        let records = read_permission_prompts(&state);
+        assert_eq!(records.len(), 1, "the corrupt line is skipped: {records:?}");
+        assert_eq!(records[0].tool, "Edit");
     }
 }
