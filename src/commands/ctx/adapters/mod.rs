@@ -759,9 +759,18 @@ pub const SHIPPED_POSTURE_ASK: &[(&str, &str)] = &[
         "Bash(git reset*--hard*)",
         "destroys uncommitted work and can discard commits, any argument position",
     ),
-    ("Bash(git rebase *)", "rewrites commit history"),
+    // Issue #306: `rebase` and `clean` no longer have a blanket glob entry
+    // here -- unlike a bare glob, both need to inspect ARGUMENTS to tell a
+    // genuinely dangerous invocation from routine, local, agent-scoped work
+    // (a non-interactive `rebase`; a pathed `clean -f...` that names an
+    // explicit target and does not also remove gitignored files). That
+    // per-argument judgment is `safety::is_destructive_vcs_action`'s job,
+    // not a glob's -- it already owns the identical judgment for `checkout`/
+    // `restore`/`worktree remove`/`branch -D`/`stash drop`/`clear`/`reflog
+    // expire`/`delete`/`gc --prune`, none of which have a blanket entry
+    // here either. `filter-branch` keeps its own blanket entry: it rewrites
+    // history unconditionally, with no narrower form to allow.
     ("Bash(git filter-branch *)", "rewrites commit history"),
-    ("Bash(git clean *)", "irreversibly deletes untracked files"),
     // These three glob entries name the most common shapes literally; the
     // general case -- ANY `find -exec`/`-ok`/`-execdir`/`-okdir` action that
     // is not on a small proven-safe allow-list (`find -exec sh -c ...`,
