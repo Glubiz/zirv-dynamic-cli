@@ -140,13 +140,21 @@ pub struct SpawnRequest {
     /// default of `Writing` -- so a request written by an older build
     /// deserialises to the least-surprising reading (every request before
     /// this field existed WAS an ordinary writing worker). Carried for
-    /// parity with the headless path's own `Delegation::mode`; a pane
-    /// fulfilling this request does not yet enforce the writer-permit pool
-    /// itself (that enforcement lives in `agent::run_with`'s own headless
-    /// fork today) -- a deliberate, narrower scope for this change, not an
-    /// oversight.
+    /// parity with the headless path's own `Delegation::mode`; the pane
+    /// fulfilling this request takes the same writer permit
+    /// `agent::run_with`'s headless fork does (`dash::fulfill_spawn_request`).
     #[serde(default)]
     pub mode: WorkerMode,
+    /// Issue #267, review round 3: whether `workdir` is a linked worktree
+    /// THIS request's own `zirv agent --worktree` allocated (so the pane
+    /// that runs there owns it and the dashboard reclaims it once the pane's
+    /// child exits) as opposed to an operator-named `--workdir` the
+    /// dashboard must never touch, even one that happens to live under
+    /// `<repo>/.zirv/worktrees/`. Ownership travels on the request; it is
+    /// never inferred from the path. `#[serde(default)]` (`false`): a request
+    /// written by an older build owns nothing.
+    #[serde(default)]
+    pub owns_workdir: bool,
 }
 
 /// The role a request actually gets. Unstated or unrecognised is
@@ -473,6 +481,20 @@ mod tests {
         (tmp, dir)
     }
 
+    /// Review round 3 on issue #267: a request written by an older build
+    /// (no `owns_workdir` key) owns nothing, so a dashboard that reaps its
+    /// pane never reclaims that pane's cwd.
+    #[test]
+    fn a_request_without_owns_workdir_deserialises_as_not_owning_it() {
+        let mut value = serde_json::to_value(sample_request()).expect("serialise");
+        value
+            .as_object_mut()
+            .expect("object")
+            .remove("owns_workdir");
+        let req: SpawnRequest = serde_json::from_value(value).expect("deserialise");
+        assert!(!req.owns_workdir);
+    }
+
     fn sample_request() -> SpawnRequest {
         SpawnRequest {
             agent: "claude".to_string(),
@@ -488,6 +510,7 @@ mod tests {
             force: false,
             workdir: None,
             mode: WorkerMode::Writing,
+            owns_workdir: false,
         }
     }
 

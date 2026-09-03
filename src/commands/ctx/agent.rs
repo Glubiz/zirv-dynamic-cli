@@ -1537,6 +1537,7 @@ fn try_join_dashboard<W: Write>(
         // enforcement (`SpawnRequest::mode`'s own doc comment) -- a pane
         // spawn does not yet enforce the writer-permit pool itself.
         mode: args.mode,
+        owns_workdir: args.worktree,
     };
     let path = match spawnreq::write_request(&dir, &req) {
         Ok(path) => path,
@@ -2039,13 +2040,19 @@ pub fn run_with<W: Write>(
         // spawning. Accepted: a clean refusal here is preferable to leaving
         // group cleanup dependent on winning a race with a dashboard that may
         // be arbitrarily slow or may never answer at all.
-        if matches!(result, Ok(0)) {
+        if matches!(result, Ok(0) | Ok(EXIT_DASH_UNCONFIRMED)) {
             // Review finding (2026-09), finding 2a: a pane was actually
             // spawned into this worktree -- ownership passes to it, and
             // `dash::mod::reap_ended_panes` reclaims it once that pane's
             // child exits. This delegation's own guard must not also try.
+            // Review round 3: the same holds for the unconfirmed answer --
+            // the dashboard has taken the request and may still spawn into
+            // this exact path moments later, so the guard must leave it
+            // alone; a clean directory left behind in that rare race is
+            // preferable to deleting a tree out from under a live spawn.
             worktree_guard.disarm();
-        } else {
+        }
+        if !matches!(result, Ok(0)) {
             discard_minted_group();
         }
         return result;
