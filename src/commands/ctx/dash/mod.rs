@@ -1424,6 +1424,11 @@ fn reap_ended_panes(
             push_error(errors, format!("reap {}: {e}", panes[index].short()));
         }
         let pane = panes.remove(index);
+        // Review finding (2026-09), finding 2a: captured before `pane` is
+        // consumed below, so the worktree-reclaim check after this pane is
+        // fully torn down still has its own cwd and label to work with.
+        let pane_cwd = pane.cwd().to_path_buf();
+        let pane_short = pane.short().to_string();
         account_reaped_pane_spend(&pane, cfg, state, repo);
         close_claimed_group(&pane, state);
         if index < queues.len() {
@@ -1451,8 +1456,62 @@ fn reap_ended_panes(
             });
         }
         (*focused, *selected) = reap_fixup(index, *focused, *selected);
+        // Review finding (2026-09), finding 2a: `agent::run_with`'s own
+        // `--worktree` reclamation only ever runs for the HEADLESS fallback
+        // path -- a dashboard-hosted worker pane's linked worktree is
+        // handed off entirely (its own allocating process disarms its own
+        // reclaim guard) and nothing else reclaimed it once the pane's
+        // child exited. `pane` (and, via its own `Drop`, any writer permit
+        // it held) is already gone by this point.
+        if let Some(outcome) = reclaim_pane_worktree(repo, &pane_cwd) {
+            push_error(
+                errors,
+                describe_pane_worktree_reclaim(&pane_short, &pane_cwd, outcome),
+            );
+        }
         // Deliberately no `index += 1`: the next pane has shifted into this
         // slot and has not been looked at yet.
+    }
+}
+
+/// Review finding (2026-09), finding 2a: reclaims `cwd` if (and only if) it
+/// is one of THIS repo's own agent-managed worktrees
+/// (`agent::is_agent_managed_worktree`) -- `None` for an ordinary pane
+/// (running at `repo` itself, or at an operator-named `--workdir` this
+/// dashboard never allocated and must never touch). Split out of
+/// [`reap_ended_panes`] so the cwd check and the reclaim call are directly
+/// testable without spawning a real pane.
+fn reclaim_pane_worktree(repo: &Path, cwd: &Path) -> Option<super::agent::ReclaimOutcome> {
+    if !super::agent::is_agent_managed_worktree(repo, cwd) {
+        return None;
+    }
+    Some(super::agent::reclaim_worktree(repo, cwd))
+}
+
+/// One stderr-bound line describing [`reclaim_pane_worktree`]'s own outcome
+/// for `pane_short`'s worktree at `path` -- routed through `push_error`
+/// (the dashboard's own notice channel) rather than `eprintln!`, since a raw
+/// stderr write would corrupt the alt-screen TUI `agent::run_with`'s own
+/// headless equivalent (`reclaim_worktree_and_report`) never has to worry
+/// about.
+fn describe_pane_worktree_reclaim(
+    pane_short: &str,
+    path: &Path,
+    outcome: super::agent::ReclaimOutcome,
+) -> String {
+    match outcome {
+        super::agent::ReclaimOutcome::Removed => format!(
+            "pane '{pane_short}' worktree {} reclaimed (clean)",
+            path.display()
+        ),
+        super::agent::ReclaimOutcome::Dirty => format!(
+            "pane '{pane_short}' worktree {} left in place (uncommitted changes)",
+            path.display()
+        ),
+        super::agent::ReclaimOutcome::Failed(reason) => format!(
+            "pane '{pane_short}' worktree {} left in place ({reason})",
+            path.display()
+        ),
     }
 }
 
@@ -11717,6 +11776,114 @@ mod tests {
             Some(linked.clone()),
             "a linked worktree must be accepted and hosted at its own path"
         );
+    }
+
+    /// A real temp git repo (`git init`, one commit) plus one linked
+    /// worktree at EXACTLY the path `agent::allocate_worktree` itself would
+    /// put it -- `<repo>/.zirv/worktrees/<short>` -- so `reclaim_pane_
+    /// worktree`'s own tests can exercise `agent::is_agent_managed_
+    /// worktree`/`agent::reclaim_worktree` against a tree those functions
+    /// actually recognise, without a real `zirv ctx agent --worktree`
+    /// delegation. Returns `None` (callers skip) if `git` itself is
+    /// unavailable or any setup step fails -- same discipline as
+    /// `git_repo_with_linked_worktree`.
+    fn git_repo_with_agent_managed_worktree() -> Option<(tempfile::TempDir, PathBuf, PathBuf)> {
+        if !git_available() {
+            eprintln!("skipping: git not found on PATH");
+            return None;
+        }
+        let root = tempfile::tempdir().ok()?;
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).ok()?;
+        let worktree = repo
+            .join(crate::utils::SCRIPT_DIR_NAME)
+            .join("worktrees")
+            .join("abcd1234");
+
+        let run = |args: &[&str], cwd: &Path| -> bool {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(cwd)
+                .args(args)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        };
+
+        if !run(&["init", "-q"], &repo) {
+            return None;
+        }
+        if !run(&["config", "user.email", "test@example.com"], &repo) {
+            return None;
+        }
+        if !run(&["config", "user.name", "test"], &repo) {
+            return None;
+        }
+        std::fs::write(repo.join("README.md"), "hello\n").ok()?;
+        if !run(&["add", "README.md"], &repo) {
+            return None;
+        }
+        if !run(&["commit", "-q", "-m", "initial"], &repo) {
+            return None;
+        }
+        let worktree_str = worktree.to_string_lossy().to_string();
+        if !run(&["worktree", "add", &worktree_str], &repo) {
+            return None;
+        }
+
+        Some((root, repo, worktree))
+    }
+
+    /// Review finding (2026-09), finding 2a: `agent::run_with`'s own
+    /// `--worktree` reclamation only ever covers the HEADLESS fallback path
+    /// -- a dashboard-hosted worker pane's linked worktree was left with
+    /// nothing reclaiming it once the pane's child exited. `reclaim_pane_
+    /// worktree` is the helper `reap_ended_panes` calls for that; tested
+    /// directly here (rather than through a real spawned pane) per the
+    /// finding's own guidance.
+    #[test]
+    fn reclaim_pane_worktree_removes_a_clean_agent_managed_worktree() {
+        let Some((_root, repo, worktree)) = git_repo_with_agent_managed_worktree() else {
+            return;
+        };
+        let outcome = reclaim_pane_worktree(&repo, &worktree);
+        assert_eq!(
+            outcome,
+            Some(crate::commands::ctx::agent::ReclaimOutcome::Removed)
+        );
+        assert!(!worktree.exists(), "the clean worktree must be removed");
+    }
+
+    /// The other half: a dirty pane cwd (an untracked file) is left in
+    /// place -- never force-removed, exactly like `agent::run_with`'s own
+    /// headless reclamation.
+    #[test]
+    fn reclaim_pane_worktree_leaves_a_dirty_agent_managed_worktree_in_place() {
+        let Some((_root, repo, worktree)) = git_repo_with_agent_managed_worktree() else {
+            return;
+        };
+        std::fs::write(worktree.join("scratch.txt"), "not committed\n").expect("write");
+
+        let outcome = reclaim_pane_worktree(&repo, &worktree);
+        assert_eq!(
+            outcome,
+            Some(crate::commands::ctx::agent::ReclaimOutcome::Dirty)
+        );
+        assert!(
+            worktree.exists(),
+            "a dirty worktree must never be force-removed"
+        );
+    }
+
+    /// An ordinary pane cwd (not under `.zirv/worktrees/`) is never touched
+    /// -- this dashboard did not allocate it, so no reclaim path may act on
+    /// it.
+    #[test]
+    fn reclaim_pane_worktree_never_touches_an_unmanaged_cwd() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir");
+        assert_eq!(reclaim_pane_worktree(&repo, &repo), None);
     }
 
     /// Mirror of the test above in the other direction: a dashboard whose
