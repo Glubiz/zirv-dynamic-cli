@@ -14,6 +14,7 @@ use super::super::event::{
     Capabilities, NormalizedEvent, SessionId, SessionRef, StructuralContext, ToolInvocation,
     TranscriptUsage, error_text_hash, last_verification_run,
 };
+use super::super::window::parse_iso8601_utc_ms;
 use super::{AgentAdapter, ResolvedProgram, TurnSignalSetup};
 
 /// Claude Code's own base layer, injected on every claude session zirv starts
@@ -204,6 +205,16 @@ pub fn parse_events(jsonl: &str) -> Vec<NormalizedEvent> {
             continue;
         }
 
+        // Issue #293: every row carries its own top-level `timestamp`
+        // (verified in `tests/fixtures/claude-real-session.jsonl`), read
+        // once per line and reused for whichever event(s) that line
+        // produces below. `None` -- never a guess -- for a line with no
+        // parseable timestamp.
+        let at_ms = row
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .and_then(parse_iso8601_utc_ms);
+
         if row.get("isApiErrorMessage").and_then(Value::as_bool) == Some(true) {
             let message = row.get("message").cloned().unwrap_or(Value::Null);
             events.push(NormalizedEvent::ProviderError {
@@ -232,7 +243,7 @@ pub fn parse_events(jsonl: &str) -> Vec<NormalizedEvent> {
                     .unwrap_or_default();
 
                 if results.is_empty() {
-                    events.push(NormalizedEvent::TurnStart);
+                    events.push(NormalizedEvent::TurnStart { at_ms });
                     continue;
                 }
                 for block in results {
@@ -241,6 +252,13 @@ pub fn parse_events(jsonl: &str) -> Vec<NormalizedEvent> {
                         .and_then(Value::as_bool)
                         .unwrap_or(false);
                     events.push(NormalizedEvent::ToolResult { is_error });
+                    // Issue #293: a sibling event, never a new field on
+                    // `ToolResult` -- see `ToolResultTimestamp`'s own doc
+                    // comment for why, the same reasoning
+                    // `ToolErrorText` (right below) already applies.
+                    if at_ms.is_some() {
+                        events.push(NormalizedEvent::ToolResultTimestamp { at_ms });
+                    }
                     // Same-error repetition (issue: `rot::Signals::
                     // same_error_repeats`): a sibling event, never a new
                     // field on `ToolResult` -- see that variant's own doc
@@ -261,9 +279,18 @@ pub fn parse_events(jsonl: &str) -> Vec<NormalizedEvent> {
                     events.push(NormalizedEvent::ModelId { id: id.to_string() });
                 }
                 let input_tokens = message.get("usage").map(context_tokens_of).unwrap_or(0);
+                let text = text_of(&message);
+                // Issue #293: a CANDIDATE first-text point, per row rather
+                // than tracked across the whole parse -- see
+                // `NormalizedEvent::AssistantFirstText`'s own doc comment
+                // for why this must stay line-local.
+                if !text.trim().is_empty() {
+                    events.push(NormalizedEvent::AssistantFirstText { at_ms });
+                }
                 events.push(NormalizedEvent::AssistantFinal {
-                    text: text_of(&message),
+                    text,
                     input_tokens,
+                    at_ms,
                 });
 
                 if let Some(blocks) = message.get("content").and_then(Value::as_array) {
@@ -280,6 +307,7 @@ pub fn parse_events(jsonl: &str) -> Vec<NormalizedEvent> {
                         events.push(NormalizedEvent::ToolCall {
                             name,
                             input_hash: input_hash(&raw),
+                            at_ms,
                         });
                     }
                 }
@@ -1895,7 +1923,7 @@ mod tests {
         assert_eq!(
             events,
             vec![
-                NormalizedEvent::TurnStart,
+                NormalizedEvent::TurnStart { at_ms: None },
                 NormalizedEvent::ToolResult { is_error: false },
             ]
         );
@@ -1953,14 +1981,71 @@ mod tests {
         assert_eq!(
             events,
             vec![
+                NormalizedEvent::AssistantFirstText { at_ms: None },
                 NormalizedEvent::AssistantFinal {
                     text: "[zirv] on it".to_string(),
                     input_tokens: 100,
+                    at_ms: None,
                 },
                 NormalizedEvent::ToolCall {
                     name: "Bash".to_string(),
                     input_hash: input_hash("{\"command\":\"ls\"}"),
+                    at_ms: None,
                 },
+            ]
+        );
+    }
+
+    /// Issue #293: `at_ms` comes from each row's own top-level `timestamp`
+    /// field, and a non-empty assistant text gets an `AssistantFirstText`
+    /// pushed right before the `AssistantFinal` that carries it.
+    #[test]
+    fn timestamps_are_read_from_each_rows_own_timestamp_field() {
+        let jsonl = concat!(
+            r#"{"type":"user","message":{"content":"go"},"timestamp":"2026-08-20T10:00:00.000Z"}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"content":["#,
+            r#"{"type":"text","text":"[zirv] hi"},"#,
+            r#"{"type":"tool_use","id":"t","name":"Bash","input":{"command":"ls"}}"#,
+            r#"],"usage":{"input_tokens":5}},"timestamp":"2026-08-20T10:00:00.500Z"}"#
+        );
+        let turn_at = parse_iso8601_utc_ms("2026-08-20T10:00:00.000Z");
+        let msg_at = parse_iso8601_utc_ms("2026-08-20T10:00:00.500Z");
+        assert!(
+            turn_at.is_some() && msg_at.is_some(),
+            "fixture timestamps must parse"
+        );
+        assert_eq!(
+            parse_events(jsonl),
+            vec![
+                NormalizedEvent::TurnStart { at_ms: turn_at },
+                NormalizedEvent::AssistantFirstText { at_ms: msg_at },
+                NormalizedEvent::AssistantFinal {
+                    text: "[zirv] hi".to_string(),
+                    input_tokens: 5,
+                    at_ms: msg_at,
+                },
+                NormalizedEvent::ToolCall {
+                    name: "Bash".to_string(),
+                    input_hash: input_hash("{\"command\":\"ls\"}"),
+                    at_ms: msg_at,
+                },
+            ]
+        );
+    }
+
+    /// Issue #293: a timestamped tool result gets a `ToolResultTimestamp`
+    /// sibling right after it, mirroring `ToolErrorText`'s own placement.
+    #[test]
+    fn a_timestamped_tool_result_gets_a_timestamp_sibling_event() {
+        let jsonl = r#"{"type":"user","message":{"content":[{"type":"tool_result","content":"ok"}]},"timestamp":"2026-08-20T10:00:00.000Z"}"#;
+        let at = parse_iso8601_utc_ms("2026-08-20T10:00:00.000Z");
+        assert!(at.is_some(), "fixture timestamp must parse");
+        assert_eq!(
+            parse_events(jsonl),
+            vec![
+                NormalizedEvent::ToolResult { is_error: false },
+                NormalizedEvent::ToolResultTimestamp { at_ms: at },
             ]
         );
     }
@@ -1973,7 +2058,8 @@ mod tests {
             events[0],
             NormalizedEvent::AssistantFinal {
                 text: String::new(),
-                input_tokens: 5
+                input_tokens: 5,
+                at_ms: None,
             }
         );
     }
@@ -2091,7 +2177,10 @@ mod tests {
             r#"{"type":"user","message":{"content":"real prompt"}}"#,
             "\n"
         );
-        assert_eq!(parse_events(jsonl), vec![NormalizedEvent::TurnStart]);
+        assert_eq!(
+            parse_events(jsonl),
+            vec![NormalizedEvent::TurnStart { at_ms: None }]
+        );
     }
 
     /// The invariant the incremental scoring path rests on (see the
@@ -2135,7 +2224,7 @@ mod tests {
         };
 
         assert_eq!(
-            count(&|e| matches!(e, NormalizedEvent::TurnStart)),
+            count(&|e| matches!(e, NormalizedEvent::TurnStart { .. })),
             want("turn_start")
         );
         assert_eq!(

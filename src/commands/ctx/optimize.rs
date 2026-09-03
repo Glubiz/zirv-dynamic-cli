@@ -1192,7 +1192,7 @@ pub fn evidence_from_transcripts(
         let events = adapter.parse_events(&jsonl);
         for event in &events {
             match event {
-                NormalizedEvent::TurnStart => evidence.turns += 1,
+                NormalizedEvent::TurnStart { .. } => evidence.turns += 1,
                 NormalizedEvent::ToolResult { is_error } => {
                     results += 1;
                     if *is_error {
@@ -2321,7 +2321,7 @@ mod tests {
         }
 
         fn parse_events(&self, _jsonl: &str) -> Vec<NormalizedEvent> {
-            vec![NormalizedEvent::TurnStart; 7]
+            vec![NormalizedEvent::TurnStart { at_ms: None }; 7]
         }
 
         fn structural_context(&self, _jsonl: &str, _last_n: usize) -> StructuralContext {
