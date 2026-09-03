@@ -1173,6 +1173,23 @@ pub struct AuditArgs {
     /// Print the report as JSON instead of the human-readable form.
     #[arg(long, default_value_t = false)]
     pub json: bool,
+    /// Issue #320: restrict the audit to one session id (or an unambiguous
+    /// short prefix of one) -- that session's own transcript plus its
+    /// `subagents/` transcripts (codex: the matching rollout file).
+    /// Conflicts with `--all-repos`: a single session already names an exact
+    /// scope, machine-wide or otherwise.
+    #[arg(long, conflicts_with = "all_repos")]
+    pub session: Option<String>,
+    /// Issue #320: audit the project at this path instead of the current
+    /// working directory's own project. No effect for `--agent codex`,
+    /// which has no per-project transcript directory to scope by.
+    #[arg(long)]
+    pub repo: Option<PathBuf>,
+    /// Issue #320: audit every project's transcripts machine-wide -- the
+    /// pre-#320 default. Without this, `--repo`, or `--session`, the audit
+    /// is scoped to the current working directory's own project.
+    #[arg(long, default_value_t = false)]
+    pub all_repos: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -1207,6 +1224,116 @@ fn transcripts_root(agent: AuditAgent) -> Option<PathBuf> {
     }
 }
 
+/// Claude Code's own per-project transcript directory name (issue #320's
+/// audit-scoping half): the given path's own string with every character
+/// that is not ASCII alphanumeric collapsed to `-`. Pure, and verified
+/// against the two real, observed encodings this issue's own investigation
+/// recorded -- `D:\GitHub\zirv-dynamic-cli` -> `D--GitHub-zirv-dynamic-cli`,
+/// and a long nested unix path -> its own leading-`-` encoding (see this
+/// module's own tests).
+pub(crate) fn claude_project_dir_name(path: &Path) -> String {
+    path.to_string_lossy()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
+}
+
+/// The directories one non-`--session` audit actually samples from, pure
+/// over its own inputs so the scoping rule is testable without touching the
+/// real home directory. Codex has no per-project transcript directory to
+/// scope by today (`transcripts_root`'s own doc comment on `AuditAgent::
+/// Codex`), so a codex audit is always machine-wide regardless of `--repo`/
+/// `--all-repos`. For claude: `--all-repos` (or its absence never having
+/// been an option before issue #320) walks the whole transcripts root;
+/// otherwise exactly one project directory under it -- `--repo <path>`, or
+/// (its default) `cwd`.
+fn resolve_scope_dirs(
+    root: &Path,
+    agent: AuditAgent,
+    repo: Option<&Path>,
+    all_repos: bool,
+    cwd: &Path,
+) -> Vec<PathBuf> {
+    if agent == AuditAgent::Codex || all_repos {
+        return vec![root.to_path_buf()];
+    }
+    let target = repo.unwrap_or(cwd);
+    vec![root.join(claude_project_dir_name(target))]
+}
+
+/// `resolve_scope_dirs`'s real-world wiring: resolves `agent`'s own
+/// transcripts root and the process's own current working directory. An
+/// unresolvable root (no platform home dir) degrades to an empty scope,
+/// same as every other `transcripts_root`-dependent path in this module.
+fn scoped_transcript_dirs(agent: AuditAgent, args: &AuditArgs) -> Vec<PathBuf> {
+    let Some(root) = transcripts_root(agent) else {
+        return Vec::new();
+    };
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    resolve_scope_dirs(&root, agent, args.repo.as_deref(), args.all_repos, &cwd)
+}
+
+/// Issue #320: transcripts matching a `--session <id-or-short-prefix>`
+/// query, walked from the agent's WHOLE transcripts root -- a session id
+/// already names an exact scope on its own, so this deliberately ignores
+/// `--repo`/`--all-repos`/cwd entirely. A match's own `subagents/` sibling
+/// directory (`<project-dir>/<session>/subagents/*.jsonl`, per this issue's
+/// own verified layout notes; claude only -- codex has no such concept, so
+/// this is a no-op for it) is pulled in alongside the match itself, mirroring
+/// how `optimize::newest_transcripts` already walks both levels together as
+/// one flat sample.
+fn session_transcripts(root: &Path, query: &str) -> Vec<PathBuf> {
+    let mut matches: Vec<PathBuf> = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            // A file already reachable through its own parent session's
+            // `subagents/` directory is pulled in below, once that parent
+            // session is found as a match -- never matched here on its own
+            // name, which would double-count it if the query also happens
+            // to prefix-match the subagent transcript's own filename.
+            let in_subagents_dir = path
+                .parent()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                == Some("subagents");
+            if in_subagents_dir {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if stem != query && !stem.starts_with(query) {
+                continue;
+            }
+            matches.push(path.clone());
+            if let Some(parent) = path.parent() {
+                let subagents_dir = parent.join(stem).join("subagents");
+                if let Ok(sub_entries) = std::fs::read_dir(&subagents_dir) {
+                    for sub in sub_entries.flatten() {
+                        let sub_path = sub.path();
+                        if sub_path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+                            matches.push(sub_path);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    matches
+}
+
 /// Codex has no per-command permission-hook contract zirv can pin the way
 /// claude's `PreToolUse` hook is (`safety.rs`'s own doc comment): a codex
 /// launch never consults `[safety]` at all (`CodexAdapter::default_sandbox_
@@ -1225,11 +1352,257 @@ const CODEX_SAFETY_NO_OP_CAVEAT: &str = "caveat: compiled [safety] allow entries
      codex has no per-command approval hook zirv can pin (upstream exec_permission_approvals \
      / request_permissions_tool are still in development)";
 
+/// Issue #321/#307's Read/Edit half of the audit: one non-Bash tool's
+/// `permission-prompts.jsonl` records collapsed to a single directory (the
+/// shortest ancestor shared by every observed target in the group) plus a
+/// count and a standing recommendation.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ToolTargetGroup {
+    pub tool: String,
+    pub count: usize,
+    pub directory: String,
+    pub recommendation: String,
+}
+
+/// The whole `permission-prompts.jsonl` half of an audit: Bash/PowerShell
+/// prompts are counted per event only (the transcript-derived family groups
+/// above already cover Bash), everything else is grouped by tool and
+/// directory.
+#[derive(Debug, Clone, PartialEq, Serialize, Default)]
+pub struct ToolPromptReport {
+    pub bash_permission_requests: usize,
+    pub bash_permission_denied: usize,
+    pub tool_groups: Vec<ToolTargetGroup>,
+}
+
+/// Tool names counted in the Bash summary line rather than re-grouped by
+/// directory -- their `permission_prompt_target` is a command, not a path.
+const BASH_PROMPT_TOOLS: [&str; 2] = ["Bash", "PowerShell"];
+
+/// Tool names whose `hook::PermissionPromptRow::family` is already the
+/// file's own parent directory (`hook::permission_family`'s own doc
+/// comment) -- the only tools this grouping treats as a directory
+/// recommendation. `WebFetch`'s family is a URL host and every other tool's
+/// is its own name, neither of which is a directory to group by.
+const DIRECTORY_FAMILY_TOOLS: [&str; 5] = ["Read", "Edit", "Write", "MultiEdit", "NotebookEdit"];
+
+/// The exact operator-only config keys a Read/Edit-family recommendation
+/// names: Claude's own native `permissions.additionalDirectories` setting,
+/// or zirv's `[sandbox] extra_allow` (`SandboxConfig::extra_allow`'s own doc
+/// comment -- operator-only, `REPO_FORBIDDEN` for a repo layer).
+const DIRECTORY_RECOMMENDATION: &str =
+    "add this directory to `permissions.additionalDirectories` or `[sandbox] extra_allow`";
+
+fn bash_prompt_summary(records: &[log::PermissionPromptRecord]) -> (usize, usize) {
+    let mut requests = 0usize;
+    let mut denied = 0usize;
+    for record in records {
+        if !BASH_PROMPT_TOOLS.contains(&record.tool.as_str()) {
+            continue;
+        }
+        match record.event.as_str() {
+            "PermissionRequest" => requests += 1,
+            "PermissionDenied" => denied += 1,
+            _ => {}
+        }
+    }
+    (requests, denied)
+}
+
+/// The longest path prefix shared by every entry in `paths`, compared
+/// component-wise (never byte-wise, which could split a path mid-component).
+/// An empty slice has no ancestor to report.
+fn shortest_common_ancestor(paths: &[PathBuf]) -> PathBuf {
+    let mut iter = paths.iter();
+    let Some(first) = iter.next() else {
+        return PathBuf::new();
+    };
+    let mut common: Vec<std::ffi::OsString> = first
+        .components()
+        .map(|c| c.as_os_str().to_os_string())
+        .collect();
+    for path in iter {
+        let components: Vec<std::ffi::OsString> = path
+            .components()
+            .map(|c| c.as_os_str().to_os_string())
+            .collect();
+        let shared = common
+            .iter()
+            .zip(components.iter())
+            .take_while(|(a, b)| a == b)
+            .count();
+        common.truncate(shared);
+    }
+    common.into_iter().collect()
+}
+
+/// Renders a directory for the `Read(//<dir>/**)` recommendation line:
+/// forward slashes always, `~` for the home directory prefix when `dir` is
+/// under it, otherwise a `//`-prefixed absolute path -- a leading native
+/// `/` is folded into that marker rather than tripling up.
+fn format_prompt_directory(dir: &Path) -> String {
+    if let Ok(home) = crate::utils::home_dir()
+        && let Ok(rel) = dir.strip_prefix(&home)
+    {
+        let rel = rel.to_string_lossy().replace('\\', "/");
+        return if rel.is_empty() {
+            "~".to_string()
+        } else {
+            format!("~/{rel}")
+        };
+    }
+    let mut text = dir.to_string_lossy().replace('\\', "/");
+    if let Some(stripped) = text.strip_prefix('/') {
+        text = stripped.to_string();
+    }
+    format!("//{text}")
+}
+
+fn group_tool_targets(records: &[log::PermissionPromptRecord]) -> Vec<ToolTargetGroup> {
+    let mut order: Vec<String> = Vec::new();
+    let mut by_tool: HashMap<String, Vec<PathBuf>> = HashMap::new();
+    for record in records {
+        if !DIRECTORY_FAMILY_TOOLS.contains(&record.tool.as_str()) || record.family.is_empty() {
+            continue;
+        }
+        // `family` is already the file's own parent directory (`hook::
+        // permission_family`), so no further `.parent()` extraction is
+        // needed here the way it would be for a raw file path.
+        let dir = PathBuf::from(&record.family);
+        by_tool
+            .entry(record.tool.clone())
+            .or_insert_with(|| {
+                order.push(record.tool.clone());
+                Vec::new()
+            })
+            .push(dir);
+    }
+    let mut groups: Vec<ToolTargetGroup> = order
+        .into_iter()
+        .map(|tool| {
+            let dirs = &by_tool[&tool];
+            let ancestor = shortest_common_ancestor(dirs);
+            ToolTargetGroup {
+                count: dirs.len(),
+                directory: format_prompt_directory(&ancestor),
+                recommendation: DIRECTORY_RECOMMENDATION.to_string(),
+                tool,
+            }
+        })
+        .collect();
+    groups.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.tool.cmp(&b.tool)));
+    groups
+}
+
+impl ToolPromptReport {
+    pub fn from_records(records: &[log::PermissionPromptRecord]) -> Self {
+        let (bash_permission_requests, bash_permission_denied) = bash_prompt_summary(records);
+        Self {
+            bash_permission_requests,
+            bash_permission_denied,
+            tool_groups: group_tool_targets(records),
+        }
+    }
+}
+
+/// Renders the `permission-prompts.jsonl` half of the report, appended after
+/// the transcript-derived family groups. Empty when there is nothing in the
+/// log at all -- an operator running the very first audit on this feature
+/// sees no new, empty section.
+fn render_tool_prompt_section(report: &ToolPromptReport) -> String {
+    if report.bash_permission_requests == 0
+        && report.bash_permission_denied == 0
+        && report.tool_groups.is_empty()
+    {
+        return String::new();
+    }
+    let mut out = String::from("## Permission-prompt log (permission-prompts.jsonl)\n\n");
+    if report.bash_permission_requests > 0 || report.bash_permission_denied > 0 {
+        out.push_str(&format!(
+            "- Bash/PowerShell: {} PermissionRequest, {} PermissionDenied\n",
+            report.bash_permission_requests, report.bash_permission_denied
+        ));
+    }
+    for group in &report.tool_groups {
+        out.push_str(&format!(
+            "- {}({}/**) -- {} request(s)\n",
+            group.tool, group.directory, group.count
+        ));
+        out.push_str(&format!("  - recommendation: {}\n", group.recommendation));
+    }
+    out.push('\n');
+    out
+}
+
+/// Issue #320/#321: `permission-prompts.jsonl` records for the sessions this
+/// audit actually sampled, matched by exact `session` id -- mirroring how
+/// `audit_report` derives a session id from each transcript's own file stem.
+/// `--all-repos` reads every record with no session filter at all: a
+/// machine-wide audit has already opted into cross-project noise, and
+/// filtering permission prompts down to only the sampled sessions while
+/// leaving the Bash/tool families machine-wide would silently narrow just
+/// this one half of the report.
+fn scoped_permission_prompts(
+    all_repos: bool,
+    session_ids: &[String],
+) -> Vec<log::PermissionPromptRecord> {
+    let Ok(state) = super::state::StateDir::resolve(&super::config::env_from_process()) else {
+        return Vec::new();
+    };
+    let all = log::read_permission_prompts(&state);
+    if all_repos {
+        return all;
+    }
+    all.into_iter()
+        .filter(|record| session_ids.iter().any(|id| id == &record.session))
+        .collect()
+}
+
+/// Issue #320: prints one line per transcript actually sampled, naming its
+/// source project directory. Audits are no longer implicitly machine-wide
+/// (see `resolve_scope_dirs`), but a `--all-repos` run (or any codex audit,
+/// which has no per-project directory to scope by) still spans many
+/// projects, and a reader must be able to see that at a glance rather than
+/// assume every session happened in the one repository they ran the command
+/// from.
+fn render_sources_section(files: &[PathBuf]) -> String {
+    if files.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("## Sampled transcripts\n\n");
+    for path in files {
+        let session = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown");
+        let project_dir =
+            super::optimize::project_dir_of(path).unwrap_or_else(|| "unknown".to_string());
+        out.push_str(&format!("- session {session} -- project {project_dir}\n"));
+    }
+    out.push('\n');
+    out
+}
+
 pub fn run_audit<W: Write>(args: &AuditArgs, w: &mut W) -> CtxResult<i32> {
-    let files = transcripts_root(args.agent)
-        .map(|root| super::optimize::newest_transcripts(&root, args.sessions))
-        .unwrap_or_default();
+    let files: Vec<PathBuf> = if let Some(session) = &args.session {
+        transcripts_root(args.agent)
+            .map(|root| session_transcripts(&root, session))
+            .unwrap_or_default()
+    } else {
+        scoped_transcript_dirs(args.agent, args)
+            .into_iter()
+            .flat_map(|dir| super::optimize::newest_transcripts(&dir, args.sessions))
+            .collect()
+    };
     let report = audit_report(args.agent, &files);
+
+    let session_ids: Vec<String> = files
+        .iter()
+        .filter_map(|p| p.file_stem().and_then(|s| s.to_str()).map(String::from))
+        .collect();
+    let prompt_records = scoped_permission_prompts(args.all_repos, &session_ids);
+    let tool_prompt_report = ToolPromptReport::from_records(&prompt_records);
+
     if args.json {
         writeln!(
             w,
@@ -1252,6 +1625,8 @@ pub fn run_audit<W: Write>(args: &AuditArgs, w: &mut W) -> CtxResult<i32> {
             Vec::new()
         };
         write!(w, "{}", render_report(&report, &native_rules))?;
+        write!(w, "{}", render_sources_section(&files))?;
+        write!(w, "{}", render_tool_prompt_section(&tool_prompt_report))?;
     }
     Ok(0)
 }
@@ -3975,6 +4350,9 @@ mod tests {
             agent: AuditAgent::Codex,
             sessions: 5,
             json: false,
+            session: None,
+            repo: None,
+            all_repos: false,
         };
         let mut out = Vec::new();
         run_audit(&codex_args, &mut out).expect("run_audit");
@@ -3988,6 +4366,9 @@ mod tests {
             agent: AuditAgent::Claude,
             sessions: 5,
             json: false,
+            session: None,
+            repo: None,
+            all_repos: false,
         };
         let mut out = Vec::new();
         run_audit(&claude_args, &mut out).expect("run_audit");
@@ -5511,6 +5892,332 @@ mod tests {
         assert!(
             rendered.contains("excluded: 'gh issue'"),
             "the excluded family's guidance must still appear: {rendered}"
+        );
+    }
+
+    // -------------------------------------------------------------
+    // Issue #320: audit scoping (claude_project_dir_name, --repo/--all-repos,
+    // --session)
+    // -------------------------------------------------------------
+
+    /// Pure encoding rule, pinned against the two real, observed examples
+    /// this issue's own investigation recorded.
+    #[test]
+    fn claude_project_dir_name_matches_observed_encoding() {
+        assert_eq!(
+            claude_project_dir_name(Path::new(r"D:\GitHub\zirv-dynamic-cli")),
+            "D--GitHub-zirv-dynamic-cli"
+        );
+        assert_eq!(
+            claude_project_dir_name(Path::new(
+                "/Users/jonathansolskov/work/gitte/gitlab.cego.dk/spilnu/services/marketing-automation"
+            )),
+            "-Users-jonathansolskov-work-gitte-gitlab-cego-dk-spilnu-services-marketing-automation"
+        );
+    }
+
+    #[test]
+    fn resolve_scope_dirs_default_and_repo_scope_to_one_project_all_repos_to_both() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("projects");
+        let repo_a = PathBuf::from("/work/repo-a");
+        let repo_b = PathBuf::from("/work/repo-b");
+        let dir_a = root.join(claude_project_dir_name(&repo_a));
+        let dir_b = root.join(claude_project_dir_name(&repo_b));
+        std::fs::create_dir_all(&dir_a).expect("mkdir a");
+        std::fs::create_dir_all(&dir_b).expect("mkdir b");
+        std::fs::write(dir_a.join("s1.jsonl"), "{}\n").expect("write s1");
+        std::fs::write(dir_b.join("s2.jsonl"), "{}\n").expect("write s2");
+
+        // Default (no --repo, no --all-repos): scoped to `cwd`'s own project.
+        let default_scope = resolve_scope_dirs(&root, AuditAgent::Claude, None, false, &repo_a);
+        let default_files: Vec<PathBuf> = default_scope
+            .iter()
+            .flat_map(|d| super::super::optimize::newest_transcripts(d, 10))
+            .collect();
+        assert_eq!(
+            default_files,
+            vec![dir_a.join("s1.jsonl")],
+            "default must be a strict subset (repo-a only)"
+        );
+
+        // --repo repo-b, even with a different cwd: scoped to repo-b.
+        let repo_scope =
+            resolve_scope_dirs(&root, AuditAgent::Claude, Some(&repo_b), false, &repo_a);
+        let repo_files: Vec<PathBuf> = repo_scope
+            .iter()
+            .flat_map(|d| super::super::optimize::newest_transcripts(d, 10))
+            .collect();
+        assert_eq!(
+            repo_files,
+            vec![dir_b.join("s2.jsonl")],
+            "--repo must be a strict subset (repo-b only)"
+        );
+
+        // --all-repos: both.
+        let all_scope = resolve_scope_dirs(&root, AuditAgent::Claude, None, true, &repo_a);
+        let mut all_files: Vec<PathBuf> = all_scope
+            .iter()
+            .flat_map(|d| super::super::optimize::newest_transcripts(d, 10))
+            .collect();
+        all_files.sort();
+        let mut expected = vec![dir_a.join("s1.jsonl"), dir_b.join("s2.jsonl")];
+        expected.sort();
+        assert_eq!(all_files, expected, "--all-repos must yield both");
+    }
+
+    /// Codex has no per-project transcript directory to scope by, so it is
+    /// always machine-wide regardless of `--repo`/`--all-repos`.
+    #[test]
+    fn resolve_scope_dirs_codex_is_always_the_whole_root() {
+        let root = PathBuf::from("/home/op/.codex/sessions");
+        let repo = PathBuf::from("/work/repo-a");
+        assert_eq!(
+            resolve_scope_dirs(&root, AuditAgent::Codex, Some(&repo), false, &repo),
+            vec![root.clone()]
+        );
+        assert_eq!(
+            resolve_scope_dirs(&root, AuditAgent::Codex, None, false, &repo),
+            vec![root]
+        );
+    }
+
+    #[test]
+    fn session_transcripts_matches_prefix_and_pulls_in_only_its_own_subagents() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("projects");
+        let project_dir = root.join("-work-repo");
+        let subagents_dir = project_dir.join("sess-abc123").join("subagents");
+        std::fs::create_dir_all(&subagents_dir).expect("mkdir subagents");
+        std::fs::write(project_dir.join("sess-abc123.jsonl"), "{}\n").expect("write parent");
+        std::fs::write(subagents_dir.join("worker1.jsonl"), "{}\n").expect("write subagent");
+        std::fs::write(project_dir.join("sess-other.jsonl"), "{}\n").expect("write unrelated");
+
+        let found = session_transcripts(&root, "sess-abc123");
+        let mut names: Vec<String> = found
+            .iter()
+            .filter_map(|p| p.file_name().and_then(|n| n.to_str()).map(str::to_string))
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec!["sess-abc123.jsonl".to_string(), "worker1.jsonl".to_string(),],
+            "must yield the session file plus its subagents only: {names:?}"
+        );
+    }
+
+    /// A short, unambiguous prefix of a session id must still match.
+    #[test]
+    fn session_transcripts_matches_a_short_prefix() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("projects");
+        let project_dir = root.join("-work-repo");
+        std::fs::create_dir_all(&project_dir).expect("mkdir");
+        std::fs::write(
+            project_dir.join("11111111-2222-4333-8444-555555555555.jsonl"),
+            "{}\n",
+        )
+        .expect("write");
+        std::fs::write(
+            project_dir.join("99999999-aaaa-bbbb-cccc-dddddddddddd.jsonl"),
+            "{}\n",
+        )
+        .expect("write unrelated");
+
+        let found = session_transcripts(&root, "11111111");
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            found[0].file_name().and_then(|n| n.to_str()),
+            Some("11111111-2222-4333-8444-555555555555.jsonl")
+        );
+    }
+
+    // -------------------------------------------------------------
+    // Issue #321/#307: permission-prompt Read/Edit families
+    // -------------------------------------------------------------
+
+    /// `family` here is exactly what `hook::permission_family` would have
+    /// already computed for the real writer -- a parent directory for
+    /// Read/Edit/Write/MultiEdit/NotebookEdit, `program subcommand` for
+    /// Bash/PowerShell -- never a raw file path or full command line.
+    fn prompt_record(
+        tool: &str,
+        family: &str,
+        event: &str,
+        session: &str,
+    ) -> log::PermissionPromptRecord {
+        log::PermissionPromptRecord {
+            ts: 1_700_000_000,
+            session: session.to_string(),
+            event: event.to_string(),
+            tool: tool.to_string(),
+            family: family.to_string(),
+            command_sha256: None,
+            cwd: "/work/repo".to_string(),
+            permission_mode: "default".to_string(),
+            reason: None,
+        }
+    }
+
+    #[test]
+    fn bash_prompt_summary_counts_per_event_and_ignores_other_tools() {
+        let records = vec![
+            prompt_record("Bash", "echo", "PermissionRequest", "s1"),
+            prompt_record("Bash", "echo", "PermissionDenied", "s1"),
+            prompt_record("PowerShell", "Get-Item", "PermissionRequest", "s1"),
+            prompt_record("Read", "/work/repo", "PermissionRequest", "s1"),
+        ];
+        assert_eq!(bash_prompt_summary(&records), (2, 1));
+    }
+
+    #[test]
+    fn shortest_common_ancestor_collapses_to_the_shared_directory() {
+        let paths = vec![
+            PathBuf::from("/work/repo/src/a"),
+            PathBuf::from("/work/repo/src/b/c"),
+            PathBuf::from("/work/repo/src"),
+        ];
+        assert_eq!(
+            shortest_common_ancestor(&paths),
+            PathBuf::from("/work/repo/src")
+        );
+    }
+
+    #[test]
+    fn shortest_common_ancestor_of_unrelated_paths_is_the_root() {
+        let paths = vec![
+            PathBuf::from("/work/repo-a"),
+            PathBuf::from("/other/repo-b"),
+        ];
+        assert_eq!(shortest_common_ancestor(&paths), PathBuf::from("/"));
+    }
+
+    #[test]
+    fn format_prompt_directory_uses_tilde_under_home_and_double_slash_otherwise() {
+        let home = crate::utils::home_dir().expect("home dir");
+        let under_home = home.join("project").join("src");
+        assert_eq!(format_prompt_directory(&under_home), "~/project/src");
+        assert_eq!(format_prompt_directory(&home), "~");
+
+        assert_eq!(
+            format_prompt_directory(Path::new("/etc/somewhere")),
+            "//etc/somewhere"
+        );
+    }
+
+    #[test]
+    fn group_tool_targets_collapses_read_events_to_one_common_directory() {
+        let records = vec![
+            // `family` is already the parent directory the real writer
+            // computed (both `main.rs` and `lib.rs` live under `src`).
+            prompt_record("Read", "/work/repo/src", "PermissionRequest", "s1"),
+            prompt_record("Read", "/work/repo/src", "PermissionRequest", "s1"),
+            prompt_record("Edit", "/work/repo", "PermissionRequest", "s1"),
+            // Bash must never be re-grouped here.
+            prompt_record("Bash", "echo", "PermissionRequest", "s1"),
+        ];
+        let groups = group_tool_targets(&records);
+        assert_eq!(groups.len(), 2, "Read and Edit, never Bash: {groups:?}");
+
+        let read_group = groups
+            .iter()
+            .find(|g| g.tool == "Read")
+            .expect("Read group");
+        assert_eq!(read_group.count, 2);
+        assert_eq!(read_group.directory, "//work/repo/src");
+        assert!(read_group.recommendation.contains("additionalDirectories"));
+        assert!(read_group.recommendation.contains("extra_allow"));
+
+        let edit_group = groups
+            .iter()
+            .find(|g| g.tool == "Edit")
+            .expect("Edit group");
+        assert_eq!(edit_group.count, 1);
+        assert_eq!(edit_group.directory, "//work/repo");
+    }
+
+    #[test]
+    fn render_tool_prompt_section_is_empty_when_there_is_nothing_to_report() {
+        let report = ToolPromptReport::default();
+        assert_eq!(render_tool_prompt_section(&report), "");
+    }
+
+    #[test]
+    fn render_tool_prompt_section_prints_bash_summary_and_tool_groups() {
+        let report = ToolPromptReport {
+            bash_permission_requests: 3,
+            bash_permission_denied: 1,
+            tool_groups: vec![ToolTargetGroup {
+                tool: "Read".to_string(),
+                count: 2,
+                directory: "//work/repo/src".to_string(),
+                recommendation: DIRECTORY_RECOMMENDATION.to_string(),
+            }],
+        };
+        let rendered = render_tool_prompt_section(&report);
+        assert!(rendered.contains("3 PermissionRequest, 1 PermissionDenied"));
+        assert!(rendered.contains("Read(//work/repo/src/**) -- 2 request(s)"));
+        assert!(rendered.contains("additionalDirectories"));
+    }
+
+    /// Appends one raw `permission-prompts.jsonl` line matching `hook::
+    /// PermissionPromptRow`'s own field shape directly -- there is no public
+    /// writer to call (the hook writes the file itself), the same seeding
+    /// approach `log.rs`'s own permission-prompt tests use.
+    fn append_prompt_line(
+        state: &super::super::state::StateDir,
+        record: &log::PermissionPromptRecord,
+    ) {
+        let dir = state.logs();
+        super::super::state::create_private_dir_all(&dir).expect("mkdir logs");
+        let mut file =
+            super::super::state::open_private_append(&dir.join("permission-prompts.jsonl"))
+                .expect("open");
+        let line = serde_json::json!({
+            "ts": record.ts,
+            "session": record.session,
+            "event": record.event,
+            "tool": record.tool,
+            "family": record.family,
+            "cwd": record.cwd,
+            "permission_mode": record.permission_mode,
+        });
+        writeln!(file, "{line}").expect("write line");
+    }
+
+    /// Real end-to-end (`HomeGuard`/`VarGuard`-backed state dir): matches on
+    /// exact session id unless `--all-repos`, in which case every record is
+    /// read regardless of session.
+    #[test]
+    fn scoped_permission_prompts_filters_by_session_unless_all_repos() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let _state_env = crate::commands::ctx::testenv::VarGuard::set(&[(
+            super::super::state::STATE_ENV,
+            Some(home.path().join("state").to_str().expect("utf8 state")),
+        )]);
+        let state =
+            super::super::state::StateDir::resolve(&super::super::config::env_from_process())
+                .expect("resolve state dir");
+
+        append_prompt_line(
+            &state,
+            &prompt_record("Read", "/work/repo", "PermissionRequest", "s1"),
+        );
+        append_prompt_line(
+            &state,
+            &prompt_record("Read", "/work/other", "PermissionRequest", "s2"),
+        );
+
+        let scoped = scoped_permission_prompts(false, &["s1".to_string()]);
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].session, "s1");
+
+        let all = scoped_permission_prompts(true, &["s1".to_string()]);
+        assert_eq!(
+            all.len(),
+            2,
+            "--all-repos must read every record with no session filter at all"
         );
     }
 }

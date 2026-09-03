@@ -1146,7 +1146,7 @@ pub fn newest_transcripts(projects_root: &Path, sample: usize) -> Vec<PathBuf> {
 /// under `projects_root`), for the report's M1 disclosure that sampling is
 /// machine-wide. A subagent file sits one level deeper (`<project>/subagents/
 /// <file>.jsonl`), so its parent's parent is the project instead.
-fn project_dir_of(path: &Path) -> Option<String> {
+pub(crate) fn project_dir_of(path: &Path) -> Option<String> {
     let parent = path.parent()?;
     let project_dir = if parent.file_name().and_then(|n| n.to_str()) == Some("subagents") {
         parent.parent()?
