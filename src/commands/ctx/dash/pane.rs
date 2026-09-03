@@ -873,6 +873,13 @@ pub struct Pane {
     /// nothing but the allocating `zirv ctx agent` process's own headless
     /// fallback path ever did.
     cwd: PathBuf,
+    /// Issue #267, review round 3: whether `cwd` is a linked worktree the
+    /// spawning `zirv agent --worktree` allocated for this pane
+    /// (`SpawnRequest::owns_workdir`), which is the only case
+    /// `dash::reap_ended_panes` may reclaim it. Never inferred from the
+    /// path: an operator-named `--workdir` under `.zirv/worktrees/` stays
+    /// the operator's.
+    owns_cwd: bool,
 }
 
 impl Pane {
@@ -1085,6 +1092,7 @@ impl Pane {
             launch_mode,
             writer_permit: None,
             cwd: cwd.to_path_buf(),
+            owns_cwd: false,
         })
     }
 
@@ -1479,6 +1487,18 @@ impl Pane {
     /// worktree-reclaim check).
     pub(crate) fn cwd(&self) -> &Path {
         &self.cwd
+    }
+
+    /// Whether this pane owns its `cwd` as an agent-allocated worktree (see
+    /// the [`Pane::owns_cwd`] field).
+    pub(crate) fn owns_cwd(&self) -> bool {
+        self.owns_cwd
+    }
+
+    /// Records that the spawning request allocated this pane's `cwd` with
+    /// `--worktree`, so the reap path may reclaim it.
+    pub(crate) fn set_owns_cwd(&mut self) {
+        self.owns_cwd = true;
     }
 
     /// Whether this pane's own turn-signal socket bound successfully at
