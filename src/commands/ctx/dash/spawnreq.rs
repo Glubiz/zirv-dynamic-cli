@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use super::super::CtxResult;
+use super::super::permit::WorkerMode;
 use super::super::policy::CapabilityWarning;
 use super::super::prompt::PromptRole;
 use super::super::state::StateDir;
@@ -134,6 +135,18 @@ pub struct SpawnRequest {
     /// unchanged pre-#228 behaviour: the pane runs at the accepted `cwd`.
     #[serde(default)]
     pub workdir: Option<PathBuf>,
+    /// Issue #267: whether the requester asked for `read-only` or `writing`
+    /// (`agent::AgentArgs::mode`). `#[serde(default)]` -- `WorkerMode`'s own
+    /// default of `Writing` -- so a request written by an older build
+    /// deserialises to the least-surprising reading (every request before
+    /// this field existed WAS an ordinary writing worker). Carried for
+    /// parity with the headless path's own `Delegation::mode`; a pane
+    /// fulfilling this request does not yet enforce the writer-permit pool
+    /// itself (that enforcement lives in `agent::run_with`'s own headless
+    /// fork today) -- a deliberate, narrower scope for this change, not an
+    /// oversight.
+    #[serde(default)]
+    pub mode: WorkerMode,
 }
 
 /// The role a request actually gets. Unstated or unrecognised is
@@ -474,6 +487,7 @@ mod tests {
             budget_tokens: None,
             force: false,
             workdir: None,
+            mode: WorkerMode::Writing,
         }
     }
 
@@ -501,6 +515,11 @@ mod tests {
             role_of(&req),
             PromptRole::Worker,
             "an unstated role is a Worker -- the least-privileged reading"
+        );
+        assert_eq!(
+            req.mode,
+            WorkerMode::Writing,
+            "an unstated mode is Writing -- every request before this field existed was one"
         );
     }
 
@@ -530,6 +549,17 @@ mod tests {
             back.cwd, req.cwd,
             "workdir must never be conflated with the requester's own cwd"
         );
+    }
+
+    /// Issue #267: `mode` round-trips through the same plain serde shape
+    /// every other field on this struct does.
+    #[test]
+    fn a_request_carrying_read_only_mode_round_trips() {
+        let mut req = sample_request();
+        req.mode = WorkerMode::ReadOnly;
+        let json = serde_json::to_string(&req).expect("serialize");
+        let back: SpawnRequest = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.mode, WorkerMode::ReadOnly);
     }
 
     #[test]

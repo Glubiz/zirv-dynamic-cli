@@ -6481,6 +6481,15 @@ pub fn run_dashboard(
                                                     // exactly as before that
                                                     // flag existed.
                                                     workdir: None,
+                                                    // The overlay has no
+                                                    // `--mode` of its own
+                                                    // either (issue #267):
+                                                    // this spawn runs as an
+                                                    // ordinary writing
+                                                    // worker, exactly as
+                                                    // before that flag
+                                                    // existed.
+                                                    mode: super::permit::WorkerMode::Writing,
                                                 };
                                                 let panes_before_spawn = panes.len();
                                                 // `trusted_interactive: true` --
@@ -10559,6 +10568,7 @@ mod tests {
             budget_tokens: None,
             force: false,
             workdir: None,
+            mode: super::super::permit::WorkerMode::Writing,
         }
     }
 

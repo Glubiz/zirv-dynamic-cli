@@ -560,6 +560,37 @@ mod tests {
         );
     }
 
+    /// Issue #267: `--mode`/`--worktree` are ordinary trailing argv to this
+    /// alias rewrite -- it forwards everything after the verb byte-for-byte,
+    /// so a new `AgentArgs` flag needs no rewrite-side change to reach
+    /// `zirv ctx agent`'s own clap parser.
+    #[test]
+    fn the_agent_alias_forwards_mode_and_worktree_flags_unchanged() {
+        assert_eq!(
+            rewrite_ctx_alias_args(
+                "agent",
+                &argv(&[
+                    "zirv",
+                    "agent",
+                    "claude",
+                    "go",
+                    "--mode",
+                    "read-only",
+                    "--worktree"
+                ])
+            ),
+            vec![
+                "ctx".to_string(),
+                "agent".to_string(),
+                "claude".to_string(),
+                "go".to_string(),
+                "--mode".to_string(),
+                "read-only".to_string(),
+                "--worktree".to_string(),
+            ]
+        );
+    }
+
     #[test]
     fn the_help_flag_still_wins_over_the_bare_alias() {
         // `zirv --help` has argv len 2, not 1, so it never reaches the bare-
