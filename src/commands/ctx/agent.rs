@@ -293,9 +293,16 @@ fn allocate_worktree(repo: &Path) -> CtxResult<PathBuf> {
 /// variant is best-effort: printed as a single stderr line by the caller,
 /// never turned into a delegation failure or a nonzero exit code.
 ///
+/// `pub(crate)` (review finding, 2026-09): `dash::mod::reap_ended_panes`
+/// matches on this too, reclaiming a dashboard-hosted `--worktree` pane's
+/// own linked worktree once its child exits -- the one exit path `run_with`
+/// itself can never observe, since ownership already passed to the pane the
+/// moment the dashboard accepted it (see [`is_agent_managed_worktree`]'s own
+/// doc comment).
+///
 /// [`Removed`]: ReclaimOutcome::Removed
 #[derive(Debug, PartialEq, Eq)]
-enum ReclaimOutcome {
+pub(crate) enum ReclaimOutcome {
     /// `git status --porcelain` reported a clean tree and `git worktree
     /// remove` (no `--force`) succeeded -- the directory is gone, but the
     /// branch `git worktree add` minted alongside it (named after the
@@ -320,7 +327,11 @@ enum ReclaimOutcome {
 /// --porcelain` reports) is left exactly as-is, `--force` is never passed to
 /// `git worktree remove`, and any I/O failure along the way also leaves the
 /// tree in place rather than risk losing work the caller cannot see.
-fn reclaim_worktree(repo: &Path, path: &Path) -> ReclaimOutcome {
+///
+/// `pub(crate)` (review finding, 2026-09): `dash::mod::reap_ended_panes`
+/// calls this directly for a dashboard-hosted `--worktree` pane -- see
+/// [`ReclaimOutcome`]'s own doc comment.
+pub(crate) fn reclaim_worktree(repo: &Path, path: &Path) -> ReclaimOutcome {
     let status = std::process::Command::new("git")
         .env_remove("GIT_DIR")
         .env_remove("GIT_COMMON_DIR")
@@ -362,6 +373,96 @@ fn reclaim_worktree(repo: &Path, path: &Path) -> ReclaimOutcome {
             String::from_utf8_lossy(&output.stderr).trim()
         )),
         Err(e) => ReclaimOutcome::Failed(format!("git worktree remove: {e}")),
+    }
+}
+
+/// Review finding (2026-09), finding 2a: whether `cwd` is a worktree
+/// [`allocate_worktree`] itself created under `repo` -- the only paths a
+/// `--worktree` spawn's own cwd can ever be (that function's own
+/// `<repo>/.zirv/worktrees/<short>` contract). `dash::mod::reap_ended_panes`
+/// uses this to decide whether a just-exited pane's cwd is one of THIS
+/// repo's own agent-managed worktrees -- never an arbitrary `--workdir` the
+/// operator named directly, which no reclaim path owns or may touch.
+/// Canonicalizes both sides so a differently-spelled (but identical) path
+/// still matches; a `repo` or `cwd` that cannot be canonicalized (already
+/// gone) never matches, since there is then nothing left to reclaim anyway.
+pub(crate) fn is_agent_managed_worktree(repo: &Path, cwd: &Path) -> bool {
+    let Ok(repo) = std::fs::canonicalize(repo) else {
+        return false;
+    };
+    let Ok(cwd) = std::fs::canonicalize(cwd) else {
+        return false;
+    };
+    let root = repo.join(crate::utils::SCRIPT_DIR_NAME).join("worktrees");
+    cwd.starts_with(&root)
+}
+
+/// Reclaims `path` (an allocated `--worktree`) and reports the outcome as a
+/// single stderr line -- shared by `run_with`'s own explicit post-run call
+/// and [`WorktreeReclaimGuard`]'s `Drop`, so both report identically rather
+/// than drifting.
+fn reclaim_worktree_and_report(repo: &Path, path: &Path) {
+    let short = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("?");
+    match reclaim_worktree(repo, path) {
+        ReclaimOutcome::Removed => {
+            eprintln!(
+                "--worktree {}: clean, reclaimed; branch {short} keeps the worker's commits",
+                path.display()
+            );
+        }
+        ReclaimOutcome::Dirty => {
+            eprintln!(
+                "--worktree {}: left in place (uncommitted changes); inspect and remove manually",
+                path.display()
+            );
+        }
+        ReclaimOutcome::Failed(reason) => {
+            eprintln!("--worktree {}: left in place ({reason})", path.display());
+        }
+    }
+}
+
+/// Review finding (2026-09), finding 2b: `allocate_worktree` runs before
+/// routing/admission/the dashboard-join fork, so EVERY subsequent early
+/// return in `run_with` -- a refusal, a validation error, an `exec` failure
+/// -- must also reclaim a clean, unused linked worktree, not just the one
+/// success path that already did. A small `Drop` guard is the least
+/// invasive way to cover every such `?`/`return` between allocation and
+/// that success path without touching each one individually.
+///
+/// Armed (`path: Some(..)`) the moment `run_with` allocates a `--worktree`;
+/// disarmed only once ownership genuinely passes elsewhere -- a spawned
+/// dashboard pane (that pane's own exit is reclaimed instead by `dash::
+/// mod::reap_ended_panes`, via [`is_agent_managed_worktree`]/
+/// [`reclaim_worktree`]), or the headless path's own explicit call to
+/// [`reclaim_worktree_and_report`] once it has already run. A REFUSED
+/// dashboard join (never actually spawned a pane) leaves the guard armed on
+/// purpose: nothing else owns that worktree, so it must still be reclaimed.
+struct WorktreeReclaimGuard<'a> {
+    repo: &'a Path,
+    path: Option<PathBuf>,
+}
+
+impl<'a> WorktreeReclaimGuard<'a> {
+    fn new(repo: &'a Path, path: Option<PathBuf>) -> Self {
+        Self { repo, path }
+    }
+
+    /// Ownership of the worktree has passed elsewhere -- `Drop` must not
+    /// also reclaim it.
+    fn disarm(&mut self) {
+        self.path = None;
+    }
+}
+
+impl Drop for WorktreeReclaimGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(path) = self.path.take() {
+            reclaim_worktree_and_report(self.repo, &path);
+        }
     }
 }
 
@@ -1705,6 +1806,20 @@ pub fn run_with<W: Write>(
     } else {
         args.workdir.as_deref().map(validate_workdir).transpose()?
     };
+    // Review finding (2026-09), finding 2b: armed the moment a `--worktree`
+    // is allocated, so every `?`/early return between here and the headless
+    // path's own explicit reclaim (further down) reclaims it too -- see
+    // `WorktreeReclaimGuard`'s own doc comment. `None` for a plain
+    // `--workdir` (or neither): this delegation never allocated that
+    // directory, so it is never this guard's to reclaim.
+    let mut worktree_guard = WorktreeReclaimGuard::new(
+        repo,
+        if args.worktree {
+            canonical_workdir.clone()
+        } else {
+            None
+        },
+    );
     let prompt = resolve_prompt(&args.prompt, &mut std::io::stdin())?;
 
     // Issue #250: no `--workdir` means the worker stays confined to `repo`
@@ -1924,7 +2039,13 @@ pub fn run_with<W: Write>(
         // spawning. Accepted: a clean refusal here is preferable to leaving
         // group cleanup dependent on winning a race with a dashboard that may
         // be arbitrarily slow or may never answer at all.
-        if !matches!(result, Ok(0)) {
+        if matches!(result, Ok(0)) {
+            // Review finding (2026-09), finding 2a: a pane was actually
+            // spawned into this worktree -- ownership passes to it, and
+            // `dash::mod::reap_ended_panes` reclaims it once that pane's
+            // child exits. This delegation's own guard must not also try.
+            worktree_guard.disarm();
+        } else {
             discard_minted_group();
         }
         return result;
@@ -2150,29 +2271,13 @@ pub fn run_with<W: Write>(
     if args.worktree
         && let Some(path) = canonical_workdir.as_deref()
     {
-        let short = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("?");
-        match reclaim_worktree(repo, path) {
-            ReclaimOutcome::Removed => {
-                eprintln!(
-                    "--worktree {}: clean, reclaimed; branch {short} keeps the worker's commits",
-                    path.display()
-                );
-            }
-            ReclaimOutcome::Dirty => {
-                eprintln!(
-                    "--worktree {}: left in place (uncommitted changes); inspect and remove \
-                     manually",
-                    path.display()
-                );
-            }
-            ReclaimOutcome::Failed(reason) => {
-                eprintln!("--worktree {}: left in place ({reason})", path.display());
-            }
-        }
+        reclaim_worktree_and_report(repo, path);
     }
+    // Review finding (2026-09), finding 2b: reclaimed above already (when
+    // `--worktree` was used) -- disarm so `worktree_guard`'s own `Drop`,
+    // whenever this function eventually returns, never attempts a second,
+    // redundant reclaim of an already-removed directory.
+    worktree_guard.disarm();
     // Issue #170: this delegation's scope is done -- successfully or not --
     // the moment its supervised run exits. The free-text completion contract
     // remains reviewer-checked; token spend is rolled up below. Closes the
@@ -4384,6 +4489,109 @@ mod tests {
         );
 
         drop(held);
+    }
+
+    /// Review finding (2026-09), finding 2b: `allocate_worktree` runs before
+    /// admission, so a refusal that happens AFTER allocation -- here, the
+    /// writer pool itself exhausted by some OTHER tree's live writer, never
+    /// the freshly-allocated one -- must still reclaim the clean, unused
+    /// worktree it allocated rather than leak it under `.zirv/worktrees/`
+    /// forever.
+    #[test]
+    fn run_with_reclaims_a_worktree_left_behind_by_a_post_allocation_refusal() {
+        if !git_available() {
+            eprintln!("skipping: git not found on PATH");
+            return;
+        }
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state_path = tmp.path().join("state");
+        let env = base_env(&state_path);
+        let state = StateDir::from_root(state_path);
+
+        assert!(git_init(tmp.path()), "git init");
+        let run = |args: &[&str]| -> bool {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(tmp.path())
+                .args(args)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        };
+        assert!(run(&["config", "user.email", "test@example.com"]));
+        assert!(run(&["config", "user.name", "test"]));
+        std::fs::write(tmp.path().join("README.md"), "hello\n").expect("write");
+        assert!(run(&["add", "README.md"]));
+        assert!(run(&["commit", "-q", "-m", "initial"]));
+
+        // Exhausts the (default) writer pool of 1 with a writer holding some
+        // OTHER tree -- `--worktree` always allocates a fresh, never-before-
+        // seen tree, so this is `WriterRefusal::PoolExhausted`, never
+        // `TreeBusy`, proving the refusal is genuinely unrelated to the
+        // worktree `run_with` is about to allocate.
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).expect("mkdir");
+        let elsewhere = std::fs::canonicalize(&elsewhere).expect("canonicalize");
+        let held = permit::acquire_writer(&state, 1, "worker-a", &elsewhere)
+            .expect("writer permit pre-held for the test");
+
+        let mut args = args_for("claude", "go");
+        args.worktree = true;
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned())
+            .expect("a writer-busy refusal is a structured exit, not an Err");
+        assert_eq!(code, exec::EXIT_WRITER_BUSY);
+
+        let worktrees_root = tmp
+            .path()
+            .join(crate::utils::SCRIPT_DIR_NAME)
+            .join("worktrees");
+        let leftover: Vec<_> = std::fs::read_dir(&worktrees_root)
+            .map(|entries| entries.flatten().collect::<Vec<_>>())
+            .unwrap_or_default();
+        assert!(
+            leftover.is_empty(),
+            "the allocated worktree must be reclaimed on a post-allocation refusal, got \
+             {leftover:?}"
+        );
+
+        drop(held);
+    }
+
+    /// Review finding (2026-09), finding 2a: `is_agent_managed_worktree`
+    /// recognises exactly the paths `allocate_worktree` itself creates, and
+    /// nothing else -- the dashboard's own pane-reap path relies on this to
+    /// decide whether it may reclaim a just-exited pane's cwd.
+    #[test]
+    fn is_agent_managed_worktree_recognizes_only_paths_under_zirv_worktrees() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        let managed = repo
+            .join(crate::utils::SCRIPT_DIR_NAME)
+            .join("worktrees")
+            .join("abcd1234");
+        let unmanaged = repo.join("some-other-dir");
+        std::fs::create_dir_all(&managed).expect("mkdir managed");
+        std::fs::create_dir_all(&unmanaged).expect("mkdir unmanaged");
+
+        assert!(
+            is_agent_managed_worktree(&repo, &managed),
+            "a path under <repo>/.zirv/worktrees/ must be recognised"
+        );
+        assert!(
+            !is_agent_managed_worktree(&repo, &unmanaged),
+            "an arbitrary directory under repo must never be recognised"
+        );
+        assert!(
+            !is_agent_managed_worktree(&repo, &repo),
+            "the repo itself is not one of its own worktrees"
+        );
+        assert!(
+            !is_agent_managed_worktree(&repo, &tmp.path().join("does-not-exist")),
+            "a path that cannot be canonicalized must never match"
+        );
     }
 
     /// Issue #228, decision 2, the core of the feature: a headless

@@ -861,6 +861,18 @@ pub struct Pane {
     /// write to its checkout -- no explicit release call needed on any exit
     /// path (reap, shutdown, or the dashboard process itself exiting).
     writer_permit: Option<super::super::permit::HeavyPermit>,
+    /// Review finding (2026-09), finding 2a: the actual directory this
+    /// pane's child runs in (`spawn`'s own `cwd` parameter, which
+    /// `command.cwd(cwd)` uses directly) -- for a `--worktree` spawn, the
+    /// linked worktree `agent::allocate_worktree` created, never `repo`
+    /// (see `Pane::spawn`'s own doc comment on why the two are kept
+    /// separate). Retained so the dashboard's own pane-reap path
+    /// (`dash::mod::reap_ended_panes`) can tell whether a just-exited
+    /// pane's cwd is one of this repo's own agent-managed worktrees
+    /// (`agent::is_agent_managed_worktree`) and reclaim it -- otherwise
+    /// nothing but the allocating `zirv ctx agent` process's own headless
+    /// fallback path ever did.
+    cwd: PathBuf,
 }
 
 impl Pane {
@@ -1072,6 +1084,7 @@ impl Pane {
             pending_submit: None,
             launch_mode,
             writer_permit: None,
+            cwd: cwd.to_path_buf(),
         })
     }
 
@@ -1458,6 +1471,14 @@ impl Pane {
 
     pub fn agent(&self) -> &str {
         &self.agent_name
+    }
+
+    /// The directory this pane's own child process actually runs in --
+    /// `spawn`'s own `cwd` parameter, verbatim. See the [`Pane::cwd`] field's
+    /// own doc comment for why this is retained (finding 2a's own
+    /// worktree-reclaim check).
+    pub(crate) fn cwd(&self) -> &Path {
+        &self.cwd
     }
 
     /// Whether this pane's own turn-signal socket bound successfully at
