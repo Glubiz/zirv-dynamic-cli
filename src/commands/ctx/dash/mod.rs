@@ -1428,6 +1428,7 @@ fn reap_ended_panes(
         // consumed below, so the worktree-reclaim check after this pane is
         // fully torn down still has its own cwd and label to work with.
         let pane_cwd = pane.cwd().to_path_buf();
+        let pane_owns_cwd = pane.owns_cwd();
         let pane_short = pane.short().to_string();
         account_reaped_pane_spend(&pane, cfg, state, repo);
         close_claimed_group(&pane, state);
@@ -1463,7 +1464,7 @@ fn reap_ended_panes(
         // reclaim guard) and nothing else reclaimed it once the pane's
         // child exited. `pane` (and, via its own `Drop`, any writer permit
         // it held) is already gone by this point.
-        if let Some(outcome) = reclaim_pane_worktree(repo, &pane_cwd) {
+        if let Some(outcome) = reclaim_pane_worktree(repo, &pane_cwd, pane_owns_cwd) {
             push_error(
                 errors,
                 describe_pane_worktree_reclaim(&pane_short, &pane_cwd, outcome),
@@ -1474,15 +1475,21 @@ fn reap_ended_panes(
     }
 }
 
-/// Review finding (2026-09), finding 2a: reclaims `cwd` if (and only if) it
-/// is one of THIS repo's own agent-managed worktrees
-/// (`agent::is_agent_managed_worktree`) -- `None` for an ordinary pane
-/// (running at `repo` itself, or at an operator-named `--workdir` this
-/// dashboard never allocated and must never touch). Split out of
-/// [`reap_ended_panes`] so the cwd check and the reclaim call are directly
-/// testable without spawning a real pane.
-fn reclaim_pane_worktree(repo: &Path, cwd: &Path) -> Option<super::agent::ReclaimOutcome> {
-    if !super::agent::is_agent_managed_worktree(repo, cwd) {
+/// Review finding (2026-09), finding 2a: reclaims `cwd` if (and only if) the
+/// pane OWNED it -- its spawn request carried `owns_workdir` because
+/// `zirv agent --worktree` allocated it (review round 3: ownership travels
+/// on the request, never inferred from the path, so an operator-named
+/// `--workdir` that happens to live under `.zirv/worktrees/` is never
+/// touched) -- and it is one of THIS repo's own agent-managed worktrees
+/// (`agent::is_agent_managed_worktree`, the second guard). `None` for an
+/// ordinary pane. Split out of [`reap_ended_panes`] so the checks and the
+/// reclaim call are directly testable without spawning a real pane.
+fn reclaim_pane_worktree(
+    repo: &Path,
+    cwd: &Path,
+    owns_cwd: bool,
+) -> Option<super::agent::ReclaimOutcome> {
+    if !owns_cwd || !super::agent::is_agent_managed_worktree(repo, cwd) {
         return None;
     }
     Some(super::agent::reclaim_worktree(repo, cwd))
@@ -4137,6 +4144,9 @@ fn fulfill_spawn_request(
         }
         pane.set_writer_permit(permit);
     }
+    if req.owns_workdir {
+        pane.set_owns_cwd();
+    }
     let short = pane.short().to_string();
     // Security review Finding 2: the dash-side half of issue #170's
     // claim/close pair. `agent::run_with` claims a group for the coordinator
@@ -6665,6 +6675,7 @@ pub fn run_dashboard(
                                                     // before that flag
                                                     // existed.
                                                     mode: super::permit::WorkerMode::Writing,
+                                                    owns_workdir: false,
                                                 };
                                                 let panes_before_spawn = panes.len();
                                                 // `trusted_interactive: true` --
@@ -10786,6 +10797,7 @@ mod tests {
             force: false,
             workdir: None,
             mode: super::super::permit::WorkerMode::Writing,
+            owns_workdir: false,
         }
     }
 
@@ -11846,7 +11858,7 @@ mod tests {
         let Some((_root, repo, worktree)) = git_repo_with_agent_managed_worktree() else {
             return;
         };
-        let outcome = reclaim_pane_worktree(&repo, &worktree);
+        let outcome = reclaim_pane_worktree(&repo, &worktree, true);
         assert_eq!(
             outcome,
             Some(crate::commands::ctx::agent::ReclaimOutcome::Removed)
@@ -11864,7 +11876,7 @@ mod tests {
         };
         std::fs::write(worktree.join("scratch.txt"), "not committed\n").expect("write");
 
-        let outcome = reclaim_pane_worktree(&repo, &worktree);
+        let outcome = reclaim_pane_worktree(&repo, &worktree, true);
         assert_eq!(
             outcome,
             Some(crate::commands::ctx::agent::ReclaimOutcome::Dirty)
@@ -11883,7 +11895,23 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let repo = tmp.path().join("repo");
         std::fs::create_dir_all(&repo).expect("mkdir");
-        assert_eq!(reclaim_pane_worktree(&repo, &repo), None);
+        assert_eq!(reclaim_pane_worktree(&repo, &repo, true), None);
+    }
+
+    /// Review round 3: ownership travels on the spawn request, never on the
+    /// path. A pane whose request did not allocate its cwd with `--worktree`
+    /// (an operator-named `--workdir` that merely lives under
+    /// `.zirv/worktrees/`) is never reclaimed, clean or not.
+    #[test]
+    fn reclaim_pane_worktree_never_touches_a_cwd_the_pane_does_not_own() {
+        let Some((_root, repo, worktree)) = git_repo_with_agent_managed_worktree() else {
+            return;
+        };
+        assert_eq!(reclaim_pane_worktree(&repo, &worktree, false), None);
+        assert!(
+            worktree.exists(),
+            "an operator-named worktree must survive its pane's exit"
+        );
     }
 
     /// Mirror of the test above in the other direction: a dashboard whose
