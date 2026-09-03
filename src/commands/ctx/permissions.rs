@@ -38,6 +38,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::CtxResult;
+use super::adapters::AGENT_ENV;
+use super::config::EnvLookup;
 use super::log::{self, SafetyDecisionRecord};
 use super::safety::{
     collapse_whitespace, command_fails_escape_screen, command_pattern_from_bash_rule, glob_match,
@@ -58,6 +60,29 @@ impl AuditAgent {
             AuditAgent::Codex => "codex",
             AuditAgent::Claude => "claude",
         }
+    }
+}
+
+/// Resolves `audit`/`compile`'s `--agent`: an explicit flag always wins;
+/// otherwise falls back to the harness this command is actually running
+/// under (`AGENT_ENV`/`ZIRV_CTX_AGENT`, exported into every adapter-launched
+/// session -- see that constant's own doc comment) so an operator running
+/// `zirv ctx permissions audit` from inside a live claude session gets its
+/// own transcripts audited by default, rather than always defaulting to
+/// codex regardless of which harness asked (issue #329). Absent or
+/// unrecognised env value -> codex, unchanged from the pre-#329 hardcoded
+/// default, so an off-session invocation (no `ZIRV_CTX_AGENT` at all)
+/// regresses nothing. Takes an [`EnvLookup`] rather than reading the process
+/// env itself, the same DI pattern `mail.rs`/`memory_cli.rs` already use for
+/// this exact env var, so this stays unit-testable without mutating real
+/// process env.
+pub(crate) fn resolved_agent(explicit: Option<AuditAgent>, env: EnvLookup<'_>) -> AuditAgent {
+    if let Some(agent) = explicit {
+        return agent;
+    }
+    match env(AGENT_ENV).as_deref() {
+        Some("claude") => AuditAgent::Claude,
+        _ => AuditAgent::Codex,
     }
 }
 
@@ -1164,9 +1189,11 @@ pub enum PermissionsVerb {
 
 #[derive(Debug, clap::Args)]
 pub struct AuditArgs {
-    /// Which agent's transcripts to read.
-    #[arg(long, value_enum, default_value = "codex")]
-    pub agent: AuditAgent,
+    /// Which agent's transcripts to read. Defaults to the harness this
+    /// command is running under (via ZIRV_CTX_AGENT), falling back to codex
+    /// when that is unset or unrecognised.
+    #[arg(long, value_enum)]
+    pub agent: Option<AuditAgent>,
     /// How many of the most recently modified transcripts to sample.
     #[arg(long, default_value_t = 5)]
     pub sessions: usize,
@@ -1177,9 +1204,11 @@ pub struct AuditArgs {
 
 #[derive(Debug, clap::Args)]
 pub struct CompileArgs {
-    /// Which agent's transcripts to read.
-    #[arg(long, value_enum, default_value = "codex")]
-    pub agent: AuditAgent,
+    /// Which agent's transcripts to read. Defaults to the harness this
+    /// command is running under (via ZIRV_CTX_AGENT), falling back to codex
+    /// when that is unset or unrecognised.
+    #[arg(long, value_enum)]
+    pub agent: Option<AuditAgent>,
     /// How many of the most recently modified transcripts to sample.
     #[arg(long, default_value_t = 5)]
     pub sessions: usize,
@@ -1226,10 +1255,12 @@ const CODEX_SAFETY_NO_OP_CAVEAT: &str = "caveat: compiled [safety] allow entries
      / request_permissions_tool are still in development)";
 
 pub fn run_audit<W: Write>(args: &AuditArgs, w: &mut W) -> CtxResult<i32> {
-    let files = transcripts_root(args.agent)
+    let env = super::config::env_from_process();
+    let agent = resolved_agent(args.agent, &env);
+    let files = transcripts_root(agent)
         .map(|root| super::optimize::newest_transcripts(&root, args.sessions))
         .unwrap_or_default();
-    let report = audit_report(args.agent, &files);
+    let report = audit_report(agent, &files);
     if args.json {
         writeln!(
             w,
@@ -1237,12 +1268,12 @@ pub fn run_audit<W: Write>(args: &AuditArgs, w: &mut W) -> CtxResult<i32> {
             serde_json::to_string_pretty(&report).unwrap_or_default()
         )?;
     } else {
-        if args.agent == AuditAgent::Codex {
+        if agent == AuditAgent::Codex {
             writeln!(w, "{CODEX_SAFETY_NO_OP_CAVEAT}")?;
         }
         // Issue #147, design decision 7: claude only -- codex has no native
         // settings.json permission-rule analogue for this to conflict with.
-        let native_rules = if matches!(args.agent, AuditAgent::Claude) {
+        let native_rules = if matches!(agent, AuditAgent::Claude) {
             crate::utils::home_dir()
                 .map(|home| {
                     read_native_claude_rules(&home, std::env::current_dir().ok().as_deref())
@@ -1405,15 +1436,17 @@ fn family_of_pattern(pattern: &str) -> &str {
 /// plausibly race on the way `exec.rs`'s heavy-worker gate's count-then-
 /// register window is (see that gate's own comment).
 pub fn run_compile<W: Write>(args: &CompileArgs, w: &mut W) -> CtxResult<i32> {
-    let files = transcripts_root(args.agent)
+    let env = super::config::env_from_process();
+    let agent = resolved_agent(args.agent, &env);
+    let files = transcripts_root(agent)
         .map(|root| super::optimize::newest_transcripts(&root, args.sessions))
         .unwrap_or_default();
-    let report = audit_report(args.agent, &files);
+    let report = audit_report(agent, &files);
 
     let (eligible_patterns, skipped_protected, skipped_too_generic) =
         compile_eligibility(&report.groups);
 
-    if args.agent == AuditAgent::Codex {
+    if agent == AuditAgent::Codex {
         writeln!(w, "{CODEX_SAFETY_NO_OP_CAVEAT}")?;
     }
 
@@ -1433,7 +1466,7 @@ pub fn run_compile<W: Write>(args: &CompileArgs, w: &mut W) -> CtxResult<i32> {
 
     // Issue #147, design decision 7: claude only -- codex has no native
     // settings.json permission-rule analogue for this to conflict with.
-    let native_rules = if matches!(args.agent, AuditAgent::Claude) {
+    let native_rules = if matches!(agent, AuditAgent::Claude) {
         read_native_claude_rules(&home, std::env::current_dir().ok().as_deref())
     } else {
         Vec::new()
@@ -1461,7 +1494,7 @@ pub fn run_compile<W: Write>(args: &CompileArgs, w: &mut W) -> CtxResult<i32> {
     // sandbox-escape-retry concept, so `escape_eligibility` always returns
     // three empty lists for it and this section would be a no-op anyway;
     // skipped outright rather than printing an empty section every time.
-    if matches!(args.agent, AuditAgent::Claude) {
+    if matches!(agent, AuditAgent::Claude) {
         let (escape_eligible, escape_skipped_protected, escape_skipped_too_generic) =
             escape_eligibility(&report.requests);
         let escape_existing =
@@ -2806,6 +2839,48 @@ mod tests {
         assert!(!is_reusable("gh pr view 12 --json body | jq -r .body"));
     }
 
+    // -------------------------------------------------------------
+    // resolved_agent (issue #329): `--agent` defaults to the harness this
+    // command is actually running under (ZIRV_CTX_AGENT), not a hardcoded
+    // codex, unless the operator passes `--agent` explicitly.
+    // -------------------------------------------------------------
+
+    #[test]
+    fn resolved_agent_explicit_flag_wins_over_env() {
+        let env = |key: &str| {
+            assert_eq!(key, AGENT_ENV);
+            Some("claude".to_string())
+        };
+        assert_eq!(
+            resolved_agent(Some(AuditAgent::Codex), &env),
+            AuditAgent::Codex
+        );
+    }
+
+    #[test]
+    fn resolved_agent_reads_claude_from_env() {
+        let env = |_: &str| Some("claude".to_string());
+        assert_eq!(resolved_agent(None, &env), AuditAgent::Claude);
+    }
+
+    #[test]
+    fn resolved_agent_reads_codex_from_env() {
+        let env = |_: &str| Some("codex".to_string());
+        assert_eq!(resolved_agent(None, &env), AuditAgent::Codex);
+    }
+
+    #[test]
+    fn resolved_agent_defaults_to_codex_when_env_unset() {
+        let env = |_: &str| None;
+        assert_eq!(resolved_agent(None, &env), AuditAgent::Codex);
+    }
+
+    #[test]
+    fn resolved_agent_defaults_to_codex_when_env_unrecognised() {
+        let env = |_: &str| Some("some-future-harness".to_string());
+        assert_eq!(resolved_agent(None, &env), AuditAgent::Codex);
+    }
+
     /// 2026-08-25 review: `is_reusable` used to check only the BARE last
     /// pipe stage, so an `env`-decorated filter target slipped past the
     /// `jq`/`grep`/`awk`/`sed` check entirely and was misjudged reusable.
@@ -3972,7 +4047,7 @@ mod tests {
         write_codex_rollout_fixture(home.path(), "gh issue create --title x");
 
         let codex_args = AuditArgs {
-            agent: AuditAgent::Codex,
+            agent: Some(AuditAgent::Codex),
             sessions: 5,
             json: false,
         };
@@ -3985,7 +4060,7 @@ mod tests {
         );
 
         let claude_args = AuditArgs {
-            agent: AuditAgent::Claude,
+            agent: Some(AuditAgent::Claude),
             sessions: 5,
             json: false,
         };
@@ -3998,9 +4073,9 @@ mod tests {
         );
     }
 
-    /// The default `--agent` value is codex (`AuditArgs`/`CompileArgs`'s own
-    /// `default_value = "codex"`), so a caller who never passes `--agent` at
-    /// all must still see the caveat.
+    /// Without `ZIRV_CTX_AGENT` set, `resolved_agent` falls back to codex
+    /// (issue #329), so a caller who never passes `--agent` at all -- and
+    /// whose env does not name a harness -- must still see the caveat.
     #[test]
     fn run_compile_prints_the_codex_safety_no_op_caveat_by_default() {
         let home = tempfile::tempdir().expect("home");
@@ -4008,7 +4083,7 @@ mod tests {
         write_codex_rollout_fixture(home.path(), "gh issue create --title x");
 
         let args = CompileArgs {
-            agent: AuditAgent::Codex,
+            agent: Some(AuditAgent::Codex),
             sessions: 5,
             dry_run: true,
             escape: false,
@@ -4032,7 +4107,7 @@ mod tests {
         );
 
         let args = CompileArgs {
-            agent: AuditAgent::Codex,
+            agent: Some(AuditAgent::Codex),
             sessions: 5,
             dry_run: true,
             escape: false,
@@ -4066,7 +4141,7 @@ mod tests {
         std::fs::write(&ctx_toml, "[safety]\nallow = [\"cargo nextest *\"]\n").expect("seed");
 
         let args = CompileArgs {
-            agent: AuditAgent::Codex,
+            agent: Some(AuditAgent::Codex),
             sessions: 5,
             dry_run: false,
             escape: false,
@@ -4245,7 +4320,7 @@ mod tests {
             write_claude_escape_ask_fixture(session, command, 1_787_738_400);
 
             let args = CompileArgs {
-                agent: AuditAgent::Claude,
+                agent: Some(AuditAgent::Claude),
                 sessions: 5,
                 dry_run: true,
                 escape: false,
@@ -4275,7 +4350,7 @@ mod tests {
             write_claude_escape_ask_fixture(session, command, 1_787_738_400);
 
             let args = CompileArgs {
-                agent: AuditAgent::Claude,
+                agent: Some(AuditAgent::Claude),
                 sessions: 5,
                 dry_run: false,
                 escape: true,

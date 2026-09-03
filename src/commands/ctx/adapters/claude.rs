@@ -720,6 +720,16 @@ const PROMPT_FREE_COMMAND_FAMILIES: &[CommandFamilyProjection] = &[
         pattern: "gh *",
         sandbox_excluded: true,
     },
+    // Issue #329: a GitLab-first shop routes every review through `glab`, and
+    // the forge CLI needs its own credential config plus network egress the
+    // sandbox denies -- exactly the `gh` situation, so it gets the identical
+    // treatment. The classifier still denies the destructive `glab` forms
+    // (`safety::publish_or_destructive_action`) ahead of this native family,
+    // the same way it narrows `gh *`.
+    CommandFamilyProjection {
+        pattern: "glab *",
+        sandbox_excluded: true,
+    },
     CommandFamilyProjection {
         pattern: "git push *",
         sandbox_excluded: true,
@@ -729,6 +739,21 @@ const PROMPT_FREE_COMMAND_FAMILIES: &[CommandFamilyProjection] = &[
         sandbox_excluded: false,
     },
 ];
+
+/// Issue #329: `denyRead` blanks all of `~/.ssh`, which also hid the two
+/// NON-secret files ssh must read to work at all -- `known_hosts` (host
+/// verification) and `config` (host aliases, `IdentityAgent`). A sandboxed
+/// `git fetch/push` therefore could not verify a host and died before it
+/// ever reached authentication. Claude resolves overlapping read rules by
+/// specificity ("the more specific path wins"), so naming these two files in
+/// `allowRead` re-opens exactly them while every private key under `~/.ssh`
+/// stays denied by the broader `denyRead` entry.
+///
+/// Deliberately NOT added to `safety::SANDBOX_DENY_READ_HOME_PATHS`'s own
+/// derived credential screen: that screen guards what an UNSANDBOXED retry
+/// may read, and these two files are not secrets.
+#[cfg_attr(windows, allow(dead_code))]
+const SSH_NON_SECRET_READ_PATHS: &[&str] = &["~/.ssh/known_hosts", "~/.ssh/config"];
 
 #[derive(Debug, Default)]
 struct LaunchEnvironment {
@@ -740,6 +765,18 @@ struct LaunchEnvironment {
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     unix_sockets: Vec<String>,
     ssh_auth_sock: Option<String>,
+    /// Issue #329: the launch repository's own linked worktrees. They were
+    /// already handed to Claude as `--add-dir` working directories, but a
+    /// working directory is not a WRITE grant: the OS sandbox still refused
+    /// every write under them, so ordinary gates in a worktree (`git status`
+    /// writing `.git/FETCH_HEAD`, a test runner's cache, a commit) failed
+    /// with `Operation not permitted` and had to be retried unsandboxed.
+    /// Emitted into BOTH `sandbox.filesystem.allowWrite` and
+    /// `permissions.additionalDirectories` as literal paths -- never globs,
+    /// since `additionalDirectories` does not support them on any platform
+    /// and `allowWrite` silently drops glob entries on Linux/WSL2.
+    #[cfg_attr(windows, allow(dead_code))]
+    workspace_write_roots: Vec<String>,
 }
 
 impl LaunchEnvironment {
@@ -759,11 +796,23 @@ impl LaunchEnvironment {
         {
             unix_sockets.push(socket.clone());
         }
+        #[cfg(not(test))]
+        let workspace_write_roots = std::env::current_dir()
+            .ok()
+            .map(|repo| linked_worktree_roots(&repo))
+            .unwrap_or_default()
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect();
+        #[cfg(test)]
+        let workspace_write_roots = Vec::new();
+
         Self {
             state_write_root,
             scratchpad_roots,
             unix_sockets,
             ssh_auth_sock,
+            workspace_write_roots,
         }
     }
 }
@@ -876,9 +925,14 @@ fn launch_settings_value(
         }
     });
 
-    if !launch_environment.scratchpad_roots.is_empty() {
+    let additional_directories: Vec<&String> = launch_environment
+        .scratchpad_roots
+        .iter()
+        .chain(launch_environment.workspace_write_roots.iter())
+        .collect();
+    if !additional_directories.is_empty() {
         settings["permissions"]["additionalDirectories"] =
-            serde_json::json!(&launch_environment.scratchpad_roots);
+            serde_json::json!(additional_directories);
     }
     if let Some(socket) = &launch_environment.ssh_auth_sock {
         settings["env"]["SSH_AUTH_SOCK"] = serde_json::json!(socket);
@@ -893,13 +947,20 @@ fn launch_settings_value(
     #[cfg(not(windows))]
     if let Some(object) = settings.as_object_mut() {
         let mut filesystem = serde_json::json!({
-            "denyRead": super::super::safety::SANDBOX_DENY_READ_HOME_PATHS
+            "denyRead": super::super::safety::SANDBOX_DENY_READ_HOME_PATHS,
+            "allowRead": SSH_NON_SECRET_READ_PATHS
         });
         // Sandbox-confined Zirv built-ins need the exact platform state root;
         // the immutable policy snapshot is operator-owned launch state and is
         // not added separately by this rule.
-        if let Some(state_root) = &launch_environment.state_write_root {
-            filesystem["allowWrite"] = serde_json::json!([state_root.display().to_string()]);
+        let allow_write: Vec<String> = launch_environment
+            .state_write_root
+            .iter()
+            .map(|root| root.display().to_string())
+            .chain(launch_environment.workspace_write_roots.iter().cloned())
+            .collect();
+        if !allow_write.is_empty() {
+            filesystem["allowWrite"] = serde_json::json!(allow_write);
         }
         #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
         let mut sandbox = serde_json::json!({
@@ -945,15 +1006,17 @@ fn parse_worktree_porcelain(output: &str) -> Vec<PathBuf> {
         .collect()
 }
 
-fn additional_worktree_args(
+/// The external, capped worktree set shared by the `--add-dir` projection
+/// and (issue #329) the launch settings' own write grants, so a worktree can
+/// never be a working directory Claude may read but not write.
+fn additional_worktree_roots(
     canonical_repo: &Path,
     canonical_worktrees: impl IntoIterator<Item = PathBuf>,
-) -> Vec<String> {
+) -> Vec<PathBuf> {
     canonical_worktrees
         .into_iter()
         .filter(|path| !path.starts_with(canonical_repo))
         .take(MAX_LINKED_WORKTREES)
-        .flat_map(|path| ["--add-dir".to_string(), path.display().to_string()])
         .collect()
 }
 
@@ -963,6 +1026,17 @@ fn additional_worktree_args(
 /// Discovery is best-effort, bounded, and never invokes a shell.
 #[cfg(not(test))]
 fn linked_worktree_args(repo: &Path) -> Vec<String> {
+    linked_worktree_roots(repo)
+        .into_iter()
+        .flat_map(|path| ["--add-dir".to_string(), path.display().to_string()])
+        .collect()
+}
+
+/// The discovery half of [`linked_worktree_args`], shared with
+/// [`LaunchEnvironment::resolve`] so the same bounded set that becomes a
+/// working directory also becomes a sandbox write grant (issue #329).
+#[cfg(not(test))]
+fn linked_worktree_roots(repo: &Path) -> Vec<PathBuf> {
     let Ok(canonical_repo) = std::fs::canonicalize(repo) else {
         return Vec::new();
     };
@@ -998,7 +1072,7 @@ fn linked_worktree_args(repo: &Path) -> Vec<String> {
                 let worktrees = parse_worktree_porcelain(&output)
                     .into_iter()
                     .filter_map(|path| std::fs::canonicalize(path).ok());
-                return additional_worktree_args(&canonical_repo, worktrees);
+                return additional_worktree_roots(&canonical_repo, worktrees);
             }
             Ok(Some(_)) => return Vec::new(),
             Ok(None) => std::thread::sleep(Duration::from_millis(20)),
@@ -3050,17 +3124,87 @@ mod tests {
         }
 
         let paths = parse_worktree_porcelain(&porcelain);
-        let args = additional_worktree_args(Path::new("/repo"), paths);
-        assert_eq!(args.len(), 16 * 2);
+        let roots = additional_worktree_roots(Path::new("/repo"), paths);
+        assert_eq!(roots.len(), 16);
         assert_eq!(
-            &args[..4],
-            &["--add-dir", "/repo-other", "--add-dir", "/outside-0"]
+            &roots[..2],
+            &[PathBuf::from("/repo-other"), PathBuf::from("/outside-0")]
         );
-        assert_eq!(&args[args.len() - 2..], &["--add-dir", "/outside-14"]);
+        assert_eq!(roots[roots.len() - 1], PathBuf::from("/outside-14"));
         assert!(
-            args.iter()
-                .all(|arg| arg != "/repo" && arg != "/repo/nested")
+            roots
+                .iter()
+                .all(|root| root != Path::new("/repo") && root != Path::new("/repo/nested"))
         );
+    }
+
+    /// Issue #329: ssh needs `known_hosts`/`config` to verify a host, but
+    /// every private key under `~/.ssh` must stay denied.
+    #[test]
+    fn launch_settings_reopen_only_the_non_secret_ssh_files_inside_the_denied_home() {
+        let policy = super::super::super::safety::SafetyPolicy::default();
+        let policy_path = Path::new("zirv-test-safety-policy.json");
+        let settings = launch_settings_value(&policy, policy_path, &LaunchEnvironment::default())
+            .expect("settings");
+
+        let allow_read = settings["sandbox"]["filesystem"]["allowRead"]
+            .as_array()
+            .expect("allowRead must be present")
+            .iter()
+            .map(|v| v.as_str().unwrap_or_default().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(allow_read, vec!["~/.ssh/known_hosts", "~/.ssh/config"]);
+
+        // The broad deny stays, so anything else under ~/.ssh (every private
+        // key) remains blocked by the less specific rule.
+        let deny_read = settings["sandbox"]["filesystem"]["denyRead"]
+            .as_array()
+            .expect("denyRead must be present")
+            .iter()
+            .map(|v| v.as_str().unwrap_or_default().to_string())
+            .collect::<Vec<_>>();
+        assert!(deny_read.contains(&"~/.ssh".to_string()));
+        assert!(
+            !allow_read.iter().any(|p| p == "~/.ssh" || p.contains('*')),
+            "no wildcard may re-open the whole key directory: {allow_read:?}"
+        );
+    }
+
+    /// Issue #329: a linked worktree Claude may `cd` into must also be
+    /// writable, or ordinary gates there fail with `Operation not permitted`
+    /// and force an unsandboxed retry. The roots land in BOTH grants, as
+    /// literal paths (neither key supports globs portably).
+    #[test]
+    fn launch_settings_grant_writes_and_working_directories_to_linked_worktrees() {
+        let policy = super::super::super::safety::SafetyPolicy::default();
+        let policy_path = Path::new("zirv-test-safety-policy.json");
+        let worktrees = vec!["/work/wt-a".to_string(), "/work/wt-b".to_string()];
+        let settings = launch_settings_value(
+            &policy,
+            policy_path,
+            &LaunchEnvironment {
+                state_write_root: Some(PathBuf::from("/state/zirv")),
+                scratchpad_roots: vec!["/tmp/claude-501".to_string()],
+                workspace_write_roots: worktrees.clone(),
+                ..LaunchEnvironment::default()
+            },
+        )
+        .expect("settings");
+
+        assert_eq!(
+            settings["permissions"]["additionalDirectories"],
+            serde_json::json!(["/tmp/claude-501", "/work/wt-a", "/work/wt-b"])
+        );
+        assert_eq!(
+            settings["sandbox"]["filesystem"]["allowWrite"],
+            serde_json::json!(["/state/zirv", "/work/wt-a", "/work/wt-b"])
+        );
+        for root in &worktrees {
+            assert!(
+                !root.contains('*'),
+                "worktree grants must be literal paths: {root}"
+            );
+        }
     }
 
     #[test]

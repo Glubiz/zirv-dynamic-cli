@@ -2856,7 +2856,11 @@ fn is_irreversible_distribution_action(command: &str) -> bool {
             .any(|pair| pair[0] == "nuget" && matches!(pair[1].as_str(), "push" | "delete")),
         "nuget" => action.is_some_and(|action| matches!(action.as_str(), "push" | "delete")),
         "gem" => action.is_some_and(|action| matches!(action.as_str(), "push" | "yank")),
-        "gh" => {
+        // Issue #329: `glab` is GitLab's equivalent forge CLI to `gh` and
+        // shares the same destructive `<noun> delete`/`api ... DELETE`
+        // spellings, so it shares this arm rather than forking a near-
+        // identical copy -- `gh`'s own behaviour stays byte-identical.
+        "gh" | "glab" => {
             let named_delete = lower
                 .windows(2)
                 .any(|pair| matches!(pair[0].as_str(), "repo" | "release") && pair[1] == "delete");
@@ -4830,12 +4834,20 @@ fn is_kubectl_read_only(tokens: &[String]) -> bool {
 
 /// Issue #168, design decision (a): whether EVERY executable segment of the
 /// retried `command` is a read-only `gh`/`glab` call, a read-only git
-/// subcommand, a GET-only `curl`/`wget`, a read-only `kubectl` verb, or one
-/// of the existing [`SANDBOX_ESCAPE_BUILTIN_PROGRAMS`] -- used ONLY on the
-/// `--dangerously-disable-sandbox` retry path (`run_check_hook_mode_with_
-/// env`), alongside `is_sandbox_bypass_safe_gh_command`/`escape_allow_
-/// matches`/`is_reserved_zirv_escape_safe`. Reuses [`normalize_segments`]'s own
-/// decomposition and [`escape_denied_by_screen`]'s credential/root-scan
+/// subcommand, a GET-only `curl`/`wget`, a read-only `kubectl` verb, one of
+/// the existing [`SANDBOX_ESCAPE_BUILTIN_PROGRAMS`], or (issue #329) a
+/// reserved zirv escape-safe segment per [`is_reserved_zirv_escape_safe_
+/// segment`] -- used ONLY on the `--dangerously-disable-sandbox` retry path
+/// (`run_check_hook_mode_with_env`), alongside `is_sandbox_bypass_safe_gh_
+/// command`/`escape_allow_matches`/`is_reserved_zirv_escape_safe`. The zirv
+/// acceptor closes a gap `is_reserved_zirv_escape_safe` leaves open on its
+/// own: that whole-command check requires EVERY segment to be zirv, so a
+/// compound mixing a reserved `zirv ctx` call with a benign read-only filter
+/// (`zirv ctx inbox | tail; zirv ctx status --brief | tail`) cleared
+/// neither check -- the zirv segment failed this function's own per-segment
+/// table (which knew nothing about zirv), and the `| tail` segment failed
+/// the other function's all-zirv requirement. Reuses [`normalize_segments`]'s
+/// own decomposition and [`escape_denied_by_screen`]'s credential/root-scan
 /// gate, exactly like [`escape_allow_matches`] -- a single disqualifying
 /// segment fails the whole command. Never applied when the base verdict is
 /// already `Deny` (see the call site).
@@ -4847,6 +4859,9 @@ pub(crate) fn is_read_only_escape_safe(command: &str, scratchpad_roots: &[String
     candidates.iter().all(|candidate| {
         if escape_denied_by_screen(candidate) {
             return false;
+        }
+        if is_reserved_zirv_escape_safe_segment(candidate) {
+            return true;
         }
         let Some(tokens) = sql_tokens(&collapse_whitespace(candidate)) else {
             return false;
@@ -4948,40 +4963,52 @@ pub(crate) fn is_reserved_zirv_escape_safe(command: &str) -> bool {
     if candidates.is_empty() {
         return false;
     }
-    candidates.iter().all(|candidate| {
-        let Some(tokens) = sql_tokens(&collapse_whitespace(candidate)) else {
-            return false;
-        };
-        let Some(program) = tokens.first() else {
-            return false;
-        };
-        if program.contains('/') || program.contains('\\') || sql_program_name(program) != "zirv" {
-            return false;
-        }
-        let Some(name) = tokens.get(1).map(|name| name.to_ascii_lowercase()) else {
-            return false;
-        };
-        match name.as_str() {
-            "ctx" => {
-                let Some(verb) = tokens.get(2).map(|verb| verb.to_ascii_lowercase()) else {
-                    return false;
-                };
-                if !ZIRV_CTX_ESCAPE_SAFE_VERBS.contains(&verb.as_str()) {
-                    return false;
-                }
-                // `usage`'s own `tee` subcommand runs an arbitrary trailing
-                // statusline command -- the one escape-safe verb with a
-                // subprocess-launching subcommand of its own.
-                !(verb == "usage"
-                    && tokens
-                        .get(3)
-                        .is_some_and(|sub| sub.eq_ignore_ascii_case("tee")))
+    candidates
+        .iter()
+        .all(|candidate| is_reserved_zirv_escape_safe_segment(candidate))
+}
+
+/// The single-segment body behind [`is_reserved_zirv_escape_safe`], factored
+/// out (issue #329) so [`is_read_only_escape_safe`] can accept the same
+/// per-segment judgment as one of ITS acceptors -- a compound mixing a
+/// reserved `zirv ctx` call with a benign read-only filter (`zirv ctx inbox
+/// | tail`) used to clear neither whole-command check on its own: this one
+/// requires EVERY segment to be zirv, the other one's per-segment table knew
+/// nothing about zirv. See [`is_read_only_escape_safe`]'s doc comment for the
+/// combined behaviour.
+fn is_reserved_zirv_escape_safe_segment(candidate: &str) -> bool {
+    let Some(tokens) = sql_tokens(&collapse_whitespace(candidate)) else {
+        return false;
+    };
+    let Some(program) = tokens.first() else {
+        return false;
+    };
+    if program.contains('/') || program.contains('\\') || sql_program_name(program) != "zirv" {
+        return false;
+    }
+    let Some(name) = tokens.get(1).map(|name| name.to_ascii_lowercase()) else {
+        return false;
+    };
+    match name.as_str() {
+        "ctx" => {
+            let Some(verb) = tokens.get(2).map(|verb| verb.to_ascii_lowercase()) else {
+                return false;
+            };
+            if !ZIRV_CTX_ESCAPE_SAFE_VERBS.contains(&verb.as_str()) {
+                return false;
             }
-            "help" | "h" | "version" | "v" | "memory" | "context" => tokens.len() == 2,
-            "report" => true,
-            _ => false,
+            // `usage`'s own `tee` subcommand runs an arbitrary trailing
+            // statusline command -- the one escape-safe verb with a
+            // subprocess-launching subcommand of its own.
+            !(verb == "usage"
+                && tokens
+                    .get(3)
+                    .is_some_and(|sub| sub.eq_ignore_ascii_case("tee")))
         }
-    })
+        "help" | "h" | "version" | "v" | "memory" | "context" => tokens.len() == 2,
+        "report" => true,
+        _ => false,
+    }
 }
 
 /// Lexically resolves `.`/`..` path components and collapses repeated `/`
@@ -6303,6 +6330,39 @@ mod tests {
         assert!(!is_read_only_escape_safe("cat ~/.ssh/id_rsa", &roots));
         assert!(!is_read_only_escape_safe("find / -name id_rsa", &roots));
         assert!(is_read_only_escape_safe("grep TODO ./src", &roots));
+    }
+
+    /// Issue #329: a compound mixing a reserved `zirv ctx` call with a
+    /// benign read-only filter used to clear neither whole-command check on
+    /// its own -- `is_reserved_zirv_escape_safe` requires EVERY segment to
+    /// be zirv, and this function's own per-segment table knew nothing about
+    /// zirv. Now that this function also accepts [`is_reserved_zirv_escape_
+    /// safe_segment`] per candidate, the mixed compound clears it.
+    #[test]
+    fn read_only_escape_safe_accepts_mixed_zirv_and_filter_compounds() {
+        let roots = vec!["/tmp/claude".to_string()];
+        for command in [
+            "zirv ctx inbox | tail; zirv ctx status --brief | tail",
+            "zirv ctx remember --help | head",
+        ] {
+            assert!(
+                is_read_only_escape_safe(command, &roots),
+                "{command} should qualify"
+            );
+        }
+    }
+
+    /// Issue #329 follow-up: the new zirv acceptor must not bypass
+    /// [`escape_denied_by_screen`] -- a segment that names credential
+    /// material still fails the whole command even when another segment is
+    /// a reserved `zirv ctx` call.
+    #[test]
+    fn read_only_escape_safe_zirv_acceptor_still_screens_credential_segments() {
+        let roots = vec!["/tmp/claude".to_string()];
+        assert!(!is_read_only_escape_safe(
+            "zirv ctx status; cat ~/.ssh/id_rsa",
+            &roots
+        ));
     }
 
     /// Code review fix (CRITICAL): `--output=X` (attached with `=`) and the
@@ -8280,6 +8340,37 @@ mod tests {
                 outcome.verdict, *expected,
                 "{command}: expected {expected:?}, got {:?}",
                 outcome.verdict
+            );
+        }
+    }
+
+    /// Issue #329: `glab`, GitLab's forge CLI, must classify destructive
+    /// `repo`/`release delete` and `api ... DELETE` forms exactly like `gh`
+    /// does, while ordinary read/create `mr`/`ci`/`issue` forms stay
+    /// unaffected -- parity, not a wider deny.
+    #[test]
+    fn irreversible_distribution_action_gives_glab_and_gh_parity() {
+        let cases = [
+            ("gh repo delete owner/repo --yes", true),
+            ("glab repo delete owner/repo --yes", true),
+            ("gh release delete v1", true),
+            ("glab release delete v1", true),
+            ("gh api -X DELETE /repos/owner/repo", true),
+            ("glab api -X DELETE projects/1/repository", true),
+            ("gh api --method=delete /repos/owner/repo", true),
+            ("glab api --method=delete projects/1/repository", true),
+            ("gh pr view 12", false),
+            ("glab mr view 12", false),
+            ("gh pr create --fill", false),
+            ("glab mr create --fill", false),
+            ("glab ci status", false),
+            ("glab issue list", false),
+        ];
+        for (command, expected) in cases {
+            assert_eq!(
+                is_irreversible_distribution_action(command),
+                expected,
+                "{command}"
             );
         }
     }
