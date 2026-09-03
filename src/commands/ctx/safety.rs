@@ -5487,6 +5487,18 @@ fn allow_verdict_retry_clears_escape_screen(command: &str, scratchpad_roots: &[S
 /// posture flags and artifact server commands are semantic Deny outcomes
 /// before this screen; the payload-carrying and session-launching names stay
 /// excluded here regardless of their base/native permission.
+///
+/// **`--dry-run` carve-out (issue #307, 2026-09-03):** `test`/`verify` stay
+/// excluded from the blanket reserved-name pass below for the reason their
+/// own doc comment on `SANDBOX_CONFINED_RESERVED_BUILTINS` gives -- an
+/// ordinary invocation selects a repository-authored `.zirv/verify.toml` (or
+/// `package.json`) command that must stay inside Claude's OS sandbox even on
+/// an unsandboxed retry. `--dry-run` is different in kind, not degree:
+/// `verification::run_check` returns `CheckStatus::DryRun` before it ever
+/// builds that child command, so a dry-run invocation cannot reach
+/// repository-authored code no matter what `.zirv/verify.toml` says. Scans
+/// every token after the reserved name (not only a literal `--dry-run` in
+/// final position), mirroring this module's other conservative token scans.
 fn is_prompt_free_zirv_retry_safe(candidate: &str) -> bool {
     if is_reserved_zirv_escape_safe(candidate) {
         return true;
@@ -5503,6 +5515,11 @@ fn is_prompt_free_zirv_retry_safe(candidate: &str) -> bool {
     let Some(name) = tokens.get(1).map(|name| name.to_ascii_lowercase()) else {
         return false;
     };
+    if matches!(name.as_str(), "test" | "verify")
+        && tokens[2..].iter().any(|token| token == "--dry-run")
+    {
+        return true;
+    }
     crate::utils::is_reserved_command(&name)
         && !matches!(
             name.as_str(),
@@ -6874,6 +6891,75 @@ mod tests {
                 "{command}: expected ask, got {text}"
             );
         }
+    }
+
+    /// Issue #307/#321: five harmless, ordinary-workflow commands, all
+    /// carrying `dangerouslyDisableSandbox: true` (the unsandboxed retry a
+    /// non-Windows OS sandbox forces once a supervised session's tool call
+    /// cannot run inside it), must all clear the reserved-zirv carve-out
+    /// silently rather than prompt or deny. `zirv ctx status` and `zirv
+    /// report --help` already qualified before this round (`is_reserved_
+    /// zirv_escape_safe` itself); `zirv workflow start`/`zirv workflow
+    /// approve` qualify via the base-Allow allow-verdict retry path
+    /// (`retry_has_allow_verdict` + `allow_verdict_retry_clears_escape_
+    /// screen` -> `is_prompt_free_zirv_retry_safe`, since `workflow` is a
+    /// reserved, non-excluded name); `zirv test changed --dry-run` needed
+    /// this round's narrow `--dry-run` carve-out in `is_prompt_free_zirv_
+    /// retry_safe` above -- without it, `test` stayed excluded (repository-
+    /// authored child, same as `verify`/`frontend`) even though `--dry-run`
+    /// provably never reaches that child (`verification::run_check` returns
+    /// `CheckStatus::DryRun` before building the command).
+    #[test]
+    fn harmless_reserved_builtins_clear_the_unsandboxed_retry_headlessly() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = super::super::testenv::HomeGuard::set(home.path());
+        let empty: HashMap<String, String> = HashMap::new();
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("loads");
+
+        for command in [
+            "zirv workflow start feature --task x",
+            "zirv workflow approve some-id",
+            "zirv test changed --dry-run",
+            "zirv ctx status",
+            "zirv report --help",
+        ] {
+            let stdin = serde_json::json!({
+                "tool_name": "Bash",
+                "tool_input": {
+                    "command": command,
+                    "dangerouslyDisableSandbox": true
+                },
+                "permission_mode": "dontAsk"
+            })
+            .to_string();
+            let mut out = Vec::new();
+            run_check_hook_mode(&cfg, &mut out, &stdin).expect("runs");
+            let text = String::from_utf8(out).expect("utf8");
+            assert!(
+                !text.contains("ask") && !text.contains("deny"),
+                "{command}: must clear the unsandboxed retry silently, got {text}"
+            );
+        }
+
+        // `zirv test changed` with no `--dry-run` must still ask/deny -- the
+        // carve-out is narrowly scoped to the provably-no-child-process case.
+        let stdin = serde_json::json!({
+            "tool_name": "Bash",
+            "tool_input": {
+                "command": "zirv test changed",
+                "dangerouslyDisableSandbox": true
+            },
+            "permission_mode": "default"
+        })
+        .to_string();
+        let mut out = Vec::new();
+        run_check_hook_mode(&cfg, &mut out, &stdin).expect("runs");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            text.contains(r#""permissionDecision":"ask""#),
+            "a real (non-dry-run) `zirv test` retry must still ask: got {text}"
+        );
     }
 
     // -- strip_known_root_cd_prefix (issue #168, decision e) --------------

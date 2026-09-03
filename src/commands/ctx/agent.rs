@@ -1295,6 +1295,85 @@ const DASH_CLAIM_EXTENSION: Duration = Duration::from_secs(10);
 /// spelled out at two call sites. The printed text is unchanged.
 pub const DASH_SPAWN_ACK_PREFIX: &str = "spawned in dashboard as ";
 
+/// Issue #307.3: every worktree linked to `repo` (`git worktree list
+/// --porcelain`), canonicalized, excluding `repo` itself -- best-effort like
+/// every other worktree helper in this module (`allocate_worktree`,
+/// `reclaim_worktree`): git missing, `repo` not a work tree, or an
+/// unparseable/uncanonicalizable path all degrade to an empty list, never a
+/// wrong hint. Unlike main's own `adapters::claude::linked_worktree_args`
+/// (which this deliberately does not depend on -- that helper is `#[cfg(not
+/// (test))]`, so `workdir_visibility_hint`'s own tests could never exercise
+/// it), this always runs, the same as every other git shellout in this file.
+fn sibling_worktree_paths(repo: &Path) -> Vec<PathBuf> {
+    let Ok(canonical_repo) = std::fs::canonicalize(repo) else {
+        return Vec::new();
+    };
+    let Ok(output) = std::process::Command::new("git")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .arg("-C")
+        .arg(&canonical_repo)
+        .args(["worktree", "list", "--porcelain"])
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.strip_prefix("worktree "))
+        .filter_map(|path| std::fs::canonicalize(path).ok())
+        .filter(|path| path != &canonical_repo)
+        .collect()
+}
+
+/// Issue #307.3: a `--workdir` outside `repo` (and outside every one of
+/// `repo`'s own sibling worktrees) is invisible to THIS session's own
+/// harness -- the launch-settings work (issue #307) grants the DELEGATED
+/// worker prompt-free access to its own `--workdir`, but the delegator
+/// itself, if it happens to be a Claude Code session, still cannot read or
+/// edit that path without a prompt, because Claude Code's own workspace
+/// scope is fixed at session start. `/add-dir <path>` is that harness's own
+/// slash command for widening it live, so this nudges toward it rather than
+/// silently leaving the operator to discover the prompt themselves.
+///
+/// Claude-only (`/add-dir` is a Claude Code slash command with no codex
+/// equivalent this module knows of): silent unless THIS session's own
+/// `AGENT_ENV` reads exactly `"claude"`. Also silent whenever there is
+/// nothing to add -- no `--workdir` at all, or one already under `repo` or
+/// one of its own worktrees (`adapters::worktree_launch_write_paths`, the
+/// same best-effort git discovery `sibling_worktree_paths` above uses --
+/// best-effort here too: a detection failure just means no hint, never a
+/// wrong one). No new permission rule is added anywhere; this is purely an
+/// operator-facing suggestion.
+fn workdir_visibility_hint(
+    workdir: Option<&Path>,
+    repo: &Path,
+    env: EnvLookup<'_>,
+) -> Option<String> {
+    let workdir = workdir?;
+    if env(super::adapters::AGENT_ENV).as_deref() != Some("claude") {
+        return None;
+    }
+    if workdir.starts_with(repo) {
+        return None;
+    }
+    let already_visible = sibling_worktree_paths(repo)
+        .iter()
+        .any(|sibling| workdir.starts_with(sibling));
+    if already_visible {
+        return None;
+    }
+    Some(format!(
+        "hint: run /add-dir {} in this session to read and edit it without prompts",
+        workdir.display()
+    ))
+}
+
 /// The requester's own reading of one [`spawnreq::SpawnAck`].
 ///
 /// O2: `ok: false` is two different answers. A policy refusal ends the
@@ -1303,7 +1382,11 @@ pub const DASH_SPAWN_ACK_PREFIX: &str = "spawned in dashboard as ";
 /// could not carry the request, which the headless path was never subject to,
 /// so the caller falls through to it with the reason printed. `None` here is
 /// exactly that fall-through.
-fn answer_for_ack<W: Write>(ack: spawnreq::SpawnAck, w: &mut W) -> Option<CtxResult<i32>> {
+fn answer_for_ack<W: Write>(
+    ack: spawnreq::SpawnAck,
+    w: &mut W,
+    workdir_hint: Option<&str>,
+) -> Option<CtxResult<i32>> {
     if ack.ok {
         let short = ack.short.unwrap_or_default();
         // Issue #230 item 3: the same stdout result surface the headless
@@ -1319,11 +1402,17 @@ fn answer_for_ack<W: Write>(ack: spawnreq::SpawnAck, w: &mut W) -> Option<CtxRes
                 return Some(Err(e.into()));
             }
         }
-        return Some(
-            writeln!(w, "{DASH_SPAWN_ACK_PREFIX}{short}")
-                .map(|_| 0)
-                .map_err(|e| e.into()),
-        );
+        if let Err(e) = writeln!(w, "{DASH_SPAWN_ACK_PREFIX}{short}") {
+            return Some(Err(e.into()));
+        }
+        // Issue #307.3: a nudge for THIS session (the delegator), not the
+        // spawned worker -- see `workdir_visibility_hint`'s own doc comment.
+        if let Some(hint) = workdir_hint
+            && let Err(e) = writeln!(w, "{hint}")
+        {
+            return Some(Err(e.into()));
+        }
+        return Some(Ok(0));
     }
     let reason = ack
         .reason
@@ -1354,9 +1443,10 @@ fn wait_out_a_claimed_request<W: Write>(
     stem: &str,
     extension: Duration,
     w: &mut W,
+    workdir_hint: Option<&str>,
 ) -> Option<CtxResult<i32>> {
     match spawnreq::wait_for_ack(dir, stem, extension) {
-        Some(ack) => answer_for_ack(ack, w),
+        Some(ack) => answer_for_ack(ack, w, workdir_hint),
         None => Some(
             writeln!(
                 w,
@@ -1556,8 +1646,12 @@ fn try_join_dashboard<W: Write>(
         );
         return None;
     };
+    // Issue #307.3: computed once, here, and threaded through both this
+    // ack and `wait_out_a_claimed_request`'s own -- a nudge for THIS
+    // session's own visibility into `--workdir`, not the worker's.
+    let workdir_hint = workdir_visibility_hint(args.workdir.as_deref(), repo, env);
     match spawnreq::wait_for_ack(&dir, &stem, ack_timeout) {
-        Some(ack) => answer_for_ack(ack, w),
+        Some(ack) => answer_for_ack(ack, w, workdir_hint.as_deref()),
         // F10: `take_requests` takes the request the moment the dashboard
         // picks it up, so a timeout here is ambiguous -- nobody was listening,
         // or somebody took it and is still spawning. Both ends acting on that
@@ -1591,7 +1685,7 @@ fn try_join_dashboard<W: Write>(
                 );
                 return None;
             }
-            wait_out_a_claimed_request(&dir, &stem, claim_extension, w)
+            wait_out_a_claimed_request(&dir, &stem, claim_extension, w, workdir_hint.as_deref())
         }
     }
 }
@@ -3775,6 +3869,13 @@ mod tests {
             .join("tests")
             .join("fixtures")
             .join(name)
+    }
+
+    fn env_map(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect()
     }
 
     fn base_env(state: &Path) -> HashMap<String, String> {
@@ -5968,6 +6069,7 @@ mod tests {
                 capability_warnings: Vec::new(),
             },
             &mut out,
+            None,
         )
         .expect("a policy refusal is final")
         .expect("writes the result");
@@ -5977,6 +6079,115 @@ mod tests {
             String::from_utf8(out)
                 .expect("utf8")
                 .contains("budget-exhausted")
+        );
+    }
+
+    // -- workdir_visibility_hint (issue #307.3) ----------------------------
+
+    #[test]
+    fn workdir_visibility_hint_is_none_without_a_workdir() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let env = env_map(&[(super::super::adapters::AGENT_ENV, "claude")]);
+        assert_eq!(
+            workdir_visibility_hint(None, repo.path(), &|k| env.get(k).cloned()),
+            None
+        );
+    }
+
+    #[test]
+    fn workdir_visibility_hint_is_none_for_a_non_claude_session() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let outside = tempfile::tempdir().expect("tempdir");
+        for agent in [None, Some("codex")] {
+            let env = match agent {
+                Some(agent) => env_map(&[(super::super::adapters::AGENT_ENV, agent)]),
+                None => env_map(&[]),
+            };
+            assert_eq!(
+                workdir_visibility_hint(Some(outside.path()), repo.path(), &|k| env
+                    .get(k)
+                    .cloned()),
+                None,
+                "agent={agent:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn workdir_visibility_hint_is_none_when_the_workdir_is_inside_repo() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let inside = repo.path().join("sub");
+        std::fs::create_dir_all(&inside).expect("mkdir");
+        let env = env_map(&[(super::super::adapters::AGENT_ENV, "claude")]);
+        assert_eq!(
+            workdir_visibility_hint(Some(&inside), repo.path(), &|k| env.get(k).cloned()),
+            None
+        );
+    }
+
+    /// The one case the hint is meant for: a Claude session delegating to a
+    /// `--workdir` genuinely outside its own repo.
+    #[test]
+    fn workdir_visibility_hint_names_the_path_for_a_claude_session_with_an_external_workdir() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let outside = tempfile::tempdir().expect("tempdir");
+        let env = env_map(&[(super::super::adapters::AGENT_ENV, "claude")]);
+        let hint =
+            workdir_visibility_hint(Some(outside.path()), repo.path(), &|k| env.get(k).cloned())
+                .expect("a claude session with an external workdir gets a hint");
+        assert!(hint.starts_with("hint: run /add-dir "), "got {hint}");
+        assert!(
+            hint.contains(&outside.path().display().to_string()),
+            "got {hint}"
+        );
+        assert!(hint.contains("without prompts"), "got {hint}");
+    }
+
+    /// End-to-end: the hint reaches stdout on the exact line after the
+    /// dashboard's own spawn ack, and only for a claude session.
+    #[test]
+    fn dashboard_join_appends_the_workdir_visibility_hint_for_a_claude_session() {
+        if !git_available() {
+            eprintln!("skipping: git not found on PATH");
+            return;
+        }
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let outside = tempfile::tempdir().expect("tempdir");
+        assert!(git_init(outside.path()), "git init");
+        let (requests_dir, mut env) = live_dashboard_dir(tmp.path());
+        env.insert(
+            super::super::adapters::AGENT_ENV.to_string(),
+            "claude".to_string(),
+        );
+
+        let responder = std::thread::spawn({
+            let dir = requests_dir.clone();
+            move || respond_to_next_request(dir, r#"{"ok":true,"short":"cafe0001","reason":null}"#)
+        });
+
+        let mut args = joinable_args("claude", "a task outside the repo");
+        args.workdir = Some(outside.path().to_path_buf());
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned())
+            .expect("dashboard join runs");
+        responder.join().expect("responder thread");
+
+        assert_eq!(code, 0);
+        let output = String::from_utf8_lossy(&out);
+        assert!(
+            output.contains("spawned in dashboard as cafe0001"),
+            "got {output}"
+        );
+        // `--workdir` reaches this point through `validate_workdir`'s own
+        // canonicalization (`run_with`'s `canonical_workdir`), which on
+        // Windows can add a `\\?\` verbatim prefix -- compare against that
+        // SAME canonical form rather than the raw tempdir path.
+        let canonical = std::fs::canonicalize(outside.path()).expect("canonicalize");
+        assert!(
+            output.contains(&format!("hint: run /add-dir {}", canonical.display())),
+            "got {output}"
         );
     }
 
