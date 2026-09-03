@@ -516,14 +516,75 @@ pub const SHIPPED_POSTURE_ALLOW: &[(&str, &str)] = &[
 /// exactly two leading slashes, never three. A Windows path with no leading
 /// slash of its own (a drive letter) is unaffected by the strip:
 /// `C:\Users\x\AppData\Local\Temp\` becomes
-/// `//C:/Users/x/AppData/Local/Temp/claude/**`; a Unix `/tmp` becomes
-/// `//tmp/claude/**`, not `///tmp/claude/**`.
-pub(crate) fn scratchpad_rules(temp_dir: &Path) -> [String; 2] {
-    let normalized = temp_dir.to_string_lossy().replace('\\', "/");
-    let trimmed = normalized.trim_end_matches('/');
-    let stripped = trimmed.strip_prefix('/').unwrap_or(trimmed);
-    let base = format!("//{stripped}/claude/**");
-    [format!("Read({base})"), format!("Edit({base})")]
+/// `//C:/Users/x/AppData/Local/Temp/claude/**`; a Unix `/tmp` base with UID
+/// 501 becomes `//tmp/claude-501/**`, not `///tmp/claude-501/**`.
+pub(crate) fn scratchpad_rules(temp_dir: &Path) -> Vec<String> {
+    scratchpad_rules_from_roots(&scratchpad_roots(temp_dir))
+}
+
+fn scratchpad_rules_from_roots(roots: &[String]) -> Vec<String> {
+    roots
+        .iter()
+        .flat_map(|root| {
+            let stripped = root.strip_prefix('/').unwrap_or(root);
+            let base = format!("//{stripped}/**");
+            [format!("Read({base})"), format!("Edit({base})")]
+        })
+        .collect()
+}
+
+/// The harness scratchpad roots from `CLAUDE_CODE_TMPDIR`, `/tmp` on Unix,
+/// or the platform temp base on Windows, normalized with no trailing separator -- the
+/// single source both [`scratchpad_rules`] and the safety hook's confined-
+/// write classifier (`safety::scratchpad_write_roots`) derive from.
+pub(crate) fn scratchpad_roots(temp_dir: &Path) -> Vec<String> {
+    let claude_tmpdir = std::env::var_os("CLAUDE_CODE_TMPDIR").map(PathBuf::from);
+    #[cfg(unix)]
+    {
+        // SAFETY: `getuid` takes no arguments and has no failure mode.
+        scratchpad_roots_for(
+            temp_dir,
+            Some(unsafe { libc::getuid() }),
+            claude_tmpdir.as_deref(),
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        scratchpad_roots_for(temp_dir, None, claude_tmpdir.as_deref())
+    }
+}
+
+/// Builds the stable scratchpad-root set for a supplied platform UID and
+/// optional Claude-specific temp base.
+pub(crate) fn scratchpad_roots_for(
+    temp_dir: &Path,
+    uid: Option<u32>,
+    claude_tmpdir: Option<&Path>,
+) -> Vec<String> {
+    let normalized_temp_dir = temp_dir.to_string_lossy().replace('\\', "/");
+    let normalized_temp_dir = normalized_temp_dir.trim_end_matches('/');
+    let Some(uid) = uid else {
+        return vec![format!("{normalized_temp_dir}/claude")];
+    };
+
+    let normalized_base = claude_tmpdir
+        .unwrap_or_else(|| Path::new("/tmp"))
+        .to_string_lossy()
+        .replace('\\', "/");
+    let normalized_base = normalized_base.trim_end_matches('/');
+    let suffix = format!("claude-{uid}");
+    let mut roots = vec![format!("{normalized_base}/{suffix}")];
+    #[cfg(target_os = "macos")]
+    if normalized_base == "/tmp" {
+        roots.push(format!("/private/tmp/{suffix}"));
+    }
+    if normalized_temp_dir.rsplit('/').next() == Some(suffix.as_str()) {
+        let normalized_temp_dir = normalized_temp_dir.to_string();
+        if !roots.contains(&normalized_temp_dir) {
+            roots.push(normalized_temp_dir);
+        }
+    }
+    roots
 }
 
 /// The destructive families this posture denies regardless of anything on
@@ -5720,10 +5781,11 @@ mod tests {
     /// prepended.
     #[test]
     fn scratchpad_rules_projects_a_windows_temp_dir() {
-        let rules = scratchpad_rules(Path::new(r"C:\Users\x\AppData\Local\Temp\"));
+        let roots = scratchpad_roots_for(Path::new(r"C:\Users\x\AppData\Local\Temp\"), None, None);
+        let rules = scratchpad_rules_from_roots(&roots);
         assert_eq!(
             rules,
-            [
+            vec![
                 "Read(//C:/Users/x/AppData/Local/Temp/claude/**)".to_string(),
                 "Edit(//C:/Users/x/AppData/Local/Temp/claude/**)".to_string(),
             ]
@@ -5732,16 +5794,96 @@ mod tests {
 
     /// A Unix-shaped temp dir already carries its own leading `/`, so the
     /// convention is `//` plus the path *without* that leading slash --
-    /// `//tmp/claude/**`, not `///tmp/claude/**` (three slashes).
+    /// `//tmp/claude-501/**`, not `///tmp/claude-501/**` (three slashes).
     #[test]
     fn scratchpad_rules_projects_a_unix_temp_dir() {
-        let rules = scratchpad_rules(Path::new("/tmp"));
+        let roots = scratchpad_roots_for(Path::new("/tmp"), Some(501), None);
+        let rules = scratchpad_rules_from_roots(&roots);
+        #[cfg(target_os = "macos")]
         assert_eq!(
             rules,
-            [
-                "Read(//tmp/claude/**)".to_string(),
-                "Edit(//tmp/claude/**)".to_string(),
+            vec![
+                "Read(//tmp/claude-501/**)".to_string(),
+                "Edit(//tmp/claude-501/**)".to_string(),
+                "Read(//private/tmp/claude-501/**)".to_string(),
+                "Edit(//private/tmp/claude-501/**)".to_string(),
             ]
+        );
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(
+            rules,
+            vec![
+                "Read(//tmp/claude-501/**)".to_string(),
+                "Edit(//tmp/claude-501/**)".to_string(),
+            ]
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn scratchpad_rules_include_claude_code_uid_roots() {
+        let roots = scratchpad_roots_for(
+            Path::new("/var/folders/x/T/"),
+            Some(501),
+            Some(Path::new("/tmp")),
+        );
+        let rules = scratchpad_rules_from_roots(&roots);
+
+        for rule in [
+            "Read(//private/tmp/claude-501/**)",
+            "Edit(//tmp/claude-501/**)",
+        ] {
+            assert!(rules.iter().any(|candidate| candidate == rule), "{rule}");
+        }
+    }
+
+    /// The already-suffixed `temp_dir` is added at most once: a hook whose
+    /// own `$TMPDIR` is the session scratchpad (`/tmp/claude-<uid>`) yields
+    /// that root a single time, never doubled by the base default.
+    #[test]
+    fn scratchpad_roots_do_not_duplicate_a_uid_temp_dir() {
+        let roots = scratchpad_roots_for(Path::new("/tmp/claude-501"), Some(501), None);
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            roots,
+            vec![
+                "/tmp/claude-501".to_string(),
+                "/private/tmp/claude-501".to_string(),
+            ]
+        );
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(roots, vec!["/tmp/claude-501".to_string()]);
+    }
+
+    /// Without a `CLAUDE_CODE_TMPDIR` override the base is `/tmp` on every
+    /// non-Windows host (Claude Code's macOS default and the usual Linux
+    /// layout), never the hook's own `temp_dir`; macOS also carries the
+    /// `/private/tmp` realpath twin so an allow rule matches both symlink
+    /// sides.
+    #[test]
+    fn scratchpad_roots_default_to_the_tmp_base_without_an_override() {
+        let roots = scratchpad_roots_for(Path::new("/var/tmp"), Some(7), None);
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            roots,
+            vec![
+                "/tmp/claude-7".to_string(),
+                "/private/tmp/claude-7".to_string(),
+            ]
+        );
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(roots, vec!["/tmp/claude-7".to_string()]);
+    }
+
+    #[test]
+    fn scratchpad_roots_prefer_the_claude_tmpdir_override() {
+        assert_eq!(
+            scratchpad_roots_for(
+                Path::new("/var/folders/x/T"),
+                Some(501),
+                Some(Path::new("/scratch")),
+            ),
+            vec!["/scratch/claude-501".to_string()]
         );
     }
 }
