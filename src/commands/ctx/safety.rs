@@ -2849,8 +2849,21 @@ fn git_action(tokens: &[String]) -> Option<(usize, &str)> {
 /// expand to an unknown, possibly tree-wide, set of paths). Text-only, like
 /// [`target_is_confined`]: this classifier cannot know what a glob expands
 /// to, so it never treats one as concrete.
+/// A path operand that names one concrete file or directory INSIDE the
+/// tree: never a glob, never a `:`-prefixed pathspec (`:/`, `:(top)`), and
+/// never a dot-only spelling of the tree itself or its parent (`.`, `./`,
+/// `..`, `../x`, `/`). Review round 2 on issue #306: `..` and `./` used to
+/// pass, reopening the tree-wide `git clean` bypass for those spellings.
 fn is_concrete_vcs_path(path: &str) -> bool {
-    !matches!(path, "." | ":/" | "*") && !path.contains(['*', '?', '['])
+    if path.contains(['*', '?', '[']) || path.starts_with(':') {
+        return false;
+    }
+    let normalized = path.replace('\\', "/");
+    let components: Vec<&str> = normalized
+        .split('/')
+        .filter(|component| !component.is_empty() && *component != ".")
+        .collect();
+    !components.is_empty() && !components.contains(&"..")
 }
 
 /// Issue #306: `path` (a `git worktree remove --force` target) lexically
@@ -8698,6 +8711,12 @@ mod tests {
             ("git clean -f :/", Verdict::Ask),
             ("git clean -f *", Verdict::Ask),
             ("git clean -fd src .", Verdict::Ask),
+            ("git clean -fd ..", Verdict::Ask),
+            ("git clean -fd ./", Verdict::Ask),
+            ("git clean -fd ../sibling", Verdict::Ask),
+            ("git clean -f :(top)", Verdict::Ask),
+            ("git clean -fd /", Verdict::Ask),
+            ("git clean -fd ./target", Verdict::Allow),
             ("git clean -fdq .zirv/work/abc", Verdict::Allow),
             ("git clean -f src/generated", Verdict::Allow),
         ];
