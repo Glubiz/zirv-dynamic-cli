@@ -3783,7 +3783,15 @@ fn fulfill_spawn_request(
     // an early return here drops it via `HeavyPermit::drop`, releasing the
     // slot exactly like every other fallible step past this point already
     // does for the group admission it rolls back.
-    let writer_permit = if req.mode == super::permit::WorkerMode::Writing {
+    //
+    // Coordinator panes never take a writer slot: an orchestrator or
+    // sub-orchestrator delegates edits to the workers it spawns into this
+    // same tree, so holding the tree's one writer permit itself would refuse
+    // every worker it is about to dispatch (`fulfill_spawn_request_never_
+    // charges_a_coordinator_pane_a_writer_permit`).
+    let writer_permit = if req.mode == super::permit::WorkerMode::Writing
+        && spawnreq::role_of(req) == prompt::PromptRole::Worker
+    {
         let tree = std::fs::canonicalize(&spawn_cwd).unwrap_or_else(|_| spawn_cwd.clone());
         match super::permit::acquire_writer(
             state,
@@ -16458,6 +16466,109 @@ mod tests {
             1,
             "the refused second request must never have taken a second writer slot"
         );
+
+        for pane in &mut panes {
+            let _ = pane.shutdown("");
+        }
+    }
+
+    /// A coordinator pane delegates edits instead of making them, so a
+    /// `sub-orchestrator` request spawned with the default `writing` mode
+    /// must leave the tree's writer slot free for the worker it dispatches
+    /// next -- otherwise every sub-orchestrator would refuse its own first
+    /// worker (the Linux run of `a_spawned_sub_orchestrator_pane_may_spawn_
+    /// a_worker_but_not_another_sub_orchestrator` caught exactly that).
+    #[test]
+    fn fulfill_spawn_request_never_charges_a_coordinator_pane_a_writer_permit() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().to_path_buf();
+
+        let cfg = CtxConfig {
+            #[cfg(windows)]
+            agent_bin: Some("ping -n 3 127.0.0.1".to_string()),
+            #[cfg(unix)]
+            agent_bin: Some("sleep 3".to_string()),
+            pace: crate::commands::ctx::config::PaceConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            ..CtxConfig::default()
+        };
+
+        // A coordinator seat may only be requested from a verified
+        // orchestrator pane, so one is spawned first (a trivial child, never
+        // a real agent) and named as the requester.
+        let orch_session = "44444444-5555-4666-8777-888888888888";
+        let spec = PaneSpec {
+            agent_name: "test-agent".to_string(),
+            argv: trivial_argv(),
+            role: prompt::PromptRole::Orchestrator,
+            verb: sessions::Verb::Chat,
+            session_id: orch_session.to_string(),
+            title: "orch".to_string(),
+        };
+        let mut panes = vec![
+            Pane::spawn(
+                spec,
+                &state,
+                &repo,
+                &repo,
+                (80, 24),
+                &[],
+                true,
+                pane::DEFAULT_IDLE_QUIET,
+            )
+            .expect("spawn"),
+        ];
+        let mut queues: Vec<VecDeque<String>> = vec![VecDeque::new()];
+        let orch_short = sessions::short_id(orch_session);
+
+        let mut sub_req = spawn_request("own this scope", &repo);
+        sub_req.parent_session = Some(orch_short.clone());
+        sub_req.role = Some("sub-orchestrator".to_string());
+        let mut errors = Vec::new();
+        let requests_dir = tmp.path().join("requests");
+        let sub = fulfill_spawn_request(
+            &sub_req,
+            false,
+            Some(&orch_short),
+            &mut panes,
+            &mut queues,
+            &cfg,
+            &state,
+            &repo,
+            (80, 24),
+            &requests_dir,
+            &mut errors,
+        );
+        assert!(sub.is_ok(), "the coordinator must spawn: {sub:?}");
+        assert_eq!(
+            super::super::permit::live_writer_count(&state),
+            0,
+            "a coordinator pane must not hold the tree's writer slot"
+        );
+
+        let worker = fulfill_spawn_request(
+            &spawn_request("do the work", &repo),
+            false,
+            None,
+            &mut panes,
+            &mut queues,
+            &cfg,
+            &state,
+            &repo,
+            (80, 24),
+            &requests_dir,
+            &mut errors,
+        );
+        assert!(
+            worker.is_ok(),
+            "the worker under a coordinator must still get the tree's writer slot: {worker:?}"
+        );
+        assert_eq!(super::super::permit::live_writer_count(&state), 1);
 
         for pane in &mut panes {
             let _ = pane.shutdown("");
