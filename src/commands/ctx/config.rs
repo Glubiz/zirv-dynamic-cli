@@ -1148,12 +1148,35 @@ pub struct HandoverConfig {
 /// sandbox_args`, so deny continues to beat allow across every source --
 /// verified live for the shipped pair, and true here by construction: the
 /// underlying CLI mechanism does not care which list an entry came from.
+///
+/// **`scrub_subprocess_env` (issue #329):** whether the generated claude
+/// launch settings set `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1`. Off by default.
+/// Read straight from the installed Claude Code binary (2.1.259), that
+/// switch does three things, none of which zirv's launch posture wants
+/// unasked: it strips a fixed list of the operator's own tool-config and
+/// auth-channel variables from EVERY Bash subprocess, sandboxed or not --
+/// `SSH_AUTH_SOCK`, `SSH_AGENT_PID`, `GIT_SSH_COMMAND`, `GH_CONFIG_DIR`,
+/// `DOCKER_CONFIG`, `KUBECONFIG`, `GNUPGHOME` and the like -- which is
+/// exactly why the `env.SSH_AUTH_SOCK` the same settings file exports never
+/// reached a single `git fetch` (#329 item 1); it forces the permission mode
+/// to `default`, silently overriding the `dontAsk` a headless launch pins;
+/// and it is documented upstream as `allowed_non_write_users` hardening for
+/// CI runners, not interactive operator sessions. Credential FILES stay
+/// unreadable inside the sandbox regardless (`sandbox.filesystem.denyRead`
+/// plus the `Read(...)` deny rules), so turning the scrub off costs only the
+/// stripping of credential-bearing environment variables from subprocesses.
+///
+/// `REPO_FORBIDDEN`, whole key, like `enabled`: the switch changes the
+/// launch's permission mode as a side effect, which is the operator's
+/// posture to set, not a repo checkout's. `ZIRV_CTX_SANDBOX_SCRUB_SUBPROCESS_
+/// ENV` is the operator's own final word.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SandboxConfig {
     pub enabled: bool,
     pub extra_allow: Vec<String>,
     pub extra_deny: Vec<String>,
+    pub scrub_subprocess_env: bool,
 }
 
 impl Default for SandboxConfig {
@@ -1162,6 +1185,7 @@ impl Default for SandboxConfig {
             enabled: true,
             extra_allow: Vec::new(),
             extra_deny: Vec::new(),
+            scrub_subprocess_env: false,
         }
     }
 }
@@ -1521,6 +1545,11 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         EnvKind::Str,
     ),
     ("ZIRV_CTX_SANDBOX", &["sandbox", "enabled"], EnvKind::Bool),
+    (
+        "ZIRV_CTX_SANDBOX_SCRUB_SUBPROCESS_ENV",
+        &["sandbox", "scrub_subprocess_env"],
+        EnvKind::Bool,
+    ),
     ("ZIRV_CTX_PROMPT", &["prompt", "enabled"], EnvKind::Bool),
     (
         "ZIRV_CTX_PROMPT_REPO",
@@ -2030,6 +2059,10 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     (&["optimize", "model"], "ZIRV_CTX_OPTIMIZE_MODEL"),
     (&["sandbox", "enabled"], "ZIRV_CTX_SANDBOX"),
     (&["sandbox", "extra_allow"], "ZIRV_CTX_SANDBOX_EXTRA_ALLOW"),
+    (
+        &["sandbox", "scrub_subprocess_env"],
+        "ZIRV_CTX_SANDBOX_SCRUB_SUBPROCESS_ENV",
+    ),
     (&["prompt", "enabled"], "ZIRV_CTX_PROMPT"),
     (&["prompt", "repo_layer"], "ZIRV_CTX_PROMPT_REPO"),
     // Without this the cap would be decorative: the untrusted layer could
@@ -5174,6 +5207,49 @@ mod tests {
         );
     }
 
+    /// Issue #329: the subprocess env scrub is off by default (it strips
+    /// `SSH_AUTH_SOCK` and forces the permission mode to `default`), only
+    /// the operator may turn it on, and the environment is the final word.
+    #[test]
+    fn subprocess_env_scrub_is_off_by_default_and_operator_only() {
+        assert!(!SandboxConfig::default().scrub_subprocess_env);
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[sandbox]\nscrub_subprocess_env = true\n",
+        )
+        .expect("write");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let empty = env_map(&[]);
+        let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+            .expect_err("a repo may not set this key")
+            .to_string();
+        assert!(err.contains("sandbox.scrub_subprocess_env"), "got {err}");
+
+        std::fs::remove_file(repo.path().join(".zirv/ctx.toml")).expect("remove");
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".zirv/ctx.toml"),
+            "[sandbox]\nscrub_subprocess_env = true\n",
+        )
+        .expect("write");
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("loads");
+        assert!(
+            cfg.sandbox.scrub_subprocess_env,
+            "the operator layer may turn it on"
+        );
+
+        let env = env_map(&[("ZIRV_CTX_SANDBOX_SCRUB_SUBPROCESS_ENV", "false")]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("loads");
+        assert!(
+            !cfg.sandbox.scrub_subprocess_env,
+            "the environment wins outright"
+        );
+    }
+
     /// The end-to-end path the coordinator asked for: even if the hard
     /// rejection above were ever weakened to a narrow-only fold instead (the
     /// shape most other `[policy]`-adjacent keys use), the resolved config
@@ -5626,6 +5702,7 @@ mod tests {
                 enabled: true,
                 extra_allow: vec!["Bash(deploy *)".to_string()],
                 extra_deny: vec!["Bash(deploy *)".to_string()],
+                scrub_subprocess_env: false,
             },
             ..CtxConfig::default()
         };

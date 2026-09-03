@@ -24,6 +24,13 @@ last-verified: 2026-09-03
 
 ## Decisions
 
+### 2026-09-03 -- Sibling-repository permissions posture is zirv's to control, not out of scope
+**Context:** `linked_worktree_args`'s own doc comment previously stated "other repositories remain out of scope; callers use `zirv agent --workdir`" — but issue #329's production evidence (9 of 21 sampled prompts) showed cross-repo work (a service plus the library it calls, plus a worktree of a third repo) is ordinary work in a services directory, and every gate in a sibling checkout failed `Operation not permitted` under the sandbox until retried unsandboxed.
+**Decision:** Operator ruling (2026-09-03): the launch repository's sibling checkouts under the same parent directory, and each sibling's own linked worktrees (read from `.git/worktrees/*/gitdir`, no process spawn), get sandbox write grants (`allowWrite`/`additionalDirectories`) — never `--add-dir`, since that would also load a sibling's own `.claude/` hooks into this session. Never the parent directory itself; nothing when the parent is a filesystem root or the home directory; capped at 32 siblings, 16 worktrees per repo.
+**Rejected:** Leaving cross-repo work to `zirv agent --workdir` — that delegates to a *worker*, and does nothing for the operator's own orchestrator seat working across repos directly, which was the actual friction in the evidence. `--add-dir` for siblings — loads a checkout's own repo-owned hooks/skills into a session that never chose to trust them.
+**Consequences:** A repo's own permissions posture (what get written outside its own tree) is explicitly zirv's decision to make on the operator's behalf, not a boundary callers must route around themselves. `sibling_repo_roots`/`linked_worktrees_from_git_dir` (`adapters/claude.rs`) are the mechanism; both are `#[cfg(not(windows))]`-relevant only for the sandbox grant (Windows has no OS sandbox) but the `--add-dir`/write-root distinction holds everywhere.
+**Spec / link:** [[Ctx Adapters]], [[Untrusted Configuration]].
+
 ### 2026-09-02 -- Handoff v3 carries constraints/decisions across restarts, splits files touched
 **Context:** A restart chain (rot restart, nudge relaunch, handover) distilled each handoff only from the current transcript tail, so an operator constraint or design decision made two restarts ago could silently drop once it aged out.
 **Decision:** `distill`/`distill_or_structural` now take the repo's latest stored handoff as `previous: Option<&Handoff>`; the prompt renders a `### Previous handoff` block with preserve/update rules. `Handoff::SECTIONS` grows 7 -> 11 (Constraints/Blocked/Key decisions added, Files touched split into Files read/Files modified). `DISTILL_PROMPT_VERSION` v2 -> v3.
