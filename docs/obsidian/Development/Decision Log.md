@@ -24,6 +24,13 @@ last-verified: 2026-09-03
 
 ## Decisions
 
+### 2026-09-03 -- Stop hook nudges the stale-gate command instead of auto-running verification (issue #309)
+**Context:** A session can end a turn with code modified since the last passing `zirv test`/`zirv verify` run, and nothing told the operator or the next turn that the evidence was stale.
+**Decision:** A new `[verify_on_stop]` section (`enabled`, `max_nudges`, narrow-only fold like `pace.enabled`, default on/cap 2 per session) makes the Stop hook append one advisory line naming the exact stale-gate command (`zirv test changed` or `zirv verify`) once a session-scoped modification checkpoint (`ModificationCheckpoint`) shows an edit-like tool call and `verification::latest_is_fresh_and_passing` says the last report no longer covers the change set. Suppressed for a doc-only change set and while the active workflow step is itself a Test/Verify gate (which already prints the same message). `zirv ctx status` gains a presentation-only `gates: fresh`/`gates: stale (edits after the last passing run)` line off the same check.
+**Rejected:** Auto-running the check on Stop -- a hook has no budget/consent to launch an arbitrary, potentially slow verification run on every turn; a nudge lets the operator or next turn decide.
+**Consequences:** The nudge is capped per session, so a persistently stale session goes quiet after `max_nudges` rather than nagging forever; a repo layer may only disable it or lower the cap, never widen it.
+**Spec / link:** [[Ctx Subsystem]], [[Untrusted Configuration]].
+
 ### 2026-09-02 -- Handoff v3 carries constraints/decisions across restarts, splits files touched
 **Context:** A restart chain (rot restart, nudge relaunch, handover) distilled each handoff only from the current transcript tail, so an operator constraint or design decision made two restarts ago could silently drop once it aged out.
 **Decision:** `distill`/`distill_or_structural` now take the repo's latest stored handoff as `previous: Option<&Handoff>`; the prompt renders a `### Previous handoff` block with preserve/update rules. `Handoff::SECTIONS` grows 7 -> 11 (Constraints/Blocked/Key decisions added, Files touched split into Files read/Files modified). `DISTILL_PROMPT_VERSION` v2 -> v3.
