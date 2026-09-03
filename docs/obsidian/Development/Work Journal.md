@@ -20,11 +20,11 @@ last-verified: 2026-09-03
 
 ## Entries
 
-### 2026-09-03: release 3.14.0 -- mail heading truncation, safety hardening, verify-on-stop nudge, permission-prompt audit, workdir visibility hint
+### 2026-09-03: release 3.15.0 -- mail heading truncation, safety hardening, verify-on-stop nudge, permission-prompt audit, workdir visibility hint
 
 **What:** Five-issue batch (`release/3.14.0-harness-batch-3`, rebuilt on top of main's own #325). #326: `mail::parse_markdown`'s `## Message` heading recognition now gates on a `header_seen` flag that fires exactly once, so a body's own `## Summary`/`## Findings` heading no longer re-closes the header and silently truncates the stored payload. #327/#321 item 2: `git push --mirror`/`--prune` and `git checkout -f`/`--force`/`-B` now ask unconditionally; a new `is_mixed_confined_write_and_read_only_escape_safe` combinator allows an unsandboxed retry mixing a scratchpad-confined write segment (e.g. `mkdir -p <scratch>/x`) with a read-only escape segment (e.g. a `gh` call redirecting into that same scratchpad). #309: a new `[verify_on_stop]` section (narrow-only, default on, cap 2/session) makes the Stop hook name the exact stale-gate command (`zirv test changed`/`zirv verify`) when this session modified code after the last passing verification run; `zirv ctx status` gains a `gates: fresh`/`stale` line off the same check. #321/#307/#320: `zirv ctx permissions audit` gains `--session`/`--repo`/`--all-repos` scoping (default: the current repo's own claude project directory) plus a `## Sampled transcripts` section, and a `## Permission-prompt log` section reading `logs/permission-prompts.jsonl` (populated by the pre-existing `zirv ctx hook permission` observer), grouping Read/Edit-family prompts by directory. #307: `zirv test`/`zirv verify --dry-run` are now escape-safe on an unsandboxed retry (a real run stays Ask/Deny); a Claude delegator joining a dashboard with `--workdir` outside its own repo/worktrees gets a `hint: run /add-dir <path> ...` line on the spawn ack.
 
-**Key changes:** `src/commands/ctx/{mail,safety,hook,config,status,log,permissions,optimize,agent}.rs`. `Cargo.toml` bumped to 3.14.0.
+**Key changes:** `src/commands/ctx/{mail,safety,hook,config,status,log,permissions,optimize,agent}.rs`. `Cargo.toml` bumped to 3.15.0.
 
 **Follow-up:** PR pending. See [[Active Work]]'s matching entry and the 2026-09-03 [[Decision Log]] entry.
 

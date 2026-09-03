@@ -3976,7 +3976,7 @@ mod tests {
         }
     }
 
-    /// Codex review (3.14.0 round 1): a subagent transcript under the real
+    /// Codex review (3.15.0 round 1): a subagent transcript under the real
     /// `<project>/<session-id>/subagents/` layout is attributed to the
     /// project, not to the session-id directory; the flat
     /// `<project>/subagents/` layout still attributes to the project.

@@ -745,7 +745,7 @@ how it was first noticed.
 
 If either parser grows a new header field, keep the terminator rule intact.
 
-**Fixed 2026-09-03, a sibling gap (issue #326, v3.14.0): a `## ` heading
+**Fixed 2026-09-03, a sibling gap (issue #326, v3.15.0): a `## ` heading
 inside the body used to re-close the header too.** `mail::parse_markdown`
 re-checked every line starting with `## ` for the `## Message` heading
 regardless of where parsing already stood, so once the header block above
