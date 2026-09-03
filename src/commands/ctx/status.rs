@@ -5,11 +5,12 @@ use serde::{Deserialize, Serialize};
 
 use super::adapters::{self, AGENT_ENV, DefaultOrigin};
 use super::config::{CtxConfig, EnvLookup, env_from_process};
-use super::event::input_hash;
+use super::event::{TranscriptUsage, input_hash};
 use super::group;
 use super::handoff::latest_for_repo;
 use super::mail;
 use super::permit;
+use super::price;
 use super::sessions::{self, Liveness};
 use super::state::{StateDir, now_secs, repo_slug};
 use super::{CtxResult, log};
@@ -717,6 +718,61 @@ pub struct StatusArgs {
     pub diff: bool,
 }
 
+/// Issue #264: the `spend:` line's own computation, factored out so a test
+/// can drive it directly against a fixture ledger without rendering the
+/// whole report. Sums `zirv ctx spend`'s identical per-row `price::price`
+/// call over two slices of the same `delegations.jsonl` ledger: every row
+/// this session's own short id delegated ("this session"), and every row
+/// completed in the trailing 5 hours regardless of who delegated it ("this
+/// 5h window") -- a time-boxed slice of the ledger itself, never the
+/// vendor's own rate-limit window (`pace::current_windows` tracks that
+/// separately, in tokens, not dollars). A row whose model has no price
+/// (`price::price` returning `None`) contributes nothing to either sum,
+/// mirroring `spend::SpendRow`'s own "never a phantom zero" rule.
+fn spend_status_line(
+    state: &StateDir,
+    cfg: &CtxConfig,
+    env: EnvLookup<'_>,
+    colour: bool,
+) -> String {
+    let table = price::resolve_table(cfg);
+    let now = now_secs();
+    let stale = table.is_stale(now, cfg.price.stale_after_days);
+    let session_ident = mail::session_identity(env);
+    let five_hours_ago = now.saturating_sub(5 * 3_600);
+
+    let mut session_micros: u64 = 0;
+    let mut window_micros: u64 = 0;
+    for row in log::read_delegations(state, usize::MAX) {
+        let Some(model) = row.model.as_deref() else {
+            continue;
+        };
+        let usage = TranscriptUsage {
+            input_tokens: row.input_tokens,
+            cache_creation_input_tokens: row.cache_creation_input_tokens,
+            cache_read_input_tokens: row.cache_read_input_tokens,
+            output_tokens: row.output_tokens,
+        };
+        let Some(cost) = price::price(model, &usage, &table) else {
+            continue;
+        };
+        if session_ident.as_deref() == Some(row.parent_session.as_str()) {
+            session_micros = session_micros.saturating_add(cost);
+        }
+        if row.ts >= five_hours_ago {
+            window_micros = window_micros.saturating_add(cost);
+        }
+    }
+
+    format!(
+        "{} {} this session \u{b7} {} this 5h window (prices as of {})",
+        label(colour, "spend:"),
+        price::format_usd(session_micros, stale),
+        price::format_usd(window_micros, stale),
+        table.as_of,
+    )
+}
+
 fn render_report<W: Write>(
     args: &StatusArgs,
     w: &mut W,
@@ -834,6 +890,21 @@ fn render_report<W: Write>(
                 cfg.fallback.min_candidate_headroom_pct,
                 cfg.fallback.unknown_headroom_pct,
             )?;
+            // Issue #264: one line naming what delegating has actually cost --
+            // the question `log::Delegation`'s own doc comment says the
+            // ledger exists to answer, surfaced where an operator already
+            // looks first. Unconditional (present in `--brief` too, unlike
+            // the per-harness fallback detail just below) and fixed to
+            // exactly two numbers, so `--brief`'s own "unchanged in bytes
+            // except this line" contract holds no matter how large the
+            // ledger grows. Reads the same `delegations.jsonl` `zirv ctx
+            // spend` aggregates; "this session" sums rows this session's own
+            // short id delegated, "this 5h window" sums every row completed
+            // in the trailing 5 hours regardless of who delegated it -- a
+            // time-boxed slice of the ledger itself, not the vendor's own
+            // rate-limit window (`pace::current_windows` tracks that
+            // separately, in tokens, not dollars).
+            writeln!(w, "{}", spend_status_line(&state, cfg, env, colour))?;
             if cfg.fallback.enabled && !args.brief {
                 let now = crate::commands::ctx::state::now_secs();
                 for name in &cfg.fallback.order {
@@ -2639,6 +2710,71 @@ mod tests {
         assert!(text.contains("77"), "got {text}");
     }
 
+    /// Issue #264: `spend:` names both this session's own delegated cost and
+    /// the trailing-5h ledger total, priced from the built-in table -- and
+    /// appears in `--brief` too (the one line that mode's own
+    /// "unchanged in bytes except this line" contract allows for).
+    #[test]
+    fn status_reports_spend_this_session_and_this_5h_window() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state = StateDir::from_root(tmp.path().join("state"));
+        state.ensure().expect("ensure");
+
+        log::append_delegation(
+            &state,
+            &log::Delegation {
+                ts: crate::commands::ctx::state::now_secs(),
+                session: "sess-child",
+                parent_session: "aaaa1111",
+                work_group_id: None,
+                agent: "claude",
+                model: Some("sonnet"),
+                input_tokens: 1_000_000,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+                output_tokens: 0,
+                wall_ms: 1_000,
+                exit_code: 0,
+                outcome: "ok",
+                mode: None,
+                task_class: None,
+            },
+        )
+        .expect("append");
+
+        let mut env = env_for(state.root());
+        env.insert(
+            crate::commands::ctx::adapters::SESSION_ENV.to_string(),
+            "aaaa1111".to_string(),
+        );
+
+        for brief in [false, true] {
+            let mut out = Vec::new();
+            run_with(
+                &StatusArgs {
+                    decisions: 5,
+                    brief,
+                    diff: false,
+                },
+                &mut out,
+                tmp.path(),
+                &|k| env.get(k).cloned(),
+                false,
+            )
+            .expect("runs");
+            let text = String::from_utf8(out).expect("utf8");
+            assert!(text.contains("spend:"), "brief={brief}: got {text}");
+            assert!(
+                text.contains("$3.00 this session"),
+                "1M input tokens @ $3/M (sonnet), attributed to this session: {text}"
+            );
+            assert!(text.contains("this 5h window"), "brief={brief}: got {text}");
+            assert!(text.contains("prices as of"), "brief={brief}: got {text}");
+        }
+    }
+
     /// The fourth surface change: a window whose `resets_at` has provably
     /// passed must read as `style::PLACEHOLDER` (issue #202: unknown values
     /// use the shared placeholder, never the word "unknown"), the same
@@ -3218,6 +3354,7 @@ mod tests {
             exit_code: 0,
             outcome: "ok".to_string(),
             mode: None,
+            task_class: None,
         }
     }
 
@@ -3423,6 +3560,7 @@ mod tests {
                 exit_code: 0,
                 outcome: "ok",
                 mode: None,
+                task_class: None,
             },
         )
         .expect("append");
@@ -3486,6 +3624,7 @@ mod tests {
                 exit_code: 0,
                 outcome: "ok",
                 mode: None,
+                task_class: None,
             },
         )
         .expect("append");
@@ -3538,6 +3677,7 @@ mod tests {
                 exit_code: 0,
                 outcome: "ok",
                 mode: None,
+                task_class: None,
             },
         )
         .expect("append");
@@ -3658,6 +3798,7 @@ mod tests {
                     exit_code: row.exit_code,
                     outcome: &row.outcome,
                     mode: row.mode,
+                    task_class: row.task_class,
                 },
             )
             .expect("append");

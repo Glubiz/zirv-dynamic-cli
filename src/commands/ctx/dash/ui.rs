@@ -19,6 +19,7 @@
 //! output it hosts.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
@@ -30,6 +31,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paddin
 use crate::style;
 
 use super::super::mail::Message;
+use super::super::price;
 use super::DashAction;
 use super::pane::PaneState;
 
@@ -79,6 +81,80 @@ pub struct HeaderFacts {
     pub error_count: usize,
     pub latest_error: Option<String>,
     pub notice: Option<String>,
+}
+
+/// Issue #264: where an aggregate-row cell's value came from -- currently
+/// only ever `Live` (read fresh this frame, or fresh as of the last
+/// throttled `delegations.jsonl` read). Kept as an explicit enum rather than
+/// folding straight into a bare `Option<T>` so a future cached/stale
+/// distinction (mirroring `price::PriceTable::is_stale`) has somewhere to go
+/// without changing every call site's shape again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    Live,
+}
+
+/// One aggregate-row cell: `Some((value, source, age))` when a live source
+/// produced it, `None` when none exists yet. [`render_aggregate_row`] renders
+/// a `None` cell as `--`, never a default number -- Ruflo's own `statusline/
+/// index.ts:517` hard-codes `patternsLearned: 156` as a literal, and this
+/// shape is what makes the equivalent bug impossible to write here: there is
+/// no code path that can hand a bare value to the renderer with no source
+/// behind it.
+pub type AggregateCell<T> = Option<(T, Source, Duration)>;
+
+/// The dashboard's own aggregate row, drawn above the roster
+/// (`dash::mod::run_dashboard`'s own draw closure carves one row off the top
+/// of the sidebar for it, issue #264). `workers_running` is cheap in-memory
+/// state (`total_live`) recomputed fresh every frame, the same discipline
+/// `HeaderFacts::live` already holds; `workers_failed`/`spend_micros` come
+/// from a throttled `delegations.jsonl` read (`dash::mod::DiskFacts::spend`)
+/// and are `None` until at least one delegation has ever completed;
+/// `five_hour_pct` reuses the same per-harness usage snapshot the header/
+/// footer already read (`DiskFacts::usage`).
+pub struct AggregateFacts {
+    pub workers_running: AggregateCell<u64>,
+    pub workers_failed: AggregateCell<u64>,
+    pub spend_micros: AggregateCell<u64>,
+    pub five_hour_pct: AggregateCell<f64>,
+}
+
+fn aggregate_cell_text<T: Copy>(cell: &AggregateCell<T>, render: impl Fn(T) -> String) -> String {
+    match cell {
+        Some((value, _, _)) => render(*value),
+        None => "--".to_string(),
+    }
+}
+
+/// Pure: the aggregate row's own text. A cell with no live source renders
+/// `--` in its place -- never a guessed or default number (see
+/// [`AggregateCell`]'s own doc comment for why that is structurally, not
+/// just conventionally, true).
+pub fn render_aggregate_row(facts: &AggregateFacts) -> String {
+    format!(
+        "workers {} running \u{b7} {} failed \u{b7} {} \u{b7} five_hour {}",
+        aggregate_cell_text(&facts.workers_running, |v: u64| v.to_string()),
+        aggregate_cell_text(&facts.workers_failed, |v: u64| v.to_string()),
+        aggregate_cell_text(&facts.spend_micros, |v: u64| price::format_usd(v, false)),
+        aggregate_cell_text(&facts.five_hour_pct, |v: f64| format!("{v:.0}%")),
+    )
+}
+
+/// Draws [`render_aggregate_row`]'s text into `area`'s first row, dim -- this
+/// is ambient summary an operator glances at, not a state they act on the
+/// way a working/idle glyph is.
+pub fn render_aggregate(f: &mut Frame, area: Rect, facts: &AggregateFacts) {
+    if area.is_empty() {
+        return;
+    }
+    let text = render_aggregate_row(facts);
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            text,
+            Style::default().add_modifier(Modifier::DIM),
+        ))),
+        Rect { height: 1, ..area },
+    );
 }
 
 /// The sidebar/grid state a row's leading glyph column renders: [`render_
@@ -2424,6 +2500,66 @@ mod tests {
     use super::*;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+
+    fn no_live_source() -> AggregateFacts {
+        AggregateFacts {
+            workers_running: None,
+            workers_failed: None,
+            spend_micros: None,
+            five_hour_pct: None,
+        }
+    }
+
+    /// Issue #264, the render-path contract: with no live source at all, the
+    /// aggregate row must contain no digit whatsoever -- proof there is no
+    /// hard-coded metric literal anywhere in `render_aggregate_row` (Ruflo's
+    /// own `statusline/index.ts:517` hard-codes `patternsLearned: 156`,
+    /// exactly the bug class this rules out). A digit could only reach the
+    /// output through a `Some` cell, and every cell here is `None`.
+    #[test]
+    fn render_aggregate_row_with_no_live_source_contains_no_digit_literal() {
+        let text = render_aggregate_row(&no_live_source());
+        assert!(
+            !text.chars().any(|c| c.is_ascii_digit()),
+            "no live source means no cell may render a number at all: {text}"
+        );
+        assert!(text.contains("--"), "got {text}");
+    }
+
+    /// Every cell backed by a live source renders its real value, in the
+    /// design's own worked shape: `workers N running · M failed · $x ·
+    /// five_hour P%`.
+    #[test]
+    fn render_aggregate_row_renders_every_live_cell() {
+        let facts = AggregateFacts {
+            workers_running: Some((3, Source::Live, Duration::ZERO)),
+            workers_failed: Some((1, Source::Live, Duration::ZERO)),
+            spend_micros: Some((4_200_000, Source::Live, Duration::ZERO)),
+            five_hour_pct: Some((41.0, Source::Live, Duration::ZERO)),
+        };
+        let text = render_aggregate_row(&facts);
+        assert_eq!(
+            text,
+            "workers 3 running \u{b7} 1 failed \u{b7} $4.20 \u{b7} five_hour 41%"
+        );
+    }
+
+    /// A mix of live and absent cells renders each independently -- `--`
+    /// never leaks into a cell that DOES have a live source, and vice versa.
+    #[test]
+    fn render_aggregate_row_mixes_live_and_absent_cells_independently() {
+        let facts = AggregateFacts {
+            workers_running: Some((2, Source::Live, Duration::ZERO)),
+            workers_failed: None,
+            spend_micros: None,
+            five_hour_pct: Some((10.0, Source::Live, Duration::ZERO)),
+        };
+        let text = render_aggregate_row(&facts);
+        assert!(text.contains("workers 2 running"), "got {text}");
+        assert!(text.contains("-- failed"), "got {text}");
+        assert!(text.contains("\u{b7} -- \u{b7}"), "got {text}");
+        assert!(text.contains("five_hour 10%"), "got {text}");
+    }
 
     /// A dialog must be opaque. `Block` paints only its border and
     /// `Paragraph` only the cells its text reaches, so without a `Clear` the

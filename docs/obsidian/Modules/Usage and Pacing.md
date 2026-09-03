@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-09-02
+last-verified: 2026-09-03
 ---
 
 # Usage and Pacing
@@ -183,6 +183,14 @@ flowchart TD
 Candidate harnesses are filtered through the normal enabled/readiness gate, `.settings.toml` capacity markers, the ordinary spawn gate, enforceable task budgets, and equivalent model-tier resolution. A candidate with no usable usage reading receives only the operator-configured conservative `fallback.unknown_headroom_pct` assumption (default 25%; 0 opts unknown seats out). Known-refused candidates are never selected. If no candidate qualifies, the existing refusal/park-and-wait behavior remains authoritative.
 
 **Issue #245 (usage-window-aware proactive routing) is this same mechanism, not new work.** The Ruflo evaluation's spike (e) asked for usage-window-aware proactive routing on every `zirv agent` dispatch; `fallback::route_new_delegation` (above) already does exactly that — live headroom routing on every dispatch, predictive steering at `fallback.predictive_headroom_pct`, reactive rerouting on an actual refusal, deterministic tie-break by `fallback.order`, and model translation via `handover::equivalent_model`. Issue #245 was closed citing this section rather than shipping new code; a usage-derived fallback *order* (reordering `fallback.order` itself by observed headroom, rather than routing against a fixed order) remains a follow-up if wanted.
+
+## Cost ledger: pricing delegations (issue #264)
+
+Everything above this section is about TOKEN budgets and rate-limit windows -- when a spawn is throttled or refused. This section is about turning the same underlying spend into a DOLLAR figure, a separate, additive concern: pacing never reads a price, and pricing never gates a spawn (budget enforcement in dollars is an explicit non-goal of issue #264).
+
+`price.rs` is pure: `price(model, usage, table) -> Option<Micros>` prices `event::TranscriptUsage`'s four raw token classes (never a pre-summed total, for the identical reason `log::Delegation` keeps them raw -- a cache-hit ratio is only computable from the raw classes) against a `PriceTable`, in integer micro-USD per class, never a float. An unrecognised model returns `None`, never `0` -- the built-in table (`price::built_in_table`, dated `price::BUILT_IN_AS_OF`) covers the models `handover.rs`'s own tier ladder names; an operator overrides it wholesale via `~/.zirv/prices.toml`, or a different path via `[price] table_path`, both `REPO_FORBIDDEN` alongside `[price] stale_after_days` (default 90) -- see [[Untrusted Configuration]]. `PriceTable::is_stale` flags a table whose `as_of` stamp is older than that threshold; every surface below prefixes a cost figure priced from a stale table with `~` rather than presenting it as current.
+
+`zirv ctx spend` (`spend.rs`) aggregates `delegations.jsonl` by harness/model/task-class/worker with the identical `price::price` call, filterable by `--session`/`--group`/`--since`; `zirv ctx status` gains one `spend: $x this session · $y this 5h window (...)` line reading the same ledger over two time slices of it (not the vendor rate-limit window this page otherwise documents); `zirv workflow stats` prices each `TelemetryEvent` (`TelemetryEvent::apply_price`) and adds a `cost: ...` line per phase, per workflow, and overall; the dashboard's own aggregate row (`ui::render_aggregate`, see [[Ctx Supervisors]]) reads a throttled snapshot of the same ledger for its `failed`/`$` cells. See [[Ctx Subsystem]]'s `spend` verb entry for the full CLI surface and [[Ctx Subsystem]]'s `agent`/`group` entries for how `Delegation::task_class`/`work_group_id`/`parent_session` get attributed at spawn time in the first place.
 
 ## See Also
 

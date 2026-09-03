@@ -849,6 +849,18 @@ pub struct Pane {
     /// see `restored_pane_turn_env`'s own doc comment for why an
     /// unconditional restore-as-Interactive was wrong.
     launch_mode: super::super::adapters::LaunchMode,
+    /// Issue #264 (EXTRA, Track A residual): the writer permit this pane
+    /// holds for its whole life, when it was spawned with `--mode writing`
+    /// (`spawnreq::SpawnRequest::mode`). `None` for a `read-only` pane, which
+    /// never takes one, and for the dashboard's own orchestrator pane. Set
+    /// once, right after `Pane::spawn`, by [`Pane::set_writer_permit`] --
+    /// the same "computed once, stored once" pattern `set_report_to`/`set_
+    /// work_group_id` already establish. Held as a plain field so it releases
+    /// automatically (`permit::HeavyPermit::drop`) the moment this `Pane` is
+    /// dropped, exactly when the pane's own child tree stops being able to
+    /// write to its checkout -- no explicit release call needed on any exit
+    /// path (reap, shutdown, or the dashboard process itself exiting).
+    writer_permit: Option<super::super::permit::HeavyPermit>,
 }
 
 impl Pane {
@@ -1059,6 +1071,7 @@ impl Pane {
             report_reminder_sent: false,
             pending_submit: None,
             launch_mode,
+            writer_permit: None,
         })
     }
 
@@ -1581,6 +1594,27 @@ impl Pane {
     /// `dash::mod::sweep_one_pane`'s own trust-label input.
     pub fn parent_session(&self) -> Option<&str> {
         self.parent_session.as_deref()
+    }
+
+    /// This pane's own child process id, when the backend can report one --
+    /// the same `process_id()` `Pane::spawn` itself already reads to stamp
+    /// `Record::pid`, exposed here so a caller that acquired a writer permit
+    /// AFTER the spawn (`dash::mod::fulfill_spawn_request`) can tie it to the
+    /// real child (`permit::HeavyPermit::set_child_pid`) rather than the
+    /// dashboard's own pid.
+    pub fn child_pid(&self) -> Option<u32> {
+        self.child.process_id()
+    }
+
+    /// Issue #264 (EXTRA): records the writer permit this pane holds for its
+    /// whole life. Called right after `Pane::spawn` by the caller that
+    /// already acquired it (`dash::mod::fulfill_spawn_request`), mirroring
+    /// `set_work_group_id`/`set_parent_session`'s own "acquired by the
+    /// caller, stored here" pattern -- see [`Pane::writer_permit`]'s own
+    /// field comment for why storing it here is what makes it release
+    /// automatically.
+    pub fn set_writer_permit(&mut self, permit: super::super::permit::HeavyPermit) {
+        self.writer_permit = Some(permit);
     }
 
     /// Whether `report_back_reminder_sweep`'s one-shot reminder has already

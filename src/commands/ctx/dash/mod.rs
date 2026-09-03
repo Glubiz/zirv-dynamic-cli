@@ -1023,6 +1023,22 @@ struct DiskFacts {
     /// the footer's own `✉` segment -- see [`MailMap`]'s own doc comment
     /// for why `mail` above cannot answer this.
     mail_by_session: MailMap,
+    /// Issue #264: the aggregate row's own `failed`/`cost` cells, read once
+    /// per throttled tick alongside `usage`/`mail` above -- `delegations.
+    /// jsonl` is a plain file read, the same no-scan/no-network discipline
+    /// `usage`'s own doc comment holds. `None` when the ledger has no rows
+    /// at all yet (a fresh state dir, or a dashboard that has never spawned
+    /// a delegated worker): [`ui::render_aggregate_row`] renders `--` for
+    /// both cells rather than a phantom `0`/`$0.00` that would be
+    /// indistinguishable from "checked and found none".
+    spend: Option<AggregateSpendFacts>,
+}
+
+/// Issue #264: [`DiskFacts::spend`]'s own shape.
+#[derive(Debug, Clone, Copy)]
+struct AggregateSpendFacts {
+    failed: u64,
+    cost_micros: u64,
 }
 
 /// Who the dashboard is, for the reads that are scoped to it: the repo it
@@ -1125,6 +1141,39 @@ impl FactsCache {
                 }
             })
             .collect();
+
+        // Issue #264: the aggregate row's own `failed`/`cost` cells. A plain
+        // file read, same as `usage` right above -- never a scan, a poll, or
+        // a network call. `None` when the ledger has no rows at all, so the
+        // aggregate row renders `--` rather than a phantom `0`/`$0.00`.
+        let delegation_rows = super::log::read_delegations(state, usize::MAX);
+        self.disk.spend = if delegation_rows.is_empty() {
+            None
+        } else {
+            let table = super::price::resolve_table(cfg);
+            let failed = delegation_rows
+                .iter()
+                .filter(|row| row.outcome != "ok")
+                .count() as u64;
+            let mut cost_micros: u64 = 0;
+            for row in &delegation_rows {
+                if let Some(model) = row.model.as_deref() {
+                    let usage = super::event::TranscriptUsage {
+                        input_tokens: row.input_tokens,
+                        cache_creation_input_tokens: row.cache_creation_input_tokens,
+                        cache_read_input_tokens: row.cache_read_input_tokens,
+                        output_tokens: row.output_tokens,
+                    };
+                    if let Some(cost) = super::price::price(model, &usage, &table) {
+                        cost_micros = cost_micros.saturating_add(cost);
+                    }
+                }
+            }
+            Some(AggregateSpendFacts {
+                failed,
+                cost_micros,
+            })
+        };
 
         // Rebuilt rather than updated in place: a reaped pane or a released
         // registry record must drop out of the map, not linger as a stale
@@ -3719,6 +3768,52 @@ fn fulfill_spawn_request(
     let session_id = SessionId::new_v4().to_string();
     let registry_short = sessions::short_id(&session_id);
     let slug = super::state::repo_slug(repo);
+
+    // Issue #264 (EXTRA, Track A residual): `req.mode` used to travel on
+    // `SpawnRequest` for data parity only (see that field's own doc comment)
+    // -- a pane fulfilling a `writing` request never actually enforced the
+    // writer-permit pool `agent::run_with`'s headless fork already does.
+    // Same gate, same reason, same one-line refusal text -- acquired here,
+    // before any further fallible step, so a refusal rolls back the group
+    // admission exactly like every other pre-spawn refusal in this function
+    // does. `spawn_cwd`, not `repo`: the tree this pane's child is actually
+    // about to write into (a linked worktree or an explicit `--workdir`),
+    // never the dashboard's own checkout. Held as a local `Option` rather
+    // than committed to the pane until the spawn actually succeeds below --
+    // an early return here drops it via `HeavyPermit::drop`, releasing the
+    // slot exactly like every other fallible step past this point already
+    // does for the group admission it rolls back.
+    let writer_permit = if req.mode == super::permit::WorkerMode::Writing {
+        let tree = std::fs::canonicalize(&spawn_cwd).unwrap_or_else(|_| spawn_cwd.clone());
+        match super::permit::acquire_writer(
+            state,
+            cfg.supervise.max_writers,
+            &format!("session {registry_short}: {}", req.agent),
+            &tree,
+        ) {
+            Ok(permit) => Some(permit),
+            Err(refusal) => {
+                rollback_admission();
+                let reason = match refusal {
+                    super::permit::WriterRefusal::TreeBusy { holder_label } => format!(
+                        "another writing worker already holds {} ({holder_label}); retry once \
+                         it finishes, or pass --worktree for an isolated checkout",
+                        tree.display()
+                    ),
+                    super::permit::WriterRefusal::PoolExhausted => format!(
+                        "the writer-permit pool ({} of {} in use) is full; retry once a writer \
+                         finishes",
+                        super::permit::live_writer_count(state),
+                        cfg.supervise.max_writers
+                    ),
+                };
+                return Err(SpawnRefusal::policy(reason));
+            }
+        }
+    } else {
+        None
+    };
+
     let (composed, mut mail_entries, mut mail_messages) = compose_worker_prompt(
         req,
         adapter.as_ref(),
@@ -3962,6 +4057,19 @@ fn fulfill_spawn_request(
     // process and so never re-reads `PARENT_SESSION_ENV` off anything) can
     // label this pane's parent mail without a filesystem round trip.
     pane.set_parent_session(verified_parent.clone());
+    // Issue #264 (EXTRA): the pane exists now, so the writer permit acquired
+    // above (if any) is tied to its real child pid -- the same `set_child_
+    // pid` discipline `agent::run_with`'s headless fork applies -- and handed
+    // to the pane itself, which is what makes it release automatically the
+    // moment this pane is dropped (`Pane::writer_permit`'s own field
+    // comment), rather than needing an explicit release call on every one of
+    // this dashboard's several pane-removal paths (reap, shutdown, quit).
+    if let Some(permit) = writer_permit {
+        if let Some(child_pid) = pane.child_pid() {
+            permit.set_child_pid(child_pid);
+        }
+        pane.set_writer_permit(permit);
+    }
     let short = pane.short().to_string();
     // Security review Finding 2: the dash-side half of issue #170's
     // claim/close pair. `agent::run_with` claims a group for the coordinator
@@ -7466,13 +7574,55 @@ pub fn run_dashboard(
             }),
         );
 
+        // Issue #264: the aggregate row's own facts. `workers_running` is
+        // cheap in-memory state (`total_live`), recomputed fresh every frame
+        // like `HeaderFacts::live` itself; `workers_failed`/`spend_micros`
+        // and `five_hour_pct` all come from this tick's throttled disk read
+        // (`FactsCache::refresh_if_due`), so their own age is how long ago
+        // that read happened -- never claimed fresher than it is.
+        let facts_age = Instant::now().saturating_duration_since(facts_cache.last_refresh);
+        let aggregate_facts = ui::AggregateFacts {
+            workers_running: Some((total_live as u64, ui::Source::Live, Duration::ZERO)),
+            workers_failed: facts_cache
+                .disk
+                .spend
+                .map(|s| (s.failed, ui::Source::Live, facts_age)),
+            spend_micros: facts_cache
+                .disk
+                .spend
+                .map(|s| (s.cost_micros, ui::Source::Live, facts_age)),
+            five_hour_pct: facts_cache
+                .disk
+                .usage
+                .first()
+                .and_then(|u| u.five_hour)
+                .map(|pct| (pct, ui::Source::Live, facts_age)),
+        };
+
         let draw = terminal.draw(|f| {
             if !zoomed {
                 ui::render_header(f, layout.header, &facts);
                 ui::render_rule(f, layout.rule_top, layout.sidebar.width, true);
+                // Issue #264: one row of `layout.sidebar` is the aggregate
+                // row, drawn above the roster -- the divider just below still
+                // spans `layout.sidebar.height` in full, so the vertical rule
+                // runs continuously alongside both.
+                let aggregate_h = 1.min(layout.sidebar.height);
+                ui::render_aggregate(
+                    f,
+                    Rect {
+                        height: aggregate_h,
+                        ..layout.sidebar
+                    },
+                    &aggregate_facts,
+                );
                 ui::render_sidebar(
                     f,
-                    layout.sidebar,
+                    Rect {
+                        y: layout.sidebar.y + aggregate_h,
+                        height: layout.sidebar.height.saturating_sub(aggregate_h),
+                        ..layout.sidebar
+                    },
                     &rows,
                     render_tick,
                     cfg.score.advise_at,
@@ -16212,6 +16362,101 @@ mod tests {
             1,
             "the forged request still spawns a pane -- forging is about the pin, not the spawn \
              itself: {errors:?}"
+        );
+
+        for pane in &mut panes {
+            let _ = pane.shutdown("");
+        }
+    }
+
+    /// Issue #264 (EXTRA, Track A residual): `SpawnRequest::mode` used to
+    /// travel on the wire for data parity only (see that field's own doc
+    /// comment) -- a pane fulfilling a `writing` request never actually
+    /// enforced the writer-permit pool `agent::run_with`'s headless fork
+    /// already does. A pane spawn now acquires the SAME permit, tied to the
+    /// pane's own real child pid, and a second writing pane into the same
+    /// tree while the first is still live is refused with the identical
+    /// one-line reason `agent::run_with` gives.
+    #[test]
+    fn fulfill_spawn_request_acquires_a_writer_permit_and_refuses_a_second_writer_in_the_same_tree()
+    {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().to_path_buf();
+
+        let cfg = CtxConfig {
+            // Same ABSOLUTE rule every other real-pty-spawn test in this
+            // module follows: a bare `claude` is not guaranteed to resolve
+            // on a CI runner's PATH, so this only has to prove the pty spawn
+            // itself succeeds.
+            #[cfg(windows)]
+            agent_bin: Some("ping -n 3 127.0.0.1".to_string()),
+            #[cfg(unix)]
+            agent_bin: Some("sleep 3".to_string()),
+            pace: crate::commands::ctx::config::PaceConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            ..CtxConfig::default()
+        };
+
+        // `spawn_request`'s own default is `WorkerMode::Writing`.
+        let req = spawn_request("do the work", &repo);
+        let mut panes: Vec<Pane> = Vec::new();
+        let mut queues: Vec<VecDeque<String>> = Vec::new();
+        let mut errors = Vec::new();
+        let requests_dir = tmp.path().join("requests");
+        let first = fulfill_spawn_request(
+            &req,
+            false,
+            None,
+            &mut panes,
+            &mut queues,
+            &cfg,
+            &state,
+            &repo,
+            (80, 24),
+            &requests_dir,
+            &mut errors,
+        );
+        assert!(first.is_ok(), "the first writer must spawn: {first:?}");
+        assert_eq!(
+            super::super::permit::live_writer_count(&state),
+            1,
+            "a `--mode writing` pane spawn must hold a writer permit for its whole life, the \
+             same way `agent::run_with`'s headless fork already does"
+        );
+
+        let second = fulfill_spawn_request(
+            &req,
+            false,
+            None,
+            &mut panes,
+            &mut queues,
+            &cfg,
+            &state,
+            &repo,
+            (80, 24),
+            &requests_dir,
+            &mut errors,
+        );
+        let refusal = second.expect_err("a second writer into the same tree must be refused");
+        assert!(
+            refusal.reason.contains("already holds"),
+            "got {:?}",
+            refusal.reason
+        );
+        assert_eq!(
+            panes.len(),
+            1,
+            "the refused second request must never have spawned a pane"
+        );
+        assert_eq!(
+            super::super::permit::live_writer_count(&state),
+            1,
+            "the refused second request must never have taken a second writer slot"
         );
 
         for pane in &mut panes {

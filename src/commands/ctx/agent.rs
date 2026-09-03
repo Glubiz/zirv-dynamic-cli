@@ -158,6 +158,16 @@ pub struct AgentArgs {
     /// artifact`.
     #[arg(long)]
     pub workflow: Option<String>,
+    /// Issue #264: what KIND of work this delegation is, for the cost
+    /// ledger's own `task_class` (`log::Delegation::task_class`) -- later
+    /// analysis and routing groups outcomes by kind of work, not only by
+    /// harness or model. `None` (the default, unstated) means "unclassified",
+    /// exactly what every delegation before this flag existed already was.
+    /// The workflow engine's own auto-spawned review/test/verify workers set
+    /// this from the step that spawned them (`workflow::engine::auto_spawn_
+    /// decision`) rather than requiring an operator to type it.
+    #[arg(long, value_enum)]
+    pub task_class: Option<super::log::TaskClass>,
 }
 
 /// `--attach-artifact`'s CLI spelling for `workflow::engine::ArtifactStage`.
@@ -2120,6 +2130,7 @@ pub fn run_with<W: Write>(
             code,
             outcome,
             args.mode,
+            args.task_class,
         );
         if let Some(id) = args.group.as_deref() {
             let _ = super::group::settle_reservation(
@@ -2185,6 +2196,13 @@ pub fn run_with<W: Write>(
     Ok(code)
 }
 
+// Issue #264 added `task_class` as this function's 8th parameter, over
+// clippy's default 7-argument threshold -- every argument here is already an
+// independent, unrelated piece of one delegation's own completion record
+// (state handle, the report itself, lineage, outcome, mode, and now task
+// class), so bundling them into a struct would only move the same list one
+// level down without making any single call site clearer.
+#[allow(clippy::too_many_arguments)]
 fn append_execution_segments(
     state: &super::state::StateDir,
     report: &exec::ExecutionReport,
@@ -2193,6 +2211,7 @@ fn append_execution_segments(
     exit_code: i32,
     outcome: &'static str,
     mode: WorkerMode,
+    task_class: Option<super::log::TaskClass>,
 ) -> TranscriptUsage {
     let mut total = TranscriptUsage::default();
     for segment in &report.segments {
@@ -2225,6 +2244,7 @@ fn append_execution_segments(
                 exit_code,
                 outcome,
                 mode: Some(mode),
+                task_class,
             },
         );
     }
@@ -3579,6 +3599,7 @@ mod tests {
             headless: false,
             attach_artifact: None,
             workflow: None,
+            task_class: None,
         }
     }
 
@@ -4723,6 +4744,7 @@ mod tests {
             0,
             "ok",
             WorkerMode::Writing,
+            Some(crate::commands::ctx::log::TaskClass::Implement),
         );
         assert_eq!(total.input_tokens, 11);
         assert_eq!(total.cache_creation_input_tokens, 22);
@@ -4734,6 +4756,11 @@ mod tests {
         assert!(rows.iter().any(|row| row.contains("\"agent\":\"claude\"")));
         assert!(rows.iter().any(|row| row.contains("\"agent\":\"codex\"")));
         assert!(rows.iter().any(|row| row.contains("gpt-5.6-terra")));
+        assert!(
+            rows.iter()
+                .all(|row| row.contains("\"task_class\":\"implement\"")),
+            "issue #264: every segment of one logical delegation carries the same task_class: {rows:?}"
+        );
     }
 
     #[test]

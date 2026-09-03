@@ -114,6 +114,10 @@ model = "fable"
 # claude = false                     # Default: false.
 # codex = false                      # Default: false.
 
+# [price]                             # every key below is REPO-FORBIDDEN
+# stale_after_days = 90              # REPO-FORBIDDEN (ZIRV_CTX_PRICE_STALE_AFTER_DAYS): a price table older than this renders every cost line as "~$x (prices as of ...)" rather than a plain figure. Default: 90.
+# table_path = "~/.zirv/prices.toml" # REPO-FORBIDDEN (ZIRV_CTX_PRICE_TABLE_PATH): operator override path for the price table. Default: unset (built-in table, merged with ~/.zirv/prices.toml when present).
+
 # [optimize]
 # enabled = true                     # whether the Stop hook may queue an "optimize recommended" entry
 # sessions_sampled = 10              # sessions sampled per optimize run
