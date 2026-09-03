@@ -29,6 +29,15 @@
 //! believing they hold the budget. This replaces an earlier count-then-write
 //! window that let two concurrent callers both observe a free slot and both
 //! acquire, exceeding `max_heavy_operations`.
+//!
+//! Issue #267 adds a SECOND, independent pool: [`acquire_writer`]'s
+//! `supervise.max_writers` slots, one per `WorkerMode::Writing` delegated
+//! worker for its WHOLE LIFETIME (not just while it runs a heavy command),
+//! plus a per-tree exclusivity rule ([`WriterRefusal::TreeBusy`]) so two
+//! writers can never hold the same checkout at once. It reuses this same
+//! `create_new` contention idiom and dead-owner sweep under its own
+//! `<state>/permits/writers/` directory ([`writer_permits_dir`]) -- the
+//! heavy pool above is untouched by it.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -94,6 +103,37 @@ pub fn is_heavy(command: &str, extra_patterns: &[String]) -> bool {
         })
 }
 
+/// Issue #267: which of the two independent permit pools a [`PermitRecord`]
+/// belongs to -- `Heavy` for a classified command (`is_heavy`, unchanged
+/// from #133/#155), `Writer` for a `WorkerMode::Writing` delegated worker
+/// holding exclusive write access to one checkout for its whole lifetime
+/// (see [`acquire_writer`]). `#[serde(default)]` on the field that carries
+/// this makes `Heavy` what every permit record written before this pool
+/// existed deserializes as -- the only kind there was.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PermitKind {
+    #[default]
+    Heavy,
+    Writer,
+}
+
+/// Issue #267: whether a delegated worker (`zirv ctx agent`) may write to
+/// its checkout. `Writing` is the CLI default (`--mode` unstated) -- a wrong
+/// "read-only" silently drops real edits, which is worse than a wrong
+/// "writing" holding a writer-permit slot it did not need. A `Writing`
+/// worker holds a writer permit ([`acquire_writer`]) for its whole
+/// lifetime, in addition to a heavy permit while it runs an actual heavy
+/// command -- unchanged from today. A `ReadOnly` worker never takes a
+/// writer permit.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum WorkerMode {
+    ReadOnly,
+    #[default]
+    Writing,
+}
+
 /// One held permit, as read back from `<state>/permits/`. `pub`, and its
 /// fields with it (issue #162): a refusal or a wait that cannot say WHO
 /// holds the budget is undiagnosable, so both `status.rs`'s occupancy line
@@ -119,6 +159,21 @@ pub struct PermitRecord {
     pub child_pid: Option<u32>,
     pub label: String,
     pub acquired_at: u64,
+    /// Issue #267: which pool this record belongs to. `#[serde(default)]`
+    /// (`PermitKind::default() == Heavy`) so a permit file written before
+    /// this field existed still deserializes -- it could only ever have
+    /// been a heavy permit.
+    #[serde(default)]
+    pub kind: PermitKind,
+    /// Issue #267: the canonical tree a `Writer` permit holds exclusively --
+    /// `None` for a `Heavy` permit, and for a `Writer` record written before
+    /// this field existed (`#[serde(default)]`; no such record exists in
+    /// practice, since the writer pool is new). Compared for equality via
+    /// [`tree_key`], never `PartialEq` on the raw `PathBuf` directly, so two
+    /// spellings of the same checkout on a case-insensitive filesystem are
+    /// recognised as the same tree.
+    #[serde(default)]
+    pub tree: Option<PathBuf>,
 }
 
 /// `<state>/permits/slot-<n>.json`, one file per budget slot (`n` in
@@ -168,6 +223,7 @@ fn create_new_private(path: &Path, contents: &str) -> std::io::Result<()> {
 /// this binary's release profile is `panic = "abort"` and a permit that
 /// fails to clean up is swept by the next [`live_count`] anyway (see that
 /// function's own doc comment).
+#[derive(Debug)]
 pub struct HeavyPermit {
     path: PathBuf,
 }
@@ -255,7 +311,18 @@ fn slot_file_is_stale(path: &Path, grace_secs: u64) -> bool {
 /// holds the budget, and reading both off this same function is what makes
 /// the two guaranteed to never disagree.
 pub fn live_records(state: &StateDir) -> Vec<PermitRecord> {
-    let Ok(entries) = std::fs::read_dir(permits_dir(state)) else {
+    live_records_in(&permits_dir(state))
+}
+
+/// Issue #267: the directory-generic core of [`live_records`], shared with
+/// [`live_writer_records`] -- one dead-owner sweep and one file-reading
+/// discipline for both independent pools, distinguished only by which
+/// directory each pool's own accessor passes in ([`permits_dir`] for the
+/// heavy pool, [`writer_permits_dir`] for the writer pool). Heavy-pool
+/// behaviour is byte-for-byte unchanged: [`live_records`] is this call with
+/// no other logic around it, exactly like before this split.
+fn live_records_in(dir: &Path) -> Vec<PermitRecord> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
     let mut found = Vec::new();
@@ -320,46 +387,59 @@ pub fn live_count(state: &StateDir) -> usize {
 /// exactly one `open` wins, and the loser tries the next index instead of
 /// believing it holds the budget.
 pub fn acquire(state: &StateDir, limit: usize, label: &str) -> Option<HeavyPermit> {
+    let record = PermitRecord {
+        pid: std::process::id(),
+        child_pid: None,
+        label: label.to_string(),
+        acquired_at: state::now_secs(),
+        kind: PermitKind::Heavy,
+        tree: None,
+    };
+    acquire_record(&permits_dir(state), limit, record)
+}
+
+/// Issue #267: the directory-and-record-generic core of [`acquire`], shared
+/// with [`acquire_writer`] -- one `create_new`-contention claim loop and one
+/// verify-then-retry discipline (finding 2b) for both independent pools.
+/// `record.pid` is trusted as the caller's own claim identity; every other
+/// field travels through untouched. Heavy-pool behaviour is byte-for-byte
+/// unchanged: [`acquire`] builds the identical `PermitRecord` it always did
+/// (now with `kind: Heavy, tree: None` made explicit) and calls this with no
+/// other logic around it.
+fn acquire_record(dir: &Path, limit: usize, record: PermitRecord) -> Option<HeavyPermit> {
     if limit == 0 {
         return None;
     }
-    let dir = permits_dir(state);
-    state::create_private_dir_all(&dir).ok()?;
+    state::create_private_dir_all(dir).ok()?;
 
     // Sweeps any slot whose owning pid is dead, freeing it for reuse below --
-    // see `live_records`'s own doc comment. `live_count` is a cheap fast
+    // see `live_records`'s own doc comment. `live_records_in` is a cheap fast
     // path ONLY, not the admission decision: skipping the slot loop entirely
     // when every slot already looked live avoids `limit` doomed `create_new`
     // attempts in the common contended case. A stale or racing count here
     // can only make this function too conservative (refuse when a slot was
     // about to free up), never too permissive -- the loop below, not this
     // check, is what enforces `limit`.
-    if live_count(state) >= limit {
+    if live_records_in(dir).len() >= limit {
         return None;
     }
 
-    let own_pid = std::process::id();
-    let record = PermitRecord {
-        pid: own_pid,
-        child_pid: None,
-        label: label.to_string(),
-        acquired_at: state::now_secs(),
-    };
+    let own_pid = record.pid;
     let json = serde_json::to_string_pretty(&record).ok()?;
 
     // Re-review (2026-08-27) finding 2b: a claim that wins `create_new` is
-    // not yet trustworthy on its own. `live_records`'s own dead-owner sweep
-    // (above, and on every other caller running concurrently) reads a slot,
-    // decides its owner is dead, and removes the file with no recheck -- so
-    // a concurrent `acquire` that wins `create_new` on that exact path
-    // between the sweeper's read and its `remove_file` gets its brand-new
-    // permit file deleted out from under it while it believes it holds the
-    // slot. Re-reading and verifying the just-written record closes that:
-    // a lost claim retries the whole scan (a slot the sweeper just freed, or
-    // that another holder just released, may now be claimable) rather than
-    // ever proceeding with a phantom permit.
+    // not yet trustworthy on its own. `live_records_in`'s own dead-owner
+    // sweep (above, and on every other caller running concurrently) reads a
+    // slot, decides its owner is dead, and removes the file with no recheck
+    // -- so a concurrent `acquire`/`acquire_writer` that wins `create_new`
+    // on that exact path between the sweeper's read and its `remove_file`
+    // gets its brand-new permit file deleted out from under it while it
+    // believes it holds the slot. Re-reading and verifying the just-written
+    // record closes that: a lost claim retries the whole scan (a slot the
+    // sweeper just freed, or that another holder just released, may now be
+    // claimable) rather than ever proceeding with a phantom permit.
     for _ in 0..CLAIM_VERIFY_ATTEMPTS {
-        let path = claim_any_slot(&dir, limit, &json)?;
+        let path = claim_any_slot(dir, limit, &json)?;
         if claim_is_verified(&path, own_pid) {
             return Some(HeavyPermit { path });
         }
@@ -368,6 +448,105 @@ pub fn acquire(state: &StateDir, limit: usize, label: &str) -> Option<HeavyPermi
         // permit. Best-effort retry: loop back and scan again.
     }
     None
+}
+
+/// `<state>/permits/writers/`: the writer pool's own directory, a sibling of
+/// the heavy pool's numbered slot files rather than sharing them (issue
+/// #267) -- so [`live_records`]/[`live_count`]'s existing heavy-pool
+/// behaviour never has to filter a writer's `writer-<n>.json` out of its own
+/// `slot-<n>.json` listing. Same `<state>/permits/` root, same `create_new`
+/// contention idiom, same dead-owner sweep -- just its own numbered
+/// namespace.
+fn writer_permits_dir(state: &StateDir) -> PathBuf {
+    permits_dir(state).join("writers")
+}
+
+/// Every writer permit currently held -- the writer-pool counterpart of
+/// [`live_records`], sweeping dead owners the identical way.
+pub fn live_writer_records(state: &StateDir) -> Vec<PermitRecord> {
+    live_records_in(&writer_permits_dir(state))
+}
+
+/// How many writer permits are currently held -- see [`live_writer_records`]
+/// for the per-holder detail this counts.
+pub fn live_writer_count(state: &StateDir) -> usize {
+    live_writer_records(state).len()
+}
+
+/// Issue #267: pure -- the comparison key for a writer permit's own tree
+/// path. Case-folded on Windows and macOS, where the filesystem itself is
+/// case-insensitive, so two spellings of the same checkout (`D:\repo` vs
+/// `d:\REPO`) are recognised as the same tree rather than silently letting
+/// two writers hold it at once; verbatim on every other platform. Callers
+/// pass an already-canonicalised path (the same contract `agent::
+/// validate_workdir`'s callers already hold); this does no filesystem I/O
+/// of its own, so it stays testable without a real directory or a real OS
+/// difference to run on.
+pub fn tree_key(path: &Path) -> String {
+    let raw = path.to_string_lossy();
+    if cfg!(any(windows, target_os = "macos")) {
+        raw.to_lowercase()
+    } else {
+        raw.into_owned()
+    }
+}
+
+/// Why [`acquire_writer`] refused. `TreeBusy` names the label of whichever
+/// live writer already holds the requested tree -- diagnosable the same way
+/// [`PermitRecord::label`] already makes a heavy-permit wait diagnosable
+/// (issue #162). `PoolExhausted` is the ordinary bounded-pool refusal every
+/// `acquire_record` caller can hit, independent of which tree was asked
+/// for. Both are retryable: the same request typically succeeds once the
+/// other writer finishes, or immediately with a fresh `--worktree`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WriterRefusal {
+    TreeBusy { holder_label: String },
+    PoolExhausted,
+}
+
+/// Issue #267: grants a writer permit for `tree` -- one checkout a `--mode
+/// writing` delegated worker holds exclusively for its whole lifetime,
+/// never only for the duration of one heavy command the way a heavy permit
+/// is. Two independent refusals, checked in this order:
+///
+/// 1. [`WriterRefusal::TreeBusy`] -- some other LIVE writer permit already
+///    names the same [`tree_key`], regardless of whether the pool itself
+///    has a free slot. This is the "never two writers in one worktree"
+///    rule (design section 3); `--worktree` sidesteps it entirely by
+///    naming a fresh, never-before-seen tree.
+/// 2. [`WriterRefusal::PoolExhausted`] -- every one of `limit` slots is
+///    already claimed (by writers in OTHER trees), the same bounded-pool
+///    refusal [`acquire`] already gives the heavy pool.
+///
+/// Reuses [`acquire_record`] for the actual claim, so a writer permit
+/// survives a crash and is swept exactly like a heavy one (same
+/// `create_new` contention files, same dead-owner sweep) -- just under
+/// [`writer_permits_dir`] instead of [`permits_dir`].
+pub fn acquire_writer(
+    state: &StateDir,
+    limit: usize,
+    label: &str,
+    tree: &Path,
+) -> Result<HeavyPermit, WriterRefusal> {
+    let dir = writer_permits_dir(state);
+    let key = tree_key(tree);
+    if let Some(holder) = live_records_in(&dir)
+        .into_iter()
+        .find(|r| r.tree.as_deref().is_some_and(|t| tree_key(t) == key))
+    {
+        return Err(WriterRefusal::TreeBusy {
+            holder_label: holder.label,
+        });
+    }
+    let record = PermitRecord {
+        pid: std::process::id(),
+        child_pid: None,
+        label: label.to_string(),
+        acquired_at: state::now_secs(),
+        kind: PermitKind::Writer,
+        tree: Some(tree.to_path_buf()),
+    };
+    acquire_record(&dir, limit, record).ok_or(WriterRefusal::PoolExhausted)
 }
 
 /// One pass over every slot index, returning the path this call manages to
@@ -423,6 +602,8 @@ mod tests {
             child_pid: None,
             label: label.to_string(),
             acquired_at: state::now_secs(),
+            kind: PermitKind::Heavy,
+            tree: None,
         };
         let path = dir.join(format!("{pid}-{}.json", uuid::Uuid::new_v4()));
         let json = serde_json::to_string_pretty(&record).expect("serialize");
@@ -572,6 +753,8 @@ mod tests {
             child_pid: Some(std::process::id()),
             label: "cargo build".to_string(),
             acquired_at: state::now_secs(),
+            kind: PermitKind::Heavy,
+            tree: None,
         };
         let json = serde_json::to_string_pretty(&record).expect("serialize");
         state::write_private(&slot_path(&dir, 0), &json).expect("write");
@@ -714,6 +897,8 @@ mod tests {
             child_pid: None,
             label: "cargo build".to_string(),
             acquired_at: state::now_secs(),
+            kind: PermitKind::Heavy,
+            tree: None,
         })
         .expect("serialize");
         create_new_private(&path, &json).expect("write");
@@ -750,6 +935,8 @@ mod tests {
             child_pid: None,
             label: "someone else's claim".to_string(),
             acquired_at: state::now_secs(),
+            kind: PermitKind::Heavy,
+            tree: None,
         })
         .expect("serialize");
         create_new_private(&path, &json).expect("write");
@@ -774,6 +961,8 @@ mod tests {
             child_pid: None,
             label: "cargo build".to_string(),
             acquired_at: state::now_secs(),
+            kind: PermitKind::Heavy,
+            tree: None,
         })
         .expect("serialize");
 
@@ -788,5 +977,133 @@ mod tests {
 
         let reclaimed = claim_any_slot(&dir, 1, &json).expect("the freed slot claims again");
         assert_eq!(reclaimed, claimed, "the same (only) slot index is reused");
+    }
+
+    /// Issue #267: a `PermitRecord` written before the writer pool existed
+    /// (no `kind`/`tree` fields at all) must still deserialise, and must
+    /// read as the only kind there ever was.
+    #[test]
+    fn a_permit_record_written_before_writer_pools_existed_still_deserialises_as_heavy() {
+        let old = r#"{"pid":123,"label":"cargo build","acquired_at":1700000000}"#;
+        let record: PermitRecord = serde_json::from_str(old).expect("older records still parse");
+        assert_eq!(record.kind, PermitKind::Heavy);
+        assert_eq!(record.tree, None);
+    }
+
+    /// Issue #267: pure case-folding, no filesystem involved -- the same
+    /// path spelled with different case is the same tree only on a
+    /// case-insensitive filesystem (Windows/macOS).
+    #[test]
+    fn tree_key_case_folds_only_on_windows_and_macos() {
+        let a = tree_key(Path::new("/Repo/Foo"));
+        let b = tree_key(Path::new("/repo/foo"));
+        if cfg!(any(windows, target_os = "macos")) {
+            assert_eq!(a, b, "case must be folded on this platform");
+        } else {
+            assert_ne!(a, b, "case must be preserved on this platform");
+        }
+    }
+
+    /// Design section 3: a second `writing` worker into a tree that already
+    /// has a live writer is refused, even when the pool itself has room for
+    /// more (`limit` of 2 here) -- tree exclusivity is a separate rule from
+    /// the bounded pool, not merely a side effect of a pool of 1.
+    #[test]
+    fn a_second_writer_in_the_same_tree_is_refused_while_the_first_is_live() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let tree = tmp.path().join("repo");
+        std::fs::create_dir_all(&tree).expect("mkdir");
+
+        let _held = acquire_writer(&state, 2, "worker-a", &tree).expect("first writer granted");
+        let err = acquire_writer(&state, 2, "worker-b", &tree)
+            .expect_err("a second writer in the same tree must be refused");
+        assert_eq!(
+            err,
+            WriterRefusal::TreeBusy {
+                holder_label: "worker-a".to_string()
+            }
+        );
+    }
+
+    /// The other half of the same rule: a DIFFERENT tree must never be
+    /// refused just because some other tree already has a live writer.
+    #[test]
+    fn a_writer_in_a_different_tree_is_granted_even_while_another_tree_is_busy() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let tree_a = tmp.path().join("repo-a");
+        let tree_b = tmp.path().join("repo-b");
+        std::fs::create_dir_all(&tree_a).expect("mkdir");
+        std::fs::create_dir_all(&tree_b).expect("mkdir");
+
+        let _held_a = acquire_writer(&state, 2, "worker-a", &tree_a).expect("granted");
+        assert!(
+            acquire_writer(&state, 2, "worker-b", &tree_b).is_ok(),
+            "a different tree must not be refused by another tree's writer"
+        );
+    }
+
+    /// The writer pool's own bound is independent of the heavy pool's --
+    /// exhausting one must never affect the other, mirroring `a_permit_is_
+    /// bounded_and_released_on_drop` for the heavy pool.
+    #[test]
+    fn the_writer_pool_is_bounded_independently_of_the_heavy_pool() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let tree_a = tmp.path().join("repo-a");
+        let tree_b = tmp.path().join("repo-b");
+        std::fs::create_dir_all(&tree_a).expect("mkdir");
+        std::fs::create_dir_all(&tree_b).expect("mkdir");
+
+        let _held_a = acquire_writer(&state, 1, "worker-a", &tree_a).expect("granted");
+        let err = acquire_writer(&state, 1, "worker-b", &tree_b)
+            .expect_err("a writer pool of 1 is exhausted by the first writer");
+        assert_eq!(err, WriterRefusal::PoolExhausted);
+
+        assert_eq!(
+            live_count(&state),
+            0,
+            "the heavy pool must be untouched by writer acquisitions"
+        );
+        assert!(
+            acquire(&state, 1, "cargo build").is_some(),
+            "the heavy pool is independent of the writer pool"
+        );
+    }
+
+    /// A writer permit left by a dead process must not wedge its tree
+    /// forever -- the writer-pool counterpart of `a_permit_left_by_a_dead_
+    /// process_is_swept`.
+    #[test]
+    fn a_writer_permit_left_by_a_dead_process_is_swept() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let tree = tmp.path().join("repo");
+        std::fs::create_dir_all(&tree).expect("mkdir");
+        let dead_pid = crate::commands::ctx::testenv::dead_pid();
+
+        let dir = writer_permits_dir(&state);
+        state::create_private_dir_all(&dir).expect("mkdir");
+        let record = PermitRecord {
+            pid: dead_pid,
+            child_pid: None,
+            label: "worker-a".to_string(),
+            acquired_at: state::now_secs(),
+            kind: PermitKind::Writer,
+            tree: Some(tree.clone()),
+        };
+        let json = serde_json::to_string_pretty(&record).expect("serialize");
+        state::write_private(&slot_path(&dir, 0), &json).expect("write");
+
+        assert_eq!(
+            live_writer_count(&state),
+            0,
+            "a dead owner's writer permit does not count"
+        );
+        assert!(
+            acquire_writer(&state, 1, "worker-b", &tree).is_ok(),
+            "the tree is free again once the dead owner's permit is swept"
+        );
     }
 }

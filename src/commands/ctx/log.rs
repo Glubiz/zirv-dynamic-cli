@@ -3,6 +3,7 @@ use std::io::Write;
 use serde::{Deserialize, Serialize};
 
 use super::CtxResult;
+use super::permit::WorkerMode;
 use super::state::StateDir;
 
 pub const LOG_FILE: &str = "decisions.jsonl";
@@ -69,6 +70,11 @@ pub struct Delegation<'a> {
     pub wall_ms: u64,
     pub exit_code: i32,
     pub outcome: &'a str,
+    /// Issue #267: whether this worker ran `read-only` or `writing`. A row
+    /// written before this field existed deserializes (via [`DelegationRow`]
+    /// `#[serde(default)]`) as `None` -- readers must treat that as
+    /// "unknown", never as either mode outright.
+    pub mode: Option<WorkerMode>,
 }
 
 /// The owned, deserializable counterpart of [`Delegation`] (which borrows
@@ -107,6 +113,12 @@ pub struct DelegationRow {
     #[allow(dead_code)]
     pub exit_code: i32,
     pub outcome: String,
+    /// Issue #267: mirrors `Delegation::mode`. `#[serde(default)]` so a row
+    /// written before this field existed deserializes as `None` rather than
+    /// failing to parse -- the only reading an old row can honestly carry.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub mode: Option<WorkerMode>,
 }
 
 pub fn append(state: &StateDir, decision: &Decision<'_>) -> CtxResult<()> {
@@ -420,6 +432,7 @@ mod tests {
                 wall_ms: 42_000,
                 exit_code: 0,
                 outcome: "ok",
+                mode: Some(WorkerMode::Writing),
             },
         )
         .expect("append");
@@ -470,6 +483,7 @@ mod tests {
                 wall_ms: 42_000,
                 exit_code: 0,
                 outcome: "ok",
+                mode: Some(WorkerMode::Writing),
             },
         )
         .expect("append");
@@ -497,6 +511,7 @@ mod tests {
                 wall_ms: 1_000,
                 exit_code: 1,
                 outcome: "failed",
+                mode: None,
             },
         )
         .expect("append");
@@ -510,9 +525,42 @@ mod tests {
         assert_eq!(rows[0].session, "sess-child");
         assert_eq!(rows[0].work_group_id.as_deref(), Some("wg-1"));
         assert_eq!(rows[0].model.as_deref(), Some("gpt-5-codex"));
+        assert_eq!(
+            rows[0].mode,
+            Some(WorkerMode::Writing),
+            "issue #267: mode round-trips when the writer set it"
+        );
         assert_eq!(rows[1].session, "sess-child-2");
         assert_eq!(rows[1].work_group_id, None);
         assert_eq!(rows[1].outcome, "failed");
+        assert_eq!(
+            rows[1].mode, None,
+            "issue #267: an omitted mode reads back as unknown, never a guessed default"
+        );
+    }
+
+    /// Issue #267: a `delegations.jsonl` row written before `mode` existed
+    /// (no such field at all) must still deserialize, and must read back as
+    /// `None` -- not a guessed default -- since no old row can honestly say
+    /// which mode it ran in.
+    #[test]
+    fn a_delegation_row_written_before_mode_existed_still_deserialises_as_unknown() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let dir = state.logs();
+        super::super::state::create_private_dir_all(&dir).expect("mkdir");
+        let old_line = r#"{"ts":1700000000,"session":"sess-child","parent_session":"sess-parent","agent":"codex","input_tokens":1000,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":500,"wall_ms":42000,"exit_code":0,"outcome":"ok"}"#;
+        let mut file =
+            super::super::state::open_private_append(&dir.join(DELEGATION_FILE)).expect("open");
+        writeln!(file, "{old_line}").expect("write");
+        drop(file);
+
+        let rows = read_delegations(&state, 10);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].mode, None,
+            "an older row has no honest mode to report"
+        );
     }
 
     /// No file at all is an empty list, not an error -- `zirv ctx agent`

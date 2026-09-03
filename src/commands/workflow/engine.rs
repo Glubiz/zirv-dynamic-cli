@@ -2702,6 +2702,14 @@ fn format_wall_clock(ms: u64) -> String {
 pub(crate) struct AutoSpawn {
     pub phase: WorkflowPhase,
     pub argv: Vec<String>,
+    /// Issue #267: every phase [`auto_spawn_decision`] can currently produce
+    /// an `AutoSpawn` for -- Review, Test, Verify -- is `read-only`: none of
+    /// `workflow review run`/`test changed`/`verify` needs to edit the
+    /// checkout to do its job. An eventual implement-step auto-spawn (not
+    /// yet wired here) is `writing` by [`crate::commands::ctx::permit::
+    /// WorkerMode`]'s own default, so this field only ever needs to name the
+    /// exception, not the rule.
+    pub mode: crate::commands::ctx::permit::WorkerMode,
 }
 
 /// Why a gate transition that WOULD otherwise be eligible (right phase,
@@ -2771,7 +2779,13 @@ pub(crate) fn auto_spawn_decision(
         WorkflowPhase::Verify => vec!["verify".to_string(), "--repo".to_string(), repo],
         _ => unreachable!("filtered above"),
     };
-    Ok(AutoSpawn { phase, argv })
+    // Issue #267: review/test/verify spawns are all read-only -- see
+    // `AutoSpawn::mode`'s own doc comment.
+    Ok(AutoSpawn {
+        phase,
+        argv,
+        mode: crate::commands::ctx::permit::WorkerMode::ReadOnly,
+    })
 }
 
 #[cfg(unix)]
@@ -3663,6 +3677,11 @@ mod tests {
         .expect("Review with a workflow adapter fires");
         assert_eq!(review.phase, WorkflowPhase::Review);
         assert_eq!(
+            review.mode,
+            crate::commands::ctx::permit::WorkerMode::ReadOnly,
+            "issue #267: a review spawn is read-only"
+        );
+        assert_eq!(
             review.argv,
             vec![
                 "workflow",
@@ -3711,6 +3730,11 @@ mod tests {
         .expect("Test fires");
         assert_eq!(test.phase, WorkflowPhase::Test);
         assert_eq!(
+            test.mode,
+            crate::commands::ctx::permit::WorkerMode::ReadOnly,
+            "issue #267: a test spawn is read-only"
+        );
+        assert_eq!(
             test.argv,
             vec![
                 "test",
@@ -3728,6 +3752,11 @@ mod tests {
         )
         .expect("Verify fires");
         assert_eq!(verify.phase, WorkflowPhase::Verify);
+        assert_eq!(
+            verify.mode,
+            crate::commands::ctx::permit::WorkerMode::ReadOnly,
+            "issue #267: a verify spawn is read-only"
+        );
         assert_eq!(
             verify.argv,
             vec!["verify", "--repo", &state.repo.display().to_string()]
