@@ -249,13 +249,34 @@ impl HeavyPermit {
     /// the slot as still held if EITHER the parent (the script-runner
     /// process that called [`acquire`]) or this child is alive -- a parent
     /// that dies first must not free a slot the real heavy work is still
-    /// using. Best-effort and silent on any I/O or (de)serialization
-    /// failure, the same discipline every other write in this module holds:
-    /// if this permit's own file cannot be updated, the pre-existing
-    /// parent-pid liveness check still applies, so this can only ever make
-    /// the sweep MORE conservative, never less.
+    /// using.
+    ///
+    /// Review finding (2026-09): a `Writer` permit's paired [`tree_claim`]
+    /// (see [`claim_tree`]) gets the SAME `child_pid` written to it. Without
+    /// this, the tree claim's own dead-owner sweep only ever saw the
+    /// (possibly already-dead) parent pid -- never the child this call is
+    /// told about -- and freed the tree the moment the parent died, even
+    /// while the real worker, running as the child, was still using it.
+    ///
+    /// [`tree_claim`]: HeavyPermit::tree_claim
+    ///
+    /// Best-effort and silent on any I/O or (de)serialization failure on
+    /// either file, the same discipline every other write in this module
+    /// holds: a file this cannot update simply keeps its previous (more
+    /// conservative) liveness answer.
     pub fn set_child_pid(&self, child_pid: u32) {
-        let Ok(contents) = std::fs::read_to_string(&self.path) else {
+        Self::write_child_pid(&self.path, child_pid);
+        if let Some(tree_claim) = &self.tree_claim {
+            Self::write_child_pid(tree_claim, child_pid);
+        }
+    }
+
+    /// The actual read-modify-write behind [`set_child_pid`], factored out
+    /// so the pool-slot file and the (optional) paired tree-claim file get
+    /// identical treatment rather than two independently-drifting copies of
+    /// the same four lines.
+    fn write_child_pid(path: &Path, child_pid: u32) {
+        let Ok(contents) = std::fs::read_to_string(path) else {
             return;
         };
         let Ok(mut record) = serde_json::from_str::<PermitRecord>(&contents) else {
@@ -263,9 +284,20 @@ impl HeavyPermit {
         };
         record.child_pid = Some(child_pid);
         if let Ok(json) = serde_json::to_string_pretty(&record) {
-            let _ = std::fs::write(&self.path, json);
+            let _ = std::fs::write(path, json);
         }
     }
+}
+
+/// Whether `record`'s owner is still alive -- true if EITHER the process
+/// that acquired the permit (`record.pid`) or, once set, the child it went
+/// on to spawn (`record.child_pid`, via [`HeavyPermit::set_child_pid`]) is
+/// still running (finding B5). Shared by every dead-owner sweep in this
+/// module -- [`live_records_in`]'s own sweep and [`claim_tree`]'s tree-claim
+/// sweep -- so the rule can never independently drift between the two
+/// (review finding, 2026-09).
+fn permit_record_is_alive(record: &PermitRecord) -> bool {
+    is_alive(record.pid) || record.child_pid.is_some_and(is_alive)
 }
 
 /// Pure: whether `modified` is more than `grace_secs` older than `now`. Split
@@ -363,7 +395,7 @@ fn live_records_in(dir: &Path) -> Vec<PermitRecord> {
         // until `HeavyPermit::set_child_pid` runs, so a permit still in its
         // brief pre-spawn window falls back to the parent-only check this
         // always had.
-        let alive = is_alive(record.pid) || record.child_pid.is_some_and(is_alive);
+        let alive = permit_record_is_alive(&record);
         if alive {
             found.push(record);
         } else {
@@ -581,8 +613,7 @@ fn claim_tree(dir: &Path, key: &str, record: &PermitRecord) -> Result<PathBuf, W
                 if let Ok(contents) = std::fs::read_to_string(&path) {
                     match serde_json::from_str::<PermitRecord>(&contents) {
                         Ok(existing) => {
-                            let alive =
-                                is_alive(existing.pid) || existing.child_pid.is_some_and(is_alive);
+                            let alive = permit_record_is_alive(&existing);
                             if alive {
                                 return Err(WriterRefusal::TreeBusy {
                                     holder_label: existing.label,
@@ -1339,6 +1370,74 @@ mod tests {
             live_writer_count(&state),
             1,
             "one writer holds one slot -- the tree claim file must not also be counted"
+        );
+    }
+
+    /// Review finding (2026-09): `set_child_pid` must propagate the SAME
+    /// `child_pid` onto the paired tree claim, not just the pool slot --
+    /// proven by acquiring a real writer permit, calling `set_child_pid`,
+    /// and reading the tree claim file back off disk directly (`live_
+    /// writer_records`/`set_child_pid_persists_to_the_permit_file` already
+    /// cover the pool-slot half of this for the heavy pool).
+    #[test]
+    fn set_child_pid_also_persists_to_the_paired_tree_claim() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let tree = tmp.path().join("repo");
+        std::fs::create_dir_all(&tree).expect("mkdir");
+
+        let permit = acquire_writer(&state, 1, "worker-a", &tree).expect("granted");
+        permit.set_child_pid(4242);
+
+        let key = tree_key(&tree);
+        let claim_path = tree_claim_path(&tree_claims_dir(&state), &key);
+        let contents = std::fs::read_to_string(&claim_path).expect("read tree claim");
+        let record: PermitRecord = serde_json::from_str(&contents).expect("parse");
+        assert_eq!(
+            record.child_pid,
+            Some(4242),
+            "the tree claim must carry the same child pid as the pool slot"
+        );
+    }
+
+    /// Review finding (2026-09), acceptance: with the child pid propagated
+    /// (as `set_child_pid` now does), a tree claim whose recorded PARENT pid
+    /// is dead but whose CHILD pid is alive must not be swept -- mirrors
+    /// `a_permit_stays_live_on_a_dead_parent_if_its_child_is_still_alive`'s
+    /// own shape, but for the tree-claim file's own sweep in `claim_tree`
+    /// rather than `live_records_in`'s. A second `acquire_writer` for the
+    /// same tree, even with room in the pool (`max_writers = 2`), must still
+    /// be refused as `TreeBusy`.
+    #[test]
+    fn a_tree_claim_stays_live_on_a_dead_parent_if_its_child_is_still_alive() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let tree = tmp.path().join("repo");
+        std::fs::create_dir_all(&tree).expect("mkdir");
+        let dead_pid = crate::commands::ctx::testenv::dead_pid();
+
+        let dir = tree_claims_dir(&state);
+        state::create_private_dir_all(&dir).expect("mkdir");
+        let key = tree_key(&tree);
+        let record = PermitRecord {
+            pid: dead_pid,
+            child_pid: Some(std::process::id()),
+            label: "worker-a".to_string(),
+            acquired_at: state::now_secs(),
+            kind: PermitKind::Writer,
+            tree: Some(tree.clone()),
+        };
+        let json = serde_json::to_string_pretty(&record).expect("serialize");
+        create_new_private(&tree_claim_path(&dir, &key), &json).expect("write");
+
+        let err = acquire_writer(&state, 2, "worker-b", &tree)
+            .expect_err("a live child must keep the tree claim even though the parent pid is dead");
+        assert_eq!(
+            err,
+            WriterRefusal::TreeBusy {
+                holder_label: "worker-a".to_string()
+            },
+            "the tree claim must not be swept just because the recorded parent pid is dead"
         );
     }
 }
