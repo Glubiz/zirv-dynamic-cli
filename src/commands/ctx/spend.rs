@@ -294,9 +294,11 @@ fn render_json(rows: &[SpendRow], total: &SpendRow, stale: bool, as_of: &str) ->
 }
 
 /// Parses `--since`: a bare number of seconds, or a number suffixed `s`/`m`/
-/// `h`/`d`. `None` for anything that does not parse -- the caller treats an
-/// unparseable `--since` as "no time filter" rather than failing the whole
-/// command over a typo'd duration.
+/// `h`/`d`. `None` for anything that does not parse. Only [`parse_since_arg`]
+/// (which turns a `None` here into a hard error) should be reached from a
+/// `--since` flag that was actually supplied -- silently treating a typo'd
+/// duration as "no time filter" would accept every row instead of the
+/// operator's intended window.
 fn parse_since(text: &str) -> Option<u64> {
     let text = text.trim();
     let (digits, multiplier) = match text.strip_suffix('s') {
@@ -315,8 +317,18 @@ fn parse_since(text: &str) -> Option<u64> {
     digits.parse::<u64>().ok().map(|n| n * multiplier)
 }
 
+/// Validates a supplied `--since` up front, before any ledger row is read.
+/// An unparseable value is a hard error -- naming the accepted forms -- so a
+/// typo (e.g. `24hours`) can never silently widen the filter to "everything".
+fn parse_since_arg(text: &str) -> super::CtxResult<u64> {
+    parse_since(text)
+        .ok_or_else(|| format!("--since '{text}': expected a duration like 30m, 24h, or 7d (or a bare number of seconds)").into())
+}
+
 /// Whether `row` survives every filter `args` names -- every unset filter
-/// passes everything, so no filters at all means "the whole ledger".
+/// passes everything, so no filters at all means "the whole ledger". Assumes
+/// `args.since` (if set) already parsed successfully -- see [`parse_since_arg`],
+/// which callers must run first.
 fn matches_filters(row: &DelegationRow, args: &SpendArgs, now: u64) -> bool {
     if let Some(session) = &args.session
         && row.parent_session != *session
@@ -353,6 +365,13 @@ pub fn run_with<W: Write>(
     w: &mut W,
     now: u64,
 ) -> super::CtxResult<i32> {
+    // An unparseable `--since` is a hard error, checked before any ledger row
+    // is read -- see `parse_since_arg`'s own doc comment for why a silent
+    // `None` fallback would be a correctness bug here.
+    if let Some(since) = &args.since {
+        parse_since_arg(since)?;
+    }
+
     // No cap: `zirv ctx spend` reads the whole ledger, unlike `status`'s own
     // bounded tail -- an aggregate over only the newest N rows would silently
     // under-report an operator's own total spend.
@@ -615,6 +634,79 @@ mod tests {
             .collect();
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].session, "new");
+    }
+
+    /// Review finding: an unparseable `--since` must error rather than
+    /// silently disabling the time filter -- `run_with` checks this before
+    /// touching the ledger at all, so nothing is printed on the error path.
+    #[test]
+    fn an_unparseable_since_errors_before_reading_the_ledger() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let cfg = CtxConfig::default();
+        let args = SpendArgs {
+            session: None,
+            group: None,
+            since: Some("24hours".to_string()),
+            by: SpendDimension::Harness,
+            json: false,
+        };
+        let mut out = Vec::new();
+        let err = run_with(&state, &cfg, &args, &mut out, 1_700_000_000)
+            .expect_err("24hours is not a valid duration");
+        assert!(
+            err.to_string().contains("24hours"),
+            "error should name the bad value: {err}"
+        );
+        assert!(
+            out.is_empty(),
+            "nothing should be printed on the error path"
+        );
+    }
+
+    /// A valid `--since` (e.g. `24h`) still filters normally through
+    /// `run_with`'s end-to-end path.
+    #[test]
+    fn a_valid_since_still_filters_through_run_with() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        crate::commands::ctx::log::append_delegation(
+            &state,
+            &crate::commands::ctx::log::Delegation {
+                ts: 1_000,
+                session: "sess-old",
+                parent_session: "sess-parent",
+                work_group_id: None,
+                agent: "claude",
+                model: Some("sonnet"),
+                input_tokens: 1_000,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+                output_tokens: 0,
+                wall_ms: 1_000,
+                exit_code: 0,
+                outcome: "ok",
+                mode: Some(WorkerMode::Writing),
+                task_class: None,
+            },
+        )
+        .expect("append");
+
+        let cfg = CtxConfig::default();
+        let args = SpendArgs {
+            session: None,
+            group: None,
+            since: Some("24h".to_string()),
+            by: SpendDimension::Harness,
+            json: false,
+        };
+        let mut out = Vec::new();
+        // now is far past the 24h window from the one row's timestamp, so it
+        // must be filtered out -- proving the valid suffix still filters.
+        let code = run_with(&state, &cfg, &args, &mut out, 1_000 + 90_000).expect("runs");
+        assert_eq!(code, 0);
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(!text.contains("claude"), "row should be filtered: {text}");
     }
 
     /// `--group` narrows to exactly one work group's own rows.
