@@ -11,7 +11,8 @@ use super::state::{StateDir, now_secs};
 use super::supervise::Watcher;
 use super::{CtxResult, log, score, signal};
 use crate::commands::workflow::adoption::{self, AdoptionPolicy, AdoptionSignals};
-use crate::commands::workflow::{classify, engine, telemetry};
+use crate::commands::workflow::skill::WorkflowPhase;
+use crate::commands::workflow::{classify, engine, telemetry, verification};
 
 #[derive(Debug, clap::Args)]
 pub struct HookArgs {
@@ -230,7 +231,10 @@ fn optimize_hint(reason: super::optimize::RecommendReason) -> &'static str {
 /// be perfectly `Healthy` by rot's own measure and still be doing substantial
 /// edit work with no active `zirv workflow`, so it is folded into both the
 /// healthy-session hint path and the ordinary advisory below, not gated
-/// behind either.
+/// behind either. Despite the name, this parameter is generic "one more
+/// advisory line" rather than exclusively about workflow adoption: `run_stop`
+/// (issue #309) also folds its own verify-on-stop nudge in here rather than
+/// widening this signature a second time.
 ///
 /// `same_error_threshold` is `ScoreConfig::same_error_threshold` (default
 /// `3`): when `score.signals.same_error_repeats` meets or exceeds it, the
@@ -737,6 +741,270 @@ fn record_speed_sample(
     let _ = telemetry::record(state, repo, &event, &telemetry_cfg);
 }
 
+/// Bumped whenever this file's own shape changes, mirroring `CorrectionCheckpoint`'s
+/// own `CORRECTION_CHECKPOINT_VERSION`.
+const MODIFICATION_CHECKPOINT_VERSION: u32 = 1;
+
+/// Issue #309: incremental cursor plus a single "has this session made at
+/// least one modification (edit-like) tool call" bit, one file per
+/// transcript (mirrors `CorrectionCheckpoint`'s own naming/shape). Kept as
+/// its own small checkpoint rather than folded into `AdoptionRecord`'s own
+/// `edit_like_calls` fold: that fold only runs once `adoption_stop_nudge`
+/// clears the `workflow.adoption != Off` gate, and verify-on-stop must keep
+/// working when an operator has workflow-adoption nudges turned off but
+/// still wants the stale-gate nudge.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct ModificationCheckpoint {
+    #[serde(default)]
+    version: u32,
+    transcript: String,
+    adapter: String,
+    modified: bool,
+    offset: u64,
+    consumed: u64,
+}
+
+fn modification_checkpoint_path(state: &StateDir, transcript: &Path) -> PathBuf {
+    // Reuses `score.rs`'s own scoring directory, like `correction_checkpoint_
+    // path` does, rather than a new state-dir root just for this.
+    state.scoring().join(format!(
+        "{:016x}-modified.json",
+        input_hash(&transcript.display().to_string())
+    ))
+}
+
+/// `None` on any doubt at all, mirroring `load_correction_checkpoint`'s own
+/// guard.
+fn load_modification_checkpoint(
+    path: &Path,
+    transcript: &Path,
+    adapter_name: &str,
+) -> Option<ModificationCheckpoint> {
+    let checkpoint: ModificationCheckpoint =
+        serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+    if checkpoint.version != MODIFICATION_CHECKPOINT_VERSION
+        || checkpoint.transcript != transcript.display().to_string()
+        || checkpoint.adapter != adapter_name
+    {
+        return None;
+    }
+    // Once `modified` is true it is a session-scoped fact that never goes
+    // back to `false` (see `session_has_modification`'s own doc comment):
+    // the `offset`/transcript-length check below exists only to validate an
+    // incremental *resume point*, which a already-`true` checkpoint has no
+    // further use for -- requiring it here would mean a transcript that
+    // later shrinks, moves, or is cleaned up mid-session could silently
+    // forget a modification this session already made.
+    if checkpoint.modified {
+        return Some(checkpoint);
+    }
+    let usable = std::fs::metadata(transcript).is_ok_and(|m| checkpoint.offset <= m.len());
+    usable.then_some(checkpoint)
+}
+
+/// Best-effort, like `save_correction_checkpoint`.
+fn save_modification_checkpoint(path: &Path, checkpoint: &ModificationCheckpoint) {
+    let Ok(json) = serde_json::to_string(checkpoint) else {
+        return;
+    };
+    if let Some(dir) = path.parent() {
+        let _ = super::state::create_private_dir_all(dir);
+    }
+    let _ = super::state::write_private(path, &json);
+}
+
+/// Whether `transcript` has shown at least one modification (edit-like) tool
+/// call this session -- cheap and incremental like `corrections_in`: only the
+/// bytes appended since the last call are parsed, via the same `Watcher`
+/// cursor `fold_adoption_delta`/`corrections_in` already use, and
+/// `adoption::signals`' own `EDIT_LIKE_TOOLS` list decides what counts (the
+/// same signal `AdoptionRecord::edit_like_calls` uses, just folded into its
+/// own checkpoint here instead of that one -- see this function's own
+/// caller's doc comment for why). Once `modified` is persisted `true`, a
+/// later call short-circuits before touching the transcript at all -- a
+/// session-scoped fact never goes back to `false`. Only ever called once
+/// `cfg.verify_on_stop.enabled` is true (see the one call site in
+/// `verify_on_stop_nudge`), so a session that has the feature off never pays
+/// even this bounded parse.
+fn session_has_modification(state: &StateDir, transcript: &Path, cfg: &CtxConfig) -> bool {
+    let Ok(adapter) = adapters::select(cfg.agent.as_deref(), &[], cfg) else {
+        return false;
+    };
+    let path = modification_checkpoint_path(state, transcript);
+    let mut checkpoint = load_modification_checkpoint(&path, transcript, adapter.name())
+        .unwrap_or_else(|| ModificationCheckpoint {
+            version: MODIFICATION_CHECKPOINT_VERSION,
+            transcript: transcript.display().to_string(),
+            adapter: adapter.name().to_string(),
+            modified: false,
+            offset: 0,
+            consumed: 0,
+        });
+    if checkpoint.modified {
+        return true;
+    }
+    if !adapter.capabilities().events {
+        return false;
+    }
+    let mut watcher = Watcher::resuming(
+        transcript.to_path_buf(),
+        checkpoint.offset,
+        checkpoint.consumed,
+    );
+    let Ok(Some(appended)) = watcher.read_appended() else {
+        return checkpoint.modified;
+    };
+    if appended.restarted {
+        checkpoint.modified = false;
+    }
+    if !checkpoint.modified {
+        let events = adapter.parse_events(&appended.lines);
+        if adoption::signals(&events).edit_like_calls > 0 {
+            checkpoint.modified = true;
+        }
+    }
+    let (offset, consumed) = watcher.position();
+    checkpoint.offset = offset;
+    checkpoint.consumed = consumed;
+    save_modification_checkpoint(&path, &checkpoint);
+    checkpoint.modified
+}
+
+/// Issue #309: whether every entry in `paths` is doc-only -- extension
+/// `md`/`txt`/`rst`, or under a root-level `docs/` prefix -- in which case a
+/// verify nudge would be noise: neither `zirv test changed` nor `zirv
+/// verify` has anything to check in a documentation-only change. Vacuously
+/// `true` for an empty slice, the same "nothing to point to" reading
+/// `changed_paths` itself gives an untouched worktree.
+fn changes_are_doc_only(paths: &[PathBuf]) -> bool {
+    paths.iter().all(|path| {
+        path.starts_with("docs")
+            || matches!(
+                path.extension().and_then(|ext| ext.to_str()),
+                Some("md" | "txt" | "rst")
+            )
+    })
+}
+
+/// Issue #309: whether `phase` is a step that itself already gates on fresh
+/// verification evidence -- `engine::advance`'s own Test/Verify check prints
+/// exactly the "run `zirv test changed`/`zirv verify`" message a Stop-hook
+/// nudge would otherwise duplicate the moment the operator tries to
+/// complete that step.
+fn workflow_step_covers_verification(phase: WorkflowPhase) -> bool {
+    matches!(phase, WorkflowPhase::Test | WorkflowPhase::Verify)
+}
+
+/// The exact command a verify-on-stop nudge names. Reached only once
+/// `workflow_step_covers_verification` has already ruled out both Test and
+/// Verify for the active step (see `verify_on_stop_nudge`'s own early
+/// return), so the `Verify` arm here is presently unreachable through that
+/// caller -- kept anyway as the direct mirror of `engine::advance`'s own
+/// `if final_only { "zirv verify" } else { "zirv test changed" }` naming, in
+/// case a future change narrows the suppression rule to `Test` alone.
+fn verify_on_stop_command(active_phase: Option<WorkflowPhase>) -> &'static str {
+    if active_phase == Some(WorkflowPhase::Verify) {
+        "zirv verify"
+    } else {
+        "zirv test changed"
+    }
+}
+
+/// Bumped whenever `VerifyOnStopRecord`'s own shape changes -- deliberately
+/// a separate constant from `MODIFICATION_CHECKPOINT_VERSION` even though
+/// both start at `1`: the two checkpoints have unrelated schemas and must be
+/// free to version independently.
+const VERIFY_ON_STOP_RECORD_VERSION: u32 = 1;
+
+/// Issue #309: how many verify-on-stop nudges this session has already
+/// received, one file per session id (mirrors `adoption_record_path`'s own
+/// naming/hash scheme).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct VerifyOnStopRecord {
+    #[serde(default)]
+    version: u32,
+    nudges: u32,
+}
+
+fn verify_on_stop_record_path(state: &StateDir, session: &str) -> PathBuf {
+    state
+        .scoring()
+        .join(format!("{:016x}-verify-on-stop.json", input_hash(session)))
+}
+
+/// `Default` (no nudges yet) on any doubt at all, or a different schema
+/// version -- like every other hook state read, never a hook failure.
+fn load_verify_on_stop_record(path: &Path) -> VerifyOnStopRecord {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|body| serde_json::from_str::<VerifyOnStopRecord>(&body).ok())
+        .filter(|record| record.version == VERIFY_ON_STOP_RECORD_VERSION)
+        .unwrap_or_default()
+}
+
+fn save_verify_on_stop_record(path: &Path, record: &VerifyOnStopRecord) {
+    let Ok(json) = serde_json::to_string(record) else {
+        return;
+    };
+    if let Some(dir) = path.parent() {
+        let _ = super::state::create_private_dir_all(dir);
+    }
+    let _ = super::state::write_private(path, &json);
+}
+
+/// Issue #309: Stop-hook advisory naming the exact stale-gate command when
+/// code changed this session after the last passing verification run.
+///
+/// `None` on any doubt at all -- like every other hook advisory, this must
+/// never fail loudly. A read-only turn (no modification tool call) runs no
+/// git command at all: `session_has_modification` is checked first, and
+/// every `verification::*` call below (all of which shell out to git) only
+/// runs once that gate is true.
+fn verify_on_stop_nudge(
+    state: &StateDir,
+    repo: &Path,
+    session: &str,
+    cfg: &CtxConfig,
+    transcript: &Path,
+) -> Option<String> {
+    if !cfg.verify_on_stop.enabled {
+        return None;
+    }
+    if !session_has_modification(state, transcript, cfg) {
+        return None;
+    }
+    // Any doubt here (no git, no repo, ...) reads as "fresh": a nudge is
+    // advisory, never worth a false positive over an unreadable repo state.
+    if verification::latest_is_fresh_and_passing(state, repo, false).unwrap_or(true) {
+        return None;
+    }
+    let changed = verification::changed_paths(repo).ok()?;
+    if changes_are_doc_only(&changed) {
+        return None;
+    }
+    let active_phase = engine::load_active(state, repo)
+        .ok()
+        .flatten()
+        .and_then(|workflow| workflow.current().map(|step| step.phase));
+    if active_phase.is_some_and(workflow_step_covers_verification) {
+        return None;
+    }
+
+    let path = verify_on_stop_record_path(state, session);
+    let mut record = load_verify_on_stop_record(&path);
+    if record.nudges >= cfg.verify_on_stop.max_nudges {
+        return None;
+    }
+    record.version = VERIFY_ON_STOP_RECORD_VERSION;
+    record.nudges += 1;
+    save_verify_on_stop_record(&path, &record);
+
+    let command = verify_on_stop_command(active_phase);
+    Some(format!(
+        "zirv ctx: code changed since the last passing run; run `{command}` before relying on this session's own verification."
+    ))
+}
+
 pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResult<i32> {
     // Every early return is deliberate: a hook that errors must still exit 0.
     let Ok(payload) = HookPayload::parse(stdin) else {
@@ -786,6 +1054,7 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
     let cfg = cfg_or_operator_only_gate(&repo, env);
     let mut optimize_recommended = None;
     let mut adoption_nudge = None;
+    let mut verify_nudge = None;
     if let Ok(state) = StateDir::resolve(env) {
         // Issue #243: a flagged screening result rides the same
         // decision line this cycle already writes, and is persisted onto the
@@ -873,14 +1142,27 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
         adoption_nudge =
             adoption_stop_nudge(&state, &repo, &session, &cfg, &score, transcript, env);
         record_speed_sample(&state, &repo, &session, &cfg, speed_sample);
+        verify_nudge = verify_on_stop_nudge(&state, &repo, &session, &cfg, transcript);
     }
+
+    // Issue #309 rides the same single advisory line `adoption_nudge`
+    // already carries -- `stop_output`'s own `adoption_nudge` parameter is
+    // generic "one more advisory line", not exclusively about workflow
+    // adoption, so folding both in here (rather than widening `stop_output`
+    // itself) keeps every one of its existing call sites/tests untouched.
+    let combined_nudge = match (adoption_nudge.as_deref(), verify_nudge.as_deref()) {
+        (Some(a), Some(b)) => Some(format!("{a}\n{b}")),
+        (Some(a), None) => Some(a.to_string()),
+        (None, Some(b)) => Some(b.to_string()),
+        (None, None) => None,
+    };
 
     if let Some(line) = stop_output(
         &payload,
         &score,
         socket.as_deref(),
         optimize_recommended,
-        adoption_nudge.as_deref(),
+        combined_nudge.as_deref(),
         cfg.score.same_error_threshold,
     ) {
         let _ = writeln!(w, "{line}");
@@ -3975,5 +4257,277 @@ mod tests {
         )
         .expect("claude shape maps straight through");
         assert_eq!(mapped.transcript_path, "/tmp/t.jsonl");
+    }
+
+    // -- Issue #309: verify-on-stop -----------------------------------------
+
+    /// A repository with one commit, mirroring `verification.rs`'s own
+    /// `git_repo()` test helper -- `changed_paths`/`latest_is_fresh_and_
+    /// passing` need something real to read.
+    fn git_repo() -> tempfile::TempDir {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.email=t@example.com",
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(repo.path())
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(repo.path().join("tracked.txt"), "one\n").expect("write");
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "base"]);
+        repo
+    }
+
+    #[test]
+    fn session_has_modification_is_false_without_an_edit_like_call() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(dir.path().to_path_buf());
+        let transcript = transcript_with_edits(dir.path(), 3, 0);
+        let cfg = CtxConfig::default();
+        assert!(!session_has_modification(&state, &transcript, &cfg));
+    }
+
+    #[test]
+    fn session_has_modification_is_true_with_an_edit_like_call() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(dir.path().to_path_buf());
+        let transcript = transcript_with_edits(dir.path(), 3, 1);
+        let cfg = CtxConfig::default();
+        assert!(session_has_modification(&state, &transcript, &cfg));
+    }
+
+    /// Once `modified` is persisted `true`, a later call must not need to
+    /// re-read the transcript at all: deleting it must not flip the answer
+    /// back to `false`.
+    #[test]
+    fn session_has_modification_short_circuits_once_persisted_true() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(dir.path().to_path_buf());
+        let transcript = transcript_with_edits(dir.path(), 3, 1);
+        let cfg = CtxConfig::default();
+        assert!(session_has_modification(&state, &transcript, &cfg));
+        std::fs::remove_file(&transcript).expect("remove transcript");
+        assert!(
+            session_has_modification(&state, &transcript, &cfg),
+            "a persisted true must never require re-reading the transcript"
+        );
+    }
+
+    #[test]
+    fn changes_are_doc_only_accepts_markdown_txt_rst_and_a_docs_prefix() {
+        assert!(changes_are_doc_only(&[]));
+        assert!(changes_are_doc_only(&[PathBuf::from("README.md")]));
+        assert!(changes_are_doc_only(&[PathBuf::from("notes.txt")]));
+        assert!(changes_are_doc_only(&[PathBuf::from("CHANGELOG.rst")]));
+        assert!(changes_are_doc_only(&[PathBuf::from("docs/guide.html")]));
+        assert!(!changes_are_doc_only(&[PathBuf::from("src/main.rs")]));
+        assert!(!changes_are_doc_only(&[
+            PathBuf::from("README.md"),
+            PathBuf::from("src/main.rs"),
+        ]));
+    }
+
+    #[test]
+    fn workflow_step_covers_verification_matches_test_and_verify_phases_only() {
+        assert!(!workflow_step_covers_verification(WorkflowPhase::Implement));
+        assert!(!workflow_step_covers_verification(WorkflowPhase::Review));
+        assert!(workflow_step_covers_verification(WorkflowPhase::Test));
+        assert!(workflow_step_covers_verification(WorkflowPhase::Verify));
+    }
+
+    /// Reachable only in theory (see the function's own doc comment): proves
+    /// the naming rule directly regardless of the current suppression
+    /// choice in `verify_on_stop_nudge`.
+    #[test]
+    fn verify_on_stop_command_names_zirv_verify_only_for_the_verify_phase() {
+        assert_eq!(verify_on_stop_command(None), "zirv test changed");
+        assert_eq!(
+            verify_on_stop_command(Some(WorkflowPhase::Implement)),
+            "zirv test changed"
+        );
+        assert_eq!(
+            verify_on_stop_command(Some(WorkflowPhase::Test)),
+            "zirv test changed"
+        );
+        assert_eq!(
+            verify_on_stop_command(Some(WorkflowPhase::Verify)),
+            "zirv verify"
+        );
+    }
+
+    fn feature_classification() -> classify::Classification {
+        classify::classify(&classify::ClassificationInput {
+            task: String::new(),
+            paths: Vec::new(),
+            changed_lines: 0,
+            tests_changed: true,
+            intent_override: None,
+            complexity_override: None,
+            risk_override: None,
+        })
+        .expect("classify")
+    }
+
+    #[test]
+    fn verify_on_stop_nudge_fires_for_a_stale_code_change_with_no_active_workflow() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(dir.path().to_path_buf());
+        let repo = git_repo();
+        std::fs::write(repo.path().join("src.rs"), "fn main() {}\n").expect("write");
+        let transcript = transcript_with_edits(dir.path(), 1, 1);
+        let cfg = CtxConfig::default();
+
+        let text = verify_on_stop_nudge(&state, repo.path(), "sess-a", &cfg, &transcript)
+            .expect("a stale code change with a real modification must nudge");
+        assert!(text.contains("zirv test changed"), "{text}");
+    }
+
+    #[test]
+    fn verify_on_stop_nudge_is_silent_when_disabled() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(dir.path().to_path_buf());
+        let repo = git_repo();
+        std::fs::write(repo.path().join("src.rs"), "fn main() {}\n").expect("write");
+        let transcript = transcript_with_edits(dir.path(), 1, 1);
+        let mut cfg = CtxConfig::default();
+        cfg.verify_on_stop.enabled = false;
+
+        assert_eq!(
+            verify_on_stop_nudge(&state, repo.path(), "sess-b", &cfg, &transcript),
+            None
+        );
+    }
+
+    /// Even with a real stale change sitting in the worktree, a transcript
+    /// with no modification tool call must never nudge -- proving the
+    /// modification gate runs, and runs first.
+    #[test]
+    fn verify_on_stop_nudge_is_silent_without_a_modification_tool_call() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(dir.path().to_path_buf());
+        let repo = git_repo();
+        std::fs::write(repo.path().join("src.rs"), "fn main() {}\n").expect("write");
+        let transcript = transcript_with_edits(dir.path(), 1, 0);
+        let cfg = CtxConfig::default();
+
+        assert_eq!(
+            verify_on_stop_nudge(&state, repo.path(), "sess-c", &cfg, &transcript),
+            None,
+            "no modification tool call this session must never nudge"
+        );
+    }
+
+    #[test]
+    fn verify_on_stop_nudge_is_silent_for_a_doc_only_change_set() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(dir.path().to_path_buf());
+        let repo = git_repo();
+        std::fs::write(repo.path().join("README.md"), "docs\n").expect("write");
+        let transcript = transcript_with_edits(dir.path(), 1, 1);
+        let cfg = CtxConfig::default();
+
+        assert_eq!(
+            verify_on_stop_nudge(&state, repo.path(), "sess-d", &cfg, &transcript),
+            None,
+            "a doc-only change set has nothing for a test/verify gate to check"
+        );
+    }
+
+    #[test]
+    fn verify_on_stop_nudge_is_silent_when_the_active_workflow_step_already_verifies() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(dir.path().to_path_buf());
+        let repo = git_repo();
+        std::fs::write(repo.path().join("src.rs"), "fn main() {}\n").expect("write");
+        let transcript = transcript_with_edits(dir.path(), 1, 1);
+        let cfg = CtxConfig::default();
+
+        let mut wf = crate::commands::workflow::engine::WorkflowState::start(
+            repo.path().to_path_buf(),
+            "task".into(),
+            crate::commands::workflow::engine::WorkflowKind::Feature,
+            None,
+            true,
+            feature_classification(),
+        );
+        let verify_index = wf
+            .steps
+            .iter()
+            .position(|step| step.phase == WorkflowPhase::Verify)
+            .expect("a Feature workflow has a Verify step");
+        wf.current_step = verify_index;
+        crate::commands::workflow::engine::save(&state, &wf, true).expect("save active workflow");
+
+        assert_eq!(
+            verify_on_stop_nudge(&state, repo.path(), "sess-e", &cfg, &transcript),
+            None,
+            "the workflow's own Verify-step gate already covers this"
+        );
+    }
+
+    /// A workflow active on a phase that does not itself gate on
+    /// verification (its default first step) must not suppress the nudge.
+    #[test]
+    fn verify_on_stop_nudge_still_fires_when_the_active_step_is_not_test_or_verify() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(dir.path().to_path_buf());
+        let repo = git_repo();
+        std::fs::write(repo.path().join("src.rs"), "fn main() {}\n").expect("write");
+        let transcript = transcript_with_edits(dir.path(), 1, 1);
+        let cfg = CtxConfig::default();
+
+        let wf = crate::commands::workflow::engine::WorkflowState::start(
+            repo.path().to_path_buf(),
+            "task".into(),
+            crate::commands::workflow::engine::WorkflowKind::Feature,
+            None,
+            true,
+            feature_classification(),
+        );
+        assert!(
+            !workflow_step_covers_verification(wf.current().expect("first step").phase),
+            "test setup: the first step must not already be Test/Verify"
+        );
+        crate::commands::workflow::engine::save(&state, &wf, true).expect("save active workflow");
+
+        assert!(
+            verify_on_stop_nudge(&state, repo.path(), "sess-f", &cfg, &transcript).is_some(),
+            "a workflow active on an unrelated phase must not suppress the nudge"
+        );
+    }
+
+    #[test]
+    fn verify_on_stop_nudge_caps_at_max_nudges_per_session() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(dir.path().to_path_buf());
+        let repo = git_repo();
+        std::fs::write(repo.path().join("src.rs"), "fn main() {}\n").expect("write");
+        let transcript = transcript_with_edits(dir.path(), 1, 1);
+        let cfg = CtxConfig::default(); // max_nudges: 2
+
+        assert!(
+            verify_on_stop_nudge(&state, repo.path(), "sess-g", &cfg, &transcript).is_some(),
+            "1st stale turn must nudge"
+        );
+        assert!(
+            verify_on_stop_nudge(&state, repo.path(), "sess-g", &cfg, &transcript).is_some(),
+            "2nd stale turn must nudge"
+        );
+        assert_eq!(
+            verify_on_stop_nudge(&state, repo.path(), "sess-g", &cfg, &transcript),
+            None,
+            "3rd stale turn in the same session must not nudge again"
+        );
     }
 }

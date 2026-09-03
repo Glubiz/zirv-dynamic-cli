@@ -14,6 +14,7 @@ use super::price;
 use super::sessions::{self, Liveness};
 use super::state::{StateDir, now_secs, repo_slug};
 use super::{CtxResult, log};
+use crate::commands::workflow::verification;
 use crate::style::{self, Tone};
 
 /// Bold section-header line: a blank line, then the painted title and colon
@@ -787,6 +788,25 @@ fn render_report<W: Write>(
         label(colour, "state dir:"),
         style::paint(&state.root().display().to_string(), Tone::Muted, colour)
     )?;
+
+    // Issue #309: presentation only, off the same `latest_is_fresh_and_
+    // passing` call the Stop hook's own verify-on-stop nudge uses -- omitted
+    // outright (rather than a third "unknown" wording) when no report has
+    // ever been persisted for this repo, or when the git-backed check itself
+    // fails: `status` must never fail just because this one line could not
+    // be computed.
+    if let Ok(Some(_)) = verification::latest_report_id(&state, repo) {
+        let fresh = verification::latest_is_fresh_and_passing(&state, repo, false).unwrap_or(false);
+        let (text, tone) = if fresh {
+            ("gates: fresh".to_string(), Tone::Ok)
+        } else {
+            (
+                "gates: stale (edits after the last passing run)".to_string(),
+                Tone::Warn,
+            )
+        };
+        writeln!(w, "{}", style::paint(&text, tone, colour))?;
+    }
 
     match crate::settings::AgentGate::load(repo, env) {
         Ok(gate) => {
@@ -1660,6 +1680,151 @@ mod tests {
         );
         assert!(text.contains("no supervised sessions"), "got {text}");
         assert!(text.contains("no handoff"), "got {text}");
+    }
+
+    /// A repository with one commit, mirroring `verification.rs`'s own
+    /// `git_repo()` test helper -- the `gates:` line's own git-backed check
+    /// (`latest_is_fresh_and_passing`) needs something real to read.
+    fn git_repo() -> tempfile::TempDir {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.email=t@example.com",
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(repo.path())
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(repo.path().join("tracked.txt"), "one\n").expect("write");
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "base"]);
+        repo
+    }
+
+    /// A minimal passing report for `repo`, matching its current change
+    /// fingerprint -- mirrors `engine.rs`'s own seeded-report test pattern.
+    fn passing_report(repo: &Path) -> verification::VerificationReport {
+        verification::VerificationReport {
+            schema_version: verification::VERIFY_REPORT_SCHEMA_VERSION,
+            id: "seeded".into(),
+            mode: verification::VerificationMode::Changed,
+            source: "configured".into(),
+            repo: repo.to_path_buf(),
+            change_fingerprint: verification::change_fingerprint(repo).expect("fingerprint"),
+            changed_paths: vec![],
+            fallback_to_full: false,
+            narrowed_to: vec![],
+            notes: vec![],
+            started_at: 0,
+            finished_at: 0,
+            checks: vec![verification::CheckResult {
+                id: "unit".into(),
+                kind: verification::CheckKind::Unit,
+                command: "true".into(),
+                source: verification::CheckSource::DiscoveredToolchain,
+                status: verification::CheckStatus::Passed,
+                exit_code: Some(0),
+                duration_ms: 1,
+                failure_output: None,
+                failure_test_names: Vec::new(),
+                inconclusive_reason: None,
+            }],
+        }
+    }
+
+    /// Issue #309: a report whose `change_fingerprint` still matches the
+    /// current tree renders `gates: fresh`.
+    #[test]
+    fn status_shows_gates_fresh_for_a_report_matching_the_current_change_set() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state_root = tmp.path().join("state");
+        let repo = git_repo();
+        let state = StateDir::from_root(state_root.clone());
+        verification::save_report(&state, &passing_report(repo.path())).expect("save report");
+
+        let env = env_for(&state_root);
+        let mut out = Vec::new();
+        run_with(
+            &StatusArgs {
+                decisions: 10,
+                brief: false,
+                diff: false,
+            },
+            &mut out,
+            repo.path(),
+            &|k| env.get(k).cloned(),
+            false,
+        )
+        .expect("runs");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(text.contains("gates: fresh"), "got {text}");
+    }
+
+    /// Issue #309: once the tree changes after the report was persisted, the
+    /// same report's fingerprint no longer matches, so the line flips to
+    /// `gates: stale ...`.
+    #[test]
+    fn status_shows_gates_stale_once_the_tree_changes_after_the_last_passing_run() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state_root = tmp.path().join("state");
+        let repo = git_repo();
+        let state = StateDir::from_root(state_root.clone());
+        verification::save_report(&state, &passing_report(repo.path())).expect("save report");
+        std::fs::write(repo.path().join("tracked.txt"), "two\n").expect("edit");
+
+        let env = env_for(&state_root);
+        let mut out = Vec::new();
+        run_with(
+            &StatusArgs {
+                decisions: 10,
+                brief: false,
+                diff: false,
+            },
+            &mut out,
+            repo.path(),
+            &|k| env.get(k).cloned(),
+            false,
+        )
+        .expect("runs");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            text.contains("gates: stale (edits after the last passing run)"),
+            "got {text}"
+        );
+    }
+
+    /// Issue #309: with no report ever persisted for this repo, the line is
+    /// omitted outright rather than printed as some third "unknown" state.
+    #[test]
+    fn status_omits_the_gates_line_when_no_report_has_ever_been_persisted() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = tmp.path().join("state");
+        let repo = git_repo();
+        let env = env_for(&state);
+        let mut out = Vec::new();
+        run_with(
+            &StatusArgs {
+                decisions: 10,
+                brief: false,
+                diff: false,
+            },
+            &mut out,
+            repo.path(),
+            &|k| env.get(k).cloned(),
+            false,
+        )
+        .expect("runs");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(!text.contains("gates:"), "got {text}");
     }
 
     /// End-to-end exit-code contract for the parse-skip half of the fix: a

@@ -410,6 +410,33 @@ impl Default for OptimizeConfig {
     }
 }
 
+/// Issue #309: whether the Stop hook may nudge the exact stale-gate command
+/// (`zirv test changed`/`zirv verify`) when the transcript shows a
+/// modification this session and the last persisted verification report no
+/// longer covers the current change set.
+///
+/// `enabled`/`max_nudges` both go through the same T9 repo-narrowing fold
+/// `pace.enabled`/`context.dedupe_native` already use (`narrow_verify_on_
+/// stop_enabled`/`narrow_max_nudges` below), not `REPO_FORBIDDEN`: an
+/// operator who wants the nudge is never blocked by the repo, but a repo
+/// checkout may only ever make the feature quieter (turn it off, or lower
+/// the cap), never louder.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct VerifyOnStopConfig {
+    pub enabled: bool,
+    pub max_nudges: u32,
+}
+
+impl Default for VerifyOnStopConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_nudges: 2,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PromptConfig {
@@ -1223,6 +1250,7 @@ pub struct CtxConfig {
     pub pace: PaceConfig,
     pub price: PriceConfig,
     pub optimize: OptimizeConfig,
+    pub verify_on_stop: VerifyOnStopConfig,
     pub prompt: PromptConfig,
     pub context: ContextConfig,
     pub mail: MailConfig,
@@ -1942,6 +1970,24 @@ fn narrow_dedupe_bool(home: bool, repo: Option<bool>) -> bool {
     home.min(repo.unwrap_or(true))
 }
 
+/// Issue #309: the repo-narrowing fold for `verify_on_stop.enabled` -- the
+/// same polarity as `narrow_dedupe_bool`, since `false` (the nudge is off) is
+/// this key's strict direction. `repo` absent contributes nothing (folds in
+/// as `true`, the loose value), so an untouched repo layer never forces the
+/// feature off for an operator who left it on, but a repo layer cannot flip
+/// an operator's own `enabled = false` back to `true` either.
+fn narrow_verify_on_stop_enabled(home: bool, repo: Option<bool>) -> bool {
+    home.min(repo.unwrap_or(true))
+}
+
+/// Issue #309: the repo-narrowing fold for `verify_on_stop.max_nudges` --
+/// lower is stricter (fewer nudges per session), the numeric mirror of
+/// `narrow_pace_percent`. `repo` absent contributes nothing (folds in as
+/// `u32::MAX`, which `min` never picks over a real `home` value).
+fn narrow_max_nudges(home: u32, repo: Option<u32>) -> u32 {
+    home.min(repo.unwrap_or(u32::MAX))
+}
+
 /// Finding 4 (review): the one comma-separated-list splitter shared by every
 /// caller that needs "trimmed, non-empty entries" -- this module's own
 /// `ZIRV_CTX_SANDBOX_EXTRA_ALLOW`/`_DENY` env values (the same shape
@@ -2610,6 +2656,13 @@ impl CtxConfig {
         // function's own doc comment for why the polarity is inverted.
         let home_context_dedupe_native =
             bool_at(take_nested(&mut merged, "context", "dedupe_native"));
+        // Issue #309: `verify_on_stop.enabled`/`max_nudges` get the identical
+        // lift-before-merge treatment -- see `narrow_verify_on_stop_enabled`/
+        // `narrow_max_nudges` below for each field's strict direction.
+        let home_verify_on_stop_enabled =
+            bool_at(take_nested(&mut merged, "verify_on_stop", "enabled"));
+        let home_verify_on_stop_max_nudges =
+            integer_at(take_nested(&mut merged, "verify_on_stop", "max_nudges"));
         // `supervise.heavy_command_patterns` gets the identical treatment as
         // `sandbox.extra_deny` above, for the identical reason: the field's
         // own doc comment promises a repo layer may only ADD patterns, never
@@ -2689,6 +2742,10 @@ impl CtxConfig {
         let repo_pace_soft_percent = float_at(take_nested(&mut repo_layer, "pace", "soft_percent"));
         let repo_context_dedupe_native =
             bool_at(take_nested(&mut repo_layer, "context", "dedupe_native"));
+        let repo_verify_on_stop_enabled =
+            bool_at(take_nested(&mut repo_layer, "verify_on_stop", "enabled"));
+        let repo_verify_on_stop_max_nudges =
+            integer_at(take_nested(&mut repo_layer, "verify_on_stop", "max_nudges"));
         let repo_heavy_patterns = string_array(take_nested(
             &mut repo_layer,
             "supervise",
@@ -2782,6 +2839,27 @@ impl CtxConfig {
                 home_context_dedupe_native.unwrap_or(default_context.dedupe_native),
                 repo_context_dedupe_native,
             )),
+        );
+        let default_verify_on_stop = VerifyOnStopConfig::default();
+        insert_path(
+            &mut merged,
+            &["verify_on_stop", "enabled"],
+            toml::Value::Boolean(narrow_verify_on_stop_enabled(
+                home_verify_on_stop_enabled.unwrap_or(default_verify_on_stop.enabled),
+                repo_verify_on_stop_enabled,
+            )),
+        );
+        let home_max_nudges = home_verify_on_stop_max_nudges
+            .and_then(|v| u32::try_from(v).ok())
+            .unwrap_or(default_verify_on_stop.max_nudges);
+        let repo_max_nudges = repo_verify_on_stop_max_nudges.and_then(|v| u32::try_from(v).ok());
+        insert_path(
+            &mut merged,
+            &["verify_on_stop", "max_nudges"],
+            toml::Value::Integer(i64::from(narrow_max_nudges(
+                home_max_nudges,
+                repo_max_nudges,
+            ))),
         );
 
         let default_fallback = FallbackConfig::default();
@@ -4003,6 +4081,73 @@ mod tests {
                 case.home, case.repo
             );
         }
+    }
+
+    /// Issue #309: the fold rule itself, pure and direct -- the same
+    /// no-config-file, no-`CtxConfig::load` shape as
+    /// `the_pace_narrowing_fold_rule_favours_the_stricter_layer_either_direction`.
+    #[test]
+    fn the_verify_on_stop_narrowing_fold_rule_favours_the_stricter_layer_either_direction() {
+        // enabled: false (stricter, the feature is off) wins no matter which
+        // layer set it.
+        assert!(narrow_verify_on_stop_enabled(true, None));
+        assert!(
+            !narrow_verify_on_stop_enabled(false, Some(true)),
+            "repo may not re-enable an operator-disabled feature"
+        );
+        assert!(
+            !narrow_verify_on_stop_enabled(true, Some(false)),
+            "repo may disable it"
+        );
+        assert!(narrow_verify_on_stop_enabled(true, Some(true)));
+
+        // max_nudges: lower (stricter) wins no matter which layer set it.
+        assert_eq!(narrow_max_nudges(2, None), 2);
+        assert_eq!(
+            narrow_max_nudges(2, Some(10)),
+            2,
+            "repo may not raise the cap above home's own"
+        );
+        assert_eq!(
+            narrow_max_nudges(5, Some(1)),
+            1,
+            "repo may lower it below home's own"
+        );
+    }
+
+    /// Issue #309: the full `CtxConfig::load` integration -- a repo-layer
+    /// `verify_on_stop.enabled = true` must not resurrect a feature the
+    /// operator's own `~/.zirv/ctx.toml` turned off, and a repo layer may
+    /// still tighten `max_nudges` below the operator's own cap.
+    #[test]
+    fn a_repo_layer_may_only_narrow_verify_on_stop_enabled_and_max_nudges() {
+        let home_dir = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home_dir.path());
+        std::fs::create_dir_all(home_dir.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home_dir.path().join(".zirv/ctx.toml"),
+            "[verify_on_stop]\nenabled = false\nmax_nudges = 5\n",
+        )
+        .expect("write");
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[verify_on_stop]\nenabled = true\nmax_nudges = 1\n",
+        )
+        .expect("write");
+
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert!(
+            !cfg.verify_on_stop.enabled,
+            "a repo may not re-enable an operator-disabled verify_on_stop"
+        );
+        assert_eq!(
+            cfg.verify_on_stop.max_nudges, 1,
+            "a repo may still tighten the nudge cap"
+        );
     }
 
     /// Issue #155, Phase 3: the fold rule itself, mirroring `the_pace_
