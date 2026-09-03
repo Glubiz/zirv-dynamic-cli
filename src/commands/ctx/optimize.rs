@@ -1144,18 +1144,37 @@ pub fn newest_transcripts(projects_root: &Path, sample: usize) -> Vec<PathBuf> {
 
 /// The project directory a sampled transcript came from (its slug directory
 /// under `projects_root`), for the report's M1 disclosure that sampling is
-/// machine-wide. A subagent file sits one level deeper (`<project>/subagents/
-/// <file>.jsonl`), so its parent's parent is the project instead.
+/// machine-wide. A subagent file sits deeper: Claude Code stores it as
+/// `<project>/<session-id>/subagents/<file>.jsonl`, so the `subagents/`
+/// directory and the session-id directory above it are both stepped over;
+/// a flat `<project>/subagents/<file>.jsonl` layout steps over `subagents/`
+/// only.
 pub(crate) fn project_dir_of(path: &Path) -> Option<String> {
     let parent = path.parent()?;
-    let project_dir = if parent.file_name().and_then(|n| n.to_str()) == Some("subagents") {
-        parent.parent()?
-    } else {
-        parent
-    };
+    let mut project_dir = parent;
+    if parent.file_name().and_then(|n| n.to_str()) == Some("subagents") {
+        project_dir = parent.parent()?;
+        if project_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(looks_like_session_id)
+        {
+            project_dir = project_dir.parent()?;
+        }
+    }
     project_dir
         .file_name()
         .map(|name| name.to_string_lossy().to_string())
+}
+
+/// A Claude Code session id directory name: the 36-character hyphenated
+/// UUID form, and nothing else.
+fn looks_like_session_id(name: &str) -> bool {
+    name.len() == 36
+        && name.bytes().enumerate().all(|(i, b)| match i {
+            8 | 13 | 18 | 23 => b == b'-',
+            _ => b.is_ascii_hexdigit(),
+        })
 }
 
 fn ranked(counts: hashbrown::HashMap<String, usize>) -> Vec<(String, usize)> {
@@ -3955,6 +3974,24 @@ mod tests {
         ] {
             assert_eq!(correction_phrase(line), None, "false positive on {line:?}");
         }
+    }
+
+    /// Codex review (3.14.0 round 1): a subagent transcript under the real
+    /// `<project>/<session-id>/subagents/` layout is attributed to the
+    /// project, not to the session-id directory; the flat
+    /// `<project>/subagents/` layout still attributes to the project.
+    #[test]
+    fn project_dir_of_steps_over_the_session_directory_of_a_subagent_transcript() {
+        let nested = Path::new(
+            "/home/u/.claude/projects/-work-repo/11111111-2222-4333-8444-555555555555/subagents/agent-1.jsonl",
+        );
+        assert_eq!(project_dir_of(nested).as_deref(), Some("-work-repo"));
+        let flat = Path::new("/home/u/.claude/projects/-work-repo/subagents/agent-1.jsonl");
+        assert_eq!(project_dir_of(flat).as_deref(), Some("-work-repo"));
+        let session = Path::new(
+            "/home/u/.claude/projects/-work-repo/11111111-2222-4333-8444-555555555555.jsonl",
+        );
+        assert_eq!(project_dir_of(session).as_deref(), Some("-work-repo"));
     }
 
     #[test]

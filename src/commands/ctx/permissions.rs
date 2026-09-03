@@ -1270,7 +1270,28 @@ fn scoped_transcript_dirs(agent: AuditAgent, args: &AuditArgs) -> Vec<PathBuf> {
         return Vec::new();
     };
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    resolve_scope_dirs(&root, agent, args.repo.as_deref(), args.all_repos, &cwd)
+    let repo = args
+        .repo
+        .as_deref()
+        .map(|repo| absolute_repo_target(repo, &cwd));
+    resolve_scope_dirs(&root, agent, repo.as_deref(), args.all_repos, &cwd)
+}
+
+/// `--repo <path>` as Claude Code would have encoded it: an absolute path
+/// with no `.` components, so `--repo .` names the same project directory the
+/// cwd default does instead of encoding as a bare `-` (codex review, round 1).
+/// Pure over `cwd`; symlinks and `..` are left as given, matching the
+/// harness's own use of the working directory's spelling.
+fn absolute_repo_target(repo: &Path, cwd: &Path) -> PathBuf {
+    let joined = if repo.is_absolute() {
+        repo.to_path_buf()
+    } else {
+        cwd.join(repo)
+    };
+    joined
+        .components()
+        .filter(|component| !matches!(component, std::path::Component::CurDir))
+        .collect()
 }
 
 /// Issue #320: transcripts matching a `--session <id-or-short-prefix>`
@@ -5913,6 +5934,25 @@ mod tests {
                 "/Users/jonathansolskov/work/gitte/gitlab.cego.dk/spilnu/services/marketing-automation"
             )),
             "-Users-jonathansolskov-work-gitte-gitlab-cego-dk-spilnu-services-marketing-automation"
+        );
+    }
+
+    /// Codex review, round 1: `--repo .` (or any relative spelling) must name
+    /// the same project directory the cwd default names, never a bare `-`.
+    #[test]
+    fn absolute_repo_target_resolves_relative_spellings_against_cwd() {
+        let cwd = Path::new("/work/repo");
+        assert_eq!(
+            claude_project_dir_name(&absolute_repo_target(Path::new("."), cwd)),
+            claude_project_dir_name(cwd)
+        );
+        assert_eq!(
+            claude_project_dir_name(&absolute_repo_target(Path::new("./sub"), cwd)),
+            claude_project_dir_name(Path::new("/work/repo/sub"))
+        );
+        assert_eq!(
+            absolute_repo_target(Path::new("/elsewhere/x"), cwd),
+            PathBuf::from("/elsewhere/x")
         );
     }
 
