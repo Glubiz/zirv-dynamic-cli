@@ -134,6 +134,7 @@ model = "fable"
 # max_harness_bytes = 4096           # REPO-FORBIDDEN (ZIRV_CTX_CONTEXT_MAX_HARNESS_BYTES): cap on .zirv/context/claude.md or codex.md. Default: 4096.
 # max_harness_roster_bytes = 4096    # REPO-FORBIDDEN (ZIRV_CTX_CONTEXT_MAX_HARNESS_ROSTER_BYTES): budget `zirv context status` measures the derived harness roster against. Default: 4096.
 # dedupe_native = true                # not REPO-FORBIDDEN (repo may only narrow to false, like pace.enabled but inverted): skip re-injecting the canonical layer when CLAUDE.md/AGENTS.md's embedded hash already matches it. Default: true.
+# lint_max_pairs = 20000              # REPO-FORBIDDEN (ZIRV_CTX_CONTEXT_LINT_MAX_PAIRS): cap on sentence pairs `zirv context lint`'s CTX002/CTX003 checks compare. Default: 20000.
 
 # [mail]
 # enabled = true                     # REPO-FORBIDDEN (ZIRV_CTX_MAIL): whether the mailbox is on at all. Default: true.

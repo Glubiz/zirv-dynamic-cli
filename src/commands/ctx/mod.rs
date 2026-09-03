@@ -9,6 +9,7 @@ pub mod compile;
 pub mod config;
 pub mod context;
 pub mod context_cli;
+pub mod context_lint;
 pub mod context_status;
 pub mod dash;
 pub mod drift;
