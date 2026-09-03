@@ -31,11 +31,11 @@
 
 | Task | Started | Finished | Evidence |
 | --- | --- | --- | --- |
-| T1 |  |  |  |
-| T2 |  |  |  |
-| T3 |  |  |  |
-| T4 |  |  |  |
-| T5 |  |  |  |
-| T6 |  |  |  |
-| T7 |  |  |  |
-| T8 |  |  |  |
+| T1 | 2026-09-02 | 2026-09-03 | Track A 6733085, merged ad7c320; `permit:: agent:: spawnreq:: engine:: config:: log::` 373/373 |
+| T2 | 2026-09-02 | 2026-09-03 | Track C d003373, merged 6b1b7d6; `event:: window:: adapters:: score:: rot:: telemetry::` 471 passed, 3 baselined |
+| T3 | 2026-09-02 | 2026-09-02 | Track D 7a7bfea, merged b241612; 323/324 (1 concurrency artifact, green on the branch) |
+| T4 | 2026-09-03 | 2026-09-03 | Track B 944177f+2c657b4, merged 712a6f7; 887/887 |
+| T5 | 2026-09-03 | 2026-09-03 | Track E b5d0158+803a051, merged 01bc7d3; `compile:: prompt:: hook:: context_lint:: context_cli::` 342/342 |
+| T6 | 2026-09-03 | 2026-09-03 | gates-3/4 logs: serial failures == the 6 baselined names; fmt/clippy clean; extra Track F #306 (5d104f1) and dash coordinator fix ea7a402 |
+| T7 | 2026-09-03 | 2026-09-03 | linux-round-6: 3903 passed / 0 failed, clippy clean on ea7a402 |
+| T8 | 2026-09-03 |  | vault pages a253dfc; review round + PR pending |
