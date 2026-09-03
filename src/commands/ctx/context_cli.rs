@@ -61,7 +61,13 @@ use std::path::{Path, PathBuf};
 use clap::{Parser, Subcommand};
 
 use super::CtxResult;
+use super::adapters;
+use super::compile;
+use super::config::{CtxConfig, EnvLookup, env_from_process};
+use super::context_lint;
 use super::context_status::{self, StatusArgs};
+use super::prompt;
+use super::state::{self, StateDir};
 use super::{context, drift, optimize};
 
 /// A generated compatibility file's first line: stable across every
@@ -391,7 +397,42 @@ fn run_report<W: Write>(w: &mut W, repo: &Path) -> CtxResult<i32> {
          context, or `zirv context sync --generate` to render canonical context into managed \
          native files."
     )?;
-    Ok(0)
+
+    // Issue #275: CTX001 (budget headroom) and CTX005 (dedupe leak) are the
+    // two `zirv context lint` findings wired into this gate as errors --
+    // every other finding (CTX002/CTX003/CTX004) stays advisory-only and is
+    // never printed here; `zirv context lint` is the full report. Always at
+    // the `Standard` budget profile: this report's pass/fail must match the
+    // configured `ctx.toml` budgets exactly, never a `--budget`-scaled one.
+    let env = env_from_process();
+    let cfg = CtxConfig::load(repo, &env)?;
+    let (layers, dedupe_leak) = gather_layers(repo, &cfg, BudgetProfile::Standard, &env);
+    let lint_report = context_lint::analyze(&layers, cfg.context.lint_max_pairs, dedupe_leak);
+    let blocking: Vec<&context_lint::Finding> = lint_report
+        .findings
+        .iter()
+        .filter(|f| {
+            (f.id == context_lint::CTX001_BUDGET_HEADROOM
+                || f.id == context_lint::CTX005_DEDUPE_LEAK)
+                && f.severity == context_lint::Severity::Error
+        })
+        .collect();
+    if !blocking.is_empty() {
+        writeln!(
+            w,
+            "\n{} context-lint error(s) (run `zirv context lint` for the full report):",
+            blocking.len()
+        )?;
+        for finding in &blocking {
+            writeln!(
+                w,
+                "  [{}] {}: {}",
+                finding.id, finding.layer, finding.message
+            )?;
+        }
+    }
+
+    Ok(if blocking.is_empty() { 0 } else { 1 })
 }
 
 fn run_generate<W: Write>(w: &mut W, repo: &Path, force: bool) -> CtxResult<i32> {
@@ -493,6 +534,297 @@ fn run_import<W: Write>(w: &mut W, repo: &Path, force: bool) -> CtxResult<i32> {
     Ok(if any_refused { 1 } else { 0 })
 }
 
+/// `--budget <profile>` for `zirv context lint`: which target CTX001 checks
+/// each layer's bytes against. The issue names the three profiles but not a
+/// scaling rule between them, so this is a deliberately simple, documented
+/// interpretation: `compact` checks against half the configured `ctx.toml`
+/// cap (catches headroom problems earlier), `standard` (the default) checks
+/// the configured cap exactly, `full` allows double. Only the CLI's own
+/// `--budget` flag is ever anything but `Standard` -- `zirv context sync
+/// --report` and the workflow verify gate's `context-lint` check both
+/// always lint at `Standard`, so a repository's real pass/fail behaviour
+/// never depends on this flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[value(rename_all = "lowercase")]
+pub enum BudgetProfile {
+    Compact,
+    Standard,
+    Full,
+}
+
+impl BudgetProfile {
+    fn scale(self, cap: usize) -> usize {
+        match self {
+            BudgetProfile::Compact => cap / 2,
+            BudgetProfile::Standard => cap,
+            BudgetProfile::Full => cap.saturating_mul(2),
+        }
+    }
+}
+
+#[derive(Debug, clap::Args)]
+pub struct LintArgs {
+    /// Print the report as JSON (`"schema": 1`) instead of plain text.
+    #[arg(long)]
+    pub json: bool,
+    /// Which budget profile CTX001 checks each layer against -- see
+    /// [`BudgetProfile`]'s own doc comment.
+    #[arg(long, value_enum, default_value = "standard")]
+    pub budget: BudgetProfile,
+    /// For every layer at or above the CTX001 warn threshold, list the top
+    /// duplicate sentences and code fences by byte cost that could be
+    /// removed or moved. Never writes or edits anything -- see
+    /// `context_lint::fix_plan`'s own doc comment.
+    #[arg(long = "fix-plan")]
+    pub fix_plan: bool,
+}
+
+/// The two built-in prompt blocks (`"default prompt"`/`"harness prompt"`),
+/// via [`compile::CompiledContext::emitted_layers`] (issue #275) over a real,
+/// read-only compile -- the exact same safe, session-free `compile::compile`
+/// call `context_status::run_with` already proves never spawns the
+/// configured agent binary (`status_never_spawns_the_configured_agent_
+/// binary`). Sliced straight out of `composed.text` by the byte ranges
+/// `emitted_layers` reports, never a second, independent read of either
+/// constant.
+///
+/// Falls back to reading [`prompt::DEFAULT_PROMPT`]/[`prompt::HARNESS_
+/// PROMPT`] directly when `StateDir::resolve`/`adapters::select` do not
+/// resolve cleanly (an unusual environment) or the compile produced no
+/// composed prompt at all (`prompt.enabled = false`) -- `zirv context lint`
+/// must never fail just because the compiler path had a problem; the built-
+/// in prompt TEXT is byte-identical either way.
+fn built_in_prompt_layers(
+    repo: &Path,
+    cfg: &CtxConfig,
+    env: EnvLookup<'_>,
+) -> Vec<context_lint::LintLayer> {
+    if let (Ok(state), Ok(adapter)) = (
+        StateDir::resolve(env),
+        adapters::select(cfg.agent.as_deref(), &[], cfg),
+    ) {
+        let home = crate::utils::home_dir().ok();
+        let compiled = compile::compile(
+            home.as_deref(),
+            repo,
+            false,
+            cfg,
+            adapter.as_ref(),
+            prompt::PromptRole::Orchestrator,
+            &state,
+            state::now_secs(),
+            adapters::LaunchMode::Headless,
+            false,
+        );
+        if let Some(composed) = &compiled.composed {
+            let text = composed.text.as_str();
+            let mut out = Vec::new();
+            for emitted in compiled.emitted_layers() {
+                let name = match emitted.source {
+                    prompt::PromptSource::Default => "default prompt",
+                    prompt::PromptSource::Harness => "harness prompt",
+                    _ => continue,
+                };
+                out.push(context_lint::LintLayer::new(name, &text[emitted.range]));
+            }
+            if !out.is_empty() {
+                return out;
+            }
+        }
+    }
+    vec![
+        context_lint::LintLayer::new("default prompt", prompt::DEFAULT_PROMPT),
+        context_lint::LintLayer::new("harness prompt", prompt::HARNESS_PROMPT),
+    ]
+}
+
+/// Reads every instructional layer `zirv context lint` analyses, exactly the
+/// same files `compile.rs`'s own canonical-context layer and `context_cli`'s
+/// `sync`/native-file handling already read (`context::common_path`/
+/// `claude_path`/`codex_path`, `native_claude_path`/`native_codex_path`),
+/// plus the two built-in prompt layers from [`built_in_prompt_layers`] --
+/// never a second, independently-typed copy of any of that text. This is the
+/// one place in this module that touches a filesystem for `lint`;
+/// `context_lint::analyze` itself is pure (see that module's own doc
+/// comment).
+///
+/// A zirv-managed native file (`is_managed`) is excluded from cross-layer
+/// comparison: it is a verbatim render of the canonical layer it came from,
+/// so comparing it against that layer would be a tautological "duplicate",
+/// the exact exclusion `surfaces_for_drift` already applies to drift
+/// analysis. A hand-authored native file (not managed) IS compared -- it is
+/// real, independent instructional prose that can genuinely duplicate or
+/// contradict the canonical layer.
+///
+/// Returns layers sorted by name (a stable, caller-controlled input order is
+/// `context_lint::analyze`'s own determinism requirement -- see that
+/// function's doc comment) and, when `cfg.context.dedupe_native` is on, at
+/// most one [`context_lint::DedupeLeak`] -- the FIRST native file found
+/// (`CLAUDE.md` checked before `AGENTS.md`) whose embedded canonical hash
+/// claims a match that its actual bytes do not honour (issue #275's "EOL
+/// mismatch class"). Both leaking simultaneously share the same fix
+/// (`zirv context sync --generate --force`), so reporting the first is
+/// enough to point an operator at the right command.
+fn gather_layers(
+    repo: &Path,
+    cfg: &CtxConfig,
+    budget: BudgetProfile,
+    env: EnvLookup<'_>,
+) -> (
+    Vec<context_lint::LintLayer>,
+    Option<context_lint::DedupeLeak>,
+) {
+    let mut layers = Vec::new();
+
+    let common_text = fs::read_to_string(context::common_path(repo))
+        .ok()
+        .filter(|t| !t.trim().is_empty());
+    if let Some(text) = &common_text {
+        layers.push(
+            context_lint::LintLayer::new("common.md", text.clone())
+                .with_budget(
+                    "context.max_common_bytes",
+                    budget.scale(cfg.context.max_common_bytes),
+                )
+                .cross_compared(),
+        );
+    }
+
+    let mut harness_text_by_name: Vec<(&str, Option<String>)> = Vec::new();
+    for (name, path) in [
+        ("claude.md", context::claude_path(repo)),
+        ("codex.md", context::codex_path(repo)),
+    ] {
+        let text = fs::read_to_string(&path)
+            .ok()
+            .filter(|t| !t.trim().is_empty());
+        if let Some(t) = &text {
+            layers.push(
+                context_lint::LintLayer::new(name, t.clone())
+                    .with_budget(
+                        "context.max_harness_bytes",
+                        budget.scale(cfg.context.max_harness_bytes),
+                    )
+                    .cross_compared(),
+            );
+        }
+        harness_text_by_name.push((name, text));
+    }
+    let harness_text_for = |wanted: &str| -> Option<String> {
+        harness_text_by_name
+            .iter()
+            .find(|(name, _)| *name == wanted)
+            .and_then(|(_, text)| text.clone())
+    };
+
+    let mut dedupe_leak = None;
+    for (name, native_path, harness_text) in [
+        (
+            "CLAUDE.md",
+            native_claude_path(repo),
+            harness_text_for("claude.md"),
+        ),
+        (
+            "AGENTS.md",
+            native_codex_path(repo),
+            harness_text_for("codex.md"),
+        ),
+    ] {
+        let Ok(native_text) = fs::read_to_string(&native_path) else {
+            continue;
+        };
+        if native_text.trim().is_empty() {
+            continue;
+        }
+        let managed = is_managed(&native_text);
+        let mut layer = context_lint::LintLayer::new(name, native_text.clone());
+        if !managed {
+            layer = layer.cross_compared();
+        }
+        layers.push(layer);
+
+        if dedupe_leak.is_none()
+            && cfg.context.dedupe_native
+            && managed
+            && let Some(embedded) = embedded_canonical_sha256(&native_text)
+            && embedded == canonical_sha256(common_text.as_deref(), harness_text.as_deref())
+            && native_text != render_generated(common_text.as_deref(), harness_text.as_deref())
+        {
+            dedupe_leak = Some(context_lint::DedupeLeak {
+                native_name: name.to_string(),
+            });
+        }
+    }
+
+    layers.extend(built_in_prompt_layers(repo, cfg, env));
+
+    layers.sort_by(|a, b| a.name.cmp(&b.name));
+    (layers, dedupe_leak)
+}
+
+fn render_lint_text<W: Write>(w: &mut W, report: &context_lint::LintReport) -> CtxResult<()> {
+    writeln!(
+        w,
+        "zirv context lint (read-only; nothing on disk is changed)\n"
+    )?;
+    if report.findings.is_empty() {
+        writeln!(w, "no findings")?;
+    }
+    for finding in &report.findings {
+        writeln!(
+            w,
+            "[{}] {} {}: {}",
+            finding.id,
+            finding.severity.as_str(),
+            finding.layer,
+            finding.message
+        )?;
+    }
+    if report.degraded {
+        writeln!(
+            w,
+            "\ndegraded: context.lint_max_pairs was exhausted before every sentence pair was \
+             compared -- duplicate/contradiction detection is partial. Raise context.lint_max_pairs \
+             in ~/.zirv/ctx.toml to compare more."
+        )?;
+    }
+    Ok(())
+}
+
+pub fn run_lint_with<W: Write>(
+    args: &LintArgs,
+    w: &mut W,
+    repo: &Path,
+    env: EnvLookup<'_>,
+) -> CtxResult<i32> {
+    let cfg = CtxConfig::load(repo, env)?;
+    let (layers, dedupe_leak) = gather_layers(repo, &cfg, args.budget, env);
+    let report = context_lint::analyze(&layers, cfg.context.lint_max_pairs, dedupe_leak);
+
+    if args.json {
+        writeln!(w, "{}", serde_json::to_string_pretty(&report)?)?;
+    } else {
+        render_lint_text(w, &report)?;
+        if args.fix_plan {
+            let plan = context_lint::fix_plan(&layers, &report);
+            if !plan.is_empty() {
+                writeln!(w, "\nfix plan (nothing is written; a plan only):")?;
+                for line in plan {
+                    writeln!(w, "{line}")?;
+                }
+            }
+        }
+    }
+
+    Ok(if report.has_blocking_error() { 1 } else { 0 })
+}
+
+pub fn run_lint<W: Write>(args: &LintArgs, w: &mut W) -> CtxResult<i32> {
+    let repo = std::env::current_dir()?;
+    let env = env_from_process();
+    run_lint_with(args, w, &repo, &env)
+}
+
 #[derive(Debug, clap::Args)]
 #[command(group(clap::ArgGroup::new("sync_mode").args(["report", "import", "generate"]).multiple(false)))]
 pub struct SyncArgs {
@@ -560,6 +892,13 @@ pub enum ContextVerb {
     /// Inspect, import, or generate CLAUDE.md/AGENTS.md compatibility with
     /// canonical `.zirv/context/`.
     Sync(SyncArgs),
+    /// Pure, read-only analysis over the same instructional layers a launch
+    /// composes: per-layer budget headroom (CTX001), cross-layer
+    /// sentence-level near-duplicates (CTX002), contradiction candidates
+    /// (CTX003), proportionality (CTX004), and a dedupe-leak check (CTX005).
+    /// Never writes anything, `--fix-plan` included -- see `context_lint`'s
+    /// own module doc comment (issue #275).
+    Lint(LintArgs),
     /// Report exactly what Zirv-managed context a session would receive:
     /// discovered instruction surfaces, canonical vs native/harness-specific
     /// split, memory/mail/handoff contribution, the harness/orchestration
@@ -593,6 +932,7 @@ pub fn dispatch(args: &[String]) -> i32 {
     let result = match &cli.verb {
         ContextVerb::Sync(a) => run(a, &mut out),
         ContextVerb::Status(a) => context_status::run(a, &mut out),
+        ContextVerb::Lint(a) => run_lint(a, &mut out),
     };
 
     match result {
@@ -1080,7 +1420,7 @@ mod tests {
                 assert!(!args.generate);
                 assert!(matches!(mode(&args), SyncMode::Report));
             }
-            ContextVerb::Status(_) => panic!("expected the sync verb"),
+            other => panic!("expected the sync verb, got {other:?}"),
         }
     }
 
@@ -1112,6 +1452,14 @@ mod tests {
             ]),
             0
         );
+        assert_eq!(
+            dispatch(&[
+                "context".to_string(),
+                "lint".to_string(),
+                "--help".to_string()
+            ]),
+            0
+        );
     }
 
     #[test]
@@ -1128,6 +1476,146 @@ mod tests {
             "sync".to_string(),
             "--report".to_string(),
         ]);
+        assert_eq!(code, 0);
+    }
+
+    // -- `zirv context lint` --------------------------------------------
+
+    fn lint_args(json: bool, fix_plan: bool) -> LintArgs {
+        LintArgs {
+            json,
+            budget: BudgetProfile::Standard,
+            fix_plan,
+        }
+    }
+
+    fn run_lint(args: &LintArgs, repo: &Path) -> (i32, String) {
+        let mut out = Vec::new();
+        let env: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let code =
+            run_lint_with(args, &mut out, repo, &|k| env.get(k).cloned()).expect("run_lint_with");
+        (code, String::from_utf8(out).expect("utf8"))
+    }
+
+    /// Acceptance criterion: `common.md` at 4047/4096 bytes warns; 4097
+    /// errors (and the exit code goes non-zero).
+    #[test]
+    fn ctx001_matches_the_repo_common_md_byte_budget_exactly() {
+        let (dir, _guard) = repo();
+        write_canonical(dir.path(), "common.md", &"x".repeat(4047));
+        let (code, out) = run_lint(&lint_args(false, false), dir.path());
+        assert_eq!(code, 0, "a warn alone must not fail the exit code: {out}");
+        assert!(out.contains("[CTX001] warn common.md"), "got {out}");
+
+        write_canonical(dir.path(), "common.md", &"x".repeat(4097));
+        let (code, out) = run_lint(&lint_args(false, false), dir.path());
+        assert_eq!(
+            code, 1,
+            "an over-budget layer must fail the exit code: {out}"
+        );
+        assert!(out.contains("[CTX001] error common.md"), "got {out}");
+    }
+
+    /// Acceptance criterion: a planted cross-layer duplicate DOES fire.
+    #[test]
+    fn ctx002_fires_on_a_planted_duplicate_between_real_files() {
+        let (dir, _guard) = repo();
+        let sentence = "Never force-push to the shared release branch without asking first.";
+        write_canonical(dir.path(), "common.md", sentence);
+        write_canonical(dir.path(), "claude.md", sentence);
+        let (_, out) = run_lint(&lint_args(false, false), dir.path());
+        assert!(out.contains("[CTX002]"), "got {out}");
+    }
+
+    /// Acceptance criterion: a planted contradiction DOES fire, as a
+    /// non-blocking candidate.
+    #[test]
+    fn ctx003_fires_on_a_planted_contradiction_between_real_files() {
+        let (dir, _guard) = repo();
+        write_canonical(
+            dir.path(),
+            "common.md",
+            "Always restart the daemon automatically after every crash.",
+        );
+        write_canonical(
+            dir.path(),
+            "claude.md",
+            "Never restart the daemon automatically after any crash.",
+        );
+        let (code, out) = run_lint(&lint_args(false, false), dir.path());
+        assert!(out.contains("[CTX003]"), "got {out}");
+        assert_eq!(code, 0, "CTX003 must never be blocking: {out}");
+    }
+
+    /// A managed native `CLAUDE.md`/`AGENTS.md` (a verbatim render) must
+    /// never be reported as duplicating the canonical layer it renders --
+    /// the same exclusion `surfaces_for_drift` already applies.
+    #[test]
+    fn a_managed_native_file_never_triggers_a_duplicate_against_its_own_canonical_source() {
+        let (dir, _guard) = repo();
+        write_canonical(
+            dir.path(),
+            "common.md",
+            "- always run the full test suite\n",
+        );
+        fs::write(
+            native_claude_path(dir.path()),
+            format!("{MANAGED_MARKER}\n\n- always run the full test suite\n"),
+        )
+        .expect("write");
+        let (_, out) = run_lint(&lint_args(false, false), dir.path());
+        assert!(!out.contains("[CTX002]"), "got {out}");
+    }
+
+    #[test]
+    fn json_output_is_schema_versioned_and_parses() {
+        let (dir, _guard) = repo();
+        write_canonical(dir.path(), "common.md", "Never skip a review.");
+        let (_, out) = run_lint(&lint_args(true, false), dir.path());
+        let value: serde_json::Value = serde_json::from_str(&out).expect("valid json");
+        assert_eq!(value["schema"], 1);
+        assert!(value["findings"].is_array());
+    }
+
+    #[test]
+    fn lint_never_writes_anything_to_disk() {
+        let (dir, _guard) = repo();
+        write_canonical(dir.path(), "common.md", &"x".repeat(4097));
+        let before = std::fs::read_dir(dir.path().join(".zirv/context"))
+            .expect("read dir")
+            .count();
+        let _ = run_lint(&lint_args(false, true), dir.path());
+        let after = std::fs::read_dir(dir.path().join(".zirv/context"))
+            .expect("read dir")
+            .count();
+        assert_eq!(
+            before, after,
+            "lint --fix-plan must never create or remove a file"
+        );
+        assert_eq!(
+            fs::read_to_string(context::common_path(dir.path())).expect("read"),
+            "x".repeat(4097),
+            "lint --fix-plan must never modify a file's content"
+        );
+    }
+
+    /// Issue #275's verify-gate wiring: `sync --report` folds in CTX001/
+    /// CTX005 ERRORS (and only those) and fails when one is present.
+    #[test]
+    fn sync_report_fails_when_a_ctx001_error_is_present() {
+        let (dir, _guard) = repo();
+        write_canonical(dir.path(), "common.md", &"x".repeat(4097));
+        let (code, out) = run_sync(&report_args(), dir.path());
+        assert_eq!(code, 1, "got {out}");
+        assert!(out.contains("[CTX001]"), "got {out}");
+        assert!(out.contains("context-lint error"), "got {out}");
+    }
+
+    #[test]
+    fn sync_report_stays_green_with_no_ctx001_or_ctx005_errors() {
+        let (dir, _guard) = repo();
+        write_canonical(dir.path(), "common.md", "short and sweet");
+        let (code, _) = run_sync(&report_args(), dir.path());
         assert_eq!(code, 0);
     }
 }

@@ -178,6 +178,167 @@ pub struct CompiledContext {
     pub harness_roster: Option<prompt::HarnessRosterInjection>,
 }
 
+/// One layer of a compiled prompt, in the order `compose`/`compile_with_
+/// harness_roster` actually emitted it, exposing the byte range that
+/// layer's own text occupies within [`CompiledContext::composed`]'s `text`
+/// and the `ctx.toml` key naming its configured budget, if it has one
+/// enforced at compose time.
+///
+/// Built entirely from data [`CompiledContext`] already holds and the exact
+/// literal header constants `prompt.rs`'s own `with_*_layer` functions write
+/// (`CONTEXT_LAYER_HEADER`, `HARNESS_ROSTER_LAYER_HEADER`, `WORKFLOW_LAYER_
+/// HEADER`, `MEMORY_PRIVATE_LAYER_HEADER`/`MEMORY_SHARED_LAYER_HEADER`) --
+/// **no file is read again** to build this list, only `composed.text` and
+/// `composed.sources`, both already in memory. Issue #275 (`zirv context
+/// lint`) is the first consumer (CTX004 proportionality over the built-in
+/// `Default`/`Harness` blocks, sliced straight out of an already-compiled
+/// prompt); issue #299 (prefix-stability tests) is expected to reuse this
+/// same accessor rather than re-deriving layer boundaries its own way --
+/// name/shape changes here should keep both in mind.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EmittedLayer {
+    pub source: PromptSource,
+    pub range: std::ops::Range<usize>,
+    /// The `ctx.toml` key naming this layer's configured budget (e.g.
+    /// `"context.max_harness_roster_bytes"`), when this layer has exactly
+    /// one. `None` for a layer with no single configured cap: `Default`/
+    /// `Harness` are fixed built-in text with no operator knob; `Context`'s
+    /// two sub-budgets (`context.max_common_bytes`/`max_harness_bytes`) are
+    /// already reported per-file by `CompiledContext::provenance` instead of
+    /// once for the combined block; `Workflow`/`Memory`/`Objective` are
+    /// uncapped or capped by a sum of two keys, not one.
+    pub budget_key: Option<&'static str>,
+}
+
+impl CompiledContext {
+    /// See [`EmittedLayer`]'s own doc comment. Walks `composed.sources` --
+    /// already in emission order, per every doc comment in this module and
+    /// `prompt.rs` -- locating each covered layer's start with the exact
+    /// literal header its own writer used, and closing the PREVIOUS layer's
+    /// range at that position. A layer with no reliable literal to search for
+    /// (`User`, the operator's optional global `system-prompt.md`; `Repo`,
+    /// whose header embeds a variable screening summary) is simply absent
+    /// from the returned list rather than reported with a guessed range --
+    /// a caller that needs the repo layer's own size reads `<repo>/.zirv/
+    /// system-prompt.md` directly, the same file this compile already read
+    /// once through `prompt::compose`. Never `panic!`s on an unexpected
+    /// shape: a source whose anchor cannot be found is skipped, not treated
+    /// as a bug in the caller.
+    pub fn emitted_layers(&self) -> Vec<EmittedLayer> {
+        let Some(composed) = &self.composed else {
+            return Vec::new();
+        };
+        let text = composed.text.as_str();
+        let mut out: Vec<EmittedLayer> = Vec::new();
+        let mut cursor = 0usize;
+
+        // `end` is `Some` only for a layer whose byte length is already
+        // known from other `CompiledContext` fields without looking at
+        // `composed.text` at all (`Default`/`Harness`, fixed built-in
+        // constants; `Harnesses`, `harness_roster.delivered_bytes`) --
+        // `None` means "ends wherever the next covered layer starts, or at
+        // the end of the text", resolved in the second pass below.
+        let mut starts_ends: Vec<(usize, Option<usize>, Option<&'static str>)> = Vec::new();
+        let mut sources_found: Vec<PromptSource> = Vec::new();
+
+        for (i, &source) in composed.sources.iter().enumerate() {
+            let is_last = i + 1 == composed.sources.len();
+            let found: Option<(usize, Option<usize>, Option<&'static str>)> = match source {
+                // Always first when present -- `prompt::compose`'s own first
+                // line is `String::from(DEFAULT_PROMPT)`.
+                PromptSource::Default => Some((0, Some(prompt::DEFAULT_PROMPT.len()), None)),
+                PromptSource::Harness => find_after(text, cursor, prompt::HARNESS_PROMPT)
+                    .map(|start| (start, Some(start + prompt::HARNESS_PROMPT.len()), None)),
+                PromptSource::Harnesses => {
+                    find_after(text, cursor, prompt::HARNESS_ROSTER_LAYER_HEADER).and_then(
+                        |header_at| {
+                            let start = header_at + prompt::HARNESS_ROSTER_LAYER_HEADER.len();
+                            self.harness_roster.map(|roster| {
+                                (
+                                    start,
+                                    Some(start + roster.delivered_bytes),
+                                    Some("context.max_harness_roster_bytes"),
+                                )
+                            })
+                        },
+                    )
+                }
+                // The combined common+harness-specific block: its two
+                // sub-budgets are already reported per-file by `provenance`,
+                // so this range covers the whole block with no single budget
+                // key of its own -- its end is resolved in the second pass,
+                // like `Workflow`/`Memory` below.
+                PromptSource::Context => find_after(text, cursor, CONTEXT_LAYER_HEADER)
+                    .map(|header_at| (header_at + CONTEXT_LAYER_HEADER.len(), None, None)),
+                PromptSource::Workflow => find_after(text, cursor, prompt::WORKFLOW_LAYER_HEADER)
+                    .map(|header_at| (header_at + prompt::WORKFLOW_LAYER_HEADER.len(), None, None)),
+                // Private-memory entries render first when present; an
+                // all-shared selection (no private entries at all) starts
+                // with the shared header instead -- try both, in the order
+                // `with_memory_layer` itself would ever actually write one.
+                PromptSource::Memory => {
+                    find_after(text, cursor, prompt::MEMORY_PRIVATE_LAYER_HEADER)
+                        .map(|at| at + prompt::MEMORY_PRIVATE_LAYER_HEADER.len())
+                        .or_else(|| {
+                            find_after(text, cursor, prompt::MEMORY_SHARED_LAYER_HEADER)
+                                .map(|at| at + prompt::MEMORY_SHARED_LAYER_HEADER.len())
+                        })
+                        .map(|start| (start, None, None))
+                }
+                // `with_objective_layer` writes no separator/header of its
+                // own (unlike every layer above), so it has no literal to
+                // search for -- but it is documented (see `PromptSource::
+                // Objective`) to always sit last, so when it truly is the
+                // last source this compile emitted, its start is simply
+                // wherever the previous covered layer's range ended, and its
+                // end is simply the end of the text (also resolved by the
+                // second pass, same as `is_last` gives every other layer).
+                PromptSource::Objective if is_last => Some((cursor, None, None)),
+                _ => None,
+            };
+
+            let Some((start, end, budget_key)) = found else {
+                continue;
+            };
+            starts_ends.push((start, end, budget_key));
+            sources_found.push(source);
+            cursor = end.unwrap_or(start);
+        }
+
+        // Second pass: resolve every `None` end as the start of the NEXT
+        // entry actually found, or the end of `composed.text` for the last
+        // one -- the same "next layer's start, or end of text" rule for
+        // every layer whose own length is not already known structurally.
+        for i in 0..starts_ends.len() {
+            if starts_ends[i].1.is_some() {
+                continue;
+            }
+            let next_start = starts_ends.get(i + 1).map(|(start, ..)| *start);
+            starts_ends[i].1 = Some(next_start.unwrap_or(text.len()));
+        }
+
+        for (source, (start, end, budget_key)) in sources_found.into_iter().zip(starts_ends) {
+            out.push(EmittedLayer {
+                source,
+                range: start..end.unwrap_or(start),
+                budget_key,
+            });
+        }
+        out
+    }
+}
+
+/// The first byte offset of `needle` in `haystack` at or after `from`, or
+/// `None` if it does not occur again. `str::find` on a sub-slice, translated
+/// back to a whole-string offset -- the same technique the golden test in
+/// this module's own `tests` uses (`text.find(anchor)`), just bounded to
+/// search forward from a cursor so an earlier layer's own text (which could,
+/// in principle, contain the same literal) can never be mistaken for a later
+/// layer's header.
+fn find_after(haystack: &str, from: usize, needle: &str) -> Option<usize> {
+    haystack[from..].find(needle).map(|at| from + at)
+}
+
 /// Gathers the always-present core memory layer and the independent,
 /// context-ranked retrieval layer. Core selection remains private-first and
 /// capped by `core_max_bytes`; retrieval uses changed repository paths as its
@@ -3009,6 +3170,136 @@ mod tests {
         assert!(
             table.contains(&measure_row("total (session prefix)", total, "")),
             "got:\n{table}"
+        );
+    }
+
+    // -- `CompiledContext::emitted_layers` (issue #275) ----------------------
+
+    #[test]
+    fn emitted_layers_is_empty_without_a_composed_prompt() {
+        let repo = repo_with_context_files(&[]);
+        let mut cfg = CtxConfig::default();
+        cfg.prompt.enabled = false;
+        let adapter = ClaudeAdapter::new(None);
+        let compiled = compile_for(repo.path(), &cfg, &adapter, PromptRole::Worker);
+        assert!(compiled.composed.is_none());
+        assert!(compiled.emitted_layers().is_empty());
+    }
+
+    /// The two built-in blocks slice out byte-for-byte identical to their
+    /// own source constants, and the canonical context block's range covers
+    /// both `common.md`'s and `claude.md`'s text -- proving `emitted_layers`
+    /// locates every covered layer correctly without reading any file a
+    /// second time (it only ever touches `composed.text`, already in
+    /// memory).
+    #[test]
+    fn emitted_layers_slices_match_the_built_in_prompts_and_cover_the_context_block() {
+        let repo = repo_with_context_files(&[
+            ("common.md", "Shared instruction for every harness."),
+            ("claude.md", "Claude-only addition."),
+        ]);
+        let cfg = CtxConfig::default();
+        let adapter = ClaudeAdapter::new(None);
+        let compiled = compile_for(repo.path(), &cfg, &adapter, PromptRole::Orchestrator);
+        let text = compiled.composed.as_ref().expect("composed").text.clone();
+
+        let layers = compiled.emitted_layers();
+        assert!(!layers.is_empty());
+
+        let default_layer = layers
+            .iter()
+            .find(|l| l.source == PromptSource::Default)
+            .expect("a Default layer");
+        assert_eq!(default_layer.range, 0..prompt::DEFAULT_PROMPT.len());
+        assert_eq!(&text[default_layer.range.clone()], prompt::DEFAULT_PROMPT);
+        assert_eq!(default_layer.budget_key, None);
+
+        let harness_layer = layers
+            .iter()
+            .find(|l| l.source == PromptSource::Harness)
+            .expect("Orchestrator role must carry a Harness layer");
+        assert_eq!(&text[harness_layer.range.clone()], prompt::HARNESS_PROMPT);
+
+        let context_layer = layers
+            .iter()
+            .find(|l| l.source == PromptSource::Context)
+            .expect("a Context layer");
+        let context_text = &text[context_layer.range.clone()];
+        assert!(context_text.contains("Shared instruction for every harness."));
+        assert!(context_text.contains("Claude-only addition."));
+        assert_eq!(context_layer.budget_key, None);
+    }
+
+    /// General shape invariant: every returned range is well-formed
+    /// (`start <= end`), ranges never overlap, and they appear in
+    /// non-decreasing start order -- true "emission order", not merely a
+    /// permutation of it.
+    #[test]
+    fn emitted_layers_ranges_are_well_formed_non_overlapping_and_in_emission_order() {
+        let repo = repo_with_context_files(&[
+            ("common.md", "Shared instruction for every harness."),
+            ("claude.md", "Claude-only addition."),
+        ]);
+        let cfg = CtxConfig::default();
+        let adapter = ClaudeAdapter::new(None);
+        let compiled = compile_for(repo.path(), &cfg, &adapter, PromptRole::Orchestrator);
+        let layers = compiled.emitted_layers();
+
+        let mut prev_end = 0usize;
+        for layer in &layers {
+            assert!(
+                layer.range.start <= layer.range.end,
+                "malformed range for {:?}: {:?}",
+                layer.source,
+                layer.range
+            );
+            assert!(
+                layer.range.start >= prev_end,
+                "{:?} at {:?} overlaps the previous layer (prev end {prev_end})",
+                layer.source,
+                layer.range
+            );
+            prev_end = layer.range.end;
+        }
+    }
+
+    #[test]
+    fn emitted_layers_harnesses_budget_key_is_reported_when_the_layer_is_present() {
+        let repo = repo_with_context_files(&[]);
+        let cfg = CtxConfig::default();
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+        let adapter = ClaudeAdapter::new(None);
+        let compiled = compile_with_harness_roster(
+            None,
+            repo.path(),
+            false,
+            &cfg,
+            &adapter,
+            PromptRole::Orchestrator,
+            &state,
+            now_secs(),
+            true,
+            LaunchMode::Interactive,
+            false,
+        );
+        let layers = compiled.emitted_layers();
+        let Some(harnesses) = layers.iter().find(|l| l.source == PromptSource::Harnesses) else {
+            // Environment-dependent (no other live adapter registered on this
+            // machine): absent is a legitimate outcome, not a failure --
+            // `compiled.harness_roster` being `None` is this same gate's own
+            // "nothing to report" case.
+            assert!(compiled.harness_roster.is_none());
+            return;
+        };
+        assert_eq!(
+            harnesses.budget_key,
+            Some("context.max_harness_roster_bytes")
+        );
+        let roster = compiled.harness_roster.expect("harness_roster present");
+        assert_eq!(
+            harnesses.range.end - harnesses.range.start,
+            roster.delivered_bytes
         );
     }
 }

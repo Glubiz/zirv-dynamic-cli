@@ -47,6 +47,11 @@ pub enum CheckKind {
     Integration,
     Typecheck,
     Build,
+    /// Issue #275: `zirv context lint`'s own CTX001/CTX005 gate over
+    /// `.zirv/context/` and the native `CLAUDE.md`/`AGENTS.md` compat
+    /// files. Discovered (never repo-authored) whenever `.zirv/context/`
+    /// exists -- see `load_or_discover_raw`.
+    ContextLint,
     Custom,
 }
 
@@ -321,6 +326,29 @@ fn load_or_discover_raw(repo: &Path) -> CtxResult<(VerificationConfig, &'static 
                 });
             }
         }
+    }
+    // Issue #275: `zirv context lint`'s own CTX001 (budget headroom) and
+    // CTX005 (dedupe leak) findings are wired into this gate as errors --
+    // discovered, like the Cargo/npm checks above, whenever the repository
+    // actually has a canonical `.zirv/context/` layer to lint. zirv's own
+    // text (`DiscoveredToolchain`), never repo-authored: a checkout cannot
+    // widen or narrow what this check runs, only whether it exists at all
+    // (by having a `.zirv/context/` directory in the first place).
+    if repo.join(".zirv").join("context").is_dir() {
+        checks.push(CheckSpec {
+            id: "context-lint".into(),
+            kind: CheckKind::ContextLint,
+            command: "zirv context lint".into(),
+            paths: vec![
+                ".zirv/context/".into(),
+                ".zirv/ctx.toml".into(),
+                "CLAUDE.md".into(),
+                "AGENTS.md".into(),
+            ],
+            changed: true,
+            final_check: true,
+            timeout_secs: 60,
+        });
     }
     let config = VerificationConfig {
         schema_version: VERIFY_CONFIG_SCHEMA_VERSION,
@@ -2752,6 +2780,84 @@ mod tests {
                 .checks
                 .iter()
                 .all(|check| check.source == CheckSource::DiscoveredScript)
+        );
+    }
+
+    /// Issue #275: `.zirv/context/` existing is what makes the
+    /// `context-lint` check appear at all, mirroring `Cargo.toml`/
+    /// `package.json` gating the Cargo/npm checks above.
+    #[test]
+    fn context_lint_check_is_discovered_only_when_zirv_context_exists() {
+        let repo = tempdir().unwrap();
+        let resolved = load_or_discover(repo.path()).unwrap();
+        assert!(
+            !resolved.checks.iter().any(|c| c.spec.id == "context-lint"),
+            "no .zirv/context/ directory, so no context-lint check: {:?}",
+            resolved.checks
+        );
+
+        std::fs::create_dir_all(repo.path().join(".zirv/context")).unwrap();
+        let resolved = load_or_discover(repo.path()).unwrap();
+        let check = resolved
+            .checks
+            .iter()
+            .find(|c| c.spec.id == "context-lint")
+            .expect("context-lint check discovered once .zirv/context/ exists");
+        assert_eq!(check.spec.kind, CheckKind::ContextLint);
+        assert_eq!(
+            check.source,
+            CheckSource::DiscoveredToolchain,
+            "zirv's own check text, never repo-authored"
+        );
+    }
+
+    /// Issue #275: the discovered `context-lint` check's own command --
+    /// `zirv context lint` -- must actually fail (non-zero exit) when a
+    /// canonical layer overflows its budget, the same real pipeline `zirv
+    /// verify`/the workflow verify gate drive `run_check` through
+    /// (`command_for_shell` ultimately runs this exact command text via a
+    /// shell). Drives `context_cli::run_lint_with` in-process rather than
+    /// spawning a real `zirv` subprocess -- `CARGO_BIN_EXE_zirv` is only set
+    /// for a `tests/*.rs` integration binary, not for this crate's own
+    /// `--bin zirv` unit-test target -- so this exercises the exact function
+    /// the discovered command's argv (`zirv context lint`) dispatches to,
+    /// proving a change to `context lint`'s own exit-code contract
+    /// (`context_lint::LintReport::has_blocking_error`) cannot silently stop
+    /// failing this gate.
+    #[test]
+    fn the_context_lint_command_itself_fails_on_a_real_budget_overflow() {
+        let repo = tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join(".zirv/context")).unwrap();
+        std::fs::write(
+            repo.path().join(".zirv/context/common.md"),
+            "x".repeat(4097),
+        )
+        .unwrap();
+        let home = tempdir().unwrap();
+        let _guard = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let empty: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let mut out = Vec::new();
+        let code = crate::commands::ctx::context_cli::run_lint_with(
+            &crate::commands::ctx::context_cli::LintArgs {
+                json: false,
+                budget: crate::commands::ctx::context_cli::BudgetProfile::Standard,
+                fix_plan: false,
+            },
+            &mut out,
+            repo.path(),
+            &|k| empty.get(k).cloned(),
+        )
+        .expect("run_lint_with");
+        let out = String::from_utf8(out).expect("utf8");
+
+        assert_eq!(
+            code, 1,
+            "an over-budget common.md must fail `zirv context lint`: {out}"
+        );
+        assert!(
+            out.contains("CTX001"),
+            "the failure must be attributable to CTX001: {out}"
         );
     }
 
