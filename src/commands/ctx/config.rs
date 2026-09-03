@@ -476,6 +476,22 @@ pub struct ContextConfig {
     /// `pace.enabled`'s "gate is on"), so a repo `true` cannot re-enable a
     /// skip the operator turned off.
     pub dedupe_native: bool,
+    /// Issue #275 (`zirv context lint`): a hard ceiling on how many sentence
+    /// pairs the duplicate (CTX002) and contradiction-candidate (CTX003)
+    /// checks will ever compare across every layer combined. Both checks are
+    /// pairwise over the imperative sentences they collect, so cost grows
+    /// quadratically with the amount of instructional prose across every
+    /// canonical/native layer -- this bounds that, the same "untrusted repo
+    /// text does not get to be unbounded" rationale as `max_common_bytes`
+    /// above, except the resource here is CPU time during `zirv context
+    /// lint`, not injected bytes. Exceeding the cap does not fail the lint:
+    /// `context_lint::analyze` stops comparing once it is spent and reports
+    /// `degraded: true` instead, so a very large repository still gets a
+    /// (partial) report rather than a hang. `REPO_FORBIDDEN`: a repo layer
+    /// could otherwise raise its own cap to force an expensive comparison
+    /// an operator deliberately bounded, the same asymmetry as every other
+    /// numeric key in this struct.
+    pub lint_max_pairs: usize,
 }
 
 impl Default for ContextConfig {
@@ -485,6 +501,7 @@ impl Default for ContextConfig {
             max_harness_bytes: 4096,
             max_harness_roster_bytes: 4096,
             dedupe_native: true,
+            lint_max_pairs: 20_000,
         }
     }
 }
@@ -1484,6 +1501,11 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         &["context", "max_harness_roster_bytes"],
         EnvKind::Int,
     ),
+    (
+        "ZIRV_CTX_CONTEXT_LINT_MAX_PAIRS",
+        &["context", "lint_max_pairs"],
+        EnvKind::Int,
+    ),
     ("ZIRV_CTX_MAIL", &["mail", "enabled"], EnvKind::Bool),
     (
         "ZIRV_CTX_MAIL_MAX_MESSAGE_BYTES",
@@ -1986,6 +2008,14 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     (
         &["context", "max_harness_roster_bytes"],
         "ZIRV_CTX_CONTEXT_MAX_HARNESS_ROSTER_BYTES",
+    ),
+    // Issue #275: without this a repo checkout could raise its own cap on
+    // how many sentence pairs `zirv context lint`'s CTX002/CTX003 checks
+    // compare, turning a bound meant to protect the operator's own CPU time
+    // into a decorative one -- same reasoning as every byte-cap entry above.
+    (
+        &["context", "lint_max_pairs"],
+        "ZIRV_CTX_CONTEXT_LINT_MAX_PAIRS",
     ),
     // Same rationale as prompt.max_repo_bytes above: mail is folded into the
     // composed prompt as its own layer (`with_mail_layer`), and without this
@@ -5989,6 +6019,7 @@ mod tests {
         ("context", "max_harness_bytes"),
         ("context", "max_harness_roster_bytes"),
         ("context", "dedupe_native"),
+        ("context", "lint_max_pairs"),
         ("mail", "enabled"),
         ("mail", "max_message_bytes"),
         ("mail", "max_delivered_bytes"),
