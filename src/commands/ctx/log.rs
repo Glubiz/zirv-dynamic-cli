@@ -14,6 +14,36 @@ pub const DELEGATION_FILE: &str = "delegations.jsonl";
 /// log alongside every delegation record.
 pub const DELEGATION_ACTION: &str = "delegation-complete";
 
+/// Issue #264: what KIND of work one delegation was, for later cost
+/// analysis/routing by kind rather than only by harness or model. Populated
+/// from `--task-class` on `zirv ctx agent`, or derived from the workflow step
+/// that auto-spawned the worker (`workflow::engine::auto_spawn_decision`,
+/// alongside the same call's own `WorkerMode` choice). `#[serde(default)]`
+/// on every reader makes `None` -- "unclassified" -- what a row written
+/// before this field existed, or one whose caller never named a class,
+/// deserializes as; never a guessed default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum TaskClass {
+    Review,
+    Test,
+    Implement,
+    Research,
+    Other,
+}
+
+impl std::fmt::Display for TaskClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Review => "review",
+            Self::Test => "test",
+            Self::Implement => "implement",
+            Self::Research => "research",
+            Self::Other => "other",
+        })
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct Decision<'a> {
     pub ts: u64,
@@ -75,6 +105,10 @@ pub struct Delegation<'a> {
     /// `#[serde(default)]`) as `None` -- readers must treat that as
     /// "unknown", never as either mode outright.
     pub mode: Option<WorkerMode>,
+    /// Issue #264: what kind of work this delegation was, when known -- see
+    /// [`TaskClass`]'s own doc comment. Same "row predates the field, or its
+    /// caller never named one" contract as `mode` above.
+    pub task_class: Option<TaskClass>,
 }
 
 /// The owned, deserializable counterpart of [`Delegation`] (which borrows
@@ -119,6 +153,12 @@ pub struct DelegationRow {
     #[serde(default)]
     #[allow(dead_code)]
     pub mode: Option<WorkerMode>,
+    /// Issue #264: mirrors `Delegation::task_class`. `#[serde(default)]` so a
+    /// row written before this field existed deserialises as `None` rather
+    /// than failing to parse. Read by `spend::aggregate`'s `--by task-class`
+    /// grouping.
+    #[serde(default)]
+    pub task_class: Option<TaskClass>,
 }
 
 pub fn append(state: &StateDir, decision: &Decision<'_>) -> CtxResult<()> {
@@ -433,6 +473,7 @@ mod tests {
                 exit_code: 0,
                 outcome: "ok",
                 mode: Some(WorkerMode::Writing),
+                task_class: None,
             },
         )
         .expect("append");
@@ -484,6 +525,7 @@ mod tests {
                 exit_code: 0,
                 outcome: "ok",
                 mode: Some(WorkerMode::Writing),
+                task_class: Some(TaskClass::Implement),
             },
         )
         .expect("append");
@@ -512,6 +554,7 @@ mod tests {
                 exit_code: 1,
                 outcome: "failed",
                 mode: None,
+                task_class: None,
             },
         )
         .expect("append");
@@ -530,12 +573,46 @@ mod tests {
             Some(WorkerMode::Writing),
             "issue #267: mode round-trips when the writer set it"
         );
+        assert_eq!(
+            rows[0].task_class,
+            Some(TaskClass::Implement),
+            "issue #264: task_class round-trips when the caller set it"
+        );
         assert_eq!(rows[1].session, "sess-child-2");
         assert_eq!(rows[1].work_group_id, None);
         assert_eq!(rows[1].outcome, "failed");
         assert_eq!(
             rows[1].mode, None,
             "issue #267: an omitted mode reads back as unknown, never a guessed default"
+        );
+        assert_eq!(
+            rows[1].task_class, None,
+            "issue #264: an omitted task_class reads back as unclassified, never a guessed default"
+        );
+    }
+
+    /// Issue #264: a `delegations.jsonl` row written before `task_class`
+    /// existed (no such field at all) must still deserialize, and must read
+    /// back as `None` -- the only honest reading for a row that predates the
+    /// field -- mirroring `a_delegation_row_written_before_mode_existed_
+    /// still_deserialises_as_unknown` for the identical `mode` shape.
+    #[test]
+    fn a_delegation_row_written_before_task_class_existed_still_deserialises_as_unclassified() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let dir = state.logs();
+        super::super::state::create_private_dir_all(&dir).expect("mkdir");
+        let old_line = r#"{"ts":1700000000,"session":"sess-child","parent_session":"sess-parent","agent":"codex","input_tokens":1000,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":500,"wall_ms":42000,"exit_code":0,"outcome":"ok","mode":"writing"}"#;
+        let mut file =
+            super::super::state::open_private_append(&dir.join(DELEGATION_FILE)).expect("open");
+        writeln!(file, "{old_line}").expect("write");
+        drop(file);
+
+        let rows = read_delegations(&state, 10);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].task_class, None,
+            "an older row has no honest task_class to report"
         );
     }
 

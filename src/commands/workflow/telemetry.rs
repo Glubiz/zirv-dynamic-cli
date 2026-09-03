@@ -185,6 +185,20 @@ pub struct TelemetryEvent {
     /// field existed still deserializes, correctly, as `false`.
     #[serde(default)]
     pub verification_unchanged: bool,
+    /// Issue #264: this event's own cost, in micro-USD, priced from `model`
+    /// plus the four raw token classes above (`price::price`) -- `None` when
+    /// `model` is unset, or is unpriced (an unrecognised model prices as
+    /// `None`, never `0`; see `price::price`'s own doc comment), or when this
+    /// event carries no token counts at all. `#[serde(default)]` so an event
+    /// written before this field existed still deserializes.
+    #[serde(default)]
+    pub cost_micros: Option<u64>,
+    /// The price table's own `as_of` stamp, alongside `cost_micros` -- so a
+    /// reader (`zirv workflow stats`) can flag a cost computed from a table
+    /// that has since gone stale (`price::PriceTable::is_stale`) without a
+    /// second lookup. `None` exactly when `cost_micros` is `None`.
+    #[serde(default)]
+    pub price_as_of: Option<String>,
 }
 
 impl TelemetryEvent {
@@ -228,6 +242,8 @@ impl TelemetryEvent {
             agent_id: None,
             workflow_active: None,
             verification_unchanged: false,
+            cost_micros: None,
+            price_as_of: None,
         }
     }
 
@@ -252,6 +268,44 @@ impl TelemetryEvent {
         let read = self.cache_read_input_tokens?;
         let total = self.input_tokens?;
         (total > 0).then(|| read as f64 / total as f64)
+    }
+
+    /// This event's own four RAW token classes, reconstructed from its
+    /// "combined context total" `input_tokens` (see that field's own doc
+    /// comment) and the already-separate cache classes -- what `price::
+    /// price` actually needs, as opposed to the pre-summed figure this type
+    /// stores for historical reasons. `None` when `input_tokens` is unset
+    /// (nothing recorded to price at all).
+    pub fn raw_usage(&self) -> Option<crate::commands::ctx::event::TranscriptUsage> {
+        let combined = self.input_tokens?;
+        let cache_write = self.cache_creation_input_tokens.unwrap_or(0);
+        let cache_read = self.cache_read_input_tokens.unwrap_or(0);
+        Some(crate::commands::ctx::event::TranscriptUsage {
+            input_tokens: combined
+                .saturating_sub(cache_write)
+                .saturating_sub(cache_read),
+            cache_creation_input_tokens: cache_write,
+            cache_read_input_tokens: cache_read,
+            output_tokens: self.output_tokens.unwrap_or(0),
+        })
+    }
+
+    /// Prices this event against `table`, setting `cost_micros`/`price_as_of`
+    /// -- best-effort, like every other optional enrichment on this type:
+    /// `None` for `model` or an unpriced one leaves both fields `None`,
+    /// never a phantom `0` (`price::price`'s own "unknown model -> None,
+    /// never 0" contract).
+    pub fn apply_price(&mut self, table: &crate::commands::ctx::price::PriceTable) {
+        let Some(model) = self.model.as_deref() else {
+            return;
+        };
+        let Some(usage) = self.raw_usage() else {
+            return;
+        };
+        if let Some(cost) = crate::commands::ctx::price::price(model, &usage, table) {
+            self.cost_micros = Some(cost);
+            self.price_as_of = Some(table.as_of.clone());
+        }
     }
 }
 
@@ -415,6 +469,12 @@ pub struct PhaseStats {
     /// `--json` carries it without a consumer re-deriving the formula.
     #[serde(default)]
     pub cache_hit_ratio: Option<f64>,
+    /// Issue #264: this phase's summed cost, in micro-USD, over every event
+    /// that priced (`TelemetryEvent::cost_micros`) -- `None` when no event
+    /// in this phase ever priced (no model, or an unpriced one), never a
+    /// manufactured `0`.
+    #[serde(default)]
+    pub cost_micros: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -472,6 +532,11 @@ pub struct WorkflowStats {
     /// this workflow's own defect-rate accounting hook. `None` when this
     /// workflow has recorded no `ReviewRun` event, never a manufactured 0.
     pub confirmed_findings_per_review: Option<f64>,
+    /// Issue #264: this workflow's own summed cost, in micro-USD, over every
+    /// event that priced. `None` when nothing this workflow recorded ever
+    /// priced, never a manufactured `0`.
+    #[serde(default)]
+    pub cost_micros: Option<u64>,
 }
 
 /// Issue #223: how often substantial edit work actually ran inside a `zirv
@@ -558,6 +623,20 @@ pub struct StatsReport {
     /// comment for why this is never a manufactured 0%.
     #[serde(default)]
     pub overall_cache_hit_ratio: Option<f64>,
+    /// Issue #264: summed cost, in micro-USD, over every event in this
+    /// report that priced -- `None` when nothing ever priced (no model on
+    /// any event, or every named model was unpriced), never a manufactured
+    /// `0`.
+    #[serde(default)]
+    pub overall_cost_micros: Option<u64>,
+    /// The price table's own `as_of` stamp behind `overall_cost_micros` --
+    /// whichever priced event's own `price_as_of` was seen last while
+    /// aggregating (every event in one `aggregate()` call is priced from the
+    /// same table in practice, so this is not a meaningful "most recent"
+    /// choice, just a deterministic one). `None` exactly when
+    /// `overall_cost_micros` is `None`.
+    #[serde(default)]
+    pub overall_price_as_of: Option<String>,
     /// Issue #223. Always last -- see `run_stats`'s own ordering comment.
     pub adoption: AdoptionStats,
 }
@@ -587,6 +666,8 @@ pub fn aggregate(events: &[TelemetryEvent]) -> StatsReport {
     let mut overall_input_tokens = 0u64;
     let mut overall_cache_read_input_tokens = 0u64;
     let mut overall_cache_events = 0usize;
+    let mut overall_cost_micros: Option<u64> = None;
+    let mut overall_price_as_of: Option<String> = None;
     for event in events {
         overall_input_tokens = overall_input_tokens.saturating_add(event.input_tokens.unwrap_or(0));
         // `TelemetryEvent::cache_hit_ratio()`'s own "no data, no ratio"
@@ -601,6 +682,10 @@ pub fn aggregate(events: &[TelemetryEvent]) -> StatsReport {
             overall_cache_read_input_tokens = overall_cache_read_input_tokens
                 .saturating_add(event.cache_read_input_tokens.unwrap_or(0));
             overall_cache_events += 1;
+        }
+        if let Some(cost) = event.cost_micros {
+            overall_cost_micros = Some(overall_cost_micros.unwrap_or(0).saturating_add(cost));
+            overall_price_as_of = event.price_as_of.clone();
         }
         if let Some(phase) = event.phase {
             let entry = phases.entry(phase.to_string()).or_default();
@@ -625,6 +710,9 @@ pub fn aggregate(events: &[TelemetryEvent]) -> StatsReport {
             }
             if event.succeeded == Some(false) {
                 entry.failures += 1;
+            }
+            if let Some(cost) = event.cost_micros {
+                entry.cost_micros = Some(entry.cost_micros.unwrap_or(0).saturating_add(cost));
             }
         }
         if let Some(adapter) = &event.adapter {
@@ -677,6 +765,9 @@ pub fn aggregate(events: &[TelemetryEvent]) -> StatsReport {
                 .saturating_add(event.output_tokens.unwrap_or(0));
             if event.input_tokens.is_some() || event.output_tokens.is_some() {
                 entry.token_events += 1;
+            }
+            if let Some(cost) = event.cost_micros {
+                entry.cost_micros = Some(entry.cost_micros.unwrap_or(0).saturating_add(cost));
             }
         }
         match event.kind {
@@ -829,6 +920,8 @@ pub fn aggregate(events: &[TelemetryEvent]) -> StatsReport {
         overall_cache_read_input_tokens,
         overall_cache_events,
         overall_cache_hit_ratio,
+        overall_cost_micros,
+        overall_price_as_of,
         adoption,
     }
 }
@@ -892,6 +985,35 @@ fn overall_cache_hit_line(report: &StatsReport) -> String {
     }
 }
 
+/// Issue #264: the `cost <...>` fragment `run_stats` appends after a phase's
+/// or a workflow's own token totals -- `"no data"` when nothing in that
+/// group ever priced (no event named a model, or every named model was
+/// unpriced), never a manufactured `$0.00`. Pure, mirroring
+/// `adapter_cache_hit_suffix`.
+fn format_cost(cost_micros: Option<u64>) -> String {
+    match cost_micros {
+        Some(cost) => crate::commands::ctx::price::format_usd(cost, false),
+        None => "no data".to_string(),
+    }
+}
+
+/// The overall `cost: ...` line `run_stats` prints right after the cache-hit
+/// line -- `"cost: no data"` when nothing in the whole report ever priced.
+fn overall_cost_line(report: &StatsReport) -> String {
+    match report.overall_cost_micros {
+        Some(cost) => format!(
+            "cost: {}{}",
+            crate::commands::ctx::price::format_usd(cost, false),
+            report
+                .overall_price_as_of
+                .as_deref()
+                .map(|as_of| format!(" (prices as of {as_of})"))
+                .unwrap_or_default()
+        ),
+        None => "cost: no data".to_string(),
+    }
+}
+
 pub fn run_stats(args: &StatsArgs, writer: &mut impl Write) -> CtxResult<i32> {
     let repo = match args.repo.as_deref() {
         Some(repo) => repo.canonicalize().unwrap_or_else(|_| repo.to_path_buf()),
@@ -912,12 +1034,13 @@ pub fn run_stats(args: &StatsArgs, writer: &mut impl Write) -> CtxResult<i32> {
         for (phase, stats) in &report.phases {
             writeln!(
                 writer,
-                "{phase}: {} events, {} ms, {} tokens ({} measured events), {} failures",
+                "{phase}: {} events, {} ms, {} tokens ({} measured events), {} failures, cost {}",
                 stats.events,
                 stats.duration_ms,
                 stats.input_tokens.saturating_add(stats.output_tokens),
                 stats.token_events,
-                stats.failures
+                stats.failures,
+                format_cost(stats.cost_micros),
             )?;
         }
         for (adapter, stats) in &report.adapters {
@@ -941,6 +1064,10 @@ pub fn run_stats(args: &StatsArgs, writer: &mut impl Write) -> CtxResult<i32> {
         // `cache_read_input_tokens` is a SUBSET of the combined
         // `input_tokens`, not a third figure to add to it.
         writeln!(writer, "{}", overall_cache_hit_line(&report))?;
+        // Issue #264: right after the cache-hit line -- the "cost" block the
+        // design asks for, at three altitudes: overall here, per-phase above
+        // (`format_cost` appended to each phase line), per-workflow below.
+        writeln!(writer, "{}", overall_cost_line(&report))?;
         if !report.token_sources.is_empty() {
             writeln!(
                 writer,
@@ -993,7 +1120,7 @@ pub fn run_stats(args: &StatsArgs, writer: &mut impl Write) -> CtxResult<i32> {
                 writeln!(
                     writer,
                     "  {workflow_id}: {} review runs, findings {} total/{} confirmed/{} dismissed, \
-                     {} tokens ({} measured events), {}",
+                     {} tokens ({} measured events), {}, cost {}",
                     stats.review_runs,
                     stats.findings_total,
                     stats.findings_meaningful,
@@ -1003,7 +1130,8 @@ pub fn run_stats(args: &StatsArgs, writer: &mut impl Write) -> CtxResult<i32> {
                     stats
                         .confirmed_findings_per_review
                         .map(|rate| format!("{rate:.2} confirmed/review"))
-                        .unwrap_or_else(|| "no review runs".to_string())
+                        .unwrap_or_else(|| "no review runs".to_string()),
+                    format_cost(stats.cost_micros),
                 )?;
             }
         }
@@ -1274,6 +1402,123 @@ mod tests {
         assert_eq!(event.input_tokens, Some(7));
         assert_eq!(event.cache_read_input_tokens, None);
         assert_eq!(event.session_id, None);
+        assert_eq!(
+            event.cost_micros, None,
+            "issue #264: an older event has no honest cost to report"
+        );
+        assert_eq!(event.price_as_of, None);
+    }
+
+    /// Issue #264: `TelemetryEvent::apply_price` reconstructs the RAW input
+    /// class from `input_tokens` (the combined context total) minus both
+    /// cache classes -- pricing the combined figure as if it were raw input
+    /// would double-count cache tokens' own cost.
+    #[test]
+    fn apply_price_reconstructs_raw_input_from_the_combined_total() {
+        let mut event = TelemetryEvent::new(TelemetryKind::PhaseCompleted);
+        event.model = Some("test-model".to_string());
+        // Combined total 1_000_000 = 700_000 raw + 200_000 cache-write +
+        // 100_000 cache-read.
+        event.input_tokens = Some(1_000_000);
+        event.cache_creation_input_tokens = Some(200_000);
+        event.cache_read_input_tokens = Some(100_000);
+        event.output_tokens = Some(0);
+
+        let table = crate::commands::ctx::price::PriceTable {
+            as_of: "2026-09-01".to_string(),
+            models: std::collections::BTreeMap::from([(
+                "test-model".to_string(),
+                crate::commands::ctx::price::ModelPrice {
+                    input_micros: 1_000_000,
+                    cache_write_micros: 0,
+                    cache_read_micros: 0,
+                    output_micros: 0,
+                },
+            )]),
+        };
+        event.apply_price(&table);
+        // 700_000 raw input tokens @ $1/M = $0.70 = 700_000 micros.
+        assert_eq!(event.cost_micros, Some(700_000));
+        assert_eq!(event.price_as_of.as_deref(), Some("2026-09-01"));
+    }
+
+    /// An event with no model (or an unpriced one) leaves `cost_micros`/
+    /// `price_as_of` both `None` -- never a manufactured `0`.
+    #[test]
+    fn apply_price_leaves_cost_none_for_an_unpriced_or_modelless_event() {
+        let table = crate::commands::ctx::price::built_in_table();
+
+        let mut no_model = TelemetryEvent::new(TelemetryKind::PhaseCompleted);
+        no_model.input_tokens = Some(1_000);
+        no_model.apply_price(&table);
+        assert_eq!(no_model.cost_micros, None);
+
+        let mut unpriced = TelemetryEvent::new(TelemetryKind::PhaseCompleted);
+        unpriced.model = Some("not-a-real-model".to_string());
+        unpriced.input_tokens = Some(1_000);
+        unpriced.apply_price(&table);
+        assert_eq!(unpriced.cost_micros, None);
+        assert_eq!(unpriced.price_as_of, None);
+    }
+
+    /// `aggregate` sums `cost_micros` per phase, per workflow, and overall --
+    /// an event with no cost contributes nothing to any of the three, never
+    /// a phantom zero.
+    #[test]
+    fn aggregate_sums_cost_per_phase_per_workflow_and_overall() {
+        let mut priced = TelemetryEvent::new(TelemetryKind::PhaseCompleted);
+        priced.workflow_id = Some("wf-a".to_string());
+        priced.phase = Some(WorkflowPhase::Implement);
+        priced.cost_micros = Some(1_000_000);
+        priced.price_as_of = Some("2026-09-01".to_string());
+
+        let mut also_priced = TelemetryEvent::new(TelemetryKind::PhaseCompleted);
+        also_priced.workflow_id = Some("wf-a".to_string());
+        also_priced.phase = Some(WorkflowPhase::Implement);
+        also_priced.cost_micros = Some(500_000);
+        also_priced.price_as_of = Some("2026-09-01".to_string());
+
+        let unpriced = TelemetryEvent::new(TelemetryKind::PhaseCompleted);
+
+        let report = aggregate(&[priced, also_priced, unpriced]);
+        assert_eq!(
+            report.phases["implement"].cost_micros,
+            Some(1_500_000),
+            "both priced events fold into the same phase"
+        );
+        assert_eq!(report.workflows["wf-a"].cost_micros, Some(1_500_000));
+        assert_eq!(report.overall_cost_micros, Some(1_500_000));
+        assert_eq!(report.overall_price_as_of.as_deref(), Some("2026-09-01"));
+    }
+
+    /// A report with nothing priced at all reports `None` everywhere, never
+    /// a manufactured zero -- the render-side counterpart lives in
+    /// `run_stats_cost_line_helpers_format_data_and_no_data_correctly`.
+    #[test]
+    fn aggregate_never_manufactures_a_zero_cost_without_data() {
+        let event = TelemetryEvent::new(TelemetryKind::PhaseCompleted);
+        let report = aggregate(&[event]);
+        assert_eq!(report.overall_cost_micros, None);
+        assert_eq!(report.overall_price_as_of, None);
+    }
+
+    /// `format_cost`/`overall_cost_line` render "no data" without a value,
+    /// and the real figure (plus, for the overall line, its own `as_of`)
+    /// with one -- the plain-text render-path counterpart of the aggregation
+    /// tests above.
+    #[test]
+    fn run_stats_cost_line_helpers_format_data_and_no_data_correctly() {
+        assert_eq!(format_cost(None), "no data");
+        assert_eq!(format_cost(Some(1_000_000)), "$1.00");
+
+        let mut report = aggregate(&[]);
+        assert_eq!(overall_cost_line(&report), "cost: no data");
+        report.overall_cost_micros = Some(3_500_000);
+        report.overall_price_as_of = Some("2026-09-01".to_string());
+        assert_eq!(
+            overall_cost_line(&report),
+            "cost: $3.50 (prices as of 2026-09-01)"
+        );
     }
 
     /// Issue #155 measurement closeout: `zirv workflow stats` previously had

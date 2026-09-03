@@ -625,6 +625,35 @@ pub struct ReportConfig {
     pub repository: Option<String>,
 }
 
+/// Issue #264: the cost ledger's own pricing knobs. Both fields are
+/// `REPO_FORBIDDEN` -- a repo checkout must not be able to widen how long a
+/// stale price table is presented as trustworthy, or point pricing at a file
+/// of its own choosing (see `price::PriceTable`/`price::price`, and
+/// [[Untrusted Configuration]]).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PriceConfig {
+    /// How many days old a price table's own `as_of` stamp may be before
+    /// every cost line it prices renders `~$x (prices as of …)` instead of a
+    /// plain figure -- a stale table is silently wrong money, never a plain
+    /// number (`price::PriceTable::is_stale`).
+    pub stale_after_days: u64,
+    /// Operator override path for the price table, read and merged over the
+    /// built-in one the same way `~/.zirv/prices.toml` is when present.
+    /// `None` -- the default -- is that ordinary resolution
+    /// (`price::resolve_table`); set only to point at a NON-default location.
+    pub table_path: Option<String>,
+}
+
+impl Default for PriceConfig {
+    fn default() -> Self {
+        Self {
+            stale_after_days: 90,
+            table_path: None,
+        }
+    }
+}
+
 /// Operator-controlled switches over the workflow subsystem
 /// (`src/commands/workflow/`). Every field is repo-forbidden except the
 /// explicitly folded `workflow.deploy.minimum_tier`, which can only make the
@@ -1192,6 +1221,7 @@ pub struct CtxConfig {
     pub supervise: SuperviseConfig,
     pub handoff: HandoffConfig,
     pub pace: PaceConfig,
+    pub price: PriceConfig,
     pub optimize: OptimizeConfig,
     pub prompt: PromptConfig,
     pub context: ContextConfig,
@@ -1744,6 +1774,16 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
     (
         "ZIRV_CTX_HANDOVER_CODEX_DEEP",
         &["handover", "codex", "deep"],
+        EnvKind::Str,
+    ),
+    (
+        "ZIRV_CTX_PRICE_STALE_AFTER_DAYS",
+        &["price", "stale_after_days"],
+        EnvKind::Int,
+    ),
+    (
+        "ZIRV_CTX_PRICE_TABLE_PATH",
+        &["price", "table_path"],
         EnvKind::Str,
     ),
 ];
@@ -2381,6 +2421,14 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
         &["score", "model_context_tokens"],
         "ZIRV_CTX_SCORE_MODEL_CONTEXT_TOKENS",
     ),
+    // Issue #264: a repo checkout must not be able to widen how long a price
+    // table is presented as trustworthy, or point pricing at a file of its
+    // own choosing -- see `PriceConfig`'s own doc comment.
+    (
+        &["price", "stale_after_days"],
+        "ZIRV_CTX_PRICE_STALE_AFTER_DAYS",
+    ),
+    (&["price", "table_path"], "ZIRV_CTX_PRICE_TABLE_PATH"),
 ];
 
 fn value_at<'a>(table: &'a toml::Table, path: &[&str]) -> Option<&'a toml::Value> {
@@ -6072,6 +6120,8 @@ mod tests {
         ("pace", "run_budget_tokens"),
         ("pace.use_credits", "claude"),
         ("pace.use_credits", "codex"),
+        ("price", "stale_after_days"),
+        ("price", "table_path"),
         ("optimize", "enabled"),
         ("optimize", "sessions_sampled"),
         ("optimize", "max_surface_bytes"),

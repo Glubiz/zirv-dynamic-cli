@@ -32,6 +32,7 @@ pub mod permissions;
 pub mod permit;
 pub mod policy;
 pub mod poll;
+pub mod price;
 pub mod prompt;
 pub mod resume;
 pub mod retrieval;
@@ -42,6 +43,7 @@ pub mod score;
 pub mod screen;
 pub mod sessions;
 pub mod signal;
+pub mod spend;
 pub mod state;
 pub mod status;
 pub mod supervise;
@@ -436,6 +438,8 @@ pub enum CtxVerb {
     Compile(compile::CompileArgs),
     /// Set, show or close this repository's durable objective (issue #285).
     Objective(objective::ObjectiveArgs),
+    /// Aggregate delegation spend from the cost ledger (issue #264).
+    Spend(spend::SpendArgs),
 }
 
 /// What a clap parse failure costs, which is not the same for every verb.
@@ -528,6 +532,7 @@ pub fn dispatch(args: &[String]) -> i32 {
         CtxVerb::Group(a) => group::run(a, &mut out),
         CtxVerb::Compile(a) => compile::run(a, &mut out),
         CtxVerb::Objective(a) => objective::run(a, &mut out),
+        CtxVerb::Spend(a) => spend::run(a, &mut out),
     };
 
     match result {
