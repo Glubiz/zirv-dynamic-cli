@@ -2554,9 +2554,11 @@ fn render_excluded_guidance<W: Write>(w: &mut W, groups: &[ExcludedGroup]) -> Ct
 
 #[derive(Debug, clap::Args)]
 pub struct ProposeArgs {
-    /// Which agent's transcripts to read.
-    #[arg(long, value_enum, default_value = "codex")]
-    pub agent: AuditAgent,
+    /// Which agent's transcripts to read. Defaults to the harness this
+    /// command is running under (via ZIRV_CTX_AGENT), falling back to codex
+    /// when that is unset or unrecognised.
+    #[arg(long, value_enum)]
+    pub agent: Option<AuditAgent>,
     /// How many of the most recently modified transcripts to sample.
     #[arg(long, default_value_t = 5)]
     pub sessions: usize,
@@ -2600,11 +2602,13 @@ struct ProposeIo {
 /// to enable this for itself (see that function's own doc comment).
 pub fn run_propose<W: Write>(args: &ProposeArgs, w: &mut W) -> CtxResult<i32> {
     let home = crate::utils::home_dir()?;
-    let state = super::state::StateDir::resolve(&super::config::env_from_process())?;
-    let files = transcripts_root(args.agent)
+    let env = super::config::env_from_process();
+    let state = super::state::StateDir::resolve(&env)?;
+    let agent = resolved_agent(args.agent, &env);
+    let files = transcripts_root(agent)
         .map(|root| super::optimize::newest_transcripts(&root, args.sessions))
         .unwrap_or_default();
-    let log_records: Vec<SafetyDecisionRecord> = if matches!(args.agent, AuditAgent::Claude) {
+    let log_records: Vec<SafetyDecisionRecord> = if matches!(agent, AuditAgent::Claude) {
         log::read_safety_decisions(&state)
     } else {
         Vec::new()
@@ -2616,12 +2620,20 @@ pub fn run_propose<W: Write>(args: &ProposeArgs, w: &mut W) -> CtxResult<i32> {
         create_issue: Box::new(crate::commands::report::create_issue),
         comment_issue: Box::new(crate::commands::report::add_issue_comment),
     };
-    run_propose_with(args, w, &home, &state, &files, &log_records, &io)
+    run_propose_with(args, agent, w, &home, &state, &files, &log_records, &io)
 }
 
+/// `agent` is the caller's already-resolved [`resolved_agent`] output, not
+/// `args.agent` re-read here -- `files`/`log_records` were themselves
+/// gathered against that same resolved value (`run_propose`'s own
+/// `transcripts_root(agent)`/log lookup), so the extractor chosen below must
+/// stay in lockstep with them rather than risk drifting back to `args.agent`
+/// directly (issue #329: that was exactly the bug -- an unresolved `--agent`
+/// silently means codex even when the transcripts sampled were claude's).
 #[allow(clippy::too_many_arguments)]
 fn run_propose_with<W: Write>(
     args: &ProposeArgs,
+    agent: AuditAgent,
     w: &mut W,
     home: &Path,
     state: &super::state::StateDir,
@@ -2649,7 +2661,7 @@ fn run_propose_with<W: Write>(
             .and_then(|s| s.to_str())
             .unwrap_or("unknown")
             .to_string();
-        let mut found = match args.agent {
+        let mut found = match agent {
             AuditAgent::Codex => extract_codex_approvals(&text, &session),
             AuditAgent::Claude => extract_claude_approvals(&text, &session, log_records),
         };
@@ -4034,6 +4046,118 @@ mod tests {
         .expect("write fixture");
     }
 
+    /// The `extract_codex_approvals` shape: an escalated `custom_tool_call`
+    /// correlated with a LATER `custom_tool_call_output` sharing the same
+    /// `call_id` -- codex's own transcript never records the operator's
+    /// answer directly, so approval is inferred from that correlation (see
+    /// `extract_codex_approvals`'s own doc comment). `command` should be one
+    /// of the clearly-safe collaboration verbs `is_irrelevant_approval`
+    /// accepts (e.g. `"gh issue create --title x --body y"`) so the fixture
+    /// actually produces proposable evidence, not just a captured-but-
+    /// excluded record.
+    fn write_codex_approval_fixture(home: &Path, command: &str) {
+        let sessions_dir = home.join(".codex").join("sessions");
+        std::fs::create_dir_all(&sessions_dir).expect("mkdir sessions");
+        let lines = [
+            serde_json::json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "custom_tool_call",
+                    "name": "exec",
+                    "sandbox_permissions": "require_escalated",
+                    "call_id": "call_1",
+                    "command": command
+                }
+            })
+            .to_string(),
+            serde_json::json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "custom_tool_call_output",
+                    "call_id": "call_1"
+                }
+            })
+            .to_string(),
+        ]
+        .join("\n");
+        std::fs::write(sessions_dir.join("s1.jsonl"), lines).expect("write fixture");
+    }
+
+    /// Issue #329: `run_propose`'s own `--agent` resolution must follow
+    /// `ZIRV_CTX_AGENT` the same way `run_audit`/`run_compile` do (the
+    /// `resolved_agent_*` tests above already cover the shared resolver
+    /// itself) -- not the pre-#329 hardcoded codex default. Exercised
+    /// through the real public `run_propose` entrypoint, not
+    /// `run_propose_with` (which now receives the already-resolved `agent`
+    /// as an explicit parameter and so has nothing left to prove about env
+    /// resolution). Kept hermetic with `--dry-run`: dry-run resolves no
+    /// token and never calls `find`/`create`/`comment_issue` (see the `if
+    /// args.dry_run { None } else { ... }` split above `run_propose_with`'s
+    /// own actionable loop), so this never touches the network or a real
+    /// GitHub credential. Only a codex-shaped approval fixture exists on
+    /// disk -- no `~/.claude/projects` fixture at all -- so resolving to
+    /// codex must find and propose it, while resolving to claude must find
+    /// nothing (the exact issue #329 symptom, on the third verb).
+    #[test]
+    fn run_propose_resolves_the_agent_from_the_environment() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".zirv/.settings.toml"),
+            "[permissions]\npropose_enabled = true\n",
+        )
+        .expect("settings");
+        write_codex_approval_fixture(home.path(), "gh issue create --title x --body y");
+
+        let args = ProposeArgs {
+            agent: None,
+            sessions: 5,
+            dry_run: true,
+        };
+
+        // Each sub-run gets its OWN state dir: `run_propose_with` persists
+        // every captured approval into the shared approval store regardless
+        // of which agent produced it, so a run's own evidence must not leak
+        // into the other's -- that would confound "which agent's transcripts
+        // got scanned" (what this test checks) with "what the persistent
+        // proposal-evidence store remembers" (a separate, deliberately
+        // cross-run-persistent concern this test is not about).
+        {
+            let state_root = tempfile::tempdir().expect("state");
+            let _state_env = crate::commands::ctx::testenv::VarGuard::set(&[(
+                super::super::state::STATE_ENV,
+                Some(state_root.path().to_str().expect("utf8 state")),
+            )]);
+            let _agent_env =
+                crate::commands::ctx::testenv::VarGuard::set(&[(AGENT_ENV, Some("codex"))]);
+            let mut out = Vec::new();
+            run_propose(&args, &mut out).expect("run_propose codex");
+            let text = String::from_utf8(out).expect("utf8");
+            assert!(
+                text.contains("would propose"),
+                "ZIRV_CTX_AGENT=codex must resolve to codex and find the codex fixture: {text}"
+            );
+        }
+
+        {
+            let state_root = tempfile::tempdir().expect("state");
+            let _state_env = crate::commands::ctx::testenv::VarGuard::set(&[(
+                super::super::state::STATE_ENV,
+                Some(state_root.path().to_str().expect("utf8 state")),
+            )]);
+            let _agent_env =
+                crate::commands::ctx::testenv::VarGuard::set(&[(AGENT_ENV, Some("claude"))]);
+            let mut out = Vec::new();
+            run_propose(&args, &mut out).expect("run_propose claude");
+            let text = String::from_utf8(out).expect("utf8");
+            assert!(
+                text.contains("nothing to propose"),
+                "ZIRV_CTX_AGENT=claude must resolve to claude and find no claude transcripts: {text}"
+            );
+        }
+    }
+
     /// Issue "codex approval hell" (2026-08-26): compiled `[safety] allow`
     /// entries never change codex's own launch posture (codex has no
     /// per-command hook zirv can pin), so both audit verbs must say so for a
@@ -5027,7 +5151,7 @@ mod tests {
         let state_root = tempfile::tempdir().expect("tempdir");
         let state = super::super::state::StateDir::from_root(state_root.path().to_path_buf());
         let args = ProposeArgs {
-            agent: AuditAgent::Claude,
+            agent: Some(AuditAgent::Claude),
             sessions: 5,
             dry_run: false,
         };
@@ -5037,8 +5161,17 @@ mod tests {
         let io = propose_io_recording(found.clone(), created.clone(), commented.clone());
         let mut out = Vec::new();
 
-        let code =
-            run_propose_with(&args, &mut out, home.path(), &state, &[], &[], &io).expect("run");
+        let code = run_propose_with(
+            &args,
+            AuditAgent::Claude,
+            &mut out,
+            home.path(),
+            &state,
+            &[],
+            &[],
+            &io,
+        )
+        .expect("run");
 
         assert_eq!(code, 0);
         assert!(created.borrow().is_empty());
@@ -5065,7 +5198,7 @@ mod tests {
         let file = write_claude_transcript(transcripts.path(), "s1", command, "/some/repo");
         let log_records = vec![safety_record("s1", command, "ask")];
         let args = ProposeArgs {
-            agent: AuditAgent::Claude,
+            agent: Some(AuditAgent::Claude),
             sessions: 5,
             dry_run: false,
         };
@@ -5077,6 +5210,7 @@ mod tests {
 
         let code = run_propose_with(
             &args,
+            AuditAgent::Claude,
             &mut out,
             home.path(),
             &state,
@@ -5110,7 +5244,7 @@ mod tests {
         let file = write_claude_transcript(transcripts.path(), "s1", command, "/some/repo");
         let log_records = vec![safety_record("s1", command, "ask")];
         let args = ProposeArgs {
-            agent: AuditAgent::Claude,
+            agent: Some(AuditAgent::Claude),
             sessions: 5,
             dry_run: false,
         };
@@ -5122,6 +5256,7 @@ mod tests {
 
         run_propose_with(
             &args,
+            AuditAgent::Claude,
             &mut out,
             home.path(),
             &state,
@@ -5152,7 +5287,7 @@ mod tests {
         let file = write_claude_transcript(transcripts.path(), "s1", command, "/some/repo");
         let log_records = vec![safety_record("s1", command, "ask")];
         let args = ProposeArgs {
-            agent: AuditAgent::Claude,
+            agent: Some(AuditAgent::Claude),
             sessions: 5,
             dry_run: true,
         };
@@ -5164,6 +5299,7 @@ mod tests {
 
         let code = run_propose_with(
             &args,
+            AuditAgent::Claude,
             &mut out,
             home.path(),
             &state,
@@ -5195,7 +5331,7 @@ mod tests {
         let file = write_claude_transcript(transcripts.path(), "s1", command, "/some/repo");
         let log_records = vec![safety_record("s1", command, "ask")];
         let args = ProposeArgs {
-            agent: AuditAgent::Claude,
+            agent: Some(AuditAgent::Claude),
             sessions: 5,
             dry_run: false,
         };
@@ -5207,6 +5343,7 @@ mod tests {
 
         run_propose_with(
             &args,
+            AuditAgent::Claude,
             &mut out,
             home.path(),
             &state,
@@ -5236,7 +5373,7 @@ mod tests {
         let file = write_claude_transcript(transcripts.path(), "s1", command, "/some/repo");
         let log_records = vec![safety_record("s1", command, "ask")];
         let args = ProposeArgs {
-            agent: AuditAgent::Claude,
+            agent: Some(AuditAgent::Claude),
             sessions: 5,
             dry_run: false,
         };
@@ -5249,6 +5386,7 @@ mod tests {
             let mut out = Vec::new();
             run_propose_with(
                 &args,
+                AuditAgent::Claude,
                 &mut out,
                 home.path(),
                 &state,
@@ -5290,7 +5428,7 @@ mod tests {
         let file = write_claude_transcript(transcripts.path(), "s1", command, "/some/repo");
         let log_records = vec![safety_record("s1", command, "ask")];
         let args = ProposeArgs {
-            agent: AuditAgent::Claude,
+            agent: Some(AuditAgent::Claude),
             sessions: 5,
             dry_run: false,
         };
@@ -5303,6 +5441,7 @@ mod tests {
         let mut out1 = Vec::new();
         run_propose_with(
             &args,
+            AuditAgent::Claude,
             &mut out1,
             home.path(),
             &state,
@@ -5324,6 +5463,7 @@ mod tests {
         let mut out2 = Vec::new();
         run_propose_with(
             &args,
+            AuditAgent::Claude,
             &mut out2,
             home.path(),
             &state,
@@ -5364,7 +5504,7 @@ mod tests {
         let file1 = write_claude_transcript(transcripts.path(), "s1", command1, "/some/repo");
         let log_records1 = vec![safety_record("s1", command1, "ask")];
         let args = ProposeArgs {
-            agent: AuditAgent::Claude,
+            agent: Some(AuditAgent::Claude),
             sessions: 5,
             dry_run: false,
         };
@@ -5376,6 +5516,7 @@ mod tests {
         let mut out1 = Vec::new();
         run_propose_with(
             &args,
+            AuditAgent::Claude,
             &mut out1,
             home.path(),
             &state,
@@ -5399,6 +5540,7 @@ mod tests {
         let mut out2 = Vec::new();
         run_propose_with(
             &args,
+            AuditAgent::Claude,
             &mut out2,
             home.path(),
             &state,
@@ -5486,7 +5628,7 @@ mod tests {
         let file = write_claude_transcript(transcripts.path(), "s1", command, "/some/repo");
         let log_records = vec![safety_record("s1", command, "ask")];
         let args = ProposeArgs {
-            agent: AuditAgent::Claude,
+            agent: Some(AuditAgent::Claude),
             sessions: 5,
             dry_run: false,
         };
@@ -5498,6 +5640,7 @@ mod tests {
 
         run_propose_with(
             &args,
+            AuditAgent::Claude,
             &mut out,
             home.path(),
             &state,
@@ -5555,7 +5698,7 @@ mod tests {
             safety_record("s1", excluded_command, "ask"),
         ];
         let args = ProposeArgs {
-            agent: AuditAgent::Claude,
+            agent: Some(AuditAgent::Claude),
             sessions: 5,
             dry_run: false,
         };
@@ -5567,6 +5710,7 @@ mod tests {
 
         run_propose_with(
             &args,
+            AuditAgent::Claude,
             &mut out,
             home.path(),
             &state,
