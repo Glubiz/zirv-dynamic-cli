@@ -72,7 +72,9 @@ repository's standards and to the engineering standard above: reuse before addin
 diff, one focused test per behaviour change, format, lint and test before reporting back.
 - Reviews follow the meta-harness rule: in proportion, once. This harness's own /code-review \
 runs at low or medium effort on the roster's review model, never high or above (that forks \
-this seat's model), and never when a `zirv workflow` review gate covers the change.";
+this seat's model), and never when a `zirv workflow` review gate covers the change.
+- Shared manifests and lockfiles (Cargo.toml, Cargo.lock, package.json, lockfiles) are edited \
+only by you or one designated integrator; a writer touching one says so in its report.";
 
 /// Claude's own layer for a delegated **Worker** session (see
 /// `AgentAdapter::worker_system_prompt`), spliced in place of
