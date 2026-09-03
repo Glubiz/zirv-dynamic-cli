@@ -1432,18 +1432,55 @@ impl AgentAdapter for CodexAdapter {
     /// `token_count` line, which arrives frequently in practice. `rot.rs`
     /// itself never sees or knows about this: it only ever receives the
     /// resulting `NormalizedEvent`s.
+    ///
+    /// Issue #293: every mapped event's `at_ms` comes from that line's own
+    /// top-level `timestamp` (`window::parse_iso8601_utc_ms`), which is
+    /// verified present on every rollout line but read independently of
+    /// timestamp parsing -- `None`, honestly, whenever a line lacks one. A
+    /// `task_complete` with a non-empty `last_agent_message` also emits
+    /// `AssistantFirstText` right before its `AssistantFinal`: codex only
+    /// ever exposes the COMPLETED message for a turn (no verified shape for
+    /// intermediate assistant text), so that message genuinely IS its own
+    /// turn's first non-empty text, not a best-effort guess.
     fn parse_events(&self, jsonl: &str) -> Vec<NormalizedEvent> {
         let mut events = Vec::new();
         let mut last_tokens: u64 = 0;
         for line in jsonl.lines() {
+            // Issue #293: parsed once per line and reused below, instead of
+            // adding a third independent `serde_json::from_str` call on top
+            // of `window::parse_rollout_record`'s own internal one -- a
+            // codex rollout line's top-level `timestamp` is the same shape
+            // `window::parse_rollout_record`'s own `TokenCount::observed_at`
+            // already reads (via a different parser, `parse_rfc3339_utc`,
+            // kept as-is here). `None` -- never a guess -- for a line with
+            // no parseable timestamp; codex legitimately produces this for
+            // some lines.
+            let row = serde_json::from_str::<Value>(line.trim()).ok();
+            let at_ms = row.as_ref().and_then(|v| {
+                v.get("timestamp")
+                    .and_then(Value::as_str)
+                    .and_then(window::parse_iso8601_utc_ms)
+            });
+
             match window::parse_rollout_record(line) {
                 Some(RolloutRecord::TaskStarted) => {
-                    events.push(NormalizedEvent::TurnStart);
+                    events.push(NormalizedEvent::TurnStart { at_ms });
                 }
                 Some(RolloutRecord::TaskComplete { last_agent_message }) => {
+                    let text = last_agent_message.unwrap_or_default();
+                    // Issue #293: codex only ever exposes the COMPLETED
+                    // message for a turn (no verified rollout shape for
+                    // intermediate assistant text -- see this method's own
+                    // doc comment above), so that message genuinely IS its
+                    // own turn's first non-empty text, not merely a
+                    // best-effort guess at one.
+                    if !text.trim().is_empty() {
+                        events.push(NormalizedEvent::AssistantFirstText { at_ms });
+                    }
                     events.push(NormalizedEvent::AssistantFinal {
-                        text: last_agent_message.unwrap_or_default(),
+                        text,
                         input_tokens: last_tokens,
+                        at_ms,
                     });
                 }
                 Some(RolloutRecord::TokenCount {
@@ -1454,11 +1491,12 @@ impl AgentAdapter for CodexAdapter {
                     events.push(NormalizedEvent::AssistantFinal {
                         text: String::new(),
                         input_tokens: last_tokens,
+                        at_ms,
                     });
                 }
                 _ => {}
             }
-            let Ok(row) = serde_json::from_str::<Value>(line.trim()) else {
+            let Some(row) = row else {
                 continue;
             };
             match row.get("type").and_then(Value::as_str) {
@@ -1791,26 +1829,52 @@ mod tests {
         let jsonl = fixture("codex-rollout-turn-events.jsonl");
         let adapter = CodexAdapter::new(None);
         let events = adapter.parse_events(&jsonl);
+
+        // Issue #293: the fixture's own recorded timestamps, read through the
+        // same parser `parse_events` itself uses -- never hand-computed
+        // epoch arithmetic that could silently drift from the real parser.
+        let t1_start = window::parse_iso8601_utc_ms("2026-08-20T10:00:00.000Z");
+        let t1_tokens = window::parse_iso8601_utc_ms("2026-08-20T10:00:05.000Z");
+        let t1_complete = window::parse_iso8601_utc_ms("2026-08-20T10:00:07.000Z");
+        let t2_start = window::parse_iso8601_utc_ms("2026-08-20T10:01:00.000Z");
+        let t2_tokens = window::parse_iso8601_utc_ms("2026-08-20T10:01:10.000Z");
+        let t2_complete = window::parse_iso8601_utc_ms("2026-08-20T10:01:15.000Z");
+        for at in [
+            t1_start,
+            t1_tokens,
+            t1_complete,
+            t2_start,
+            t2_tokens,
+            t2_complete,
+        ] {
+            assert!(at.is_some(), "fixture timestamps must parse");
+        }
+
         assert_eq!(
             events,
             vec![
-                NormalizedEvent::TurnStart,
+                NormalizedEvent::TurnStart { at_ms: t1_start },
                 NormalizedEvent::AssistantFinal {
                     text: String::new(),
                     input_tokens: 1200,
+                    at_ms: t1_tokens,
                 },
+                NormalizedEvent::AssistantFirstText { at_ms: t1_complete },
                 NormalizedEvent::AssistantFinal {
                     text: "[zirv] wired the webhook route".to_string(),
                     input_tokens: 1200,
+                    at_ms: t1_complete,
                 },
-                NormalizedEvent::TurnStart,
+                NormalizedEvent::TurnStart { at_ms: t2_start },
                 NormalizedEvent::AssistantFinal {
                     text: String::new(),
                     input_tokens: 3400,
+                    at_ms: t2_tokens,
                 },
                 NormalizedEvent::AssistantFinal {
                     text: String::new(),
                     input_tokens: 3400,
+                    at_ms: t2_complete,
                 },
                 NormalizedEvent::ProviderError {
                     class: crate::commands::ctx::event::ProviderErrorClass::Other,

@@ -166,16 +166,78 @@ pub struct ModelChange {
     pub limit_pressure: bool,
 }
 
+/// Wall-clock speed signals for the events a `Score` was computed over
+/// (issue #293): per-turn latency (`TurnStart` to that turn's last
+/// `AssistantFinal`), time-to-first-text (`TurnStart` to that turn's first
+/// `AssistantFirstText`), and the tool-error rate over the same events.
+/// Derived in `score::derive_speed_metrics`, attached onto `Score` the same
+/// post-hoc way `score::attach_model_change` already attaches
+/// `Score::model_change` -- `rot.rs`'s own scoring functions always leave
+/// this `None`, never reason about it, and never call a clock to fill it.
+/// Every field is `None`, never `0`, when its underlying samples are empty:
+/// a session with no timed turns yet has UNKNOWN speed, not zero-latency
+/// speed.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
+pub struct SpeedMetrics {
+    pub turn_p50_ms: Option<u64>,
+    pub turn_max_ms: Option<u64>,
+    pub ttft_p50_ms: Option<u64>,
+    pub tool_error_rate: Option<f64>,
+}
+
+impl SpeedMetrics {
+    /// All-`None`: no timed samples at all. `derive_speed_metrics` returns
+    /// this for an events slice with no usable timestamps, and it is what a
+    /// consumer should treat as "nothing to report".
+    pub fn is_empty(&self) -> bool {
+        self.turn_p50_ms.is_none()
+            && self.turn_max_ms.is_none()
+            && self.ttft_p50_ms.is_none()
+            && self.tool_error_rate.is_none()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum NormalizedEvent {
-    TurnStart,
+    /// `at_ms` is the unix-millisecond wall-clock time this turn began, read
+    /// by the adapter from the transcript line it already parses (issue
+    /// #293, `window::parse_iso8601_utc_ms`). `None` when the line carried no
+    /// parseable timestamp -- never a guess, and never `0`.
+    TurnStart {
+        at_ms: Option<u64>,
+    },
+    /// A CANDIDATE first-non-empty-assistant-text point, emitted right
+    /// before the `AssistantFinal` that carries the same text, whenever that
+    /// text is non-empty (issue #293). Deliberately per-row, not tracked
+    /// across a `parse_events` call: `AgentAdapter::parse_events` must stay
+    /// line-local (a transcript cut at newlines and parsed piecewise must
+    /// yield exactly the events one whole-file parse yields -- the
+    /// incremental scoring path depends on it), so an adapter cannot
+    /// remember "have I already seen this turn's first text" across calls.
+    /// More than one of these can appear inside a single turn; the ONE
+    /// consumer that needs the true first-per-turn value
+    /// (`score::derive_speed_metrics`) reduces the stream itself, keeping
+    /// only the earliest one seen since the last `TurnStart`. This is the
+    /// distinction Prime's own telemetry draws between "visible TTFT" (first
+    /// non-empty text) and "first model event" (any model activity at all,
+    /// which `AssistantFinal`/`ToolCall` already cover) -- see the issue's
+    /// Origin section. An adapter that cannot identify any assistant text at
+    /// all (a future one with no verified shape for it) simply never emits
+    /// this variant.
+    AssistantFirstText {
+        at_ms: Option<u64>,
+    },
     AssistantFinal {
         text: String,
         input_tokens: u64,
+        /// Issue #293: same rules as `TurnStart::at_ms`.
+        at_ms: Option<u64>,
     },
     ToolCall {
         name: String,
         input_hash: u64,
+        /// Issue #293: same rules as `TurnStart::at_ms`.
+        at_ms: Option<u64>,
     },
     ToolResult {
         is_error: bool,
@@ -191,6 +253,21 @@ pub enum NormalizedEvent {
     /// already has. Feeds `rot::Signals::same_error_repeats`.
     ToolErrorText {
         hash: u64,
+    },
+    /// The wall-clock timestamp of the immediately preceding `ToolResult`,
+    /// emitted right after it -- never in place of it -- whenever the
+    /// adapter could extract one (issue #293). A SEPARATE variant for
+    /// exactly the reason `ToolErrorText` (above) already is one: `ToolResult`
+    /// is matched with exhaustive field patterns in several places across
+    /// the crate, and no metric `score.rs` derives from it today
+    /// (`tool_error_rate` is a ratio, not time-based) needs a per-result
+    /// timestamp, so a fielded addition there would have touched every one
+    /// of those matches for a signal nothing yet reads. The issue's own
+    /// decision explicitly authorizes this fallback for `ToolResult`
+    /// specifically (unlike `TurnStart`/`AssistantFinal`/`ToolCall`, which
+    /// took the field directly).
+    ToolResultTimestamp {
+        at_ms: Option<u64>,
     },
     ProviderError {
         class: ProviderErrorClass,

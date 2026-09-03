@@ -560,6 +560,44 @@ fn adoption_stop_nudge(
     text
 }
 
+/// Issue #293: records ONE `TurnLatencySampled` sample for this scoring
+/// pass, mirroring `adoption_stop_nudge`'s own local telemetry write right
+/// next to it -- "the score is computed for a live session" is exactly this
+/// call site, `run_stop`, and only here: the Stop hook is a fresh process on
+/// every turn (`score_transcript_cached`'s own doc comment), so one call
+/// here is one sample per turn, never per dashboard poll (`score::
+/// cached_score`'s own fast path answers most of ITS polls from an
+/// in-memory cache without ever reaching a scoring pass at all). `speed`
+/// comes from `score::score_transcript_cached`'s third element
+/// (`IncrementalScorer::last_speed_sample`) -- deliberately NOT a field on
+/// `Score` itself, since it is only ever derived from this ONE poll's
+/// appended events, not the whole session's accumulated history, and so is
+/// legitimately allowed to differ between a bounded poll and a full parse
+/// (unlike every field `Score` actually carries, which the incremental fold
+/// and a full parse must always agree on). A no-op when `speed` is `None`
+/// -- nothing measurable this pass, so nothing to record; best-effort like
+/// every other telemetry write in this module (`let _ =
+/// telemetry::record(..)`).
+fn record_speed_sample(
+    state: &StateDir,
+    repo: &Path,
+    session: &str,
+    cfg: &CtxConfig,
+    speed: Option<crate::commands::ctx::event::SpeedMetrics>,
+) {
+    let Some(speed) = speed else {
+        return;
+    };
+    let telemetry_cfg = telemetry::TelemetryConfig::from_config(&cfg.workflow);
+    let mut event = telemetry::TelemetryEvent::new(telemetry::TelemetryKind::TurnLatencySampled);
+    event.session_id = Some(session.to_string());
+    event.turn_p50_ms = speed.turn_p50_ms;
+    event.turn_max_ms = speed.turn_max_ms;
+    event.ttft_p50_ms = speed.ttft_p50_ms;
+    event.tool_error_rate = speed.tool_error_rate;
+    let _ = telemetry::record(state, repo, &event, &telemetry_cfg);
+}
+
 pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResult<i32> {
     // Every early return is deliberate: a hook that errors must still exit 0.
     let Ok(payload) = HookPayload::parse(stdin) else {
@@ -575,8 +613,11 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
     let repo = payload.repo();
     // Cached: this hook is a fresh process after every single turn, so scoring
     // the whole transcript each time is quadratic over a session's length.
-    // Issue #243: also screens the bytes this cycle ingested.
-    let Ok((score, screening)) = score::score_transcript_cached(transcript, None, &repo, env)
+    // Issue #243: also screens the bytes this cycle ingested. Issue #293:
+    // also surfaces this pass's speed sample, cheaply -- the same
+    // incremental fold, nothing extra read or parsed.
+    let Ok((score, screening, speed_sample)) =
+        score::score_transcript_cached(transcript, None, &repo, env)
     else {
         return Ok(0);
     };
@@ -692,6 +733,7 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
 
         adoption_nudge =
             adoption_stop_nudge(&state, &repo, &session, &cfg, &score, transcript, env);
+        record_speed_sample(&state, &repo, &session, &cfg, speed_sample);
     }
 
     if let Some(line) = stop_output(
@@ -2260,6 +2302,58 @@ mod tests {
             .filter(|e| e.kind == telemetry::TelemetryKind::AdoptionRecovered)
             .count();
         assert_eq!(recovered, 1, "recovery must be recorded exactly once");
+    }
+
+    /// Issue #293: `record_speed_sample` writes exactly one
+    /// `TurnLatencySampled` event, carrying the sample's four fields and
+    /// this call's `session`.
+    #[test]
+    fn record_speed_sample_writes_one_turn_latency_sampled_event() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = tempfile::tempdir().expect("repo");
+        let state = StateDir::from_root(dir.path().to_path_buf());
+        let cfg = CtxConfig::default();
+
+        let speed = crate::commands::ctx::event::SpeedMetrics {
+            turn_p50_ms: Some(400),
+            turn_max_ms: Some(900),
+            ttft_p50_ms: Some(150),
+            tool_error_rate: Some(0.2),
+        };
+
+        record_speed_sample(&state, repo.path(), "sess-speed", &cfg, Some(speed));
+
+        let events = telemetry::list(&state, repo.path()).expect("list");
+        let sampled = events
+            .iter()
+            .find(|e| e.kind == telemetry::TelemetryKind::TurnLatencySampled)
+            .expect("TurnLatencySampled must be recorded");
+        assert_eq!(sampled.session_id, Some("sess-speed".to_string()));
+        assert_eq!(sampled.turn_p50_ms, Some(400));
+        assert_eq!(sampled.turn_max_ms, Some(900));
+        assert_eq!(sampled.ttft_p50_ms, Some(150));
+        assert_eq!(sampled.tool_error_rate, Some(0.2));
+    }
+
+    /// No speed data (`None`, the ordinary case for a poll whose appended
+    /// events carried no usable timestamps) records nothing -- never a
+    /// fabricated all-`None` sample.
+    #[test]
+    fn record_speed_sample_is_a_no_op_when_speed_is_none() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = tempfile::tempdir().expect("repo");
+        let state = StateDir::from_root(dir.path().to_path_buf());
+        let cfg = CtxConfig::default();
+
+        record_speed_sample(&state, repo.path(), "sess-nospeed", &cfg, None);
+
+        let events = telemetry::list(&state, repo.path()).expect("list");
+        assert!(
+            !events
+                .iter()
+                .any(|e| e.kind == telemetry::TelemetryKind::TurnLatencySampled),
+            "no speed data means nothing to record"
+        );
     }
 
     /// The Prompt hook's own live re-check: a record still saying

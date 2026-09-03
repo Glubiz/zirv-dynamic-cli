@@ -70,7 +70,7 @@ pub fn turn_final_texts(events: &[NormalizedEvent]) -> Vec<String> {
 
     for event in events {
         match event {
-            NormalizedEvent::TurnStart => {
+            NormalizedEvent::TurnStart { .. } => {
                 if in_turn && let Some(text) = current.take() {
                     finals.push(text);
                 }
@@ -119,7 +119,7 @@ fn events_in_last_turns(events: &[NormalizedEvent], window: usize) -> &[Normaliz
     let starts: Vec<usize> = events
         .iter()
         .enumerate()
-        .filter(|(_, e)| matches!(e, NormalizedEvent::TurnStart))
+        .filter(|(_, e)| matches!(e, NormalizedEvent::TurnStart { .. }))
         .map(|(i, _)| i)
         .collect();
 
@@ -273,7 +273,9 @@ pub fn signals(events: &[NormalizedEvent], caps: Capabilities, cfg: &ScoreConfig
 
     let (repetition_hits, max_repeat) = repetition(
         tail.iter().filter_map(|e| match e {
-            NormalizedEvent::ToolCall { name, input_hash } => Some((name.as_str(), *input_hash)),
+            NormalizedEvent::ToolCall {
+                name, input_hash, ..
+            } => Some((name.as_str(), *input_hash)),
             _ => None,
         }),
         cfg.repetition_threshold,
@@ -387,7 +389,7 @@ impl RotState {
 
     pub fn feed(&mut self, event: &NormalizedEvent) {
         match event {
-            NormalizedEvent::TurnStart => {
+            NormalizedEvent::TurnStart { .. } => {
                 if self.in_turn
                     && let Some(marked) = self.open_marker
                 {
@@ -405,13 +407,17 @@ impl RotState {
                     }
                 }
             }
-            NormalizedEvent::AssistantFinal { text, input_tokens } => {
+            NormalizedEvent::AssistantFinal {
+                text, input_tokens, ..
+            } => {
                 self.last_tokens = *input_tokens;
                 if !text.trim().is_empty() {
                     self.open_marker = Some(has_marker(text, &self.marker));
                 }
             }
-            NormalizedEvent::ToolCall { name, input_hash } => {
+            NormalizedEvent::ToolCall {
+                name, input_hash, ..
+            } => {
                 if let Some(segment) = self.segments.back_mut() {
                     segment.calls.push((name.clone(), *input_hash));
                 }
@@ -439,7 +445,10 @@ impl RotState {
                     segment.provider_overflows += 1;
                 }
             }
-            NormalizedEvent::ProviderError { .. } | NormalizedEvent::ModelId { .. } => {}
+            NormalizedEvent::ProviderError { .. }
+            | NormalizedEvent::ModelId { .. }
+            | NormalizedEvent::AssistantFirstText { .. }
+            | NormalizedEvent::ToolResultTimestamp { .. } => {}
             NormalizedEvent::Compaction => self.reset_behavioral_window(),
         }
     }
@@ -759,6 +768,7 @@ mod tests {
         NormalizedEvent::AssistantFinal {
             text: text.to_string(),
             input_tokens: tokens,
+            at_ms: None,
         }
     }
 
@@ -766,6 +776,7 @@ mod tests {
         NormalizedEvent::ToolCall {
             name: name.to_string(),
             input_hash: input_hash(input),
+            at_ms: None,
         }
     }
 
@@ -781,7 +792,7 @@ mod tests {
         tokens: u64,
     ) -> Vec<NormalizedEvent> {
         vec![
-            NormalizedEvent::TurnStart,
+            NormalizedEvent::TurnStart { at_ms: None },
             assistant(mid_text, tokens),
             tool("Bash", tool_input),
             NormalizedEvent::ToolResult { is_error },
@@ -850,20 +861,22 @@ mod tests {
         before_first_turn.extend(turns(3, "", "[zirv] ok", false, 120_000));
 
         let mut open_turn = turns(11, "", "[zirv] ok", false, 120_000);
-        open_turn.push(NormalizedEvent::TurnStart);
+        open_turn.push(NormalizedEvent::TurnStart { at_ms: None });
         open_turn.push(assistant("still working", 130_000));
 
         // Review finding F1: a successful result, and separately a textless
         // error result, must each break a same-error streak the same way for
         // the incremental fold as for a full parse.
-        let mut same_error_interrupted_by_success = vec![NormalizedEvent::TurnStart];
+        let mut same_error_interrupted_by_success =
+            vec![NormalizedEvent::TurnStart { at_ms: None }];
         same_error_interrupted_by_success.extend(erroring_tool_result("error A"));
         same_error_interrupted_by_success.push(NormalizedEvent::ToolResult { is_error: false });
         same_error_interrupted_by_success.extend(erroring_tool_result("error A"));
         same_error_interrupted_by_success.extend(erroring_tool_result("error A"));
         same_error_interrupted_by_success.extend(turns(3, "", "[zirv] ok", false, 120_000));
 
-        let mut same_error_interrupted_by_textless_error = vec![NormalizedEvent::TurnStart];
+        let mut same_error_interrupted_by_textless_error =
+            vec![NormalizedEvent::TurnStart { at_ms: None }];
         same_error_interrupted_by_textless_error.extend(erroring_tool_result("error A"));
         same_error_interrupted_by_textless_error
             .push(NormalizedEvent::ToolResult { is_error: true });
@@ -983,12 +996,12 @@ mod tests {
     #[test]
     fn turn_finals_take_the_last_text_per_turn_and_skip_textless_turns() {
         let events = vec![
-            NormalizedEvent::TurnStart,
+            NormalizedEvent::TurnStart { at_ms: None },
             assistant("mid", 1),
             assistant("final one", 1),
-            NormalizedEvent::TurnStart,
+            NormalizedEvent::TurnStart { at_ms: None },
             assistant("", 1),
-            NormalizedEvent::TurnStart,
+            NormalizedEvent::TurnStart { at_ms: None },
             assistant("final two", 1),
         ];
         assert_eq!(turn_final_texts(&events), vec!["final one", "final two"]);
@@ -1032,7 +1045,10 @@ mod tests {
 
     #[test]
     fn no_tool_results_means_no_failures() {
-        let events = vec![NormalizedEvent::TurnStart, assistant("[zirv] hi", 120_000)];
+        let events = vec![
+            NormalizedEvent::TurnStart { at_ms: None },
+            assistant("[zirv] hi", 120_000),
+        ];
         let s = signals(&events, full_caps(), &ScoreConfig::default());
         assert_eq!(s.tool_failure_rate, 0.0);
     }
@@ -1040,7 +1056,7 @@ mod tests {
     #[test]
     fn identical_tool_calls_are_counted_and_distinct_ones_are_not() {
         let cfg = ScoreConfig::default();
-        let mut repeated = vec![NormalizedEvent::TurnStart];
+        let mut repeated = vec![NormalizedEvent::TurnStart { at_ms: None }];
         for _ in 0..4 {
             repeated.push(tool("Bash", "{\"command\":\"ls\"}"));
         }
@@ -1048,7 +1064,7 @@ mod tests {
         assert_eq!(s.max_repeat, 4);
         assert_eq!(s.repetition_hits, 1);
 
-        let mut distinct = vec![NormalizedEvent::TurnStart];
+        let mut distinct = vec![NormalizedEvent::TurnStart { at_ms: None }];
         for i in 0..4 {
             distinct.push(tool("Bash", &format!("{{\"command\":\"ls {i}\"}}")));
         }
@@ -1060,7 +1076,7 @@ mod tests {
     #[test]
     fn same_input_different_tool_is_not_a_repetition() {
         let events = vec![
-            NormalizedEvent::TurnStart,
+            NormalizedEvent::TurnStart { at_ms: None },
             tool("Read", "{\"file_path\":\"/a\"}"),
             tool("Write", "{\"file_path\":\"/a\"}"),
             tool("Edit", "{\"file_path\":\"/a\"}"),
@@ -1075,7 +1091,7 @@ mod tests {
     #[test]
     fn a_repeat_interrupted_by_an_edit_like_call_does_not_count() {
         let cfg = ScoreConfig::default(); // repetition_threshold: 3
-        let mut events = vec![NormalizedEvent::TurnStart];
+        let mut events = vec![NormalizedEvent::TurnStart { at_ms: None }];
         for _ in 0..4 {
             events.push(tool("Bash", "{\"command\":\"cargo test\"}"));
             events.push(tool("Edit", "{\"file_path\":\"/a.rs\"}"));
@@ -1093,7 +1109,7 @@ mod tests {
     #[test]
     fn a_repeat_interleaved_with_only_non_edit_calls_still_counts() {
         let cfg = ScoreConfig::default(); // repetition_threshold: 3
-        let mut events = vec![NormalizedEvent::TurnStart];
+        let mut events = vec![NormalizedEvent::TurnStart { at_ms: None }];
         for i in 0..4 {
             events.push(tool("Bash", "{\"command\":\"cargo test\"}"));
             // Distinct each time, so only the Bash repetition is under test.
@@ -1113,7 +1129,7 @@ mod tests {
     #[test]
     fn edit_like_calls_are_never_tracked_as_a_repetition_themselves() {
         let cfg = ScoreConfig::default();
-        let mut events = vec![NormalizedEvent::TurnStart];
+        let mut events = vec![NormalizedEvent::TurnStart { at_ms: None }];
         for _ in 0..5 {
             events.push(tool("Edit", "{\"file_path\":\"/a.rs\"}"));
         }
@@ -1156,7 +1172,7 @@ mod tests {
     #[test]
     fn identical_error_text_across_different_tool_inputs_builds_a_streak() {
         let cfg = ScoreConfig::default();
-        let mut events = vec![NormalizedEvent::TurnStart];
+        let mut events = vec![NormalizedEvent::TurnStart { at_ms: None }];
         for i in 0..4 {
             events.push(tool(
                 "Bash",
@@ -1178,7 +1194,7 @@ mod tests {
     #[test]
     fn a_different_error_resets_the_same_error_streak() {
         let cfg = ScoreConfig::default();
-        let mut events = vec![NormalizedEvent::TurnStart];
+        let mut events = vec![NormalizedEvent::TurnStart { at_ms: None }];
         events.extend(erroring_tool_result("error A"));
         events.extend(erroring_tool_result("error A"));
         events.extend(erroring_tool_result("error B"));
@@ -1196,7 +1212,7 @@ mod tests {
     #[test]
     fn a_successful_result_between_same_errors_breaks_the_streak() {
         let cfg = ScoreConfig::default();
-        let mut events = vec![NormalizedEvent::TurnStart];
+        let mut events = vec![NormalizedEvent::TurnStart { at_ms: None }];
         events.extend(erroring_tool_result("error A"));
         events.push(NormalizedEvent::ToolResult { is_error: false });
         events.extend(erroring_tool_result("error A"));
@@ -1215,7 +1231,7 @@ mod tests {
     #[test]
     fn an_error_with_no_extractable_text_breaks_the_streak() {
         let cfg = ScoreConfig::default();
-        let mut events = vec![NormalizedEvent::TurnStart];
+        let mut events = vec![NormalizedEvent::TurnStart { at_ms: None }];
         events.extend(erroring_tool_result("error A"));
         events.push(NormalizedEvent::ToolResult { is_error: true });
         events.extend(erroring_tool_result("error A"));
@@ -1232,7 +1248,7 @@ mod tests {
     #[test]
     fn three_same_errors_with_no_intervening_results_run_three() {
         let cfg = ScoreConfig::default();
-        let mut events = vec![NormalizedEvent::TurnStart];
+        let mut events = vec![NormalizedEvent::TurnStart { at_ms: None }];
         events.extend(erroring_tool_result("error A"));
         events.extend(erroring_tool_result("error A"));
         events.extend(erroring_tool_result("error A"));
@@ -1243,7 +1259,7 @@ mod tests {
     #[test]
     fn same_error_repeats_normalizes_digits_and_paths_that_differ_between_attempts() {
         let cfg = ScoreConfig::default();
-        let mut events = vec![NormalizedEvent::TurnStart];
+        let mut events = vec![NormalizedEvent::TurnStart { at_ms: None }];
         events.extend(erroring_tool_result(
             "error[E0433]: failed to resolve at /tmp/build123/src/foo.rs:42:10",
         ));
@@ -1293,14 +1309,14 @@ mod tests {
     #[test]
     fn same_error_repeats_folds_incrementally_the_same_as_a_full_parse() {
         let cfg = ScoreConfig::default();
-        let mut events = vec![NormalizedEvent::TurnStart];
+        let mut events = vec![NormalizedEvent::TurnStart { at_ms: None }];
         for i in 0..5 {
             events.push(tool(
                 "Bash",
                 &format!("{{\"command\":\"cargo test mod{i}\"}}"),
             ));
             events.extend(erroring_tool_result("error[E0433]: unresolved import"));
-            events.push(NormalizedEvent::TurnStart);
+            events.push(NormalizedEvent::TurnStart { at_ms: None });
         }
         let expected = score_events(&events, full_caps(), &cfg);
         for chunk in [1, 3, 7] {
@@ -1874,5 +1890,98 @@ mod tests {
         assert_eq!(result.signals.marker_miss_rate, Some(0.4));
         assert_eq!(result.score, 12);
         assert_eq!(result.verdict, Verdict::Healthy);
+    }
+
+    /// Issue #293's own acceptance criterion: adding wall-clock timestamps to
+    /// an event stream must never move an existing verdict. Built from the
+    /// same fixtures `equivalence_fixtures` already exercises for the
+    /// incremental fold, stamped with a strictly increasing `at_ms` on every
+    /// `TurnStart`/`AssistantFinal`/`ToolCall`, plus a genuine
+    /// `AssistantFirstText`/`ToolResultTimestamp` sprinkled in (the two new
+    /// variants `rot.rs` treats as pure no-ops) -- `rot.rs` must score the
+    /// stamped and unstamped streams identically -- `Score` itself carries
+    /// no speed field at all (that lives in `score.rs`'s own
+    /// `derive_speed_metrics`, deliberately outside `Score` so the
+    /// incremental-fold-equals-full-parse contract every other `Score`
+    /// field already upholds is never put at risk by a signal that is
+    /// legitimately allowed to differ between a bounded poll and a full
+    /// parse).
+    #[test]
+    fn timestamps_never_move_a_verdict() {
+        fn stamp(events: &[NormalizedEvent]) -> Vec<NormalizedEvent> {
+            let mut clock = 1_700_000_000_000u64;
+            let mut out = Vec::with_capacity(events.len() * 2);
+            for event in events {
+                clock += 1_000;
+                match event.clone() {
+                    NormalizedEvent::TurnStart { .. } => {
+                        out.push(NormalizedEvent::TurnStart { at_ms: Some(clock) });
+                    }
+                    NormalizedEvent::AssistantFinal {
+                        text, input_tokens, ..
+                    } => {
+                        if !text.trim().is_empty() {
+                            out.push(NormalizedEvent::AssistantFirstText { at_ms: Some(clock) });
+                        }
+                        out.push(NormalizedEvent::AssistantFinal {
+                            text,
+                            input_tokens,
+                            at_ms: Some(clock),
+                        });
+                    }
+                    NormalizedEvent::ToolCall {
+                        name, input_hash, ..
+                    } => {
+                        out.push(NormalizedEvent::ToolCall {
+                            name,
+                            input_hash,
+                            at_ms: Some(clock),
+                        });
+                    }
+                    NormalizedEvent::ToolResult { is_error } => {
+                        out.push(NormalizedEvent::ToolResult { is_error });
+                        out.push(NormalizedEvent::ToolResultTimestamp { at_ms: Some(clock) });
+                    }
+                    other => out.push(other),
+                }
+            }
+            out
+        }
+
+        let cfg = ScoreConfig::default();
+        for (name, events) in equivalence_fixtures() {
+            let unstamped = score_events(&events, full_caps(), &cfg);
+            let stamped = score_events(&stamp(&events), full_caps(), &cfg);
+            assert_eq!(
+                stamped.verdict, unstamped.verdict,
+                "{name}: timestamps must never move the verdict"
+            );
+            assert_eq!(
+                stamped.score, unstamped.score,
+                "{name}: timestamps must never move the score"
+            );
+            assert_eq!(
+                stamped.signals, unstamped.signals,
+                "{name}: timestamps must never move a signal"
+            );
+        }
+    }
+
+    /// `rot.rs`'s production code must never read a clock: time only ever
+    /// arrives as data already carried on an event (issue #293, mirroring
+    /// `rot_stays_pure_of_pace_and_window_data` above).
+    #[test]
+    fn rot_stays_pure_of_a_clock() {
+        const THIS_FILE: &str = include_str!("rot.rs");
+        let production_code = THIS_FILE
+            .split("#[cfg(test)]")
+            .next()
+            .expect("this file always has a #[cfg(test)] module");
+        for needle in ["SystemTime", "Instant::now", "std::time::Instant"] {
+            assert!(
+                !production_code.contains(needle),
+                "rot.rs's production code must never call a clock -- found `{needle}`"
+            );
+        }
     }
 }
