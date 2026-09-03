@@ -32,6 +32,42 @@
 #                                           in the requested --workdir)
 #   FAKE_AGENT_COMPACTION_EVENT=0           omit the compact-boundary event,
 #                                           exercising fail-closed verification
+#   FAKE_AGENT_PROMPT_LOG=<path>            issue #299 (prompt-prefix
+#                                           stability harness): append the
+#                                           composed system prompt this run
+#                                           was actually handed, byte-exact,
+#                                           framed as \036<turn-index>\036
+#                                           followed by the raw bytes -- no
+#                                           normalization, no trailing
+#                                           newline, no shell interpolation
+#                                           of the payload (cat/printf '%s'
+#                                           only). Turn index starts at 1 and
+#                                           is tracked in a companion
+#                                           "$FAKE_AGENT_PROMPT_LOG.turn"
+#                                           file, since one log file spans
+#                                           every launch of one test.
+#                                           zirv's claude adapter delivers
+#                                           the composed prompt one of two
+#                                           ways: inline on argv
+#                                           (--append-system-prompt <text>,
+#                                           logged verbatim) or, when the
+#                                           installed binary supports it,
+#                                           through a private file
+#                                           (--append-system-prompt-file
+#                                           <path>, whose BYTES are logged,
+#                                           never the path). The codex
+#                                           adapter has no per-run
+#                                           system-prompt mechanism at all
+#                                           and instead folds the composed
+#                                           prompt into a `-c
+#                                           developer_instructions=<json>`
+#                                           config override, also on argv
+#                                           (the raw, still-JSON-encoded
+#                                           value is logged, matching
+#                                           whatever actually reached this
+#                                           process). A run with none of the
+#                                           three present still logs its
+#                                           frame with an empty payload.
 #
 #   healthy  distinct tool inputs, marker on every final, 20k tokens
 #   rot      identical tool input, every result an error, marker only on the
@@ -73,6 +109,13 @@ mv_bin=mv
 session=""
 prompt=""
 resumed=false
+# Issue #299: the three verified ways zirv's own adapters actually deliver
+# the composed system prompt to this process -- see FAKE_AGENT_PROMPT_LOG's
+# own doc comment above for which adapter uses which.
+sys_prompt=""
+sys_prompt_set=false
+sys_prompt_file=""
+codex_dev_instructions=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --session-id) session="${2:-}"; shift 2 ;;
@@ -85,10 +128,42 @@ while [ $# -gt 0 ]; do
         shift
       fi
       ;;
+    --append-system-prompt)
+      sys_prompt="${2:-}"
+      sys_prompt_set=true
+      shift 2
+      ;;
+    --append-system-prompt-file)
+      sys_prompt_file="${2:-}"
+      shift 2
+      ;;
+    -c)
+      case "${2:-}" in
+        developer_instructions=*)
+          codex_dev_instructions="${2#developer_instructions=}"
+          ;;
+      esac
+      shift 2
+      ;;
     *) shift ;;
   esac
 done
 [ -n "$session" ] || { echo "fake-agent: no --session-id given" >&2; exit 64; }
+
+if [ -n "${FAKE_AGENT_PROMPT_LOG:-}" ]; then
+  turn_file="$FAKE_AGENT_PROMPT_LOG.turn"
+  turn_n=1
+  [ -s "$turn_file" ] && turn_n=$("$head_bin" -n 1 "$turn_file")
+  printf '%s' "$((turn_n + 1))" > "$turn_file"
+  printf '\036%s\036' "$turn_n" >> "$FAKE_AGENT_PROMPT_LOG"
+  if [ -n "$sys_prompt_file" ]; then
+    cat "$sys_prompt_file" >> "$FAKE_AGENT_PROMPT_LOG"
+  elif [ "$sys_prompt_set" = true ]; then
+    printf '%s' "$sys_prompt" >> "$FAKE_AGENT_PROMPT_LOG"
+  elif [ -n "$codex_dev_instructions" ]; then
+    printf '%s' "$codex_dev_instructions" >> "$FAKE_AGENT_PROMPT_LOG"
+  fi
+fi
 
 mode="${FAKE_AGENT_MODE:-healthy}"
 case "$prompt" in
