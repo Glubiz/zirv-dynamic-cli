@@ -1669,7 +1669,7 @@ fn resolve_one_check_env_var(
 /// stdout) is silently `None` -- this is a best-effort fallback, never a
 /// reason to fail a check.
 #[cfg(target_os = "macos")]
-fn launchd_getenv(name: &str) -> Option<String> {
+pub(crate) fn launchd_getenv(name: &str) -> Option<String> {
     let mut command = Command::new("launchctl");
     command
         .args(["getenv", name])

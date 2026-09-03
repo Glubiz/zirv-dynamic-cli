@@ -30,6 +30,10 @@ pub enum HookEvent {
     /// Claude PreToolUse hook: refuse a subagent dispatch that would inherit
     /// this seat's expensive model.
     Pretool,
+    /// Observe Claude permission requests and denials without changing their
+    /// flow. Sandboxed-command network prompts emit a `Notification` instead
+    /// and do not invoke `PermissionRequest` hooks.
+    Permission,
     /// Claude SessionStart hook: re-inject the latest handoff on resume/clear.
     SessionStart,
     /// Codex notify program: same role as Stop.
@@ -66,6 +70,141 @@ impl HookPayload {
             std::path::PathBuf::from(&self.cwd)
         }
     }
+}
+
+const PERMISSION_PROMPTS_FILE: &str = "permission-prompts.jsonl";
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+struct PermissionHookPayload {
+    session_id: String,
+    cwd: String,
+    permission_mode: String,
+    hook_event_name: Option<String>,
+    reason: Option<String>,
+    tool_name: String,
+    tool_input: PermissionToolInput,
+}
+
+impl PermissionHookPayload {
+    fn parse(raw: &str) -> CtxResult<Self> {
+        Ok(serde_json::from_str(raw)?)
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+struct PermissionToolInput {
+    command: String,
+    file_path: String,
+    url: String,
+}
+
+#[derive(Debug, Serialize)]
+struct PermissionPromptRow<'a> {
+    ts: u64,
+    session: &'a str,
+    event: &'a str,
+    tool: &'a str,
+    family: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    command_sha256: Option<String>,
+    cwd: &'a str,
+    permission_mode: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<&'a str>,
+}
+
+fn web_url_host(url: &str) -> Option<String> {
+    let (_, remainder) = url.split_once("://")?;
+    let authority = remainder.split(['/', '?', '#']).next()?;
+    let host_and_port = authority.rsplit('@').next()?;
+    let host = if let Some(ipv6) = host_and_port.strip_prefix('[') {
+        ipv6.split_once(']')?.0
+    } else {
+        host_and_port.split(':').next()?
+    };
+    (!host.is_empty()).then(|| host.to_string())
+}
+
+fn permission_family(payload: &PermissionHookPayload) -> (String, Option<String>) {
+    match payload.tool_name.as_str() {
+        "Bash" | "PowerShell" => {
+            // Program name plus the first non-flag argument, but never a token
+            // that could itself carry a credential (`-pSECRET` starts with
+            // `-`; `user:pass@host` and `KEY=val` carry `:`/`@`/`=`). The full
+            // command is captured only as an opaque sha256, never in clear.
+            let mut tokens = payload.tool_input.command.split_whitespace();
+            let program = tokens.next().unwrap_or("");
+            let subcommand =
+                tokens.find(|token| !token.starts_with('-') && !token.contains([':', '@', '=']));
+            let family = match (program, subcommand) {
+                ("", _) => payload.tool_name.clone(),
+                (program, Some(subcommand)) => format!("{program} {subcommand}"),
+                (program, None) => program.to_string(),
+            };
+            (
+                family,
+                Some(super::safety::sha256_hex(
+                    payload.tool_input.command.as_bytes(),
+                )),
+            )
+        }
+        "Read" | "Edit" | "Write" | "MultiEdit" | "NotebookEdit" => {
+            let path = Path::new(&payload.tool_input.file_path);
+            let parent = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            (parent.display().to_string(), None)
+        }
+        "WebFetch" => (
+            web_url_host(&payload.tool_input.url).unwrap_or_else(|| payload.tool_name.clone()),
+            None,
+        ),
+        _ => (payload.tool_name.clone(), None),
+    }
+}
+
+fn permission_prompt_row(payload: &PermissionHookPayload, ts: u64) -> PermissionPromptRow<'_> {
+    let (family, command_sha256) = permission_family(payload);
+    PermissionPromptRow {
+        ts,
+        session: &payload.session_id,
+        event: payload
+            .hook_event_name
+            .as_deref()
+            .unwrap_or("PermissionRequest"),
+        tool: &payload.tool_name,
+        family,
+        command_sha256,
+        cwd: &payload.cwd,
+        permission_mode: &payload.permission_mode,
+        reason: payload.reason.as_deref(),
+    }
+}
+
+/// Records one privacy-preserving permission-prompt row without affecting
+/// Claude's permission flow. Every error is swallowed and stdout stays empty.
+fn run_permission<W: Write>(_w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResult<i32> {
+    let Ok(payload) = PermissionHookPayload::parse(stdin) else {
+        return Ok(0);
+    };
+    let Ok(state) = StateDir::resolve(env) else {
+        return Ok(0);
+    };
+    let Ok(line) = serde_json::to_string(&permission_prompt_row(&payload, now_secs())) else {
+        return Ok(0);
+    };
+    let dir = state.logs();
+    if super::state::create_private_dir_all(&dir).is_err() {
+        return Ok(0);
+    }
+    let Ok(mut file) = super::state::open_private_append(&dir.join(PERMISSION_PROMPTS_FILE)) else {
+        return Ok(0);
+    };
+    let _ = writeln!(file, "{line}");
+    Ok(0)
 }
 
 /// The optimize hint sentence, worded from the signal that actually fired
@@ -1208,6 +1347,7 @@ pub fn run<W: Write>(args: &HookArgs, w: &mut W) -> CtxResult<i32> {
         }
         HookEvent::PreCompact => run_pre_compact(w, &read_stdin(), &env),
         HookEvent::Pretool => run_pretool(w, &read_stdin(), &env),
+        HookEvent::Permission => run_permission(w, &read_stdin(), &env),
         HookEvent::SessionStart => run_session_start(w, &read_stdin(), &env),
         HookEvent::Notify { payload } => {
             let raw = match payload {
@@ -3144,6 +3284,161 @@ mod tests {
         let code = run_notify(&mut out, "agent-turn-complete", &|_| None).expect("runs");
         assert_eq!(code, 0);
         assert!(out.is_empty(), "no output and no panic: {out:?}");
+    }
+
+    // -- PermissionRequest / PermissionDenied observation -----------------
+
+    fn permission_stdin(
+        event: Option<&str>,
+        tool_name: &str,
+        tool_input: serde_json::Value,
+    ) -> String {
+        let mut payload = serde_json::json!({
+            "session_id": "abc123",
+            "transcript_path": "/tmp/t.jsonl",
+            "cwd": "/work/repo",
+            "permission_mode": "default",
+            "tool_name": tool_name,
+            "tool_input": tool_input,
+        });
+        if let Some(event) = event {
+            payload["hook_event_name"] = serde_json::json!(event);
+        }
+        payload.to_string()
+    }
+
+    #[test]
+    fn permission_rows_normalize_bash_read_and_unknown_tools() {
+        let command = "gh issue view 321 --json title";
+        let bash = PermissionHookPayload::parse(&permission_stdin(
+            None,
+            "Bash",
+            serde_json::json!({"command": command}),
+        ))
+        .expect("payload");
+        assert_eq!(
+            serde_json::to_value(permission_prompt_row(&bash, 42)).expect("row"),
+            serde_json::json!({
+                "ts": 42,
+                "session": "abc123",
+                "event": "PermissionRequest",
+                "tool": "Bash",
+                "family": "gh issue",
+                "command_sha256": super::super::safety::sha256_hex(command.as_bytes()),
+                "cwd": "/work/repo",
+                "permission_mode": "default"
+            })
+        );
+
+        let read = PermissionHookPayload::parse(&permission_stdin(
+            Some("PermissionDenied"),
+            "Read",
+            serde_json::json!({"file_path": "/work/repo/src/main.rs"}),
+        ))
+        .expect("payload");
+        let read = serde_json::to_value(permission_prompt_row(&read, 43)).expect("row");
+        assert_eq!(read["event"], "PermissionDenied");
+        assert_eq!(read["family"], "/work/repo/src");
+        assert!(read["command_sha256"].is_null());
+
+        let unknown = PermissionHookPayload::parse(&permission_stdin(
+            Some("PermissionRequest"),
+            "mcp__example__lookup",
+            serde_json::json!({"query": "private input"}),
+        ))
+        .expect("payload");
+        let unknown = serde_json::to_value(permission_prompt_row(&unknown, 44)).expect("row");
+        assert_eq!(unknown["family"], "mcp__example__lookup");
+        assert!(
+            !unknown.to_string().contains("private input"),
+            "raw tool input must never enter the row: {unknown}"
+        );
+    }
+
+    #[test]
+    fn permission_family_never_captures_a_credential_bearing_token() {
+        let cases = [
+            ("mysql -pSECRET -h host", "mysql host", "SECRET"),
+            ("curl https://user:pass@host/api", "curl", "pass"),
+            ("git push origin main", "git push", "origin"),
+        ];
+        for (command, expected_family, secret) in cases {
+            let payload = PermissionHookPayload::parse(&permission_stdin(
+                None,
+                "Bash",
+                serde_json::json!({ "command": command }),
+            ))
+            .expect("payload");
+            let row = serde_json::to_value(permission_prompt_row(&payload, 1)).expect("row");
+            assert_eq!(row["family"], expected_family, "{command}");
+            assert!(
+                !row["family"].as_str().unwrap().contains(secret),
+                "family leaked `{secret}` for `{command}`"
+            );
+        }
+    }
+
+    #[test]
+    fn permission_denied_reason_is_recorded_only_when_present() {
+        let mut denied: serde_json::Value = serde_json::from_str(&permission_stdin(
+            Some("PermissionDenied"),
+            "Bash",
+            serde_json::json!({"command": "git push"}),
+        ))
+        .expect("payload json");
+        denied["reason"] = serde_json::json!("Blocked by auto-mode classifier");
+        let denied = PermissionHookPayload::parse(&denied.to_string()).expect("payload");
+        let denied = serde_json::to_value(permission_prompt_row(&denied, 45)).expect("row");
+        assert_eq!(denied["reason"], "Blocked by auto-mode classifier");
+
+        let requested = PermissionHookPayload::parse(&permission_stdin(
+            Some("PermissionRequest"),
+            "Bash",
+            serde_json::json!({"command": "git status"}),
+        ))
+        .expect("payload");
+        let requested = serde_json::to_value(permission_prompt_row(&requested, 46)).expect("row");
+        assert!(requested.get("reason").is_none());
+    }
+
+    #[test]
+    fn run_permission_exits_zero_and_silent_on_garbage_stdin() {
+        let mut out = Vec::new();
+        let code = run_permission(&mut out, "not json", &|_| None).expect("never errors");
+        assert_eq!(code, 0);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn run_permission_appends_one_parseable_json_line() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = dir.path().join("state");
+        let env: std::collections::HashMap<String, String> = [(
+            crate::commands::ctx::state::STATE_ENV.to_string(),
+            state.display().to_string(),
+        )]
+        .into();
+        let mut out = Vec::new();
+        let code = run_permission(
+            &mut out,
+            &permission_stdin(
+                Some("PermissionRequest"),
+                "Read",
+                serde_json::json!({"file_path": "/work/repo/src/lib.rs"}),
+            ),
+            &|key| env.get(key).cloned(),
+        )
+        .expect("never errors");
+        assert_eq!(code, 0);
+        assert!(out.is_empty());
+
+        let log = std::fs::read_to_string(state.join("logs/permission-prompts.jsonl"))
+            .expect("permission prompt log");
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(lines.len(), 1);
+        let row: serde_json::Value = serde_json::from_str(lines[0]).expect("json row");
+        assert_eq!(row["session"], "abc123");
+        assert_eq!(row["family"], "/work/repo/src");
     }
 
     // -- PreToolUse: the expensive-seat inheritance guard ------------------

@@ -659,16 +659,7 @@ impl ClaudeAdapter {
         let policy_dir = dir.join("policies");
         let policy_path = policy_dir.join(format!("{fingerprint}.json"));
         let path = dir.join(format!("claude-launch-settings-{fingerprint}.json"));
-        // Issue #222: sandbox-confined Zirv built-ins persist workflow,
-        // verification, frontend, telemetry, and related state throughout
-        // the platform state root. Resolve that root once from the operator/
-        // platform environment; repository input cannot configure it.
-        // Best-effort: resolution failure omits allowWrite without blocking
-        // the rest of the attested settings layer.
-        let state_root =
-            super::super::state::StateDir::resolve(&super::super::config::env_from_process())
-                .ok()
-                .map(|state| state.root().to_path_buf());
+        let launch_environment = LaunchEnvironment::resolve();
         let result = (|| -> std::io::Result<()> {
             super::super::state::create_private_dir_all(&dir)?;
             super::super::state::create_private_dir_all(&policy_dir)?;
@@ -676,7 +667,7 @@ impl ClaudeAdapter {
                 serde_json::to_string_pretty(safety).map_err(std::io::Error::other)?;
             policy_body.push('\n');
             super::super::state::write_private(&policy_path, &policy_body)?;
-            let settings = launch_settings_value(safety, &policy_path, state_root.as_deref())
+            let settings = launch_settings_value(safety, &policy_path, &launch_environment)
                 .map_err(std::io::Error::other)?;
             let mut body =
                 serde_json::to_string_pretty(&settings).map_err(std::io::Error::other)?;
@@ -739,11 +730,86 @@ const PROMPT_FREE_COMMAND_FAMILIES: &[CommandFamilyProjection] = &[
     },
 ];
 
-#[cfg_attr(windows, allow(unused_variables))]
+#[derive(Debug, Default)]
+struct LaunchEnvironment {
+    // Native Windows has no OS sandbox, so the `#[cfg(not(windows))]`
+    // filesystem block that reads this is compiled out there.
+    #[cfg_attr(windows, allow(dead_code))]
+    state_write_root: Option<PathBuf>,
+    scratchpad_roots: Vec<String>,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    unix_sockets: Vec<String>,
+    ssh_auth_sock: Option<String>,
+}
+
+impl LaunchEnvironment {
+    fn resolve() -> Self {
+        let state_write_root =
+            super::super::state::StateDir::resolve(&super::super::config::env_from_process())
+                .ok()
+                .map(|state| state.root().to_path_buf());
+        let scratchpad_roots = super::scratchpad_roots(&std::env::temp_dir());
+        let mut unix_sockets = resolve_docker_socket_paths(
+            Path::new("/var/run/docker.sock"),
+            std::env::var("DOCKER_HOST").ok().as_deref(),
+        );
+        let ssh_auth_sock = resolve_ssh_auth_sock();
+        if let Some(socket) = &ssh_auth_sock
+            && !unix_sockets.contains(socket)
+        {
+            unix_sockets.push(socket.clone());
+        }
+        Self {
+            state_write_root,
+            scratchpad_roots,
+            unix_sockets,
+            ssh_auth_sock,
+        }
+    }
+}
+
+fn resolve_docker_socket_paths(docker_socket: &Path, docker_host: Option<&str>) -> Vec<String> {
+    let mut sockets = Vec::new();
+    let mut push_existing = |path: &Path| {
+        if path.exists() {
+            let path = path.display().to_string();
+            if !sockets.contains(&path) {
+                sockets.push(path);
+            }
+        }
+    };
+
+    push_existing(docker_socket);
+    if std::fs::symlink_metadata(docker_socket).is_ok_and(|meta| meta.file_type().is_symlink())
+        && let Ok(target) = std::fs::canonicalize(docker_socket)
+    {
+        push_existing(&target);
+    }
+    if let Some(path) = docker_host.and_then(|host| host.strip_prefix("unix://"))
+        && !path.is_empty()
+    {
+        push_existing(Path::new(path));
+    }
+    sockets
+}
+
+fn resolve_ssh_auth_sock() -> Option<String> {
+    let process_value = std::env::var("SSH_AUTH_SOCK")
+        .ok()
+        .filter(|path| !path.is_empty() && Path::new(path).exists());
+    #[cfg(target_os = "macos")]
+    let value = process_value
+        .or_else(|| crate::commands::workflow::verification::launchd_getenv("SSH_AUTH_SOCK"));
+    #[cfg(not(target_os = "macos"))]
+    let value = process_value;
+
+    value.filter(|path| !path.is_empty() && Path::new(path).exists())
+}
+
 fn launch_settings_value(
     safety: &super::super::safety::SafetyPolicy,
     policy_path: &Path,
-    state_write_root: Option<&Path>,
+    launch_environment: &LaunchEnvironment,
 ) -> Result<Value, serde_json::Error> {
     let fingerprint = super::super::safety::policy_fingerprint(safety)?;
     let reserved_zirv_patterns = super::super::safety::reserved_zirv_command_patterns();
@@ -773,6 +839,18 @@ fn launch_settings_value(
                     "type": "command",
                     "command": "zirv ctx safety check"
                 }]
+            }],
+            "PermissionRequest": [{
+                "hooks": [{
+                    "type": "command",
+                    "command": "zirv ctx hook permission"
+                }]
+            }],
+            "PermissionDenied": [{
+                "hooks": [{
+                    "type": "command",
+                    "command": "zirv ctx hook permission"
+                }]
             }]
         },
         "permissions": {
@@ -798,6 +876,14 @@ fn launch_settings_value(
         }
     });
 
+    if !launch_environment.scratchpad_roots.is_empty() {
+        settings["permissions"]["additionalDirectories"] =
+            serde_json::json!(&launch_environment.scratchpad_roots);
+    }
+    if let Some(socket) = &launch_environment.ssh_auth_sock {
+        settings["env"]["SSH_AUTH_SOCK"] = serde_json::json!(socket);
+    }
+
     // Claude's OS sandbox is currently supported on macOS, Linux and WSL2,
     // but not native Windows. On supported hosts it is the hard containment
     // boundary beneath Zirv's semantic classifier: compatible Bash commands
@@ -812,20 +898,25 @@ fn launch_settings_value(
         // Sandbox-confined Zirv built-ins need the exact platform state root;
         // the immutable policy snapshot is operator-owned launch state and is
         // not added separately by this rule.
-        if let Some(state_root) = state_write_root {
+        if let Some(state_root) = &launch_environment.state_write_root {
             filesystem["allowWrite"] = serde_json::json!([state_root.display().to_string()]);
         }
-        object.insert(
-            "sandbox".to_string(),
-            serde_json::json!({
+        #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
+        let mut sandbox = serde_json::json!({
             "enabled": true,
             "autoAllowBashIfSandboxed": true,
             "allowUnsandboxedCommands": true,
             "excludedCommands": sandbox_exclusions,
             "failIfUnavailable": true,
             "filesystem": filesystem
-            }),
-        );
+        });
+        #[cfg(target_os = "macos")]
+        if !launch_environment.unix_sockets.is_empty() {
+            sandbox["network"] = serde_json::json!({
+                "allowUnixSockets": &launch_environment.unix_sockets
+            });
+        }
+        object.insert("sandbox".to_string(), sandbox);
     }
 
     Ok(settings)
@@ -840,6 +931,87 @@ fn warn_launch_settings_once(path: &Path, error: &std::io::Error) {
             path.display()
         );
     }
+}
+
+const MAX_LINKED_WORKTREES: usize = 16;
+#[cfg(not(test))]
+const WORKTREE_LIST_TIMEOUT: Duration = Duration::from_secs(3);
+
+fn parse_worktree_porcelain(output: &str) -> Vec<PathBuf> {
+    output
+        .lines()
+        .filter_map(|line| line.strip_prefix("worktree "))
+        .map(PathBuf::from)
+        .collect()
+}
+
+fn additional_worktree_args(
+    canonical_repo: &Path,
+    canonical_worktrees: impl IntoIterator<Item = PathBuf>,
+) -> Vec<String> {
+    canonical_worktrees
+        .into_iter()
+        .filter(|path| !path.starts_with(canonical_repo))
+        .take(MAX_LINKED_WORKTREES)
+        .flat_map(|path| ["--add-dir".to_string(), path.display().to_string()])
+        .collect()
+}
+
+/// Adds linked worktrees belonging to the launch repository to Claude's
+/// working-directory set. Other repositories remain out of scope; callers
+/// use `zirv agent --workdir` when a cross-repository target is intentional.
+/// Discovery is best-effort, bounded, and never invokes a shell.
+#[cfg(not(test))]
+fn linked_worktree_args(repo: &Path) -> Vec<String> {
+    let Ok(canonical_repo) = std::fs::canonicalize(repo) else {
+        return Vec::new();
+    };
+    let Ok(mut child) = Command::new("git")
+        .arg("-C")
+        .arg(&canonical_repo)
+        .args(["worktree", "list", "--porcelain"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return Vec::new();
+    };
+
+    let mut stdout_pipe = child.stdout.take();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut output = String::new();
+        if let Some(mut pipe) = stdout_pipe.take() {
+            let _ = pipe.read_to_string(&mut output);
+        }
+        let _ = tx.send(output);
+    });
+
+    let deadline = Instant::now() + WORKTREE_LIST_TIMEOUT;
+    while Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => {
+                let Ok(output) = rx.recv_timeout(Duration::from_secs(1)) else {
+                    return Vec::new();
+                };
+                let worktrees = parse_worktree_porcelain(&output)
+                    .into_iter()
+                    .filter_map(|path| std::fs::canonicalize(path).ok());
+                return additional_worktree_args(&canonical_repo, worktrees);
+            }
+            Ok(Some(_)) => return Vec::new(),
+            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Vec::new();
+            }
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    Vec::new()
 }
 
 /// Bounds the `--help` probe below: a hang here must never hang the whole
@@ -1486,6 +1658,12 @@ impl AgentAdapter for ClaudeAdapter {
             args.push("--settings".to_string());
             args.push(path.display().to_string());
         }
+        #[cfg(not(test))]
+        args.extend(
+            std::env::current_dir()
+                .ok()
+                .map_or_else(Vec::new, |repo| linked_worktree_args(&repo)),
+        );
         args
     }
 
@@ -1663,7 +1841,7 @@ mod tests {
         launch_settings_value(
             &Default::default(),
             Path::new("zirv-test-safety-policy.json"),
-            None,
+            &LaunchEnvironment::default(),
         )
         .expect("settings")
     }
@@ -2566,10 +2744,136 @@ mod tests {
     }
 
     #[test]
+    fn launch_settings_observe_permission_events_without_changing_pretooluse() {
+        let settings = test_launch_settings();
+        assert_eq!(
+            settings["hooks"]["PreToolUse"],
+            serde_json::json!([{
+                "matcher": "Bash|PowerShell",
+                "hooks": [{
+                    "type": "command",
+                    "command": "zirv ctx safety check"
+                }]
+            }])
+        );
+        let observer = serde_json::json!([{
+            "hooks": [{
+                "type": "command",
+                "command": "zirv ctx hook permission"
+            }]
+        }]);
+        assert_eq!(settings["hooks"]["PermissionRequest"], observer);
+        assert_eq!(settings["hooks"]["PermissionDenied"], observer);
+    }
+
+    #[test]
+    fn launch_settings_additional_directories_exactly_match_the_scratchpad_roots() {
+        let policy = super::super::super::safety::SafetyPolicy::default();
+        let policy_path = Path::new("zirv-test-safety-policy.json");
+        let scratchpad_roots = super::super::scratchpad_roots(&std::env::temp_dir());
+        let settings = launch_settings_value(
+            &policy,
+            policy_path,
+            &LaunchEnvironment {
+                scratchpad_roots: scratchpad_roots.clone(),
+                ..LaunchEnvironment::default()
+            },
+        )
+        .expect("settings");
+        assert_eq!(
+            settings["permissions"]["additionalDirectories"],
+            serde_json::json!(scratchpad_roots)
+        );
+
+        let settings = launch_settings_value(&policy, policy_path, &LaunchEnvironment::default())
+            .expect("settings");
+        assert!(settings["permissions"]["additionalDirectories"].is_null());
+    }
+
+    #[test]
+    fn launch_settings_export_ssh_auth_sock_only_when_resolved() {
+        let policy = super::super::super::safety::SafetyPolicy::default();
+        let policy_path = Path::new("zirv-test-safety-policy.json");
+        let settings = launch_settings_value(
+            &policy,
+            policy_path,
+            &LaunchEnvironment {
+                ssh_auth_sock: Some("/tmp/ssh-agent.sock".to_string()),
+                ..LaunchEnvironment::default()
+            },
+        )
+        .expect("settings");
+        assert_eq!(settings["env"]["SSH_AUTH_SOCK"], "/tmp/ssh-agent.sock");
+        assert_eq!(settings["env"]["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"], "1");
+        assert!(settings["env"][super::super::super::safety::POLICY_FINGERPRINT_ENV].is_string());
+        assert_eq!(
+            settings["env"][super::super::super::safety::POLICY_SNAPSHOT_ENV],
+            policy_path.display().to_string()
+        );
+
+        let settings = launch_settings_value(&policy, policy_path, &LaunchEnvironment::default())
+            .expect("settings");
+        assert!(settings["env"]["SSH_AUTH_SOCK"].is_null());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn launch_settings_allow_the_resolved_unix_sockets_on_macos() {
+        let settings = launch_settings_value(
+            &Default::default(),
+            Path::new("zirv-test-safety-policy.json"),
+            &LaunchEnvironment {
+                unix_sockets: vec![
+                    "/var/run/docker.sock".to_string(),
+                    "/tmp/ssh-agent.sock".to_string(),
+                ],
+                ..LaunchEnvironment::default()
+            },
+        )
+        .expect("settings");
+        assert_eq!(
+            settings["sandbox"]["network"]["allowUnixSockets"],
+            serde_json::json!(["/var/run/docker.sock", "/tmp/ssh-agent.sock"])
+        );
+
+        let settings = launch_settings_value(
+            &Default::default(),
+            Path::new("zirv-test-safety-policy.json"),
+            &LaunchEnvironment::default(),
+        )
+        .expect("settings");
+        assert!(settings["sandbox"]["network"].is_null());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn launch_environment_deduplicates_existing_docker_socket_paths() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("docker-target.sock");
+        std::fs::write(&target, "").expect("fake socket target");
+        let socket = dir.path().join("docker.sock");
+        symlink(&target, &socket).expect("socket symlink");
+        let canonical_target = target.canonicalize().expect("canonical target");
+        let docker_host = format!("unix://{}", canonical_target.display());
+
+        assert_eq!(
+            resolve_docker_socket_paths(&socket, Some(&docker_host)),
+            vec![
+                socket.display().to_string(),
+                canonical_target.display().to_string(),
+            ]
+        );
+        assert!(resolve_docker_socket_paths(&dir.path().join("missing"), None).is_empty());
+    }
+
+    #[test]
     fn launch_settings_bind_the_hook_to_an_immutable_policy_snapshot() {
         let policy = super::super::super::safety::SafetyPolicy::default();
         let policy_path = Path::new("C:/safe/policies/policy.json");
-        let settings = launch_settings_value(&policy, policy_path, None).expect("settings");
+        let settings = launch_settings_value(&policy, policy_path, &LaunchEnvironment::default())
+            .expect("settings");
         let expected =
             super::super::super::safety::policy_fingerprint(&policy).expect("fingerprint");
 
@@ -2705,8 +3009,15 @@ mod tests {
         let policy = super::super::super::safety::SafetyPolicy::default();
         let policy_path = Path::new("/operator/.zirv/runtime/policies/abc123.json");
         let state_root = Path::new("/state");
-        let settings =
-            launch_settings_value(&policy, policy_path, Some(state_root)).expect("settings");
+        let settings = launch_settings_value(
+            &policy,
+            policy_path,
+            &LaunchEnvironment {
+                state_write_root: Some(state_root.to_path_buf()),
+                ..LaunchEnvironment::default()
+            },
+        )
+        .expect("settings");
         let allow_write = settings["sandbox"]["filesystem"]["allowWrite"]
             .as_array()
             .expect("allowWrite must be present when a state root is given");
@@ -2722,8 +3033,34 @@ mod tests {
         // No state root resolved (best-effort failure): no allowWrite key at
         // all, never an empty-but-present one that could mask a future bug.
         let settings_without_state =
-            launch_settings_value(&policy, policy_path, None).expect("settings");
+            launch_settings_value(&policy, policy_path, &LaunchEnvironment::default())
+                .expect("settings");
         assert!(settings_without_state["sandbox"]["filesystem"]["allowWrite"].is_null());
+    }
+
+    #[test]
+    fn worktree_porcelain_projects_only_external_paths_and_honours_the_cap() {
+        let mut porcelain = String::from(
+            "worktree /repo\nHEAD abc\nbranch refs/heads/main\n\n\
+             worktree /repo/nested\nHEAD def\ndetached\n\n\
+             worktree /repo-other\nHEAD ghi\nbare\n\n",
+        );
+        for i in 0..20 {
+            porcelain.push_str(&format!("worktree /outside-{i}\nHEAD {i}\n\n"));
+        }
+
+        let paths = parse_worktree_porcelain(&porcelain);
+        let args = additional_worktree_args(Path::new("/repo"), paths);
+        assert_eq!(args.len(), 16 * 2);
+        assert_eq!(
+            &args[..4],
+            &["--add-dir", "/repo-other", "--add-dir", "/outside-0"]
+        );
+        assert_eq!(&args[args.len() - 2..], &["--add-dir", "/outside-14"]);
+        assert!(
+            args.iter()
+                .all(|arg| arg != "/repo" && arg != "/repo/nested")
+        );
     }
 
     #[test]
@@ -2777,11 +3114,6 @@ mod tests {
             &std::fs::read_to_string(path).expect("read materialized settings"),
         )
         .expect("valid settings JSON");
-        let state_root = super::super::super::state::StateDir::resolve(
-            &super::super::super::config::env_from_process(),
-        )
-        .ok()
-        .map(|state| state.root().to_path_buf());
         assert_eq!(
             written["sandbox"]["filesystem"]["allowWrite"],
             serde_json::json!([state.path().display().to_string()]),
@@ -2796,7 +3128,8 @@ mod tests {
         );
         assert_eq!(
             written,
-            launch_settings_value(&policy, &policy_path, state_root.as_deref()).expect("settings")
+            launch_settings_value(&policy, &policy_path, &LaunchEnvironment::resolve())
+                .expect("settings")
         );
         let snapshotted: super::super::super::safety::SafetyPolicy = serde_json::from_str(
             &std::fs::read_to_string(policy_path).expect("read policy snapshot"),
