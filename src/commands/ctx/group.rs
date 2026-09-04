@@ -188,6 +188,38 @@ pub fn close(state: &StateDir, id: &str, now: u64) -> CtxResult<()> {
     Ok(())
 }
 
+/// Issue #317: read-only view of the durable task cards (`task.rs`) belonging
+/// to `group_id` -- a card outlives any one delegation and is tracked
+/// entirely independently of this group's own admission/spend ledger, which
+/// this never reads or touches. A `WorkGroup` record carries no repository of
+/// its own (unlike a task card, whose event log is repo-slugged), so this
+/// scans every repository's task event log under `state.tasks()` rather than
+/// requiring a repo to be named up front -- best-effort like every other
+/// reader here: a directory that cannot be read, or a repository with no
+/// cards naming this group, contributes nothing rather than failing the
+/// whole lookup.
+pub fn cards_for_group(state: &StateDir, group_id: &str) -> Vec<super::task::Card> {
+    let Ok(entries) = std::fs::read_dir(state.tasks()) else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(repo_slug) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        found.extend(
+            super::task::load_cards(state, repo_slug)
+                .into_values()
+                .filter(|card| card.group_id.as_deref() == Some(group_id)),
+        );
+    }
+    found
+}
+
 #[derive(Debug)]
 struct AdmissionExhausted(String);
 
@@ -549,6 +581,18 @@ fn print_group<W: Write>(
         write!(w, " ABANDONED")?;
     }
     writeln!(w)?;
+    // Issue #317: durable task cards are tracked independently of this
+    // group's own admission ledger, so a card naming this group is worth
+    // surfacing here even though `admitted_children` above already answers
+    // how many delegations this group let in.
+    let cards = cards_for_group(state, &group.work_group_id);
+    if !cards.is_empty() {
+        write!(w, "  tasks:")?;
+        for card in &cards {
+            write!(w, " {}[{}]", card.id, card.state)?;
+        }
+        writeln!(w)?;
+    }
     Ok(())
 }
 
@@ -1256,6 +1300,134 @@ mod tests {
             !discard_if_unused(&state, "wg-never-existed"),
             "and an unknown group is not an error, just nothing to remove"
         );
+    }
+
+    /// Issue #317: `cards_for_group` is a read-only view over `task.rs`'s own
+    /// event log, filtered by `group_id` -- a card naming a different group
+    /// (or no group at all) is excluded, and the group's own admission
+    /// ledger (`admitted_children`/`spent_tokens`) is left untouched by
+    /// reading it.
+    #[test]
+    fn cards_for_group_filters_task_cards_by_group_id() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        super::super::task::append_event(
+            &state,
+            "repo",
+            &super::super::task::Event::Created {
+                id: "task-in".to_string(),
+                repo_slug: "repo".to_string(),
+                title: "in group".to_string(),
+                brief: "b".to_string(),
+                parents: Vec::new(),
+                group_id: Some("wg-1".to_string()),
+                workdir: None,
+                at: 1,
+            },
+        )
+        .expect("create in-group card");
+        super::super::task::append_event(
+            &state,
+            "repo",
+            &super::super::task::Event::Created {
+                id: "task-out".to_string(),
+                repo_slug: "repo".to_string(),
+                title: "no group".to_string(),
+                brief: "b".to_string(),
+                parents: Vec::new(),
+                group_id: None,
+                workdir: None,
+                at: 1,
+            },
+        )
+        .expect("create ungrouped card");
+
+        let cards = cards_for_group(&state, "wg-1");
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0].id, "task-in");
+    }
+
+    /// `cards_for_group` scans across every repository's own task event log
+    /// (a `WorkGroup` names no repository of its own), so a card in a
+    /// different repo naming the same group id is still found.
+    #[test]
+    fn cards_for_group_scans_every_repository() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        super::super::task::append_event(
+            &state,
+            "repo-a",
+            &super::super::task::Event::Created {
+                id: "task-a".to_string(),
+                repo_slug: "repo-a".to_string(),
+                title: "a".to_string(),
+                brief: "b".to_string(),
+                parents: Vec::new(),
+                group_id: Some("wg-shared".to_string()),
+                workdir: None,
+                at: 1,
+            },
+        )
+        .expect("create in repo-a");
+        super::super::task::append_event(
+            &state,
+            "repo-b",
+            &super::super::task::Event::Created {
+                id: "task-b".to_string(),
+                repo_slug: "repo-b".to_string(),
+                title: "b".to_string(),
+                brief: "b".to_string(),
+                parents: Vec::new(),
+                group_id: Some("wg-shared".to_string()),
+                workdir: None,
+                at: 1,
+            },
+        )
+        .expect("create in repo-b");
+
+        let mut cards = cards_for_group(&state, "wg-shared");
+        cards.sort_by(|a, b| a.id.cmp(&b.id));
+        assert_eq!(cards.len(), 2);
+        assert_eq!(cards[0].id, "task-a");
+        assert_eq!(cards[1].id, "task-b");
+    }
+
+    /// `zirv ctx group status` surfaces a group's own task cards (id and
+    /// state) alongside its admission summary.
+    #[test]
+    fn group_status_lists_the_groups_task_cards() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        create(&state, &sample_group("wg-1")).expect("create group");
+        super::super::task::append_event(
+            &state,
+            "repo",
+            &super::super::task::Event::Created {
+                id: "task-1".to_string(),
+                repo_slug: "repo".to_string(),
+                title: "t".to_string(),
+                brief: "b".to_string(),
+                parents: Vec::new(),
+                group_id: Some("wg-1".to_string()),
+                workdir: None,
+                at: 1,
+            },
+        )
+        .expect("create card");
+
+        let mut out = Vec::new();
+        run_status(
+            &state,
+            &mut out,
+            &StatusArgs {
+                work_group_id: Some("wg-1".to_string()),
+            },
+            1_700_000_100,
+        )
+        .expect("status runs");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(text.contains("task-1"), "got {text}");
+        assert!(text.contains("[ready]"), "got {text}");
     }
 
     #[test]

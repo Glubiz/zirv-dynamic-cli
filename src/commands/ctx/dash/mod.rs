@@ -1503,7 +1503,7 @@ fn reap_ended_panes(
         // reclaim guard) and nothing else reclaimed it once the pane's
         // child exited. `pane` (and, via its own `Drop`, any writer permit
         // it held) is already gone by this point.
-        if let Some(outcome) = reclaim_pane_worktree(repo, &pane_cwd, pane_owns_cwd) {
+        if let Some(outcome) = reclaim_pane_worktree(state, repo, &pane_cwd, pane_owns_cwd) {
             push_error(
                 errors,
                 describe_pane_worktree_reclaim(&pane_short, &pane_cwd, outcome),
@@ -1524,6 +1524,7 @@ fn reap_ended_panes(
 /// ordinary pane. Split out of [`reap_ended_panes`] so the checks and the
 /// reclaim call are directly testable without spawning a real pane.
 fn reclaim_pane_worktree(
+    state: &StateDir,
     repo: &Path,
     cwd: &Path,
     owns_cwd: bool,
@@ -1531,7 +1532,7 @@ fn reclaim_pane_worktree(
     if !owns_cwd || !super::agent::is_agent_managed_worktree(repo, cwd) {
         return None;
     }
-    Some(super::agent::reclaim_worktree(repo, cwd))
+    Some(super::agent::reclaim_worktree(state, repo, cwd))
 }
 
 /// One stderr-bound line describing [`reclaim_pane_worktree`]'s own outcome
@@ -1550,8 +1551,13 @@ fn describe_pane_worktree_reclaim(
             "pane '{pane_short}' worktree {} reclaimed (clean)",
             path.display()
         ),
-        super::agent::ReclaimOutcome::Dirty => format!(
-            "pane '{pane_short}' worktree {} left in place (uncommitted changes)",
+        super::agent::ReclaimOutcome::Archived(dest) => format!(
+            "pane '{pane_short}' worktree {} untracked content archived to {}, then reclaimed",
+            path.display(),
+            dest.display()
+        ),
+        super::agent::ReclaimOutcome::InspectionFailed { probe, note } => format!(
+            "pane '{pane_short}' worktree {} left in place ({probe}: {note})",
             path.display()
         ),
         super::agent::ReclaimOutcome::Failed(reason) => format!(
@@ -3859,6 +3865,22 @@ fn fulfill_spawn_request(
         super::pace::describe_spawn_gate(&gate, reading_age, super::pace::Seat::Pane)
     {
         if matches!(gate, super::pace::SpawnGate::Refuse { .. }) {
+            // Issue #349: filed against the REQUESTING pane's own short id
+            // (`req.requested_by`) -- untrusted the same way the log line
+            // right below already treats it (best-effort, informational
+            // only; a bogus value just files a stray, harmless row).
+            let _ = super::attention::record(
+                state,
+                &req.requested_by,
+                super::attention::Observation::new(
+                    super::attention::Authority::Supervisor,
+                    note.clone(),
+                    80,
+                    now,
+                )
+                .with_attention(super::attention::Attention::Quota),
+                now,
+            );
             return Err(SpawnRefusal::policy(note));
         }
         push_error(
@@ -6030,6 +6052,63 @@ fn build_pane_rows(panes: &[Pane]) -> Vec<PaneRowMeta> {
         .collect()
 }
 
+/// Issue #349, design point 3: `PaneState` is the dashboard's own quiescence
+/// signal -- the weakest authority, [`super::attention::Authority::
+/// QuietHeuristic`] -- projected onto the shared attention model's
+/// [`super::attention::Lifecycle`]. `Working` stays `Working`; `Idle` means
+/// this pane has gone quiet at its prompt, which reads as `Settled` (the
+/// same "turn ended, waiting for the next one" fact a Claude Stop hook would
+/// report, just inferred from silence instead of told directly); `Ended`
+/// means the child process is gone, `Exited`.
+fn quiet_heuristic_lifecycle(state: PaneState) -> super::attention::Lifecycle {
+    match state {
+        PaneState::Working => super::attention::Lifecycle::Working,
+        PaneState::Idle => super::attention::Lifecycle::Settled,
+        PaneState::Ended(_) => super::attention::Lifecycle::Exited,
+    }
+}
+
+/// Files one `QuietHeuristic` observation per pane whose `PaneState` has
+/// actually changed since the last call -- `last_lifecycle` is the caller's
+/// own per-dashboard memory of what it last reported, so a pane sitting
+/// quietly at `Idle` for an hour costs exactly one write, on the tick it
+/// first went quiet, never one per tick thereafter. Best-effort, like every
+/// other attention write: a failure here must never affect the dashboard's
+/// own rendering or input handling.
+fn sync_quiet_heuristic_attention(
+    panes: &[Pane],
+    state: &StateDir,
+    last_lifecycle: &mut HashMap<String, super::attention::Lifecycle>,
+) {
+    let now = super::state::now_secs();
+    let mut seen: HashSet<&str> = HashSet::new();
+    for pane in panes {
+        let short = pane.short();
+        seen.insert(short);
+        let lifecycle = quiet_heuristic_lifecycle(pane.state());
+        if last_lifecycle.get(short) == Some(&lifecycle) {
+            continue;
+        }
+        last_lifecycle.insert(short.to_string(), lifecycle);
+        let _ = super::attention::record(
+            state,
+            short,
+            super::attention::Observation::new(
+                super::attention::Authority::QuietHeuristic,
+                format!("pane went {lifecycle:?}"),
+                50,
+                now,
+            )
+            .with_lifecycle(lifecycle),
+            now,
+        );
+    }
+    // Drop bookkeeping for a pane that no longer exists (reaped) so a short
+    // id ever reused later starts fresh rather than diffing against a stale
+    // entry from a completely different session.
+    last_lifecycle.retain(|short, _| seen.contains(short.as_str()));
+}
+
 /// Runs the dashboard until the operator quits, owning `first` (the
 /// orchestrator pane the caller already built via `build_launch`) plus
 /// whatever additional panes get spawned along the way. Nesting is the
@@ -6044,6 +6123,12 @@ pub fn run_dashboard(
     force_pace: bool,
 ) -> CtxResult<i32> {
     let mut errors: Vec<String> = Vec::new();
+
+    // Issue #319, design item 4: a conservative startup GC of any `--worktree`
+    // trees this repo's own dead sessions left behind. Best-effort and never
+    // fatal to the dashboard itself -- the same never-make-it-worse posture
+    // the owner-pid write just below already holds to.
+    let _ = super::worktree::gc(state, repo, &sessions::is_alive);
 
     // Mutable, and kept current by the `Event::Resize` arm below (F6): the
     // zoom handler resizes every pane against `full`, so a `full` frozen at
@@ -6462,6 +6547,12 @@ pub fn run_dashboard(
     // Issue #209/v3 codex review finding 1: the footer's dead-pane fallback
     // -- see `LastExited`'s own doc comment.
     let mut last_exited: Option<LastExited> = None;
+    // Issue #349: this dashboard's own memory of what it last reported for
+    // each pane's `QuietHeuristic` lifecycle -- see `sync_quiet_heuristic_
+    // attention`'s own doc comment for why a per-tick diff against this
+    // (rather than an unconditional write) is what keeps a pane sitting
+    // quietly at `Idle` for an hour from costing more than one write.
+    let mut quiet_lifecycle: HashMap<String, super::attention::Lifecycle> = HashMap::new();
 
     let exit_code: i32 = 'main: loop {
         // Task 2: bumps the tick counter every iteration and writes a line
@@ -6631,6 +6722,12 @@ pub fn run_dashboard(
         // A pane can have gone away (or arrived) since the last tick, so both
         // indices are re-clamped before anything reads them.
         focused = focused.min(panes.len().saturating_sub(1));
+        // Issue #349: once per tick, at the same read `build_pane_rows` right
+        // below is about to make of every pane's `PaneState` -- not inside
+        // `build_pane_rows` itself, which is pure and called a second time
+        // per tick purely to re-render (see its own doc comment), so doing
+        // it there would double-fire for the same tick's own transition.
+        sync_quiet_heuristic_attention(&panes, state, &mut quiet_lifecycle);
         let rows = assemble_sidebar(
             &build_pane_rows(&panes),
             &visible_registry,
@@ -7112,6 +7209,16 @@ pub fn run_dashboard(
                                             panes.len(),
                                             total_rows,
                                         );
+                                        // Issue #349: the operator just looked
+                                        // at this pane -- the only thing that
+                                        // may ever clear the `Unseen` latch.
+                                        // Best-effort, like every other
+                                        // attention write: a focus change must
+                                        // never fail just because this did.
+                                        if let Some(pane) = panes.get(focused) {
+                                            let _ =
+                                                super::attention::mark_seen_io(state, pane.short());
+                                        }
                                     }
                                     // Scrollback, on the focused pane, for every
                                     // terminal that does not deliver wheel events
@@ -11956,7 +12063,13 @@ mod tests {
     /// delegation. Returns `None` (callers skip) if `git` itself is
     /// unavailable or any setup step fails -- same discipline as
     /// `git_repo_with_linked_worktree`.
-    fn git_repo_with_agent_managed_worktree() -> Option<(tempfile::TempDir, PathBuf, PathBuf)> {
+    /// Issue #319: also writes a matching ownership record (as `agent::
+    /// allocate_worktree` now does for real) into the returned `StateDir` --
+    /// without one, `agent::reclaim_worktree` has no recorded base commit to
+    /// probe against and refuses outright (`InspectionFailed { probe:
+    /// "record", .. }`), which is correct but not what these tests exercise.
+    fn git_repo_with_agent_managed_worktree()
+    -> Option<(tempfile::TempDir, StateDir, PathBuf, PathBuf)> {
         if !git_available() {
             eprintln!("skipping: git not found on PATH");
             return None;
@@ -11995,12 +12108,49 @@ mod tests {
         if !run(&["commit", "-q", "-m", "initial"], &repo) {
             return None;
         }
+        let base_output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .ok()?;
+        let base_commit = String::from_utf8_lossy(&base_output.stdout)
+            .trim()
+            .to_string();
         let worktree_str = worktree.to_string_lossy().to_string();
-        if !run(&["worktree", "add", &worktree_str], &repo) {
+        if !run(
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "abcd1234",
+                &worktree_str,
+                &base_commit,
+            ],
+            &repo,
+        ) {
             return None;
         }
 
-        Some((root, repo, worktree))
+        let state = StateDir::from_root(root.path().join("state"));
+        let repo_slug = crate::commands::ctx::state::repo_slug(&repo);
+        crate::commands::ctx::worktree::append_record(
+            &state,
+            &repo_slug,
+            &crate::commands::ctx::worktree::WorktreeRecord {
+                path: worktree.to_string_lossy().to_string(),
+                branch: "abcd1234".to_string(),
+                base_commit,
+                owner_session: None,
+                owner_pid: None,
+                created_at: 1_700_000_000,
+                status: crate::commands::ctx::worktree::WorktreeStatus::Active,
+                note: None,
+            },
+        )
+        .ok()?;
+
+        Some((root, state, repo, worktree))
     }
 
     /// Review finding (2026-09), finding 2a: `agent::run_with`'s own
@@ -12012,10 +12162,10 @@ mod tests {
     /// finding's own guidance.
     #[test]
     fn reclaim_pane_worktree_removes_a_clean_agent_managed_worktree() {
-        let Some((_root, repo, worktree)) = git_repo_with_agent_managed_worktree() else {
+        let Some((_root, state, repo, worktree)) = git_repo_with_agent_managed_worktree() else {
             return;
         };
-        let outcome = reclaim_pane_worktree(&repo, &worktree, true);
+        let outcome = reclaim_pane_worktree(&state, &repo, &worktree, true);
         assert_eq!(
             outcome,
             Some(crate::commands::ctx::agent::ReclaimOutcome::Removed)
@@ -12023,24 +12173,29 @@ mod tests {
         assert!(!worktree.exists(), "the clean worktree must be removed");
     }
 
-    /// The other half: a dirty pane cwd (an untracked file) is left in
-    /// place -- never force-removed, exactly like `agent::run_with`'s own
-    /// headless reclamation.
+    /// Issue #319: a pane cwd with only untracked content is archived, then
+    /// removed -- never left in place, and never force-removed without a
+    /// copy first, exactly like `agent::run_with`'s own headless reclamation.
     #[test]
-    fn reclaim_pane_worktree_leaves_a_dirty_agent_managed_worktree_in_place() {
-        let Some((_root, repo, worktree)) = git_repo_with_agent_managed_worktree() else {
+    fn reclaim_pane_worktree_archives_untracked_content_then_removes_it() {
+        let Some((_root, state, repo, worktree)) = git_repo_with_agent_managed_worktree() else {
             return;
         };
         std::fs::write(worktree.join("scratch.txt"), "not committed\n").expect("write");
 
-        let outcome = reclaim_pane_worktree(&repo, &worktree, true);
-        assert_eq!(
-            outcome,
-            Some(crate::commands::ctx::agent::ReclaimOutcome::Dirty)
-        );
+        let outcome = reclaim_pane_worktree(&state, &repo, &worktree, true);
+        match outcome {
+            Some(crate::commands::ctx::agent::ReclaimOutcome::Archived(dest)) => {
+                assert_eq!(
+                    std::fs::read_to_string(dest.join("scratch.txt")).expect("read archived"),
+                    "not committed\n"
+                );
+            }
+            other => panic!("expected Some(Archived), got {other:?}"),
+        }
         assert!(
-            worktree.exists(),
-            "a dirty worktree must never be force-removed"
+            !worktree.exists(),
+            "the worktree must be removed once its untracked content is archived"
         );
     }
 
@@ -12050,9 +12205,10 @@ mod tests {
     #[test]
     fn reclaim_pane_worktree_never_touches_an_unmanaged_cwd() {
         let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
         let repo = tmp.path().join("repo");
         std::fs::create_dir_all(&repo).expect("mkdir");
-        assert_eq!(reclaim_pane_worktree(&repo, &repo, true), None);
+        assert_eq!(reclaim_pane_worktree(&state, &repo, &repo, true), None);
     }
 
     /// Review round 3: ownership travels on the spawn request, never on the
@@ -12061,10 +12217,10 @@ mod tests {
     /// `.zirv/worktrees/`) is never reclaimed, clean or not.
     #[test]
     fn reclaim_pane_worktree_never_touches_a_cwd_the_pane_does_not_own() {
-        let Some((_root, repo, worktree)) = git_repo_with_agent_managed_worktree() else {
+        let Some((_root, state, repo, worktree)) = git_repo_with_agent_managed_worktree() else {
             return;
         };
-        assert_eq!(reclaim_pane_worktree(&repo, &worktree, false), None);
+        assert_eq!(reclaim_pane_worktree(&state, &repo, &worktree, false), None);
         assert!(
             worktree.exists(),
             "an operator-named worktree must survive its pane's exit"
@@ -13066,6 +13222,75 @@ mod tests {
         let reason = refusal_for(&spawn_request("do the work", &repo), &cfg, &repo);
         assert!(reason.contains("pane limit reached"), "got {reason}");
         assert!(reason.contains("dash.max_panes"), "got {reason}");
+    }
+
+    /// Issue #349: a pacing (`SpawnGate::Refuse`) refusal files an
+    /// `Attention::Quota` row against the REQUESTING pane's own short id
+    /// (`req.requested_by`) -- the same "requester, not the never-spawned
+    /// worker" reasoning as the writer-permit and pane-count refusals.
+    #[test]
+    fn fulfill_spawn_request_records_quota_attention_on_a_pacing_refusal() {
+        let repo = std::env::current_dir().expect("cwd");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let mut cfg = CtxConfig::default();
+        // Cross-harness fallback is on by default and would otherwise reroute
+        // this request to a harness with no usage data of its own (`Proceed`
+        // trivially) instead of ever reaching the spawn gate for "claude"'s
+        // own exhausted reading -- this test is about the gate itself, not
+        // the reroute.
+        cfg.fallback.enabled = false;
+        let now = super::super::state::now_secs();
+
+        // A fresh five-hour reading pinned at 100%, above the default
+        // `spawn_hard_pct` (95%) -- "anthropic" is the claude adapter's own
+        // provider slug (see `refresh_if_due_reads_per_harness_usage_off_
+        // disk_only`, above, for the same key).
+        super::super::window::store_for(
+            &state,
+            "anthropic",
+            &super::super::window::UsageWindows {
+                five_hour: Some(super::super::window::Window {
+                    used_percentage: 100.0,
+                    resets_at: now + 999_999,
+                    observed_at: now,
+                    overage_covered: false,
+                    limit_reached: false,
+                }),
+                seven_day: None,
+            },
+        )
+        .expect("seed a hard-refusal usage reading");
+
+        let req = spawn_request("do the work", &repo);
+        let mut panes: Vec<Pane> = Vec::new();
+        let mut queues: Vec<VecDeque<String>> = Vec::new();
+        let mut errors = Vec::new();
+        let result = fulfill_spawn_request(
+            &req,
+            false,
+            None,
+            &mut panes,
+            &mut queues,
+            &cfg,
+            &state,
+            &repo,
+            (80, 24),
+            &tmp.path().join("requests"),
+            &mut errors,
+        );
+        let reason = result.err().map(|e| e.reason).unwrap_or_default();
+        assert!(
+            reason.contains("spawn_hard_pct"),
+            "must refuse via the spawn gate specifically, got: {reason}"
+        );
+
+        let status = super::super::attention::load(&state, &req.requested_by);
+        assert_eq!(
+            status.attention,
+            super::super::attention::Attention::Quota,
+            "the requesting pane's own attention row must show Quota"
+        );
     }
 
     /// Issue #155, Phase 5(a): the depth cap is enforced HERE, at the
@@ -14733,6 +14958,70 @@ mod tests {
     #[cfg(unix)]
     fn trivial_argv() -> Vec<String> {
         vec!["sh".to_string(), "-c".to_string(), "exit 0".to_string()]
+    }
+
+    /// Issue #349: a pane going `Ended` files exactly one `QuietHeuristic`
+    /// `Lifecycle::Exited` observation, and a second call with nothing
+    /// changed since is a pure no-op (no repeat write, no revision bump) --
+    /// the whole point of keying off `last_lifecycle` rather than writing
+    /// unconditionally every tick.
+    #[test]
+    fn sync_quiet_heuristic_attention_fires_once_per_transition() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().to_path_buf();
+        let spec = PaneSpec {
+            agent_name: "test-agent".to_string(),
+            argv: trivial_argv(),
+            role: prompt::PromptRole::Worker,
+            verb: sessions::Verb::Dash,
+            session_id: "77778888-2222-4333-8444-555555555555".to_string(),
+            title: "wrk test".to_string(),
+        };
+        let mut pane = Pane::spawn(
+            spec,
+            &state,
+            &repo,
+            &repo,
+            (80, 24),
+            &[],
+            true,
+            pane::DEFAULT_IDLE_QUIET,
+        )
+        .expect("spawn");
+        let short = pane.short().to_string();
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline && !matches!(pane.state(), PaneState::Ended(_)) {
+            pane.drain();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            matches!(pane.state(), PaneState::Ended(_)),
+            "the trivial child must exit within the deadline, got {:?}",
+            pane.state()
+        );
+
+        let panes = vec![pane];
+        let mut cache: HashMap<String, super::super::attention::Lifecycle> = HashMap::new();
+        sync_quiet_heuristic_attention(&panes, &state, &mut cache);
+
+        let status = super::super::attention::load(&state, &short);
+        assert_eq!(status.lifecycle, super::super::attention::Lifecycle::Exited);
+        assert_eq!(
+            cache.get(&short),
+            Some(&super::super::attention::Lifecycle::Exited)
+        );
+        let revision_after_first_call = status.revision;
+
+        sync_quiet_heuristic_attention(&panes, &state, &mut cache);
+        let status_again = super::super::attention::load(&state, &short);
+        assert_eq!(
+            status_again.revision, revision_after_first_call,
+            "nothing changed, so the second call must not write again"
+        );
     }
 
     /// A trivial, immediately-exiting child -- never a real agent (the

@@ -210,8 +210,15 @@ fn write_builtins<W: Write>(
                 desc: &["Configure AI context, memory, hooks, migration, and safe resets"],
             },
             Row {
-                name: "skill",
-                desc: &["Inspect model-agnostic engineering skills"],
+                name: "skill [--json]",
+                desc: &[
+                    "Print the bundled operator orientation skill for this binary (also `zirv",
+                    "--skill`); `skill list`/`skill show <id>` inspect engineering skills instead",
+                ],
+            },
+            Row {
+                name: "commands [--json]",
+                desc: &["List every command this binary accepts, generated from its clap model"],
             },
             Row {
                 name: "workflow",
@@ -272,6 +279,10 @@ fn write_builtins<W: Write>(
             Row {
                 name: "-h, --help",
                 desc: &["Show this help"],
+            },
+            Row {
+                name: "--skill [--json]",
+                desc: &["Print the bundled operator orientation skill (same as `zirv skill`)"],
             },
         ],
         colour,
@@ -541,6 +552,37 @@ shortcuts:
         assert!(
             output.contains("ctx") && output.contains("Context management"),
             "got {output}"
+        );
+        Ok(())
+    }
+
+    /// Issue #355: `zirv commands` (the generated command surface) and the
+    /// dual meaning of `zirv skill` (the bundled operator orientation vs.
+    /// the pre-existing engineering-skill inspection tree) must both be
+    /// discoverable from `zirv help`.
+    #[test]
+    fn test_show_help_lists_commands_and_the_dual_skill_builtin()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempdir()?;
+        let temp_path = temp_dir.path().to_path_buf();
+        setup_zirv_dir(&temp_path);
+
+        let _cwd = crate::commands::ctx::testenv::CwdGuard::enter(&temp_path)?;
+        let mut buffer = Cursor::new(Vec::new());
+        show_help(&mut buffer, false)?;
+
+        let output = String::from_utf8(buffer.into_inner())?;
+        assert!(
+            output.contains("commands [--json]") && output.contains("clap model"),
+            "got {output}"
+        );
+        assert!(
+            output.contains("--skill") && output.contains("operator orientation"),
+            "got {output}"
+        );
+        assert!(
+            output.contains("skill list") || output.contains("engineering skills"),
+            "the pre-existing engineering-skill tree must still be discoverable: {output}"
         );
         Ok(())
     }

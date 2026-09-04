@@ -742,6 +742,8 @@ fn run_with_clock_inner<W: Write>(
             spent_tokens: 0,
             started_at: now_fn(),
             status: objective::Status::Active,
+            pending_note: None,
+            evidence: Vec::new(),
         };
         objective::store(&state, &key, &record)?;
     }
@@ -1762,6 +1764,23 @@ fn run_with_clock_inner<W: Write>(
                     &prior_usage,
                     execution_model.as_deref(),
                     execution_started,
+                );
+                // Issue #349: the child is genuinely gone -- no rot, no
+                // timeout, no restart -- so `Supervisor` is the authority
+                // that actually knows this, regardless of what any
+                // `AdapterHook` observation last said about the (now
+                // nonexistent) turn.
+                let _ = super::attention::record(
+                    &state,
+                    &registry_short,
+                    super::attention::Observation::new(
+                        super::attention::Authority::Supervisor,
+                        format!("exited with code {code}"),
+                        100,
+                        now_secs(),
+                    )
+                    .with_lifecycle(super::attention::Lifecycle::Exited),
+                    now_secs(),
                 );
                 session_guard.release();
                 return Ok(code);
@@ -3084,6 +3103,24 @@ fn supervise_run(
             super::stall::StallAction::ClearLatch => {
                 stall_latch = None;
                 super::sessions::clear_stall_marker(state, registry_short);
+                // Issue #349: progress resumed, so the stalled attention
+                // this same authority raised no longer applies. `Supervisor`
+                // authority, matching the observation that raised it -- a
+                // higher authority's own attention (an `AdapterHook`
+                // permission prompt, say) is untouched by this, since the
+                // two axes are resolved independently.
+                let _ = super::attention::record(
+                    state,
+                    registry_short,
+                    super::attention::Observation::new(
+                        super::attention::Authority::Supervisor,
+                        "progress resumed",
+                        90,
+                        now_secs(),
+                    )
+                    .with_attention(super::attention::Attention::None),
+                    now_secs(),
+                );
             }
             super::stall::StallAction::LatchAndNudge => {
                 let baseline = stall_signals.baseline();
@@ -3093,6 +3130,18 @@ fn supervise_run(
                 });
                 super::sessions::write_stall_marker(state, registry_short, now_secs());
                 let idle_secs = Instant::now().saturating_duration_since(baseline).as_secs();
+                let _ = super::attention::record(
+                    state,
+                    registry_short,
+                    super::attention::Observation::new(
+                        super::attention::Authority::Supervisor,
+                        format!("no progress observed for {idle_secs}s"),
+                        90,
+                        now_secs(),
+                    )
+                    .with_attention(super::attention::Attention::Stalled),
+                    now_secs(),
+                );
                 announcer.emit(&super::announce::Event::Stalled { idle_secs });
                 let _ = log::append(
                     state,
@@ -5928,6 +5977,8 @@ mod tests {
                 spent_tokens: 0,
                 started_at: now_secs(),
                 status: objective::Status::Active,
+                pending_note: None,
+                evidence: Vec::new(),
             },
         )
         .expect("store objective");

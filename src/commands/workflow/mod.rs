@@ -217,6 +217,15 @@ struct WorkflowCli {
     command: WorkflowCommand,
 }
 
+/// This tree's `clap::Command`, for `commands::command_entries` (issue #355)
+/// to walk alongside `CtxCli`/`MemoryCli`/etc. `WorkflowCli` itself stays
+/// private -- nothing outside this module needs the parsed `WorkflowCli`
+/// value, only its shape.
+pub(crate) fn command() -> clap::Command {
+    use clap::CommandFactory;
+    WorkflowCli::command()
+}
+
 #[derive(Debug, Subcommand)]
 enum WorkflowCommand {
     /// Inspect model-agnostic engineering skills.

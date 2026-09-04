@@ -1124,8 +1124,10 @@ pub struct CompileArgs {
 /// `bytes / 4`, rounded to the nearest integer -- the same rough token
 /// estimate every row of the measurement table uses. Deliberately crude: the
 /// table labels it an estimate, and an exact count needs the provider's own
-/// tokenizer, which this offline command has no way to call.
-fn estimate_tokens(bytes: usize) -> usize {
+/// tokenizer, which this offline command has no way to call. `pub(crate)` so
+/// `skill::to_json` (issue #355) reuses the same heuristic for the bundled
+/// skill's own reported size rather than re-deriving it.
+pub(crate) fn estimate_tokens(bytes: usize) -> usize {
     ((bytes as f64) / 4.0).round() as usize
 }
 
@@ -1565,6 +1567,43 @@ mod tests {
             false,
         );
         assert_eq!(first, second);
+    }
+
+    /// Issue #355: the pointer at `zirv --skill`/`zirv commands --json`
+    /// lives only in `prompt::HARNESS_PROMPT` (see that constant's own "v17"
+    /// doc comment), never duplicated into `prompt::DEFAULT_PROMPT`. An
+    /// Orchestrator session gets both layers concatenated -- this asserts
+    /// the compiled result never carries the hint twice regardless, and a
+    /// Worker session (no harness layer at all) still compiles cleanly with
+    /// the hint absent rather than duplicated some other way.
+    #[test]
+    fn an_orchestrator_composition_never_duplicates_the_skill_discovery_hint() {
+        const HINT: &str = "zirv commands --json";
+        let repo = tempfile::tempdir().expect("tempdir");
+        let cfg = CtxConfig::default();
+        let adapter = ClaudeAdapter::new(None);
+
+        let orchestrator = compile_for(repo.path(), &cfg, &adapter, PromptRole::Orchestrator);
+        let text = orchestrator
+            .composed
+            .expect("an orchestrator session composes a prompt")
+            .text;
+        assert_eq!(
+            text.matches(HINT).count(),
+            1,
+            "the skill-discovery hint must appear exactly once, got: {text}"
+        );
+
+        let worker = compile_for(repo.path(), &cfg, &adapter, PromptRole::Worker);
+        let worker_text = worker
+            .composed
+            .expect("a worker session composes a prompt")
+            .text;
+        assert_eq!(
+            worker_text.matches(HINT).count(),
+            0,
+            "a worker never sees the harness layer, so it must not see this hint either"
+        );
     }
 
     /// Pins the exact composed prompt for a realistic launch (canonical
@@ -2161,6 +2200,8 @@ mod tests {
                 spent_tokens: 500,
                 started_at: now,
                 status: super::super::objective::Status::Active,
+                pending_note: None,
+                evidence: Vec::new(),
             },
         )
         .expect("store objective");
@@ -2243,6 +2284,8 @@ mod tests {
                 spent_tokens: 0,
                 started_at: now,
                 status: super::super::objective::Status::Closed,
+                pending_note: None,
+                evidence: Vec::new(),
             },
         )
         .expect("store objective");

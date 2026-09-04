@@ -29,7 +29,9 @@ use super::pace;
 use super::permit::{self, WorkerMode};
 use super::policy;
 use super::result_schema::{self, Schema};
+use super::state::StateDir;
 use super::supervise;
+use super::worktree;
 
 #[derive(Debug, Clone, clap::Args)]
 pub struct AgentArgs {
@@ -214,6 +216,18 @@ pub struct AgentArgs {
     /// (`envelope::CannotGrow`), never silently clamped.
     #[arg(long)]
     pub depth: Option<u8>,
+    /// Issue #317: the durable task-card id (`zirv ctx task create`/`zirv ctx
+    /// swarm`) this delegation fulfils. Resolved and claimed before any
+    /// spawn -- refused, with nothing launched, when the card cannot be
+    /// claimed (unmet parents, or already running elsewhere under a live
+    /// claimant). Every parent card's own `outcome`, plus this card's
+    /// `brief`, are appended verbatim (labelled) after the operator's own
+    /// prompt text. On completion the card is marked `Done` from the actual
+    /// report-back (never a synthetic success just because the process
+    /// exited 0); a crash or an unvalidated report-back applies `task::
+    /// respawn_decision` instead of ever marking it `Done` silently.
+    #[arg(long)]
+    pub task: Option<String>,
 }
 
 /// `--attach-artifact`'s CLI spelling for `workflow::engine::ArtifactStage`.
@@ -283,35 +297,72 @@ pub(crate) fn validate_workdir(dir: &Path) -> CtxResult<PathBuf> {
     Ok(canon)
 }
 
-/// Issue #267: `--worktree`'s own allocation -- a fresh linked `git worktree
-/// add` sibling of `repo` at `<repo>/.zirv/worktrees/<short>`, returned
-/// through [`validate_workdir`] so it is held to the identical contract
-/// every other `--workdir` value is (canonicalised, confirmed a real
-/// directory inside a git repository) before this delegation ever reads it
-/// as one.
+/// Issue #267/#319: `--worktree`'s own allocation -- a fresh linked `git
+/// worktree add` sibling of `repo` at `<repo>/.zirv/worktrees/<short>`,
+/// returned through [`validate_workdir`] so it is held to the identical
+/// contract every other `--workdir` value is (canonicalised, confirmed a
+/// real directory inside a git repository) before this delegation ever
+/// reads it as one.
 ///
 /// `short` is a fresh v4 UUID's own [`super::sessions::short_id`] -- the
 /// same 8-character derivation a session id gets, reused here purely for a
 /// short, collision-resistant directory name, not because this names a
 /// session.
 ///
-/// `git worktree add <path>` (no explicit branch) is deliberate: git's own
-/// convenience behaviour mints a new branch named after the target
-/// directory's own basename when no branch of that name already exists,
-/// which `short`'s fresh UUID prefix guarantees here -- so this never
-/// collides with a branch the operator already has checked out elsewhere.
+/// Issue #319: `repo`'s own `HEAD` is captured with `git rev-parse HEAD`
+/// BEFORE `git worktree add` runs and passed explicitly (`-b <short> <path>
+/// <base_commit>`), so the tree's base is exactly what was recorded, never
+/// implicitly "whatever HEAD happened to be when `add` ran" -- and `-b
+/// <short>` makes the branch-minting explicit rather than relying on git's
+/// own "commit-ish omitted" convenience (which this replaces: the old,
+/// implicit form checked out the same thing, since HEAD had not moved
+/// between the two calls in practice, but named nothing on the record this
+/// module now needs for every later probe/decide). The recorded base commit
+/// and the fresh ownership record (`<state>/worktrees/<repo-slug>.jsonl`)
+/// are what let [`reclaim_worktree`] later prove -- rather than merely
+/// check porcelain cleanliness -- that nothing would be lost by removing
+/// this tree.
 ///
-/// Best-effort I/O, but NOT best-effort failure handling: unlike most of
-/// this module's state-dir housekeeping, a `--worktree` that fails to
-/// allocate has no honest fallback (running the worker in `repo` instead
-/// would silently defeat the very isolation the operator asked for), so
-/// this fails the delegation outright rather than degrading.
-fn allocate_worktree(repo: &Path) -> CtxResult<PathBuf> {
+/// Best-effort I/O, but NOT best-effort failure handling for the worktree
+/// itself: unlike most of this module's state-dir housekeeping, a
+/// `--worktree` that fails to allocate has no honest fallback (running the
+/// worker in `repo` instead would silently defeat the very isolation the
+/// operator asked for), so this fails the delegation outright rather than
+/// degrading. Recording ownership, by contrast, IS best-effort: a failed
+/// write leaves this tree without a record, which only means a later
+/// reclaim treats it conservatively (see [`reclaim_worktree`]'s own doc
+/// comment) -- never that the tree itself failed to allocate.
+fn allocate_worktree(
+    state: &StateDir,
+    repo: &Path,
+    owner_session: Option<&str>,
+) -> CtxResult<PathBuf> {
     let root = repo.join(crate::utils::SCRIPT_DIR_NAME).join("worktrees");
     std::fs::create_dir_all(&root)
         .map_err(|e| format!("--worktree: could not create {}: {e}", root.display()))?;
     let short = super::sessions::short_id(&SessionId::new_v4().to_string());
     let path = root.join(&short);
+    let base_commit = std::process::Command::new("git")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .arg("-C")
+        .arg(repo)
+        .arg("rev-parse")
+        .arg("HEAD")
+        .output()
+        .map_err(|e| format!("--worktree: could not run `git rev-parse HEAD`: {e}"))?;
+    if !base_commit.status.success() {
+        return Err(format!(
+            "--worktree: `git rev-parse HEAD` failed: {}",
+            String::from_utf8_lossy(&base_commit.stderr).trim()
+        )
+        .into());
+    }
+    let base_commit = String::from_utf8_lossy(&base_commit.stdout)
+        .trim()
+        .to_string();
     let output = std::process::Command::new("git")
         .env_remove("GIT_DIR")
         .env_remove("GIT_COMMON_DIR")
@@ -321,7 +372,10 @@ fn allocate_worktree(repo: &Path) -> CtxResult<PathBuf> {
         .arg(repo)
         .arg("worktree")
         .arg("add")
+        .arg("-b")
+        .arg(&short)
         .arg(&path)
+        .arg(&base_commit)
         .output()
         .map_err(|e| format!("--worktree: could not run `git worktree add`: {e}"))?;
     if !output.status.success() {
@@ -332,12 +386,32 @@ fn allocate_worktree(repo: &Path) -> CtxResult<PathBuf> {
         )
         .into());
     }
-    validate_workdir(&path)
+    let path = validate_workdir(&path)?;
+    let repo_slug = super::state::repo_slug(repo);
+    let record = worktree::WorktreeRecord {
+        path: path.to_string_lossy().to_string(),
+        branch: short,
+        base_commit,
+        owner_session: owner_session.map(str::to_string),
+        owner_pid: Some(std::process::id()),
+        created_at: super::state::now_secs(),
+        status: worktree::WorktreeStatus::Active,
+        note: None,
+    };
+    if let Err(e) = worktree::append_record(state, &repo_slug, &record) {
+        eprintln!(
+            "--worktree {}: could not record ownership ({e}); a later reclaim will require \
+             manual `zirv ctx worktree prune`",
+            path.display()
+        );
+    }
+    Ok(path)
 }
 
-/// The result of one [`reclaim_worktree`] attempt -- every non-[`Removed`]
-/// variant is best-effort: printed as a single stderr line by the caller,
-/// never turned into a delegation failure or a nonzero exit code.
+/// The result of one [`reclaim_worktree`] attempt -- every non-[`Removed`]/
+/// [`Archived`] variant is best-effort: printed as a single stderr line by
+/// the caller, never turned into a delegation failure or a nonzero exit
+/// code.
 ///
 /// `pub(crate)` (review finding, 2026-09): `dash::mod::reap_ended_panes`
 /// matches on this too, reclaiming a dashboard-hosted `--worktree` pane's
@@ -347,78 +421,63 @@ fn allocate_worktree(repo: &Path) -> CtxResult<PathBuf> {
 /// doc comment).
 ///
 /// [`Removed`]: ReclaimOutcome::Removed
+/// [`Archived`]: ReclaimOutcome::Archived
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ReclaimOutcome {
-    /// `git status --porcelain` reported a clean tree and `git worktree
-    /// remove` (no `--force`) succeeded -- the directory is gone, but the
-    /// branch `git worktree add` minted alongside it (named after the
-    /// worktree's own short id) survives untouched.
+    /// Every probe (`ahead`/`dirty`/`cherry`) came back clean and `git
+    /// worktree remove` (no `--force`) succeeded -- the directory is gone,
+    /// but the branch survives untouched.
     Removed,
-    /// The worktree has uncommitted or untracked changes -- left in place,
-    /// never force-removed, so the operator can inspect or recover them.
-    Dirty,
-    /// `git status --porcelain` or `git worktree remove` itself could not be
-    /// run, or `remove` refused for some other reason (e.g. a stray lock) --
-    /// left in place either way.
+    /// The tree carried only untracked content, which was copied to the
+    /// returned archive directory before the tree was removed.
+    Archived(PathBuf),
+    /// Issue #319: `worktree::decide` refused -- an unpushed commit, tracked
+    /// dirt, a cherry-unmatched commit, a probe that could not be run, or no
+    /// ownership record at all for this path. Left in place either way; the
+    /// named probe and note are exactly `worktree::InspectionFailed`'s own.
+    InspectionFailed { probe: &'static str, note: String },
+    /// `decide` said this tree was safe to remove (or to archive-then-remove)
+    /// but the archive copy or `git worktree remove` itself failed. Left in
+    /// place either way.
     Failed(String),
 }
 
-/// Review finding (2026-09): `allocate_worktree`'s own `<repo>/.zirv/
-/// worktrees/<short>` had no matching cleanup -- called once, best-effort,
-/// after a `--worktree` worker's child has exited. `repo` is the delegating
-/// session's own directory (`git worktree add`'s target in `allocate_
-/// worktree` above), `path` the allocated worktree to consider reclaiming.
+/// Issue #319: routed entirely through `worktree::prune_one` -- the same
+/// proof-required probe/decide/archive contract the `zirv ctx worktree
+/// prune` verb and startup GC use, so a dashboard-hosted pane's automatic
+/// reclaim, a headless delegation's own post-run reclaim, and an operator's
+/// explicit prune can never quietly drift apart on how much proof is
+/// required before a tree is removed.
 ///
-/// Deliberately conservative: a dirty tree (anything `git status
-/// --porcelain` reports) is left exactly as-is, `--force` is never passed to
-/// `git worktree remove`, and any I/O failure along the way also leaves the
-/// tree in place rather than risk losing work the caller cannot see.
+/// Looks up `path`'s ownership record (written by [`allocate_worktree`]) to
+/// find its recorded base commit; a path with no record at all (a tree from
+/// before this record existed, or one whose write failed) is left in place
+/// as [`ReclaimOutcome::InspectionFailed`] rather than guessed at -- there
+/// is no base commit to prove anything against, so this module never
+/// pretends otherwise. Run `zirv ctx worktree prune <path>` after manually
+/// confirming such a tree is safe to discard.
 ///
 /// `pub(crate)` (review finding, 2026-09): `dash::mod::reap_ended_panes`
 /// calls this directly for a dashboard-hosted `--worktree` pane -- see
 /// [`ReclaimOutcome`]'s own doc comment.
-pub(crate) fn reclaim_worktree(repo: &Path, path: &Path) -> ReclaimOutcome {
-    let status = std::process::Command::new("git")
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_COMMON_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE")
-        .arg("-C")
-        .arg(path)
-        .arg("status")
-        .arg("--porcelain")
-        .output();
-    let status = match status {
-        Ok(output) if output.status.success() => output,
-        Ok(output) => {
-            return ReclaimOutcome::Failed(format!(
-                "git status --porcelain: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            ));
-        }
-        Err(e) => return ReclaimOutcome::Failed(format!("git status --porcelain: {e}")),
+pub(crate) fn reclaim_worktree(state: &StateDir, repo: &Path, path: &Path) -> ReclaimOutcome {
+    let repo_slug = super::state::repo_slug(repo);
+    let Some(record) = worktree::latest_for_path(state, &repo_slug, path) else {
+        return ReclaimOutcome::InspectionFailed {
+            probe: "record",
+            note: "no ownership record for this worktree; run `zirv ctx worktree prune` after \
+                   manual inspection"
+                .to_string(),
+        };
     };
-    if !String::from_utf8_lossy(&status.stdout).trim().is_empty() {
-        return ReclaimOutcome::Dirty;
-    }
-    let removed = std::process::Command::new("git")
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_COMMON_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE")
-        .arg("-C")
-        .arg(repo)
-        .arg("worktree")
-        .arg("remove")
-        .arg(path)
-        .output();
-    match removed {
-        Ok(output) if output.status.success() => ReclaimOutcome::Removed,
-        Ok(output) => ReclaimOutcome::Failed(format!(
-            "git worktree remove: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )),
-        Err(e) => ReclaimOutcome::Failed(format!("git worktree remove: {e}")),
+    match worktree::prune_one(state, repo, &repo_slug, path, &record.base_commit) {
+        worktree::PruneOutcome::Removed => ReclaimOutcome::Removed,
+        worktree::PruneOutcome::Archived(dest) => ReclaimOutcome::Archived(dest),
+        worktree::PruneOutcome::Kept(reason) => ReclaimOutcome::InspectionFailed {
+            probe: reason.probe,
+            note: reason.note,
+        },
+        worktree::PruneOutcome::Failed(reason) => ReclaimOutcome::Failed(reason),
     }
 }
 
@@ -447,21 +506,31 @@ pub(crate) fn is_agent_managed_worktree(repo: &Path, cwd: &Path) -> bool {
 /// single stderr line -- shared by `run_with`'s own explicit post-run call
 /// and [`WorktreeReclaimGuard`]'s `Drop`, so both report identically rather
 /// than drifting.
-fn reclaim_worktree_and_report(repo: &Path, path: &Path) {
+fn reclaim_worktree_and_report(state: &StateDir, repo: &Path, path: &Path) {
     let short = path
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("?");
-    match reclaim_worktree(repo, path) {
+    match reclaim_worktree(state, repo, path) {
         ReclaimOutcome::Removed => {
             eprintln!(
                 "--worktree {}: clean, reclaimed; branch {short} keeps the worker's commits",
                 path.display()
             );
         }
-        ReclaimOutcome::Dirty => {
+        ReclaimOutcome::Archived(dest) => {
             eprintln!(
-                "--worktree {}: left in place (uncommitted changes); inspect and remove manually",
+                "--worktree {}: untracked content archived to {}, then reclaimed; branch {short} \
+                 keeps the worker's commits",
+                path.display(),
+                dest.display()
+            );
+        }
+        ReclaimOutcome::InspectionFailed { probe, note } => {
+            eprintln!(
+                "--worktree {}: left in place ({probe}: {note}); inspect and remove manually, or \
+                 `zirv ctx worktree prune {}`",
+                path.display(),
                 path.display()
             );
         }
@@ -488,13 +557,14 @@ fn reclaim_worktree_and_report(repo: &Path, path: &Path) {
 /// dashboard join (never actually spawned a pane) leaves the guard armed on
 /// purpose: nothing else owns that worktree, so it must still be reclaimed.
 struct WorktreeReclaimGuard<'a> {
+    state: &'a StateDir,
     repo: &'a Path,
     path: Option<PathBuf>,
 }
 
 impl<'a> WorktreeReclaimGuard<'a> {
-    fn new(repo: &'a Path, path: Option<PathBuf>) -> Self {
-        Self { repo, path }
+    fn new(state: &'a StateDir, repo: &'a Path, path: Option<PathBuf>) -> Self {
+        Self { state, repo, path }
     }
 
     /// Ownership of the worktree has passed elsewhere -- `Drop` must not
@@ -507,7 +577,7 @@ impl<'a> WorktreeReclaimGuard<'a> {
 impl Drop for WorktreeReclaimGuard<'_> {
     fn drop(&mut self) {
         if let Some(path) = self.path.take() {
-            reclaim_worktree_and_report(self.repo, &path);
+            reclaim_worktree_and_report(self.state, self.repo, &path);
         }
     }
 }
@@ -1462,6 +1532,154 @@ fn attach_artifact_to_prompt(
     }
 }
 
+/// Issue #317: appends `--task`'s own brief plus every parent card's own
+/// `outcome` (labelled, verbatim) after the operator's own prompt text --
+/// same splice-point contract as [`attach_artifact_to_prompt`] immediately
+/// above (both forks of this delegation read the one `prompt` binding this
+/// returns). `Err` when `--task` names a card this repository has no record
+/// of: a worker sent off with no idea what its own card actually asked for
+/// would burn a whole run on a typo.
+fn attach_task_context_to_prompt(
+    args: &AgentArgs,
+    state: &super::state::StateDir,
+    repo: &Path,
+    prompt: String,
+) -> CtxResult<String> {
+    let Some(task_id) = &args.task else {
+        return Ok(prompt);
+    };
+    let repo_slug = super::state::repo_slug(repo);
+    let cards = super::task::load_cards(state, &repo_slug);
+    let card = cards
+        .get(task_id)
+        .ok_or_else(|| format!("--task '{task_id}' has no task card in this repository"))?;
+    let parents: Vec<&super::task::Card> =
+        card.parents.iter().filter_map(|id| cards.get(id)).collect();
+    Ok(format!(
+        "{prompt}{}",
+        super::task::compile_task_prompt(card, &parents)
+    ))
+}
+
+/// Issue #317: resolves (reaping/promoting) and claims `--task`'s own card
+/// through `task::claim_locked` -- the SAME locked read -> decide -> append
+/// helper `zirv ctx task claim` itself goes through, so this delegation's
+/// own claim can never race a concurrent `zirv ctx task claim` (or another
+/// delegation) against the same card: whichever caller's lock acquisition
+/// loses re-reads the winner's already-written state before deciding.
+/// Refuses before any spawn when the card cannot be claimed -- see
+/// [`AgentArgs::task`]'s own doc comment for the full contract. `Err`'s text
+/// is written verbatim to the delegator's stdout by the caller.
+fn claim_task_for_delegation(
+    state: &super::state::StateDir,
+    repo: &Path,
+    task_id: &str,
+    env: EnvLookup<'_>,
+    now: u64,
+) -> Result<(), String> {
+    let repo_slug = super::state::repo_slug(repo);
+    let session = super::mail::session_identity(env)
+        .unwrap_or_else(|| format!("agent-pid-{}", std::process::id()));
+    let pid = std::process::id();
+    match super::task::claim_locked(
+        state,
+        &repo_slug,
+        task_id,
+        &session,
+        pid,
+        super::sessions::process_start_secs(pid),
+        &super::task::local_host(),
+        now,
+        super::task::DEFAULT_CLAIM_TTL_SECS,
+    )
+    .map_err(|e| e.to_string())?
+    {
+        None => Err(format!("no task '{task_id}' in this repository")),
+        Some(Ok(_claimed)) => Ok(()),
+        Some(Err(refusal)) => Err(format!("cannot claim task '{task_id}': {refusal}")),
+    }
+}
+
+/// Issue #317: closes `--task`'s own card once this delegation has finished,
+/// entirely best-effort -- a delegation that ran must never fail because its
+/// task-card bookkeeping could not be written, the same discipline every
+/// other accounting call in this function's own completion block already
+/// holds. `Reported` (a genuine report-back, or a plain successful exit with
+/// no structural contract declared) marks the card `Done` with `outcome`
+/// verbatim; anything else runs [`super::task::respawn_decision`] and applies
+/// its verdict, so a crash or an unvalidated report-back returns the card to
+/// `Ready` for a fresh delegation to pick up, or auto-blocks it once the
+/// retry ceiling is reached -- NEVER a silent `Done`.
+fn finish_task_card(
+    state: &super::state::StateDir,
+    repo: &Path,
+    args: &AgentArgs,
+    exit_kind: super::task::ExitKind,
+    outcome: &str,
+    now: u64,
+) {
+    let Some(task_id) = &args.task else {
+        return;
+    };
+    let repo_slug = super::state::repo_slug(repo);
+    let cards = super::task::load_cards(state, &repo_slug);
+    let Some(card) = cards.get(task_id) else {
+        return;
+    };
+    match exit_kind {
+        super::task::ExitKind::Reported => {
+            let _ = super::task::append_event(
+                state,
+                &repo_slug,
+                &super::task::Event::Completed {
+                    id: card.id.clone(),
+                    outcome: outcome.to_string(),
+                    at: now,
+                },
+            );
+        }
+        other => {
+            match super::task::respawn_decision(card, other, super::task::DEFAULT_MAX_ATTEMPTS) {
+                super::task::RespawnVerdict::Respawn => {
+                    let reset_event = match other {
+                        super::task::ExitKind::SilentZero => super::task::Event::Protocol {
+                            id: card.id.clone(),
+                            detail: "exited without a validated report-back".to_string(),
+                            at: now,
+                        },
+                        _ => super::task::Event::Crash {
+                            id: card.id.clone(),
+                            at: now,
+                        },
+                    };
+                    let _ = super::task::append_event(state, &repo_slug, &reset_event);
+                    let _ = super::task::append_event(
+                        state,
+                        &repo_slug,
+                        &super::task::Event::Respawned {
+                            id: card.id.clone(),
+                            at: now,
+                        },
+                    );
+                }
+                super::task::RespawnVerdict::AutoBlock(reason) => {
+                    let _ = super::task::append_event(
+                        state,
+                        &repo_slug,
+                        &super::task::Event::Blocked {
+                            id: card.id.clone(),
+                            reason,
+                            by: "system:respawn-guard".to_string(),
+                            at: now,
+                        },
+                    );
+                }
+                super::task::RespawnVerdict::Refuse(_) => {}
+            }
+        }
+    }
+}
+
 /// The supervisor's own two outcomes (rot-exhausted, timed out) get a
 /// human-readable line; every other exit code -- including a plain success --
 /// gets none, since that is either self-explanatory or the agent's own doing.
@@ -2330,6 +2548,12 @@ pub fn run_with<W: Write>(
     if args.worktree && args.workdir.is_some() {
         return Err("--worktree and --workdir are mutually exclusive".into());
     }
+    // Issue #186: resolve the requested worker model before the spawn gate so
+    // an exhausted/low-headroom seat can be translated to an equivalent tier
+    // on another enabled harness. Issue #319: also moved ahead of `--worktree`
+    // allocation below, which needs it to record ownership and to run
+    // startup GC first.
+    let state = super::state::StateDir::resolve(env)?;
     // Issue #228: validated and canonicalised before anything else in this
     // delegation runs -- a bad `--workdir` must fail loudly, up front, not
     // surface as a confusing sandbox error deep inside a harness's own
@@ -2341,8 +2565,17 @@ pub fn run_with<W: Write>(
     // binding an explicit `--workdir` would -- allocated once, here, before
     // either fork of this delegation (a live dashboard pane, or the
     // headless fallback) reads it, so both see the identical tree.
+    //
+    // Issue #319, design item 4: a conservative startup GC runs immediately
+    // before allocating a new tree -- best-effort, never fatal to this
+    // delegation, so a GC failure never blocks a worker from starting.
     let canonical_workdir = if args.worktree {
-        Some(allocate_worktree(repo)?)
+        let _ = worktree::gc(&state, repo, &super::sessions::is_alive);
+        Some(allocate_worktree(
+            &state,
+            repo,
+            env(adapters::SESSION_ENV).as_deref(),
+        )?)
     } else {
         args.workdir.as_deref().map(validate_workdir).transpose()?
     };
@@ -2353,6 +2586,7 @@ pub fn run_with<W: Write>(
     // `--workdir` (or neither): this delegation never allocated that
     // directory, so it is never this guard's to reclaim.
     let mut worktree_guard = WorktreeReclaimGuard::new(
+        &state,
         repo,
         if args.worktree {
             canonical_workdir.clone()
@@ -2411,11 +2645,6 @@ pub fn run_with<W: Write>(
         return Ok(2);
     }
 
-    // Issue #186: resolve the requested worker model before the spawn gate so
-    // an exhausted/low-headroom seat can be translated to an equivalent tier
-    // on another enabled harness. This does not launch anything.
-    let state = super::state::StateDir::resolve(env)?;
-
     // `--attach-artifact`: resolved and spliced onto the operator's own
     // prompt text before anything else below reads `prompt` -- both forks of
     // this delegation (`try_join_dashboard`'s pane request, and the headless
@@ -2430,6 +2659,11 @@ pub fn run_with<W: Write>(
     // same seam, same "both forks read this one binding" guarantee as
     // `--attach-artifact` immediately above.
     let prompt = attach_result_contract_to_prompt(result_schema.as_ref(), prompt);
+    // Issue #317: `--task`'s brief and every parent card's own outcome,
+    // labelled -- same seam, same "both forks read this one binding"
+    // guarantee as `--attach-artifact`/`--result-schema` above. Fails fast
+    // when the named card does not exist in this repository.
+    let prompt = attach_task_context_to_prompt(args, &state, repo, prompt)?;
 
     // Issue #223 §E: refuses before any routing/spawn decision below, so an
     // enforced session never even gets as far as picking a route or joining
@@ -2439,6 +2673,22 @@ pub fn run_with<W: Write>(
     }
 
     let now = super::state::now_secs();
+    // Issue #317: resolves and claims `--task`'s own card before any
+    // spawn/routing decision below -- refused, with nothing launched, when
+    // the card cannot be claimed (unmet parents, or already running
+    // elsewhere under a live claimant). The claim is recorded under THIS
+    // process's own pid: if everything below this point fails before a
+    // worker ever actually runs, this same `zirv ctx agent` process exits
+    // shortly after returning, so the claim's pid goes dead and a later
+    // `reap`/`claim` attempt (`task::claim_locked`) returns the card to
+    // `Ready` on its own -- never left falsely `Running` forever, and never
+    // silently marked `Done`.
+    if let Some(task_id) = &args.task
+        && let Err(refusal) = claim_task_for_delegation(&state, repo, task_id, env, now)
+    {
+        writeln!(w, "agent: {refusal}")?;
+        return Ok(2);
+    }
     let requested_adapter = adapters::select(Some(&args.name), &[], &cfg)?;
     let live_inherited_dashboard = env(spawnreq::DASH_REQUESTS_ENV)
         .map(PathBuf::from)
@@ -2582,11 +2832,49 @@ pub fn run_with<W: Write>(
         } else {
             ""
         };
+        // Issue #349: the REQUESTING session (this process's own caller) is
+        // the one pacing actually refused -- same reasoning as the writer-
+        // permit refusal below (issue #267): the worker this refusal
+        // prevented from ever existing has no attention row of its own.
+        if let Some(short) = super::mail::session_identity(env) {
+            let _ = super::attention::record(
+                &state,
+                &short,
+                super::attention::Observation::new(
+                    super::attention::Authority::Supervisor,
+                    gate_note
+                        .clone()
+                        .unwrap_or_else(|| "usage-pacing refused new work".to_string()),
+                    80,
+                    super::state::now_secs(),
+                )
+                .with_attention(super::attention::Attention::Quota),
+                super::state::now_secs(),
+            );
+        }
         return Err(format!(
             "{}.{fallback_note}{exclusion_note}",
             gate_note.unwrap_or_else(|| "refusing to start new delegated work".to_string())
         )
         .into());
+    }
+    // Issue #349: the gate did not refuse this call (`Proceed`, `Warn`, a
+    // forced `Refuse`, or a deferred cross-harness wait, all of which
+    // continue past the refusal above) -- clear any `Quota` attention a
+    // PRIOR refusal left on this same requesting session.
+    if let Some(short) = super::mail::session_identity(env) {
+        let _ = super::attention::record(
+            &state,
+            &short,
+            super::attention::Observation::new(
+                super::attention::Authority::Supervisor,
+                "usage pacing allowed new work",
+                80,
+                super::state::now_secs(),
+            )
+            .with_attention(super::attention::Attention::None),
+            super::state::now_secs(),
+        );
     }
     if let Some(choice) = deferred_reset.as_ref() {
         let detail = choice.detail();
@@ -2861,6 +3149,24 @@ pub fn run_with<W: Write>(
                     cfg.supervise.max_writers,
                     &tree,
                 );
+                // Issue #349: the REQUESTING session (this process's own
+                // caller) is the one that needs to know its delegation was
+                // refused -- the worker session this refusal prevented from
+                // ever existing has no attention row to file it under.
+                if let Some(short) = super::mail::session_identity(&env) {
+                    let _ = super::attention::record(
+                        &state,
+                        &short,
+                        super::attention::Observation::new(
+                            super::attention::Authority::Supervisor,
+                            reason.clone(),
+                            80,
+                            super::state::now_secs(),
+                        )
+                        .with_attention(super::attention::Attention::WriterConflict),
+                        super::state::now_secs(),
+                    );
+                }
                 let code = exec::EXIT_WRITER_BUSY;
                 writeln!(w, "{reason}")?;
                 return Ok(code);
@@ -2931,6 +3237,17 @@ pub fn run_with<W: Write>(
             // again, so a group this invocation minted for a launch that
             // never happened is removed rather than left open forever.
             discard_minted_group();
+            // Issue #317: the worker never actually ran -- same "never
+            // Done, always crash/respawn-guarded" treatment as any other
+            // run that reached completion but failed.
+            finish_task_card(
+                &state,
+                repo,
+                args,
+                super::task::ExitKind::Crash,
+                "launch failed",
+                super::state::now_secs(),
+            );
             return Err(e);
         }
     };
@@ -2949,7 +3266,7 @@ pub fn run_with<W: Write>(
     if args.worktree
         && let Some(path) = canonical_workdir.as_deref()
     {
-        reclaim_worktree_and_report(repo, path);
+        reclaim_worktree_and_report(&state, repo, path);
     }
     // Review finding (2026-09), finding 2b: reclaimed above already (when
     // `--worktree` was used) -- disarm so `worktree_guard`'s own `Drop`,
@@ -2989,6 +3306,21 @@ pub fn run_with<W: Write>(
     if let Ok(state_dir) = super::state::StateDir::resolve(&env) {
         let parent_session = super::mail::session_identity(&env).unwrap_or_default();
         let outcome = delegation_outcome(code);
+        // Issue #317: `--task`'s own completion signal. Without a declared
+        // `--result-schema`, a plain exit 0 is the only success evidence this
+        // function has, so it is treated as `Reported`; a schema declared
+        // below overrides this once `validated` is known -- an unvalidated
+        // report-back is exactly the "worker completed but produced nothing
+        // usable" shape `ExitKind::SilentZero` exists for.
+        let mut task_exit_kind = if result_schema.is_none() {
+            Some(if code == 0 {
+                super::task::ExitKind::Reported
+            } else {
+                super::task::ExitKind::Crash
+            })
+        } else {
+            None
+        };
 
         // Issue #318: when a schema was declared, the report-back mail and
         // its own outcome supersede the plain success/failure report below
@@ -3107,6 +3439,12 @@ pub fn run_with<W: Write>(
                 }
             }
 
+            task_exit_kind = Some(if validated.is_some() {
+                super::task::ExitKind::Reported
+            } else {
+                super::task::ExitKind::SilentZero
+            });
+
             writeln!(
                 w,
                 "result: {}",
@@ -3193,6 +3531,19 @@ pub fn run_with<W: Write>(
             let _ = super::mail::store_to(&state_dir, &repo_slug, &repo_slug, &msg, &cfg);
         }
         let envelope_sha256 = envelope::digest(&child_envelope).ok();
+        // Issue #317: closes (or respawn-guards) `--task`'s own card now that
+        // this delegation's real outcome is known -- see `finish_task_card`'s
+        // own doc comment for why this never marks a card `Done` silently.
+        if let Some(exit_kind) = task_exit_kind {
+            finish_task_card(
+                &state_dir,
+                repo,
+                args,
+                exit_kind,
+                outcome,
+                super::state::now_secs(),
+            );
+        }
         let total = append_execution_segments(
             &state_dir,
             &execution_report,
@@ -3734,6 +4085,92 @@ mod tests {
 
         let without_contract = attach_result_contract_to_prompt(None, "do the thing".to_string());
         assert_eq!(without_contract, "do the thing");
+    }
+
+    /// Issue #317: `--task` appends the card's own brief and every resolved
+    /// parent's outcome after the operator's own prompt text -- the same
+    /// splice-point contract `attach_artifact_to_prompt` holds.
+    #[test]
+    fn attach_task_context_to_prompt_appends_the_brief_and_parent_outcomes() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let repo_slug = crate::commands::ctx::state::repo_slug(repo.path());
+        crate::commands::ctx::task::append_event(
+            &state,
+            &repo_slug,
+            &crate::commands::ctx::task::Event::Created {
+                id: "parent-1".to_string(),
+                repo_slug: repo_slug.clone(),
+                title: "parent".to_string(),
+                brief: "b".to_string(),
+                parents: Vec::new(),
+                group_id: None,
+                workdir: None,
+                at: 1,
+            },
+        )
+        .expect("create parent");
+        crate::commands::ctx::task::append_event(
+            &state,
+            &repo_slug,
+            &crate::commands::ctx::task::Event::Completed {
+                id: "parent-1".to_string(),
+                outcome: "migrated the schema".to_string(),
+                at: 2,
+            },
+        )
+        .expect("complete parent");
+        crate::commands::ctx::task::append_event(
+            &state,
+            &repo_slug,
+            &crate::commands::ctx::task::Event::Created {
+                id: "child-1".to_string(),
+                repo_slug: repo_slug.clone(),
+                title: "child".to_string(),
+                brief: "wire up the new column".to_string(),
+                parents: vec!["parent-1".to_string()],
+                group_id: None,
+                workdir: None,
+                at: 3,
+            },
+        )
+        .expect("create child");
+
+        let mut args = args_for("claude", "do the operator's own thing");
+        args.task = Some("child-1".to_string());
+        let prompt = attach_task_context_to_prompt(
+            &args,
+            &state,
+            repo.path(),
+            "do the operator's own thing".to_string(),
+        )
+        .expect("resolves");
+        assert!(prompt.starts_with("do the operator's own thing"));
+        assert!(prompt.contains("child-1"));
+        assert!(prompt.contains("wire up the new column"));
+        assert!(prompt.contains("parent-1"));
+        assert!(prompt.contains("migrated the schema"));
+    }
+
+    #[test]
+    fn attach_task_context_to_prompt_fails_for_an_unknown_task_id() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let mut args = args_for("claude", "go");
+        args.task = Some("does-not-exist".to_string());
+        let err = attach_task_context_to_prompt(&args, &state, repo.path(), "go".to_string())
+            .expect_err("no such task");
+        assert!(err.to_string().contains("does-not-exist"));
+    }
+
+    #[test]
+    fn attach_task_context_to_prompt_is_a_no_op_without_task() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let args = args_for("claude", "go");
+        let prompt = attach_task_context_to_prompt(&args, &state, repo.path(), "go".to_string())
+            .expect("resolves");
+        assert_eq!(prompt, "go");
     }
 
     /// Issue #223 §E: `workflow.adoption = enforce` refuses a delegation when
@@ -5028,6 +5465,7 @@ mod tests {
             path_scope: Vec::new(),
             no_network: false,
             depth: None,
+            task: None,
         }
     }
 
@@ -5155,7 +5593,8 @@ mod tests {
         assert!(run(&["add", "README.md"]));
         assert!(run(&["commit", "-q", "-m", "initial"]));
 
-        let worktree = allocate_worktree(&repo).expect("allocate a fresh worktree");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let worktree = allocate_worktree(&state, &repo, None).expect("allocate a fresh worktree");
 
         assert!(
             worktree.starts_with(
@@ -5209,14 +5648,16 @@ mod tests {
         assert!(run(&["add", "README.md"]));
         assert!(run(&["commit", "-q", "-m", "initial"]));
 
-        let first = allocate_worktree(&repo).expect("first allocation");
-        let second = allocate_worktree(&repo).expect("second allocation");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let first = allocate_worktree(&state, &repo, None).expect("first allocation");
+        let second = allocate_worktree(&state, &repo, None).expect("second allocation");
         assert_ne!(first, second, "each --worktree call must get its own tree");
     }
 
-    /// Review finding (2026-09), acceptance: a clean allocated worktree is
-    /// removed by `reclaim_worktree`, and the branch `git worktree add`
-    /// minted for it survives -- the worker's own commits are never lost.
+    /// Review finding (2026-09), acceptance: a genuinely clean allocated
+    /// worktree (no commits, no changes at all beyond what `allocate_
+    /// worktree` itself minted) is removed by `reclaim_worktree`, and the
+    /// branch `git worktree add` minted for it survives.
     #[test]
     fn reclaim_worktree_removes_a_clean_tree_and_keeps_its_branch() {
         if !git_available() {
@@ -5242,20 +5683,15 @@ mod tests {
         assert!(run(&repo, &["add", "README.md"]));
         assert!(run(&repo, &["commit", "-q", "-m", "initial"]));
 
-        let worktree = allocate_worktree(&repo).expect("allocate a fresh worktree");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let worktree = allocate_worktree(&state, &repo, None).expect("allocate a fresh worktree");
         let short = worktree
             .file_name()
             .and_then(|n| n.to_str())
             .expect("short id")
             .to_string();
 
-        // The worker committed something in its own worktree -- the whole
-        // point of keeping the branch around after reclamation.
-        std::fs::write(worktree.join("worker-output.txt"), "done\n").expect("write");
-        assert!(run(&worktree, &["add", "worker-output.txt"]));
-        assert!(run(&worktree, &["commit", "-q", "-m", "worker commit"]));
-
-        let outcome = reclaim_worktree(&repo, &worktree);
+        let outcome = reclaim_worktree(&state, &repo, &worktree);
         assert_eq!(outcome, ReclaimOutcome::Removed);
         assert!(
             !worktree.exists(),
@@ -5272,15 +5708,20 @@ mod tests {
             .expect("git branch --list");
         assert!(
             !String::from_utf8_lossy(&branches.stdout).trim().is_empty(),
-            "the branch {short} must survive reclamation with the worker's commits"
+            "the branch {short} must survive reclamation"
         );
     }
 
-    /// Review finding (2026-09): a dirty allocated worktree (here, an
-    /// untracked file) is left in place by `reclaim_worktree` -- never
-    /// force-removed.
+    /// Issue #319: a worktree with a genuine, unpushed commit of its own
+    /// (proof the worker actually did something) is now left ENTIRELY in
+    /// place by `reclaim_worktree` -- directory and all -- never silently
+    /// removed just because `git status --porcelain` happens to read clean.
+    /// This tightens the pre-#319 contract (which removed on porcelain-clean
+    /// alone, discarding the *directory* while trusting the branch to carry
+    /// the commit): now an operator gets a chance to look before even the
+    /// directory goes away.
     #[test]
-    fn reclaim_worktree_leaves_a_dirty_tree_in_place() {
+    fn reclaim_worktree_keeps_a_tree_with_an_unpushed_worker_commit() {
         if !git_available() {
             eprintln!("skipping: git not found on PATH");
             return;
@@ -5304,18 +5745,71 @@ mod tests {
         assert!(run(&repo, &["add", "README.md"]));
         assert!(run(&repo, &["commit", "-q", "-m", "initial"]));
 
-        let worktree = allocate_worktree(&repo).expect("allocate a fresh worktree");
-        // An untracked file is enough to make `git status --porcelain`
-        // non-empty -- no commit needed to be "dirty".
-        std::fs::write(worktree.join("scratch.txt"), "not committed\n").expect("write");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let worktree = allocate_worktree(&state, &repo, None).expect("allocate a fresh worktree");
+        std::fs::write(worktree.join("worker-output.txt"), "done\n").expect("write");
+        assert!(run(&worktree, &["add", "worker-output.txt"]));
+        assert!(run(&worktree, &["commit", "-q", "-m", "worker commit"]));
 
-        let outcome = reclaim_worktree(&repo, &worktree);
-        assert_eq!(outcome, ReclaimOutcome::Dirty);
+        let outcome = reclaim_worktree(&state, &repo, &worktree);
+        match outcome {
+            ReclaimOutcome::InspectionFailed { probe, .. } => assert_eq!(probe, "ahead"),
+            other => panic!("expected InspectionFailed(ahead), got {other:?}"),
+        }
         assert!(
             worktree.exists(),
-            "a dirty worktree must be left in place, never force-removed"
+            "a tree with an unpushed commit must never be removed automatically"
         );
-        assert!(worktree.join("scratch.txt").exists());
+    }
+
+    /// Review finding (2026-09), extended for issue #319: an allocated
+    /// worktree with only untracked content is archived, then removed --
+    /// never left in place, and never force-removed without a copy first.
+    #[test]
+    fn reclaim_worktree_archives_untracked_content_then_removes_the_tree() {
+        if !git_available() {
+            eprintln!("skipping: git not found on PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("session-base");
+        std::fs::create_dir_all(&repo).expect("mkdir");
+        assert!(git_init(&repo), "git init");
+        let run = |dir: &Path, args: &[&str]| -> bool {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        };
+        assert!(run(&repo, &["config", "user.email", "test@example.com"]));
+        assert!(run(&repo, &["config", "user.name", "test"]));
+        std::fs::write(repo.join("README.md"), "hello\n").expect("write");
+        assert!(run(&repo, &["add", "README.md"]));
+        assert!(run(&repo, &["commit", "-q", "-m", "initial"]));
+
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let worktree = allocate_worktree(&state, &repo, None).expect("allocate a fresh worktree");
+        // An untracked file is enough to make `git status --porcelain`
+        // non-empty -- no commit needed.
+        std::fs::write(worktree.join("scratch.txt"), "not committed\n").expect("write");
+
+        let outcome = reclaim_worktree(&state, &repo, &worktree);
+        match outcome {
+            ReclaimOutcome::Archived(dest) => {
+                assert_eq!(
+                    std::fs::read_to_string(dest.join("scratch.txt")).expect("read archived"),
+                    "not committed\n"
+                );
+            }
+            other => panic!("expected Archived, got {other:?}"),
+        }
+        assert!(
+            !worktree.exists(),
+            "the worktree must be removed once its untracked content is archived"
+        );
     }
 
     #[test]
@@ -6823,6 +7317,131 @@ mod tests {
                 .any(|line| line.contains(crate::commands::ctx::log::DELEGATION_ACTION)),
             "the main decision log must also get a one-line delegation-complete marker: \
              {decisions:?}"
+        );
+    }
+
+    /// Issue #317: `--task <id>` claims the card before any spawn, and a
+    /// successful run marks it `Done` with the delegation's own outcome --
+    /// never left `Running`.
+    #[test]
+    fn run_with_task_claims_before_spawn_and_completes_on_success() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state_dir = tmp.path().join("state");
+        let mut env = base_env(&state_dir);
+        env.insert("ZIRV_CTX_PACE".to_string(), "false".to_string());
+        unsafe {
+            std::env::set_var("FAKE_AGENT_MODE", "healthy");
+        }
+
+        let state = crate::commands::ctx::state::StateDir::resolve(&|k: &str| env.get(k).cloned())
+            .expect("state resolves");
+        let repo_slug = crate::commands::ctx::state::repo_slug(tmp.path());
+        crate::commands::ctx::task::append_event(
+            &state,
+            &repo_slug,
+            &crate::commands::ctx::task::Event::Created {
+                id: "task-1".to_string(),
+                repo_slug: repo_slug.clone(),
+                title: "do the work".to_string(),
+                brief: "do the work well".to_string(),
+                parents: Vec::new(),
+                group_id: None,
+                workdir: None,
+                at: 1,
+            },
+        )
+        .expect("create task card");
+
+        let mut args = args_for("claude", "do the work");
+        args.task = Some("task-1".to_string());
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE");
+        }
+        assert_eq!(code.expect("runs"), 0);
+
+        let cards = crate::commands::ctx::task::load_cards(&state, &repo_slug);
+        let card = &cards["task-1"];
+        assert_eq!(
+            card.state,
+            crate::commands::ctx::task::State::Done,
+            "a successful run closes the card, never leaves it Running"
+        );
+        assert!(card.outcome.is_some());
+    }
+
+    /// Issue #317 acceptance: a card with an unmet parent cannot be claimed,
+    /// so `--task` refuses BEFORE any worker spawns -- exit 2, nothing
+    /// launched, and the card is left exactly as it was.
+    #[test]
+    fn run_with_task_refuses_before_any_spawn_when_a_parent_is_unmet() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state_dir = tmp.path().join("state");
+        let mut env = base_env(&state_dir);
+        env.insert("ZIRV_CTX_PACE".to_string(), "false".to_string());
+        unsafe {
+            std::env::set_var("FAKE_AGENT_MODE", "healthy");
+        }
+
+        let state = crate::commands::ctx::state::StateDir::resolve(&|k: &str| env.get(k).cloned())
+            .expect("state resolves");
+        let repo_slug = crate::commands::ctx::state::repo_slug(tmp.path());
+        crate::commands::ctx::task::append_event(
+            &state,
+            &repo_slug,
+            &crate::commands::ctx::task::Event::Created {
+                id: "parent-1".to_string(),
+                repo_slug: repo_slug.clone(),
+                title: "parent".to_string(),
+                brief: "b".to_string(),
+                parents: Vec::new(),
+                group_id: None,
+                workdir: None,
+                at: 1,
+            },
+        )
+        .expect("create parent");
+        crate::commands::ctx::task::append_event(
+            &state,
+            &repo_slug,
+            &crate::commands::ctx::task::Event::Created {
+                id: "child-1".to_string(),
+                repo_slug: repo_slug.clone(),
+                title: "child".to_string(),
+                brief: "b".to_string(),
+                parents: vec!["parent-1".to_string()],
+                group_id: None,
+                workdir: None,
+                at: 1,
+            },
+        )
+        .expect("create child");
+
+        let mut args = args_for("claude", "do the work");
+        args.task = Some("child-1".to_string());
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE");
+        }
+        assert_eq!(code.expect("runs"), 2, "refused before any spawn");
+
+        let cards = crate::commands::ctx::task::load_cards(&state, &repo_slug);
+        assert_eq!(
+            cards["child-1"].state,
+            crate::commands::ctx::task::State::Todo,
+            "the refused card is left exactly as it was"
+        );
+        assert!(
+            crate::commands::ctx::log::tail_delegations(&state, 10)
+                .expect("tail")
+                .is_empty(),
+            "nothing was ever launched"
         );
     }
 

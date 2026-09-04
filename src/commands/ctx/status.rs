@@ -14,6 +14,7 @@ use super::permit;
 use super::price;
 use super::sessions::{self, Liveness};
 use super::state::{StateDir, now_secs, repo_slug};
+use super::task;
 use super::{CtxResult, log};
 use crate::commands::workflow::verification;
 use crate::style::{self, Tone};
@@ -208,6 +209,31 @@ fn sessions_lines(
                     style::paint(&model_change_status_text(&change), Tone::Warn, colour)
                 ));
             }
+            // Issue #349: the composed attention projection, shown for every
+            // record regardless of liveness -- a `dead` session that ended
+            // with an unread completion (`DoneUnread`) is exactly the case
+            // "background completion never disappears into idle" exists for.
+            let attention_status = super::attention::load(state, &record.short);
+            let projection = super::attention::project(&attention_status);
+            let attention_tone = match projection {
+                super::attention::Projection::Blocked(_) | super::attention::Projection::Failed => {
+                    Tone::Err
+                }
+                super::attention::Projection::DoneUnread => Tone::Warn,
+                _ => Tone::Muted,
+            };
+            line.push_str(&format!(
+                "  {}",
+                style::paint(
+                    &format!(
+                        "attention: {} ({})",
+                        projection.label(),
+                        super::attention::reason(&attention_status)
+                    ),
+                    attention_tone,
+                    colour
+                )
+            ));
             let delivery = mail::session_delivery_metrics(state, &record.short, now);
             line.push_str(&format!(
                 "  {}",
@@ -522,6 +548,47 @@ pub fn group_tree_lines(
     }
 
     lines
+}
+
+/// Issue #317: task cards for a repository, right beside `group_tree_lines`'s
+/// own work-group tree -- open cards only (anything short of `Done`/
+/// `Archived`), each with its state, claimant (when claimed) and claim age,
+/// the same "nothing to show is nothing shown" rule the rest of `status`
+/// follows. PURE (no fs/clock/env): `cards` and `now` both arrive as
+/// parameters, the same testability seam `group_tree_lines` already draws;
+/// `status::run_with` supplies them from `task::load_cards` and `state::
+/// now_secs`.
+pub fn task_tree_lines(cards: &[task::Card], now: u64, colour: bool) -> Vec<String> {
+    let mut open: Vec<&task::Card> = cards
+        .iter()
+        .filter(|card| !matches!(card.state, task::State::Done | task::State::Archived))
+        .collect();
+    if open.is_empty() {
+        return Vec::new();
+    }
+    open.sort_by(|a, b| a.id.cmp(&b.id));
+    open.into_iter()
+        .map(|card| {
+            let mut line = format!(
+                "  {} [{}] {}",
+                style::paint(&card.id, Tone::Accent, colour),
+                style::paint(&card.state.to_string(), Tone::Muted, colour),
+                card.title,
+            );
+            if let Some(claim) = &card.claim {
+                line.push_str(&style::paint(
+                    &format!(
+                        " claimed-by={} age={}s",
+                        claim.session,
+                        now.saturating_sub(claim.claimed_at)
+                    ),
+                    Tone::Muted,
+                    colour,
+                ));
+            }
+            line
+        })
+        .collect()
 }
 
 /// One raw `[input, cache_creation, cache_read, output]` total across
@@ -1260,6 +1327,22 @@ fn render_report<W: Write>(
     if !group_tree.is_empty() {
         writeln!(w, "{}", header(colour, "work groups"))?;
         for line in &group_tree {
+            writeln!(w, "{line}")?;
+        }
+    }
+
+    // Issue #317: right beside the work-group tree above -- durable task
+    // cards are a different unit (a card outlives any one delegation, and
+    // can be claimed, blocked, or reclaimed independently of a group's own
+    // admission ledger), so this is its own section rather than folded into
+    // `group_tree`.
+    let task_cards: Vec<task::Card> = task::load_cards(&state, &repo_slug(repo))
+        .into_values()
+        .collect();
+    let task_tree = task_tree_lines(&task_cards, now_secs(), colour);
+    if !task_tree.is_empty() {
+        writeln!(w, "{}", header(colour, "tasks"))?;
+        for line in &task_tree {
             writeln!(w, "{line}")?;
         }
     }
@@ -4316,6 +4399,57 @@ mod tests {
     #[test]
     fn no_groups_and_no_delegations_render_nothing() {
         assert!(group_tree_lines(&[], &[], &[], false).is_empty());
+    }
+
+    fn sample_task_card(id: &str, state: task::State, title: &str) -> task::Card {
+        task::Card {
+            id: id.to_string(),
+            repo_slug: "repo".to_string(),
+            title: title.to_string(),
+            brief: "brief".to_string(),
+            state,
+            parents: Vec::new(),
+            claim: None,
+            block: None,
+            comments: Vec::new(),
+            workdir: None,
+            group_id: None,
+            outcome: None,
+            attempts: 0,
+            created_at: 1_700_000_000,
+            updated_at: 1_700_000_000,
+        }
+    }
+
+    /// Issue #317: `task_tree_lines` shows every open card (id, state,
+    /// title), claimant and age when claimed -- and excludes `Done`/
+    /// `Archived` cards entirely.
+    #[test]
+    fn task_tree_lines_shows_open_cards_with_claimant_and_age() {
+        let mut running = sample_task_card("task-1", task::State::Running, "ship the thing");
+        running.claim = Some(task::Claim {
+            session: "sess-a".to_string(),
+            pid: 1,
+            pid_start_time: None,
+            host: "h".to_string(),
+            claimed_at: 100,
+            ttl_secs: 900,
+        });
+        let done = sample_task_card("task-2", task::State::Done, "finished");
+        let cards = vec![running, done];
+
+        let text = task_tree_lines(&cards, 500, false).join("\n");
+        assert!(text.contains("task-1"), "got {text}");
+        assert!(text.contains("ship the thing"), "got {text}");
+        assert!(text.contains("claimed-by=sess-a"), "got {text}");
+        assert!(text.contains("age=400s"), "got {text}");
+        assert!(!text.contains("task-2"), "a Done card is not shown: {text}");
+    }
+
+    #[test]
+    fn task_tree_lines_is_empty_when_nothing_is_open() {
+        let done = sample_task_card("task-1", task::State::Done, "finished");
+        assert!(task_tree_lines(&[done], 500, false).is_empty());
     }
 
     /// A delegation's `work_group_id` naming a group this listing never

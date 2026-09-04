@@ -94,6 +94,31 @@
 #            json block's `status` value (`"bogus"`) is not one of the
 #            contract's declared enum values, exits 0
 #
+# Issue #314: an invocation with NO --session-id at all is not a headless
+# agent launch -- it is a one-shot distiller/judge call
+# (`handoff::run_model`/adapter `distiller_cmd`, e.g. `-p --model <m>
+# --output-format text ...`, prompt on stdin, nothing written to a
+# transcript). Answered separately, per FAKE_JUDGE_MODE (default "done"):
+#   done            {"verdict":"done","reason":"objective satisfied"}
+#   blocked         {"verdict":"blocked","reason":"missing credential"}
+#   continue        {"verdict":"continue","reason":"more work remains"}
+#   wait_seconds    {"verdict":"wait","wait_on":{"seconds":1},...}
+#   wait_pid        {"verdict":"wait","wait_on":{"pid":999999999},...} (an
+#                   implausible pid, so a real liveness check sees it dead)
+#   wait_file       {"verdict":"wait","wait_on":{"file":"$FAKE_JUDGE_WAIT_FILE"}}
+#   bad             plain prose with no JSON at all, an unparseable answer
+#   fail            non-zero exit
+#   hang            never answers
+# FAKE_JUDGE_PROMPT_LOG=<path>  writes the received prompt verbatim, so a
+#                   test can assert what the judge was actually asked.
+# FAKE_JUDGE_MODE_FILE=<path>   one mode per line, popped per judge call --
+#                   the FAKE_JUDGE_MODE analogue of FAKE_AGENT_MODE_FILE, so
+##                   one test can script a sequence of verdicts (e.g. "wait"
+#                   then "done" once the loop resumes). A `--help` invocation
+#                   (claude adapter's own pre-existing file-support probe,
+#                   `detect_help_flag`) is answered separately and never
+#                   touches FAKE_JUDGE_MODE/FAKE_JUDGE_MODE_FILE at all.
+#
 # FAKE_AGENT_MODE_FILE lets one test script a sequence across restarts, for
 # example "rot" then "healthy" to prove a restarted child is supervised on its
 # own transcript. FAKE_AGENT_SLEEP applies only in rot mode, so a rotted run
@@ -112,6 +137,16 @@ mv_bin=mv
 [ ! -x /bin/mv ] || mv_bin=/bin/mv
 
 [ -z "${FAKE_AGENT_ARGV_LOG:-}" ] || printf '%s\n' "$*" >> "$FAKE_AGENT_ARGV_LOG"
+# Captured before the arg-parsing loop below (which consumes "$@" into named
+# variables and drops anything it does not recognise): whether this
+# invocation is claude adapter's own pre-existing `--help` capability probe
+# (`detect_help_flag`, stdin nulled, no --session-id) rather than a real
+# headless launch OR a distiller/judge call, both of which this script tells
+# apart by --session-id's presence alone below. Without this, issue #314's
+# own "no --session-id means judge" rule would misclassify that unrelated,
+# already-existing probe as a judge call, silently consuming a scripted
+# FAKE_JUDGE_MODE_FILE line meant for the real one.
+original_all_args="$*"
 
 session=""
 prompt=""
@@ -155,7 +190,47 @@ while [ $# -gt 0 ]; do
     *) shift ;;
   esac
 done
-[ -n "$session" ] || { echo "fake-agent: no --session-id given" >&2; exit 64; }
+if [ -z "$session" ]; then
+  case " $original_all_args " in
+    *' --help '*)
+      # claude adapter's own pre-existing `--help` capability probe -- see
+      # this block's own comment above. Deliberately never names
+      # --append-system-prompt-file, so `system_prompt_supported` reads
+      # "unsupported" here exactly as it always has (fake-agent.sh never
+      # supported that probe answering "yes").
+      printf 'usage: claude [options]\n'
+      exit 0
+      ;;
+  esac
+  # Issue #314: no --session-id (and not the --help probe above) means this
+  # is a distiller/judge call, not a headless agent launch -- see this
+  # file's own header comment. Entirely separate from FAKE_AGENT_MODE/
+  # FAKE_AGENT_MODE_FILE above, which only ever apply to a real
+  # --session-id launch.
+  judge_prompt=$(cat)
+  [ -z "${FAKE_JUDGE_PROMPT_LOG:-}" ] || printf '%s' "$judge_prompt" > "$FAKE_JUDGE_PROMPT_LOG"
+  judge_mode="${FAKE_JUDGE_MODE:-done}"
+  if [ -n "${FAKE_JUDGE_MODE_FILE:-}" ] && [ -s "${FAKE_JUDGE_MODE_FILE}" ]; then
+    judge_mode=$("$head_bin" -n 1 "$FAKE_JUDGE_MODE_FILE")
+    "$tail_bin" -n +2 "$FAKE_JUDGE_MODE_FILE" > "$FAKE_JUDGE_MODE_FILE.next"
+    "$mv_bin" "$FAKE_JUDGE_MODE_FILE.next" "$FAKE_JUDGE_MODE_FILE"
+  fi
+  case "$judge_mode" in
+    fail) echo "fake judge blocked by sandbox" >&2; exit 4 ;;
+    hang) while true; do "$sleep_bin" 1; done ;;
+    bad) printf 'I looked things over and it seems mostly fine.\n' ;;
+    blocked) printf '{"verdict":"blocked","reason":"missing credential"}\n' ;;
+    continue) printf '{"verdict":"continue","reason":"more work remains"}\n' ;;
+    wait_seconds) printf '{"verdict":"wait","reason":"napping","wait_on":{"seconds":1}}\n' ;;
+    wait_pid) printf '{"verdict":"wait","reason":"napping","wait_on":{"pid":999999999}}\n' ;;
+    wait_file)
+      printf '{"verdict":"wait","reason":"napping","wait_on":{"file":"%s"}}\n' \
+        "${FAKE_JUDGE_WAIT_FILE:-/nonexistent}"
+      ;;
+    *) printf '{"verdict":"done","reason":"objective satisfied"}\n' ;;
+  esac
+  exit 0
+fi
 
 if [ -n "${FAKE_AGENT_PROMPT_LOG:-}" ]; then
   turn_file="$FAKE_AGENT_PROMPT_LOG.turn"

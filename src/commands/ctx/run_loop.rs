@@ -4,13 +4,19 @@ use std::time::{Duration, Instant};
 
 use super::config::{CtxConfig, EnvLookup, env_from_process};
 use super::event::{SessionId, SessionRef};
+use super::judge::{GateOutcome, Step, WaitOn};
 use super::pace;
 use super::state::{StateDir, now_secs};
 use super::supervise::{self, Outcome, Tick};
-use super::{CtxResult, adapters, log, objective, score};
+use super::{CtxResult, adapters, handoff, judge, log, mail, objective, score};
 
 /// Repeated cycle failures, escalated to the caller.
 pub const EXIT_FAILED: i32 = 75;
+/// Issue #314: the judge called the objective `blocked`.
+pub const EXIT_OBJECTIVE_BLOCKED: i32 = 76;
+/// Issue #314: `[objective] max_cycles_without_progress` consecutive
+/// no-progress cycles.
+pub const EXIT_OBJECTIVE_NO_PROGRESS: i32 = 77;
 
 #[derive(Debug, clap::Args)]
 pub struct LoopArgs {
@@ -149,6 +155,8 @@ pub(crate) fn run_with_clock<W: Write>(
             spent_tokens: 0,
             started_at: now_fn(),
             status: objective::Status::Active,
+            pending_note: None,
+            evidence: Vec::new(),
         };
         objective::store(&state, &key, &record)?;
     }
@@ -183,6 +191,11 @@ pub(crate) fn run_with_clock<W: Write>(
     // screening summary that has not changed since the last poll is
     // announced once for the whole run, not once per cycle.
     let mut screening_announced: Option<String> = None;
+    // Issue #314: the objective completion-judge's own progress tracker,
+    // owned across every cycle -- see `judge::progress_made`'s own doc
+    // comment for what "progress" means. `None` until the first cycle this
+    // run has actually evaluated an objective for.
+    let mut objective_progress = ObjectiveProgress::default();
     loop {
         if let Some(limit) = args.cycles
             && cycle >= limit
@@ -757,6 +770,41 @@ pub(crate) fn run_with_clock<W: Write>(
             );
         }
 
+        // Issue #314: deterministic gates first, a cheap-model verdict
+        // second, for an active durable objective -- see `judge.rs`'s own
+        // module doc. A missing/non-`Active` objective is a complete no-op
+        // (`ObjectiveOutcome::Inactive`), so a `loop` run with no objective
+        // set is byte-for-byte unaffected by everything below.
+        match evaluate_objective_after_cycle(
+            &cfg,
+            &state,
+            w,
+            repo,
+            env,
+            adapter.as_ref(),
+            &transcript,
+            session.as_str(),
+            parent_short.as_deref(),
+            &mut objective_progress,
+        ) {
+            ObjectiveOutcome::Inactive | ObjectiveOutcome::Continue => {}
+            ObjectiveOutcome::Stop(code) => {
+                if let Some(guard) = session_guard.as_mut() {
+                    guard.release();
+                }
+                return Ok(code);
+            }
+            ObjectiveOutcome::Park(wait_on) => {
+                park_on(&wait_on, now_fn, sleep_fn);
+                // Resuming after a park must not count as a cycle: the next
+                // iteration's own `cycle += 1` at the top of this loop
+                // restores the value this decrements, a net no-op on the
+                // counter across the parked iteration.
+                cycle -= 1;
+                continue;
+            }
+        }
+
         if limit_hit {
             // A confirmed vendor refusal is authoritative even when the
             // operator disabled proactive pacing. Re-enable only this park;
@@ -805,6 +853,341 @@ pub(crate) fn run_with_clock<W: Write>(
                 guard.release();
             }
             return Ok(code);
+        }
+    }
+}
+
+/// Issue #314: this run's own progress tracker for the objective completion
+/// judge, owned across every cycle by `run_with_clock` -- see
+/// `judge::progress_made`'s own doc comment for what "progress" means.
+/// `Default` (`None`/`false`/`0`) is exactly right for a run that has not
+/// evaluated an objective yet.
+#[derive(Debug, Default)]
+struct ObjectiveProgress {
+    last_digest: Option<u64>,
+    last_gate_red: bool,
+    cycles_without_progress: u32,
+}
+
+/// What `run_with_clock` does after `evaluate_objective_after_cycle` runs.
+#[derive(Debug)]
+enum ObjectiveOutcome {
+    /// No active objective (none set, or its status left `Active`): a
+    /// complete no-op, the loop proceeds exactly as it would without this
+    /// feature at all.
+    Inactive,
+    /// A step was taken (a gate failure was recorded, the judge said
+    /// `continue`, or it was unavailable/disabled/parse-failed) but the
+    /// cycle otherwise proceeds normally.
+    Continue,
+    /// Pause on a concrete external event without counting a cycle.
+    Park(WaitOn),
+    /// The loop is done: exit with this code.
+    Stop(i32),
+}
+
+/// Overrides the gate/judge binary word `"zirv"` resolves to when running a
+/// configured `[objective] gates` command, mirroring `ZIRV_CTX_AGENT_BIN`'s
+/// own space-separated "interpreter path" shape (`"sh <script>"`). Test-only
+/// in practice: production always resolves via `std::env::current_exe()`.
+const GATE_BIN_ENV: &str = "ZIRV_CTX_OBJECTIVE_GATE_BIN";
+
+/// Cap on how long a single `Step::Park` ever blocks before giving up and
+/// letting the cycle continue -- the design calls for this explicitly on a
+/// `Wait(Seconds(n))`; a `Pid`/`File` target gets the identical cap so a
+/// judge that names a target that never resolves cannot wedge the loop
+/// forever.
+const MAX_PARK_SECS: u64 = 3600;
+
+/// The literal `"zirv"` word in a configured gate command, resolved to this
+/// process's own executable (or, in a test, `GATE_BIN_ENV`'s override) --
+/// see `run_gate`'s own doc comment for why this is a `Vec`, not a single
+/// path: the override mirrors `ZIRV_CTX_AGENT_BIN`'s "interpreter path"
+/// shape (`"sh <script>"`, two words), while `current_exe()` is always
+/// exactly one word regardless of any space its own path might contain.
+fn zirv_invocation(env: EnvLookup<'_>) -> CtxResult<Vec<String>> {
+    if let Some(bin) = env(GATE_BIN_ENV) {
+        return Ok(bin.split_whitespace().map(str::to_string).collect());
+    }
+    Ok(vec![std::env::current_exe()?.display().to_string()])
+}
+
+/// The last `max_bytes` of `bytes`, lossily decoded -- shared by a gate's
+/// stdout+stderr tail and the judge prompt's transcript tail.
+fn tail_of_bytes(bytes: &[u8], max_bytes: usize) -> String {
+    let start = bytes.len().saturating_sub(max_bytes);
+    String::from_utf8_lossy(&bytes[start..]).into_owned()
+}
+
+/// Runs one configured gate command in `repo`. Applies the #287 unchanged-
+/// workspace skip first (`verification::last_failure_fingerprint`): a gate
+/// whose current `change_fingerprint` matches the fingerprint recorded on
+/// its own last failure is not re-run at all (`GateOutcome::Skipped`) --
+/// re-running it would only reproduce the identical failure. Any I/O error
+/// along the way (this is not a git repository, the gate command could not
+/// be spawned, ...) is itself conservative evidence: it degrades to `Red`
+/// rather than ever being mistaken for `Green`, and never propagates out of
+/// this function -- a gate check must never be able to abort the loop.
+fn run_gate(gate_cmd: &str, state: &StateDir, repo: &Path, env: EnvLookup<'_>) -> GateOutcome {
+    let attempt = || -> CtxResult<GateOutcome> {
+        let fingerprint = crate::commands::workflow::verification::change_fingerprint(repo)?;
+        let last_failure = crate::commands::workflow::verification::last_failure_fingerprint(
+            state, repo, gate_cmd,
+        )?;
+        if last_failure == Some(fingerprint) {
+            return Ok(GateOutcome::Skipped);
+        }
+        let mut words: Vec<String> = gate_cmd.split_whitespace().map(str::to_string).collect();
+        if words.first().map(String::as_str) == Some("zirv") {
+            words.splice(0..1, zirv_invocation(env)?);
+        }
+        let (program, args) = words
+            .split_first()
+            .ok_or_else(|| format!("empty gate command: {gate_cmd:?}"))?;
+        let mut command = std::process::Command::new(program);
+        command.args(args).current_dir(repo);
+        super::sessions::scrub_supervision_env_cmd(&mut command);
+        let output = command.output()?;
+        if output.status.success() {
+            return Ok(GateOutcome::Green);
+        }
+        let mut combined = output.stdout;
+        combined.extend_from_slice(&output.stderr);
+        Ok(GateOutcome::Red {
+            cmd: gate_cmd.to_string(),
+            code: output.status.code().unwrap_or(-1),
+            tail: tail_of_bytes(&combined, 3 * 1024),
+        })
+    };
+    attempt().unwrap_or_else(|err| GateOutcome::Red {
+        cmd: gate_cmd.to_string(),
+        code: -1,
+        tail: err.to_string(),
+    })
+}
+
+/// Blocks on `wait_on`, bounded by [`MAX_PARK_SECS`] on every axis so a
+/// judge naming a target that never resolves cannot wedge the loop forever.
+fn park_on(wait_on: &WaitOn, now_fn: &dyn Fn() -> u64, sleep_fn: &dyn Fn(Duration)) {
+    match wait_on {
+        WaitOn::Seconds(secs) => sleep_fn(Duration::from_secs((*secs).min(MAX_PARK_SECS))),
+        WaitOn::Pid(pid) => {
+            let deadline = now_fn().saturating_add(MAX_PARK_SECS);
+            while now_fn() < deadline && super::sessions::is_alive(*pid) {
+                sleep_fn(Duration::from_secs(1));
+            }
+        }
+        WaitOn::File(path) => {
+            let deadline = now_fn().saturating_add(MAX_PARK_SECS);
+            while now_fn() < deadline && !path.exists() {
+                sleep_fn(Duration::from_secs(1));
+            }
+        }
+    }
+}
+
+/// The strict judge output contract, appended to every judge prompt this
+/// module sends -- `judge::parse_verdict`'s own doc comment names exactly
+/// what it accepts.
+const JUDGE_OUTPUT_CONTRACT: &str = "\n\n---\nRespond with EXACTLY one JSON object and nothing \
+else: {\"verdict\": \"done\"|\"blocked\"|\"continue\"|\"wait\", \"reason\": \"...\"}. When (and \
+only when) verdict is \"wait\", also include \"wait_on\": {\"pid\": <n>} or {\"file\": \"<path>\"} \
+or {\"seconds\": <n>}.";
+
+/// The core flow issue #314 asks for: deterministic gates first, a cheap-
+/// model verdict second, `blocked`/`wait` as first-class outcomes. Every
+/// side effect (gate spawn, judge model call, objective record writes,
+/// mail, handoff, logging) lives here; `judge.rs`'s `next_step`/
+/// `progress_made` make every decision this function only carries out.
+#[allow(clippy::too_many_arguments)]
+fn evaluate_objective_after_cycle<W: Write>(
+    cfg: &CtxConfig,
+    state: &StateDir,
+    w: &mut W,
+    repo: &Path,
+    env: EnvLookup<'_>,
+    adapter: &dyn adapters::AgentAdapter,
+    transcript: &Path,
+    session: &str,
+    parent_short: Option<&str>,
+    progress: &mut ObjectiveProgress,
+) -> ObjectiveOutcome {
+    let key = super::state::repo_slug(repo);
+    let record = match objective::load(state, &key) {
+        Ok(Some(record)) if record.status == objective::Status::Active => record,
+        _ => return ObjectiveOutcome::Inactive,
+    };
+
+    let mut gate_outcome = GateOutcome::Green;
+    for gate_cmd in &cfg.objective.gates {
+        let outcome = run_gate(gate_cmd, state, repo, env);
+        let is_green = matches!(outcome, GateOutcome::Green);
+        gate_outcome = outcome;
+        if !is_green {
+            break;
+        }
+    }
+
+    let curr_gate_green = matches!(gate_outcome, GateOutcome::Green);
+    let curr_digest = std::fs::read_to_string(transcript)
+        .ok()
+        .map(|body| super::event::input_hash(&body))
+        .unwrap_or_default();
+    if judge::progress_made(
+        progress.last_digest,
+        curr_digest,
+        progress.last_gate_red,
+        curr_gate_green,
+    ) {
+        progress.cycles_without_progress = 0;
+    } else {
+        progress.cycles_without_progress = progress.cycles_without_progress.saturating_add(1);
+    }
+    progress.last_digest = Some(curr_digest);
+    progress.last_gate_red = !curr_gate_green;
+
+    let clear_pending_note = || {
+        if record.pending_note.is_some() {
+            let mut cleared = record.clone();
+            cleared.pending_note = None;
+            let _ = objective::store(state, &key, &cleared);
+        }
+    };
+    let log_decision = |verdict: &str, action: &str, detail: &str| {
+        let _ = log::append(
+            state,
+            &log::Decision {
+                ts: now_secs(),
+                session,
+                verb: "loop",
+                verdict,
+                score: 0,
+                action,
+                detail,
+                observed_at: None,
+            },
+        );
+    };
+
+    match judge::next_step(
+        gate_outcome,
+        cfg.objective.judge,
+        None,
+        progress.cycles_without_progress,
+        cfg.objective.max_cycles_without_progress,
+    ) {
+        Step::InjectFailure(note) => {
+            let mut updated = record;
+            updated.pending_note = Some(note.clone());
+            let _ = objective::store(state, &key, &updated);
+            log_decision("n/a", "objective-gate-red", &note);
+            let _ = writeln!(w, "zirv ctx loop: objective gate red: {note}");
+            ObjectiveOutcome::Continue
+        }
+        Step::StopNoProgress => {
+            log_decision("n/a", "objective-no-progress", "gave up: no progress");
+            ObjectiveOutcome::Stop(EXIT_OBJECTIVE_NO_PROGRESS)
+        }
+        Step::Continue => {
+            clear_pending_note();
+            ObjectiveOutcome::Continue
+        }
+        Step::RunJudge => {
+            let model = handoff::resolve_distiller_model(cfg.handoff.model.as_deref(), adapter);
+            let transcript_tail = std::fs::read(transcript)
+                .map(|bytes| tail_of_bytes(&bytes, 4 * 1024))
+                .unwrap_or_default();
+            let prompt = format!(
+                "{}\n\n---\nRecent transcript (tail):\n{transcript_tail}{JUDGE_OUTPUT_CONTRACT}",
+                objective::layer_text(&record),
+            );
+            let answer = handoff::run_model(
+                adapter,
+                &model,
+                &prompt,
+                Duration::from_secs(cfg.handoff.timeout_secs),
+            );
+            let parsed = answer.ok().and_then(|text| judge::parse_verdict(&text));
+            let Some((verdict, reason)) = parsed else {
+                // Fails open: an unavailable or non-conforming judge is
+                // never grounds to stop, block, or (least of all) close.
+                log_decision(
+                    "n/a",
+                    "objective-judge-unavailable",
+                    "judge call failed or its answer did not parse",
+                );
+                clear_pending_note();
+                return ObjectiveOutcome::Continue;
+            };
+            clear_pending_note();
+            match judge::next_step(
+                GateOutcome::Green,
+                true,
+                Some((verdict, reason.clone())),
+                progress.cycles_without_progress,
+                cfg.objective.max_cycles_without_progress,
+            ) {
+                Step::Close(reason) => {
+                    let evidence = vec![format!("judge: {reason}")];
+                    match objective::record_completion(state, repo, evidence) {
+                        Ok(true) => {
+                            log_decision("done", "objective-done", &reason);
+                            let _ = writeln!(w, "zirv ctx loop: objective done -- {reason}");
+                            ObjectiveOutcome::Stop(0)
+                        }
+                        _ => {
+                            // The fresh-and-passing precondition refused (or
+                            // the check itself errored): never asserted by
+                            // the judge's own prose alone.
+                            log_decision(
+                                "n/a",
+                                "objective-close-refused",
+                                "no fresh, passing final verification; continuing",
+                            );
+                            ObjectiveOutcome::Continue
+                        }
+                    }
+                }
+                Step::StopBlocked(reason) => {
+                    let blocked_handoff = handoff::Handoff {
+                        task: record.objective.clone(),
+                        blocked: vec![reason.clone()],
+                        ..Default::default()
+                    };
+                    let _ = handoff::store(state, repo, session, &blocked_handoff);
+                    if let Some(parent) = parent_short {
+                        let _ = mail::run_send_with(
+                            &mail::SendArgs {
+                                to_session: Some(parent.to_string()),
+                                message: Some(format!("objective blocked: {reason}")),
+                                ..Default::default()
+                            },
+                            &mut std::io::sink(),
+                            repo,
+                            env,
+                            &mut std::io::empty(),
+                        );
+                    }
+                    log_decision("blocked", "objective-blocked", &reason);
+                    let _ = writeln!(w, "zirv ctx loop: objective blocked -- {reason}");
+                    ObjectiveOutcome::Stop(EXIT_OBJECTIVE_BLOCKED)
+                }
+                Step::Park(wait_on) => {
+                    log_decision("wait", "objective-park", &reason);
+                    ObjectiveOutcome::Park(wait_on)
+                }
+                Step::Continue => ObjectiveOutcome::Continue,
+                Step::StopNoProgress => {
+                    log_decision("n/a", "objective-no-progress", "gave up: no progress");
+                    ObjectiveOutcome::Stop(EXIT_OBJECTIVE_NO_PROGRESS)
+                }
+                Step::RunJudge | Step::InjectFailure(_) => {
+                    unreachable!("a green gate's second-stage next_step never re-requests either")
+                }
+            }
+        }
+        Step::Close(_) | Step::StopBlocked(_) | Step::Park(_) => {
+            unreachable!("the first-stage next_step call (verdict: None) never returns these")
         }
     }
 }
@@ -1501,6 +1884,8 @@ mod tests {
                 spent_tokens: 0,
                 started_at: now_secs(),
                 status: objective::Status::Active,
+                pending_note: None,
+                evidence: Vec::new(),
             },
         )
         .expect("store objective");
@@ -1563,6 +1948,8 @@ mod tests {
                 spent_tokens: 0,
                 started_at: now_secs(),
                 status: objective::Status::Active,
+                pending_note: None,
+                evidence: Vec::new(),
             },
         )
         .expect("store objective");
@@ -2447,5 +2834,468 @@ mod tests {
             argv.contains("heads up: the webhook route moved"),
             "but must not withhold mail, whose channel does not depend on composed: {argv}"
         );
+    }
+
+    // Issue #314: the completion-judge integration -- deterministic gates
+    // first, a cheap-model verdict second. `evaluate_objective_after_cycle`
+    // needs a real git repository (it calls `verification::change_
+    // fingerprint`, which shells out to `git`), so every test below inits
+    // one instead of using `testenv::repo()`'s plain tempdir. The state dir
+    // is a SEPARATE tempdir, never nested under the repo: a state write
+    // under the repo itself would show up as an untracked path and move the
+    // very fingerprint these tests pin.
+    mod objective_judge {
+        use super::*;
+
+        fn git_repo() -> tempfile::TempDir {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let git = |args: &[&str]| {
+                let status = std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(tmp.path())
+                    .status()
+                    .expect("run git");
+                assert!(status.success(), "git {args:?} failed");
+            };
+            git(&["init", "-q"]);
+            git(&["config", "user.email", "test@example.com"]);
+            git(&["config", "user.name", "test"]);
+            std::fs::write(tmp.path().join("a.txt"), "hi").expect("write file");
+            git(&["add", "."]);
+            git(&["commit", "-q", "-m", "init"]);
+            tmp
+        }
+
+        fn report_with_status(
+            repo: &Path,
+            fingerprint: u64,
+            status: crate::commands::workflow::verification::CheckStatus,
+        ) -> crate::commands::workflow::verification::VerificationReport {
+            use crate::commands::workflow::verification::{
+                CheckKind, CheckResult, CheckSource, VerificationMode, VerificationReport,
+            };
+            VerificationReport {
+                schema_version:
+                    crate::commands::workflow::verification::VERIFY_REPORT_SCHEMA_VERSION,
+                id: "r1".to_string(),
+                mode: VerificationMode::Final,
+                source: "test".to_string(),
+                repo: repo.to_path_buf(),
+                change_fingerprint: fingerprint,
+                changed_paths: Vec::new(),
+                fallback_to_full: false,
+                narrowed_to: Vec::new(),
+                notes: Vec::new(),
+                started_at: 0,
+                finished_at: 0,
+                checks: vec![CheckResult {
+                    id: "build".to_string(),
+                    kind: CheckKind::Build,
+                    command: "cargo build".to_string(),
+                    source: CheckSource::DiscoveredToolchain,
+                    status,
+                    exit_code: Some(0),
+                    duration_ms: 1,
+                    failure_output: None,
+                    failure_test_names: Vec::new(),
+                    inconclusive_reason: None,
+                }],
+            }
+        }
+
+        fn objective_env(state_dir: &std::path::Path, gate_exit: &str) -> HashMap<String, String> {
+            let mut env = base_env(state_dir);
+            env.insert("ZIRV_CTX_PACE".to_string(), "false".to_string());
+            env.insert(
+                "ZIRV_CTX_OBJECTIVE_GATE_BIN".to_string(),
+                format!("sh {}", fixture("fake-gate.sh").display()),
+            );
+            // SAFETY: CI runs tests single-threaded.
+            unsafe {
+                std::env::set_var("FAKE_GATE_EXIT", gate_exit);
+            }
+            env
+        }
+
+        fn store_active_objective(state: &StateDir, repo: &Path) -> String {
+            let key = crate::commands::ctx::state::repo_slug(repo);
+            objective::store(
+                state,
+                &key,
+                &objective::Objective {
+                    schema_version: objective::SCHEMA_VERSION,
+                    objective: "ship it".to_string(),
+                    budget_tokens: None,
+                    deadline_secs: None,
+                    spent_tokens: 0,
+                    started_at: now_secs(),
+                    status: objective::Status::Active,
+                    pending_note: None,
+                    evidence: Vec::new(),
+                },
+            )
+            .expect("store objective");
+            key
+        }
+
+        #[test]
+        fn a_red_gate_short_circuits_before_the_judge_and_an_unchanged_failure_skips_the_next_run()
+        {
+            let repo_dir = git_repo();
+            let repo = repo_dir.path();
+            let state_tmp = tempfile::tempdir().expect("state tempdir");
+            let state = StateDir::from_root(state_tmp.path().to_path_buf());
+            let home = state_tmp.path().join("home");
+            let gate_log = state_tmp.path().join("gate.log");
+
+            let env = objective_env(state_tmp.path(), "1");
+            let key = store_active_objective(&state, repo);
+
+            let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+            let _fake_agent = crate::commands::ctx::testenv::VarGuard::set(&[
+                ("FAKE_AGENT_MODE", Some("healthy")),
+                ("FAKE_AGENT_TURNS", Some("1")),
+                ("FAKE_GATE_LOG", gate_log.to_str()),
+            ]);
+
+            let mut args = args_for(1);
+            args.simple = false;
+            let mut out = Vec::new();
+            let code = run_with(&args, &mut out, repo, &|k| env.get(k).cloned());
+            assert_eq!(code.expect("runs"), 0, "a red gate is never a loop failure");
+
+            let log = std::fs::read_to_string(state_tmp.path().join("logs/decisions.jsonl"))
+                .expect("log");
+            assert!(log.contains("\"action\":\"objective-gate-red\""), "{log}");
+            assert!(
+                !log.contains("\"action\":\"objective-judge"),
+                "a red gate must never let the judge run: {log}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&gate_log)
+                    .unwrap_or_default()
+                    .lines()
+                    .count(),
+                1,
+                "the gate ran exactly once"
+            );
+            let record = objective::load(&state, &key)
+                .expect("load")
+                .expect("present");
+            assert!(
+                record
+                    .pending_note
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("exited 1"),
+                "the failure detail must be pending for the next cycle's prompt: {record:?}"
+            );
+
+            // The repo tree has not moved since the gate above failed: seed a
+            // FAILING report at the current fingerprint, matching what a real
+            // `zirv test changed`/`zirv verify` child would itself have
+            // persisted -- the next run's own gate check must see this and
+            // skip re-running the (stubbed) gate entirely.
+            let fingerprint =
+                crate::commands::workflow::verification::change_fingerprint(repo).expect("fp");
+            crate::commands::workflow::verification::save_report(
+                &state,
+                &report_with_status(
+                    repo,
+                    fingerprint,
+                    crate::commands::workflow::verification::CheckStatus::Failed,
+                ),
+            )
+            .expect("save report");
+
+            let mut out2 = Vec::new();
+            let code2 = run_with(&args, &mut out2, repo, &|k| env.get(k).cloned());
+            assert_eq!(code2.expect("runs"), 0);
+            assert_eq!(
+                std::fs::read_to_string(&gate_log)
+                    .unwrap_or_default()
+                    .lines()
+                    .count(),
+                1,
+                "an unchanged tree since the gate's own last failure must skip re-running it"
+            );
+            let log = std::fs::read_to_string(state_tmp.path().join("logs/decisions.jsonl"))
+                .expect("log");
+            assert!(
+                !log.contains("\"action\":\"objective-judge"),
+                "still never reaches the judge: {log}"
+            );
+        }
+
+        #[test]
+        fn a_green_gate_runs_the_judge_and_a_non_conforming_or_failed_answer_fails_open() {
+            let repo_dir = git_repo();
+            let repo = repo_dir.path();
+            let state_tmp = tempfile::tempdir().expect("state tempdir");
+            let state = StateDir::from_root(state_tmp.path().to_path_buf());
+            let home = state_tmp.path().join("home");
+
+            let env = objective_env(state_tmp.path(), "0");
+            store_active_objective(&state, repo);
+
+            let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+
+            for mode in ["bad", "fail"] {
+                let _fake = crate::commands::ctx::testenv::VarGuard::set(&[
+                    ("FAKE_AGENT_MODE", Some("healthy")),
+                    ("FAKE_AGENT_TURNS", Some("1")),
+                    ("FAKE_JUDGE_MODE", Some(mode)),
+                ]);
+                let mut args = args_for(1);
+                args.simple = false;
+                let mut out = Vec::new();
+                let code = run_with(&args, &mut out, repo, &|k| env.get(k).cloned());
+                assert_eq!(
+                    code.expect("runs"),
+                    0,
+                    "mode {mode}: fails open, never a loop failure"
+                );
+            }
+
+            let log = std::fs::read_to_string(state_tmp.path().join("logs/decisions.jsonl"))
+                .expect("log");
+            assert!(
+                log.matches("\"action\":\"objective-judge-unavailable\"")
+                    .count()
+                    >= 2,
+                "both a non-conforming answer and a spawn failure must log the same fail-open \
+                 path: {log}"
+            );
+            assert!(
+                !log.contains("\"action\":\"objective-done\"")
+                    && !log.contains("\"action\":\"objective-blocked\""),
+                "neither answer names a real verdict: {log}"
+            );
+        }
+
+        #[test]
+        fn a_done_verdict_closes_the_objective_with_evidence_once_verification_is_fresh() {
+            let repo_dir = git_repo();
+            let repo = repo_dir.path();
+            let state_tmp = tempfile::tempdir().expect("state tempdir");
+            let state = StateDir::from_root(state_tmp.path().to_path_buf());
+            let home = state_tmp.path().join("home");
+
+            let env = objective_env(state_tmp.path(), "0");
+            let key = store_active_objective(&state, repo);
+
+            let fingerprint =
+                crate::commands::workflow::verification::change_fingerprint(repo).expect("fp");
+            crate::commands::workflow::verification::save_report(
+                &state,
+                &report_with_status(
+                    repo,
+                    fingerprint,
+                    crate::commands::workflow::verification::CheckStatus::Passed,
+                ),
+            )
+            .expect("save report");
+
+            let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+            let _fake_agent = crate::commands::ctx::testenv::VarGuard::set(&[
+                ("FAKE_AGENT_MODE", Some("healthy")),
+                ("FAKE_AGENT_TURNS", Some("1")),
+                ("FAKE_JUDGE_MODE", Some("done")),
+            ]);
+
+            let mut out = Vec::new();
+            // A generous cycle budget: the objective must stop the loop on
+            // its own, well before this is ever exhausted.
+            let mut args = args_for(5);
+            args.simple = false;
+            let code = run_with(&args, &mut out, repo, &|k| env.get(k).cloned());
+            assert_eq!(code.expect("runs"), 0);
+
+            assert_eq!(
+                transcripts_in(&home).len(),
+                1,
+                "the objective closing must stop the loop, not run all 5 cycles"
+            );
+            let record = objective::load(&state, &key)
+                .expect("load")
+                .expect("present");
+            assert_eq!(record.status, objective::Status::Closed);
+            assert_eq!(
+                record.evidence,
+                vec!["judge: objective satisfied".to_string()]
+            );
+            let log = std::fs::read_to_string(state_tmp.path().join("logs/decisions.jsonl"))
+                .expect("log");
+            assert!(log.contains("\"action\":\"objective-done\""), "{log}");
+        }
+
+        #[test]
+        fn a_blocked_verdict_stops_the_loop_and_populates_the_handoff() {
+            let repo_dir = git_repo();
+            let repo = repo_dir.path();
+            let state_tmp = tempfile::tempdir().expect("state tempdir");
+            let state = StateDir::from_root(state_tmp.path().to_path_buf());
+            let home = state_tmp.path().join("home");
+
+            let env = objective_env(state_tmp.path(), "0");
+            store_active_objective(&state, repo);
+
+            let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+            let _fake_agent = crate::commands::ctx::testenv::VarGuard::set(&[
+                ("FAKE_AGENT_MODE", Some("healthy")),
+                ("FAKE_AGENT_TURNS", Some("1")),
+                ("FAKE_JUDGE_MODE", Some("blocked")),
+            ]);
+
+            let mut out = Vec::new();
+            let mut args = args_for(5);
+            args.simple = false;
+            let code = run_with(&args, &mut out, repo, &|k| env.get(k).cloned());
+            assert_eq!(code.expect("runs"), EXIT_OBJECTIVE_BLOCKED);
+            assert_eq!(
+                transcripts_in(&home).len(),
+                1,
+                "blocked stops the loop rather than running every cycle"
+            );
+
+            let (_, handoff) = handoff::latest_for_repo(&state, repo)
+                .expect("load")
+                .expect("a handoff was stored");
+            assert_eq!(handoff.blocked, vec!["missing credential".to_string()]);
+
+            let log = std::fs::read_to_string(state_tmp.path().join("logs/decisions.jsonl"))
+                .expect("log");
+            assert!(log.contains("\"action\":\"objective-blocked\""), "{log}");
+        }
+
+        #[test]
+        fn a_wait_verdict_parks_without_consuming_a_cycle_and_resumes_on_its_trigger() {
+            let repo_dir = git_repo();
+            let repo = repo_dir.path();
+            let state_tmp = tempfile::tempdir().expect("state tempdir");
+            let state = StateDir::from_root(state_tmp.path().to_path_buf());
+            let home = state_tmp.path().join("home");
+            let mode_file = state_tmp.path().join("judge-modes.txt");
+            std::fs::write(&mode_file, "wait_seconds\ndone\n").expect("write mode file");
+
+            let mut env = objective_env(state_tmp.path(), "0");
+            // The blind-delay pacing gate would otherwise itself call
+            // `sleep_fn`; disabling it keeps this test's own sleep-call
+            // count unambiguous.
+            env.insert(
+                "ZIRV_CTX_PACE_BLIND_DELAY_SECS".to_string(),
+                "0".to_string(),
+            );
+            let key = store_active_objective(&state, repo);
+
+            let fingerprint =
+                crate::commands::workflow::verification::change_fingerprint(repo).expect("fp");
+            crate::commands::workflow::verification::save_report(
+                &state,
+                &report_with_status(
+                    repo,
+                    fingerprint,
+                    crate::commands::workflow::verification::CheckStatus::Passed,
+                ),
+            )
+            .expect("save report");
+
+            let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+            let _fake_agent = crate::commands::ctx::testenv::VarGuard::set(&[
+                ("FAKE_AGENT_MODE", Some("healthy")),
+                ("FAKE_AGENT_TURNS", Some("1")),
+                ("FAKE_JUDGE_MODE_FILE", mode_file.to_str()),
+            ]);
+
+            let slept = std::sync::Mutex::new(Vec::<Duration>::new());
+            let mut out = Vec::new();
+            // `cycles: 1` on purpose -- a park must not consume it: the loop
+            // is expected to run a SECOND real agent cycle (the resume)
+            // before it closes, well past this nominal limit.
+            let code = run_with_clock(
+                &args_for(1),
+                &mut out,
+                repo,
+                &|k| env.get(k).cloned(),
+                &now_secs,
+                &|d: Duration| slept.lock().expect("lock").push(d),
+            );
+            assert_eq!(code.expect("runs"), 0);
+
+            assert_eq!(
+                transcripts_in(&home).len(),
+                2,
+                "the park's resume must run a further real cycle before closing"
+            );
+            assert!(
+                slept
+                    .lock()
+                    .expect("lock")
+                    .contains(&Duration::from_secs(1)),
+                "the park itself must reach the injected sleep_fn with the judge's own duration"
+            );
+            let record = objective::load(&state, &key)
+                .expect("load")
+                .expect("present");
+            assert_eq!(record.status, objective::Status::Closed);
+            let log = std::fs::read_to_string(state_tmp.path().join("logs/decisions.jsonl"))
+                .expect("log");
+            assert!(log.contains("\"action\":\"objective-park\""), "{log}");
+            assert!(log.contains("\"action\":\"objective-done\""), "{log}");
+        }
+
+        #[test]
+        fn max_cycles_without_progress_stops_the_loop_under_repeated_continue() {
+            let repo_dir = git_repo();
+            let repo = repo_dir.path();
+            std::fs::create_dir_all(repo.join(".zirv")).expect("mkdir .zirv");
+            std::fs::write(
+                repo.join(".zirv/ctx.toml"),
+                "[objective]\nmax_cycles_without_progress = 2\n",
+            )
+            .expect("write repo ctx.toml");
+            std::process::Command::new("git")
+                .args(["add", ".zirv"])
+                .current_dir(repo)
+                .status()
+                .expect("git add");
+            std::process::Command::new("git")
+                .args(["commit", "-q", "-m", "narrow the backstop"])
+                .current_dir(repo)
+                .status()
+                .expect("git commit");
+
+            let state_tmp = tempfile::tempdir().expect("state tempdir");
+            let state = StateDir::from_root(state_tmp.path().to_path_buf());
+            let home = state_tmp.path().join("home");
+
+            let env = objective_env(state_tmp.path(), "0");
+            store_active_objective(&state, repo);
+
+            let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+            let _fake_agent = crate::commands::ctx::testenv::VarGuard::set(&[
+                ("FAKE_AGENT_MODE", Some("healthy")),
+                ("FAKE_AGENT_TURNS", Some("1")),
+                ("FAKE_JUDGE_MODE", Some("continue")),
+            ]);
+
+            let mut out = Vec::new();
+            let mut args = args_for(10);
+            args.simple = false;
+            let code = run_with(&args, &mut out, repo, &|k| env.get(k).cloned());
+            assert_eq!(code.expect("runs"), EXIT_OBJECTIVE_NO_PROGRESS);
+            assert_eq!(
+                transcripts_in(&home).len(),
+                3,
+                "it must give up once the backstop trips, not run all 10 cycles"
+            );
+
+            let log = std::fs::read_to_string(state_tmp.path().join("logs/decisions.jsonl"))
+                .expect("log");
+            assert!(
+                log.contains("\"action\":\"objective-no-progress\""),
+                "{log}"
+            );
+        }
     }
 }

@@ -367,6 +367,15 @@ impl StateDir {
         self.0.join("frontend")
     }
 
+    /// Issue #349: the composed per-session attention model
+    /// (`super::attention::SessionStatus`), one file per session
+    /// (`<state>/attention/<short>.json`), keyed by the same stable short id
+    /// the session registry (`sessions::Record::short`) uses -- mirroring
+    /// `adoption()`'s own per-session layout above.
+    pub fn attention(&self) -> PathBuf {
+        self.0.join("attention")
+    }
+
     /// The dashboard's own state: today, only the spawn-request capability-
     /// token directories `super::dash::spawnreq::request_dir_for` names
     /// under `<state>/dash/<dash_short>-<token>/requests`. A future roster
@@ -434,6 +443,24 @@ impl StateDir {
         self.0.join("groups")
     }
 
+    /// Issue #319: worktree ownership records -- one append-only JSONL file
+    /// per repository slug, `<state>/worktrees/<repo-slug>.jsonl`. See
+    /// `super::worktree` for the record format and the "materialized by
+    /// path" read contract (later lines for the same `path` supersede
+    /// earlier ones).
+    pub fn worktrees(&self) -> PathBuf {
+        self.0.join("worktrees")
+    }
+
+    /// Issue #319: where `super::worktree::archive_untracked` copies a
+    /// pruned worktree's untracked files before `git worktree remove` ever
+    /// runs -- `<state>/archive/worktree-prune/<slug>-<unix-ts>/...`.
+    /// Untracked content a prune decision leaves behind is moved here, never
+    /// destroyed outright.
+    pub fn worktree_archive(&self) -> PathBuf {
+        self.0.join("archive").join("worktree-prune")
+    }
+
     /// `<state>/objective` -- one JSON file per repository's durable
     /// objective (issue #285), keyed by `state::repo_slug`. Outlives any one
     /// `exec`/`loop` session or restart the way `groups()` outlives any one
@@ -449,6 +476,18 @@ impl StateDir {
     /// process boundaries rather than within one.
     pub fn restart_chains(&self) -> PathBuf {
         self.0.join("restart-chains")
+    }
+
+    /// `<state>/tasks/<repo-slug>/events.jsonl` -- durable task-card event log
+    /// (issue #317). One append-only event stream per repository, keyed by
+    /// `state::repo_slug` the same way `objective()`/`restart_chains()` are: a
+    /// task card outlives any one delegated worker or supervising process,
+    /// which is exactly why it is an event log rather than a per-record file
+    /// like `groups()` -- replaying it (`task::materialize`) is what lets a
+    /// fresh orchestrator or a human reconstruct every card's current state
+    /// after a crash.
+    pub fn tasks(&self) -> PathBuf {
+        self.0.join("tasks")
     }
 
     /// Issue #178: captured operator-approved permission prompts, ready for
@@ -957,5 +996,12 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(tmp.path().to_path_buf());
         assert_eq!(state.restart_chains(), tmp.path().join("restart-chains"));
+    }
+
+    #[test]
+    fn the_tasks_dir_hangs_off_the_state_root() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        assert_eq!(state.tasks(), tmp.path().join("tasks"));
     }
 }

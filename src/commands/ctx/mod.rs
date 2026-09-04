@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand};
 pub mod adapters;
 pub mod agent;
 pub mod announce;
+pub mod attention;
 pub mod breakdown;
 pub mod chain;
 pub mod chat;
@@ -24,6 +25,7 @@ pub mod group;
 pub mod handoff;
 pub mod handover;
 pub mod hook;
+pub mod judge;
 pub mod log;
 pub mod mail;
 pub mod memory;
@@ -57,9 +59,11 @@ pub mod state;
 pub mod status;
 pub mod supervise;
 pub mod surface;
+pub mod task;
 pub mod term;
 pub mod usage;
 pub mod window;
+pub mod worktree;
 pub mod wrap;
 
 /// The minimum gap a deferred injection leaves between writing its text and
@@ -400,6 +404,14 @@ pub enum CtxVerb {
     Hook(hook::HookArgs),
     /// Show supervised sessions, scores and handoffs.
     Status(status::StatusArgs),
+    /// Explain one session's composed attention projection: what it is,
+    /// why, which authority decided, and every fallback that was suppressed
+    /// (issue #349).
+    #[command(name = "explain-status")]
+    ExplainStatus(attention::ExplainStatusArgs),
+    /// Block until a session's attention projection matches, or time out
+    /// (issue #349).
+    Wait(attention::WaitArgs),
     /// Stateless loop runner: a fresh headless session per cycle.
     #[command(name = "loop")]
     Loop(run_loop::LoopArgs),
@@ -455,6 +467,16 @@ pub enum CtxVerb {
     /// artifacts and mail against a query, or scroll a specific session with
     /// `--session`/`--around` (issue #315).
     Search(search::SearchArgs),
+    /// List, finalize or prune `zirv ctx agent --worktree`'s own linked
+    /// worktrees (issue #319): proof-required reclaim, so nothing is ever
+    /// removed without affirmative evidence it carries no unrecoverable work.
+    Worktree(worktree::WorktreeArgs),
+    /// Durable task cards for delegated work: create/list/show/claim/
+    /// heartbeat/complete/block/unblock/comment/archive (issue #317).
+    Task(task::TaskArgs),
+    /// Mints a root + N worker + verifier + synthesizer task-card batch, all
+    /// as one atomic write (issue #317).
+    Swarm(task::SwarmArgs),
 }
 
 /// What a clap parse failure costs, which is not the same for every verb.
@@ -527,6 +549,8 @@ pub fn dispatch(args: &[String]) -> i32 {
         CtxVerb::Resume(a) => resume::run(a, &mut out),
         CtxVerb::Hook(a) => hook::run(a, &mut out),
         CtxVerb::Status(a) => status::run(a, &mut out),
+        CtxVerb::ExplainStatus(a) => attention::run_explain_status(a, &mut out),
+        CtxVerb::Wait(a) => attention::run_wait(a, &mut out),
         CtxVerb::Loop(a) => run_loop::run(a, &mut out),
         CtxVerb::Exec(a) => exec::run(a, &mut out),
         CtxVerb::Wrap(a) => wrap::run(a, &mut out),
@@ -550,6 +574,9 @@ pub fn dispatch(args: &[String]) -> i32 {
         CtxVerb::Spend(a) => spend::run(a, &mut out),
         CtxVerb::Snapshot(a) => snapshot::run(a, &mut out),
         CtxVerb::Search(a) => search::run(a, &mut out),
+        CtxVerb::Worktree(a) => worktree::run(a, &mut out),
+        CtxVerb::Task(a) => task::run(a, &mut out),
+        CtxVerb::Swarm(a) => task::run_swarm(a, &mut out),
     };
 
     match result {
@@ -909,6 +936,50 @@ mod tests {
         match cli.verb {
             CtxVerb::Resume(args) => assert_eq!(args.extra, vec!["--continue".to_string()]),
             other => panic!("expected Resume, got {other:?}"),
+        }
+    }
+
+    /// Issue #317: `zirv ctx task create/claim/...` and `zirv ctx swarm` both
+    /// parse.
+    #[test]
+    fn task_and_swarm_verbs_parse() {
+        let cli = CtxCli::try_parse_from([
+            "zirv ctx",
+            "task",
+            "create",
+            "do the thing",
+            "--brief",
+            "do it well",
+        ])
+        .expect("task create should parse");
+        match cli.verb {
+            CtxVerb::Task(a) => match a.command {
+                task::TaskVerb::Create(create) => {
+                    assert_eq!(create.title, "do the thing");
+                    assert_eq!(create.brief, "do it well");
+                }
+                other => panic!("expected Create, got {other:?}"),
+            },
+            other => panic!("expected Task, got {other:?}"),
+        }
+
+        let cli = CtxCli::try_parse_from(["zirv ctx", "task", "claim", "task-1"])
+            .expect("task claim should parse");
+        assert!(matches!(
+            cli.verb,
+            CtxVerb::Task(task::TaskArgs {
+                command: task::TaskVerb::Claim(_)
+            })
+        ));
+
+        let cli = CtxCli::try_parse_from(["zirv ctx", "swarm", "ship it", "--workers", "3"])
+            .expect("swarm should parse");
+        match cli.verb {
+            CtxVerb::Swarm(a) => {
+                assert_eq!(a.scope, "ship it");
+                assert_eq!(a.workers, 3);
+            }
+            other => panic!("expected Swarm, got {other:?}"),
         }
     }
 
