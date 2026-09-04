@@ -100,6 +100,7 @@ Plus a third, read-only case: `zirv ctx optimize` reads the repo's own CLAUDE.md
 | `worker.codex` | `ZIRV_CTX_WORKER_MODEL_CODEX` |
 | `worker.default_depth` | `ZIRV_CTX_WORKER_DEFAULT_DEPTH` |
 | `worker.default_read_only` | `ZIRV_CTX_WORKER_DEFAULT_READ_ONLY` |
+| `search.max_output_bytes` | `ZIRV_CTX_SEARCH_MAX_OUTPUT_BYTES` |
 | `handover` (`handover.<agent>.<tier>`) | `ZIRV_CTX_HANDOVER_<AGENT>_<TIER>` (e.g. `ZIRV_CTX_HANDOVER_CLAUDE_DEEP`) |
 | `workflow.repo_checks_enabled` | `ZIRV_CTX_WORKFLOW_REPO_CHECKS` |
 | `workflow.repo_skills_enabled` | `ZIRV_CTX_WORKFLOW_REPO_SKILLS` |
