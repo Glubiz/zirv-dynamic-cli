@@ -737,6 +737,15 @@ impl ClaudeAdapter {
 /// the native projection. PreToolUse still evaluates every invocation before
 /// execution, so dangerous `gh` and push forms and repo `deny`/`ask` rules
 /// continue to narrow the broad native families.
+///
+/// Issue #334: `launch_settings_value`'s own `PreToolUse` array also carries
+/// an `Edit|Write|MultiEdit|NotebookEdit` matcher running `zirv ctx hook
+/// pretool` -- the orchestrator-write guard that makes an orchestrator seat
+/// technically unable to edit repository files itself. It sits alongside,
+/// not instead of, an `Agent|Task` matcher running the same command: that
+/// entry attests the existing expensive-seat-inheritance guard on every
+/// launch, rather than depending on a one-time `zirv setup apply` having
+/// installed it into the operator's own global settings first.
 struct CommandFamilyProjection {
     pattern: &'static str,
     sandbox_excluded: bool,
@@ -1057,6 +1066,18 @@ fn launch_settings_value(
                 "hooks": [{
                     "type": "command",
                     "command": "zirv ctx safety check"
+                }]
+            }, {
+                "matcher": "Edit|Write|MultiEdit|NotebookEdit",
+                "hooks": [{
+                    "type": "command",
+                    "command": "zirv ctx hook pretool"
+                }]
+            }, {
+                "matcher": "Agent|Task",
+                "hooks": [{
+                    "type": "command",
+                    "command": "zirv ctx hook pretool"
                 }]
             }],
             "PermissionRequest": [{
@@ -2996,6 +3017,26 @@ mod tests {
             settings.pointer("/hooks/PreToolUse/0/hooks/0/command"),
             Some(&serde_json::json!("zirv ctx safety check"))
         );
+        // Issue #334: the orchestrator-write guard and the expensive-seat
+        // guard are separate `PreToolUse` entries, both running `zirv ctx
+        // hook pretool` -- the former attested on every launch instead of
+        // depending on a one-time `zirv setup apply`.
+        assert_eq!(
+            settings.pointer("/hooks/PreToolUse/1/matcher"),
+            Some(&serde_json::json!("Edit|Write|MultiEdit|NotebookEdit"))
+        );
+        assert_eq!(
+            settings.pointer("/hooks/PreToolUse/1/hooks/0/command"),
+            Some(&serde_json::json!("zirv ctx hook pretool"))
+        );
+        assert_eq!(
+            settings.pointer("/hooks/PreToolUse/2/matcher"),
+            Some(&serde_json::json!("Agent|Task"))
+        );
+        assert_eq!(
+            settings.pointer("/hooks/PreToolUse/2/hooks/0/command"),
+            Some(&serde_json::json!("zirv ctx hook pretool"))
+        );
         assert!(
             !settings["permissions"]["ask"]
                 .as_array()
@@ -3148,6 +3189,9 @@ mod tests {
     #[test]
     fn launch_settings_observe_permission_events_without_changing_pretooluse() {
         let settings = test_launch_settings();
+        // Issue #334 added the two guard entries below; wiring the
+        // `PermissionRequest`/`PermissionDenied` observers in must not
+        // perturb this array further.
         assert_eq!(
             settings["hooks"]["PreToolUse"],
             serde_json::json!([{
@@ -3155,6 +3199,18 @@ mod tests {
                 "hooks": [{
                     "type": "command",
                     "command": "zirv ctx safety check"
+                }]
+            }, {
+                "matcher": "Edit|Write|MultiEdit|NotebookEdit",
+                "hooks": [{
+                    "type": "command",
+                    "command": "zirv ctx hook pretool"
+                }]
+            }, {
+                "matcher": "Agent|Task",
+                "hooks": [{
+                    "type": "command",
+                    "command": "zirv ctx hook pretool"
                 }]
             }])
         );

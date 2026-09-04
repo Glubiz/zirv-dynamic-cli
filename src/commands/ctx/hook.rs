@@ -29,7 +29,8 @@ pub enum HookEvent {
     /// Claude PreCompact hook: record that a compaction is starting.
     PreCompact,
     /// Claude PreToolUse hook: refuse a subagent dispatch that would inherit
-    /// this seat's expensive model.
+    /// this seat's expensive model, and refuse an orchestrator seat's own
+    /// direct edit of a repository file (issue #334).
     Pretool,
     /// Observe Claude permission requests and denials without changing their
     /// flow. Sandboxed-command network prompts emit a `Notification` instead
@@ -1312,7 +1313,9 @@ pub fn run_session_start<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -
     Ok(0)
 }
 
-// -- PreToolUse: the expensive-seat inheritance guard ----------------------
+// -- PreToolUse: the expensive-seat inheritance guard, and (below) the
+// orchestrator-write guard that refuses an orchestrator seat's own direct
+// edit of a repository file (issue #334) ------------------------------------
 
 /// Model-name fragments that mark a seat too expensive to inherit silently.
 /// Matched case-insensitively as substrings, so a vendor-qualified id
@@ -1336,11 +1339,18 @@ const GENERIC_SUBAGENT_TYPES: [&str; 5] = ["fork", "claude", "general-purpose", 
 /// field is optional with a zero default, the same rule the Stop payload
 /// follows: a hook that fails to parse is a hook that silently stops
 /// guarding, so nothing here may be mandatory.
+///
+/// `cwd`/`session_id` (issue #334) feed the orchestrator-write guard:
+/// `cwd` resolves a relative `file_path`/`notebook_path` and anchors
+/// `repo_root_for`, `session_id` is the fallback identity for a logged
+/// block when this process has no zirv session env of its own.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct PreToolPayload {
     pub tool_name: String,
     pub tool_input: PreToolInput,
+    pub cwd: String,
+    pub session_id: String,
 }
 
 /// `tool_input` is tool-specific, so only the subagent tool's own parameters
@@ -1359,6 +1369,10 @@ pub struct PreToolInput {
     /// and fails open on it instead of denying on the zero values `#[serde(
     /// default)]` invented for fields the payload never carried at all.
     pub prompt: String,
+    /// `Edit`/`Write`/`MultiEdit`'s own target path (issue #334).
+    pub file_path: String,
+    /// `NotebookEdit`'s own target path (issue #334).
+    pub notebook_path: String,
 }
 
 impl PreToolPayload {
@@ -1432,6 +1446,109 @@ pub fn pretool_decision(seat: Option<&str>, payload: &PreToolPayload) -> Option<
     denied.then(|| pretool_deny_reason(seat))
 }
 
+// -- PreToolUse: the orchestrator-write guard (issues #328/#334) -----------
+
+/// Tool names that write repository files. An orchestrator seat must be
+/// technically unable to edit repository files itself -- every change goes
+/// through a dispatched worker instead.
+const FILE_MODIFICATION_TOOLS: [&str; 4] = ["Edit", "Write", "MultiEdit", "NotebookEdit"];
+
+/// Resolves `path` lexically: `.` components drop, `..` pops the previous
+/// component (or is kept literally once there is nothing left to pop, so a
+/// relative path that climbs above its own root still reads as "outside").
+/// Deliberately NOT `std::fs::canonicalize`: a `Write` target may not exist
+/// yet, and this must stay a pure path computation, no filesystem access.
+fn normalize_lexically(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir if out.pop() => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// The absolute, lexically-normalized target `payload` names, or `None` when
+/// the tool is not a [`FILE_MODIFICATION_TOOLS`] entry or the payload names
+/// no target at all (schema drift, not a real write). A relative target is
+/// resolved against `payload.cwd`, falling back to `repo_root` when `cwd` is
+/// empty.
+fn normalized_write_target(payload: &PreToolPayload, repo_root: &Path) -> Option<PathBuf> {
+    if !FILE_MODIFICATION_TOOLS.contains(&payload.tool_name.as_str()) {
+        return None;
+    }
+    let target = if !payload.tool_input.file_path.is_empty() {
+        payload.tool_input.file_path.as_str()
+    } else if !payload.tool_input.notebook_path.is_empty() {
+        payload.tool_input.notebook_path.as_str()
+    } else {
+        return None;
+    };
+    let target = Path::new(target);
+    let resolved = if target.is_absolute() {
+        target.to_path_buf()
+    } else if !payload.cwd.is_empty() {
+        Path::new(&payload.cwd).join(target)
+    } else {
+        repo_root.join(target)
+    };
+    Some(normalize_lexically(&resolved))
+}
+
+/// What the model is told when an orchestrator seat's own guard refuses a
+/// repository write. Names the exact path so the model can see why, and the
+/// remedy: dispatch a worker rather than retry the same tool call.
+fn orchestrator_write_deny_reason(target: &Path) -> String {
+    format!(
+        "orchestrator seat: dispatch a worker -- this seat coordinates and never edits \
+         repository files itself ({}). Delegate the change to a worker: the native Agent \
+         tool for this harness, `zirv agent <other-harness>` for another. Writes under \
+         .zirv/work and .zirv/memory stay allowed.",
+        target.display()
+    )
+}
+
+/// The whole orchestrator-write decision, pure: `Some(reason)` denies,
+/// `None` allows. `role` is `SEAT_ROLE_ENV`'s value.
+///
+/// Every gate below is a reason to allow: a non-orchestrator role, a tool
+/// that is not a [`FILE_MODIFICATION_TOOLS`] entry, an empty target (schema
+/// drift), a target outside `repo_root` entirely, or one that lands under
+/// `<repo_root>/.zirv/work` or `<repo_root>/.zirv/memory` -- the two roots a
+/// worker's own dispatch/handoff/memory writes still need from this seat.
+pub fn orchestrator_write_decision(
+    role: Option<&str>,
+    payload: &PreToolPayload,
+    repo_root: &Path,
+) -> Option<String> {
+    if role != Some("orchestrator") {
+        return None;
+    }
+    let target = normalized_write_target(payload, repo_root)?;
+    if !target.starts_with(repo_root) {
+        return None;
+    }
+    let allowed_roots = [repo_root.join(".zirv/work"), repo_root.join(".zirv/memory")];
+    if allowed_roots.iter().any(|root| target.starts_with(root)) {
+        return None;
+    }
+    Some(orchestrator_write_deny_reason(&target))
+}
+
+/// Walks from `cwd` up through its ancestors and returns the first directory
+/// carrying a `.git` entry -- a directory for an ordinary checkout, a FILE
+/// for a linked worktree (`gitdir: ...`) -- so both shapes resolve to the
+/// same repository root. Falls back to `cwd` itself when no ancestor carries
+/// one. Pure apart from `Path::exists`.
+fn repo_root_for(cwd: &Path) -> PathBuf {
+    cwd.ancestors()
+        .find(|ancestor| ancestor.join(".git").exists())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| cwd.to_path_buf())
+}
+
 /// The documented PreToolUse deny envelope. Printed on stdout with exit 0:
 /// exit 2 would block too, but it blocks on stderr text and cannot be
 /// overridden, and this hook must never be the reason a session cannot make
@@ -1447,21 +1564,66 @@ pub fn pretool_output(reason: &str) -> String {
     .to_string()
 }
 
-/// Fails open on every path: no seat env, an unparseable payload, a tool this
-/// guard knows nothing about and any internal error all exit 0 with nothing
-/// on stdout, which claude reads as "no decision, use the normal permission
-/// flow". Nothing here may `unwrap`, `expect` or return `Err` -- the release
-/// profile is `panic = "abort"`, and a hook that aborts takes the tool call
-/// with it.
+/// Runs two independent guards against the same payload: the expensive-seat
+/// subagent guard above (gated on `SEAT_MODEL_ENV`) and the orchestrator-
+/// write guard below (gated on `SEAT_ROLE_ENV`, issue #334) -- an
+/// orchestrator seat launched on a cheap model still carries no
+/// `SEAT_MODEL_ENV` (`seat_model_env` only ever exports it for an expensive
+/// tier), but must still be technically unable to edit repository files, so
+/// the second guard cannot be nested inside the first's own early return.
+///
+/// Fails open on every path: no seat env, an unparseable payload, a tool
+/// either guard knows nothing about, an unresolvable `cwd`, and any internal
+/// error all exit 0 with nothing on stdout, which claude reads as "no
+/// decision, use the normal permission flow". Nothing here may `unwrap`,
+/// `expect` or return `Err` -- the release profile is `panic = "abort"`, and
+/// a hook that aborts takes the tool call with it.
 pub fn run_pretool<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResult<i32> {
-    let Some(seat) = env(adapters::SEAT_MODEL_ENV) else {
-        return Ok(0);
-    };
     let Ok(payload) = PreToolPayload::parse(stdin) else {
         return Ok(0);
     };
-    if let Some(reason) = pretool_decision(Some(&seat), &payload) {
+
+    if let Some(seat) = env(adapters::SEAT_MODEL_ENV)
+        && let Some(reason) = pretool_decision(Some(&seat), &payload)
+    {
         let _ = writeln!(w, "{}", pretool_output(&reason));
+        return Ok(0);
+    }
+
+    if !FILE_MODIFICATION_TOOLS.contains(&payload.tool_name.as_str()) {
+        return Ok(0);
+    }
+    let cwd = if !payload.cwd.is_empty() {
+        PathBuf::from(&payload.cwd)
+    } else {
+        let Ok(cwd) = std::env::current_dir() else {
+            return Ok(0);
+        };
+        cwd
+    };
+    let repo_root = repo_root_for(&cwd);
+    let role = env(adapters::SEAT_ROLE_ENV);
+    let Some(reason) = orchestrator_write_decision(role.as_deref(), &payload, &repo_root) else {
+        return Ok(0);
+    };
+    let _ = writeln!(w, "{}", pretool_output(&reason));
+
+    // Best-effort: a block record that fails to write costs an operator one
+    // audit-log row, never a hook failure -- the deny above already stands.
+    if let Ok(state) = StateDir::resolve(env) {
+        let target = normalized_write_target(&payload, &repo_root).unwrap_or_default();
+        let session =
+            super::mail::session_identity(env).unwrap_or_else(|| payload.session_id.clone());
+        let _ = log::append_orchestrator_block(
+            &state,
+            &log::OrchestratorBlock {
+                ts: now_secs(),
+                session: &session,
+                tool: &payload.tool_name,
+                target: &target.display().to_string(),
+                reason: "repository write",
+            },
+        );
     }
     Ok(0)
 }
@@ -4113,6 +4275,308 @@ mod tests {
         .expect("an ordinary Bash payload must parse");
         assert_eq!(payload.tool_name, "Bash");
         assert_eq!(pretool_decision(SEAT, &payload), None);
+    }
+
+    // -- PreToolUse: the orchestrator-write guard (issues #328/#334) -------
+
+    /// Builds the PreToolUse stdin claude sends for a file-modification
+    /// tool, with a caller-chosen `cwd`/`session_id` -- `pretool_stdin`
+    /// above hardcodes both, which this guard's own tests need to vary.
+    fn orchestrator_pretool_stdin(
+        cwd: &str,
+        session_id: &str,
+        tool_name: &str,
+        tool_input: serde_json::Value,
+    ) -> String {
+        serde_json::json!({
+            "session_id": session_id,
+            "transcript_path": "/tmp/t.jsonl",
+            "cwd": cwd,
+            "permission_mode": "default",
+            "hook_event_name": "PreToolUse",
+            "tool_name": tool_name,
+            "tool_input": tool_input,
+            "tool_use_id": "toolu_01ABC123",
+        })
+        .to_string()
+    }
+
+    /// A repo root with a `.git` directory -- the ordinary checkout shape
+    /// `repo_root_for` and `orchestrator_write_decision` both need to be
+    /// exercised against something real. Deliberately not canonicalized:
+    /// macOS's `/var/folders` vs `/private/var` split means `cwd` and every
+    /// `file_path` built from `repo.path()` must stay spelled the same way
+    /// for `Path::starts_with` to see them as confined.
+    fn orchestrator_repo() -> tempfile::TempDir {
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".git")).expect(".git dir");
+        repo
+    }
+
+    fn edit_payload(repo: &Path, relative_target: &str) -> PreToolPayload {
+        let file_path = repo.join(relative_target);
+        PreToolPayload::parse(&orchestrator_pretool_stdin(
+            &repo.display().to_string(),
+            "claude-session-id",
+            "Edit",
+            serde_json::json!({"file_path": file_path.display().to_string()}),
+        ))
+        .expect("the documented payload must parse")
+    }
+
+    #[test]
+    fn orchestrator_write_decision_denies_an_edit_under_the_repo() {
+        let repo = orchestrator_repo();
+        let payload = edit_payload(repo.path(), "src/x.rs");
+        let reason = orchestrator_write_decision(Some("orchestrator"), &payload, repo.path())
+            .expect("an orchestrator editing a repo file must be denied");
+        assert!(
+            reason.contains("orchestrator seat: dispatch a worker"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn orchestrator_write_decision_allows_every_non_orchestrator_role() {
+        let repo = orchestrator_repo();
+        let payload = edit_payload(repo.path(), "src/x.rs");
+        for role in [None, Some("worker"), Some("sub-orchestrator")] {
+            assert_eq!(
+                orchestrator_write_decision(role, &payload, repo.path()),
+                None,
+                "{role:?} must never be blocked from editing"
+            );
+        }
+    }
+
+    #[test]
+    fn orchestrator_write_decision_allows_zirv_work_and_memory_writes() {
+        let repo = orchestrator_repo();
+        for relative in [".zirv/work/notes.md", ".zirv/memory/x.md"] {
+            let payload = edit_payload(repo.path(), relative);
+            assert_eq!(
+                orchestrator_write_decision(Some("orchestrator"), &payload, repo.path()),
+                None,
+                "{relative} must stay allowed"
+            );
+        }
+    }
+
+    #[test]
+    fn orchestrator_write_decision_resolves_a_relative_target_against_cwd() {
+        let repo = orchestrator_repo();
+        let inside = PreToolPayload::parse(&orchestrator_pretool_stdin(
+            &repo.path().display().to_string(),
+            "claude-session-id",
+            "Edit",
+            serde_json::json!({"file_path": "src/x.rs"}),
+        ))
+        .expect("payload parses");
+        assert!(
+            orchestrator_write_decision(Some("orchestrator"), &inside, repo.path()).is_some(),
+            "a relative target must resolve against cwd, landing inside the repo"
+        );
+
+        let outside = PreToolPayload::parse(&orchestrator_pretool_stdin(
+            &repo.path().display().to_string(),
+            "claude-session-id",
+            "Edit",
+            serde_json::json!({"file_path": "../outside.txt"}),
+        ))
+        .expect("payload parses");
+        assert_eq!(
+            orchestrator_write_decision(Some("orchestrator"), &outside, repo.path()),
+            None,
+            "a relative target that climbs outside the repo must be allowed"
+        );
+    }
+
+    #[test]
+    fn orchestrator_write_decision_treats_an_empty_target_as_schema_drift() {
+        let repo = orchestrator_repo();
+        let payload = PreToolPayload::parse(&orchestrator_pretool_stdin(
+            &repo.path().display().to_string(),
+            "claude-session-id",
+            "Write",
+            serde_json::json!({"file_path": ""}),
+        ))
+        .expect("payload parses");
+        assert_eq!(
+            orchestrator_write_decision(Some("orchestrator"), &payload, repo.path()),
+            None,
+            "an empty target is schema drift, not a real write"
+        );
+    }
+
+    #[test]
+    fn orchestrator_write_decision_denies_a_notebook_edit_under_the_repo() {
+        let repo = orchestrator_repo();
+        let notebook_path = repo.path().join("nb.ipynb");
+        let payload = PreToolPayload::parse(&orchestrator_pretool_stdin(
+            &repo.path().display().to_string(),
+            "claude-session-id",
+            "NotebookEdit",
+            serde_json::json!({"notebook_path": notebook_path.display().to_string()}),
+        ))
+        .expect("payload parses");
+        assert!(orchestrator_write_decision(Some("orchestrator"), &payload, repo.path()).is_some());
+    }
+
+    #[test]
+    fn orchestrator_write_decision_ignores_read_and_bash() {
+        let repo = orchestrator_repo();
+        let file_path = repo.path().join("src/x.rs");
+        for (tool, input) in [
+            (
+                "Read",
+                serde_json::json!({"file_path": file_path.display().to_string()}),
+            ),
+            ("Bash", serde_json::json!({"command": "cat src/x.rs"})),
+        ] {
+            let payload = PreToolPayload::parse(&orchestrator_pretool_stdin(
+                &repo.path().display().to_string(),
+                "claude-session-id",
+                tool,
+                input,
+            ))
+            .expect("payload parses");
+            assert_eq!(
+                orchestrator_write_decision(Some("orchestrator"), &payload, repo.path()),
+                None,
+                "{tool} is not a file-modification tool"
+            );
+        }
+    }
+
+    #[test]
+    fn repo_root_for_finds_a_git_directory_ancestor() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).expect(".git dir");
+        let nested = repo.join("src").join("deep");
+        std::fs::create_dir_all(&nested).expect("nested dirs");
+        assert_eq!(repo_root_for(&nested), repo);
+    }
+
+    #[test]
+    fn repo_root_for_finds_a_git_file_ancestor_for_a_linked_worktree() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let worktree = tmp.path().join("worktree");
+        std::fs::create_dir_all(&worktree).expect("worktree dir");
+        std::fs::write(
+            worktree.join(".git"),
+            "gitdir: /elsewhere/.git/worktrees/wt\n",
+        )
+        .expect(".git file");
+        let nested = worktree.join("src");
+        std::fs::create_dir_all(&nested).expect("nested dir");
+        assert_eq!(repo_root_for(&nested), worktree);
+    }
+
+    #[test]
+    fn repo_root_for_falls_back_to_cwd_with_no_git_ancestor_at_all() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let plain = tmp.path().join("no-git-here");
+        std::fs::create_dir_all(&plain).expect("mkdir");
+        assert_eq!(repo_root_for(&plain), plain);
+    }
+
+    #[test]
+    fn run_pretool_denies_an_orchestrator_edit_with_no_seat_model_env_at_all() {
+        let repo = orchestrator_repo();
+        let env: std::collections::HashMap<String, String> = [(
+            adapters::SEAT_ROLE_ENV.to_string(),
+            "orchestrator".to_string(),
+        )]
+        .into();
+        let mut out = Vec::new();
+        let code = run_pretool(
+            &mut out,
+            &orchestrator_pretool_stdin(
+                &repo.path().display().to_string(),
+                "claude-session-id",
+                "Edit",
+                serde_json::json!({"file_path": repo.path().join("src/x.rs").display().to_string()}),
+            ),
+            &|k| env.get(k).cloned(),
+        )
+        .expect("never errors");
+        assert_eq!(code, 0, "exit 2 would block on stderr text instead of json");
+
+        let printed = String::from_utf8(out).expect("utf8");
+        let parsed: serde_json::Value = serde_json::from_str(printed.trim()).expect("json");
+        assert_eq!(parsed["hookSpecificOutput"]["permissionDecision"], "deny");
+        assert!(
+            parsed["hookSpecificOutput"]["permissionDecisionReason"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("orchestrator seat: dispatch a worker"),
+            "a cheap-model orchestrator (no SEAT_MODEL_ENV) must still be guarded: {parsed}"
+        );
+    }
+
+    #[test]
+    fn run_pretool_stays_silent_for_a_worker_editing_a_repo_file() {
+        let repo = orchestrator_repo();
+        let env: std::collections::HashMap<String, String> =
+            [(adapters::SEAT_ROLE_ENV.to_string(), "worker".to_string())].into();
+        let mut out = Vec::new();
+        let code = run_pretool(
+            &mut out,
+            &edit_payload_stdin(repo.path(), "src/x.rs"),
+            &|k| env.get(k).cloned(),
+        )
+        .expect("never errors");
+        assert_eq!(code, 0);
+        assert!(out.is_empty(), "a worker must be free to edit: {out:?}");
+    }
+
+    fn edit_payload_stdin(repo: &Path, relative_target: &str) -> String {
+        orchestrator_pretool_stdin(
+            &repo.display().to_string(),
+            "claude-session-id",
+            "Edit",
+            serde_json::json!({"file_path": repo.join(relative_target).display().to_string()}),
+        )
+    }
+
+    /// A deny appends exactly one row to `orchestrator-blocks.jsonl`, keyed
+    /// by the zirv session short id (`SESSION_ENV`), not the harness's own
+    /// `session_id` field.
+    #[test]
+    fn run_pretool_denial_appends_exactly_one_orchestrator_block_row() {
+        let repo = orchestrator_repo();
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let env: std::collections::HashMap<String, String> = [
+            (
+                adapters::SEAT_ROLE_ENV.to_string(),
+                "orchestrator".to_string(),
+            ),
+            (
+                crate::commands::ctx::state::STATE_ENV.to_string(),
+                state_dir.path().display().to_string(),
+            ),
+            (SESSION_ENV.to_string(), "zirv-sess-42".to_string()),
+        ]
+        .into();
+        let mut out = Vec::new();
+        let code = run_pretool(
+            &mut out,
+            &edit_payload_stdin(repo.path(), "src/x.rs"),
+            &|k| env.get(k).cloned(),
+        )
+        .expect("never errors");
+        assert_eq!(code, 0);
+        assert!(!out.is_empty(), "must still print the deny envelope");
+
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+        let rows = log::read_orchestrator_blocks(&state);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].tool, "Edit");
+        assert_eq!(
+            rows[0].session,
+            crate::commands::ctx::sessions::short_id("zirv-sess-42")
+        );
     }
 
     // -- the seat env the orchestrator exports ------------------------------

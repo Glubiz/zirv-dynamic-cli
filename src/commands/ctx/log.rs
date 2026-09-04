@@ -222,11 +222,6 @@ pub fn read_permission_prompts(state: &StateDir) -> Vec<PermissionPromptRecord> 
 /// native subagent tool instead. Privacy-preserving like `SafetyDecision`:
 /// `target` never carries full command text, only a path or a program
 /// family.
-// No production writer yet -- issues #328/#334's own guard (the `zirv ctx
-// hook pretool`/`zirv ctx safety check` refusal this record feeds) lands in
-// a later PR; this module's own tests exercise the write/read round trip in
-// the meantime, the same dormancy pattern `drift::analyze` already uses.
-#[allow(dead_code)]
 #[derive(Debug, Serialize)]
 pub struct OrchestratorBlock<'a> {
     pub ts: u64,
@@ -243,8 +238,6 @@ pub struct OrchestratorBlock<'a> {
 
 /// Appends to `orchestrator-blocks.jsonl`, the same private dir/append-file
 /// contract `append`/`append_delegation` give their own flat logs.
-// No production caller yet -- see `OrchestratorBlock`'s own doc comment.
-#[allow(dead_code)]
 pub fn append_orchestrator_block(state: &StateDir, block: &OrchestratorBlock<'_>) -> CtxResult<()> {
     let dir = state.logs();
     super::state::create_private_dir_all(&dir)?;
