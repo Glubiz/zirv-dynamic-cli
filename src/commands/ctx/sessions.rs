@@ -57,10 +57,16 @@ pub fn short_id(session: &str) -> String {
 /// unscrubbed would see its grandparent's id instead of never having one of
 /// its own set at all (see `agent::parent_session_env`'s own doc comment for
 /// the same rule at the fold that sets it fresh).
-pub const SUPERVISION_ENV: [&str; 7] = [
+///
+/// Issues #328/#334: `SEAT_ROLE_ENV` rides along for the same reason
+/// `SEAT_MODEL_ENV` does -- it names *this* session's own seat role, and a
+/// worker that inherited an orchestrator's copy would be mistaken for the
+/// seat it is not sitting in.
+pub const SUPERVISION_ENV: [&str; 8] = [
     super::adapters::SESSION_ENV,
     super::adapters::SOCKET_ENV,
     super::adapters::SEAT_MODEL_ENV,
+    super::adapters::SEAT_ROLE_ENV,
     super::wrap::TRANSCRIPT_ENV,
     super::adapters::LAUNCH_MODE_ENV,
     super::agent::PARENT_SESSION_ENV,

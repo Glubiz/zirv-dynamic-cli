@@ -139,6 +139,11 @@ pub struct AgentArgs {
     /// explicit request now, since any of those would otherwise hard-error
     /// rather than silently demote (see `try_join_dashboard`'s own doc
     /// comment).
+    ///
+    /// Decision (#328, 2026-09-04): headless stays as this explicit opt-in
+    /// and as the fallback when no live dashboard can host a pane
+    /// (announced on stderr); inside a live dashboard, delegation is always
+    /// a visible pane.
     #[arg(long, default_value_t = false)]
     pub headless: bool,
     /// Attach the repo's accepted workflow artifact for this stage to the
@@ -2111,32 +2116,37 @@ fn try_join_dashboard<W: Write>(
 ///
 /// `None` only when nothing usable was found anywhere; the caller's existing
 /// headless fallback then runs unchanged.
+fn inherited_dashboard_liveness(inherited: &Path) -> Option<super::sessions::OwnerLiveness> {
+    inherited
+        .is_dir()
+        .then(|| super::sessions::dashboard_owner_liveness(inherited))
+}
+
 fn live_join_target(inherited: &Path, env: EnvLookup<'_>) -> Option<PathBuf> {
-    if inherited.is_dir() {
-        match super::sessions::dashboard_owner_liveness(inherited) {
-            super::sessions::OwnerLiveness::Live => return Some(inherited.to_path_buf()),
-            super::sessions::OwnerLiveness::Dead(pid) => {
-                eprintln!(
-                    "zirv ctx agent: {} names a dashboard that already quit (owner.pid names \
-                     dead pid {pid}); looking for another live dashboard",
-                    inherited.display()
-                );
-            }
-            super::sessions::OwnerLiveness::Missing => {
-                eprintln!(
-                    "zirv ctx agent: {} has no readable owner.pid, so no dashboard can be \
-                     confirmed live; looking for another live dashboard",
-                    inherited.display()
-                );
-            }
+    match inherited_dashboard_liveness(inherited) {
+        Some(super::sessions::OwnerLiveness::Live) => return Some(inherited.to_path_buf()),
+        Some(super::sessions::OwnerLiveness::Dead(pid)) => {
+            eprintln!(
+                "zirv ctx agent: {} names a dashboard that already quit (owner.pid names \
+                 dead pid {pid}); looking for another live dashboard",
+                inherited.display()
+            );
         }
-    } else {
-        eprintln!(
-            "zirv ctx agent: {} (inherited via {}) no longer exists; looking for another live \
-             dashboard",
-            inherited.display(),
-            spawnreq::DASH_REQUESTS_ENV
-        );
+        Some(super::sessions::OwnerLiveness::Missing) => {
+            eprintln!(
+                "zirv ctx agent: {} has no readable owner.pid, so no dashboard can be \
+                 confirmed live; looking for another live dashboard",
+                inherited.display()
+            );
+        }
+        None => {
+            eprintln!(
+                "zirv ctx agent: {} (inherited via {}) no longer exists; looking for another live \
+                 dashboard",
+                inherited.display(),
+                spawnreq::DASH_REQUESTS_ENV
+            );
+        }
     }
 
     let state = match super::state::StateDir::resolve(env) {
@@ -2250,6 +2260,48 @@ fn adoption_enforcement_refusal(
     ))
 }
 
+/// Issue #328: from an orchestrator seat, `zirv agent <own harness>` is
+/// refused unless it is a work-group operation or `--force`. Same-harness
+/// delegation belongs to the harness's own native subagent tool -- it stays
+/// visible in the calling session and returns its result directly, which a
+/// zirv-supervised headless worker cannot do; `zirv agent` exists for
+/// another harness, or for a work group/sub-orchestrator (a distinct
+/// concept from "delegate to the same harness"), not as a second way to
+/// spawn a subagent on the seat's own harness.
+///
+/// Refuses only when ALL of: the seat is an orchestrator ([`adapters::
+/// SEAT_ROLE_ENV`]); this session's own harness ([`adapters::AGENT_ENV`])
+/// trimmed equals `args.name` trimmed, case-insensitively; `args.role` is
+/// not `"sub-orchestrator"`; `args.group` is unset; and `args.force` is
+/// false. Any one of those failing is enough to let the delegation through
+/// -- an unknown own-harness (`AGENT_ENV` unset) never refuses either,
+/// since there is nothing to compare `args.name` against.
+fn same_harness_refusal(args: &AgentArgs, env: EnvLookup<'_>) -> Option<String> {
+    if env(adapters::SEAT_ROLE_ENV).as_deref() != Some("orchestrator") {
+        return None;
+    }
+    let own_harness = env(adapters::AGENT_ENV)?;
+    if !own_harness.trim().eq_ignore_ascii_case(args.name.trim()) {
+        return None;
+    }
+    if args.role.as_deref() == Some("sub-orchestrator") || args.group.is_some() || args.force {
+        return None;
+    }
+    let other = adapters::ADAPTERS
+        .iter()
+        .map(|(adapter_name, _)| *adapter_name)
+        .find(|adapter_name| !adapter_name.eq_ignore_ascii_case(args.name.trim()))
+        .unwrap_or("<other-harness>");
+    Some(format!(
+        "zirv ctx agent: '{name}' is this session's own harness. From an orchestrator seat, \
+         same-harness delegation uses the harness's native subagent tool (it stays visible in \
+         this session and returns its result directly); `zirv agent` is for another harness \
+         (e.g. `zirv agent {other}`) or a work group (`--role sub-orchestrator --scope \
+         \"<area>\"`). Pass --force to spawn a zirv-supervised worker anyway.",
+        name = args.name,
+    ))
+}
+
 pub fn run_with<W: Write>(
     args: &AgentArgs,
     w: &mut W,
@@ -2258,6 +2310,9 @@ pub fn run_with<W: Write>(
 ) -> CtxResult<i32> {
     validate_flags(&args.flags)?;
     validate_role(&args.role)?;
+    if let Some(message) = same_harness_refusal(args, env) {
+        return Err(message.into());
+    }
     // Issue #318: resolved up front, before anything else in this
     // delegation runs -- a bad `--result-schema`/`--result-kind` must fail
     // loudly here, not surface only once a worker has already burned a run
@@ -2379,6 +2434,27 @@ pub fn run_with<W: Write>(
 
     let now = super::state::now_secs();
     let requested_adapter = adapters::select(Some(&args.name), &[], &cfg)?;
+    let live_inherited_dashboard = env(spawnreq::DASH_REQUESTS_ENV)
+        .map(PathBuf::from)
+        .and_then(|path| inherited_dashboard_liveness(&path))
+        .is_some_and(|liveness| matches!(liveness, super::sessions::OwnerLiveness::Live));
+    let seat = if !args.headless && live_inherited_dashboard {
+        pace::Seat::Pane
+    } else {
+        pace::Seat::Cli
+    };
+    let mut refresh_flags = pace::PaceGateFlags::default();
+    pace::refresh_sources(
+        &state,
+        &cfg.pace,
+        now,
+        requested_adapter.provider(),
+        &pace::PaceGate {
+            use_credits: false,
+            poller: None,
+        },
+        &mut refresh_flags,
+    );
     let requested_command =
         worker_launch_flags(&cfg, &args.name, requested_adapter.as_ref(), &args.flags);
     let requested_model = adapters::last_model_flag(&requested_command);
@@ -2388,12 +2464,27 @@ pub fn run_with<W: Write>(
         tool_calls: args.max_tool_calls,
     };
 
+    // Issue #328 fix: never let cross-harness fallback reroute a low-
+    // headroom dispatch back onto the orchestrator seat's OWN harness --
+    // that is the identical same-harness delegation `same_harness_refusal`
+    // above already refuses through the front door, just reached via the
+    // fallback back door instead (codex sitting at 100% of its 7-day window
+    // used to reroute every `zirv agent codex` straight back onto the
+    // calling claude seat). Not applied under `--force`: the operator
+    // already opted into spending on this exact harness regardless of
+    // headroom, so there is no back door left to close.
+    let same_harness_exclude = (env(adapters::SEAT_ROLE_ENV).as_deref() == Some("orchestrator")
+        && !args.force)
+        .then(|| env(adapters::AGENT_ENV))
+        .flatten();
+
     let route_request = super::fallback::RouteRequest {
         requested: &args.name,
         source_model: requested_model,
         source_model_explicit,
         bounds,
         now,
+        exclude: same_harness_exclude.as_deref(),
     };
     let route = super::fallback::route_new_delegation(&state, &cfg, route_request, args.force);
     let mut routed_args = args.clone();
@@ -2411,7 +2502,7 @@ pub fn run_with<W: Write>(
         routed_args.flags = flags;
         let parent_session =
             super::mail::session_identity(env).unwrap_or_else(|| "delegation".to_string());
-        let detail = route.detail();
+        let detail = route.detail(seat);
         let _ = super::log::append(
             &state,
             &super::log::Decision {
@@ -2460,7 +2551,10 @@ pub fn run_with<W: Write>(
     let provider = adapters::provider_for_agent_name(Some(&routed_args.name));
     let (collector, estimator) = pace::current_windows(&state, &cfg.pace, now, provider);
     let gate = pace::spawn_gate(&collector, estimator.as_ref(), now, &cfg.pace);
-    if let Some(note) = pace::describe_spawn_gate(&gate) {
+    let reading_age = pace::spawn_headroom(&collector, estimator.as_ref(), now, &cfg.pace)
+        .map(|reading| reading.age_secs);
+    let gate_note = pace::describe_spawn_gate(&gate, reading_age, seat);
+    if let Some(note) = gate_note.as_deref() {
         eprintln!("zirv ctx agent: {note}");
     }
     if spawn_blocked(&gate, args.force) && deferred_reset.is_none() {
@@ -2469,9 +2563,20 @@ pub fn run_with<W: Write>(
         } else {
             ""
         };
+        // Issue #328 fix: named only when `same_harness_exclude` actually
+        // kept the fallback search from landing back on the orchestrator
+        // seat's own harness -- an operator hitting this refusal for an
+        // ordinary reason (no exclusion applied at all) gets the plain
+        // message unchanged.
+        let exclusion_note = if same_harness_exclude.is_some() {
+            " Same-harness work from an orchestrator seat uses the harness's native subagent \
+              tool."
+        } else {
+            ""
+        };
         return Err(format!(
-            "refusing to start new delegated work at this usage level; wait for the window to \
-             reset, or pass --force to spend anyway.{fallback_note}"
+            "{}.{fallback_note}{exclusion_note}",
+            gate_note.unwrap_or_else(|| "refusing to start new delegated work".to_string())
         )
         .into());
     }
@@ -3218,6 +3323,7 @@ mod tests {
     use super::*;
     use crate::commands::ctx::hook;
     use crate::commands::ctx::state::StateDir;
+    use crate::commands::ctx::{fallback, window};
     use std::collections::HashMap;
     use std::path::PathBuf;
 
@@ -3738,6 +3844,135 @@ mod tests {
         };
         assert!(!spawn_blocked(&warn, false), "a warning never blocks");
         assert!(!spawn_blocked(&pace::SpawnGate::Proceed, false));
+    }
+
+    #[test]
+    fn a_stale_dashboard_env_yields_the_cli_override_hint() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state_dir = tmp.path().join("state");
+        let state = StateDir::from_root(state_dir.clone());
+        let now = crate::commands::ctx::state::now_secs();
+        window::store_for(
+            &state,
+            "anthropic",
+            &window::UsageWindows {
+                five_hour: Some(window::Window {
+                    used_percentage: 96.0,
+                    resets_at: now + 600,
+                    observed_at: now,
+                    overage_covered: false,
+                }),
+                seven_day: None,
+            },
+        )
+        .expect("store source usage");
+        let mut env = base_env(&state_dir);
+        env.insert("ZIRV_CTX_FALLBACK".to_string(), "false".to_string());
+        env.insert(
+            crate::commands::ctx::dash::spawnreq::DASH_REQUESTS_ENV.to_string(),
+            tmp.path()
+                .join("missing-dashboard-requests")
+                .display()
+                .to_string(),
+        );
+
+        let result = run_with(
+            &joinable_args("claude", "go"),
+            &mut Vec::new(),
+            tmp.path(),
+            &|key| env.get(key).cloned(),
+        );
+        let message = result.expect_err("the hard spawn gate refuses").to_string();
+        assert!(
+            message.contains("to override, pass --force"),
+            "got {message}"
+        );
+        assert!(!message.contains("--headless --force"), "got {message}");
+    }
+
+    #[test]
+    fn delegation_refreshes_requested_codex_usage_before_gating_and_routing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("home tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let rollout_dir = home.path().join(".codex/sessions/2026/09/04");
+        std::fs::create_dir_all(&rollout_dir).expect("rollout dir");
+        std::fs::write(
+            rollout_dir.join(
+                "rollout-2026-09-04T07-56-26-01a06afd-63c2-7061-8bdf-2798fe10b9e2.jsonl",
+            ),
+            include_str!(
+                "../../../tests/fixtures/codex-rollouts/2026/09/04/rollout-2026-09-04T07-56-26-01a06afd-63c2-7061-8bdf-2798fe10b9e2.jsonl"
+            ),
+        )
+        .expect("rollout fixture");
+
+        let state_dir = tmp.path().join("state");
+        let state = StateDir::from_root(state_dir.clone());
+        window::store_for(
+            &state,
+            window::CODEX_USAGE_PROVIDER,
+            &window::UsageWindows {
+                five_hour: None,
+                seven_day: Some(window::Window {
+                    used_percentage: 99.0,
+                    resets_at: 1_788_758_370,
+                    observed_at: 1_788_423_353,
+                    overage_covered: false,
+                }),
+            },
+        )
+        .expect("stale reading");
+        let mut env = base_env(&state_dir);
+        env.insert("ZIRV_CTX_FALLBACK".to_string(), "false".to_string());
+        let mut args = args_for("codex", "go");
+        args.headless = true;
+        let result = run_with(&args, &mut Vec::new(), tmp.path(), &|key| {
+            env.get(key).cloned()
+        });
+        assert!(
+            result.is_ok(),
+            "the refreshed reading must let delegation reach its launch path: {result:?}"
+        );
+
+        let mut cfg = CtxConfig {
+            agent_bin: Some(
+                std::env::current_exe()
+                    .expect("current test executable")
+                    .display()
+                    .to_string(),
+            ),
+            ..CtxConfig::default()
+        };
+        cfg.pace.estimator = false;
+        let now = 1_788_501_500;
+        let (collector, estimator) =
+            pace::current_windows(&state, &cfg.pace, now, window::CODEX_USAGE_PROVIDER);
+        assert_eq!(
+            pace::spawn_gate(&collector, estimator.as_ref(), now, &cfg.pace),
+            pace::SpawnGate::Proceed
+        );
+        assert_eq!(
+            fallback::route_new_delegation(
+                &state,
+                &cfg,
+                fallback::RouteRequest {
+                    requested: "codex",
+                    source_model: Some("gpt-5.6-terra"),
+                    source_model_explicit: false,
+                    bounds: fallback::TaskBounds {
+                        tokens: None,
+                        tool_calls: None,
+                    },
+                    now,
+                    exclude: None,
+                },
+                false,
+            ),
+            None
+        );
     }
 
     /// Issue #155, Phase 5(d): a budget bounds WORK. At 80% the worker is
@@ -5212,6 +5447,129 @@ mod tests {
         let found: Vec<&str> =
             candidate_path_tokens(r"see (\\server\share\project) please").collect();
         assert_eq!(found, vec![r"\\server\share\project"], "got {found:?}");
+    }
+
+    // -- same_harness_refusal (issue #328) ---------------------------------
+
+    /// The baseline refusal shape: an orchestrator seat asking `zirv agent`
+    /// to delegate to its own harness.
+    #[test]
+    fn same_harness_refusal_refuses_the_orchestrators_own_harness() {
+        let env = env_map(&[
+            (adapters::SEAT_ROLE_ENV, "orchestrator"),
+            (adapters::AGENT_ENV, "claude"),
+        ]);
+        let args = args_for("claude", "go");
+        let message = same_harness_refusal(&args, &|k| env.get(k).cloned())
+            .expect("same-harness delegation from an orchestrator seat is refused");
+        assert!(message.contains("own harness"), "got {message}");
+        assert!(message.contains("--force"), "got {message}");
+    }
+
+    #[test]
+    fn same_harness_refusal_allows_force() {
+        let env = env_map(&[
+            (adapters::SEAT_ROLE_ENV, "orchestrator"),
+            (adapters::AGENT_ENV, "claude"),
+        ]);
+        let mut args = args_for("claude", "go");
+        args.force = true;
+        assert!(same_harness_refusal(&args, &|k| env.get(k).cloned()).is_none());
+    }
+
+    #[test]
+    fn same_harness_refusal_allows_a_sub_orchestrator_role() {
+        let env = env_map(&[
+            (adapters::SEAT_ROLE_ENV, "orchestrator"),
+            (adapters::AGENT_ENV, "claude"),
+        ]);
+        let mut args = args_for("claude", "go");
+        args.role = Some("sub-orchestrator".to_string());
+        assert!(same_harness_refusal(&args, &|k| env.get(k).cloned()).is_none());
+    }
+
+    #[test]
+    fn same_harness_refusal_allows_a_work_group() {
+        let env = env_map(&[
+            (adapters::SEAT_ROLE_ENV, "orchestrator"),
+            (adapters::AGENT_ENV, "claude"),
+        ]);
+        let mut args = args_for("claude", "go");
+        args.group = Some("g1".to_string());
+        assert!(same_harness_refusal(&args, &|k| env.get(k).cloned()).is_none());
+    }
+
+    #[test]
+    fn same_harness_refusal_allows_a_different_harness() {
+        let env = env_map(&[
+            (adapters::SEAT_ROLE_ENV, "orchestrator"),
+            (adapters::AGENT_ENV, "claude"),
+        ]);
+        let args = args_for("codex", "go");
+        assert!(same_harness_refusal(&args, &|k| env.get(k).cloned()).is_none());
+    }
+
+    #[test]
+    fn same_harness_refusal_allows_with_no_seat_role_env() {
+        let env = env_map(&[(adapters::AGENT_ENV, "claude")]);
+        let args = args_for("claude", "go");
+        assert!(same_harness_refusal(&args, &|k| env.get(k).cloned()).is_none());
+    }
+
+    #[test]
+    fn same_harness_refusal_allows_a_sub_orchestrator_seat() {
+        let env = env_map(&[
+            (adapters::SEAT_ROLE_ENV, "sub-orchestrator"),
+            (adapters::AGENT_ENV, "claude"),
+        ]);
+        let args = args_for("claude", "go");
+        assert!(same_harness_refusal(&args, &|k| env.get(k).cloned()).is_none());
+    }
+
+    /// The own-harness comparison is case-insensitive: `Claude` still
+    /// matches an `AGENT_ENV` of `claude`.
+    #[test]
+    fn same_harness_refusal_matches_the_own_harness_case_insensitively() {
+        let env = env_map(&[
+            (adapters::SEAT_ROLE_ENV, "orchestrator"),
+            (adapters::AGENT_ENV, "claude"),
+        ]);
+        let args = args_for("Claude", "go");
+        assert!(same_harness_refusal(&args, &|k| env.get(k).cloned()).is_some());
+    }
+
+    /// Issue #328, end to end: the refusal fires inside `run_with` itself,
+    /// before `--worktree` ever allocates anything.
+    #[test]
+    fn run_with_refuses_same_harness_delegation_before_allocating_a_worktree() {
+        if !git_available() {
+            eprintln!("skipping: git not found on PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir");
+        assert!(git_init(&repo), "git init");
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+
+        let mut env = base_env(&tmp.path().join("state"));
+        env.insert(
+            adapters::SEAT_ROLE_ENV.to_string(),
+            "orchestrator".to_string(),
+        );
+        env.insert(adapters::AGENT_ENV.to_string(), "claude".to_string());
+
+        let mut args = args_for("claude", "go");
+        args.worktree = true;
+        let mut out = Vec::new();
+        let err = run_with(&args, &mut out, &repo, &|k| env.get(k).cloned())
+            .expect_err("same-harness delegation from an orchestrator seat must be refused");
+        assert!(err.to_string().contains("own harness"), "got {err}");
+        assert!(
+            !repo.join(".zirv").join("worktrees").exists(),
+            "the refusal must land before any worktree is allocated"
+        );
     }
 
     /// Issue #267: allocating a fresh tree and being told to use a specific

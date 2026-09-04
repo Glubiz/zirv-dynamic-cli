@@ -4397,6 +4397,12 @@ struct HookToolPayload {
     tool_name: String,
     tool_input: HookToolInput,
     permission_mode: String,
+    /// The calling process's working directory (issue #334): the repo root
+    /// [`orchestrator_repo_write_target`] resolves relative write targets
+    /// against, when the hook payload carries it. Falls back to this
+    /// process's own `std::env::current_dir()` when empty, the same
+    /// fallback [`cd_allow_roots`] already uses.
+    cwd: String,
     /// Issue #313: the path to this session's own transcript JSONL, present
     /// on claude's real PreToolUse payload. `None` on an older payload that
     /// omits it, or when the field fails to parse -- the identical-failing-
@@ -4921,6 +4927,504 @@ pub(crate) fn write_targets_confined(command: &str, scratchpad_roots: &[String])
         return None;
     }
     Some(confined)
+}
+
+// -- orchestrator repo-write guard (issues #328/#334) ---------------------
+
+/// Blanks runs of two or more consecutive `<` (a heredoc `<<`/here-string
+/// `<<<` operator) to spaces before `segment` reaches [`segment_write_
+/// targets`] -- that scanner has no heredoc-syntax awareness of its own,
+/// and a heredoc opener's `<<'DELIM'` (left standing by [`redact_single_
+/// quoted_heredocs`], which only blanks the BODY) reads as a second,
+/// dangling INPUT redirect with nothing after it, aborting the scan of the
+/// whole segment and discarding a real `>` write target earlier on the
+/// same line (`cat > README.md <<'EOF'`). A lone `<` is left alone: an
+/// ordinary input redirect, already folded into `segment_write_targets`'s
+/// own targets exactly like today.
+fn neutralize_heredoc_operator(segment: &str) -> String {
+    let chars: Vec<char> = segment.chars().collect();
+    let mut out = String::with_capacity(chars.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '<' && chars.get(i + 1) == Some(&'<') {
+            out.push(' ');
+            out.push(' ');
+            i += 2;
+            while chars.get(i) == Some(&'<') {
+                out.push(' ');
+                i += 1;
+            }
+            continue;
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
+}
+
+/// Resolves `target` to a forward-slash-normalized, lexically `.`/`..`-
+/// collapsed path: an absolute target (a leading `/`, `~`, or drive
+/// letter) is normalized as-is; a relative one resolves against `cwd`.
+/// `None` when `target` cannot be confidently resolved at all -- it
+/// carries `$`/a backtick (built through expansion this text-only module
+/// cannot resolve), or it is `/dev/null` (never a write target in the
+/// first place). A `~`-prefixed result is left exactly as written -- it is
+/// not a real filesystem-absolute path (expanding it needs `$HOME`, which
+/// this text-only module never reads), so [`repo_write_violation`] treats
+/// it as unresolvable rather than feeding it to `repo_root_of`.
+fn resolve_repo_write_target(target: &str, cwd: &str) -> Option<String> {
+    if target.contains(['$', '`']) || target == "/dev/null" {
+        return None;
+    }
+    let normalized = target.replace('\\', "/");
+    let is_absolute = normalized.starts_with('/')
+        || normalized.starts_with('~')
+        || (normalized.as_bytes().get(1) == Some(&b':')
+            && matches!(normalized.as_bytes().get(2), Some(b'/')));
+    let combined = if is_absolute {
+        normalized
+    } else {
+        format!("{cwd}/{normalized}")
+    };
+    if let Some(rest) = combined.strip_prefix('/') {
+        Some(format!(
+            "/{}",
+            resolve_lexical_path_components(rest).join("/")
+        ))
+    } else if combined.as_bytes().get(1) == Some(&b':') {
+        let (drive, rest) = combined.split_at(2);
+        let rest = rest.strip_prefix('/').unwrap_or(rest);
+        Some(format!(
+            "{drive}/{}",
+            resolve_lexical_path_components(rest).join("/")
+        ))
+    } else {
+        Some(resolve_lexical_path_components(&combined).join("/"))
+    }
+}
+
+/// `target` is a repository write iff its resolved, filesystem-absolute
+/// form ([`resolve_repo_write_target`]) sits inside a git repository
+/// (`repo_root_of` finds a `.git` ancestor for it) AND is not equal to or
+/// nested under that repo's own `.zirv/work` or `.zirv/memory` -- the same
+/// root-plus-separator boundary rule [`target_is_confined`] applies to its
+/// own scratchpad roots. Issue #334 MAJOR fix: which repository owns the
+/// target is answered PER TARGET, not assumed to be the launch repo --
+/// `git repo /a` and `git repo /b/.zirv/work` are two different repos'
+/// scratch areas, and a sibling checkout's own `.zirv/work` never confines
+/// a write into the launch repo, or vice versa. A resolved form that is
+/// not filesystem-absolute at all (a `~`-prefixed target) is never even
+/// handed to `repo_root_of`: this module cannot resolve `~` to a real
+/// path, so it stays unresolvable rather than guessed at. Returns `target`
+/// unchanged (as originally written) on a violation, so a caller can
+/// report it without leaking a resolved absolute path.
+fn repo_write_violation(
+    target: &str,
+    cwd: &str,
+    repo_root_of: &dyn Fn(&str) -> Option<String>,
+) -> Option<String> {
+    let resolved = resolve_repo_write_target(target, cwd)?;
+    let is_filesystem_absolute = resolved.starts_with('/')
+        || (resolved.as_bytes().get(1) == Some(&b':')
+            && matches!(resolved.as_bytes().get(2), Some(b'/')));
+    if !is_filesystem_absolute {
+        return None;
+    }
+    let root = repo_root_of(&resolved)?;
+    let allowed_roots = [format!("{root}/.zirv/work"), format!("{root}/.zirv/memory")];
+    let under_allowed = allowed_roots
+        .iter()
+        .any(|allowed| resolved == *allowed || resolved.starts_with(&format!("{allowed}/")));
+    if under_allowed {
+        None
+    } else {
+        Some(target.to_string())
+    }
+}
+
+/// The nearest git repository root containing `path` (issue #334): starts
+/// at `path`'s own PARENT directory -- the file itself may not exist yet
+/// (`cp`/`mv`'s destination need not, though `sed -i`'s target usually
+/// does) -- and walks upward looking for a `.git` entry (a directory for
+/// an ordinary checkout, a plain file naming the real gitdir for a linked
+/// worktree -- either counts, `Path::exists` alone answers both). `None`
+/// when no ancestor up to the filesystem root carries one, or `path` has
+/// no parent at all (already the root). The one real filesystem walk in
+/// this guard: [`orchestrator_repo_write_target`] itself stays pure and
+/// takes this as an injected closure so tests can fake it deterministically.
+fn filesystem_repo_root_of(path: &str) -> Option<String> {
+    let mut dir = std::path::Path::new(path).parent()?.to_path_buf();
+    loop {
+        if dir.join(".git").exists() {
+            return Some(
+                dir.to_string_lossy()
+                    .replace('\\', "/")
+                    .trim_end_matches('/')
+                    .to_string(),
+            );
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
+}
+
+/// Like [`split_segments`], but each segment also carries whether the
+/// separator immediately before it was a bare pipe `|` (not `||`) --
+/// issue #334's `git apply`/`git am`/`patch` carve-out needs to tell
+/// "piped from the previous stage" apart from "chained by `;`/`&&`/`||`/
+/// newline", which `split_segments` itself does not preserve. Quote/escape
+/// handling mirrors `split_segments` exactly (same branches, same order)
+/// so the two can never disagree about where a segment starts or ends --
+/// only the extra per-segment `bool` is new.
+fn split_segments_with_pipe_marker(command: &str) -> Vec<(String, bool)> {
+    let chars: Vec<char> = command.chars().collect();
+    let mut segments = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    let mut i = 0;
+    let mut preceded_by_pipe = false;
+    while i < chars.len() {
+        let c = chars[i];
+        let next = chars.get(i + 1).copied();
+        if escaped {
+            current.push(c);
+            escaped = false;
+            i += 1;
+        } else if c == '\\' && quote != Some('\'') {
+            current.push(c);
+            escaped = true;
+            i += 1;
+        } else if let Some(active) = quote {
+            current.push(c);
+            if c == active {
+                quote = None;
+            }
+            i += 1;
+        } else if matches!(c, '\'' | '"' | '`') {
+            quote = Some(c);
+            current.push(c);
+            i += 1;
+        } else if c == ';' || c == '\n' {
+            segments.push((std::mem::take(&mut current), preceded_by_pipe));
+            preceded_by_pipe = false;
+            i += 1;
+        } else if (c == '&' && next == Some('&')) || (c == '|' && next == Some('|')) {
+            segments.push((std::mem::take(&mut current), preceded_by_pipe));
+            preceded_by_pipe = false;
+            i += 2;
+        } else if c == '|'
+            || (c == '&'
+                && !matches!(current.chars().next_back(), Some('>' | '<'))
+                && next != Some('>'))
+        {
+            let is_pipe = c == '|';
+            segments.push((std::mem::take(&mut current), preceded_by_pipe));
+            preceded_by_pipe = is_pipe;
+            i += 1;
+        } else {
+            current.push(c);
+            i += 1;
+        }
+    }
+    segments.push((current, preceded_by_pipe));
+    segments
+}
+
+/// The sentinel label [`orchestrator_repo_write_target`] reports for a
+/// `git apply`/`git am`/`patch` segment -- `None` for every other `git`
+/// subcommand (`commit`, `merge`, `cherry-pick`, `checkout`, `stash`,
+/// `worktree`, ...), which stay exempt as before: git integration is the
+/// orchestrator seat's own job. These three specifically are NOT exempt on
+/// program name alone, because they apply an arbitrary diff to the working
+/// tree -- the write can land anywhere the diff names, regardless of where
+/// the diff text itself came from (a heredoc, a literal file argument, a
+/// `<` redirect, or bare stdin all count). `subcommand` must be the git
+/// action [`git_action`] resolves -- NOT a raw `tokens.get(1)` -- so a
+/// global option ahead of the verb (`git -C <dir>`, `-c k=v`, `--git-dir=`,
+/// `--work-tree=`, `--namespace=`) can never be mistaken for the verb
+/// itself and slip an actual `apply`/`am` through to the blanket `git`
+/// exemption (issue #334 review round 2, HIGH: `git -C <sibling-worktree>
+/// apply p.diff` used to do exactly that).
+fn git_apply_program_label(program: &str, subcommand: Option<&str>) -> Option<&'static str> {
+    match (program, subcommand) {
+        ("git", Some("apply")) => Some("<git apply>"),
+        ("git", Some("am")) => Some("<git am>"),
+        ("patch", _) => Some("<patch>"),
+        _ => None,
+    }
+}
+
+/// Diff-producing `git` actions (issue #334 review round 2, MEDIUM) whose
+/// output is a legitimate upstream for a piped `git apply`/`git am` -- the
+/// one form that is how the orchestrator seat integrates a worker's diff
+/// rather than authoring one itself (`git -C <wt> diff | git apply`, `git
+/// format-patch --stdout | git am`). Deliberately narrow, not "any `git`
+/// subcommand": `git cat-file -p <sha>:path | git apply` reads an
+/// arbitrary blob, not necessarily a diff, and every other `git` action
+/// (`log` without `-p`, `status`, `commit`, ...) does not reliably produce
+/// patch-shaped output either -- resolved via [`git_action`] the same way
+/// [`git_apply_program_label`]'s own `subcommand` is, so a global option
+/// ahead of the verb cannot hide a non-diff action behind it either.
+const GIT_DIFF_PRODUCING_ACTIONS: &[&str] = &[
+    "diff",
+    "show",
+    "format-patch",
+    "diff-tree",
+    "diff-index",
+    "log",
+];
+
+/// Whether `token` is a `sed`/`perl` in-place-edit flag: `-i`, `-i<suffix>`
+/// (`-i.bak`), `--in-place[=<suffix>]`, or a clustered short-flag group
+/// containing `i` (`-pi`, `-pie`, `-ni`).
+fn is_sed_perl_inplace_flag(token: &str) -> bool {
+    if token == "--in-place" || token.starts_with("--in-place=") {
+        return true;
+    }
+    if token.starts_with("--") || !token.starts_with('-') || token.len() < 2 {
+        return false;
+    }
+    token[1..].contains('i')
+}
+
+/// The file-argument positionals a `sed`/`perl` in-place edit (`program` at
+/// `tokens[0]`) would write to: every non-flag argument that is not the
+/// script/expression consumed by an `-e`/`-f` flag, and -- for `sed` with
+/// no `-e`/`-f` anywhere on the line -- not the first positional either
+/// (its own implicit script).
+fn sed_perl_inplace_targets(program: &str, tokens: &[String]) -> Vec<String> {
+    let has_e_or_f = tokens[1..].iter().any(|t| t == "-e" || t == "-f");
+    let mut awaiting_implicit_script = program == "sed" && !has_e_or_f;
+    let mut targets = Vec::new();
+    let mut i = 1;
+    while i < tokens.len() {
+        let token = &tokens[i];
+        if token == "-e" || token == "-f" {
+            i += 2;
+            continue;
+        }
+        if token.starts_with('-') {
+            i += 1;
+            continue;
+        }
+        if awaiting_implicit_script {
+            awaiting_implicit_script = false;
+            i += 1;
+            continue;
+        }
+        targets.push(token.clone());
+        i += 1;
+    }
+    targets
+}
+
+/// The last non-flag argument of `tokens` (`cp`/`mv`/`install`/`rsync`/`ln`
+/// all write to their final positional).
+fn last_non_flag_argument(tokens: &[String]) -> Option<&str> {
+    tokens[1..]
+        .iter()
+        .rfind(|t| !t.starts_with('-'))
+        .map(String::as_str)
+}
+
+/// The code argument following a `-c`/`-e` flag among `tokens`, for an
+/// inline interpreter invocation (`python3 -c "..."`, `node -e "..."`).
+fn inline_interpreter_code(tokens: &[String]) -> Option<&str> {
+    let mut iter = tokens[1..].iter();
+    while let Some(token) = iter.next() {
+        if token == "-c" || token == "-e" {
+            return iter.next().map(String::as_str);
+        }
+    }
+    None
+}
+
+/// Plain substring write primitives: present anywhere in inline
+/// interpreter `code` means a write, no further analysis needed.
+const INLINE_WRITE_PRIMITIVES: &[&str] = &[
+    ".write_text(",
+    ".write_bytes(",
+    "writeFile",
+    "writeFileSync",
+    "appendFile",
+    "File.write",
+    "file_put_contents(",
+];
+
+/// Open-style primitives that only mean a write when paired with a write
+/// mode (see [`INLINE_WRITE_MODE_LITERALS`]) -- an `open('f').read()` is
+/// not a write.
+const INLINE_MODE_GATED_PRIMITIVES: &[&str] = &["open(", "File.open", "fopen("];
+
+const INLINE_WRITE_MODE_LITERALS: &[&str] = &[
+    "'w'", "\"w\"", "'a'", "\"a\"", "'wb'", "\"wb\"", "'ab'", "\"ab\"", "'w+'", "\"w+\"", "'a+'",
+    "\"a+\"", "'x'", "\"x\"",
+];
+
+/// Whether inline interpreter `code` contains a recognized write primitive
+/// -- approximate (a substring scan, not a real parse), deliberately
+/// permissive toward flagging: an orchestrator seat only ever pays for a
+/// false positive here by dispatching a worker it did not strictly need,
+/// never by silently keeping a real write.
+fn inline_code_has_write_primitive(code: &str) -> bool {
+    if INLINE_WRITE_PRIMITIVES.iter().any(|p| code.contains(p)) {
+        return true;
+    }
+    INLINE_MODE_GATED_PRIMITIVES
+        .iter()
+        .any(|p| code.contains(p))
+        && INLINE_WRITE_MODE_LITERALS.iter().any(|m| code.contains(m))
+}
+
+/// Issue #334: the first repository file `command` would write from an
+/// orchestrator seat, or `None`. `cwd` is forward-slash normalized, no
+/// trailing slash; `repo_root_of(absolute_path)` returns the nearest git
+/// repository root containing `absolute_path`, or `None` when it names no
+/// repository at all -- production passes a real filesystem walk
+/// ([`filesystem_repo_root_of`]), tests pass a deterministic fake. This
+/// function itself stays pure: no clock, filesystem, or environment access
+/// of its own.
+///
+/// Scans each of [`split_segments_with_pipe_marker`]'s segments (over the
+/// already heredoc-redacted command) for five write shapes: (a) a
+/// redirect/`tee` target ([`segment_write_targets`]); (b) a `sed`/`perl`
+/// in-place edit's file arguments; (c) the last argument of `cp`/`mv`/
+/// `install`/`rsync`/`ln`; (d) an inline interpreter (`python`/`python3`/
+/// `node`/`ruby`/`perl`/`php`) invoked with `-c`/`-e` whose code contains a
+/// write primitive and mentions none of `cwd`'s own repo's allowed roots;
+/// (e) `git apply`, `git am`, or `patch` ([`git_apply_program_label`]) --
+/// these three apply an arbitrary diff to the working tree, so they are
+/// NEVER exempt on program name alone the way every other `git` subcommand
+/// is, UNLESS the segment is itself piped from an immediately preceding
+/// `git` segment whose OWN action is one of [`GIT_DIFF_PRODUCING_ACTIONS`]
+/// (`git -C <wt> diff | git apply`, `git format-patch --stdout | git am`)
+/// -- the one form that is how the seat integrates a worker's diff rather
+/// than authoring one itself; `git cat-file -p <sha>:path | git apply` is
+/// NOT exempt, a non-diff `git` action is no safer an upstream than a
+/// non-`git` one. Every `git` action -- both the segment's own (for the
+/// apply/am/patch check) and its would-be upstream's (for the pipe
+/// exemption) -- is resolved via [`git_action`], which skips `git`'s own
+/// global options (`-C <dir>`, `-c k=v`, `--git-dir=`, `--work-tree=`,
+/// `--namespace=`) ahead of the verb, so neither can be defeated by one.
+///
+/// Known gaps, documented rather than chased (this classifier is text-only
+/// and argv-scoped, the same declared limits every other classifier in
+/// this module accepts):
+/// - No `cd` tracking: `cd src && sed -i ... lib.rs` resolves `lib.rs`
+///   against `cwd`, not `cwd/src`, and is not caught.
+/// - An inline interpreter write primitive's ambiguity analysis is
+///   narrowed to "does the code mention one of `cwd`'s own repo's allowed
+///   roots" -- it does not attempt to prove a mentioned path is genuinely
+///   outside that repo, or resolve which repo a DIFFERENT mentioned path
+///   belongs to the way (a)-(c)/(e)'s structured targets do.
+pub(crate) fn orchestrator_repo_write_target(
+    command: &str,
+    cwd: &str,
+    repo_root_of: &dyn Fn(&str) -> Option<String>,
+) -> Option<String> {
+    // (d)'s own approximation needs SOME allowed-roots list to check an
+    // inline interpreter's code text against, but has no structured target
+    // path to resolve a repo for -- `cwd` itself may already be the repo
+    // root, and a bare trailing `.` is lexically stripped by `Path::parent`
+    // (landing one level too high), so a synthetic nested leaf is probed
+    // instead of `cwd` directly, making `repo_root_of`'s own "starts at the
+    // parent" contract land exactly on `cwd`.
+    let cwd_allowed_roots: Vec<String> = repo_root_of(&format!("{cwd}/__zirv_cwd_probe__"))
+        .into_iter()
+        .flat_map(|root| [format!("{root}/.zirv/work"), format!("{root}/.zirv/memory")])
+        .collect();
+
+    let sanitized = redact_single_quoted_heredocs(command);
+    // Whether the immediately preceding segment was itself a `git`
+    // invocation whose action is one of `GIT_DIFF_PRODUCING_ACTIONS` --
+    // the only kind of upstream a piped `git apply`/`git am` may be exempt
+    // for. Reset to `false` at the top of every iteration this loop
+    // doesn't explicitly set it in, so it only ever reflects the segment
+    // immediately before the one currently being examined.
+    let mut previous_diff_producing_git = false;
+    for (segment, preceded_by_pipe) in split_segments_with_pipe_marker(&sanitized) {
+        let collapsed = collapse_whitespace(&segment);
+        let Some(tokens) = sql_tokens(&collapsed) else {
+            previous_diff_producing_git = false;
+            continue;
+        };
+        let Some(first) = tokens.first() else {
+            previous_diff_producing_git = false;
+            continue;
+        };
+        let program = sql_program_name(first);
+
+        // Issue #334 review round 2, HIGH: the real git action, skipping
+        // any global option ahead of the verb -- `tokens.get(1)` alone
+        // would read `-C`/`-c`/`--git-dir=.../--work-tree=.../--namespace=`
+        // as the verb and let an actual `apply`/`am` slip past both checks
+        // below via the blanket `git` exemption.
+        if program == "git" {
+            let action = git_action(&tokens).map(|(_, action)| action.to_ascii_lowercase());
+            if let Some(label) = git_apply_program_label(&program, action.as_deref()) {
+                let exempt = preceded_by_pipe && previous_diff_producing_git;
+                previous_diff_producing_git = false;
+                if exempt {
+                    continue;
+                }
+                return Some(label.to_string());
+            }
+            previous_diff_producing_git = action
+                .as_deref()
+                .is_some_and(|action| GIT_DIFF_PRODUCING_ACTIONS.contains(&action));
+            continue;
+        }
+
+        if let Some(label) = git_apply_program_label(&program, None) {
+            let exempt = preceded_by_pipe && previous_diff_producing_git;
+            previous_diff_producing_git = false;
+            if exempt {
+                continue;
+            }
+            return Some(label.to_string());
+        }
+        previous_diff_producing_git = false;
+
+        if let Some(targets) = segment_write_targets(&neutralize_heredoc_operator(&segment)) {
+            for target in &targets {
+                if let Some(hit) = repo_write_violation(target, cwd, repo_root_of) {
+                    return Some(hit);
+                }
+            }
+        }
+
+        if matches!(program.as_str(), "sed" | "perl")
+            && tokens[1..].iter().any(|t| is_sed_perl_inplace_flag(t))
+        {
+            for target in sed_perl_inplace_targets(&program, &tokens) {
+                if let Some(hit) = repo_write_violation(&target, cwd, repo_root_of) {
+                    return Some(hit);
+                }
+            }
+        }
+
+        if matches!(program.as_str(), "cp" | "mv" | "install" | "rsync" | "ln")
+            && let Some(target) = last_non_flag_argument(&tokens)
+            && let Some(hit) = repo_write_violation(target, cwd, repo_root_of)
+        {
+            return Some(hit);
+        }
+
+        if matches!(
+            program.as_str(),
+            "python" | "python3" | "node" | "ruby" | "perl" | "php"
+        ) && let Some(code) = inline_interpreter_code(&tokens)
+            && inline_code_has_write_primitive(code)
+            && !cwd_allowed_roots
+                .iter()
+                .any(|root| code.contains(root.as_str()))
+        {
+            return Some("<inline interpreter write>".to_string());
+        }
+    }
+    None
 }
 
 /// Issue #168, design decision (d): true when every one of `command`'s
@@ -6392,6 +6896,53 @@ fn cd_allow_roots(scratchpad_roots: &[String]) -> Vec<String> {
     roots
 }
 
+/// The forward-slash-normalized, no-trailing-separator working directory
+/// [`orchestrator_repo_write_target`] resolves an orchestrator seat's
+/// relative write targets against (issue #334): `cwd` (the PreToolUse
+/// payload's own working directory) when non-empty, else this process's
+/// own `std::env::current_dir()` -- `None` (fail open, no repo-write check
+/// at all) when neither is available, mirroring `cd_allow_roots`'s
+/// identical cwd-normalization fallback. Which git repository (if any) a
+/// resolved target actually lands in is a separate question, answered per
+/// target by [`filesystem_repo_root_of`], not by this function.
+fn hook_repo_root(cwd: &str) -> Option<String> {
+    if !cwd.is_empty() {
+        return Some(cwd.replace('\\', "/").trim_end_matches('/').to_string());
+    }
+    std::env::current_dir().ok().map(|path| {
+        path.to_string_lossy()
+            .replace('\\', "/")
+            .trim_end_matches('/')
+            .to_string()
+    })
+}
+
+/// The program-family label for `OrchestratorBlock.target` on a Bash/
+/// PowerShell repository-write refusal (issues #328/#334): `command`'s
+/// first segment's first token, plus -- for `sed`/`perl` -- whichever
+/// in-place flag is present, e.g. `"sed -i"`. Never the full command text:
+/// `OrchestratorBlock` is privacy-preserving like `SafetyDecision`.
+fn orchestrator_block_tool_family(command: &str) -> String {
+    let sanitized = redact_single_quoted_heredocs(command);
+    let Some(first_segment) = split_segments(&sanitized).into_iter().next() else {
+        return String::new();
+    };
+    let collapsed = collapse_whitespace(&first_segment);
+    let Some(tokens) = sql_tokens(&collapsed) else {
+        return String::new();
+    };
+    let Some(first) = tokens.first() else {
+        return String::new();
+    };
+    let program = sql_program_name(first);
+    if matches!(program.as_str(), "sed" | "perl")
+        && let Some(flag) = tokens[1..].iter().find(|t| is_sed_perl_inplace_flag(t))
+    {
+        return format!("{program} {flag}");
+    }
+    program
+}
+
 /// Issue #313 (identical-failing-command guard): parses one session
 /// transcript's JSONL exactly the way `adapters::claude::structural_context`
 /// already does internally -- a `Bash` `tool_use` block (assistant message,
@@ -6559,6 +7110,20 @@ fn run_check_hook_mode_with_env<W: Write>(
     let effective_command =
         strip_known_root_cd_prefix(command, &cd_roots).unwrap_or_else(|| command.to_string());
 
+    // Issue #328/#334: an orchestrator seat must not write a repository
+    // file through Bash any more than through Edit/Write -- computed here,
+    // before both `evaluate_with_attestation_evidence` and the scratchpad/
+    // sandbox widening below, so its `Deny` (applied to `outcome` right
+    // after `evidence` resolves) is never reconsidered by either: both
+    // already guard on `outcome.verdict != Verdict::Deny`.
+    let orchestrator_repo_write = (env(super::adapters::SEAT_ROLE_ENV).as_deref()
+        == Some("orchestrator"))
+    .then(|| hook_repo_root(&payload.cwd))
+    .flatten()
+    .and_then(|cwd| {
+        orchestrator_repo_write_target(&effective_command, &cwd, &filesystem_repo_root_of)
+    });
+
     let evidence = evaluate_with_attestation_evidence(
         &cfg.safety,
         &effective_command,
@@ -6567,6 +7132,32 @@ fn run_check_hook_mode_with_env<W: Write>(
         &scratchpad_roots,
     );
     let mut outcome = evidence.outcome.clone();
+    if let Some(target) = orchestrator_repo_write {
+        outcome = Outcome {
+            verdict: Verdict::Deny,
+            matched: Some(Rule {
+                pattern: format!(
+                    "<orchestrator seat: dispatch a worker -- repository write to {target}>"
+                ),
+                origin: Origin::BuiltIn,
+            }),
+        };
+        if let Ok(state) = super::state::StateDir::resolve(env) {
+            let session =
+                super::mail::session_identity(env).unwrap_or_else(|| payload.session_id.clone());
+            let tool_family = orchestrator_block_tool_family(&effective_command);
+            let _ = super::log::append_orchestrator_block(
+                &state,
+                &super::log::OrchestratorBlock {
+                    ts: super::state::now_secs(),
+                    session: &session,
+                    tool: &payload.tool_name,
+                    target: &tool_family,
+                    reason: "repository write",
+                },
+            );
+        }
+    }
     // Issue #168, design decision (d): a compound whose every write target
     // is confined to the session scratchpad is treated as `Allow` even when
     // it would otherwise rely on the unmatched-command mode default. Checked
@@ -7862,6 +8453,364 @@ mod tests {
     #[test]
     fn write_targets_confined_returns_none_with_no_scratchpad_roots_configured() {
         assert_eq!(write_targets_confined("echo hi > /dev/null", &[]), None);
+    }
+
+    // -- orchestrator_repo_write_target (issues #328/#334) -----------------
+
+    /// Test fake for `repo_root_of`: `/work/repo` and `/work/sibling` are
+    /// two distinct git repositories (the launch repo and a sibling
+    /// checkout/linked worktree); anything else names no repository at
+    /// all. Mirrors `filesystem_repo_root_of`'s own root-plus-separator
+    /// boundary rule, just without touching a real filesystem.
+    fn fake_repo_root_of(path: &str) -> Option<String> {
+        for root in ["/work/repo", "/work/sibling"] {
+            if path == root || path.starts_with(&format!("{root}/")) {
+                return Some(root.to_string());
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn orchestrator_repo_write_target_catches_repository_writes() {
+        let cwd = "/work/repo";
+        for command in [
+            "sed -i 's/a/b/' src/main.rs",
+            "sed -i.bak -e 's/a/b/' src/main.rs",
+            "perl -pi -e 's/a/b/' Cargo.toml",
+            "echo x > src/lib.rs",
+            "echo x >> /work/repo/README.md",
+            "cat > README.md <<'EOF'\nhi\nEOF",
+            "some | tee src/x.rs",
+            "cp /tmp/claude-501/x src/y.rs",
+            "mv a.txt docs/b.txt",
+            "python3 -c \"open('src/x.py','w').write('a')\"",
+            "node -e \"require('fs').writeFileSync('src/x.js','a')\"",
+            // Issue #334 review fix: `git apply`/`git am`/`patch` are
+            // never exempt on program name alone -- they apply an
+            // arbitrary diff, which can write anywhere.
+            "git apply p.diff",
+            "git apply - <<'EOF'\nx\nEOF",
+            "git am 0001.patch",
+            "patch -p1 < .zirv/work/p.diff",
+        ] {
+            assert!(
+                orchestrator_repo_write_target(command, cwd, &fake_repo_root_of).is_some(),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn orchestrator_repo_write_target_has_no_opinion_on_non_repository_writes() {
+        let cwd = "/work/repo";
+        for command in [
+            "echo x > .zirv/work/notes.md",
+            "echo x > /work/repo/.zirv/memory/m.md",
+            "echo x > /tmp/claude-501/s/out.md",
+            "echo x > /dev/null",
+            "git commit -m x",
+            "git checkout -- src/x.rs",
+            "cargo build",
+            "cargo fmt -- --check",
+            "sed 's/a/b/' src/main.rs",
+            "sed -n '1,5p' src/main.rs",
+            "cat src/main.rs",
+            "echo x > \"$TMPDIR/x\"",
+            "echo x > $OUT",
+            "mkdir -p .zirv/work/x && gh issue view 1 > .zirv/work/x/i.md",
+            "python3 -c \"print(open('src/x.py').read())\"",
+            "python3 -c \"open('/work/repo/.zirv/work/o.txt','w').write('a')\"",
+            "cp src/a.rs /tmp/claude-501/s/a.rs",
+            "echo x > ~/notes.md",
+            "echo x > ../outside.txt",
+            // Issue #334 review fix: `git apply`/`git am` piped straight
+            // from a `git` upstream is how the seat integrates a worker's
+            // diff, and stays exempt.
+            "git -C /w diff | git apply",
+            "git diff main | git apply -",
+            "git format-patch --stdout | git am",
+        ] {
+            assert_eq!(
+                orchestrator_repo_write_target(command, cwd, &fake_repo_root_of),
+                None,
+                "{command}"
+            );
+        }
+    }
+
+    /// Issue #334 review round 2, HIGH: a git global option ahead of the
+    /// verb (`-C <dir>`, `-c k=v`, `--git-dir=`) must not defeat detection
+    /// by being mistaken for the verb itself -- the real action comes from
+    /// `git_action`, not a raw second token, exactly for the sibling-
+    /// worktree shape this bug let through (`git -C <sibling> apply
+    /// p.diff` used to read `-C` as the verb and fall through to the
+    /// blanket `git` exemption).
+    #[test]
+    fn orchestrator_repo_write_target_sees_through_git_global_options_before_apply() {
+        let cwd = "/work/repo";
+        for command in [
+            "git -C /work/sibling apply p.diff",
+            "git -c core.autocrlf=false apply p.diff",
+            "git --git-dir=/work/repo/.git apply p.diff",
+        ] {
+            assert!(
+                orchestrator_repo_write_target(command, cwd, &fake_repo_root_of).is_some(),
+                "{command}"
+            );
+        }
+        for command in [
+            "git -C /work/wt diff | git apply",
+            "git -C /work/wt diff | git -C /work/repo apply",
+        ] {
+            assert_eq!(
+                orchestrator_repo_write_target(command, cwd, &fake_repo_root_of),
+                None,
+                "{command}"
+            );
+        }
+    }
+
+    /// Issue #334 review round 2, MEDIUM: the pipe exemption is narrowed to
+    /// an allowlist of diff-producing `git` actions -- an arbitrary `git`
+    /// subcommand (`cat-file`, reading a blob rather than a diff) must not
+    /// qualify as a safe upstream just because it is *some* `git` call, and
+    /// a non-`git` upstream (`cat`) never qualifies either.
+    #[test]
+    fn orchestrator_repo_write_target_narrows_the_pipe_exemption_to_diff_producing_git_actions() {
+        let cwd = "/work/repo";
+        for command in [
+            "git cat-file -p abc:p.diff | git apply",
+            "cat p.diff | git apply",
+        ] {
+            assert!(
+                orchestrator_repo_write_target(command, cwd, &fake_repo_root_of).is_some(),
+                "{command}"
+            );
+        }
+        for command in [
+            "git show HEAD | git apply",
+            "git diff-tree -p HEAD | git apply",
+            "git log -p -1 | git apply",
+        ] {
+            assert_eq!(
+                orchestrator_repo_write_target(command, cwd, &fake_repo_root_of),
+                None,
+                "{command}"
+            );
+        }
+    }
+
+    /// Issue #334, MAJOR review fix: the guard used to only know the
+    /// launch repo's own root, so an absolute target in a SIBLING
+    /// checkout/linked worktree of a different repository sailed through
+    /// unrecognized. `repo_root_of` is now consulted per target, so a
+    /// sibling repo's own file is caught even though it is nowhere near
+    /// `cwd`.
+    #[test]
+    fn orchestrator_repo_write_target_catches_a_sibling_checkouts_own_files_too() {
+        let cwd = "/work/repo";
+        let command = "cp /tmp/claude-501/x /work/sibling/src/a.rs";
+        assert_eq!(
+            orchestrator_repo_write_target(command, cwd, &fake_repo_root_of),
+            Some("/work/sibling/src/a.rs".to_string())
+        );
+    }
+
+    /// The other half: a sibling repo's OWN `.zirv/work`/`.zirv/memory`
+    /// still confines a write, exactly as the launch repo's own does --
+    /// the allowed roots are resolved against WHICHEVER repo the target
+    /// lands in, not hardcoded to the launch repo.
+    #[test]
+    fn orchestrator_repo_write_target_allows_a_sibling_checkouts_own_scratchpad() {
+        let cwd = "/work/repo";
+        for command in [
+            "cp /tmp/claude-501/x /work/sibling/.zirv/work/o.txt",
+            "echo x > /work/sibling/.zirv/memory/m.md",
+        ] {
+            assert_eq!(
+                orchestrator_repo_write_target(command, cwd, &fake_repo_root_of),
+                None,
+                "{command}"
+            );
+        }
+    }
+
+    /// An absolute target that names no repository at all (per
+    /// `repo_root_of`) is not a repository write -- there is no repo whose
+    /// boundary it could be crossing.
+    #[test]
+    fn orchestrator_repo_write_target_allows_an_absolute_path_outside_any_known_repo() {
+        let cwd = "/work/repo";
+        let command = "cp /tmp/claude-501/x /elsewhere/not-a-repo/file.txt";
+        assert_eq!(
+            orchestrator_repo_write_target(command, cwd, &fake_repo_root_of),
+            None
+        );
+    }
+
+    /// `filesystem_repo_root_of` walks up from a target's PARENT (the
+    /// target itself need not exist yet) until it finds a `.git` entry --
+    /// here, two directories up.
+    #[test]
+    fn filesystem_repo_root_of_walks_up_to_the_nearest_git_marker() {
+        let root = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(root.path().join(".git")).expect("git marker");
+        let nested = root.path().join("src").join("nested");
+        std::fs::create_dir_all(&nested).expect("mkdir nested");
+        let target = nested.join("file.rs");
+        let target_str = target.to_string_lossy().replace('\\', "/");
+
+        let found = filesystem_repo_root_of(&target_str).expect("finds the repo root");
+        let expected = root
+            .path()
+            .to_string_lossy()
+            .replace('\\', "/")
+            .trim_end_matches('/')
+            .to_string();
+        assert_eq!(found, expected);
+    }
+
+    /// End-to-end: an orchestrator seat's `sed -i` on a repository file
+    /// denies through the hook, naming the guard's own rule text.
+    #[test]
+    fn orchestrator_seat_repository_write_denies_through_the_hook() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        // `filesystem_repo_root_of` only checks for a `.git` entry, so a
+        // bare marker directory is enough to stand in for a real repo --
+        // no `git init`/real git binary needed.
+        std::fs::create_dir_all(repo.path().join(".git")).expect("fake git marker");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = super::super::testenv::HomeGuard::set(home.path());
+        let empty: HashMap<String, String> = HashMap::new();
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("loads");
+        let repo_cwd = repo.path().to_string_lossy().replace('\\', "/");
+
+        let mut env_map: HashMap<String, String> = HashMap::new();
+        env_map.insert(
+            super::super::adapters::SEAT_ROLE_ENV.to_string(),
+            "orchestrator".to_string(),
+        );
+        let stdin = format!(
+            r#"{{"tool_name":"Bash","tool_input":{{"command":"sed -i 's/a/b/' src/main.rs"}},"permission_mode":"default","cwd":"{repo_cwd}"}}"#
+        );
+        let mut out = Vec::new();
+        run_check_hook_mode_with_env(&cfg, &mut out, &stdin, &|k| env_map.get(k).cloned())
+            .expect("runs");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            text.contains(r#""permissionDecision":"deny""#),
+            "got {text}"
+        );
+        assert!(
+            text.contains("orchestrator seat: dispatch a worker"),
+            "got {text}"
+        );
+    }
+
+    /// The same repository-write command from a non-orchestrator seat (no
+    /// role env at all, or an explicit `worker` role) is never denied by
+    /// this rule -- the guard is scoped to the orchestrator seat only.
+    #[test]
+    fn orchestrator_seat_repository_write_guard_does_not_apply_off_the_orchestrator_seat() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = super::super::testenv::HomeGuard::set(home.path());
+        let empty: HashMap<String, String> = HashMap::new();
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("loads");
+        let repo_cwd = repo.path().to_string_lossy().replace('\\', "/");
+        let stdin = format!(
+            r#"{{"tool_name":"Bash","tool_input":{{"command":"sed -i 's/a/b/' src/main.rs"}},"permission_mode":"default","cwd":"{repo_cwd}"}}"#
+        );
+
+        for env_map in [
+            HashMap::new(),
+            HashMap::from([(
+                super::super::adapters::SEAT_ROLE_ENV.to_string(),
+                "worker".to_string(),
+            )]),
+        ] {
+            let mut out = Vec::new();
+            run_check_hook_mode_with_env(&cfg, &mut out, &stdin, &|k| env_map.get(k).cloned())
+                .expect("runs");
+            let text = String::from_utf8(out).expect("utf8");
+            assert!(
+                !text.contains("orchestrator seat: dispatch a worker"),
+                "{env_map:?}: got {text}"
+            );
+        }
+    }
+
+    /// An orchestrator-seat write CONFINED to `.zirv/work` is not denied by
+    /// this rule -- the scratchpad/allowed-root carve-out still applies.
+    #[test]
+    fn orchestrator_seat_write_confined_to_zirv_work_is_not_denied() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".git")).expect("fake git marker");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = super::super::testenv::HomeGuard::set(home.path());
+        let empty: HashMap<String, String> = HashMap::new();
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("loads");
+        let repo_cwd = repo.path().to_string_lossy().replace('\\', "/");
+
+        let mut env_map: HashMap<String, String> = HashMap::new();
+        env_map.insert(
+            super::super::adapters::SEAT_ROLE_ENV.to_string(),
+            "orchestrator".to_string(),
+        );
+        let stdin = format!(
+            r#"{{"tool_name":"Bash","tool_input":{{"command":"echo x > .zirv/work/n.md"}},"permission_mode":"default","cwd":"{repo_cwd}"}}"#
+        );
+        let mut out = Vec::new();
+        run_check_hook_mode_with_env(&cfg, &mut out, &stdin, &|k| env_map.get(k).cloned())
+            .expect("runs");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            !text.contains("orchestrator seat: dispatch a worker"),
+            "got {text}"
+        );
+    }
+
+    /// A denied repository write appends one `orchestrator-blocks.jsonl`
+    /// row whose `target` is a program-family label, never the full
+    /// command text.
+    #[test]
+    fn orchestrator_seat_repository_write_denial_appends_an_orchestrator_block() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".git")).expect("fake git marker");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = super::super::testenv::HomeGuard::set(home.path());
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let empty: HashMap<String, String> = HashMap::new();
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("loads");
+        let repo_cwd = repo.path().to_string_lossy().replace('\\', "/");
+
+        let mut env_map: HashMap<String, String> = HashMap::new();
+        env_map.insert(
+            super::super::adapters::SEAT_ROLE_ENV.to_string(),
+            "orchestrator".to_string(),
+        );
+        env_map.insert(
+            super::super::state::STATE_ENV.to_string(),
+            state_dir.path().to_string_lossy().to_string(),
+        );
+        let command = "sed -i 's/a/b/' src/main.rs";
+        let stdin = format!(
+            r#"{{"tool_name":"Bash","tool_input":{{"command":"{command}"}},"permission_mode":"default","cwd":"{repo_cwd}"}}"#
+        );
+        let mut out = Vec::new();
+        run_check_hook_mode_with_env(&cfg, &mut out, &stdin, &|k| env_map.get(k).cloned())
+            .expect("runs");
+
+        let state = super::super::state::StateDir::from_root(state_dir.path().to_path_buf());
+        let records = super::super::log::read_orchestrator_blocks(&state);
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert_eq!(records[0].tool, "Bash");
+        assert!(
+            !records[0].target.contains(command),
+            "target must not carry the full command text: {:?}",
+            records[0].target
+        );
     }
 
     #[test]

@@ -89,6 +89,25 @@ pub const AGENT_ENV: &str = "ZIRV_CTX_AGENT";
 /// exactly like `SESSION_ENV`/`SOCKET_ENV`.
 pub const SEAT_MODEL_ENV: &str = "ZIRV_CTX_SEAT_MODEL";
 
+/// Tells a spawned session which **role** launched it -- orchestrator,
+/// sub-orchestrator, or worker -- so a hook process (`zirv ctx hook
+/// pretool`, `zirv ctx safety check`) and `zirv ctx agent` can learn which
+/// seat role is running without re-deriving it. Only the value
+/// `"orchestrator"` ever gates any behaviour: an orchestrator seat must be
+/// technically unable to edit repository files, and delegation inside the
+/// same harness must use the harness's own native subagent tool rather than
+/// a nested `zirv ctx` launch (issues #328/#334).
+///
+/// Set for every role, unlike `SEAT_MODEL_ENV` (orchestrator-only) -- a
+/// worker or sub-orchestrator seat needs to be told apart from an
+/// orchestrator seat just as reliably as an orchestrator needs to be
+/// detected. Inherited exactly like `SEAT_MODEL_ENV`: listed in `sessions::
+/// SUPERVISION_ENV` so a worker spawned from inside an orchestrator session
+/// has it scrubbed rather than inherited -- a seat's role is a property of
+/// the session that owns it, exactly like `SESSION_ENV`/`SOCKET_ENV`/
+/// `SEAT_MODEL_ENV`.
+pub const SEAT_ROLE_ENV: &str = "ZIRV_CTX_SEAT_ROLE";
+
 /// Set on every child zirv itself launches interactively -- `zirv chat`,
 /// `zirv ctx wrap`, or a dashboard pane spawned from a request that vouches
 /// a human is present (`SpawnRequest.interactive`) -- so `zirv ctx safety
@@ -991,6 +1010,17 @@ pub fn seat_model_env(
         Some(model) => vec![(SEAT_MODEL_ENV.to_string(), model.to_string())],
         None => Vec::new(),
     }
+}
+
+/// The `SEAT_ROLE_ENV` pair a launch exports -- unlike `seat_model_env`,
+/// unconditional for every role, since a hook process (`zirv ctx hook
+/// pretool`, `zirv ctx safety check`) and `zirv ctx agent` need to tell a
+/// worker or sub-orchestrator seat apart from an orchestrator one just as
+/// reliably as they need to detect an orchestrator seat at all. Only the
+/// value `"orchestrator"` ever gates any behaviour (issues #328/#334). Pure,
+/// so which role a launch discloses is testable without a pty.
+pub fn seat_role_env(role: super::prompt::PromptRole) -> Vec<(String, String)> {
+    vec![(SEAT_ROLE_ENV.to_string(), role.label().to_string())]
 }
 
 /// `Debug` is a supertrait so `Box<dyn AgentAdapter>` can appear in
@@ -5886,6 +5916,30 @@ mod tests {
                 Some(Path::new("/scratch")),
             ),
             vec!["/scratch/claude-501".to_string()]
+        );
+    }
+
+    // -- the seat role env every launch exports (issues #328/#334) ---------
+
+    /// Unlike `seat_model_env` (orchestrator-only), `seat_role_env` fires
+    /// for every role -- a hook process needs to tell a worker or
+    /// sub-orchestrator seat apart from an orchestrator one just as
+    /// reliably as it needs to detect an orchestrator seat at all.
+    #[test]
+    fn seat_role_env_labels_every_role() {
+        use crate::commands::ctx::prompt::PromptRole;
+
+        assert_eq!(
+            seat_role_env(PromptRole::Orchestrator),
+            vec![(SEAT_ROLE_ENV.to_string(), "orchestrator".to_string())]
+        );
+        assert_eq!(
+            seat_role_env(PromptRole::SubOrchestrator),
+            vec![(SEAT_ROLE_ENV.to_string(), "sub-orchestrator".to_string())]
+        );
+        assert_eq!(
+            seat_role_env(PromptRole::Worker),
+            vec![(SEAT_ROLE_ENV.to_string(), "worker".to_string())]
         );
     }
 }

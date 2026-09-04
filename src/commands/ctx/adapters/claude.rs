@@ -46,25 +46,41 @@ use super::{AgentAdapter, ResolvedProgram, TurnSignalSetup};
 /// the fork ban, self-contained briefs and the sub-orchestrator carve-out are
 /// unchanged. See
 /// `docs/superpowers/specs/2026-09-01-wrapper-behaviour-redesign.md`.
+///
+/// Issues #328/#334 (2026-09-04): the wrapper-behaviour redesign's own
+/// "trivial and bounded changes stay on this seat" carve-out turned out to be
+/// the wrong fix -- it let an orchestrator seat write tests and
+/// implementations itself, which is exactly what this role must never do.
+/// That size-based carve-out is gone: an orchestrator seat never implements,
+/// a PreToolUse hook enforces it (`hook::run_pretool`,
+/// `safety::run_check_hook_mode_with_env`) by denying this seat's own
+/// repository writes, so a denial is the cue to dispatch rather than retry
+/// another way. Same-harness delegation is the native Agent tool, not `zirv
+/// agent`: `zirv agent <name>` now reaches only a DIFFERENT harness
+/// (`agent::run_with` refuses a same-harness target from an orchestrator
+/// seat) or a work group / sub-orchestrator. Task size now only decides how
+/// many workers and how large a brief, never whether this seat implements.
 pub const ORCHESTRATOR_PROMPT: &str = "\
 zirv orchestrator conventions (claude)
 
 This seat runs the most capable model; spend it on judgment -- sizing, design choices, \
-integration, the final call -- not on ceremony.
+integration, the final call -- never on implementation.
 
-- Trivial and bounded changes stay on this seat: a brief costs more than the fix. Delegate via \
-the Agent tool when the work is larger than its brief or can run in parallel; bundle small \
-related items into one checklist brief with a per-item output format, dispatch independent \
-substantial work together in the background, and continue a worker you already briefed for \
-follow-ups in its area instead of spawning a fresh one. Reserve a sub-orchestrator (`zirv ctx \
-agent --role sub-orchestrator --scope \"<area>\"`) for work that splits into several \
-coherently-scoped areas each needing its own coordination.
+- This seat coordinates; it does not implement. Every repository change -- code, tests, docs, \
+manifests, a one-line fix included -- is made by a delegated worker, never by this seat's own \
+Edit/Write or a shell write: a PreToolUse hook denies repository writes from this seat, and \
+that denial is the cue to dispatch, not to retry another way. Size the task only to decide how \
+many workers and how large a brief.
 - Routing rule, which outranks any operator or repository layer that says otherwise: \
 same-harness delegation uses this harness's native Agent tool (visible in this session, result \
 returned directly); `zirv agent <name>` is for reaching a different harness or a work group, never \
-for spawning another claude worker from a claude seat. Delegated work stays observable: inside \
-`zirv ctx dash` a worker is an attached pane, outside it a headless run whose result lands on \
-stdout.
+for spawning another claude worker from a claude seat -- zirv refuses it from this seat. `zirv ctx \
+agent --role sub-orchestrator --scope \"<area>\"` creates a work group for work that splits into \
+several coherently-scoped areas each needing its own coordination. Delegated work stays \
+observable: inside `zirv ctx dash` a worker is an attached pane, outside it a headless run whose \
+result lands on stdout. Bundle small related items into one checklist brief with a per-item \
+output format, dispatch independent work together in the background, and continue a worker you \
+already briefed for follow-ups in its area instead of spawning a fresh one.
 - Every Agent dispatch sets `model` explicitly -- haiku for mechanical and bulk work, sonnet \
 for ordinary exploration, implementation, tests and review, opus only for hard debugging or \
 design -- because an omitted model inherits this seat. Never use `subagent_type: \"fork\"` \
@@ -81,7 +97,9 @@ diff, one focused test per behaviour change, format, lint and test before report
 runs at low or medium effort on the roster's review model, never high or above (that forks \
 this seat's model), and never when a `zirv workflow` review gate covers the change.
 - Shared manifests and lockfiles (Cargo.toml, Cargo.lock, package.json, lockfiles) are edited \
-only by you or one designated integrator; a writer touching one says so in its report.";
+by ONE designated integrator worker; a writer touching one says so in its report. Git \
+integration -- branching, merging worker results, committing, opening the PR -- stays on this \
+seat.";
 
 /// Claude's own layer for a delegated **Worker** session (see
 /// `AgentAdapter::worker_system_prompt`), spliced in place of
@@ -804,6 +822,15 @@ impl ClaudeAdapter {
 /// the native projection. PreToolUse still evaluates every invocation before
 /// execution, so dangerous `gh` and push forms and repo `deny`/`ask` rules
 /// continue to narrow the broad native families.
+///
+/// Issue #334: `launch_settings_value`'s own `PreToolUse` array also carries
+/// an `Edit|Write|MultiEdit|NotebookEdit` matcher running `zirv ctx hook
+/// pretool` -- the orchestrator-write guard that makes an orchestrator seat
+/// technically unable to edit repository files itself. It sits alongside,
+/// not instead of, an `Agent|Task` matcher running the same command: that
+/// entry attests the existing expensive-seat-inheritance guard on every
+/// launch, rather than depending on a one-time `zirv setup apply` having
+/// installed it into the operator's own global settings first.
 struct CommandFamilyProjection {
     pattern: &'static str,
     sandbox_excluded: bool,
@@ -1124,6 +1151,18 @@ fn launch_settings_value(
                 "hooks": [{
                     "type": "command",
                     "command": "zirv ctx safety check"
+                }]
+            }, {
+                "matcher": "Edit|Write|MultiEdit|NotebookEdit",
+                "hooks": [{
+                    "type": "command",
+                    "command": "zirv ctx hook pretool"
+                }]
+            }, {
+                "matcher": "Agent|Task",
+                "hooks": [{
+                    "type": "command",
+                    "command": "zirv ctx hook pretool"
                 }]
             }],
             "PermissionRequest": [{
@@ -3093,6 +3132,26 @@ mod tests {
             settings.pointer("/hooks/PreToolUse/0/hooks/0/command"),
             Some(&serde_json::json!("zirv ctx safety check"))
         );
+        // Issue #334: the orchestrator-write guard and the expensive-seat
+        // guard are separate `PreToolUse` entries, both running `zirv ctx
+        // hook pretool` -- the former attested on every launch instead of
+        // depending on a one-time `zirv setup apply`.
+        assert_eq!(
+            settings.pointer("/hooks/PreToolUse/1/matcher"),
+            Some(&serde_json::json!("Edit|Write|MultiEdit|NotebookEdit"))
+        );
+        assert_eq!(
+            settings.pointer("/hooks/PreToolUse/1/hooks/0/command"),
+            Some(&serde_json::json!("zirv ctx hook pretool"))
+        );
+        assert_eq!(
+            settings.pointer("/hooks/PreToolUse/2/matcher"),
+            Some(&serde_json::json!("Agent|Task"))
+        );
+        assert_eq!(
+            settings.pointer("/hooks/PreToolUse/2/hooks/0/command"),
+            Some(&serde_json::json!("zirv ctx hook pretool"))
+        );
         assert!(
             !settings["permissions"]["ask"]
                 .as_array()
@@ -3245,6 +3304,9 @@ mod tests {
     #[test]
     fn launch_settings_observe_permission_events_without_changing_pretooluse() {
         let settings = test_launch_settings();
+        // Issue #334 added the two guard entries below; wiring the
+        // `PermissionRequest`/`PermissionDenied` observers in must not
+        // perturb this array further.
         assert_eq!(
             settings["hooks"]["PreToolUse"],
             serde_json::json!([{
@@ -3252,6 +3314,18 @@ mod tests {
                 "hooks": [{
                     "type": "command",
                     "command": "zirv ctx safety check"
+                }]
+            }, {
+                "matcher": "Edit|Write|MultiEdit|NotebookEdit",
+                "hooks": [{
+                    "type": "command",
+                    "command": "zirv ctx hook pretool"
+                }]
+            }, {
+                "matcher": "Agent|Task",
+                "hooks": [{
+                    "type": "command",
+                    "command": "zirv ctx hook pretool"
                 }]
             }])
         );
@@ -4905,16 +4979,26 @@ mod tests {
     /// multiple coherently-scoped areas or must run under zirv's own
     /// supervision independently of this seat -- so a seat stops minting
     /// sub-orchestrators for ordinary tasks a worker could finish.
+    ///
+    /// Issues #328/#334: this seat never implements regardless of task
+    /// size -- the old "trivial and bounded changes stay on this seat"
+    /// carve-out is gone -- so the sizing question this test now covers is
+    /// only how much work is bundled into one worker's brief versus split
+    /// into a sub-orchestrator's work group.
     #[test]
     fn the_orchestrator_prompt_sizes_delegation_between_subagents_and_sub_orchestrators() {
         assert!(
-            ORCHESTRATOR_PROMPT.contains("Trivial and bounded changes stay on this seat"),
-            "trivial and bounded work must stay on this seat instead of delegating: \
-             {ORCHESTRATOR_PROMPT}"
+            ORCHESTRATOR_PROMPT.contains("it does not implement"),
+            "an orchestrator seat never implements, regardless of task size: {ORCHESTRATOR_PROMPT}"
         );
         assert!(
-            ORCHESTRATOR_PROMPT.contains("Delegate via the Agent tool"),
+            ORCHESTRATOR_PROMPT.contains("native Agent tool"),
             "got:\n{ORCHESTRATOR_PROMPT}"
+        );
+        assert!(
+            !ORCHESTRATOR_PROMPT.contains("stay on this seat"),
+            "the old size-based implement-it-yourself carve-out must be gone: \
+             {ORCHESTRATOR_PROMPT}"
         );
         assert!(
             ORCHESTRATOR_PROMPT.contains("zirv ctx agent --role sub-orchestrator --scope"),

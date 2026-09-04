@@ -2022,6 +2022,10 @@ fn run_with_clock_inner<W: Write>(
                     tool_calls: worker_budget.tool_calls,
                 },
                 now: now_fn(),
+                // A running worker's own vendor-blocked reroute is not an
+                // orchestrator-seat delegation (issue #328's exclusion is
+                // scoped to `agent::run_with` specifically).
+                exclude: None,
             };
             let route = (adapter_builds_launch && prompt.is_some())
                 .then(|| {
@@ -2035,7 +2039,13 @@ fn run_with_clock_inner<W: Write>(
                 .flatten();
             let alternate = route
                 .as_ref()
-                .map(|route| (route.selected.clone(), route.model.clone(), route.detail()))
+                .map(|route| {
+                    (
+                        route.selected.clone(),
+                        route.model.clone(),
+                        route.detail(super::pace::Seat::Cli),
+                    )
+                })
                 .or_else(|| {
                     deferred_reset.as_ref().and_then(|choice| {
                         if !choice.is_cross_harness() {
@@ -5133,6 +5143,7 @@ mod tests {
                     used_percentage: percent,
                     resets_at: now + resets_in,
                     observed_at: now,
+                    overage_covered: false,
                 }),
                 seven_day: None,
             },

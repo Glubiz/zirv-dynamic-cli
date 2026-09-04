@@ -303,8 +303,9 @@ impl StateDir {
         self.0.join("mail")
     }
 
-    /// Cross-session memory bank: `<state>/memory/<repo_slug>/...`. See
-    /// `super::memory` for the storage layout and entry format.
+    /// Cross-session memory banks: `<state>/memory/<repo_slug>/...` and the
+    /// machine-wide `<state>/memory/_global/...`. See `super::memory` for the
+    /// storage layout and entry format.
     pub fn memory(&self) -> PathBuf {
         self.0.join("memory")
     }
@@ -605,6 +606,19 @@ mod tests {
         assert_eq!(
             repo_slug(std::path::Path::new("/Users/x/Documents/my repo.git")),
             "-Users-x-Documents-my-repo-git"
+        );
+    }
+
+    #[test]
+    fn the_global_memory_slug_cannot_collide_with_a_repository_slug() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let slug = repo_slug(&repo.path().join("_global"));
+        assert_ne!(slug, super::super::memory::GLOBAL_SLUG);
+        assert!(
+            super::super::memory::GLOBAL_SLUG
+                .chars()
+                .any(|ch| !ch.is_ascii_alphanumeric() && ch != '-'),
+            "the reserved global slug must contain a character repo_slug never emits"
         );
     }
 

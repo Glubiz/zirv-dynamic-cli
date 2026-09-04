@@ -818,6 +818,42 @@ fn spend_status_line(
     )
 }
 
+/// Issues #328/#334: one line naming how many writes an orchestrator seat's
+/// own guard has refused -- `None` when `log::read_orchestrator_blocks`
+/// returns nothing, so an unmodified report's bytes stay byte-identical.
+/// "This session" sums rows whose `session` matches `mail::
+/// session_identity(env)`, the identical rule `spend_status_line` uses for
+/// its own "this session" figure; "total" is every row ever logged, and
+/// "last" is the newest row (`log::read_orchestrator_blocks` returns oldest
+/// first).
+fn orchestrator_blocks_status_line(
+    state: &StateDir,
+    env: EnvLookup<'_>,
+    colour: bool,
+) -> Option<String> {
+    let rows = log::read_orchestrator_blocks(state);
+    let last = rows.last()?;
+    let session_ident = mail::session_identity(env);
+    let this_session = rows
+        .iter()
+        .filter(|row| session_ident.as_deref() == Some(row.session.as_str()))
+        .count();
+    Some(format!(
+        "{} {}",
+        label(colour, "orchestrator writes blocked:"),
+        style::paint(
+            &format!(
+                "{this_session} this session \u{b7} {} total (last: {} {})",
+                rows.len(),
+                last.tool,
+                last.target,
+            ),
+            Tone::Warn,
+            colour,
+        )
+    ))
+}
+
 fn render_report<W: Write>(
     args: &StatusArgs,
     w: &mut W,
@@ -969,6 +1005,12 @@ fn render_report<W: Write>(
             // rate-limit window (`pace::current_windows` tracks that
             // separately, in tokens, not dollars).
             writeln!(w, "{}", spend_status_line(&state, cfg, env, colour))?;
+            // Issues #328/#334: present in `--brief` too, the same allowance
+            // `spend:` gets, and silent (no line at all) when nothing has
+            // ever been blocked -- see `orchestrator_blocks_status_line`.
+            if let Some(line) = orchestrator_blocks_status_line(&state, env, colour) {
+                writeln!(w, "{line}")?;
+            }
             if cfg.fallback.enabled && !args.brief {
                 let now = crate::commands::ctx::state::now_secs();
                 for name in &cfg.fallback.order {
@@ -3156,6 +3198,7 @@ mod tests {
                     // start failing this test for reasons unrelated to it.
                     resets_at: crate::commands::ctx::state::now_secs() + 1000,
                     observed_at: crate::commands::ctx::state::now_secs(),
+                    overage_covered: false,
                 }),
                 seven_day: None,
             },
@@ -3249,6 +3292,97 @@ mod tests {
         }
     }
 
+    /// Issues #328/#334: `orchestrator writes blocked:` names both this
+    /// session's own refused count and the all-time total, plus the newest
+    /// blocked call -- and appears in `--brief` too, the same allowance
+    /// `spend:` gets.
+    #[test]
+    fn status_reports_orchestrator_blocks_this_session_and_total() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(tmp.path().join("state"));
+        state.ensure().expect("ensure");
+
+        log::append_orchestrator_block(
+            &state,
+            &log::OrchestratorBlock {
+                ts: crate::commands::ctx::state::now_secs(),
+                session: "aaaa1111",
+                tool: "Edit",
+                target: "/work/repo/src/main.rs",
+                reason: "orchestrator seats may not edit repository files",
+            },
+        )
+        .expect("append");
+        log::append_orchestrator_block(
+            &state,
+            &log::OrchestratorBlock {
+                ts: crate::commands::ctx::state::now_secs(),
+                session: "bbbb2222",
+                tool: "Bash",
+                target: "sed -i",
+                reason: "orchestrator seats may not edit repository files",
+            },
+        )
+        .expect("append");
+
+        let mut env = env_for(state.root());
+        env.insert(
+            crate::commands::ctx::adapters::SESSION_ENV.to_string(),
+            "aaaa1111".to_string(),
+        );
+
+        for brief in [false, true] {
+            let mut out = Vec::new();
+            run_with(
+                &StatusArgs {
+                    decisions: 5,
+                    brief,
+                    diff: false,
+                    breakdown: None,
+                },
+                &mut out,
+                tmp.path(),
+                &|k| env.get(k).cloned(),
+                false,
+            )
+            .expect("runs");
+            let text = String::from_utf8(out).expect("utf8");
+            assert!(
+                text.contains(
+                    "orchestrator writes blocked: 1 this session \u{b7} 2 total (last: Bash sed -i)"
+                ),
+                "brief={brief}: got {text}"
+            );
+        }
+    }
+
+    /// Nothing blocked yet must render byte-identical to before this line
+    /// existed -- no `orchestrator writes blocked:` text at all.
+    #[test]
+    fn status_omits_the_orchestrator_blocks_line_with_no_rows() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        state.ensure().expect("ensure");
+        let env = env_for(state.root());
+
+        let mut out = Vec::new();
+        run_with(
+            &StatusArgs {
+                decisions: 5,
+                brief: false,
+                diff: false,
+                breakdown: None,
+            },
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            false,
+        )
+        .expect("runs");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(!text.contains("orchestrator writes blocked"), "got {text}");
+    }
+
     /// The fourth surface change: a window whose `resets_at` has provably
     /// passed must read as `style::PLACEHOLDER` (issue #202: unknown values
     /// use the shared placeholder, never the word "unknown"), the same
@@ -3269,6 +3403,7 @@ mod tests {
                     used_percentage: 77.0,
                     resets_at: 1, // long past any real wall clock
                     observed_at: 1,
+                    overage_covered: false,
                 }),
                 seven_day: None,
             },
@@ -3332,6 +3467,7 @@ mod tests {
                     used_percentage: 77.0,
                     resets_at: 1_785_509_000,
                     observed_at: crate::commands::ctx::state::now_secs(),
+                    overage_covered: false,
                 }),
                 seven_day: None,
             },

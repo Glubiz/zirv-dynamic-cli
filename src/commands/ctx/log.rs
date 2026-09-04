@@ -10,6 +10,7 @@ pub const LOG_FILE: &str = "decisions.jsonl";
 pub const SAFETY_LOG_DIR: &str = "safety-decisions";
 pub const DELEGATION_FILE: &str = "delegations.jsonl";
 pub const PERMISSION_PROMPTS_FILE: &str = "permission-prompts.jsonl";
+pub const ORCHESTRATOR_BLOCKS_FILE: &str = "orchestrator-blocks.jsonl";
 
 /// `Decision::action` for the one-line marker written into the MAIN decision
 /// log alongside every delegation record.
@@ -229,6 +230,65 @@ pub struct PermissionPromptRecord {
 /// delegations` gives its own file.
 pub fn read_permission_prompts(state: &StateDir) -> Vec<PermissionPromptRecord> {
     let path = state.logs().join(PERMISSION_PROMPTS_FILE);
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect()
+}
+
+/// One tool call an orchestrator seat's own guard refused because it would
+/// have edited a repository file directly (issues #328/#334): an
+/// orchestrator seat must be technically unable to edit repository files,
+/// and delegation inside the same harness must go through the harness's own
+/// native subagent tool instead. Privacy-preserving like `SafetyDecision`:
+/// `target` never carries full command text, only a path or a program
+/// family.
+#[derive(Debug, Serialize)]
+pub struct OrchestratorBlock<'a> {
+    pub ts: u64,
+    /// zirv session short id (`mail::session_identity`), else the harness's
+    /// own session id.
+    pub session: &'a str,
+    /// Tool name: Edit, Write, MultiEdit, NotebookEdit, Bash, PowerShell.
+    pub tool: &'a str,
+    /// What was blocked: a file path for file tools; for Bash the program
+    /// family (e.g. "sed -i"), NEVER the full command text.
+    pub target: &'a str,
+    pub reason: &'a str,
+}
+
+/// Appends to `orchestrator-blocks.jsonl`, the same private dir/append-file
+/// contract `append`/`append_delegation` give their own flat logs.
+pub fn append_orchestrator_block(state: &StateDir, block: &OrchestratorBlock<'_>) -> CtxResult<()> {
+    let dir = state.logs();
+    super::state::create_private_dir_all(&dir)?;
+    let mut file = super::state::open_private_append(&dir.join(ORCHESTRATOR_BLOCKS_FILE))?;
+    writeln!(file, "{}", serde_json::to_string(block)?)?;
+    Ok(())
+}
+
+/// The owned, deserializable counterpart of [`OrchestratorBlock`] (which
+/// borrows and is serialize-only) -- what [`read_orchestrator_blocks`]
+/// parses one logged line back into, the same borrowed-for-writing/owned-
+/// for-reading split `SafetyDecision`/`SafetyDecisionRecord` already uses.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct OrchestratorBlockRecord {
+    pub ts: u64,
+    pub session: String,
+    pub tool: String,
+    pub target: String,
+    pub reason: String,
+}
+
+/// Reads every parseable line in `orchestrator-blocks.jsonl`, oldest first --
+/// a missing file is an empty list, not an error, and a corrupt line is
+/// skipped rather than fatal, the same best-effort contract `read_
+/// permission_prompts` gives its own file.
+pub fn read_orchestrator_blocks(state: &StateDir) -> Vec<OrchestratorBlockRecord> {
+    let path = state.logs().join(ORCHESTRATOR_BLOCKS_FILE);
     let Ok(text) = std::fs::read_to_string(path) else {
         return Vec::new();
     };
@@ -1003,6 +1063,85 @@ mod tests {
         }
 
         let records = read_permission_prompts(&state);
+        assert_eq!(records.len(), 1, "the corrupt line is skipped: {records:?}");
+        assert_eq!(records[0].tool, "Edit");
+    }
+
+    /// Issues #328/#334: every field of two logged `orchestrator-blocks.jsonl`
+    /// rows round-trips back through `read_orchestrator_blocks`, oldest first.
+    #[test]
+    fn orchestrator_blocks_append_as_jsonl_and_round_trip_in_order() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+
+        append_orchestrator_block(
+            &state,
+            &OrchestratorBlock {
+                ts: 1_700_000_000,
+                session: "sess-1",
+                tool: "Edit",
+                target: "/work/repo/src/main.rs",
+                reason: "orchestrator seats may not edit repository files",
+            },
+        )
+        .expect("append");
+        append_orchestrator_block(
+            &state,
+            &OrchestratorBlock {
+                ts: 1_700_000_100,
+                session: "sess-1",
+                tool: "Bash",
+                target: "sed -i",
+                reason: "orchestrator seats may not edit repository files",
+            },
+        )
+        .expect("append");
+
+        let records = read_orchestrator_blocks(&state);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].session, "sess-1");
+        assert_eq!(records[0].tool, "Edit");
+        assert_eq!(records[0].target, "/work/repo/src/main.rs");
+        assert_eq!(records[1].tool, "Bash");
+        assert_eq!(records[1].target, "sed -i");
+    }
+
+    /// No file at all is an empty list, not an error -- no tool call has
+    /// ever been blocked on this machine.
+    #[test]
+    fn read_orchestrator_blocks_before_any_exist_is_empty_not_an_error() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        assert!(read_orchestrator_blocks(&state).is_empty());
+    }
+
+    /// A corrupt line landing in the middle of a concurrent write is
+    /// skipped, not fatal -- the same tolerance `read_permission_prompts`
+    /// already gives its own file.
+    #[test]
+    fn read_orchestrator_blocks_skips_a_corrupt_line() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        append_orchestrator_block(
+            &state,
+            &OrchestratorBlock {
+                ts: 1_700_000_000,
+                session: "sess-1",
+                tool: "Edit",
+                target: "/work/repo",
+                reason: "orchestrator seats may not edit repository files",
+            },
+        )
+        .expect("append");
+        {
+            let mut file = super::super::state::open_private_append(
+                &state.logs().join(ORCHESTRATOR_BLOCKS_FILE),
+            )
+            .expect("open");
+            writeln!(file, "not json").expect("write corrupt line");
+        }
+
+        let records = read_orchestrator_blocks(&state);
         assert_eq!(records.len(), 1, "the corrupt line is skipped: {records:?}");
         assert_eq!(records[0].tool, "Edit");
     }
