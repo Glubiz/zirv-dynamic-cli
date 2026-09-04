@@ -14,6 +14,8 @@ Each entry gets a changelog comment at the top of the file, newest first:
 <!-- Updated YYYY-MM-DD (branch, state): what changed -->
 ```
 
+<!-- Updated 2026-09-04 (release/3.17.0-harness-batch-5, issue #310): recorded that the interactive `wrap` path has no stall detection yet -- `stall.rs`'s progress-clock/latch mechanism lives entirely in `exec`'s own tick today -->
+<!-- Updated 2026-09-04 (release/3.17.0-harness-batch-5, issue #312): recorded that `rot::Score.window_breakdown` is always `None` as returned by `score_from`/`score_events` -- it is attached post-hoc by `score.rs`, never by the engine itself -->
 <!-- Updated 2026-09-04 (release/3.16.0-harness-batch-4, issue #318): recorded that a dashboard-restored pane loses its declared --result-schema/--result-kind OUTPUT CONTRACT env, since roster::RosterPane carries no field for it -->
 <!-- Updated 2026-09-03 (fix/prompt-free-posture-329, issue #329, v3.14.0): recorded two candidates surfaced while implementing #329 -- codex 0.149+ prompting on ordinary zirv commands with dynamic shell words (upstream, no per-command allowlist key exists in codex 0.152) and repo-defined zirv scripts (`zirv sgc`/`zirv lint`) still asking on an unsandboxed retry by design, since `[safety] escape_allow` is the intended standing-approval mechanism for that case -->
 <!-- Updated 2026-09-02 (feat/wrapper-proportionality, harness iteration round 3): resolved a status.rs test hermeticity gap -- status_shows_no_usage_source_for_a_codex_configured_repo_rather_than_anthropic_numbers read the real ~/.zirv/ctx.toml with no HomeGuard, so a machine with operator config touching usage/agent resolution could flip the assertion; root cause of an intermittent CI flake -->
@@ -83,6 +85,14 @@ Each entry gets a changelog comment at the top of the file, newest first:
 <!-- Updated 2026-08-13 (feat/dashboard, docs sweep): dashboard panes carry no rot score yet -->
 <!-- Updated 2026-08-13 (feat/agent-coordination, review round): markdown header absorption; registry short is a stable address; supervision env scrubbed on every spawn -->
 <!-- Updated 2026-08-13 (feat/agent-coordination, console-safety round): portable-pty do_kill inversion; ConPTY control-byte broadcast; empty nudge prefixes -->
+
+## The interactive `wrap` path has no stall detection yet
+
+Recorded 2026-09-04 (`release/3.17.0-harness-batch-5`, issue #310): the progress-based stall detector (`stall.rs`'s `ProgressSignals`/`StallLatch`/`decide`) and the once-only steering-nudge-then-terminate lifecycle it drives are wired into `exec.rs`'s own tick only. `zirv ctx wrap` (and therefore `zirv chat`'s plain-`wrap` fallback and the dashboard's per-pane supervision) has no equivalent liveness check — a hung interactive session behind a PTY still reads `Live` forever from `sessions::Liveness`'s bare pid probe, exactly as before this issue. Not yet fixed; would need `wrap`'s own pump loop to track the same three progress channels (output, turn signal, mail) and decide when to intervene without taking the wheel away from an operator who may be looking at the screen. See [[Ctx Supervisors]].
+
+## `rot::Score.window_breakdown` is always `None` from the scoring engine itself
+
+Recorded 2026-09-04 (`release/3.17.0-harness-batch-5`, issue #312): `Score` gained a `window_breakdown: Option<breakdown::BreakdownSummary>` field, but `score_from`/`score_events`/`RotState::score` never populate it — it stays `None` on every path through the engine, by design, so the incremental (`RotState`) and full-parse (`score_events`) scoring paths never have to agree on it for the equivalence tests both already uphold on every other field. `score.rs`'s own callers (`score_transcript`'s JSON driver, `status::render_breakdown`) attach a computed `BreakdownSummary` post-hoc, outside `Score` itself, when a caller actually asked for one (`zirv ctx score`'s JSON, `zirv ctx status --breakdown`). Reading `Score.window_breakdown` directly — from a test, a new caller, or a debugger — will always see `None`; this is not a bug to fix, just a gotcha for anyone assuming the struct field mirrors what the CLI prints. See [[Rot Engine]]'s "Window attribution" section.
 
 ## A dashboard-restored pane loses its declared `--result-schema`/`--result-kind` contract
 
