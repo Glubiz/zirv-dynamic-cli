@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-09-03
+last-verified: 2026-09-04
 ---
 
 # Decision Log
@@ -23,6 +23,27 @@ last-verified: 2026-09-03
 - If the entry is longer than the cap, the "why" is a spec, not an ADR — write it under `docs/superpowers/specs/` and link to it.
 
 ## Decisions
+
+### 2026-09-04 -- Same-harness delegation is a hint, not a refusal, and stays a headless/pane path outside a dashboard
+**Context:** Issue #328 reported a hand-written, operator-authored `CLAUDE.md` instruction telling a claude session to "delegate only through `zirv agent`" even for same-harness work -- the opposite of the intended rule (native Agent tool for same-harness, `zirv agent` for another harness or a work group) -- and asked whether headless `zirv agent` workers should be removed now that the native tool exists.
+**Decision:** State the routing rule explicitly in `claude::ORCHESTRATOR_PROMPT`, and say it outranks a contradicting operator/repo layer, closing the loophole a more-specific-sounding hand-written file could otherwise win. `agent::same_harness_hint` prints a one-line advisory when `<name>` matches the running harness outside a work group/sub-orchestrator scope, but the run still proceeds -- an operator who typed the command on purpose has nobody else to answer if it refuses. Headless workers stay as the non-dashboard delegation path; `--headless` remains an explicit opt-in even inside a dashboard.
+**Rejected:** Removing headless `zirv agent` workers entirely -- would leave `zirv agent codex` (a genuine cross-harness case) unusable from a plain shell with no dashboard running. Refusing a same-harness dispatch outright instead of hinting -- an operator-issued command with no dashboard/native-tool alternative in reach must not be blocked.
+**Consequences:** The layer's routing rule is now the single source of truth a repo/operator text cannot override by being more specific; a future routing ambiguity should extend this same rule rather than adding a second, possibly conflicting one.
+**Spec / link:** [[Ctx Adapters]], [[Ctx Subsystem]]'s `agent.rs` entry.
+
+### 2026-09-04 -- The Stop hook's diagnostics checker gets its own `CARGO_TARGET_DIR` under the state dir
+**Context:** Issue #308 stage 1's post-edit `cargo check` runs inside the same repository the session is actively working in. A first cut let it share the repository's own `target/`, which blocks on cargo's build-directory lock for the whole timeout whenever the session's own `cargo test`/`cargo build` is still running -- exactly the moment a post-edit check fires -- and churns that build's own incremental fingerprints.
+**Decision:** `run_checker_with_target` takes an explicit `cargo_target_dir`, and the Stop hook always passes `<state>/diagnostics/<repo_slug>/target` (`diagnostics_target_dir`), never the repository's own. The first run in a fresh target directory pays a full metadata-only check and may hit the timeout; cargo persists what it finished, so later turns are incremental.
+**Rejected:** Sharing the repository's own `target/` -- correct for a one-off manual `cargo check`, wrong for a background advisory that must never contend with the session's own build.
+**Consequences:** A repo working under multiple concurrent sessions gets one diagnostics target dir per repo slug, not per session -- an acceptable shared cache, since diagnostics are advisory and session-scoped only by the baseline diff, not by the target directory.
+**Spec / link:** [[Ctx Subsystem]]'s `hook` entry, [[Untrusted Configuration]].
+
+### 2026-09-04 -- Loop-breaker thresholds narrow via a zero-means-disabled fold, not `narrow_max_nudges`'s plain `min`
+**Context:** Issue #313 added two safety-hook loop breakers (a consecutive-denial breaker, an identical-failing-command guard), each configured by a threshold where `0` is the documented way to disable it. `config.rs`'s existing narrowing-only precedent, `narrow_max_nudges` (`verify_on_stop.max_nudges`), treats `0` as *unbounded* and folds with a plain `home.min(repo)` -- reusing it unmodified for these three thresholds would let a repo layer silently re-enable a breaker an operator set to `0` by naming any smaller nonzero value, since `min(0, 2)` is `0` only by accident of which side is smaller, not by intent.
+**Decision:** A new `narrow_threshold(home, repo)` in `safety.rs` special-cases both zero directions: `home == 0` always stays `0` regardless of `repo` (an operator's disable can never be reversed), and `repo == Some(0)` is ignored as an attempted widening (treated like `None`), with `home.min(repo)` only for the ordinary nonzero/nonzero case. None of the three keys is `REPO_FORBIDDEN` -- a repo may still make a breaker fire sooner for itself.
+**Rejected:** Reusing `narrow_max_nudges` as-is -- correct for a cap where `0` genuinely means "no limit," wrong here where `0` is a distinct disabled state a repo must not be able to un-disable. Making the three keys `REPO_FORBIDDEN` instead -- forecloses a repo's legitimate ability to tighten its own loop-breaker posture, the same asymmetry `deny`/`ask`'s union already rejects for the same reason.
+**Consequences:** `[safety]` now has a fourth distinct fold shape (union for `deny`/`ask`, `REPO_FORBIDDEN` for `allow`/`escape_allow`/`default`/`interactive_default`/`sql`, and now this zero-aware narrowing for the three thresholds) -- a future `[safety]` key with its own "0 means X" semantics should reuse `narrow_threshold`'s shape, not `narrow_max_nudges`'s, if `0` is a state rather than an absence of a cap.
+**Spec / link:** [[Command Safety]], [[Untrusted Configuration]].
 
 ### 2026-09-03 -- Stop hook nudges the stale-gate command instead of auto-running verification (issue #309)
 **Context:** A session can end a turn with code modified since the last passing `zirv test`/`zirv verify` run, and nothing told the operator or the next turn that the evidence was stale.

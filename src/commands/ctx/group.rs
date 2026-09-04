@@ -83,7 +83,7 @@ fn lock_path(state: &StateDir, id: &str) -> PathBuf {
 }
 
 #[cfg(unix)]
-fn open_lock_file(path: &Path) -> std::io::Result<std::fs::File> {
+pub(crate) fn open_lock_file(path: &Path) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
     std::fs::OpenOptions::new()
         .read(true)
@@ -95,7 +95,7 @@ fn open_lock_file(path: &Path) -> std::io::Result<std::fs::File> {
 }
 
 #[cfg(not(unix))]
-fn open_lock_file(path: &Path) -> std::io::Result<std::fs::File> {
+pub(crate) fn open_lock_file(path: &Path) -> std::io::Result<std::fs::File> {
     std::fs::OpenOptions::new()
         .read(true)
         .write(true)

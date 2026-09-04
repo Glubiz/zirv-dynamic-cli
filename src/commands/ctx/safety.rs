@@ -62,9 +62,42 @@
 //! to. [`resolve`] (the layering step, one level up) takes its environment
 //! as an injected closure, exactly like `policy::resolve`, so it stays
 //! deterministic and testable without touching real process state.
+//!
+//! ## Two loop breakers (issue #313)
+//!
+//! A policy verdict alone cannot tell an agent stuck retrying variations of
+//! the same blocked command, or re-running the identical failing command
+//! over and over, to stop -- it can only keep saying "no" the same way each
+//! time. Two additive, narrowing-only breakers sit in the PreToolUse hook
+//! path (`run_check_hook_mode_with_env`), after the ordinary verdict is
+//! final, and change only the TEXT a hook decision carries, never the
+//! verdict family of any existing command:
+//!
+//! - The **consecutive-denial breaker** (`denial_breaker_threshold`) counts
+//!   this session's own trailing run of `Ask`/`Deny` verdicts (via the
+//!   bounded `log::read_recent_safety_decisions`) and, past the threshold,
+//!   prefixes the hook's `permissionDecisionReason` with an explicit "stop
+//!   retrying" instruction -- the original policy explanation stays, joined
+//!   by ` -- `.
+//! - The **identical-failing-command guard** (`identical_command_warn_after`/
+//!   `_refuse_after`) parses the session's own transcript
+//!   (`trailing_same_command_failure_run`) for a trailing run of failures of
+//!   the EXACT SAME command and, past `warn_after`, adds a
+//!   `hookSpecificOutput.additionalContext` warning to an otherwise-`Allow`
+//!   verdict; past `refuse_after`, ONLY in a headless launch, turns that
+//!   `Allow` into a `Deny`. A command already `is_read_only_escape_safe`
+//!   (benign, repeatable inspection) is never guarded.
+//!
+//! Both thresholds fold across layers via `narrow_threshold`: unlike
+//! `allow`/`default`/`sql` (`REPO_FORBIDDEN`, operator-home-layer only,
+//! since there is no narrowing reading of widening either), a repo MAY
+//! lower one of these three -- narrowing is always safe -- but never raise
+//! it above the operator's own ceiling, and an operator's `0` (disabled)
+//! can never be re-enabled by a repo. See `narrow_threshold`'s own doc
+//! comment for the exact fold.
 
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -226,6 +259,29 @@ pub struct SafetyPolicy {
     /// could silence every prompt for the session it sits in.
     pub interactive_default: Verdict,
     pub sql: SqlMode,
+    /// Issue #313 (consecutive-denial breaker): how many trailing consecutive
+    /// `Ask`/`Deny` verdicts in ONE session (this decision included) before
+    /// the hook's `permissionDecisionReason` stops explaining the policy and
+    /// instead tells the agent outright to stop retrying variations of the
+    /// same command. `0` disables the breaker entirely -- the loosest
+    /// setting, since it means a stuck agent gets no nudge at all. Folded
+    /// narrowing-only across layers (see [`resolve`]'s own fold): a repo may
+    /// LOWER this (fire the breaker sooner) but never raise it or turn a
+    /// disabled breaker back on.
+    pub denial_breaker_threshold: u32,
+    /// Issue #313 (identical-failing-command guard): how many trailing
+    /// consecutive failures of the EXACT SAME Bash command (same command
+    /// text, from the session's own transcript) before an otherwise-`Allow`
+    /// verdict also carries a warning in `hookSpecificOutput.
+    /// additionalContext`. `0` disables the warning. Same narrowing-only fold
+    /// as `denial_breaker_threshold`.
+    pub identical_command_warn_after: u32,
+    /// Issue #313: the same identical-failing-command count at which a
+    /// HEADLESS launch (only) turns the verdict itself into `Deny` instead of
+    /// merely warning -- interactive launches never auto-refuse (an operator
+    /// is watching and can decide for themselves). `0` disables the refusal;
+    /// same narrowing-only fold.
+    pub identical_command_refuse_after: u32,
 }
 
 impl Default for SafetyPolicy {
@@ -242,6 +298,9 @@ impl Default for SafetyPolicy {
             default: Verdict::Ask,
             interactive_default: Verdict::Allow,
             sql: SqlMode::On,
+            denial_breaker_threshold: 3,
+            identical_command_warn_after: 2,
+            identical_command_refuse_after: 5,
         }
     }
 }
@@ -3938,6 +3997,9 @@ struct SafetyLayer {
     default: Option<Verdict>,
     interactive_default: Option<Verdict>,
     sql: Option<SqlMode>,
+    denial_breaker_threshold: Option<u32>,
+    identical_command_warn_after: Option<u32>,
+    identical_command_refuse_after: Option<u32>,
 }
 
 fn parse_layer(layer: Option<toml::Value>, origin: &str) -> CtxResult<SafetyLayer> {
@@ -3955,6 +4017,32 @@ fn rules_from(patterns: &[String], origin: Origin) -> Vec<Rule> {
         .cloned()
         .map(|pattern| Rule { pattern, origin })
         .collect()
+}
+
+/// Issue #313: the repo-narrowing fold for the three loop-breaker
+/// thresholds (`denial_breaker_threshold`/`identical_command_warn_after`/
+/// `identical_command_refuse_after`), mirroring `config.rs`'s own
+/// `narrow_max_nudges` (`home.min(repo.unwrap_or(u32::MAX))`) but with `0`
+/// carrying its own meaning ("disabled") rather than "unbounded", so plain
+/// `min` cannot be used unmodified:
+///
+/// - `home == 0`: the operator disabled this breaker outright. A repo may
+///   only narrow, never re-enable something the operator turned off, so this
+///   stays `0` regardless of what `repo` says (unlike `narrow_max_nudges`,
+///   where `home == 0` is just an ordinary, narrowable value).
+/// - `repo == Some(0)`: a repo trying to set `0` is trying to WIDEN (disable
+///   the breaker), which is never narrowing -- ignored, exactly like a
+///   `None`.
+/// - Otherwise: `home.min(repo)` -- a repo may lower the threshold (fire the
+///   breaker sooner) but never raise it above the operator's own ceiling.
+fn narrow_threshold(home: u32, repo: Option<u32>) -> u32 {
+    if home == 0 {
+        return 0;
+    }
+    match repo {
+        Some(0) | None => home,
+        Some(repo) => home.min(repo),
+    }
 }
 
 /// Resolves the layered `[safety]` policy -- see the module doc for the
@@ -4063,6 +4151,27 @@ pub fn resolve(
         None => home_layer.sql.unwrap_or_default(),
     };
 
+    // Issue #313: the two loop breakers' three thresholds get the identical
+    // narrowing fold `config.rs`'s own `narrow_max_nudges` uses for
+    // `verify_on_stop.max_nudges` -- lower is stricter -- via
+    // `narrow_threshold` (this module's own `0`-means-disabled variant of
+    // that fold; see its doc comment). No environment override today: unlike
+    // `deny`/`ask`/`allow`, nothing yet needs an operator escape hatch above
+    // the fold for these, and one can be added later without disturbing this
+    // shape.
+    let denial_breaker_threshold = narrow_threshold(
+        home_layer.denial_breaker_threshold.unwrap_or(3),
+        repo_layer.denial_breaker_threshold,
+    );
+    let identical_command_warn_after = narrow_threshold(
+        home_layer.identical_command_warn_after.unwrap_or(2),
+        repo_layer.identical_command_warn_after,
+    );
+    let identical_command_refuse_after = narrow_threshold(
+        home_layer.identical_command_refuse_after.unwrap_or(5),
+        repo_layer.identical_command_refuse_after,
+    );
+
     Ok(SafetyPolicy {
         deny,
         ask,
@@ -4071,6 +4180,9 @@ pub fn resolve(
         default,
         interactive_default,
         sql,
+        denial_breaker_threshold,
+        identical_command_warn_after,
+        identical_command_refuse_after,
     })
 }
 
@@ -4168,6 +4280,13 @@ struct HookToolPayload {
     /// process's own `std::env::current_dir()` when empty, the same
     /// fallback [`cd_allow_roots`] already uses.
     cwd: String,
+    /// Issue #313: the path to this session's own transcript JSONL, present
+    /// on claude's real PreToolUse payload. `None` on an older payload that
+    /// omits it, or when the field fails to parse -- the identical-failing-
+    /// command guard simply does not run in that case (see its call site),
+    /// the same fail-open discipline this whole struct already follows.
+    #[serde(default)]
+    transcript_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -5572,6 +5691,18 @@ fn ctx_base_allow_verbs() -> impl Iterator<Item = &'static str> {
 /// qualified programs are excluded: `./zirv ctx` could name repo-controlled
 /// code and must not inherit the installed binary's trust boundary. Explicit
 /// policy `deny`/`ask` still wins before this helper is called.
+///
+/// **Scope note (issue #331, 2026-09-04):** this helper is the NARROW
+/// acceptor only. The retry chain's general acceptor is
+/// [`is_prompt_free_zirv_retry_safe`] (issue #222), which deliberately admits
+/// `zirv agent <adapter> "<prompt>"` -- bare or inside a compound such as
+/// `zirv agent codex "x" | head` -- because the worker it launches runs under
+/// zirv's own sandbox posture and every dangerous spelling (`-- --sandbox
+/// danger-full-access`, `--dangerously-bypass-approvals-and-sandbox`) is a
+/// semantic Deny before that screen runs. `exec`, `usage tee`, `wrap`, `chat`
+/// and repo-controlled `./zirv` stay Ask on both acceptors. That Allow is the
+/// operator's policy, pinned by the #222 tests, not a fallthrough bypassing
+/// this list.
 pub(crate) fn is_reserved_zirv_escape_safe(command: &str) -> bool {
     let candidates = normalize_segments(command);
     if candidates.is_empty() {
@@ -6288,6 +6419,15 @@ fn explain_text(
 /// pinned `dontAsk` themselves -- `adapters::flags_pin_policy` already makes
 /// zirv stand down entirely for the latter. Pinned end to end by
 /// `the_dont_ask_suppression_is_reachable_only_from_the_headless_posture`.
+///
+/// Issue #313: the production call site (`run_check_hook_mode_with_env`) now
+/// calls [`hook_output_with_extras`] directly (it always has extras to pass,
+/// even if every field is `None` for an ordinary decision), so this five-
+/// argument form survives only as the pre-#313 shape every existing test
+/// below still calls -- `#[cfg(test)]` reflects that honestly rather than
+/// leaving a production-looking function `dead_code` would have to warn
+/// about.
+#[cfg(test)]
 fn hook_output(
     command: &str,
     outcome: &Outcome,
@@ -6295,7 +6435,110 @@ fn hook_output(
     divergence: SnapshotDivergence,
     status: &str,
 ) -> Option<String> {
+    hook_output_with_extras(
+        command,
+        outcome,
+        permission_mode,
+        divergence,
+        status,
+        &HookOutputExtras::default(),
+    )
+}
+
+/// Extra text issue #313's two loop breakers fold into the emitted
+/// `hookSpecificOutput`, threaded through one struct rather than growing
+/// [`hook_output`]'s own parameter list (which every pre-existing call site,
+/// production and test alike, still calls at its original five-argument
+/// arity via the thin wrapper above): the breaker and the guard each write
+/// into their own disjoint verdict branch (the denial-breaker note only ever
+/// accompanies an `Ask`/`Deny`; the identical-command guard's override/
+/// context only ever accompanies an `Allow`, or an `Allow` the guard itself
+/// has just turned into a `Deny`), so nothing here needs to reconcile the
+/// two against each other.
+#[derive(Debug, Clone, Default)]
+struct HookOutputExtras {
+    /// Consecutive-denial breaker (issue #313): prefixes the ordinary
+    /// `explain_text` narrative with an explicit "N consecutive denials --
+    /// stop retrying" instruction, joined by ` -- ` so the operator still
+    /// sees the original reason underneath.
+    breaker_note: Option<String>,
+    /// Identical-command guard refuse (issue #313, headless only): REPLACES
+    /// the ordinary `explain_text` narrative outright with a guard-specific
+    /// reason. The caller has already turned the underlying verdict into
+    /// `Deny` before reaching `hook_output_with_extras`; this is only the
+    /// text.
+    reason_override: Option<String>,
+    /// Identical-command guard warn (issue #313): folded into
+    /// `hookSpecificOutput.additionalContext`. Also forces output for an
+    /// `Allow` that `hook_output`/`hook_output_with_extras` would otherwise
+    /// print nothing for (`dontAsk`) -- staying silent there would hide the
+    /// one signal that could break the loop.
+    additional_context: Option<String>,
+}
+
+/// The reason text for one hook decision: `extras.reason_override` when
+/// present (the identical-command guard's own full text), otherwise the
+/// ordinary `explain_text` narrative -- with `extras.breaker_note`, when
+/// present, prefixed onto whichever of those two won, joined by ` -- `.
+fn hook_reason_text(
+    command: &str,
+    outcome: &Outcome,
+    mode: super::adapters::LaunchMode,
+    divergence: SnapshotDivergence,
+    status: &str,
+    extras: &HookOutputExtras,
+) -> String {
+    let base = extras
+        .reason_override
+        .clone()
+        .unwrap_or_else(|| explain_text(command, outcome, mode, divergence, status));
+    match &extras.breaker_note {
+        Some(note) => format!("{note} -- {base}"),
+        None => base,
+    }
+}
+
+/// Builds the JSON envelope [`hook_output_with_extras`] emits, with
+/// `additional_context` folded into `hookSpecificOutput.additionalContext`
+/// when present -- the one place both this new field and the pre-existing
+/// three ever get serialized, so the shape can never drift between the
+/// `Some`/`None` cases.
+fn hook_output_json(decision: &str, reason: String, additional_context: Option<&str>) -> String {
+    let mut value = serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": decision,
+            "permissionDecisionReason": reason,
+        }
+    });
+    if let Some(ctx) = additional_context {
+        value["hookSpecificOutput"]["additionalContext"] =
+            serde_json::Value::String(ctx.to_string());
+    }
+    value.to_string()
+}
+
+/// [`hook_output`] plus issue #313's two loop breakers. Behaviourally
+/// identical to the pre-#313 `hook_output` when `extras` is
+/// `HookOutputExtras::default()` (every field `None`): `hook_reason_text`
+/// then reduces to plain `explain_text`, and `hook_output_json` omits
+/// `additionalContext` entirely, matching the original envelope byte for
+/// byte -- see `hook_output`'s own doc comment for the full contract this
+/// preserves.
+fn hook_output_with_extras(
+    command: &str,
+    outcome: &Outcome,
+    permission_mode: &str,
+    divergence: SnapshotDivergence,
+    status: &str,
+    extras: &HookOutputExtras,
+) -> Option<String> {
     let dont_ask = permission_mode == "dontAsk";
+    let mode = if dont_ask {
+        super::adapters::LaunchMode::Headless
+    } else {
+        super::adapters::LaunchMode::Interactive
+    };
     let decision = match outcome.verdict {
         Verdict::Deny => "deny",
         // Under `dontAsk` an "ask" is an unsatisfiable prompt claude turns
@@ -6303,10 +6546,21 @@ fn hook_output(
         // (issue #102) -- unchanged.
         Verdict::Ask if dont_ask => return None,
         Verdict::Ask => "ask",
-        // Under `dontAsk`, silence is right: the mode already resolves
-        // anything pre-approved, and issue #102's finding was that a hook
-        // decision there displaces the operator's own rules.
-        Verdict::Allow if dont_ask => return None,
+        // Under `dontAsk`, silence is ordinarily right: the mode already
+        // resolves anything pre-approved, and issue #102's finding was that
+        // a hook decision there displaces the operator's own rules. Issue
+        // #313's identical-command WARNING is the one exception: it must
+        // still reach the transcript even here, or the one signal that could
+        // break the loop would be the one thing `dontAsk` hides.
+        Verdict::Allow if dont_ask => {
+            return extras.additional_context.as_deref().map(|ctx| {
+                hook_output_json(
+                    "allow",
+                    hook_reason_text(command, outcome, mode, divergence, status, extras),
+                    Some(ctx),
+                )
+            });
+        }
         // Interactively, silence is WRONG (2026-08-24). This hook is now the
         // sole prompting gate: `--permission-mode default` prompts for
         // anything not pre-approved, and the interactive projection
@@ -6316,26 +6570,11 @@ fn hook_output(
         // Stating "allow" is what makes them silent.
         Verdict::Allow => "allow",
     };
-    Some(
-        serde_json::json!({
-            "hookSpecificOutput": {
-                "hookEventName": "PreToolUse",
-                "permissionDecision": decision,
-                "permissionDecisionReason": explain_text(
-                    command,
-                    outcome,
-                    if dont_ask {
-                        super::adapters::LaunchMode::Headless
-                    } else {
-                        super::adapters::LaunchMode::Interactive
-                    },
-                    divergence,
-                    status,
-                ),
-            }
-        })
-        .to_string(),
-    )
+    Some(hook_output_json(
+        decision,
+        hook_reason_text(command, outcome, mode, divergence, status, extras),
+        extras.additional_context.as_deref(),
+    ))
 }
 
 /// Core of `zirv ctx safety check`. Fast and side-effect-free beyond
@@ -6504,6 +6743,123 @@ fn orchestrator_block_tool_family(command: &str) -> String {
         return format!("{program} {flag}");
     }
     program
+}
+
+/// Issue #313 (identical-failing-command guard): parses one session
+/// transcript's JSONL exactly the way `adapters::claude::structural_context`
+/// already does internally -- a `Bash` `tool_use` block (assistant message,
+/// keyed by its own `id`) paired with its `tool_result` (a later user
+/// message, matched by `tool_use_id`, however many other tool calls fall
+/// between them) -- but narrowed to invocations whose command TEXT equals
+/// `command` exactly (no normalization: this catches an agent re-running the
+/// identical failing line, not a family of similar commands) and folded into
+/// a trailing run rather than a full history: the count of consecutive
+/// erroring invocations of `command` ending at the most recent one, reset to
+/// zero by any intervening SUCCESSFUL invocation of `command`. A dedicated
+/// parser rather than a reuse of `structural_context`'s own internal
+/// `invocations` list: that list is private to its own `last_verification_
+/// run` and never exposed outside `claude.rs`.
+///
+/// Pure over its two string arguments: no clock, filesystem, or environment
+/// -- the same discipline `evaluate`/`glob_match` hold to. A line that fails
+/// to parse as JSON, or lacks the fields this function looks for, is simply
+/// skipped, matching every other best-effort transcript reader in this
+/// codebase.
+/// How much of the transcript's tail the identical-command guard reads on
+/// each PreToolUse call. A guard that re-read a multi-megabyte transcript in
+/// full before every Bash call would add latency to the hot path for a
+/// signal that only ever concerns the most recent few invocations; a partial
+/// first line is skipped by the tolerant parser like any other bad line.
+const GUARD_TRANSCRIPT_TAIL_BYTES: u64 = 2 * 1024 * 1024;
+
+fn read_transcript_tail(path: &Path) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    if len > GUARD_TRANSCRIPT_TAIL_BYTES {
+        file.seek(SeekFrom::Start(len - GUARD_TRANSCRIPT_TAIL_BYTES))
+            .ok()?;
+    }
+    let mut bytes = Vec::with_capacity(len.min(GUARD_TRANSCRIPT_TAIL_BYTES) as usize);
+    file.read_to_end(&mut bytes).ok()?;
+    Some(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+fn trailing_same_command_failure_run(jsonl: &str, command: &str) -> usize {
+    use std::collections::HashMap;
+
+    let mut pending_bash: HashMap<String, String> = HashMap::new();
+    let mut run = 0usize;
+
+    for line in jsonl.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(row) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let message = row
+            .get("message")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        match row.get("type").and_then(serde_json::Value::as_str) {
+            Some("user") => {
+                let Some(blocks) = message.get("content").and_then(serde_json::Value::as_array)
+                else {
+                    continue;
+                };
+                for block in blocks {
+                    if block.get("type").and_then(serde_json::Value::as_str) != Some("tool_result")
+                    {
+                        continue;
+                    }
+                    let Some(matched_command) = block
+                        .get("tool_use_id")
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(|id| pending_bash.remove(id))
+                    else {
+                        continue;
+                    };
+                    if matched_command != command {
+                        continue;
+                    }
+                    let is_error =
+                        block.get("is_error").and_then(serde_json::Value::as_bool) == Some(true);
+                    run = if is_error { run + 1 } else { 0 };
+                }
+            }
+            Some("assistant") => {
+                let Some(blocks) = message.get("content").and_then(serde_json::Value::as_array)
+                else {
+                    continue;
+                };
+                for block in blocks {
+                    if block.get("type").and_then(serde_json::Value::as_str) != Some("tool_use") {
+                        continue;
+                    }
+                    let tool_name = block
+                        .get("name")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("");
+                    if !tool_name.eq_ignore_ascii_case("Bash") {
+                        continue;
+                    }
+                    if let (Some(id), Some(cmd)) = (
+                        block.get("id").and_then(serde_json::Value::as_str),
+                        block
+                            .get("input")
+                            .and_then(|input| input.get("command"))
+                            .and_then(serde_json::Value::as_str),
+                    ) {
+                        pending_bash.insert(id.to_string(), cmd.to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    run
 }
 
 /// The hook-mode core of `run_check`, split out so it can be tested by
@@ -6740,12 +7096,90 @@ fn run_check_hook_mode_with_env<W: Write>(
             }
         };
     }
-    if let Some(output) = hook_output(
+    // Issue #313, breaker 1: a run of trailing consecutive Ask/Deny
+    // verdicts in THIS session -- this decision included -- past the
+    // configured threshold stops the reason text from explaining the policy
+    // yet again and instead tells the agent outright to stop retrying.
+    // Counted from the log BEFORE `audit_hook_decision` appends this
+    // decision below, so "this decision included" means `+ 1`, not a read
+    // of a record that does not exist yet.
+    let mut breaker_note: Option<String> = None;
+    if matches!(outcome.verdict, Verdict::Ask | Verdict::Deny)
+        && !payload.session_id.is_empty()
+        && cfg.safety.denial_breaker_threshold > 0
+        && let Ok(state) = super::state::StateDir::resolve(env)
+    {
+        let recent = super::log::read_recent_safety_decisions(
+            &state,
+            &payload.session_id,
+            50,
+            super::state::now_secs() / 86_400,
+        );
+        let trailing_denials = recent
+            .iter()
+            .rev()
+            .take_while(|record| matches!(record.verdict.as_str(), "ask" | "deny"))
+            .count() as u32;
+        let total = trailing_denials + 1;
+        if total >= cfg.safety.denial_breaker_threshold {
+            breaker_note = Some(format!(
+                "{total} consecutive denials this session: stop attempting variations of \
+                 this command; report the blocker in your final message or via `zirv ctx \
+                 send`, then continue with other work."
+            ));
+        }
+    }
+
+    // Issue #313, breaker 2: the identical-failing-command guard. Only
+    // examined when the base verdict is `Allow` -- a command the policy is
+    // already blocking gets no additional treatment here -- and only for a
+    // command that is not already read-only-escape-safe (that carve-out
+    // exists precisely for benign, repeatable inspection commands, which are
+    // never the loop this guard exists to catch).
+    let mut reason_override: Option<String> = None;
+    let mut additional_context: Option<String> = None;
+    if outcome.verdict == Verdict::Allow
+        && cfg.safety.identical_command_warn_after > 0
+        && !is_read_only_escape_safe(command, &scratchpad_roots)
+        && let Some(transcript_path) = payload.transcript_path.as_deref()
+        && let Some(transcript) = read_transcript_tail(Path::new(transcript_path))
+    {
+        let run = trailing_same_command_failure_run(&transcript, command);
+        let refuses = cfg.safety.identical_command_refuse_after > 0
+            && run >= cfg.safety.identical_command_refuse_after as usize
+            && mode == super::adapters::LaunchMode::Headless;
+        if refuses {
+            outcome = Outcome {
+                verdict: Verdict::Deny,
+                matched: Some(Rule {
+                    pattern: "<guard: identical failing command>".to_string(),
+                    origin: Origin::BuiltIn,
+                }),
+            };
+            reason_override = Some(format!(
+                "zirv guard: this exact command has failed {run} times in a row; refusing \
+                 to run it again -- report the blocker."
+            ));
+        } else if run >= cfg.safety.identical_command_warn_after as usize {
+            additional_context = Some(format!(
+                "zirv guard: this exact command has failed {run} times in a row; change the \
+                 approach or the input before running it again."
+            ));
+        }
+    }
+
+    let extras = HookOutputExtras {
+        breaker_note,
+        reason_override,
+        additional_context,
+    };
+    if let Some(output) = hook_output_with_extras(
         command,
         &outcome,
         &payload.permission_mode,
         evidence.divergence,
         evidence.status,
+        &extras,
     ) {
         writeln!(w, "{output}")?;
     }
@@ -8993,6 +9427,7 @@ mod tests {
             default,
             interactive_default: Verdict::Allow,
             sql: SqlMode::On,
+            ..SafetyPolicy::default()
         }
     }
 
@@ -11691,6 +12126,110 @@ mod tests {
         );
     }
 
+    // -- issue #313: loop-breaker threshold narrowing fold ---------------
+
+    /// The pure fold, pinned directly: lower always wins when both layers
+    /// set a nonzero value, a repo `0` (an attempt to WIDEN by disabling) is
+    /// ignored, and an operator `0` (disabled) can never be turned back on
+    /// by a repo.
+    #[test]
+    fn narrow_threshold_lets_a_repo_lower_but_never_raise_or_reenable() {
+        assert_eq!(narrow_threshold(3, Some(2)), 2, "repo may narrow");
+        assert_eq!(narrow_threshold(3, Some(5)), 3, "repo may not raise");
+        assert_eq!(
+            narrow_threshold(3, Some(0)),
+            3,
+            "a repo 0 is an attempted widening (disable) -- ignored"
+        );
+        assert_eq!(narrow_threshold(3, None), 3, "no repo value: home stands");
+        assert_eq!(
+            narrow_threshold(0, Some(2)),
+            0,
+            "operator-disabled stays disabled -- a repo cannot re-enable it"
+        );
+        assert_eq!(narrow_threshold(0, None), 0);
+    }
+
+    #[test]
+    fn a_repo_layer_may_narrow_but_not_raise_the_denial_breaker_threshold() {
+        let home = table("[safety]\ndenial_breaker_threshold = 3\n")
+            .and_then(|v| v.get("safety").cloned());
+        let repo = table("[safety]\ndenial_breaker_threshold = 2\n")
+            .and_then(|v| v.get("safety").cloned());
+        let empty = env_from(&[]);
+        let policy = resolve(home, repo, &|k| empty.get(k).cloned()).expect("resolves");
+        assert_eq!(policy.denial_breaker_threshold, 2, "repo may narrow to 2");
+
+        let repo_wider = table("[safety]\ndenial_breaker_threshold = 5\n")
+            .and_then(|v| v.get("safety").cloned());
+        let home_again = table("[safety]\ndenial_breaker_threshold = 3\n")
+            .and_then(|v| v.get("safety").cloned());
+        let policy_wider =
+            resolve(home_again, repo_wider, &|k| empty.get(k).cloned()).expect("resolves");
+        assert_eq!(
+            policy_wider.denial_breaker_threshold, 3,
+            "repo may not raise the threshold above home's own"
+        );
+    }
+
+    #[test]
+    fn a_repo_zero_denial_breaker_threshold_is_ignored_as_an_attempted_widening() {
+        let home = table("[safety]\ndenial_breaker_threshold = 3\n")
+            .and_then(|v| v.get("safety").cloned());
+        let repo = table("[safety]\ndenial_breaker_threshold = 0\n")
+            .and_then(|v| v.get("safety").cloned());
+        let empty = env_from(&[]);
+        let policy = resolve(home, repo, &|k| empty.get(k).cloned()).expect("resolves");
+        assert_eq!(
+            policy.denial_breaker_threshold, 3,
+            "a repo 0 would disable the breaker -- that is widening, not narrowing"
+        );
+    }
+
+    #[test]
+    fn an_operator_disabled_denial_breaker_cannot_be_reenabled_by_a_repo() {
+        let home = table("[safety]\ndenial_breaker_threshold = 0\n")
+            .and_then(|v| v.get("safety").cloned());
+        let repo = table("[safety]\ndenial_breaker_threshold = 2\n")
+            .and_then(|v| v.get("safety").cloned());
+        let empty = env_from(&[]);
+        let policy = resolve(home, repo, &|k| empty.get(k).cloned()).expect("resolves");
+        assert_eq!(
+            policy.denial_breaker_threshold, 0,
+            "an operator who disabled the breaker cannot have it re-enabled by a repo checkout"
+        );
+    }
+
+    #[test]
+    fn the_two_identical_command_guard_thresholds_follow_the_identical_narrowing_fold() {
+        let home = table(
+            "[safety]\nidentical_command_warn_after = 2\nidentical_command_refuse_after = 5\n",
+        )
+        .and_then(|v| v.get("safety").cloned());
+        let repo = table(
+            "[safety]\nidentical_command_warn_after = 1\nidentical_command_refuse_after = 9\n",
+        )
+        .and_then(|v| v.get("safety").cloned());
+        let empty = env_from(&[]);
+        let policy = resolve(home, repo, &|k| empty.get(k).cloned()).expect("resolves");
+        assert_eq!(
+            policy.identical_command_warn_after, 1,
+            "repo may narrow warn_after"
+        );
+        assert_eq!(
+            policy.identical_command_refuse_after, 5,
+            "repo may not raise refuse_after above home's own"
+        );
+    }
+
+    #[test]
+    fn the_default_loop_breaker_thresholds_match_the_documented_defaults() {
+        let policy = SafetyPolicy::default();
+        assert_eq!(policy.denial_breaker_threshold, 3);
+        assert_eq!(policy.identical_command_warn_after, 2);
+        assert_eq!(policy.identical_command_refuse_after, 5);
+    }
+
     #[test]
     fn an_unparseable_default_env_value_is_an_error_not_a_silent_default() {
         let vars = env_from(&[("ZIRV_CTX_SAFETY_DEFAULT", "sometimes")]);
@@ -13839,5 +14378,322 @@ mod tests {
     #[test]
     fn a_shell_wrapper_with_no_real_inline_command_flag_is_not_unwrapped() {
         assert!(unwrap_shell_wrapper("bash --rcfile /dev/null --norc").is_none());
+    }
+
+    // -- issue #313: consecutive-denial breaker (hook integration) -------
+
+    /// Runs the hook once against a persistent `state` dir/session, the same
+    /// shape `audited_unsandboxed_retry` above uses but reusable across
+    /// several sequential calls (the breaker needs THIS session's own prior
+    /// decisions to already be on disk).
+    fn run_hook_for_loop_breaker(
+        cfg: &CtxConfig,
+        state_root: &std::path::Path,
+        session: &str,
+        command: &str,
+        permission_mode: &str,
+    ) -> String {
+        let env = env_from(&[(
+            super::super::state::STATE_ENV,
+            state_root.to_str().expect("utf8 state"),
+        )]);
+        let stdin = serde_json::json!({
+            "session_id": session,
+            "tool_name": "Bash",
+            "tool_input": { "command": command },
+            "permission_mode": permission_mode
+        })
+        .to_string();
+        let mut out = Vec::new();
+        run_check_hook_mode_with_env(cfg, &mut out, &stdin, &|key| env.get(key).cloned())
+            .expect("runs");
+        String::from_utf8(out).expect("utf8")
+    }
+
+    fn default_cfg_for_loop_breaker_tests() -> CtxConfig {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = super::super::testenv::HomeGuard::set(home.path());
+        let empty: HashMap<String, String> = HashMap::new();
+        CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("loads")
+    }
+
+    #[test]
+    fn three_consecutive_denials_in_one_session_flip_the_reason_on_the_third() {
+        let cfg = default_cfg_for_loop_breaker_tests();
+        assert_eq!(cfg.safety.denial_breaker_threshold, 3);
+        let state = tempfile::tempdir().expect("state");
+        let command = "git push --force origin main";
+
+        let first = run_hook_for_loop_breaker(&cfg, state.path(), "brk-1", command, "default");
+        assert!(
+            first.contains(r#""permissionDecision":"ask""#),
+            "got {first}"
+        );
+        assert!(
+            !first.contains("consecutive denials"),
+            "1st denial must not trip the breaker: {first}"
+        );
+
+        let second = run_hook_for_loop_breaker(&cfg, state.path(), "brk-1", command, "default");
+        assert!(
+            !second.contains("consecutive denials"),
+            "2nd denial must not trip the breaker: {second}"
+        );
+
+        let third = run_hook_for_loop_breaker(&cfg, state.path(), "brk-1", command, "default");
+        assert!(
+            third.contains("3 consecutive denials this session"),
+            "3rd denial must trip the breaker: {third}"
+        );
+        assert!(
+            third.contains(" -- ") && third.contains("git push"),
+            "the original policy explanation must survive after ` -- `: {third}"
+        );
+    }
+
+    #[test]
+    fn an_allow_between_denials_resets_the_breakers_trailing_run() {
+        let cfg = default_cfg_for_loop_breaker_tests();
+        let state = tempfile::tempdir().expect("state");
+        let deny_command = "git push --force origin main";
+        let allow_command = "npm install";
+
+        run_hook_for_loop_breaker(&cfg, state.path(), "brk-2", deny_command, "default");
+        run_hook_for_loop_breaker(&cfg, state.path(), "brk-2", deny_command, "default");
+        let allowed =
+            run_hook_for_loop_breaker(&cfg, state.path(), "brk-2", allow_command, "default");
+        assert!(
+            allowed.contains(r#""permissionDecision":"allow""#),
+            "got {allowed}"
+        );
+
+        let third_deny =
+            run_hook_for_loop_breaker(&cfg, state.path(), "brk-2", deny_command, "default");
+        assert!(
+            !third_deny.contains("consecutive denials"),
+            "the intervening allow must reset the trailing run: {third_deny}"
+        );
+    }
+
+    #[test]
+    fn a_zero_denial_breaker_threshold_never_trips() {
+        let mut cfg = default_cfg_for_loop_breaker_tests();
+        cfg.safety.denial_breaker_threshold = 0;
+        let state = tempfile::tempdir().expect("state");
+        let command = "git push --force origin main";
+        for _ in 0..5 {
+            let output = run_hook_for_loop_breaker(&cfg, state.path(), "brk-3", command, "default");
+            assert!(
+                !output.contains("consecutive denials"),
+                "threshold 0 must disable the breaker entirely: {output}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_different_sessions_denials_never_count_towards_this_sessions_breaker() {
+        let cfg = default_cfg_for_loop_breaker_tests();
+        let state = tempfile::tempdir().expect("state");
+        let command = "git push --force origin main";
+        run_hook_for_loop_breaker(&cfg, state.path(), "sess-a", command, "default");
+        run_hook_for_loop_breaker(&cfg, state.path(), "sess-a", command, "default");
+        run_hook_for_loop_breaker(&cfg, state.path(), "sess-b", command, "default");
+        let second_for_b =
+            run_hook_for_loop_breaker(&cfg, state.path(), "sess-b", command, "default");
+        assert!(
+            !second_for_b.contains("consecutive denials"),
+            "sess-b has only 2 of its own denials, sess-a's must not count: {second_for_b}"
+        );
+    }
+
+    // -- issue #313: identical-failing-command guard ----------------------
+
+    /// One `(tool_use, tool_result)` Bash pair as two transcript JSONL lines,
+    /// the identical shape claude's own real transcripts use (and the
+    /// existing `structural_context`/`last_verification_run` fixtures in
+    /// `adapters::claude` already exercise): `id` links the pair, `is_error`
+    /// marks a failure.
+    fn transcript_bash_pair(id: &str, command: &str, is_error: bool) -> String {
+        format!(
+            "{}\n{}\n",
+            serde_json::json!({
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {"type": "tool_use", "id": id, "name": "Bash", "input": {"command": command}}
+                    ]
+                }
+            }),
+            serde_json::json!({
+                "type": "user",
+                "message": {
+                    "content": [
+                        {"type": "tool_result", "tool_use_id": id, "is_error": is_error, "content": "x"}
+                    ]
+                }
+            })
+        )
+    }
+
+    fn transcript_jsonl(entries: &[(&str, &str, bool)]) -> String {
+        entries
+            .iter()
+            .map(|(id, command, is_error)| transcript_bash_pair(id, command, *is_error))
+            .collect()
+    }
+
+    #[test]
+    fn trailing_same_command_failure_run_counts_only_the_trailing_run_of_this_exact_command() {
+        let jsonl = transcript_jsonl(&[
+            ("b1", "cargo test", true),
+            ("b2", "cargo test", true),
+            ("b3", "cargo test", false),
+            ("b4", "cargo test", true),
+            ("other", "cargo build", true),
+        ]);
+        assert_eq!(
+            trailing_same_command_failure_run(&jsonl, "cargo test"),
+            1,
+            "the success at b3 resets the run; a different command never counts"
+        );
+        assert_eq!(trailing_same_command_failure_run(&jsonl, "cargo build"), 1);
+    }
+
+    #[test]
+    fn trailing_same_command_failure_run_skips_unparseable_lines() {
+        let mut jsonl = transcript_jsonl(&[("b1", "cargo test", true), ("b2", "cargo test", true)]);
+        jsonl.push_str("not json\n");
+        assert_eq!(trailing_same_command_failure_run(&jsonl, "cargo test"), 2);
+    }
+
+    fn write_transcript(dir: &tempfile::TempDir, jsonl: &str) -> String {
+        let path = dir.path().join("transcript.jsonl");
+        std::fs::write(&path, jsonl).expect("write transcript");
+        path.to_str().expect("utf8 path").to_string()
+    }
+
+    /// Every call gets a FRESH state dir: these guard tests care only about
+    /// what the transcript produces, and an isolated, empty state dir keeps
+    /// the (session-history-driven) denial breaker from this same PR ever
+    /// contributing to the output -- the same isolation `audited_
+    /// unsandboxed_retry` above already gives its own single-call tests.
+    fn run_hook_with_transcript(
+        cfg: &CtxConfig,
+        command: &str,
+        permission_mode: &str,
+        transcript_path: &str,
+    ) -> String {
+        let state = tempfile::tempdir().expect("state");
+        let env = env_from(&[(
+            super::super::state::STATE_ENV,
+            state.path().to_str().expect("utf8 state"),
+        )]);
+        let stdin = serde_json::json!({
+            "session_id": "guard-session",
+            "tool_name": "Bash",
+            "tool_input": { "command": command },
+            "permission_mode": permission_mode,
+            "transcript_path": transcript_path,
+        })
+        .to_string();
+        let mut out = Vec::new();
+        run_check_hook_mode_with_env(cfg, &mut out, &stdin, &|key| env.get(key).cloned())
+            .expect("runs");
+        String::from_utf8(out).expect("utf8")
+    }
+
+    #[test]
+    fn two_trailing_failures_warn_but_still_allow() {
+        let cfg = default_cfg_for_loop_breaker_tests();
+        assert_eq!(cfg.safety.identical_command_warn_after, 2);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let jsonl = transcript_jsonl(&[("b1", "cargo test", true), ("b2", "cargo test", true)]);
+        let path = write_transcript(&dir, &jsonl);
+
+        let output = run_hook_with_transcript(&cfg, "cargo test", "default", &path);
+        assert!(
+            output.contains(r#""permissionDecision":"allow""#),
+            "got {output}"
+        );
+        assert!(
+            output.contains("additionalContext")
+                && output.contains("failed 2 times in a row")
+                && output.contains("change the approach"),
+            "got {output}"
+        );
+    }
+
+    #[test]
+    fn five_trailing_failures_refuse_headless_but_only_warn_interactive() {
+        let cfg = default_cfg_for_loop_breaker_tests();
+        assert_eq!(cfg.safety.identical_command_refuse_after, 5);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let jsonl = transcript_jsonl(&[
+            ("b1", "cargo test", true),
+            ("b2", "cargo test", true),
+            ("b3", "cargo test", true),
+            ("b4", "cargo test", true),
+            ("b5", "cargo test", true),
+        ]);
+        let path = write_transcript(&dir, &jsonl);
+
+        let headless = run_hook_with_transcript(&cfg, "cargo test", "dontAsk", &path);
+        assert!(
+            headless.contains(r#""permissionDecision":"deny""#),
+            "headless must refuse at the 5th trailing failure: {headless}"
+        );
+        assert!(
+            headless.contains("refusing to run it again"),
+            "got {headless}"
+        );
+
+        let interactive = run_hook_with_transcript(&cfg, "cargo test", "default", &path);
+        assert!(
+            interactive.contains(r#""permissionDecision":"allow""#),
+            "interactive must never auto-refuse: {interactive}"
+        );
+        assert!(
+            interactive.contains("additionalContext") && interactive.contains("failed 5 times"),
+            "interactive still warns: {interactive}"
+        );
+    }
+
+    #[test]
+    fn a_read_only_command_never_triggers_the_identical_command_guard() {
+        let cfg = default_cfg_for_loop_breaker_tests();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let jsonl = transcript_jsonl(&[
+            ("b1", "git status", true),
+            ("b2", "git status", true),
+            ("b3", "git status", true),
+            ("b4", "git status", true),
+            ("b5", "git status", true),
+        ]);
+        let path = write_transcript(&dir, &jsonl);
+
+        let output = run_hook_with_transcript(&cfg, "git status", "dontAsk", &path);
+        assert!(
+            !output.contains("additionalContext") && !output.contains("zirv guard"),
+            "a read-only command must never be guarded, even headless: {output}"
+        );
+    }
+
+    #[test]
+    fn a_success_in_the_middle_resets_the_guards_trailing_run_too() {
+        let cfg = default_cfg_for_loop_breaker_tests();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let jsonl = transcript_jsonl(&[
+            ("b1", "cargo test", true),
+            ("b2", "cargo test", true),
+            ("b3", "cargo test", false),
+        ]);
+        let path = write_transcript(&dir, &jsonl);
+
+        let output = run_hook_with_transcript(&cfg, "cargo test", "default", &path);
+        assert!(
+            !output.contains("additionalContext"),
+            "the success at b3 must reset the trailing run below warn_after: {output}"
+        );
     }
 }

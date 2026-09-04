@@ -245,3 +245,10 @@ model = "fable"
 # default = "ask"                    # REPO-FORBIDDEN (ZIRV_CTX_SAFETY_DEFAULT): verdict for a command matching no rule. Default: "ask".
 # interactive_default = "allow"      # REPO-FORBIDDEN (ZIRV_CTX_SAFETY_INTERACTIVE_DEFAULT): verdict for a command matching no rule on an INTERACTIVE launch. Default: "allow" -- a command zirv has never seen must not prompt. `default` above still governs headless launches.
 # sql = "on"                         # REPO-FORBIDDEN (ZIRV_CTX_SAFETY_SQL): "on" classifies psql/mysql/mariadb/sqlite3/duckdb/sqlcmd statements (a single provably read-only SELECT/EXPLAIN/SHOW is allowed, everything else asks); "off" disables it. Default: "on".
+# Issue #313's two loop breakers: NOT REPO-FORBIDDEN, unlike every other key
+# in this table above -- a repo may LOWER (narrow) any of the three, but
+# never raise one above the operator's own home-layer ceiling, and never
+# turn a `0` (disabled) breaker back on. See `narrow_threshold` in safety.rs.
+# denial_breaker_threshold = 3        # trailing consecutive Ask/Deny verdicts in one session, this decision included, before the hook's reason text stops explaining the policy and tells the agent to stop retrying. 0 disables. Default: 3.
+# identical_command_warn_after = 2    # trailing consecutive failures of the exact same Bash command (from the session transcript) before an Allow verdict also carries a warning in additionalContext. 0 disables. Default: 2.
+# identical_command_refuse_after = 5  # the same identical-failing-command count at which a HEADLESS launch (only) turns the verdict into Deny instead of merely warning; interactive launches never auto-refuse. 0 disables. Default: 5.

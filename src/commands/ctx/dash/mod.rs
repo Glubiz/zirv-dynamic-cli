@@ -4057,6 +4057,14 @@ fn fulfill_spawn_request(
     if let Some(parent) = &verified_parent {
         turn_env.push((super::agent::PARENT_SESSION_ENV.to_string(), parent.clone()));
     }
+    // Issue #318: the OUTPUT CONTRACT this delegation declared travels the
+    // same way -- into the pane's own child env, so a self-report it sends
+    // with `zirv ctx send --to-session` (which inherits this real process
+    // environment) is held to the identical contract the headless retry
+    // path validates against.
+    if let Some(schema) = &req.result_schema {
+        turn_env.push((super::agent::RESULT_SCHEMA_ENV.to_string(), schema.clone()));
+    }
 
     // T10: the same launch-time pacing gate `wrap::run_with`/this dashboard's
     // own first pane apply, but *non-interactively* here: this spawn happens
@@ -6683,6 +6691,15 @@ pub fn run_dashboard(
                                                     // existed.
                                                     mode: super::permit::WorkerMode::Writing,
                                                     owns_workdir: false,
+                                                    // The overlay has no
+                                                    // `--result-schema`/
+                                                    // `--result-kind` of its
+                                                    // own either (issue
+                                                    // #318): this spawn
+                                                    // declares no contract,
+                                                    // exactly as before
+                                                    // those flags existed.
+                                                    result_schema: None,
                                                 };
                                                 let panes_before_spawn = panes.len();
                                                 // `trusted_interactive: true` --
@@ -10805,6 +10822,7 @@ mod tests {
             workdir: None,
             mode: super::super::permit::WorkerMode::Writing,
             owns_workdir: false,
+            result_schema: None,
         }
     }
 

@@ -13,8 +13,9 @@ use serde::{Deserialize, Serialize};
 use super::CtxResult;
 use super::adapters::{AGENT_ENV, SESSION_ENV};
 use super::config::{CtxConfig, EnvLookup, MailConfig, env_from_process};
+use super::result_schema;
 use super::sessions;
-use super::state::{StateDir, now_secs, repo_slug};
+use super::state::{self, StateDir, now_secs, repo_slug};
 
 /// One mail message: a free-form markdown note plus who sent it, who it is
 /// addressed to, and when.
@@ -1826,7 +1827,7 @@ pub fn run_send_with<W: Write>(
         );
     }
 
-    let body = resolve_message(args, stdin)?;
+    let mut body = resolve_message(args, stdin)?;
     if body.is_empty() {
         return Err(
             "zirv ctx send: no message given; pass --message, --message-file, or pipe one on stdin"
@@ -1839,6 +1840,53 @@ pub fn run_send_with<W: Write>(
     let created_at = now_secs();
     let expires_at = created_at.saturating_add(args.ttl_seconds);
     let from = sender_party(&state, &own_slug, env);
+    // Issue #318: a worker running under a declared OUTPUT CONTRACT
+    // (`agent::RESULT_SCHEMA_ENV`, exported into this process's own real
+    // environment by the headless launch, or into a pane's child env by
+    // `dash::fulfill_spawn_request`) has its self-report held to the same
+    // contract the headless retry path validates against -- one
+    // declaration, enforced on whichever fork actually ran the worker.
+    //
+    // First failure: refuses to send at all, prints the exact
+    // `result_schema::build_retry_message` back to the worker on stderr (its
+    // own harness reads that the same way it reads any other tool-call
+    // error), and leaves a marker so a SECOND consecutive failure is not
+    // silently swallowed the same way -- it sends anyway, body prefixed
+    // `contract_failed:` plus the errors, so the delegator still gets
+    // *something* durable rather than the worker looping forever against a
+    // contract it cannot satisfy. A valid body always clears the marker, so
+    // a later, unrelated send from the same session starts clean.
+    if let Some(schema_json) = env(super::agent::RESULT_SCHEMA_ENV).filter(|s| !s.is_empty()) {
+        let schema = result_schema::Schema::from_json(&schema_json).map_err(|e| {
+            format!(
+                "zirv ctx send: invalid {}: {e}",
+                super::agent::RESULT_SCHEMA_ENV
+            )
+        })?;
+        let short = sessions::short_id(&from.session);
+        let marker = state.mail().join(format!(".contract-attempt-{short}"));
+        match result_schema::evaluate(&schema, &body) {
+            Ok(_) => {
+                let _ = std::fs::remove_file(&marker);
+            }
+            Err(errors) if marker.exists() => {
+                let _ = std::fs::remove_file(&marker);
+                let mut prefixed = String::from("contract_failed:\n");
+                for error in &errors {
+                    prefixed.push_str(&format!("- {error}\n"));
+                }
+                prefixed.push('\n');
+                prefixed.push_str(&body);
+                body = prefixed;
+            }
+            Err(errors) => {
+                eprintln!("{}", result_schema::build_retry_message(&errors));
+                let _ = state::create_private_dir_all(&state.mail());
+                let _ = state::write_private(&marker, "");
+                return Ok(1);
+            }
+        }
+    }
     let to_agent = args.to.clone().unwrap_or_else(|| "any".to_string());
     let mut targets = Vec::new();
     let mut notify = Vec::new();
@@ -3705,6 +3753,157 @@ This is part of the body too.\n";
             remaining.len(),
             2,
             "both the directed-to-a-live-session and the undirected message remain: {remaining:?}"
+        );
+    }
+
+    /// Issue #318: the small schema `--result-schema`/`--result-kind`
+    /// exports as `ZIRV_CTX_RESULT_SCHEMA` -- `{"fields":[{"name":"status",
+    /// "kind":"enum","values":["done","blocked"],"required":true}]}` --
+    /// used by both contract-enforcement tests below.
+    fn contract_schema_json() -> &'static str {
+        r#"{"fields":[{"name":"status","kind":"enum","values":["done","blocked"],"required":true}]}"#
+    }
+
+    /// A worker's first self-report that fails the declared OUTPUT CONTRACT
+    /// must not be sent at all: the delegator would otherwise read a
+    /// non-conforming body as if it were the worker's real, final answer.
+    /// Refuses cleanly (`Ok(1)`, never an `Err`, so this is an ordinary
+    /// exit code a harness sees on its own tool call, not a crash) and
+    /// leaves a marker so a second consecutive failure is handled
+    /// differently (see the test right below).
+    #[test]
+    fn a_first_contract_failure_refuses_to_send_and_leaves_a_marker() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let state_dir = tmp.path().join("state");
+        let state = StateDir::from_root(state_dir.clone());
+        let repo = tmp.path().join("repo");
+        let record = sessions::Record::new(
+            "11111111-2222-4333-8444-555555555555",
+            "claude",
+            &repo,
+            sessions::Verb::Exec,
+        );
+        let target_short = record.short.clone();
+        let _guard = sessions::SessionGuard::register(&state, record);
+
+        let env = env_map(&[
+            (
+                super::super::state::STATE_ENV,
+                state_dir.to_str().expect("utf8"),
+            ),
+            (SESSION_ENV, "sender11-2222-3333-4444-555555555555"),
+            (
+                super::super::agent::RESULT_SCHEMA_ENV,
+                contract_schema_json(),
+            ),
+        ]);
+        let args = SendArgs {
+            to_session: Some(target_short.clone()),
+            message: Some("not a json contract reply at all".to_string()),
+            ..SendArgs::default()
+        };
+        let mut out = Vec::new();
+        let mut stdin = std::io::Cursor::new(Vec::<u8>::new());
+        let code = run_send_with(
+            &args,
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            &mut stdin,
+        )
+        .expect("a contract refusal is a clean Ok(1), never an Err");
+        assert_eq!(code, 1, "a first contract failure refuses without sending");
+
+        let target_slug = repo_slug(&repo);
+        assert!(
+            list(&state, &target_slug, None, None)
+                .expect("list")
+                .is_empty(),
+            "nothing is sent on a first contract failure"
+        );
+        let marker = state.mail().join(".contract-attempt-sender11");
+        assert!(
+            marker.exists(),
+            "a marker is left so a second failure is handled differently"
+        );
+    }
+
+    /// The other half: a SECOND consecutive contract failure from the same
+    /// sending session (the marker from the test above already exists) is
+    /// sent anyway, body prefixed `contract_failed:` plus the errors --
+    /// never silently dropped a second time, since a worker looping forever
+    /// against a contract it cannot satisfy would otherwise never report
+    /// back at all. The marker is cleared once this happens.
+    #[test]
+    fn a_second_consecutive_contract_failure_sends_prefixed_and_clears_the_marker() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let state_dir = tmp.path().join("state");
+        let state = StateDir::from_root(state_dir.clone());
+        let repo = tmp.path().join("repo");
+        let record = sessions::Record::new(
+            "22222222-3333-4444-8555-666666666666",
+            "claude",
+            &repo,
+            sessions::Verb::Exec,
+        );
+        let target_short = record.short.clone();
+        let _guard = sessions::SessionGuard::register(&state, record);
+
+        let marker = state.mail().join(".contract-attempt-sender22");
+        state::create_private_dir_all(&state.mail()).expect("mkdir mail dir");
+        state::write_private(&marker, "").expect("write marker");
+
+        let env = env_map(&[
+            (
+                super::super::state::STATE_ENV,
+                state_dir.to_str().expect("utf8"),
+            ),
+            (SESSION_ENV, "sender22-2222-3333-4444-555555555555"),
+            (
+                super::super::agent::RESULT_SCHEMA_ENV,
+                contract_schema_json(),
+            ),
+        ]);
+        let args = SendArgs {
+            to_session: Some(target_short.clone()),
+            message: Some("still not a json contract reply".to_string()),
+            ..SendArgs::default()
+        };
+        let mut out = Vec::new();
+        let mut stdin = std::io::Cursor::new(Vec::<u8>::new());
+        let code = run_send_with(
+            &args,
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            &mut stdin,
+        )
+        .expect("a second failure still sends");
+        assert_eq!(
+            code, 0,
+            "the message is delivered, not refused a second time"
+        );
+
+        let target_slug = repo_slug(&repo);
+        let listed = list(&state, &target_slug, None, None).expect("list");
+        assert_eq!(listed.len(), 1, "the message was sent this time");
+        assert!(
+            listed[0].1.body.starts_with("contract_failed:"),
+            "got {}",
+            listed[0].1.body
+        );
+        assert!(
+            listed[0].1.body.contains("still not a json contract reply"),
+            "the original body is preserved after the prefix: got {}",
+            listed[0].1.body
+        );
+        assert!(
+            !marker.exists(),
+            "the marker is cleared once the second failure is delivered"
         );
     }
 

@@ -155,6 +155,14 @@ pub struct SpawnRequest {
     /// written by an older build owns nothing.
     #[serde(default)]
     pub owns_workdir: bool,
+    /// Issue #318: the canonical JSON of the `result_schema::Schema` this
+    /// delegation declared via `--result-schema`/`--result-kind`, if any.
+    /// `dash::fulfill_spawn_request` pushes this verbatim into the
+    /// fulfilling pane's own child env (`agent::RESULT_SCHEMA_ENV`), the
+    /// same shape `work_group_id` already travels in. `#[serde(default)]`:
+    /// a request written by an older build declared no contract.
+    #[serde(default)]
+    pub result_schema: Option<String>,
 }
 
 /// The role a request actually gets. Unstated or unrecognised is
@@ -511,6 +519,7 @@ mod tests {
             workdir: None,
             mode: WorkerMode::Writing,
             owns_workdir: false,
+            result_schema: None,
         }
     }
 
