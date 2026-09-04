@@ -77,6 +77,30 @@ impl HookPayload {
 
 const PERMISSION_PROMPTS_FILE: &str = "permission-prompts.jsonl";
 
+/// The short id issue #349's [`super::attention`] observations are filed
+/// under -- the same stable short a session's registry record uses
+/// (`sessions::Record::short`), recovered the same way `run_stop`'s own
+/// inline `stable_short` is (via the bound turn-signal socket's file stem,
+/// which does not rotate across an internal restart), falling back to
+/// `sessions::short_id` of whatever session id this hook call carries when
+/// no socket was ever bound (an unsupervised launch, or a hook that fired
+/// before one existed). Deliberately its own small function rather than a
+/// refactor of `run_stop`'s existing inline derivation (no drive-by
+/// refactors) -- this codebase already accepts exactly this kind of
+/// duplication for this exact derivation; see `sessions::short_id`'s own
+/// doc comment.
+fn attention_short(env: EnvLookup<'_>, session_id_fallback: &str) -> String {
+    env(SOCKET_ENV)
+        .and_then(|raw| {
+            Path::new(&raw)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| super::sessions::short_id(session_id_fallback))
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 struct PermissionHookPayload {
@@ -196,6 +220,23 @@ fn run_permission<W: Write>(_w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxR
     let Ok(state) = StateDir::resolve(env) else {
         return Ok(0);
     };
+    // Issue #349: the one live choke point for "an operator needs to decide
+    // something" -- this hook only ever fires while Claude is actually
+    // holding for a permission decision. Best-effort, like every other
+    // attention observation: a failure to persist it must never affect the
+    // permission flow this hook only observes.
+    let _ = super::attention::record(
+        &state,
+        &attention_short(env, &payload.session_id),
+        super::attention::Observation::new(
+            super::attention::Authority::AdapterHook,
+            format!("permission requested for {}", payload.tool_name),
+            100,
+            now_secs(),
+        )
+        .with_attention(super::attention::Attention::Approval),
+        now_secs(),
+    );
     let Ok(line) = serde_json::to_string(&permission_prompt_row(&payload, now_secs())) else {
         return Ok(0);
     };
@@ -1363,6 +1404,26 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
             .filter(|s| !s.is_empty())
             .map(str::to_string)
             .unwrap_or_else(|| super::sessions::short_id(&payload.session_id));
+        // Issue #349: a Stop hook is exactly a `Working -> Settled` turn
+        // boundary -- the agent has finished its response and is back at an
+        // idle prompt. `Attention::None` here is deliberate, not a no-op:
+        // it is what lets a LOWER-ranked authority's stale attention (a
+        // `Supervisor` stall latch from a prior turn, say) be cleared the
+        // moment the turn actually completes cleanly, since `AdapterHook`
+        // outranks every other authority on the attention axis too.
+        let _ = super::attention::record(
+            &state,
+            &stable_short,
+            super::attention::Observation::new(
+                super::attention::Authority::AdapterHook,
+                "turn completed cleanly",
+                100,
+                now_secs(),
+            )
+            .with_lifecycle(super::attention::Lifecycle::Settled)
+            .with_attention(super::attention::Attention::None),
+            now_secs(),
+        );
         // A fresh process every turn has nothing to compare a repeated
         // summary against, and no `Announcer` of its own -- the decision-
         // log line above already covers this turn's own finding, so
@@ -1580,6 +1641,23 @@ fn latest_handoff_for_injection(payload: &HookPayload, env: EnvLookup<'_>) -> Op
 /// the prior one -- can use a handoff.
 pub fn run_session_start<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResult<i32> {
     let payload = HookPayload::parse(stdin).unwrap_or_default();
+    // Issue #349: a session starting (fresh, resumed, cleared or post-
+    // compact) is `Working` again regardless of source -- best-effort, like
+    // every other observation here.
+    if let Ok(state) = StateDir::resolve(env) {
+        let _ = super::attention::record(
+            &state,
+            &attention_short(env, &payload.session_id),
+            super::attention::Observation::new(
+                super::attention::Authority::AdapterHook,
+                format!("session start ({})", payload.source),
+                100,
+                now_secs(),
+            )
+            .with_lifecycle(super::attention::Lifecycle::Working),
+            now_secs(),
+        );
+    }
     if matches!(payload.source.as_str(), "resume" | "clear")
         && let Some(labeled) = latest_handoff_for_injection(&payload, env)
     {
@@ -2073,6 +2151,24 @@ pub fn run<W: Write>(args: &HookArgs, w: &mut W) -> CtxResult<i32> {
                 .and_then(|cfg| prompt_adoption_nudge(&repo, cfg, &env));
             if !marker.is_empty() || adoption_nudge.is_some() {
                 let _ = writeln!(w, "{}", prompt_output(&marker, adoption_nudge.as_deref()));
+            }
+            // Issue #349: a fresh user prompt is the clearest possible
+            // `Working` signal -- the operator just handed the agent
+            // something to do.
+            if let Ok(state) = StateDir::resolve(&env) {
+                let session_id = env(SESSION_ENV).unwrap_or_default();
+                let _ = super::attention::record(
+                    &state,
+                    &attention_short(&env, &session_id),
+                    super::attention::Observation::new(
+                        super::attention::Authority::AdapterHook,
+                        "user prompt submitted",
+                        100,
+                        now_secs(),
+                    )
+                    .with_lifecycle(super::attention::Lifecycle::Working),
+                    now_secs(),
+                );
             }
             Ok(0)
         }

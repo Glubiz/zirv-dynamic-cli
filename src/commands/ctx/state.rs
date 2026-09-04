@@ -367,6 +367,15 @@ impl StateDir {
         self.0.join("frontend")
     }
 
+    /// Issue #349: the composed per-session attention model
+    /// (`super::attention::SessionStatus`), one file per session
+    /// (`<state>/attention/<short>.json`), keyed by the same stable short id
+    /// the session registry (`sessions::Record::short`) uses -- mirroring
+    /// `adoption()`'s own per-session layout above.
+    pub fn attention(&self) -> PathBuf {
+        self.0.join("attention")
+    }
+
     /// The dashboard's own state: today, only the spawn-request capability-
     /// token directories `super::dash::spawnreq::request_dir_for` names
     /// under `<state>/dash/<dash_short>-<token>/requests`. A future roster

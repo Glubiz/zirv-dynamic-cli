@@ -3106,6 +3106,24 @@ pub fn run_with<W: Write>(
                         cfg.supervise.max_writers
                     ),
                 };
+                // Issue #349: the REQUESTING session (this process's own
+                // caller) is the one that needs to know its delegation was
+                // refused -- the worker session this refusal prevented from
+                // ever existing has no attention row to file it under.
+                if let Some(short) = super::mail::session_identity(&env) {
+                    let _ = super::attention::record(
+                        &state,
+                        &short,
+                        super::attention::Observation::new(
+                            super::attention::Authority::Supervisor,
+                            reason.clone(),
+                            80,
+                            super::state::now_secs(),
+                        )
+                        .with_attention(super::attention::Attention::WriterConflict),
+                        super::state::now_secs(),
+                    );
+                }
                 let code = exec::EXIT_WRITER_BUSY;
                 writeln!(w, "{}: {reason}", delegation_outcome(code))?;
                 return Ok(code);

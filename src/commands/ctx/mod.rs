@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand};
 pub mod adapters;
 pub mod agent;
 pub mod announce;
+pub mod attention;
 pub mod breakdown;
 pub mod chain;
 pub mod chat;
@@ -403,6 +404,14 @@ pub enum CtxVerb {
     Hook(hook::HookArgs),
     /// Show supervised sessions, scores and handoffs.
     Status(status::StatusArgs),
+    /// Explain one session's composed attention projection: what it is,
+    /// why, which authority decided, and every fallback that was suppressed
+    /// (issue #349).
+    #[command(name = "explain-status")]
+    ExplainStatus(attention::ExplainStatusArgs),
+    /// Block until a session's attention projection matches, or time out
+    /// (issue #349).
+    Wait(attention::WaitArgs),
     /// Stateless loop runner: a fresh headless session per cycle.
     #[command(name = "loop")]
     Loop(run_loop::LoopArgs),
@@ -540,6 +549,8 @@ pub fn dispatch(args: &[String]) -> i32 {
         CtxVerb::Resume(a) => resume::run(a, &mut out),
         CtxVerb::Hook(a) => hook::run(a, &mut out),
         CtxVerb::Status(a) => status::run(a, &mut out),
+        CtxVerb::ExplainStatus(a) => attention::run_explain_status(a, &mut out),
+        CtxVerb::Wait(a) => attention::run_wait(a, &mut out),
         CtxVerb::Loop(a) => run_loop::run(a, &mut out),
         CtxVerb::Exec(a) => exec::run(a, &mut out),
         CtxVerb::Wrap(a) => wrap::run(a, &mut out),

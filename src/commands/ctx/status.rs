@@ -209,6 +209,31 @@ fn sessions_lines(
                     style::paint(&model_change_status_text(&change), Tone::Warn, colour)
                 ));
             }
+            // Issue #349: the composed attention projection, shown for every
+            // record regardless of liveness -- a `dead` session that ended
+            // with an unread completion (`DoneUnread`) is exactly the case
+            // "background completion never disappears into idle" exists for.
+            let attention_status = super::attention::load(state, &record.short);
+            let projection = super::attention::project(&attention_status);
+            let attention_tone = match projection {
+                super::attention::Projection::Blocked(_) | super::attention::Projection::Failed => {
+                    Tone::Err
+                }
+                super::attention::Projection::DoneUnread => Tone::Warn,
+                _ => Tone::Muted,
+            };
+            line.push_str(&format!(
+                "  {}",
+                style::paint(
+                    &format!(
+                        "attention: {} ({})",
+                        projection.label(),
+                        super::attention::reason(&attention_status)
+                    ),
+                    attention_tone,
+                    colour
+                )
+            ));
             let delivery = mail::session_delivery_metrics(state, &record.short, now);
             line.push_str(&format!(
                 "  {}",

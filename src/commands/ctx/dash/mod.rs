@@ -7124,6 +7124,16 @@ pub fn run_dashboard(
                                             panes.len(),
                                             total_rows,
                                         );
+                                        // Issue #349: the operator just looked
+                                        // at this pane -- the only thing that
+                                        // may ever clear the `Unseen` latch.
+                                        // Best-effort, like every other
+                                        // attention write: a focus change must
+                                        // never fail just because this did.
+                                        if let Some(pane) = panes.get(focused) {
+                                            let _ =
+                                                super::attention::mark_seen_io(state, pane.short());
+                                        }
                                     }
                                     // Scrollback, on the focused pane, for every
                                     // terminal that does not deliver wheel events
