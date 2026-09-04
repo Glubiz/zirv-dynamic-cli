@@ -56,6 +56,14 @@ pub struct ReportArgs {
     /// Read the Markdown issue body from this file.
     #[arg(long, value_name = "PATH", conflicts_with = "body")]
     body_file: Option<PathBuf>,
+    /// Append a redacted `zirv ctx snapshot` to the issue body, in a
+    /// collapsed `<details>` block (issue #320).
+    #[arg(long, conflicts_with = "snapshot_file")]
+    snapshot: bool,
+    /// Write the same collapsed snapshot block to this file instead of
+    /// filing anything -- for review before deciding to attach it.
+    #[arg(long, value_name = "PATH")]
+    snapshot_file: Option<PathBuf>,
 }
 
 /// `pub(crate)`: issue #178's `permissions::propose` builds these directly to
@@ -323,6 +331,28 @@ fn issue_body(body: Option<String>, env: EnvLookup<'_>) -> String {
     }
 }
 
+/// The collapsed `<details>` block `--snapshot`/`--snapshot-file` both use --
+/// the same content either appended to an issue body or written to disk
+/// untouched, so a reviewer sees exactly what would have been filed.
+const SNAPSHOT_SUMMARY: &str = "zirv snapshot";
+
+fn snapshot_block(env: EnvLookup<'_>) -> ReportResult<String> {
+    let repo = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let text = crate::commands::ctx::snapshot::build(None, &repo, env)?;
+    Ok(format!(
+        "<details><summary>{SNAPSHOT_SUMMARY}</summary>\n\n{text}\n\n</details>"
+    ))
+}
+
+/// `--snapshot-file <path>` on either verb: writes the same collapsed block
+/// `--snapshot` would append, but files nothing at all -- no credential
+/// resolution, no network call. `None` when the flag was not passed.
+fn snapshot_file_path(verb: &ReportVerb) -> Option<PathBuf> {
+    match verb {
+        ReportVerb::Bug(args) | ReportVerb::Feature(args) => args.snapshot_file.clone(),
+    }
+}
+
 fn supplied_body(args: &ReportArgs) -> ReportResult<Option<String>> {
     match (&args.body, &args.body_file) {
         (Some(body), None) => Ok(Some(body.clone())),
@@ -343,9 +373,17 @@ fn request_for(verb: &ReportVerb, env: EnvLookup<'_>) -> ReportResult<IssueReque
     if title.is_empty() {
         return Err("report title must not be empty".into());
     }
+    let mut body = supplied_body(args)?;
+    if args.snapshot {
+        let block = snapshot_block(env)?;
+        body = Some(match body {
+            Some(existing) => format!("{}\n\n{block}", existing.trim_end()),
+            None => block,
+        });
+    }
     Ok(IssueRequest {
         title: title.to_string(),
-        body: issue_body(supplied_body(args)?, env),
+        body: issue_body(body, env),
         labels: vec![label.to_string()],
     })
 }
@@ -358,6 +396,13 @@ fn run_with<W: Write>(
     cli_token: &dyn Fn() -> Option<String>,
     issue_creator: &dyn Fn(&str, &IssueRequest) -> ReportResult<String>,
 ) -> ReportResult<i32> {
+    if let Some(path) = snapshot_file_path(&cli.verb) {
+        let block = snapshot_block(env)?;
+        std::fs::write(&path, &block)
+            .map_err(|error| format!("could not write {}: {error}", path.display()))?;
+        writeln!(writer, "{}", path.display())?;
+        return Ok(0);
+    }
     let request = request_for(&cli.verb, env)?;
     let token = resolve_token(home, env, cli_token)?;
     let url = issue_creator(&token, &request)?;
@@ -583,5 +628,110 @@ mod tests {
         );
         assert!(validate_repository("../owner/repo").is_err());
         assert_eq!(validate_repository("owner/repo").unwrap(), "owner/repo");
+    }
+
+    /// An isolated `ZIRV_CTX_STATE_DIR` so a snapshot-composing test never
+    /// scans this machine's own (potentially large) real decision log --
+    /// the same isolation `score.rs`'s own `state_env` test helper gives its
+    /// checkpoints.
+    fn isolated_state_env(dir: &std::path::Path) -> HashMap<String, String> {
+        [(
+            crate::commands::ctx::state::STATE_ENV.to_string(),
+            dir.join("state").display().to_string(),
+        )]
+        .into()
+    }
+
+    /// Issue #320: `--snapshot` appends a collapsed `<details>` block --
+    /// containing the redacted snapshot text -- after the supplied body,
+    /// which itself is still followed by the ordinary environment section.
+    #[test]
+    fn snapshot_flag_appends_a_collapsed_details_block_to_the_body() {
+        let state = tempfile::tempdir().expect("tempdir");
+        let vars = isolated_state_env(state.path());
+        let parsed = cli(&[
+            "zirv report",
+            "bug",
+            "Something broke",
+            "--body",
+            "Details",
+            "--snapshot",
+        ]);
+        let request = request_for(&parsed.verb, &|key| vars.get(key).cloned()).expect("request");
+
+        assert!(
+            request.body.starts_with("Details\n\n"),
+            "got {}",
+            request.body
+        );
+        assert!(
+            request
+                .body
+                .contains("<details><summary>zirv snapshot</summary>"),
+            "got {}",
+            request.body
+        );
+        assert!(request.body.contains("</details>"), "got {}", request.body);
+        assert!(
+            request.body.contains("---\nEnvironment"),
+            "the ordinary environment section must still be appended: {}",
+            request.body
+        );
+    }
+
+    /// Issue #320: `--snapshot-file <path>` writes the identical collapsed
+    /// block to disk and returns success WITHOUT resolving credentials or
+    /// calling the issue creator at all -- both callbacks panic if reached,
+    /// proving nothing was filed.
+    #[test]
+    fn snapshot_file_writes_the_block_and_files_nothing() {
+        let state = tempfile::tempdir().expect("tempdir");
+        let vars = isolated_state_env(state.path());
+        let out_dir = tempfile::tempdir().expect("tempdir");
+        let out_path = out_dir.path().join("snapshot.md");
+
+        let parsed = cli(&[
+            "zirv report",
+            "bug",
+            "Something broke",
+            "--snapshot-file",
+            out_path.to_str().expect("utf8"),
+        ]);
+        let mut output = Vec::new();
+        let code = run_with(
+            &parsed,
+            &mut output,
+            None,
+            &|key| vars.get(key).cloned(),
+            &|| panic!("credentials must never be resolved for --snapshot-file"),
+            &|_, _| panic!("no issue may be filed for --snapshot-file"),
+        )
+        .expect("run");
+
+        assert_eq!(code, 0);
+        assert_eq!(
+            String::from_utf8(output).expect("utf8").trim(),
+            out_path.display().to_string()
+        );
+        let written = std::fs::read_to_string(&out_path).expect("read written snapshot");
+        assert!(written.contains("<details><summary>zirv snapshot</summary>"));
+        assert!(written.contains("</details>"));
+    }
+
+    /// `--snapshot` and `--snapshot-file` are mutually exclusive -- passing
+    /// both is almost certainly a mistake (append-and-file vs.
+    /// write-and-skip-filing are opposite intents).
+    #[test]
+    fn snapshot_and_snapshot_file_conflict() {
+        let error = ReportCli::try_parse_from([
+            "zirv report",
+            "bug",
+            "title",
+            "--snapshot",
+            "--snapshot-file",
+            "out.md",
+        ])
+        .expect_err("conflict");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 }

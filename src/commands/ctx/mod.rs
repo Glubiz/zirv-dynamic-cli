@@ -45,6 +45,7 @@ pub mod score;
 pub mod screen;
 pub mod sessions;
 pub mod signal;
+pub mod snapshot;
 pub mod spend;
 pub mod state;
 pub mod status;
@@ -442,6 +443,8 @@ pub enum CtxVerb {
     Objective(objective::ObjectiveArgs),
     /// Aggregate delegation spend from the cost ledger (issue #264).
     Spend(spend::SpendArgs),
+    /// Print a redacted, capped diagnostic-state summary (issue #320).
+    Snapshot(snapshot::SnapshotArgs),
 }
 
 /// What a clap parse failure costs, which is not the same for every verb.
@@ -535,6 +538,7 @@ pub fn dispatch(args: &[String]) -> i32 {
         CtxVerb::Compile(a) => compile::run(a, &mut out),
         CtxVerb::Objective(a) => objective::run(a, &mut out),
         CtxVerb::Spend(a) => spend::run(a, &mut out),
+        CtxVerb::Snapshot(a) => snapshot::run(a, &mut out),
     };
 
     match result {

@@ -276,6 +276,13 @@ pub struct SafetyDecisionRecord {
     pub command_sha256: String,
     #[serde(default)]
     pub matched_pattern: Option<String>,
+    /// Issue #320: `zirv ctx snapshot`'s own hook-attestation-state field --
+    /// mirrors [`SafetyDecision::attestation`] exactly. `#[serde(default)]`
+    /// so a row written before any reader deserialized this field still
+    /// parses; an empty string reads as "unknown", the only honest reading
+    /// for a record that predates it.
+    #[serde(default)]
+    pub attestation: String,
 }
 
 /// Reads every parseable line across every day-bucketed
@@ -478,9 +485,32 @@ mod tests {
         assert_eq!(records[0].command_sha256, "aaa");
         assert_eq!(records[1].command_sha256, "bbb");
         assert_eq!(
+            records[0].attestation, "not-present",
+            "issue #320: attestation must round-trip through the reader too"
+        );
+        assert_eq!(
             records[1].matched_pattern.as_deref(),
             Some("<sandbox: escape_allow>")
         );
+    }
+
+    /// Issue #320: a `safety-decisions/*.jsonl` line written before any
+    /// reader deserialized `attestation` at all (no such field in the JSON)
+    /// must still parse, reading back as an empty string -- the only honest
+    /// reading for a record that predates the field, never a guessed
+    /// `"not-present"`/`"valid"`.
+    #[test]
+    fn a_safety_decision_written_before_attestation_was_read_still_deserialises_as_empty() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let dir = state.logs().join(SAFETY_LOG_DIR);
+        super::super::state::create_private_dir_all(&dir).expect("mkdir");
+        let old_line = r#"{"ts":1700000000,"session":"s1","mode":"interactive","verdict":"ask","command_sha256":"aaa"}"#;
+        std::fs::write(dir.join("0000019675.jsonl"), format!("{old_line}\n")).expect("write");
+
+        let records = read_safety_decisions(&state);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].attestation, "");
     }
 
     /// Issue #313: `read_recent_safety_decisions` opens only the newest TWO
