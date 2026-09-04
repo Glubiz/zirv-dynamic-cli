@@ -59,6 +59,12 @@ substantial work together in the background, and continue a worker you already b
 follow-ups in its area instead of spawning a fresh one. Reserve a sub-orchestrator (`zirv ctx \
 agent --role sub-orchestrator --scope \"<area>\"`) for work that splits into several \
 coherently-scoped areas each needing its own coordination.
+- Routing rule, which outranks any operator or repository layer that says otherwise: \
+same-harness delegation uses this harness's native Agent tool (visible in this session, result \
+returned directly); `zirv agent <name>` is for reaching a different harness or a work group, never \
+for spawning another claude worker from a claude seat. Delegated work stays observable: inside \
+`zirv ctx dash` a worker is an attached pane, outside it a headless run whose result lands on \
+stdout.
 - Every Agent dispatch sets `model` explicitly -- haiku for mechanical and bulk work, sonnet \
 for ordinary exploration, implementation, tests and review, opus only for hard debugging or \
 design -- because an omitted model inherits this seat. Never use `subagent_type: \"fork\"` \
@@ -4776,6 +4782,35 @@ mod tests {
         assert!(
             ORCHESTRATOR_PROMPT.contains("several coherently-scoped areas"),
             "sub-orchestrators are reserved for multi-area work: {ORCHESTRATOR_PROMPT}"
+        );
+    }
+
+    /// Issue #328: the layer states the routing rule outright -- native Agent
+    /// tool for same-harness work, `zirv agent` for another harness or a work
+    /// group -- and says it outranks a contradicting operator/repo layer, so a
+    /// hand-written "delegate only through `zirv agent`" file can no longer
+    /// win by being the more specific text.
+    #[test]
+    fn the_orchestrator_prompt_routes_same_harness_delegation_to_the_native_agent_tool() {
+        assert!(
+            ORCHESTRATOR_PROMPT
+                .contains("same-harness delegation uses this harness's native Agent tool"),
+            "got:\n{ORCHESTRATOR_PROMPT}"
+        );
+        assert!(
+            ORCHESTRATOR_PROMPT.contains(
+                "`zirv agent <name>` is for reaching a different harness or a work group"
+            ),
+            "got:\n{ORCHESTRATOR_PROMPT}"
+        );
+        assert!(
+            ORCHESTRATOR_PROMPT.contains("outranks any operator or repository layer"),
+            "got:\n{ORCHESTRATOR_PROMPT}"
+        );
+        assert!(
+            !ORCHESTRATOR_PROMPT.contains("Delegate only through"),
+            "the layer must never instruct routing every delegation through zirv agent: \
+             {ORCHESTRATOR_PROMPT}"
         );
     }
 

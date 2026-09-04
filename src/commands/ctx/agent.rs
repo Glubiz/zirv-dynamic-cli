@@ -579,6 +579,31 @@ fn out_of_repo_paths_in_prompt(
         .collect()
 }
 
+/// Issue #328: the one-line nudge printed when a session delegates to the
+/// SAME harness it already runs under (`ZIRV_CTX_AGENT` names `<name>`).
+/// The operator's routing rule is that zirv reaches another harness or a
+/// work group, while same-harness delegation belongs to the harness's own
+/// native subagent tool -- visible in the session, result returned directly,
+/// no mail hop. A work-group dispatch (`--group`, or an inherited
+/// `WORK_GROUP_ENV`) is exactly the case zirv exists for, so it never hints,
+/// and neither does a sub-orchestrator scope. The hint is advice, not a
+/// refusal: the run proceeds unchanged, because refusing would strand an
+/// operator who typed the command on purpose with nobody to answer.
+fn same_harness_hint(args: &AgentArgs, env: EnvLookup<'_>) -> Option<String> {
+    if args.group.is_some() || args.scope.is_some() || env(WORK_GROUP_ENV).is_some() {
+        return None;
+    }
+    let running = env(super::adapters::AGENT_ENV)?;
+    if !running.eq_ignore_ascii_case(args.name.trim()) {
+        return None;
+    }
+    Some(format!(
+        "hint: this session already runs under {running}; for same-harness delegation use the \
+         harness's native subagent tool (visible here, result returned directly) and keep `zirv \
+         agent` for another harness or a work group -- proceeding anyway"
+    ))
+}
+
 /// Prints [`out_of_repo_paths_in_prompt`]'s findings as non-fatal stderr
 /// warnings, one line per offending path. Never called when `--workdir` was
 /// given -- an explicit `--workdir` already says the operator meant to point
@@ -1927,6 +1952,12 @@ pub fn run_with<W: Write>(
             .or_else(|| env("USERPROFILE"))
             .map(PathBuf::from);
         warn_about_paths_outside_launch_repo(&prompt, repo, home.as_deref());
+    }
+    // Issue #328: printed on stdout ahead of either fork (pane ack or
+    // headless result) so the delegating session reads it whichever path
+    // runs the task.
+    if let Some(hint) = same_harness_hint(args, env) {
+        writeln!(w, "{hint}")?;
     }
 
     // Loaded here rather than after the dashboard-join attempt below (its
@@ -6079,6 +6110,53 @@ mod tests {
             String::from_utf8(out)
                 .expect("utf8")
                 .contains("budget-exhausted")
+        );
+    }
+
+    // -- same_harness_hint (issue #328) --------------------------------------
+
+    #[test]
+    fn same_harness_hint_fires_only_for_the_running_harness_outside_a_work_group() {
+        let env = env_map(&[(super::super::adapters::AGENT_ENV, "claude")]);
+        let lookup = |k: &str| env.get(k).cloned();
+        let hint = same_harness_hint(&args_for("claude", "brief"), &lookup)
+            .expect("claude from a claude seat hints");
+        assert!(hint.contains("native subagent tool"), "got: {hint}");
+        assert!(hint.contains("proceeding anyway"), "got: {hint}");
+        assert!(
+            same_harness_hint(&args_for("codex", "brief"), &lookup).is_none(),
+            "another harness is exactly what zirv agent is for"
+        );
+        assert!(
+            same_harness_hint(&args_for("Claude", "brief"), &lookup).is_some(),
+            "adapter names match case-insensitively like dispatch"
+        );
+
+        let grouped = AgentArgs {
+            group: Some("wg-1".to_string()),
+            ..args_for("claude", "brief")
+        };
+        assert!(same_harness_hint(&grouped, &lookup).is_none());
+        let scoped = AgentArgs {
+            role: Some("sub-orchestrator".to_string()),
+            scope: Some("area".to_string()),
+            ..args_for("claude", "brief")
+        };
+        assert!(same_harness_hint(&scoped, &lookup).is_none());
+
+        let inherited = env_map(&[
+            (super::super::adapters::AGENT_ENV, "claude"),
+            (WORK_GROUP_ENV, "wg-2"),
+        ]);
+        assert!(
+            same_harness_hint(&args_for("claude", "brief"), &|k| inherited.get(k).cloned())
+                .is_none(),
+            "an inherited work group is a zirv dispatch by design"
+        );
+        let unset = env_map(&[]);
+        assert!(
+            same_harness_hint(&args_for("claude", "brief"), &|k| unset.get(k).cloned()).is_none(),
+            "no running-harness evidence, no hint"
         );
     }
 
