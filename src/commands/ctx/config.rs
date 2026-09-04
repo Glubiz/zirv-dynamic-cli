@@ -757,6 +757,40 @@ impl Default for PriceConfig {
     }
 }
 
+/// Issue #312: thresholds for `hook.rs`'s reclaim-gated compact advisory --
+/// a SECOND, cost-driven tier alongside the rot `Verdict` ladder, firing only
+/// when stale tool-result tokens exceed `min_reclaim_tokens` AND the window
+/// exceeds `window_fraction` of the model's context window.
+///
+/// Deliberately **not** `REPO_FORBIDDEN`, unlike `score.token_floor`/
+/// `token_ceiling` right above: those gate the rot engine's own
+/// restart/compact behavior, so a checkout that could widen them escapes
+/// real supervision. This section only tunes how eagerly a PURE, ignorable
+/// suggestion fires -- the advisory never forces anything, and the verdict
+/// ladder that actually forces a restart/compact stays governed by the
+/// already-forbidden `score.*` keys no matter what this section says.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CompactAdvisoryConfig {
+    /// Stale tool-result tokens (the `tool_results_stale` bucket of
+    /// `breakdown::BreakdownSummary`) must exceed this before the advisory
+    /// even considers firing. Default `4096`.
+    pub min_reclaim_tokens: u64,
+    /// AND the current window must exceed this fraction of the model's
+    /// resolved context window (the same capacity `rot::token_gates`
+    /// resolves) before the advisory fires. Default `0.6`.
+    pub window_fraction: f64,
+}
+
+impl Default for CompactAdvisoryConfig {
+    fn default() -> Self {
+        Self {
+            min_reclaim_tokens: 4096,
+            window_fraction: 0.6,
+        }
+    }
+}
+
 /// Operator-controlled switches over the workflow subsystem
 /// (`src/commands/workflow/`). Every field is repo-forbidden except the
 /// explicitly folded `workflow.deploy.minimum_tier`, which can only make the
@@ -1392,6 +1426,7 @@ pub struct CtxConfig {
     pub handoff: HandoffConfig,
     pub pace: PaceConfig,
     pub price: PriceConfig,
+    pub compact_advisory: CompactAdvisoryConfig,
     pub optimize: OptimizeConfig,
     pub verify_on_stop: VerifyOnStopConfig,
     pub diagnostics: DiagnosticsConfig,
@@ -2007,6 +2042,16 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         "ZIRV_CTX_PRICE_TABLE_PATH",
         &["price", "table_path"],
         EnvKind::Str,
+    ),
+    (
+        "ZIRV_CTX_COMPACT_ADVISORY_MIN_RECLAIM_TOKENS",
+        &["compact_advisory", "min_reclaim_tokens"],
+        EnvKind::Int,
+    ),
+    (
+        "ZIRV_CTX_COMPACT_ADVISORY_WINDOW_FRACTION",
+        &["compact_advisory", "window_fraction"],
+        EnvKind::Float,
     ),
 ];
 
@@ -3767,6 +3812,42 @@ mod tests {
         let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
         assert_eq!(cfg.score.window, 7);
         assert_eq!(cfg.score.marker, "[env]");
+    }
+
+    /// Issue #312: `compact_advisory`'s two keys are ordinary, repo-settable
+    /// config -- unlike `score.token_floor`/`token_ceiling` (see
+    /// `CompactAdvisoryConfig`'s own doc comment for why), a plain repo
+    /// `ctx.toml` value takes effect with no narrowing gate, and an env var
+    /// still wins over the repo layer, the same precedence order every other
+    /// ordinary key already follows.
+    #[test]
+    fn compact_advisory_defaults_and_layers_like_an_ordinary_repo_settable_key() {
+        assert_eq!(CompactAdvisoryConfig::default().min_reclaim_tokens, 4096);
+        assert_eq!(CompactAdvisoryConfig::default().window_fraction, 0.6);
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[compact_advisory]\nmin_reclaim_tokens = 2048\nwindow_fraction = 0.5\n",
+        )
+        .expect("write");
+
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert_eq!(
+            cfg.compact_advisory.min_reclaim_tokens, 2048,
+            "a plain repo checkout may set this -- it only tunes an ignorable suggestion"
+        );
+        assert_eq!(cfg.compact_advisory.window_fraction, 0.5);
+
+        let env = env_map(&[
+            ("ZIRV_CTX_COMPACT_ADVISORY_MIN_RECLAIM_TOKENS", "8192"),
+            ("ZIRV_CTX_COMPACT_ADVISORY_WINDOW_FRACTION", "0.75"),
+        ]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert_eq!(cfg.compact_advisory.min_reclaim_tokens, 8192);
+        assert_eq!(cfg.compact_advisory.window_fraction, 0.75);
     }
 
     /// Companion to the test above, for the token gate's own five keys
@@ -6932,6 +7013,8 @@ mod tests {
         ("pace.use_credits", "codex"),
         ("price", "stale_after_days"),
         ("price", "table_path"),
+        ("compact_advisory", "min_reclaim_tokens"),
+        ("compact_advisory", "window_fraction"),
         ("optimize", "enabled"),
         ("optimize", "sessions_sampled"),
         ("optimize", "max_surface_bytes"),

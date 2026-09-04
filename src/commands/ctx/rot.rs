@@ -448,7 +448,15 @@ impl RotState {
             NormalizedEvent::ProviderError { .. }
             | NormalizedEvent::ModelId { .. }
             | NormalizedEvent::AssistantFirstText { .. }
-            | NormalizedEvent::ToolResultTimestamp { .. } => {}
+            | NormalizedEvent::ToolResultTimestamp { .. }
+            // Issue #312: window-attribution siblings. `RotState` scores
+            // rot signals only -- the byte/staleness bookkeeping they carry
+            // is folded separately, by `breakdown::BreakdownAccumulator`
+            // (see `score.rs`'s own I/O-layer callers), never here.
+            | NormalizedEvent::UserText { .. }
+            | NormalizedEvent::AssistantThinking { .. }
+            | NormalizedEvent::ToolResultSize { .. }
+            | NormalizedEvent::ToolCallPath { .. } => {}
             NormalizedEvent::Compaction => self.reset_behavioral_window(),
         }
     }
@@ -571,6 +579,15 @@ pub struct Score {
     pub context_tokens: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_change: Option<ModelChange>,
+    /// Issue #312: where this session's window went, by bucket. Attached
+    /// post-hoc by `score.rs`, exactly like `model_change` -- `score_from`
+    /// itself always leaves this `None`, so the incremental (`RotState`) and
+    /// full-parse (`score_events`) scoring paths never have to agree on it
+    /// for the equivalence tests both already uphold on every OTHER field.
+    /// `None` when it was never computed for this `Score`, never a
+    /// fabricated empty summary.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub window_breakdown: Option<super::breakdown::BreakdownSummary>,
 }
 
 /// Zero below the threshold, then a linear ramp that saturates at
@@ -697,6 +714,7 @@ pub fn score_from(signals: Signals, tokens: u64, cfg: &ScoreConfig, caps: Capabi
         signals,
         context_tokens: tokens,
         model_change: None,
+        window_breakdown: None,
     }
 }
 

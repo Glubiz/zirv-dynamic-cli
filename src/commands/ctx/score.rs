@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use super::adapters::AgentAdapter;
+use super::breakdown::{self, BreakdownSummary};
 use super::config::{CtxConfig, EnvLookup, ScoreConfig, env_from_process};
 use super::event::{ModelChange, NormalizedEvent, SessionId, SessionRef, SpeedMetrics, input_hash};
 use super::rot::{self, RotState, Score};
@@ -150,7 +151,13 @@ pub fn derive_speed_metrics(events: &[NormalizedEvent]) -> SpeedMetrics {
             | NormalizedEvent::ToolResultTimestamp { .. }
             | NormalizedEvent::ToolErrorText { .. }
             | NormalizedEvent::ProviderError { .. }
-            | NormalizedEvent::ModelId { .. } => {}
+            | NormalizedEvent::ModelId { .. }
+            // Issue #312: window-attribution siblings, irrelevant to speed
+            // metrics.
+            | NormalizedEvent::UserText { .. }
+            | NormalizedEvent::AssistantThinking { .. }
+            | NormalizedEvent::ToolResultSize { .. }
+            | NormalizedEvent::ToolCallPath { .. } => {}
         }
     }
     close_turn(turn_start, turn_last_assistant, &mut turn_latencies);
@@ -259,6 +266,120 @@ pub fn model_change_for_session(
     full_score(adapter.as_ref(), &transcript, &cfg.score)
         .ok()?
         .model_change
+}
+
+/// Issue #312: the window-attribution summary for one registered session,
+/// plus the model's resolved context window (for a percentage-of-window
+/// render) when either the operator or the adapter states one. `status.rs`'s
+/// `--breakdown <session>` is the one caller: transcript resolution,
+/// compile-context bytes and the one-shot event parse all stay at this I/O
+/// layer, never leaking into `breakdown.rs`'s pure attribution pass.
+///
+/// `session` matches either a registered record's full session id
+/// (`sessions::Record::session`) or its short id (`::short`), whichever the
+/// operator typed -- the same two spellings `zirv ctx status`'s own session
+/// list already prints side by side.
+pub fn breakdown_for_session(
+    session: &str,
+    repo: &Path,
+    env: EnvLookup<'_>,
+) -> CtxResult<(BreakdownSummary, Option<u64>)> {
+    let cfg = CtxConfig::load(repo, env)?;
+    let state = StateDir::resolve(env)?;
+    let record = super::sessions::list(&state)
+        .into_iter()
+        .map(|(record, _)| record)
+        .find(|record| record.session == session || record.short == session)
+        .ok_or_else(|| format!("no registered session matches `{session}`"))?;
+    let adapter = adapters::select(Some(record.agent.as_str()), &[], &cfg)?;
+    let transcript = adapter.transcript_path(&SessionRef {
+        id: SessionId::parse(&record.session),
+        cwd: record.repo.clone(),
+    });
+    let jsonl = std::fs::read_to_string(&transcript)
+        .map_err(|e| format!("{}: {e}", transcript.display()))?;
+    Ok(window_breakdown_core(
+        adapter.as_ref(),
+        &jsonl,
+        &record.repo,
+        &cfg,
+        &state,
+    ))
+}
+
+/// As [`breakdown_for_session`], but for an arbitrary transcript path rather
+/// than a registered session id -- the shape `zirv ctx score`'s own
+/// `--transcript` flag already takes. Used to fold a `window_breakdown` key
+/// into that verb's printed JSON (`run_with`, below) without ever touching
+/// `rot::Score` itself: see that type's `window_breakdown` field for why it
+/// must always stay `None` there.
+pub fn window_breakdown_for_transcript(
+    transcript: &Path,
+    agent: Option<&str>,
+    repo: &Path,
+    env: EnvLookup<'_>,
+) -> CtxResult<(BreakdownSummary, Option<u64>)> {
+    let cfg = CtxConfig::load(repo, env)?;
+    let state = StateDir::resolve(env)?;
+    let adapter = adapters::select(agent.or(cfg.agent.as_deref()), &[], &cfg)?;
+    let jsonl = std::fs::read_to_string(transcript)
+        .map_err(|e| format!("{}: {e}", transcript.display()))?;
+    Ok(window_breakdown_core(adapter.as_ref(), &jsonl, repo, &cfg, &state))
+}
+
+/// Shared by [`breakdown_for_session`] and [`window_breakdown_for_transcript`]
+/// so the two can never drift on how a `BreakdownSummary` is actually built.
+/// The same compiled-prompt pass `zirv ctx compile --measure` already
+/// performs, read for its byte totals rather than a second, hand-rolled
+/// measurement: `composed.text.len()` is `system_and_layers`'s real weight,
+/// and the harness roster's own `delivered_bytes` is the closest available
+/// proxy for `tool_schemas` (issue #312's own design: zirv has no visibility
+/// into the harness's real per-tool API schema bytes).
+fn window_breakdown_core(
+    adapter: &dyn AgentAdapter,
+    jsonl: &str,
+    repo: &Path,
+    cfg: &CtxConfig,
+    state: &StateDir,
+) -> (BreakdownSummary, Option<u64>) {
+    let events = adapter.parse_events(jsonl);
+    let caps = adapter.capabilities_for_model(adapter.model_hint(jsonl).as_deref());
+    let total_tokens = rot::context_tokens(&events);
+
+    let home = crate::utils::home_dir().ok();
+    let compiled = super::compile::compile_with_harness_roster(
+        home.as_deref(),
+        repo,
+        false,
+        cfg,
+        adapter,
+        super::prompt::PromptRole::Orchestrator,
+        state,
+        super::state::now_secs(),
+        true,
+        adapters::LaunchMode::Interactive,
+        true,
+    );
+    let system_and_layers_bytes = compiled
+        .composed
+        .as_ref()
+        .map_or(0, |composed| composed.text.len() as u64);
+    let tool_schema_bytes = compiled
+        .harness_roster
+        .as_ref()
+        .map(|roster| roster.delivered_bytes as u64);
+
+    let window_tokens = cfg
+        .score
+        .model_context_tokens
+        .or(caps.context_window_tokens);
+    let summary = breakdown::attribute_window(
+        &events,
+        total_tokens,
+        system_and_layers_bytes,
+        tool_schema_bytes,
+    );
+    (summary, window_tokens)
 }
 
 /// Folds a growing transcript into a `RotState` so each pass costs the bytes
@@ -934,7 +1055,22 @@ pub fn run_with<W: Write>(
     env: EnvLookup<'_>,
 ) -> CtxResult<i32> {
     let score = score_transcript(&args.transcript, args.agent.as_deref(), repo, env)?;
-    writeln!(w, "{}", serde_json::to_string(&score)?)?;
+    let mut json = serde_json::to_value(&score)?;
+    // Issue #312: `window_breakdown` never reaches `Score` itself (see that
+    // field's own doc comment for why -- attaching it there would break the
+    // incremental/full-parse equivalence every other field upholds), but
+    // this one-shot verb can still report it, folded into the printed
+    // object directly. Best-effort: a transcript this cannot be computed
+    // for (an unreadable compile context, say) still prints the plain
+    // score, exactly as it did before this key existed.
+    if let Ok((breakdown, _window_tokens)) =
+        window_breakdown_for_transcript(&args.transcript, args.agent.as_deref(), repo, env)
+        && let Ok(breakdown_json) = serde_json::to_value(&breakdown)
+        && let Some(object) = json.as_object_mut()
+    {
+        object.insert("window_breakdown".to_string(), breakdown_json);
+    }
+    writeln!(w, "{json}")?;
     Ok(0)
 }
 
@@ -1084,6 +1220,77 @@ mod tests {
             dir.join("state").display().to_string(),
         )]
         .into()
+    }
+
+    /// Issue #312: end-to-end wiring for `status.rs --breakdown` -- a real
+    /// registered session, a real claude transcript at the path the
+    /// adapter's own scanning fallback finds, and a real compile pass for
+    /// the `system_and_layers`/`tool_schemas` bytes. Only the SUM invariant
+    /// is asserted (never a hand-computed byte count): the compiled prompt
+    /// this test's own empty repo produces is real, non-trivial content
+    /// this test does not want to pin byte-for-byte, but `attribute_
+    /// window`'s apportionment guarantee (proven in `breakdown.rs`'s own
+    /// tests) means the buckets must still sum to the real total regardless.
+    #[test]
+    fn breakdown_for_session_computes_a_real_summary_for_a_registered_session() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home_guard = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let env_vars = state_env(dir.path());
+        let env = |k: &str| env_vars.get(k).cloned();
+
+        let state = StateDir::resolve(&env).expect("state dir");
+        let record = crate::commands::ctx::sessions::Record::new(
+            "sess-full-id",
+            "claude",
+            &repo,
+            crate::commands::ctx::sessions::Verb::Exec,
+        );
+        let _session_guard = crate::commands::ctx::sessions::SessionGuard::register(&state, record);
+
+        // Written under the claude adapter's own project-root, but not at
+        // the exact slug path -- `ClaudeAdapter::transcript_path`'s
+        // documented scanning fallback finds it regardless, so this test
+        // does not need to reproduce the slug rule itself.
+        let projects = home.path().join(".claude").join("projects").join("slug");
+        std::fs::create_dir_all(&projects).expect("mkdir projects");
+        std::fs::write(
+            projects.join("sess-full-id.jsonl"),
+            concat!(
+                "{\"type\":\"user\",\"message\":{\"content\":\"hello there\"}}\n",
+                "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"hi\"}],\"usage\":{\"input_tokens\":100}}}\n",
+            ),
+        )
+        .expect("write transcript");
+
+        let (summary, _window_tokens) =
+            breakdown_for_session("sess-full-id", &repo, &env).expect("breakdown");
+        assert_eq!(summary.total_tokens, 100);
+        let sum = summary.system_and_layers
+            + summary.tool_schemas.unwrap_or(0)
+            + summary.tool_results_live
+            + summary.tool_results_stale
+            + summary.assistant_text
+            + summary.user_text
+            + summary.thinking;
+        assert_eq!(
+            sum, summary.total_tokens,
+            "buckets must sum to the real total"
+        );
+    }
+
+    #[test]
+    fn breakdown_for_session_refuses_an_unregistered_session() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home_guard = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env_vars = state_env(dir.path());
+        let env = |k: &str| env_vars.get(k).cloned();
+        let err = breakdown_for_session("no-such-session", dir.path(), &env)
+            .expect_err("no session is registered at all");
+        assert!(err.to_string().contains("no-such-session"), "got {err}");
     }
 
     /// D: an adapter with no verified event parsing at all must refuse

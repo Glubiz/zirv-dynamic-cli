@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand};
 pub mod adapters;
 pub mod agent;
 pub mod announce;
+pub mod breakdown;
 pub mod chain;
 pub mod chat;
 pub mod chrome;

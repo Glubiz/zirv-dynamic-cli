@@ -754,6 +754,13 @@ pub struct StatusArgs {
     /// written.
     #[arg(long, default_value_t = false)]
     pub diff: bool,
+    /// Issue #312: print a single window-attribution table for `<session>`
+    /// (a registered session id, `sessions::Record::session`) instead of the
+    /// ordinary report -- bucket, tokens, and percentage of the model's
+    /// resolved context window, reusing this command's own session
+    /// resolution (`sessions::list`) rather than a second lookup mechanism.
+    #[arg(long, value_name = "SESSION")]
+    pub breakdown: Option<String>,
 }
 
 /// Issue #264: the `spend:` line's own computation, factored out so a test
@@ -1590,6 +1597,73 @@ fn save_status_snapshot(state: &StateDir, path: &Path, snapshot: &StatusSnapshot
     }
 }
 
+/// Issue #312: `zirv ctx status --breakdown <session>` -- one deterministic
+/// bucket/tokens/percentage-of-window table. `score::breakdown_for_session`
+/// (I/O: session lookup, transcript read, compile-context bytes) supplies
+/// the numbers; [`render_breakdown_table`] (pure) renders them, so the
+/// table's own shape is unit-tested without a real session or transcript.
+fn render_breakdown<W: Write>(
+    session: &str,
+    w: &mut W,
+    repo: &Path,
+    env: EnvLookup<'_>,
+) -> CtxResult<i32> {
+    let (summary, window_tokens) = super::score::breakdown_for_session(session, repo, env)?;
+    write!(
+        w,
+        "{}",
+        render_breakdown_table(session, &summary, window_tokens)
+    )?;
+    Ok(0)
+}
+
+/// Pure rendering half of [`render_breakdown`]. Every bucket row prints its
+/// token count and its percentage of `window_tokens` (the model's resolved
+/// context window) when known, or the literal `unknown` when it is not --
+/// never a fabricated percentage against a denominator zirv does not
+/// actually have. The `tool_schemas` row appears only when the summary
+/// itself carries one (see `BreakdownSummary::tool_schemas`'s own doc
+/// comment: absent, not a fabricated zero, when it was not computable), and
+/// a `stale source` line appears only when at least one byte is stale.
+fn render_breakdown_table(
+    session: &str,
+    summary: &super::breakdown::BreakdownSummary,
+    window_tokens: Option<u64>,
+) -> String {
+    let pct = |tokens: u64| match window_tokens {
+        Some(window) if window > 0 => format!("{:.1}%", (tokens as f64 / window as f64) * 100.0),
+        _ => "unknown".to_string(),
+    };
+    let mut rows: Vec<(&str, u64)> = vec![("system_and_layers", summary.system_and_layers)];
+    if let Some(schema) = summary.tool_schemas {
+        rows.push(("tool_schemas", schema));
+    }
+    rows.push(("tool_results_live", summary.tool_results_live));
+    rows.push(("tool_results_stale", summary.tool_results_stale));
+    rows.push(("assistant_text", summary.assistant_text));
+    rows.push(("user_text", summary.user_text));
+    rows.push(("thinking", summary.thinking));
+
+    let mut out = format!("window breakdown for {session}\n");
+    out.push_str(&format!(
+        "{:<20}{:>12}{:>10}\n",
+        "bucket", "tokens", "% window"
+    ));
+    for (name, tokens) in &rows {
+        out.push_str(&format!("{name:<20}{tokens:>12}{:>10}\n", pct(*tokens)));
+    }
+    out.push_str(&format!(
+        "{:<20}{:>12}{:>10}\n",
+        "total",
+        summary.total_tokens,
+        pct(summary.total_tokens)
+    ));
+    if let Some(source) = &summary.stale_source {
+        out.push_str(&format!("stale source: {source}\n"));
+    }
+    out
+}
+
 pub fn run_with<W: Write>(
     args: &StatusArgs,
     w: &mut W,
@@ -1597,6 +1671,9 @@ pub fn run_with<W: Write>(
     env: EnvLookup<'_>,
     colour: bool,
 ) -> CtxResult<i32> {
+    if let Some(session) = &args.breakdown {
+        return render_breakdown(session, w, repo, env);
+    }
     if !args.diff {
         return render_report(args, w, repo, env, colour);
     }
@@ -1689,6 +1766,62 @@ mod tests {
         [(STATE_ENV.to_string(), state.display().to_string())].into()
     }
 
+    /// Issue #312: the pure rendering half of `--breakdown`, exercised
+    /// directly against a hand-built summary -- no session, transcript, or
+    /// compile pass involved. Pins the deterministic shape: every bucket row
+    /// with its percentage of the window, the `tool_schemas` row present
+    /// only when the summary carries one, and a `stale source` line only
+    /// when something is actually stale.
+    #[test]
+    fn render_breakdown_table_shows_every_bucket_with_its_window_percentage() {
+        let summary = super::super::breakdown::BreakdownSummary {
+            system_and_layers: 40,
+            tool_schemas: Some(10),
+            tool_results_live: 20,
+            tool_results_stale: 10,
+            assistant_text: 15,
+            user_text: 3,
+            thinking: 2,
+            total_tokens: 100,
+            stale_source: Some("Read".to_string()),
+        };
+        let text = render_breakdown_table("sess-1", &summary, Some(1000));
+        assert!(
+            text.starts_with("window breakdown for sess-1\n"),
+            "got {text}"
+        );
+        assert!(text.contains("system_and_layers"), "got {text}");
+        assert!(text.contains("tool_schemas"), "got {text}");
+        assert!(text.contains("4.0%"), "40/1000 = 4.0%: got {text}");
+        assert!(text.contains("total"), "got {text}");
+        assert!(text.contains("10.0%"), "100/1000 = 10.0%: got {text}");
+        assert!(text.contains("stale source: Read"), "got {text}");
+    }
+
+    /// A model with no known context window renders `unknown`, never a
+    /// fabricated percentage against a denominator zirv does not have.
+    #[test]
+    fn render_breakdown_table_shows_unknown_percentage_without_a_window() {
+        let summary = super::super::breakdown::BreakdownSummary {
+            system_and_layers: 100,
+            tool_schemas: None,
+            tool_results_live: 0,
+            tool_results_stale: 0,
+            assistant_text: 0,
+            user_text: 0,
+            thinking: 0,
+            total_tokens: 100,
+            stale_source: None,
+        };
+        let text = render_breakdown_table("sess-2", &summary, None);
+        assert!(text.contains("unknown"), "got {text}");
+        assert!(
+            !text.contains("tool_schemas"),
+            "absent, not fabricated: got {text}"
+        );
+        assert!(!text.contains("stale source"), "nothing stale: got {text}");
+    }
+
     #[test]
     fn an_empty_state_dir_reports_nothing_supervised() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -1701,6 +1834,7 @@ mod tests {
                 decisions: 10,
                 brief: false,
                 diff: false,
+                breakdown: None,
             },
             &mut out,
             tmp.path(),
@@ -1795,6 +1929,7 @@ mod tests {
                 decisions: 10,
                 brief: false,
                 diff: false,
+                breakdown: None,
             },
             &mut out,
             repo.path(),
@@ -1825,6 +1960,7 @@ mod tests {
                 decisions: 10,
                 brief: false,
                 diff: false,
+                breakdown: None,
             },
             &mut out,
             repo.path(),
@@ -1853,6 +1989,7 @@ mod tests {
                 decisions: 10,
                 brief: false,
                 diff: false,
+                breakdown: None,
             },
             &mut out,
             repo.path(),
@@ -1885,6 +2022,7 @@ mod tests {
                 decisions: 10,
                 brief: false,
                 diff: false,
+                breakdown: None,
             },
             &mut out,
             &repo,
@@ -1929,6 +2067,7 @@ mod tests {
                 decisions: 10,
                 brief: false,
                 diff: false,
+                breakdown: None,
             },
             &mut out,
             &repo,
@@ -1972,6 +2111,7 @@ mod tests {
                 decisions: 10,
                 brief: false,
                 diff: false,
+                breakdown: None,
             },
             &mut out,
             &repo,
@@ -2031,6 +2171,7 @@ mod tests {
                 decisions: 10,
                 brief: false,
                 diff: false,
+                breakdown: None,
             },
             &mut out,
             tmp.path(),
@@ -2067,6 +2208,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                breakdown: None,
             },
             &mut out,
             tmp.path(),
@@ -2116,6 +2258,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                breakdown: None,
             },
             &mut out,
             &repo,
@@ -2170,6 +2313,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                breakdown: None,
             },
             &mut out,
             &repo,
@@ -2323,6 +2467,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                breakdown: None,
             },
             &mut out,
             &repo,
@@ -2369,6 +2514,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                breakdown: None,
             },
             &mut out,
             &repo,
@@ -2425,6 +2571,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                breakdown: None,
             },
             &mut out,
             &repo,
@@ -2476,6 +2623,7 @@ mod tests {
                 decisions: 2,
                 brief: false,
                 diff: false,
+                breakdown: None,
             },
             &mut out,
             tmp.path(),
@@ -2513,6 +2661,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                breakdown: None,
             },
             &mut out,
             tmp.path(),
@@ -2586,6 +2735,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                breakdown: None,
             },
             &mut out,
             tmp.path(),
@@ -2643,6 +2793,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                breakdown: None,
             },
             &mut out,
             tmp.path(),
@@ -2685,6 +2836,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                breakdown: None,
             },
             &mut out,
             tmp.path(),
@@ -2737,6 +2889,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                breakdown: None,
             },
             &mut out,
             tmp.path(),
@@ -2782,6 +2935,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                breakdown: None,
             },
             &mut out,
             tmp.path(),
@@ -2897,6 +3051,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                breakdown: None,
             },
             &mut out,
             tmp.path(),
@@ -2963,6 +3118,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                breakdown: None,
             },
             &mut out,
             tmp.path(),
@@ -3010,6 +3166,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                breakdown: None,
             },
             &mut out,
             tmp.path(),
@@ -3071,6 +3228,7 @@ mod tests {
                     decisions: 5,
                     brief,
                     diff: false,
+                    breakdown: None,
                 },
                 &mut out,
                 tmp.path(),
@@ -3121,6 +3279,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                breakdown: None,
             },
             &mut out,
             tmp.path(),
@@ -3183,6 +3342,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                breakdown: None,
             },
             &mut out,
             tmp.path(),
@@ -3234,6 +3394,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                breakdown: None,
             },
             &mut out,
             tmp.path(),
@@ -3273,6 +3434,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                breakdown: None,
             },
             &mut out,
             tmp.path(),
@@ -3308,6 +3470,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                breakdown: None,
             },
             &mut out,
             tmp.path(),
@@ -3353,6 +3516,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                breakdown: None,
             },
             &mut out,
             &repo,
@@ -3401,6 +3565,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                breakdown: None,
             },
             &mut out,
             &repo,
@@ -3462,6 +3627,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                breakdown: None,
             },
             &mut out,
             &repo,
@@ -3495,6 +3661,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                breakdown: None,
             },
             &mut out,
             tmp.path(),
@@ -3535,6 +3702,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                breakdown: None,
             },
             &mut out,
             tmp.path(),
@@ -3569,6 +3737,7 @@ mod tests {
                         decisions: 5,
                         brief: false,
                         diff: false,
+                        breakdown: None,
                     },
                     &mut out,
                     tmp.path(),
@@ -3611,6 +3780,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                breakdown: None,
             },
             &mut out,
             tmp.path(),
@@ -3809,6 +3979,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                breakdown: None,
             },
             &mut out,
             tmp.path(),
@@ -3838,6 +4009,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                breakdown: None,
             },
             &mut out,
             tmp.path(),
@@ -3890,6 +4062,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                breakdown: None,
             },
             &mut out,
             tmp.path(),
@@ -3956,6 +4129,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                breakdown: None,
             },
             &mut out,
             tmp.path(),
@@ -4019,6 +4193,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                breakdown: None,
             },
             &mut out,
             tmp.path(),
@@ -4170,6 +4345,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                breakdown: None,
             },
             &mut full_out,
             &repo,
@@ -4185,6 +4361,7 @@ mod tests {
                 decisions: 5,
                 brief: true,
                 diff: false,
+                breakdown: None,
             },
             &mut brief_out,
             &repo,
@@ -4316,6 +4493,7 @@ mod tests {
                 decisions: 10,
                 brief: false,
                 diff: true,
+                breakdown: None,
             },
             &mut out,
             tmp.path(),
@@ -4350,6 +4528,7 @@ mod tests {
             decisions: 10,
             brief: false,
             diff: true,
+            breakdown: None,
         };
 
         let mut first = Vec::new();
@@ -4394,6 +4573,7 @@ mod tests {
             decisions: 10,
             brief: false,
             diff: true,
+            breakdown: None,
         };
 
         let mut first = Vec::new();
@@ -4479,6 +4659,7 @@ mod tests {
             decisions: 10,
             brief: false,
             diff: true,
+            breakdown: None,
         };
         let mut first_out = Vec::new();
         run_with(
@@ -4504,6 +4685,7 @@ mod tests {
                 decisions: 10,
                 brief: false,
                 diff: false,
+                breakdown: None,
             },
             &mut status_out,
             &repo,
@@ -4576,6 +4758,7 @@ mod tests {
             decisions: 10,
             brief: false,
             diff: true,
+            breakdown: None,
         };
 
         let mut out_a = Vec::new();
@@ -4620,6 +4803,7 @@ mod tests {
                 decisions: 10,
                 brief: false,
                 diff: true,
+                breakdown: None,
             },
             &mut full_out,
             tmp.path(),
@@ -4634,6 +4818,7 @@ mod tests {
                 decisions: 10,
                 brief: true,
                 diff: true,
+                breakdown: None,
             },
             &mut brief_out,
             tmp.path(),
@@ -4663,6 +4848,7 @@ mod tests {
                 decisions: 10,
                 brief: false,
                 diff: true,
+                breakdown: None,
             },
             &mut out,
             tmp.path(),
