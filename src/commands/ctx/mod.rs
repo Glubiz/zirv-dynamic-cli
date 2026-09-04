@@ -46,6 +46,8 @@ pub mod run_loop;
 pub mod safety;
 pub mod score;
 pub mod screen;
+pub mod search;
+pub mod search_index;
 pub mod sessions;
 pub mod signal;
 pub mod snapshot;
@@ -449,6 +451,10 @@ pub enum CtxVerb {
     Spend(spend::SpendArgs),
     /// Print a redacted, capped diagnostic-state summary (issue #320).
     Snapshot(snapshot::SnapshotArgs),
+    /// Zero-model cross-session recall: rank transcripts, handoffs, work
+    /// artifacts and mail against a query, or scroll a specific session with
+    /// `--session`/`--around` (issue #315).
+    Search(search::SearchArgs),
 }
 
 /// What a clap parse failure costs, which is not the same for every verb.
@@ -543,6 +549,7 @@ pub fn dispatch(args: &[String]) -> i32 {
         CtxVerb::Objective(a) => objective::run(a, &mut out),
         CtxVerb::Spend(a) => spend::run(a, &mut out),
         CtxVerb::Snapshot(a) => snapshot::run(a, &mut out),
+        CtxVerb::Search(a) => search::run(a, &mut out),
     };
 
     match result {

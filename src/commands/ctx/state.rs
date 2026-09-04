@@ -309,6 +309,13 @@ impl StateDir {
         self.0.join("memory")
     }
 
+    /// `zirv ctx search`'s persisted per-file index: `<state>/search/
+    /// <repo_slug>/index.json` (issue #315). See `super::search_index` for
+    /// the file layout and change-detection cache.
+    pub fn search(&self) -> PathBuf {
+        self.0.join("search")
+    }
+
     /// Durable provider-neutral workflow state. Each repository gets an
     /// isolated slug directory; workflow prompts contain only the current
     /// step, while completed-step state stays here across compaction/restart.

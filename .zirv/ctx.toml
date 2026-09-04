@@ -221,6 +221,9 @@ model = "fable"
 # [report]
 # repository = "owner/repository"    # REPO-FORBIDDEN (ZIRV_CTX_REPORT_REPOSITORY): destination for workflow-maintain incidents only. The ordinary report command keeps its fixed Zirv repository default.
 
+# [search]
+# max_output_bytes = 2048            # REPO-FORBIDDEN (ZIRV_CTX_SEARCH_MAX_OUTPUT_BYTES): cap on one rendered `zirv ctx search`/`--session --around` window. Default: 2048.
+
 # [policy]                           # zirv's own canonical permissions policy (src/commands/ctx/policy.rs).
 # Not REPO-FORBIDDEN, and the ONE table here that does NOT deep-merge:
 # `[policy]` is lifted out of every layer and folded by `policy::resolve` as

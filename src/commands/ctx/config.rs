@@ -728,6 +728,32 @@ pub struct ReportConfig {
     pub repository: Option<String>,
 }
 
+/// Issue #315 (`zirv ctx search`): the single knob for how much rendered
+/// text a search/scroll call is allowed to hand back at once, the same
+/// "untrusted/large content does not get to be unbounded" rationale as
+/// `context.max_common_bytes`/`mail.max_delivered_bytes` above -- a
+/// mid-task agent calls this to check its own history without spending a
+/// model call, and an unbounded result would defeat that purpose by
+/// flooding the calling session's context instead. `REPO_FORBIDDEN`: a
+/// checked-out repo raising its own output cap is exactly the same
+/// asymmetry as every other byte cap in this file.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SearchConfig {
+    /// Hard cap, in bytes, on one rendered window (`search::render_window_
+    /// text`). Default `2048`, matching the issue's own acceptance
+    /// criterion.
+    pub max_output_bytes: usize,
+}
+
+impl Default for SearchConfig {
+    fn default() -> Self {
+        Self {
+            max_output_bytes: 2048,
+        }
+    }
+}
+
 /// Issue #264: the cost ledger's own pricing knobs. Both fields are
 /// `REPO_FORBIDDEN` -- a repo checkout must not be able to widen how long a
 /// stale price table is presented as trustworthy, or point pricing at a file
@@ -1436,6 +1462,7 @@ pub struct CtxConfig {
     pub mail: MailConfig,
     pub workflow: WorkflowConfig,
     pub report: ReportConfig,
+    pub search: SearchConfig,
     pub memory: MemoryConfig,
     pub setup: SetupConfig,
     pub chrome: ChromeConfig,
@@ -1841,6 +1868,11 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         "ZIRV_CTX_REPORT_REPOSITORY",
         &["report", "repository"],
         EnvKind::Str,
+    ),
+    (
+        "ZIRV_CTX_SEARCH_MAX_OUTPUT_BYTES",
+        &["search", "max_output_bytes"],
+        EnvKind::Int,
     ),
     (
         "ZIRV_CTX_WORKFLOW_TELEMETRY",
@@ -2818,6 +2850,13 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
         "ZIRV_CTX_PRICE_STALE_AFTER_DAYS",
     ),
     (&["price", "table_path"], "ZIRV_CTX_PRICE_TABLE_PATH"),
+    // Issue #315: a repo checkout must not be able to widen its own
+    // `zirv ctx search` output cap -- same trust asymmetry as every other
+    // byte cap in this table, see `SearchConfig`'s own doc comment.
+    (
+        &["search", "max_output_bytes"],
+        "ZIRV_CTX_SEARCH_MAX_OUTPUT_BYTES",
+    ),
 ];
 
 fn value_at<'a>(table: &'a toml::Table, path: &[&str]) -> Option<&'a toml::Value> {
@@ -7000,6 +7039,35 @@ mod tests {
         assert_eq!(cfg.report.repository.as_deref(), Some("operator/incidents"));
     }
 
+    /// Issue #315: `search.max_output_bytes` defaults to 2048, an operator's
+    /// env var wins, and a repository checkout may never set it at all (same
+    /// asymmetry as every other byte cap in this file -- see `SearchConfig`'s
+    /// own doc comment).
+    #[test]
+    fn search_max_output_bytes_defaults_and_is_operator_only() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tempfile::tempdir().expect("repo");
+
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|key| empty.get(key).cloned()).expect("load");
+        assert_eq!(cfg.search.max_output_bytes, 2048);
+
+        let env = env_map(&[("ZIRV_CTX_SEARCH_MAX_OUTPUT_BYTES", "4096")]);
+        let cfg = CtxConfig::load(repo.path(), &|key| env.get(key).cloned()).expect("load");
+        assert_eq!(cfg.search.max_output_bytes, 4096);
+
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[search]\nmax_output_bytes = 999999\n",
+        )
+        .expect("write");
+        let err = CtxConfig::load(repo.path(), &|key| empty.get(key).cloned())
+            .expect_err("a repository must not be able to widen its own search output cap");
+        assert!(is_repo_forbidden(err.as_ref()), "got: {err}");
+    }
+
     /// Every configurable key in `CtxConfig`'s tree, as (table path, key)
     /// pairs. `table path` is dot-joined to match how a nested table's
     /// header appears in the sample-config file (`"pace.use_credits"`); the
@@ -7144,6 +7212,7 @@ mod tests {
         ("workflow", "adoption"),
         ("workflow.maintain", "timeout_secs"),
         ("report", "repository"),
+        ("search", "max_output_bytes"),
         ("workflow", "telemetry_enabled"),
         ("workflow", "telemetry_max_events"),
         ("workflow", "telemetry_retention_days"),
