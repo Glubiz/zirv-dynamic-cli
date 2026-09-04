@@ -45,6 +45,7 @@ pub mod reservation;
 pub mod result_schema;
 pub mod resume;
 pub mod retrieval;
+pub mod rollover;
 pub mod rot;
 pub mod run_loop;
 pub mod safety;

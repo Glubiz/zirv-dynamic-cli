@@ -2779,6 +2779,10 @@ pub fn run_with<W: Write>(
                 observed_at: route.requested_observed_at,
             },
         );
+        // Issue #358 (task 5): the same reroute, in the capacity-pool
+        // vocabulary, so an operator can read delegation placement and
+        // orchestrator rollover out of one story instead of two.
+        super::rollover::record_route(&state, &parent_session, "agent", now, &route, bounds.tokens);
         eprintln!("zirv ctx agent: {}", automatic_route_message(&route, seat));
         route_applied = Some(route);
     }

@@ -237,13 +237,9 @@ pub fn release(state: &StateDir, provider: &str, id: &str) -> CtxResult<bool> {
 /// today's liveness check ([`is_owner_alive`]) needs no age comparison of
 /// its own.
 ///
-/// Not yet called from any non-test code in this task (issue #358's own T2
-/// worktree builds the machine-wide capacity snapshot this feeds, against a
-/// stub of the identical signature it points at this function once both
-/// land together) -- `#[allow(dead_code)]` rather than left unbuilt, the
-/// same "public API ahead of its first caller" shape `state::write_shared`
-/// already holds.
-#[allow(dead_code)]
+/// Read by `fallback::capacity_snapshot`'s own per-provider builder (issue
+/// #358, task T5), which is the single place a machine-wide capacity picture
+/// is assembled.
 pub fn outstanding(state: &StateDir, provider: &str, now: u64) -> u64 {
     let _ = now;
     load(state, provider)

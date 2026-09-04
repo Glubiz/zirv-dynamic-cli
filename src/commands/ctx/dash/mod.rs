@@ -1773,22 +1773,35 @@ fn push_error(errors: &mut Vec<String>, message: String) {
 /// actual pty swap. The pane keeps its registry short id throughout (`Pane::
 /// handover` never re-registers), which is what keeps mail and `zirv ctx
 /// nudge` addressed to it valid across the swap.
+///
+/// Issue #358 (task 5): takes an already-built `HandoverRequest` rather than
+/// a target agent/model pair, so an automatically decided rollover
+/// (`rollover::evaluate`) and the operator's own picker are executed by the
+/// exact same code -- including the seat transaction `req.generation` names.
+/// Returns whether the swap actually happened.
 fn handover_pane(
     pane: &mut Pane,
-    target_agent: &str,
-    target_model: &str,
+    req: &handover::HandoverRequest,
     cfg: &CtxConfig,
     repo: &Path,
     state: &StateDir,
     errors: &mut Vec<String>,
-) {
+) -> bool {
     let old_agent_name = pane.agent().to_string();
     let Ok(old_adapter) = adapters::select(Some(&old_agent_name), &[], cfg) else {
-        push_error(
-            errors,
-            format!("handover: could not resolve this pane's own agent '{old_agent_name}'"),
-        );
-        return;
+        let reason = format!("could not resolve this pane's own agent '{old_agent_name}'");
+        if let Some(generation) = req.generation {
+            let _ = super::rollover::fail(
+                state,
+                "dash",
+                pane.short(),
+                generation,
+                &reason,
+                super::state::now_secs(),
+            );
+        }
+        push_error(errors, format!("handover: {reason}"));
+        return false;
     };
     let transcript_path = old_adapter.transcript_path(&SessionRef {
         id: SessionId::parse(pane.session_id()),
@@ -1802,34 +1815,172 @@ fn handover_pane(
         .ok()
         .flatten()
         .map(|(_, h)| h);
-    let (note, _source) = handoff::distill_or_structural(
-        old_adapter.as_ref(),
-        &distiller_model,
-        &ctx,
-        Duration::from_secs(cfg.handoff.timeout_secs),
-        cfg.chrome.events,
-        previous.as_ref(),
-    );
-
-    let req = handover::HandoverRequest {
-        target_agent: target_agent.to_string(),
-        target_model: Some(target_model.to_string()),
-        force: false,
-        requested_at: super::state::now_secs(),
-        // `handover_pane` is only ever reached from the dashboard's own
-        // Handover overlay's `KeyCode::Enter` -- a human at this exact
-        // dashboard's live TUI just chose this swap.
-        interactive: true,
+    // Issue #358: a reactive rollover fires because this provider stopped
+    // answering; the distiller call would run against that same provider.
+    let (note, _source) = if req.structural_only {
+        (handoff::structural(&ctx), "structural")
+    } else {
+        handoff::distill_or_structural(
+            old_adapter.as_ref(),
+            &distiller_model,
+            &ctx,
+            Duration::from_secs(cfg.handoff.timeout_secs),
+            cfg.chrome.events,
+            previous.as_ref(),
+        )
     };
+
     let role = if pane.verb() == sessions::Verb::Chat {
         prompt::PromptRole::Orchestrator
     } else {
         prompt::PromptRole::Worker
     };
     let size = pane.screen().size();
-    match pane.handover(cfg, &req, &note, role, repo, (size.1, size.0)) {
-        Ok(()) => {}
-        Err(e) => push_error(errors, format!("handover: {e}")),
+    match pane.handover(cfg, req, &note, role, repo, (size.1, size.0)) {
+        Ok(()) => true,
+        Err(e) => {
+            // `Pane::handover` assembles the successor completely before it
+            // touches the old child, so a failure here leaves the pane
+            // exactly as it was -- the seat transaction is a clean abort.
+            if let Some(generation) = req.generation {
+                let _ = super::rollover::fail(
+                    state,
+                    "dash",
+                    pane.short(),
+                    generation,
+                    &e.to_string(),
+                    super::state::now_secs(),
+                );
+            }
+            push_error(errors, format!("handover: {e}"));
+            false
+        }
+    }
+}
+
+/// Issue #358 (task 5): one automatic rollover evaluation for the
+/// dashboard's own orchestrator pane. The evaluation, the seat transaction
+/// and the swap all go through the same seams a manual `Ctrl+A o` does; the
+/// only difference is who decided. A parked seat is asked first, in case its
+/// window has elapsed and the best harness is no longer its own.
+fn rollover_sweep(
+    panes: &mut [Pane],
+    cfg: &CtxConfig,
+    repo: &Path,
+    state: &StateDir,
+    pending: &mut Option<(String, u64, Instant)>,
+    errors: &mut Vec<String>,
+) {
+    let Some(idx) = panes
+        .iter()
+        .position(|pane| pane.role() == prompt::PromptRole::Orchestrator)
+    else {
+        return;
+    };
+    let short = panes[idx].short().to_string();
+    let provider = adapters::provider_for_agent_name(Some(panes[idx].agent())).to_string();
+    let idle = panes[idx].state() == PaneState::Idle;
+    let now = super::state::now_secs();
+
+    let req = match super::rollover::on_resume(state, cfg, "dash", &short, now, true) {
+        Some(req) => req,
+        None => {
+            let blocked = super::rollover::confirmed_block(state, cfg, now, &provider);
+            match super::rollover::evaluate(state, cfg, "dash", &short, now, idle, blocked, true) {
+                super::rollover::Evaluation::Rollover { request, .. } => request,
+                _ => return,
+            }
+        }
+    };
+    // The seat transaction is already open, so a pane that is no longer at a
+    // clean boundary has to close it rather than leave it prepared -- the
+    // same rule `wrap`'s own refusal arm follows.
+    if !idle && !req.force {
+        if let Some(generation) = req.generation {
+            let _ = super::rollover::fail(
+                state,
+                "dash",
+                &short,
+                generation,
+                "the orchestrator pane is mid-turn",
+                now,
+            );
+        }
+        return;
+    }
+    if handover_pane(&mut panes[idx], &req, cfg, repo, state, errors)
+        && let Some(generation) = req.generation
+    {
+        *pending = Some((short, generation, Instant::now()));
+    }
+}
+
+/// The other half: an open rollover transaction is committed only once the
+/// successor pane has actually answered, and aborted when it never does.
+/// `Pane::handover` spawns the successor before it touches the old child, so
+/// a pane that has already ENDED here is the only genuine "it never came up"
+/// case; a timeout leaves the (live but silent) successor alone rather than
+/// killing the operator's own orchestrator pane.
+fn settle_pending_rollover(
+    panes: &mut [Pane],
+    cfg: &CtxConfig,
+    state: &StateDir,
+    pending: &mut Option<(String, u64, Instant)>,
+) {
+    let Some((short, generation, started)) = pending.clone() else {
+        return;
+    };
+    let Some(pane) = panes.iter_mut().find(|pane| pane.short() == short) else {
+        let _ = super::rollover::fail(
+            state,
+            "dash",
+            &short,
+            generation,
+            "the successor pane is gone",
+            super::state::now_secs(),
+        );
+        *pending = None;
+        return;
+    };
+    let pane_state = pane.state();
+    let readiness = super::rollover::successor_readiness(
+        !matches!(pane_state, PaneState::Ended(_)),
+        true,
+        pane_state == PaneState::Idle,
+        pane_state == PaneState::Idle,
+        Instant::now().saturating_duration_since(started),
+        Duration::from_secs(cfg.handoff.timeout_secs),
+    );
+    let now = super::state::now_secs();
+    match readiness {
+        super::rollover::Readiness::Ready => {
+            let _ =
+                super::rollover::commit(state, "dash", &short, generation, pane.session_id(), now);
+            *pending = None;
+        }
+        super::rollover::Readiness::Dead => {
+            let _ = super::rollover::fail(
+                state,
+                "dash",
+                &short,
+                generation,
+                "the successor exited before it answered",
+                now,
+            );
+            *pending = None;
+        }
+        super::rollover::Readiness::TimedOut => {
+            let _ = super::rollover::fail(
+                state,
+                "dash",
+                &short,
+                generation,
+                "the successor did not answer within handoff.timeout_secs",
+                now,
+            );
+            *pending = None;
+        }
+        super::rollover::Readiness::Waiting => {}
     }
 }
 
@@ -3803,6 +3954,10 @@ fn fulfill_spawn_request(
                 observed_at: route.requested_observed_at,
             },
         );
+        // Issue #358 (task 5): the same reroute, in the capacity-pool
+        // vocabulary, so an operator can read delegation placement and
+        // orchestrator rollover out of one story instead of two.
+        super::rollover::record_route(state, &req.requested_by, "dash", now, &route, None);
         push_error(
             errors,
             format!(
@@ -6226,6 +6381,22 @@ pub fn run_dashboard(
     // Issues #328/#334: which seat role this pane runs as, for the same
     // guard -- unlike `seat_model_env`, unconditional for every role.
     turn_env.extend(super::adapters::seat_role_env(first.role));
+    // Issue #358 (task 5): the seat's fencing generation, so a session an
+    // automatic rollover later supersedes refuses to keep coordinating
+    // (`seat::fence`). The seat itself is registered by `Pane::spawn` below,
+    // which cannot run before this vector exists -- so the generation is read
+    // from whatever record this address already carries (an earlier
+    // dashboard's, restored across a crash), defaulting to the `1` a fresh
+    // `seat::register` is about to create.
+    if first.role == prompt::PromptRole::Orchestrator {
+        let generation = super::seat::load(state, &sessions::short_id(&session_id))
+            .map(|seat| seat.generation)
+            .unwrap_or(1);
+        turn_env.push((
+            super::seat::GENERATION_ENV.to_string(),
+            generation.to_string(),
+        ));
+    }
 
     // Task 10: the spawn-request channel. `dashboard_short` is derivable
     // before any pane has actually spawned -- `Record::new`'s own `short`
@@ -6551,6 +6722,12 @@ pub fn run_dashboard(
     // the whole dashboard run, not just one tick, so an unchanged inbox is
     // advised once and then left alone until genuinely new mail arrives.
     let mut advised_mail: HashMap<String, mail::AdvisedIds> = HashMap::new();
+    // Issue #358 (task 5): the orchestrator pane's automatic rollover -- its
+    // own (much coarser than `FACTS_THROTTLE`) cadence, and the one seat
+    // transaction that may be open at a time. Seeded with this dashboard's
+    // start so no usage I/O runs while it is still coming up.
+    let mut last_rollover_eval = Instant::now();
+    let mut pending_rollover: Option<(String, u64, Instant)> = None;
     // R8: see `input_stream_is_dead`.
     let mut input_errors: usize = 0;
     // D4: set by the "every pane ended" exit arm, so the closing line is
@@ -6708,6 +6885,31 @@ pub fn run_dashboard(
             // Issue #115: same cadence as the mail sweep just above -- a
             // one-shot reminder has no sub-tick latency requirement either.
             report_back_reminder_sweep(&mut panes, state, &mut errors);
+        }
+        // Issue #358 (task 5): the orchestrator pane's automatic rollover.
+        // Both halves live on their own cadence -- the readiness watch is
+        // pure in-memory state, the evaluation costs a capacity snapshot --
+        // and both are no-ops until `fallback.auto_orchestrator_rollover`
+        // is on.
+        if cfg.fallback.auto_orchestrator_rollover {
+            settle_pending_rollover(&mut panes, cfg, state, &mut pending_rollover);
+            if pending_rollover.is_none()
+                && due(
+                    last_rollover_eval,
+                    sweep_now,
+                    super::rollover::evaluate_interval(cfg),
+                )
+            {
+                last_rollover_eval = sweep_now;
+                rollover_sweep(
+                    &mut panes,
+                    cfg,
+                    repo,
+                    state,
+                    &mut pending_rollover,
+                    &mut errors,
+                );
+            }
         }
         deliver_queued_nudges(&mut panes, &mut nudge_queues, &mut errors);
         // F1/F2: every tick, not throttled -- see `drain_pending_submits`'s
@@ -7143,8 +7345,22 @@ pub fn run_dashboard(
                                                 {
                                                     handover_pane(
                                                         &mut panes[idx],
-                                                        &target_agent,
-                                                        &target_model,
+                                                        &handover::HandoverRequest {
+                                                            target_agent: target_agent.clone(),
+                                                            target_model: Some(
+                                                                target_model.clone(),
+                                                            ),
+                                                            force: false,
+                                                            requested_at: super::state::now_secs(),
+                                                            // Reached only from the
+                                                            // dashboard's own Handover
+                                                            // overlay: a human at this
+                                                            // live TUI just chose it.
+                                                            interactive: true,
+                                                            automatic: false,
+                                                            generation: None,
+                                                            structural_only: false,
+                                                        },
                                                         cfg,
                                                         repo,
                                                         state,

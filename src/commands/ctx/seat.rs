@@ -28,17 +28,6 @@
 //! two calls this module cannot make for itself without touching those
 //! files.
 
-// Issue #358, task 4 of a multi-task rollout: this module's own persistence
-// and decision API lands ahead of the driver code (task 5) that actually
-// calls most of it -- `prepare`/`commit`/`abort`/`park`/`resume`/`recover`,
-// `decide`, `register`, `generation_env`, `pin_from_env` and friends are only
-// exercised by this module's own tests today, matching `config.rs`'s own
-// `FallbackConfig::rollover_headroom_pct` doc comment for the identical
-// task-ordering reason. `fence` (called from `agent.rs`/`handover.rs`/
-// `mail.rs`/`task.rs` already) and the constants it uses are the one slice
-// of this module already wired into a live caller.
-#![allow(dead_code)]
-
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -828,7 +817,9 @@ pub fn decide(inputs: &RolloverInputs<'_>, cfg: &CtxConfig) -> RolloverDecision 
 /// Test/assertion helper: whether `seat.visited` never records the same
 /// `(agent, epoch)` pair twice -- the invariant [`decide`]'s visited-filter
 /// is supposed to guarantee no matter how many prepare/commit/abort cycles a
-/// seat goes through.
+/// seat goes through. `#[cfg(test)]` because it asserts a property rather
+/// than deciding anything: no production path branches on it.
+#[cfg(test)]
 pub fn no_flap_invariant(seat: &Seat) -> bool {
     let mut seen = std::collections::BTreeSet::new();
     seat.visited

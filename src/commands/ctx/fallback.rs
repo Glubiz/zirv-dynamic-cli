@@ -404,9 +404,12 @@ fn build_provider_capacity(
     )
 }
 
-/// T3 wires reservation::outstanding here.
-fn outstanding_reserved_tokens(_state: &StateDir, _provider: &str, _now: u64) -> u64 {
-    0
+/// Every admitted-but-unsettled delegation's expected spend against this
+/// provider (issue #358, task T3's own ledger). A live reservation is
+/// capacity already promised to a child that has not reported yet, so a
+/// snapshot that ignored it would hand the same headroom out twice.
+fn outstanding_reserved_tokens(state: &StateDir, provider: &str, now: u64) -> u64 {
+    super::reservation::outstanding(state, provider, now)
 }
 
 fn best_alternate(

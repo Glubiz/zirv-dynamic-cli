@@ -1064,6 +1064,39 @@ impl Pane {
             record.unreachable()
         };
         let guard = SessionGuard::register(state, record);
+        // Issue #358 (task 5): the logical orchestrator seat this pane sits
+        // in -- only ever an orchestrator pane's, since nothing rolls a
+        // worker over. The model comes from `turn_env`, the single source of
+        // truth for what this child actually inherits (the same derivation
+        // `launch_mode` above already makes from it), and `pinned` from the
+        // dashboard process's own environment, which is where an operator's
+        // `ZIRV_CTX_SEAT_PIN` lands.
+        if role == PromptRole::Orchestrator {
+            let seat_model = turn_env
+                .iter()
+                .find(|(key, _)| key == super::super::adapters::SEAT_MODEL_ENV)
+                .map(|(_, value)| value.clone());
+            let short = sessions::short_id(&session_id);
+            if super::super::seat::register(
+                state,
+                &short,
+                &session_id,
+                &agent_name,
+                seat_model.as_deref(),
+                super::super::adapters::provider_for_agent_name(Some(&agent_name)),
+                role.label(),
+                super::super::seat::pin_from_env(&super::super::config::env_from_process()),
+                super::super::state::now_secs(),
+            )
+            .is_ok()
+            {
+                // A dashboard that died mid-swap leaves the seat `Prepared`,
+                // refusing every future rollover. Nothing that outlived that
+                // crash can still be answering at this address, so recovery
+                // always aborts rather than committing.
+                super::super::rollover::on_startup(state, &short, &|_| None);
+            }
+        }
 
         Ok(Pane {
             title,
@@ -1850,6 +1883,12 @@ impl Pane {
         // profile is `panic = "abort"`.
         self.lifecycle.release();
         wrap::unpublish_socket_path(&self.state_dir, &self.session_id);
+        // Issue #358: the seat is an address for a live session, released
+        // alongside every other per-session artifact this pane owns. A
+        // worker pane never registered one, so this is a no-op for it.
+        if self.role == PromptRole::Orchestrator {
+            super::super::rollover::forget(&self.state_dir, self.guard.short());
+        }
         self.guard.release();
         Ok(())
     }
@@ -1909,6 +1948,12 @@ impl Pane {
         }
         self.lifecycle.release();
         wrap::unpublish_socket_path(&self.state_dir, &self.session_id);
+        // Issue #358: the seat is an address for a live session, released
+        // alongside every other per-session artifact this pane owns. A
+        // worker pane never registered one, so this is a no-op for it.
+        if self.role == PromptRole::Orchestrator {
+            super::super::rollover::forget(&self.state_dir, self.guard.short());
+        }
         self.guard.release();
         Ok(())
     }
@@ -3439,6 +3484,9 @@ pub(crate) mod tests {
             force: true,
             requested_at: 0,
             interactive: false,
+            automatic: false,
+            generation: None,
+            structural_only: false,
         };
         let handoff_note = crate::commands::ctx::handoff::Handoff::default();
 
@@ -3534,6 +3582,9 @@ pub(crate) mod tests {
             force: true,
             requested_at: 0,
             interactive: false,
+            automatic: false,
+            generation: None,
+            structural_only: false,
         };
         let handoff_note = crate::commands::ctx::handoff::Handoff::default();
 
@@ -3619,6 +3670,9 @@ pub(crate) mod tests {
             force: true,
             requested_at: 0,
             interactive: false,
+            automatic: false,
+            generation: None,
+            structural_only: false,
         };
         let handoff_note = crate::commands::ctx::handoff::Handoff::default();
 

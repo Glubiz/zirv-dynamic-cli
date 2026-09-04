@@ -209,6 +209,23 @@ pub struct HandoverRequest {
     /// deserialises to. `resolve_swap_launch` is what actually reads it.
     #[serde(default)]
     pub interactive: bool,
+    /// Issue #358 (task 5): whether this swap was decided by `rollover::
+    /// evaluate` rather than typed by an operator. A manual request always
+    /// wins over an automatic one at the supervisors' own request check, and
+    /// only an automatic one may retry the next candidate on failure.
+    #[serde(default)]
+    pub automatic: bool,
+    /// The seat generation `seat::prepare` reserved for this swap, which
+    /// `seat::commit`/`seat::abort` must be handed back verbatim. `None` for
+    /// a manual swap, which opens no seat transaction at all.
+    #[serde(default)]
+    pub generation: Option<u64>,
+    /// Skip the distiller and store the structural packet directly
+    /// (`handoff::structural`). Set for a reactive rollover: a provider that
+    /// just hard-refused the session cannot answer a distiller call either,
+    /// so spending the round trip only delays the swap.
+    #[serde(default)]
+    pub structural_only: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -465,6 +482,12 @@ pub fn run_with<W: Write>(
         // stdio is the same check `wrap.rs`'s launch-time gate already uses
         // to answer the identical question (2026-08-24 hardening).
         interactive: std::io::stdin().is_terminal() && std::io::stdout().is_terminal(),
+        // A human typed this: it opens no seat transaction, it always wins
+        // over a `rollover::evaluate` request at the supervisors' own
+        // request check, and it still spends a distiller call.
+        automatic: false,
+        generation: None,
+        structural_only: false,
     };
     write_request(&state, &short, &req)?;
 
@@ -806,6 +829,9 @@ mod tests {
             force: false,
             requested_at: 1,
             interactive: false,
+            automatic: false,
+            generation: None,
+            structural_only: false,
         };
         write_request(&state, "abcd1234", &req).expect("write");
         let claimed = take_request(&state, "abcd1234").expect("present");
@@ -814,6 +840,21 @@ mod tests {
             take_request(&state, "abcd1234").is_none(),
             "claimed once only"
         );
+    }
+
+    #[test]
+    fn a_request_written_before_issue_358_still_parses() {
+        let older = r#"{"target_agent":"codex","target_model":"gpt-5.6-terra","force":true,
+            "requested_at":42,"interactive":true}"#;
+        let req: HandoverRequest = serde_json::from_str(older).expect("an older request parses");
+        assert_eq!(req.target_agent, "codex");
+        assert!(req.interactive);
+        assert!(
+            !req.automatic,
+            "a request that predates the field is an operator's, never the scheduler's"
+        );
+        assert_eq!(req.generation, None, "it opened no seat transaction");
+        assert!(!req.structural_only, "it still spends a distiller call");
     }
 
     #[test]
@@ -854,6 +895,9 @@ mod tests {
             force: false,
             requested_at: 0,
             interactive: false,
+            automatic: false,
+            generation: None,
+            structural_only: false,
         };
         let (_, extra) = resolve_swap_launch(&cfg, &req).expect("resolves");
         assert!(
