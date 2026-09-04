@@ -6000,6 +6000,9 @@ pub fn run_dashboard(
         &first.argv,
         cfg.chat.model.as_deref(),
     ));
+    // Issues #328/#334: which seat role this pane runs as, for the same
+    // guard -- unlike `seat_model_env`, unconditional for every role.
+    turn_env.extend(super::adapters::seat_role_env(first.role));
 
     // Task 10: the spawn-request channel. `dashboard_short` is derivable
     // before any pane has actually spawned -- `Record::new`'s own `short`
