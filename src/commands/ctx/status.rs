@@ -4,6 +4,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use super::adapters::{self, AGENT_ENV, DefaultOrigin};
+use super::chain;
 use super::config::{CtxConfig, EnvLookup, env_from_process};
 use super::event::{TranscriptUsage, input_hash};
 use super::group;
@@ -93,6 +94,21 @@ fn policy_snapshot_is_stale(record: &sessions::Record, env: EnvLookup<'_>) -> bo
 /// more than one purpose this pass (the heavy-worker count in `run_with`,
 /// below) must fetch it exactly once and share the result, or a second call
 /// would find that record's file already gone.
+/// Issue #310: the display label for one restart-chain failure class --
+/// hyphenated, matching the acceptance criterion's own wording ("restart
+/// chain: crash 1, usage-limit 2"), distinct from `FailureClass`'s
+/// `snake_case` serde spelling used on disk.
+fn chain_class_label(class: chain::FailureClass) -> &'static str {
+    match class {
+        chain::FailureClass::Crash => "crash",
+        chain::FailureClass::Stalled => "stalled",
+        chain::FailureClass::UsageLimit => "usage-limit",
+        chain::FailureClass::AuthBlocked => "auth-blocked",
+        chain::FailureClass::Protocol => "protocol",
+        chain::FailureClass::Budget => "budget",
+    }
+}
+
 fn sessions_lines(
     records: &[(sessions::Record, Liveness)],
     state: &StateDir,
@@ -204,6 +220,27 @@ fn sessions_lines(
                     colour
                 )
             ));
+            // Issue #310 (3b): this session's own restart-chain counters,
+            // keyed by repo like every other per-session disk read here --
+            // only shown when at least one class has a non-zero count, so a
+            // repository that has never tripped anything gains no line.
+            if let Ok(Some(chain_record)) = chain::load(state, &record.repo_slug) {
+                let counts = chain::counts_by_class(&chain_record);
+                if !counts.is_empty() {
+                    let parts: Vec<String> = counts
+                        .iter()
+                        .map(|(class, n)| format!("{} {n}", chain_class_label(*class)))
+                        .collect();
+                    line.push_str(&format!(
+                        "  {}",
+                        style::paint(
+                            &format!("restart chain: {}", parts.join(", ")),
+                            Tone::Warn,
+                            colour
+                        )
+                    ));
+                }
+            }
             line
         })
         .collect();
@@ -2145,6 +2182,116 @@ mod tests {
             text.contains("screening: 1 flag: prompt-injection marker"),
             "got {text}"
         );
+    }
+
+    /// Issue #310 (3b): a repository with a non-zero restart-chain count for
+    /// at least one failure class shows a `restart chain:` note naming every
+    /// class with a non-zero count, hyphen-spelled per the acceptance
+    /// criterion's own wording.
+    #[test]
+    fn a_session_with_a_non_zero_restart_chain_count_shows_it_on_its_status_line() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        state.ensure().expect("ensure");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let env = env_for(state.root());
+
+        let record = crate::commands::ctx::sessions::Record::new(
+            "dddd4444-2222-4333-8444-555555555555",
+            "claude",
+            &repo,
+            crate::commands::ctx::sessions::Verb::Wrap,
+        );
+        let repo_slug = record.repo_slug.clone();
+        let _guard = crate::commands::ctx::sessions::SessionGuard::register(&state, record);
+        chain::record_boot_and_evaluate(
+            &state,
+            &repo_slug,
+            chain::FailureClass::Crash,
+            false,
+            0,
+            3,
+            300,
+        );
+        chain::record_boot_and_evaluate(
+            &state,
+            &repo_slug,
+            chain::FailureClass::UsageLimit,
+            false,
+            1,
+            3,
+            300,
+        );
+        chain::record_boot_and_evaluate(
+            &state,
+            &repo_slug,
+            chain::FailureClass::UsageLimit,
+            false,
+            2,
+            3,
+            300,
+        );
+
+        let mut out = Vec::new();
+        run_with(
+            &StatusArgs {
+                decisions: 5,
+                brief: false,
+                diff: false,
+            },
+            &mut out,
+            &repo,
+            &|k| env.get(k).cloned(),
+            false,
+        )
+        .expect("runs");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            text.contains("restart chain: crash 1, usage-limit 2"),
+            "got {text}"
+        );
+    }
+
+    /// The absent half: a repository with no restart-chain record at all
+    /// (never respawned, or the state dir has nothing stored) carries no
+    /// `restart chain:` note.
+    #[test]
+    fn a_session_with_no_restart_chain_record_shows_no_note() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        state.ensure().expect("ensure");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let env = env_for(state.root());
+
+        let record = crate::commands::ctx::sessions::Record::new(
+            "eeee5555-2222-4333-8444-555555555555",
+            "claude",
+            &repo,
+            crate::commands::ctx::sessions::Verb::Wrap,
+        );
+        let _guard = crate::commands::ctx::sessions::SessionGuard::register(&state, record);
+
+        let mut out = Vec::new();
+        run_with(
+            &StatusArgs {
+                decisions: 5,
+                brief: false,
+                diff: false,
+            },
+            &mut out,
+            &repo,
+            &|k| env.get(k).cloned(),
+            false,
+        )
+        .expect("runs");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(!text.contains("restart chain"), "got {text}");
     }
 
     /// The absent half: a session with no screening summary carries no

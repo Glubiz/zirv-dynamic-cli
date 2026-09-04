@@ -184,11 +184,8 @@ pub fn evaluate(
 /// Pure: independent per-class counts over the WHOLE stored window (not only
 /// the trailing window `evaluate` checks), planned boots excluded -- what
 /// issue #310's "each its own counter" acceptance criterion asks for
-/// directly. Not yet called by any production reporting surface (a natural
-/// `zirv ctx status` addition, out of this round's scope); exercised
-/// directly by this module's own unit tests, which is what proves classes
-/// stay independent regardless of which caller wires it up.
-#[allow(dead_code)]
+/// directly. Surfaced by `zirv ctx status`'s own per-session restart-chain
+/// line.
 pub fn counts_by_class(record: &ChainRecord) -> BTreeMap<FailureClass, u32> {
     let mut counts = BTreeMap::new();
     for boot in record.boots.iter().filter(|b| !b.planned) {

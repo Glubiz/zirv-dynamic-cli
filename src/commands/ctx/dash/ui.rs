@@ -743,6 +743,14 @@ pub struct FooterAliveFacts {
     /// opposed to never having bound in the first place), which stays out
     /// of this issue's scope (§E).
     pub supervised: bool,
+    /// Issue #310: this pane's stall latch is currently armed
+    /// (`sessions::stall_marker`, via `DiskFacts::stalled`) -- overrides the
+    /// supervision segment with a `stalled` badge instead of `supervised`/
+    /// `unsupervised` while it holds, and reverts the instant the latch
+    /// clears (observed progress, or the session ended). Takes priority over
+    /// `supervised`: a session can be both reachable and stalled at once,
+    /// and the operator needs to see the more urgent fact.
+    pub stalled: bool,
 }
 
 /// The dead-pane-focused footer shape (mock §04's third example): a
@@ -861,7 +869,15 @@ fn footer_alive_spans(
 
     let (workflow_full, workflow_compressed) = footer_workflow_spans(&facts.workflow);
 
-    let supervision: FooterSeg = if facts.supervised {
+    // Issue #310: a stalled latch takes priority over the ordinary
+    // supervised/unsupervised segment -- see `FooterAliveFacts::stalled`'s
+    // own doc comment.
+    let supervision: FooterSeg = if facts.stalled {
+        vec![(
+            "\u{25c6} stalled".to_string(),
+            style::tui::warning().add_modifier(Modifier::BOLD),
+        )]
+    } else if facts.supervised {
         vec![
             ("\u{25cf} ".to_string(), style::tui::ok()),
             ("supervised".to_string(), Style::default()),
@@ -3587,6 +3603,7 @@ mod tests {
                 gated: false,
             },
             supervised: true,
+            stalled: false,
         }
     }
 
@@ -3607,6 +3624,27 @@ mod tests {
         assert!(text.contains("feature"), "got {text:?}");
         assert!(text.contains("design"), "got {text:?}");
         assert!(text.contains("supervised"), "got {text:?}");
+        assert!(
+            !text.contains("stalled"),
+            "an unlatched session must not render the stalled badge: got {text:?}"
+        );
+    }
+
+    /// Issue #310: an armed stall latch overrides the ordinary
+    /// supervised/unsupervised segment with a `stalled` badge.
+    #[test]
+    fn footer_renders_a_stalled_badge_when_the_latch_is_armed() {
+        let mut alive = alive_footer_facts();
+        alive.stalled = true;
+        let facts = FooterFacts::Alive(alive);
+        let text = render_and_capture_text(Rect::new(0, 0, 80, 1), |f, area| {
+            render_footer(f, area, &facts, 40, 60)
+        });
+        assert!(text.contains("stalled"), "got {text:?}");
+        assert!(
+            !text.contains("supervised"),
+            "the stalled badge replaces the supervised segment: got {text:?}"
+        );
     }
 
     /// The mock's own "attention" example: warming, unread mail, and a
@@ -3625,6 +3663,7 @@ mod tests {
                 gated: true,
             },
             supervised: true,
+            stalled: false,
         });
         let text = render_and_capture_text(Rect::new(0, 0, 80, 1), |f, area| {
             render_footer(f, area, &facts, 40, 60)
@@ -3814,6 +3853,7 @@ mod tests {
                 gated: true,
             },
             supervised: true,
+            stalled: false,
         });
         let text = render_and_capture_text(Rect::new(0, 0, 44, 1), |f, area| {
             render_footer(f, area, &facts, 40, 60)

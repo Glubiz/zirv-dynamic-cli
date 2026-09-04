@@ -1466,13 +1466,9 @@ pub fn write_stall_marker(state: &StateDir, short: &str, latched_at_secs: u64) {
 /// Reads this session's stall latch, if armed -- the unix-seconds moment it
 /// armed, or `None` if there is no latch (never armed, already cleared, or
 /// unreadable/malformed). Read-only and repeatable, unlike
-/// `claim_nudge_marker`: both the owning poll loop and a dashboard render
-/// need to observe the same latch on every pass without consuming it. Not
-/// yet called by any production reader (a natural `zirv ctx status`/
-/// dashboard banner addition, out of this round's scope, which is what
-/// `write_stall_marker` above is written for); exercised directly by this
-/// module's own unit tests.
-#[allow(dead_code)]
+/// `claim_nudge_marker`: both the owning poll loop and the dashboard's own
+/// `DiskFacts::stalled` refresh need to observe the same latch on every pass
+/// without consuming it.
 pub fn stall_marker(state: &StateDir, short: &str) -> Option<u64> {
     std::fs::read_to_string(stall_marker_path(state, short))
         .ok()?
