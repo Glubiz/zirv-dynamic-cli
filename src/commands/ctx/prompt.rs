@@ -6198,6 +6198,8 @@ mod tests {
                 spent_tokens: 10,
                 started_at: 1,
                 status: Status::Active,
+                pending_note: None,
+                evidence: Vec::new(),
             })),
         )
         .expect("composed");

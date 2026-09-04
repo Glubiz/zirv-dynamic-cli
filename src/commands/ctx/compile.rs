@@ -2198,6 +2198,8 @@ mod tests {
                 spent_tokens: 500,
                 started_at: now,
                 status: super::super::objective::Status::Active,
+                pending_note: None,
+                evidence: Vec::new(),
             },
         )
         .expect("store objective");
@@ -2280,6 +2282,8 @@ mod tests {
                 spent_tokens: 0,
                 started_at: now,
                 status: super::super::objective::Status::Closed,
+                pending_note: None,
+                evidence: Vec::new(),
             },
         )
         .expect("store objective");

@@ -43,6 +43,11 @@ model = "fable"
 # max_depth = 255                   # narrow-only (a repo layer may only LOWER this): operator ceiling on any envelope's delegation_depth. Default: 255 (no extra cap beyond default_depth).
 # deny_network = false              # narrow-only (a repo layer may only turn this ON): denies network tools for every envelope computed in this repo. Default: false.
 
+# [objective]                        # completion-judge policy for an objective-driven `zirv ctx loop` run (issue #314); every key below is narrow-only
+# gates = ["zirv test changed", "zirv verify"]  # narrow-only (a repo layer may only DROP entries, never add or reorder one): deterministic gates run, in order, before the judge every cycle.
+# max_cycles_without_progress = 5   # narrow-only (a repo layer may only LOWER this): consecutive no-progress cycles before the loop gives up.
+# judge = true                      # narrow-only (a repo layer may only turn this OFF): whether a cheap-model verdict is consulted once every gate is green.
+
 # [handover.claude]                 # every key below is REPO-FORBIDDEN (ZIRV_CTX_HANDOVER_CLAUDE_CHEAP / _STANDARD / _DEEP) -- model-id override for `zirv ctx handover`'s generic tiers on a claude target.
 # cheap = "haiku"                   # Default: unset (built-in ladder default "haiku").
 # standard = "sonnet"               # Default: unset (built-in ladder default "sonnet").

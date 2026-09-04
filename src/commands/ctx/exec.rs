@@ -742,6 +742,8 @@ fn run_with_clock_inner<W: Write>(
             spent_tokens: 0,
             started_at: now_fn(),
             status: objective::Status::Active,
+            pending_note: None,
+            evidence: Vec::new(),
         };
         objective::store(&state, &key, &record)?;
     }
@@ -5691,6 +5693,8 @@ mod tests {
                 spent_tokens: 0,
                 started_at: now_secs(),
                 status: objective::Status::Active,
+                pending_note: None,
+                evidence: Vec::new(),
             },
         )
         .expect("store objective");

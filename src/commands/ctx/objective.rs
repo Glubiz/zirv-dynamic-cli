@@ -54,6 +54,20 @@ pub struct Objective {
     pub spent_tokens: u64,
     pub started_at: u64,
     pub status: Status,
+    /// Issue #314: text injected into the NEXT cycle's prompt via
+    /// [`layer_text`], exactly the way [`WRAP_UP_INSTRUCTION`] already is --
+    /// today only a red (or skipped-as-still-red) gate's failure detail sets
+    /// this, cleared back to `None` the next time a gate comes back green.
+    /// `#[serde(default)]` so an older record without this field still
+    /// parses.
+    #[serde(default)]
+    pub pending_note: Option<String>,
+    /// Issue #314: what closed this objective -- gate report ids and/or the
+    /// judge's own reason -- recorded on a successful [`record_completion`].
+    /// Empty for every record that is not `Closed` via that path (including
+    /// every record predating it, via `#[serde(default)]`).
+    #[serde(default)]
+    pub evidence: Vec<String>,
 }
 
 fn record_path(state: &StateDir, key: &str) -> PathBuf {
@@ -169,6 +183,14 @@ pub fn layer_text(record: &Objective) -> String {
         text.push('\n');
         text.push_str(WRAP_UP_INSTRUCTION);
     }
+    // Issue #314: a red (or skipped-as-still-red) gate's own failure detail,
+    // set by `run_loop`'s gate check and cleared the next time a gate comes
+    // back green -- injected the same way the wrap-up instruction above is,
+    // volatile rather than part of the record's own long-lived shape.
+    if let Some(note) = &record.pending_note {
+        text.push('\n');
+        text.push_str(note);
+    }
     text
 }
 
@@ -224,6 +246,8 @@ pub fn run_set<W: Write>(
         spent_tokens: 0,
         started_at: now,
         status: Status::Active,
+        pending_note: None,
+        evidence: Vec::new(),
     };
     store(state, &key, &record)?;
     writeln!(
@@ -265,9 +289,34 @@ pub fn run_show<W: Write>(state: &StateDir, w: &mut W, repo: &Path) -> CtxResult
     }
 }
 
-pub fn run_close<W: Write>(state: &StateDir, w: &mut W, repo: &Path) -> CtxResult<i32> {
+/// The shared close-precondition check `run_close` and `run_loop`'s own
+/// `done`-verdict path both go through: refuses (returns `Ok(false)`, the
+/// record left untouched) unless the latest verification for `repo` is
+/// fresh and passing, exactly like `run_close` always has. On success,
+/// records `evidence` (gate report ids and/or the judge's own reason) on
+/// the closed record. `Ok(true)` both for a record this call actually
+/// closed and for one that was already `Closed` -- idempotent, matching
+/// `run_close`'s own "already closed" no-op.
+pub fn record_completion(state: &StateDir, repo: &Path, evidence: Vec<String>) -> CtxResult<bool> {
     let key = super::state::repo_slug(repo);
     let Some(mut record) = load(state, &key)? else {
+        return Ok(false);
+    };
+    if record.status == Status::Closed {
+        return Ok(true);
+    }
+    if !crate::commands::workflow::verification::latest_is_fresh_and_passing(state, repo, true)? {
+        return Ok(false);
+    }
+    record.status = Status::Closed;
+    record.evidence = evidence;
+    store(state, &key, &record)?;
+    Ok(true)
+}
+
+pub fn run_close<W: Write>(state: &StateDir, w: &mut W, repo: &Path) -> CtxResult<i32> {
+    let key = super::state::repo_slug(repo);
+    let Some(record) = load(state, &key)? else {
         writeln!(w, "no objective set for {}", repo.display())?;
         return Ok(1);
     };
@@ -275,19 +324,18 @@ pub fn run_close<W: Write>(state: &StateDir, w: &mut W, repo: &Path) -> CtxResul
         writeln!(w, "zirv ctx objective: already closed")?;
         return Ok(0);
     }
-    if !crate::commands::workflow::verification::latest_is_fresh_and_passing(state, repo, true)? {
+    if record_completion(state, repo, Vec::new())? {
+        writeln!(w, "zirv ctx objective: closed")?;
+        Ok(0)
+    } else {
         writeln!(
             w,
             "zirv ctx objective close: no fresh, passing final verification for {}; refusing to \
              close (completion is asserted only by a passing verification gate, never by prose)",
             repo.display()
         )?;
-        return Ok(1);
+        Ok(1)
     }
-    record.status = Status::Closed;
-    store(state, &key, &record)?;
-    writeln!(w, "zirv ctx objective: closed")?;
-    Ok(0)
 }
 
 pub fn run<W: Write>(args: &ObjectiveArgs, w: &mut W) -> CtxResult<i32> {
@@ -318,6 +366,8 @@ mod tests {
             spent_tokens: 0,
             started_at: now,
             status: Status::Active,
+            pending_note: None,
+            evidence: Vec::new(),
         }
     }
 
@@ -350,6 +400,22 @@ mod tests {
         let restored: Objective = serde_json::from_value(old_shape).expect("deserialize");
         assert_eq!(restored.spent_tokens, 0);
         assert_eq!(restored.schema_version, SCHEMA_VERSION);
+    }
+
+    /// Issue #314: a record written before `pending_note`/`evidence` existed
+    /// still parses, defaulting both -- the identical shape as
+    /// `an_older_record_defaults_spent_tokens_and_schema_version`.
+    #[test]
+    fn an_older_record_defaults_pending_note_and_evidence() {
+        let record = sample(1_700_000_000);
+        let mut old_shape = serde_json::to_value(&record).expect("serialize");
+        let object = old_shape.as_object_mut().expect("object");
+        object.remove("pending_note");
+        object.remove("evidence");
+
+        let restored: Objective = serde_json::from_value(old_shape).expect("deserialize");
+        assert_eq!(restored.pending_note, None);
+        assert_eq!(restored.evidence, Vec::<String>::new());
     }
 
     #[test]
@@ -421,6 +487,23 @@ mod tests {
         assert!(
             text.contains("progress made") || text.contains("remaining"),
             "must ask for progress/remaining/blockers/next step: {text}"
+        );
+    }
+
+    /// Issue #314: a red (or skipped) gate's own failure detail is injected
+    /// via `pending_note` exactly the way the wrap-up instruction is via
+    /// `status`, and is absent when there is nothing pending.
+    #[test]
+    fn layer_text_carries_a_pending_note_when_one_is_set() {
+        let clean = layer_text(&sample(1_700_000_000));
+        assert!(!clean.contains("gate red"), "nothing pending: {clean}");
+
+        let mut record = sample(1_700_000_000);
+        record.pending_note = Some("gate red: zirv verify exited 1\nsome tail".to_string());
+        let text = layer_text(&record);
+        assert!(
+            text.contains("gate red: zirv verify exited 1"),
+            "got {text}"
         );
     }
 
@@ -521,6 +604,141 @@ mod tests {
             load(&state, &key).expect("load").expect("present").status,
             Status::Active,
             "a refused close must not flip the status"
+        );
+    }
+
+    /// Issue #314: `record_completion` is the seam `run_loop`'s own `done`
+    /// verdict path uses -- same refusal precondition as `run_close`, but it
+    /// also records the caller's evidence on a successful close.
+    #[test]
+    fn record_completion_refuses_without_a_fresh_passing_verification() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let key = super::super::state::repo_slug(&repo);
+        store(&state, &key, &sample(1_700_000_000)).expect("store");
+
+        let closed =
+            record_completion(&state, &repo, vec!["judge: done".to_string()]).expect("runs");
+        assert!(!closed, "no verification evidence at all -- refused");
+        let record = load(&state, &key).expect("load").expect("present");
+        assert_eq!(record.status, Status::Active);
+        assert!(
+            record.evidence.is_empty(),
+            "a refused close records nothing"
+        );
+    }
+
+    #[test]
+    fn record_completion_is_idempotent_once_already_closed() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let mut record = sample(1_700_000_000);
+        record.status = Status::Closed;
+        let key = super::super::state::repo_slug(&repo);
+        store(&state, &key, &record).expect("store");
+
+        let closed =
+            record_completion(&state, &repo, vec!["judge: done".to_string()]).expect("runs");
+        assert!(closed);
+        assert_eq!(
+            load(&state, &key).expect("load").expect("present").evidence,
+            Vec::<String>::new(),
+            "an already-closed record is left untouched, evidence included"
+        );
+    }
+
+    fn git_repo_with_one_commit() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(tmp.path())
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "test"]);
+        std::fs::write(tmp.path().join("a.txt"), "hi").expect("write file");
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "init"]);
+        tmp
+    }
+
+    fn passing_report(
+        repo: &Path,
+        fingerprint: u64,
+    ) -> crate::commands::workflow::verification::VerificationReport {
+        use crate::commands::workflow::verification::{
+            CheckKind, CheckResult, CheckStatus, VerificationMode, VerificationReport,
+        };
+        VerificationReport {
+            schema_version: crate::commands::workflow::verification::VERIFY_REPORT_SCHEMA_VERSION,
+            id: "r1".to_string(),
+            mode: VerificationMode::Final,
+            source: "test".to_string(),
+            repo: repo.to_path_buf(),
+            change_fingerprint: fingerprint,
+            changed_paths: Vec::new(),
+            fallback_to_full: false,
+            narrowed_to: Vec::new(),
+            notes: Vec::new(),
+            started_at: 0,
+            finished_at: 0,
+            checks: vec![CheckResult {
+                id: "build".to_string(),
+                kind: CheckKind::Build,
+                command: "cargo build".to_string(),
+                source: crate::commands::workflow::verification::CheckSource::DiscoveredToolchain,
+                status: CheckStatus::Passed,
+                exit_code: Some(0),
+                duration_ms: 1,
+                failure_output: None,
+                failure_test_names: Vec::new(),
+                inconclusive_reason: None,
+            }],
+        }
+    }
+
+    /// Issue #314, the core acceptance criterion: `record_completion` closes
+    /// the objective and records the caller's evidence once (and only once)
+    /// the latest verification is genuinely fresh and passing.
+    #[test]
+    fn record_completion_closes_and_records_evidence_with_a_fresh_passing_report() {
+        let repo_dir = git_repo_with_one_commit();
+        let repo = repo_dir.path();
+        // The state dir lives OUTSIDE the git repo, matching real deployment
+        // (it is resolved under the operator's home directory, never the
+        // checkout itself) -- writing it under `repo` would otherwise show
+        // up as new untracked paths and move `change_fingerprint` between
+        // the two calls below, out from under this very test.
+        let state_dir = tempfile::tempdir().expect("state tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+        let key = super::super::state::repo_slug(repo);
+        store(&state, &key, &sample(1_700_000_000)).expect("store");
+
+        let fingerprint =
+            crate::commands::workflow::verification::change_fingerprint(repo).expect("fingerprint");
+        crate::commands::workflow::verification::save_report(
+            &state,
+            &passing_report(repo, fingerprint),
+        )
+        .expect("save report");
+
+        let closed =
+            record_completion(&state, repo, vec!["judge: objective satisfied".to_string()])
+                .expect("runs");
+        assert!(closed);
+        let record = load(&state, &key).expect("load").expect("present");
+        assert_eq!(record.status, Status::Closed);
+        assert_eq!(
+            record.evidence,
+            vec!["judge: objective satisfied".to_string()]
         );
     }
 
