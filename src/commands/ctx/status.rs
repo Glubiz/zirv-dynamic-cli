@@ -1385,6 +1385,45 @@ fn render_report<W: Write>(
         }
         None => {}
     }
+    if let (Some(cfg), Some(provider)) = (cfg_result.as_ref().ok(), provider)
+        && provider != crate::commands::ctx::window::CODEX_USAGE_PROVIDER
+    {
+        let now = crate::commands::ctx::state::now_secs();
+        let reading = crate::commands::ctx::window::load_for(
+            &state,
+            crate::commands::ctx::window::CODEX_USAGE_PROVIDER,
+        );
+        let mut parts = Vec::new();
+        if let Some(windows) = reading {
+            for (name, reading) in [
+                ("five_hour", windows.five_hour.as_ref()),
+                ("seven_day", windows.seven_day.as_ref()),
+            ] {
+                let Some(reading) = reading else {
+                    continue;
+                };
+                let age = crate::commands::ctx::window::age_secs(reading, now);
+                let stale = if age > cfg.pace.collector_max_age_secs {
+                    ", stale"
+                } else {
+                    ""
+                };
+                parts.push(format!(
+                    "codex {name}: {:.1}% used (rollout, observed {} ago at unix {}{stale}, resets at unix {})",
+                    reading.used_percentage,
+                    style::format_age(age),
+                    reading.observed_at,
+                    reading.resets_at
+                ));
+            }
+        }
+        let line = if parts.is_empty() {
+            "codex: no usage signal (no rollout rate_limits ingested yet)".to_string()
+        } else {
+            parts.join(" | ")
+        };
+        writeln!(w, "  {}", style::paint(&line, Tone::Muted, colour))?;
+    }
 
     if args.brief {
         match latest_for_repo(&state, repo)? {
@@ -2034,6 +2073,7 @@ mod tests {
                 score: 64,
                 action: "inject",
                 detail: "cooldown armed",
+                observed_at: None,
             },
         )
         .expect("append");
@@ -2380,6 +2420,7 @@ mod tests {
                     score: 0,
                     action: &format!("tick{i}"),
                     detail: "",
+                    observed_at: None,
                 },
             )
             .expect("append");
@@ -3240,6 +3281,54 @@ mod tests {
             text.contains(&format!("five_hour {}", crate::style::PLACEHOLDER)),
             "expired reads the same as never-recorded: {text}"
         );
+    }
+
+    #[test]
+    fn status_marks_an_old_codex_rollout_reading_stale() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("home tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let state = StateDir::from_root(tmp.path().join("state"));
+        state.ensure().expect("ensure");
+        let now = crate::commands::ctx::state::now_secs();
+        crate::commands::ctx::window::store_for(
+            &state,
+            crate::commands::ctx::window::CODEX_USAGE_PROVIDER,
+            &crate::commands::ctx::window::UsageWindows {
+                five_hour: Some(crate::commands::ctx::window::Window {
+                    used_percentage: 91.0,
+                    resets_at: now + 3_600,
+                    observed_at: now.saturating_sub(901),
+                    overage_covered: false,
+                }),
+                seven_day: None,
+            },
+        )
+        .expect("store codex reading");
+        let mut env = env_for(state.root());
+        env.insert("ZIRV_CTX_AGENT".to_string(), "claude".to_string());
+
+        let mut out = Vec::new();
+        run_with(
+            &StatusArgs {
+                decisions: 5,
+                brief: false,
+                diff: false,
+            },
+            &mut out,
+            tmp.path(),
+            &|key| env.get(key).cloned(),
+            false,
+        )
+        .expect("runs");
+
+        let text = String::from_utf8(out).expect("utf8");
+        let codex_line = text
+            .lines()
+            .find(|line| line.contains("codex five_hour"))
+            .expect("codex usage line");
+        assert!(codex_line.contains("91.0% used"), "got {codex_line}");
+        assert!(codex_line.contains("stale"), "got {codex_line}");
     }
 
     /// The third of the three usage surfaces this fixes (alongside `zirv ctx

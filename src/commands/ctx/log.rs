@@ -46,7 +46,7 @@ impl std::fmt::Display for TaskClass {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Decision<'a> {
     pub ts: u64,
     pub session: &'a str,
@@ -55,6 +55,8 @@ pub struct Decision<'a> {
     pub score: u32,
     pub action: &'a str,
     pub detail: &'a str,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_at: Option<u64>,
 }
 
 /// Privacy-preserving evidence for one command-policy decision. Commands are
@@ -445,6 +447,27 @@ mod tests {
     use crate::commands::ctx::state::StateDir;
 
     #[test]
+    fn decision_rows_deserialize_with_or_without_an_observed_at_timestamp() {
+        let old_json = r#"{"ts":1,"session":"s","verb":"agent","verdict":"reroute","score":0,"action":"harness-reroute","detail":"old"}"#;
+        let old: Decision<'_> = serde_json::from_str(old_json).expect("old row deserializes");
+        assert_eq!(old.observed_at, None);
+
+        let current = Decision {
+            ts: 2,
+            session: "s",
+            verb: "agent",
+            verdict: "reroute",
+            score: 0,
+            action: "harness-reroute",
+            detail: "current",
+            observed_at: Some(1_700_000_000),
+        };
+        let json = serde_json::to_string(&current).expect("serialize");
+        let round_tripped: Decision<'_> = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(round_tripped.observed_at, Some(1_700_000_000));
+    }
+
+    #[test]
     fn decisions_append_as_jsonl_and_tail_returns_newest_last() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(tmp.path().to_path_buf());
@@ -461,6 +484,7 @@ mod tests {
                     score: 64,
                     action,
                     detail: "",
+                    observed_at: None,
                 },
             )
             .expect("append");
@@ -626,6 +650,7 @@ mod tests {
                 score: 0,
                 action: "observe",
                 detail: "/home/someone/.claude/projects/x/y.jsonl",
+                observed_at: None,
             },
         )
         .expect("append");
@@ -655,6 +680,7 @@ mod tests {
                 score: 0,
                 action: "observe",
                 detail: "",
+                observed_at: None,
             },
         )
         .expect("append must create its directory");

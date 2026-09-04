@@ -3348,6 +3348,7 @@ fn compose_worker_prompt(
                     "requested_by {:?} is not addressable; no report-back instruction was attached",
                     req.requested_by
                 ),
+                observed_at: None,
             },
         );
     }
@@ -3681,6 +3682,7 @@ fn fulfill_spawn_request(
             requested: &req.agent,
             source_model: source_model.as_deref(),
             source_model_explicit: req.model.is_some(),
+            delegation: true,
             bounds: super::fallback::TaskBounds {
                 tokens: None,
                 tool_calls: None,
@@ -3717,11 +3719,15 @@ fn fulfill_spawn_request(
                 score: 0,
                 action: "harness-reroute",
                 detail: &detail,
+                observed_at: route.requested_observed_at,
             },
         );
         push_error(
             errors,
-            format!("dashboard spawn automatically routed {detail}"),
+            format!(
+                "dashboard spawn {}",
+                super::agent::automatic_route_message(&route, super::pace::Seat::Pane)
+            ),
         );
     }
     let req = &effective_req;
@@ -5600,6 +5606,7 @@ fn report_back_reminder_sweep(panes: &mut [Pane], state: &StateDir, errors: &mut
                         score: 0,
                         action: "report-back-reminder",
                         detail: &format!("reminded to report back to {report_to}"),
+                        observed_at: None,
                     },
                 );
             }

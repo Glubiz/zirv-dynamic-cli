@@ -87,6 +87,7 @@ fn log_truncation_decisions(state: &StateDir, now: u64, provenance: &[ContextPro
                 score: 0,
                 action: TRUNCATED_ACTION,
                 detail: &detail,
+                observed_at: None,
             },
         );
     }
@@ -120,6 +121,7 @@ fn log_dedup_skip_decision(
             score: 0,
             action: DEDUP_SKIP_ACTION,
             detail: &detail,
+            observed_at: None,
         },
     );
 }

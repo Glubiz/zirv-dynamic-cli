@@ -674,6 +674,7 @@ pub(crate) fn run_with_clock<W: Write>(
                                 score: 0,
                                 action: "compact",
                                 detail: &transcript.display().to_string(),
+                                observed_at: None,
                             },
                         );
                         command = continued;
@@ -691,6 +692,7 @@ pub(crate) fn run_with_clock<W: Write>(
                                 score: 0,
                                 action: "compact-failed",
                                 detail: &reason,
+                                observed_at: None,
                             },
                         );
                         writeln!(
@@ -737,6 +739,7 @@ pub(crate) fn run_with_clock<W: Write>(
                 score: 0,
                 action,
                 detail: &decision_detail,
+                observed_at: None,
             },
         );
 
@@ -862,6 +865,7 @@ fn handle_cycle_outcome<W: Write>(
                 score: 0,
                 action: "give-up",
                 detail: &detail,
+                observed_at: None,
             },
         );
         writeln!(

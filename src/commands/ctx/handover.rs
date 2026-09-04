@@ -146,6 +146,35 @@ pub fn equivalent_model(
     resolve_model(target_agent, tier, cfg).ok()
 }
 
+/// Chooses a target model for a delegated worker reroute. An explicit source
+/// model preserves its verified tier; otherwise the target harness's worker
+/// default is authoritative, falling back to its standard tier.
+pub fn equivalent_delegation_model(
+    source_agent: &str,
+    source_model: Option<&str>,
+    source_model_explicit: bool,
+    target_agent: &str,
+    cfg: &CtxConfig,
+) -> Option<String> {
+    if source_model_explicit {
+        return equivalent_model(
+            source_agent,
+            source_model,
+            source_model_explicit,
+            target_agent,
+            cfg,
+        );
+    }
+    let configured = match target_agent {
+        "claude" => cfg.worker.claude.as_deref(),
+        "codex" => cfg.worker.codex.as_deref(),
+        _ => None,
+    };
+    configured
+        .map(str::to_string)
+        .or_else(|| resolve_model(target_agent, "standard", cfg).ok())
+}
+
 #[derive(Debug, clap::Args)]
 pub struct HandoverArgs {
     /// Target model: a literal model id, or a generic tier (cheap/standard/deep)
@@ -660,6 +689,36 @@ mod tests {
         assert_eq!(
             equivalent_model("codex", None, false, "claude", &cfg),
             Some("sonnet".to_string())
+        );
+    }
+
+    #[test]
+    fn delegation_model_uses_the_target_worker_default_or_standard_tier() {
+        let mut cfg = CtxConfig::default();
+        cfg.worker.claude = Some("claude-worker".to_string());
+        assert_eq!(
+            equivalent_delegation_model("codex", Some("gpt-5.6-sol"), false, "claude", &cfg,),
+            Some("claude-worker".to_string())
+        );
+
+        cfg.worker.claude = None;
+        assert_eq!(
+            equivalent_delegation_model("codex", Some("gpt-5.6-sol"), false, "claude", &cfg,),
+            Some("sonnet".to_string())
+        );
+        assert_eq!(
+            equivalent_delegation_model("codex", Some("gpt-5.6-sol"), true, "claude", &cfg,),
+            Some("opus".to_string())
+        );
+    }
+
+    #[test]
+    fn session_handover_still_mirrors_the_source_models_tier() {
+        let mut cfg = CtxConfig::default();
+        cfg.worker.claude = Some("claude-worker".to_string());
+        assert_eq!(
+            equivalent_model("codex", Some("gpt-5.6-sol"), false, "claude", &cfg,),
+            Some("opus".to_string())
         );
     }
 

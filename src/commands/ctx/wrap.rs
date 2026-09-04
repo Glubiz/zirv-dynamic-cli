@@ -1277,6 +1277,7 @@ pub fn note_failure(
                 score: 0,
                 action: "degrade",
                 detail: what,
+                observed_at: None,
             },
         );
     }
@@ -3133,6 +3134,7 @@ fn pump(
                         score: supervision.score,
                         action: "handover-refused",
                         detail: &reason,
+                        observed_at: None,
                     },
                 );
             } else {
@@ -3216,6 +3218,7 @@ fn pump(
                                     outcome.source,
                                     stored_text
                                 ),
+                                observed_at: None,
                             },
                         );
                     }
@@ -3246,6 +3249,7 @@ fn pump(
                                 score: supervision.score,
                                 action: "handover-failed",
                                 detail: &reason,
+                                observed_at: None,
                             },
                         );
                         let status = child.wait()?;
@@ -3339,6 +3343,7 @@ fn pump(
                             .path()
                             .map(|path| path.display().to_string())
                             .unwrap_or_else(|| "no transcript reported".to_string()),
+                        observed_at: None,
                     },
                 );
             }
@@ -3528,6 +3533,7 @@ fn pump(
                             Ok(path) => format!("{source} handoff at {}", path.display()),
                             Err(e) => format!("{source} handoff not stored: {e}"),
                         },
+                        observed_at: None,
                     },
                 );
                 if !relaunched {
