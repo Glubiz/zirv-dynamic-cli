@@ -1261,6 +1261,11 @@ checkout:
 | `supervise.max_heavy_workers` | `ZIRV_CTX_SUPERVISE_MAX_HEAVY_WORKERS` (deprecated alias for `max_heavy_operations`) |
 | `supervise.max_heavy_operations` | `ZIRV_CTX_SUPERVISE_MAX_HEAVY_OPERATIONS` |
 | `supervise.max_writers` | `ZIRV_CTX_SUPERVISE_MAX_WRITERS` |
+| `supervise.idle_no_tool_secs` | `ZIRV_CTX_SUPERVISE_IDLE_NO_TOOL_SECS` |
+| `supervise.in_tool_secs` | `ZIRV_CTX_SUPERVISE_IN_TOOL_SECS` |
+| `supervise.stall_grace_secs` | `ZIRV_CTX_SUPERVISE_STALL_GRACE_SECS` |
+| `supervise.chain_max_restarts` | `ZIRV_CTX_SUPERVISE_CHAIN_MAX_RESTARTS` |
+| `supervise.chain_max_gap_secs` | `ZIRV_CTX_SUPERVISE_CHAIN_MAX_GAP_SECS` |
 | `pace.use_credits` | `ZIRV_CTX_PACE_USE_CREDITS_CLAUDE` (the table-node match also blocks `pace.use_credits.codex` alone) |
 | `pace.poll_enabled` | `ZIRV_CTX_PACE_POLL` |
 | `pace.poll_min_interval_secs` | `ZIRV_CTX_PACE_POLL_MIN_INTERVAL_SECS` |

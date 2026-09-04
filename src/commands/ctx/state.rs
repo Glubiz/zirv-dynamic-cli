@@ -434,6 +434,15 @@ impl StateDir {
         self.0.join("objective")
     }
 
+    /// `<state>/restart-chains` -- one JSON file per chain key (issue #310,
+    /// 3b), keyed by `state::repo_slug` the same way `objective()` is: a
+    /// sibling of it, and for the same reason -- this outlives any one
+    /// `exec`/`loop` invocation or restart, chaining inter-boot gaps ACROSS
+    /// process boundaries rather than within one.
+    pub fn restart_chains(&self) -> PathBuf {
+        self.0.join("restart-chains")
+    }
+
     /// Issue #178: captured operator-approved permission prompts, ready for
     /// `permissions::propose`'s safe-list classifier -- `<state>/approvals/
     /// *.jsonl`, one file per day (see `log::append_safety`'s own doc
@@ -920,5 +929,12 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(tmp.path().to_path_buf());
         assert_eq!(state.objective(), tmp.path().join("objective"));
+    }
+
+    #[test]
+    fn the_restart_chains_dir_hangs_off_the_state_root() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        assert_eq!(state.restart_chains(), tmp.path().join("restart-chains"));
     }
 }

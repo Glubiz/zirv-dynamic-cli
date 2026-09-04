@@ -1440,6 +1440,55 @@ pub fn claim_nudge_marker(state: &StateDir, short: &str) -> Option<String> {
     )
 }
 
+// Issue #310 (3a): the once-only stalled-latch marker. Unlike the nudge
+// marker above -- consumed on read, exactly once, by whichever supervisor
+// gets there first -- the stall latch has to be observed repeatedly (by the
+// poll loop that owns it, and by a dashboard banner render) without being
+// consumed, so it is a plain best-effort read/write/remove trio rather than
+// `claim_nudge_marker`'s atomic claim. It still mirrors that idiom in every
+// other respect: best-effort in every direction, matching every other piece
+// of state-dir housekeeping in this module.
+
+fn stall_marker_path(state: &StateDir, short: &str) -> PathBuf {
+    state.sessions().join(format!("{short}.stall"))
+}
+
+/// Arms this session's stall latch, recording the unix-seconds moment it
+/// armed (so a caller -- `zirv ctx status`, a dashboard banner -- can report
+/// "stalled since"). Best-effort: a marker that fails to write only costs
+/// that observability, never the supervising process's own in-memory latch,
+/// which is what actually drives the nudge/terminate decision.
+pub fn write_stall_marker(state: &StateDir, short: &str, latched_at_secs: u64) {
+    let _ = super::state::create_private_dir_all(&state.sessions());
+    let _ = std::fs::write(stall_marker_path(state, short), latched_at_secs.to_string());
+}
+
+/// Reads this session's stall latch, if armed -- the unix-seconds moment it
+/// armed, or `None` if there is no latch (never armed, already cleared, or
+/// unreadable/malformed). Read-only and repeatable, unlike
+/// `claim_nudge_marker`: both the owning poll loop and a dashboard render
+/// need to observe the same latch on every pass without consuming it. Not
+/// yet called by any production reader (a natural `zirv ctx status`/
+/// dashboard banner addition, out of this round's scope, which is what
+/// `write_stall_marker` above is written for); exercised directly by this
+/// module's own unit tests.
+#[allow(dead_code)]
+pub fn stall_marker(state: &StateDir, short: &str) -> Option<u64> {
+    std::fs::read_to_string(stall_marker_path(state, short))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// Clears this session's stall latch -- called the instant observed progress
+/// proves the session was not actually stuck. Best-effort: a marker that
+/// fails to remove just means the next poll (or the process's own in-memory
+/// state, which is authoritative) clears it instead.
+pub fn clear_stall_marker(state: &StateDir, short: &str) {
+    let _ = std::fs::remove_file(stall_marker_path(state, short));
+}
+
 /// The `for_session` filter a supervisor passes to `mail::list` when listing
 /// mail *for itself*.
 ///
@@ -2824,6 +2873,65 @@ mod tests {
             None,
             "a second observer finds nothing left to claim"
         );
+    }
+
+    // -- stall marker (issue #310, 3a) ------------------------------------
+
+    #[test]
+    fn a_freshly_armed_stall_marker_reads_back_its_own_timestamp() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = state_in(tmp.path());
+        write_stall_marker(&state, "aaaa1111", 1_000);
+        assert_eq!(stall_marker(&state, "aaaa1111"), Some(1_000));
+    }
+
+    #[test]
+    fn a_stall_marker_is_absent_until_written() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = state_in(tmp.path());
+        assert_eq!(stall_marker(&state, "aaaa1111"), None);
+    }
+
+    /// Unlike the nudge marker, reading the stall marker must not consume
+    /// it -- both the owning poll loop and a dashboard render observe the
+    /// same latch repeatedly.
+    #[test]
+    fn reading_a_stall_marker_does_not_consume_it() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = state_in(tmp.path());
+        write_stall_marker(&state, "aaaa1111", 1_000);
+        assert_eq!(stall_marker(&state, "aaaa1111"), Some(1_000));
+        assert_eq!(
+            stall_marker(&state, "aaaa1111"),
+            Some(1_000),
+            "a second read must still see it"
+        );
+    }
+
+    #[test]
+    fn clearing_a_stall_marker_removes_it() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = state_in(tmp.path());
+        write_stall_marker(&state, "aaaa1111", 1_000);
+        clear_stall_marker(&state, "aaaa1111");
+        assert_eq!(stall_marker(&state, "aaaa1111"), None);
+    }
+
+    #[test]
+    fn clearing_a_stall_marker_that_was_never_armed_is_not_an_error() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = state_in(tmp.path());
+        clear_stall_marker(&state, "aaaa1111");
+        assert_eq!(stall_marker(&state, "aaaa1111"), None);
+    }
+
+    #[test]
+    fn a_malformed_stall_marker_reads_as_absent() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = state_in(tmp.path());
+        super::super::state::create_private_dir_all(&state.sessions()).expect("mkdir");
+        std::fs::write(stall_marker_path(&state, "aaaa1111"), b"not-a-number").expect("write");
+        assert_eq!(stall_marker(&state, "aaaa1111"), None);
     }
 
     /// C4: the marker carries the *sender's* short id. Every emitter used to

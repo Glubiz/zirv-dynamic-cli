@@ -190,6 +190,45 @@ pub struct SuperviseConfig {
     /// so a repo checkout widening this list cannot reproduce issue #133's
     /// ungoverned-concurrency incident.
     pub heavy_command_patterns: Vec<String>,
+    /// Issue #310 (3a): a session with NO PTY output, transcript growth, or
+    /// mail activity for this long, while it is not inside a tool call,
+    /// latches `stalled` (`stall::evaluate_progress`, `ToolState::Idle`).
+    /// Mirrors the Hermes Agent reference architecture's own
+    /// `_STALE_IDLE_SECONDS` (450.0).
+    ///
+    /// `REPO_FORBIDDEN`, same reasoning as `max_writers`: a checked-out repo
+    /// raising its own stall fuse could silently defeat the detector for a
+    /// session running against it.
+    pub idle_no_tool_secs: u64,
+    /// Same progress clock as `idle_no_tool_secs`, applied while the session
+    /// IS inside a tool call (`ToolState::InTool`) -- a stuck tool call is
+    /// expected to run longer than idle "thinking" time before it counts as
+    /// a stall. Mirrors Hermes's `_STALE_IN_TOOL_SECONDS` (1200.0).
+    ///
+    /// `REPO_FORBIDDEN`, same reasoning as `idle_no_tool_secs`.
+    pub in_tool_secs: u64,
+    /// Issue #310 (3a): once the stall latch arms and the one steering
+    /// nudge is sent, how long a session gets to show observed progress
+    /// before it is terminated via the existing kill path. Mirrors Hermes's
+    /// `_STALL_GRACE_SECONDS` (120.0).
+    ///
+    /// `REPO_FORBIDDEN`, same reasoning as `idle_no_tool_secs`.
+    pub stall_grace_secs: u64,
+    /// Issue #310 (3b): the restart-chain breaker's own trip threshold --
+    /// this many unplanned, same-class respawns, each no more than
+    /// `chain_max_gap_secs` apart, means "do not auto-resume, report"
+    /// instead of looping forever across process boundaries
+    /// (`chain::evaluate`). Mirrors Hermes's `DEFAULT_MAX_RESTARTS` (3).
+    ///
+    /// `REPO_FORBIDDEN`, same reasoning as `idle_no_tool_secs`: a repo
+    /// checkout raising its own restart budget could silently defeat the
+    /// breaker.
+    pub chain_max_restarts: u32,
+    /// See `chain_max_restarts` right above. Mirrors Hermes's
+    /// `DEFAULT_MAX_GAP_SECONDS` (300).
+    ///
+    /// `REPO_FORBIDDEN`, same reasoning as `chain_max_restarts`.
+    pub chain_max_gap_secs: u64,
 }
 
 impl Default for SuperviseConfig {
@@ -206,6 +245,11 @@ impl Default for SuperviseConfig {
             max_heavy_operations: 1,
             max_writers: 1,
             heavy_command_patterns: Vec::new(),
+            idle_no_tool_secs: 450,
+            in_tool_secs: 1200,
+            stall_grace_secs: 120,
+            chain_max_restarts: 3,
+            chain_max_gap_secs: 300,
         }
     }
 }
@@ -1481,6 +1525,31 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         &["supervise", "max_writers"],
         EnvKind::Int,
     ),
+    (
+        "ZIRV_CTX_SUPERVISE_IDLE_NO_TOOL_SECS",
+        &["supervise", "idle_no_tool_secs"],
+        EnvKind::Int,
+    ),
+    (
+        "ZIRV_CTX_SUPERVISE_IN_TOOL_SECS",
+        &["supervise", "in_tool_secs"],
+        EnvKind::Int,
+    ),
+    (
+        "ZIRV_CTX_SUPERVISE_STALL_GRACE_SECS",
+        &["supervise", "stall_grace_secs"],
+        EnvKind::Int,
+    ),
+    (
+        "ZIRV_CTX_SUPERVISE_CHAIN_MAX_RESTARTS",
+        &["supervise", "chain_max_restarts"],
+        EnvKind::Int,
+    ),
+    (
+        "ZIRV_CTX_SUPERVISE_CHAIN_MAX_GAP_SECS",
+        &["supervise", "chain_max_gap_secs"],
+        EnvKind::Int,
+    ),
     ("ZIRV_CTX_MODEL", &["handoff", "model"], EnvKind::Str),
     (
         "ZIRV_CTX_HANDOFF_TIMEOUT_SECS",
@@ -2398,6 +2467,34 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     (
         &["supervise", "max_writers"],
         "ZIRV_CTX_SUPERVISE_MAX_WRITERS",
+    ),
+    // Issue #310: same trust asymmetry as `max_writers`/`max_heavy_
+    // operations` above -- a repo checkout raising its own stall fuse or
+    // grace period could silently defeat the 3a stall detector for a
+    // session running against it (see `SuperviseConfig::idle_no_tool_secs`'s
+    // own doc comment).
+    (
+        &["supervise", "idle_no_tool_secs"],
+        "ZIRV_CTX_SUPERVISE_IDLE_NO_TOOL_SECS",
+    ),
+    (
+        &["supervise", "in_tool_secs"],
+        "ZIRV_CTX_SUPERVISE_IN_TOOL_SECS",
+    ),
+    (
+        &["supervise", "stall_grace_secs"],
+        "ZIRV_CTX_SUPERVISE_STALL_GRACE_SECS",
+    ),
+    // Same reasoning, for the 3b restart-chain breaker: a repo checkout
+    // raising its own restart budget or gap window could silently defeat
+    // the breaker.
+    (
+        &["supervise", "chain_max_restarts"],
+        "ZIRV_CTX_SUPERVISE_CHAIN_MAX_RESTARTS",
+    ),
+    (
+        &["supervise", "chain_max_gap_secs"],
+        "ZIRV_CTX_SUPERVISE_CHAIN_MAX_GAP_SECS",
     ),
     // Mouse capture takes over the terminal's own text selection, so which
     // way that trade goes is the operator's call about their own terminal,
@@ -3478,6 +3575,31 @@ mod tests {
             SuperviseConfig::default().heavy_command_patterns,
             Vec::<String>::new(),
             "the built-in set is baked into permit::is_heavy, not duplicated here"
+        );
+        assert_eq!(
+            SuperviseConfig::default().idle_no_tool_secs,
+            450,
+            "issue #310: mirrors the Hermes reference's own _STALE_IDLE_SECONDS"
+        );
+        assert_eq!(
+            SuperviseConfig::default().in_tool_secs,
+            1200,
+            "issue #310: mirrors the Hermes reference's own _STALE_IN_TOOL_SECONDS"
+        );
+        assert_eq!(
+            SuperviseConfig::default().stall_grace_secs,
+            120,
+            "issue #310: mirrors the Hermes reference's own _STALL_GRACE_SECONDS"
+        );
+        assert_eq!(
+            SuperviseConfig::default().chain_max_restarts,
+            3,
+            "issue #310: mirrors the Hermes reference's own DEFAULT_MAX_RESTARTS"
+        );
+        assert_eq!(
+            SuperviseConfig::default().chain_max_gap_secs,
+            300,
+            "issue #310: mirrors the Hermes reference's own DEFAULT_MAX_GAP_SECONDS"
         );
         assert_eq!(
             HandoffConfig::default().model,
@@ -5251,6 +5373,75 @@ mod tests {
         assert!(err.to_string().contains("max_writers"), "got {err}");
     }
 
+    /// Issue #310: each of the 3a/3b `[supervise]` keys reads from its own
+    /// env var like every other `supervise.*` key.
+    #[test]
+    fn idle_no_tool_secs_env_override_sets_the_key() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let env = env_map(&[("ZIRV_CTX_SUPERVISE_IDLE_NO_TOOL_SECS", "60")]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert_eq!(cfg.supervise.idle_no_tool_secs, 60);
+    }
+
+    #[test]
+    fn in_tool_secs_env_override_sets_the_key() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let env = env_map(&[("ZIRV_CTX_SUPERVISE_IN_TOOL_SECS", "600")]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert_eq!(cfg.supervise.in_tool_secs, 600);
+    }
+
+    #[test]
+    fn stall_grace_secs_env_override_sets_the_key() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let env = env_map(&[("ZIRV_CTX_SUPERVISE_STALL_GRACE_SECS", "30")]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert_eq!(cfg.supervise.stall_grace_secs, 30);
+    }
+
+    #[test]
+    fn chain_max_restarts_env_override_sets_the_key() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let env = env_map(&[("ZIRV_CTX_SUPERVISE_CHAIN_MAX_RESTARTS", "5")]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert_eq!(cfg.supervise.chain_max_restarts, 5);
+    }
+
+    #[test]
+    fn chain_max_gap_secs_env_override_sets_the_key() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let env = env_map(&[("ZIRV_CTX_SUPERVISE_CHAIN_MAX_GAP_SECS", "600")]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert_eq!(cfg.supervise.chain_max_gap_secs, 600);
+    }
+
+    /// Issue #310: every 3a/3b `[supervise]` key is `REPO_FORBIDDEN`, same
+    /// reasoning as `max_writers` -- a checked-out repo must not be able to
+    /// silently defeat the stall detector or the restart-chain breaker by
+    /// raising its own thresholds.
+    #[test]
+    fn no_supervisor_reliability_key_may_come_from_a_repo_layer() {
+        for key in [
+            "idle_no_tool_secs",
+            "in_tool_secs",
+            "stall_grace_secs",
+            "chain_max_restarts",
+            "chain_max_gap_secs",
+        ] {
+            let repo = tempfile::tempdir().expect("repo");
+            std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+            std::fs::write(
+                repo.path().join(".zirv").join(CTX_CONFIG_FILE),
+                format!("[supervise]\n{key} = 999999\n"),
+            )
+            .expect("write");
+            let empty: HashMap<String, String> = HashMap::new();
+            let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+                .expect_err("a repo layer must be rejected");
+            assert!(err.to_string().contains(key), "got {err}");
+        }
+    }
+
     /// Unlike `max_heavy_operations`, `heavy_command_patterns` is not
     /// `REPO_FORBIDDEN`: a repo may ADD a pattern (only ever narrowing, per
     /// the field's own doc comment), but a plain deep merge would let a
@@ -6455,6 +6646,11 @@ mod tests {
         ("supervise", "max_heavy_operations"),
         ("supervise", "max_heavy_workers"),
         ("supervise", "max_writers"),
+        ("supervise", "idle_no_tool_secs"),
+        ("supervise", "in_tool_secs"),
+        ("supervise", "stall_grace_secs"),
+        ("supervise", "chain_max_restarts"),
+        ("supervise", "chain_max_gap_secs"),
         ("handoff", "model"),
         ("handoff", "tail_items"),
         ("handoff", "timeout_secs"),
