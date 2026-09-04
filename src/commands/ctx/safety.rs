@@ -5017,7 +5017,13 @@ fn split_segments_with_pipe_marker(command: &str) -> Vec<(String, bool)> {
 /// program name alone, because they apply an arbitrary diff to the working
 /// tree -- the write can land anywhere the diff names, regardless of where
 /// the diff text itself came from (a heredoc, a literal file argument, a
-/// `<` redirect, or bare stdin all count).
+/// `<` redirect, or bare stdin all count). `subcommand` must be the git
+/// action [`git_action`] resolves -- NOT a raw `tokens.get(1)` -- so a
+/// global option ahead of the verb (`git -C <dir>`, `-c k=v`, `--git-dir=`,
+/// `--work-tree=`, `--namespace=`) can never be mistaken for the verb
+/// itself and slip an actual `apply`/`am` through to the blanket `git`
+/// exemption (issue #334 review round 2, HIGH: `git -C <sibling-worktree>
+/// apply p.diff` used to do exactly that).
 fn git_apply_program_label(program: &str, subcommand: Option<&str>) -> Option<&'static str> {
     match (program, subcommand) {
         ("git", Some("apply")) => Some("<git apply>"),
@@ -5026,6 +5032,26 @@ fn git_apply_program_label(program: &str, subcommand: Option<&str>) -> Option<&'
         _ => None,
     }
 }
+
+/// Diff-producing `git` actions (issue #334 review round 2, MEDIUM) whose
+/// output is a legitimate upstream for a piped `git apply`/`git am` -- the
+/// one form that is how the orchestrator seat integrates a worker's diff
+/// rather than authoring one itself (`git -C <wt> diff | git apply`, `git
+/// format-patch --stdout | git am`). Deliberately narrow, not "any `git`
+/// subcommand": `git cat-file -p <sha>:path | git apply` reads an
+/// arbitrary blob, not necessarily a diff, and every other `git` action
+/// (`log` without `-p`, `status`, `commit`, ...) does not reliably produce
+/// patch-shaped output either -- resolved via [`git_action`] the same way
+/// [`git_apply_program_label`]'s own `subcommand` is, so a global option
+/// ahead of the verb cannot hide a non-diff action behind it either.
+const GIT_DIFF_PRODUCING_ACTIONS: &[&str] = &[
+    "diff",
+    "show",
+    "format-patch",
+    "diff-tree",
+    "diff-index",
+    "log",
+];
 
 /// Whether `token` is a `sed`/`perl` in-place-edit flag: `-i`, `-i<suffix>`
 /// (`-i.bak`), `--in-place[=<suffix>]`, or a clustered short-flag group
@@ -5149,9 +5175,16 @@ fn inline_code_has_write_primitive(code: &str) -> bool {
 /// these three apply an arbitrary diff to the working tree, so they are
 /// NEVER exempt on program name alone the way every other `git` subcommand
 /// is, UNLESS the segment is itself piped from an immediately preceding
-/// `git` segment (`git -C <wt> diff | git apply`, `git format-patch
-/// --stdout | git am`) -- the one form that is how the seat integrates a
-/// worker's diff rather than authoring one itself.
+/// `git` segment whose OWN action is one of [`GIT_DIFF_PRODUCING_ACTIONS`]
+/// (`git -C <wt> diff | git apply`, `git format-patch --stdout | git am`)
+/// -- the one form that is how the seat integrates a worker's diff rather
+/// than authoring one itself; `git cat-file -p <sha>:path | git apply` is
+/// NOT exempt, a non-diff `git` action is no safer an upstream than a
+/// non-`git` one. Every `git` action -- both the segment's own (for the
+/// apply/am/patch check) and its would-be upstream's (for the pipe
+/// exemption) -- is resolved via [`git_action`], which skips `git`'s own
+/// global options (`-C <dir>`, `-c k=v`, `--git-dir=`, `--work-tree=`,
+/// `--namespace=`) ahead of the verb, so neither can be defeated by one.
 ///
 /// Known gaps, documented rather than chased (this classifier is text-only
 /// and argv-scoped, the same declared limits every other classifier in
@@ -5181,33 +5214,55 @@ pub(crate) fn orchestrator_repo_write_target(
         .collect();
 
     let sanitized = redact_single_quoted_heredocs(command);
-    let mut previous_program: Option<String> = None;
+    // Whether the immediately preceding segment was itself a `git`
+    // invocation whose action is one of `GIT_DIFF_PRODUCING_ACTIONS` --
+    // the only kind of upstream a piped `git apply`/`git am` may be exempt
+    // for. Reset to `false` at the top of every iteration this loop
+    // doesn't explicitly set it in, so it only ever reflects the segment
+    // immediately before the one currently being examined.
+    let mut previous_diff_producing_git = false;
     for (segment, preceded_by_pipe) in split_segments_with_pipe_marker(&sanitized) {
         let collapsed = collapse_whitespace(&segment);
         let Some(tokens) = sql_tokens(&collapsed) else {
-            previous_program = None;
+            previous_diff_producing_git = false;
             continue;
         };
         let Some(first) = tokens.first() else {
-            previous_program = None;
+            previous_diff_producing_git = false;
             continue;
         };
         let program = sql_program_name(first);
-        let subcommand = tokens.get(1).map(String::as_str);
 
-        if let Some(label) = git_apply_program_label(&program, subcommand) {
-            let exempt = preceded_by_pipe && previous_program.as_deref() == Some("git");
-            previous_program = Some(program);
+        // Issue #334 review round 2, HIGH: the real git action, skipping
+        // any global option ahead of the verb -- `tokens.get(1)` alone
+        // would read `-C`/`-c`/`--git-dir=.../--work-tree=.../--namespace=`
+        // as the verb and let an actual `apply`/`am` slip past both checks
+        // below via the blanket `git` exemption.
+        if program == "git" {
+            let action = git_action(&tokens).map(|(_, action)| action.to_ascii_lowercase());
+            if let Some(label) = git_apply_program_label(&program, action.as_deref()) {
+                let exempt = preceded_by_pipe && previous_diff_producing_git;
+                previous_diff_producing_git = false;
+                if exempt {
+                    continue;
+                }
+                return Some(label.to_string());
+            }
+            previous_diff_producing_git = action
+                .as_deref()
+                .is_some_and(|action| GIT_DIFF_PRODUCING_ACTIONS.contains(&action));
+            continue;
+        }
+
+        if let Some(label) = git_apply_program_label(&program, None) {
+            let exempt = preceded_by_pipe && previous_diff_producing_git;
+            previous_diff_producing_git = false;
             if exempt {
                 continue;
             }
             return Some(label.to_string());
         }
-
-        if program == "git" {
-            previous_program = Some(program);
-            continue;
-        }
+        previous_diff_producing_git = false;
 
         if let Some(targets) = segment_write_targets(&neutralize_heredoc_operator(&segment)) {
             for target in &targets {
@@ -5245,8 +5300,6 @@ pub(crate) fn orchestrator_repo_write_target(
         {
             return Some("<inline interpreter write>".to_string());
         }
-
-        previous_program = Some(program);
     }
     None
 }
@@ -8327,6 +8380,68 @@ mod tests {
             "git -C /w diff | git apply",
             "git diff main | git apply -",
             "git format-patch --stdout | git am",
+        ] {
+            assert_eq!(
+                orchestrator_repo_write_target(command, cwd, &fake_repo_root_of),
+                None,
+                "{command}"
+            );
+        }
+    }
+
+    /// Issue #334 review round 2, HIGH: a git global option ahead of the
+    /// verb (`-C <dir>`, `-c k=v`, `--git-dir=`) must not defeat detection
+    /// by being mistaken for the verb itself -- the real action comes from
+    /// `git_action`, not a raw second token, exactly for the sibling-
+    /// worktree shape this bug let through (`git -C <sibling> apply
+    /// p.diff` used to read `-C` as the verb and fall through to the
+    /// blanket `git` exemption).
+    #[test]
+    fn orchestrator_repo_write_target_sees_through_git_global_options_before_apply() {
+        let cwd = "/work/repo";
+        for command in [
+            "git -C /work/sibling apply p.diff",
+            "git -c core.autocrlf=false apply p.diff",
+            "git --git-dir=/work/repo/.git apply p.diff",
+        ] {
+            assert!(
+                orchestrator_repo_write_target(command, cwd, &fake_repo_root_of).is_some(),
+                "{command}"
+            );
+        }
+        for command in [
+            "git -C /work/wt diff | git apply",
+            "git -C /work/wt diff | git -C /work/repo apply",
+        ] {
+            assert_eq!(
+                orchestrator_repo_write_target(command, cwd, &fake_repo_root_of),
+                None,
+                "{command}"
+            );
+        }
+    }
+
+    /// Issue #334 review round 2, MEDIUM: the pipe exemption is narrowed to
+    /// an allowlist of diff-producing `git` actions -- an arbitrary `git`
+    /// subcommand (`cat-file`, reading a blob rather than a diff) must not
+    /// qualify as a safe upstream just because it is *some* `git` call, and
+    /// a non-`git` upstream (`cat`) never qualifies either.
+    #[test]
+    fn orchestrator_repo_write_target_narrows_the_pipe_exemption_to_diff_producing_git_actions() {
+        let cwd = "/work/repo";
+        for command in [
+            "git cat-file -p abc:p.diff | git apply",
+            "cat p.diff | git apply",
+        ] {
+            assert!(
+                orchestrator_repo_write_target(command, cwd, &fake_repo_root_of).is_some(),
+                "{command}"
+            );
+        }
+        for command in [
+            "git show HEAD | git apply",
+            "git diff-tree -p HEAD | git apply",
+            "git log -p -1 | git apply",
         ] {
             assert_eq!(
                 orchestrator_repo_write_target(command, cwd, &fake_repo_root_of),
