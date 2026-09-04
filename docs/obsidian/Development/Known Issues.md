@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-09-03
+last-verified: 2026-09-04
 ---
 
 # Known Issues
@@ -14,6 +14,7 @@ Each entry gets a changelog comment at the top of the file, newest first:
 <!-- Updated YYYY-MM-DD (branch, state): what changed -->
 ```
 
+<!-- Updated 2026-09-04 (release/3.16.0-harness-batch-4, issue #318): recorded that a dashboard-restored pane loses its declared --result-schema/--result-kind OUTPUT CONTRACT env, since roster::RosterPane carries no field for it -->
 <!-- Updated 2026-09-03 (fix/prompt-free-posture-329, issue #329, v3.14.0): recorded two candidates surfaced while implementing #329 -- codex 0.149+ prompting on ordinary zirv commands with dynamic shell words (upstream, no per-command allowlist key exists in codex 0.152) and repo-defined zirv scripts (`zirv sgc`/`zirv lint`) still asking on an unsandboxed retry by design, since `[safety] escape_allow` is the intended standing-approval mechanism for that case -->
 <!-- Updated 2026-09-02 (feat/wrapper-proportionality, harness iteration round 3): resolved a status.rs test hermeticity gap -- status_shows_no_usage_source_for_a_codex_configured_repo_rather_than_anthropic_numbers read the real ~/.zirv/ctx.toml with no HomeGuard, so a machine with operator config touching usage/agent resolution could flip the assertion; root cause of an intermittent CI flake -->
 <!-- Updated 2026-09-01 (feature/238-246-review-waiver-status-diff, v3.4.0): resolved issue #238 -- `zirv workflow review package`'s `VerificationEvidence` no longer reports a raw, waiver-blind `passed:false` for a run the test/deploy gate had already accepted via the operator's recorded baseline (issue #215); the gate and the review package now share one `evaluate_against_operator_baseline` seam. No new residuals found while implementing #246 (`zirv ctx status --diff`) -->
@@ -82,6 +83,10 @@ Each entry gets a changelog comment at the top of the file, newest first:
 <!-- Updated 2026-08-13 (feat/dashboard, docs sweep): dashboard panes carry no rot score yet -->
 <!-- Updated 2026-08-13 (feat/agent-coordination, review round): markdown header absorption; registry short is a stable address; supervision env scrubbed on every spawn -->
 <!-- Updated 2026-08-13 (feat/agent-coordination, console-safety round): portable-pty do_kill inversion; ConPTY control-byte broadcast; empty nudge prefixes -->
+
+## A dashboard-restored pane loses its declared `--result-schema`/`--result-kind` contract
+
+Discovered 2026-09-04 (`release/3.16.0-harness-batch-4`, issue #318): `zirv agent --result-schema`/`--result-kind` exports the declared contract into a worker's env as `ZIRV_CTX_RESULT_SCHEMA`, carried into a fresh dashboard pane spawn via `SpawnRequest.result_schema` (`dash::fulfill_spawn_request`). `restored_pane_turn_env`, the function that rebuilds a pane's env after the dashboard itself restarts, has no equivalent field to read it back from — `roster::RosterPane` never persisted one — so a pane restored across a dashboard quit/restart carries every other piece of lineage forward (`WORK_GROUP_ENV`, `PARENT_SESSION_ENV`) except the OUTPUT CONTRACT. A restored worker's self-report (`zirv ctx send --to-session`) is therefore no longer validated against the contract it was originally launched under, and the headless-exit retry/report-back path never runs for it either (that path only fires when `agent::run_with`'s own headless fork returns, which a restored pane's launch does not go through). Not yet fixed; would need `RosterPane`/the roster persistence format to gain a `result_schema` field.
 
 ## A `status.rs` test read the real `~/.zirv/ctx.toml`, an intermittent CI flake root cause
 
