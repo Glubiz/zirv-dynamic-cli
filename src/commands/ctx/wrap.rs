@@ -2124,6 +2124,9 @@ pub fn run_with(
         _ => None,
     };
     turn_env.extend(adapters::seat_model_env(role, rest, seat_cfg_model));
+    // Issues #328/#334: which seat role this session runs as, for the same
+    // guard -- unlike `seat_model_env`, unconditional for every role.
+    turn_env.extend(adapters::seat_role_env(role));
     // Scrubbed before any of it is applied -- see `apply_session_env`. When
     // the bind above failed, `turn_env` carries only `AGENT_ENV`, and the
     // scrub is the only thing standing between this child and the outer
@@ -3827,6 +3830,7 @@ mod tests {
                     // filter (covered separately), so the reading must still
                     // be inside its own five_hour span.
                     observed_at: super::super::state::now_secs(),
+                    overage_covered: false,
                 }),
                 seven_day: None,
             },
@@ -3883,6 +3887,7 @@ mod tests {
                     used_percentage: 14.0,
                     resets_at: 1, // long past any real wall clock
                     observed_at: 1,
+                    overage_covered: false,
                 }),
                 seven_day: None,
             },

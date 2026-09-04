@@ -273,7 +273,9 @@ pub fn resolve_swap_launch(
 /// never moves across a handover), `AGENT_ENV` naming the new harness, and
 /// (for an `Orchestrator` launch) `SEAT_MODEL_ENV` naming the resolved
 /// target model. Shared by every live-swap seam for the same reason
-/// `resolve_swap_launch` is.
+/// `resolve_swap_launch` is. Also carries `SEAT_ROLE_ENV` for the new
+/// session's role, unconditionally (issues #328/#334) -- unlike
+/// `SEAT_MODEL_ENV`, which only an `Orchestrator` launch discloses.
 pub fn build_turn_env(
     new_adapter: &dyn adapters::AgentAdapter,
     server: Option<&super::signal::SignalServer>,
@@ -309,6 +311,7 @@ pub fn build_turn_env(
         env.push((adapters::SESSION_ENV.to_string(), session_id.to_string()));
     }
     env.extend(adapters::seat_model_env(role, &[], target_model));
+    env.extend(adapters::seat_role_env(role));
     env
 }
 

@@ -36,28 +36,35 @@ pub struct Route {
     pub model: String,
     pub reason: RouteReason,
     pub requested_headroom_pct: Option<f64>,
+    pub requested_age_secs: Option<u64>,
     pub selected_headroom_pct: f64,
     pub selected_headroom_assumed: bool,
 }
 
 impl Route {
-    pub fn detail(&self) -> String {
+    pub fn detail(&self, seat: pace::Seat) -> String {
         let from = self
             .requested_headroom_pct
             .map(|v| format!("{v:.1}%"))
             .unwrap_or_else(|| "unknown".to_string());
+        let observed = self
+            .requested_age_secs
+            .map(|age| format!(", observed {} ago", crate::style::format_age(age)))
+            .unwrap_or_default();
         let assumption = if self.selected_headroom_assumed {
             " assumed"
         } else {
             ""
         };
         format!(
-            "{} -> {} ({}, source headroom {from}, target headroom {:.1}%{assumption}, model {})",
+            "{} -> {} ({}, source headroom {from}{observed}, target headroom \
+             {:.1}%{assumption}, model {}; to override, {})",
             self.requested,
             self.selected,
             self.reason.label(),
             self.selected_headroom_pct,
-            self.model
+            self.model,
+            seat.override_hint()
         )
     }
 }
@@ -130,6 +137,15 @@ pub struct RouteRequest<'a> {
     pub source_model_explicit: bool,
     pub bounds: TaskBounds,
     pub now: u64,
+    /// Issue #328 fix: a harness [`best_alternate`]/[`earliest_reset_choice`]
+    /// must never select, compared case-insensitively -- an orchestrator
+    /// seat's own harness, so a low-headroom `zirv agent <other-harness>`
+    /// cannot be silently rerouted back onto the very same seat
+    /// `same_harness_refusal` (agent.rs) already refuses through the front
+    /// door. `None` for every caller with no such concept -- a running
+    /// worker's own vendor-blocked reroute (`route_blocked_session`) is not
+    /// an orchestrator-seat delegation and excludes nothing extra.
+    pub exclude: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -171,11 +187,15 @@ fn candidate_headroom(
     (pct > 0.0 && pct >= floor).then_some(CandidateHeadroom { pct, assumed: true })
 }
 
-fn requested_headroom(state: &StateDir, cfg: &CtxConfig, name: &str, now: u64) -> Option<f64> {
+fn requested_reading(
+    state: &StateDir,
+    cfg: &CtxConfig,
+    name: &str,
+    now: u64,
+) -> Option<pace::SpawnHeadroom> {
     let provider = adapters::provider_for_agent_name(Some(name));
     let (collector, estimator) = pace::current_windows(state, &cfg.pace, now, provider);
     pace::spawn_headroom(&collector, estimator.as_ref(), now, &cfg.pace)
-        .map(|reading| reading.headroom_pct)
 }
 
 /// Pure policy question used by tests and by the runtime selector. A
@@ -195,6 +215,9 @@ fn best_alternate(
     for (order_index, name) in cfg.fallback.order.iter().enumerate() {
         if name == request.requested
             || excluded.iter().any(|seen| seen == name)
+            || request
+                .exclude
+                .is_some_and(|excl| excl.eq_ignore_ascii_case(name))
             || !cfg.agents.is_enabled(name)
         {
             continue;
@@ -258,6 +281,9 @@ pub fn route_new_delegation(
     let gate = pace::spawn_gate(&collector, estimator.as_ref(), request.now, &cfg.pace);
     let source_reading =
         pace::spawn_headroom(&collector, estimator.as_ref(), request.now, &cfg.pace);
+    if source_reading.is_some_and(|reading| reading.overage_covered) {
+        return None;
+    }
     let source_headroom = source_reading.map(|reading| reading.headroom_pct);
     let task_will_not_fit = source_reading.is_some_and(|reading| {
         request
@@ -282,6 +308,7 @@ pub fn route_new_delegation(
         model,
         reason,
         requested_headroom_pct: source_headroom,
+        requested_age_secs: source_reading.map(|reading| reading.age_secs),
         selected_headroom_pct: headroom.pct,
         selected_headroom_assumed: headroom.assumed,
     })
@@ -320,6 +347,9 @@ pub fn earliest_reset_choice(
     for (order_index, name) in cfg.fallback.order.iter().enumerate() {
         if name == request.requested
             || excluded.iter().any(|seen| seen == name)
+            || request
+                .exclude
+                .is_some_and(|excl| excl.eq_ignore_ascii_case(name))
             || !cfg.agents.is_enabled(name)
             || !candidate_allowed_by_capacity(cfg, name, request.bounds)
         {
@@ -381,13 +411,15 @@ pub fn route_blocked_session(
     if !cfg.fallback.enabled {
         return None;
     }
+    let requested_reading = requested_reading(state, cfg, request.requested, request.now);
     let (selected, model, headroom) = best_alternate(state, cfg, request, excluded)?;
     Some(Route {
         requested: request.requested.to_string(),
         selected,
         model,
         reason: RouteReason::Exhausted,
-        requested_headroom_pct: requested_headroom(state, cfg, request.requested, request.now),
+        requested_headroom_pct: requested_reading.map(|reading| reading.headroom_pct),
+        requested_age_secs: requested_reading.map(|reading| reading.age_secs),
         selected_headroom_pct: headroom.pct,
         selected_headroom_assumed: headroom.assumed,
     })
@@ -476,6 +508,7 @@ mod tests {
                     used_percentage: percent,
                     resets_at: reset_at,
                     observed_at: now,
+                    overage_covered: false,
                 }),
                 seven_day: None,
             },
@@ -504,6 +537,7 @@ mod tests {
                     tool_calls: None,
                 },
                 now,
+                exclude: None,
             },
             &[],
         )
@@ -539,6 +573,7 @@ mod tests {
                     tool_calls: None,
                 },
                 now,
+                exclude: None,
             },
             false,
         )
@@ -546,6 +581,96 @@ mod tests {
 
         assert_eq!(route.reason, RouteReason::Predictive);
         assert_eq!(route.selected, "codex");
+    }
+
+    #[test]
+    fn a_credit_covered_source_reading_never_routes_new_work_away() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = test_cfg_with_ready_adapters();
+        let now = 1_700_000_000;
+        crate::commands::ctx::window::store_for(
+            &state,
+            "openai",
+            &crate::commands::ctx::window::UsageWindows {
+                five_hour: Some(crate::commands::ctx::window::Window {
+                    used_percentage: 100.0,
+                    resets_at: now + 600,
+                    observed_at: now,
+                    overage_covered: true,
+                }),
+                seven_day: None,
+            },
+        )
+        .expect("store provider usage");
+
+        let route = route_new_delegation(
+            &state,
+            &cfg,
+            RouteRequest {
+                requested: "codex",
+                source_model: Some("gpt-5.6-terra"),
+                source_model_explicit: false,
+                bounds: TaskBounds {
+                    tokens: None,
+                    tool_calls: None,
+                },
+                now,
+                exclude: None,
+            },
+            false,
+        );
+
+        assert_eq!(route, None);
+    }
+
+    #[test]
+    fn a_covered_seven_day_does_not_stop_a_reroute_when_the_five_hour_is_genuinely_exhausted() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = test_cfg_with_ready_adapters();
+        let now = 1_700_000_000;
+        crate::commands::ctx::window::store_for(
+            &state,
+            "openai",
+            &crate::commands::ctx::window::UsageWindows {
+                five_hour: Some(crate::commands::ctx::window::Window {
+                    used_percentage: 96.0,
+                    resets_at: now + 600,
+                    observed_at: now,
+                    overage_covered: false,
+                }),
+                seven_day: Some(crate::commands::ctx::window::Window {
+                    used_percentage: 100.0,
+                    resets_at: now + 3_600,
+                    observed_at: now,
+                    overage_covered: true,
+                }),
+            },
+        )
+        .expect("store source usage");
+        store_usage(&state, "anthropic", 20.0, now + 3_600, now);
+
+        let route = route_new_delegation(
+            &state,
+            &cfg,
+            RouteRequest {
+                requested: "codex",
+                source_model: Some("gpt-5.6-terra"),
+                source_model_explicit: false,
+                bounds: TaskBounds {
+                    tokens: None,
+                    tool_calls: None,
+                },
+                now,
+                exclude: None,
+            },
+            false,
+        )
+        .expect("the uncovered hard refusal reroutes to the admissible alternate");
+
+        assert_eq!(route.reason, RouteReason::Exhausted);
+        assert_eq!(route.selected, "claude");
     }
 
     #[test]
@@ -572,6 +697,7 @@ mod tests {
                     tool_calls: None,
                 },
                 now,
+                exclude: None,
             },
             &[],
         )
@@ -582,6 +708,158 @@ mod tests {
             "an exact tie should keep the requested harness"
         );
         assert_eq!(choice.reset_at, now + 3_600);
+    }
+
+    // -- RouteRequest::exclude (issue #328 back-door fix) -------------------
+
+    /// Mirrors `predictive_routing_uses_the_task_budget_when_the_source_
+    /// cannot_fit_it`'s exact fixture, but excludes the only viable
+    /// alternate (`codex`) -- the shape an orchestrator seat's own
+    /// same-harness exclusion produces when THAT seat's own harness is the
+    /// one and only enabled alternate. No reroute must happen: rerouting
+    /// back onto the excluded harness would be the exact same-harness
+    /// zirv-supervised worker `same_harness_refusal` (agent.rs) already
+    /// refuses through the front door.
+    #[test]
+    fn an_excluded_harness_is_never_selected_even_as_the_only_viable_alternate() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let mut cfg = test_cfg_with_ready_adapters();
+        cfg.pace.five_hour_budget_tokens = 100_000;
+        cfg.fallback.predictive_headroom_pct = 20.0;
+        let now = 1_700_000_000;
+        store_usage(&state, "anthropic", 75.0, now + 3_600, now);
+        store_usage(&state, "openai", 20.0, now + 3_600, now);
+
+        let route = route_new_delegation(
+            &state,
+            &cfg,
+            RouteRequest {
+                requested: "claude",
+                source_model: Some("sonnet"),
+                source_model_explicit: false,
+                bounds: TaskBounds {
+                    tokens: Some(30_000),
+                    tool_calls: None,
+                },
+                now,
+                exclude: Some("codex"),
+            },
+            false,
+        );
+
+        assert!(
+            route.is_none(),
+            "the only viable alternate is excluded, so no reroute should happen: {route:?}"
+        );
+    }
+
+    /// `exclude` compares case-insensitively, the same as `same_harness_
+    /// refusal`'s own own-harness comparison in agent.rs.
+    #[test]
+    fn exclude_matches_the_harness_name_case_insensitively() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let mut cfg = test_cfg_with_ready_adapters();
+        cfg.pace.five_hour_budget_tokens = 100_000;
+        cfg.fallback.predictive_headroom_pct = 20.0;
+        let now = 1_700_000_000;
+        store_usage(&state, "anthropic", 75.0, now + 3_600, now);
+        store_usage(&state, "openai", 20.0, now + 3_600, now);
+
+        let route = route_new_delegation(
+            &state,
+            &cfg,
+            RouteRequest {
+                requested: "claude",
+                source_model: Some("sonnet"),
+                source_model_explicit: false,
+                bounds: TaskBounds {
+                    tokens: Some(30_000),
+                    tool_calls: None,
+                },
+                now,
+                exclude: Some("Codex"),
+            },
+            false,
+        );
+
+        assert!(
+            route.is_none(),
+            "exclude must match case-insensitively: {route:?}"
+        );
+    }
+
+    /// The `earliest_reset_choice` fallback path (all seats hard-blocked)
+    /// must honor the exclusion too: `codex` resets earliest, but with it
+    /// excluded the requested harness (`claude`) must be kept even though
+    /// it resets later.
+    #[test]
+    fn earliest_reset_choice_never_selects_an_excluded_harness() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = test_cfg_with_ready_adapters();
+        let now = 1_700_000_000;
+        store_usage(&state, "anthropic", 100.0, now + 3_600, now);
+        store_usage(&state, "openai", 100.0, now + 600, now);
+
+        let choice = earliest_reset_choice(
+            &state,
+            &cfg,
+            RouteRequest {
+                requested: "claude",
+                source_model: Some("sonnet"),
+                source_model_explicit: false,
+                bounds: TaskBounds {
+                    tokens: None,
+                    tool_calls: None,
+                },
+                now,
+                exclude: Some("codex"),
+            },
+            &[],
+        )
+        .expect("the requested harness is itself still hard-blocked");
+
+        assert_eq!(
+            choice.selected, "claude",
+            "codex resets earlier but is excluded, so the requested harness must be kept"
+        );
+    }
+
+    /// Without an exclusion, routing behaves exactly as before -- the same
+    /// fixture as `predictive_routing_uses_the_task_budget_when_the_source_
+    /// cannot_fit_it` reroutes to `codex` when `exclude` is `None`.
+    #[test]
+    fn no_exclusion_reroutes_exactly_as_before() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let mut cfg = test_cfg_with_ready_adapters();
+        cfg.pace.five_hour_budget_tokens = 100_000;
+        cfg.fallback.predictive_headroom_pct = 20.0;
+        let now = 1_700_000_000;
+        store_usage(&state, "anthropic", 75.0, now + 3_600, now);
+        store_usage(&state, "openai", 20.0, now + 3_600, now);
+
+        let route = route_new_delegation(
+            &state,
+            &cfg,
+            RouteRequest {
+                requested: "claude",
+                source_model: Some("sonnet"),
+                source_model_explicit: false,
+                bounds: TaskBounds {
+                    tokens: Some(30_000),
+                    tool_calls: None,
+                },
+                now,
+                exclude: None,
+            },
+            false,
+        )
+        .expect("no exclusion is applied, so the usual reroute still happens");
+
+        assert_eq!(route.selected, "codex");
     }
 
     #[test]
@@ -607,12 +885,15 @@ mod tests {
             model: "gpt-5.6-terra".into(),
             reason: RouteReason::Exhausted,
             requested_headroom_pct: Some(0.0),
+            requested_age_secs: Some(22 * 3600),
             selected_headroom_pct: 25.0,
             selected_headroom_assumed: true,
         };
-        let detail = route.detail();
+        let detail = route.detail(pace::Seat::Cli);
         assert!(detail.contains("claude -> codex"));
+        assert!(detail.contains("observed 22h ago"));
         assert!(detail.contains("25.0% assumed"));
         assert!(detail.contains("gpt-5.6-terra"));
+        assert!(detail.contains("pass --force"));
     }
 }

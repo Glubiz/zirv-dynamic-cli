@@ -490,23 +490,47 @@ pub enum SpawnGate {
     },
 }
 
-/// PURE: the same collector-then-estimator layering `decide` applies just
-/// above (`binding`/`worst`, both reused rather than re-implemented), so this
-/// gate and the pacing verdict can never disagree about which window is
-/// binding or which source is authoritative. `!cfg.enabled` and "nothing
-/// binding at all" both read as `Proceed` -- blindness must never become a
-/// refusal, the same reasoning `decide`'s own `Unknown` arm and T8's
-/// `blind_delay_secs` already apply, see `no_usage_reading_proceeds_rather_
-/// than_refusing` below.
+/// The binding reading exposed to cross-harness fallback. When any binding
+/// slot is uncovered, this describes the worst uncovered slot; a covered
+/// reading is exposed only when every binding slot is covered.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SpawnHeadroom {
     pub window: &'static str,
     pub percent: f64,
     pub headroom_pct: f64,
     pub source: Source,
+    /// How old the reading this headroom came from is, so a caller can say so
+    /// (issue #337). Always `0` for an estimator reading, which is computed
+    /// from transcripts as of `now`.
+    pub age_secs: u64,
+    /// Issue #337: the vendor covers this window's overage from credits and
+    /// has not actually refused, so being at 100% is a cost signal, not a
+    /// block -- cross-harness rerouting must not fire on it.
+    pub overage_covered: bool,
 }
 
-/// Issue #186: exposes the same binding usage reading as `spawn_gate` as
+fn spawn_bindings<'a>(
+    collector: &'a UsageWindows,
+    estimator: Option<&'a UsageWindows>,
+    now: u64,
+    cfg: &PaceConfig,
+) -> (Source, Option<&'a Window>, Option<&'a Window>) {
+    let collector_five = binding(&collector.five_hour, now, cfg);
+    let collector_seven = binding(&collector.seven_day, now, cfg);
+    if collector_five.is_some() || collector_seven.is_some() {
+        (Source::Collector, collector_five, collector_seven)
+    } else if cfg.estimator {
+        (
+            Source::Estimator,
+            estimator.and_then(|windows| windows.five_hour.as_ref()),
+            estimator.and_then(|windows| windows.seven_day.as_ref()),
+        )
+    } else {
+        (Source::None, None, None)
+    }
+}
+
+/// Issue #186: exposes the binding usage reading most relevant to fallback as
 /// remaining percentage headroom. `None` is deliberately honest uncertainty;
 /// cross-harness fallback applies its configured conservative assumption rather
 /// than pretending an absent signal is either empty or exhausted.
@@ -519,24 +543,19 @@ pub fn spawn_headroom(
     if !cfg.enabled {
         return None;
     }
-    let collector_worst = worst(
-        binding(&collector.five_hour, now, cfg),
-        binding(&collector.seven_day, now, cfg),
-    );
-    let (source, picked) = match collector_worst {
-        Some(found) => (Source::Collector, Some(found)),
-        None if cfg.estimator => (
-            Source::Estimator,
-            estimator
-                .and_then(|windows| worst(windows.five_hour.as_ref(), windows.seven_day.as_ref())),
-        ),
-        None => (Source::None, None),
-    };
+    let (source, five, seven) = spawn_bindings(collector, estimator, now, cfg);
+    let picked = worst(
+        five.filter(|reading| !reading.overage_covered),
+        seven.filter(|reading| !reading.overage_covered),
+    )
+    .or_else(|| worst(five, seven));
     picked.map(|(window, reading)| SpawnHeadroom {
         window,
         percent: reading.used_percentage,
         headroom_pct: (100.0 - reading.used_percentage).clamp(0.0, 100.0),
         source,
+        age_secs: age_secs(reading, now),
+        overage_covered: reading.overage_covered,
     })
 }
 
@@ -582,7 +601,7 @@ pub fn spawn_reset(
         .into_iter()
         .filter_map(|(window, reading)| {
             let reading = reading?;
-            (reading.used_percentage >= cfg.spawn_hard_pct).then(|| {
+            (!reading.overage_covered && reading.used_percentage >= cfg.spawn_hard_pct).then(|| {
                 let reset_at = if reading.resets_at > now {
                     reading.resets_at
                 } else {
@@ -608,40 +627,42 @@ pub fn spawn_gate(
         return SpawnGate::Proceed;
     }
 
-    let collector_worst = worst(
-        binding(&collector.five_hour, now, cfg),
-        binding(&collector.seven_day, now, cfg),
-    );
-
-    let (source, picked) = match collector_worst {
-        Some(found) => (Source::Collector, Some(found)),
-        None if cfg.estimator => (
-            Source::Estimator,
-            estimator
-                .and_then(|windows| worst(windows.five_hour.as_ref(), windows.seven_day.as_ref())),
-        ),
-        None => (Source::None, None),
+    let (source, five, seven) = spawn_bindings(collector, estimator, now, cfg);
+    let gate_for = |name, window: &Window| {
+        if !window.overage_covered && window.used_percentage >= cfg.spawn_hard_pct {
+            SpawnGate::Refuse {
+                window: name,
+                percent: window.used_percentage,
+                source,
+            }
+        } else if window.used_percentage >= cfg.spawn_soft_pct {
+            SpawnGate::Warn {
+                window: name,
+                percent: window.used_percentage,
+                source,
+            }
+        } else {
+            SpawnGate::Proceed
+        }
     };
-
-    let Some((name, window)) = picked else {
-        return SpawnGate::Proceed;
+    let rank = |gate: &SpawnGate| match gate {
+        SpawnGate::Proceed => (0, 0.0),
+        SpawnGate::Warn { percent, .. } => (1, *percent),
+        SpawnGate::Refuse { percent, .. } => (2, *percent),
     };
-
-    if window.used_percentage >= cfg.spawn_hard_pct {
-        return SpawnGate::Refuse {
-            window: name,
-            percent: window.used_percentage,
-            source,
-        };
-    }
-    if window.used_percentage >= cfg.spawn_soft_pct {
-        return SpawnGate::Warn {
-            window: name,
-            percent: window.used_percentage,
-            source,
-        };
-    }
-    SpawnGate::Proceed
+    [("five_hour", five), ("seven_day", seven)]
+        .into_iter()
+        .filter_map(|(name, window)| window.map(|reading| gate_for(name, reading)))
+        .max_by(|a, b| {
+            let (a_severity, a_percent) = rank(a);
+            let (b_severity, b_percent) = rank(b);
+            a_severity.cmp(&b_severity).then_with(|| {
+                a_percent
+                    .partial_cmp(&b_percent)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+        })
+        .unwrap_or(SpawnGate::Proceed)
 }
 
 /// Deterministic spread so several supervisors on one machine do not all wake
@@ -744,11 +765,43 @@ pub fn describe(decision: &PaceDecision) -> String {
     }
 }
 
+/// Where a usage message is being written, because the override that actually
+/// works differs between the two (issue #337). A pane's own spawn request
+/// carries untrusted `force` JSON, so the only real override from there is to
+/// leave the dashboard channel (`--headless --force`) or move the ceiling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Seat {
+    /// An operator's own `zirv ctx agent`/`exec` invocation.
+    Cli,
+    /// A spawn request fulfilled inside a dashboard pane.
+    Pane,
+}
+
+impl Seat {
+    pub fn override_hint(self) -> &'static str {
+        match self {
+            Self::Cli => "pass --force",
+            Self::Pane => {
+                "pass --headless --force, or raise pace.spawn_hard_pct in ~/.zirv/ctx.toml"
+            }
+        }
+    }
+}
+
 /// The operator-facing line for a `SpawnGate`, or `None` for `Proceed` (which
 /// has nothing to say and nothing to print). Names the window, the
-/// percentage, the data source, and -- for a refusal -- how to override it,
-/// mirroring `describe`'s own shape for `PaceDecision` above.
-pub fn describe_spawn_gate(gate: &SpawnGate) -> Option<String> {
+/// percentage, the data source, how old that reading is, and -- for a refusal
+/// -- how to override it from this seat, mirroring `describe`'s own shape for
+/// `PaceDecision` above. `reading_age_secs` is `None` when the caller has no
+/// binding reading to date (nothing is claimed rather than "0m ago").
+pub fn describe_spawn_gate(
+    gate: &SpawnGate,
+    reading_age_secs: Option<u64>,
+    seat: Seat,
+) -> Option<String> {
+    let observed = reading_age_secs
+        .map(|age| format!(", observed {} ago", crate::style::format_age(age)))
+        .unwrap_or_default();
     match gate {
         SpawnGate::Proceed => None,
         SpawnGate::Warn {
@@ -756,7 +809,7 @@ pub fn describe_spawn_gate(gate: &SpawnGate) -> Option<String> {
             percent,
             source,
         } => Some(format!(
-            "{window} window at {percent:.1}% ({} data), approaching the spawn ceiling \
+            "{window} window at {percent:.1}% ({} data{observed}), approaching the spawn ceiling \
              (pace.spawn_hard_pct) -- starting anyway",
             source.as_str()
         )),
@@ -765,9 +818,11 @@ pub fn describe_spawn_gate(gate: &SpawnGate) -> Option<String> {
             percent,
             source,
         } => Some(format!(
-            "{window} window at {percent:.1}% ({} data), at or above pace.spawn_hard_pct -- \
-             refusing to start new delegated work; this never affects a session already running",
-            source.as_str()
+            "{window} window at {percent:.1}% ({} data{observed}), at or above \
+             pace.spawn_hard_pct -- refusing to start new delegated work; this never affects a \
+             session already running; to override, {}",
+            source.as_str(),
+            seat.override_hint()
         )),
     }
 }
@@ -907,7 +962,7 @@ pub fn current_windows(
 /// the inner gate either, so every 30s wait-loop iteration re-walks the
 /// whole `~/.codex/sessions` tree for nothing. Shares the same constant
 /// `wrap.rs`'s status-bar refresh uses, so the two floors cannot drift.
-fn refresh_sources(
+pub(super) fn refresh_sources(
     state: &StateDir,
     cfg: &PaceConfig,
     now: u64,
@@ -1494,11 +1549,13 @@ mod tests {
                 used_percentage: 99.0,
                 resets_at: now + 600,
                 observed_at: now,
+                overage_covered: false,
             }),
             seven_day: Some(super::Window {
                 used_percentage: 96.0,
                 resets_at: now + 3_600,
                 observed_at: now,
+                overage_covered: false,
             }),
         };
         let reset = super::spawn_reset(&collector, None, now, &cfg).expect("hard refused");
@@ -1520,6 +1577,7 @@ mod tests {
                 used_percentage: 100.0,
                 resets_at: 0,
                 observed_at: now,
+                overage_covered: false,
             }),
             seven_day: None,
         };
@@ -1541,6 +1599,7 @@ mod tests {
             used_percentage: percent,
             resets_at,
             observed_at,
+            overage_covered: false,
         })
     }
 
@@ -1667,6 +1726,101 @@ mod tests {
         assert!(matches!(
             spawn_gate(&at(100.0), None, 0, &cfg),
             SpawnGate::Refuse { .. }
+        ));
+    }
+
+    #[test]
+    fn a_covered_window_never_masks_an_uncovered_hard_refusal_in_the_other_slot() {
+        let now = 1_700_000_000;
+        let collector = UsageWindows {
+            five_hour: Some(Window {
+                used_percentage: 96.0,
+                resets_at: now + 600,
+                observed_at: now,
+                overage_covered: false,
+            }),
+            seven_day: Some(Window {
+                used_percentage: 100.0,
+                resets_at: now + 3_600,
+                observed_at: now,
+                overage_covered: true,
+            }),
+        };
+
+        assert_eq!(
+            spawn_gate(&collector, None, now, &PaceConfig::default()),
+            SpawnGate::Refuse {
+                window: "five_hour",
+                percent: 96.0,
+                source: Source::Collector,
+            }
+        );
+        let headroom = spawn_headroom(&collector, None, now, &PaceConfig::default())
+            .expect("an uncovered binding window");
+        assert_eq!(headroom.window, "five_hour");
+        assert!(!headroom.overage_covered);
+    }
+
+    #[test]
+    fn two_covered_windows_still_only_warn() {
+        let now = 1_700_000_000;
+        let collector = UsageWindows {
+            five_hour: Some(Window {
+                used_percentage: 96.0,
+                resets_at: now + 600,
+                observed_at: now,
+                overage_covered: true,
+            }),
+            seven_day: Some(Window {
+                used_percentage: 100.0,
+                resets_at: now + 3_600,
+                observed_at: now,
+                overage_covered: true,
+            }),
+        };
+
+        assert_eq!(
+            spawn_gate(&collector, None, now, &PaceConfig::default()),
+            SpawnGate::Warn {
+                window: "seven_day",
+                percent: 100.0,
+                source: Source::Collector,
+            }
+        );
+    }
+
+    #[test]
+    fn a_real_credit_covered_codex_window_warns_but_a_reached_window_refuses() {
+        let raw = include_str!(
+            "../../../tests/fixtures/codex-rollouts/2026/09/03/rollout-2026-09-03T12-29-19-01a066d0-df70-7c21-9a93-920c7f9df2b6.jsonl"
+        );
+        let covered = window::parse_rollout_line(raw).expect("real rollout reading");
+        let now = window::newest_observation(&covered);
+        assert!(
+            spawn_headroom(&covered, None, now, &PaceConfig::default())
+                .expect("binding reading")
+                .overage_covered
+        );
+        assert!(matches!(
+            spawn_gate(&covered, None, now, &PaceConfig::default()),
+            SpawnGate::Warn { percent: 100.0, .. }
+        ));
+        assert!(spawn_reset(&covered, None, now, &PaceConfig::default()).is_none());
+
+        let mut blocked: serde_json::Value = serde_json::from_str(raw).expect("real rollout json");
+        blocked["payload"]["rate_limits"]["rate_limit_reached_type"] =
+            serde_json::Value::String("primary".to_string());
+        let blocked = window::parse_rollout_line(&blocked.to_string()).expect("blocked reading");
+        assert!(
+            !blocked
+                .seven_day
+                .as_ref()
+                .expect("seven_day")
+                .overage_covered
+        );
+        assert!(matches!(
+            spawn_gate(&blocked, None, now, &PaceConfig::default()),
+            SpawnGate::Refuse { percent: 100.0, .. }
         ));
     }
 

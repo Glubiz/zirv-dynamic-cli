@@ -120,6 +120,9 @@ pub struct ListArgs {
     /// meant to be committed) instead of the private, machine-local one.
     #[arg(long, default_value_t = false)]
     pub shared: bool,
+    /// List the operator-owned global bank shared by every repository.
+    #[arg(long, default_value_t = false, conflicts_with = "shared")]
+    pub global: bool,
     /// Emit one JSON object per line instead of human-readable text.
     #[arg(long, default_value_t = false)]
     pub json: bool,
@@ -132,6 +135,9 @@ pub struct RecallArgs {
     /// Search the shared bank instead of the private one.
     #[arg(long, default_value_t = false)]
     pub shared: bool,
+    /// Search the operator-owned global bank shared by every repository.
+    #[arg(long, default_value_t = false, conflicts_with = "shared")]
+    pub global: bool,
     /// Emit one JSON object per line instead of human-readable text.
     #[arg(long, default_value_t = false)]
     pub json: bool,
@@ -155,6 +161,9 @@ pub struct RememberArgs {
     /// it isn't.
     #[arg(long, default_value_t = false)]
     pub shared: bool,
+    /// Store in the operator-owned global bank shared by every repository.
+    #[arg(long, default_value_t = false, conflicts_with = "shared")]
+    pub global: bool,
     /// How important this fact is: `low`, `normal`, or `high`. Affects
     /// `zirv memory recall`'s ranking (`retrieval::score_one`); has no
     /// effect on `status`/`list`. Unset by default.
@@ -207,6 +216,9 @@ pub struct ForgetArgs {
     /// Forget from the shared bank instead of the private one.
     #[arg(long, default_value_t = false)]
     pub shared: bool,
+    /// Forget from the operator-owned global bank shared by every repository.
+    #[arg(long, default_value_t = false, conflicts_with = "shared")]
+    pub global: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -216,6 +228,9 @@ pub struct VerifyArgs {
     /// Verify in the shared bank instead of the private one.
     #[arg(long, default_value_t = false)]
     pub shared: bool,
+    /// Verify in the operator-owned global bank shared by every repository.
+    #[arg(long, default_value_t = false, conflicts_with = "shared")]
+    pub global: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -239,17 +254,15 @@ pub struct OptimizeArgs {
     #[arg(long)]
     pub agent: Option<String>,
 }
-/// Thin, surface-local name for `MemoryScope::of` (issue #172 cross-review
-/// finding 6): the bool-to-scope mapping itself is centralized there rather
-/// than duplicated here, but every call site in this file reads more
-/// naturally as `scope_of(args.shared)` than `MemoryScope::of(args.shared)`.
-fn scope_of(shared: bool) -> MemoryScope {
-    MemoryScope::of(shared)
+/// Thin, surface-local name for the centralized two-flag scope mapping.
+fn scope_of(shared: bool, global: bool) -> MemoryScope {
+    MemoryScope::from_flags(shared, global)
 }
 
 fn scope_label(scope: MemoryScope) -> &'static str {
     match scope {
         MemoryScope::Private => "private",
+        MemoryScope::Global => "global",
         MemoryScope::Shared => "shared",
     }
 }
@@ -309,10 +322,11 @@ pub fn run_status_with<W: Write>(w: &mut W, repo: &Path, env: EnvLookup<'_>) -> 
 
     writeln!(w, "memory bank status for {}", repo.display())?;
     write_scope_status(w, MemoryScope::Private, repo, &state, &slug, &cfg)?;
+    write_scope_status(w, MemoryScope::Global, repo, &state, &slug, &cfg)?;
     write_scope_status(w, MemoryScope::Shared, repo, &state, &slug, &cfg)?;
     writeln!(
         w,
-        "core injection budget: {} bytes (private + shared, merged private-first; issue #34)",
+        "core injection budget: {} bytes (private + global + shared, merged private-first; issue #34)",
         cfg.memory.core_max_bytes
     )?;
     writeln!(
@@ -385,7 +399,7 @@ fn render_entries<W: Write>(
         let verified_days = now.saturating_sub(entry.verified) / 86_400;
         let trust_note = match scope {
             MemoryScope::Shared => " -- shared: repository-owned content, not operator-verified",
-            MemoryScope::Private => "",
+            MemoryScope::Private | MemoryScope::Global => "",
         };
         writeln!(
             w,
@@ -437,7 +451,7 @@ fn render_ranked<W: Write>(
         let verified_days = now.saturating_sub(entry.verified) / 86_400;
         let trust_note = match scope {
             MemoryScope::Shared => " -- shared: repository-owned content, not operator-verified",
-            MemoryScope::Private => "",
+            MemoryScope::Private | MemoryScope::Global => "",
         };
         let reasons = if r.reasons.is_empty() {
             "no signal matched".to_string()
@@ -468,7 +482,7 @@ pub fn run_list_with<W: Write>(
     let cfg = CtxConfig::load(repo, env)?;
     let state = StateDir::resolve(env)?;
     let slug = repo_slug(repo);
-    let scope = scope_of(args.shared);
+    let scope = scope_of(args.shared, args.global);
     if !scope.enabled(&cfg) {
         crate::output::warn(format!(
             "{} memory disabled ({}); listing nothing",
@@ -507,7 +521,7 @@ pub fn run_recall_with<W: Write>(
     let cfg = CtxConfig::load(repo, env)?;
     let state = StateDir::resolve(env)?;
     let slug = repo_slug(repo);
-    let scope = scope_of(args.shared);
+    let scope = scope_of(args.shared, args.global);
 
     let candidates = retrieval::candidates_for_scope(scope, repo, &state, &slug, &cfg, now_secs())?;
     let ctx = RetrievalContext {
@@ -540,8 +554,9 @@ pub fn run_remember_with<W: Write>(
     let importance = validate_level_opt("--importance", &args.importance)?;
     let confidence = validate_level_opt("--confidence", &args.confidence)?;
 
-    if !args.shared {
-        // The private arm is a thin wrapper over the exact code path `zirv
+    let scope = scope_of(args.shared, args.global);
+    if scope != MemoryScope::Shared {
+        // The trusted arms are thin wrappers over the exact code path `zirv
         // ctx remember` calls (identity resolution, the `memory.enabled`
         // gate, the oversize/prune rules) -- reused rather than
         // reimplemented, so the two surfaces can never drift apart here.
@@ -554,6 +569,7 @@ pub fn run_remember_with<W: Write>(
             text_file: None,
             verify: false,
             repo: false,
+            global: scope == MemoryScope::Global,
             allow_sensitive: false,
             importance,
             confidence,
@@ -589,14 +605,15 @@ pub fn run_remember_with<W: Write>(
         // yet.
         paths: Vec::new(),
     };
-    let path = if args.allow_sensitive {
+    let path = if scope == MemoryScope::Shared && args.allow_sensitive {
         memory::upsert_shared_allow_sensitive(repo, &state, &slug, &cfg, &entry)?
     } else {
-        memory::upsert_scoped(MemoryScope::Shared, repo, &state, &slug, &cfg, &entry)?
+        memory::upsert_scoped(scope, repo, &state, &slug, &cfg, &entry)?
     };
+    let label = scope_label(scope);
     writeln!(
         w,
-        "zirv memory remember: stored '{}' in the shared bank at {}",
+        "zirv memory remember: stored '{}' in the {label} bank at {}",
         args.key,
         path.display()
     )?;
@@ -617,7 +634,7 @@ pub fn run_forget_with<W: Write>(
 ) -> CtxResult<i32> {
     let state = StateDir::resolve(env)?;
     let slug = repo_slug(repo);
-    let scope = scope_of(args.shared);
+    let scope = scope_of(args.shared, args.global);
     let label = scope_label(scope);
     if memory::forget_scoped(scope, repo, &state, &slug, &args.key)? {
         writeln!(
@@ -649,7 +666,7 @@ pub fn run_verify_with<W: Write>(
 ) -> CtxResult<i32> {
     let state = StateDir::resolve(env)?;
     let slug = repo_slug(repo);
-    let scope = scope_of(args.shared);
+    let scope = scope_of(args.shared, args.global);
     let label = scope_label(scope);
     if memory::verify_scoped(scope, repo, &state, &slug, &args.key)? {
         writeln!(
@@ -884,6 +901,71 @@ mod tests {
     }
 
     #[test]
+    fn global_and_shared_flags_conflict_on_every_verb() {
+        for argv in [
+            vec!["zirv memory", "list", "--shared", "--global"],
+            vec!["zirv memory", "recall", "query", "--shared", "--global"],
+            vec![
+                "zirv memory",
+                "remember",
+                "key",
+                "body",
+                "--shared",
+                "--global",
+            ],
+            vec!["zirv memory", "forget", "key", "--shared", "--global"],
+            vec!["zirv memory", "verify", "key", "--shared", "--global"],
+        ] {
+            assert!(
+                MemoryCli::try_parse_from(&argv).is_err(),
+                "both scope flags must conflict: {argv:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn status_reports_the_global_bank_between_private_and_shared() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = HomeGuard::set(home.path());
+        let state_dir = repo.path().join("state");
+        let state = StateDir::from_root(state_dir.clone());
+        memory::remember(
+            &state,
+            memory::GLOBAL_SLUG,
+            &Entry {
+                key: "global-fact".to_string(),
+                written_by: "test".to_string(),
+                written: 1,
+                verified: 1,
+                source: "explicit".to_string(),
+                body: "global body".to_string(),
+                importance: None,
+                confidence: None,
+                tags: Vec::new(),
+                paths: Vec::new(),
+            },
+            &CtxConfig::default(),
+        )
+        .expect("remember global");
+        let env = env_map(&[(state::STATE_ENV, state_dir.to_str().expect("utf8"))]);
+        let mut out = Vec::new();
+
+        run_status_with(&mut out, repo.path(), &|key| env.get(key).cloned()).expect("status");
+
+        let text = String::from_utf8(out).expect("utf8");
+        let private = text.find("private memory:").expect("private status");
+        let global = text.find("global memory:").expect("global status");
+        let shared = text.find("shared memory:").expect("shared status");
+        assert!(private < global && global < shared, "{text}");
+        assert!(text.contains("global memory: enabled, 1 entries"), "{text}");
+        assert!(
+            text.contains("private + global + shared, merged private-first"),
+            "{text}"
+        );
+    }
+
+    #[test]
     fn help_exits_zero_on_every_verb_and_bare_memory() {
         for argv in [
             vec!["memory", "--help"],
@@ -934,6 +1016,7 @@ mod tests {
         assert_eq!(code, 0);
         let text = String::from_utf8(out).expect("utf8");
         assert!(text.contains("private memory: disabled"), "got {text}");
+        assert!(text.contains("global memory: disabled"), "got {text}");
         assert!(text.contains("shared memory: disabled"), "got {text}");
     }
 
@@ -955,6 +1038,7 @@ mod tests {
                 key: "private-fact".to_string(),
                 text: "private body".to_string(),
                 shared: false,
+                global: false,
                 importance: None,
                 confidence: None,
                 tags: Vec::new(),
@@ -968,9 +1052,27 @@ mod tests {
         .expect("remember private");
         run_remember_with(
             &RememberArgs {
+                key: "global-fact".to_string(),
+                text: "global body".to_string(),
+                shared: false,
+                global: true,
+                importance: None,
+                confidence: None,
+                tags: Vec::new(),
+                allow_sensitive: false,
+            },
+            &mut Vec::new(),
+            repo.path(),
+            &|k| enabled_env.get(k).cloned(),
+            &mut stdin,
+        )
+        .expect("remember global");
+        run_remember_with(
+            &RememberArgs {
                 key: "shared-fact".to_string(),
                 text: "shared body".to_string(),
                 shared: true,
+                global: false,
                 importance: None,
                 confidence: None,
                 tags: Vec::new(),
@@ -993,6 +1095,10 @@ mod tests {
         assert!(
             text.contains("private memory: disabled, 1 entries"),
             "a disabled scope must still report what it holds: {text}"
+        );
+        assert!(
+            text.contains("global memory: disabled, 1 entries"),
+            "got {text}"
         );
         assert!(
             text.contains("shared memory: disabled, 1 entries"),
@@ -1049,6 +1155,7 @@ mod tests {
             key: "private-fact".to_string(),
             text: "this body must never appear verbatim in status".to_string(),
             shared: false,
+            global: false,
             importance: None,
             confidence: None,
             tags: Vec::new(),
@@ -1068,6 +1175,7 @@ mod tests {
             key: "shared-fact".to_string(),
             text: "shared body text".to_string(),
             shared: true,
+            global: false,
             importance: None,
             confidence: None,
             tags: Vec::new(),
@@ -1172,6 +1280,7 @@ mod tests {
                 key: "priv".to_string(),
                 text: "private body".to_string(),
                 shared: false,
+                global: false,
                 importance: None,
                 confidence: None,
                 tags: Vec::new(),
@@ -1188,6 +1297,7 @@ mod tests {
                 key: "shr".to_string(),
                 text: "shared body".to_string(),
                 shared: true,
+                global: false,
                 importance: None,
                 confidence: None,
                 tags: Vec::new(),
@@ -1204,6 +1314,7 @@ mod tests {
         run_list_with(
             &ListArgs {
                 shared: false,
+                global: false,
                 json: true,
             },
             &mut out,
@@ -1220,6 +1331,7 @@ mod tests {
         run_list_with(
             &ListArgs {
                 shared: true,
+                global: false,
                 json: true,
             },
             &mut out,
@@ -1255,6 +1367,7 @@ mod tests {
         let code = run_list_with(
             &ListArgs {
                 shared: true,
+                global: false,
                 json: false,
             },
             &mut out,
@@ -1285,6 +1398,7 @@ mod tests {
         run_list_with(
             &ListArgs {
                 shared: true,
+                global: false,
                 json: false,
             },
             &mut out,
@@ -1319,6 +1433,7 @@ mod tests {
                 key: "db".to_string(),
                 text: "the exact-key entry".to_string(),
                 shared: false,
+                global: false,
                 importance: None,
                 confidence: None,
                 tags: Vec::new(),
@@ -1335,6 +1450,7 @@ mod tests {
                 key: "staging-db-creds".to_string(),
                 text: "mentions db in its key only".to_string(),
                 shared: false,
+                global: false,
                 importance: None,
                 confidence: None,
                 tags: Vec::new(),
@@ -1352,6 +1468,7 @@ mod tests {
             &RecallArgs {
                 query: "db".to_string(),
                 shared: false,
+                global: false,
                 json: true,
                 include_archived: false,
             },
@@ -1388,6 +1505,7 @@ mod tests {
                     key: key.to_string(),
                     text: format!("body for {key}"),
                     shared: false,
+                    global: false,
                     importance: None,
                     confidence: None,
                     tags: Vec::new(),
@@ -1406,6 +1524,7 @@ mod tests {
             &RecallArgs {
                 query: String::new(),
                 shared: false,
+                global: false,
                 json: true,
                 include_archived: false,
             },
@@ -1441,6 +1560,7 @@ mod tests {
                     key: format!("release-note-{i}"),
                     text: "mentions the release process".to_string(),
                     shared: false,
+                    global: false,
                     importance: None,
                     confidence: None,
                     tags: Vec::new(),
@@ -1459,6 +1579,7 @@ mod tests {
             &RecallArgs {
                 query: "release".to_string(),
                 shared: false,
+                global: false,
                 json: true,
                 include_archived: false,
             },
@@ -1489,6 +1610,7 @@ mod tests {
                 key: "staging-db-creds".to_string(),
                 text: "the staging DB creds live in 1Password".to_string(),
                 shared: false,
+                global: false,
                 importance: None,
                 confidence: None,
                 tags: Vec::new(),
@@ -1506,6 +1628,7 @@ mod tests {
             &RecallArgs {
                 query: "1password".to_string(),
                 shared: false,
+                global: false,
                 json: true,
                 include_archived: false,
             },
@@ -1536,6 +1659,7 @@ mod tests {
                 key: "build-cmd".to_string(),
                 text: "cargo build --release".to_string(),
                 shared: true,
+                global: false,
                 importance: None,
                 confidence: None,
                 tags: Vec::new(),
@@ -1564,6 +1688,7 @@ mod tests {
                 key: "other".to_string(),
                 text: "text".to_string(),
                 shared: true,
+                global: false,
                 importance: None,
                 confidence: None,
                 tags: Vec::new(),
@@ -1592,6 +1717,7 @@ mod tests {
                 key: "staging-db-creds".to_string(),
                 text: "see the ops runbook for details.".to_string(),
                 shared: true,
+                global: false,
                 importance: None,
                 confidence: None,
                 tags: Vec::new(),
@@ -1618,6 +1744,7 @@ mod tests {
                 key: "staging-db-creds".to_string(),
                 text: "see the ops runbook for details.".to_string(),
                 shared: true,
+                global: false,
                 importance: None,
                 confidence: None,
                 tags: Vec::new(),
@@ -1654,6 +1781,7 @@ mod tests {
                 key: "k".to_string(),
                 text: "t".to_string(),
                 shared: false,
+                global: false,
                 importance: None,
                 confidence: None,
                 tags: Vec::new(),
@@ -1686,6 +1814,7 @@ mod tests {
                 key: "release-notes-a".to_string(),
                 text: "how the release process works".to_string(),
                 shared: false,
+                global: false,
                 importance: Some("high".to_string()),
                 confidence: Some("high".to_string()),
                 tags: vec!["release".to_string(), "deploy".to_string()],
@@ -1702,6 +1831,7 @@ mod tests {
                 key: "release-notes-b".to_string(),
                 text: "also about the release process".to_string(),
                 shared: false,
+                global: false,
                 importance: Some("low".to_string()),
                 confidence: None,
                 tags: Vec::new(),
@@ -1738,6 +1868,7 @@ mod tests {
             &RecallArgs {
                 query: "release process".to_string(),
                 shared: false,
+                global: false,
                 json: false,
                 include_archived: false,
             },
@@ -1769,6 +1900,7 @@ mod tests {
                 key: "k".to_string(),
                 text: "t".to_string(),
                 shared: false,
+                global: false,
                 importance: Some("urgent".to_string()),
                 confidence: None,
                 tags: Vec::new(),
@@ -1794,7 +1926,7 @@ mod tests {
     }
 
     #[test]
-    fn forget_and_verify_work_in_both_scopes_even_when_disabled() {
+    fn forget_and_verify_work_in_all_three_scopes_even_when_disabled() {
         let repo = crate::commands::ctx::testenv::repo();
         let home = tempfile::tempdir().expect("tempdir");
         let _home = HomeGuard::set(home.path());
@@ -1807,6 +1939,7 @@ mod tests {
                 key: "priv".to_string(),
                 text: "text".to_string(),
                 shared: false,
+                global: false,
                 importance: None,
                 confidence: None,
                 tags: Vec::new(),
@@ -1820,9 +1953,27 @@ mod tests {
         .expect("remember private");
         run_remember_with(
             &RememberArgs {
+                key: "glob".to_string(),
+                text: "text".to_string(),
+                shared: false,
+                global: true,
+                importance: None,
+                confidence: None,
+                tags: Vec::new(),
+                allow_sensitive: false,
+            },
+            &mut Vec::new(),
+            repo.path(),
+            &|k| env.get(k).cloned(),
+            &mut stdin,
+        )
+        .expect("remember global");
+        run_remember_with(
+            &RememberArgs {
                 key: "shr".to_string(),
                 text: "text".to_string(),
                 shared: true,
+                global: false,
                 importance: None,
                 confidence: None,
                 tags: Vec::new(),
@@ -1846,6 +1997,7 @@ mod tests {
             &VerifyArgs {
                 key: "priv".to_string(),
                 shared: false,
+                global: false,
             },
             &mut out,
             repo.path(),
@@ -1857,8 +2009,23 @@ mod tests {
         let mut out = Vec::new();
         let code = run_verify_with(
             &VerifyArgs {
+                key: "glob".to_string(),
+                shared: false,
+                global: true,
+            },
+            &mut out,
+            repo.path(),
+            &|k| disabled_env.get(k).cloned(),
+        )
+        .expect("verify global while disabled");
+        assert_eq!(code, 0);
+
+        let mut out = Vec::new();
+        let code = run_verify_with(
+            &VerifyArgs {
                 key: "shr".to_string(),
                 shared: true,
+                global: false,
             },
             &mut out,
             repo.path(),
@@ -1872,6 +2039,7 @@ mod tests {
             &ForgetArgs {
                 key: "priv".to_string(),
                 shared: false,
+                global: false,
             },
             &mut out,
             repo.path(),
@@ -1884,8 +2052,24 @@ mod tests {
         let mut out = Vec::new();
         let code = run_forget_with(
             &ForgetArgs {
+                key: "glob".to_string(),
+                shared: false,
+                global: true,
+            },
+            &mut out,
+            repo.path(),
+            &|k| disabled_env.get(k).cloned(),
+        )
+        .expect("forget global while disabled");
+        assert_eq!(code, 0);
+        assert!(String::from_utf8(out).expect("utf8").contains("removed"));
+
+        let mut out = Vec::new();
+        let code = run_forget_with(
+            &ForgetArgs {
                 key: "shr".to_string(),
                 shared: true,
+                global: false,
             },
             &mut out,
             repo.path(),
@@ -1908,6 +2092,7 @@ mod tests {
             &VerifyArgs {
                 key: "no-such-key".to_string(),
                 shared: false,
+                global: false,
             },
             &mut Vec::new(),
             repo.path(),
@@ -1961,6 +2146,7 @@ mod tests {
                 key: key.to_string(),
                 text: text.to_string(),
                 shared: true,
+                global: false,
                 importance: None,
                 confidence: None,
                 tags: Vec::new(),
@@ -2242,6 +2428,7 @@ mod tests {
         run_list_with(
             &ListArgs {
                 shared: true,
+                global: false,
                 json: true,
             },
             &mut recall_out,
@@ -2295,6 +2482,7 @@ mod tests {
             &RecallArgs {
                 query: "old-note".to_string(),
                 shared: true,
+                global: false,
                 json: true,
                 include_archived: false,
             },
@@ -2314,6 +2502,7 @@ mod tests {
             &RecallArgs {
                 query: "old-note".to_string(),
                 shared: true,
+                global: false,
                 json: true,
                 include_archived: true,
             },
