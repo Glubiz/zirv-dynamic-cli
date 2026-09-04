@@ -227,7 +227,7 @@ On unix, directories are created `0700` and files `0600` (`create_private_dir_al
 
 ## Decision Log
 
-`log.rs` appends one JSON line per context decision to `<state>/logs/decisions.jsonl` via `append()`, using the same private-file helpers as the rest of the state dir. Each `Decision` record carries a timestamp, session id, verb, rot verdict, numeric score, action taken, and free-text detail. `tail(state, count)` reads the whole file and returns the last `count` lines (oldest of the tail first) — used by the `status` verb. Separately, Claude permission hooks append privacy-preserving `SafetyDecision` records to UTC-day buckets at `<state>/logs/safety-decisions/<day>.jsonl`: verdict/rule/origin, platform, policy fingerprints and attestation status, with only SHA-256 of the command rather than raw shell text. Audit append is best-effort and can never alter a permission answer.
+`log.rs` appends one JSON line per context decision to `<state>/logs/decisions.jsonl` via `append()`, using the same private-file helpers as the rest of the state dir. Each `Decision` record carries a timestamp, session id, verb, rot verdict, numeric score, action taken, free-text detail, and an optional source-reading `observed_at` timestamp for cross-harness reroutes; omission remains compatible with older rows. `tail(state, count)` reads the whole file and returns the last `count` lines (oldest of the tail first) — used by the `status` verb. Separately, Claude permission hooks append privacy-preserving `SafetyDecision` records to UTC-day buckets at `<state>/logs/safety-decisions/<day>.jsonl`: verdict/rule/origin, platform, policy fingerprints and attestation status, with only SHA-256 of the command rather than raw shell text. Audit append is best-effort and can never alter a permission answer.
 
 ## Verb Modules (score / handoff / resume / hook / status)
 
@@ -393,6 +393,8 @@ Two more modules round out the coordination surface: a live registry of every su
 ## Cross-harness token fallback (issue #186, v2.36.0)
 
 The ctx subsystem now connects the agent roster, usage windows, model-tier ladder, delegation path, and supervisor handoff machinery through `fallback.rs`. New work may be rerouted away from an exhausted or measured-low-headroom harness; an already-running supervised prompt can move only after that harness stops on a recognized usage-limit message. The alternate must be enabled, ready, capacity-compatible, budget-compatible, and able to provide a verified equivalent model tier.
+
+Issue #335 makes an explicit agent reroute visible and reversible: `--force` disables automatic cross-harness routing, and route notices say which requested harness it keeps. New delegations without an explicit `--model` use the target harness's configured worker default, falling back to its standard tier; explicit models and already-running session handovers retain source-tier mirroring. Reroute decisions include the source reading's absolute observation time as structured log data as well as in their human-readable detail.
 
 Operator policy lives under `[fallback]` in `~/.zirv/ctx.toml`: `enabled`, `order`, `predictive_headroom_pct`, `min_candidate_headroom_pct`, `unknown_headroom_pct`, `small_task_max_tokens`, and `small_task_max_tool_calls`. The repository layer may only narrow these values; `ZIRV_CTX_FALLBACK*` environment variables are the final operator override. See [[Usage and Pacing]], [[Ctx Supervisors]], and [[Untrusted Configuration]] for the selection, continuation, and trust contracts.
 

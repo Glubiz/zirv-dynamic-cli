@@ -86,12 +86,10 @@ pub struct AgentArgs {
     /// Tool-call ceiling for this worker, independent of `--budget-tokens`.
     #[arg(long)]
     pub max_tool_calls: Option<u32>,
-    /// Issue #155, Phase 6(c): spend anyway at or above `pace.spawn_hard_pct`
-    /// (`pace::SpawnGate::Refuse`). The operator's own informed call --
-    /// never a signal that reaches rotation, which this gate never touches
-    /// either way. Travels on the `SpawnRequest` (`SpawnRequest::force`) the
-    /// same way `--role`/`--group` do, so a pane spawn fulfilled by a
-    /// dashboard honours the same override this process already decided on.
+    /// Spend anyway at or above `pace.spawn_hard_pct`, and disable automatic
+    /// cross-harness rerouting of an explicitly named agent. Travels on the
+    /// `SpawnRequest` so headless and dashboard-pane delegations honor the
+    /// same operator override.
     #[arg(long, default_value_t = false)]
     pub force: bool,
     /// Issue #228: a harness-agnostic working directory for this worker,
@@ -984,6 +982,14 @@ fn attach_result_contract_to_prompt(schema: Option<&Schema>, prompt: String) -> 
 /// must never reach rotation.
 pub(crate) fn spawn_blocked(gate: &pace::SpawnGate, force: bool) -> bool {
     matches!(gate, pace::SpawnGate::Refuse { .. }) && !force
+}
+
+pub(crate) fn automatic_route_message(route: &super::fallback::Route, seat: pace::Seat) -> String {
+    format!(
+        "automatically routed {} (pass --force to keep {})",
+        route.detail(seat),
+        route.requested
+    )
 }
 
 /// Resolves this delegation's [`WorkerBudget`] from `--budget-tokens`/
@@ -2286,6 +2292,7 @@ pub fn run_with<W: Write>(
         requested: &args.name,
         source_model: requested_model,
         source_model_explicit,
+        delegation: true,
         bounds,
         now,
         exclude: same_harness_exclude.as_deref(),
@@ -2317,9 +2324,10 @@ pub fn run_with<W: Write>(
                 score: 0,
                 action: "harness-reroute",
                 detail: &detail,
+                observed_at: route.requested_observed_at,
             },
         );
-        eprintln!("zirv ctx agent: automatically routed {detail}");
+        eprintln!("zirv ctx agent: {}", automatic_route_message(&route, seat));
         route_applied = Some(route);
     }
 
@@ -2398,6 +2406,7 @@ pub fn run_with<W: Write>(
                 score: 0,
                 action: "harness-reset-wait",
                 detail: &detail,
+                observed_at: None,
             },
         );
         eprintln!("zirv ctx agent: {detail}; pacing until that seat is available");
@@ -2494,11 +2503,25 @@ pub fn run_with<W: Write>(
     let quieted = quiet_env(env, args.quiet);
     let grouped = group_env(&quieted, args.group.clone());
     let parented = parent_session_env(&grouped, worker_parent);
+    let delegated = |key: &str| {
+        if key == super::fallback::DELEGATION_ENV {
+            Some(
+                if source_model_explicit {
+                    "explicit-model"
+                } else {
+                    "implicit-model"
+                }
+                .to_string(),
+            )
+        } else {
+            parented(key)
+        }
+    };
     // Issue #318: same fold, so a headless child sees `RESULT_SCHEMA_ENV`
     // when this delegation declared a contract (`exec.rs`'s `turn_env_for`
     // reads it back out of this exact binding).
     let env = result_schema_env(
-        &parented,
+        &delegated,
         result_schema.as_ref().map(Schema::to_canonical_json),
     );
 
@@ -3006,6 +3029,7 @@ pub fn run_with<W: Write>(
                 score: 0,
                 action: super::log::DELEGATION_ACTION,
                 detail: &detail,
+                observed_at: None,
             },
         );
     }
@@ -3092,6 +3116,7 @@ mod tests {
     use crate::commands::ctx::hook;
     use crate::commands::ctx::state::StateDir;
     use crate::commands::ctx::{fallback, window};
+    use clap::Args as _;
     use std::collections::HashMap;
     use std::path::PathBuf;
 
@@ -3730,6 +3755,7 @@ mod tests {
                     requested: "codex",
                     source_model: Some("gpt-5.6-terra"),
                     source_model_explicit: false,
+                    delegation: true,
                     bounds: fallback::TaskBounds {
                         tokens: None,
                         tool_calls: None,
@@ -3740,6 +3766,100 @@ mod tests {
                 false,
             ),
             None
+        );
+    }
+
+    #[test]
+    fn delegation_ignores_an_expired_stale_codex_reading_when_refresh_finds_no_rollout() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tempfile::tempdir().expect("home tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let state_dir = tmp.path().join("state");
+        let state = StateDir::from_root(state_dir.clone());
+        let now = crate::commands::ctx::state::now_secs();
+        window::store_for(
+            &state,
+            window::CODEX_USAGE_PROVIDER,
+            &window::UsageWindows {
+                five_hour: None,
+                seven_day: Some(window::Window {
+                    used_percentage: 99.0,
+                    resets_at: now,
+                    observed_at: now.saturating_sub(901),
+                    overage_covered: false,
+                }),
+            },
+        )
+        .expect("store expired reading");
+        window::store_for(
+            &state,
+            window::LEGACY_USAGE_PROVIDER,
+            &window::UsageWindows {
+                five_hour: Some(window::Window {
+                    used_percentage: 10.0,
+                    resets_at: now + 3_600,
+                    observed_at: now,
+                    overage_covered: false,
+                }),
+                seven_day: None,
+            },
+        )
+        .expect("store alternate reading");
+        let mut env = base_env(&state_dir);
+        env.insert(
+            "ZIRV_CTX_AGENT_BIN".to_string(),
+            format!("sh {}", fixture("fake-codex-agent.sh").display()),
+        );
+        env.insert("ZIRV_CTX_PACE_ESTIMATOR".to_string(), "false".to_string());
+        let mut args = args_for("codex", "go");
+        args.headless = true;
+        let mut out = Vec::new();
+        let result = run_with(&args, &mut out, tmp.path(), &|key| env.get(key).cloned());
+
+        assert_eq!(result.expect("delegation runs"), 0);
+        let output = String::from_utf8(out).expect("utf8");
+        assert!(!output.contains("automatically routed"), "got {output}");
+        let decisions = crate::commands::ctx::log::tail(&state, 20).expect("decisions");
+        assert!(
+            !decisions
+                .iter()
+                .any(|line| line.contains("\"action\":\"harness-reroute\"")),
+            "no reroute decision expected: {decisions:?}"
+        );
+        let delegations = crate::commands::ctx::log::read_delegations(&state, 10);
+        assert_eq!(delegations.len(), 1, "one worker ran: {delegations:?}");
+        assert_eq!(delegations[0].agent, "codex");
+    }
+
+    #[test]
+    fn routed_message_contains_the_force_opt_out_for_the_requested_agent() {
+        let route = fallback::Route {
+            requested: "codex".to_string(),
+            selected: "claude".to_string(),
+            model: "sonnet".to_string(),
+            reason: fallback::RouteReason::Exhausted,
+            requested_headroom_pct: Some(1.0),
+            requested_age_secs: Some(10),
+            requested_observed_at: Some(1_700_000_000),
+            selected_headroom_pct: 66.0,
+            selected_headroom_assumed: false,
+        };
+        let message = automatic_route_message(&route, pace::Seat::Cli);
+        assert!(
+            message.contains("(pass --force to keep codex)"),
+            "got {message}"
+        );
+    }
+
+    #[test]
+    fn routed_force_help_explains_that_it_disables_cross_harness_rerouting() {
+        let help = AgentArgs::augment_args(clap::Command::new("agent"))
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("--force"), "got {help}");
+        assert!(
+            help.contains("disable automatic cross-harness rerouting"),
+            "got {help}"
         );
     }
 

@@ -268,6 +268,41 @@ pub fn report<W: Write>(
     Ok(())
 }
 
+fn report_codex_rollout<W: Write>(w: &mut W, state: &StateDir, now: u64) -> CtxResult<()> {
+    let Some(windows) = window::load_for(state, window::CODEX_USAGE_PROVIDER) else {
+        writeln!(
+            w,
+            "codex: no usage signal (no rollout rate_limits ingested yet)"
+        )?;
+        return Ok(());
+    };
+    let mut wrote = false;
+    for (name, reading) in [
+        ("five_hour", windows.five_hour.as_ref()),
+        ("seven_day", windows.seven_day.as_ref()),
+    ] {
+        let Some(reading) = reading else {
+            continue;
+        };
+        wrote = true;
+        writeln!(
+            w,
+            "codex {name}: {:.1}% used (rollout, observed {} ago at unix {}, resets at unix {})",
+            reading.used_percentage,
+            crate::style::format_age(window::age_secs(reading, now)),
+            reading.observed_at,
+            reading.resets_at
+        )?;
+    }
+    if !wrote {
+        writeln!(
+            w,
+            "codex: no usage signal (no rollout rate_limits ingested yet)"
+        )?;
+    }
+    Ok(())
+}
+
 /// Issue #225: the default view's own cache-hit line -- unlike `render_
 /// sessions`' per-session ratio (which manufactures 0.0% for a session with
 /// no raw token data at all), this aggregate is `n/a` whenever the trailing
@@ -438,10 +473,16 @@ pub fn run_with<W: Write>(
                 && provider != window::LEGACY_USAGE_PROVIDER
             {
                 writeln!(w, "{provider}: no usage source")?;
+                if provider != window::CODEX_USAGE_PROVIDER {
+                    report_codex_rollout(w, &state, now)?;
+                }
                 return Ok(0);
             }
             let (collector, estimator) = pace::current_windows(&state, &cfg.pace, now, provider);
             report(w, &collector, estimator.as_ref(), now, &cfg.pace)?;
+            if provider != window::CODEX_USAGE_PROVIDER {
+                report_codex_rollout(w, &state, now)?;
+            }
 
             // Issue #225: the default view's own cache-hit line, computed
             // from the same `SessionSpend` totals `render_sessions`'
@@ -1024,6 +1065,108 @@ mod tests {
         .expect("codex rollout was refreshed");
         assert_eq!(seven_day.used_percentage, 0.0);
         assert_eq!(seven_day.observed_at, 1_788_501_391);
+    }
+
+    #[test]
+    fn a_claude_primary_readout_also_shows_the_stored_codex_rollout_reading() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("home tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let state_dir = tmp.path().join("state");
+        let state = StateDir::from_root(state_dir.clone());
+        let now = now_secs();
+        window::store_for(
+            &state,
+            window::LEGACY_USAGE_PROVIDER,
+            &UsageWindows {
+                five_hour: Some(Window {
+                    used_percentage: 12.0,
+                    resets_at: now + 3_600,
+                    observed_at: now,
+                    overage_covered: false,
+                }),
+                seven_day: None,
+            },
+        )
+        .expect("store claude reading");
+        window::store_for(
+            &state,
+            window::CODEX_USAGE_PROVIDER,
+            &UsageWindows {
+                five_hour: Some(Window {
+                    used_percentage: 73.5,
+                    resets_at: now + 1_800,
+                    observed_at: now.saturating_sub(42),
+                    overage_covered: false,
+                }),
+                seven_day: None,
+            },
+        )
+        .expect("store codex reading");
+        let env: std::collections::HashMap<String, String> = [
+            (
+                crate::commands::ctx::state::STATE_ENV.to_string(),
+                state_dir.display().to_string(),
+            ),
+            ("ZIRV_CTX_AGENT".to_string(), "claude".to_string()),
+            ("ZIRV_CTX_PACE".to_string(), "false".to_string()),
+        ]
+        .into();
+
+        let mut out = Vec::new();
+        run_with(
+            &UsageArgs {
+                action: None,
+                sessions: false,
+            },
+            &mut out,
+            tmp.path(),
+            &|key| env.get(key).cloned(),
+        )
+        .expect("usage report");
+
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(text.contains("codex five_hour: 73.5% used"), "got {text}");
+        assert!(text.contains("observed 42s ago at unix"), "got {text}");
+        assert!(
+            text.contains(&format!("resets at unix {}", now + 1_800)),
+            "got {text}"
+        );
+    }
+
+    #[test]
+    fn a_claude_primary_readout_says_when_no_codex_rollout_signal_exists() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("home tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let state_dir = tmp.path().join("state");
+        let env: std::collections::HashMap<String, String> = [
+            (
+                crate::commands::ctx::state::STATE_ENV.to_string(),
+                state_dir.display().to_string(),
+            ),
+            ("ZIRV_CTX_AGENT".to_string(), "claude".to_string()),
+            ("ZIRV_CTX_PACE".to_string(), "false".to_string()),
+        ]
+        .into();
+
+        let mut out = Vec::new();
+        run_with(
+            &UsageArgs {
+                action: None,
+                sessions: false,
+            },
+            &mut out,
+            tmp.path(),
+            &|key| env.get(key).cloned(),
+        )
+        .expect("usage report");
+
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            text.contains("codex: no usage signal (no rollout rate_limits ingested yet)"),
+            "got {text}"
+        );
     }
 
     /// O: before this command was provider-scoped it never called `adapters::

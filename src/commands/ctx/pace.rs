@@ -153,6 +153,7 @@ pub fn note_limit_wording_drift<W: Write>(
             score: 0,
             action: "limit-wording-drift",
             detail: &redacted,
+            observed_at: None,
         },
     );
 }
@@ -503,6 +504,9 @@ pub struct SpawnHeadroom {
     /// (issue #337). Always `0` for an estimator reading, which is computed
     /// from transcripts as of `now`.
     pub age_secs: u64,
+    /// Absolute timestamp paired with `age_secs`, for an auditable reroute
+    /// decision that remains useful after the relative age goes stale.
+    pub observed_at: u64,
     /// Issue #337: the vendor covers this window's overage from credits and
     /// has not actually refused, so being at 100% is a cost signal, not a
     /// block -- cross-harness rerouting must not fire on it.
@@ -555,6 +559,7 @@ pub fn spawn_headroom(
         headroom_pct: (100.0 - reading.used_percentage).clamp(0.0, 100.0),
         source,
         age_secs: age_secs(reading, now),
+        observed_at: reading.observed_at,
         overage_covered: reading.overage_covered,
     })
 }
@@ -1091,6 +1096,7 @@ fn blind_wait<W: Write>(
                 action: "pacing-blind",
                 detail: "no usage source; applying the blind-mode safety delay instead of \
                          proceeding unthrottled",
+                observed_at: None,
             },
         );
         flags.no_source_announced = true;
@@ -1338,6 +1344,7 @@ pub fn wait_for_window<W: Write>(
                     score: 0,
                     action: "use-credits-skip",
                     detail: "use_credits enabled; throttle/pause skipped for this harness",
+                    observed_at: None,
                 },
             );
             flags.credits_announced = true;
@@ -1520,6 +1527,7 @@ pub fn wait_for_window<W: Write>(
                     score: 0,
                     action: "pace-wait",
                     detail: &describe(&decision),
+                    observed_at: None,
                 },
             );
         }

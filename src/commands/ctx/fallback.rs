@@ -13,6 +13,7 @@ use super::pace::{self, SpawnGate};
 use super::state::StateDir;
 
 pub const VISITED_ENV: &str = "ZIRV_CTX_FALLBACK_VISITED";
+pub const DELEGATION_ENV: &str = "ZIRV_CTX_DELEGATION";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RouteReason {
@@ -37,6 +38,7 @@ pub struct Route {
     pub reason: RouteReason,
     pub requested_headroom_pct: Option<f64>,
     pub requested_age_secs: Option<u64>,
+    pub requested_observed_at: Option<u64>,
     pub selected_headroom_pct: f64,
     pub selected_headroom_assumed: bool,
 }
@@ -47,10 +49,14 @@ impl Route {
             .requested_headroom_pct
             .map(|v| format!("{v:.1}%"))
             .unwrap_or_else(|| "unknown".to_string());
-        let observed = self
-            .requested_age_secs
-            .map(|age| format!(", observed {} ago", crate::style::format_age(age)))
-            .unwrap_or_default();
+        let observed = match (self.requested_age_secs, self.requested_observed_at) {
+            (Some(age), Some(observed_at)) => format!(
+                ", observed {} ago, observed_at unix {observed_at}",
+                crate::style::format_age(age)
+            ),
+            (Some(age), None) => format!(", observed {} ago", crate::style::format_age(age)),
+            _ => String::new(),
+        };
         let assumption = if self.selected_headroom_assumed {
             " assumed"
         } else {
@@ -135,6 +141,10 @@ pub struct RouteRequest<'a> {
     pub requested: &'a str,
     pub source_model: Option<&'a str>,
     pub source_model_explicit: bool,
+    /// Delegations use the target harness's worker model policy unless the
+    /// source model was explicitly pinned. Session continuations keep tier
+    /// mirroring.
+    pub delegation: bool,
     pub bounds: TaskBounds,
     pub now: u64,
     /// Issue #328 fix: a harness [`best_alternate`]/[`earliest_reset_choice`]
@@ -238,13 +248,24 @@ fn best_alternate(
         else {
             continue;
         };
-        let Some(model) = handover::equivalent_model(
-            request.requested,
-            request.source_model,
-            request.source_model_explicit,
-            name,
-            cfg,
-        ) else {
+        let model = if request.delegation {
+            handover::equivalent_delegation_model(
+                request.requested,
+                request.source_model,
+                request.source_model_explicit,
+                name,
+                cfg,
+            )
+        } else {
+            handover::equivalent_model(
+                request.requested,
+                request.source_model,
+                request.source_model_explicit,
+                name,
+                cfg,
+            )
+        };
+        let Some(model) = model else {
             continue;
         };
         let replace = match &best {
@@ -309,6 +330,7 @@ pub fn route_new_delegation(
         reason,
         requested_headroom_pct: source_headroom,
         requested_age_secs: source_reading.map(|reading| reading.age_secs),
+        requested_observed_at: source_reading.map(|reading| reading.observed_at),
         selected_headroom_pct: headroom.pct,
         selected_headroom_assumed: headroom.assumed,
     })
@@ -361,13 +383,24 @@ pub fn earliest_reset_choice(
         if request.bounds.tool_calls.is_some() && !candidate_adapter.counts_tool_calls() {
             continue;
         }
-        let Some(model) = handover::equivalent_model(
-            request.requested,
-            request.source_model,
-            request.source_model_explicit,
-            name,
-            cfg,
-        ) else {
+        let model = if request.delegation {
+            handover::equivalent_delegation_model(
+                request.requested,
+                request.source_model,
+                request.source_model_explicit,
+                name,
+                cfg,
+            )
+        } else {
+            handover::equivalent_model(
+                request.requested,
+                request.source_model,
+                request.source_model_explicit,
+                name,
+                cfg,
+            )
+        };
+        let Some(model) = model else {
             continue;
         };
         let provider = candidate_adapter.provider();
@@ -420,6 +453,7 @@ pub fn route_blocked_session(
         reason: RouteReason::Exhausted,
         requested_headroom_pct: requested_reading.map(|reading| reading.headroom_pct),
         requested_age_secs: requested_reading.map(|reading| reading.age_secs),
+        requested_observed_at: requested_reading.map(|reading| reading.observed_at),
         selected_headroom_pct: headroom.pct,
         selected_headroom_assumed: headroom.assumed,
     })
@@ -532,6 +566,7 @@ mod tests {
                 requested: "claude",
                 source_model: Some("sonnet"),
                 source_model_explicit: false,
+                delegation: true,
                 bounds: TaskBounds {
                     tokens: None,
                     tool_calls: None,
@@ -568,6 +603,7 @@ mod tests {
                 requested: "claude",
                 source_model: Some("sonnet"),
                 source_model_explicit: false,
+                delegation: true,
                 bounds: TaskBounds {
                     tokens: Some(30_000),
                     tool_calls: None,
@@ -611,6 +647,7 @@ mod tests {
                 requested: "codex",
                 source_model: Some("gpt-5.6-terra"),
                 source_model_explicit: false,
+                delegation: true,
                 bounds: TaskBounds {
                     tokens: None,
                     tool_calls: None,
@@ -658,6 +695,7 @@ mod tests {
                 requested: "codex",
                 source_model: Some("gpt-5.6-terra"),
                 source_model_explicit: false,
+                delegation: true,
                 bounds: TaskBounds {
                     tokens: None,
                     tool_calls: None,
@@ -692,6 +730,7 @@ mod tests {
                 requested: "claude",
                 source_model: Some("sonnet"),
                 source_model_explicit: false,
+                delegation: true,
                 bounds: TaskBounds {
                     tokens: None,
                     tool_calls: None,
@@ -738,6 +777,7 @@ mod tests {
                 requested: "claude",
                 source_model: Some("sonnet"),
                 source_model_explicit: false,
+                delegation: true,
                 bounds: TaskBounds {
                     tokens: Some(30_000),
                     tool_calls: None,
@@ -774,6 +814,7 @@ mod tests {
                 requested: "claude",
                 source_model: Some("sonnet"),
                 source_model_explicit: false,
+                delegation: true,
                 bounds: TaskBounds {
                     tokens: Some(30_000),
                     tool_calls: None,
@@ -810,6 +851,7 @@ mod tests {
                 requested: "claude",
                 source_model: Some("sonnet"),
                 source_model_explicit: false,
+                delegation: true,
                 bounds: TaskBounds {
                     tokens: None,
                     tool_calls: None,
@@ -848,6 +890,7 @@ mod tests {
                 requested: "claude",
                 source_model: Some("sonnet"),
                 source_model_explicit: false,
+                delegation: true,
                 bounds: TaskBounds {
                     tokens: Some(30_000),
                     tool_calls: None,
@@ -886,14 +929,53 @@ mod tests {
             reason: RouteReason::Exhausted,
             requested_headroom_pct: Some(0.0),
             requested_age_secs: Some(22 * 3600),
+            requested_observed_at: Some(1_700_000_000),
             selected_headroom_pct: 25.0,
             selected_headroom_assumed: true,
         };
         let detail = route.detail(pace::Seat::Cli);
         assert!(detail.contains("claude -> codex"));
         assert!(detail.contains("observed 22h ago"));
+        assert!(detail.contains("observed_at unix 1700000000"));
         assert!(detail.contains("25.0% assumed"));
         assert!(detail.contains("gpt-5.6-terra"));
         assert!(detail.contains("pass --force"));
+    }
+
+    #[test]
+    fn delegation_reroutes_use_the_target_worker_model_unless_the_source_was_explicit() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let mut cfg = test_cfg_with_ready_adapters();
+        cfg.worker.codex = Some("gpt-5.6-sol".to_string());
+        cfg.worker.claude = Some("claude-worker".to_string());
+        let now = 1_700_000_000;
+        store_usage(&state, "openai", 99.0, now + 3_600, now);
+        store_usage(&state, "anthropic", 10.0, now + 3_600, now);
+
+        let request = |source_model_explicit| RouteRequest {
+            requested: "codex",
+            source_model: Some("gpt-5.6-sol"),
+            source_model_explicit,
+            delegation: true,
+            bounds: TaskBounds {
+                tokens: None,
+                tool_calls: None,
+            },
+            now,
+            exclude: None,
+        };
+        let implicit = route_new_delegation(&state, &cfg, request(false), false)
+            .expect("implicit worker model reroutes");
+        assert_eq!(implicit.model, "claude-worker");
+
+        cfg.worker.claude = None;
+        let standard = route_new_delegation(&state, &cfg, request(false), false)
+            .expect("implicit worker model reroutes to standard");
+        assert_eq!(standard.model, "sonnet");
+
+        let explicit = route_new_delegation(&state, &cfg, request(true), false)
+            .expect("explicit worker model reroutes by tier");
+        assert_eq!(explicit.model, "opus");
     }
 }

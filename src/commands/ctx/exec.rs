@@ -1106,6 +1106,7 @@ fn run_with_clock_inner<W: Write>(
                     score: 0,
                     action: "no-socket",
                     detail: &e.to_string(),
+                    observed_at: None,
                 },
             );
             None
@@ -1481,6 +1482,7 @@ fn run_with_clock_inner<W: Write>(
                     score: 0,
                     action: "kill",
                     detail: &transcript.display().to_string(),
+                    observed_at: None,
                 },
             );
             writeln!(
@@ -1569,6 +1571,7 @@ fn run_with_clock_inner<W: Write>(
                     score: 0,
                     action: "account-exhausted",
                     detail: label,
+                    observed_at: None,
                 },
             );
             writeln!(
@@ -1655,6 +1658,7 @@ fn run_with_clock_inner<W: Write>(
                             score: 0,
                             action: "compact",
                             detail: &transcript.display().to_string(),
+                            observed_at: None,
                         },
                     );
                     command = continued;
@@ -1672,6 +1676,7 @@ fn run_with_clock_inner<W: Write>(
                             score: 0,
                             action: "compact-failed",
                             detail: &reason,
+                            observed_at: None,
                         },
                     );
                     writeln!(
@@ -1942,6 +1947,7 @@ fn run_with_clock_inner<W: Write>(
                     score: 0,
                     action: "nudge-restart",
                     detail: &format!("{source} handoff at {}", stored.display()),
+                    observed_at: None,
                 },
             );
             writeln!(
@@ -1993,10 +1999,17 @@ fn run_with_clock_inner<W: Write>(
                 .map(|raw| super::config::split_csv_list(&raw))
                 .unwrap_or_default();
             let source_model = adapters::last_model_flag(&args.command);
+            let delegation = env(super::fallback::DELEGATION_ENV);
+            let is_delegation = delegation.is_some();
             let route_request = super::fallback::RouteRequest {
                 requested: adapter.name(),
                 source_model,
-                source_model_explicit: source_model.is_some(),
+                source_model_explicit: if is_delegation {
+                    delegation.as_deref() == Some("explicit-model")
+                } else {
+                    source_model.is_some()
+                },
+                delegation: is_delegation,
                 bounds: super::fallback::TaskBounds {
                     tokens: worker_budget.tokens,
                     tool_calls: worker_budget.tool_calls,
@@ -2038,6 +2051,7 @@ fn run_with_clock_inner<W: Write>(
                         ))
                     })
                 });
+            let route_observed_at = route.as_ref().and_then(|route| route.requested_observed_at);
 
             if let Some((selected_agent, selected_model, selection_detail)) = alternate {
                 let jsonl = std::fs::read_to_string(&transcript).unwrap_or_default();
@@ -2104,6 +2118,7 @@ fn run_with_clock_inner<W: Write>(
                             score: 0,
                             action: "fallback-budget-exhausted",
                             detail: "usage limit coincided with the delegation budget ceiling",
+                            observed_at: None,
                         },
                     );
                     session_guard.release();
@@ -2133,6 +2148,7 @@ fn run_with_clock_inner<W: Write>(
                         score: 100,
                         action: "harness-handover",
                         detail: &detail,
+                        observed_at: route_observed_at,
                     },
                 );
                 writeln!(
@@ -2211,6 +2227,7 @@ fn run_with_clock_inner<W: Write>(
                     score: 100,
                     action: "limit-park",
                     detail: &wait_detail,
+                    observed_at: None,
                 },
             );
             writeln!(w, "zirv ctx exec: {wait_detail}")?;
@@ -2362,6 +2379,7 @@ fn run_with_clock_inner<W: Write>(
                 score: 0,
                 action: "kill",
                 detail: &transcript.display().to_string(),
+                observed_at: None,
             },
         );
 
@@ -2380,6 +2398,7 @@ fn run_with_clock_inner<W: Write>(
                     score: 0,
                     action: "stand-down",
                     detail: "no prompt available for restart",
+                    observed_at: None,
                 },
             );
             record_execution_segment(
@@ -2406,6 +2425,7 @@ fn run_with_clock_inner<W: Write>(
                     score: 0,
                     action: "give-up",
                     detail: "restart budget exhausted",
+                    observed_at: None,
                 },
             );
             if capacity_exit {
@@ -2483,6 +2503,7 @@ fn run_with_clock_inner<W: Write>(
                 score: 0,
                 action: "restart",
                 detail: &format!("{source} handoff at {}", stored.display()),
+                observed_at: None,
             },
         );
         writeln!(
@@ -2866,6 +2887,7 @@ fn supervise_run(
                     } else {
                         "no prompt available for a nudge relaunch; message left unread"
                     },
+                    observed_at: None,
                 },
             );
             return Tick::Continue;

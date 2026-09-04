@@ -1127,6 +1127,7 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
                     "advise"
                 },
                 detail: &detail,
+                observed_at: None,
             },
         );
         // Issue #243 (review round, F2): the STABLE short this session's
@@ -1295,6 +1296,7 @@ pub fn run_pre_compact<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> 
                 score: 0,
                 action: "pre-compact",
                 detail: &payload.transcript_path,
+                observed_at: None,
             },
         );
     }
@@ -1766,6 +1768,7 @@ pub fn run_notify<W: Write>(w: &mut W, payload: &str, env: EnvLookup<'_>) -> Ctx
                     score: 0,
                     action: "notify-unmapped",
                     detail: &notify_shape(payload),
+                    observed_at: None,
                 },
             );
         }

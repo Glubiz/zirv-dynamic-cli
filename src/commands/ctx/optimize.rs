@@ -2098,6 +2098,7 @@ pub fn run_with<W: Write>(
                 score: findings.len() as u32,
                 action: "report",
                 detail: &detail,
+                observed_at: None,
             },
         );
     }
@@ -2262,6 +2263,7 @@ pub fn queue_recommendation(
             score: score.score,
             action: RECOMMEND_ACTION,
             detail: &detail,
+            observed_at: None,
         },
     )
     .ok()?;
@@ -4194,6 +4196,7 @@ mod tests {
                     score: 0,
                     action,
                     detail: "",
+                    observed_at: None,
                 },
             )
             .expect("append");
@@ -4241,6 +4244,7 @@ mod tests {
                     score: 0,
                     action: "rot-kill",
                     detail: "",
+                    observed_at: None,
                 },
             )
             .expect("append");
@@ -4349,6 +4353,7 @@ mod tests {
                 score: 0,
                 action: "rot-kill",
                 detail: "",
+                observed_at: None,
             },
         )
         .expect("append");
@@ -4498,6 +4503,7 @@ mod tests {
                         score: 0,
                         action,
                         detail: "",
+                        observed_at: None,
                     },
                 )
                 .expect("append");
@@ -5405,6 +5411,7 @@ mod tests {
                 score: 50,
                 action: RECOMMEND_ACTION,
                 detail: "",
+                observed_at: None,
             },
         )
         .expect("append");
@@ -5434,6 +5441,7 @@ mod tests {
                 score: 50,
                 action: "advise",
                 detail: "",
+                observed_at: None,
             },
         )
         .expect("append");

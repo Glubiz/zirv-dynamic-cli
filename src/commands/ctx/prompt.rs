@@ -2333,6 +2333,7 @@ pub fn log_injection(
             score: 0,
             action,
             detail: &detail,
+            observed_at: None,
         },
     );
 }
