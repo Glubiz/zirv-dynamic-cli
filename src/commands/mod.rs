@@ -1,3 +1,4 @@
+pub mod command_schema;
 pub mod create;
 pub mod ctx;
 pub mod help;

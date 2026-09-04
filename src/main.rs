@@ -18,6 +18,7 @@ mod input;
 mod output;
 mod script_runner;
 mod settings;
+mod skill;
 mod style;
 mod utils;
 
@@ -92,6 +93,51 @@ fn is_top_level_report(argv: &[String]) -> bool {
 fn is_top_level_context(argv: &[String]) -> bool {
     argv.get(1)
         .is_some_and(|s| s.eq_ignore_ascii_case("context"))
+}
+
+/// Whether argv requests the bundled operator skill (issue #355): either the
+/// top-level `--skill` flag or a bare `zirv skill` with no further argument.
+/// `zirv skill list`/`zirv skill show <id>` remain the pre-existing
+/// `workflow::skill` engineering-skill inspection tree (see that module's
+/// own doc comment) and fall through to `is_top_level_workflow_command`'s
+/// dispatch unchanged: a bare `zirv skill` already failed to parse there,
+/// since `SkillArgs::command` is a required subcommand, so repurposing that
+/// one previously-erroring shape here breaks no working invocation.
+/// Case-insensitive for the bare-word form, matching every other reserved
+/// built-in. Returns whether `--json` was also requested; `None` when argv
+/// names neither form (including a `skill`/`--skill` invocation with any
+/// other trailing argument, which is left to fall through).
+fn top_level_skill_request(argv: &[String]) -> Option<bool> {
+    let names_skill = argv.get(1).map(String::as_str) == Some("--skill")
+        || argv.get(1).is_some_and(|s| s.eq_ignore_ascii_case("skill"));
+    if !names_skill {
+        return None;
+    }
+    match argv.get(2).map(String::as_str) {
+        None => Some(false),
+        Some("--json") if argv.len() == 3 => Some(true),
+        _ => None,
+    }
+}
+
+/// Whether argv requests the generated command surface (issue #355):
+/// `zirv commands [--json]`, matched case-insensitively like every other
+/// reserved built-in. `None` for anything else, including a trailing
+/// argument this built-in does not recognize -- there is no further verb
+/// tree to fall through to here, so that case is left to the ordinary
+/// script-lookup "not found" error.
+fn top_level_commands_request(argv: &[String]) -> Option<bool> {
+    if !argv
+        .get(1)
+        .is_some_and(|s| s.eq_ignore_ascii_case("commands"))
+    {
+        return None;
+    }
+    match argv.get(2).map(String::as_str) {
+        None => Some(false),
+        Some("--json") if argv.len() == 3 => Some(true),
+        _ => None,
+    }
 }
 
 /// `zirv chat` and `zirv agent` are top-level aliases for `zirv ctx chat`
@@ -241,6 +287,29 @@ async fn main() {
 
     if is_top_level_context(&argv) {
         std::process::exit(ctx::context_cli::dispatch(&argv[1..]));
+    }
+
+    if let Some(json) = top_level_skill_request(&argv) {
+        let version = env!("CARGO_PKG_VERSION");
+        if json {
+            match serde_json::to_string_pretty(&skill::to_json(version)) {
+                Ok(text) => println!("{text}"),
+                Err(e) => {
+                    output::error(e);
+                    std::process::exit(1);
+                }
+            }
+        } else {
+            println!("{}", skill::render(version));
+        }
+        return;
+    }
+
+    if let Some(json) = top_level_commands_request(&argv) {
+        std::process::exit(commands::command_schema::dispatch(
+            json,
+            &mut std::io::stdout(),
+        ));
     }
 
     if is_top_level_workflow_command(&argv) {
@@ -604,6 +673,69 @@ mod tests {
     fn chat_and_agent_are_reserved_so_a_script_can_never_shadow_them() {
         assert!(utils::is_reserved_command("chat"));
         assert!(utils::is_reserved_command("agent"));
+    }
+
+    /// Issue #355: the top-level `--skill` flag and a bare `zirv skill` (no
+    /// further argument) both request the bundled operator skill, with or
+    /// without `--json`. Case-insensitive for the bare-word form, matching
+    /// every other reserved built-in.
+    #[test]
+    fn top_level_skill_request_matches_the_flag_and_bare_word_forms() {
+        assert_eq!(
+            top_level_skill_request(&argv(&["zirv", "--skill"])),
+            Some(false)
+        );
+        assert_eq!(
+            top_level_skill_request(&argv(&["zirv", "--skill", "--json"])),
+            Some(true)
+        );
+        assert_eq!(
+            top_level_skill_request(&argv(&["zirv", "skill"])),
+            Some(false)
+        );
+        assert_eq!(
+            top_level_skill_request(&argv(&["zirv", "SKILL"])),
+            Some(false)
+        );
+        assert_eq!(
+            top_level_skill_request(&argv(&["zirv", "skill", "--json"])),
+            Some(true)
+        );
+        assert_eq!(top_level_skill_request(&argv(&["zirv", "build"])), None);
+    }
+
+    /// `zirv skill list`/`zirv skill show <id>` are the pre-existing
+    /// `workflow::skill` engineering-skill tree, not the bundled operator
+    /// skill: a trailing argument other than `--json` must fall through to
+    /// `is_top_level_workflow_command`'s own dispatch instead of being
+    /// treated as this built-in.
+    #[test]
+    fn top_level_skill_request_leaves_the_engineering_skill_subcommands_alone() {
+        assert_eq!(
+            top_level_skill_request(&argv(&["zirv", "skill", "list"])),
+            None
+        );
+        assert_eq!(
+            top_level_skill_request(&argv(&["zirv", "skill", "show", "delegate"])),
+            None
+        );
+        assert!(is_top_level_workflow_command(&argv(&[
+            "zirv", "skill", "list"
+        ])));
+    }
+
+    #[test]
+    fn top_level_commands_request_matches_with_and_without_json() {
+        assert_eq!(
+            top_level_commands_request(&argv(&["zirv", "commands"])),
+            Some(false)
+        );
+        assert_eq!(
+            top_level_commands_request(&argv(&["zirv", "COMMANDS", "--json"])),
+            Some(true)
+        );
+        assert_eq!(top_level_commands_request(&argv(&["zirv", "build"])), None);
+        assert!(utils::is_reserved_command("commands"));
     }
 
     #[test]

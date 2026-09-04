@@ -300,6 +300,19 @@ pass, or a step was skipped, say so and show the output. Never call unverified w
 /// layer. This layer stays vendor-neutral, so it names neither "the Agent
 /// tool" nor any harness by name -- see
 /// `harness_prompt_never_names_vendor_specific_models`.
+/// v17 (issue #355): a new closing bullet points this session at the
+/// self-describing command surface -- `zirv --skill` for this same
+/// orientation on demand, `zirv commands --json` for the full generated
+/// command schema -- instead of trusting remembered or hand-copied command
+/// text. Deliberately placed in this layer only, never duplicated into
+/// `DEFAULT_PROMPT`: a Worker/SubOrchestrator session (`DEFAULT_PROMPT`
+/// alone, no harness layer) already receives a self-contained task brief
+/// from the orchestrator that dispatched it and has no standing need to
+/// re-discover zirv's own command surface, while an Orchestrator session
+/// (which gets both layers) would otherwise see the same pointer twice --
+/// see `compile.rs`'s `an_orchestrator_composition_never_duplicates_the_
+/// skill_discovery_hint`.
+///
 /// The literal header the derived harness/orchestration roster
 /// (`PromptSource::Harnesses`) starts with -- named, like `CONTEXT_LAYER_
 /// HEADER` and the workflow/memory headers, so `compile.rs`'s `CompiledContext::
@@ -309,7 +322,7 @@ pass, or a step was skipped, say so and show the output. Never call unverified w
 pub(super) const HARNESS_ROSTER_LAYER_HEADER: &str = "\n\n---\n\nzirv harness roster (session)\n\n";
 
 pub const HARNESS_PROMPT: &str = "\
-zirv meta-harness (v16)
+zirv meta-harness (v17)
 
 - zirv is the harness supervising this session -- context, usage, and cross-harness \
 communication. It launched the agent in this seat and is not one of the agents.
@@ -350,7 +363,10 @@ confirmed findings, and hard-stop after 2 fix rounds, reporting what remains as 
 findings.
 - The harness roster below (when present) lists the harnesses this session can initiate; `zirv \
 ctx status` shows the same plus live sessions and unread mail. Availability is the operator's \
-choice in `.zirv/.settings.toml`.";
+choice in `.zirv/.settings.toml`.
+- The installed zirv binary is the authority for its own syntax: run `zirv --skill` for this same \
+orientation on demand, or `zirv commands --json` for the full generated command schema, rather \
+than trusting remembered or hand-copied command text.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromptRole {
@@ -4322,7 +4338,7 @@ mod tests {
     #[test]
     fn the_harness_layer_only_promises_the_mail_a_worker_is_actually_told_to_send() {
         assert!(
-            HARNESS_PROMPT.starts_with("zirv meta-harness (v16)"),
+            HARNESS_PROMPT.starts_with("zirv meta-harness (v17)"),
             "a reworded layer carries its own version: {}",
             HARNESS_PROMPT.lines().next().unwrap_or_default()
         );
@@ -4382,7 +4398,7 @@ mod tests {
     #[test]
     fn the_harness_layer_teaches_the_fan_out_send_mode_too() {
         assert!(
-            HARNESS_PROMPT.starts_with("zirv meta-harness (v16)"),
+            HARNESS_PROMPT.starts_with("zirv meta-harness (v17)"),
             "a reworded layer carries its own version: {}",
             HARNESS_PROMPT.lines().next().unwrap_or_default()
         );
@@ -4420,7 +4436,7 @@ mod tests {
     #[test]
     fn the_harness_layer_names_workdir_for_cross_repo_delegation() {
         assert!(
-            HARNESS_PROMPT.starts_with("zirv meta-harness (v16)"),
+            HARNESS_PROMPT.starts_with("zirv meta-harness (v17)"),
             "a reworded layer carries its own version: {}",
             HARNESS_PROMPT.lines().next().unwrap_or_default()
         );
@@ -4475,9 +4491,17 @@ mod tests {
             "must say which one wins"
         );
         assert!(
-            HARNESS_PROMPT.contains("(v16)"),
+            HARNESS_PROMPT.contains("(v17)"),
             "a changed instruction layer must bump its own version token"
         );
+    }
+
+    /// Issue #355: the harness layer points a session at the generated
+    /// command surface instead of trusting hand-copied command text.
+    #[test]
+    fn the_harness_layer_points_at_the_generated_command_surface() {
+        assert!(HARNESS_PROMPT.contains("zirv --skill"));
+        assert!(HARNESS_PROMPT.contains("zirv commands --json"));
     }
 
     /// Issue #204: an operator-handed design- or UX-shaped task gets a gate --
