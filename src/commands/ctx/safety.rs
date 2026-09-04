@@ -5121,6 +5121,18 @@ fn ctx_base_allow_verbs() -> impl Iterator<Item = &'static str> {
 /// qualified programs are excluded: `./zirv ctx` could name repo-controlled
 /// code and must not inherit the installed binary's trust boundary. Explicit
 /// policy `deny`/`ask` still wins before this helper is called.
+///
+/// **Scope note (issue #331, 2026-09-04):** this helper is the NARROW
+/// acceptor only. The retry chain's general acceptor is
+/// [`is_prompt_free_zirv_retry_safe`] (issue #222), which deliberately admits
+/// `zirv agent <adapter> "<prompt>"` -- bare or inside a compound such as
+/// `zirv agent codex "x" | head` -- because the worker it launches runs under
+/// zirv's own sandbox posture and every dangerous spelling (`-- --sandbox
+/// danger-full-access`, `--dangerously-bypass-approvals-and-sandbox`) is a
+/// semantic Deny before that screen runs. `exec`, `usage tee`, `wrap`, `chat`
+/// and repo-controlled `./zirv` stay Ask on both acceptors. That Allow is the
+/// operator's policy, pinned by the #222 tests, not a fallthrough bypassing
+/// this list.
 pub(crate) fn is_reserved_zirv_escape_safe(command: &str) -> bool {
     let candidates = normalize_segments(command);
     if candidates.is_empty() {
