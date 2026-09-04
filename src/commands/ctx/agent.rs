@@ -136,6 +136,11 @@ pub struct AgentArgs {
     /// explicit request now, since any of those would otherwise hard-error
     /// rather than silently demote (see `try_join_dashboard`'s own doc
     /// comment).
+    ///
+    /// Decision (#328, 2026-09-04): headless stays as this explicit opt-in
+    /// and as the fallback when no live dashboard can host a pane
+    /// (announced on stderr); inside a live dashboard, delegation is always
+    /// a visible pane.
     #[arg(long, default_value_t = false)]
     pub headless: bool,
     /// Attach the repo's accepted workflow artifact for this stage to the
@@ -1871,6 +1876,48 @@ fn adoption_enforcement_refusal(
     ))
 }
 
+/// Issue #328: from an orchestrator seat, `zirv agent <own harness>` is
+/// refused unless it is a work-group operation or `--force`. Same-harness
+/// delegation belongs to the harness's own native subagent tool -- it stays
+/// visible in the calling session and returns its result directly, which a
+/// zirv-supervised headless worker cannot do; `zirv agent` exists for
+/// another harness, or for a work group/sub-orchestrator (a distinct
+/// concept from "delegate to the same harness"), not as a second way to
+/// spawn a subagent on the seat's own harness.
+///
+/// Refuses only when ALL of: the seat is an orchestrator ([`adapters::
+/// SEAT_ROLE_ENV`]); this session's own harness ([`adapters::AGENT_ENV`])
+/// trimmed equals `args.name` trimmed, case-insensitively; `args.role` is
+/// not `"sub-orchestrator"`; `args.group` is unset; and `args.force` is
+/// false. Any one of those failing is enough to let the delegation through
+/// -- an unknown own-harness (`AGENT_ENV` unset) never refuses either,
+/// since there is nothing to compare `args.name` against.
+fn same_harness_refusal(args: &AgentArgs, env: EnvLookup<'_>) -> Option<String> {
+    if env(adapters::SEAT_ROLE_ENV).as_deref() != Some("orchestrator") {
+        return None;
+    }
+    let own_harness = env(adapters::AGENT_ENV)?;
+    if !own_harness.trim().eq_ignore_ascii_case(args.name.trim()) {
+        return None;
+    }
+    if args.role.as_deref() == Some("sub-orchestrator") || args.group.is_some() || args.force {
+        return None;
+    }
+    let other = adapters::ADAPTERS
+        .iter()
+        .map(|(adapter_name, _)| *adapter_name)
+        .find(|adapter_name| !adapter_name.eq_ignore_ascii_case(args.name.trim()))
+        .unwrap_or("<other-harness>");
+    Some(format!(
+        "zirv ctx agent: '{name}' is this session's own harness. From an orchestrator seat, \
+         same-harness delegation uses the harness's native subagent tool (it stays visible in \
+         this session and returns its result directly); `zirv agent` is for another harness \
+         (e.g. `zirv agent {other}`) or a work group (`--role sub-orchestrator --scope \
+         \"<area>\"`). Pass --force to spawn a zirv-supervised worker anyway.",
+        name = args.name,
+    ))
+}
+
 pub fn run_with<W: Write>(
     args: &AgentArgs,
     w: &mut W,
@@ -1879,6 +1926,9 @@ pub fn run_with<W: Write>(
 ) -> CtxResult<i32> {
     validate_flags(&args.flags)?;
     validate_role(&args.role)?;
+    if let Some(message) = same_harness_refusal(args, env) {
+        return Err(message.into());
+    }
     // Issue #267: allocating a fresh tree and being told to use a specific
     // existing one are two different requests -- honouring one over the
     // other silently would surprise whichever the operator actually meant.
@@ -4459,6 +4509,129 @@ mod tests {
         let found: Vec<&str> =
             candidate_path_tokens(r"see (\\server\share\project) please").collect();
         assert_eq!(found, vec![r"\\server\share\project"], "got {found:?}");
+    }
+
+    // -- same_harness_refusal (issue #328) ---------------------------------
+
+    /// The baseline refusal shape: an orchestrator seat asking `zirv agent`
+    /// to delegate to its own harness.
+    #[test]
+    fn same_harness_refusal_refuses_the_orchestrators_own_harness() {
+        let env = env_map(&[
+            (adapters::SEAT_ROLE_ENV, "orchestrator"),
+            (adapters::AGENT_ENV, "claude"),
+        ]);
+        let args = args_for("claude", "go");
+        let message = same_harness_refusal(&args, &|k| env.get(k).cloned())
+            .expect("same-harness delegation from an orchestrator seat is refused");
+        assert!(message.contains("own harness"), "got {message}");
+        assert!(message.contains("--force"), "got {message}");
+    }
+
+    #[test]
+    fn same_harness_refusal_allows_force() {
+        let env = env_map(&[
+            (adapters::SEAT_ROLE_ENV, "orchestrator"),
+            (adapters::AGENT_ENV, "claude"),
+        ]);
+        let mut args = args_for("claude", "go");
+        args.force = true;
+        assert!(same_harness_refusal(&args, &|k| env.get(k).cloned()).is_none());
+    }
+
+    #[test]
+    fn same_harness_refusal_allows_a_sub_orchestrator_role() {
+        let env = env_map(&[
+            (adapters::SEAT_ROLE_ENV, "orchestrator"),
+            (adapters::AGENT_ENV, "claude"),
+        ]);
+        let mut args = args_for("claude", "go");
+        args.role = Some("sub-orchestrator".to_string());
+        assert!(same_harness_refusal(&args, &|k| env.get(k).cloned()).is_none());
+    }
+
+    #[test]
+    fn same_harness_refusal_allows_a_work_group() {
+        let env = env_map(&[
+            (adapters::SEAT_ROLE_ENV, "orchestrator"),
+            (adapters::AGENT_ENV, "claude"),
+        ]);
+        let mut args = args_for("claude", "go");
+        args.group = Some("g1".to_string());
+        assert!(same_harness_refusal(&args, &|k| env.get(k).cloned()).is_none());
+    }
+
+    #[test]
+    fn same_harness_refusal_allows_a_different_harness() {
+        let env = env_map(&[
+            (adapters::SEAT_ROLE_ENV, "orchestrator"),
+            (adapters::AGENT_ENV, "claude"),
+        ]);
+        let args = args_for("codex", "go");
+        assert!(same_harness_refusal(&args, &|k| env.get(k).cloned()).is_none());
+    }
+
+    #[test]
+    fn same_harness_refusal_allows_with_no_seat_role_env() {
+        let env = env_map(&[(adapters::AGENT_ENV, "claude")]);
+        let args = args_for("claude", "go");
+        assert!(same_harness_refusal(&args, &|k| env.get(k).cloned()).is_none());
+    }
+
+    #[test]
+    fn same_harness_refusal_allows_a_sub_orchestrator_seat() {
+        let env = env_map(&[
+            (adapters::SEAT_ROLE_ENV, "sub-orchestrator"),
+            (adapters::AGENT_ENV, "claude"),
+        ]);
+        let args = args_for("claude", "go");
+        assert!(same_harness_refusal(&args, &|k| env.get(k).cloned()).is_none());
+    }
+
+    /// The own-harness comparison is case-insensitive: `Claude` still
+    /// matches an `AGENT_ENV` of `claude`.
+    #[test]
+    fn same_harness_refusal_matches_the_own_harness_case_insensitively() {
+        let env = env_map(&[
+            (adapters::SEAT_ROLE_ENV, "orchestrator"),
+            (adapters::AGENT_ENV, "claude"),
+        ]);
+        let args = args_for("Claude", "go");
+        assert!(same_harness_refusal(&args, &|k| env.get(k).cloned()).is_some());
+    }
+
+    /// Issue #328, end to end: the refusal fires inside `run_with` itself,
+    /// before `--worktree` ever allocates anything.
+    #[test]
+    fn run_with_refuses_same_harness_delegation_before_allocating_a_worktree() {
+        if !git_available() {
+            eprintln!("skipping: git not found on PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir");
+        assert!(git_init(&repo), "git init");
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+
+        let mut env = base_env(&tmp.path().join("state"));
+        env.insert(
+            adapters::SEAT_ROLE_ENV.to_string(),
+            "orchestrator".to_string(),
+        );
+        env.insert(adapters::AGENT_ENV.to_string(), "claude".to_string());
+
+        let mut args = args_for("claude", "go");
+        args.worktree = true;
+        let mut out = Vec::new();
+        let err = run_with(&args, &mut out, &repo, &|k| env.get(k).cloned())
+            .expect_err("same-harness delegation from an orchestrator seat must be refused");
+        assert!(err.to_string().contains("own harness"), "got {err}");
+        assert!(
+            !repo.join(".zirv").join("worktrees").exists(),
+            "the refusal must land before any worktree is allocated"
+        );
     }
 
     /// Issue #267: allocating a fresh tree and being told to use a specific

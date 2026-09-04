@@ -4162,6 +4162,12 @@ struct HookToolPayload {
     tool_name: String,
     tool_input: HookToolInput,
     permission_mode: String,
+    /// The calling process's working directory (issue #334): the repo root
+    /// [`orchestrator_repo_write_target`] resolves relative write targets
+    /// against, when the hook payload carries it. Falls back to this
+    /// process's own `std::env::current_dir()` when empty, the same
+    /// fallback [`cd_allow_roots`] already uses.
+    cwd: String,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -4679,6 +4685,283 @@ pub(crate) fn write_targets_confined(command: &str, scratchpad_roots: &[String])
         return None;
     }
     Some(confined)
+}
+
+// -- orchestrator repo-write guard (issues #328/#334) ---------------------
+
+/// Blanks runs of two or more consecutive `<` (a heredoc `<<`/here-string
+/// `<<<` operator) to spaces before `segment` reaches [`segment_write_
+/// targets`] -- that scanner has no heredoc-syntax awareness of its own,
+/// and a heredoc opener's `<<'DELIM'` (left standing by [`redact_single_
+/// quoted_heredocs`], which only blanks the BODY) reads as a second,
+/// dangling INPUT redirect with nothing after it, aborting the scan of the
+/// whole segment and discarding a real `>` write target earlier on the
+/// same line (`cat > README.md <<'EOF'`). A lone `<` is left alone: an
+/// ordinary input redirect, already folded into `segment_write_targets`'s
+/// own targets exactly like today.
+fn neutralize_heredoc_operator(segment: &str) -> String {
+    let chars: Vec<char> = segment.chars().collect();
+    let mut out = String::with_capacity(chars.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '<' && chars.get(i + 1) == Some(&'<') {
+            out.push(' ');
+            out.push(' ');
+            i += 2;
+            while chars.get(i) == Some(&'<') {
+                out.push(' ');
+                i += 1;
+            }
+            continue;
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
+}
+
+/// Resolves `target` to a forward-slash-normalized, lexically `.`/`..`-
+/// collapsed path for repo-boundary comparison: an absolute target (a
+/// leading `/`, `~`, or drive letter) is normalized as-is; a relative one
+/// resolves against `repo_root`. `None` when `target` cannot be
+/// confidently resolved at all -- it carries `$`/a backtick (built through
+/// expansion this text-only module cannot resolve), or it is `/dev/null`
+/// (never a write target in the first place).
+fn resolve_repo_write_target(target: &str, repo_root: &str) -> Option<String> {
+    if target.contains(['$', '`']) || target == "/dev/null" {
+        return None;
+    }
+    let normalized = target.replace('\\', "/");
+    let is_absolute = normalized.starts_with('/')
+        || normalized.starts_with('~')
+        || (normalized.as_bytes().get(1) == Some(&b':')
+            && matches!(normalized.as_bytes().get(2), Some(b'/')));
+    let combined = if is_absolute {
+        normalized
+    } else {
+        format!("{repo_root}/{normalized}")
+    };
+    if let Some(rest) = combined.strip_prefix('/') {
+        Some(format!(
+            "/{}",
+            resolve_lexical_path_components(rest).join("/")
+        ))
+    } else if combined.as_bytes().get(1) == Some(&b':') {
+        let (drive, rest) = combined.split_at(2);
+        let rest = rest.strip_prefix('/').unwrap_or(rest);
+        Some(format!(
+            "{drive}/{}",
+            resolve_lexical_path_components(rest).join("/")
+        ))
+    } else {
+        Some(resolve_lexical_path_components(&combined).join("/"))
+    }
+}
+
+/// `target` is a repository write iff its resolved form ([`resolve_repo_
+/// write_target`]) equals `repo_root` or is nested under it, AND is not
+/// equal to or nested under any of `allowed_roots` -- the same root-plus-
+/// separator boundary rule [`target_is_confined`] applies to its own
+/// scratchpad roots. Returns `target` unchanged (as originally written) on
+/// a violation, so a caller can report it without leaking a resolved
+/// absolute path.
+fn repo_write_violation(target: &str, repo_root: &str, allowed_roots: &[String]) -> Option<String> {
+    let resolved = resolve_repo_write_target(target, repo_root)?;
+    let under_repo = resolved == repo_root || resolved.starts_with(&format!("{repo_root}/"));
+    if !under_repo {
+        return None;
+    }
+    let under_allowed = allowed_roots.iter().any(|root| {
+        !root.is_empty() && (resolved == *root || resolved.starts_with(&format!("{root}/")))
+    });
+    if under_allowed {
+        None
+    } else {
+        Some(target.to_string())
+    }
+}
+
+/// Whether `token` is a `sed`/`perl` in-place-edit flag: `-i`, `-i<suffix>`
+/// (`-i.bak`), `--in-place[=<suffix>]`, or a clustered short-flag group
+/// containing `i` (`-pi`, `-pie`, `-ni`).
+fn is_sed_perl_inplace_flag(token: &str) -> bool {
+    if token == "--in-place" || token.starts_with("--in-place=") {
+        return true;
+    }
+    if token.starts_with("--") || !token.starts_with('-') || token.len() < 2 {
+        return false;
+    }
+    token[1..].contains('i')
+}
+
+/// The file-argument positionals a `sed`/`perl` in-place edit (`program` at
+/// `tokens[0]`) would write to: every non-flag argument that is not the
+/// script/expression consumed by an `-e`/`-f` flag, and -- for `sed` with
+/// no `-e`/`-f` anywhere on the line -- not the first positional either
+/// (its own implicit script).
+fn sed_perl_inplace_targets(program: &str, tokens: &[String]) -> Vec<String> {
+    let has_e_or_f = tokens[1..].iter().any(|t| t == "-e" || t == "-f");
+    let mut awaiting_implicit_script = program == "sed" && !has_e_or_f;
+    let mut targets = Vec::new();
+    let mut i = 1;
+    while i < tokens.len() {
+        let token = &tokens[i];
+        if token == "-e" || token == "-f" {
+            i += 2;
+            continue;
+        }
+        if token.starts_with('-') {
+            i += 1;
+            continue;
+        }
+        if awaiting_implicit_script {
+            awaiting_implicit_script = false;
+            i += 1;
+            continue;
+        }
+        targets.push(token.clone());
+        i += 1;
+    }
+    targets
+}
+
+/// The last non-flag argument of `tokens` (`cp`/`mv`/`install`/`rsync`/`ln`
+/// all write to their final positional).
+fn last_non_flag_argument(tokens: &[String]) -> Option<&str> {
+    tokens[1..]
+        .iter()
+        .rfind(|t| !t.starts_with('-'))
+        .map(String::as_str)
+}
+
+/// The code argument following a `-c`/`-e` flag among `tokens`, for an
+/// inline interpreter invocation (`python3 -c "..."`, `node -e "..."`).
+fn inline_interpreter_code(tokens: &[String]) -> Option<&str> {
+    let mut iter = tokens[1..].iter();
+    while let Some(token) = iter.next() {
+        if token == "-c" || token == "-e" {
+            return iter.next().map(String::as_str);
+        }
+    }
+    None
+}
+
+/// Plain substring write primitives: present anywhere in inline
+/// interpreter `code` means a write, no further analysis needed.
+const INLINE_WRITE_PRIMITIVES: &[&str] = &[
+    ".write_text(",
+    ".write_bytes(",
+    "writeFile",
+    "writeFileSync",
+    "appendFile",
+    "File.write",
+    "file_put_contents(",
+];
+
+/// Open-style primitives that only mean a write when paired with a write
+/// mode (see [`INLINE_WRITE_MODE_LITERALS`]) -- an `open('f').read()` is
+/// not a write.
+const INLINE_MODE_GATED_PRIMITIVES: &[&str] = &["open(", "File.open", "fopen("];
+
+const INLINE_WRITE_MODE_LITERALS: &[&str] = &[
+    "'w'", "\"w\"", "'a'", "\"a\"", "'wb'", "\"wb\"", "'ab'", "\"ab\"", "'w+'", "\"w+\"", "'a+'",
+    "\"a+\"", "'x'", "\"x\"",
+];
+
+/// Whether inline interpreter `code` contains a recognized write primitive
+/// -- approximate (a substring scan, not a real parse), deliberately
+/// permissive toward flagging: an orchestrator seat only ever pays for a
+/// false positive here by dispatching a worker it did not strictly need,
+/// never by silently keeping a real write.
+fn inline_code_has_write_primitive(code: &str) -> bool {
+    if INLINE_WRITE_PRIMITIVES.iter().any(|p| code.contains(p)) {
+        return true;
+    }
+    INLINE_MODE_GATED_PRIMITIVES
+        .iter()
+        .any(|p| code.contains(p))
+        && INLINE_WRITE_MODE_LITERALS.iter().any(|m| code.contains(m))
+}
+
+/// Issue #334: the first repository file `command` would write from an
+/// orchestrator seat, or `None`. `repo_root` and `allowed_roots` are
+/// forward-slash normalized, no trailing slash.
+///
+/// Scans each of [`split_segments`]'s segments (over the already heredoc-
+/// redacted command) for four write shapes: (a) a redirect/`tee` target
+/// ([`segment_write_targets`]); (b) a `sed`/`perl` in-place edit's file
+/// arguments; (c) the last argument of `cp`/`mv`/`install`/`rsync`/`ln`;
+/// (d) an inline interpreter (`python`/`python3`/`node`/`ruby`/`perl`/
+/// `php`) invoked with `-c`/`-e` whose code contains a write primitive and
+/// mentions no `allowed_roots` entry. A `git` segment (any subcommand) is
+/// never scanned at all under any of the four shapes -- git integration
+/// stays the orchestrator seat's own job.
+///
+/// Known gaps, documented rather than chased (this classifier is text-only
+/// and argv-scoped, the same declared limits every other classifier in
+/// this module accepts):
+/// - No `cd` tracking: `cd src && sed -i ... lib.rs` resolves `lib.rs`
+///   against `repo_root`, not `repo_root/src`, and is not caught.
+/// - An inline interpreter write primitive's ambiguity analysis is
+///   narrowed to "does the code mention an allowed root" -- it does not
+///   attempt to prove a mentioned path is genuinely outside the repo.
+pub(crate) fn orchestrator_repo_write_target(
+    command: &str,
+    repo_root: &str,
+    allowed_roots: &[String],
+) -> Option<String> {
+    let sanitized = redact_single_quoted_heredocs(command);
+    for segment in split_segments(&sanitized) {
+        let collapsed = collapse_whitespace(&segment);
+        let Some(tokens) = sql_tokens(&collapsed) else {
+            continue;
+        };
+        let Some(first) = tokens.first() else {
+            continue;
+        };
+        let program = sql_program_name(first);
+        if program == "git" {
+            continue;
+        }
+
+        if let Some(targets) = segment_write_targets(&neutralize_heredoc_operator(&segment)) {
+            for target in &targets {
+                if let Some(hit) = repo_write_violation(target, repo_root, allowed_roots) {
+                    return Some(hit);
+                }
+            }
+        }
+
+        if matches!(program.as_str(), "sed" | "perl")
+            && tokens[1..].iter().any(|t| is_sed_perl_inplace_flag(t))
+        {
+            for target in sed_perl_inplace_targets(&program, &tokens) {
+                if let Some(hit) = repo_write_violation(&target, repo_root, allowed_roots) {
+                    return Some(hit);
+                }
+            }
+        }
+
+        if matches!(program.as_str(), "cp" | "mv" | "install" | "rsync" | "ln")
+            && let Some(target) = last_non_flag_argument(&tokens)
+            && let Some(hit) = repo_write_violation(target, repo_root, allowed_roots)
+        {
+            return Some(hit);
+        }
+
+        if matches!(
+            program.as_str(),
+            "python" | "python3" | "node" | "ruby" | "perl" | "php"
+        ) && let Some(code) = inline_interpreter_code(&tokens)
+            && inline_code_has_write_primitive(code)
+            && !allowed_roots
+                .iter()
+                .any(|root| code.contains(root.as_str()))
+        {
+            return Some("<inline interpreter write>".to_string());
+        }
+    }
+    None
 }
 
 /// Issue #168, design decision (d): true when every one of `command`'s
@@ -6008,6 +6291,50 @@ fn cd_allow_roots(scratchpad_roots: &[String]) -> Vec<String> {
     roots
 }
 
+/// The forward-slash-normalized, no-trailing-separator repo root a hook
+/// process judges an orchestrator seat's writes against (issue #334):
+/// `cwd` (the PreToolUse payload's own working directory) when non-empty,
+/// else this process's own `std::env::current_dir()` -- `None` (fail
+/// open, no repo-write check at all) when neither is available, mirroring
+/// `cd_allow_roots`'s identical cwd-normalization fallback.
+fn hook_repo_root(cwd: &str) -> Option<String> {
+    if !cwd.is_empty() {
+        return Some(cwd.replace('\\', "/").trim_end_matches('/').to_string());
+    }
+    std::env::current_dir().ok().map(|path| {
+        path.to_string_lossy()
+            .replace('\\', "/")
+            .trim_end_matches('/')
+            .to_string()
+    })
+}
+
+/// The program-family label for `OrchestratorBlock.target` on a Bash/
+/// PowerShell repository-write refusal (issues #328/#334): `command`'s
+/// first segment's first token, plus -- for `sed`/`perl` -- whichever
+/// in-place flag is present, e.g. `"sed -i"`. Never the full command text:
+/// `OrchestratorBlock` is privacy-preserving like `SafetyDecision`.
+fn orchestrator_block_tool_family(command: &str) -> String {
+    let sanitized = redact_single_quoted_heredocs(command);
+    let Some(first_segment) = split_segments(&sanitized).into_iter().next() else {
+        return String::new();
+    };
+    let collapsed = collapse_whitespace(&first_segment);
+    let Some(tokens) = sql_tokens(&collapsed) else {
+        return String::new();
+    };
+    let Some(first) = tokens.first() else {
+        return String::new();
+    };
+    let program = sql_program_name(first);
+    if matches!(program.as_str(), "sed" | "perl")
+        && let Some(flag) = tokens[1..].iter().find(|t| is_sed_perl_inplace_flag(t))
+    {
+        return format!("{program} {flag}");
+    }
+    program
+}
+
 /// The hook-mode core of `run_check`, split out so it can be tested by
 /// feeding it a raw stdin payload directly rather than the process's actual
 /// stdin (which `run_check` only reads lazily, once it knows this is hook
@@ -6058,6 +6385,24 @@ fn run_check_hook_mode_with_env<W: Write>(
     let effective_command =
         strip_known_root_cd_prefix(command, &cd_roots).unwrap_or_else(|| command.to_string());
 
+    // Issue #328/#334: an orchestrator seat must not write a repository
+    // file through Bash any more than through Edit/Write -- computed here,
+    // before both `evaluate_with_attestation_evidence` and the scratchpad/
+    // sandbox widening below, so its `Deny` (applied to `outcome` right
+    // after `evidence` resolves) is never reconsidered by either: both
+    // already guard on `outcome.verdict != Verdict::Deny`.
+    let orchestrator_repo_write = (env(super::adapters::SEAT_ROLE_ENV).as_deref()
+        == Some("orchestrator"))
+    .then(|| hook_repo_root(&payload.cwd))
+    .flatten()
+    .and_then(|repo_root| {
+        let allowed_roots = vec![
+            format!("{repo_root}/.zirv/work"),
+            format!("{repo_root}/.zirv/memory"),
+        ];
+        orchestrator_repo_write_target(&effective_command, &repo_root, &allowed_roots)
+    });
+
     let evidence = evaluate_with_attestation_evidence(
         &cfg.safety,
         &effective_command,
@@ -6066,6 +6411,32 @@ fn run_check_hook_mode_with_env<W: Write>(
         &scratchpad_roots,
     );
     let mut outcome = evidence.outcome.clone();
+    if let Some(target) = orchestrator_repo_write {
+        outcome = Outcome {
+            verdict: Verdict::Deny,
+            matched: Some(Rule {
+                pattern: format!(
+                    "<orchestrator seat: dispatch a worker -- repository write to {target}>"
+                ),
+                origin: Origin::BuiltIn,
+            }),
+        };
+        if let Ok(state) = super::state::StateDir::resolve(env) {
+            let session =
+                super::mail::session_identity(env).unwrap_or_else(|| payload.session_id.clone());
+            let tool_family = orchestrator_block_tool_family(&effective_command);
+            let _ = super::log::append_orchestrator_block(
+                &state,
+                &super::log::OrchestratorBlock {
+                    ts: super::state::now_secs(),
+                    session: &session,
+                    tool: &payload.tool_name,
+                    target: &tool_family,
+                    reason: "repository write",
+                },
+            );
+        }
+    }
     // Issue #168, design decision (d): a compound whose every write target
     // is confined to the session scratchpad is treated as `Allow` even when
     // it would otherwise rely on the unmatched-command mode default. Checked
@@ -7278,6 +7649,208 @@ mod tests {
     #[test]
     fn write_targets_confined_returns_none_with_no_scratchpad_roots_configured() {
         assert_eq!(write_targets_confined("echo hi > /dev/null", &[]), None);
+    }
+
+    // -- orchestrator_repo_write_target (issues #328/#334) -----------------
+
+    #[test]
+    fn orchestrator_repo_write_target_catches_repository_writes() {
+        let repo_root = "/work/repo";
+        let allowed_roots = vec![
+            "/work/repo/.zirv/work".to_string(),
+            "/work/repo/.zirv/memory".to_string(),
+        ];
+        for command in [
+            "sed -i 's/a/b/' src/main.rs",
+            "sed -i.bak -e 's/a/b/' src/main.rs",
+            "perl -pi -e 's/a/b/' Cargo.toml",
+            "echo x > src/lib.rs",
+            "echo x >> /work/repo/README.md",
+            "cat > README.md <<'EOF'\nhi\nEOF",
+            "some | tee src/x.rs",
+            "cp /tmp/claude-501/x src/y.rs",
+            "mv a.txt docs/b.txt",
+            "python3 -c \"open('src/x.py','w').write('a')\"",
+            "node -e \"require('fs').writeFileSync('src/x.js','a')\"",
+        ] {
+            assert!(
+                orchestrator_repo_write_target(command, repo_root, &allowed_roots).is_some(),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn orchestrator_repo_write_target_has_no_opinion_on_non_repository_writes() {
+        let repo_root = "/work/repo";
+        let allowed_roots = vec![
+            "/work/repo/.zirv/work".to_string(),
+            "/work/repo/.zirv/memory".to_string(),
+        ];
+        for command in [
+            "echo x > .zirv/work/notes.md",
+            "echo x > /work/repo/.zirv/memory/m.md",
+            "echo x > /tmp/claude-501/s/out.md",
+            "echo x > /dev/null",
+            "git commit -m x",
+            "git apply p.diff",
+            "git checkout -- src/x.rs",
+            "cargo build",
+            "cargo fmt -- --check",
+            "sed 's/a/b/' src/main.rs",
+            "sed -n '1,5p' src/main.rs",
+            "cat src/main.rs",
+            "echo x > \"$TMPDIR/x\"",
+            "echo x > $OUT",
+            "mkdir -p .zirv/work/x && gh issue view 1 > .zirv/work/x/i.md",
+            "python3 -c \"print(open('src/x.py').read())\"",
+            "python3 -c \"open('/work/repo/.zirv/work/o.txt','w').write('a')\"",
+            "cp src/a.rs /tmp/claude-501/s/a.rs",
+            "echo x > ~/notes.md",
+            "echo x > ../outside.txt",
+        ] {
+            assert_eq!(
+                orchestrator_repo_write_target(command, repo_root, &allowed_roots),
+                None,
+                "{command}"
+            );
+        }
+    }
+
+    /// End-to-end: an orchestrator seat's `sed -i` on a repository file
+    /// denies through the hook, naming the guard's own rule text.
+    #[test]
+    fn orchestrator_seat_repository_write_denies_through_the_hook() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = super::super::testenv::HomeGuard::set(home.path());
+        let empty: HashMap<String, String> = HashMap::new();
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("loads");
+        let repo_cwd = repo.path().to_string_lossy().replace('\\', "/");
+
+        let mut env_map: HashMap<String, String> = HashMap::new();
+        env_map.insert(
+            super::super::adapters::SEAT_ROLE_ENV.to_string(),
+            "orchestrator".to_string(),
+        );
+        let stdin = format!(
+            r#"{{"tool_name":"Bash","tool_input":{{"command":"sed -i 's/a/b/' src/main.rs"}},"permission_mode":"default","cwd":"{repo_cwd}"}}"#
+        );
+        let mut out = Vec::new();
+        run_check_hook_mode_with_env(&cfg, &mut out, &stdin, &|k| env_map.get(k).cloned())
+            .expect("runs");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            text.contains(r#""permissionDecision":"deny""#),
+            "got {text}"
+        );
+        assert!(
+            text.contains("orchestrator seat: dispatch a worker"),
+            "got {text}"
+        );
+    }
+
+    /// The same repository-write command from a non-orchestrator seat (no
+    /// role env at all, or an explicit `worker` role) is never denied by
+    /// this rule -- the guard is scoped to the orchestrator seat only.
+    #[test]
+    fn orchestrator_seat_repository_write_guard_does_not_apply_off_the_orchestrator_seat() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = super::super::testenv::HomeGuard::set(home.path());
+        let empty: HashMap<String, String> = HashMap::new();
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("loads");
+        let repo_cwd = repo.path().to_string_lossy().replace('\\', "/");
+        let stdin = format!(
+            r#"{{"tool_name":"Bash","tool_input":{{"command":"sed -i 's/a/b/' src/main.rs"}},"permission_mode":"default","cwd":"{repo_cwd}"}}"#
+        );
+
+        for env_map in [
+            HashMap::new(),
+            HashMap::from([(
+                super::super::adapters::SEAT_ROLE_ENV.to_string(),
+                "worker".to_string(),
+            )]),
+        ] {
+            let mut out = Vec::new();
+            run_check_hook_mode_with_env(&cfg, &mut out, &stdin, &|k| env_map.get(k).cloned())
+                .expect("runs");
+            let text = String::from_utf8(out).expect("utf8");
+            assert!(
+                !text.contains("orchestrator seat: dispatch a worker"),
+                "{env_map:?}: got {text}"
+            );
+        }
+    }
+
+    /// An orchestrator-seat write CONFINED to `.zirv/work` is not denied by
+    /// this rule -- the scratchpad/allowed-root carve-out still applies.
+    #[test]
+    fn orchestrator_seat_write_confined_to_zirv_work_is_not_denied() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = super::super::testenv::HomeGuard::set(home.path());
+        let empty: HashMap<String, String> = HashMap::new();
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("loads");
+        let repo_cwd = repo.path().to_string_lossy().replace('\\', "/");
+
+        let mut env_map: HashMap<String, String> = HashMap::new();
+        env_map.insert(
+            super::super::adapters::SEAT_ROLE_ENV.to_string(),
+            "orchestrator".to_string(),
+        );
+        let stdin = format!(
+            r#"{{"tool_name":"Bash","tool_input":{{"command":"echo x > .zirv/work/n.md"}},"permission_mode":"default","cwd":"{repo_cwd}"}}"#
+        );
+        let mut out = Vec::new();
+        run_check_hook_mode_with_env(&cfg, &mut out, &stdin, &|k| env_map.get(k).cloned())
+            .expect("runs");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            !text.contains("orchestrator seat: dispatch a worker"),
+            "got {text}"
+        );
+    }
+
+    /// A denied repository write appends one `orchestrator-blocks.jsonl`
+    /// row whose `target` is a program-family label, never the full
+    /// command text.
+    #[test]
+    fn orchestrator_seat_repository_write_denial_appends_an_orchestrator_block() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = super::super::testenv::HomeGuard::set(home.path());
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let empty: HashMap<String, String> = HashMap::new();
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("loads");
+        let repo_cwd = repo.path().to_string_lossy().replace('\\', "/");
+
+        let mut env_map: HashMap<String, String> = HashMap::new();
+        env_map.insert(
+            super::super::adapters::SEAT_ROLE_ENV.to_string(),
+            "orchestrator".to_string(),
+        );
+        env_map.insert(
+            super::super::state::STATE_ENV.to_string(),
+            state_dir.path().to_string_lossy().to_string(),
+        );
+        let command = "sed -i 's/a/b/' src/main.rs";
+        let stdin = format!(
+            r#"{{"tool_name":"Bash","tool_input":{{"command":"{command}"}},"permission_mode":"default","cwd":"{repo_cwd}"}}"#
+        );
+        let mut out = Vec::new();
+        run_check_hook_mode_with_env(&cfg, &mut out, &stdin, &|k| env_map.get(k).cloned())
+            .expect("runs");
+
+        let state = super::super::state::StateDir::from_root(state_dir.path().to_path_buf());
+        let records = super::super::log::read_orchestrator_blocks(&state);
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert_eq!(records[0].tool, "Bash");
+        assert!(
+            !records[0].target.contains(command),
+            "target must not carry the full command text: {:?}",
+            records[0].target
+        );
     }
 
     #[test]
