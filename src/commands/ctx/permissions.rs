@@ -3482,6 +3482,7 @@ mod tests {
             verdict: verdict.to_string(),
             command_sha256: sha256_hex(command.trim().as_bytes()),
             matched_pattern: matched_pattern.map(str::to_string),
+            attestation: String::new(),
         }
     }
 
@@ -5309,6 +5310,7 @@ mod tests {
             verdict: verdict.to_string(),
             command_sha256: sha256_hex(command.trim().as_bytes()),
             matched_pattern: None,
+            attestation: String::new(),
         }
     }
 

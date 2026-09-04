@@ -5511,6 +5511,7 @@ mod tests {
             worker: crate::commands::ctx::config::WorkerConfig {
                 claude: Some("opus".to_string()),
                 codex: None,
+                ..Default::default()
             },
             ..permissive_cfg()
         };
@@ -5551,6 +5552,7 @@ mod tests {
             worker: crate::commands::ctx::config::WorkerConfig {
                 claude: None,
                 codex: Some("gpt-5.6-terra".to_string()),
+                ..Default::default()
             },
             ..permissive_cfg()
         };

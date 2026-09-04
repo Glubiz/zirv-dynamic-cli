@@ -269,6 +269,52 @@ pub enum NormalizedEvent {
     ToolResultTimestamp {
         at_ms: Option<u64>,
     },
+    /// The literal byte length of a human-typed user turn's text (issue
+    /// #312), emitted alongside `TurnStart` whenever that row carries
+    /// extractable text -- never in place of it, and never emitted at all for
+    /// a `TurnStart` whose row had no text (a tool-only or empty row). Feeds
+    /// `breakdown::attribute_window`'s `user_text` bucket; nothing else reads
+    /// it. A sibling variant rather than a field on `TurnStart` for the same
+    /// reason `ToolErrorText` is one: an exhaustive-pattern addition would
+    /// have touched every existing `TurnStart { .. }` match for a signal only
+    /// one consumer needs.
+    UserText {
+        byte_len: u64,
+    },
+    /// The combined byte length of every `thinking`-block text in one
+    /// assistant row (issue #312), emitted right after that row's
+    /// `AssistantFinal` whenever the row carried at least one such block.
+    /// `text_of` already drops thinking blocks entirely when building
+    /// `AssistantFinal::text`, so without this sibling event that content is
+    /// invisible to `breakdown::attribute_window`'s `thinking` bucket.
+    AssistantThinking {
+        byte_len: u64,
+    },
+    /// The byte length and content fingerprint of the immediately preceding
+    /// `ToolResult`'s raw content (issue #312), emitted right after it --
+    /// never in place of it, mirroring `ToolErrorText`/`ToolResultTimestamp`'s
+    /// own sibling-variant rationale. `content_hash` is `input_hash` of the
+    /// FULL result text (not `normalize_error_text`'s fuzzy, capped
+    /// fingerprint): `breakdown::attribute_window` uses it to dedupe
+    /// byte-identical results, which needs an exact match, not a fuzzy one.
+    ToolResultSize {
+        byte_len: u64,
+        content_hash: u64,
+    },
+    /// The file-shaped path argument of the immediately preceding `ToolCall`
+    /// (issue #312), emitted right after it whenever the adapter's transcript
+    /// shape exposes one -- omitted entirely for a call with no recognizable
+    /// path argument, never a guessed empty string. `is_modification` mirrors
+    /// `StructuralContext::files_modified`'s own read/write split: `true` for
+    /// an edit-shaped tool (`Edit`/`Write`/`MultiEdit`/`NotebookEdit`), `false`
+    /// for a read-shaped one. Lets `breakdown::attribute_window` mark an
+    /// earlier live tool result STALE once a later `ToolCallPath` with
+    /// `is_modification: true` names the same path -- a sibling variant for
+    /// the same reason `ToolErrorText` is one.
+    ToolCallPath {
+        path: String,
+        is_modification: bool,
+    },
     ProviderError {
         class: ProviderErrorClass,
     },

@@ -192,6 +192,32 @@ fn text_of(message: &Value) -> String {
         .unwrap_or_default()
 }
 
+/// The literal human-typed text of a `user` row's `message.content` (issue
+/// #312): the plain-string shape Claude Code writes for an ordinary prompt,
+/// or the `text`-block shape a content array carries otherwise. Mirrors
+/// `structural_context`'s own user-text extraction (below), factored out
+/// here so `parse_events` can size it for `NormalizedEvent::UserText`
+/// without a second full parse of the row.
+fn user_message_text(content: Option<&Value>) -> String {
+    let Some(content) = content else {
+        return String::new();
+    };
+    if let Some(text) = content.as_str() {
+        return text.to_string();
+    }
+    content
+        .as_array()
+        .map(|blocks| {
+            blocks
+                .iter()
+                .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
+                .filter_map(|b| b.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default()
+}
+
 /// The four raw token classes from one `message.usage` object. A missing
 /// field is `0`, the same tolerance `context_tokens_of` has always had.
 pub fn usage_categories(usage: &Value) -> TranscriptUsage {
@@ -268,6 +294,15 @@ pub fn parse_events(jsonl: &str) -> Vec<NormalizedEvent> {
 
                 if results.is_empty() {
                     events.push(NormalizedEvent::TurnStart { at_ms });
+                    // Issue #312: the literal human-typed text of this turn,
+                    // for `breakdown::attribute_window`'s `user_text` bucket
+                    // -- a sibling of `TurnStart`, never a field on it, for
+                    // the same reason `ToolErrorText` is one (see that
+                    // variant's own doc comment).
+                    let byte_len = user_message_text(message.get("content")).len() as u64;
+                    if byte_len > 0 {
+                        events.push(NormalizedEvent::UserText { byte_len });
+                    }
                     continue;
                 }
                 for block in results {
@@ -276,6 +311,17 @@ pub fn parse_events(jsonl: &str) -> Vec<NormalizedEvent> {
                         .and_then(Value::as_bool)
                         .unwrap_or(false);
                     events.push(NormalizedEvent::ToolResult { is_error });
+                    // Issue #312: the result's own raw content, sized and
+                    // hashed for `breakdown::attribute_window`'s dedup and
+                    // live/stale accounting -- computed unconditionally
+                    // (unlike the error-only `detail` read this replaces)
+                    // since every result needs a byte length regardless of
+                    // whether it errored.
+                    let detail = tool_result_text(block);
+                    events.push(NormalizedEvent::ToolResultSize {
+                        byte_len: detail.len() as u64,
+                        content_hash: input_hash(&detail),
+                    });
                     // Issue #293: a sibling event, never a new field on
                     // `ToolResult` -- see `ToolResultTimestamp`'s own doc
                     // comment for why, the same reasoning
@@ -287,13 +333,10 @@ pub fn parse_events(jsonl: &str) -> Vec<NormalizedEvent> {
                     // same_error_repeats`): a sibling event, never a new
                     // field on `ToolResult` -- see that variant's own doc
                     // comment for why.
-                    if is_error {
-                        let detail = tool_result_text(block);
-                        if !detail.is_empty() {
-                            events.push(NormalizedEvent::ToolErrorText {
-                                hash: error_text_hash(&detail),
-                            });
-                        }
+                    if is_error && !detail.is_empty() {
+                        events.push(NormalizedEvent::ToolErrorText {
+                            hash: error_text_hash(&detail),
+                        });
                     }
                 }
             }
@@ -316,6 +359,27 @@ pub fn parse_events(jsonl: &str) -> Vec<NormalizedEvent> {
                     input_tokens,
                     at_ms,
                 });
+                // Issue #312: `text_of` above already drops `thinking`
+                // blocks entirely when building `AssistantFinal::text`, so
+                // without this sibling event that content is invisible to
+                // `breakdown::attribute_window`'s `thinking` bucket.
+                let thinking_bytes: u64 = message
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .map(|blocks| {
+                        blocks
+                            .iter()
+                            .filter(|b| b.get("type").and_then(Value::as_str) == Some("thinking"))
+                            .filter_map(|b| b.get("thinking").and_then(Value::as_str))
+                            .map(|t| t.len() as u64)
+                            .sum()
+                    })
+                    .unwrap_or(0);
+                if thinking_bytes > 0 {
+                    events.push(NormalizedEvent::AssistantThinking {
+                        byte_len: thinking_bytes,
+                    });
+                }
 
                 if let Some(blocks) = message.get("content").and_then(Value::as_array) {
                     for block in blocks
@@ -327,12 +391,31 @@ pub fn parse_events(jsonl: &str) -> Vec<NormalizedEvent> {
                             .and_then(Value::as_str)
                             .unwrap_or("unknown")
                             .to_string();
+                        let is_modification = MODIFICATION_TOOLS
+                            .iter()
+                            .any(|t| name.eq_ignore_ascii_case(t));
                         let raw = block.get("input").map(Value::to_string).unwrap_or_default();
                         events.push(NormalizedEvent::ToolCall {
                             name,
                             input_hash: input_hash(&raw),
                             at_ms,
                         });
+                        // Issue #312: the call's file-shaped argument, when
+                        // its transcript shape exposes one, so
+                        // `breakdown::attribute_window` can mark an earlier
+                        // live result STALE once a modifying call names the
+                        // same path. A sibling of `ToolCall`, never a field
+                        // on it, for the same reason `ToolErrorText` is one.
+                        if let Some(path) = block.get("input").and_then(|input| {
+                            FILE_KEYS
+                                .iter()
+                                .find_map(|key| input.get(*key).and_then(Value::as_str))
+                        }) {
+                            events.push(NormalizedEvent::ToolCallPath {
+                                path: path.to_string(),
+                                is_modification,
+                            });
+                        }
                     }
                 }
             }
@@ -2388,7 +2471,12 @@ mod tests {
             events,
             vec![
                 NormalizedEvent::TurnStart { at_ms: None },
+                NormalizedEvent::UserText { byte_len: 12 },
                 NormalizedEvent::ToolResult { is_error: false },
+                NormalizedEvent::ToolResultSize {
+                    byte_len: 2,
+                    content_hash: input_hash("ok"),
+                },
             ]
         );
     }
@@ -2399,7 +2487,13 @@ mod tests {
             r#"{"type":"user","message":{"content":[{"type":"tool_result","content":"ok"}]}}"#;
         assert_eq!(
             parse_events(jsonl),
-            vec![NormalizedEvent::ToolResult { is_error: false }]
+            vec![
+                NormalizedEvent::ToolResult { is_error: false },
+                NormalizedEvent::ToolResultSize {
+                    byte_len: 2,
+                    content_hash: input_hash("ok"),
+                },
+            ]
         );
     }
 
@@ -2414,6 +2508,10 @@ mod tests {
             parse_events(jsonl),
             vec![
                 NormalizedEvent::ToolResult { is_error: true },
+                NormalizedEvent::ToolResultSize {
+                    byte_len: "boom: file missing".len() as u64,
+                    content_hash: input_hash("boom: file missing"),
+                },
                 NormalizedEvent::ToolErrorText {
                     hash: error_text_hash("boom: file missing"),
                 },
@@ -2428,7 +2526,13 @@ mod tests {
         let jsonl = r#"{"type":"user","message":{"content":[{"type":"tool_result","content":"all good"}]}}"#;
         assert_eq!(
             parse_events(jsonl),
-            vec![NormalizedEvent::ToolResult { is_error: false }]
+            vec![
+                NormalizedEvent::ToolResult { is_error: false },
+                NormalizedEvent::ToolResultSize {
+                    byte_len: "all good".len() as u64,
+                    content_hash: input_hash("all good"),
+                },
+            ]
         );
     }
 
@@ -2451,6 +2555,7 @@ mod tests {
                     input_tokens: 100,
                     at_ms: None,
                 },
+                NormalizedEvent::AssistantThinking { byte_len: 3 },
                 NormalizedEvent::ToolCall {
                     name: "Bash".to_string(),
                     input_hash: input_hash("{\"command\":\"ls\"}"),
@@ -2483,6 +2588,7 @@ mod tests {
             parse_events(jsonl),
             vec![
                 NormalizedEvent::TurnStart { at_ms: turn_at },
+                NormalizedEvent::UserText { byte_len: 2 },
                 NormalizedEvent::AssistantFirstText { at_ms: msg_at },
                 NormalizedEvent::AssistantFinal {
                     text: "[zirv] hi".to_string(),
@@ -2509,6 +2615,10 @@ mod tests {
             parse_events(jsonl),
             vec![
                 NormalizedEvent::ToolResult { is_error: false },
+                NormalizedEvent::ToolResultSize {
+                    byte_len: 2,
+                    content_hash: input_hash("ok"),
+                },
                 NormalizedEvent::ToolResultTimestamp { at_ms: at },
             ]
         );
@@ -2643,7 +2753,10 @@ mod tests {
         );
         assert_eq!(
             parse_events(jsonl),
-            vec![NormalizedEvent::TurnStart { at_ms: None }]
+            vec![
+                NormalizedEvent::TurnStart { at_ms: None },
+                NormalizedEvent::UserText { byte_len: 11 },
+            ]
         );
     }
 

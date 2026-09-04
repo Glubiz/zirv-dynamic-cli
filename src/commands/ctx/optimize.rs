@@ -5261,6 +5261,7 @@ mod tests {
             },
             context_tokens: 120_000,
             model_change: None,
+            window_breakdown: None,
         }
     }
 

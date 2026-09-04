@@ -56,6 +56,12 @@ pub const EXIT_ACCOUNT_EXHAUSTED: i32 = 79;
 /// code above it IS retryable: the same delegation typically succeeds once
 /// the other writer finishes, or immediately with `--worktree`.
 pub const EXIT_WRITER_BUSY: i32 = 80;
+/// Issue #310 (3a): the progress clock latched, one steering nudge got no
+/// observed progress within the grace period, and the restart budget is
+/// spent -- distinct from `EXIT_TIMEOUT`/`EXIT_ROT_EXHAUSTED` so the
+/// restart-chain breaker (3b) can count this as its own `stalled` failure
+/// class rather than folding it into `crash`.
+pub const EXIT_STALLED: i32 = 81;
 
 /// The supervisor reports its own outcomes through the same `i32` an agent's
 /// exit code arrives on, so "exited with code 75" reads as something the
@@ -82,6 +88,10 @@ pub fn describe_exit(code: i32) -> String {
         EXIT_WRITER_BUSY => {
             "another writing worker already holds this checkout; retry once it finishes, or \
              pass --worktree for an isolated one"
+                .to_string()
+        }
+        EXIT_STALLED => {
+            "no progress was observed after a steering nudge and the restart budget ran out"
                 .to_string()
         }
         other => format!("exited with code {other}"),
@@ -1439,6 +1449,10 @@ fn run_with_clock_inner<W: Write>(
 
         // C3: reset below whenever this run reported a turn of its own.
         let mut progressed = false;
+        // Issue #310 (3a): fresh per iteration, like `rotted`/`limit_hit`
+        // above -- a restart mints a fresh child, so its own stall clock
+        // starts over along with it.
+        let mut stalled = false;
         let outcome = supervise_run(
             &mut child,
             Instant::now() + timeout,
@@ -1472,6 +1486,12 @@ fn run_with_clock_inner<W: Write>(
             prior_tool_calls,
             &mut budget_soft_warned,
             &mut budget_exhausted,
+            repo,
+            cfg.mail.enabled,
+            Duration::from_secs(cfg.supervise.idle_no_tool_secs),
+            Duration::from_secs(cfg.supervise.in_tool_secs),
+            Duration::from_secs(cfg.supervise.stall_grace_secs),
+            &mut stalled,
         )?;
 
         if budget_exhausted {
@@ -2391,6 +2411,8 @@ fn run_with_clock_inner<W: Write>(
 
         let reason = if capacity_exit {
             "capacity"
+        } else if stalled {
+            "stalled"
         } else if rotted {
             "rot"
         } else {
@@ -2398,6 +2420,8 @@ fn run_with_clock_inner<W: Write>(
         };
         let exhausted_code = if capacity_exit {
             EXIT_CAPACITY_EXHAUSTED
+        } else if stalled {
+            EXIT_STALLED
         } else if rotted {
             EXIT_ROT_EXHAUSTED
         } else {
@@ -2448,6 +2472,67 @@ fn run_with_clock_inner<W: Write>(
             session_guard.release();
             return Ok(exhausted_code);
         };
+
+        // Issue #310 (3b): chain this boot across process boundaries BEFORE
+        // deciding whether this process's own `max_restarts` allows another
+        // one -- a tripped chain must give up even when this single
+        // invocation's own budget still has room, since the whole point is
+        // to catch a pattern that keeps recurring across separate
+        // `exec`/`loop` launches, not just within one of them. A usage-limit
+        // ("capacity") boot and a stall-detected one each get their own
+        // class, so neither ever spends the plain `crash` budget "rot"/
+        // "timeout" restarts do (issue #227).
+        let failure_class = match reason {
+            "capacity" => super::chain::FailureClass::UsageLimit,
+            "stalled" => super::chain::FailureClass::Stalled,
+            _ => super::chain::FailureClass::Crash,
+        };
+        let chain_key = super::state::repo_slug(repo);
+        if let super::chain::ChainVerdict::Tripped { boots } =
+            super::chain::record_boot_and_evaluate(
+                &state,
+                &chain_key,
+                failure_class,
+                false,
+                now_secs(),
+                cfg.supervise.chain_max_restarts,
+                cfg.supervise.chain_max_gap_secs,
+            )
+        {
+            let _ = log::append(
+                &state,
+                &log::Decision {
+                    ts: now_secs(),
+                    session: session.as_str(),
+                    verb: "exec",
+                    verdict: reason,
+                    score: 0,
+                    action: "chain-tripped",
+                    detail: &format!(
+                        "{boots} unplanned {reason} respawns within the configured gap; not \
+                         auto-resuming"
+                    ),
+                    observed_at: None,
+                },
+            );
+            writeln!(
+                w,
+                "zirv ctx exec: restart-chain breaker tripped ({boots} {reason} respawns within \
+                 the configured gap); not auto-resuming -- run `zirv ctx status` (exit \
+                 {exhausted_code})"
+            )?;
+            record_execution_segment(
+                report,
+                adapter.as_ref(),
+                &session,
+                &transcript,
+                &prior_usage,
+                execution_model.as_deref(),
+                execution_started,
+            );
+            session_guard.release();
+            return Ok(exhausted_code);
+        }
 
         if restarts >= max_restarts {
             let _ = log::append(
@@ -2839,6 +2924,21 @@ fn supervise_run(
     prior_tool_calls: u32,
     soft_warned: &mut bool,
     budget_exhausted: &mut bool,
+    // Issue #310 (3a): progress-clock inputs and the once-only stall latch.
+    // `repo`/`mail_enabled` feed the mail-activity progress signal
+    // (`mail::unread_counts`); the three durations are `cfg.supervise.
+    // {idle_no_tool,in_tool,stall_grace}_secs`, read once by the caller so
+    // this function -- like every other decision seam in this module --
+    // never reads `cfg` itself. `stalled` mirrors `rotted` above: set the
+    // instant the grace period elapses with no observed progress, so the
+    // caller's own `reason`/chain-recording logic can tell this restart
+    // apart from an ordinary rot/timeout one.
+    repo: &Path,
+    mail_enabled: bool,
+    idle_no_tool: Duration,
+    in_tool: Duration,
+    stall_grace: Duration,
+    stalled: &mut bool,
 ) -> CtxResult<Outcome> {
     // Issue #203: `evaluate_worker_budget` reads the transcript fresh on
     // every tick, so it can see a `HardStop` the instant the child's last
@@ -2856,14 +2956,21 @@ fn supervise_run(
     // Only a child still alive on the SECOND consecutive `HardStop` tick is
     // actually killed for budget.
     let mut budget_grace_given = false;
+    // Issue #310 (3a): the progress clock for this one boot -- fresh per
+    // `supervise_run` call, the same "a restart mints a fresh child, so its
+    // own clock starts over" reasoning `budget_grace_given`/`compact_budget`
+    // already follow. `last_mail_activity` is the previous tick's own mail
+    // reading, so a CHANGE (new mail arrived, or was consumed) is what
+    // counts as the mail signal advancing, not merely mail existing.
+    let mut stall_signals = super::stall::ProgressSignals::new(Instant::now());
+    let mut stall_latch: Option<super::stall::StallLatch> = None;
+    let mut last_mail_activity: Option<(usize, usize)> = None;
     let mut tick = || {
-        if pace::scan_for_limit(
-            &tap.try_lines(),
-            state,
-            session,
-            "exec",
-            &mut std::io::stderr(),
-        ) {
+        let lines = tap.try_lines();
+        if !lines.is_empty() {
+            stall_signals.last_output = Some(Instant::now());
+        }
+        if pace::scan_for_limit(&lines, state, session, "exec", &mut std::io::stderr()) {
             let now = now_secs();
             match pace::confirm_limit_hit(state, pace_cfg, now, adapter.provider()) {
                 pace::LimitConfirmation::Confirmed { detail } => {
@@ -2894,6 +3001,9 @@ fn supervise_run(
             if received.session_id == session {
                 *progressed = true;
                 compact_budget.observe_progress();
+                // Issue #310 (3a): a turn boundary is exactly the progress
+                // clock's own turn-signal channel.
+                stall_signals.last_turn = Some(Instant::now());
                 // Issue #281: this session's own turn just reached a clean
                 // boundary -- see this parameter's own doc comment.
                 session_guard.clear_in_flight();
@@ -2944,6 +3054,79 @@ fn supervise_run(
                 },
             );
             return Tick::Continue;
+        }
+        // Issue #310 (3a): mail activity is the progress clock's third
+        // channel -- a CHANGE in the unread counts (new mail arrived, or was
+        // just consumed by the nudge check above) counts as progress, not
+        // merely mail existing.
+        let mail_activity =
+            super::mail::unread_counts(state, repo, adapter.name(), registry_short, mail_enabled);
+        if mail_activity != last_mail_activity {
+            stall_signals.last_mail = Some(Instant::now());
+            last_mail_activity = mail_activity;
+        }
+        match super::stall::decide(
+            stall_latch,
+            &stall_signals,
+            // exec.rs has no live tool-call boundary tracking yet
+            // (`IncrementalScorer` does not expose its parsed events), so
+            // this always applies the LONGER `in_tool` threshold -- the
+            // conservative direction: it only ever grows the fuse for a
+            // session that might genuinely be idle-thinking, never shortens
+            // it below what a legitimate long-running tool call could need.
+            super::stall::ToolState::InTool,
+            Instant::now(),
+            idle_no_tool,
+            in_tool,
+            stall_grace,
+        ) {
+            super::stall::StallAction::Continue => {}
+            super::stall::StallAction::ClearLatch => {
+                stall_latch = None;
+                super::sessions::clear_stall_marker(state, registry_short);
+            }
+            super::stall::StallAction::LatchAndNudge => {
+                let baseline = stall_signals.baseline();
+                stall_latch = Some(super::stall::StallLatch {
+                    latched_at: Instant::now(),
+                    baseline_at_latch: baseline,
+                });
+                super::sessions::write_stall_marker(state, registry_short, now_secs());
+                let idle_secs = Instant::now().saturating_duration_since(baseline).as_secs();
+                announcer.emit(&super::announce::Event::Stalled { idle_secs });
+                let _ = log::append(
+                    state,
+                    &log::Decision {
+                        ts: now_secs(),
+                        session,
+                        verb: "exec",
+                        verdict: "n/a",
+                        score: 0,
+                        action: "stall-nudge",
+                        detail: "no progress observed; latching and sending a steering nudge",
+                        observed_at: None,
+                    },
+                );
+            }
+            super::stall::StallAction::AwaitGrace => {}
+            super::stall::StallAction::Terminate => {
+                *stalled = true;
+                super::sessions::clear_stall_marker(state, registry_short);
+                let _ = log::append(
+                    state,
+                    &log::Decision {
+                        ts: now_secs(),
+                        session,
+                        verb: "exec",
+                        verdict: "n/a",
+                        score: 0,
+                        action: "stall-terminate",
+                        detail: "grace period elapsed with no observed progress",
+                        observed_at: None,
+                    },
+                );
+                return Tick::Stop("stalled");
+            }
         }
         // Issue #155, Phase 5(d): `evaluate_worker_budget` itself skips the
         // transcript read entirely when no ceiling is configured (every

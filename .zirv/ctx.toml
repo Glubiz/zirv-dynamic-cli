@@ -35,9 +35,13 @@ model = "fable"
 # claude = "opus"                   # code-review model for a claude harness. Default: unset (one tier below the orchestrator seat's model on claude's ladder -- see AgentAdapter::review_model_below).
 # codex = "gpt-5.6-terra"           # code-review model for a codex harness. Default: unset (one tier below the seat on codex's own ladder).
 
-# [worker]                          # every key below is REPO-FORBIDDEN (ZIRV_CTX_WORKER_MODEL_CLAUDE / ZIRV_CTX_WORKER_MODEL_CODEX)
+# [worker]                          # claude/codex/default_depth/default_read_only below are REPO-FORBIDDEN; max_depth/deny_network may only be NARROWED by a repo layer (issue #262)
 # claude = "opus"                   # model for a delegated headless claude worker (`zirv ctx agent`, and the dashboard's own spawn-request pane). Default: unset (claude's own hard default "sonnet" -- see AgentAdapter::default_worker_model).
 # codex = "gpt-5.6-terra"           # model for a delegated headless codex worker. Default: unset (codex has no adapter-owned default, so its own CLI/config default applies).
+# default_depth = 1                 # REPO-FORBIDDEN (ZIRV_CTX_WORKER_DEFAULT_DEPTH): hops of further `zirv agent` delegation a ROOT session's envelope starts with. Default: 1.
+# default_read_only = false         # REPO-FORBIDDEN (ZIRV_CTX_WORKER_DEFAULT_READ_ONLY): whether a ROOT session's envelope starts read-only when `--mode` is unstated. Default: false.
+# max_depth = 255                   # narrow-only (a repo layer may only LOWER this): operator ceiling on any envelope's delegation_depth. Default: 255 (no extra cap beyond default_depth).
+# deny_network = false              # narrow-only (a repo layer may only turn this ON): denies network tools for every envelope computed in this repo. Default: false.
 
 # [handover.claude]                 # every key below is REPO-FORBIDDEN (ZIRV_CTX_HANDOVER_CLAUDE_CHEAP / _STANDARD / _DEEP) -- model-id override for `zirv ctx handover`'s generic tiers on a claude target.
 # cheap = "haiku"                   # Default: unset (built-in ladder default "haiku").
@@ -84,6 +88,11 @@ model = "fable"
 # max_heavy_operations = 1           # REPO-FORBIDDEN (ZIRV_CTX_SUPERVISE_MAX_HEAVY_OPERATIONS): machine-wide cap on concurrent heavy commands (issue #155, replacing #133's max_heavy_workers)
 # max_heavy_workers = 1              # DEPRECATED alias for max_heavy_operations. REPO-FORBIDDEN (ZIRV_CTX_SUPERVISE_MAX_HEAVY_WORKERS)
 # max_writers = 1                    # REPO-FORBIDDEN (ZIRV_CTX_SUPERVISE_MAX_WRITERS): machine-wide cap on concurrent writing-mode delegated workers, one per checkout (issue #267)
+# idle_no_tool_secs = 450            # REPO-FORBIDDEN (ZIRV_CTX_SUPERVISE_IDLE_NO_TOOL_SECS): no PTY output/transcript growth/mail activity for this long while idle latches `stalled` (issue #310)
+# in_tool_secs = 1200                # REPO-FORBIDDEN (ZIRV_CTX_SUPERVISE_IN_TOOL_SECS): same progress clock, applied while inside a tool call (issue #310)
+# stall_grace_secs = 120             # REPO-FORBIDDEN (ZIRV_CTX_SUPERVISE_STALL_GRACE_SECS): time a steering nudge gets before a stalled session is terminated (issue #310)
+# chain_max_restarts = 3             # REPO-FORBIDDEN (ZIRV_CTX_SUPERVISE_CHAIN_MAX_RESTARTS): unplanned same-class respawns across process boundaries before the restart-chain breaker trips (issue #310)
+# chain_max_gap_secs = 300           # REPO-FORBIDDEN (ZIRV_CTX_SUPERVISE_CHAIN_MAX_GAP_SECS): max gap between chained respawns still counted toward the breaker (issue #310)
 
 # [handoff]
 # model = "haiku"                    # REPO-FORBIDDEN (ZIRV_CTX_MODEL): distiller/judgment model override. Default: unset (adapter decides).
@@ -117,6 +126,10 @@ model = "fable"
 # [price]                             # every key below is REPO-FORBIDDEN
 # stale_after_days = 90              # REPO-FORBIDDEN (ZIRV_CTX_PRICE_STALE_AFTER_DAYS): a price table older than this renders every cost line as "~$x (prices as of ...)" rather than a plain figure. Default: 90.
 # table_path = "~/.zirv/prices.toml" # REPO-FORBIDDEN (ZIRV_CTX_PRICE_TABLE_PATH): operator override path for the price table. Default: unset (built-in table, merged with ~/.zirv/prices.toml when present).
+
+# [compact_advisory]
+# min_reclaim_tokens = 4096           # stale tool-result tokens must exceed this before the reclaim-gated /compact advisory even considers firing (ZIRV_CTX_COMPACT_ADVISORY_MIN_RECLAIM_TOKENS). Default: 4096.
+# window_fraction = 0.6               # AND the window must exceed this fraction of the model's context window (ZIRV_CTX_COMPACT_ADVISORY_WINDOW_FRACTION). Default: 0.6.
 
 # [optimize]
 # enabled = true                     # whether the Stop hook may queue an "optimize recommended" entry
@@ -207,6 +220,9 @@ model = "fable"
 
 # [report]
 # repository = "owner/repository"    # REPO-FORBIDDEN (ZIRV_CTX_REPORT_REPOSITORY): destination for workflow-maintain incidents only. The ordinary report command keeps its fixed Zirv repository default.
+
+# [search]
+# max_output_bytes = 2048            # REPO-FORBIDDEN (ZIRV_CTX_SEARCH_MAX_OUTPUT_BYTES): cap on one rendered `zirv ctx search`/`--session --around` window. Default: 2048.
 
 # [policy]                           # zirv's own canonical permissions policy (src/commands/ctx/policy.rs).
 # Not REPO-FORBIDDEN, and the ONE table here that does NOT deep-merge:
