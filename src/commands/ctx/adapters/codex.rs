@@ -75,24 +75,34 @@ use super::{AgentAdapter, ResolvedProgram, TurnSignalSetup};
 /// Native-subagent-first framing, model-tier discipline and the
 /// sub-orchestrator carve-out are unchanged. See
 /// `docs/superpowers/specs/2026-09-01-wrapper-behaviour-redesign.md`.
+///
+/// Issues #328/#334 (2026-09-04): mirrors the same fix now applied to
+/// `claude::ORCHESTRATOR_PROMPT` -- the "trivial and bounded changes stay on
+/// this seat" carve-out is gone, because it let an orchestrator seat
+/// implement small changes itself. Codex has no PreToolUse-equivalent hook
+/// to enforce this mechanically, so here the never-implement rule is
+/// prompt-only. Task size now only decides how many worker subagents and how
+/// large a brief, never whether this seat implements.
 pub const ORCHESTRATOR_PROMPT: &str = "\
 zirv orchestrator conventions (codex)
 
 This seat runs the top tier; spend it on judgment -- sizing, design choices, integration, the \
-final call -- not on ceremony.
+final call -- never on implementation.
 
-- Trivial and bounded changes stay on this seat: a brief costs more than the fix. Delegate when \
-the work is larger than its brief or can run in parallel. Native codex subagent threads \
-(worker/explorer roles) are the primary path inside this repo, each pinned to the cheapest \
-fitting tier -- the smallest tier for mechanical and bulk work (currently gpt-5.6-luna), a mid \
-tier for ordinary exploration, implementation and tests (currently gpt-5.6-terra), this seat's \
-own tier only for hard debugging and design. Never spawn a subagent without an explicit cheaper \
-model unless the operator's `[agents] default_subagent_model` names one; an omitted model \
-inherits this seat. `zirv agent <name> \"<prompt>\" -- --model <m>` is the route for \
-cross-harness work and the fallback when native subagents are unavailable or off (`[agents] \
-enabled = false`). Reserve a sub-orchestrator (`zirv ctx agent --role sub-orchestrator --scope \
-\"<area>\"`) for work that splits into several coherently-scoped areas each needing its own \
-coordination.
+- This seat coordinates; it does not implement. Every repository change -- code, tests, docs, \
+manifests, a one-line fix included -- is made by a delegated worker, never by this seat's own \
+edits or shell writes. Size the task only to decide how many workers and how large a brief.
+- Delegation inside this harness uses native codex subagent threads (worker/explorer roles), \
+each pinned to the cheapest fitting tier -- the smallest tier for mechanical and bulk work \
+(currently gpt-5.6-luna), a mid tier for ordinary exploration, implementation and tests \
+(currently gpt-5.6-terra), this seat's own tier only for hard debugging and design. Never spawn \
+a subagent without an explicit cheaper model unless the operator's `[agents] \
+default_subagent_model` names one; an omitted model inherits this seat. `zirv agent <name> \
+\"<prompt>\" -- --model <m>` exists to reach a DIFFERENT harness and is refused for your own \
+harness from this seat, except as the fallback when native subagents are off (`[agents] \
+enabled = false`; pass --force); `zirv ctx agent --role sub-orchestrator --scope \"<area>\"` \
+creates a work group for work that splits into several coherently-scoped areas each needing its \
+own coordination.
 - Bundle small related items into one checklist brief with a per-item output format; continue a \
 worker you already briefed for follow-ups in its area instead of spawning a fresh one.
 - Briefs are self-contained -- goal, constraints, relevant paths, exact output format -- and \
@@ -105,7 +115,9 @@ diff, one focused test per behaviour change, format, lint and test before report
 - Reviews follow the meta-harness rule: in proportion, once. You own the final integration: \
 resolve conflicts between worker outputs and report outcomes, including failures, plainly.
 - Shared manifests and lockfiles (Cargo.toml, Cargo.lock, package.json, lockfiles) are edited \
-only by you or one designated integrator; a writer touching one says so in its report.";
+by ONE designated integrator worker; a writer touching one says so in its report. Git \
+integration -- branching, merging worker results, committing, opening the PR -- stays on this \
+seat.";
 
 /// Codex's own layer for a delegated **Worker** session (see
 /// `AgentAdapter::worker_system_prompt`), spliced in place of
@@ -2231,7 +2243,7 @@ mod tests {
              {ORCHESTRATOR_PROMPT}"
         );
         assert!(
-            ORCHESTRATOR_PROMPT.contains("cross-harness")
+            ORCHESTRATOR_PROMPT.contains("DIFFERENT harness")
                 && ORCHESTRATOR_PROMPT.contains("[agents] enabled = false"),
             "zirv agent's role must be scoped to cross-harness work and the disabled-subagents \
              fallback, not the default in-repo path: {ORCHESTRATOR_PROMPT}"
@@ -2263,8 +2275,8 @@ mod tests {
              {ORCHESTRATOR_PROMPT}"
         );
         assert!(
-            ORCHESTRATOR_PROMPT.contains("Trivial and bounded changes stay on this seat"),
-            "small/trivial tasks must be exempt from forced delegation: {ORCHESTRATOR_PROMPT}"
+            ORCHESTRATOR_PROMPT.contains("it does not implement"),
+            "an orchestrator seat never implements, regardless of task size: {ORCHESTRATOR_PROMPT}"
         );
         assert!(
             !ORCHESTRATOR_PROMPT.contains("haiku") && !ORCHESTRATOR_PROMPT.contains("sonnet"),
@@ -2278,16 +2290,23 @@ mod tests {
     /// sub-orchestrator is reserved for work that genuinely splits into
     /// multiple coherently-scoped areas or must run under zirv's own
     /// supervision independently of this seat.
+    ///
+    /// Issues #328/#334: task size no longer decides WHETHER this seat
+    /// delegates -- it never implements, size only decides how many workers
+    /// and how large a brief -- so the old "stay on this seat" marker is
+    /// gone; `the_codex_orchestrator_layer_names_its_own_delegation_route_
+    /// and_tiers` already covers the "it does not implement" replacement, so
+    /// this test keeps only the assertions specific to sub-orchestrator
+    /// sizing.
     #[test]
     fn the_orchestrator_prompt_sizes_delegation_between_subagents_and_sub_orchestrators() {
         assert!(
-            ORCHESTRATOR_PROMPT.contains("Native codex subagent threads"),
+            ORCHESTRATOR_PROMPT.contains("native codex subagent threads"),
             "got:\n{ORCHESTRATOR_PROMPT}"
         );
         assert!(
-            ORCHESTRATOR_PROMPT.contains("Trivial and bounded changes stay on this seat"),
-            "trivial and bounded work must stay on this seat instead of delegating: \
-             {ORCHESTRATOR_PROMPT}"
+            ORCHESTRATOR_PROMPT.contains("it does not implement"),
+            "an orchestrator seat never implements, regardless of task size: {ORCHESTRATOR_PROMPT}"
         );
         assert!(
             ORCHESTRATOR_PROMPT.contains("zirv ctx agent --role sub-orchestrator --scope"),
@@ -2308,7 +2327,7 @@ mod tests {
     fn the_codex_worker_and_sub_orchestrator_layers_do_not_gain_the_sizing_rule() {
         for layer in [WORKER_PROMPT, SUB_ORCHESTRATOR_PROMPT] {
             assert!(
-                !layer.contains("Trivial and bounded changes stay on this seat"),
+                !layer.contains("it does not implement"),
                 "only the orchestrator layer decides delegation shape: {layer}"
             );
         }
