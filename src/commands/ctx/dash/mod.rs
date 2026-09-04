@@ -1362,23 +1362,27 @@ fn enforce_pane_token_budgets(
 }
 
 fn account_reaped_pane_spend(pane: &Pane, cfg: &CtxConfig, state: &StateDir, repo: &Path) {
-    let Some(group_id) = pane.work_group_id() else {
-        return;
-    };
     let Some(usage) = pane_transcript_usage(pane, cfg, repo) else {
         return;
     };
-    // Issue #301: `pane.budget_tokens()` is exactly the ceiling `admit_child`
-    // reserved for this pane at spawn time (`fulfill_spawn_request` sets
-    // both from the same `admit_child` result), so settling here always
-    // releases exactly what was reserved.
-    let reserved = pane.budget_tokens().unwrap_or(0);
-    let _ = super::group::settle_reservation(
-        state,
-        group_id,
-        reserved,
-        super::agent::token_spend(&usage),
-    );
+    let actual = super::agent::token_spend(&usage);
+    if let Some(group_id) = pane.work_group_id() {
+        // Issue #301: `pane.budget_tokens()` is exactly the ceiling
+        // `admit_child` reserved for this pane at spawn time
+        // (`fulfill_spawn_request` sets both from the same `admit_child`
+        // result), so settling here always releases exactly what was
+        // reserved.
+        let reserved = pane.budget_tokens().unwrap_or(0);
+        let _ = super::group::settle_reservation(state, group_id, reserved, actual);
+    }
+    // Issue #358 (task T3): the provider-level reservation `fulfill_spawn_
+    // request` took for this pane, regardless of whether it also belonged
+    // to a work group -- settled with the same actual spend just computed
+    // above, mirroring `agent::run_with`'s own headless completion path.
+    if let Some(reservation_id) = pane.reservation_id() {
+        let provider = adapters::provider_for_agent_name(Some(pane.agent()));
+        let _ = super::reservation::settle(state, provider, reservation_id, actual);
+    }
 }
 
 /// Pure: `selected` after `new_pane_count - old_pane_count` panes were
@@ -3917,6 +3921,37 @@ fn fulfill_spawn_request(
     } else {
         req.budget_tokens
     };
+    let session_id = SessionId::new_v4().to_string();
+    let registry_short = sessions::short_id(&session_id);
+    let slug = super::state::repo_slug(repo);
+
+    // Issue #358 (task T3): the pane-side mirror of `agent::run_with`'s own
+    // provider reservation -- a durable, per-PROVIDER ledger entry for this
+    // pane's own token ceiling, independent of `req.work_group_id`'s own
+    // `reserved_tokens` (which protects one group's budget, not a
+    // provider's machine-wide outstanding total). Released via
+    // `reservation::release` by `rollback_admission` below on every
+    // pre-spawn refusal, or settled via `reservation::settle` once the
+    // pane's own child actually exits (`account_reaped_pane_spend`).
+    // Best-effort, like every other ledger write in this codebase: a ledger
+    // error must never refuse a spawn this dashboard already admitted.
+    let reservation_id = match super::reservation::reserve(
+        state,
+        adapter.provider(),
+        &session_id,
+        budget_tokens.unwrap_or(0),
+        now,
+    ) {
+        Ok(reservation) => Some(reservation.id),
+        Err(e) => {
+            eprintln!(
+                "zirv ctx dash: failed to record a token reservation for provider '{}': {e}",
+                adapter.provider()
+            );
+            None
+        }
+    };
+
     // Re-review (2026-08-27) finding 1: from here on, `req.work_group_id`
     // (if any) has genuinely been admitted -- every remaining fallible step
     // between here and the pane actually spawning must roll that admission
@@ -3926,16 +3961,16 @@ fn fulfill_spawn_request(
     // its reservation forever. Best-effort, like `rollback_admission`
     // itself: never shadows the real refusal being returned. `budget_tokens`
     // is exactly the ceiling `admit_child` just reserved (or `None` if it
-    // reserved nothing), so releasing it here always matches.
+    // reserved nothing), so releasing it here always matches. Issue #358:
+    // the provider-level reservation just above rolls back the same way.
     let rollback_admission = || {
         if let Some(group_id) = &req.work_group_id {
             super::group::rollback_admission(state, group_id, budget_tokens.unwrap_or(0));
         }
+        if let Some(reservation_id) = &reservation_id {
+            let _ = super::reservation::release(state, adapter.provider(), reservation_id);
+        }
     };
-
-    let session_id = SessionId::new_v4().to_string();
-    let registry_short = sessions::short_id(&session_id);
-    let slug = super::state::repo_slug(repo);
 
     // Issue #264 (EXTRA, Track A residual): `req.mode` used to travel on
     // `SpawnRequest` for data parity only (see that field's own doc comment)
@@ -4248,6 +4283,7 @@ fn fulfill_spawn_request(
     pane.set_intake_dir(pane_channel);
     pane.set_work_group_id(req.work_group_id.clone());
     pane.set_budget_tokens(budget_tokens);
+    pane.set_reservation_id(reservation_id.clone());
     // Issue #249: the same server-verified value just pushed into this
     // pane's own `turn_env` above, stored here too so this dashboard's own
     // in-process mail sweep (`sweep_one_pane`, which never spawns a new OS

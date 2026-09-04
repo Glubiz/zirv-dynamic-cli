@@ -3088,6 +3088,33 @@ pub fn run_with<W: Write>(
             return Err(e);
         }
     };
+    // Issue #358 (task T3): a durable, per-PROVIDER reservation of this
+    // delegation's own token ceiling, independent of `--group`'s own
+    // `reserved_tokens` (which protects one group's budget, not a
+    // provider's machine-wide outstanding total) -- released via
+    // `reservation::release` on every failure path between here and a
+    // genuinely running child, or settled via `reservation::settle` once
+    // the delegation actually completes, mirroring `reserved_ceiling`'s own
+    // reserve/rollback/settle lifecycle exactly. Best-effort like every
+    // other ledger write in this codebase (`group::rollback_admission`'s own
+    // doc comment): a ledger error must never abort a launch this session
+    // already committed to.
+    let reservation_id = match super::reservation::reserve(
+        &state,
+        provider,
+        &worker_session,
+        worker_budget.tokens.unwrap_or(0),
+        super::state::now_secs(),
+    ) {
+        Ok(reservation) => Some(reservation.id),
+        Err(e) => {
+            eprintln!(
+                "zirv ctx agent: failed to record a token reservation for provider \
+                 '{provider}': {e}"
+            );
+            None
+        }
+    };
 
     // Issue #262: this worker's own delegation envelope, computed by
     // narrowing `parent_envelope` against what THIS delegation is asking
@@ -3213,6 +3240,10 @@ pub fn run_with<W: Write>(
         // model/writable-root argv the original headless launch did.
         command: command.clone(),
         simple: false,
+        // Issue #358 (task T3): carried through so `exec.rs`'s own
+        // harness-handover restart can move it to the new provider mid-run
+        // -- see `ExecArgs::reservation_id`'s own doc comment.
+        reservation_id: reservation_id.clone(),
     };
 
     announcer.emit(&Event::DelegatedStart {
@@ -3232,6 +3263,9 @@ pub fn run_with<W: Write>(
         Err(e) => {
             if let Some(id) = &args.group {
                 super::group::rollback_admission(&state, id, reserved_ceiling.unwrap_or(0));
+            }
+            if let Some(reservation_id) = &reservation_id {
+                let _ = super::reservation::release(&state, provider, reservation_id);
             }
             // Finding 4: with the admission rolled back the group is pristine
             // again, so a group this invocation minted for a launch that
@@ -3561,6 +3595,14 @@ pub fn run_with<W: Write>(
                 &state_dir,
                 id,
                 reserved_ceiling.unwrap_or(0),
+                token_spend(&total),
+            );
+        }
+        if let Some(reservation_id) = &reservation_id {
+            let _ = super::reservation::settle(
+                &state_dir,
+                provider,
+                reservation_id,
                 token_spend(&total),
             );
         }
@@ -4850,6 +4892,44 @@ mod tests {
                 .admitted_children,
             0,
             "the failed delegation must not have permanently burned the group slot"
+        );
+    }
+
+    /// Issue #358 (task T3): the same failed launch above must also release
+    /// this delegation's own provider-level token reservation -- the pane-
+    /// less, headless-only mirror of `group::rollback_admission`'s own
+    /// group-slot rollback, written by `run_with` right after `resolve_
+    /// worker_budget` succeeds and released on the identical `exec::
+    /// run_with_report` failure path.
+    #[test]
+    fn a_failed_delegation_after_admission_releases_the_provider_reservation() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state_path = tmp.path().join("state");
+        let state = crate::commands::ctx::state::StateDir::from_root(state_path.clone());
+        crate::commands::ctx::group::create(&state, &sample_work_group("wg-1", 3, 0))
+            .expect("create group");
+
+        let env = base_env(&state_path);
+        let mut args = args_for("codex", "go");
+        args.group = Some("wg-1".to_string());
+        args.max_tool_calls = Some(5);
+
+        let mut out = Vec::new();
+        let err = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned())
+            .expect_err("codex + --max-tool-calls is refused by exec::run_with");
+        assert!(err.to_string().contains("--max-tool-calls"), "got {err}");
+
+        let provider = crate::commands::ctx::adapters::provider_for_agent_name(Some("codex"));
+        assert_eq!(
+            crate::commands::ctx::reservation::outstanding(&state, provider, 1_700_000_000),
+            0,
+            "the failed launch must have released its own provider reservation"
+        );
+        assert!(
+            crate::commands::ctx::reservation::entries(&state, provider).is_empty(),
+            "the released reservation must be gone from the ledger, not merely excluded"
         );
     }
 

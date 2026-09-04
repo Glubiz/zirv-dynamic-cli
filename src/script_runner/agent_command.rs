@@ -195,6 +195,11 @@ fn run_supervised(agent: &str, prompt: &str, flags: &[String], repo: &Path) -> R
         objective: None,
         command: flags.to_vec(),
         simple: false,
+        // No provider reservation either: this script `agent:` step never
+        // goes through `agent::run_with`'s own admission choke point (the
+        // only place issue #358's reservation ledger is written for a
+        // launch), so there is nothing to carry.
+        reservation_id: None,
     };
 
     let mut out = std::io::stdout();

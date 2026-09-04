@@ -154,6 +154,18 @@ pub struct ExecArgs {
     /// default. Supervision, pacing and hooks still apply.
     #[arg(long, default_value_t = false)]
     pub simple: bool,
+    /// NOT a CLI flag -- `#[arg(skip)]` always leaves this at its default
+    /// (`None`) on `zirv ctx exec`'s own command line, the same reasoning
+    /// `memory::RememberArgs::importance`'s own doc comment gives. Issue
+    /// #358 (task T3): the id of the calling delegation's own entry in
+    /// `reservation`'s per-provider ledger (`agent::run_with` sets it when
+    /// building this struct for a headless worker's launch), carried
+    /// through so a harness-handover restart, below, can release it against
+    /// the OLD provider and reserve a fresh one against the NEW provider it
+    /// is about to continue on -- `None` for a plain `zirv ctx exec` with no
+    /// delegation reservation of its own, which this never creates one for.
+    #[arg(skip)]
+    pub reservation_id: Option<String>,
 }
 
 /// One vendor-backed portion of a logical supervised execution. A cross-harness
@@ -2227,6 +2239,41 @@ fn run_with_clock_inner<W: Write>(
                     handoff::labeled_for_injection(&note)
                 );
                 let target = adapters::select(Some(&selected_agent), &[], &cfg)?;
+                // Issue #358 (task T3): this run's own token reservation, if
+                // any (`args.reservation_id`, set only when this is a
+                // delegated worker's launch -- see `ExecArgs::reservation_id`'s
+                // own doc comment), moves providers right here along with the
+                // harness itself: released against the OLD provider and
+                // re-reserved against the NEW one for the remaining token
+                // ceiling, so the per-provider ledger never keeps counting
+                // outstanding spend against a harness this run has already
+                // left. `None` when this run carries no reservation to begin
+                // with (a plain `zirv ctx exec` with no delegation) -- never
+                // minting one here that nothing downstream would ever settle.
+                // Best-effort, matching every other reservation write in this
+                // codebase: a ledger error must never block an otherwise-
+                // legitimate harness handover.
+                let mut reservation_id = None;
+                if let Some(old_id) = args.reservation_id.as_deref() {
+                    let _ = super::reservation::release(&state, adapter.provider(), old_id);
+                    reservation_id = match super::reservation::reserve(
+                        &state,
+                        target.provider(),
+                        session.as_str(),
+                        remaining_tokens.unwrap_or(0),
+                        now_fn(),
+                    ) {
+                        Ok(reservation) => Some(reservation.id),
+                        Err(e) => {
+                            eprintln!(
+                                "zirv ctx exec: failed to record a token reservation for \
+                                 provider '{}': {e}",
+                                target.provider()
+                            );
+                            None
+                        }
+                    };
+                }
                 let nested_args = ExecArgs {
                     agent: Some(selected_agent.clone()),
                     session_id: None,
@@ -2244,6 +2291,7 @@ fn run_with_clock_inner<W: Write>(
                     objective: None,
                     command: target.model_args(&selected_model),
                     simple: args.simple,
+                    reservation_id,
                 };
 
                 let mut next_visited = visited;
@@ -4007,6 +4055,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(60),
             simple: true,
+            reservation_id: None,
             command,
         };
         let mut out = Vec::new();
@@ -4043,6 +4092,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(60),
             simple: false,
+            reservation_id: None,
             command: fake_agent_command(session),
         };
         let mut out = Vec::new();
@@ -4090,6 +4140,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(60),
             simple: false,
+            reservation_id: None,
             command: fake_agent_command(session),
         };
         let mut out = Vec::new();
@@ -4137,6 +4188,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(60),
             simple: false,
+            reservation_id: None,
             command: fake_agent_command(session),
         };
         let mut out = Vec::new();
@@ -4173,6 +4225,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(60),
             simple: false,
+            reservation_id: None,
             command: fake_agent_command(session),
         };
         let mut out = Vec::new();
@@ -4235,6 +4288,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(60),
             simple: false,
+            reservation_id: None,
             command: fake_agent_command(session),
         };
         let mut out = Vec::new();
@@ -4320,6 +4374,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(60),
             simple: false,
+            reservation_id: None,
             command: fake_agent_command(session),
         };
         let mut out = Vec::new();
@@ -4375,6 +4430,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(60),
             simple: false,
+            reservation_id: None,
             command,
         };
         let mut out = Vec::new();
@@ -4429,6 +4485,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(60),
             simple: false,
+            reservation_id: None,
             command,
         };
         let mut out = Vec::new();
@@ -4478,6 +4535,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(60),
             simple: false,
+            reservation_id: None,
             command,
         };
         let mut out = Vec::new();
@@ -4513,6 +4571,7 @@ mod tests {
             objective: None,
             timeout_secs: None,
             simple: false,
+            reservation_id: None,
             command: Vec::new(),
         };
         let mut out = Vec::new();
@@ -4547,6 +4606,7 @@ mod tests {
             objective: None,
             timeout_secs: None,
             simple: false,
+            reservation_id: None,
             command: vec!["true".to_string()],
         };
         let mut out = Vec::new();
@@ -4722,6 +4782,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(60),
             simple: false,
+            reservation_id: None,
             command: fake_agent_command(session),
         };
         let mut out = Vec::new();
@@ -4787,6 +4848,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(60),
             simple: false,
+            reservation_id: None,
             command: fake_agent_command(session),
         };
         let mut out = Vec::new();
@@ -4838,6 +4900,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(60),
             simple: false,
+            reservation_id: None,
             command: fake_agent_command(session),
         };
         let mut out = Vec::new();
@@ -4896,6 +4959,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(1),
             simple: false,
+            reservation_id: None,
             command: fake_agent_command(session),
         };
         let started = std::time::Instant::now();
@@ -4949,6 +5013,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(30),
             simple: false,
+            reservation_id: None,
             command: fake_agent_command(session),
         };
         let started = std::time::Instant::now();
@@ -5005,6 +5070,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(30),
             simple: false,
+            reservation_id: None,
             command: fake_agent_command(session),
         };
         let mut out = Vec::new();
@@ -5049,6 +5115,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(30),
             simple: false,
+            reservation_id: None,
             command: fake_agent_command(session),
         };
         let mut out = Vec::new();
@@ -5091,6 +5158,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(30),
             simple: false,
+            reservation_id: None,
             command: fake_agent_command(session),
         };
         let mut out = Vec::new();
@@ -5131,6 +5199,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(30),
             simple: false,
+            reservation_id: None,
             command: vec!["codex".to_string(), "exec".to_string()],
         };
         let mut out = Vec::new();
@@ -5170,6 +5239,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(30),
             simple: false,
+            reservation_id: None,
             command: fake_agent_command(session),
         };
         let mut out = Vec::new();
@@ -5213,6 +5283,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(30),
             simple: false,
+            reservation_id: None,
             command,
         };
         let mut out = Vec::new();
@@ -5248,6 +5319,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(30),
             simple: false,
+            reservation_id: None,
             command: fake_agent_command(session),
         };
         let mut out = Vec::new();
@@ -5335,6 +5407,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(30),
             simple: false,
+            reservation_id: None,
             command: Vec::new(),
         };
         let mut out = Vec::new();
@@ -5399,6 +5472,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(30),
             simple: false,
+            reservation_id: None,
             command: Vec::new(),
         };
         let mut out = Vec::new();
@@ -5462,6 +5536,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(30),
             simple: false,
+            reservation_id: None,
             command: Vec::new(),
         };
         let clock = std::cell::Cell::new(crate::commands::ctx::state::now_secs());
@@ -5534,6 +5609,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(60),
             simple: false,
+            reservation_id: None,
             command: fake_agent_command(session),
         };
         let mut out = Vec::new();
@@ -5587,6 +5663,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(60),
             simple: false,
+            reservation_id: None,
             command: fake_agent_command(session),
         };
         let mut out = Vec::new();
@@ -5641,6 +5718,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(60),
             simple: false,
+            reservation_id: None,
             command: fake_agent_command(session),
         };
         let mut out = Vec::new();
@@ -5715,6 +5793,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(60),
             simple: false,
+            reservation_id: None,
             command: fake_agent_command(session),
         };
         let mut out = Vec::new();
@@ -5773,6 +5852,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(60),
             simple: false,
+            reservation_id: None,
             command: fake_agent_command(session),
         };
         let mut out = Vec::new();
@@ -5829,6 +5909,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(60),
             simple: false,
+            reservation_id: None,
             command: fake_agent_command(session),
         };
         let started = std::time::Instant::now();
@@ -5879,6 +5960,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(60),
             simple: false,
+            reservation_id: None,
             command: fake_agent_command(session),
         };
         let mut out = Vec::new();
@@ -5929,6 +6011,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(60),
             simple: false,
+            reservation_id: None,
             command: fake_agent_command(session),
         };
         let mut out = Vec::new();
@@ -6003,6 +6086,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(60),
             simple: false,
+            reservation_id: None,
             command: fake_agent_command(session),
         };
         let mut out = Vec::new();
@@ -6074,6 +6158,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(60),
             simple: false,
+            reservation_id: None,
             command,
         };
         let mut out = Vec::new();
@@ -6135,6 +6220,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(60),
             simple: false,
+            reservation_id: None,
             command: fake_agent_command(session),
         };
         let mut out = Vec::new();
@@ -6212,6 +6298,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(60),
             simple: false,
+            reservation_id: None,
             command: fake_agent_command(session),
         };
         let mut out = Vec::new();
@@ -6296,6 +6383,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(60),
             simple: false,
+            reservation_id: None,
             command: fake_agent_command(session),
         };
         let mut out = Vec::new();
@@ -6382,6 +6470,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(60),
             simple: false,
+            reservation_id: None,
             // No trailing command: zirv builds the launch itself
             // (`adapter_builds_launch`), which is the shape both
             // `zirv ctx agent codex <prompt>` and a bare `zirv ctx exec
@@ -6475,6 +6564,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(60),
             simple: true,
+            reservation_id: None,
             command: Vec::new(),
         };
         let mut out = Vec::new();
@@ -6547,6 +6637,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(60),
             simple: false,
+            reservation_id: None,
             command: vec![
                 "sh".to_string(),
                 fixture("fake-codex-agent.sh").display().to_string(),
@@ -6643,6 +6734,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(30),
             simple: false,
+            reservation_id: None,
             command: vec![
                 "sh".to_string(),
                 fixture("fake-codex-agent.sh").display().to_string(),
@@ -6751,6 +6843,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(30),
             simple: false,
+            reservation_id: None,
             command: vec![
                 "sh".to_string(),
                 fixture("fake-codex-agent.sh").display().to_string(),
@@ -6830,6 +6923,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(30),
             simple: true,
+            reservation_id: None,
             command: Vec::new(),
         };
         let mut out = Vec::new();
@@ -6899,6 +6993,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(30),
             simple: true,
+            reservation_id: None,
             command: Vec::new(),
         };
         let mut out = Vec::new();
@@ -7052,6 +7147,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(30),
             simple: false,
+            reservation_id: None,
             command: Vec::new(),
         };
         let mut out = Vec::new();
@@ -7123,6 +7219,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(60),
             simple: false,
+            reservation_id: None,
             command: fake_agent_command(session),
         };
         let mut out = Vec::new();
@@ -7196,6 +7293,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(60),
             simple: false,
+            reservation_id: None,
             command: fake_agent_command(session1),
         };
         let mut out1 = Vec::new();
@@ -7226,6 +7324,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(60),
             simple: false,
+            reservation_id: None,
             command: fake_agent_command(session2),
         };
         let mut out2 = Vec::new();
@@ -7290,6 +7389,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(60),
             simple: false,
+            reservation_id: None,
             command: fake_agent_command(session),
         };
         let mut out = Vec::new();
@@ -7349,6 +7449,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(60),
             simple: false,
+            reservation_id: None,
             // `adapters::select` still resolves and readies "claude" (via
             // `ZIRV_CTX_AGENT_BIN` in `base_env`, unaffected by this); only
             // the actual spawn of *this* program has to fail, deterministically
@@ -7425,6 +7526,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(60),
             simple: false,
+            reservation_id: None,
             command: fake_agent_command(session),
         };
         let mut out = Vec::new();
@@ -7473,6 +7575,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(60),
             simple: false,
+            reservation_id: None,
             command,
         };
         let mut out = Vec::new();
@@ -7534,6 +7637,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(60),
             simple: false,
+            reservation_id: None,
             command: fake_agent_command(session),
         };
         let mut out = Vec::new();
@@ -7740,6 +7844,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(30),
             simple: false,
+            reservation_id: None,
             command: fake_agent_command(session),
         };
         let mut out = Vec::new();
@@ -7825,6 +7930,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(30),
             simple: false,
+            reservation_id: None,
             command: fake_agent_command(session),
         };
         let mut out = Vec::new();
@@ -7902,6 +8008,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(30),
             simple: false,
+            reservation_id: None,
             command: fake_agent_command(session),
         };
         let mut out = Vec::new();
@@ -8001,6 +8108,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(30),
             simple: false,
+            reservation_id: None,
             command: fake_agent_command(session),
         };
         let mut out = Vec::new();
@@ -8107,6 +8215,7 @@ mod tests {
             // hanging the test forever.
             timeout_secs: Some(3),
             simple: false,
+            reservation_id: None,
             command: fake_agent_command(session),
         };
         let mut out = Vec::new();

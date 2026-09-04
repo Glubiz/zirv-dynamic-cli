@@ -811,6 +811,15 @@ pub struct Pane {
     /// this pane's transcript with the same `agent::budget_state` and
     /// one-tick hard-stop grace as the headless exec supervisor.
     budget_tokens: Option<u64>,
+    /// Issue #358 (task T3): the id of this pane's own entry in
+    /// `reservation`'s per-provider ledger, if the reservation write at
+    /// spawn time succeeded (best-effort, so `None` also covers a ledger
+    /// error that must never have refused the spawn itself). Settled by
+    /// `account_reaped_pane_spend` once this pane's own child exits, or
+    /// released by `fulfill_spawn_request`'s own `rollback_admission` on a
+    /// pre-spawn refusal -- the pane-side mirror of `work_group_id`'s own
+    /// reserve/settle lifecycle, just keyed by provider instead of group.
+    reservation_id: Option<String>,
     budget_soft_warned: bool,
     budget_grace_given: bool,
     /// Issue #249: this pane's own server-verified supervising session
@@ -1084,6 +1093,7 @@ impl Pane {
             intake_dir: None,
             work_group_id: None,
             budget_tokens: None,
+            reservation_id: None,
             budget_soft_warned: false,
             budget_grace_given: false,
             parent_session: None,
@@ -1577,6 +1587,20 @@ impl Pane {
 
     pub fn budget_tokens(&self) -> Option<u64> {
         self.budget_tokens
+    }
+
+    /// Issue #358 (task T3): records the provider-level token-reservation
+    /// ledger entry (`reservation::reserve`) `fulfill_spawn_request` took
+    /// for this pane at spawn time -- called right after `Pane::spawn`, the
+    /// same way [`Self::set_work_group_id`]/[`Self::set_budget_tokens`]
+    /// are, so `account_reaped_pane_spend` can settle it once this pane's
+    /// own child exits.
+    pub fn set_reservation_id(&mut self, id: Option<String>) {
+        self.reservation_id = id;
+    }
+
+    pub fn reservation_id(&self) -> Option<&str> {
+        self.reservation_id.as_deref()
     }
 
     /// Applies the pane's transcript usage to the same budget state machine

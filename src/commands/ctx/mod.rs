@@ -41,6 +41,7 @@ pub mod policy;
 pub mod poll;
 pub mod price;
 pub mod prompt;
+pub mod reservation;
 pub mod result_schema;
 pub mod resume;
 pub mod retrieval;

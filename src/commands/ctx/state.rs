@@ -443,6 +443,19 @@ impl StateDir {
         self.0.join("groups")
     }
 
+    /// `<state>/reservations/<provider-slug>.json` -- one ledger per provider
+    /// of expected token spend for admitted-but-unsettled delegated work
+    /// (issue #358, task T3). A sibling of `groups()`, not inside it: a work
+    /// group's own `reserved_tokens` tracks a ceiling per GROUP, while this
+    /// ledger tracks the same in-flight-spend idea per PROVIDER, across every
+    /// group and every ungrouped delegation, so a capacity snapshot can ask
+    /// "how much does this provider already owe, machine-wide" without
+    /// walking every group record. The slug is sanitised by [`provider_slug`],
+    /// mirroring [`Self::usage_for`].
+    pub fn reservations(&self) -> PathBuf {
+        self.0.join("reservations")
+    }
+
     /// Issue #319: worktree ownership records -- one append-only JSONL file
     /// per repository slug, `<state>/worktrees/<repo-slug>.jsonl`. See
     /// `super::worktree` for the record format and the "materialized by
@@ -1003,5 +1016,12 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(tmp.path().to_path_buf());
         assert_eq!(state.tasks(), tmp.path().join("tasks"));
+    }
+
+    #[test]
+    fn the_reservations_dir_hangs_off_the_state_root() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        assert_eq!(state.reservations(), tmp.path().join("reservations"));
     }
 }
