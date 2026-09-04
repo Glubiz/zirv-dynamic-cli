@@ -494,6 +494,21 @@ pub fn labeled_for_injection_with_working_set(
     out
 }
 
+/// Issue #317: appends one line per still-open task card (`task:<id> <state>
+/// -- <reason>`, `task::open_card_lines`) to `handoff.blocked`, keeping the
+/// v3 `Vec<String>` shape -- durable, real state alongside whatever the
+/// previous session's own transcript-distilled prose already said was
+/// blocking it. Best-effort: `open_card_lines` degrades to an empty list
+/// (never an error) when this repository has no task cards at all, so a
+/// repo that has never used `zirv ctx task` sees `handoff.to_markdown()`
+/// byte-for-byte unchanged.
+pub fn with_open_task_cards(mut handoff: Handoff, state: &StateDir, repo: &Path) -> Handoff {
+    handoff
+        .blocked
+        .extend(super::task::open_card_lines(state, repo));
+    handoff
+}
+
 fn strip_bullet(line: &str) -> Option<String> {
     let trimmed = line.trim();
     for prefix in ["- ", "* ", "+ "] {
@@ -1164,6 +1179,11 @@ pub fn run_with<W: Write>(
             previous.as_ref(),
         )
     };
+    // Issue #317: real, durable task-card state appended alongside whatever
+    // the distilled handoff itself wrote to `Blocked` -- a fresh
+    // orchestrator resuming from this handoff sees the actual open cards,
+    // not only the previous session's own prose.
+    let handoff = with_open_task_cards(handoff, &state, repo);
 
     if args.stdout {
         write!(w, "{}", handoff.to_markdown())?;
@@ -1950,6 +1970,69 @@ mod tests {
             .is_usable(),
             "a handoff with no next step is not something to stand on"
         );
+    }
+
+    /// Issue #317: `with_open_task_cards` appends one `task:<id> <state> --
+    /// <reason>` line per open card to the (already-distilled) `blocked`
+    /// list, keeping the v3 shape -- and leaves a handoff untouched when this
+    /// repository has no task cards at all.
+    #[test]
+    fn with_open_task_cards_appends_real_card_state_to_blocked() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir");
+        let repo_slug = super::super::state::repo_slug(&repo);
+        super::super::task::append_event(
+            &state,
+            &repo_slug,
+            &super::super::task::Event::Created {
+                id: "task-1".to_string(),
+                repo_slug: repo_slug.clone(),
+                title: "t".to_string(),
+                brief: "b".to_string(),
+                parents: Vec::new(),
+                group_id: None,
+                workdir: None,
+                at: 1,
+            },
+        )
+        .expect("create");
+        super::super::task::append_event(
+            &state,
+            &repo_slug,
+            &super::super::task::Event::Blocked {
+                id: "task-1".to_string(),
+                reason: "missing credential".to_string(),
+                by: "sess-1".to_string(),
+                at: 2,
+            },
+        )
+        .expect("block");
+
+        let handoff = Handoff {
+            blocked: vec!["a prose-authored blocker".to_string()],
+            ..Handoff::default()
+        };
+        let merged = with_open_task_cards(handoff, &state, &repo);
+        assert_eq!(merged.blocked[0], "a prose-authored blocker");
+        assert!(
+            merged.blocked[1].contains("task:task-1") && merged.blocked[1].contains("blocked"),
+            "got {:?}",
+            merged.blocked
+        );
+        assert!(merged.blocked[1].contains("missing credential"));
+    }
+
+    #[test]
+    fn with_open_task_cards_is_a_no_op_with_no_task_cards() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir");
+        let handoff = sample();
+        let merged = with_open_task_cards(handoff.clone(), &state, &repo);
+        assert_eq!(merged, handoff);
     }
 
     #[test]

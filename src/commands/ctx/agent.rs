@@ -218,6 +218,18 @@ pub struct AgentArgs {
     /// (`envelope::CannotGrow`), never silently clamped.
     #[arg(long)]
     pub depth: Option<u8>,
+    /// Issue #317: the durable task-card id (`zirv ctx task create`/`zirv ctx
+    /// swarm`) this delegation fulfils. Resolved and claimed before any
+    /// spawn -- refused, with nothing launched, when the card cannot be
+    /// claimed (unmet parents, or already running elsewhere under a live
+    /// claimant). Every parent card's own `outcome`, plus this card's
+    /// `brief`, are appended verbatim (labelled) after the operator's own
+    /// prompt text. On completion the card is marked `Done` from the actual
+    /// report-back (never a synthetic success just because the process
+    /// exited 0); a crash or an unvalidated report-back applies `task::
+    /// respawn_decision` instead of ever marking it `Done` silently.
+    #[arg(long)]
+    pub task: Option<String>,
 }
 
 /// `--attach-artifact`'s CLI spelling for `workflow::engine::ArtifactStage`.
@@ -1514,6 +1526,165 @@ fn attach_artifact_to_prompt(
     }
 }
 
+/// Issue #317: appends `--task`'s own brief plus every parent card's own
+/// `outcome` (labelled, verbatim) after the operator's own prompt text --
+/// same splice-point contract as [`attach_artifact_to_prompt`] immediately
+/// above (both forks of this delegation read the one `prompt` binding this
+/// returns). `Err` when `--task` names a card this repository has no record
+/// of: a worker sent off with no idea what its own card actually asked for
+/// would burn a whole run on a typo.
+fn attach_task_context_to_prompt(
+    args: &AgentArgs,
+    state: &super::state::StateDir,
+    repo: &Path,
+    prompt: String,
+) -> CtxResult<String> {
+    let Some(task_id) = &args.task else {
+        return Ok(prompt);
+    };
+    let repo_slug = super::state::repo_slug(repo);
+    let cards = super::task::load_cards(state, &repo_slug);
+    let card = cards
+        .get(task_id)
+        .ok_or_else(|| format!("--task '{task_id}' has no task card in this repository"))?;
+    let parents: Vec<&super::task::Card> =
+        card.parents.iter().filter_map(|id| cards.get(id)).collect();
+    Ok(format!(
+        "{prompt}{}",
+        super::task::compile_task_prompt(card, &parents)
+    ))
+}
+
+/// Issue #317: resolves (reaping/promoting, `task::resolve_for_claim`) and
+/// claims `--task`'s own card, refusing before any spawn when it cannot be --
+/// see [`AgentArgs::task`]'s own doc comment for the full contract. `Err`'s
+/// text is written verbatim to the delegator's stdout by the caller.
+fn claim_task_for_delegation(
+    state: &super::state::StateDir,
+    repo: &Path,
+    task_id: &str,
+    env: EnvLookup<'_>,
+    now: u64,
+) -> Result<(), String> {
+    let repo_slug = super::state::repo_slug(repo);
+    let card = super::task::resolve_for_claim(state, &repo_slug, task_id, now)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("no task '{task_id}' in this repository"))?;
+    let cards = super::task::load_cards(state, &repo_slug);
+    let parents_done = card.parents.iter().all(|id| {
+        cards
+            .get(id)
+            .is_some_and(|p| p.state == super::task::State::Done)
+    });
+    let session = super::mail::session_identity(env)
+        .unwrap_or_else(|| format!("agent-pid-{}", std::process::id()));
+    let pid = std::process::id();
+    let claimed = super::task::claim(
+        &card,
+        &session,
+        pid,
+        super::sessions::process_start_secs(pid),
+        &super::task::local_host(),
+        now,
+        super::task::DEFAULT_CLAIM_TTL_SECS,
+        parents_done,
+    )
+    .map_err(|refusal| format!("cannot claim task '{task_id}': {refusal}"))?;
+    let claim = claimed.claim.clone().expect("claim always sets it");
+    super::task::append_event(
+        state,
+        &repo_slug,
+        &super::task::Event::Claimed {
+            id: card.id.clone(),
+            claim,
+            attempts: claimed.attempts,
+            at: now,
+        },
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Issue #317: closes `--task`'s own card once this delegation has finished,
+/// entirely best-effort -- a delegation that ran must never fail because its
+/// task-card bookkeeping could not be written, the same discipline every
+/// other accounting call in this function's own completion block already
+/// holds. `Reported` (a genuine report-back, or a plain successful exit with
+/// no structural contract declared) marks the card `Done` with `outcome`
+/// verbatim; anything else runs [`super::task::respawn_decision`] and applies
+/// its verdict, so a crash or an unvalidated report-back returns the card to
+/// `Ready` for a fresh delegation to pick up, or auto-blocks it once the
+/// retry ceiling is reached -- NEVER a silent `Done`.
+fn finish_task_card(
+    state: &super::state::StateDir,
+    repo: &Path,
+    args: &AgentArgs,
+    exit_kind: super::task::ExitKind,
+    outcome: &str,
+    now: u64,
+) {
+    let Some(task_id) = &args.task else {
+        return;
+    };
+    let repo_slug = super::state::repo_slug(repo);
+    let cards = super::task::load_cards(state, &repo_slug);
+    let Some(card) = cards.get(task_id) else {
+        return;
+    };
+    match exit_kind {
+        super::task::ExitKind::Reported => {
+            let _ = super::task::append_event(
+                state,
+                &repo_slug,
+                &super::task::Event::Completed {
+                    id: card.id.clone(),
+                    outcome: outcome.to_string(),
+                    at: now,
+                },
+            );
+        }
+        other => {
+            match super::task::respawn_decision(card, other, super::task::DEFAULT_MAX_ATTEMPTS) {
+                super::task::RespawnVerdict::Respawn => {
+                    let reset_event = match other {
+                        super::task::ExitKind::SilentZero => super::task::Event::Protocol {
+                            id: card.id.clone(),
+                            detail: "exited without a validated report-back".to_string(),
+                            at: now,
+                        },
+                        _ => super::task::Event::Crash {
+                            id: card.id.clone(),
+                            at: now,
+                        },
+                    };
+                    let _ = super::task::append_event(state, &repo_slug, &reset_event);
+                    let _ = super::task::append_event(
+                        state,
+                        &repo_slug,
+                        &super::task::Event::Respawned {
+                            id: card.id.clone(),
+                            at: now,
+                        },
+                    );
+                }
+                super::task::RespawnVerdict::AutoBlock(reason) => {
+                    let _ = super::task::append_event(
+                        state,
+                        &repo_slug,
+                        &super::task::Event::Blocked {
+                            id: card.id.clone(),
+                            reason,
+                            by: "system:respawn-guard".to_string(),
+                            at: now,
+                        },
+                    );
+                }
+                super::task::RespawnVerdict::Refuse(_) => {}
+            }
+        }
+    }
+}
+
 /// The supervisor's own two outcomes (rot-exhausted, timed out) get a
 /// human-readable line; every other exit code -- including a plain success --
 /// gets none, since that is either self-explanatory or the agent's own doing.
@@ -2493,6 +2664,11 @@ pub fn run_with<W: Write>(
     // same seam, same "both forks read this one binding" guarantee as
     // `--attach-artifact` immediately above.
     let prompt = attach_result_contract_to_prompt(result_schema.as_ref(), prompt);
+    // Issue #317: `--task`'s brief and every parent card's own outcome,
+    // labelled -- same seam, same "both forks read this one binding"
+    // guarantee as `--attach-artifact`/`--result-schema` above. Fails fast
+    // when the named card does not exist in this repository.
+    let prompt = attach_task_context_to_prompt(args, &state, repo, prompt)?;
 
     // Issue #223 §E: refuses before any routing/spawn decision below, so an
     // enforced session never even gets as far as picking a route or joining
@@ -2502,6 +2678,22 @@ pub fn run_with<W: Write>(
     }
 
     let now = super::state::now_secs();
+    // Issue #317: resolves and claims `--task`'s own card before any
+    // spawn/routing decision below -- refused, with nothing launched, when
+    // the card cannot be claimed (unmet parents, or already running
+    // elsewhere under a live claimant). The claim is recorded under THIS
+    // process's own pid: if everything below this point fails before a
+    // worker ever actually runs, this same `zirv ctx agent` process exits
+    // shortly after returning, so the claim's pid goes dead and a later
+    // `reap`/`claim` attempt (`task::resolve_for_claim`) returns the card to
+    // `Ready` on its own -- never left falsely `Running` forever, and never
+    // silently marked `Done`.
+    if let Some(task_id) = &args.task
+        && let Err(refusal) = claim_task_for_delegation(&state, repo, task_id, env, now)
+    {
+        writeln!(w, "agent: {refusal}")?;
+        return Ok(2);
+    }
     let requested_adapter = adapters::select(Some(&args.name), &[], &cfg)?;
     let live_inherited_dashboard = env(spawnreq::DASH_REQUESTS_ENV)
         .map(PathBuf::from)
@@ -2984,6 +3176,17 @@ pub fn run_with<W: Write>(
             // again, so a group this invocation minted for a launch that
             // never happened is removed rather than left open forever.
             discard_minted_group();
+            // Issue #317: the worker never actually ran -- same "never
+            // Done, always crash/respawn-guarded" treatment as any other
+            // run that reached completion but failed.
+            finish_task_card(
+                &state,
+                repo,
+                args,
+                super::task::ExitKind::Crash,
+                "launch failed",
+                super::state::now_secs(),
+            );
             return Err(e);
         }
     };
@@ -3042,6 +3245,21 @@ pub fn run_with<W: Write>(
     if let Ok(state_dir) = super::state::StateDir::resolve(&env) {
         let parent_session = super::mail::session_identity(&env).unwrap_or_default();
         let outcome = delegation_outcome(code);
+        // Issue #317: `--task`'s own completion signal. Without a declared
+        // `--result-schema`, a plain exit 0 is the only success evidence this
+        // function has, so it is treated as `Reported`; a schema declared
+        // below overrides this once `validated` is known -- an unvalidated
+        // report-back is exactly the "worker completed but produced nothing
+        // usable" shape `ExitKind::SilentZero` exists for.
+        let mut task_exit_kind = if result_schema.is_none() {
+            Some(if code == 0 {
+                super::task::ExitKind::Reported
+            } else {
+                super::task::ExitKind::Crash
+            })
+        } else {
+            None
+        };
 
         // Issue #318: when a schema was declared, the report-back mail and
         // its own outcome supersede the plain success/failure report below
@@ -3160,6 +3378,12 @@ pub fn run_with<W: Write>(
                 }
             }
 
+            task_exit_kind = Some(if validated.is_some() {
+                super::task::ExitKind::Reported
+            } else {
+                super::task::ExitKind::SilentZero
+            });
+
             writeln!(
                 w,
                 "result: {}",
@@ -3246,6 +3470,19 @@ pub fn run_with<W: Write>(
             let _ = super::mail::store_to(&state_dir, &repo_slug, &repo_slug, &msg, &cfg);
         }
         let envelope_sha256 = envelope::digest(&child_envelope).ok();
+        // Issue #317: closes (or respawn-guards) `--task`'s own card now that
+        // this delegation's real outcome is known -- see `finish_task_card`'s
+        // own doc comment for why this never marks a card `Done` silently.
+        if let Some(exit_kind) = task_exit_kind {
+            finish_task_card(
+                &state_dir,
+                repo,
+                args,
+                exit_kind,
+                outcome,
+                super::state::now_secs(),
+            );
+        }
         let total = append_execution_segments(
             &state_dir,
             &execution_report,
@@ -3785,6 +4022,92 @@ mod tests {
 
         let without_contract = attach_result_contract_to_prompt(None, "do the thing".to_string());
         assert_eq!(without_contract, "do the thing");
+    }
+
+    /// Issue #317: `--task` appends the card's own brief and every resolved
+    /// parent's outcome after the operator's own prompt text -- the same
+    /// splice-point contract `attach_artifact_to_prompt` holds.
+    #[test]
+    fn attach_task_context_to_prompt_appends_the_brief_and_parent_outcomes() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let repo_slug = crate::commands::ctx::state::repo_slug(repo.path());
+        crate::commands::ctx::task::append_event(
+            &state,
+            &repo_slug,
+            &crate::commands::ctx::task::Event::Created {
+                id: "parent-1".to_string(),
+                repo_slug: repo_slug.clone(),
+                title: "parent".to_string(),
+                brief: "b".to_string(),
+                parents: Vec::new(),
+                group_id: None,
+                workdir: None,
+                at: 1,
+            },
+        )
+        .expect("create parent");
+        crate::commands::ctx::task::append_event(
+            &state,
+            &repo_slug,
+            &crate::commands::ctx::task::Event::Completed {
+                id: "parent-1".to_string(),
+                outcome: "migrated the schema".to_string(),
+                at: 2,
+            },
+        )
+        .expect("complete parent");
+        crate::commands::ctx::task::append_event(
+            &state,
+            &repo_slug,
+            &crate::commands::ctx::task::Event::Created {
+                id: "child-1".to_string(),
+                repo_slug: repo_slug.clone(),
+                title: "child".to_string(),
+                brief: "wire up the new column".to_string(),
+                parents: vec!["parent-1".to_string()],
+                group_id: None,
+                workdir: None,
+                at: 3,
+            },
+        )
+        .expect("create child");
+
+        let mut args = args_for("claude", "do the operator's own thing");
+        args.task = Some("child-1".to_string());
+        let prompt = attach_task_context_to_prompt(
+            &args,
+            &state,
+            repo.path(),
+            "do the operator's own thing".to_string(),
+        )
+        .expect("resolves");
+        assert!(prompt.starts_with("do the operator's own thing"));
+        assert!(prompt.contains("child-1"));
+        assert!(prompt.contains("wire up the new column"));
+        assert!(prompt.contains("parent-1"));
+        assert!(prompt.contains("migrated the schema"));
+    }
+
+    #[test]
+    fn attach_task_context_to_prompt_fails_for_an_unknown_task_id() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let mut args = args_for("claude", "go");
+        args.task = Some("does-not-exist".to_string());
+        let err = attach_task_context_to_prompt(&args, &state, repo.path(), "go".to_string())
+            .expect_err("no such task");
+        assert!(err.to_string().contains("does-not-exist"));
+    }
+
+    #[test]
+    fn attach_task_context_to_prompt_is_a_no_op_without_task() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let args = args_for("claude", "go");
+        let prompt = attach_task_context_to_prompt(&args, &state, repo.path(), "go".to_string())
+            .expect("resolves");
+        assert_eq!(prompt, "go");
     }
 
     /// Issue #223 §E: `workflow.adoption = enforce` refuses a delegation when
@@ -4980,6 +5303,7 @@ mod tests {
             path_scope: Vec::new(),
             no_network: false,
             depth: None,
+            task: None,
         }
     }
 
@@ -6827,6 +7151,131 @@ mod tests {
                 .any(|line| line.contains(crate::commands::ctx::log::DELEGATION_ACTION)),
             "the main decision log must also get a one-line delegation-complete marker: \
              {decisions:?}"
+        );
+    }
+
+    /// Issue #317: `--task <id>` claims the card before any spawn, and a
+    /// successful run marks it `Done` with the delegation's own outcome --
+    /// never left `Running`.
+    #[test]
+    fn run_with_task_claims_before_spawn_and_completes_on_success() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state_dir = tmp.path().join("state");
+        let mut env = base_env(&state_dir);
+        env.insert("ZIRV_CTX_PACE".to_string(), "false".to_string());
+        unsafe {
+            std::env::set_var("FAKE_AGENT_MODE", "healthy");
+        }
+
+        let state = crate::commands::ctx::state::StateDir::resolve(&|k: &str| env.get(k).cloned())
+            .expect("state resolves");
+        let repo_slug = crate::commands::ctx::state::repo_slug(tmp.path());
+        crate::commands::ctx::task::append_event(
+            &state,
+            &repo_slug,
+            &crate::commands::ctx::task::Event::Created {
+                id: "task-1".to_string(),
+                repo_slug: repo_slug.clone(),
+                title: "do the work".to_string(),
+                brief: "do the work well".to_string(),
+                parents: Vec::new(),
+                group_id: None,
+                workdir: None,
+                at: 1,
+            },
+        )
+        .expect("create task card");
+
+        let mut args = args_for("claude", "do the work");
+        args.task = Some("task-1".to_string());
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE");
+        }
+        assert_eq!(code.expect("runs"), 0);
+
+        let cards = crate::commands::ctx::task::load_cards(&state, &repo_slug);
+        let card = &cards["task-1"];
+        assert_eq!(
+            card.state,
+            crate::commands::ctx::task::State::Done,
+            "a successful run closes the card, never leaves it Running"
+        );
+        assert!(card.outcome.is_some());
+    }
+
+    /// Issue #317 acceptance: a card with an unmet parent cannot be claimed,
+    /// so `--task` refuses BEFORE any worker spawns -- exit 2, nothing
+    /// launched, and the card is left exactly as it was.
+    #[test]
+    fn run_with_task_refuses_before_any_spawn_when_a_parent_is_unmet() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state_dir = tmp.path().join("state");
+        let mut env = base_env(&state_dir);
+        env.insert("ZIRV_CTX_PACE".to_string(), "false".to_string());
+        unsafe {
+            std::env::set_var("FAKE_AGENT_MODE", "healthy");
+        }
+
+        let state = crate::commands::ctx::state::StateDir::resolve(&|k: &str| env.get(k).cloned())
+            .expect("state resolves");
+        let repo_slug = crate::commands::ctx::state::repo_slug(tmp.path());
+        crate::commands::ctx::task::append_event(
+            &state,
+            &repo_slug,
+            &crate::commands::ctx::task::Event::Created {
+                id: "parent-1".to_string(),
+                repo_slug: repo_slug.clone(),
+                title: "parent".to_string(),
+                brief: "b".to_string(),
+                parents: Vec::new(),
+                group_id: None,
+                workdir: None,
+                at: 1,
+            },
+        )
+        .expect("create parent");
+        crate::commands::ctx::task::append_event(
+            &state,
+            &repo_slug,
+            &crate::commands::ctx::task::Event::Created {
+                id: "child-1".to_string(),
+                repo_slug: repo_slug.clone(),
+                title: "child".to_string(),
+                brief: "b".to_string(),
+                parents: vec!["parent-1".to_string()],
+                group_id: None,
+                workdir: None,
+                at: 1,
+            },
+        )
+        .expect("create child");
+
+        let mut args = args_for("claude", "do the work");
+        args.task = Some("child-1".to_string());
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE");
+        }
+        assert_eq!(code.expect("runs"), 2, "refused before any spawn");
+
+        let cards = crate::commands::ctx::task::load_cards(&state, &repo_slug);
+        assert_eq!(
+            cards["child-1"].state,
+            crate::commands::ctx::task::State::Todo,
+            "the refused card is left exactly as it was"
+        );
+        assert!(
+            crate::commands::ctx::log::tail_delegations(&state, 10)
+                .expect("tail")
+                .is_empty(),
+            "nothing was ever launched"
         );
     }
 

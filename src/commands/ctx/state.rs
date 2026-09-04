@@ -469,6 +469,18 @@ impl StateDir {
         self.0.join("restart-chains")
     }
 
+    /// `<state>/tasks/<repo-slug>/events.jsonl` -- durable task-card event log
+    /// (issue #317). One append-only event stream per repository, keyed by
+    /// `state::repo_slug` the same way `objective()`/`restart_chains()` are: a
+    /// task card outlives any one delegated worker or supervising process,
+    /// which is exactly why it is an event log rather than a per-record file
+    /// like `groups()` -- replaying it (`task::materialize`) is what lets a
+    /// fresh orchestrator or a human reconstruct every card's current state
+    /// after a crash.
+    pub fn tasks(&self) -> PathBuf {
+        self.0.join("tasks")
+    }
+
     /// Issue #178: captured operator-approved permission prompts, ready for
     /// `permissions::propose`'s safe-list classifier -- `<state>/approvals/
     /// *.jsonl`, one file per day (see `log::append_safety`'s own doc
@@ -975,5 +987,12 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(tmp.path().to_path_buf());
         assert_eq!(state.restart_chains(), tmp.path().join("restart-chains"));
+    }
+
+    #[test]
+    fn the_tasks_dir_hangs_off_the_state_root() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        assert_eq!(state.tasks(), tmp.path().join("tasks"));
     }
 }
