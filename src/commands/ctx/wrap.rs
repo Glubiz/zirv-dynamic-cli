@@ -1277,6 +1277,7 @@ pub fn note_failure(
                 score: 0,
                 action: "degrade",
                 detail: what,
+                observed_at: None,
             },
         );
     }
@@ -3133,6 +3134,7 @@ fn pump(
                         score: supervision.score,
                         action: "handover-refused",
                         detail: &reason,
+                        observed_at: None,
                     },
                 );
             } else {
@@ -3216,6 +3218,7 @@ fn pump(
                                     outcome.source,
                                     stored_text
                                 ),
+                                observed_at: None,
                             },
                         );
                     }
@@ -3246,6 +3249,7 @@ fn pump(
                                 score: supervision.score,
                                 action: "handover-failed",
                                 detail: &reason,
+                                observed_at: None,
                             },
                         );
                         let status = child.wait()?;
@@ -3339,6 +3343,7 @@ fn pump(
                             .path()
                             .map(|path| path.display().to_string())
                             .unwrap_or_else(|| "no transcript reported".to_string()),
+                        observed_at: None,
                     },
                 );
             }
@@ -3528,6 +3533,7 @@ fn pump(
                             Ok(path) => format!("{source} handoff at {}", path.display()),
                             Err(e) => format!("{source} handoff not stored: {e}"),
                         },
+                        observed_at: None,
                     },
                 );
                 if !relaunched {
@@ -3831,6 +3837,7 @@ mod tests {
                     // be inside its own five_hour span.
                     observed_at: super::super::state::now_secs(),
                     overage_covered: false,
+                    limit_reached: false,
                 }),
                 seven_day: None,
             },
@@ -3888,6 +3895,7 @@ mod tests {
                     resets_at: 1, // long past any real wall clock
                     observed_at: 1,
                     overage_covered: false,
+                    limit_reached: false,
                 }),
                 seven_day: None,
             },

@@ -1206,6 +1206,7 @@ pub fn run_with<W: Write>(
             score: 0,
             action: source,
             detail: &path.display().to_string(),
+            observed_at: None,
         },
     );
 

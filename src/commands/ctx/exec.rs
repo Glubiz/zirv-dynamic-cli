@@ -1118,6 +1118,7 @@ fn run_with_clock_inner<W: Write>(
                     score: 0,
                     action: "no-socket",
                     detail: &e.to_string(),
+                    observed_at: None,
                 },
             );
             None
@@ -1439,6 +1440,7 @@ fn run_with_clock_inner<W: Write>(
         let mut rotted = false;
         let mut compact_requested = false;
         let mut limit_hit = false;
+        let mut limit_confirmation_detail = None;
         let mut nudged_by: Option<String> = None;
         // Issue #155, Phase 5(d): fresh per iteration too -- the child a
         // restart mints is a fresh transcript, so its own soft-warn latch and
@@ -1460,6 +1462,7 @@ fn run_with_clock_inner<W: Write>(
             &mut scorer,
             adapter.as_ref(),
             &cfg.score,
+            &cfg.pace,
             &state,
             server.as_ref(),
             session.as_str(),
@@ -1474,6 +1477,7 @@ fn run_with_clock_inner<W: Write>(
             &mut progressed,
             &tap,
             &mut limit_hit,
+            &mut limit_confirmation_detail,
             &mut nudged_by,
             nudge_restarts,
             cfg.supervise.max_nudges,
@@ -1503,6 +1507,7 @@ fn run_with_clock_inner<W: Write>(
                     score: 0,
                     action: "kill",
                     detail: &transcript.display().to_string(),
+                    observed_at: None,
                 },
             );
             writeln!(
@@ -1556,13 +1561,32 @@ fn run_with_clock_inner<W: Write>(
         let mut account_pattern: Option<&'static str> = None;
         if !limit_hit {
             let final_lines = tap.drain_to_eof(supervise::FINAL_DRAIN_BUDGET);
-            limit_hit = pace::scan_for_limit(
+            let limit_text_seen = pace::scan_for_limit(
                 &final_lines,
                 &state,
                 session.as_str(),
                 "exec",
                 &mut std::io::stderr(),
             );
+            if limit_text_seen {
+                let now = now_fn();
+                match pace::confirm_limit_hit(&state, &cfg.pace, now, adapter.provider()) {
+                    pace::LimitConfirmation::Confirmed { detail } => {
+                        limit_hit = true;
+                        limit_confirmation_detail = Some(detail);
+                    }
+                    pace::LimitConfirmation::Unconfirmed { detail } => {
+                        pace::note_unconfirmed_limit_text(
+                            &state,
+                            now,
+                            session.as_str(),
+                            "exec",
+                            &detail,
+                            &mut std::io::stderr(),
+                        );
+                    }
+                }
+            }
             if !limit_hit {
                 account_pattern = pace::scan_for_account_exhausted(&final_lines);
                 if account_pattern.is_none() {
@@ -1591,6 +1615,7 @@ fn run_with_clock_inner<W: Write>(
                     score: 0,
                     action: "account-exhausted",
                     detail: label,
+                    observed_at: None,
                 },
             );
             writeln!(
@@ -1677,6 +1702,7 @@ fn run_with_clock_inner<W: Write>(
                             score: 0,
                             action: "compact",
                             detail: &transcript.display().to_string(),
+                            observed_at: None,
                         },
                     );
                     command = continued;
@@ -1694,6 +1720,7 @@ fn run_with_clock_inner<W: Write>(
                             score: 0,
                             action: "compact-failed",
                             detail: &reason,
+                            observed_at: None,
                         },
                     );
                     writeln!(
@@ -1981,6 +2008,7 @@ fn run_with_clock_inner<W: Write>(
                     score: 0,
                     action: "nudge-restart",
                     detail: &format!("{source} handoff at {}", stored.display()),
+                    observed_at: None,
                 },
             );
             writeln!(
@@ -2032,10 +2060,17 @@ fn run_with_clock_inner<W: Write>(
                 .map(|raw| super::config::split_csv_list(&raw))
                 .unwrap_or_default();
             let source_model = adapters::last_model_flag(&args.command);
+            let delegation = env(super::fallback::DELEGATION_ENV);
+            let is_delegation = delegation.is_some();
             let route_request = super::fallback::RouteRequest {
                 requested: adapter.name(),
                 source_model,
-                source_model_explicit: source_model.is_some(),
+                source_model_explicit: if is_delegation {
+                    delegation.as_deref() == Some("explicit-model")
+                } else {
+                    source_model.is_some()
+                },
+                delegation: is_delegation,
                 bounds: super::fallback::TaskBounds {
                     tokens: worker_budget.tokens,
                     tool_calls: worker_budget.tool_calls,
@@ -2077,6 +2112,7 @@ fn run_with_clock_inner<W: Write>(
                         ))
                     })
                 });
+            let route_observed_at = route.as_ref().and_then(|route| route.requested_observed_at);
 
             if let Some((selected_agent, selected_model, selection_detail)) = alternate {
                 let jsonl = std::fs::read_to_string(&transcript).unwrap_or_default();
@@ -2143,6 +2179,7 @@ fn run_with_clock_inner<W: Write>(
                             score: 0,
                             action: "fallback-budget-exhausted",
                             detail: "usage limit coincided with the delegation budget ceiling",
+                            observed_at: None,
                         },
                     );
                     session_guard.release();
@@ -2156,8 +2193,12 @@ fn run_with_clock_inner<W: Write>(
                 // call.
                 let _ = objective_layer_for_restart(&state, repo, now_fn(), spent_tokens);
 
+                let confirmation = limit_confirmation_detail
+                    .as_deref()
+                    .map(|detail| format!("; structured confirmation: {detail}"))
+                    .unwrap_or_default();
                 let detail = format!(
-                    "{}; {} handoff at {}",
+                    "{}{confirmation}; {} handoff at {}",
                     selection_detail,
                     source,
                     stored.display()
@@ -2172,6 +2213,7 @@ fn run_with_clock_inner<W: Write>(
                         score: 100,
                         action: "harness-handover",
                         detail: &detail,
+                        observed_at: route_observed_at,
                     },
                 );
                 writeln!(
@@ -2233,13 +2275,16 @@ fn run_with_clock_inner<W: Write>(
                 );
             }
 
-            let wait_detail = deferred_reset
+            let mut wait_detail = deferred_reset
                 .as_ref()
                 .map(super::fallback::ResetChoice::detail)
                 .unwrap_or_else(|| {
                     "agent reported a usage limit; parking until the current window resets"
                         .to_string()
                 });
+            if let Some(detail) = &limit_confirmation_detail {
+                wait_detail.push_str(&format!("; structured confirmation: {detail}"));
+            }
             let _ = log::append(
                 &state,
                 &log::Decision {
@@ -2250,14 +2295,21 @@ fn run_with_clock_inner<W: Write>(
                     score: 100,
                     action: "limit-park",
                     detail: &wait_detail,
+                    observed_at: None,
                 },
             );
             writeln!(w, "zirv ctx exec: {wait_detail}")?;
 
+            // A confirmed vendor refusal is authoritative even when the
+            // operator disabled proactive pacing. Re-enable only this park;
+            // otherwise `wait_for_window` would return immediately and launch
+            // straight back into the refusal it just confirmed.
+            let mut confirmed_limit_pace = cfg.pace.clone();
+            confirmed_limit_pace.enabled = true;
             pace::wait_for_window(
                 w,
                 &state,
-                &cfg.pace,
+                &confirmed_limit_pace,
                 "exec",
                 session.as_str(),
                 now_fn,
@@ -2405,6 +2457,7 @@ fn run_with_clock_inner<W: Write>(
                 score: 0,
                 action: "kill",
                 detail: &transcript.display().to_string(),
+                observed_at: None,
             },
         );
 
@@ -2423,6 +2476,7 @@ fn run_with_clock_inner<W: Write>(
                     score: 0,
                     action: "stand-down",
                     detail: "no prompt available for restart",
+                    observed_at: None,
                 },
             );
             record_execution_segment(
@@ -2477,6 +2531,7 @@ fn run_with_clock_inner<W: Write>(
                         "{boots} unplanned {reason} respawns within the configured gap; not \
                          auto-resuming"
                     ),
+                    observed_at: None,
                 },
             );
             writeln!(
@@ -2509,6 +2564,7 @@ fn run_with_clock_inner<W: Write>(
                     score: 0,
                     action: "give-up",
                     detail: "restart budget exhausted",
+                    observed_at: None,
                 },
             );
             if capacity_exit {
@@ -2586,6 +2642,7 @@ fn run_with_clock_inner<W: Write>(
                 score: 0,
                 action: "restart",
                 detail: &format!("{source} handoff at {}", stored.display()),
+                observed_at: None,
             },
         );
         writeln!(
@@ -2837,6 +2894,7 @@ fn supervise_run(
     scorer: &mut score::IncrementalScorer,
     adapter: &dyn adapters::AgentAdapter,
     score_cfg: &super::config::ScoreConfig,
+    pace_cfg: &super::config::PaceConfig,
     state: &StateDir,
     server: Option<&signal::SignalServer>,
     session: &str,
@@ -2866,6 +2924,7 @@ fn supervise_run(
     progressed: &mut bool,
     tap: &supervise::OutputTap,
     limit_hit: &mut bool,
+    limit_confirmation_detail: &mut Option<String>,
     nudged_by: &mut Option<String>,
     nudges_used: u32,
     max_nudges: u32,
@@ -2931,8 +2990,24 @@ fn supervise_run(
             stall_signals.last_output = Some(Instant::now());
         }
         if pace::scan_for_limit(&lines, state, session, "exec", &mut std::io::stderr()) {
-            *limit_hit = true;
-            return Tick::Stop("limit");
+            let now = now_secs();
+            match pace::confirm_limit_hit(state, pace_cfg, now, adapter.provider()) {
+                pace::LimitConfirmation::Confirmed { detail } => {
+                    *limit_hit = true;
+                    *limit_confirmation_detail = Some(detail);
+                    return Tick::Stop("limit");
+                }
+                pace::LimitConfirmation::Unconfirmed { detail } => {
+                    pace::note_unconfirmed_limit_text(
+                        state,
+                        now,
+                        session,
+                        "exec",
+                        &detail,
+                        &mut std::io::stderr(),
+                    );
+                }
+            }
         }
         if let Some(server) = server
             && let Some(received) = server.try_recv()
@@ -2994,6 +3069,7 @@ fn supervise_run(
                     } else {
                         "no prompt available for a nudge relaunch; message left unread"
                     },
+                    observed_at: None,
                 },
             );
             return Tick::Continue;
@@ -3077,6 +3153,7 @@ fn supervise_run(
                         score: 0,
                         action: "stall-nudge",
                         detail: "no progress observed; latching and sending a steering nudge",
+                        observed_at: None,
                     },
                 );
             }
@@ -3094,6 +3171,7 @@ fn supervise_run(
                         score: 0,
                         action: "stall-terminate",
                         detail: "grace period elapsed with no observed progress",
+                        observed_at: None,
                     },
                 );
                 return Tick::Stop("stalled");
@@ -5193,11 +5271,94 @@ mod tests {
                     resets_at: now + resets_in,
                     observed_at: now,
                     overage_covered: false,
+                    limit_reached: false,
                 }),
                 seven_day: None,
             },
         )
         .expect("store collector state");
+    }
+
+    fn store_provider_collector(
+        state_dir: &std::path::Path,
+        provider: &str,
+        percent: f64,
+        limit_reached: bool,
+    ) {
+        let state = crate::commands::ctx::state::StateDir::from_root(state_dir.to_path_buf());
+        let now = crate::commands::ctx::state::now_secs();
+        window::store_for(
+            &state,
+            provider,
+            &UsageWindows {
+                five_hour: Some(Window {
+                    used_percentage: percent,
+                    resets_at: now + 60,
+                    observed_at: now,
+                    overage_covered: false,
+                    limit_reached,
+                }),
+                seven_day: None,
+            },
+        )
+        .expect("store provider collector state");
+    }
+
+    #[test]
+    fn unconfirmed_vendor_exhaustion_text_is_ignored() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let state_dir = tmp.path().join("state");
+        let argv_log = tmp.path().join("argv.log");
+        let mut env = base_env(&state_dir);
+        env.insert(
+            "ZIRV_CTX_AGENT_BIN".to_string(),
+            format!("sh {}", fixture("fake-codex-agent.sh").display()),
+        );
+        store_provider_collector(&state_dir, window::CODEX_USAGE_PROVIDER, 2.0, false);
+
+        let modes = tmp.path().join("modes.txt");
+        std::fs::write(&modes, "limit\n").expect("write modes");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let _fake_agent = crate::commands::ctx::testenv::VarGuard::set(&[
+            ("FAKE_AGENT_MODE_FILE", modes.to_str()),
+            ("FAKE_AGENT_ARGV_LOG", argv_log.to_str()),
+        ]);
+        let args = ExecArgs {
+            agent: Some("codex".to_string()),
+            session_id: None,
+            transcript: None,
+            prompt: Some("finish the requested work".to_string()),
+            max_restarts: Some(0),
+            budget_tokens: None,
+            max_tool_calls: None,
+            objective: None,
+            timeout_secs: Some(30),
+            simple: false,
+            command: Vec::new(),
+        };
+        let mut out = Vec::new();
+
+        assert_eq!(
+            run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned()).expect("runs"),
+            1,
+            "an unconfirmed text match preserves the child's own exit code"
+        );
+        let log = std::fs::read_to_string(state_dir.join("logs/decisions.jsonl")).expect("log");
+        assert!(
+            log.contains("\"action\":\"limit-text-unconfirmed\""),
+            "{log}"
+        );
+        assert!(!log.contains("\"action\":\"harness-handover\""), "{log}");
+        assert!(!log.contains("\"action\":\"limit-park\""), "{log}");
+        assert!(!log.contains("\"action\":\"give-up\""), "{log}");
+        assert!(!log.contains("\"action\":\"kill\""), "{log}");
+        let argv = std::fs::read_to_string(&argv_log).expect("argv log");
+        assert_eq!(
+            argv.matches("finish the requested work").count(),
+            1,
+            "the false positive must not relaunch"
+        );
     }
 
     #[test]
@@ -5221,6 +5382,7 @@ mod tests {
         let modes = tmp.path().join("modes.txt");
         std::fs::write(&modes, "limit\nhealthy\n").expect("write modes");
         let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        store_provider_collector(&state_dir, window::CODEX_USAGE_PROVIDER, 2.0, true);
         let _fake_agent = crate::commands::ctx::testenv::VarGuard::set(&[
             ("FAKE_AGENT_MODE_FILE", modes.to_str()),
             ("FAKE_AGENT_ARGV_LOG", argv_log.to_str()),
@@ -5264,6 +5426,79 @@ mod tests {
     }
 
     #[test]
+    fn a_low_percentage_reached_flag_waits_before_same_harness_relaunch() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let state_dir = tmp.path().join("state");
+        let argv_log = tmp.path().join("argv.log");
+        let mut env = base_env(&state_dir);
+        // Proactive pacing is deliberately off: an actual vendor refusal is
+        // stronger than that preference and must still park. Disable fallback
+        // to exercise the same-harness relaunch rather than a handover.
+        env.insert("ZIRV_CTX_PACE".to_string(), "false".to_string());
+        env.insert("ZIRV_CTX_FALLBACK".to_string(), "false".to_string());
+        env.insert("ZIRV_CTX_PACE_JITTER_SECS".to_string(), "0".to_string());
+        env.insert(
+            "ZIRV_CTX_AGENT_BIN".to_string(),
+            format!("sh {}", fixture("fake-codex-agent.sh").display()),
+        );
+        store_provider_collector(&state_dir, window::CODEX_USAGE_PROVIDER, 2.0, true);
+
+        let modes = tmp.path().join("modes.txt");
+        std::fs::write(&modes, "limit\nhealthy\n").expect("write modes");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let _fake_agent = crate::commands::ctx::testenv::VarGuard::set(&[
+            ("FAKE_AGENT_MODE_FILE", modes.to_str()),
+            ("FAKE_AGENT_ARGV_LOG", argv_log.to_str()),
+        ]);
+        let args = ExecArgs {
+            agent: Some("codex".to_string()),
+            session_id: None,
+            transcript: None,
+            prompt: Some("finish the requested work".to_string()),
+            max_restarts: Some(0),
+            budget_tokens: None,
+            max_tool_calls: None,
+            objective: None,
+            timeout_secs: Some(30),
+            simple: false,
+            command: Vec::new(),
+        };
+        let clock = std::cell::Cell::new(crate::commands::ctx::state::now_secs());
+        let slept = std::cell::RefCell::new(Vec::new());
+        let mut out = Vec::new();
+
+        let code = run_with_clock(
+            &args,
+            &mut out,
+            tmp.path(),
+            &|key| env.get(key).cloned(),
+            &|| clock.get(),
+            &|duration| {
+                let seconds = duration.as_secs();
+                slept.borrow_mut().push(seconds);
+                clock.set(clock.get().saturating_add(seconds));
+            },
+        );
+
+        assert_eq!(code.expect("runs"), 0);
+        assert!(
+            slept.borrow().iter().sum::<u64>() > 0,
+            "the confirmed refusal must delay the relaunch, got {:?}",
+            slept.borrow()
+        );
+        let log = std::fs::read_to_string(state_dir.join("logs/decisions.jsonl")).expect("log");
+        assert!(log.contains("\"action\":\"limit-park\""), "{log}");
+        assert!(
+            std::fs::read_to_string(&modes)
+                .expect("remaining modes")
+                .trim()
+                .is_empty(),
+            "the healthy second launch must complete after the wait"
+        );
+    }
+
+    #[test]
     fn a_limit_hit_parks_and_relaunches_without_spending_the_restart_budget() {
         let tmp = crate::commands::ctx::testenv::repo();
         let home = tmp.path().join("home");
@@ -5275,6 +5510,8 @@ mod tests {
         env.insert("ZIRV_CTX_PACE_JITTER_SECS".to_string(), "0".to_string());
         env.insert("ZIRV_CTX_PACE_FALLBACK_SECS".to_string(), "1".to_string());
         env.insert("ZIRV_CTX_PACE_MAX_WAIT_SECS".to_string(), "2".to_string());
+        env.insert("ZIRV_CTX_PACE".to_string(), "false".to_string());
+        store_collector(&state, 100.0, 60);
 
         // First child hits the limit, second runs clean.
         let modes = tmp.path().join("modes.txt");
@@ -6772,6 +7009,7 @@ mod tests {
             &CtxConfig::default(),
         )
         .expect("store launch mail");
+        store_provider_collector(&state_dir, window::CODEX_USAGE_PROVIDER, 2.0, true);
 
         // hang (nudge target) -> limit (the nudged relaunch parks) -> healthy
         // (the park's own relaunch, the one under test).

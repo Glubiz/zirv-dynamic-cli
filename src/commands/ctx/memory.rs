@@ -628,6 +628,7 @@ pub fn get_scoped(
                             "canonical file for '{key}' has header Key '{}': refusing to return it",
                             parsed.key
                         ),
+                        observed_at: None,
                     },
                 );
                 return Ok(None);
@@ -1075,6 +1076,7 @@ pub fn forget_scoped(
                             score: 0,
                             action: "forget-collision-left",
                             detail: &format!("'{key}' still claimed by: {}", stray.join(", ")),
+                            observed_at: None,
                         },
                     );
                 }
@@ -1156,6 +1158,7 @@ pub fn verify_scoped(
                             "canonical file for '{key}' has header Key '{}': refusing to verify it",
                             parsed.key
                         ),
+                        observed_at: None,
                     },
                 );
                 return Ok(false);
@@ -1906,6 +1909,7 @@ fn write_durable(
                     score: 0,
                     action: "harvest-skipped",
                     detail: &format!("'{key}' is already an explicit entry"),
+                    observed_at: None,
                 },
             );
             continue;
@@ -1935,6 +1939,7 @@ fn write_durable(
                     detail: &format!(
                         "'{key}' looks credential-shaped ({matched}); refusing to harvest it into the shared bank"
                     ),
+                    observed_at: None,
                 },
             );
             continue;
@@ -2026,6 +2031,7 @@ fn harvest_durable_with_tool_errors(
                     detail: &format!(
                         "'{key}' looks credential-shaped ({matched}); refusing to harvest it into the shared bank"
                     ),
+                    observed_at: None,
                 },
             );
         }

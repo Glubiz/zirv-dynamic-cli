@@ -1705,7 +1705,7 @@ fn split_segments(command: &str) -> Vec<String> {
         } else if (c == '&' && next == Some('&')) || (c == '|' && next == Some('|')) {
             segments.push(std::mem::take(&mut current));
             i += 2;
-        } else if c == '|'
+        } else if (c == '|' && !current.ends_with('>'))
             || (c == '&'
                 && !matches!(current.chars().next_back(), Some('>' | '<'))
                 && next != Some('>'))
@@ -4394,6 +4394,9 @@ fn read_stdin() -> String {
 #[serde(default)]
 struct HookToolPayload {
     session_id: String,
+    /// Present only inside a native Claude subagent. Such a call is already
+    /// the delegated worker the orchestrator-write rule asks the seat to use.
+    agent_id: String,
     tool_name: String,
     tool_input: HookToolInput,
     permission_mode: String,
@@ -4786,25 +4789,39 @@ fn target_is_confined(target: &str, scratchpad_roots: &[String]) -> bool {
     })
 }
 
-/// Issue #168, design decision (d): scans `segment` (already heredoc-
-/// redacted by the caller) for unquoted output-redirection targets -- `>`,
-/// `>>`, `<`, digit-prefixed (`1>`/`2>`) and `&>`/`&>>` forms, with or
-/// without a space before the target text. `None` means a redirection
-/// operator was found with NOTHING usable after it (a dangling operator at
-/// the very end of the segment) -- ambiguous, never guessed at. `&1`/`&2`
-/// (descriptor duplication, e.g. `2>&1`) names no filesystem path at all and
-/// is recognized and skipped, not treated as ambiguous: this is a character-
-/// level scan (unlike a whitespace-token split), so it cannot miss a glued
-/// operator the way a token-based scan could, and every quote/escape rule
-/// mirrors [`contains_unquoted_redirection`] so the two can never disagree
-/// about which `>`/`<` in the text is live shell syntax versus quoted data.
+/// Issue #168/#345: scans `segment` (already heredoc-redacted by the caller)
+/// for unquoted path-bearing output redirections: `>`, `>>`, `>|`, `&>`,
+/// `&>>`, Bash's legacy `>&word`, and digit-prefixed forms. Input redirections, process
+/// substitutions, and descriptor duplications name no write target and are
+/// skipped. Command substitutions are scanned recursively because their own
+/// output redirections still write; their closing delimiter is never part of
+/// the target word. `None` means a real output operator had no usable word
+/// after it, so the caller must not guess.
 fn scan_redirection_targets(segment: &str) -> Option<Vec<String>> {
+    scan_redirection_targets_at_depth(segment, 0)
+}
+
+fn scan_redirection_targets_at_depth(segment: &str, depth: usize) -> Option<Vec<String>> {
+    if depth >= MAX_STRUCTURAL_DEPTH {
+        return None;
+    }
     let chars: Vec<char> = segment.chars().collect();
+    let substitutions = command_substitution_spans(segment);
+    let mut substitution_index = 0usize;
     let mut targets = Vec::new();
+    for (_, _, body) in &substitutions {
+        targets.extend(scan_redirection_targets_at_depth(body, depth + 1)?);
+    }
     let mut quote: Option<char> = None;
     let mut escaped = false;
     let mut i = 0usize;
     while i < chars.len() {
+        while substitutions
+            .get(substitution_index)
+            .is_some_and(|(_, end, _)| *end <= i)
+        {
+            substitution_index += 1;
+        }
         let c = chars[i];
         if escaped {
             escaped = false;
@@ -4814,6 +4831,13 @@ fn scan_redirection_targets(segment: &str) -> Option<Vec<String>> {
         if c == '\\' && quote != Some('\'') {
             escaped = true;
             i += 1;
+            continue;
+        }
+        if let Some((start, end, _)) = substitutions.get(substitution_index)
+            && *start <= i
+        {
+            substitution_index += 1;
+            i = *end;
             continue;
         }
         if let Some(active) = quote {
@@ -4828,25 +4852,90 @@ fn scan_redirection_targets(segment: &str) -> Option<Vec<String>> {
             i += 1;
             continue;
         }
-        let is_digit_prefixed_redirect = c.is_ascii_digit() && chars.get(i + 1) == Some(&'>');
+
+        // `<(...)` and `>(...)` are process substitutions, not file
+        // redirects. Their bodies are still shell code and may contain a
+        // genuine output redirect of their own.
+        if matches!(c, '<' | '>') && chars.get(i + 1) == Some(&'(') {
+            if let Some(end) = command_substitution_end(&chars, i + 2, depth) {
+                let body: String = chars[i + 2..end].iter().collect();
+                targets.extend(scan_redirection_targets_at_depth(&body, depth + 1)?);
+                i = end + 1;
+            } else {
+                i += 2;
+            }
+            continue;
+        }
+
+        let digits_end = if c.is_ascii_digit() {
+            let mut end = i + 1;
+            while chars.get(end).is_some_and(char::is_ascii_digit) {
+                end += 1;
+            }
+            Some(end)
+        } else {
+            None
+        };
+        let is_digit_prefixed_input = digits_end.is_some_and(|end| chars.get(end) == Some(&'<'));
+        if c == '<' || is_digit_prefixed_input {
+            i = digits_end.unwrap_or(i) + 1;
+            continue;
+        }
+
+        let is_digit_prefixed_redirect = digits_end.is_some_and(|end| chars.get(end) == Some(&'>'));
         let is_amp_redirect = c == '&' && chars.get(i + 1) == Some(&'>');
-        if !(c == '>' || c == '<' || is_amp_redirect || is_digit_prefixed_redirect) {
+        if !(c == '>' || is_amp_redirect || is_digit_prefixed_redirect) {
             i += 1;
             continue;
         }
-        let mut j = if is_amp_redirect || is_digit_prefixed_redirect {
+        let mut j = if is_digit_prefixed_redirect {
+            digits_end.unwrap_or(i) + 1
+        } else if is_amp_redirect {
             i + 2
         } else {
             i + 1
         };
-        if chars.get(j) == Some(&'>') {
+        if chars.get(j) == Some(&'>') || chars.get(j) == Some(&'|') {
             j += 1;
         }
-        while chars.get(j) == Some(&' ') {
+        while chars.get(j).is_some_and(|c| c.is_whitespace()) {
             j += 1;
         }
+
+        // `>&N`, `N>&M`, and `>&-` duplicate or close a descriptor. The
+        // operand ends at a shell word boundary, including a command
+        // substitution's closing `)`. A non-descriptor word after `>&` is
+        // Bash's legacy spelling of `&>word`, however, and still names a real
+        // output path; advance past the ampersand so it is collected below.
+        if chars.get(j) == Some(&'&') {
+            let mut operand_start = j + 1;
+            while chars.get(operand_start).is_some_and(|c| c.is_whitespace()) {
+                operand_start += 1;
+            }
+            let mut descriptor_end = operand_start;
+            if chars.get(descriptor_end) == Some(&'-') {
+                descriptor_end += 1;
+            } else {
+                while chars.get(descriptor_end).is_some_and(char::is_ascii_digit) {
+                    descriptor_end += 1;
+                }
+            }
+            let is_descriptor = descriptor_end > operand_start
+                && chars.get(descriptor_end).is_none_or(|c| {
+                    c.is_whitespace() || matches!(c, ';' | '&' | '|' | '<' | '>' | '(' | ')')
+                });
+            if is_descriptor {
+                i = descriptor_end;
+                continue;
+            }
+            j = operand_start;
+        }
+
         let target_start = j;
-        while j < chars.len() && !chars[j].is_whitespace() && chars[j] != '>' && chars[j] != '<' {
+        while j < chars.len()
+            && !chars[j].is_whitespace()
+            && !matches!(chars[j], ';' | '&' | '|' | '<' | '>' | '(' | ')')
+        {
             j += 1;
         }
         let target: String = chars[target_start..j].iter().collect();
@@ -4854,9 +4943,7 @@ fn scan_redirection_targets(segment: &str) -> Option<Vec<String>> {
             // A dangling operator with nothing after it at all -- ambiguous.
             return None;
         }
-        if !matches!(target.as_str(), "&1" | "&2") {
-            targets.push(target);
-        }
+        targets.push(target);
         i = j;
     }
     Some(targets)
@@ -5012,22 +5099,28 @@ fn resolve_repo_write_target(target: &str, cwd: &str) -> Option<String> {
 /// target is answered PER TARGET, not assumed to be the launch repo --
 /// `git repo /a` and `git repo /b/.zirv/work` are two different repos'
 /// scratch areas, and a sibling checkout's own `.zirv/work` never confines
-/// a write into the launch repo, or vice versa. A resolved form that is
-/// not filesystem-absolute at all (a `~`-prefixed target) is never even
-/// handed to `repo_root_of`: this module cannot resolve `~` to a real
-/// path, so it stays unresolvable rather than guessed at. Returns `target`
-/// unchanged (as originally written) on a violation, so a caller can
-/// report it without leaking a resolved absolute path.
+/// a write into the launch repo, or vice versa. A target under Claude Code's
+/// own harness home (`CLAUDE_CONFIG_DIR`, `$HOME/.claude`, or
+/// `%USERPROFILE%\\.claude`) is likewise not a repository write. A resolved form that is not filesystem-absolute at
+/// all (a `~`-prefixed target) is never even handed to `repo_root_of`: this
+/// module cannot resolve `~` to a real path, so it stays unresolvable rather
+/// than guessed at. Returns `target` unchanged (as originally written) on a
+/// violation, so a caller can report it without leaking a resolved absolute
+/// path.
 fn repo_write_violation(
     target: &str,
     cwd: &str,
     repo_root_of: &dyn Fn(&str) -> Option<String>,
+    env: EnvLookup<'_>,
 ) -> Option<String> {
     let resolved = resolve_repo_write_target(target, cwd)?;
     let is_filesystem_absolute = resolved.starts_with('/')
         || (resolved.as_bytes().get(1) == Some(&b':')
             && matches!(resolved.as_bytes().get(2), Some(b'/')));
     if !is_filesystem_absolute {
+        return None;
+    }
+    if super::hook::target_is_under_harness_home(std::path::Path::new(&resolved), env) {
         return None;
     }
     let root = repo_root_of(&resolved)?;
@@ -5114,7 +5207,7 @@ fn split_segments_with_pipe_marker(command: &str) -> Vec<(String, bool)> {
             segments.push((std::mem::take(&mut current), preceded_by_pipe));
             preceded_by_pipe = false;
             i += 2;
-        } else if c == '|'
+        } else if (c == '|' && !current.ends_with('>'))
             || (c == '&'
                 && !matches!(current.chars().next_back(), Some('>' | '<'))
                 && next != Some('>'))
@@ -5283,9 +5376,10 @@ fn inline_code_has_write_primitive(code: &str) -> bool {
 /// trailing slash; `repo_root_of(absolute_path)` returns the nearest git
 /// repository root containing `absolute_path`, or `None` when it names no
 /// repository at all -- production passes a real filesystem walk
-/// ([`filesystem_repo_root_of`]), tests pass a deterministic fake. This
-/// function itself stays pure: no clock, filesystem, or environment access
-/// of its own.
+/// ([`filesystem_repo_root_of`]), tests pass a deterministic fake.
+/// Environment lookup is injected; filesystem access is limited to the
+/// shared canonical harness-home containment check and the injected
+/// `repo_root_of` callback.
 ///
 /// Scans each of [`split_segments_with_pipe_marker`]'s segments (over the
 /// already heredoc-redacted command) for five write shapes: (a) a
@@ -5323,6 +5417,7 @@ pub(crate) fn orchestrator_repo_write_target(
     command: &str,
     cwd: &str,
     repo_root_of: &dyn Fn(&str) -> Option<String>,
+    env: EnvLookup<'_>,
 ) -> Option<String> {
     // (d)'s own approximation needs SOME allowed-roots list to check an
     // inline interpreter's code text against, but has no structured target
@@ -5389,7 +5484,7 @@ pub(crate) fn orchestrator_repo_write_target(
 
         if let Some(targets) = segment_write_targets(&neutralize_heredoc_operator(&segment)) {
             for target in &targets {
-                if let Some(hit) = repo_write_violation(target, cwd, repo_root_of) {
+                if let Some(hit) = repo_write_violation(target, cwd, repo_root_of, env) {
                     return Some(hit);
                 }
             }
@@ -5399,7 +5494,7 @@ pub(crate) fn orchestrator_repo_write_target(
             && tokens[1..].iter().any(|t| is_sed_perl_inplace_flag(t))
         {
             for target in sed_perl_inplace_targets(&program, &tokens) {
-                if let Some(hit) = repo_write_violation(&target, cwd, repo_root_of) {
+                if let Some(hit) = repo_write_violation(&target, cwd, repo_root_of, env) {
                     return Some(hit);
                 }
             }
@@ -5407,7 +5502,7 @@ pub(crate) fn orchestrator_repo_write_target(
 
         if matches!(program.as_str(), "cp" | "mv" | "install" | "rsync" | "ln")
             && let Some(target) = last_non_flag_argument(&tokens)
-            && let Some(hit) = repo_write_violation(target, cwd, repo_root_of)
+            && let Some(hit) = repo_write_violation(target, cwd, repo_root_of, env)
         {
             return Some(hit);
         }
@@ -7117,11 +7212,12 @@ fn run_check_hook_mode_with_env<W: Write>(
     // after `evidence` resolves) is never reconsidered by either: both
     // already guard on `outcome.verdict != Verdict::Deny`.
     let orchestrator_repo_write = (env(super::adapters::SEAT_ROLE_ENV).as_deref()
-        == Some("orchestrator"))
+        == Some("orchestrator")
+        && payload.agent_id.is_empty())
     .then(|| hook_repo_root(&payload.cwd))
     .flatten()
     .and_then(|cwd| {
-        orchestrator_repo_write_target(&effective_command, &cwd, &filesystem_repo_root_of)
+        orchestrator_repo_write_target(&effective_command, &cwd, &filesystem_repo_root_of, env)
     });
 
     let evidence = evaluate_with_attestation_evidence(
@@ -8495,7 +8591,67 @@ mod tests {
             "patch -p1 < .zirv/work/p.diff",
         ] {
             assert!(
-                orchestrator_repo_write_target(command, cwd, &fake_repo_root_of).is_some(),
+                orchestrator_repo_write_target(command, cwd, &fake_repo_root_of, &|_| None)
+                    .is_some(),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn orchestrator_repo_write_target_only_reports_path_output_redirections() {
+        let cwd = "/work/repo";
+        for (command, target) in [
+            ("echo x > src/x.rs", "src/x.rs"),
+            ("cat > README.md", "README.md"),
+            ("cmd 2> src/err.log", "src/err.log"),
+            ("cmd &> out.txt", "out.txt"),
+            ("cmd >& legacy.txt", "legacy.txt"),
+            ("cmd >&src/legacy.log", "src/legacy.log"),
+            ("cmd >> src/out.log", "src/out.log"),
+            ("cmd >| src/out.log", "src/out.log"),
+        ] {
+            assert_eq!(
+                orchestrator_repo_write_target(command, cwd, &fake_repo_root_of, &|_| None),
+                Some(target.to_string()),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn orchestrator_repo_write_target_ignores_input_and_descriptor_redirections() {
+        let cwd = "/work/repo";
+        for command in [
+            "zirv agent codex --workdir /x/wt338 - < /private/tmp/claude-501/session/scratchpad/brief-338.md",
+            "cat < README.md",
+            "cmd 2>&1 | grep x",
+            "cmd >&2",
+            "cmd >& 2",
+            "cmd 2>& 1",
+            "cmd 2>& -",
+            "cat <<'EOF'\nhello\nEOF",
+            "diff <(a) <(b)",
+            "for i in $(seq 1 80); do s=$(zirv ctx status --brief 2>&1); if echo \"$s\" | grep -qE 'x'; then echo READY; exit 0; fi; sleep 30; done",
+        ] {
+            assert_eq!(
+                orchestrator_repo_write_target(command, cwd, &fake_repo_root_of, &|_| None),
+                None,
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn orchestrator_repo_write_target_scans_command_substitutions_for_real_writes() {
+        let cwd = "/work/repo";
+        for (command, target) in [
+            ("echo $(cmd > src/substitution.log)", "src/substitution.log"),
+            ("echo `cmd > src/backtick.log`", "src/backtick.log"),
+        ] {
+            assert_eq!(
+                orchestrator_repo_write_target(command, cwd, &fake_repo_root_of, &|_| None),
+                Some(target.to_string()),
                 "{command}"
             );
         }
@@ -8532,7 +8688,7 @@ mod tests {
             "git format-patch --stdout | git am",
         ] {
             assert_eq!(
-                orchestrator_repo_write_target(command, cwd, &fake_repo_root_of),
+                orchestrator_repo_write_target(command, cwd, &fake_repo_root_of, &|_| None),
                 None,
                 "{command}"
             );
@@ -8555,7 +8711,8 @@ mod tests {
             "git --git-dir=/work/repo/.git apply p.diff",
         ] {
             assert!(
-                orchestrator_repo_write_target(command, cwd, &fake_repo_root_of).is_some(),
+                orchestrator_repo_write_target(command, cwd, &fake_repo_root_of, &|_| None)
+                    .is_some(),
                 "{command}"
             );
         }
@@ -8564,7 +8721,7 @@ mod tests {
             "git -C /work/wt diff | git -C /work/repo apply",
         ] {
             assert_eq!(
-                orchestrator_repo_write_target(command, cwd, &fake_repo_root_of),
+                orchestrator_repo_write_target(command, cwd, &fake_repo_root_of, &|_| None),
                 None,
                 "{command}"
             );
@@ -8584,7 +8741,8 @@ mod tests {
             "cat p.diff | git apply",
         ] {
             assert!(
-                orchestrator_repo_write_target(command, cwd, &fake_repo_root_of).is_some(),
+                orchestrator_repo_write_target(command, cwd, &fake_repo_root_of, &|_| None)
+                    .is_some(),
                 "{command}"
             );
         }
@@ -8594,7 +8752,7 @@ mod tests {
             "git log -p -1 | git apply",
         ] {
             assert_eq!(
-                orchestrator_repo_write_target(command, cwd, &fake_repo_root_of),
+                orchestrator_repo_write_target(command, cwd, &fake_repo_root_of, &|_| None),
                 None,
                 "{command}"
             );
@@ -8612,7 +8770,7 @@ mod tests {
         let cwd = "/work/repo";
         let command = "cp /tmp/claude-501/x /work/sibling/src/a.rs";
         assert_eq!(
-            orchestrator_repo_write_target(command, cwd, &fake_repo_root_of),
+            orchestrator_repo_write_target(command, cwd, &fake_repo_root_of, &|_| None),
             Some("/work/sibling/src/a.rs".to_string())
         );
     }
@@ -8629,7 +8787,7 @@ mod tests {
             "echo x > /work/sibling/.zirv/memory/m.md",
         ] {
             assert_eq!(
-                orchestrator_repo_write_target(command, cwd, &fake_repo_root_of),
+                orchestrator_repo_write_target(command, cwd, &fake_repo_root_of, &|_| None),
                 None,
                 "{command}"
             );
@@ -8644,7 +8802,7 @@ mod tests {
         let cwd = "/work/repo";
         let command = "cp /tmp/claude-501/x /elsewhere/not-a-repo/file.txt";
         assert_eq!(
-            orchestrator_repo_write_target(command, cwd, &fake_repo_root_of),
+            orchestrator_repo_write_target(command, cwd, &fake_repo_root_of, &|_| None),
             None
         );
     }
@@ -8669,6 +8827,61 @@ mod tests {
             .trim_end_matches('/')
             .to_string();
         assert_eq!(found, expected);
+    }
+
+    #[test]
+    fn orchestrator_seat_allows_harness_memory_but_still_denies_repository_source() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = super::super::testenv::HomeGuard::set(home.path());
+        let _vars = super::super::testenv::VarGuard::set(&[("CLAUDE_CONFIG_DIR", None)]);
+        let harness_home = home.path().join(".claude");
+        let repo = home.path().join("repo");
+        for path in [&harness_home, &repo] {
+            std::fs::create_dir_all(path).expect("repo dir");
+            let status = std::process::Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(path)
+                .status()
+                .expect("run git init");
+            assert!(status.success(), "git init failed for {}", path.display());
+        }
+
+        let env = |key: &str| match key {
+            super::super::adapters::SEAT_ROLE_ENV => Some("orchestrator".to_string()),
+            "HOME" | "CLAUDE_CONFIG_DIR" => std::env::var(key).ok(),
+            _ => None,
+        };
+        let cfg = CtxConfig::load(&repo, &env).expect("loads");
+        let repo_cwd = repo.to_string_lossy().replace('\\', "/");
+
+        for (command, denied) in [
+            (
+                format!(
+                    "printf 'x' >> {}",
+                    harness_home
+                        .join("projects/slug/memory/MEMORY.md")
+                        .display()
+                ),
+                false,
+            ),
+            ("printf 'x' >> src/x.rs".to_string(), true),
+        ] {
+            let stdin = serde_json::json!({
+                "tool_name": "Bash",
+                "tool_input": {"command": command},
+                "permission_mode": "default",
+                "cwd": repo_cwd,
+            })
+            .to_string();
+            let mut out = Vec::new();
+            run_check_hook_mode_with_env(&cfg, &mut out, &stdin, &env).expect("runs");
+            let text = String::from_utf8(out).expect("utf8");
+            assert_eq!(
+                text.contains("orchestrator seat: dispatch a worker"),
+                denied,
+                "{command}: got {text}"
+            );
+        }
     }
 
     /// End-to-end: an orchestrator seat's `sed -i` on a repository file
@@ -8708,6 +8921,42 @@ mod tests {
         );
     }
 
+    #[test]
+    fn orchestrator_seat_read_only_redirect_commands_allow_through_the_hook() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".git")).expect("fake git marker");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = super::super::testenv::HomeGuard::set(home.path());
+        let empty: HashMap<String, String> = HashMap::new();
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("loads");
+        let repo_cwd = repo.path().to_string_lossy().replace('\\', "/");
+        let env_map = HashMap::from([(
+            super::super::adapters::SEAT_ROLE_ENV.to_string(),
+            "orchestrator".to_string(),
+        )]);
+
+        for command in [
+            "zirv agent codex --workdir /x/wt338 - < /private/tmp/claude-501/session/scratchpad/brief-338.md",
+            "for i in $(seq 1 80); do s=$(zirv ctx status --brief 2>&1); if echo \"$s\" | grep -qE 'x'; then echo READY; exit 0; fi; sleep 30; done",
+        ] {
+            let stdin = serde_json::json!({
+                "tool_name": "Bash",
+                "tool_input": {"command": command},
+                "permission_mode": "default",
+                "cwd": repo_cwd,
+            })
+            .to_string();
+            let mut out = Vec::new();
+            run_check_hook_mode_with_env(&cfg, &mut out, &stdin, &|k| env_map.get(k).cloned())
+                .expect("runs");
+            let text = String::from_utf8(out).expect("utf8");
+            assert!(
+                text.contains(r#""permissionDecision":"allow""#),
+                "the read-only command must allow from an orchestrator seat: {command}: got {text}"
+            );
+        }
+    }
+
     /// The same repository-write command from a non-orchestrator seat (no
     /// role env at all, or an explicit `worker` role) is never denied by
     /// this rule -- the guard is scoped to the orchestrator seat only.
@@ -8739,6 +8988,43 @@ mod tests {
                 "{env_map:?}: got {text}"
             );
         }
+    }
+
+    #[test]
+    fn orchestrator_seat_repository_write_guard_allows_a_native_subagent_bash_write() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".git")).expect("fake git marker");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = super::super::testenv::HomeGuard::set(home.path());
+        let empty: HashMap<String, String> = HashMap::new();
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("loads");
+        let repo_cwd = repo.path().to_string_lossy().replace('\\', "/");
+        let stdin = serde_json::json!({
+            "agent_id": "a1b2",
+            "agent_type": "general-purpose",
+            "tool_name": "Bash",
+            "tool_input": {"command": "echo x > src/x.rs"},
+            "permission_mode": "default",
+            "cwd": repo_cwd,
+        })
+        .to_string();
+        let env_map = HashMap::from([(
+            super::super::adapters::SEAT_ROLE_ENV.to_string(),
+            "orchestrator".to_string(),
+        )]);
+
+        let mut out = Vec::new();
+        run_check_hook_mode_with_env(&cfg, &mut out, &stdin, &|k| env_map.get(k).cloned())
+            .expect("runs");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            !text.contains("orchestrator seat: dispatch a worker"),
+            "a native subagent is the delegated worker: got {text}"
+        );
+        assert!(
+            !text.contains(r#""permissionDecision":"deny""#),
+            "the delegated worker's write must not be denied: got {text}"
+        );
     }
 
     /// An orchestrator-seat write CONFINED to `.zirv/work` is not denied by

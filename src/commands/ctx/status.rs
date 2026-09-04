@@ -1251,32 +1251,52 @@ fn render_report<W: Write>(
         // writer permit names the tree it holds, so `--worktree`'s own
         // allocation is visible here too.
         let live_writers = permit::live_writer_records(&state);
+        let writer_occupancy = if cfg.supervise.max_writers == 0 {
+            format!(
+                "{} in use (no machine-wide cap; one writer per worktree)",
+                live_writers.len()
+            )
+        } else {
+            format!(
+                "{} of {} slots in use",
+                live_writers.len(),
+                cfg.supervise.max_writers
+            )
+        };
         writeln!(
             w,
             "{} {}",
             label(colour, "writers:"),
-            style::paint(
-                &format!(
-                    "{} of {} slots in use",
-                    live_writers.len(),
-                    cfg.supervise.max_writers
-                ),
-                Tone::Muted,
-                colour
-            )
+            style::paint(&writer_occupancy, Tone::Muted, colour)
         )?;
         if !args.brief {
+            let invocation_common_dir =
+                adapters::git_common_dir(repo).and_then(|path| std::fs::canonicalize(path).ok());
             for record in &live_writers {
                 let tree = record
                     .tree
                     .as_deref()
                     .map(|p| p.display().to_string())
                     .unwrap_or_else(|| "(unknown tree)".to_string());
+                let other_repo = match (
+                    record
+                        .tree
+                        .as_deref()
+                        .and_then(adapters::git_common_dir)
+                        .and_then(|path| std::fs::canonicalize(path).ok()),
+                    invocation_common_dir.as_ref(),
+                ) {
+                    (Some(holder), Some(invocation)) if &holder != invocation => " (other repo)",
+                    _ => "",
+                };
                 writeln!(
                     w,
                     "  {}",
                     style::paint(
-                        &format!("pid {} -- {} -- {tree}", record.pid, record.label),
+                        &format!(
+                            "pid {} -- {} -- {tree}{other_repo}",
+                            record.pid, record.label
+                        ),
                         Tone::Muted,
                         colour
                     )
@@ -1466,14 +1486,40 @@ fn render_report<W: Write>(
             // sees it -- the same rule `wrap`'s status bar and the dashboard
             // header apply, so all three usage surfaces agree on what
             // "unknown" means.
+            let now = crate::commands::ctx::state::now_secs();
             let windows = crate::commands::ctx::window::available(
                 &crate::commands::ctx::window::load_for(&state, provider).unwrap_or_default(),
-                crate::commands::ctx::state::now_secs(),
+                now,
             );
+            let collector_max_age_secs = cfg_result
+                .as_ref()
+                .ok()
+                .map(|cfg| cfg.pace.collector_max_age_secs)
+                .unwrap_or_default();
+            let provider_prefix = if provider == crate::commands::ctx::window::CODEX_USAGE_PROVIDER
+            {
+                "codex "
+            } else {
+                ""
+            };
             let describe =
                 |name: &str, window: Option<&crate::commands::ctx::window::Window>| match window {
-                    Some(found) => format!("{name} {}", style::format_pct(found.used_percentage)),
-                    None => format!("{name} {}", style::PLACEHOLDER),
+                    Some(found) => {
+                        let stale = if provider
+                            == crate::commands::ctx::window::CODEX_USAGE_PROVIDER
+                            && crate::commands::ctx::window::age_secs(found, now)
+                                > collector_max_age_secs
+                        {
+                            " (stale)"
+                        } else {
+                            ""
+                        };
+                        format!(
+                            "{provider_prefix}{name} {}{stale}",
+                            style::format_pct(found.used_percentage)
+                        )
+                    }
+                    None => format!("{provider_prefix}{name} {}", style::PLACEHOLDER),
                 };
             writeln!(
                 w,
@@ -1491,6 +1537,45 @@ fn render_report<W: Write>(
             )?;
         }
         None => {}
+    }
+    if let (Some(cfg), Some(provider)) = (cfg_result.as_ref().ok(), provider)
+        && provider != crate::commands::ctx::window::CODEX_USAGE_PROVIDER
+    {
+        let now = crate::commands::ctx::state::now_secs();
+        let reading = crate::commands::ctx::window::load_for(
+            &state,
+            crate::commands::ctx::window::CODEX_USAGE_PROVIDER,
+        );
+        let mut parts = Vec::new();
+        if let Some(windows) = reading {
+            for (name, reading) in [
+                ("five_hour", windows.five_hour.as_ref()),
+                ("seven_day", windows.seven_day.as_ref()),
+            ] {
+                let Some(reading) = reading else {
+                    continue;
+                };
+                let age = crate::commands::ctx::window::age_secs(reading, now);
+                let stale = if age > cfg.pace.collector_max_age_secs {
+                    ", stale"
+                } else {
+                    ""
+                };
+                parts.push(format!(
+                    "codex {name}: {:.1}% used (rollout, observed {} ago at unix {}{stale}, resets at unix {})",
+                    reading.used_percentage,
+                    style::format_age(age),
+                    reading.observed_at,
+                    reading.resets_at
+                ));
+            }
+        }
+        let line = if parts.is_empty() {
+            "codex: no usage signal (no rollout rate_limits ingested yet)".to_string()
+        } else {
+            parts.join(" | ")
+        };
+        writeln!(w, "  {}", style::paint(&line, Tone::Muted, colour))?;
     }
 
     if args.brief {
@@ -2274,6 +2359,7 @@ mod tests {
                 score: 64,
                 action: "inject",
                 detail: "cooldown armed",
+                observed_at: None,
             },
         )
         .expect("append");
@@ -2739,6 +2825,7 @@ mod tests {
                     score: 0,
                     action: &format!("tick{i}"),
                     detail: "",
+                    observed_at: None,
                 },
             )
             .expect("append");
@@ -3035,6 +3122,105 @@ mod tests {
         drop(held);
     }
 
+    /// Issue #338: the shipped zero value describes the absence of a
+    /// machine-wide cap rather than rendering an impossible zero-slot pool.
+    #[test]
+    fn status_reports_the_writer_pool_without_a_machine_wide_cap_by_default() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        state.ensure().expect("ensure");
+        let env = env_for(state.root());
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let mut out = Vec::new();
+        run_with(
+            &StatusArgs {
+                decisions: 5,
+                brief: false,
+                diff: false,
+                breakdown: None,
+            },
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            false,
+        )
+        .expect("runs");
+        let text = String::from_utf8(out).expect("utf8");
+
+        assert!(
+            text.contains("writers: 0 in use (no machine-wide cap; one writer per worktree)"),
+            "got {text}"
+        );
+    }
+
+    /// Issue #338: holder rows distinguish another repository from another
+    /// linked worktree of this repository by comparing Git common dirs.
+    #[test]
+    fn status_reports_the_writer_repository_relationship() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        let other_repo = tmp.path().join("other-repo");
+        for path in [&repo, &other_repo] {
+            std::fs::create_dir_all(path).expect("mkdir");
+            let init = std::process::Command::new("git")
+                .arg("init")
+                .arg("-q")
+                .arg(path)
+                .output()
+                .expect("git init");
+            assert!(init.status.success(), "git init must succeed in {path:?}");
+        }
+
+        let state = StateDir::from_root(tmp.path().join("state"));
+        state.ensure().expect("ensure");
+        let env = env_for(state.root());
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let same = permit::acquire_writer(&state, 0, "same-repo", &repo).expect("granted");
+        let other = permit::acquire_writer(&state, 0, "other-repo", &other_repo).expect("granted");
+
+        let mut out = Vec::new();
+        run_with(
+            &StatusArgs {
+                decisions: 5,
+                brief: false,
+                diff: false,
+                breakdown: None,
+            },
+            &mut out,
+            &repo,
+            &|k| env.get(k).cloned(),
+            false,
+        )
+        .expect("runs");
+        let text = String::from_utf8(out).expect("utf8");
+        let pid = std::process::id();
+
+        assert!(
+            text.contains(&format!("pid {pid} -- same-repo -- {}", repo.display())),
+            "the invocation repo holder must be listed: got {text}"
+        );
+        assert!(
+            !text.contains(&format!(
+                "pid {pid} -- same-repo -- {} (other repo)",
+                repo.display()
+            )),
+            "the invocation repo must not be marked as another repo: got {text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "pid {pid} -- other-repo -- {} (other repo)",
+                other_repo.display()
+            )),
+            "the unrelated repository must be marked: got {text}"
+        );
+
+        drop(other);
+        drop(same);
+    }
+
     /// A `REPO_FORBIDDEN` config rejection must not add a second failure
     /// mode on top of the `CONFIG REJECTED` line already reported above --
     /// the heavy-operations line is simply omitted, degrading silently the
@@ -3282,6 +3468,7 @@ mod tests {
                     resets_at: crate::commands::ctx::state::now_secs() + 1000,
                     observed_at: crate::commands::ctx::state::now_secs(),
                     overage_covered: false,
+                    limit_reached: false,
                 }),
                 seven_day: None,
             },
@@ -3487,6 +3674,7 @@ mod tests {
                     resets_at: 1, // long past any real wall clock
                     observed_at: 1,
                     overage_covered: false,
+                    limit_reached: false,
                 }),
                 seven_day: None,
             },
@@ -3516,6 +3704,109 @@ mod tests {
             text.contains(&format!("five_hour {}", crate::style::PLACEHOLDER)),
             "expired reads the same as never-recorded: {text}"
         );
+    }
+
+    #[test]
+    fn status_marks_an_old_codex_rollout_reading_stale() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("home tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let state = StateDir::from_root(tmp.path().join("state"));
+        state.ensure().expect("ensure");
+        let now = crate::commands::ctx::state::now_secs();
+        crate::commands::ctx::window::store_for(
+            &state,
+            crate::commands::ctx::window::CODEX_USAGE_PROVIDER,
+            &crate::commands::ctx::window::UsageWindows {
+                five_hour: Some(crate::commands::ctx::window::Window {
+                    used_percentage: 91.0,
+                    resets_at: now + 3_600,
+                    observed_at: now.saturating_sub(901),
+                    overage_covered: false,
+                    limit_reached: false,
+                }),
+                seven_day: None,
+            },
+        )
+        .expect("store codex reading");
+        let mut env = env_for(state.root());
+        env.insert("ZIRV_CTX_AGENT".to_string(), "claude".to_string());
+
+        let mut out = Vec::new();
+        run_with(
+            &StatusArgs {
+                decisions: 5,
+                brief: false,
+                diff: false,
+                breakdown: None,
+            },
+            &mut out,
+            tmp.path(),
+            &|key| env.get(key).cloned(),
+            false,
+        )
+        .expect("runs");
+
+        let text = String::from_utf8(out).expect("utf8");
+        let codex_line = text
+            .lines()
+            .find(|line| line.contains("codex five_hour"))
+            .expect("codex usage line");
+        assert!(codex_line.contains("91.0% used"), "got {codex_line}");
+        assert!(codex_line.contains("stale"), "got {codex_line}");
+    }
+
+    #[test]
+    fn status_labels_and_marks_a_stale_codex_primary_reading() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("home tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let state = StateDir::from_root(tmp.path().join("state"));
+        state.ensure().expect("ensure");
+        let now = crate::commands::ctx::state::now_secs();
+        crate::commands::ctx::window::store_for(
+            &state,
+            crate::commands::ctx::window::CODEX_USAGE_PROVIDER,
+            &crate::commands::ctx::window::UsageWindows {
+                five_hour: Some(crate::commands::ctx::window::Window {
+                    used_percentage: 91.0,
+                    resets_at: now + 3_600,
+                    observed_at: now.saturating_sub(901),
+                    overage_covered: false,
+                    limit_reached: false,
+                }),
+                seven_day: None,
+            },
+        )
+        .expect("store codex reading");
+        let mut env = env_for(state.root());
+        env.insert("ZIRV_CTX_AGENT".to_string(), "codex".to_string());
+
+        let mut out = Vec::new();
+        run_with(
+            &StatusArgs {
+                decisions: 5,
+                brief: true,
+                diff: false,
+                breakdown: None,
+            },
+            &mut out,
+            tmp.path(),
+            &|key| env.get(key).cloned(),
+            false,
+        )
+        .expect("runs");
+
+        let text = String::from_utf8(out).expect("utf8");
+        let usage_line = text
+            .lines()
+            .find(|line| line.contains("usage windows:"))
+            .expect("usage summary");
+        assert!(
+            usage_line.contains("codex five_hour 91%"),
+            "got {usage_line}"
+        );
+        assert!(usage_line.contains("stale"), "got {usage_line}");
     }
 
     /// The third of the three usage surfaces this fixes (alongside `zirv ctx
@@ -3551,6 +3842,7 @@ mod tests {
                     resets_at: 1_785_509_000,
                     observed_at: crate::commands::ctx::state::now_secs(),
                     overage_covered: false,
+                    limit_reached: false,
                 }),
                 seven_day: None,
             },

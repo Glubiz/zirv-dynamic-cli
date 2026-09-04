@@ -1380,6 +1380,7 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
                     "advise"
                 },
                 detail: &detail,
+                observed_at: None,
             },
         );
         // Issue #243 (review round, F2): the STABLE short this session's
@@ -1583,6 +1584,7 @@ pub fn run_pre_compact<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> 
                 score: 0,
                 action: "pre-compact",
                 detail: &payload.transcript_path,
+                observed_at: None,
             },
         );
     }
@@ -1698,7 +1700,9 @@ const GENERIC_SUBAGENT_TYPES: [&str; 5] = ["fork", "claude", "general-purpose", 
 /// repository root the guard confines itself to is derived from the
 /// resolved TARGET (`repo_root_for_target`), never from `cwd` -- and
 /// `session_id` is the fallback identity for a logged block when this
-/// process has no zirv session env of its own.
+/// process has no zirv session env of its own. `agent_id` distinguishes a
+/// delegated native subagent from the orchestrator's guarded main thread;
+/// `agent_type` retains the other documented subagent discriminator.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct PreToolPayload {
@@ -1706,6 +1710,12 @@ pub struct PreToolPayload {
     pub tool_input: PreToolInput,
     pub cwd: String,
     pub session_id: String,
+    #[serde(default)]
+    pub agent_id: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    // retained from Claude's documented payload; agent_id is the discriminator
+    pub agent_type: String,
 }
 
 /// `tool_input` is tool-specific, so only the subagent tool's own parameters
@@ -1825,6 +1835,49 @@ fn normalize_lexically(path: &Path) -> PathBuf {
     out
 }
 
+/// Claude Code's operator-owned configuration directory. An explicit,
+/// non-empty `CLAUDE_CONFIG_DIR` wins; otherwise Claude's default beneath
+/// `HOME` (or Windows' `USERPROFILE`) applies. Environment access stays
+/// injectable so both write guards remain deterministic in tests.
+fn harness_home(env: EnvLookup<'_>) -> Option<PathBuf> {
+    env("CLAUDE_CONFIG_DIR")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            env("HOME")
+                .or_else(|| env("USERPROFILE"))
+                .filter(|value| !value.is_empty())
+                .map(|home| PathBuf::from(home).join(".claude"))
+        })
+}
+
+/// Canonicalizes the longest existing prefix of `path`, then restores any
+/// missing tail. Write targets and their parent directories need not exist.
+fn canonicalize_with_missing_tail(path: &Path) -> Option<PathBuf> {
+    let existing = path.ancestors().find(|ancestor| ancestor.exists())?;
+    let tail = path.strip_prefix(existing).ok()?;
+    std::fs::canonicalize(existing)
+        .ok()
+        .map(|root| root.join(tail))
+}
+
+/// Whether a write target belongs to Claude Code's own configuration tree.
+/// Existing harness homes compare in canonical space so symlinked home/temp
+/// paths agree; a not-yet-created harness home uses a component-aware lexical
+/// comparison on the paths exactly as supplied.
+pub(crate) fn target_is_under_harness_home(target: &Path, env: EnvLookup<'_>) -> bool {
+    let Some(harness_home) = harness_home(env) else {
+        return false;
+    };
+    if !harness_home.exists() {
+        return target.starts_with(harness_home);
+    }
+    let Ok(harness_home) = std::fs::canonicalize(harness_home) else {
+        return false;
+    };
+    canonicalize_with_missing_tail(target).is_some_and(|target| target.starts_with(harness_home))
+}
+
 /// The absolute, lexically-normalized target `payload` names, or `None` when
 /// the tool is not a [`FILE_MODIFICATION_TOOLS`] entry or the payload names
 /// no target at all (schema drift, not a real write). A relative target is
@@ -1878,9 +1931,10 @@ fn repo_root_for_target(target: &Path) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
-/// The whole orchestrator-write decision, pure apart from `Path::exists`
-/// (`repo_root_for_target`'s own ancestor walk): `Some(reason)` denies,
-/// `None` allows. `role` is `SEAT_ROLE_ENV`'s value.
+/// The whole orchestrator-write decision, with environment lookup injected
+/// and filesystem access limited to repository discovery plus canonical path
+/// comparison: `Some(reason)` denies, `None` allows. `role` is
+/// `SEAT_ROLE_ENV`'s value.
 ///
 /// Confinement is anchored on the resolved TARGET, never on `cwd` or the
 /// launch repo: an orchestrator seat has no business editing source in ANY
@@ -1890,20 +1944,30 @@ fn repo_root_for_target(target: &Path) -> Option<PathBuf> {
 /// target itself sits in, and the deny is narrowed only against THAT
 /// repo's own `<target_repo>/.zirv/work`/`<target_repo>/.zirv/memory` --
 /// the two roots a worker's own dispatch/handoff/memory writes still need
-/// from this seat. A target that sits in no git repository at all is
-/// outside this guard's scope and is allowed. Every other gate below is
-/// also a reason to allow: a non-orchestrator role, a tool that is not a
-/// [`FILE_MODIFICATION_TOOLS`] entry, or an empty target (schema drift, not
-/// a real write).
+/// from this seat. Claude Code's own harness home (`CLAUDE_CONFIG_DIR`, or
+/// `$HOME/.claude`/`%USERPROFILE%\\.claude`) is outside repository-write
+/// classification even when an ancestor carries `.git`. A target that sits in no git repository at all
+/// is outside this guard's scope and is allowed. Every other gate below is
+/// also a reason to allow: a non-orchestrator role, a native subagent call
+/// (`agent_id` is non-empty), a tool that is not a
+/// [`FILE_MODIFICATION_TOOLS`] entry, or an empty target (schema drift, not a
+/// real write).
 pub fn orchestrator_write_decision(
     role: Option<&str>,
     payload: &PreToolPayload,
     cwd: &Path,
+    env: EnvLookup<'_>,
 ) -> Option<String> {
     if role != Some("orchestrator") {
         return None;
     }
+    if !payload.agent_id.is_empty() {
+        return None;
+    }
     let target = normalized_write_target(payload, cwd)?;
+    if target_is_under_harness_home(&target, env) {
+        return None;
+    }
     let target_repo = repo_root_for_target(&target)?;
     let allowed_roots = [
         target_repo.join(".zirv/work"),
@@ -1968,7 +2032,7 @@ pub fn run_pretool<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxR
         cwd
     };
     let role = env(adapters::SEAT_ROLE_ENV);
-    let Some(reason) = orchestrator_write_decision(role.as_deref(), &payload, &cwd) else {
+    let Some(reason) = orchestrator_write_decision(role.as_deref(), &payload, &cwd, env) else {
         return Ok(0);
     };
     let _ = writeln!(w, "{}", pretool_output(&reason));
@@ -2071,6 +2135,7 @@ pub fn run_notify<W: Write>(w: &mut W, payload: &str, env: EnvLookup<'_>) -> Ctx
                     score: 0,
                     action: "notify-unmapped",
                     detail: &notify_shape(payload),
+                    observed_at: None,
                 },
             );
         }
@@ -4914,6 +4979,16 @@ mod tests {
         repo
     }
 
+    fn init_git_repo(path: &Path) {
+        std::fs::create_dir_all(path).expect("repo dir");
+        let status = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(path)
+            .status()
+            .expect("run git init");
+        assert!(status.success(), "git init failed");
+    }
+
     fn edit_payload(repo: &Path, relative_target: &str) -> PreToolPayload {
         let file_path = repo.join(relative_target);
         PreToolPayload::parse(&orchestrator_pretool_stdin(
@@ -4929,11 +5004,133 @@ mod tests {
     fn orchestrator_write_decision_denies_an_edit_under_the_repo() {
         let repo = orchestrator_repo();
         let payload = edit_payload(repo.path(), "src/x.rs");
-        let reason = orchestrator_write_decision(Some("orchestrator"), &payload, repo.path())
-            .expect("an orchestrator editing a repo file must be denied");
+        let reason =
+            orchestrator_write_decision(Some("orchestrator"), &payload, repo.path(), &|_| None)
+                .expect("an orchestrator editing a repo file must be denied");
         assert!(
             reason.contains("orchestrator seat: dispatch a worker"),
             "{reason}"
+        );
+    }
+
+    #[test]
+    fn orchestrator_write_decision_allows_an_edit_under_the_default_harness_home() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let _config = crate::commands::ctx::testenv::VarGuard::set(&[("CLAUDE_CONFIG_DIR", None)]);
+        let harness_home = home.path().join(".claude");
+        init_git_repo(&harness_home);
+        let target = harness_home.join("projects/slug/memory/note.md");
+        let payload = PreToolPayload::parse(&orchestrator_pretool_stdin(
+            &home.path().display().to_string(),
+            "claude-session-id",
+            "Edit",
+            serde_json::json!({"file_path": target.display().to_string()}),
+        ))
+        .expect("payload parses");
+        let env = env_from_process();
+
+        assert_eq!(
+            orchestrator_write_decision(Some("orchestrator"), &payload, home.path(), &env),
+            None
+        );
+    }
+
+    #[test]
+    fn default_harness_home_uses_userprofile_when_home_is_absent() {
+        let profile = tempfile::tempdir().expect("tempdir");
+        let harness_home = profile.path().join(".claude");
+        std::fs::create_dir_all(&harness_home).expect("harness home");
+        let target = harness_home.join("projects/slug/memory/note.md");
+        let profile = profile.path().display().to_string();
+        let env = |key: &str| match key {
+            "USERPROFILE" => Some(profile.clone()),
+            _ => None,
+        };
+
+        assert!(target_is_under_harness_home(&target, &env));
+    }
+
+    #[test]
+    fn orchestrator_write_decision_allows_an_edit_under_a_configured_harness_home() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let configured = home.path().join("cfg");
+        init_git_repo(&configured);
+        let configured_value = configured.to_string_lossy();
+        let _config = crate::commands::ctx::testenv::VarGuard::set(&[(
+            "CLAUDE_CONFIG_DIR",
+            Some(configured_value.as_ref()),
+        )]);
+        let target = configured.join("projects/slug/memory/MEMORY.md");
+        let payload = PreToolPayload::parse(&orchestrator_pretool_stdin(
+            &home.path().display().to_string(),
+            "claude-session-id",
+            "Edit",
+            serde_json::json!({"file_path": target.display().to_string()}),
+        ))
+        .expect("payload parses");
+        let env = env_from_process();
+
+        assert_eq!(
+            orchestrator_write_decision(Some("orchestrator"), &payload, home.path(), &env),
+            None
+        );
+    }
+
+    #[test]
+    fn orchestrator_write_decision_still_denies_a_repo_elsewhere_under_home() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let _config = crate::commands::ctx::testenv::VarGuard::set(&[("CLAUDE_CONFIG_DIR", None)]);
+        let repo = home.path().join("repo");
+        init_git_repo(&repo);
+        let target = repo.join("src/x.rs");
+        let payload = PreToolPayload::parse(&orchestrator_pretool_stdin(
+            &repo.display().to_string(),
+            "claude-session-id",
+            "Edit",
+            serde_json::json!({"file_path": target.display().to_string()}),
+        ))
+        .expect("payload parses");
+        let env = env_from_process();
+
+        assert!(
+            orchestrator_write_decision(Some("orchestrator"), &payload, &repo, &env).is_some(),
+            "a repository outside the harness home must stay denied"
+        );
+    }
+
+    #[test]
+    fn pretool_payload_parses_and_defaults_subagent_identity() {
+        let main_thread =
+            PreToolPayload::parse(r#"{"tool_name":"Edit"}"#).expect("a main-thread payload parses");
+        assert!(main_thread.agent_id.is_empty());
+        assert!(main_thread.agent_type.is_empty());
+
+        let subagent = PreToolPayload::parse(
+            r#"{"tool_name":"Edit","agent_id":"a1b2","agent_type":"general-purpose"}"#,
+        )
+        .expect("a subagent payload parses");
+        assert_eq!(subagent.agent_id, "a1b2");
+        assert_eq!(subagent.agent_type, "general-purpose");
+    }
+
+    #[test]
+    fn orchestrator_write_decision_allows_a_native_subagent_edit() {
+        let repo = orchestrator_repo();
+        let mut payload = edit_payload(repo.path(), "src/x.rs");
+        payload.agent_id = "a1b2".to_string();
+
+        assert_eq!(
+            orchestrator_write_decision(Some("orchestrator"), &payload, repo.path(), &|_| None),
+            None,
+            "a native subagent is the worker this guard asks the seat to dispatch"
+        );
+        assert_eq!(
+            orchestrator_write_decision(Some("worker"), &payload, repo.path(), &|_| None),
+            None,
+            "subagent identity must not change non-orchestrator behavior"
         );
     }
 
@@ -4943,7 +5140,7 @@ mod tests {
         let payload = edit_payload(repo.path(), "src/x.rs");
         for role in [None, Some("worker"), Some("sub-orchestrator")] {
             assert_eq!(
-                orchestrator_write_decision(role, &payload, repo.path()),
+                orchestrator_write_decision(role, &payload, repo.path(), &|_| None),
                 None,
                 "{role:?} must never be blocked from editing"
             );
@@ -4956,7 +5153,7 @@ mod tests {
         for relative in [".zirv/work/notes.md", ".zirv/memory/x.md"] {
             let payload = edit_payload(repo.path(), relative);
             assert_eq!(
-                orchestrator_write_decision(Some("orchestrator"), &payload, repo.path()),
+                orchestrator_write_decision(Some("orchestrator"), &payload, repo.path(), &|_| None,),
                 None,
                 "{relative} must stay allowed"
             );
@@ -4974,7 +5171,8 @@ mod tests {
         ))
         .expect("payload parses");
         assert!(
-            orchestrator_write_decision(Some("orchestrator"), &inside, repo.path()).is_some(),
+            orchestrator_write_decision(Some("orchestrator"), &inside, repo.path(), &|_| None,)
+                .is_some(),
             "a relative target must resolve against cwd, landing inside the repo"
         );
 
@@ -4986,7 +5184,7 @@ mod tests {
         ))
         .expect("payload parses");
         assert_eq!(
-            orchestrator_write_decision(Some("orchestrator"), &outside, repo.path()),
+            orchestrator_write_decision(Some("orchestrator"), &outside, repo.path(), &|_| None,),
             None,
             "a relative target that climbs outside the repo must be allowed"
         );
@@ -5003,7 +5201,7 @@ mod tests {
         ))
         .expect("payload parses");
         assert_eq!(
-            orchestrator_write_decision(Some("orchestrator"), &payload, repo.path()),
+            orchestrator_write_decision(Some("orchestrator"), &payload, repo.path(), &|_| None,),
             None,
             "an empty target is schema drift, not a real write"
         );
@@ -5020,7 +5218,10 @@ mod tests {
             serde_json::json!({"notebook_path": notebook_path.display().to_string()}),
         ))
         .expect("payload parses");
-        assert!(orchestrator_write_decision(Some("orchestrator"), &payload, repo.path()).is_some());
+        assert!(
+            orchestrator_write_decision(Some("orchestrator"), &payload, repo.path(), &|_| None,)
+                .is_some()
+        );
     }
 
     #[test]
@@ -5042,7 +5243,7 @@ mod tests {
             ))
             .expect("payload parses");
             assert_eq!(
-                orchestrator_write_decision(Some("orchestrator"), &payload, repo.path()),
+                orchestrator_write_decision(Some("orchestrator"), &payload, repo.path(), &|_| None,),
                 None,
                 "{tool} is not a file-modification tool"
             );
@@ -5073,9 +5274,13 @@ mod tests {
         ))
         .expect("payload parses");
 
-        let reason =
-            orchestrator_write_decision(Some("orchestrator"), &payload, launch_repo.path())
-                .expect("a sibling checkout's own source must be denied too");
+        let reason = orchestrator_write_decision(
+            Some("orchestrator"),
+            &payload,
+            launch_repo.path(),
+            &|_| None,
+        )
+        .expect("a sibling checkout's own source must be denied too");
         assert!(
             reason.contains("orchestrator seat: dispatch a worker"),
             "{reason}"
@@ -5101,7 +5306,12 @@ mod tests {
         .expect("payload parses");
 
         assert_eq!(
-            orchestrator_write_decision(Some("orchestrator"), &payload, launch_repo.path()),
+            orchestrator_write_decision(
+                Some("orchestrator"),
+                &payload,
+                launch_repo.path(),
+                &|_| None,
+            ),
             None,
             "a target outside any git repository is outside this guard's scope"
         );
@@ -5125,7 +5335,12 @@ mod tests {
         .expect("payload parses");
 
         assert_eq!(
-            orchestrator_write_decision(Some("orchestrator"), &payload, launch_repo.path()),
+            orchestrator_write_decision(
+                Some("orchestrator"),
+                &payload,
+                launch_repo.path(),
+                &|_| None,
+            ),
             None,
             "a sibling repo's own .zirv/work stays allowed"
         );

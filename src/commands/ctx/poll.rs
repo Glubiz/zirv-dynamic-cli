@@ -128,6 +128,7 @@ fn parse_anthropic_usage(body: &str, now: u64) -> Option<PollReading> {
                 .unwrap_or(0),
             observed_at: now,
             overage_covered: false,
+            limit_reached: false,
         })
     };
     let windows = UsageWindows {
@@ -715,6 +716,7 @@ mod tests {
                 resets_at,
                 observed_at,
                 overage_covered: false,
+                limit_reached: false,
             }),
             seven_day: None,
         }
@@ -872,12 +874,14 @@ mod tests {
                 resets_at: now - 1,
                 observed_at: now - 10,
                 overage_covered: false,
+                limit_reached: false,
             }),
             seven_day: Some(Window {
                 used_percentage: 30.0,
                 resets_at: now + 7 * 24 * 3600,
                 observed_at: now - 10,
                 overage_covered: false,
+                limit_reached: false,
             }),
         };
         window::store_for(&state, provider, &mixed).expect("store mixed reading");
