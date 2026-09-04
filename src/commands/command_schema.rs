@@ -137,8 +137,6 @@ const READ_ONLY: &[&str] = &[
     "zirv setup status",
     "zirv skill list",
     "zirv skill show",
-    "zirv report bug",
-    "zirv report feature",
 ];
 
 /// Leaf paths that write: state on disk, a session/registry entry, a
@@ -149,6 +147,8 @@ const READ_ONLY: &[&str] = &[
 const MUTATING: &[&str] = &[
     "zirv init",
     "zirv create",
+    "zirv report bug",
+    "zirv report feature",
     "zirv ctx chat",
     "zirv ctx agent",
     "zirv ctx handoff",
@@ -561,6 +561,21 @@ mod tests {
             "got flags: {long_flags:?}"
         );
         assert!(long_flags.contains(&"workdir"), "got flags: {long_flags:?}");
+    }
+
+    #[test]
+    fn report_bug_and_feature_are_mutating_they_file_a_real_github_issue() {
+        let entries = command_entries().expect("classified");
+        for path in ["zirv report bug", "zirv report feature"] {
+            let entry = entries
+                .iter()
+                .find(|entry| entry.path == path)
+                .unwrap_or_else(|| panic!("{path} must be discovered"));
+            assert!(
+                entry.mutating,
+                "{path} files a real GitHub issue over HTTP: it mutates"
+            );
+        }
     }
 
     #[test]

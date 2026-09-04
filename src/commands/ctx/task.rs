@@ -254,14 +254,23 @@ pub fn read_events(state: &StateDir, repo_slug: &str) -> Vec<Event> {
         .collect()
 }
 
-/// Appends one event under the repository's lock.
-pub fn append_event(state: &StateDir, repo_slug: &str, event: &Event) -> CtxResult<()> {
-    let _lock = lock_tasks(state, repo_slug)?;
+/// Writes one event, assuming the repository's task lock is ALREADY held by
+/// the caller -- the shared body [`append_event`] and every locked
+/// read-then-append helper below ([`with_task_lock`], [`write_events_atomic_
+/// locked`]) call once they hold that lock, so a nested caller never has to
+/// acquire the (non-reentrant) lock a second time.
+fn write_event_locked(state: &StateDir, repo_slug: &str, event: &Event) -> CtxResult<()> {
     let dir = state.tasks().join(repo_slug);
     create_private_dir_all(&dir)?;
     let mut file = super::state::open_private_append(&dir.join(EVENTS_FILE))?;
     writeln!(file, "{}", serde_json::to_string(event)?)?;
     Ok(())
+}
+
+/// Appends one event under the repository's lock.
+pub fn append_event(state: &StateDir, repo_slug: &str, event: &Event) -> CtxResult<()> {
+    let _lock = lock_tasks(state, repo_slug)?;
+    write_event_locked(state, repo_slug, event)
 }
 
 /// Appends every event in `events` as ONE atomic batch: builds the whole new
@@ -275,6 +284,17 @@ pub fn append_event(state: &StateDir, repo_slug: &str, event: &Event) -> CtxResu
 /// interruption never leaves an orphaned partial batch on disk.
 pub fn append_events_atomic(state: &StateDir, repo_slug: &str, events: &[Event]) -> CtxResult<()> {
     let _lock = lock_tasks(state, repo_slug)?;
+    write_events_atomic_locked(state, repo_slug, events)
+}
+
+/// The body of [`append_events_atomic`], assuming the repository's task lock
+/// is ALREADY held -- see [`write_event_locked`]'s own doc comment for why
+/// this split exists.
+fn write_events_atomic_locked(
+    state: &StateDir,
+    repo_slug: &str,
+    events: &[Event],
+) -> CtxResult<()> {
     let dir = state.tasks().join(repo_slug);
     create_private_dir_all(&dir)?;
     let path = dir.join(EVENTS_FILE);
@@ -424,28 +444,6 @@ pub fn load_cards(state: &StateDir, repo_slug: &str) -> BTreeMap<String, Card> {
     materialize(&read_events(state, repo_slug))
 }
 
-/// Looks up `id`, reaping a stale dead-claimant lock and auto-promoting a
-/// `Todo` card whose parents are all now `Done` first -- the same two
-/// self-healing steps [`run_claim`] applies before attempting a claim, factored
-/// out so `zirv ctx agent --task` (which claims outside this module's own CLI
-/// verb) gets the identical up-to-date view rather than a second,
-/// possibly-drifting reimplementation. `Ok(None)` when no card with `id`
-/// exists in this repository.
-pub fn resolve_for_claim(
-    state: &StateDir,
-    repo_slug: &str,
-    id: &str,
-    now: u64,
-) -> CtxResult<Option<Card>> {
-    let cards = load_cards(state, repo_slug);
-    let Some(card) = cards.get(id) else {
-        return Ok(None);
-    };
-    let card = reap_if_stale(state, repo_slug, card, now)?;
-    let card = promote_if_ready(state, repo_slug, &cards, &card, now)?;
-    Ok(Some(card))
-}
-
 // -- Pure transitions -----------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -455,6 +453,12 @@ pub enum Refusal {
     NotClaimed,
     WrongClaimant(String),
     ClaimantDead,
+    /// [`block`]: refused off anything but Todo/Ready/Running/Review.
+    CannotBlock(State),
+    /// [`unblock`]: refused off anything but Blocked.
+    CannotUnblock(State),
+    /// [`archive`]: refused off anything but Done or Blocked.
+    CannotArchive(State),
 }
 
 impl std::fmt::Display for Refusal {
@@ -469,6 +473,9 @@ impl std::fmt::Display for Refusal {
                 write!(f, "claimed by a different session ({session})")
             }
             Self::ClaimantDead => write!(f, "claimant is no longer alive"),
+            Self::CannotBlock(state) => write!(f, "cannot block from state {state}"),
+            Self::CannotUnblock(state) => write!(f, "cannot unblock from state {state}"),
+            Self::CannotArchive(state) => write!(f, "cannot archive from state {state}"),
         }
     }
 }
@@ -575,7 +582,16 @@ pub fn complete(card: &Card, outcome: &str, now: u64) -> Card {
     next
 }
 
-pub fn block(card: &Card, reason: &str, by: &str, now: u64) -> Card {
+/// Refuses unless `card.state` is one of Todo/Ready/Running/Review -- an
+/// already-`Blocked`, `Done`, or `Archived` card cannot be blocked again (or
+/// at all, once terminal).
+pub fn block(card: &Card, reason: &str, by: &str, now: u64) -> Result<Card, Refusal> {
+    if !matches!(
+        card.state,
+        State::Todo | State::Ready | State::Running | State::Review
+    ) {
+        return Err(Refusal::CannotBlock(card.state));
+    }
     let mut next = card.clone();
     next.state = State::Blocked;
     next.block = Some(Block {
@@ -584,22 +600,33 @@ pub fn block(card: &Card, reason: &str, by: &str, now: u64) -> Card {
     });
     next.claim = None;
     next.updated_at = now;
-    next
+    Ok(next)
 }
 
-pub fn unblock(card: &Card, now: u64) -> Card {
+/// Refuses unless `card.state` is `Blocked` -- there is nothing to clear off
+/// any other state.
+pub fn unblock(card: &Card, now: u64) -> Result<Card, Refusal> {
+    if card.state != State::Blocked {
+        return Err(Refusal::CannotUnblock(card.state));
+    }
     let mut next = card.clone();
     next.state = State::Ready;
     next.block = None;
     next.updated_at = now;
-    next
+    Ok(next)
 }
 
-pub fn archive(card: &Card, now: u64) -> Card {
+/// Refuses unless `card.state` is `Done` or `Blocked` -- a card still
+/// actively in flight (Todo/Ready/Running/Review) is never archived out from
+/// under it.
+pub fn archive(card: &Card, now: u64) -> Result<Card, Refusal> {
+    if !matches!(card.state, State::Done | State::Blocked) {
+        return Err(Refusal::CannotArchive(card.state));
+    }
     let mut next = card.clone();
     next.state = State::Archived;
     next.updated_at = now;
-    next
+    Ok(next)
 }
 
 pub fn add_comment(card: &Card, by: &str, text: &str, now: u64) -> Card {
@@ -1001,60 +1028,143 @@ pub fn run_show<W: Write>(
 /// event) when every parent is now `Done` -- a fresh orchestrator picking up
 /// work after a crash must not have to run a separate "ready" step by hand
 /// before `claim` can succeed.
-fn promote_if_ready(
-    state: &StateDir,
-    repo_slug: &str,
+/// Pure: [`promote_if_ready`]'s own decision, minus the I/O -- appends a
+/// [`Event::Readied`] to `events` (for the caller to persist) instead of
+/// writing it itself, so a locked caller ([`with_task_lock`]) can fold this
+/// into the SAME atomic batch as whatever it decides next, rather than each
+/// step taking and releasing the lock separately.
+fn promote_if_ready_pure(
     cards: &BTreeMap<String, Card>,
     card: &Card,
     now: u64,
-) -> CtxResult<Card> {
+    events: &mut Vec<Event>,
+) -> Card {
     if card.state != State::Todo {
-        return Ok(card.clone());
+        return card.clone();
     }
     let parents: Vec<&Card> = card.parents.iter().filter_map(|id| cards.get(id)).collect();
     match ready_when_parents_done(card, &parents, now) {
         Some(promoted) => {
-            append_event(
-                state,
-                repo_slug,
-                &Event::Readied {
-                    id: card.id.clone(),
-                    at: now,
-                },
-            )?;
-            Ok(promoted)
+            events.push(Event::Readied {
+                id: card.id.clone(),
+                at: now,
+            });
+            promoted
         }
-        None => Ok(card.clone()),
+        None => card.clone(),
     }
 }
 
-/// Reaps `card`'s own claim back to `Ready` first (appending a `Crash` event)
+/// Pure: [`reap_if_stale`]'s own decision, minus the I/O -- see [`promote_
+/// if_ready_pure`]'s doc comment for why this split exists. Reaps `card`'s
+/// own claim back to `Ready` (recording an [`Event::Crash`] into `events`)
 /// when it is `Running`, its TTL has elapsed, and its claimant is confirmed
 /// dead -- so a fresh `claim` attempt against a card a crashed worker left
 /// stuck `Running` succeeds without a separate maintenance step. A live
 /// claimant, or one whose TTL has not yet elapsed, is left untouched (`reap`'s
 /// own doc comment).
-fn reap_if_stale(state: &StateDir, repo_slug: &str, card: &Card, now: u64) -> CtxResult<Card> {
+fn reap_if_stale_pure(card: &Card, now: u64, events: &mut Vec<Event>) -> Card {
     let Some(existing) = &card.claim else {
-        return Ok(card.clone());
+        return card.clone();
     };
     if card.state != State::Running || !is_ttl_expired(existing, now) {
-        return Ok(card.clone());
+        return card.clone();
     }
     match reap(card, now, claimant_alive(existing)) {
         Some(reaped) => {
-            append_event(
-                state,
-                repo_slug,
-                &Event::Crash {
-                    id: card.id.clone(),
-                    at: now,
-                },
-            )?;
-            Ok(reaped)
+            events.push(Event::Crash {
+                id: card.id.clone(),
+                at: now,
+            });
+            reaped
         }
-        None => Ok(card.clone()),
+        None => card.clone(),
     }
+}
+
+/// The one locked entry point every read-then-append task verb goes
+/// through: acquires `repo_slug`'s task lock, loads a FRESH view of every
+/// card in the repository under that lock (never a caller's own, possibly
+/// stale, earlier read), hands it to the pure `decide` closure, and durably
+/// appends whatever events `decide` returns -- all before the lock is
+/// released. This is the fix for issue #317's own claim race: two concurrent
+/// callers deciding against the same id can never both observe a
+/// pre-mutation card and both append a conflicting event, because the
+/// loser's own fresh read (taken only once IT holds the lock) already
+/// reflects the winner's write.
+///
+/// `decide` returns `Ok(None)` when `id` names no card in this repository
+/// (nothing is appended); `Ok(Some((Err(refusal), events)))` when the pure
+/// transition itself refuses (any events already decided along the way --
+/// e.g. a stale-claim reap -- are still appended, since those are honest
+/// facts regardless of whether the verb's own transition succeeds);
+/// `Ok(Some((Ok(result), events)))` once `events` has been durably appended.
+fn with_task_lock<T>(
+    state: &StateDir,
+    repo_slug: &str,
+    decide: impl FnOnce(&BTreeMap<String, Card>) -> Option<(Result<T, Refusal>, Vec<Event>)>,
+) -> CtxResult<Option<Result<T, Refusal>>> {
+    let _lock = lock_tasks(state, repo_slug)?;
+    let cards = load_cards(state, repo_slug);
+    let Some((outcome, events)) = decide(&cards) else {
+        return Ok(None);
+    };
+    if !events.is_empty() {
+        write_events_atomic_locked(state, repo_slug, &events)?;
+    }
+    Ok(Some(outcome))
+}
+
+/// [`claim`]'s own locked entry point, going through [`with_task_lock`]: the
+/// self-healing reap/promote steps [`run_claim`] and `zirv ctx agent --task`
+/// (`agent::claim_task_for_delegation`) both need before attempting a claim,
+/// then the claim attempt itself, all decided against ONE fresh read and
+/// appended as one atomic batch under one hold of the lock. `Ok(None)` when
+/// no card with `id` exists in this repository.
+#[allow(clippy::too_many_arguments)]
+pub fn claim_locked(
+    state: &StateDir,
+    repo_slug: &str,
+    id: &str,
+    session: &str,
+    pid: u32,
+    pid_start_time: Option<u64>,
+    host: &str,
+    now: u64,
+    ttl_secs: u64,
+) -> CtxResult<Option<Result<Card, Refusal>>> {
+    with_task_lock(state, repo_slug, |cards| {
+        let card = cards.get(id)?;
+        let mut events = Vec::new();
+        let card = reap_if_stale_pure(card, now, &mut events);
+        let card = promote_if_ready_pure(cards, &card, now, &mut events);
+        let parents_done = card
+            .parents
+            .iter()
+            .all(|pid| cards.get(pid).is_some_and(|p| p.state == State::Done));
+        match claim(
+            &card,
+            session,
+            pid,
+            pid_start_time,
+            host,
+            now,
+            ttl_secs,
+            parents_done,
+        ) {
+            Ok(claimed) => {
+                let claim_val = claimed.claim.clone().expect("claim always sets it");
+                events.push(Event::Claimed {
+                    id: card.id.clone(),
+                    claim: claim_val,
+                    attempts: claimed.attempts,
+                    at: now,
+                });
+                Some((Ok(claimed), events))
+            }
+            Err(refusal) => Some((Err(refusal), events)),
+        }
+    })
 }
 
 pub fn run_claim<W: Write>(
@@ -1065,49 +1175,32 @@ pub fn run_claim<W: Write>(
     now: u64,
 ) -> CtxResult<i32> {
     let repo_slug = resolve_repo_slug()?;
-    let cards = load_cards(state, &repo_slug);
-    let Some(card) = cards.get(&args.id) else {
-        writeln!(w, "no task '{}'", args.id)?;
-        return Ok(1);
-    };
-    let card = reap_if_stale(state, &repo_slug, card, now)?;
-    let card = promote_if_ready(state, &repo_slug, &cards, &card, now)?;
-    let parents_done = card
-        .parents
-        .iter()
-        .all(|id| cards.get(id).is_some_and(|p| p.state == State::Done));
     let session = resolve_session(&args.session, env);
     let pid = std::process::id();
     let pid_start_time = super::sessions::process_start_secs(pid);
     let ttl_secs = args.ttl_secs.unwrap_or(DEFAULT_CLAIM_TTL_SECS);
     let host = local_host();
-    match claim(
-        &card,
+    match claim_locked(
+        state,
+        &repo_slug,
+        &args.id,
         &session,
         pid,
         pid_start_time,
         &host,
         now,
         ttl_secs,
-        parents_done,
-    ) {
-        Ok(claimed) => {
-            let claim_val = claimed.claim.clone().expect("claim always sets it");
-            append_event(
-                state,
-                &repo_slug,
-                &Event::Claimed {
-                    id: card.id.clone(),
-                    claim: claim_val,
-                    attempts: claimed.attempts,
-                    at: now,
-                },
-            )?;
-            writeln!(w, "claimed {}", card.id)?;
+    )? {
+        None => {
+            writeln!(w, "no task '{}'", args.id)?;
+            Ok(1)
+        }
+        Some(Ok(claimed)) => {
+            writeln!(w, "claimed {}", claimed.id)?;
             Ok(0)
         }
-        Err(refusal) => {
-            writeln!(w, "cannot claim {}: {refusal}", card.id)?;
+        Some(Err(refusal)) => {
+            writeln!(w, "cannot claim {}: {refusal}", args.id)?;
             Ok(1)
         }
     }
@@ -1121,29 +1214,33 @@ pub fn run_heartbeat<W: Write>(
     now: u64,
 ) -> CtxResult<i32> {
     let repo_slug = resolve_repo_slug()?;
-    let cards = load_cards(state, &repo_slug);
-    let Some(card) = cards.get(&args.id) else {
-        writeln!(w, "no task '{}'", args.id)?;
-        return Ok(1);
-    };
     let session = resolve_session(&args.session, env);
-    let alive = card.claim.as_ref().is_some_and(claimant_alive);
-    match heartbeat(card, &session, now, alive) {
-        Ok(_) => {
-            append_event(
-                state,
-                &repo_slug,
-                &Event::Heartbeat {
-                    id: card.id.clone(),
+    let outcome = with_task_lock(state, &repo_slug, |cards| {
+        let card = cards.get(&args.id)?;
+        let alive = card.claim.as_ref().is_some_and(claimant_alive);
+        match heartbeat(card, &session, now, alive) {
+            Ok(next) => {
+                let event = Event::Heartbeat {
+                    id: args.id.clone(),
                     claimed_at: now,
                     at: now,
-                },
-            )?;
-            writeln!(w, "heartbeat {}", card.id)?;
+                };
+                Some((Ok(next), vec![event]))
+            }
+            Err(refusal) => Some((Err(refusal), Vec::new())),
+        }
+    })?;
+    match outcome {
+        None => {
+            writeln!(w, "no task '{}'", args.id)?;
+            Ok(1)
+        }
+        Some(Ok(_)) => {
+            writeln!(w, "heartbeat {}", args.id)?;
             Ok(0)
         }
-        Err(refusal) => {
-            writeln!(w, "cannot heartbeat {}: {refusal}", card.id)?;
+        Some(Err(refusal)) => {
+            writeln!(w, "cannot heartbeat {}: {refusal}", args.id)?;
             Ok(1)
         }
     }
@@ -1156,23 +1253,32 @@ pub fn run_complete<W: Write>(
     now: u64,
 ) -> CtxResult<i32> {
     let repo_slug = resolve_repo_slug()?;
-    let cards = load_cards(state, &repo_slug);
-    let Some(card) = cards.get(&args.id) else {
-        writeln!(w, "no task '{}'", args.id)?;
-        return Ok(1);
-    };
-    let completed = complete(card, &args.outcome, now);
-    append_event(
-        state,
-        &repo_slug,
-        &Event::Completed {
+    let outcome = with_task_lock(state, &repo_slug, |cards| {
+        let card = cards.get(&args.id)?;
+        let completed = complete(card, &args.outcome, now);
+        let event = Event::Completed {
             id: args.id.clone(),
-            outcome: completed.outcome.unwrap_or_default(),
+            outcome: completed.outcome.clone().unwrap_or_default(),
             at: completed.updated_at,
-        },
-    )?;
-    writeln!(w, "completed {}", args.id)?;
-    Ok(0)
+        };
+        Some((Ok(completed), vec![event]))
+    })?;
+    match outcome {
+        None => {
+            writeln!(w, "no task '{}'", args.id)?;
+            Ok(1)
+        }
+        Some(Ok(_)) => {
+            writeln!(w, "completed {}", args.id)?;
+            Ok(0)
+        }
+        Some(Err(refusal)) => {
+            // `complete` never refuses today, but the shape is kept uniform
+            // with every other locked verb rather than special-cased away.
+            writeln!(w, "cannot complete {}: {refusal}", args.id)?;
+            Ok(1)
+        }
+    }
 }
 
 pub fn run_block<W: Write>(
@@ -1182,26 +1288,37 @@ pub fn run_block<W: Write>(
     now: u64,
 ) -> CtxResult<i32> {
     let repo_slug = resolve_repo_slug()?;
-    let cards = load_cards(state, &repo_slug);
-    let Some(card) = cards.get(&args.id) else {
-        writeln!(w, "no task '{}'", args.id)?;
-        return Ok(1);
-    };
     let by = args.by.clone().unwrap_or_else(|| "operator".to_string());
-    let blocked = block(card, &args.reason, &by, now);
-    let outcome = blocked.block.expect("block always sets it");
-    append_event(
-        state,
-        &repo_slug,
-        &Event::Blocked {
-            id: args.id.clone(),
-            reason: outcome.reason,
-            by: outcome.by,
-            at: blocked.updated_at,
-        },
-    )?;
-    writeln!(w, "blocked {}", args.id)?;
-    Ok(0)
+    let outcome = with_task_lock(state, &repo_slug, |cards| {
+        let card = cards.get(&args.id)?;
+        match block(card, &args.reason, &by, now) {
+            Ok(blocked) => {
+                let b = blocked.block.clone().expect("block always sets it");
+                let event = Event::Blocked {
+                    id: args.id.clone(),
+                    reason: b.reason,
+                    by: b.by,
+                    at: blocked.updated_at,
+                };
+                Some((Ok(blocked), vec![event]))
+            }
+            Err(refusal) => Some((Err(refusal), Vec::new())),
+        }
+    })?;
+    match outcome {
+        None => {
+            writeln!(w, "no task '{}'", args.id)?;
+            Ok(1)
+        }
+        Some(Ok(_)) => {
+            writeln!(w, "blocked {}", args.id)?;
+            Ok(0)
+        }
+        Some(Err(refusal)) => {
+            writeln!(w, "cannot block {}: {refusal}", args.id)?;
+            Ok(1)
+        }
+    }
 }
 
 pub fn run_unblock<W: Write>(
@@ -1211,22 +1328,33 @@ pub fn run_unblock<W: Write>(
     now: u64,
 ) -> CtxResult<i32> {
     let repo_slug = resolve_repo_slug()?;
-    let cards = load_cards(state, &repo_slug);
-    let Some(card) = cards.get(&args.id) else {
-        writeln!(w, "no task '{}'", args.id)?;
-        return Ok(1);
-    };
-    let unblocked = unblock(card, now);
-    append_event(
-        state,
-        &repo_slug,
-        &Event::Unblocked {
-            id: args.id.clone(),
-            at: unblocked.updated_at,
-        },
-    )?;
-    writeln!(w, "unblocked {}", args.id)?;
-    Ok(0)
+    let outcome = with_task_lock(state, &repo_slug, |cards| {
+        let card = cards.get(&args.id)?;
+        match unblock(card, now) {
+            Ok(unblocked) => {
+                let event = Event::Unblocked {
+                    id: args.id.clone(),
+                    at: unblocked.updated_at,
+                };
+                Some((Ok(unblocked), vec![event]))
+            }
+            Err(refusal) => Some((Err(refusal), Vec::new())),
+        }
+    })?;
+    match outcome {
+        None => {
+            writeln!(w, "no task '{}'", args.id)?;
+            Ok(1)
+        }
+        Some(Ok(_)) => {
+            writeln!(w, "unblocked {}", args.id)?;
+            Ok(0)
+        }
+        Some(Err(refusal)) => {
+            writeln!(w, "cannot unblock {}: {refusal}", args.id)?;
+            Ok(1)
+        }
+    }
 }
 
 pub fn run_comment<W: Write>(
@@ -1236,24 +1364,34 @@ pub fn run_comment<W: Write>(
     now: u64,
 ) -> CtxResult<i32> {
     let repo_slug = resolve_repo_slug()?;
-    let cards = load_cards(state, &repo_slug);
-    let Some(card) = cards.get(&args.id) else {
-        writeln!(w, "no task '{}'", args.id)?;
-        return Ok(1);
-    };
     let by = args.by.clone().unwrap_or_else(|| "operator".to_string());
-    let commented = add_comment(card, &by, &args.text, now);
-    let comment = commented.comments.last().expect("just pushed").clone();
-    append_event(
-        state,
-        &repo_slug,
-        &Event::Commented {
+    let outcome = with_task_lock(state, &repo_slug, |cards| {
+        let card = cards.get(&args.id)?;
+        let commented = add_comment(card, &by, &args.text, now);
+        let comment = commented.comments.last().expect("just pushed").clone();
+        let event = Event::Commented {
             id: args.id.clone(),
             comment,
-        },
-    )?;
-    writeln!(w, "commented on {}", args.id)?;
-    Ok(0)
+        };
+        Some((Ok(commented), vec![event]))
+    })?;
+    match outcome {
+        None => {
+            writeln!(w, "no task '{}'", args.id)?;
+            Ok(1)
+        }
+        Some(Ok(_)) => {
+            writeln!(w, "commented on {}", args.id)?;
+            Ok(0)
+        }
+        Some(Err(refusal)) => {
+            // `add_comment` never refuses today, but the shape is kept
+            // uniform with every other locked verb rather than special-cased
+            // away.
+            writeln!(w, "cannot comment on {}: {refusal}", args.id)?;
+            Ok(1)
+        }
+    }
 }
 
 pub fn run_archive<W: Write>(
@@ -1263,22 +1401,33 @@ pub fn run_archive<W: Write>(
     now: u64,
 ) -> CtxResult<i32> {
     let repo_slug = resolve_repo_slug()?;
-    let cards = load_cards(state, &repo_slug);
-    let Some(card) = cards.get(&args.id) else {
-        writeln!(w, "no task '{}'", args.id)?;
-        return Ok(1);
-    };
-    let archived = archive(card, now);
-    append_event(
-        state,
-        &repo_slug,
-        &Event::Archived {
-            id: args.id.clone(),
-            at: archived.updated_at,
-        },
-    )?;
-    writeln!(w, "archived {}", args.id)?;
-    Ok(0)
+    let outcome = with_task_lock(state, &repo_slug, |cards| {
+        let card = cards.get(&args.id)?;
+        match archive(card, now) {
+            Ok(archived) => {
+                let event = Event::Archived {
+                    id: args.id.clone(),
+                    at: archived.updated_at,
+                };
+                Some((Ok(archived), vec![event]))
+            }
+            Err(refusal) => Some((Err(refusal), Vec::new())),
+        }
+    })?;
+    match outcome {
+        None => {
+            writeln!(w, "no task '{}'", args.id)?;
+            Ok(1)
+        }
+        Some(Ok(_)) => {
+            writeln!(w, "archived {}", args.id)?;
+            Ok(0)
+        }
+        Some(Err(refusal)) => {
+            writeln!(w, "cannot archive {}: {refusal}", args.id)?;
+            Ok(1)
+        }
+    }
 }
 
 pub fn run<W: Write>(args: &TaskArgs, w: &mut W) -> CtxResult<i32> {
@@ -1695,14 +1844,14 @@ mod tests {
     #[test]
     fn block_and_unblock_round_trip() {
         let card = sample_card("t1", State::Ready, Vec::new());
-        let blocked = block(&card, "missing credential", "sess-1", 100);
+        let blocked = block(&card, "missing credential", "sess-1", 100).expect("block from ready");
         assert_eq!(blocked.state, State::Blocked);
         assert_eq!(
             blocked.block.as_ref().expect("block").reason,
             "missing credential"
         );
 
-        let unblocked = unblock(&blocked, 200);
+        let unblocked = unblock(&blocked, 200).expect("unblock from blocked");
         assert_eq!(unblocked.state, State::Ready);
         assert!(unblocked.block.is_none());
     }
@@ -1710,7 +1859,42 @@ mod tests {
     #[test]
     fn archive_sets_the_archived_state() {
         let card = sample_card("t1", State::Done, Vec::new());
-        assert_eq!(archive(&card, 100).state, State::Archived);
+        assert_eq!(
+            archive(&card, 100).expect("archive from done").state,
+            State::Archived
+        );
+    }
+
+    /// Issue #317 review finding: `block` applies unconditionally today --
+    /// it must refuse a card that is already terminal (`Done`/`Archived`) or
+    /// already `Blocked`, since blocking an already-blocked card would
+    /// silently overwrite its existing reason/by without an `Unblocked` in
+    /// between.
+    #[test]
+    fn block_refuses_a_card_that_is_already_done() {
+        let card = sample_card("t1", State::Done, Vec::new());
+        let err = block(&card, "reason", "sess-1", 100).expect_err("done cannot be blocked");
+        assert_eq!(err, Refusal::CannotBlock(State::Done));
+    }
+
+    /// Issue #317 review finding: `unblock` applies unconditionally today --
+    /// it must refuse anything but `Blocked` (there is nothing to clear off
+    /// e.g. a `Ready` or `Running` card).
+    #[test]
+    fn unblock_refuses_a_card_that_is_not_blocked() {
+        let card = sample_card("t1", State::Ready, Vec::new());
+        let err = unblock(&card, 100).expect_err("ready is not blocked");
+        assert_eq!(err, Refusal::CannotUnblock(State::Ready));
+    }
+
+    /// Issue #317 review finding: `archive` applies unconditionally today --
+    /// it must refuse a card still actively in flight (only `Done`/`Blocked`
+    /// may be archived).
+    #[test]
+    fn archive_refuses_a_card_that_is_still_running() {
+        let card = sample_card("t1", State::Running, Vec::new());
+        let err = archive(&card, 100).expect_err("running cannot be archived");
+        assert_eq!(err, Refusal::CannotArchive(State::Running));
     }
 
     #[test]
@@ -1955,6 +2139,93 @@ mod tests {
         );
     }
 
+    /// Issue #317 review finding: the tasks file lock used to be held only
+    /// inside `append_event`/`append_events_atomic`, so two concurrent
+    /// claims of the same `Ready` card could both read the pre-claim state,
+    /// both pass the pure `claim()` check, and both append `Claimed`. This
+    /// proves `claim_locked` (the fix: one locked read -> decide -> append
+    /// helper, `with_task_lock`) closes that window -- a caller's own
+    /// earlier, now-stale read of the card is NEVER what a second claim
+    /// attempt decides against: `claim_locked` always re-reads under the
+    /// lock, so of two claims through it, only the first can ever succeed.
+    #[test]
+    fn claim_locked_refuses_when_the_card_was_already_claimed_since_an_earlier_stale_read() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let repo_slug = "repo".to_string();
+
+        append_event(
+            &state,
+            &repo_slug,
+            &Event::Created {
+                id: "t1".to_string(),
+                repo_slug: repo_slug.clone(),
+                title: "t".to_string(),
+                brief: "b".to_string(),
+                parents: Vec::new(),
+                group_id: None,
+                workdir: None,
+                at: 1_000,
+            },
+        )
+        .expect("create");
+
+        // A caller takes an early, now-stale snapshot -- the shape of the
+        // read a naive read-then-append implementation would have decided
+        // against.
+        let stale_view = load_cards(&state, &repo_slug);
+        assert_eq!(stale_view["t1"].state, State::Ready, "stale view is Ready");
+
+        // A first caller claims the card through the locked helper.
+        let first = claim_locked(
+            &state,
+            &repo_slug,
+            "t1",
+            "sess-first",
+            111,
+            None,
+            "host",
+            1_100,
+            900,
+        )
+        .expect("claim_locked io")
+        .expect("card exists")
+        .expect("the first claim succeeds");
+        assert_eq!(first.state, State::Running);
+        assert_eq!(first.claim.expect("claim set").session, "sess-first");
+
+        // A second caller, deciding from the SAME stale (pre-claim) view a
+        // naive implementation would have trusted, attempts to claim the
+        // same card through the SAME locked helper. It must be refused --
+        // never a second `Claimed` event on top of the first.
+        assert_eq!(stale_view["t1"].state, State::Ready, "still says Ready");
+        let second = claim_locked(
+            &state,
+            &repo_slug,
+            "t1",
+            "sess-second",
+            222,
+            None,
+            "host",
+            1_200,
+            900,
+        )
+        .expect("claim_locked io")
+        .expect("card exists");
+        assert_eq!(
+            second,
+            Err(Refusal::NotReady(State::Running)),
+            "the locked re-read sees the first claim, never the caller's stale view"
+        );
+
+        // Exactly one `Claimed` event was ever appended.
+        let claimed_events = read_events(&state, &repo_slug)
+            .into_iter()
+            .filter(|e| matches!(e, Event::Claimed { .. }))
+            .count();
+        assert_eq!(claimed_events, 1, "only the first claim ever wrote Claimed");
+    }
+
     #[test]
     fn block_and_unblock_verbs_round_trip_through_the_event_log() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -2036,6 +2307,18 @@ mod tests {
             1_100,
         )
         .expect("comment");
+        // `archive` only accepts Done/Blocked -- complete it first so the
+        // archive below is a valid transition.
+        run_complete(
+            &state,
+            &mut Vec::new(),
+            &CompleteArgs {
+                id: id.clone(),
+                outcome: "shipped".to_string(),
+            },
+            1_150,
+        )
+        .expect("complete");
         run_archive(
             &state,
             &mut Vec::new(),

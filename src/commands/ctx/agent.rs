@@ -1555,10 +1555,15 @@ fn attach_task_context_to_prompt(
     ))
 }
 
-/// Issue #317: resolves (reaping/promoting, `task::resolve_for_claim`) and
-/// claims `--task`'s own card, refusing before any spawn when it cannot be --
-/// see [`AgentArgs::task`]'s own doc comment for the full contract. `Err`'s
-/// text is written verbatim to the delegator's stdout by the caller.
+/// Issue #317: resolves (reaping/promoting) and claims `--task`'s own card
+/// through `task::claim_locked` -- the SAME locked read -> decide -> append
+/// helper `zirv ctx task claim` itself goes through, so this delegation's
+/// own claim can never race a concurrent `zirv ctx task claim` (or another
+/// delegation) against the same card: whichever caller's lock acquisition
+/// loses re-reads the winner's already-written state before deciding.
+/// Refuses before any spawn when the card cannot be claimed -- see
+/// [`AgentArgs::task`]'s own doc comment for the full contract. `Err`'s text
+/// is written verbatim to the delegator's stdout by the caller.
 fn claim_task_for_delegation(
     state: &super::state::StateDir,
     repo: &Path,
@@ -1567,42 +1572,26 @@ fn claim_task_for_delegation(
     now: u64,
 ) -> Result<(), String> {
     let repo_slug = super::state::repo_slug(repo);
-    let card = super::task::resolve_for_claim(state, &repo_slug, task_id, now)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("no task '{task_id}' in this repository"))?;
-    let cards = super::task::load_cards(state, &repo_slug);
-    let parents_done = card.parents.iter().all(|id| {
-        cards
-            .get(id)
-            .is_some_and(|p| p.state == super::task::State::Done)
-    });
     let session = super::mail::session_identity(env)
         .unwrap_or_else(|| format!("agent-pid-{}", std::process::id()));
     let pid = std::process::id();
-    let claimed = super::task::claim(
-        &card,
+    match super::task::claim_locked(
+        state,
+        &repo_slug,
+        task_id,
         &session,
         pid,
         super::sessions::process_start_secs(pid),
         &super::task::local_host(),
         now,
         super::task::DEFAULT_CLAIM_TTL_SECS,
-        parents_done,
     )
-    .map_err(|refusal| format!("cannot claim task '{task_id}': {refusal}"))?;
-    let claim = claimed.claim.clone().expect("claim always sets it");
-    super::task::append_event(
-        state,
-        &repo_slug,
-        &super::task::Event::Claimed {
-            id: card.id.clone(),
-            claim,
-            attempts: claimed.attempts,
-            at: now,
-        },
-    )
-    .map_err(|e| e.to_string())?;
-    Ok(())
+    .map_err(|e| e.to_string())?
+    {
+        None => Err(format!("no task '{task_id}' in this repository")),
+        Some(Ok(_claimed)) => Ok(()),
+        Some(Err(refusal)) => Err(format!("cannot claim task '{task_id}': {refusal}")),
+    }
 }
 
 /// Issue #317: closes `--task`'s own card once this delegation has finished,
@@ -2685,7 +2674,7 @@ pub fn run_with<W: Write>(
     // process's own pid: if everything below this point fails before a
     // worker ever actually runs, this same `zirv ctx agent` process exits
     // shortly after returning, so the claim's pid goes dead and a later
-    // `reap`/`claim` attempt (`task::resolve_for_claim`) returns the card to
+    // `reap`/`claim` attempt (`task::claim_locked`) returns the card to
     // `Ready` on its own -- never left falsely `Running` forever, and never
     // silently marked `Done`.
     if let Some(task_id) = &args.task
