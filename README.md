@@ -1308,6 +1308,8 @@ checkout:
 | `price.stale_after_days` | `ZIRV_CTX_PRICE_STALE_AFTER_DAYS` |
 | `price.table_path` | `ZIRV_CTX_PRICE_TABLE_PATH` |
 | `search.max_output_bytes` | `ZIRV_CTX_SEARCH_MAX_OUTPUT_BYTES` |
+| `fallback.orchestrator_rollover_headroom_pct` | `ZIRV_CTX_FALLBACK_ORCHESTRATOR_ROLLOVER_HEADROOM_PCT` |
+| `fallback.rollover_cooldown_secs` | `ZIRV_CTX_FALLBACK_ROLLOVER_COOLDOWN_SECS` |
 
 The `mail.*`/`chrome.events` entries close the same hole `prompt.max_repo_bytes`
 does: mail is folded into a launched worker's prompt as its own layer, so a
@@ -1347,6 +1349,13 @@ pick which vendor account gets spent with that guard never in the way.
 nudge/enforce gate (issue #223): a repo checkout must not be able to turn its
 own adoption pressure down to `off`, or up to `enforce` to hold an operator's
 own agent dispatches hostage.
+`fallback.orchestrator_rollover_headroom_pct`/`fallback.rollover_cooldown_secs`
+(issue #358) close the same hole for automatic orchestrator-seat rollover: the
+on/off switch (`fallback.auto_orchestrator_rollover`) stays repo-narrowable
+like `fallback.enabled`, but tuning *when* an already-enabled rollover fires
+or how soon another one may follow picks the same kind of vendor-spend
+decision `handoff.model`/`optimize.model` already gate, so only the operator
+may set either.
 Everything else, including `chrome.banner`/`chrome.bar`,
 `supervise.max_nudges`, and every threshold, is still repo-configurable.
 
