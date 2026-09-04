@@ -1393,7 +1393,9 @@ const GENERIC_SUBAGENT_TYPES: [&str; 5] = ["fork", "claude", "general-purpose", 
 /// repository root the guard confines itself to is derived from the
 /// resolved TARGET (`repo_root_for_target`), never from `cwd` -- and
 /// `session_id` is the fallback identity for a logged block when this
-/// process has no zirv session env of its own.
+/// process has no zirv session env of its own. `agent_id` distinguishes a
+/// delegated native subagent from the orchestrator's guarded main thread;
+/// `agent_type` retains the other documented subagent discriminator.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct PreToolPayload {
@@ -1401,6 +1403,12 @@ pub struct PreToolPayload {
     pub tool_input: PreToolInput,
     pub cwd: String,
     pub session_id: String,
+    #[serde(default)]
+    pub agent_id: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    // retained from Claude's documented payload; agent_id is the discriminator
+    pub agent_type: String,
 }
 
 /// `tool_input` is tool-specific, so only the subagent tool's own parameters
@@ -1587,15 +1595,19 @@ fn repo_root_for_target(target: &Path) -> Option<PathBuf> {
 /// the two roots a worker's own dispatch/handoff/memory writes still need
 /// from this seat. A target that sits in no git repository at all is
 /// outside this guard's scope and is allowed. Every other gate below is
-/// also a reason to allow: a non-orchestrator role, a tool that is not a
-/// [`FILE_MODIFICATION_TOOLS`] entry, or an empty target (schema drift, not
-/// a real write).
+/// also a reason to allow: a non-orchestrator role, a native subagent call
+/// (`agent_id` is non-empty), a tool that is not a
+/// [`FILE_MODIFICATION_TOOLS`] entry, or an empty target (schema drift, not a
+/// real write).
 pub fn orchestrator_write_decision(
     role: Option<&str>,
     payload: &PreToolPayload,
     cwd: &Path,
 ) -> Option<String> {
     if role != Some("orchestrator") {
+        return None;
+    }
+    if !payload.agent_id.is_empty() {
         return None;
     }
     let target = normalized_write_target(payload, cwd)?;
@@ -4393,6 +4405,39 @@ mod tests {
         assert!(
             reason.contains("orchestrator seat: dispatch a worker"),
             "{reason}"
+        );
+    }
+
+    #[test]
+    fn pretool_payload_parses_and_defaults_subagent_identity() {
+        let main_thread =
+            PreToolPayload::parse(r#"{"tool_name":"Edit"}"#).expect("a main-thread payload parses");
+        assert!(main_thread.agent_id.is_empty());
+        assert!(main_thread.agent_type.is_empty());
+
+        let subagent = PreToolPayload::parse(
+            r#"{"tool_name":"Edit","agent_id":"a1b2","agent_type":"general-purpose"}"#,
+        )
+        .expect("a subagent payload parses");
+        assert_eq!(subagent.agent_id, "a1b2");
+        assert_eq!(subagent.agent_type, "general-purpose");
+    }
+
+    #[test]
+    fn orchestrator_write_decision_allows_a_native_subagent_edit() {
+        let repo = orchestrator_repo();
+        let mut payload = edit_payload(repo.path(), "src/x.rs");
+        payload.agent_id = "a1b2".to_string();
+
+        assert_eq!(
+            orchestrator_write_decision(Some("orchestrator"), &payload, repo.path()),
+            None,
+            "a native subagent is the worker this guard asks the seat to dispatch"
+        );
+        assert_eq!(
+            orchestrator_write_decision(Some("worker"), &payload, repo.path()),
+            None,
+            "subagent identity must not change non-orchestrator behavior"
         );
     }
 
