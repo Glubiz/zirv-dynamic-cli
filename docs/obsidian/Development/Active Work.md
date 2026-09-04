@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-09-03
+last-verified: 2026-09-04
 ---
 
 # Active Work
@@ -15,6 +15,10 @@ Entries use the format:
 ```
 
 ## In Progress
+
+### Issue #313 — consecutive-denial breaker + identical-failing-command guard — implemented, not yet committed (`feature/issue-313-safety-loop-breakers`, 2026-09-04)
+**Status (2026-09-04):** Additive-only change to `zirv ctx`'s command safety hook (`src/commands/ctx/safety.rs`); no existing verdict family changed for any command. `SafetyPolicy` gains three thresholds (`denial_breaker_threshold`/`identical_command_warn_after`/`identical_command_refuse_after`, defaults 3/2/5), folded across layers by a new `narrow_threshold` (a `0`-means-disabled variant of `config.rs`'s `narrow_max_nudges` pattern — not `REPO_FORBIDDEN`). The PreToolUse hook now: (1) prefixes its reason text with an explicit "stop retrying" note once a session's own trailing run of consecutive Ask/Deny verdicts (`log::read_recent_safety_decisions`, a new bounded reader) crosses the threshold; (2) parses the session transcript (`trailing_same_command_failure_run`, mirroring `adapters::claude::structural_context`'s tool_use/tool_result pairing) for a trailing run of the exact same failing Bash command and warns via `additionalContext` at the warn threshold, refusing outright (headless only) at the refuse threshold. `.zirv/ctx.toml` documents the three new sample-config rows.
+**Next:** Run the five verification gates, then commit and open a PR against `release/3.16.0-harness-batch-4`. See [[Command Safety]]'s new "Loop breakers" section, [[Untrusted Configuration]]'s `[safety]` fold section, and the 2026-09-04 [[Decision Log]]/[[Work Journal]] entries.
 
 ### Issue #198 — two parts, one in flight (2026-08-30)
 **Status (2026-08-30):** Issue #198 covers two related refreshes tracked together: **part 1**, refreshing the `Glubiz/zirv-generic-frontend` template repository itself (dependency bump, a real README, `.zirv/` script audit against the current schema) — not yet started, no branch/PR in either repo; **part 2**, this repo's `README.md` (`docs/198-readme-refresh`) — PR open, see the matching 2026-08-30 [[Work Journal]] entry for what it closed.

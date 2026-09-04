@@ -6419,6 +6419,9 @@ mod tests {
         ("safety", "default"),
         ("safety", "interactive_default"),
         ("safety", "sql"),
+        ("safety", "denial_breaker_threshold"),
+        ("safety", "identical_command_warn_after"),
+        ("safety", "identical_command_refuse_after"),
     ];
 
     /// The lines belonging to table `path` in a sample-config file like

@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-09-03
+last-verified: 2026-09-04
 ---
 
 # Decision Log
@@ -23,6 +23,13 @@ last-verified: 2026-09-03
 - If the entry is longer than the cap, the "why" is a spec, not an ADR — write it under `docs/superpowers/specs/` and link to it.
 
 ## Decisions
+
+### 2026-09-04 -- Loop-breaker thresholds narrow via a zero-means-disabled fold, not `narrow_max_nudges`'s plain `min`
+**Context:** Issue #313 added two safety-hook loop breakers (a consecutive-denial breaker, an identical-failing-command guard), each configured by a threshold where `0` is the documented way to disable it. `config.rs`'s existing narrowing-only precedent, `narrow_max_nudges` (`verify_on_stop.max_nudges`), treats `0` as *unbounded* and folds with a plain `home.min(repo)` -- reusing it unmodified for these three thresholds would let a repo layer silently re-enable a breaker an operator set to `0` by naming any smaller nonzero value, since `min(0, 2)` is `0` only by accident of which side is smaller, not by intent.
+**Decision:** A new `narrow_threshold(home, repo)` in `safety.rs` special-cases both zero directions: `home == 0` always stays `0` regardless of `repo` (an operator's disable can never be reversed), and `repo == Some(0)` is ignored as an attempted widening (treated like `None`), with `home.min(repo)` only for the ordinary nonzero/nonzero case. None of the three keys is `REPO_FORBIDDEN` -- a repo may still make a breaker fire sooner for itself.
+**Rejected:** Reusing `narrow_max_nudges` as-is -- correct for a cap where `0` genuinely means "no limit," wrong here where `0` is a distinct disabled state a repo must not be able to un-disable. Making the three keys `REPO_FORBIDDEN` instead -- forecloses a repo's legitimate ability to tighten its own loop-breaker posture, the same asymmetry `deny`/`ask`'s union already rejects for the same reason.
+**Consequences:** `[safety]` now has a fourth distinct fold shape (union for `deny`/`ask`, `REPO_FORBIDDEN` for `allow`/`escape_allow`/`default`/`interactive_default`/`sql`, and now this zero-aware narrowing for the three thresholds) -- a future `[safety]` key with its own "0 means X" semantics should reuse `narrow_threshold`'s shape, not `narrow_max_nudges`'s, if `0` is a state rather than an absence of a cap.
+**Spec / link:** [[Command Safety]], [[Untrusted Configuration]].
 
 ### 2026-09-03 -- Stop hook nudges the stale-gate command instead of auto-running verification (issue #309)
 **Context:** A session can end a turn with code modified since the last passing `zirv test`/`zirv verify` run, and nothing told the operator or the next turn that the evidence was stale.

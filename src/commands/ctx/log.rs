@@ -311,6 +311,50 @@ pub fn read_safety_decisions(state: &StateDir) -> Vec<SafetyDecisionRecord> {
     out
 }
 
+/// Issue #313 (consecutive-denial breaker): a BOUNDED counterpart to
+/// [`read_safety_decisions`] for a hook process that runs on every single
+/// PreToolUse invocation and cannot afford that function's unbounded,
+/// every-file-ever-written scan. Opens only the newest TWO day-bucketed
+/// files (today's, and yesterday's in case the session's own history spans
+/// a UTC midnight), filters to `session`, and returns at most the last
+/// `limit` matching records, oldest-first -- exactly the tail the breaker
+/// needs to count a trailing run of consecutive denials. Same best-effort
+/// tolerance as `read_safety_decisions`: an absent directory or a line that
+/// fails to parse is skipped, never fatal.
+pub fn read_recent_safety_decisions(
+    state: &StateDir,
+    session: &str,
+    limit: usize,
+) -> Vec<SafetyDecisionRecord> {
+    let dir = state.logs().join(SAFETY_LOG_DIR);
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut files: Vec<_> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("jsonl"))
+        .collect();
+    files.sort();
+    let newest_two: Vec<_> = files.into_iter().rev().take(2).collect();
+
+    let mut out = Vec::new();
+    for path in newest_two.into_iter().rev() {
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        for line in text.lines() {
+            if let Ok(record) = serde_json::from_str::<SafetyDecisionRecord>(line)
+                && record.session == session
+            {
+                out.push(record);
+            }
+        }
+    }
+    let from = out.len().saturating_sub(limit);
+    out[from..].to_vec()
+}
+
 /// Tails `delegations.jsonl`'s newest `count` raw JSON lines, same contract
 /// `tail` gives the main decision log. [`read_delegations`] is the reader
 /// that parses these back into [`DelegationRow`]s for `status::
@@ -443,6 +487,62 @@ mod tests {
             records[1].matched_pattern.as_deref(),
             Some("<sandbox: escape_allow>")
         );
+    }
+
+    /// Issue #313: `read_recent_safety_decisions` opens only the newest TWO
+    /// day-bucketed files (a record from a third, older bucket is excluded
+    /// even though it matches `session`), filters to the requested session
+    /// (a different session's records never appear), and returns at most
+    /// `limit` records, oldest first.
+    #[test]
+    fn read_recent_safety_decisions_is_bounded_to_two_files_and_filtered_by_session() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+
+        let record =
+            |ts: u64, session: &'static str, command_sha256: &'static str| SafetyDecision {
+                ts,
+                session,
+                mode: "headless",
+                verdict: "deny",
+                command_sha256,
+                policy_sha256: "p",
+                launch_policy_sha256: None,
+                attestation: "not-present",
+                matched_pattern: None,
+                origin: Some("built-in"),
+                platform: "linux",
+            };
+
+        // Three day buckets: day 0 (too old to be scanned), day 1, day 2.
+        append_safety(&state, &record(0, "s1", "too-old")).expect("append");
+        append_safety(&state, &record(86_400, "s1", "day1-a")).expect("append");
+        append_safety(&state, &record(86_401, "s2", "day1-other-session")).expect("append");
+        append_safety(&state, &record(172_800, "s1", "day2-a")).expect("append");
+
+        let records = read_recent_safety_decisions(&state, "s1", 50);
+        assert_eq!(
+            records
+                .iter()
+                .map(|r| r.command_sha256.as_str())
+                .collect::<Vec<_>>(),
+            vec!["day1-a", "day2-a"],
+            "too-old bucket excluded, other session filtered, oldest-first: {records:?}"
+        );
+
+        // `limit` keeps only the newest matching records, still oldest-first.
+        let limited = read_recent_safety_decisions(&state, "s1", 1);
+        assert_eq!(limited.len(), 1);
+        assert_eq!(limited[0].command_sha256, "day2-a");
+    }
+
+    /// No directory at all (no safety decision ever logged for this state
+    /// dir) is an empty list, not an error.
+    #[test]
+    fn read_recent_safety_decisions_before_any_exist_is_empty_not_an_error() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        assert!(read_recent_safety_decisions(&state, "s1", 50).is_empty());
     }
 
     /// The log names sessions, repositories and transcript paths, so on a
