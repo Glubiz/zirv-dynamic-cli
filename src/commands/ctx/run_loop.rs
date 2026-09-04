@@ -758,10 +758,16 @@ pub(crate) fn run_with_clock<W: Write>(
         }
 
         if limit_hit {
+            // A confirmed vendor refusal is authoritative even when the
+            // operator disabled proactive pacing. Re-enable only this park;
+            // otherwise the next loop cycle would launch straight back into
+            // the refusal it just confirmed.
+            let mut confirmed_limit_pace = cfg.pace.clone();
+            confirmed_limit_pace.enabled = true;
             pace::wait_for_window(
                 w,
                 &state,
-                &cfg.pace,
+                &confirmed_limit_pace,
                 "loop",
                 session.as_str(),
                 now_fn,

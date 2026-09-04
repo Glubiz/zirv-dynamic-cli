@@ -479,6 +479,9 @@ pub fn run_with<W: Write>(
                 return Ok(0);
             }
             let (collector, estimator) = pace::current_windows(&state, &cfg.pace, now, provider);
+            if provider == window::CODEX_USAGE_PROVIDER {
+                writeln!(w, "codex:")?;
+            }
             report(w, &collector, estimator.as_ref(), now, &cfg.pace)?;
             if provider != window::CODEX_USAGE_PROVIDER {
                 report_codex_rollout(w, &state, now)?;
@@ -1171,6 +1174,56 @@ mod tests {
             text.contains("codex: no usage signal (no rollout rate_limits ingested yet)"),
             "got {text}"
         );
+    }
+
+    #[test]
+    fn a_codex_primary_readout_labels_its_stored_rollout_reading() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("home tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let state_dir = tmp.path().join("state");
+        let state = StateDir::from_root(state_dir.clone());
+        let now = now_secs();
+        window::store_for(
+            &state,
+            window::CODEX_USAGE_PROVIDER,
+            &UsageWindows {
+                five_hour: Some(Window {
+                    used_percentage: 73.5,
+                    resets_at: now + 1_800,
+                    observed_at: now,
+                    overage_covered: false,
+                    limit_reached: false,
+                }),
+                seven_day: None,
+            },
+        )
+        .expect("store codex reading");
+        let env: std::collections::HashMap<String, String> = [
+            (
+                crate::commands::ctx::state::STATE_ENV.to_string(),
+                state_dir.display().to_string(),
+            ),
+            ("ZIRV_CTX_AGENT".to_string(), "codex".to_string()),
+            ("ZIRV_CTX_PACE".to_string(), "false".to_string()),
+        ]
+        .into();
+
+        let mut out = Vec::new();
+        run_with(
+            &UsageArgs {
+                action: None,
+                sessions: false,
+            },
+            &mut out,
+            tmp.path(),
+            &|key| env.get(key).cloned(),
+        )
+        .expect("usage report");
+
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(text.starts_with("codex:\ncollector"), "got {text}");
+        assert!(text.contains("five_hour: 73.5% used"), "got {text}");
     }
 
     /// O: before this command was provider-scoped it never called `adapters::

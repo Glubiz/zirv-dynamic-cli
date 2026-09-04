@@ -1532,14 +1532,15 @@ fn normalize_lexically(path: &Path) -> PathBuf {
 
 /// Claude Code's operator-owned configuration directory. An explicit,
 /// non-empty `CLAUDE_CONFIG_DIR` wins; otherwise Claude's default beneath
-/// `HOME` applies. Environment access stays injectable so both write guards
-/// remain deterministic in tests.
+/// `HOME` (or Windows' `USERPROFILE`) applies. Environment access stays
+/// injectable so both write guards remain deterministic in tests.
 fn harness_home(env: EnvLookup<'_>) -> Option<PathBuf> {
     env("CLAUDE_CONFIG_DIR")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .or_else(|| {
             env("HOME")
+                .or_else(|| env("USERPROFILE"))
                 .filter(|value| !value.is_empty())
                 .map(|home| PathBuf::from(home).join(".claude"))
         })
@@ -1639,8 +1640,8 @@ fn repo_root_for_target(target: &Path) -> Option<PathBuf> {
 /// repo's own `<target_repo>/.zirv/work`/`<target_repo>/.zirv/memory` --
 /// the two roots a worker's own dispatch/handoff/memory writes still need
 /// from this seat. Claude Code's own harness home (`CLAUDE_CONFIG_DIR`, or
-/// `$HOME/.claude`) is outside repository-write classification even when an
-/// ancestor carries `.git`. A target that sits in no git repository at all
+/// `$HOME/.claude`/`%USERPROFILE%\\.claude`) is outside repository-write
+/// classification even when an ancestor carries `.git`. A target that sits in no git repository at all
 /// is outside this guard's scope and is allowed. Every other gate below is
 /// also a reason to allow: a non-orchestrator role, a native subagent call
 /// (`agent_id` is non-empty), a tool that is not a
@@ -4492,6 +4493,21 @@ mod tests {
             orchestrator_write_decision(Some("orchestrator"), &payload, home.path(), &env),
             None
         );
+    }
+
+    #[test]
+    fn default_harness_home_uses_userprofile_when_home_is_absent() {
+        let profile = tempfile::tempdir().expect("tempdir");
+        let harness_home = profile.path().join(".claude");
+        std::fs::create_dir_all(&harness_home).expect("harness home");
+        let target = harness_home.join("projects/slug/memory/note.md");
+        let profile = profile.path().display().to_string();
+        let env = |key: &str| match key {
+            "USERPROFILE" => Some(profile.clone()),
+            _ => None,
+        };
+
+        assert!(target_is_under_harness_home(&target, &env));
     }
 
     #[test]

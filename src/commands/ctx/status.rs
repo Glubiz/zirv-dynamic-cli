@@ -1359,14 +1359,40 @@ fn render_report<W: Write>(
             // sees it -- the same rule `wrap`'s status bar and the dashboard
             // header apply, so all three usage surfaces agree on what
             // "unknown" means.
+            let now = crate::commands::ctx::state::now_secs();
             let windows = crate::commands::ctx::window::available(
                 &crate::commands::ctx::window::load_for(&state, provider).unwrap_or_default(),
-                crate::commands::ctx::state::now_secs(),
+                now,
             );
+            let collector_max_age_secs = cfg_result
+                .as_ref()
+                .ok()
+                .map(|cfg| cfg.pace.collector_max_age_secs)
+                .unwrap_or_default();
+            let provider_prefix = if provider == crate::commands::ctx::window::CODEX_USAGE_PROVIDER
+            {
+                "codex "
+            } else {
+                ""
+            };
             let describe =
                 |name: &str, window: Option<&crate::commands::ctx::window::Window>| match window {
-                    Some(found) => format!("{name} {}", style::format_pct(found.used_percentage)),
-                    None => format!("{name} {}", style::PLACEHOLDER),
+                    Some(found) => {
+                        let stale = if provider
+                            == crate::commands::ctx::window::CODEX_USAGE_PROVIDER
+                            && crate::commands::ctx::window::age_secs(found, now)
+                                > collector_max_age_secs
+                        {
+                            " (stale)"
+                        } else {
+                            ""
+                        };
+                        format!(
+                            "{provider_prefix}{name} {}{stale}",
+                            style::format_pct(found.used_percentage)
+                        )
+                    }
+                    None => format!("{provider_prefix}{name} {}", style::PLACEHOLDER),
                 };
             writeln!(
                 w,
@@ -3330,6 +3356,58 @@ mod tests {
             .expect("codex usage line");
         assert!(codex_line.contains("91.0% used"), "got {codex_line}");
         assert!(codex_line.contains("stale"), "got {codex_line}");
+    }
+
+    #[test]
+    fn status_labels_and_marks_a_stale_codex_primary_reading() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("home tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let state = StateDir::from_root(tmp.path().join("state"));
+        state.ensure().expect("ensure");
+        let now = crate::commands::ctx::state::now_secs();
+        crate::commands::ctx::window::store_for(
+            &state,
+            crate::commands::ctx::window::CODEX_USAGE_PROVIDER,
+            &crate::commands::ctx::window::UsageWindows {
+                five_hour: Some(crate::commands::ctx::window::Window {
+                    used_percentage: 91.0,
+                    resets_at: now + 3_600,
+                    observed_at: now.saturating_sub(901),
+                    overage_covered: false,
+                    limit_reached: false,
+                }),
+                seven_day: None,
+            },
+        )
+        .expect("store codex reading");
+        let mut env = env_for(state.root());
+        env.insert("ZIRV_CTX_AGENT".to_string(), "codex".to_string());
+
+        let mut out = Vec::new();
+        run_with(
+            &StatusArgs {
+                decisions: 5,
+                brief: true,
+                diff: false,
+            },
+            &mut out,
+            tmp.path(),
+            &|key| env.get(key).cloned(),
+            false,
+        )
+        .expect("runs");
+
+        let text = String::from_utf8(out).expect("utf8");
+        let usage_line = text
+            .lines()
+            .find(|line| line.contains("usage windows:"))
+            .expect("usage summary");
+        assert!(
+            usage_line.contains("codex five_hour 91%"),
+            "got {usage_line}"
+        );
+        assert!(usage_line.contains("stale"), "got {usage_line}");
     }
 
     /// The third of the three usage surfaces this fixes (alongside `zirv ctx

@@ -4668,7 +4668,7 @@ fn target_is_confined(target: &str, scratchpad_roots: &[String]) -> bool {
 
 /// Issue #168/#345: scans `segment` (already heredoc-redacted by the caller)
 /// for unquoted path-bearing output redirections: `>`, `>>`, `>|`, `&>`,
-/// `&>>`, and digit-prefixed forms. Input redirections, process
+/// `&>>`, Bash's legacy `>&word`, and digit-prefixed forms. Input redirections, process
 /// substitutions, and descriptor duplications name no write target and are
 /// skipped. Command substitutions are scanned recursively because their own
 /// output redirections still write; their closing delimiter is never part of
@@ -4781,9 +4781,15 @@ fn scan_redirection_targets_at_depth(segment: &str, depth: usize) -> Option<Vec<
 
         // `>&N`, `N>&M`, and `>&-` duplicate or close a descriptor. The
         // operand ends at a shell word boundary, including a command
-        // substitution's closing `)`.
+        // substitution's closing `)`. A non-descriptor word after `>&` is
+        // Bash's legacy spelling of `&>word`, however, and still names a real
+        // output path; advance past the ampersand so it is collected below.
         if chars.get(j) == Some(&'&') {
-            let mut descriptor_end = j + 1;
+            let mut operand_start = j + 1;
+            while chars.get(operand_start).is_some_and(|c| c.is_whitespace()) {
+                operand_start += 1;
+            }
+            let mut descriptor_end = operand_start;
             if chars.get(descriptor_end) == Some(&'-') {
                 descriptor_end += 1;
             } else {
@@ -4791,7 +4797,7 @@ fn scan_redirection_targets_at_depth(segment: &str, depth: usize) -> Option<Vec<
                     descriptor_end += 1;
                 }
             }
-            let is_descriptor = descriptor_end > j + 1
+            let is_descriptor = descriptor_end > operand_start
                 && chars.get(descriptor_end).is_none_or(|c| {
                     c.is_whitespace() || matches!(c, ';' | '&' | '|' | '<' | '>' | '(' | ')')
                 });
@@ -4799,6 +4805,7 @@ fn scan_redirection_targets_at_depth(segment: &str, depth: usize) -> Option<Vec<
                 i = descriptor_end;
                 continue;
             }
+            j = operand_start;
         }
 
         let target_start = j;
@@ -4970,8 +4977,8 @@ fn resolve_repo_write_target(target: &str, cwd: &str) -> Option<String> {
 /// `git repo /a` and `git repo /b/.zirv/work` are two different repos'
 /// scratch areas, and a sibling checkout's own `.zirv/work` never confines
 /// a write into the launch repo, or vice versa. A target under Claude Code's
-/// own harness home (`CLAUDE_CONFIG_DIR`, or `$HOME/.claude`) is likewise not
-/// a repository write. A resolved form that is not filesystem-absolute at
+/// own harness home (`CLAUDE_CONFIG_DIR`, `$HOME/.claude`, or
+/// `%USERPROFILE%\\.claude`) is likewise not a repository write. A resolved form that is not filesystem-absolute at
 /// all (a `~`-prefixed target) is never even handed to `repo_root_of`: this
 /// module cannot resolve `~` to a real path, so it stays unresolvable rather
 /// than guessed at. Returns `target` unchanged (as originally written) on a
@@ -8449,6 +8456,8 @@ mod tests {
             ("cat > README.md", "README.md"),
             ("cmd 2> src/err.log", "src/err.log"),
             ("cmd &> out.txt", "out.txt"),
+            ("cmd >& legacy.txt", "legacy.txt"),
+            ("cmd >&src/legacy.log", "src/legacy.log"),
             ("cmd >> src/out.log", "src/out.log"),
             ("cmd >| src/out.log", "src/out.log"),
         ] {
@@ -8468,6 +8477,9 @@ mod tests {
             "cat < README.md",
             "cmd 2>&1 | grep x",
             "cmd >&2",
+            "cmd >& 2",
+            "cmd 2>& 1",
+            "cmd 2>& -",
             "cat <<'EOF'\nhello\nEOF",
             "diff <(a) <(b)",
             "for i in $(seq 1 80); do s=$(zirv ctx status --brief 2>&1); if echo \"$s\" | grep -qE 'x'; then echo READY; exit 0; fi; sleep 30; done",

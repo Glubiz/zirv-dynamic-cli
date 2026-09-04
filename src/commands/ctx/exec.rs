@@ -2261,10 +2261,16 @@ fn run_with_clock_inner<W: Write>(
             );
             writeln!(w, "zirv ctx exec: {wait_detail}")?;
 
+            // A confirmed vendor refusal is authoritative even when the
+            // operator disabled proactive pacing. Re-enable only this park;
+            // otherwise `wait_for_window` would return immediately and launch
+            // straight back into the refusal it just confirmed.
+            let mut confirmed_limit_pace = cfg.pace.clone();
+            confirmed_limit_pace.enabled = true;
             pace::wait_for_window(
                 w,
                 &state,
-                &cfg.pace,
+                &confirmed_limit_pace,
                 "exec",
                 session.as_str(),
                 now_fn,
@@ -5184,6 +5190,79 @@ mod tests {
         assert!(
             argv.contains("finish the requested work"),
             "the logical task must survive the handoff: {argv}"
+        );
+    }
+
+    #[test]
+    fn a_low_percentage_reached_flag_waits_before_same_harness_relaunch() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let state_dir = tmp.path().join("state");
+        let argv_log = tmp.path().join("argv.log");
+        let mut env = base_env(&state_dir);
+        // Proactive pacing is deliberately off: an actual vendor refusal is
+        // stronger than that preference and must still park. Disable fallback
+        // to exercise the same-harness relaunch rather than a handover.
+        env.insert("ZIRV_CTX_PACE".to_string(), "false".to_string());
+        env.insert("ZIRV_CTX_FALLBACK".to_string(), "false".to_string());
+        env.insert("ZIRV_CTX_PACE_JITTER_SECS".to_string(), "0".to_string());
+        env.insert(
+            "ZIRV_CTX_AGENT_BIN".to_string(),
+            format!("sh {}", fixture("fake-codex-agent.sh").display()),
+        );
+        store_provider_collector(&state_dir, window::CODEX_USAGE_PROVIDER, 2.0, true);
+
+        let modes = tmp.path().join("modes.txt");
+        std::fs::write(&modes, "limit\nhealthy\n").expect("write modes");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let _fake_agent = crate::commands::ctx::testenv::VarGuard::set(&[
+            ("FAKE_AGENT_MODE_FILE", modes.to_str()),
+            ("FAKE_AGENT_ARGV_LOG", argv_log.to_str()),
+        ]);
+        let args = ExecArgs {
+            agent: Some("codex".to_string()),
+            session_id: None,
+            transcript: None,
+            prompt: Some("finish the requested work".to_string()),
+            max_restarts: Some(0),
+            budget_tokens: None,
+            max_tool_calls: None,
+            objective: None,
+            timeout_secs: Some(30),
+            simple: false,
+            command: Vec::new(),
+        };
+        let clock = std::cell::Cell::new(crate::commands::ctx::state::now_secs());
+        let slept = std::cell::RefCell::new(Vec::new());
+        let mut out = Vec::new();
+
+        let code = run_with_clock(
+            &args,
+            &mut out,
+            tmp.path(),
+            &|key| env.get(key).cloned(),
+            &|| clock.get(),
+            &|duration| {
+                let seconds = duration.as_secs();
+                slept.borrow_mut().push(seconds);
+                clock.set(clock.get().saturating_add(seconds));
+            },
+        );
+
+        assert_eq!(code.expect("runs"), 0);
+        assert!(
+            slept.borrow().iter().sum::<u64>() > 0,
+            "the confirmed refusal must delay the relaunch, got {:?}",
+            slept.borrow()
+        );
+        let log = std::fs::read_to_string(state_dir.join("logs/decisions.jsonl")).expect("log");
+        assert!(log.contains("\"action\":\"limit-park\""), "{log}");
+        assert!(
+            std::fs::read_to_string(&modes)
+                .expect("remaining modes")
+                .trim()
+                .is_empty(),
+            "the healthy second launch must complete after the wait"
         );
     }
 
