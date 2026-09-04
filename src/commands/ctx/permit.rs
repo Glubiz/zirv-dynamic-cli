@@ -30,14 +30,15 @@
 //! window that let two concurrent callers both observe a free slot and both
 //! acquire, exceeding `max_heavy_operations`.
 //!
-//! Issue #267 adds a SECOND, independent pool: [`acquire_writer`]'s
-//! `supervise.max_writers` slots, one per `WorkerMode::Writing` delegated
-//! worker for its WHOLE LIFETIME (not just while it runs a heavy command),
-//! plus a per-tree exclusivity rule ([`WriterRefusal::TreeBusy`]) so two
-//! writers can never hold the same checkout at once. It reuses this same
+//! Issues #267/#338 add a SECOND, independent writer-permit registry, one
+//! record per `WorkerMode::Writing` delegated worker for its WHOLE LIFETIME
+//! (not just while it runs a heavy command), plus a per-tree exclusivity rule
+//! ([`WriterRefusal::TreeBusy`]) so two writers can never hold the same
+//! checkout at once. `supervise.max_writers` optionally caps those records
+//! machine-wide; zero leaves only per-tree exclusivity. It reuses this same
 //! `create_new` contention idiom and dead-owner sweep under its own
-//! `<state>/permits/writers/` directory ([`writer_permits_dir`]) -- the
-//! heavy pool above is untouched by it.
+//! `<state>/permits/writers/` directory ([`writer_permits_dir`]) -- the heavy
+//! pool above is untouched by it.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -511,12 +512,6 @@ pub fn live_writer_records(state: &StateDir) -> Vec<PermitRecord> {
     live_records_in(&writer_permits_dir(state))
 }
 
-/// How many writer permits are currently held -- see [`live_writer_records`]
-/// for the per-holder detail this counts.
-pub fn live_writer_count(state: &StateDir) -> usize {
-    live_writer_records(state).len()
-}
-
 /// Issue #267: pure -- the comparison key for a writer permit's own tree
 /// path. Case-folded on Windows and macOS, where the filesystem itself is
 /// case-insensitive, so two spellings of the same checkout (`D:\repo` vs
@@ -548,11 +543,53 @@ pub enum WriterRefusal {
     PoolExhausted,
 }
 
+/// Issues #267/#338: the one diagnostic rendering shared by headless and
+/// dashboard worker admission. A tree refusal keeps the original holder and
+/// `--worktree` guidance. A machine-wide refusal names its operator controls
+/// and every live holder, including each holder's tree, so a cross-repository
+/// collision is diagnosable without a separate status call.
+pub(crate) fn describe_writer_refusal(
+    refusal: &WriterRefusal,
+    state: &StateDir,
+    max_writers: usize,
+    tree: &Path,
+) -> String {
+    match refusal {
+        WriterRefusal::TreeBusy { holder_label } => format!(
+            "writer-busy: another writing worker already holds {} ({holder_label}); retry once \
+             it finishes, or pass --worktree for an isolated checkout",
+            tree.display()
+        ),
+        WriterRefusal::PoolExhausted => {
+            let holders = live_writer_records(state);
+            let mut description = format!(
+                "writer-busy: the writer-permit pool ({} of {} in use) is full; raise \
+                 supervise.max_writers or ZIRV_CTX_SUPERVISE_MAX_WRITERS (0 lifts the \
+                 machine-wide cap), or retry once a writer finishes",
+                holders.len(),
+                max_writers
+            );
+            for holder in holders {
+                let holder_tree = holder
+                    .tree
+                    .as_deref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "(unknown tree)".to_string());
+                description.push_str(&format!(
+                    "\n  pid {} -- {} -- {holder_tree}",
+                    holder.pid, holder.label
+                ));
+            }
+            description
+        }
+    }
+}
+
 /// `<state>/permits/writers/trees/`: a subdirectory of the writer pool's own
 /// slot directory, deliberately separate from the `slot-<n>.json` files
 /// [`live_records_in`] scans there -- a tree claim (see [`claim_tree`]) is
-/// not a pool slot, and [`live_writer_records`]/[`live_writer_count`] must
-/// keep counting exactly the slots they always did (`std::fs::read_dir` is
+/// not a pool slot, and [`live_writer_records`] must keep returning exactly
+/// the slots it always did (`std::fs::read_dir` is
 /// not recursive, so this subdirectory's files never appear in that
 /// listing).
 fn tree_claims_dir(state: &StateDir) -> PathBuf {
@@ -662,11 +699,13 @@ fn claim_tree(dir: &Path, key: &str, record: &PermitRecord) -> Result<PathBuf, W
 ///    [`claim_tree`], taken before anything else below). This is the "never
 ///    two writers in one worktree" rule (design section 3); `--worktree`
 ///    sidesteps it entirely by naming a fresh, never-before-seen tree.
-/// 2. [`WriterRefusal::PoolExhausted`] -- every one of `limit` slots is
-///    already claimed (by writers in OTHER trees), the same bounded-pool
-///    refusal [`acquire`] already gives the heavy pool. A tree claim taken
-///    just above but not backed by a pool slot is released immediately, so
-///    a refused request never wedges the tree for one that never launched.
+/// 2. [`WriterRefusal::PoolExhausted`] -- when `limit` is positive, every one
+///    of its slots is already claimed by writers in OTHER trees. Zero means
+///    there is no machine-wide cap; the holder record is still written, with
+///    an effective limit of [`usize::MAX`], so status and refusal diagnostics
+///    continue to list every writer. A tree claim not backed by a pool slot is
+///    released immediately, so a refused request never wedges the tree for
+///    one that never launched.
 ///
 /// Reuses [`acquire_record`] for the pool-slot claim, so a writer permit
 /// survives a crash and is swept exactly like a heavy one (same
@@ -689,7 +728,8 @@ pub fn acquire_writer(
         tree: Some(tree.to_path_buf()),
     };
     let claim_path = claim_tree(&tree_claims_dir(state), &key, &record)?;
-    match acquire_record(&dir, limit, record) {
+    let effective_limit = if limit == 0 { usize::MAX } else { limit };
+    match acquire_record(&dir, effective_limit, record) {
         Some(mut permit) => {
             permit.tree_claim = Some(claim_path);
             Ok(permit)
@@ -1198,6 +1238,81 @@ mod tests {
         );
     }
 
+    /// Issue #338: zero removes only the machine-wide bound. Writers in
+    /// different trees are both recorded, while the atomic tree claim still
+    /// refuses a second writer in either occupied tree.
+    #[test]
+    fn zero_writer_limit_allows_different_trees_but_keeps_tree_exclusivity() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let tree_a = tmp.path().join("repo-a");
+        let tree_b = tmp.path().join("repo-b");
+        std::fs::create_dir_all(&tree_a).expect("mkdir");
+        std::fs::create_dir_all(&tree_b).expect("mkdir");
+
+        let _held_a = acquire_writer(&state, 0, "worker-a", &tree_a).expect("first granted");
+        let _held_b = acquire_writer(&state, 0, "worker-b", &tree_b).expect("second granted");
+        let err = acquire_writer(&state, 0, "worker-c", &tree_a)
+            .expect_err("the occupied tree must still be exclusive");
+        assert_eq!(
+            err,
+            WriterRefusal::TreeBusy {
+                holder_label: "worker-a".to_string()
+            }
+        );
+
+        let records = live_writer_records(&state);
+        assert_eq!(records.len(), 2, "both live writers must remain visible");
+        assert!(records.iter().any(|record| record.label == "worker-a"));
+        assert!(records.iter().any(|record| record.label == "worker-b"));
+    }
+
+    /// Issue #338: zero is the opt-out, not a removal of the configurable
+    /// machine-wide policy. An explicit bound of one preserves the prior
+    /// cross-tree refusal.
+    #[test]
+    fn explicit_writer_limit_one_preserves_the_machine_wide_cap() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let tree_a = tmp.path().join("repo-a");
+        let tree_b = tmp.path().join("repo-b");
+        std::fs::create_dir_all(&tree_a).expect("mkdir");
+        std::fs::create_dir_all(&tree_b).expect("mkdir");
+
+        let _held = acquire_writer(&state, 1, "worker-a", &tree_a).expect("first granted");
+        let err = acquire_writer(&state, 1, "worker-b", &tree_b)
+            .expect_err("the configured machine-wide bound must be enforced");
+        assert_eq!(err, WriterRefusal::PoolExhausted);
+    }
+
+    /// Issue #338: an exhausted machine-wide pool names both operator
+    /// controls and every live holder, including the repository tree that
+    /// status alone previously made hard to correlate with the refusal.
+    #[test]
+    fn pool_exhaustion_description_names_the_controls_count_and_holders() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let tree_a = tmp.path().join("repo-a");
+        let tree_b = tmp.path().join("repo-b");
+        std::fs::create_dir_all(&tree_a).expect("mkdir");
+        std::fs::create_dir_all(&tree_b).expect("mkdir");
+
+        let _held = acquire_writer(&state, 1, "worker-a", &tree_a).expect("first granted");
+        let description =
+            describe_writer_refusal(&WriterRefusal::PoolExhausted, &state, 1, &tree_b);
+
+        assert!(description.starts_with("writer-busy:"));
+        assert!(description.contains("1 of 1 in use"));
+        assert!(description.contains("supervise.max_writers"));
+        assert!(description.contains("ZIRV_CTX_SUPERVISE_MAX_WRITERS"));
+        assert!(description.contains("0 lifts the machine-wide cap"));
+        assert!(description.contains(&format!(
+            "pid {} -- worker-a -- {}",
+            std::process::id(),
+            tree_a.display()
+        )));
+    }
+
     /// The writer pool's own bound is independent of the heavy pool's --
     /// exhausting one must never affect the other, mirroring `a_permit_is_
     /// bounded_and_released_on_drop` for the heavy pool.
@@ -1251,7 +1366,7 @@ mod tests {
         state::write_private(&slot_path(&dir, 0), &json).expect("write");
 
         assert_eq!(
-            live_writer_count(&state),
+            live_writer_records(&state).len(),
             0,
             "a dead owner's writer permit does not count"
         );
@@ -1354,8 +1469,8 @@ mod tests {
         );
     }
 
-    /// `live_writer_records`/`live_writer_count` must keep counting exactly
-    /// the pool slots they always did -- a tree claim (living under its own
+    /// `live_writer_records` must keep returning exactly the pool slots it
+    /// always did -- a tree claim (living under its own
     /// `writers/trees/` subdirectory) must never be double-counted as a
     /// second writer.
     #[test]
@@ -1367,7 +1482,7 @@ mod tests {
 
         let _held = acquire_writer(&state, 2, "worker-a", &tree).expect("granted");
         assert_eq!(
-            live_writer_count(&state),
+            live_writer_records(&state).len(),
             1,
             "one writer holds one slot -- the tree claim file must not also be counted"
         );

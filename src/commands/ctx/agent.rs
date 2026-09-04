@@ -25,7 +25,7 @@ use super::dash::spawnreq;
 use super::event::{SessionId, SessionRef, TranscriptUsage};
 use super::exec::{self, ExecArgs};
 use super::pace;
-use super::permit::{self, WorkerMode, WriterRefusal};
+use super::permit::{self, WorkerMode};
 use super::policy;
 use super::result_schema::{self, Schema};
 use super::supervise;
@@ -2607,21 +2607,14 @@ pub fn run_with<W: Write>(
                 // delegation must not outlive it -- same discipline as
                 // every other pre-launch refusal above.
                 discard_minted_group();
-                let reason = match refusal {
-                    WriterRefusal::TreeBusy { holder_label } => format!(
-                        "another writing worker already holds {} ({holder_label}); retry once \
-                         it finishes, or pass --worktree for an isolated checkout",
-                        tree.display()
-                    ),
-                    WriterRefusal::PoolExhausted => format!(
-                        "the writer-permit pool ({} of {} in use) is full; retry once a writer \
-                         finishes",
-                        permit::live_writer_count(&state),
-                        cfg.supervise.max_writers
-                    ),
-                };
+                let reason = permit::describe_writer_refusal(
+                    &refusal,
+                    &state,
+                    cfg.supervise.max_writers,
+                    &tree,
+                );
                 let code = exec::EXIT_WRITER_BUSY;
-                writeln!(w, "{}: {reason}", delegation_outcome(code))?;
+                writeln!(w, "{reason}")?;
                 return Ok(code);
             }
         }
@@ -5488,7 +5481,11 @@ mod tests {
         let home = tmp.path().join("home");
         let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
         let state_path = tmp.path().join("state");
-        let env = base_env(&state_path);
+        let mut env = base_env(&state_path);
+        env.insert(
+            "ZIRV_CTX_SUPERVISE_MAX_WRITERS".to_string(),
+            "1".to_string(),
+        );
         let state = StateDir::from_root(state_path);
 
         assert!(git_init(tmp.path()), "git init");
@@ -5507,7 +5504,7 @@ mod tests {
         assert!(run(&["add", "README.md"]));
         assert!(run(&["commit", "-q", "-m", "initial"]));
 
-        // Exhausts the (default) writer pool of 1 with a writer holding some
+        // Exhausts the explicitly configured writer pool of 1 with a writer holding some
         // OTHER tree -- `--worktree` always allocates a fresh, never-before-
         // seen tree, so this is `WriterRefusal::PoolExhausted`, never
         // `TreeBusy`, proving the refusal is genuinely unrelated to the

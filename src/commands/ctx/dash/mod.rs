@@ -3871,19 +3871,12 @@ fn fulfill_spawn_request(
             Ok(permit) => Some(permit),
             Err(refusal) => {
                 rollback_admission();
-                let reason = match refusal {
-                    super::permit::WriterRefusal::TreeBusy { holder_label } => format!(
-                        "another writing worker already holds {} ({holder_label}); retry once \
-                         it finishes, or pass --worktree for an isolated checkout",
-                        tree.display()
-                    ),
-                    super::permit::WriterRefusal::PoolExhausted => format!(
-                        "the writer-permit pool ({} of {} in use) is full; retry once a writer \
-                         finishes",
-                        super::permit::live_writer_count(state),
-                        cfg.supervise.max_writers
-                    ),
-                };
+                let reason = super::permit::describe_writer_refusal(
+                    &refusal,
+                    state,
+                    cfg.supervise.max_writers,
+                    &tree,
+                );
                 return Err(SpawnRefusal::policy(reason));
             }
         }
@@ -16673,7 +16666,7 @@ mod tests {
         );
         assert!(first.is_ok(), "the first writer must spawn: {first:?}");
         assert_eq!(
-            super::super::permit::live_writer_count(&state),
+            super::super::permit::live_writer_records(&state).len(),
             1,
             "a `--mode writing` pane spawn must hold a writer permit for its whole life, the \
              same way `agent::run_with`'s headless fork already does"
@@ -16704,7 +16697,7 @@ mod tests {
             "the refused second request must never have spawned a pane"
         );
         assert_eq!(
-            super::super::permit::live_writer_count(&state),
+            super::super::permit::live_writer_records(&state).len(),
             1,
             "the refused second request must never have taken a second writer slot"
         );
@@ -16788,7 +16781,7 @@ mod tests {
         );
         assert!(sub.is_ok(), "the coordinator must spawn: {sub:?}");
         assert_eq!(
-            super::super::permit::live_writer_count(&state),
+            super::super::permit::live_writer_records(&state).len(),
             0,
             "a coordinator pane must not hold the tree's writer slot"
         );
@@ -16810,7 +16803,7 @@ mod tests {
             worker.is_ok(),
             "the worker under a coordinator must still get the tree's writer slot: {worker:?}"
         );
-        assert_eq!(super::super::permit::live_writer_count(&state), 1);
+        assert_eq!(super::super::permit::live_writer_records(&state).len(), 1);
 
         for pane in &mut panes {
             let _ = pane.shutdown("");

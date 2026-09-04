@@ -160,25 +160,23 @@ pub struct SuperviseConfig {
     /// `agents_in_ctx_toml_is_rejected_so_the_two_files_stay_distinct`) --
     /// this is a `[supervise]` key like every other cap in this struct.
     pub max_heavy_operations: usize,
-    /// Issue #267: how many `--mode writing` delegated workers may hold a
-    /// WRITER permit at once, machine-wide -- a second, independent pool
-    /// from `max_heavy_operations` above: a writer permit is held for a
-    /// worker's WHOLE LIFETIME (`agent::run_with`), not only while it runs
-    /// one classified heavy command, and additionally never lets two
-    /// writers hold the SAME checkout at once (`permit::acquire_writer`'s
-    /// own per-tree exclusivity, which this count alone does not express).
-    /// A `--mode read-only` worker never takes a writer permit and does not
-    /// count against this.
+    /// Issues #267/#338: an optional machine-wide cap on how many `--mode
+    /// writing` delegated workers may hold a WRITER permit at once -- a
+    /// second, independent pool from `max_heavy_operations` above. A writer
+    /// permit is held for a worker's WHOLE LIFETIME (`agent::run_with`), not
+    /// only while it runs one classified heavy command. Regardless of this
+    /// cap, `permit::acquire_writer` never lets two writers hold the SAME
+    /// checkout at once. A `--mode read-only` worker never takes a writer
+    /// permit and does not count against this.
     ///
-    /// Defaults to 1, the same "never two writers in one worktree" posture
-    /// Ruflo's own CLAUDE.md conventions this issue is modeled on already
-    /// enforce by hand -- an operator who has verified their own workflow
-    /// can take more raises this explicitly.
+    /// Defaults to 0: no machine-wide cap, with per-tree exclusivity only.
+    /// An operator who wants the coarser machine-wide policy can set a
+    /// positive limit explicitly; 1 restores the original single-writer
+    /// behavior.
     ///
-    /// `REPO_FORBIDDEN`, same reasoning as `max_heavy_operations` right
-    /// above: a checked-out repo raising the machine-wide writer-concurrency
-    /// budget is exactly the corrupted-diff failure this cap exists to
-    /// prevent.
+    /// `REPO_FORBIDDEN`: whether unrelated repositories coordinate through
+    /// a machine-wide writer cap is an operator policy, not something one
+    /// checked-out repository may choose for the whole machine.
     pub max_writers: usize,
     /// Extra command patterns an operator classifies as heavy on their own
     /// machine, ADDED to the built-in set (`permit::BUILTIN_HEAVY_PATTERNS`),
@@ -204,7 +202,7 @@ impl Default for SuperviseConfig {
             on_failure: None,
             max_nudges: 3,
             max_heavy_operations: 1,
-            max_writers: 1,
+            max_writers: 0,
             heavy_command_patterns: Vec::new(),
         }
     }
@@ -3469,8 +3467,8 @@ mod tests {
         );
         assert_eq!(
             SuperviseConfig::default().max_writers,
-            1,
-            "issue #267: never two writers in one worktree is the safe default"
+            0,
+            "issue #338: 0 means no machine-wide cap, with per-tree exclusivity only"
         );
         assert_eq!(
             SuperviseConfig::default().heavy_command_patterns,
