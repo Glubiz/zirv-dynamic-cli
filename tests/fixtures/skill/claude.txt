@@ -50,6 +50,16 @@ semantic verb unless raw control is specifically needed.
 - `zirv ctx kill`: stop a session outright.
 - `zirv memory`: read and write the durable, repo-scoped memory bank.
 - `zirv workflow`: run a durable, gated development workflow.
+- `zirv ctx worktree`: list, finalize, or prune `agent --worktree`'s linked
+  worktrees; proof-required, nothing is removed without evidence.
+- `zirv ctx task`: durable task cards for delegated work -- create, claim,
+  heartbeat, complete, block/unblock, comment, archive.
+- `zirv ctx swarm`: mint a root plus worker/verifier/synthesizer task-card
+  batch in one atomic write.
+- `zirv ctx explain-status`: explain why a session's composed attention
+  projection is what it is.
+- `zirv ctx wait`: block until a session's attention projection matches, or
+  time out.
 
 Background session creation defaults to no focus: it does not steal the
 operator's terminal unless asked to.
