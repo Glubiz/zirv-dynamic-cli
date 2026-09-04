@@ -97,7 +97,7 @@
 //! comment for the exact fold.
 
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -6267,6 +6267,26 @@ fn cd_allow_roots(scratchpad_roots: &[String]) -> Vec<String> {
 /// to parse as JSON, or lacks the fields this function looks for, is simply
 /// skipped, matching every other best-effort transcript reader in this
 /// codebase.
+/// How much of the transcript's tail the identical-command guard reads on
+/// each PreToolUse call. A guard that re-read a multi-megabyte transcript in
+/// full before every Bash call would add latency to the hot path for a
+/// signal that only ever concerns the most recent few invocations; a partial
+/// first line is skipped by the tolerant parser like any other bad line.
+const GUARD_TRANSCRIPT_TAIL_BYTES: u64 = 2 * 1024 * 1024;
+
+fn read_transcript_tail(path: &Path) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    if len > GUARD_TRANSCRIPT_TAIL_BYTES {
+        file.seek(SeekFrom::Start(len - GUARD_TRANSCRIPT_TAIL_BYTES))
+            .ok()?;
+    }
+    let mut bytes = Vec::with_capacity(len.min(GUARD_TRANSCRIPT_TAIL_BYTES) as usize);
+    file.read_to_end(&mut bytes).ok()?;
+    Some(String::from_utf8_lossy(&bytes).into_owned())
+}
+
 fn trailing_same_command_failure_run(jsonl: &str, command: &str) -> usize {
     use std::collections::HashMap;
 
@@ -6579,7 +6599,7 @@ fn run_check_hook_mode_with_env<W: Write>(
         && cfg.safety.identical_command_warn_after > 0
         && !is_read_only_escape_safe(command, &scratchpad_roots)
         && let Some(transcript_path) = payload.transcript_path.as_deref()
-        && let Ok(transcript) = std::fs::read_to_string(transcript_path)
+        && let Some(transcript) = read_transcript_tail(Path::new(transcript_path))
     {
         let run = trailing_same_command_failure_run(&transcript, command);
         let refuses = cfg.safety.identical_command_refuse_after > 0
