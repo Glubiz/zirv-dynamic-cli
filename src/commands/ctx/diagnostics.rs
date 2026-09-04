@@ -9,7 +9,7 @@
 //! a cost an operator must opt into.
 //!
 //! Every piece that touches the filesystem or spawns a process
-//! (`checker_for`/`run_checker`) is kept separate from the pure parsing/
+//! (`checker_for`/`run_checker_with_target`) is kept separate from the pure parsing/
 //! diffing/rendering helpers below it, so the bulk of this module's own
 //! logic is tested without ever running a real compiler.
 //!
@@ -56,7 +56,7 @@ impl Diagnostic {
 }
 
 /// Which fast checker a repo resolves to. Kept small and `Copy` so a test
-/// closure standing in for [`run_checker`] can take it by value.
+/// closure standing in for [`run_checker_with_target`] can take it by value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Checker {
     Cargo,
@@ -86,11 +86,29 @@ pub fn checker_for(repo: &Path) -> Option<Checker> {
 /// stdout/stderr are drained on background threads while the main thread
 /// only polls `try_wait`, so a checker that floods either stream can never
 /// deadlock this call the way a naive "wait then read" would.
-pub fn run_checker(repo: &Path, checker: Checker, timeout_secs: u64) -> Option<String> {
+///
+/// `cargo_target_dir`: the Stop hook passes one under the state dir (see
+/// [`diagnostics_target_dir`]): a check
+/// sharing the repository's own `target/` would block on cargo's build
+/// directory lock for the whole timeout whenever the session's own
+/// `cargo test`/`cargo build` is still running -- exactly the moment a
+/// post-edit check fires -- and would churn that build's fingerprints. The
+/// first run in a fresh target directory pays a full metadata-only check and
+/// may hit the timeout; cargo persists what it finished, so the next turn's
+/// run is incremental. `None` keeps cargo's own default (tests, CLI use).
+pub fn run_checker_with_target(
+    repo: &Path,
+    checker: Checker,
+    timeout_secs: u64,
+    cargo_target_dir: Option<&Path>,
+) -> Option<String> {
     let mut command = match checker {
         Checker::Cargo => {
             let mut c = Command::new("cargo");
             c.args(["check", "--message-format=json", "--all-targets"]);
+            if let Some(target) = cargo_target_dir {
+                c.env("CARGO_TARGET_DIR", target);
+            }
             c
         }
         Checker::Tsc => {
@@ -385,15 +403,26 @@ fn save_diagnostics_record(path: &Path, record: &DiagnosticsRecord) {
 ///    fact `verify_on_stop_nudge` gates on).
 /// 3. At least one of `adapter_files_modified` resolves under `repo`.
 /// 4. `checker_for(repo)` finds a checker at all.
-/// 5. `run` (the real [`run_checker`] in production; a closure in tests)
+/// 5. `run` (the real [`run_checker_with_target`] in production; a closure in tests)
 ///    returns some stdout.
 /// 6. Parsing, filtering to the modified files, and diffing against the
 ///    session's own baseline leaves at least one new diagnostic.
 ///
-/// `run` is a parameter (rather than this function calling [`run_checker`]
+/// `run` is a parameter (rather than this function calling [`run_checker_with_target`]
 /// directly) purely for testability: a test can hand it a counting closure
 /// and assert the checker never ran, without needing a real `cargo`/`tsc` on
 /// the test machine.
+/// The per-repository cargo target directory the Stop hook's checker uses,
+/// under the state dir so it never contends with the repository's own
+/// `target/` lock (see [`run_checker_with_target`]).
+pub fn diagnostics_target_dir(state: &StateDir, repo: &Path) -> PathBuf {
+    state
+        .root()
+        .join("diagnostics")
+        .join(super::state::repo_slug(repo))
+        .join("target")
+}
+
 pub fn post_edit_nudge(
     state: &StateDir,
     cfg: &CtxConfig,

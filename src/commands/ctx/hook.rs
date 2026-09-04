@@ -1033,6 +1033,7 @@ fn diagnostics_stop_nudge(
     let adapter = adapters::select(cfg.agent.as_deref(), &[], cfg).ok()?;
     let jsonl = std::fs::read_to_string(transcript).ok()?;
     let files_modified = adapter.structural_context(&jsonl, 64).files_modified;
+    let target = diagnostics::diagnostics_target_dir(state, repo);
     diagnostics::post_edit_nudge(
         state,
         cfg,
@@ -1040,7 +1041,9 @@ fn diagnostics_stop_nudge(
         repo,
         session,
         files_modified,
-        &diagnostics::run_checker,
+        &|repo, checker, timeout| {
+            diagnostics::run_checker_with_target(repo, checker, timeout, Some(&target))
+        },
     )
 }
 
@@ -4578,7 +4581,7 @@ mod tests {
 
     /// Issue #308 stage 1: `diagnostics::post_edit_nudge`'s modification gate
     /// runs before the checker is ever considered -- proven here by handing
-    /// it a counting closure standing in for `diagnostics::run_checker` and
+    /// it a counting closure standing in for `diagnostics::run_checker_with_target` and
     /// asserting it is never invoked, without needing a real `cargo`/`tsc` on
     /// the test machine.
     #[test]
