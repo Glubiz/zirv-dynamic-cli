@@ -892,14 +892,16 @@ fn spend_status_line(
     )
 }
 
-/// Issues #328/#334: one line naming how many writes an orchestrator seat's
-/// own guard has refused -- `None` when `log::read_orchestrator_blocks`
-/// returns nothing, so an unmodified report's bytes stay byte-identical.
-/// "This session" sums rows whose `session` matches `mail::
-/// session_identity(env)`, the identical rule `spend_status_line` uses for
-/// its own "this session" figure; "total" is every row ever logged, and
-/// "last" is the newest row (`log::read_orchestrator_blocks` returns oldest
-/// first).
+/// Issues #328/#334, posture-aware since issue #358 T8: one line naming how
+/// many writes an orchestrator seat's own guard has decided on -- `None`
+/// when `log::read_orchestrator_blocks` returns nothing, so an unmodified
+/// report's bytes stay byte-identical. "This session" sums rows whose
+/// `session` matches `mail::session_identity(env)`, the identical rule
+/// `spend_status_line` uses for its own "this session" figure; "total" is
+/// every row ever logged, "denied" is every row whose `outcome == "denied"`
+/// (a pre-#358 row with no `outcome` field at all defaults to "denied" --
+/// see `log::OrchestratorBlockRecord`), and "last" is the newest row
+/// (`log::read_orchestrator_blocks` returns oldest first).
 fn orchestrator_blocks_status_line(
     state: &StateDir,
     env: EnvLookup<'_>,
@@ -912,12 +914,13 @@ fn orchestrator_blocks_status_line(
         .iter()
         .filter(|row| session_ident.as_deref() == Some(row.session.as_str()))
         .count();
+    let denied = rows.iter().filter(|row| row.outcome == "denied").count();
     Some(format!(
         "{} {}",
-        label(colour, "orchestrator writes blocked:"),
+        label(colour, "orchestrator writes:"),
         style::paint(
             &format!(
-                "{this_session} this session \u{b7} {} total (last: {} {})",
+                "{this_session} this session \u{b7} {} total ({denied} denied; last: {} {})",
                 rows.len(),
                 last.tool,
                 last.target,
@@ -1090,6 +1093,19 @@ fn render_report<W: Write>(
             // rate-limit window (`pace::current_windows` tracks that
             // separately, in tokens, not dollars).
             writeln!(w, "{}", spend_status_line(&state, cfg, env, colour))?;
+            // Issue #358 T8: this seat's own current write-guard posture,
+            // unconditional (present in `--brief` too, the same allowance
+            // `spend:`/`orchestrator writes:` (the counts line right below)
+            // both get) -- an operator should not need `zirv ctx status
+            // --diff` or to re-read `.zirv/ctx.toml` just to see whether
+            // this session's own direct edits are denied, advised, or
+            // silently allowed.
+            writeln!(
+                w,
+                "{} {}",
+                label(colour, "orchestrator write posture:"),
+                cfg.supervise.orchestrator_writes.label()
+            )?;
             // Issues #328/#334: present in `--brief` too, the same allowance
             // `spend:` gets, and silent (no line at all) when nothing has
             // ever been blocked -- see `orchestrator_blocks_status_line`.
@@ -3724,9 +3740,10 @@ mod tests {
         }
     }
 
-    /// Issues #328/#334: `orchestrator writes blocked:` names both this
-    /// session's own refused count and the all-time total, plus the newest
-    /// blocked call -- and appears in `--brief` too, the same allowance
+    /// Issues #328/#334, posture-aware since issue #358 T8: `orchestrator
+    /// writes:` names both this session's own count and the all-time total
+    /// (plus how many of those were denied) and the newest logged call --
+    /// and appears in `--brief` too, the same allowance
     /// `spend:` gets.
     #[test]
     fn status_reports_orchestrator_blocks_this_session_and_total() {
@@ -3742,6 +3759,7 @@ mod tests {
                 tool: "Edit",
                 target: "/work/repo/src/main.rs",
                 reason: "orchestrator seats may not edit repository files",
+                outcome: "denied",
             },
         )
         .expect("append");
@@ -3753,6 +3771,7 @@ mod tests {
                 tool: "Bash",
                 target: "sed -i",
                 reason: "orchestrator seats may not edit repository files",
+                outcome: "denied",
             },
         )
         .expect("append");
@@ -3782,15 +3801,110 @@ mod tests {
             let text = String::from_utf8(out).expect("utf8");
             assert!(
                 text.contains(
-                    "orchestrator writes blocked: 1 this session \u{b7} 2 total (last: Bash sed -i)"
+                    "orchestrator writes: 1 this session \u{b7} 2 total (2 denied; last: Bash sed -i)"
                 ),
                 "brief={brief}: got {text}"
             );
         }
     }
 
-    /// Nothing blocked yet must render byte-identical to before this line
-    /// existed -- no `orchestrator writes blocked:` text at all.
+    /// Issue #358 T8: a mix of `denied`/`advised`/`allowed` rows counts each
+    /// correctly -- `denied` is scoped to `outcome == "denied"`, distinct
+    /// from the plain totals `status_reports_orchestrator_blocks_this_
+    /// session_and_total` already covers for an all-denied log.
+    #[test]
+    fn status_reports_the_denied_count_separately_from_the_total() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(tmp.path().join("state"));
+        state.ensure().expect("ensure");
+
+        for (session, tool, target, outcome) in [
+            ("aaaa1111", "Edit", "/work/repo/src/main.rs", "denied"),
+            ("aaaa1111", "Edit", "/work/repo/src/lib.rs", "advised"),
+            ("aaaa1111", "Bash", "sed -i", "allowed"),
+        ] {
+            log::append_orchestrator_block(
+                &state,
+                &log::OrchestratorBlock {
+                    ts: crate::commands::ctx::state::now_secs(),
+                    session,
+                    tool,
+                    target,
+                    reason: "repository write",
+                    outcome,
+                },
+            )
+            .expect("append");
+        }
+
+        let mut env = env_for(state.root());
+        env.insert(
+            crate::commands::ctx::adapters::SESSION_ENV.to_string(),
+            "aaaa1111".to_string(),
+        );
+
+        let mut out = Vec::new();
+        run_with(
+            &StatusArgs {
+                decisions: 5,
+                brief: false,
+                diff: false,
+                breakdown: None,
+            },
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            false,
+        )
+        .expect("runs");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            text.contains(
+                "orchestrator writes: 3 this session \u{b7} 3 total (1 denied; last: Bash sed -i)"
+            ),
+            "got {text}"
+        );
+    }
+
+    /// Issue #358 T8: `orchestrator write posture:` is unconditional --
+    /// present with no rows logged at all, and names the configured
+    /// posture, not the built-in default, when the repo narrows it.
+    #[test]
+    fn status_reports_the_orchestrator_write_posture() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        std::fs::create_dir_all(tmp.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            tmp.path().join(".zirv/ctx.toml"),
+            "[supervise]\norchestrator_writes = \"deny\"\n",
+        )
+        .expect("write");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        state.ensure().expect("ensure");
+        let env = env_for(state.root());
+
+        let mut out = Vec::new();
+        run_with(
+            &StatusArgs {
+                decisions: 5,
+                brief: false,
+                diff: false,
+                breakdown: None,
+            },
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            false,
+        )
+        .expect("runs");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            text.contains("orchestrator write posture: deny"),
+            "got {text}"
+        );
+    }
+
+    /// Nothing logged yet must render byte-identical to before this line
+    /// existed -- no `orchestrator writes:` text at all.
     #[test]
     fn status_omits_the_orchestrator_blocks_line_with_no_rows() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -3814,7 +3928,7 @@ mod tests {
         )
         .expect("runs");
         let text = String::from_utf8(out).expect("utf8");
-        assert!(!text.contains("orchestrator writes blocked"), "got {text}");
+        assert!(!text.contains("orchestrator writes:"), "got {text}");
     }
 
     /// The fourth surface change: a window whose `resets_at` has provably

@@ -5,7 +5,7 @@ pub mod claude;
 pub mod codex;
 
 use super::CtxResult;
-use super::config::CtxConfig;
+use super::config::{CtxConfig, OrchestratorWrites};
 use super::event::{
     Capabilities, NormalizedEvent, ProviderErrorClass, SessionId, SessionRef, StructuralContext,
     TranscriptUsage,
@@ -1255,7 +1255,15 @@ pub trait AgentAdapter: std::fmt::Debug {
     /// `None` (the default) means this agent contributes nothing of its own,
     /// which is what an agent whose tool vocabulary zirv has not verified
     /// must do rather than be handed another agent's instructions.
-    fn base_system_prompt(&self) -> Option<&'static str> {
+    ///
+    /// `posture` is this seat's own repository-write guard posture (issue
+    /// #358 T8, `SuperviseConfig::orchestrator_writes`) -- the one place
+    /// this layer's text depends on live config rather than being purely
+    /// static, because it names the guard's actual enforcement behaviour
+    /// (`prompt::orchestrator_write_lines`). Owned `String`, unlike every
+    /// other layer on this trait, for exactly that reason.
+    fn base_system_prompt(&self, posture: OrchestratorWrites) -> Option<String> {
+        let _ = posture;
         None
     }
 
@@ -5017,7 +5025,10 @@ mod tests {
     /// no base layer, rather than another agent's instructions.
     #[test]
     fn an_unverified_agent_receives_no_base_layer_by_default() {
-        assert_eq!(NoOverrideAdapter(String::new()).base_system_prompt(), None);
+        assert_eq!(
+            NoOverrideAdapter(String::new()).base_system_prompt(OrchestratorWrites::Deny),
+            None
+        );
     }
 
     /// Issue #167: both real adapters now have their own base layer, and
@@ -5026,10 +5037,10 @@ mod tests {
     #[test]
     fn each_real_adapter_receives_its_own_distinct_base_layer() {
         let claude_layer = claude::ClaudeAdapter::new(None)
-            .base_system_prompt()
+            .base_system_prompt(OrchestratorWrites::Deny)
             .expect("claude has one of its own");
         let codex_layer = codex::CodexAdapter::new(None)
-            .base_system_prompt()
+            .base_system_prompt(OrchestratorWrites::Deny)
             .expect("codex has one of its own, issue #167");
         assert_ne!(claude_layer, codex_layer);
         assert!(

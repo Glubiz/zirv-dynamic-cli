@@ -7205,12 +7205,16 @@ fn run_check_hook_mode_with_env<W: Write>(
     let effective_command =
         strip_known_root_cd_prefix(command, &cd_roots).unwrap_or_else(|| command.to_string());
 
-    // Issue #328/#334: an orchestrator seat must not write a repository
-    // file through Bash any more than through Edit/Write -- computed here,
-    // before both `evaluate_with_attestation_evidence` and the scratchpad/
-    // sandbox widening below, so its `Deny` (applied to `outcome` right
-    // after `evidence` resolves) is never reconsidered by either: both
-    // already guard on `outcome.verdict != Verdict::Deny`.
+    // Issue #328/#334 (posture-aware since issue #358 T8): an orchestrator
+    // seat's own repository write through Bash is detected here -- before
+    // both `evaluate_with_attestation_evidence` and the scratchpad/sandbox
+    // widening below -- the same as before. Under `OrchestratorWrites::Deny`
+    // this still forces `outcome` to a hard deny, never reconsidered by
+    // either (both already guard on `outcome.verdict != Verdict::Deny`).
+    // Under `Advise`/`Allow` the write proceeds through the ordinary
+    // evaluation below unmodified; only a rate-limited advisory note
+    // (`Advise`) and the same logged row (`Advise`/`Allow` both) ride along
+    // via `orchestrator_advisory` below.
     let orchestrator_repo_write = (env(super::adapters::SEAT_ROLE_ENV).as_deref()
         == Some("orchestrator")
         && payload.agent_id.is_empty())
@@ -7219,6 +7223,7 @@ fn run_check_hook_mode_with_env<W: Write>(
     .and_then(|cwd| {
         orchestrator_repo_write_target(&effective_command, &cwd, &filesystem_repo_root_of, env)
     });
+    let orchestrator_posture = super::hook::orchestrator_write_posture(cfg);
 
     let evidence = evaluate_with_attestation_evidence(
         &cfg.safety,
@@ -7228,19 +7233,35 @@ fn run_check_hook_mode_with_env<W: Write>(
         &scratchpad_roots,
     );
     let mut outcome = evidence.outcome.clone();
+    let mut orchestrator_advisory: Option<String> = None;
     if let Some(target) = orchestrator_repo_write {
-        outcome = Outcome {
-            verdict: Verdict::Deny,
-            matched: Some(Rule {
-                pattern: format!(
-                    "<orchestrator seat: dispatch a worker -- repository write to {target}>"
-                ),
-                origin: Origin::BuiltIn,
-            }),
+        let session =
+            super::mail::session_identity(env).unwrap_or_else(|| payload.session_id.clone());
+        let outcome_label = match orchestrator_posture {
+            super::config::OrchestratorWrites::Deny => {
+                outcome = Outcome {
+                    verdict: Verdict::Deny,
+                    matched: Some(Rule {
+                        pattern: format!(
+                            "<orchestrator seat: dispatch a worker -- repository write to {target}>"
+                        ),
+                        origin: Origin::BuiltIn,
+                    }),
+                };
+                "denied"
+            }
+            super::config::OrchestratorWrites::Advise => {
+                if super::hook::orchestrator_advisory_should_surface(env, &session) {
+                    orchestrator_advisory = Some(format!(
+                        "orchestrator seat wrote to {target}: fine for a trivial edit; \
+                         delegate substantial changes to a worker"
+                    ));
+                }
+                "advised"
+            }
+            super::config::OrchestratorWrites::Allow => "allowed",
         };
         if let Ok(state) = super::state::StateDir::resolve(env) {
-            let session =
-                super::mail::session_identity(env).unwrap_or_else(|| payload.session_id.clone());
             let tool_family = orchestrator_block_tool_family(&effective_command);
             let _ = super::log::append_orchestrator_block(
                 &state,
@@ -7250,6 +7271,7 @@ fn run_check_hook_mode_with_env<W: Write>(
                     tool: &payload.tool_name,
                     target: &tool_family,
                     reason: "repository write",
+                    outcome: outcome_label,
                 },
             );
         }
@@ -7431,7 +7453,13 @@ fn run_check_hook_mode_with_env<W: Write>(
     // exists precisely for benign, repeatable inspection commands, which are
     // never the loop this guard exists to catch).
     let mut reason_override: Option<String> = None;
-    let mut additional_context: Option<String> = None;
+    // Issue #358 T8: seeded from the orchestrator-write advisory above
+    // (`OrchestratorWrites::Advise`, rate-limited) rather than starting at
+    // `None` -- both this guard's own warning and that advisory only ever
+    // accompany an `Allow`, so a command that is BOTH a rate-limited
+    // orchestrator write AND an identical-failure run gets both notes,
+    // joined below, rather than one silently overwriting the other.
+    let mut additional_context: Option<String> = orchestrator_advisory;
     if outcome.verdict == Verdict::Allow
         && cfg.safety.identical_command_warn_after > 0
         && !is_read_only_escape_safe(command, &scratchpad_roots)
@@ -7455,11 +7483,25 @@ fn run_check_hook_mode_with_env<W: Write>(
                  to run it again -- report the blocker."
             ));
         } else if run >= cfg.safety.identical_command_warn_after as usize {
-            additional_context = Some(format!(
+            let identical_command_note = format!(
                 "zirv guard: this exact command has failed {run} times in a row; change the \
                  approach or the input before running it again."
-            ));
+            );
+            additional_context = Some(match additional_context {
+                Some(existing) => format!("{existing} | {identical_command_note}"),
+                None => identical_command_note,
+            });
         }
+    }
+
+    // Neither this guard's own warn note nor the orchestrator-write advisory
+    // seeded above is ever meant to survive onto a `Deny` -- the identical-
+    // command guard's own `refuses` branch (just above) can turn a prior
+    // `Allow` into a `Deny` after `additional_context` was already seeded,
+    // which would otherwise leave a stale "fine for a trivial edit"-style
+    // note riding alongside an actual refusal.
+    if outcome.verdict != Verdict::Allow {
+        additional_context = None;
     }
 
     let extras = HookOutputExtras {
@@ -8846,8 +8888,12 @@ mod tests {
             assert!(status.success(), "git init failed for {}", path.display());
         }
 
+        // Issue #358 T8: pinned to `deny` explicitly -- this test's own
+        // subject is the harness-home exemption, not posture, and the
+        // default posture is now `advise`.
         let env = |key: &str| match key {
             super::super::adapters::SEAT_ROLE_ENV => Some("orchestrator".to_string()),
+            "ZIRV_CTX_SUPERVISE_ORCHESTRATOR_WRITES" => Some("deny".to_string()),
             "HOME" | "CLAUDE_CONFIG_DIR" => std::env::var(key).ok(),
             _ => None,
         };
@@ -8884,41 +8930,66 @@ mod tests {
         }
     }
 
-    /// End-to-end: an orchestrator seat's `sed -i` on a repository file
-    /// denies through the hook, naming the guard's own rule text.
+    /// End-to-end, per posture (issue #358 T8): an orchestrator seat's
+    /// `sed -i` on a repository file denies through the hook under `deny`
+    /// (naming the guard's own rule text), and proceeds under `advise`/
+    /// `allow` -- `advise` carrying a rate-limited (first-write-always-
+    /// surfaces) advisory note in `additionalContext`, `allow` carrying
+    /// none.
     #[test]
     fn orchestrator_seat_repository_write_denies_through_the_hook() {
-        let repo = tempfile::tempdir().expect("tempdir");
-        // `filesystem_repo_root_of` only checks for a `.git` entry, so a
-        // bare marker directory is enough to stand in for a real repo --
-        // no `git init`/real git binary needed.
-        std::fs::create_dir_all(repo.path().join(".git")).expect("fake git marker");
-        let home = tempfile::tempdir().expect("tempdir");
-        let _home = super::super::testenv::HomeGuard::set(home.path());
-        let empty: HashMap<String, String> = HashMap::new();
-        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("loads");
-        let repo_cwd = repo.path().to_string_lossy().replace('\\', "/");
+        for (posture, want_decision, want_advisory) in [
+            ("deny", "deny", false),
+            ("advise", "allow", true),
+            ("allow", "allow", false),
+        ] {
+            let repo = tempfile::tempdir().expect("tempdir");
+            // `filesystem_repo_root_of` only checks for a `.git` entry, so a
+            // bare marker directory is enough to stand in for a real repo --
+            // no `git init`/real git binary needed.
+            std::fs::create_dir_all(repo.path().join(".git")).expect("fake git marker");
+            let home = tempfile::tempdir().expect("tempdir");
+            let _home = super::super::testenv::HomeGuard::set(home.path());
+            let state_dir = tempfile::tempdir().expect("state dir");
 
-        let mut env_map: HashMap<String, String> = HashMap::new();
-        env_map.insert(
-            super::super::adapters::SEAT_ROLE_ENV.to_string(),
-            "orchestrator".to_string(),
-        );
-        let stdin = format!(
-            r#"{{"tool_name":"Bash","tool_input":{{"command":"sed -i 's/a/b/' src/main.rs"}},"permission_mode":"default","cwd":"{repo_cwd}"}}"#
-        );
-        let mut out = Vec::new();
-        run_check_hook_mode_with_env(&cfg, &mut out, &stdin, &|k| env_map.get(k).cloned())
-            .expect("runs");
-        let text = String::from_utf8(out).expect("utf8");
-        assert!(
-            text.contains(r#""permissionDecision":"deny""#),
-            "got {text}"
-        );
-        assert!(
-            text.contains("orchestrator seat: dispatch a worker"),
-            "got {text}"
-        );
+            let mut env_map: HashMap<String, String> = HashMap::new();
+            env_map.insert(
+                super::super::adapters::SEAT_ROLE_ENV.to_string(),
+                "orchestrator".to_string(),
+            );
+            env_map.insert(
+                "ZIRV_CTX_SUPERVISE_ORCHESTRATOR_WRITES".to_string(),
+                posture.to_string(),
+            );
+            env_map.insert(
+                crate::commands::ctx::state::STATE_ENV.to_string(),
+                state_dir.path().display().to_string(),
+            );
+            let cfg = CtxConfig::load(repo.path(), &|k| env_map.get(k).cloned()).expect("loads");
+            let repo_cwd = repo.path().to_string_lossy().replace('\\', "/");
+
+            let stdin = format!(
+                r#"{{"tool_name":"Bash","tool_input":{{"command":"sed -i 's/a/b/' src/main.rs"}},"permission_mode":"default","cwd":"{repo_cwd}"}}"#
+            );
+            let mut out = Vec::new();
+            run_check_hook_mode_with_env(&cfg, &mut out, &stdin, &|k| env_map.get(k).cloned())
+                .expect("runs");
+            let text = String::from_utf8(out).expect("utf8");
+            assert!(
+                text.contains(&format!(r#""permissionDecision":"{want_decision}""#)),
+                "posture={posture}: got {text}"
+            );
+            assert_eq!(
+                text.contains("orchestrator seat: dispatch a worker"),
+                posture == "deny",
+                "posture={posture}: got {text}"
+            );
+            assert_eq!(
+                text.contains("fine for a trivial edit; delegate substantial changes to a worker"),
+                want_advisory,
+                "posture={posture}: got {text}"
+            );
+        }
     }
 
     #[test]
@@ -9059,7 +9130,8 @@ mod tests {
 
     /// A denied repository write appends one `orchestrator-blocks.jsonl`
     /// row whose `target` is a program-family label, never the full
-    /// command text.
+    /// command text -- pinned to `deny` explicitly (issue #358 T8: the
+    /// default posture is now `advise`).
     #[test]
     fn orchestrator_seat_repository_write_denial_appends_an_orchestrator_block() {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -9067,9 +9139,6 @@ mod tests {
         let home = tempfile::tempdir().expect("tempdir");
         let _home = super::super::testenv::HomeGuard::set(home.path());
         let state_dir = tempfile::tempdir().expect("tempdir");
-        let empty: HashMap<String, String> = HashMap::new();
-        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("loads");
-        let repo_cwd = repo.path().to_string_lossy().replace('\\', "/");
 
         let mut env_map: HashMap<String, String> = HashMap::new();
         env_map.insert(
@@ -9080,6 +9149,13 @@ mod tests {
             super::super::state::STATE_ENV.to_string(),
             state_dir.path().to_string_lossy().to_string(),
         );
+        env_map.insert(
+            "ZIRV_CTX_SUPERVISE_ORCHESTRATOR_WRITES".to_string(),
+            "deny".to_string(),
+        );
+        let cfg = CtxConfig::load(repo.path(), &|k| env_map.get(k).cloned()).expect("loads");
+        let repo_cwd = repo.path().to_string_lossy().replace('\\', "/");
+
         let command = "sed -i 's/a/b/' src/main.rs";
         let stdin = format!(
             r#"{{"tool_name":"Bash","tool_input":{{"command":"{command}"}},"permission_mode":"default","cwd":"{repo_cwd}"}}"#
@@ -9092,6 +9168,7 @@ mod tests {
         let records = super::super::log::read_orchestrator_blocks(&state);
         assert_eq!(records.len(), 1, "{records:?}");
         assert_eq!(records[0].tool, "Bash");
+        assert_eq!(records[0].outcome, "denied");
         assert!(
             !records[0].target.contains(command),
             "target must not carry the full command text: {:?}",

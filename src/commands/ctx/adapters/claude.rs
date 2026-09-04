@@ -101,6 +101,63 @@ by ONE designated integrator worker; a writer touching one says so in its report
 integration -- branching, merging worker results, committing, opening the PR -- stays on this \
 seat.";
 
+/// Everything in [`ORCHESTRATOR_PROMPT`] AFTER its own first (write-guard)
+/// bullet -- shared verbatim by [`orchestrator_prompt_for`]'s `Advise`/
+/// `Allow` arms, which splice a different first bullet in front of it.
+const ORCHESTRATOR_PROMPT_TAIL_AFTER_WRITE_GUARD_BULLET: &str = "\n\
+- Routing rule, which outranks any operator or repository layer that says otherwise: \
+same-harness delegation uses this harness's native Agent tool (visible in this session, result \
+returned directly); `zirv agent <name>` is for reaching a different harness or a work group, never \
+for spawning another claude worker from a claude seat -- zirv refuses it from this seat. `zirv ctx \
+agent --role sub-orchestrator --scope \"<area>\"` creates a work group for work that splits into \
+several coherently-scoped areas each needing its own coordination. Delegated work stays \
+observable: inside `zirv ctx dash` a worker is an attached pane, outside it a headless run whose \
+result lands on stdout. Bundle small related items into one checklist brief with a per-item \
+output format, dispatch independent work together in the background, and continue a worker you \
+already briefed for follow-ups in its area instead of spawning a fresh one.
+- Every Agent dispatch sets `model` explicitly -- haiku for mechanical and bulk work, sonnet \
+for ordinary exploration, implementation, tests and review, opus only for hard debugging or \
+design -- because an omitted model inherits this seat. Never use `subagent_type: \"fork\"` \
+here; forks always inherit the seat model. Agents in .claude/agents that pin their own model \
+keep it, except that reviews always run on the roster's review model.
+- Briefs are self-contained -- goal, constraints, relevant paths, exact output format -- and \
+tell the worker to run tests in the FOREGROUND and reply with compact structured findings, \
+never raw file dumps. Subagents share none of your context.
+- Decide rather than let a worker loop: choices between valid designs, architecture changes, \
+and anything a worker has failed at twice come back to you. Hold implementers to the \
+repository's standards and to the engineering standard above: reuse before adding, minimal \
+diff, one focused test per behaviour change, format, lint and test before reporting back.
+- Reviews follow the meta-harness rule: in proportion, once. This harness's own /code-review \
+runs at low or medium effort on the roster's review model, never high or above (that forks \
+this seat's model), and never when a `zirv workflow` review gate covers the change.
+- Shared manifests and lockfiles (Cargo.toml, Cargo.lock, package.json, lockfiles) are edited \
+by ONE designated integrator worker; a writer touching one says so in its report. Git \
+integration -- branching, merging worker results, committing, opening the PR -- stays on this \
+seat.";
+
+/// The same layer as [`ORCHESTRATOR_PROMPT`], but with the write-guard
+/// bullet (its own first bullet, above) posture-dependent (issue #358 T8)
+/// instead of hardcoded to `deny`'s wording. `Deny` returns
+/// [`ORCHESTRATOR_PROMPT`] itself, unchanged -- the exact, already-shipped,
+/// already-tested text -- rather than a reconstruction that could drift
+/// from it; `Advise`/`Allow` splice `prompt::orchestrator_write_lines`'s
+/// shared, adapter-neutral text in front of
+/// [`ORCHESTRATOR_PROMPT_TAIL_AFTER_WRITE_GUARD_BULLET`], the same tail
+/// [`ORCHESTRATOR_PROMPT`] carries either way.
+fn orchestrator_prompt_for(posture: super::super::config::OrchestratorWrites) -> String {
+    use super::super::config::OrchestratorWrites;
+    if posture == OrchestratorWrites::Deny {
+        return ORCHESTRATOR_PROMPT.to_string();
+    }
+    format!(
+        "zirv orchestrator conventions (claude)\n\n\
+         This seat runs the most capable model; spend it on judgment -- sizing, design \
+         choices, integration, the final call -- never on implementation.\n\n\
+         - {}{ORCHESTRATOR_PROMPT_TAIL_AFTER_WRITE_GUARD_BULLET}",
+        super::super::prompt::orchestrator_write_lines(posture)
+    )
+}
+
 /// Claude's own layer for a delegated **Worker** session (see
 /// `AgentAdapter::worker_system_prompt`), spliced in place of
 /// [`ORCHESTRATOR_PROMPT`] for `PromptRole::Worker`. A worker never gets that
@@ -1605,8 +1662,11 @@ impl AgentAdapter for ClaudeAdapter {
         Some("--append-system-prompt-file")
     }
 
-    fn base_system_prompt(&self) -> Option<&'static str> {
-        Some(ORCHESTRATOR_PROMPT)
+    fn base_system_prompt(
+        &self,
+        posture: super::super::config::OrchestratorWrites,
+    ) -> Option<String> {
+        Some(orchestrator_prompt_for(posture))
     }
 
     fn worker_system_prompt(&self) -> Option<&'static str> {
@@ -2203,6 +2263,7 @@ impl AgentAdapter for ClaudeAdapter {
 
 #[cfg(test)]
 mod tests {
+    use super::super::super::config::OrchestratorWrites;
     use super::*;
     use crate::commands::ctx::event::{NormalizedEvent, input_hash};
 
@@ -4884,7 +4945,7 @@ mod tests {
     #[test]
     fn claude_contributes_the_orchestrator_layer_and_it_names_claudes_own_tools() {
         let layer = ClaudeAdapter::new(None)
-            .base_system_prompt()
+            .base_system_prompt(OrchestratorWrites::Deny)
             .expect("claude has a base layer of its own");
         assert_eq!(layer, ORCHESTRATOR_PROMPT);
         for claude_specific in ["Agent tool", ".claude/agents", "/code-review"] {
@@ -4893,6 +4954,47 @@ mod tests {
                 "the layer is claude-specific by construction: '{claude_specific}'"
             );
         }
+    }
+
+    /// Issue #358 T8: the default posture (`advise`) no longer says "it does
+    /// not implement" -- the pinned deny-only assertion moved onto `deny`
+    /// itself (`claude_contributes_the_orchestrator_layer_and_it_names_
+    /// claudes_own_tools` above, and `ORCHESTRATOR_PROMPT`'s own direct-const
+    /// tests elsewhere in this file). One test per posture.
+    #[test]
+    fn the_orchestrator_layer_follows_this_seats_write_posture() {
+        let deny = ClaudeAdapter::new(None)
+            .base_system_prompt(OrchestratorWrites::Deny)
+            .expect("deny has a base layer");
+        assert_eq!(deny, ORCHESTRATOR_PROMPT);
+        assert!(deny.contains("it does not implement"));
+        assert!(deny.contains("PreToolUse hook denies repository writes"));
+
+        let advise = ClaudeAdapter::new(None)
+            .base_system_prompt(OrchestratorWrites::Advise)
+            .expect("advise has a base layer");
+        assert!(
+            !advise.contains("it does not implement"),
+            "advise no longer claims writes are technically blocked: {advise}"
+        );
+        assert!(advise.contains("make trivial edits"), "got:\n{advise}");
+        assert!(
+            advise.contains("Repository writes from this seat are recorded"),
+            "got:\n{advise}"
+        );
+        // Everything after the write-guard bullet is unchanged.
+        assert!(advise.contains("Routing rule, which outranks"));
+        assert!(advise.contains("Agent tool"));
+
+        let allow = ClaudeAdapter::new(None)
+            .base_system_prompt(OrchestratorWrites::Allow)
+            .expect("allow has a base layer");
+        assert!(allow.contains("make trivial edits"), "got:\n{allow}");
+        assert!(
+            !allow.contains("Repository writes from this seat are recorded"),
+            "allow drops advise's own last sentence: {allow}"
+        );
+        assert!(allow.contains("Routing rule, which outranks"));
     }
 
     /// The review bullet must route review to the harness roster's own

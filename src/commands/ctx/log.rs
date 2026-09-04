@@ -240,11 +240,11 @@ pub fn read_permission_prompts(state: &StateDir) -> Vec<PermissionPromptRecord> 
         .collect()
 }
 
-/// One tool call an orchestrator seat's own guard refused because it would
-/// have edited a repository file directly (issues #328/#334): an
-/// orchestrator seat must be technically unable to edit repository files,
-/// and delegation inside the same harness must go through the harness's own
-/// native subagent tool instead. Privacy-preserving like `SafetyDecision`:
+/// One tool call an orchestrator seat's own repository-write guard decided
+/// on (issues #328/#334, posture-aware since issue #358 T8): under
+/// `OrchestratorWrites::Deny` the write was refused outright; under
+/// `Advise`/`Allow` it proceeded, and this row exists purely so `zirv ctx
+/// status` can still count it. Privacy-preserving like `SafetyDecision`:
 /// `target` never carries full command text, only a path or a program
 /// family.
 #[derive(Debug, Serialize)]
@@ -255,10 +255,17 @@ pub struct OrchestratorBlock<'a> {
     pub session: &'a str,
     /// Tool name: Edit, Write, MultiEdit, NotebookEdit, Bash, PowerShell.
     pub tool: &'a str,
-    /// What was blocked: a file path for file tools; for Bash the program
-    /// family (e.g. "sed -i"), NEVER the full command text.
+    /// What this row is about: a file path for file tools; for Bash the
+    /// program family (e.g. "sed -i"), NEVER the full command text.
     pub target: &'a str,
     pub reason: &'a str,
+    /// This decision's own posture outcome: "denied", "advised", or
+    /// "allowed" (`hook::OrchestratorWriteOutcome::log_label`). Issue #358
+    /// T8: every row before this field existed was necessarily a denial
+    /// (the guard only ever refused), which is exactly what [`
+    /// OrchestratorBlockRecord`]'s own `#[serde(default)]` value preserves
+    /// for an old log line that never wrote this field at all.
+    pub outcome: &'a str,
 }
 
 /// Appends to `orchestrator-blocks.jsonl`, the same private dir/append-file
@@ -269,6 +276,13 @@ pub fn append_orchestrator_block(state: &StateDir, block: &OrchestratorBlock<'_>
     let mut file = super::state::open_private_append(&dir.join(ORCHESTRATOR_BLOCKS_FILE))?;
     writeln!(file, "{}", serde_json::to_string(block)?)?;
     Ok(())
+}
+
+/// The default `outcome` for a pre-#358 log row that never wrote the field
+/// at all -- every such row was, by construction, a denial (the guard only
+/// ever refused before this task).
+fn default_orchestrator_block_outcome() -> String {
+    "denied".to_string()
 }
 
 /// The owned, deserializable counterpart of [`OrchestratorBlock`] (which
@@ -283,6 +297,8 @@ pub struct OrchestratorBlockRecord {
     pub tool: String,
     pub target: String,
     pub reason: String,
+    #[serde(default = "default_orchestrator_block_outcome")]
+    pub outcome: String,
 }
 
 /// Reads every parseable line in `orchestrator-blocks.jsonl`, oldest first --
@@ -1108,6 +1124,7 @@ mod tests {
                 tool: "Edit",
                 target: "/work/repo/src/main.rs",
                 reason: "orchestrator seats may not edit repository files",
+                outcome: "denied",
             },
         )
         .expect("append");
@@ -1119,6 +1136,7 @@ mod tests {
                 tool: "Bash",
                 target: "sed -i",
                 reason: "orchestrator seats may not edit repository files",
+                outcome: "advised",
             },
         )
         .expect("append");
@@ -1128,8 +1146,41 @@ mod tests {
         assert_eq!(records[0].session, "sess-1");
         assert_eq!(records[0].tool, "Edit");
         assert_eq!(records[0].target, "/work/repo/src/main.rs");
+        assert_eq!(records[0].outcome, "denied");
         assert_eq!(records[1].tool, "Bash");
         assert_eq!(records[1].target, "sed -i");
+        assert_eq!(records[1].outcome, "advised");
+    }
+
+    /// Issue #358 T8: a pre-existing log row written before `outcome`
+    /// existed at all must still parse, defaulting to "denied" -- the guard
+    /// only ever refused before this task, so that is the only honest
+    /// backfill.
+    #[test]
+    fn an_orchestrator_block_row_with_no_outcome_field_defaults_to_denied() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        std::fs::create_dir_all(state.logs()).expect("mkdir");
+        let mut file =
+            super::super::state::open_private_append(&state.logs().join(ORCHESTRATOR_BLOCKS_FILE))
+                .expect("open");
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({
+                "ts": 1_700_000_000_u64,
+                "session": "sess-1",
+                "tool": "Edit",
+                "target": "/work/repo/src/main.rs",
+                "reason": "orchestrator seats may not edit repository files",
+            })
+        )
+        .expect("write pre-outcome row");
+        drop(file);
+
+        let records = read_orchestrator_blocks(&state);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].outcome, "denied");
     }
 
     /// No file at all is an empty list, not an error -- no tool call has
@@ -1156,6 +1207,7 @@ mod tests {
                 tool: "Edit",
                 target: "/work/repo",
                 reason: "orchestrator seats may not edit repository files",
+                outcome: "denied",
             },
         )
         .expect("append");

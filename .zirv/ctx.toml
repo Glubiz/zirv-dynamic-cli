@@ -98,6 +98,7 @@ model = "fable"
 # stall_grace_secs = 120             # REPO-FORBIDDEN (ZIRV_CTX_SUPERVISE_STALL_GRACE_SECS): time a steering nudge gets before a stalled session is terminated (issue #310)
 # chain_max_restarts = 3             # REPO-FORBIDDEN (ZIRV_CTX_SUPERVISE_CHAIN_MAX_RESTARTS): unplanned same-class respawns across process boundaries before the restart-chain breaker trips (issue #310)
 # chain_max_gap_secs = 300           # REPO-FORBIDDEN (ZIRV_CTX_SUPERVISE_CHAIN_MAX_GAP_SECS): max gap between chained respawns still counted toward the breaker (issue #310)
+# orchestrator_writes = "advise"     # narrow-only (ZIRV_CTX_SUPERVISE_ORCHESTRATOR_WRITES): this seat's own repository-write guard posture -- "allow", "advise", or "deny". A repo may only tighten (allow -> advise -> deny), never loosen. Default: advise (issue #358 T8).
 
 # [handoff]
 # model = "haiku"                    # REPO-FORBIDDEN (ZIRV_CTX_MODEL): distiller/judgment model override. Default: unset (adapter decides).
