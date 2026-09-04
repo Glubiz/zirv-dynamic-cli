@@ -314,32 +314,26 @@ pub fn read_safety_decisions(state: &StateDir) -> Vec<SafetyDecisionRecord> {
 /// Issue #313 (consecutive-denial breaker): a BOUNDED counterpart to
 /// [`read_safety_decisions`] for a hook process that runs on every single
 /// PreToolUse invocation and cannot afford that function's unbounded,
-/// every-file-ever-written scan. Opens only the newest TWO day-bucketed
-/// files (today's, and yesterday's in case the session's own history spans
-/// a UTC midnight), filters to `session`, and returns at most the last
-/// `limit` matching records, oldest-first -- exactly the tail the breaker
-/// needs to count a trailing run of consecutive denials. Same best-effort
-/// tolerance as `read_safety_decisions`: an absent directory or a line that
-/// fails to parse is skipped, never fatal.
+/// every-file-ever-written scan. Opens only the day-bucketed files for
+/// `now_day` (today, as `ts / 86_400`) and the day before it, in case the
+/// session's own history spans a UTC midnight -- never merely "the two
+/// newest files that exist" (codex review round 1): after days with no
+/// safety decisions at all, those would be stale records that must not
+/// count toward a CURRENT run of denials. Filters to `session` and returns
+/// at most the last `limit` matching records, oldest-first -- exactly the
+/// tail the breaker needs to count a trailing run of consecutive denials.
+/// Same best-effort tolerance as `read_safety_decisions`: an absent file or
+/// a line that fails to parse is skipped, never fatal.
 pub fn read_recent_safety_decisions(
     state: &StateDir,
     session: &str,
     limit: usize,
+    now_day: u64,
 ) -> Vec<SafetyDecisionRecord> {
     let dir = state.logs().join(SAFETY_LOG_DIR);
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return Vec::new();
-    };
-    let mut files: Vec<_> = entries
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("jsonl"))
-        .collect();
-    files.sort();
-    let newest_two: Vec<_> = files.into_iter().rev().take(2).collect();
-
     let mut out = Vec::new();
-    for path in newest_two.into_iter().rev() {
+    for day in [now_day.saturating_sub(1), now_day] {
+        let path = dir.join(format!("{day:010}.jsonl"));
         let Ok(text) = std::fs::read_to_string(&path) else {
             continue;
         };
@@ -520,7 +514,7 @@ mod tests {
         append_safety(&state, &record(86_401, "s2", "day1-other-session")).expect("append");
         append_safety(&state, &record(172_800, "s1", "day2-a")).expect("append");
 
-        let records = read_recent_safety_decisions(&state, "s1", 50);
+        let records = read_recent_safety_decisions(&state, "s1", 50, 2);
         assert_eq!(
             records
                 .iter()
@@ -531,9 +525,17 @@ mod tests {
         );
 
         // `limit` keeps only the newest matching records, still oldest-first.
-        let limited = read_recent_safety_decisions(&state, "s1", 1);
+        let limited = read_recent_safety_decisions(&state, "s1", 1, 2);
         assert_eq!(limited.len(), 1);
         assert_eq!(limited[0].command_sha256, "day2-a");
+
+        // Codex review round 1: the window is anchored on TODAY, not on
+        // whichever files happen to be newest -- days later, with no
+        // decisions since, the same files contribute nothing.
+        assert!(
+            read_recent_safety_decisions(&state, "s1", 50, 10).is_empty(),
+            "stale day buckets must never feed a current denial run"
+        );
     }
 
     /// No directory at all (no safety decision ever logged for this state
@@ -542,7 +544,7 @@ mod tests {
     fn read_recent_safety_decisions_before_any_exist_is_empty_not_an_error() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(tmp.path().to_path_buf());
-        assert!(read_recent_safety_decisions(&state, "s1", 50).is_empty());
+        assert!(read_recent_safety_decisions(&state, "s1", 50, 0).is_empty());
     }
 
     /// The log names sessions, repositories and transcript paths, so on a

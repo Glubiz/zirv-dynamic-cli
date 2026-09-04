@@ -6571,7 +6571,12 @@ fn run_check_hook_mode_with_env<W: Write>(
         && cfg.safety.denial_breaker_threshold > 0
         && let Ok(state) = super::state::StateDir::resolve(env)
     {
-        let recent = super::log::read_recent_safety_decisions(&state, &payload.session_id, 50);
+        let recent = super::log::read_recent_safety_decisions(
+            &state,
+            &payload.session_id,
+            50,
+            super::state::now_secs() / 86_400,
+        );
         let trailing_denials = recent
             .iter()
             .rev()
