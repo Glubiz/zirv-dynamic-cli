@@ -1503,7 +1503,7 @@ fn reap_ended_panes(
         // reclaim guard) and nothing else reclaimed it once the pane's
         // child exited. `pane` (and, via its own `Drop`, any writer permit
         // it held) is already gone by this point.
-        if let Some(outcome) = reclaim_pane_worktree(repo, &pane_cwd, pane_owns_cwd) {
+        if let Some(outcome) = reclaim_pane_worktree(state, repo, &pane_cwd, pane_owns_cwd) {
             push_error(
                 errors,
                 describe_pane_worktree_reclaim(&pane_short, &pane_cwd, outcome),
@@ -1524,6 +1524,7 @@ fn reap_ended_panes(
 /// ordinary pane. Split out of [`reap_ended_panes`] so the checks and the
 /// reclaim call are directly testable without spawning a real pane.
 fn reclaim_pane_worktree(
+    state: &StateDir,
     repo: &Path,
     cwd: &Path,
     owns_cwd: bool,
@@ -1531,7 +1532,7 @@ fn reclaim_pane_worktree(
     if !owns_cwd || !super::agent::is_agent_managed_worktree(repo, cwd) {
         return None;
     }
-    Some(super::agent::reclaim_worktree(repo, cwd))
+    Some(super::agent::reclaim_worktree(state, repo, cwd))
 }
 
 /// One stderr-bound line describing [`reclaim_pane_worktree`]'s own outcome
@@ -1550,8 +1551,13 @@ fn describe_pane_worktree_reclaim(
             "pane '{pane_short}' worktree {} reclaimed (clean)",
             path.display()
         ),
-        super::agent::ReclaimOutcome::Dirty => format!(
-            "pane '{pane_short}' worktree {} left in place (uncommitted changes)",
+        super::agent::ReclaimOutcome::Archived(dest) => format!(
+            "pane '{pane_short}' worktree {} untracked content archived to {}, then reclaimed",
+            path.display(),
+            dest.display()
+        ),
+        super::agent::ReclaimOutcome::InspectionFailed { probe, note } => format!(
+            "pane '{pane_short}' worktree {} left in place ({probe}: {note})",
             path.display()
         ),
         super::agent::ReclaimOutcome::Failed(reason) => format!(
@@ -6044,6 +6050,12 @@ pub fn run_dashboard(
     force_pace: bool,
 ) -> CtxResult<i32> {
     let mut errors: Vec<String> = Vec::new();
+
+    // Issue #319, design item 4: a conservative startup GC of any `--worktree`
+    // trees this repo's own dead sessions left behind. Best-effort and never
+    // fatal to the dashboard itself -- the same never-make-it-worse posture
+    // the owner-pid write just below already holds to.
+    let _ = super::worktree::gc(state, repo, &sessions::is_alive);
 
     // Mutable, and kept current by the `Event::Resize` arm below (F6): the
     // zoom handler resizes every pane against `full`, so a `full` frozen at
@@ -11954,7 +11966,13 @@ mod tests {
     /// delegation. Returns `None` (callers skip) if `git` itself is
     /// unavailable or any setup step fails -- same discipline as
     /// `git_repo_with_linked_worktree`.
-    fn git_repo_with_agent_managed_worktree() -> Option<(tempfile::TempDir, PathBuf, PathBuf)> {
+    /// Issue #319: also writes a matching ownership record (as `agent::
+    /// allocate_worktree` now does for real) into the returned `StateDir` --
+    /// without one, `agent::reclaim_worktree` has no recorded base commit to
+    /// probe against and refuses outright (`InspectionFailed { probe:
+    /// "record", .. }`), which is correct but not what these tests exercise.
+    fn git_repo_with_agent_managed_worktree()
+    -> Option<(tempfile::TempDir, StateDir, PathBuf, PathBuf)> {
         if !git_available() {
             eprintln!("skipping: git not found on PATH");
             return None;
@@ -11993,12 +12011,49 @@ mod tests {
         if !run(&["commit", "-q", "-m", "initial"], &repo) {
             return None;
         }
+        let base_output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .ok()?;
+        let base_commit = String::from_utf8_lossy(&base_output.stdout)
+            .trim()
+            .to_string();
         let worktree_str = worktree.to_string_lossy().to_string();
-        if !run(&["worktree", "add", &worktree_str], &repo) {
+        if !run(
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "abcd1234",
+                &worktree_str,
+                &base_commit,
+            ],
+            &repo,
+        ) {
             return None;
         }
 
-        Some((root, repo, worktree))
+        let state = StateDir::from_root(root.path().join("state"));
+        let repo_slug = crate::commands::ctx::state::repo_slug(&repo);
+        crate::commands::ctx::worktree::append_record(
+            &state,
+            &repo_slug,
+            &crate::commands::ctx::worktree::WorktreeRecord {
+                path: worktree.to_string_lossy().to_string(),
+                branch: "abcd1234".to_string(),
+                base_commit,
+                owner_session: None,
+                owner_pid: None,
+                created_at: 1_700_000_000,
+                status: crate::commands::ctx::worktree::WorktreeStatus::Active,
+                note: None,
+            },
+        )
+        .ok()?;
+
+        Some((root, state, repo, worktree))
     }
 
     /// Review finding (2026-09), finding 2a: `agent::run_with`'s own
@@ -12010,10 +12065,10 @@ mod tests {
     /// finding's own guidance.
     #[test]
     fn reclaim_pane_worktree_removes_a_clean_agent_managed_worktree() {
-        let Some((_root, repo, worktree)) = git_repo_with_agent_managed_worktree() else {
+        let Some((_root, state, repo, worktree)) = git_repo_with_agent_managed_worktree() else {
             return;
         };
-        let outcome = reclaim_pane_worktree(&repo, &worktree, true);
+        let outcome = reclaim_pane_worktree(&state, &repo, &worktree, true);
         assert_eq!(
             outcome,
             Some(crate::commands::ctx::agent::ReclaimOutcome::Removed)
@@ -12021,24 +12076,29 @@ mod tests {
         assert!(!worktree.exists(), "the clean worktree must be removed");
     }
 
-    /// The other half: a dirty pane cwd (an untracked file) is left in
-    /// place -- never force-removed, exactly like `agent::run_with`'s own
-    /// headless reclamation.
+    /// Issue #319: a pane cwd with only untracked content is archived, then
+    /// removed -- never left in place, and never force-removed without a
+    /// copy first, exactly like `agent::run_with`'s own headless reclamation.
     #[test]
-    fn reclaim_pane_worktree_leaves_a_dirty_agent_managed_worktree_in_place() {
-        let Some((_root, repo, worktree)) = git_repo_with_agent_managed_worktree() else {
+    fn reclaim_pane_worktree_archives_untracked_content_then_removes_it() {
+        let Some((_root, state, repo, worktree)) = git_repo_with_agent_managed_worktree() else {
             return;
         };
         std::fs::write(worktree.join("scratch.txt"), "not committed\n").expect("write");
 
-        let outcome = reclaim_pane_worktree(&repo, &worktree, true);
-        assert_eq!(
-            outcome,
-            Some(crate::commands::ctx::agent::ReclaimOutcome::Dirty)
-        );
+        let outcome = reclaim_pane_worktree(&state, &repo, &worktree, true);
+        match outcome {
+            Some(crate::commands::ctx::agent::ReclaimOutcome::Archived(dest)) => {
+                assert_eq!(
+                    std::fs::read_to_string(dest.join("scratch.txt")).expect("read archived"),
+                    "not committed\n"
+                );
+            }
+            other => panic!("expected Some(Archived), got {other:?}"),
+        }
         assert!(
-            worktree.exists(),
-            "a dirty worktree must never be force-removed"
+            !worktree.exists(),
+            "the worktree must be removed once its untracked content is archived"
         );
     }
 
@@ -12048,9 +12108,10 @@ mod tests {
     #[test]
     fn reclaim_pane_worktree_never_touches_an_unmanaged_cwd() {
         let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
         let repo = tmp.path().join("repo");
         std::fs::create_dir_all(&repo).expect("mkdir");
-        assert_eq!(reclaim_pane_worktree(&repo, &repo, true), None);
+        assert_eq!(reclaim_pane_worktree(&state, &repo, &repo, true), None);
     }
 
     /// Review round 3: ownership travels on the spawn request, never on the
@@ -12059,10 +12120,10 @@ mod tests {
     /// `.zirv/worktrees/`) is never reclaimed, clean or not.
     #[test]
     fn reclaim_pane_worktree_never_touches_a_cwd_the_pane_does_not_own() {
-        let Some((_root, repo, worktree)) = git_repo_with_agent_managed_worktree() else {
+        let Some((_root, state, repo, worktree)) = git_repo_with_agent_managed_worktree() else {
             return;
         };
-        assert_eq!(reclaim_pane_worktree(&repo, &worktree, false), None);
+        assert_eq!(reclaim_pane_worktree(&state, &repo, &worktree, false), None);
         assert!(
             worktree.exists(),
             "an operator-named worktree must survive its pane's exit"

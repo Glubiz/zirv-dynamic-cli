@@ -434,6 +434,24 @@ impl StateDir {
         self.0.join("groups")
     }
 
+    /// Issue #319: worktree ownership records -- one append-only JSONL file
+    /// per repository slug, `<state>/worktrees/<repo-slug>.jsonl`. See
+    /// `super::worktree` for the record format and the "materialized by
+    /// path" read contract (later lines for the same `path` supersede
+    /// earlier ones).
+    pub fn worktrees(&self) -> PathBuf {
+        self.0.join("worktrees")
+    }
+
+    /// Issue #319: where `super::worktree::archive_untracked` copies a
+    /// pruned worktree's untracked files before `git worktree remove` ever
+    /// runs -- `<state>/archive/worktree-prune/<slug>-<unix-ts>/...`.
+    /// Untracked content a prune decision leaves behind is moved here, never
+    /// destroyed outright.
+    pub fn worktree_archive(&self) -> PathBuf {
+        self.0.join("archive").join("worktree-prune")
+    }
+
     /// `<state>/objective` -- one JSON file per repository's durable
     /// objective (issue #285), keyed by `state::repo_slug`. Outlives any one
     /// `exec`/`loop` session or restart the way `groups()` outlives any one

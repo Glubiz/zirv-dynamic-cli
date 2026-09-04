@@ -60,6 +60,7 @@ pub mod surface;
 pub mod term;
 pub mod usage;
 pub mod window;
+pub mod worktree;
 pub mod wrap;
 
 /// The minimum gap a deferred injection leaves between writing its text and
@@ -455,6 +456,10 @@ pub enum CtxVerb {
     /// artifacts and mail against a query, or scroll a specific session with
     /// `--session`/`--around` (issue #315).
     Search(search::SearchArgs),
+    /// List, finalize or prune `zirv ctx agent --worktree`'s own linked
+    /// worktrees (issue #319): proof-required reclaim, so nothing is ever
+    /// removed without affirmative evidence it carries no unrecoverable work.
+    Worktree(worktree::WorktreeArgs),
 }
 
 /// What a clap parse failure costs, which is not the same for every verb.
@@ -550,6 +555,7 @@ pub fn dispatch(args: &[String]) -> i32 {
         CtxVerb::Spend(a) => spend::run(a, &mut out),
         CtxVerb::Snapshot(a) => snapshot::run(a, &mut out),
         CtxVerb::Search(a) => search::run(a, &mut out),
+        CtxVerb::Worktree(a) => worktree::run(a, &mut out),
     };
 
     match result {
