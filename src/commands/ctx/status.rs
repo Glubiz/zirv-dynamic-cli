@@ -3011,6 +3011,7 @@ mod tests {
                     resets_at: crate::commands::ctx::state::now_secs() + 1000,
                     observed_at: crate::commands::ctx::state::now_secs(),
                     overage_covered: false,
+                    limit_reached: false,
                 }),
                 seven_day: None,
             },
@@ -3210,6 +3211,7 @@ mod tests {
                     resets_at: 1, // long past any real wall clock
                     observed_at: 1,
                     overage_covered: false,
+                    limit_reached: false,
                 }),
                 seven_day: None,
             },
@@ -3273,6 +3275,7 @@ mod tests {
                     resets_at: 1_785_509_000,
                     observed_at: crate::commands::ctx::state::now_secs(),
                     overage_covered: false,
+                    limit_reached: false,
                 }),
                 seven_day: None,
             },

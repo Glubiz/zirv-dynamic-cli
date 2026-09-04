@@ -13,6 +13,11 @@ pub struct Window {
     pub used_percentage: f64,
     pub resets_at: u64,
     pub observed_at: u64,
+    /// The vendor explicitly reports that it refused a request against this
+    /// window. Additive for compatibility with readings stored before the
+    /// codex rollout exposed this signal.
+    #[serde(default)]
+    pub limit_reached: bool,
     /// The vendor reports paid credits behind this window and has not actually
     /// refused a request against it, so being at 100% costs money rather than
     /// blocking work. Only the codex rollout/poller path ever sets it (issue
@@ -39,6 +44,7 @@ fn window_at(node: Option<&Value>, observed_at: u64) -> Option<Window> {
         resets_at: node.get("resets_at").and_then(Value::as_u64).unwrap_or(0),
         observed_at,
         overage_covered: false,
+        limit_reached: false,
     })
 }
 
@@ -518,6 +524,7 @@ fn estimated_window(used: u64, budget: u64, oldest: u64, span: u64, now: u64) ->
         resets_at,
         observed_at: now,
         overage_covered: false,
+        limit_reached: false,
     })
 }
 
@@ -634,10 +641,10 @@ pub fn windows_from_rate_limits(
         .pointer("/credits/has_credits")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let not_reached = limits
+    let limit_reached = limits
         .get("rate_limit_reached_type")
-        .is_none_or(Value::is_null);
-    let overage_covered = has_credits && not_reached;
+        .is_some_and(|value| !value.is_null());
+    let overage_covered = has_credits && !limit_reached;
     let mut out = UsageWindows::default();
     for key in ["primary", "secondary"] {
         let Some(w) = limits.get(key).filter(|w| w.is_object()) else {
@@ -662,6 +669,7 @@ pub fn windows_from_rate_limits(
             resets_at,
             observed_at,
             overage_covered,
+            limit_reached,
         };
         if five_hour {
             out.five_hour = Some(win);
@@ -790,7 +798,7 @@ pub(crate) const CODEX_SCAN_FLOOR_SECS: u64 = 60;
 #[allow(dead_code)]
 const ROLLOUT_TAIL_BYTES: u64 = 64 * 1024;
 #[allow(dead_code)]
-const ROLLOUT_SCAN_FILES: usize = 3;
+pub(crate) const ROLLOUT_SCAN_FILES: usize = 3;
 
 #[allow(dead_code)]
 fn collect_jsonl(
@@ -1003,6 +1011,7 @@ mod tests {
                 resets_at: 1000,
                 observed_at: 500,
                 overage_covered: false,
+                limit_reached: false,
             }),
             seven_day: None,
         };
@@ -1021,6 +1030,7 @@ mod tests {
                 resets_at: 1000,
                 observed_at: 500,
                 overage_covered: false,
+                limit_reached: false,
             }),
             seven_day: None,
         };
@@ -1037,6 +1047,7 @@ mod tests {
                 resets_at: 0,
                 observed_at: 1000,
                 overage_covered: false,
+                limit_reached: false,
             }),
         };
         // Just inside the seven_day span from observation.
@@ -1052,6 +1063,7 @@ mod tests {
                 resets_at: 0,
                 observed_at: 1000,
                 overage_covered: false,
+                limit_reached: false,
             }),
             seven_day: None,
         };
@@ -1071,12 +1083,14 @@ mod tests {
                 resets_at: 100,
                 observed_at: 0,
                 overage_covered: false,
+                limit_reached: false,
             }),
             seven_day: Some(Window {
                 used_percentage: 20.0,
                 resets_at: 100_000,
                 observed_at: 0,
                 overage_covered: false,
+                limit_reached: false,
             }),
         };
         let out = available(&windows, 5000);
@@ -1100,6 +1114,7 @@ mod tests {
                 resets_at: 1000,
                 observed_at: 999,
                 overage_covered: false,
+                limit_reached: false,
             }),
             seven_day: None,
         };
@@ -1118,6 +1133,7 @@ mod tests {
                 resets_at: 1000,
                 observed_at: 999,
                 overage_covered: false,
+                limit_reached: false,
             }),
             seven_day: None,
         };
@@ -1136,6 +1152,7 @@ mod tests {
                 resets_at: 4_102_444_800, // year 2100, i.e. "certainly not reset"
                 observed_at: 0,
                 overage_covered: false,
+                limit_reached: false,
             }),
             seven_day: None,
         };
@@ -1164,12 +1181,14 @@ mod tests {
                 resets_at: now - 1,
                 observed_at: now - 10,
                 overage_covered: false,
+                limit_reached: false,
             }),
             seven_day: Some(Window {
                 used_percentage: 30.0,
                 resets_at: now + SEVEN_DAY_SECS,
                 observed_at: now - 10,
                 overage_covered: false,
+                limit_reached: false,
             }),
         };
         assert_eq!(
@@ -1204,6 +1223,7 @@ mod tests {
                 resets_at: 100,
                 observed_at: 10,
                 overage_covered: false,
+                limit_reached: false,
             }),
             seven_day: None,
         };
@@ -1246,6 +1266,7 @@ mod tests {
                 resets_at: 1000,
                 observed_at,
                 overage_covered: false,
+                limit_reached: false,
             }),
             seven_day: None,
         }
@@ -1381,12 +1402,14 @@ mod tests {
                 resets_at: 100,
                 observed_at: 10,
                 overage_covered: false,
+                limit_reached: false,
             }),
             seven_day: Some(Window {
                 used_percentage: 20.0,
                 resets_at: 200,
                 observed_at: 10,
                 overage_covered: false,
+                limit_reached: false,
             }),
         };
         let fresh = UsageWindows {
@@ -1395,6 +1418,7 @@ mod tests {
                 resets_at: 300,
                 observed_at: 50,
                 overage_covered: false,
+                limit_reached: false,
             }),
             seven_day: None,
         };
@@ -1416,6 +1440,7 @@ mod tests {
                 resets_at: 300,
                 observed_at: 50,
                 overage_covered: false,
+                limit_reached: false,
             }),
             seven_day: None,
         };
@@ -1425,6 +1450,7 @@ mod tests {
                 resets_at: 100,
                 observed_at: 10,
                 overage_covered: false,
+                limit_reached: false,
             }),
             seven_day: None,
         };
@@ -1443,6 +1469,7 @@ mod tests {
             resets_at: 0,
             observed_at: 100,
             overage_covered: false,
+            limit_reached: false,
         };
         assert_eq!(age_secs(&window, 160), 60);
         assert_eq!(
@@ -1876,6 +1903,39 @@ mod tests {
         .expect("old window shape");
 
         assert!(!window.overage_covered);
+        assert!(!window.limit_reached);
+    }
+
+    #[test]
+    fn rollout_reached_type_is_retained() {
+        let record = |reached: serde_json::Value| {
+            serde_json::json!({
+                "timestamp": "2026-02-26T18:52:21.222Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "rate_limits": {
+                        "rate_limit_reached_type": reached,
+                        "primary": {
+                            "used_percent": 2.0,
+                            "window_minutes": 300,
+                            "resets_at": 1_772_135_737u64,
+                        }
+                    }
+                }
+            })
+            .to_string()
+        };
+        let reading = |line: String| match parse_rollout_record(&line) {
+            Some(RolloutRecord::TokenCount {
+                windows: Some(windows),
+                ..
+            }) => windows.five_hour.expect("five-hour reading"),
+            other => panic!("unexpected rollout record: {other:?}"),
+        };
+
+        assert!(reading(record(serde_json::json!("primary"))).limit_reached);
+        assert!(!reading(record(serde_json::Value::Null)).limit_reached);
     }
 
     #[test]
@@ -2022,6 +2082,7 @@ mod tests {
                 resets_at: now + 100_000,
                 observed_at: now - 100, // well within max_age
                 overage_covered: false,
+                limit_reached: false,
             }),
             seven_day: None,
         };
@@ -2042,6 +2103,7 @@ mod tests {
                 resets_at: 500,
                 observed_at: now - 10_000, // well beyond max_age
                 overage_covered: false,
+                limit_reached: false,
             }),
             seven_day: None,
         };
@@ -2102,6 +2164,7 @@ mod tests {
                 resets_at: now - 1,
                 observed_at: now - 20,
                 overage_covered: false,
+                limit_reached: false,
             }),
             seven_day: None,
         };
@@ -2134,6 +2197,7 @@ mod tests {
                     resets_at: 1000,
                     observed_at: 10,
                     overage_covered: false,
+                    limit_reached: false,
                 }),
                 seven_day: None,
             },
@@ -2156,6 +2220,7 @@ mod tests {
                     resets_at: 2000,
                     observed_at: 20,
                     overage_covered: false,
+                    limit_reached: false,
                 }),
                 seven_day: None,
             },
@@ -2275,6 +2340,7 @@ mod tests {
                 resets_at: 1_788_758_370,
                 observed_at: 1_788_423_353,
                 overage_covered: false,
+                limit_reached: false,
             }),
         }
     }

@@ -3624,6 +3624,7 @@ mod tests {
                     resets_at: now + 600,
                     observed_at: now,
                     overage_covered: false,
+                    limit_reached: false,
                 }),
                 seven_day: None,
             },
@@ -3682,6 +3683,7 @@ mod tests {
                     resets_at: 1_788_758_370,
                     observed_at: 1_788_423_353,
                     overage_covered: false,
+                    limit_reached: false,
                 }),
             },
         )

@@ -1427,6 +1427,7 @@ fn run_with_clock_inner<W: Write>(
         let mut rotted = false;
         let mut compact_requested = false;
         let mut limit_hit = false;
+        let mut limit_confirmation_detail = None;
         let mut nudged_by: Option<String> = None;
         // Issue #155, Phase 5(d): fresh per iteration too -- the child a
         // restart mints is a fresh transcript, so its own soft-warn latch and
@@ -1444,6 +1445,7 @@ fn run_with_clock_inner<W: Write>(
             &mut scorer,
             adapter.as_ref(),
             &cfg.score,
+            &cfg.pace,
             &state,
             server.as_ref(),
             session.as_str(),
@@ -1458,6 +1460,7 @@ fn run_with_clock_inner<W: Write>(
             &mut progressed,
             &tap,
             &mut limit_hit,
+            &mut limit_confirmation_detail,
             &mut nudged_by,
             nudge_restarts,
             cfg.supervise.max_nudges,
@@ -1534,13 +1537,32 @@ fn run_with_clock_inner<W: Write>(
         let mut account_pattern: Option<&'static str> = None;
         if !limit_hit {
             let final_lines = tap.drain_to_eof(supervise::FINAL_DRAIN_BUDGET);
-            limit_hit = pace::scan_for_limit(
+            let limit_text_seen = pace::scan_for_limit(
                 &final_lines,
                 &state,
                 session.as_str(),
                 "exec",
                 &mut std::io::stderr(),
             );
+            if limit_text_seen {
+                let now = now_fn();
+                match pace::confirm_limit_hit(&state, &cfg.pace, now, adapter.provider()) {
+                    pace::LimitConfirmation::Confirmed { detail } => {
+                        limit_hit = true;
+                        limit_confirmation_detail = Some(detail);
+                    }
+                    pace::LimitConfirmation::Unconfirmed { detail } => {
+                        pace::note_unconfirmed_limit_text(
+                            &state,
+                            now,
+                            session.as_str(),
+                            "exec",
+                            &detail,
+                            &mut std::io::stderr(),
+                        );
+                    }
+                }
+            }
             if !limit_hit {
                 account_pattern = pace::scan_for_account_exhausted(&final_lines);
                 if account_pattern.is_none() {
@@ -2117,8 +2139,12 @@ fn run_with_clock_inner<W: Write>(
                 // call.
                 let _ = objective_layer_for_restart(&state, repo, now_fn(), spent_tokens);
 
+                let confirmation = limit_confirmation_detail
+                    .as_deref()
+                    .map(|detail| format!("; structured confirmation: {detail}"))
+                    .unwrap_or_default();
                 let detail = format!(
-                    "{}; {} handoff at {}",
+                    "{}{confirmation}; {} handoff at {}",
                     selection_detail,
                     source,
                     stored.display()
@@ -2194,13 +2220,16 @@ fn run_with_clock_inner<W: Write>(
                 );
             }
 
-            let wait_detail = deferred_reset
+            let mut wait_detail = deferred_reset
                 .as_ref()
                 .map(super::fallback::ResetChoice::detail)
                 .unwrap_or_else(|| {
                     "agent reported a usage limit; parking until the current window resets"
                         .to_string()
                 });
+            if let Some(detail) = &limit_confirmation_detail {
+                wait_detail.push_str(&format!("; structured confirmation: {detail}"));
+            }
             let _ = log::append(
                 &state,
                 &log::Decision {
@@ -2734,6 +2763,7 @@ fn supervise_run(
     scorer: &mut score::IncrementalScorer,
     adapter: &dyn adapters::AgentAdapter,
     score_cfg: &super::config::ScoreConfig,
+    pace_cfg: &super::config::PaceConfig,
     state: &StateDir,
     server: Option<&signal::SignalServer>,
     session: &str,
@@ -2763,6 +2793,7 @@ fn supervise_run(
     progressed: &mut bool,
     tap: &supervise::OutputTap,
     limit_hit: &mut bool,
+    limit_confirmation_detail: &mut Option<String>,
     nudged_by: &mut Option<String>,
     nudges_used: u32,
     max_nudges: u32,
@@ -2806,8 +2837,24 @@ fn supervise_run(
             "exec",
             &mut std::io::stderr(),
         ) {
-            *limit_hit = true;
-            return Tick::Stop("limit");
+            let now = now_secs();
+            match pace::confirm_limit_hit(state, pace_cfg, now, adapter.provider()) {
+                pace::LimitConfirmation::Confirmed { detail } => {
+                    *limit_hit = true;
+                    *limit_confirmation_detail = Some(detail);
+                    return Tick::Stop("limit");
+                }
+                pace::LimitConfirmation::Unconfirmed { detail } => {
+                    pace::note_unconfirmed_limit_text(
+                        state,
+                        now,
+                        session,
+                        "exec",
+                        &detail,
+                        &mut std::io::stderr(),
+                    );
+                }
+            }
         }
         if let Some(server) = server
             && let Some(received) = server.try_recv()
@@ -4964,11 +5011,94 @@ mod tests {
                     resets_at: now + resets_in,
                     observed_at: now,
                     overage_covered: false,
+                    limit_reached: false,
                 }),
                 seven_day: None,
             },
         )
         .expect("store collector state");
+    }
+
+    fn store_provider_collector(
+        state_dir: &std::path::Path,
+        provider: &str,
+        percent: f64,
+        limit_reached: bool,
+    ) {
+        let state = crate::commands::ctx::state::StateDir::from_root(state_dir.to_path_buf());
+        let now = crate::commands::ctx::state::now_secs();
+        window::store_for(
+            &state,
+            provider,
+            &UsageWindows {
+                five_hour: Some(Window {
+                    used_percentage: percent,
+                    resets_at: now + 60,
+                    observed_at: now,
+                    overage_covered: false,
+                    limit_reached,
+                }),
+                seven_day: None,
+            },
+        )
+        .expect("store provider collector state");
+    }
+
+    #[test]
+    fn unconfirmed_vendor_exhaustion_text_is_ignored() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let state_dir = tmp.path().join("state");
+        let argv_log = tmp.path().join("argv.log");
+        let mut env = base_env(&state_dir);
+        env.insert(
+            "ZIRV_CTX_AGENT_BIN".to_string(),
+            format!("sh {}", fixture("fake-codex-agent.sh").display()),
+        );
+        store_provider_collector(&state_dir, window::CODEX_USAGE_PROVIDER, 2.0, false);
+
+        let modes = tmp.path().join("modes.txt");
+        std::fs::write(&modes, "limit\n").expect("write modes");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let _fake_agent = crate::commands::ctx::testenv::VarGuard::set(&[
+            ("FAKE_AGENT_MODE_FILE", modes.to_str()),
+            ("FAKE_AGENT_ARGV_LOG", argv_log.to_str()),
+        ]);
+        let args = ExecArgs {
+            agent: Some("codex".to_string()),
+            session_id: None,
+            transcript: None,
+            prompt: Some("finish the requested work".to_string()),
+            max_restarts: Some(0),
+            budget_tokens: None,
+            max_tool_calls: None,
+            objective: None,
+            timeout_secs: Some(30),
+            simple: false,
+            command: Vec::new(),
+        };
+        let mut out = Vec::new();
+
+        assert_eq!(
+            run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned()).expect("runs"),
+            1,
+            "an unconfirmed text match preserves the child's own exit code"
+        );
+        let log = std::fs::read_to_string(state_dir.join("logs/decisions.jsonl")).expect("log");
+        assert!(
+            log.contains("\"action\":\"limit-text-unconfirmed\""),
+            "{log}"
+        );
+        assert!(!log.contains("\"action\":\"harness-handover\""), "{log}");
+        assert!(!log.contains("\"action\":\"limit-park\""), "{log}");
+        assert!(!log.contains("\"action\":\"give-up\""), "{log}");
+        assert!(!log.contains("\"action\":\"kill\""), "{log}");
+        let argv = std::fs::read_to_string(&argv_log).expect("argv log");
+        assert_eq!(
+            argv.matches("finish the requested work").count(),
+            1,
+            "the false positive must not relaunch"
+        );
     }
 
     #[test]
@@ -4992,6 +5122,7 @@ mod tests {
         let modes = tmp.path().join("modes.txt");
         std::fs::write(&modes, "limit\nhealthy\n").expect("write modes");
         let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        store_provider_collector(&state_dir, window::CODEX_USAGE_PROVIDER, 2.0, true);
         let _fake_agent = crate::commands::ctx::testenv::VarGuard::set(&[
             ("FAKE_AGENT_MODE_FILE", modes.to_str()),
             ("FAKE_AGENT_ARGV_LOG", argv_log.to_str()),
@@ -5046,6 +5177,8 @@ mod tests {
         env.insert("ZIRV_CTX_PACE_JITTER_SECS".to_string(), "0".to_string());
         env.insert("ZIRV_CTX_PACE_FALLBACK_SECS".to_string(), "1".to_string());
         env.insert("ZIRV_CTX_PACE_MAX_WAIT_SECS".to_string(), "2".to_string());
+        env.insert("ZIRV_CTX_PACE".to_string(), "false".to_string());
+        store_collector(&state, 100.0, 60);
 
         // First child hits the limit, second runs clean.
         let modes = tmp.path().join("modes.txt");
@@ -6541,6 +6674,7 @@ mod tests {
             &CtxConfig::default(),
         )
         .expect("store launch mail");
+        store_provider_collector(&state_dir, window::CODEX_USAGE_PROVIDER, 2.0, true);
 
         // hang (nudge target) -> limit (the nudged relaunch parks) -> healthy
         // (the park's own relaunch, the one under test).

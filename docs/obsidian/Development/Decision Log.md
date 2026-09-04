@@ -24,6 +24,13 @@ last-verified: 2026-09-04
 
 ## Decisions
 
+### 2026-09-04 -- Raw usage-limit text is a candidate signal, never sufficient evidence
+**Context:** `spawn_tapped` intentionally interleaves and forwards a worker's stdout/stderr, so the worker's own tool output can reproduce documented vendor wording and falsely trigger a park or cross-harness handover.
+**Decision:** Keep the strict pattern table and tapped transport unchanged, but require the source provider's binding structured usage reading before acting on a text match. Codex force-scans rollouts and retains the non-null reached type additively on each stored window; claude uses its bound collector percentage. Missing, stale, unbound, or low readings are logged and ignored. Loose wording drift is one batch-level breadcrumb.
+**Rejected:** Channel separation or codex JSON-mode argv changes -- both widen the transport/adapter contract beyond this false-positive fix. Text-only routing -- the source reading was already available but previously used only in the route's display detail.
+**Consequences:** Provider-confirmed blocks still park/reroute without spending restart budget; copied vendor wording follows normal child exit handling. Existing stored usage JSON remains readable because the reached flag defaults false.
+**Spec / link:** [[Usage and Pacing]], [[Ctx Supervisors]], issue #340.
+
 ### 2026-09-04 -- Same-harness delegation is a hint, not a refusal, and stays a headless/pane path outside a dashboard
 **Context:** Issue #328 reported a hand-written, operator-authored `CLAUDE.md` instruction telling a claude session to "delegate only through `zirv agent`" even for same-harness work -- the opposite of the intended rule (native Agent tool for same-harness, `zirv agent` for another harness or a work group) -- and asked whether headless `zirv agent` workers should be removed now that the native tool exists.
 **Decision:** State the routing rule explicitly in `claude::ORCHESTRATOR_PROMPT`, and say it outranks a contradicting operator/repo layer, closing the loophole a more-specific-sounding hand-written file could otherwise win. `agent::same_harness_hint` prints a one-line advisory when `<name>` matches the running harness outside a work group/sub-orchestrator scope, but the run still proceeds -- an operator who typed the command on purpose has nobody else to answer if it refuses. Headless workers stay as the non-dashboard delegation path; `--headless` remains an explicit opt-in even inside a dashboard.
