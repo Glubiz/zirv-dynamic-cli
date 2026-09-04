@@ -1146,20 +1146,63 @@ pub struct ReviewConfig {
 /// override, adapter-owned default) are combined into the argv a
 /// delegation spawn actually launches with.
 ///
-/// `REPO_FORBIDDEN` as a whole table, the same trust asymmetry as
-/// `review.claude`/`review.codex` right above: a repo checkout must not be
-/// able to choose which model -- and so which vendor account -- spends the
-/// operator's tokens running a delegated worker. Unlike `review.*`, which
-/// only lands in injected prompt *text*, these keys reach a real launch
-/// argv directly (`AgentAdapter::model_args`), so the same charset/length/
-/// leading-dash guard `validate_model_str` applies to `chat.model`/
-/// `review.*` applies to both keys here too -- see the call sites in
-/// `CtxConfig::load`.
-#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+/// `claude`/`codex` are `REPO_FORBIDDEN` (each its own leaf entry, not the
+/// whole table -- see `REPO_FORBIDDEN`'s own comment on this), the same
+/// trust asymmetry as `review.claude`/`review.codex` right above: a repo
+/// checkout must not be able to choose which model -- and so which vendor
+/// account -- spends the operator's tokens running a delegated worker.
+/// Unlike `review.*`, which only lands in injected prompt *text*, these keys
+/// reach a real launch argv directly (`AgentAdapter::model_args`), so the
+/// same charset/length/leading-dash guard `validate_model_str` applies to
+/// `chat.model`/`review.*` applies to both keys here too -- see the call
+/// sites in `CtxConfig::load`.
+///
+/// `default_depth`/`default_read_only`/`max_depth`/`deny_network` are issue
+/// #262's delegation-envelope defaults (`envelope::WorkerEnvelope`), added
+/// to this same table rather than a new one since they are the other half
+/// of "what governs a delegated worker".
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct WorkerConfig {
     pub claude: Option<String>,
     pub codex: Option<String>,
+    /// Issue #262: how many hops of further `zirv agent` delegation a ROOT
+    /// session's envelope starts with (`envelope::WorkerEnvelope::
+    /// delegation_depth`) -- `1` lets a top-level worker delegate exactly
+    /// once more before a nested `zirv agent` refuses. `REPO_FORBIDDEN`: a
+    /// repo checkout must not be able to grant itself more delegation reach
+    /// than the operator configured.
+    pub default_depth: u8,
+    /// Issue #262: whether a ROOT session's envelope starts read-only
+    /// (`destructive: false`, no write paths) when `--mode` was not passed.
+    /// `REPO_FORBIDDEN`, same reasoning as `default_depth`.
+    pub default_read_only: bool,
+    /// Issue #262: an operator ceiling no envelope's `delegation_depth` may
+    /// exceed, regardless of `default_depth` or any `--depth` request.
+    /// Narrow-only fold with the repo layer (`narrow_worker_max_depth`,
+    /// mirroring `narrow_max_nudges`): a repo checkout may only LOWER this,
+    /// never raise it above the operator's own value. `u8::MAX` (no extra
+    /// cap beyond `default_depth`) is the default.
+    pub max_depth: u8,
+    /// Issue #262: whether every envelope computed in this repo denies
+    /// network tools outright. Narrow-only fold with the repo layer
+    /// (`narrow_worker_deny_network`, mirroring `narrow_pace_bool`): a repo
+    /// checkout may only turn this ON, never force it back off once the
+    /// operator (or another repo layer) has denied network access.
+    pub deny_network: bool,
+}
+
+impl Default for WorkerConfig {
+    fn default() -> Self {
+        Self {
+            claude: None,
+            codex: None,
+            default_depth: 1,
+            default_read_only: false,
+            max_depth: u8::MAX,
+            deny_network: false,
+        }
+    }
 }
 
 /// One harness's three generic tiers (`handover::TIERS`), each an optional
@@ -1906,6 +1949,26 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         EnvKind::Str,
     ),
     (
+        "ZIRV_CTX_WORKER_DEFAULT_DEPTH",
+        &["worker", "default_depth"],
+        EnvKind::Int,
+    ),
+    (
+        "ZIRV_CTX_WORKER_DEFAULT_READ_ONLY",
+        &["worker", "default_read_only"],
+        EnvKind::Bool,
+    ),
+    (
+        "ZIRV_CTX_WORKER_MAX_DEPTH",
+        &["worker", "max_depth"],
+        EnvKind::Int,
+    ),
+    (
+        "ZIRV_CTX_WORKER_DENY_NETWORK",
+        &["worker", "deny_network"],
+        EnvKind::Bool,
+    ),
+    (
         "ZIRV_CTX_HANDOVER_CLAUDE_CHEAP",
         &["handover", "claude", "cheap"],
         EnvKind::Str,
@@ -2138,6 +2201,22 @@ fn narrow_max_diagnostics(home: u32, repo: Option<u32>) -> u32 {
 /// longer than the operator allows), the `u64` mirror of `narrow_max_nudges`.
 fn narrow_diagnostics_timeout_secs(home: u64, repo: Option<u64>) -> u64 {
     home.min(repo.unwrap_or(u64::MAX))
+}
+
+/// Issue #262: the repo-narrowing fold for `worker.max_depth` -- lower is
+/// stricter (fewer hops of delegation reach), the `u8` mirror of
+/// `narrow_max_nudges`.
+fn narrow_worker_max_depth(home: u8, repo: Option<u8>) -> u8 {
+    home.min(repo.unwrap_or(u8::MAX))
+}
+
+/// Issue #262: the repo-narrowing fold for `worker.deny_network` -- `true`
+/// (network denied) is the strict direction, the same polarity as
+/// `narrow_pace_bool`: a repo checkout may deny network access for every
+/// delegated worker it hosts, but may never reopen it once the operator (or
+/// another repo layer) has denied it.
+fn narrow_worker_deny_network(home: bool, repo: Option<bool>) -> bool {
+    home.max(repo.unwrap_or(false))
 }
 
 /// Finding 4 (review): the one comma-separated-list splitter shared by every
@@ -2586,10 +2665,30 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     // tokens running a delegated headless worker (`zirv ctx agent`, and the
     // dashboard's own spawn-request pane variant), which is background spend
     // an operator never explicitly launched an interactive session for. See
-    // `WorkerConfig`'s own doc comment. `value_at` matches a table node the
-    // same way it matches a leaf (see `pace.use_credits`/`review` above), so
-    // this one entry blocks both `worker.claude` and `worker.codex` together.
-    (&["worker"], "ZIRV_CTX_WORKER_MODEL_CLAUDE"),
+    // `WorkerConfig`'s own doc comment. Unlike `review`/`pace.use_credits`
+    // above, these are two LEAF entries rather than one whole-table entry:
+    // issue #262 added `worker.max_depth`/`worker.deny_network` to this same
+    // table, and those two keys are deliberately NOT `REPO_FORBIDDEN` -- a
+    // repo checkout may narrow them (see `narrow_worker_max_depth`/
+    // `narrow_worker_deny_network`), so a whole-table entry here would wrongly
+    // block that narrowing too.
+    (&["worker", "claude"], "ZIRV_CTX_WORKER_MODEL_CLAUDE"),
+    (&["worker", "codex"], "ZIRV_CTX_WORKER_MODEL_CODEX"),
+    // Issue #262: the delegation-envelope defaults a ROOT session's
+    // `envelope::WorkerEnvelope` starts from. See `WorkerConfig`'s own doc
+    // comment on each field for why these two -- unlike `max_depth`/
+    // `deny_network` right above -- are operator-only outright rather than
+    // repo-narrowable: they set the STARTING point a repo could otherwise
+    // only ever narrow away from, so letting a repo raise them would be
+    // indistinguishable from letting it widen the narrow-only fold itself.
+    (
+        &["worker", "default_depth"],
+        "ZIRV_CTX_WORKER_DEFAULT_DEPTH",
+    ),
+    (
+        &["worker", "default_read_only"],
+        "ZIRV_CTX_WORKER_DEFAULT_READ_ONLY",
+    ),
     // `handover.*` (issue #84): a repo checkout must not be able to pick
     // which model -- and so which vendor account -- the orchestrator seat
     // swaps onto via `zirv ctx handover`, the same trust asymmetry as
@@ -2857,6 +2956,16 @@ impl CtxConfig {
             integer_at(take_nested(&mut merged, "diagnostics", "max_diagnostics"));
         let home_diagnostics_timeout =
             integer_at(take_nested(&mut merged, "diagnostics", "timeout_secs"));
+        // Issue #262: `worker.max_depth`/`worker.deny_network` get the
+        // identical lift-before-merge treatment -- see `narrow_worker_
+        // max_depth`/`narrow_worker_deny_network` below for each field's
+        // strict direction. `worker.claude`/`worker.codex`/`worker.
+        // default_depth`/`worker.default_read_only` are NOT lifted here:
+        // they are `REPO_FORBIDDEN` outright, so `reject_untrusted_keys`
+        // (below) catches a repo file naming them before a repo layer could
+        // ever reach this merge.
+        let home_worker_max_depth = integer_at(take_nested(&mut merged, "worker", "max_depth"));
+        let home_worker_deny_network = bool_at(take_nested(&mut merged, "worker", "deny_network"));
         // `supervise.heavy_command_patterns` gets the identical treatment as
         // `sandbox.extra_deny` above, for the identical reason: the field's
         // own doc comment promises a repo layer may only ADD patterns, never
@@ -2949,6 +3058,9 @@ impl CtxConfig {
         ));
         let repo_diagnostics_timeout =
             integer_at(take_nested(&mut repo_layer, "diagnostics", "timeout_secs"));
+        let repo_worker_max_depth = integer_at(take_nested(&mut repo_layer, "worker", "max_depth"));
+        let repo_worker_deny_network =
+            bool_at(take_nested(&mut repo_layer, "worker", "deny_network"));
         let repo_heavy_patterns = string_array(take_nested(
             &mut repo_layer,
             "supervise",
@@ -3101,6 +3213,28 @@ impl CtxConfig {
                 ))
                 .unwrap_or(i64::MAX),
             ),
+        );
+
+        let default_worker = WorkerConfig::default();
+        let home_worker_max_depth_value = home_worker_max_depth
+            .and_then(|v| u8::try_from(v).ok())
+            .unwrap_or(default_worker.max_depth);
+        let repo_worker_max_depth_value = repo_worker_max_depth.and_then(|v| u8::try_from(v).ok());
+        insert_path(
+            &mut merged,
+            &["worker", "max_depth"],
+            toml::Value::Integer(i64::from(narrow_worker_max_depth(
+                home_worker_max_depth_value,
+                repo_worker_max_depth_value,
+            ))),
+        );
+        insert_path(
+            &mut merged,
+            &["worker", "deny_network"],
+            toml::Value::Boolean(narrow_worker_deny_network(
+                home_worker_deny_network.unwrap_or(default_worker.deny_network),
+                repo_worker_deny_network,
+            )),
         );
 
         let default_fallback = FallbackConfig::default();
@@ -4406,6 +4540,114 @@ mod tests {
         assert_eq!(narrow_diagnostics_timeout_secs(120, None), 120);
     }
 
+    /// Issue #262: the fold rule itself, the same no-config-file, no-
+    /// `CtxConfig::load` shape as `the_diagnostics_narrowing_fold_rule_
+    /// favours_the_stricter_layer_either_direction`.
+    #[test]
+    fn the_worker_narrowing_fold_rule_favours_the_stricter_layer_either_direction() {
+        // max_depth: home 5 / repo 1 -> 1 (repo may tighten the cap).
+        assert_eq!(narrow_worker_max_depth(5, Some(1)), 1);
+        // max_depth: home 1 / repo 5 -> 1 (repo may not raise it).
+        assert_eq!(narrow_worker_max_depth(1, Some(5)), 1);
+        assert_eq!(narrow_worker_max_depth(5, None), 5);
+
+        // deny_network: home false / repo true -> true (repo may deny it).
+        assert!(narrow_worker_deny_network(false, Some(true)));
+        // deny_network: home true / repo false -> true (repo may not reopen
+        // network access an operator (or another repo layer) already denied).
+        assert!(narrow_worker_deny_network(true, Some(false)));
+        assert!(!narrow_worker_deny_network(false, None));
+        assert!(!narrow_worker_deny_network(false, Some(false)));
+    }
+
+    /// Issue #262: the full `CtxConfig::load` integration -- a repo-layer
+    /// `worker.max_depth`/`worker.deny_network` may only tighten what the
+    /// operator's own `~/.zirv/ctx.toml` allows, never loosen it.
+    #[test]
+    fn a_repo_layer_may_only_narrow_worker_max_depth_and_deny_network() {
+        let home_dir = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home_dir.path());
+        std::fs::create_dir_all(home_dir.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home_dir.path().join(".zirv/ctx.toml"),
+            "[worker]\nmax_depth = 5\ndeny_network = false\n",
+        )
+        .expect("write");
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[worker]\nmax_depth = 1\ndeny_network = true\n",
+        )
+        .expect("write");
+
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert_eq!(cfg.worker.max_depth, 1, "a repo may tighten the depth cap");
+        assert!(
+            cfg.worker.deny_network,
+            "a repo may deny network for every worker it hosts"
+        );
+
+        // The other direction: a repo trying to WIDEN either key is ignored,
+        // not honored -- narrowing works from BOTH layers' own strictness,
+        // never just "the repo wins".
+        let repo_widen = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo_widen.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo_widen.path().join(".zirv/ctx.toml"),
+            "[worker]\nmax_depth = 50\ndeny_network = false\n",
+        )
+        .expect("write");
+        let cfg = CtxConfig::load(repo_widen.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert_eq!(
+            cfg.worker.max_depth, 5,
+            "a repo may not raise the depth cap above the operator's own"
+        );
+        assert!(
+            !cfg.worker.deny_network,
+            "an operator who left network open is not affected by a repo's own false"
+        );
+    }
+
+    /// Issue #262: `worker.default_depth`/`worker.default_read_only` set the
+    /// STARTING point a repo could otherwise only narrow away from, so --
+    /// unlike `max_depth`/`deny_network` right above -- they are operator-only
+    /// outright, the same trust boundary as `workflow.review_worker_budget_
+    /// tokens`.
+    #[test]
+    fn a_repo_layer_may_not_set_worker_default_depth_or_read_only() {
+        for (toml, key, escape_hatch) in [
+            (
+                "[worker]\ndefault_depth = 9\n",
+                "worker.default_depth",
+                "ZIRV_CTX_WORKER_DEFAULT_DEPTH",
+            ),
+            (
+                "[worker]\ndefault_read_only = true\n",
+                "worker.default_read_only",
+                "ZIRV_CTX_WORKER_DEFAULT_READ_ONLY",
+            ),
+        ] {
+            let repo = tempfile::tempdir().expect("tempdir");
+            std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+            std::fs::write(repo.path().join(".zirv/ctx.toml"), toml).expect("write");
+
+            let home = tempfile::tempdir().expect("tempdir");
+            let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+            let empty = env_map(&[]);
+            let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+                .expect_err("a repo may not set its own delegation-envelope starting point")
+                .to_string();
+            assert!(err.contains(key), "names the offending key: {err}");
+            assert!(
+                err.contains(escape_hatch),
+                "names the operator escape hatch: {err}"
+            );
+        }
+    }
+
     /// Issue #309: the full `CtxConfig::load` integration -- a repo-layer
     /// `verify_on_stop.enabled = true` must not resurrect a feature the
     /// operator's own `~/.zirv/ctx.toml` turned off, and a repo layer may
@@ -4649,6 +4891,10 @@ mod tests {
         let worker = WorkerConfig::default();
         assert_eq!(worker.claude, None);
         assert_eq!(worker.codex, None);
+        assert_eq!(worker.default_depth, 1);
+        assert!(!worker.default_read_only);
+        assert_eq!(worker.max_depth, u8::MAX);
+        assert!(!worker.deny_network);
     }
 
     #[test]
@@ -4683,9 +4929,15 @@ mod tests {
     /// account running a delegated headless worker.
     #[test]
     fn a_repo_layer_may_not_touch_worker_model_keys() {
-        for toml in [
-            "[worker]\nclaude = \"opus\"\n",
-            "[worker]\ncodex = \"gpt-5.6-terra\"\n",
+        for (toml, escape_hatch) in [
+            (
+                "[worker]\nclaude = \"opus\"\n",
+                "ZIRV_CTX_WORKER_MODEL_CLAUDE",
+            ),
+            (
+                "[worker]\ncodex = \"gpt-5.6-terra\"\n",
+                "ZIRV_CTX_WORKER_MODEL_CODEX",
+            ),
         ] {
             let repo = tempfile::tempdir().expect("tempdir");
             std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
@@ -4699,7 +4951,7 @@ mod tests {
                 .to_string();
             assert!(err.contains("worker"), "names the offending key: {err}");
             assert!(
-                err.contains("ZIRV_CTX_WORKER_MODEL_CLAUDE"),
+                err.contains(escape_hatch),
                 "names the operator escape hatch: {err}"
             );
         }
@@ -6610,6 +6862,10 @@ mod tests {
         ("review", "codex"),
         ("worker", "claude"),
         ("worker", "codex"),
+        ("worker", "default_depth"),
+        ("worker", "default_read_only"),
+        ("worker", "max_depth"),
+        ("worker", "deny_network"),
         ("handover.claude", "cheap"),
         ("handover.claude", "standard"),
         ("handover.claude", "deep"),

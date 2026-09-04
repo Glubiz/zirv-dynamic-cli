@@ -104,6 +104,7 @@ use sha2::{Digest, Sha256};
 
 use super::CtxResult;
 use super::config::{CtxConfig, EnvLookup, env_from_process, split_csv_list};
+use super::envelope;
 
 /// One of the three things zirv's safety policy can say about a command.
 /// Deliberately unrelated to `policy::Stance`: a `Stance` is a *capability*
@@ -412,6 +413,7 @@ struct AttestedEvaluation {
 /// silently ignored: it only ever improves the next call, never gates this
 /// one. `status: "self-healed"` distinguishes this path in the audit log
 /// and from both `"not-present"` and `"valid"`.
+#[allow(clippy::too_many_arguments)]
 fn self_healed_evaluation(
     current: &SafetyPolicy,
     command: &str,
@@ -420,12 +422,13 @@ fn self_healed_evaluation(
     launch_fingerprint: Option<String>,
     snapshot_path: Option<&str>,
     scratchpad_roots: &[String],
+    envelope: Option<&envelope::WorkerEnvelope>,
 ) -> AttestedEvaluation {
     if let Some(path) = snapshot_path {
         let _ = rematerialize_policy_snapshot(path, current);
     }
     AttestedEvaluation {
-        outcome: evaluate_with_scratchpad_roots(current, command, mode, scratchpad_roots),
+        outcome: evaluate_with_scratchpad_roots(current, command, mode, scratchpad_roots, envelope),
         current_fingerprint,
         launch_fingerprint,
         status: "self-healed",
@@ -456,6 +459,14 @@ fn evaluate_with_attestation_evidence(
     env: EnvLookup<'_>,
     scratchpad_roots: &[String],
 ) -> AttestedEvaluation {
+    // Issue #262: parsed once here (this function already reads `env` for
+    // the attestation fingerprint/snapshot, so this is not a new dependency)
+    // and threaded down into every `evaluate_with_scratchpad_roots` call
+    // below -- `evaluate`/`evaluate_with_scratchpad_roots` themselves stay
+    // pure, taking the envelope as an explicit parameter rather than reading
+    // `ENVELOPE_ENV` internally.
+    let envelope = parse_envelope_env(env);
+    let envelope = envelope.as_ref();
     let current_fingerprint =
         policy_fingerprint(current).unwrap_or_else(|_| "unavailable".to_string());
     let (expected_fingerprint, snapshot_path) =
@@ -467,6 +478,7 @@ fn evaluate_with_attestation_evidence(
                         command,
                         mode,
                         scratchpad_roots,
+                        envelope,
                     ),
                     current_fingerprint,
                     launch_fingerprint: None,
@@ -484,6 +496,7 @@ fn evaluate_with_attestation_evidence(
                     fingerprint,
                     None,
                     scratchpad_roots,
+                    envelope,
                 );
             }
         };
@@ -500,6 +513,7 @@ fn evaluate_with_attestation_evidence(
             Some(expected_fingerprint),
             Some(snapshot_path.as_str()),
             scratchpad_roots,
+            envelope,
         );
     };
     if policy_fingerprint(&launch).ok().as_deref() != Some(expected_fingerprint.as_str()) {
@@ -511,11 +525,14 @@ fn evaluate_with_attestation_evidence(
             Some(expected_fingerprint),
             Some(snapshot_path.as_str()),
             scratchpad_roots,
+            envelope,
         );
     }
 
-    let current_outcome = evaluate_with_scratchpad_roots(current, command, mode, scratchpad_roots);
-    let launch_outcome = evaluate_with_scratchpad_roots(&launch, command, mode, scratchpad_roots);
+    let current_outcome =
+        evaluate_with_scratchpad_roots(current, command, mode, scratchpad_roots, envelope);
+    let launch_outcome =
+        evaluate_with_scratchpad_roots(&launch, command, mode, scratchpad_roots, envelope);
     let divergence = if verdict_rank(launch_outcome.verdict) > verdict_rank(current_outcome.verdict)
     {
         SnapshotDivergence::SnapshotStricter {
@@ -1496,29 +1513,135 @@ pub fn evaluate(
     command: &str,
     mode: super::adapters::LaunchMode,
 ) -> Outcome {
-    evaluate_with_scratchpad_roots(policy, command, mode, &[])
+    evaluate_with_scratchpad_roots(policy, command, mode, &[], None)
 }
 
 /// Same as [`evaluate`], but also threads `scratchpad_roots` down into the
 /// VCS classifier so a `git worktree remove --force` targeting the session's
 /// own scratchpad root (`target_is_confined`) can be recognized as agent-
 /// scoped cleanup rather than a destructive action on someone else's
-/// worktree. Callers that already compute `scratchpad_roots` for other
-/// analyzers in the same hook evaluation (`run_check_hook_mode_with_env`,
-/// `run_explain`) use this instead of `evaluate` so the two stay consistent.
+/// worktree, and `envelope` (issue #262) down into [`apply_envelope_outcome`]
+/// -- when present, its own restrictions apply on top of `policy`,
+/// regardless of `policy`'s own posture. Callers that already compute
+/// `scratchpad_roots` for other analyzers in the same hook evaluation
+/// (`run_check_hook_mode_with_env`, `run_explain`) use this instead of
+/// `evaluate` so the two stay consistent. Stays pure: `envelope` is an
+/// explicit parameter, never read from the process environment in here --
+/// see `evaluate_with_attestation_evidence`'s own `parse_envelope_env` call
+/// for where that reading actually happens.
 pub(crate) fn evaluate_with_scratchpad_roots(
     policy: &SafetyPolicy,
     command: &str,
     mode: super::adapters::LaunchMode,
     scratchpad_roots: &[String],
+    envelope: Option<&envelope::WorkerEnvelope>,
 ) -> Outcome {
-    evaluate_candidates(
+    let base = evaluate_candidates(
         policy,
         command,
         policy.default_verdict(mode),
         mode,
         scratchpad_roots,
-    )
+    );
+    apply_envelope_outcome(envelope, command, scratchpad_roots, base)
+}
+
+/// Issue #262: a command a delegation envelope forbids is `Deny` --
+/// regardless of `policy`'s own posture, the one override this module
+/// applies unconditionally. `Deny` is the top of `verdict_rank`'s ordering,
+/// so returning it outright here (rather than folding it in via
+/// `verdict_rank` comparison, the way every other `apply_*_outcome` step
+/// does) is equivalent and simpler: nothing `base` could already be ranks
+/// above `Deny`.
+fn apply_envelope_outcome(
+    envelope: Option<&envelope::WorkerEnvelope>,
+    command: &str,
+    scratchpad_roots: &[String],
+    base: Outcome,
+) -> Outcome {
+    let Some(envelope) = envelope else {
+        return base;
+    };
+    let deny = |reason: &'static str| Outcome {
+        verdict: Verdict::Deny,
+        matched: Some(Rule {
+            pattern: format!("<envelope: {reason}>"),
+            origin: Origin::BuiltIn,
+        }),
+    };
+    if !envelope.destructive && command_is_destructive(command, scratchpad_roots) {
+        return deny("destructive command outside the delegation envelope");
+    }
+    if envelope_write_targets_confined(command, envelope) == Some(false) {
+        return deny("write target outside the delegation envelope's paths");
+    }
+    base
+}
+
+/// Issue #262: the union of every classifier this module already has for
+/// "the policy classifies this as destructive" -- an independent OR of the
+/// existing per-family analyzers rather than a new, separately-maintained
+/// definition, so the envelope override always agrees with whatever this
+/// module already considers destructive elsewhere.
+fn command_is_destructive(command: &str, scratchpad_roots: &[String]) -> bool {
+    is_recursive_delete(command)
+        || is_destructive_orchestrator_action(command)
+        || is_irreversible_distribution_action(command)
+        || is_destructive_vcs_action(command, scratchpad_roots)
+}
+
+/// Issue #262: the envelope-aware analogue of [`write_targets_confined`],
+/// checked against `envelope.paths` via `PathScope::is_subset_of` (so a `"."`
+/// scope correctly means "everything", the way a raw scratchpad-root prefix
+/// comparison does not) rather than against a scratchpad root list. Same
+/// conservative contract as `write_targets_confined`: `None` ("no opinion")
+/// whenever a target cannot be confidently resolved (`$`/backtick/`~`/glob)
+/// or `command` names no write target at all -- an envelope violation must
+/// be a definite fact, never a guess.
+fn envelope_write_targets_confined(
+    command: &str,
+    envelope: &envelope::WorkerEnvelope,
+) -> Option<bool> {
+    let sanitized = redact_single_quoted_heredocs(command);
+    let mut confined = true;
+    let mut saw_any_target = false;
+    for segment in split_segments(&sanitized) {
+        let targets = segment_write_targets(&segment)?;
+        for target in &targets {
+            saw_any_target = true;
+            if target == "/dev/null" {
+                continue;
+            }
+            if target.contains(['$', '`', '~', '*', '?']) {
+                return None;
+            }
+            let scope = envelope::PathScope::new(target.clone());
+            if !envelope.paths.iter().any(|root| scope.is_subset_of(root)) {
+                confined = false;
+            }
+        }
+    }
+    if !saw_any_target {
+        return None;
+    }
+    Some(confined)
+}
+
+/// Issue #262: reads [`super::agent::ENVELOPE_ENV`] and parses it as a
+/// [`envelope::WorkerEnvelope`]. Absence is `None` -- no envelope in force,
+/// this session's OWN posture governs alone, exactly today's behavior. A
+/// PRESENT but malformed value is never treated as absent (that would mean
+/// "no restriction" for what is very likely a bounded worker whose envelope
+/// got corrupted in transit): it falls back to
+/// [`envelope::WorkerEnvelope::locked`], the tightest possible grant,
+/// consistent with `agent::resolve_parent_envelope`'s own fail-closed
+/// handling of the identical case.
+fn parse_envelope_env(env: EnvLookup<'_>) -> Option<envelope::WorkerEnvelope> {
+    let raw = env(super::agent::ENVELOPE_ENV)?;
+    if raw.trim().is_empty() {
+        return None;
+    }
+    Some(serde_json::from_str(&raw).unwrap_or_else(|_| envelope::WorkerEnvelope::locked()))
 }
 
 /// Collapses runs of ASCII/Unicode whitespace to a single space and trims
@@ -5898,6 +6021,7 @@ fn explain_text(
     mode: super::adapters::LaunchMode,
     divergence: SnapshotDivergence,
     status: &str,
+    envelope: Option<&envelope::WorkerEnvelope>,
 ) -> String {
     let head = match &outcome.matched {
         Some(rule) => format!(
@@ -5930,6 +6054,27 @@ fn explain_text(
              missing, unreadable, or did not match its expected fingerprint, so this reflects \
              your current policy directly rather than an unverifiable launch snapshot.",
         );
+    }
+    // Issue #262: the delegation envelope's own contribution, when one
+    // applies -- printed unconditionally rather than only on the commands it
+    // actually denied, so `zirv ctx safety explain` also answers "what would
+    // this worker's own scope allow" for a command it happens to already
+    // allow for other reasons.
+    if let Some(envelope) = envelope {
+        let paths = if envelope.paths.is_empty() {
+            "none".to_string()
+        } else {
+            envelope
+                .paths
+                .iter()
+                .map(|scope| scope.0.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        text.push_str(&format!(
+            " Delegation envelope `{}`: paths [{paths}], network {}, destructive {}, depth {}.",
+            envelope.principal, envelope.network, envelope.destructive, envelope.delegation_depth
+        ));
     }
     text
 }
@@ -6040,7 +6185,7 @@ fn hook_reason_text(
     let base = extras
         .reason_override
         .clone()
-        .unwrap_or_else(|| explain_text(command, outcome, mode, divergence, status));
+        .unwrap_or_else(|| explain_text(command, outcome, mode, divergence, status, None));
     match &extras.breaker_note {
         Some(note) => format!("{note} -- {base}"),
         None => base,
@@ -6742,6 +6887,10 @@ pub fn run_explain<W: Write>(args: &ExplainArgs, w: &mut W, env: EnvLookup<'_>) 
         env,
         &scratchpad_roots,
     );
+    // Issue #262: re-parsed here (rather than threaded out of `evidence`)
+    // purely to print its own contribution -- `evaluate_with_attestation_
+    // evidence` already applied it to `evidence.outcome` internally.
+    let envelope = parse_envelope_env(env);
     writeln!(
         w,
         "{}",
@@ -6751,6 +6900,7 @@ pub fn run_explain<W: Write>(args: &ExplainArgs, w: &mut W, env: EnvLookup<'_>) 
             args.mode,
             evidence.divergence,
             evidence.status,
+            envelope.as_ref(),
         )
     )?;
     Ok(evidence.outcome.verdict.exit_code())
@@ -9690,6 +9840,7 @@ mod tests {
                 command,
                 LaunchMode::Headless,
                 &scratchpad_roots,
+                None,
             );
             assert_eq!(outcome.verdict, Verdict::Ask, "{command}: {outcome:?}");
             let outcome = evaluate_with_scratchpad_roots(
@@ -9697,6 +9848,7 @@ mod tests {
                 command,
                 LaunchMode::Interactive,
                 &scratchpad_roots,
+                None,
             );
             assert_eq!(
                 outcome.verdict,
@@ -9720,6 +9872,7 @@ mod tests {
                 command,
                 LaunchMode::Headless,
                 &scratchpad_roots,
+                None,
             );
             assert_eq!(outcome.verdict, Verdict::Allow, "{command}: {outcome:?}");
             let outcome = evaluate_with_scratchpad_roots(
@@ -9727,6 +9880,7 @@ mod tests {
                 command,
                 LaunchMode::Interactive,
                 &scratchpad_roots,
+                None,
             );
             assert_eq!(
                 outcome.verdict,
@@ -9936,7 +10090,7 @@ mod tests {
         for mode in [LaunchMode::Interactive, LaunchMode::Headless] {
             for command in &commands {
                 assert_eq!(
-                    evaluate_with_scratchpad_roots(&policy, command, mode, &scratchpad_roots)
+                    evaluate_with_scratchpad_roots(&policy, command, mode, &scratchpad_roots, None)
                         .verdict,
                     Verdict::Allow,
                     "{mode:?}: {command}"
@@ -13064,6 +13218,7 @@ mod tests {
             LaunchMode::Interactive,
             SnapshotDivergence::Unchanged,
             "not-present",
+            None,
         );
         assert!(interactive.contains("built-in"), "got {interactive}");
         assert!(interactive.contains("prompts"), "got {interactive}");
@@ -13074,6 +13229,7 @@ mod tests {
             LaunchMode::Headless,
             SnapshotDivergence::Unchanged,
             "not-present",
+            None,
         );
         assert!(headless.contains("fails closed"), "got {headless}");
         assert!(
@@ -13100,6 +13256,7 @@ mod tests {
                 current_verdict: Verdict::Allow,
             },
             "valid",
+            None,
         );
         assert!(
             text.contains("launch snapshot"),
@@ -13135,6 +13292,7 @@ mod tests {
             LaunchMode::Interactive,
             SnapshotDivergence::Unchanged,
             "not-present",
+            None,
         );
         assert!(
             !text.contains("launch snapshot"),
@@ -13157,6 +13315,7 @@ mod tests {
             LaunchMode::Interactive,
             SnapshotDivergence::Unchanged,
             "self-healed",
+            None,
         );
         assert!(healed.to_lowercase().contains("self-heal"), "got {healed}");
 
@@ -13167,6 +13326,7 @@ mod tests {
                 LaunchMode::Interactive,
                 SnapshotDivergence::Unchanged,
                 status,
+                None,
             );
             assert!(
                 !text.to_lowercase().contains("self-heal"),

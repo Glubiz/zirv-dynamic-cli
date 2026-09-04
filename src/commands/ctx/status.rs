@@ -2905,6 +2905,8 @@ mod tests {
                 outcome: "ok",
                 mode: None,
                 task_class: None,
+                principal: "root",
+                envelope_sha256: None,
             },
         )
         .expect("append");
@@ -3520,6 +3522,8 @@ mod tests {
             outcome: "ok".to_string(),
             mode: None,
             task_class: None,
+            principal: "root".to_string(),
+            envelope_sha256: None,
         }
     }
 
@@ -3726,6 +3730,8 @@ mod tests {
                 outcome: "ok",
                 mode: None,
                 task_class: None,
+                principal: "root",
+                envelope_sha256: None,
             },
         )
         .expect("append");
@@ -3790,6 +3796,8 @@ mod tests {
                 outcome: "ok",
                 mode: None,
                 task_class: None,
+                principal: "root",
+                envelope_sha256: None,
             },
         )
         .expect("append");
@@ -3843,6 +3851,8 @@ mod tests {
                 outcome: "ok",
                 mode: None,
                 task_class: None,
+                principal: "root",
+                envelope_sha256: None,
             },
         )
         .expect("append");
@@ -3964,6 +3974,8 @@ mod tests {
                     outcome: &row.outcome,
                     mode: row.mode,
                     task_class: row.task_class,
+                    principal: &row.principal,
+                    envelope_sha256: row.envelope_sha256.as_deref(),
                 },
             )
             .expect("append");

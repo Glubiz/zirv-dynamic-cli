@@ -15,6 +15,7 @@ pub mod context_status;
 pub mod dash;
 pub mod diagnostics;
 pub mod drift;
+pub mod envelope;
 pub mod event;
 pub mod exec;
 pub mod fallback;

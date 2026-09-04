@@ -163,6 +163,28 @@ pub struct SpawnRequest {
     /// a request written by an older build declared no contract.
     #[serde(default)]
     pub result_schema: Option<String>,
+    /// Issue #262: the canonical JSON of the REQUESTING session's own
+    /// `envelope::WorkerEnvelope` -- the PARENT the pane about to fulfil this
+    /// request must narrow from, not a pre-computed child. `fulfill_spawn_
+    /// request` reconstructs the requested candidate itself from this plus
+    /// `path_scope`/`no_network`/`mode`/`depth` below, using the pane's own
+    /// freshly minted session id for `principal` (which this requesting
+    /// process cannot know in advance) -- the same "carried, then
+    /// re-validated at the fulfilment side" contract `workdir` already has,
+    /// never trusted as a ready-made grant. `#[serde(default)]`: a request
+    /// written by an older build carried no envelope at all, which `dash::
+    /// mod::fulfill_spawn_request` reads as "this dashboard's own root".
+    #[serde(default)]
+    pub envelope: Option<String>,
+    /// Issue #262: mirrors `agent::AgentArgs::path_scope`.
+    #[serde(default)]
+    pub path_scope: Vec<PathBuf>,
+    /// Issue #262: mirrors `agent::AgentArgs::no_network`.
+    #[serde(default)]
+    pub no_network: bool,
+    /// Issue #262: mirrors `agent::AgentArgs::depth`.
+    #[serde(default)]
+    pub depth: Option<u8>,
 }
 
 /// The role a request actually gets. Unstated or unrecognised is
@@ -520,6 +542,10 @@ mod tests {
             mode: WorkerMode::Writing,
             owns_workdir: false,
             result_schema: None,
+            envelope: None,
+            path_scope: Vec::new(),
+            no_network: false,
+            depth: None,
         }
     }
 

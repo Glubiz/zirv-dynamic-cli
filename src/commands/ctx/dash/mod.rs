@@ -39,6 +39,7 @@ use super::CtxResult;
 use super::adapters;
 use super::adapters::AgentAdapter;
 use super::config::{CtxConfig, EnvLookup, validate_model_str};
+use super::envelope;
 use super::event::{SessionId, SessionRef};
 use super::policy;
 use super::state::StateDir;
@@ -3557,6 +3558,38 @@ fn fulfill_spawn_request(
     let roots = workdir_roots(cfg, repo);
     let spawn_cwd = resolved_spawn_cwd(spawn_cwd, req.workdir.as_deref(), &roots)
         .map_err(|e| SpawnRefusal::channel(e.to_string()))?;
+    // Issue #262: `req.envelope` is the REQUESTING session's own envelope
+    // (the parent), never a ready-made grant -- reconstructed and re-
+    // narrowed here exactly like `workdir` just above, rather than trusted
+    // outright. Absent `envelope` (an older request, or the human-driven
+    // Spawn overlay, which has no delegation lineage at all) reads as "this
+    // dashboard's own root" (`agent::root_envelope`). `principal` is
+    // finalised once this pane's own session id exists, further down --
+    // narrowing itself does not depend on it, only the value carried in the
+    // resulting envelope's `principal` field does.
+    let parent_envelope = match req.envelope.as_deref().filter(|s| !s.trim().is_empty()) {
+        Some(raw) => {
+            serde_json::from_str(raw).unwrap_or_else(|_| envelope::WorkerEnvelope::locked())
+        }
+        None => super::agent::root_envelope(cfg),
+    };
+    let path_scope: Vec<String> = req
+        .path_scope
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    let requested_envelope = envelope::WorkerEnvelope::requested(
+        &parent_envelope,
+        String::new(),
+        &path_scope,
+        req.no_network,
+        req.mode == super::permit::WorkerMode::ReadOnly,
+        req.depth,
+        req.budget_tokens,
+    );
+    let mut child_envelope =
+        envelope::WorkerEnvelope::narrow(&parent_envelope, &requested_envelope)
+            .map_err(|e| SpawnRefusal::channel(format!("delegation envelope refused: {e}")))?;
     // R2: every pane in the vector is a live one -- `reap_ended_panes` takes
     // an exited pane out on the very next tick -- so the cap is a plain
     // `len()` again rather than a filtered count over a vector that only ever
@@ -4061,6 +4094,26 @@ fn fulfill_spawn_request(
     if let Some(schema) = &req.result_schema {
         turn_env.push((super::agent::RESULT_SCHEMA_ENV.to_string(), schema.clone()));
     }
+    // Issue #262: `child_envelope` was already narrowed (and, on a widening
+    // request, this function already returned `Err` before ever reaching
+    // this point) -- `principal` just needed this pane's own session id,
+    // which now exists. Pushed into the pane's real process env the same
+    // way `WORK_GROUP_ENV`/`RESULT_SCHEMA_ENV` are, so a further `zirv
+    // agent` this pane's own child runs reads it back as ITS parent
+    // envelope (`agent::resolve_parent_envelope`).
+    child_envelope.principal = format!(
+        "{}/{}",
+        parent_envelope.principal,
+        super::sessions::short_id(&session_id)
+    );
+    turn_env.push((
+        super::agent::ENVELOPE_ENV.to_string(),
+        envelope::canonical_json(&child_envelope).unwrap_or_default(),
+    ));
+    turn_env.push((
+        super::agent::PRINCIPAL_ENV.to_string(),
+        child_envelope.principal.clone(),
+    ));
 
     // T10: the same launch-time pacing gate `wrap::run_with`/this dashboard's
     // own first pane apply, but *non-interactively* here: this spawn happens
@@ -6693,6 +6746,20 @@ pub fn run_dashboard(
                                                     // exactly as before
                                                     // those flags existed.
                                                     result_schema: None,
+                                                    // The overlay has no
+                                                    // `--path-scope`/
+                                                    // `--no-network`/
+                                                    // `--depth` of its own
+                                                    // either (issue #262):
+                                                    // absent `envelope`
+                                                    // reads as "this
+                                                    // dashboard's own
+                                                    // root" at the
+                                                    // fulfilment side.
+                                                    envelope: None,
+                                                    path_scope: Vec::new(),
+                                                    no_network: false,
+                                                    depth: None,
                                                 };
                                                 let panes_before_spawn = panes.len();
                                                 // `trusted_interactive: true` --
@@ -10816,6 +10883,10 @@ mod tests {
             mode: super::super::permit::WorkerMode::Writing,
             owns_workdir: false,
             result_schema: None,
+            envelope: None,
+            path_scope: Vec::new(),
+            no_network: false,
+            depth: None,
         }
     }
 
@@ -10830,6 +10901,7 @@ mod tests {
             worker: crate::commands::ctx::config::WorkerConfig {
                 claude: Some("opus".to_string()),
                 codex: None,
+                ..Default::default()
             },
             ..CtxConfig::default()
         };

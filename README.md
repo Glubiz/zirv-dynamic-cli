@@ -1211,7 +1211,8 @@ enough to change what zirv executes. `<repo>/.zirv/ctx.toml` may not set
 `optimize.model`, `sandbox.enabled`, `prompt.enabled`, `prompt.repo_layer`,
 `prompt.max_repo_bytes`, `prompt.harnesses`, `prompt.codex_orchestrator`, `mail.enabled`,
 `mail.max_delivered_bytes`, `chrome.events`, any `memory.*` key, any
-`dash.*` key, any `pace.*` key, any `price.*` key, `review`, `worker`,
+`dash.*` key, any `pace.*` key, any `price.*` key, `review`, `worker.claude`,
+`worker.codex`, `worker.default_depth`, `worker.default_read_only`,
 `handover`, or any of the five keys that feed the token gate (`score.token_floor`,
 `score.token_ceiling`, `score.token_floor_ratio`, `score.token_ceiling_ratio`,
 `score.model_context_tokens`); doing so is an error
@@ -1274,7 +1275,10 @@ checkout:
 | `pace.spawn_hard_pct` | `ZIRV_CTX_PACE_SPAWN_HARD_PCT` |
 | `pace.run_budget_tokens` | `ZIRV_CTX_PACE_RUN_BUDGET_TOKENS` |
 | `review` (`review.claude`, `review.codex`) | `ZIRV_CTX_REVIEW_MODEL_CLAUDE` / `ZIRV_CTX_REVIEW_MODEL_CODEX` |
-| `worker` (`worker.claude`, `worker.codex`) | `ZIRV_CTX_WORKER_MODEL_CLAUDE` / `ZIRV_CTX_WORKER_MODEL_CODEX` |
+| `worker.claude` | `ZIRV_CTX_WORKER_MODEL_CLAUDE` |
+| `worker.codex` | `ZIRV_CTX_WORKER_MODEL_CODEX` |
+| `worker.default_depth` | `ZIRV_CTX_WORKER_DEFAULT_DEPTH` |
+| `worker.default_read_only` | `ZIRV_CTX_WORKER_DEFAULT_READ_ONLY` |
 | `handover` (`handover.<agent>.<tier>`) | `ZIRV_CTX_HANDOVER_<AGENT>_<TIER>` (e.g. `ZIRV_CTX_HANDOVER_CLAUDE_DEEP`) |
 | `safety.allow` | `ZIRV_CTX_SAFETY_ALLOW` |
 | `safety.escape_allow` | `ZIRV_CTX_SAFETY_ESCAPE_ALLOW` |

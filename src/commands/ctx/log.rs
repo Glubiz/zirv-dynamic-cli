@@ -110,6 +110,16 @@ pub struct Delegation<'a> {
     /// [`TaskClass`]'s own doc comment. Same "row predates the field, or its
     /// caller never named one" contract as `mode` above.
     pub task_class: Option<TaskClass>,
+    /// Issue #262: the `"<parent short>/<child short>"` delegation chain
+    /// this worker ran under (`envelope::WorkerEnvelope::principal`), or
+    /// `"root"` for a top-level, non-delegated session.
+    pub principal: &'a str,
+    /// Issue #262: `sha256(canonical_json(envelope))` for the envelope this
+    /// worker actually ran under (`envelope::digest`) -- lets a later reader
+    /// prove under which delegation envelope a worker ran, without the raw
+    /// envelope itself needing to be logged. `None` only for a row logged
+    /// before this field existed.
+    pub envelope_sha256: Option<&'a str>,
 }
 
 /// The owned, deserializable counterpart of [`Delegation`] (which borrows
@@ -160,6 +170,19 @@ pub struct DelegationRow {
     /// grouping.
     #[serde(default)]
     pub task_class: Option<TaskClass>,
+    /// Issue #262: mirrors `Delegation::principal`. `#[serde(default)]` so a
+    /// row written before this field existed deserializes as `""` (empty,
+    /// distinguished from a real `"root"`) rather than failing to parse.
+    /// Kept for parity with every field `Delegation` writes -- not read by
+    /// any reader yet, the same kept-for-parity-not-yet-read pattern
+    /// `SafetyDecisionRecord::mode` already uses.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub principal: String,
+    /// Issue #262: mirrors `Delegation::envelope_sha256`.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub envelope_sha256: Option<String>,
 }
 
 /// The owned, deserializable counterpart of `hook::PermissionPromptRow`
@@ -659,6 +682,8 @@ mod tests {
                 outcome: "ok",
                 mode: Some(WorkerMode::Writing),
                 task_class: None,
+                principal: "root",
+                envelope_sha256: None,
             },
         )
         .expect("append");
@@ -711,6 +736,8 @@ mod tests {
                 outcome: "ok",
                 mode: Some(WorkerMode::Writing),
                 task_class: Some(TaskClass::Implement),
+                principal: "root/aaaa1111",
+                envelope_sha256: Some("deadbeef"),
             },
         )
         .expect("append");
@@ -740,6 +767,8 @@ mod tests {
                 outcome: "failed",
                 mode: None,
                 task_class: None,
+                principal: "root",
+                envelope_sha256: None,
             },
         )
         .expect("append");
