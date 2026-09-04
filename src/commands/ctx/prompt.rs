@@ -119,17 +119,27 @@ pub const SUB_ORCHESTRATOR_PROMPT_FILE: &str = "system-prompt.sub-orchestrator.m
 /// generalises "match the existing patterns" out of the UI-only bullet since
 /// it now applies to every change. See
 /// `docs/superpowers/specs/2026-09-01-wrapper-behaviour-redesign.md`.
+///
+/// v5 (issues #328/#334, 2026-09-04): the sizing bullet's "do it directly"
+/// wording was a second voice on WHO implements, and it contradicted the
+/// orchestrator layer above it (`claude::ORCHESTRATOR_PROMPT`/`codex::
+/// ORCHESTRATOR_PROMPT`), which now says an orchestrator seat never
+/// implements at any size. Dropping "do it directly" already takes this
+/// bullet out of the who-implements question, so no replacement sentence
+/// naming the role layer is needed -- the orchestrator layer stays the sole
+/// voice on who performs a change, and this standard speaks only to
+/// proportionality: how much ceremony a given size needs.
 pub const DEFAULT_PROMPT: &str = "\
-zirv engineering standard (v4)
+zirv engineering standard (v5)
 
 Work the way a top-tier engineer works: judgment first, process in proportion, nothing wasted.
 
 - Size the task first and let the size set everything else. Trivial (a few lines, an obvious \
-fix, a doc or comment): do it directly, run the one check that could catch a mistake, report \
-in a sentence. Bounded (one area, one intent): read what you need once, make the change, run \
-the tests that cover it. Substantial (several areas, real design choices, or elevated risk): \
-plan briefly, then work in verifiable steps. Never apply a heavier tier's ceremony to a \
-lighter tier's task.
+fix, a doc or comment): one change, the one check that could catch a mistake, a one-sentence \
+report. Bounded (one area, one intent): read what you need once, make the change, run the \
+tests that cover it. Substantial (several areas, real design choices, or elevated risk): plan \
+briefly, then work in verifiable steps. Never apply a heavier tier's ceremony to a lighter \
+tier's task.
 - Read before you write: understand the code you're changing and mirror its naming, \
 structure and style. Touch only what the task needs.
 - Choose the simplest design that fully meets the requirement. Reuse before adding; prefer \
@@ -278,6 +288,18 @@ pass, or a step was skipped, say so and show the output. Never call unverified w
 /// task instead of applying them unconditionally, and drops the
 /// restatements duplicated in `ORCHESTRATOR_PROMPT` for each adapter. See
 /// `docs/superpowers/specs/2026-09-01-wrapper-behaviour-redesign.md`.
+///
+/// v16 (issues #328/#334): the delegation bullet's "do trivial and bounded
+/// work yourself" framing let an orchestrator seat implement small changes
+/// itself, which is exactly what this role must never do -- implementation,
+/// tests and docs are always a worker's, at any task size. The bullet also
+/// used to send same-harness delegation through `zirv agent`; that verb now
+/// reaches only a DIFFERENT harness (or a sub-orchestrator work group), so
+/// same-harness delegation is redirected to each harness's own native
+/// subagent mechanism, described concretely by that harness's own adapter
+/// layer. This layer stays vendor-neutral, so it names neither "the Agent
+/// tool" nor any harness by name -- see
+/// `harness_prompt_never_names_vendor_specific_models`.
 /// The literal header the derived harness/orchestration roster
 /// (`PromptSource::Harnesses`) starts with -- named, like `CONTEXT_LAYER_
 /// HEADER` and the workflow/memory headers, so `compile.rs`'s `CompiledContext::
@@ -287,19 +309,20 @@ pass, or a step was skipped, say so and show the output. Never call unverified w
 pub(super) const HARNESS_ROSTER_LAYER_HEADER: &str = "\n\n---\n\nzirv harness roster (session)\n\n";
 
 pub const HARNESS_PROMPT: &str = "\
-zirv meta-harness (v15)
+zirv meta-harness (v16)
 
 - zirv is the harness supervising this session -- context, usage, and cross-harness \
 communication. It launched the agent in this seat and is not one of the agents.
-- Delegation is a tool, not a rule: do trivial and bounded work yourself; delegate when a task \
-is larger than the brief needed to describe it, can run independently of what you are doing \
-now, or belongs in another harness. `zirv agent <name> \"<prompt>\" -- --model <m>` runs a \
-supervised worker to completion and returns its result; inside a dashboard it spawns an \
-attached pane, returns that pane's short id, and the worker mails its outcome back (`zirv ctx \
-inbox`). Name the cheapest model that can do the job, pass `--workdir <path>` for another repo \
-or worktree (otherwise the worker stays confined to this one and reports BLOCKED), and trust \
-the result exactly as you would a native subagent's. A worker runs unattended and must not \
-delegate further.
+- This seat coordinates and integrates; implementation, tests and docs are a worker's, whatever \
+the task size. Delegate inside your own harness with its native subagent mechanism. `zirv agent \
+<name> \"<prompt>\" -- --model <m>` reaches a DIFFERENT harness -- it runs a supervised worker to \
+completion and returns its result; inside a dashboard it spawns an attached pane, returns that \
+pane's short id, and the worker mails its outcome back (`zirv ctx inbox`) -- and is refused for \
+your own harness from an orchestrator seat. `zirv ctx agent --role sub-orchestrator --scope \
+\"<area>\"` creates a coordinated work group. Name the cheapest model that can do the job, pass \
+`--workdir <path>` for another repo or worktree (otherwise the worker stays confined to this \
+one and reports BLOCKED), and trust the result exactly as you would a native subagent's. A \
+worker runs unattended and must not delegate further.
 - Checkpoints: `zirv ctx status --brief --diff` and `zirv ctx inbox` at task start, after long \
 steps, and before reporting done. A `[zirv \u{25b8} mail]` line means mail is already waiting: \
 run `zirv ctx inbox` (never `--peek`) right away. Steer a live worker with `zirv ctx send \
@@ -3554,6 +3577,50 @@ mod tests {
         );
     }
 
+    /// Issues #328/#334: the composed text a claude Orchestrator session
+    /// actually receives must carry the never-implement rule and route
+    /// same-harness delegation to the native Agent tool, and must have fully
+    /// dropped the old size-based "implement it yourself" carve-out.
+    #[test]
+    fn an_orchestrator_never_implements_on_the_composed_claude_prompt() {
+        let adapter = ClaudeAdapter::new(None);
+        let (_tmp, home, repo) = tree();
+        let composed = compose(
+            Some(&home),
+            &repo,
+            false,
+            &PromptConfig::default(),
+            PromptRole::Orchestrator,
+            &[],
+            usize::MAX,
+        );
+
+        let (_, merged) = merge_command_line_prompt(
+            &adapter,
+            &["claude".to_string()],
+            composed,
+            None,
+            PromptRole::Orchestrator,
+            &PromptConfig::default(),
+        );
+
+        let merged = merged.expect("composed");
+        for claim in ["it does not implement", "native Agent tool"] {
+            assert!(
+                merged.text.contains(claim),
+                "the composed orchestrator prompt must say '{claim}':\n{}",
+                merged.text
+            );
+        }
+        for old_phrase in ["stay on this seat", "do trivial and bounded work yourself"] {
+            assert!(
+                !merged.text.contains(old_phrase),
+                "the old size-based carve-out '{old_phrase}' must be gone:\n{}",
+                merged.text
+            );
+        }
+    }
+
     /// The role split itself: a delegated Worker gets claude's own worker
     /// layer *in place of* the orchestrator one -- never both, and never the
     /// orchestrator layer's own delegation coaching, which is exactly what
@@ -4255,7 +4322,7 @@ mod tests {
     #[test]
     fn the_harness_layer_only_promises_the_mail_a_worker_is_actually_told_to_send() {
         assert!(
-            HARNESS_PROMPT.starts_with("zirv meta-harness (v15)"),
+            HARNESS_PROMPT.starts_with("zirv meta-harness (v16)"),
             "a reworded layer carries its own version: {}",
             HARNESS_PROMPT.lines().next().unwrap_or_default()
         );
@@ -4315,7 +4382,7 @@ mod tests {
     #[test]
     fn the_harness_layer_teaches_the_fan_out_send_mode_too() {
         assert!(
-            HARNESS_PROMPT.starts_with("zirv meta-harness (v15)"),
+            HARNESS_PROMPT.starts_with("zirv meta-harness (v16)"),
             "a reworded layer carries its own version: {}",
             HARNESS_PROMPT.lines().next().unwrap_or_default()
         );
@@ -4353,7 +4420,7 @@ mod tests {
     #[test]
     fn the_harness_layer_names_workdir_for_cross_repo_delegation() {
         assert!(
-            HARNESS_PROMPT.starts_with("zirv meta-harness (v15)"),
+            HARNESS_PROMPT.starts_with("zirv meta-harness (v16)"),
             "a reworded layer carries its own version: {}",
             HARNESS_PROMPT.lines().next().unwrap_or_default()
         );
@@ -4408,7 +4475,7 @@ mod tests {
             "must say which one wins"
         );
         assert!(
-            HARNESS_PROMPT.contains("(v15)"),
+            HARNESS_PROMPT.contains("(v16)"),
             "a changed instruction layer must bump its own version token"
         );
     }
@@ -6789,11 +6856,14 @@ mod tests {
     // redesign), and the codex worker fallback that mirrors the mail fallback.
     // v4 (round 2, same day): read-before-write, debugging discipline,
     // stuck-twice, finish-the-whole-task and no-flattery bullets.
+    // v5 (issues #328/#334): the sizing bullet no longer says who implements,
+    // only how much ceremony a size needs -- that question moved to the role
+    // layer above it.
 
     #[test]
-    fn the_default_prompt_carries_the_v4_marker_and_new_wording() {
+    fn the_default_prompt_carries_the_v5_marker_and_new_wording() {
         assert!(
-            DEFAULT_PROMPT.contains("zirv engineering standard (v4)"),
+            DEFAULT_PROMPT.contains("zirv engineering standard (v5)"),
             "got {DEFAULT_PROMPT}"
         );
         assert!(
@@ -6807,7 +6877,7 @@ mod tests {
     }
 
     #[test]
-    fn a_composed_prompt_carries_the_v4_marker_and_new_wording() {
+    fn a_composed_prompt_carries_the_v5_marker_and_new_wording() {
         let (_tmp, home, repo) = tree();
         let composed = compose(
             Some(&home),
@@ -6821,7 +6891,7 @@ mod tests {
         .expect("composed");
 
         assert!(
-            composed.text.contains("zirv engineering standard (v4)"),
+            composed.text.contains("zirv engineering standard (v5)"),
             "got {}",
             composed.text
         );

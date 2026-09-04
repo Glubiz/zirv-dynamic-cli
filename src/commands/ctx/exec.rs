@@ -2002,6 +2002,10 @@ fn run_with_clock_inner<W: Write>(
                     tool_calls: worker_budget.tool_calls,
                 },
                 now: now_fn(),
+                // A running worker's own vendor-blocked reroute is not an
+                // orchestrator-seat delegation (issue #328's exclusion is
+                // scoped to `agent::run_with` specifically).
+                exclude: None,
             };
             let route = (adapter_builds_launch && prompt.is_some())
                 .then(|| {

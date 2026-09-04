@@ -137,6 +137,15 @@ pub struct RouteRequest<'a> {
     pub source_model_explicit: bool,
     pub bounds: TaskBounds,
     pub now: u64,
+    /// Issue #328 fix: a harness [`best_alternate`]/[`earliest_reset_choice`]
+    /// must never select, compared case-insensitively -- an orchestrator
+    /// seat's own harness, so a low-headroom `zirv agent <other-harness>`
+    /// cannot be silently rerouted back onto the very same seat
+    /// `same_harness_refusal` (agent.rs) already refuses through the front
+    /// door. `None` for every caller with no such concept -- a running
+    /// worker's own vendor-blocked reroute (`route_blocked_session`) is not
+    /// an orchestrator-seat delegation and excludes nothing extra.
+    pub exclude: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -206,6 +215,9 @@ fn best_alternate(
     for (order_index, name) in cfg.fallback.order.iter().enumerate() {
         if name == request.requested
             || excluded.iter().any(|seen| seen == name)
+            || request
+                .exclude
+                .is_some_and(|excl| excl.eq_ignore_ascii_case(name))
             || !cfg.agents.is_enabled(name)
         {
             continue;
@@ -335,6 +347,9 @@ pub fn earliest_reset_choice(
     for (order_index, name) in cfg.fallback.order.iter().enumerate() {
         if name == request.requested
             || excluded.iter().any(|seen| seen == name)
+            || request
+                .exclude
+                .is_some_and(|excl| excl.eq_ignore_ascii_case(name))
             || !cfg.agents.is_enabled(name)
             || !candidate_allowed_by_capacity(cfg, name, request.bounds)
         {
@@ -522,6 +537,7 @@ mod tests {
                     tool_calls: None,
                 },
                 now,
+                exclude: None,
             },
             &[],
         )
@@ -557,6 +573,7 @@ mod tests {
                     tool_calls: None,
                 },
                 now,
+                exclude: None,
             },
             false,
         )
@@ -599,6 +616,7 @@ mod tests {
                     tool_calls: None,
                 },
                 now,
+                exclude: None,
             },
             false,
         );
@@ -645,6 +663,7 @@ mod tests {
                     tool_calls: None,
                 },
                 now,
+                exclude: None,
             },
             false,
         )
@@ -678,6 +697,7 @@ mod tests {
                     tool_calls: None,
                 },
                 now,
+                exclude: None,
             },
             &[],
         )
@@ -688,6 +708,158 @@ mod tests {
             "an exact tie should keep the requested harness"
         );
         assert_eq!(choice.reset_at, now + 3_600);
+    }
+
+    // -- RouteRequest::exclude (issue #328 back-door fix) -------------------
+
+    /// Mirrors `predictive_routing_uses_the_task_budget_when_the_source_
+    /// cannot_fit_it`'s exact fixture, but excludes the only viable
+    /// alternate (`codex`) -- the shape an orchestrator seat's own
+    /// same-harness exclusion produces when THAT seat's own harness is the
+    /// one and only enabled alternate. No reroute must happen: rerouting
+    /// back onto the excluded harness would be the exact same-harness
+    /// zirv-supervised worker `same_harness_refusal` (agent.rs) already
+    /// refuses through the front door.
+    #[test]
+    fn an_excluded_harness_is_never_selected_even_as_the_only_viable_alternate() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let mut cfg = test_cfg_with_ready_adapters();
+        cfg.pace.five_hour_budget_tokens = 100_000;
+        cfg.fallback.predictive_headroom_pct = 20.0;
+        let now = 1_700_000_000;
+        store_usage(&state, "anthropic", 75.0, now + 3_600, now);
+        store_usage(&state, "openai", 20.0, now + 3_600, now);
+
+        let route = route_new_delegation(
+            &state,
+            &cfg,
+            RouteRequest {
+                requested: "claude",
+                source_model: Some("sonnet"),
+                source_model_explicit: false,
+                bounds: TaskBounds {
+                    tokens: Some(30_000),
+                    tool_calls: None,
+                },
+                now,
+                exclude: Some("codex"),
+            },
+            false,
+        );
+
+        assert!(
+            route.is_none(),
+            "the only viable alternate is excluded, so no reroute should happen: {route:?}"
+        );
+    }
+
+    /// `exclude` compares case-insensitively, the same as `same_harness_
+    /// refusal`'s own own-harness comparison in agent.rs.
+    #[test]
+    fn exclude_matches_the_harness_name_case_insensitively() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let mut cfg = test_cfg_with_ready_adapters();
+        cfg.pace.five_hour_budget_tokens = 100_000;
+        cfg.fallback.predictive_headroom_pct = 20.0;
+        let now = 1_700_000_000;
+        store_usage(&state, "anthropic", 75.0, now + 3_600, now);
+        store_usage(&state, "openai", 20.0, now + 3_600, now);
+
+        let route = route_new_delegation(
+            &state,
+            &cfg,
+            RouteRequest {
+                requested: "claude",
+                source_model: Some("sonnet"),
+                source_model_explicit: false,
+                bounds: TaskBounds {
+                    tokens: Some(30_000),
+                    tool_calls: None,
+                },
+                now,
+                exclude: Some("Codex"),
+            },
+            false,
+        );
+
+        assert!(
+            route.is_none(),
+            "exclude must match case-insensitively: {route:?}"
+        );
+    }
+
+    /// The `earliest_reset_choice` fallback path (all seats hard-blocked)
+    /// must honor the exclusion too: `codex` resets earliest, but with it
+    /// excluded the requested harness (`claude`) must be kept even though
+    /// it resets later.
+    #[test]
+    fn earliest_reset_choice_never_selects_an_excluded_harness() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = test_cfg_with_ready_adapters();
+        let now = 1_700_000_000;
+        store_usage(&state, "anthropic", 100.0, now + 3_600, now);
+        store_usage(&state, "openai", 100.0, now + 600, now);
+
+        let choice = earliest_reset_choice(
+            &state,
+            &cfg,
+            RouteRequest {
+                requested: "claude",
+                source_model: Some("sonnet"),
+                source_model_explicit: false,
+                bounds: TaskBounds {
+                    tokens: None,
+                    tool_calls: None,
+                },
+                now,
+                exclude: Some("codex"),
+            },
+            &[],
+        )
+        .expect("the requested harness is itself still hard-blocked");
+
+        assert_eq!(
+            choice.selected, "claude",
+            "codex resets earlier but is excluded, so the requested harness must be kept"
+        );
+    }
+
+    /// Without an exclusion, routing behaves exactly as before -- the same
+    /// fixture as `predictive_routing_uses_the_task_budget_when_the_source_
+    /// cannot_fit_it` reroutes to `codex` when `exclude` is `None`.
+    #[test]
+    fn no_exclusion_reroutes_exactly_as_before() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let mut cfg = test_cfg_with_ready_adapters();
+        cfg.pace.five_hour_budget_tokens = 100_000;
+        cfg.fallback.predictive_headroom_pct = 20.0;
+        let now = 1_700_000_000;
+        store_usage(&state, "anthropic", 75.0, now + 3_600, now);
+        store_usage(&state, "openai", 20.0, now + 3_600, now);
+
+        let route = route_new_delegation(
+            &state,
+            &cfg,
+            RouteRequest {
+                requested: "claude",
+                source_model: Some("sonnet"),
+                source_model_explicit: false,
+                bounds: TaskBounds {
+                    tokens: Some(30_000),
+                    tool_calls: None,
+                },
+                now,
+                exclude: None,
+            },
+            false,
+        )
+        .expect("no exclusion is applied, so the usual reroute still happens");
+
+        assert_eq!(route.selected, "codex");
     }
 
     #[test]

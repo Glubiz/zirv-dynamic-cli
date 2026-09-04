@@ -3686,6 +3686,10 @@ fn fulfill_spawn_request(
                 tool_calls: None,
             },
             now,
+            // The dashboard's own Spawn overlay authority path, not an
+            // `agent::run_with` orchestrator-seat delegation -- issue
+            // #328's same-harness exclusion is scoped to that call site.
+            exclude: None,
         },
         req.force,
     );
@@ -6007,6 +6011,9 @@ pub fn run_dashboard(
         &first.argv,
         cfg.chat.model.as_deref(),
     ));
+    // Issues #328/#334: which seat role this pane runs as, for the same
+    // guard -- unlike `seat_model_env`, unconditional for every role.
+    turn_env.extend(super::adapters::seat_role_env(first.role));
 
     // Task 10: the spawn-request channel. `dashboard_short` is derivable
     // before any pane has actually spawned -- `Record::new`'s own `short`
@@ -11114,7 +11121,7 @@ mod tests {
              DEFAULT_PROMPT: {prompt}"
         );
         assert_eq!(
-            prompt.matches("zirv engineering standard (v4)").count(),
+            prompt.matches("zirv engineering standard (v5)").count(),
             1,
             "DEFAULT_PROMPT's header must appear exactly once, carried by the composed text \
              rather than a second time from task_prompt_with_conventions_fallback: {prompt}"
@@ -11211,7 +11218,7 @@ mod tests {
         // report-back instruction, which only makes sense as mail.
         assert!(prompt.starts_with("do the work"), "got {prompt}");
         assert_eq!(
-            prompt.contains("zirv engineering standard (v4)"),
+            prompt.contains("zirv engineering standard (v5)"),
             fallback_is_safe,
             "the composed conventions ride the fallback exactly when it is safe: {prompt}"
         );

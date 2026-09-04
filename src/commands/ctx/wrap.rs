@@ -2124,6 +2124,9 @@ pub fn run_with(
         _ => None,
     };
     turn_env.extend(adapters::seat_model_env(role, rest, seat_cfg_model));
+    // Issues #328/#334: which seat role this session runs as, for the same
+    // guard -- unlike `seat_model_env`, unconditional for every role.
+    turn_env.extend(adapters::seat_role_env(role));
     // Scrubbed before any of it is applied -- see `apply_session_env`. When
     // the bind above failed, `turn_env` carries only `AGENT_ENV`, and the
     // scrub is the only thing standing between this child and the outer
