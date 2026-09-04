@@ -766,9 +766,10 @@ impl Default for PriceConfig {
 /// `token_ceiling` right above: those gate the rot engine's own
 /// restart/compact behavior, so a checkout that could widen them escapes
 /// real supervision. This section only tunes how eagerly a PURE, ignorable
-/// suggestion fires -- the advisory never forces anything, and the verdict
-/// ladder that actually forces a restart/compact stays governed by the
-/// already-forbidden `score.*` keys no matter what this section says.
+/// suggestion fires. It is still narrow-only, the same shape as
+/// `[verify_on_stop]`/`[diagnostics]`: a repo layer may only RAISE either
+/// threshold (quieten the advisory), never lower one so the Stop hook nags
+/// every turn -- see `narrow_compact_advisory_min_reclaim`.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CompactAdvisoryConfig {
@@ -2248,6 +2249,20 @@ fn narrow_diagnostics_timeout_secs(home: u64, repo: Option<u64>) -> u64 {
     home.min(repo.unwrap_or(u64::MAX))
 }
 
+/// Issue #312: the repo-narrowing fold for `compact_advisory.min_reclaim_tokens`
+/// -- HIGHER is stricter here (the advisory fires less eagerly), the opposite
+/// polarity from `narrow_max_nudges`: a repo checkout may quieten the Stop
+/// hook's compact suggestion, never make it nag every turn.
+fn narrow_compact_advisory_min_reclaim(home: u64, repo: Option<u64>) -> u64 {
+    home.max(repo.unwrap_or(0))
+}
+
+/// Issue #312: the same fold for `compact_advisory.window_fraction` -- a
+/// higher fraction means the advisory waits for a fuller window.
+fn narrow_compact_advisory_window_fraction(home: f64, repo: Option<f64>) -> f64 {
+    home.max(repo.unwrap_or(0.0))
+}
+
 /// Issue #262: the repo-narrowing fold for `worker.max_depth` -- lower is
 /// stricter (fewer hops of delegation reach), the `u8` mirror of
 /// `narrow_max_nudges`.
@@ -3001,6 +3016,18 @@ impl CtxConfig {
             integer_at(take_nested(&mut merged, "diagnostics", "max_diagnostics"));
         let home_diagnostics_timeout =
             integer_at(take_nested(&mut merged, "diagnostics", "timeout_secs"));
+        // Issue #312: both `compact_advisory` keys are narrow-only in the
+        // "less eager" direction -- see `narrow_compact_advisory_min_reclaim`.
+        let home_compact_advisory_min_reclaim = integer_at(take_nested(
+            &mut merged,
+            "compact_advisory",
+            "min_reclaim_tokens",
+        ));
+        let home_compact_advisory_window_fraction = float_at(take_nested(
+            &mut merged,
+            "compact_advisory",
+            "window_fraction",
+        ));
         // Issue #262: `worker.max_depth`/`worker.deny_network` get the
         // identical lift-before-merge treatment -- see `narrow_worker_
         // max_depth`/`narrow_worker_deny_network` below for each field's
@@ -3103,6 +3130,16 @@ impl CtxConfig {
         ));
         let repo_diagnostics_timeout =
             integer_at(take_nested(&mut repo_layer, "diagnostics", "timeout_secs"));
+        let repo_compact_advisory_min_reclaim = integer_at(take_nested(
+            &mut repo_layer,
+            "compact_advisory",
+            "min_reclaim_tokens",
+        ));
+        let repo_compact_advisory_window_fraction = float_at(take_nested(
+            &mut repo_layer,
+            "compact_advisory",
+            "window_fraction",
+        ));
         let repo_worker_max_depth = integer_at(take_nested(&mut repo_layer, "worker", "max_depth"));
         let repo_worker_deny_network =
             bool_at(take_nested(&mut repo_layer, "worker", "deny_network"));
@@ -3258,6 +3295,31 @@ impl CtxConfig {
                 ))
                 .unwrap_or(i64::MAX),
             ),
+        );
+
+        let default_compact_advisory = CompactAdvisoryConfig::default();
+        let home_compact_advisory_min_reclaim_tokens = home_compact_advisory_min_reclaim
+            .and_then(|v| u64::try_from(v).ok())
+            .unwrap_or(default_compact_advisory.min_reclaim_tokens);
+        insert_path(
+            &mut merged,
+            &["compact_advisory", "min_reclaim_tokens"],
+            toml::Value::Integer(
+                i64::try_from(narrow_compact_advisory_min_reclaim(
+                    home_compact_advisory_min_reclaim_tokens,
+                    repo_compact_advisory_min_reclaim.and_then(|v| u64::try_from(v).ok()),
+                ))
+                .unwrap_or(i64::MAX),
+            ),
+        );
+        insert_path(
+            &mut merged,
+            &["compact_advisory", "window_fraction"],
+            toml::Value::Float(narrow_compact_advisory_window_fraction(
+                home_compact_advisory_window_fraction
+                    .unwrap_or(default_compact_advisory.window_fraction),
+                repo_compact_advisory_window_fraction,
+            )),
         );
 
         let default_worker = WorkerConfig::default();
@@ -3814,16 +3876,21 @@ mod tests {
         assert_eq!(cfg.score.marker, "[env]");
     }
 
-    /// Issue #312: `compact_advisory`'s two keys are ordinary, repo-settable
-    /// config -- unlike `score.token_floor`/`token_ceiling` (see
-    /// `CompactAdvisoryConfig`'s own doc comment for why), a plain repo
-    /// `ctx.toml` value takes effect with no narrowing gate, and an env var
-    /// still wins over the repo layer, the same precedence order every other
-    /// ordinary key already follows.
+    /// Issue #312: `compact_advisory`'s two keys are repo-settable but
+    /// narrow-only in the "less eager" direction (see `CompactAdvisoryConfig`'s
+    /// own doc comment): a repo layer may raise either threshold, a repo value
+    /// below the operator's is ignored, and an env var still wins over the
+    /// home layer as the base the repo narrows from.
     #[test]
-    fn compact_advisory_defaults_and_layers_like_an_ordinary_repo_settable_key() {
+    fn compact_advisory_repo_layer_may_only_quieten_the_advisory() {
         assert_eq!(CompactAdvisoryConfig::default().min_reclaim_tokens, 4096);
         assert_eq!(CompactAdvisoryConfig::default().window_fraction, 0.6);
+        assert_eq!(narrow_compact_advisory_min_reclaim(4096, Some(2048)), 4096);
+        assert_eq!(narrow_compact_advisory_min_reclaim(4096, Some(8192)), 8192);
+        assert_eq!(narrow_compact_advisory_min_reclaim(4096, None), 4096);
+        assert_eq!(narrow_compact_advisory_window_fraction(0.6, Some(0.5)), 0.6);
+        assert_eq!(narrow_compact_advisory_window_fraction(0.6, Some(0.9)), 0.9);
+        assert_eq!(narrow_compact_advisory_window_fraction(0.6, None), 0.6);
 
         let repo = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
@@ -3836,18 +3903,27 @@ mod tests {
         let empty = env_map(&[]);
         let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
         assert_eq!(
-            cfg.compact_advisory.min_reclaim_tokens, 2048,
-            "a plain repo checkout may set this -- it only tunes an ignorable suggestion"
+            cfg.compact_advisory.min_reclaim_tokens, 4096,
+            "a repo checkout may not make the advisory fire more eagerly"
         );
-        assert_eq!(cfg.compact_advisory.window_fraction, 0.5);
+        assert_eq!(cfg.compact_advisory.window_fraction, 0.6);
+
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[compact_advisory]\nmin_reclaim_tokens = 16384\nwindow_fraction = 0.9\n",
+        )
+        .expect("write");
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert_eq!(cfg.compact_advisory.min_reclaim_tokens, 16384);
+        assert_eq!(cfg.compact_advisory.window_fraction, 0.9);
 
         let env = env_map(&[
-            ("ZIRV_CTX_COMPACT_ADVISORY_MIN_RECLAIM_TOKENS", "8192"),
-            ("ZIRV_CTX_COMPACT_ADVISORY_WINDOW_FRACTION", "0.75"),
+            ("ZIRV_CTX_COMPACT_ADVISORY_MIN_RECLAIM_TOKENS", "32768"),
+            ("ZIRV_CTX_COMPACT_ADVISORY_WINDOW_FRACTION", "0.95"),
         ]);
         let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
-        assert_eq!(cfg.compact_advisory.min_reclaim_tokens, 8192);
-        assert_eq!(cfg.compact_advisory.window_fraction, 0.75);
+        assert_eq!(cfg.compact_advisory.min_reclaim_tokens, 32768);
+        assert_eq!(cfg.compact_advisory.window_fraction, 0.95);
     }
 
     /// Companion to the test above, for the token gate's own five keys
