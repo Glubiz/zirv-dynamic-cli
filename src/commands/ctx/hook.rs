@@ -1341,9 +1341,11 @@ const GENERIC_SUBAGENT_TYPES: [&str; 5] = ["fork", "claude", "general-purpose", 
 /// guarding, so nothing here may be mandatory.
 ///
 /// `cwd`/`session_id` (issue #334) feed the orchestrator-write guard:
-/// `cwd` resolves a relative `file_path`/`notebook_path` and anchors
-/// `repo_root_for`, `session_id` is the fallback identity for a logged
-/// block when this process has no zirv session env of its own.
+/// `cwd` resolves a relative `file_path`/`notebook_path` only -- the
+/// repository root the guard confines itself to is derived from the
+/// resolved TARGET (`repo_root_for_target`), never from `cwd` -- and
+/// `session_id` is the fallback identity for a logged block when this
+/// process has no zirv session env of its own.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct PreToolPayload {
@@ -1473,9 +1475,9 @@ fn normalize_lexically(path: &Path) -> PathBuf {
 /// The absolute, lexically-normalized target `payload` names, or `None` when
 /// the tool is not a [`FILE_MODIFICATION_TOOLS`] entry or the payload names
 /// no target at all (schema drift, not a real write). A relative target is
-/// resolved against `payload.cwd`, falling back to `repo_root` when `cwd` is
-/// empty.
-fn normalized_write_target(payload: &PreToolPayload, repo_root: &Path) -> Option<PathBuf> {
+/// resolved against `cwd` -- the caller's own already-resolved value (see
+/// `run_pretool`: `payload.cwd`, falling back to the process cwd).
+fn normalized_write_target(payload: &PreToolPayload, cwd: &Path) -> Option<PathBuf> {
     if !FILE_MODIFICATION_TOOLS.contains(&payload.tool_name.as_str()) {
         return None;
     }
@@ -1489,10 +1491,8 @@ fn normalized_write_target(payload: &PreToolPayload, repo_root: &Path) -> Option
     let target = Path::new(target);
     let resolved = if target.is_absolute() {
         target.to_path_buf()
-    } else if !payload.cwd.is_empty() {
-        Path::new(&payload.cwd).join(target)
     } else {
-        repo_root.join(target)
+        cwd.join(target)
     };
     Some(normalize_lexically(&resolved))
 }
@@ -1510,43 +1510,56 @@ fn orchestrator_write_deny_reason(target: &Path) -> String {
     )
 }
 
-/// The whole orchestrator-write decision, pure: `Some(reason)` denies,
+/// The nearest git repository the write TARGET itself sits in, or `None`
+/// when it sits in no git repository at all. Walks from the target's own
+/// PARENT (never the target itself -- a `Write` target may not exist yet)
+/// up through its ancestors for the first one carrying a `.git` entry -- a
+/// directory for an ordinary checkout, a FILE for a linked worktree
+/// (`gitdir: ...`) -- so both shapes resolve to the same repository root.
+/// Pure apart from `Path::exists`.
+fn repo_root_for_target(target: &Path) -> Option<PathBuf> {
+    target
+        .parent()?
+        .ancestors()
+        .find(|ancestor| ancestor.join(".git").exists())
+        .map(Path::to_path_buf)
+}
+
+/// The whole orchestrator-write decision, pure apart from `Path::exists`
+/// (`repo_root_for_target`'s own ancestor walk): `Some(reason)` denies,
 /// `None` allows. `role` is `SEAT_ROLE_ENV`'s value.
 ///
-/// Every gate below is a reason to allow: a non-orchestrator role, a tool
-/// that is not a [`FILE_MODIFICATION_TOOLS`] entry, an empty target (schema
-/// drift), a target outside `repo_root` entirely, or one that lands under
-/// `<repo_root>/.zirv/work` or `<repo_root>/.zirv/memory` -- the two roots a
-/// worker's own dispatch/handoff/memory writes still need from this seat.
+/// Confinement is anchored on the resolved TARGET, never on `cwd` or the
+/// launch repo: an orchestrator seat has no business editing source in ANY
+/// git repository, including a sibling checkout or a linked worktree of a
+/// repository entirely unrelated to the one it was launched in (review
+/// finding on issue #334) -- so `repo_root_for_target` finds the repo the
+/// target itself sits in, and the deny is narrowed only against THAT
+/// repo's own `<target_repo>/.zirv/work`/`<target_repo>/.zirv/memory` --
+/// the two roots a worker's own dispatch/handoff/memory writes still need
+/// from this seat. A target that sits in no git repository at all is
+/// outside this guard's scope and is allowed. Every other gate below is
+/// also a reason to allow: a non-orchestrator role, a tool that is not a
+/// [`FILE_MODIFICATION_TOOLS`] entry, or an empty target (schema drift, not
+/// a real write).
 pub fn orchestrator_write_decision(
     role: Option<&str>,
     payload: &PreToolPayload,
-    repo_root: &Path,
+    cwd: &Path,
 ) -> Option<String> {
     if role != Some("orchestrator") {
         return None;
     }
-    let target = normalized_write_target(payload, repo_root)?;
-    if !target.starts_with(repo_root) {
-        return None;
-    }
-    let allowed_roots = [repo_root.join(".zirv/work"), repo_root.join(".zirv/memory")];
+    let target = normalized_write_target(payload, cwd)?;
+    let target_repo = repo_root_for_target(&target)?;
+    let allowed_roots = [
+        target_repo.join(".zirv/work"),
+        target_repo.join(".zirv/memory"),
+    ];
     if allowed_roots.iter().any(|root| target.starts_with(root)) {
         return None;
     }
     Some(orchestrator_write_deny_reason(&target))
-}
-
-/// Walks from `cwd` up through its ancestors and returns the first directory
-/// carrying a `.git` entry -- a directory for an ordinary checkout, a FILE
-/// for a linked worktree (`gitdir: ...`) -- so both shapes resolve to the
-/// same repository root. Falls back to `cwd` itself when no ancestor carries
-/// one. Pure apart from `Path::exists`.
-fn repo_root_for(cwd: &Path) -> PathBuf {
-    cwd.ancestors()
-        .find(|ancestor| ancestor.join(".git").exists())
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| cwd.to_path_buf())
 }
 
 /// The documented PreToolUse deny envelope. Printed on stdout with exit 0:
@@ -1601,9 +1614,8 @@ pub fn run_pretool<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxR
         };
         cwd
     };
-    let repo_root = repo_root_for(&cwd);
     let role = env(adapters::SEAT_ROLE_ENV);
-    let Some(reason) = orchestrator_write_decision(role.as_deref(), &payload, &repo_root) else {
+    let Some(reason) = orchestrator_write_decision(role.as_deref(), &payload, &cwd) else {
         return Ok(0);
     };
     let _ = writeln!(w, "{}", pretool_output(&reason));
@@ -1611,7 +1623,7 @@ pub fn run_pretool<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxR
     // Best-effort: a block record that fails to write costs an operator one
     // audit-log row, never a hook failure -- the deny above already stands.
     if let Ok(state) = StateDir::resolve(env) {
-        let target = normalized_write_target(&payload, &repo_root).unwrap_or_default();
+        let target = normalized_write_target(&payload, &cwd).unwrap_or_default();
         let session =
             super::mail::session_identity(env).unwrap_or_else(|| payload.session_id.clone());
         let _ = log::append_orchestrator_block(
@@ -4302,8 +4314,8 @@ mod tests {
     }
 
     /// A repo root with a `.git` directory -- the ordinary checkout shape
-    /// `repo_root_for` and `orchestrator_write_decision` both need to be
-    /// exercised against something real. Deliberately not canonicalized:
+    /// `repo_root_for_target` and `orchestrator_write_decision` both need to
+    /// be exercised against something real. Deliberately not canonicalized:
     /// macOS's `/var/folders` vs `/private/var` split means `cwd` and every
     /// `file_path` built from `repo.path()` must stay spelled the same way
     /// for `Path::starts_with` to see them as confined.
@@ -4448,18 +4460,100 @@ mod tests {
         }
     }
 
+    /// Review finding on issue #334: confinement is anchored on the TARGET,
+    /// not on `cwd`/the launch repo -- editing a SIBLING checkout or a
+    /// linked worktree of an entirely different repository must still be
+    /// denied, even though it sits nowhere under `cwd`.
     #[test]
-    fn repo_root_for_finds_a_git_directory_ancestor() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let repo = tmp.path().join("repo");
-        std::fs::create_dir_all(repo.join(".git")).expect(".git dir");
-        let nested = repo.join("src").join("deep");
-        std::fs::create_dir_all(&nested).expect("nested dirs");
-        assert_eq!(repo_root_for(&nested), repo);
+    fn orchestrator_write_decision_denies_a_target_inside_a_different_repo_than_cwd() {
+        let launch_repo = orchestrator_repo();
+        let sibling = tempfile::tempdir().expect("sibling tempdir");
+        // A linked worktree of some other repository: `.git` is a FILE.
+        std::fs::write(
+            sibling.path().join(".git"),
+            "gitdir: /elsewhere/.git/worktrees/wt\n",
+        )
+        .expect(".git file");
+        let target = sibling.path().join("src").join("foo.rs");
+
+        let payload = PreToolPayload::parse(&orchestrator_pretool_stdin(
+            &launch_repo.path().display().to_string(),
+            "claude-session-id",
+            "Edit",
+            serde_json::json!({"file_path": target.display().to_string()}),
+        ))
+        .expect("payload parses");
+
+        let reason =
+            orchestrator_write_decision(Some("orchestrator"), &payload, launch_repo.path())
+                .expect("a sibling checkout's own source must be denied too");
+        assert!(
+            reason.contains("orchestrator seat: dispatch a worker"),
+            "{reason}"
+        );
+    }
+
+    /// A target that sits in no git repository at all is outside this
+    /// guard's scope: there is no "repository file" here to protect. Uses a
+    /// fresh tempdir rather than the raw OS temp root, which on some
+    /// machines is itself inside a git checkout.
+    #[test]
+    fn orchestrator_write_decision_allows_a_target_with_no_git_ancestor_at_all() {
+        let launch_repo = orchestrator_repo();
+        let no_git = tempfile::tempdir().expect("tempdir with no .git anywhere above it");
+        let target = no_git.path().join("scratch.txt");
+
+        let payload = PreToolPayload::parse(&orchestrator_pretool_stdin(
+            &launch_repo.path().display().to_string(),
+            "claude-session-id",
+            "Edit",
+            serde_json::json!({"file_path": target.display().to_string()}),
+        ))
+        .expect("payload parses");
+
+        assert_eq!(
+            orchestrator_write_decision(Some("orchestrator"), &payload, launch_repo.path()),
+            None,
+            "a target outside any git repository is outside this guard's scope"
+        );
+    }
+
+    /// `.zirv/work` inside a SIBLING repo -- not the launch repo -- must
+    /// stay allowed too: the exemption is scoped to the target's own
+    /// repository, never hardcoded to whichever repo the seat launched in.
+    #[test]
+    fn orchestrator_write_decision_allows_zirv_work_inside_a_sibling_repo() {
+        let launch_repo = orchestrator_repo();
+        let sibling = orchestrator_repo();
+        let target = sibling.path().join(".zirv").join("work").join("x.md");
+
+        let payload = PreToolPayload::parse(&orchestrator_pretool_stdin(
+            &launch_repo.path().display().to_string(),
+            "claude-session-id",
+            "Edit",
+            serde_json::json!({"file_path": target.display().to_string()}),
+        ))
+        .expect("payload parses");
+
+        assert_eq!(
+            orchestrator_write_decision(Some("orchestrator"), &payload, launch_repo.path()),
+            None,
+            "a sibling repo's own .zirv/work stays allowed"
+        );
     }
 
     #[test]
-    fn repo_root_for_finds_a_git_file_ancestor_for_a_linked_worktree() {
+    fn repo_root_for_target_finds_a_git_directory_ancestor() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).expect(".git dir");
+        // The target itself need not exist -- a `Write` target may not yet.
+        let target = repo.join("src").join("deep").join("new_file.rs");
+        assert_eq!(repo_root_for_target(&target), Some(repo));
+    }
+
+    #[test]
+    fn repo_root_for_target_finds_a_git_file_ancestor_for_a_linked_worktree() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let worktree = tmp.path().join("worktree");
         std::fs::create_dir_all(&worktree).expect("worktree dir");
@@ -4468,17 +4562,16 @@ mod tests {
             "gitdir: /elsewhere/.git/worktrees/wt\n",
         )
         .expect(".git file");
-        let nested = worktree.join("src");
-        std::fs::create_dir_all(&nested).expect("nested dir");
-        assert_eq!(repo_root_for(&nested), worktree);
+        let target = worktree.join("src").join("new_file.rs");
+        assert_eq!(repo_root_for_target(&target), Some(worktree));
     }
 
     #[test]
-    fn repo_root_for_falls_back_to_cwd_with_no_git_ancestor_at_all() {
+    fn repo_root_for_target_is_none_with_no_git_ancestor_at_all() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let plain = tmp.path().join("no-git-here");
-        std::fs::create_dir_all(&plain).expect("mkdir");
-        assert_eq!(repo_root_for(&plain), plain);
+        let target = plain.join("new_file.rs");
+        assert_eq!(repo_root_for_target(&target), None);
     }
 
     #[test]
