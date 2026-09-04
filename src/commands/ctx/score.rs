@@ -324,7 +324,13 @@ pub fn window_breakdown_for_transcript(
     let adapter = adapters::select(agent.or(cfg.agent.as_deref()), &[], &cfg)?;
     let jsonl = std::fs::read_to_string(transcript)
         .map_err(|e| format!("{}: {e}", transcript.display()))?;
-    Ok(window_breakdown_core(adapter.as_ref(), &jsonl, repo, &cfg, &state))
+    Ok(window_breakdown_core(
+        adapter.as_ref(),
+        &jsonl,
+        repo,
+        &cfg,
+        &state,
+    ))
 }
 
 /// Shared by [`breakdown_for_session`] and [`window_breakdown_for_transcript`]
