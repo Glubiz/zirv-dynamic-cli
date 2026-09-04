@@ -773,10 +773,8 @@ impl Default for WorkflowConfig {
 pub struct MemoryConfig {
     /// MASTER switch for the whole memory subsystem, kept under its
     /// original name for backward compatibility (it predates
-    /// `memory::MemoryScope`). `false` disables both the private and the
-    /// shared scope, however `shared_enabled` below is set: an operator who
-    /// disabled memory before the shared scope existed must not silently
-    /// start receiving repo-controlled prompt content on upgrade. See
+    /// `memory::MemoryScope`). `false` disables the private, global, and
+    /// shared scopes, however `shared_enabled` below is set. See
     /// `memory::MemoryScope::enabled`.
     pub enabled: bool,
     /// Whether facts may be harvested automatically from distilled handoffs.
@@ -790,7 +788,7 @@ pub struct MemoryConfig {
     /// truncates rather than fails an oversize entry.
     pub max_entry_bytes: usize,
     /// Superseded by `core_max_bytes` (issue #34): every prompt-injection
-    /// call site now caps the merged private+shared core layer with that key
+    /// call site now caps the merged private+global+shared core layer with that key
     /// instead. Kept, parsed, and still `REPO_FORBIDDEN`, purely so an
     /// existing `ctx.toml`/env setting this key does not hard-error on load
     /// (this struct is `deny_unknown_fields`) -- the same "kept under its
@@ -804,8 +802,8 @@ pub struct MemoryConfig {
     /// `enabled = false` always wins regardless of this value. On by
     /// default like every other memory switch.
     pub shared_enabled: bool,
-    /// Hard byte budget for the **core** memory layer (issue #34): private
-    /// and shared entries merged with private-first precedence (see
+    /// Hard byte budget for the **core** memory layer: private, global, and
+    /// shared entries merged with private-first precedence (see
     /// `prompt::select_memory_within_cap`), always eligible for injection
     /// into every zirv-started session regardless of query or context.
     /// Independent of `max_entries`/`max_entry_bytes` (which cap what the
