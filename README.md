@@ -1211,7 +1211,8 @@ enough to change what zirv executes. `<repo>/.zirv/ctx.toml` may not set
 `optimize.model`, `sandbox.enabled`, `prompt.enabled`, `prompt.repo_layer`,
 `prompt.max_repo_bytes`, `prompt.harnesses`, `prompt.codex_orchestrator`, `mail.enabled`,
 `mail.max_delivered_bytes`, `chrome.events`, any `memory.*` key, any
-`dash.*` key, any `pace.*` key, any `price.*` key, `review`, `worker`,
+`dash.*` key, any `pace.*` key, any `price.*` key, `review`, `worker.claude`,
+`worker.codex`, `worker.default_depth`, `worker.default_read_only`,
 `handover`, or any of the five keys that feed the token gate (`score.token_floor`,
 `score.token_ceiling`, `score.token_floor_ratio`, `score.token_ceiling_ratio`,
 `score.model_context_tokens`); doing so is an error
@@ -1261,6 +1262,11 @@ checkout:
 | `supervise.max_heavy_workers` | `ZIRV_CTX_SUPERVISE_MAX_HEAVY_WORKERS` (deprecated alias for `max_heavy_operations`) |
 | `supervise.max_heavy_operations` | `ZIRV_CTX_SUPERVISE_MAX_HEAVY_OPERATIONS` |
 | `supervise.max_writers` | `ZIRV_CTX_SUPERVISE_MAX_WRITERS` |
+| `supervise.idle_no_tool_secs` | `ZIRV_CTX_SUPERVISE_IDLE_NO_TOOL_SECS` |
+| `supervise.in_tool_secs` | `ZIRV_CTX_SUPERVISE_IN_TOOL_SECS` |
+| `supervise.stall_grace_secs` | `ZIRV_CTX_SUPERVISE_STALL_GRACE_SECS` |
+| `supervise.chain_max_restarts` | `ZIRV_CTX_SUPERVISE_CHAIN_MAX_RESTARTS` |
+| `supervise.chain_max_gap_secs` | `ZIRV_CTX_SUPERVISE_CHAIN_MAX_GAP_SECS` |
 | `pace.use_credits` | `ZIRV_CTX_PACE_USE_CREDITS_CLAUDE` (the table-node match also blocks `pace.use_credits.codex` alone) |
 | `pace.poll_enabled` | `ZIRV_CTX_PACE_POLL` |
 | `pace.poll_min_interval_secs` | `ZIRV_CTX_PACE_POLL_MIN_INTERVAL_SECS` |
@@ -1269,7 +1275,10 @@ checkout:
 | `pace.spawn_hard_pct` | `ZIRV_CTX_PACE_SPAWN_HARD_PCT` |
 | `pace.run_budget_tokens` | `ZIRV_CTX_PACE_RUN_BUDGET_TOKENS` |
 | `review` (`review.claude`, `review.codex`) | `ZIRV_CTX_REVIEW_MODEL_CLAUDE` / `ZIRV_CTX_REVIEW_MODEL_CODEX` |
-| `worker` (`worker.claude`, `worker.codex`) | `ZIRV_CTX_WORKER_MODEL_CLAUDE` / `ZIRV_CTX_WORKER_MODEL_CODEX` |
+| `worker.claude` | `ZIRV_CTX_WORKER_MODEL_CLAUDE` |
+| `worker.codex` | `ZIRV_CTX_WORKER_MODEL_CODEX` |
+| `worker.default_depth` | `ZIRV_CTX_WORKER_DEFAULT_DEPTH` |
+| `worker.default_read_only` | `ZIRV_CTX_WORKER_DEFAULT_READ_ONLY` |
 | `handover` (`handover.<agent>.<tier>`) | `ZIRV_CTX_HANDOVER_<AGENT>_<TIER>` (e.g. `ZIRV_CTX_HANDOVER_CLAUDE_DEEP`) |
 | `safety.allow` | `ZIRV_CTX_SAFETY_ALLOW` |
 | `safety.escape_allow` | `ZIRV_CTX_SAFETY_ESCAPE_ALLOW` |
@@ -1298,6 +1307,7 @@ checkout:
 | `workflow.allow_empty_verify` | `ZIRV_CTX_WORKFLOW_ALLOW_EMPTY_VERIFY` |
 | `price.stale_after_days` | `ZIRV_CTX_PRICE_STALE_AFTER_DAYS` |
 | `price.table_path` | `ZIRV_CTX_PRICE_TABLE_PATH` |
+| `search.max_output_bytes` | `ZIRV_CTX_SEARCH_MAX_OUTPUT_BYTES` |
 
 The `mail.*`/`chrome.events` entries close the same hole `prompt.max_repo_bytes`
 does: mail is folded into a launched worker's prompt as its own layer, so a

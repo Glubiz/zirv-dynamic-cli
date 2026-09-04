@@ -22,6 +22,7 @@ use super::announce::{Announcer, Event};
 use super::chat::quiet_env;
 use super::config::{CtxConfig, EnvLookup, env_from_process};
 use super::dash::spawnreq;
+use super::envelope;
 use super::event::{SessionId, SessionRef, TranscriptUsage};
 use super::exec::{self, ExecArgs};
 use super::pace;
@@ -192,6 +193,29 @@ pub struct AgentArgs {
     /// typed out by hand.
     #[arg(long, conflicts_with = "result_schema")]
     pub result_kind: Option<String>,
+    /// Issue #262: an additional write root this worker's delegation
+    /// envelope may narrow to, repeatable. Each value must already be
+    /// contained by the parent's own envelope
+    /// (`envelope::WorkerEnvelope::narrow`) or the delegation is refused
+    /// before any spawn. Named `--path-scope`, not `--scope`: `--scope`
+    /// above already names the work-group purpose text (issue #170).
+    /// Unstated defers to the parent's own paths (`--mode writing`) or no
+    /// write roots at all (`--mode read-only`, which holds no writer permit
+    /// and so needs none).
+    #[arg(long = "path-scope")]
+    pub path_scope: Vec<PathBuf>,
+    /// Issue #262: denies network tools in this worker's delegation
+    /// envelope, regardless of what the parent envelope allowed. Only ever
+    /// narrows: unstated leaves the parent's own `network` value untouched.
+    #[arg(long, default_value_t = false)]
+    pub no_network: bool,
+    /// Issue #262: how many further hops of `zirv agent` this worker's own
+    /// envelope should carry. Unstated defers to `parent.delegation_depth -
+    /// 1`, the automatic decrement every delegation gets; an explicit value
+    /// above that ceiling is refused before any spawn
+    /// (`envelope::CannotGrow`), never silently clamped.
+    #[arg(long)]
+    pub depth: Option<u8>,
 }
 
 /// `--attach-artifact`'s CLI spelling for `workflow::engine::ArtifactStage`.
@@ -922,6 +946,132 @@ fn result_schema_env<'a>(
             env(key)
         }
     }
+}
+
+/// Issue #262: the child's own env key for the canonical JSON of the
+/// [`envelope::WorkerEnvelope`] this delegation narrowed for it -- read back
+/// by a nested `zirv agent` as ITS OWN parent envelope
+/// (`resolve_parent_envelope`), and by `zirv ctx safety check`/`explain` to
+/// enforce/explain the envelope's own contribution to a verdict.
+pub const ENVELOPE_ENV: &str = "ZIRV_ENVELOPE";
+/// Issue #262: the child's own env key for the `"<parent short>/<child
+/// short>"` delegation chain (`envelope::WorkerEnvelope::principal`).
+/// Carried alongside `ENVELOPE_ENV` rather than folded into the envelope's
+/// own JSON reader, so a caller that only wants the human-readable chain
+/// (`zirv ctx status`, a log line) need not parse JSON to get it -- though
+/// the two always agree, since both are derived from the same `principal`
+/// binding at the same fold site.
+pub const PRINCIPAL_ENV: &str = "ZIRV_PRINCIPAL";
+
+/// Folds this delegation's own resolved envelope and principal chain into
+/// the env lookup its launch runs under, the same unconditional-substitute
+/// shape [`result_schema_env`] already established: both always win
+/// outright, `None` included, so a stray inherited [`ENVELOPE_ENV`]/
+/// [`PRINCIPAL_ENV`] from further up this process's own delegation chain can
+/// never leak into a worker whose own envelope was computed fresh here.
+fn envelope_env<'a>(
+    env: EnvLookup<'a>,
+    envelope_json: Option<String>,
+    principal: Option<String>,
+) -> impl Fn(&str) -> Option<String> + 'a {
+    move |key: &str| {
+        if key == ENVELOPE_ENV {
+            envelope_json.clone()
+        } else if key == PRINCIPAL_ENV {
+            principal.clone()
+        } else {
+            env(key)
+        }
+    }
+}
+
+/// Issue #262: the envelope a ROOT session (no [`ENVELOPE_ENV`] in its own
+/// process env) starts from -- computed from operator posture
+/// (`WorkerConfig`), never unbounded by default. `default_read_only`
+/// narrows `destructive`/`tools.edit`/`paths` together, the same three
+/// fields `--mode read-only` narrows for a non-root delegation
+/// (`requested_envelope_from_args`), so a repo/operator that wants every
+/// top-level delegation to start read-only gets the identical restriction a
+/// `--mode read-only` flag would have asked for by hand.
+pub(crate) fn root_envelope(cfg: &CtxConfig) -> envelope::WorkerEnvelope {
+    let read_only = cfg.worker.default_read_only;
+    envelope::WorkerEnvelope {
+        principal: "root".to_string(),
+        paths: if read_only {
+            Vec::new()
+        } else {
+            vec![envelope::PathScope::new(".")]
+        },
+        tools: if read_only {
+            envelope::ToolSet {
+                edit: false,
+                ..envelope::ToolSet::all()
+            }
+        } else {
+            envelope::ToolSet::all()
+        },
+        network: !cfg.worker.deny_network,
+        destructive: !read_only,
+        delegation_depth: cfg.worker.default_depth.min(cfg.worker.max_depth),
+        expires_at: u64::MAX,
+        token_budget: None,
+    }
+}
+
+/// Issue #262: this session's OWN parent envelope -- what a delegating
+/// session (if any) narrowed for THIS session when it spawned it. Absence
+/// (no [`ENVELOPE_ENV`] in the process env at all) means this session is a
+/// ROOT: freshly computed from operator posture ([`root_envelope`]), never
+/// treated as unbounded by omission. A PRESENT but malformed value is
+/// refused outright rather than treated as absent: a corrupted envelope
+/// must never silently upgrade a bounded child into an unbounded root.
+fn resolve_parent_envelope(
+    cfg: &CtxConfig,
+    env: EnvLookup<'_>,
+) -> Result<envelope::WorkerEnvelope, String> {
+    match env(ENVELOPE_ENV).filter(|raw| !raw.trim().is_empty()) {
+        Some(raw) => {
+            serde_json::from_str(&raw).map_err(|e| format!("malformed {ENVELOPE_ENV}: {e}"))
+        }
+        None => Ok(root_envelope(cfg)),
+    }
+}
+
+/// Issue #262: this delegation's own REQUESTED envelope fields, built from
+/// `args`' flags and `parent` -- before narrowing.
+/// [`envelope::WorkerEnvelope::narrow`] is what actually enforces every
+/// rule; this only resolves what to ASK for, so a request that merely
+/// repeats what `parent` already allows never trips `CannotGrow`.
+///
+/// `--path-scope` unstated defers to `parent`'s own paths (`--mode
+/// writing`) or no paths at all (`--mode read-only`, which holds no writer
+/// permit and so needs none -- see `AgentArgs::mode`'s own doc comment).
+/// `--depth` unstated defers to the automatic `parent.delegation_depth - 1`
+/// decrement every delegation gets. `--no-network` and `--mode read-only`
+/// only ever narrow toward `false`; leaving both unstated carries `parent`'s
+/// own `network`/`destructive` forward UNCHANGED (never re-requests `true`),
+/// so an ordinary `--mode writing` delegation under an already-restricted
+/// parent never spuriously hits `CannotGrow` merely by existing.
+fn requested_envelope_from_args(
+    args: &AgentArgs,
+    parent: &envelope::WorkerEnvelope,
+    principal: String,
+    token_budget: Option<u64>,
+) -> envelope::WorkerEnvelope {
+    let path_scope: Vec<String> = args
+        .path_scope
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    envelope::WorkerEnvelope::requested(
+        parent,
+        principal,
+        &path_scope,
+        args.no_network,
+        args.mode == WorkerMode::ReadOnly,
+        args.depth,
+        token_budget,
+    )
 }
 
 /// Issue #318: resolves `--result-schema`/`--result-kind` into the actual
@@ -1723,6 +1873,24 @@ fn try_join_dashboard<W: Write>(
     claim_extension: Duration,
     result_schema: Option<&Schema>,
 ) -> Option<CtxResult<i32>> {
+    // Issue #262: recomputed here rather than threaded in as a parameter --
+    // `run_with` already resolved (and, on depth 0, already refused before
+    // ever reaching this function) the identical value from the identical
+    // `(repo, env)`, so this is one more redundant, deterministic config
+    // read, the same trade-off `run_with`'s own doc comment on its `cfg`
+    // load already accepts (`exec::run_with` loads its own copy too).
+    // `.unwrap_or_else` on a config-load failure falls back to the tightest
+    // grant rather than propagating an error out of a function whose return
+    // type has no room for one -- `run_with`'s own earlier, identical load
+    // already surfaced any real config error before this point.
+    let parent_envelope = CtxConfig::load_for_launch(repo, env)
+        .ok()
+        .map(|cfg| {
+            resolve_parent_envelope(&cfg, env)
+                .unwrap_or_else(|_| envelope::WorkerEnvelope::locked())
+        })
+        .unwrap_or_else(envelope::WorkerEnvelope::locked);
+    let parent_envelope = &parent_envelope;
     let inherited = env(spawnreq::DASH_REQUESTS_ENV).map(std::path::PathBuf::from)?;
     let dir = live_join_target(&inherited, env)?;
     // A pane is not a supervised headless run: the restart budget, the
@@ -1837,6 +2005,13 @@ fn try_join_dashboard<W: Write>(
         // push it into a fulfilling pane's own child env identically --
         // see that field's own doc comment.
         result_schema: result_schema.map(Schema::to_canonical_json),
+        // Issue #262: the parent, not a pre-computed child -- see
+        // `SpawnRequest::envelope`'s own doc comment for why the pane
+        // fulfilling this request must derive its own child envelope itself.
+        envelope: envelope::canonical_json(parent_envelope).ok(),
+        path_scope: args.path_scope.clone(),
+        no_network: args.no_network,
+        depth: args.depth,
     };
     let path = match spawnreq::write_request(&dir, &req) {
         Ok(path) => path,
@@ -2208,6 +2383,27 @@ pub fn run_with<W: Write>(
     // so this remains one extra read of the same layered config rather than
     // a new code path.
     let cfg = CtxConfig::load_for_launch(repo, env)?;
+
+    // Issue #262: this session's OWN delegation envelope (root, when
+    // `ENVELOPE_ENV` is absent), read before any routing/spawn decision --
+    // depth 0 means this session may not run `zirv agent` itself at all, so
+    // refusing here, before `try_join_dashboard`/anything else that could
+    // spawn, is the "one line, exit code 2, before any spawn" the nested-
+    // delegation contract requires.
+    let parent_envelope = match resolve_parent_envelope(&cfg, env) {
+        Ok(envelope) => envelope,
+        Err(reason) => {
+            writeln!(w, "agent: {reason}")?;
+            return Ok(2);
+        }
+    };
+    if parent_envelope.delegation_depth == 0 {
+        writeln!(
+            w,
+            "agent: this session's delegation envelope has depth 0; it may not run `zirv agent` itself"
+        )?;
+        return Ok(2);
+    }
 
     // Issue #186: resolve the requested worker model before the spawn gate so
     // an exhausted/low-headroom seat can be translated to an equivalent tier
@@ -2582,6 +2778,35 @@ pub fn run_with<W: Write>(
         }
     };
 
+    // Issue #262: this worker's own delegation envelope, computed by
+    // narrowing `parent_envelope` against what THIS delegation is asking
+    // for (`--path-scope`/`--no-network`/`--depth`, and `args.mode` for the
+    // read-only/writing split). Refused before any spawn, the same
+    // "nothing ran yet" discipline as the budget/writer-permit refusals
+    // around it: a request that would WIDEN what the parent granted is a
+    // hard error (`envelope::CannotGrow`), never a silent clamp.
+    let child_short = super::sessions::short_id(&worker_session);
+    let principal = format!("{}/{}", parent_envelope.principal, child_short);
+    let requested_envelope = requested_envelope_from_args(
+        args,
+        &parent_envelope,
+        principal.clone(),
+        worker_budget.tokens,
+    );
+    let child_envelope =
+        match envelope::WorkerEnvelope::narrow(&parent_envelope, &requested_envelope) {
+            Ok(envelope) => envelope,
+            Err(err) => {
+                discard_minted_group();
+                writeln!(w, "failed: delegation envelope refused: {err}")?;
+                return Ok(2);
+            }
+        };
+    let envelope_json = envelope::canonical_json(&child_envelope)
+        .ok()
+        .filter(|s| !s.is_empty());
+    let env = envelope_env(&env, envelope_json, Some(principal.clone()));
+
     // Issue #267: a `writing` worker holds a writer permit for its WHOLE
     // lifetime, refused up front -- before any child ever launches -- when
     // another live writer already holds `launch_repo`'s own tree. A
@@ -2951,6 +3176,7 @@ pub fn run_with<W: Write>(
             let repo_slug = super::state::repo_slug(repo);
             let _ = super::mail::store_to(&state_dir, &repo_slug, &repo_slug, &msg, &cfg);
         }
+        let envelope_sha256 = envelope::digest(&child_envelope).ok();
         let total = append_execution_segments(
             &state_dir,
             &execution_report,
@@ -2960,6 +3186,8 @@ pub fn run_with<W: Write>(
             outcome,
             args.mode,
             args.task_class,
+            &principal,
+            envelope_sha256.as_deref(),
         );
         if let Some(id) = args.group.as_deref() {
             let _ = super::group::settle_reservation(
@@ -3041,6 +3269,8 @@ fn append_execution_segments(
     outcome: &'static str,
     mode: WorkerMode,
     task_class: Option<super::log::TaskClass>,
+    principal: &str,
+    envelope_sha256: Option<&str>,
 ) -> TranscriptUsage {
     let mut total = TranscriptUsage::default();
     for segment in &report.segments {
@@ -3074,6 +3304,8 @@ fn append_execution_segments(
                 outcome,
                 mode: Some(mode),
                 task_class,
+                principal,
+                envelope_sha256,
             },
         );
     }
@@ -4240,6 +4472,7 @@ mod tests {
             worker: crate::commands::ctx::config::WorkerConfig {
                 claude: None,
                 codex: Some("gpt-5.6-terra".to_string()),
+                ..Default::default()
             },
             ..CtxConfig::default()
         };
@@ -4296,6 +4529,7 @@ mod tests {
             worker: crate::commands::ctx::config::WorkerConfig {
                 claude: None,
                 codex: Some("gpt-5.6-terra".to_string()),
+                ..Default::default()
             },
             ..CtxConfig::default()
         };
@@ -4328,6 +4562,7 @@ mod tests {
             worker: crate::commands::ctx::config::WorkerConfig {
                 claude: Some("opus".to_string()),
                 codex: None,
+                ..Default::default()
             },
             ..CtxConfig::default()
         };
@@ -4673,6 +4908,9 @@ mod tests {
             task_class: None,
             result_schema: None,
             result_kind: None,
+            path_scope: Vec::new(),
+            no_network: false,
+            depth: None,
         }
     }
 
@@ -6341,6 +6579,8 @@ mod tests {
             "ok",
             WorkerMode::Writing,
             Some(crate::commands::ctx::log::TaskClass::Implement),
+            "root",
+            None,
         );
         assert_eq!(total.input_tokens, 11);
         assert_eq!(total.cache_creation_input_tokens, 22);

@@ -51,6 +51,15 @@ pub enum Event {
     /// verified event parsing at all, `handoff::distill_or_structural`'s own
     /// vocabulary) and where the handoff was stored.
     Restart { style: String, stored: String },
+    /// Issue #310: the progress clock latched -- no PTY output, transcript
+    /// growth, or mail activity for `idle_secs`, and this is the ONE time the
+    /// once-only banner fires for this stall episode (`sessions::write_stall_
+    /// marker`'s own claim-once idiom is what keeps this from repeating every
+    /// poll). A steering nudge is sent at the same moment this is emitted;
+    /// if no progress is observed within the configured grace period the
+    /// session is terminated, which is its own, separate log/report, not a
+    /// second `Stalled` event.
+    Stalled { idle_secs: u64 },
     /// Unread mail is waiting in the mailbox (the T8 advisory `wrap`'s pump
     /// used to build by hand).
     MailWaiting { count: usize },
@@ -326,6 +335,10 @@ impl Event {
             Event::Restart { style, stored } => {
                 format!("session restarted with a {style} handoff, stored at {stored}")
             }
+            Event::Stalled { idle_secs } => format!(
+                "no progress for {idle_secs}s; sending a steering nudge and terminating if it \
+                 stays unresponsive"
+            ),
             Event::MailWaiting { count } => {
                 let plural = if *count == 1 { "" } else { "s" };
                 format!(
@@ -785,6 +798,15 @@ mod tests {
         let line = event.line();
         assert!(line.contains("distilled"), "got {line}");
         assert!(line.contains("/state/handoffs/abc.md"), "got {line}");
+    }
+
+    /// Issue #310: the stalled banner names how long the session went quiet.
+    #[test]
+    fn a_stalled_announcement_names_the_idle_duration() {
+        let event = Event::Stalled { idle_secs: 450 };
+        let line = event.line();
+        assert!(line.contains("450"), "got {line}");
+        assert!(line.contains("nudge"), "got {line}");
     }
 
     #[test]

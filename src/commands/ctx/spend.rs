@@ -437,6 +437,8 @@ mod tests {
             outcome: outcome.to_string(),
             mode: Some(WorkerMode::Writing),
             task_class,
+            principal: "root".to_string(),
+            envelope_sha256: None,
         }
     }
 
@@ -688,6 +690,8 @@ mod tests {
                 outcome: "ok",
                 mode: Some(WorkerMode::Writing),
                 task_class: None,
+                principal: "root",
+                envelope_sha256: None,
             },
         )
         .expect("append");
@@ -796,6 +800,8 @@ mod tests {
                 outcome: "ok",
                 mode: Some(WorkerMode::Writing),
                 task_class: None,
+                principal: "root",
+                envelope_sha256: None,
             },
         )
         .expect("append");

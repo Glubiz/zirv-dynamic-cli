@@ -4,6 +4,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use super::adapters::{self, AGENT_ENV, DefaultOrigin};
+use super::chain;
 use super::config::{CtxConfig, EnvLookup, env_from_process};
 use super::event::{TranscriptUsage, input_hash};
 use super::group;
@@ -93,6 +94,21 @@ fn policy_snapshot_is_stale(record: &sessions::Record, env: EnvLookup<'_>) -> bo
 /// more than one purpose this pass (the heavy-worker count in `run_with`,
 /// below) must fetch it exactly once and share the result, or a second call
 /// would find that record's file already gone.
+/// Issue #310: the display label for one restart-chain failure class --
+/// hyphenated, matching the acceptance criterion's own wording ("restart
+/// chain: crash 1, usage-limit 2"), distinct from `FailureClass`'s
+/// `snake_case` serde spelling used on disk.
+fn chain_class_label(class: chain::FailureClass) -> &'static str {
+    match class {
+        chain::FailureClass::Crash => "crash",
+        chain::FailureClass::Stalled => "stalled",
+        chain::FailureClass::UsageLimit => "usage-limit",
+        chain::FailureClass::AuthBlocked => "auth-blocked",
+        chain::FailureClass::Protocol => "protocol",
+        chain::FailureClass::Budget => "budget",
+    }
+}
+
 fn sessions_lines(
     records: &[(sessions::Record, Liveness)],
     state: &StateDir,
@@ -204,6 +220,27 @@ fn sessions_lines(
                     colour
                 )
             ));
+            // Issue #310 (3b): this session's own restart-chain counters,
+            // keyed by repo like every other per-session disk read here --
+            // only shown when at least one class has a non-zero count, so a
+            // repository that has never tripped anything gains no line.
+            if let Ok(Some(chain_record)) = chain::load(state, &record.repo_slug) {
+                let counts = chain::counts_by_class(&chain_record);
+                if !counts.is_empty() {
+                    let parts: Vec<String> = counts
+                        .iter()
+                        .map(|(class, n)| format!("{} {n}", chain_class_label(*class)))
+                        .collect();
+                    line.push_str(&format!(
+                        "  {}",
+                        style::paint(
+                            &format!("restart chain: {}", parts.join(", ")),
+                            Tone::Warn,
+                            colour
+                        )
+                    ));
+                }
+            }
             line
         })
         .collect();
@@ -717,6 +754,13 @@ pub struct StatusArgs {
     /// written.
     #[arg(long, default_value_t = false)]
     pub diff: bool,
+    /// Issue #312: print a single window-attribution table for `<session>`
+    /// (a registered session id, `sessions::Record::session`) instead of the
+    /// ordinary report -- bucket, tokens, and percentage of the model's
+    /// resolved context window, reusing this command's own session
+    /// resolution (`sessions::list`) rather than a second lookup mechanism.
+    #[arg(long, value_name = "SESSION")]
+    pub breakdown: Option<String>,
 }
 
 /// Issue #264: the `spend:` line's own computation, factored out so a test
@@ -1595,6 +1639,73 @@ fn save_status_snapshot(state: &StateDir, path: &Path, snapshot: &StatusSnapshot
     }
 }
 
+/// Issue #312: `zirv ctx status --breakdown <session>` -- one deterministic
+/// bucket/tokens/percentage-of-window table. `score::breakdown_for_session`
+/// (I/O: session lookup, transcript read, compile-context bytes) supplies
+/// the numbers; [`render_breakdown_table`] (pure) renders them, so the
+/// table's own shape is unit-tested without a real session or transcript.
+fn render_breakdown<W: Write>(
+    session: &str,
+    w: &mut W,
+    repo: &Path,
+    env: EnvLookup<'_>,
+) -> CtxResult<i32> {
+    let (summary, window_tokens) = super::score::breakdown_for_session(session, repo, env)?;
+    write!(
+        w,
+        "{}",
+        render_breakdown_table(session, &summary, window_tokens)
+    )?;
+    Ok(0)
+}
+
+/// Pure rendering half of [`render_breakdown`]. Every bucket row prints its
+/// token count and its percentage of `window_tokens` (the model's resolved
+/// context window) when known, or the literal `unknown` when it is not --
+/// never a fabricated percentage against a denominator zirv does not
+/// actually have. The `tool_schemas` row appears only when the summary
+/// itself carries one (see `BreakdownSummary::tool_schemas`'s own doc
+/// comment: absent, not a fabricated zero, when it was not computable), and
+/// a `stale source` line appears only when at least one byte is stale.
+fn render_breakdown_table(
+    session: &str,
+    summary: &super::breakdown::BreakdownSummary,
+    window_tokens: Option<u64>,
+) -> String {
+    let pct = |tokens: u64| match window_tokens {
+        Some(window) if window > 0 => format!("{:.1}%", (tokens as f64 / window as f64) * 100.0),
+        _ => "unknown".to_string(),
+    };
+    let mut rows: Vec<(&str, u64)> = vec![("system_and_layers", summary.system_and_layers)];
+    if let Some(schema) = summary.tool_schemas {
+        rows.push(("tool_schemas", schema));
+    }
+    rows.push(("tool_results_live", summary.tool_results_live));
+    rows.push(("tool_results_stale", summary.tool_results_stale));
+    rows.push(("assistant_text", summary.assistant_text));
+    rows.push(("user_text", summary.user_text));
+    rows.push(("thinking", summary.thinking));
+
+    let mut out = format!("window breakdown for {session}\n");
+    out.push_str(&format!(
+        "{:<20}{:>12}{:>10}\n",
+        "bucket", "tokens", "% window"
+    ));
+    for (name, tokens) in &rows {
+        out.push_str(&format!("{name:<20}{tokens:>12}{:>10}\n", pct(*tokens)));
+    }
+    out.push_str(&format!(
+        "{:<20}{:>12}{:>10}\n",
+        "total",
+        summary.total_tokens,
+        pct(summary.total_tokens)
+    ));
+    if let Some(source) = &summary.stale_source {
+        out.push_str(&format!("stale source: {source}\n"));
+    }
+    out
+}
+
 pub fn run_with<W: Write>(
     args: &StatusArgs,
     w: &mut W,
@@ -1602,6 +1713,9 @@ pub fn run_with<W: Write>(
     env: EnvLookup<'_>,
     colour: bool,
 ) -> CtxResult<i32> {
+    if let Some(session) = &args.breakdown {
+        return render_breakdown(session, w, repo, env);
+    }
     if !args.diff {
         return render_report(args, w, repo, env, colour);
     }
@@ -1694,6 +1808,62 @@ mod tests {
         [(STATE_ENV.to_string(), state.display().to_string())].into()
     }
 
+    /// Issue #312: the pure rendering half of `--breakdown`, exercised
+    /// directly against a hand-built summary -- no session, transcript, or
+    /// compile pass involved. Pins the deterministic shape: every bucket row
+    /// with its percentage of the window, the `tool_schemas` row present
+    /// only when the summary carries one, and a `stale source` line only
+    /// when something is actually stale.
+    #[test]
+    fn render_breakdown_table_shows_every_bucket_with_its_window_percentage() {
+        let summary = super::super::breakdown::BreakdownSummary {
+            system_and_layers: 40,
+            tool_schemas: Some(10),
+            tool_results_live: 20,
+            tool_results_stale: 10,
+            assistant_text: 15,
+            user_text: 3,
+            thinking: 2,
+            total_tokens: 100,
+            stale_source: Some("Read".to_string()),
+        };
+        let text = render_breakdown_table("sess-1", &summary, Some(1000));
+        assert!(
+            text.starts_with("window breakdown for sess-1\n"),
+            "got {text}"
+        );
+        assert!(text.contains("system_and_layers"), "got {text}");
+        assert!(text.contains("tool_schemas"), "got {text}");
+        assert!(text.contains("4.0%"), "40/1000 = 4.0%: got {text}");
+        assert!(text.contains("total"), "got {text}");
+        assert!(text.contains("10.0%"), "100/1000 = 10.0%: got {text}");
+        assert!(text.contains("stale source: Read"), "got {text}");
+    }
+
+    /// A model with no known context window renders `unknown`, never a
+    /// fabricated percentage against a denominator zirv does not have.
+    #[test]
+    fn render_breakdown_table_shows_unknown_percentage_without_a_window() {
+        let summary = super::super::breakdown::BreakdownSummary {
+            system_and_layers: 100,
+            tool_schemas: None,
+            tool_results_live: 0,
+            tool_results_stale: 0,
+            assistant_text: 0,
+            user_text: 0,
+            thinking: 0,
+            total_tokens: 100,
+            stale_source: None,
+        };
+        let text = render_breakdown_table("sess-2", &summary, None);
+        assert!(text.contains("unknown"), "got {text}");
+        assert!(
+            !text.contains("tool_schemas"),
+            "absent, not fabricated: got {text}"
+        );
+        assert!(!text.contains("stale source"), "nothing stale: got {text}");
+    }
+
     #[test]
     fn an_empty_state_dir_reports_nothing_supervised() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -1706,6 +1876,7 @@ mod tests {
                 decisions: 10,
                 brief: false,
                 diff: false,
+                breakdown: None,
             },
             &mut out,
             tmp.path(),
@@ -1800,6 +1971,7 @@ mod tests {
                 decisions: 10,
                 brief: false,
                 diff: false,
+                breakdown: None,
             },
             &mut out,
             repo.path(),
@@ -1830,6 +2002,7 @@ mod tests {
                 decisions: 10,
                 brief: false,
                 diff: false,
+                breakdown: None,
             },
             &mut out,
             repo.path(),
@@ -1858,6 +2031,7 @@ mod tests {
                 decisions: 10,
                 brief: false,
                 diff: false,
+                breakdown: None,
             },
             &mut out,
             repo.path(),
@@ -1890,6 +2064,7 @@ mod tests {
                 decisions: 10,
                 brief: false,
                 diff: false,
+                breakdown: None,
             },
             &mut out,
             &repo,
@@ -1934,6 +2109,7 @@ mod tests {
                 decisions: 10,
                 brief: false,
                 diff: false,
+                breakdown: None,
             },
             &mut out,
             &repo,
@@ -1977,6 +2153,7 @@ mod tests {
                 decisions: 10,
                 brief: false,
                 diff: false,
+                breakdown: None,
             },
             &mut out,
             &repo,
@@ -2036,6 +2213,7 @@ mod tests {
                 decisions: 10,
                 brief: false,
                 diff: false,
+                breakdown: None,
             },
             &mut out,
             tmp.path(),
@@ -2072,6 +2250,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                breakdown: None,
             },
             &mut out,
             tmp.path(),
@@ -2121,6 +2300,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                breakdown: None,
             },
             &mut out,
             &repo,
@@ -2175,6 +2355,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                breakdown: None,
             },
             &mut out,
             &repo,
@@ -2187,6 +2368,118 @@ mod tests {
             text.contains("screening: 1 flag: prompt-injection marker"),
             "got {text}"
         );
+    }
+
+    /// Issue #310 (3b): a repository with a non-zero restart-chain count for
+    /// at least one failure class shows a `restart chain:` note naming every
+    /// class with a non-zero count, hyphen-spelled per the acceptance
+    /// criterion's own wording.
+    #[test]
+    fn a_session_with_a_non_zero_restart_chain_count_shows_it_on_its_status_line() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        state.ensure().expect("ensure");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let env = env_for(state.root());
+
+        let record = crate::commands::ctx::sessions::Record::new(
+            "dddd4444-2222-4333-8444-555555555555",
+            "claude",
+            &repo,
+            crate::commands::ctx::sessions::Verb::Wrap,
+        );
+        let repo_slug = record.repo_slug.clone();
+        let _guard = crate::commands::ctx::sessions::SessionGuard::register(&state, record);
+        chain::record_boot_and_evaluate(
+            &state,
+            &repo_slug,
+            chain::FailureClass::Crash,
+            false,
+            0,
+            3,
+            300,
+        );
+        chain::record_boot_and_evaluate(
+            &state,
+            &repo_slug,
+            chain::FailureClass::UsageLimit,
+            false,
+            1,
+            3,
+            300,
+        );
+        chain::record_boot_and_evaluate(
+            &state,
+            &repo_slug,
+            chain::FailureClass::UsageLimit,
+            false,
+            2,
+            3,
+            300,
+        );
+
+        let mut out = Vec::new();
+        run_with(
+            &StatusArgs {
+                decisions: 5,
+                brief: false,
+                diff: false,
+                breakdown: None,
+            },
+            &mut out,
+            &repo,
+            &|k| env.get(k).cloned(),
+            false,
+        )
+        .expect("runs");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            text.contains("restart chain: crash 1, usage-limit 2"),
+            "got {text}"
+        );
+    }
+
+    /// The absent half: a repository with no restart-chain record at all
+    /// (never respawned, or the state dir has nothing stored) carries no
+    /// `restart chain:` note.
+    #[test]
+    fn a_session_with_no_restart_chain_record_shows_no_note() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        state.ensure().expect("ensure");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let env = env_for(state.root());
+
+        let record = crate::commands::ctx::sessions::Record::new(
+            "eeee5555-2222-4333-8444-555555555555",
+            "claude",
+            &repo,
+            crate::commands::ctx::sessions::Verb::Wrap,
+        );
+        let _guard = crate::commands::ctx::sessions::SessionGuard::register(&state, record);
+
+        let mut out = Vec::new();
+        run_with(
+            &StatusArgs {
+                decisions: 5,
+                brief: false,
+                diff: false,
+                breakdown: None,
+            },
+            &mut out,
+            &repo,
+            &|k| env.get(k).cloned(),
+            false,
+        )
+        .expect("runs");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(!text.contains("restart chain"), "got {text}");
     }
 
     /// The absent half: a session with no screening summary carries no
@@ -2218,6 +2511,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                breakdown: None,
             },
             &mut out,
             &repo,
@@ -2264,6 +2558,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                breakdown: None,
             },
             &mut out,
             &repo,
@@ -2320,6 +2615,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                breakdown: None,
             },
             &mut out,
             &repo,
@@ -2371,6 +2667,7 @@ mod tests {
                 decisions: 2,
                 brief: false,
                 diff: false,
+                breakdown: None,
             },
             &mut out,
             tmp.path(),
@@ -2408,6 +2705,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                breakdown: None,
             },
             &mut out,
             tmp.path(),
@@ -2481,6 +2779,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                breakdown: None,
             },
             &mut out,
             tmp.path(),
@@ -2538,6 +2837,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                breakdown: None,
             },
             &mut out,
             tmp.path(),
@@ -2580,6 +2880,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                breakdown: None,
             },
             &mut out,
             tmp.path(),
@@ -2632,6 +2933,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                breakdown: None,
             },
             &mut out,
             tmp.path(),
@@ -2677,6 +2979,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                breakdown: None,
             },
             &mut out,
             tmp.path(),
@@ -2792,6 +3095,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                breakdown: None,
             },
             &mut out,
             tmp.path(),
@@ -2858,6 +3162,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                breakdown: None,
             },
             &mut out,
             tmp.path(),
@@ -2906,6 +3211,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                breakdown: None,
             },
             &mut out,
             tmp.path(),
@@ -2948,6 +3254,8 @@ mod tests {
                 outcome: "ok",
                 mode: None,
                 task_class: None,
+                principal: "root",
+                envelope_sha256: None,
             },
         )
         .expect("append");
@@ -2965,6 +3273,7 @@ mod tests {
                     decisions: 5,
                     brief,
                     diff: false,
+                    breakdown: None,
                 },
                 &mut out,
                 tmp.path(),
@@ -3029,6 +3338,7 @@ mod tests {
                     decisions: 5,
                     brief,
                     diff: false,
+                    breakdown: None,
                 },
                 &mut out,
                 tmp.path(),
@@ -3061,6 +3371,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                breakdown: None,
             },
             &mut out,
             tmp.path(),
@@ -3105,6 +3416,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                breakdown: None,
             },
             &mut out,
             tmp.path(),
@@ -3168,6 +3480,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                breakdown: None,
             },
             &mut out,
             tmp.path(),
@@ -3219,6 +3532,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                breakdown: None,
             },
             &mut out,
             tmp.path(),
@@ -3258,6 +3572,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                breakdown: None,
             },
             &mut out,
             tmp.path(),
@@ -3293,6 +3608,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                breakdown: None,
             },
             &mut out,
             tmp.path(),
@@ -3338,6 +3654,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                breakdown: None,
             },
             &mut out,
             &repo,
@@ -3386,6 +3703,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                breakdown: None,
             },
             &mut out,
             &repo,
@@ -3447,6 +3765,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                breakdown: None,
             },
             &mut out,
             &repo,
@@ -3480,6 +3799,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                breakdown: None,
             },
             &mut out,
             tmp.path(),
@@ -3520,6 +3840,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                breakdown: None,
             },
             &mut out,
             tmp.path(),
@@ -3554,6 +3875,7 @@ mod tests {
                         decisions: 5,
                         brief: false,
                         diff: false,
+                        breakdown: None,
                     },
                     &mut out,
                     tmp.path(),
@@ -3596,6 +3918,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                breakdown: None,
             },
             &mut out,
             tmp.path(),
@@ -3654,6 +3977,8 @@ mod tests {
             outcome: "ok".to_string(),
             mode: None,
             task_class: None,
+            principal: "root".to_string(),
+            envelope_sha256: None,
         }
     }
 
@@ -3792,6 +4117,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                breakdown: None,
             },
             &mut out,
             tmp.path(),
@@ -3821,6 +4147,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                breakdown: None,
             },
             &mut out,
             tmp.path(),
@@ -3860,6 +4187,8 @@ mod tests {
                 outcome: "ok",
                 mode: None,
                 task_class: None,
+                principal: "root",
+                envelope_sha256: None,
             },
         )
         .expect("append");
@@ -3871,6 +4200,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                breakdown: None,
             },
             &mut out,
             tmp.path(),
@@ -3924,6 +4254,8 @@ mod tests {
                 outcome: "ok",
                 mode: None,
                 task_class: None,
+                principal: "root",
+                envelope_sha256: None,
             },
         )
         .expect("append");
@@ -3935,6 +4267,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                breakdown: None,
             },
             &mut out,
             tmp.path(),
@@ -3977,6 +4310,8 @@ mod tests {
                 outcome: "ok",
                 mode: None,
                 task_class: None,
+                principal: "root",
+                envelope_sha256: None,
             },
         )
         .expect("append");
@@ -3996,6 +4331,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                breakdown: None,
             },
             &mut out,
             tmp.path(),
@@ -4098,6 +4434,8 @@ mod tests {
                     outcome: &row.outcome,
                     mode: row.mode,
                     task_class: row.task_class,
+                    principal: &row.principal,
+                    envelope_sha256: row.envelope_sha256.as_deref(),
                 },
             )
             .expect("append");
@@ -4145,6 +4483,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                breakdown: None,
             },
             &mut full_out,
             &repo,
@@ -4160,6 +4499,7 @@ mod tests {
                 decisions: 5,
                 brief: true,
                 diff: false,
+                breakdown: None,
             },
             &mut brief_out,
             &repo,
@@ -4291,6 +4631,7 @@ mod tests {
                 decisions: 10,
                 brief: false,
                 diff: true,
+                breakdown: None,
             },
             &mut out,
             tmp.path(),
@@ -4325,6 +4666,7 @@ mod tests {
             decisions: 10,
             brief: false,
             diff: true,
+            breakdown: None,
         };
 
         let mut first = Vec::new();
@@ -4369,6 +4711,7 @@ mod tests {
             decisions: 10,
             brief: false,
             diff: true,
+            breakdown: None,
         };
 
         let mut first = Vec::new();
@@ -4454,6 +4797,7 @@ mod tests {
             decisions: 10,
             brief: false,
             diff: true,
+            breakdown: None,
         };
         let mut first_out = Vec::new();
         run_with(
@@ -4479,6 +4823,7 @@ mod tests {
                 decisions: 10,
                 brief: false,
                 diff: false,
+                breakdown: None,
             },
             &mut status_out,
             &repo,
@@ -4551,6 +4896,7 @@ mod tests {
             decisions: 10,
             brief: false,
             diff: true,
+            breakdown: None,
         };
 
         let mut out_a = Vec::new();
@@ -4595,6 +4941,7 @@ mod tests {
                 decisions: 10,
                 brief: false,
                 diff: true,
+                breakdown: None,
             },
             &mut full_out,
             tmp.path(),
@@ -4609,6 +4956,7 @@ mod tests {
                 decisions: 10,
                 brief: true,
                 diff: true,
+                breakdown: None,
             },
             &mut brief_out,
             tmp.path(),
@@ -4638,6 +4986,7 @@ mod tests {
                 decisions: 10,
                 brief: false,
                 diff: true,
+                breakdown: None,
             },
             &mut out,
             tmp.path(),

@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use super::adapters::{self, SESSION_ENV, SOCKET_ENV};
 use super::config::{CtxConfig, EnvLookup, env_from_process};
 use super::diagnostics;
-use super::event::input_hash;
+use super::event::{NormalizedEvent, input_hash};
 use super::rot::{Score, Verdict};
 use super::state::{StateDir, now_secs};
 use super::supervise::Watcher;
@@ -461,6 +461,217 @@ fn corrections_in(state: &StateDir, transcript: &Path, cfg: &CtxConfig) -> usize
     checkpoint.consumed = consumed;
     save_correction_checkpoint(&path, &checkpoint);
     checkpoint.corrections
+}
+
+/// Bumped whenever this file's shape changes, mirroring `CorrectionCheckpoint`'s
+/// own `CORRECTION_CHECKPOINT_VERSION` pattern.
+const COMPACT_ADVISORY_CHECKPOINT_VERSION: u32 = 1;
+
+/// Issue #312: the reclaim-gated compact advisory's own persisted state, one
+/// file per transcript (mirrors `CorrectionCheckpoint`). `accumulator` is
+/// `breakdown::BreakdownAccumulator`, folded incrementally the same way
+/// `AdoptionRecord::edit_like_calls` is -- UNBOUNDED, unlike `RotState`'s
+/// windowed segments, because a stale-marking edit can reference a path read
+/// arbitrarily many turns back (see that type's own doc comment).
+/// `last_fired_window_tokens` is the hysteresis: `None` until the advisory
+/// has fired once, then the window size (`Score::context_tokens`) it fired
+/// at, so it cannot refire until the window has regrown a full
+/// trigger-sized runway past that point -- mirroring Hermes's own
+/// disarm-until-regrowth rule (see the issue's Origin section), reimplemented
+/// here as advice rather than automatic pruning.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct CompactAdvisoryCheckpoint {
+    #[serde(default)]
+    version: u32,
+    transcript: String,
+    adapter: String,
+    #[serde(default)]
+    accumulator: super::breakdown::BreakdownAccumulator,
+    offset: u64,
+    consumed: u64,
+    #[serde(default)]
+    last_fired_window_tokens: Option<u64>,
+}
+
+fn compact_advisory_checkpoint_path(state: &StateDir, transcript: &Path) -> PathBuf {
+    // Reuses `score.rs`'s own scoring directory, like `correction_checkpoint_
+    // path` right above.
+    state.scoring().join(format!(
+        "{:016x}-compact-advisory.json",
+        input_hash(&transcript.display().to_string())
+    ))
+}
+
+/// `None` on any doubt at all -- unreadable, corrupt, a different schema
+/// version, a different transcript, a different adapter, or an offset that no
+/// longer fits the file -- which sends the caller back to a fresh fold from
+/// byte zero, mirroring every other checkpoint loader in this crate.
+fn load_compact_advisory_checkpoint(
+    path: &Path,
+    transcript: &Path,
+    adapter_name: &str,
+) -> Option<CompactAdvisoryCheckpoint> {
+    let checkpoint: CompactAdvisoryCheckpoint =
+        serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+    let usable = checkpoint.version == COMPACT_ADVISORY_CHECKPOINT_VERSION
+        && checkpoint.transcript == transcript.display().to_string()
+        && checkpoint.adapter == adapter_name
+        && checkpoint.offset <= std::fs::metadata(transcript).ok()?.len();
+    usable.then_some(checkpoint)
+}
+
+/// Best-effort, like every other checkpoint writer in this file: a checkpoint
+/// that fails to write costs the next Stop hook call a full re-fold, never a
+/// hook failure.
+fn save_compact_advisory_checkpoint(path: &Path, checkpoint: &CompactAdvisoryCheckpoint) {
+    let Ok(json) = serde_json::to_string(checkpoint) else {
+        return;
+    };
+    if let Some(dir) = path.parent() {
+        let _ = super::state::create_private_dir_all(dir);
+    }
+    let _ = super::state::write_private(path, &json);
+}
+
+/// `~18k`-style rounding for the advisory's own reclaim figure -- plain
+/// tokens below 1000, otherwise truncated to the nearest thousand. Cosmetic
+/// only: the gate itself always compares the exact token count.
+fn approx_tokens(tokens: u64) -> String {
+    if tokens >= 1000 {
+        format!("{}k", tokens / 1000)
+    } else {
+        tokens.to_string()
+    }
+}
+
+/// Issue #312: the reclaim-gated compact advisory -- a SECOND, cost-driven
+/// tier alongside the rot `Verdict` ladder `stop_output` already renders,
+/// firing only when stale tool-result tokens exceed `compact_advisory.
+/// min_reclaim_tokens` AND the window exceeds `compact_advisory.
+/// window_fraction` of the model's resolved context window. Independent of
+/// `score.verdict`: `run_stop` folds this into the same `combined_nudge`
+/// line the healthy-session early return in `stop_output` already honours,
+/// so a `Healthy`-verdict session with a lot of stale tool output still gets
+/// told.
+///
+/// A real compaction (`NormalizedEvent::Compaction` among the newly
+/// appended events) resets both the accumulator and the hysteresis: the
+/// bytes it summarized are no longer live context, and "regrown a full
+/// trigger-sized runway" must count from the post-compaction window, not a
+/// stale pre-compaction one.
+///
+/// Reads the current compiled-prompt bytes (`compile::compile_with_harness_
+/// roster`) on every call, like `zirv ctx status --breakdown` does, so this
+/// advisory's own numbers can never disagree with that table's for the same
+/// session at the same moment -- a fixed, largely probe-cached cost, not an
+/// O(session) transcript reparse (the accumulator fold above already keeps
+/// that part incremental).
+///
+/// `None` on every failure path and whenever either gate is not met -- like
+/// every other hook advisory, this must never fail loudly.
+fn compact_advisory_stop_nudge(
+    state: &StateDir,
+    repo: &Path,
+    cfg: &CtxConfig,
+    score: &Score,
+    transcript: &Path,
+    adapter: &dyn adapters::AgentAdapter,
+) -> Option<String> {
+    let path = compact_advisory_checkpoint_path(state, transcript);
+    let mut checkpoint = load_compact_advisory_checkpoint(&path, transcript, adapter.name())
+        .unwrap_or_else(|| CompactAdvisoryCheckpoint {
+            version: COMPACT_ADVISORY_CHECKPOINT_VERSION,
+            transcript: transcript.display().to_string(),
+            adapter: adapter.name().to_string(),
+            accumulator: super::breakdown::BreakdownAccumulator::default(),
+            offset: 0,
+            consumed: 0,
+            last_fired_window_tokens: None,
+        });
+
+    let mut watcher = Watcher::resuming(
+        transcript.to_path_buf(),
+        checkpoint.offset,
+        checkpoint.consumed,
+    );
+    if let Ok(Some(appended)) = watcher.read_appended() {
+        let events = adapter.parse_events(&appended.lines);
+        match events
+            .iter()
+            .rposition(|event| matches!(event, NormalizedEvent::Compaction))
+        {
+            Some(boundary) => {
+                checkpoint.accumulator = super::breakdown::BreakdownAccumulator::default();
+                checkpoint.last_fired_window_tokens = None;
+                checkpoint.accumulator.feed_all(&events[boundary + 1..]);
+            }
+            None => checkpoint.accumulator.feed_all(&events),
+        }
+        let (offset, consumed) = watcher.position();
+        checkpoint.offset = offset;
+        checkpoint.consumed = consumed;
+    }
+
+    let model_window = cfg
+        .score
+        .model_context_tokens
+        .or(adapter.capabilities_for_model(None).context_window_tokens);
+    let advisory = model_window
+        .filter(|window| *window > 0)
+        .and_then(|window| {
+            let home = crate::utils::home_dir().ok();
+            let compiled = super::compile::compile_with_harness_roster(
+                home.as_deref(),
+                repo,
+                false,
+                cfg,
+                adapter,
+                super::prompt::PromptRole::Orchestrator,
+                state,
+                now_secs(),
+                true,
+                adapters::LaunchMode::Interactive,
+                true,
+            );
+            let system_bytes = compiled
+                .composed
+                .as_ref()
+                .map_or(0, |composed| composed.text.len() as u64);
+            let schema_bytes = compiled
+                .harness_roster
+                .as_ref()
+                .map(|roster| roster.delivered_bytes as u64);
+            let summary = checkpoint.accumulator.materialize(
+                score.context_tokens,
+                system_bytes,
+                schema_bytes,
+            );
+
+            if summary.tool_results_stale < cfg.compact_advisory.min_reclaim_tokens {
+                return None;
+            }
+            let window_fraction = score.context_tokens as f64 / window as f64;
+            if window_fraction < cfg.compact_advisory.window_fraction {
+                return None;
+            }
+            let trigger_tokens = (cfg.compact_advisory.window_fraction * window as f64) as u64;
+            if let Some(last_fired) = checkpoint.last_fired_window_tokens
+                && score.context_tokens < last_fired.saturating_add(trigger_tokens)
+            {
+                return None;
+            }
+
+            checkpoint.last_fired_window_tokens = Some(score.context_tokens);
+            let source = summary.stale_source.as_deref().unwrap_or("tool-result");
+            Some(format!(
+                "zirv ctx: ~{} tokens are stale `{source}` output; /compact now saves more than it \
+             costs. Park bulk tool output on disk going forward.",
+                approx_tokens(summary.tool_results_stale)
+            ))
+        });
+
+    save_compact_advisory_checkpoint(&path, &checkpoint);
+    advisory
 }
 
 /// `CtxConfig::load`'s degrade-on-error fallback used by the Stop hook's
@@ -1099,6 +1310,7 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
     let mut adoption_nudge = None;
     let mut verify_nudge = None;
     let mut diagnostics_nudge = None;
+    let mut compact_advisory_nudge = None;
     if let Ok(state) = StateDir::resolve(env) {
         // Issue #243: a flagged screening result rides the same
         // decision line this cycle already writes, and is persisted onto the
@@ -1188,6 +1400,19 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
         record_speed_sample(&state, &repo, &session, &cfg, speed_sample);
         verify_nudge = verify_on_stop_nudge(&state, &repo, &session, &cfg, transcript);
         diagnostics_nudge = diagnostics_stop_nudge(&state, &repo, &session, &cfg, transcript);
+        // Issue #312: independent of the rot `Verdict` ladder above -- a
+        // cost-driven tier of its own, gated on stale tool-result tokens and
+        // window fraction, never on `score.verdict`.
+        if let Ok(adapter) = adapters::select(cfg.agent.as_deref(), &[], &cfg) {
+            compact_advisory_nudge = compact_advisory_stop_nudge(
+                &state,
+                &repo,
+                &cfg,
+                &score,
+                transcript,
+                adapter.as_ref(),
+            );
+        }
     }
 
     // Issue #309 rides the same single advisory line `adoption_nudge`
@@ -1196,10 +1421,12 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
     // adoption, so folding both in here (rather than widening `stop_output`
     // itself) keeps every one of its existing call sites/tests untouched.
     // Issue #308 rides the same fold a third time, for the identical reason.
+    // Issue #312 rides it a fourth time, for the identical reason.
     let combined_nudge = [
         adoption_nudge.as_deref(),
         verify_nudge.as_deref(),
         diagnostics_nudge.as_deref(),
+        compact_advisory_nudge.as_deref(),
     ]
     .into_iter()
     .flatten()
@@ -1899,7 +2126,224 @@ mod tests {
             },
             context_tokens: 170_000,
             model_change: None,
+            window_breakdown: None,
         }
+    }
+
+    /// Issue #312: a claude transcript with one large `Read` of `/big.rs`
+    /// followed by an `Edit` of the same path -- the read's content is live
+    /// until the edit stales it. `big_len` controls how many bytes of stale
+    /// content this fixture carries, so a test can push it above or below
+    /// `compact_advisory.min_reclaim_tokens`'s gate deliberately.
+    fn stale_read_then_edit_transcript(big_len: usize, tokens: u64) -> String {
+        let big = "x".repeat(big_len);
+        format!(
+            "{{\"type\":\"assistant\",\"message\":{{\"content\":[{{\"type\":\"tool_use\",\"id\":\"r1\",\"name\":\"Read\",\"input\":{{\"file_path\":\"/big.rs\"}}}}],\"usage\":{{\"input_tokens\":{tokens}}}}}}}\n\
+             {{\"type\":\"user\",\"message\":{{\"content\":[{{\"type\":\"tool_result\",\"tool_use_id\":\"r1\",\"content\":\"{big}\"}}]}}}}\n\
+             {{\"type\":\"assistant\",\"message\":{{\"content\":[{{\"type\":\"tool_use\",\"id\":\"e1\",\"name\":\"Edit\",\"input\":{{\"file_path\":\"/big.rs\"}}}}],\"usage\":{{\"input_tokens\":{tokens}}}}}}}\n\
+             {{\"type\":\"user\",\"message\":{{\"content\":[{{\"type\":\"tool_result\",\"tool_use_id\":\"e1\",\"content\":\"ok\"}}]}}}}\n"
+        )
+    }
+
+    /// Claude's own conservative window for an unstated model
+    /// (`ClaudeAdapter::DEFAULT_CONTEXT_WINDOW_TOKENS`), duplicated here as a
+    /// plain constant since it is private to `adapters::claude` -- every
+    /// test below sizes its `context_tokens` fixture off this number so the
+    /// `window_fraction` gate's arithmetic is exact rather than guessed.
+    const CLAUDE_DEFAULT_WINDOW: u64 = 200_000;
+
+    #[test]
+    fn compact_advisory_fires_when_both_gates_clear() {
+        let repo_dir = tempfile::tempdir().expect("tempdir");
+        let state_tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_tmp.path().to_path_buf());
+        let transcript_dir = tempfile::tempdir().expect("tempdir");
+        let transcript = transcript_dir.path().join("session.jsonl");
+        // Window fraction: 150_000 / 200_000 = 0.75, above the default 0.6.
+        let tokens = 150_000u64;
+        std::fs::write(&transcript, stale_read_then_edit_transcript(50_000, tokens))
+            .expect("write transcript");
+
+        let adapter = super::adapters::claude::ClaudeAdapter::new(None);
+        let cfg = CtxConfig::default();
+        let score = Score {
+            context_tokens: tokens,
+            ..score_of(Verdict::Healthy, 0)
+        };
+
+        let advisory = compact_advisory_stop_nudge(
+            &state,
+            repo_dir.path(),
+            &cfg,
+            &score,
+            &transcript,
+            &adapter,
+        )
+        .expect("both gates should clear with 50k stale bytes at 75% of the window");
+        assert!(advisory.contains("stale"), "got {advisory}");
+        assert!(advisory.contains("/compact"), "got {advisory}");
+        assert!(
+            advisory.contains("Read"),
+            "names the stale source: {advisory}"
+        );
+    }
+
+    #[test]
+    fn compact_advisory_does_not_fire_below_the_reclaim_floor() {
+        let repo_dir = tempfile::tempdir().expect("tempdir");
+        let state_tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_tmp.path().to_path_buf());
+        let transcript_dir = tempfile::tempdir().expect("tempdir");
+        let transcript = transcript_dir.path().join("session.jsonl");
+        let tokens = 150_000u64;
+        // A single stale byte is not enough to clear `min_reclaim_tokens`
+        // even at a generous window fraction.
+        std::fs::write(&transcript, stale_read_then_edit_transcript(1, tokens))
+            .expect("write transcript");
+
+        let adapter = super::adapters::claude::ClaudeAdapter::new(None);
+        let cfg = CtxConfig::default();
+        let score = Score {
+            context_tokens: tokens,
+            ..score_of(Verdict::Healthy, 0)
+        };
+
+        assert_eq!(
+            compact_advisory_stop_nudge(
+                &state,
+                repo_dir.path(),
+                &cfg,
+                &score,
+                &transcript,
+                &adapter
+            ),
+            None,
+            "one stale byte must not clear the reclaim floor"
+        );
+    }
+
+    #[test]
+    fn compact_advisory_does_not_fire_below_the_window_fraction() {
+        let repo_dir = tempfile::tempdir().expect("tempdir");
+        let state_tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_tmp.path().to_path_buf());
+        let transcript_dir = tempfile::tempdir().expect("tempdir");
+        let transcript = transcript_dir.path().join("session.jsonl");
+        // 10_000 / 200_000 = 5%, well below the default 60% trigger, even
+        // though this fixture carries the same 50k stale bytes as the
+        // firing test above.
+        let tokens = 10_000u64;
+        std::fs::write(&transcript, stale_read_then_edit_transcript(50_000, tokens))
+            .expect("write transcript");
+
+        let adapter = super::adapters::claude::ClaudeAdapter::new(None);
+        let cfg = CtxConfig::default();
+        let score = Score {
+            context_tokens: tokens,
+            ..score_of(Verdict::Healthy, 0)
+        };
+
+        assert_eq!(
+            compact_advisory_stop_nudge(
+                &state,
+                repo_dir.path(),
+                &cfg,
+                &score,
+                &transcript,
+                &adapter
+            ),
+            None,
+            "5% of the window must not clear the window_fraction gate"
+        );
+    }
+
+    /// Issue #312's own hysteresis acceptance criterion: once the advisory
+    /// fires at a given window size, it must not refire until the window has
+    /// regrown a full trigger-sized runway (`window_fraction * window`)
+    /// PAST that point -- even across several more Stop-hook calls at the
+    /// same or a slightly larger window -- and must be allowed to fire again
+    /// once it genuinely has.
+    #[test]
+    fn compact_advisory_rearms_only_after_a_full_trigger_sized_runway() {
+        let repo_dir = tempfile::tempdir().expect("tempdir");
+        let state_tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_tmp.path().to_path_buf());
+        let transcript_dir = tempfile::tempdir().expect("tempdir");
+        let transcript = transcript_dir.path().join("session.jsonl");
+        std::fs::write(
+            &transcript,
+            stale_read_then_edit_transcript(50_000, 150_000),
+        )
+        .expect("write transcript");
+
+        let adapter = super::adapters::claude::ClaudeAdapter::new(None);
+        let cfg = CtxConfig::default();
+        // Default `window_fraction` is 0.6; the trigger-sized runway on
+        // `CLAUDE_DEFAULT_WINDOW` is 120_000 tokens.
+        let trigger_tokens = (0.6 * CLAUDE_DEFAULT_WINDOW as f64) as u64;
+
+        let first_score = Score {
+            context_tokens: 150_000,
+            ..score_of(Verdict::Healthy, 0)
+        };
+        let first = compact_advisory_stop_nudge(
+            &state,
+            repo_dir.path(),
+            &cfg,
+            &first_score,
+            &transcript,
+            &adapter,
+        );
+        assert!(first.is_some(), "the first call at 150_000 must fire");
+
+        // Same window, another Stop-hook call (a fresh process would reload
+        // the persisted checkpoint the same way): must not refire.
+        let second = compact_advisory_stop_nudge(
+            &state,
+            repo_dir.path(),
+            &cfg,
+            &first_score,
+            &transcript,
+            &adapter,
+        );
+        assert_eq!(second, None, "an unchanged window must not refire");
+
+        // Grown, but not by a full trigger-sized runway past the point it
+        // fired (150_000 + 120_000 = 270_000): still must not refire.
+        let partly_regrown_score = Score {
+            context_tokens: 150_000 + trigger_tokens - 1,
+            ..score_of(Verdict::Healthy, 0)
+        };
+        let third = compact_advisory_stop_nudge(
+            &state,
+            repo_dir.path(),
+            &cfg,
+            &partly_regrown_score,
+            &transcript,
+            &adapter,
+        );
+        assert_eq!(
+            third, None,
+            "one token short of a full trigger-sized runway must not refire"
+        );
+
+        // Now a full trigger-sized runway past the firing point: must rearm.
+        let fully_regrown_score = Score {
+            context_tokens: 150_000 + trigger_tokens,
+            ..score_of(Verdict::Healthy, 0)
+        };
+        let fourth = compact_advisory_stop_nudge(
+            &state,
+            repo_dir.path(),
+            &cfg,
+            &fully_regrown_score,
+            &transcript,
+            &adapter,
+        );
+        assert!(
+            fourth.is_some(),
+            "a full trigger-sized runway past the firing point must rearm"
+        );
     }
 
     #[test]
@@ -2670,6 +3114,7 @@ mod tests {
                 marker_miss_rate: None,
             },
             model_change: None,
+            window_breakdown: None,
         }
     }
 

@@ -190,6 +190,45 @@ pub struct SuperviseConfig {
     /// so a repo checkout widening this list cannot reproduce issue #133's
     /// ungoverned-concurrency incident.
     pub heavy_command_patterns: Vec<String>,
+    /// Issue #310 (3a): a session with NO PTY output, transcript growth, or
+    /// mail activity for this long, while it is not inside a tool call,
+    /// latches `stalled` (`stall::evaluate_progress`, `ToolState::Idle`).
+    /// Mirrors the Hermes Agent reference architecture's own
+    /// `_STALE_IDLE_SECONDS` (450.0).
+    ///
+    /// `REPO_FORBIDDEN`, same reasoning as `max_writers`: a checked-out repo
+    /// raising its own stall fuse could silently defeat the detector for a
+    /// session running against it.
+    pub idle_no_tool_secs: u64,
+    /// Same progress clock as `idle_no_tool_secs`, applied while the session
+    /// IS inside a tool call (`ToolState::InTool`) -- a stuck tool call is
+    /// expected to run longer than idle "thinking" time before it counts as
+    /// a stall. Mirrors Hermes's `_STALE_IN_TOOL_SECONDS` (1200.0).
+    ///
+    /// `REPO_FORBIDDEN`, same reasoning as `idle_no_tool_secs`.
+    pub in_tool_secs: u64,
+    /// Issue #310 (3a): once the stall latch arms and the one steering
+    /// nudge is sent, how long a session gets to show observed progress
+    /// before it is terminated via the existing kill path. Mirrors Hermes's
+    /// `_STALL_GRACE_SECONDS` (120.0).
+    ///
+    /// `REPO_FORBIDDEN`, same reasoning as `idle_no_tool_secs`.
+    pub stall_grace_secs: u64,
+    /// Issue #310 (3b): the restart-chain breaker's own trip threshold --
+    /// this many unplanned, same-class respawns, each no more than
+    /// `chain_max_gap_secs` apart, means "do not auto-resume, report"
+    /// instead of looping forever across process boundaries
+    /// (`chain::evaluate`). Mirrors Hermes's `DEFAULT_MAX_RESTARTS` (3).
+    ///
+    /// `REPO_FORBIDDEN`, same reasoning as `idle_no_tool_secs`: a repo
+    /// checkout raising its own restart budget could silently defeat the
+    /// breaker.
+    pub chain_max_restarts: u32,
+    /// See `chain_max_restarts` right above. Mirrors Hermes's
+    /// `DEFAULT_MAX_GAP_SECONDS` (300).
+    ///
+    /// `REPO_FORBIDDEN`, same reasoning as `chain_max_restarts`.
+    pub chain_max_gap_secs: u64,
 }
 
 impl Default for SuperviseConfig {
@@ -206,6 +245,11 @@ impl Default for SuperviseConfig {
             max_heavy_operations: 1,
             max_writers: 1,
             heavy_command_patterns: Vec::new(),
+            idle_no_tool_secs: 450,
+            in_tool_secs: 1200,
+            stall_grace_secs: 120,
+            chain_max_restarts: 3,
+            chain_max_gap_secs: 300,
         }
     }
 }
@@ -684,6 +728,32 @@ pub struct ReportConfig {
     pub repository: Option<String>,
 }
 
+/// Issue #315 (`zirv ctx search`): the single knob for how much rendered
+/// text a search/scroll call is allowed to hand back at once, the same
+/// "untrusted/large content does not get to be unbounded" rationale as
+/// `context.max_common_bytes`/`mail.max_delivered_bytes` above -- a
+/// mid-task agent calls this to check its own history without spending a
+/// model call, and an unbounded result would defeat that purpose by
+/// flooding the calling session's context instead. `REPO_FORBIDDEN`: a
+/// checked-out repo raising its own output cap is exactly the same
+/// asymmetry as every other byte cap in this file.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SearchConfig {
+    /// Hard cap, in bytes, on one rendered window (`search::render_window_
+    /// text`). Default `2048`, matching the issue's own acceptance
+    /// criterion.
+    pub max_output_bytes: usize,
+}
+
+impl Default for SearchConfig {
+    fn default() -> Self {
+        Self {
+            max_output_bytes: 2048,
+        }
+    }
+}
+
 /// Issue #264: the cost ledger's own pricing knobs. Both fields are
 /// `REPO_FORBIDDEN` -- a repo checkout must not be able to widen how long a
 /// stale price table is presented as trustworthy, or point pricing at a file
@@ -709,6 +779,41 @@ impl Default for PriceConfig {
         Self {
             stale_after_days: 90,
             table_path: None,
+        }
+    }
+}
+
+/// Issue #312: thresholds for `hook.rs`'s reclaim-gated compact advisory --
+/// a SECOND, cost-driven tier alongside the rot `Verdict` ladder, firing only
+/// when stale tool-result tokens exceed `min_reclaim_tokens` AND the window
+/// exceeds `window_fraction` of the model's context window.
+///
+/// Deliberately **not** `REPO_FORBIDDEN`, unlike `score.token_floor`/
+/// `token_ceiling` right above: those gate the rot engine's own
+/// restart/compact behavior, so a checkout that could widen them escapes
+/// real supervision. This section only tunes how eagerly a PURE, ignorable
+/// suggestion fires. It is still narrow-only, the same shape as
+/// `[verify_on_stop]`/`[diagnostics]`: a repo layer may only RAISE either
+/// threshold (quieten the advisory), never lower one so the Stop hook nags
+/// every turn -- see `narrow_compact_advisory_min_reclaim`.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CompactAdvisoryConfig {
+    /// Stale tool-result tokens (the `tool_results_stale` bucket of
+    /// `breakdown::BreakdownSummary`) must exceed this before the advisory
+    /// even considers firing. Default `4096`.
+    pub min_reclaim_tokens: u64,
+    /// AND the current window must exceed this fraction of the model's
+    /// resolved context window (the same capacity `rot::token_gates`
+    /// resolves) before the advisory fires. Default `0.6`.
+    pub window_fraction: f64,
+}
+
+impl Default for CompactAdvisoryConfig {
+    fn default() -> Self {
+        Self {
+            min_reclaim_tokens: 4096,
+            window_fraction: 0.6,
         }
     }
 }
@@ -1100,20 +1205,63 @@ pub struct ReviewConfig {
 /// override, adapter-owned default) are combined into the argv a
 /// delegation spawn actually launches with.
 ///
-/// `REPO_FORBIDDEN` as a whole table, the same trust asymmetry as
-/// `review.claude`/`review.codex` right above: a repo checkout must not be
-/// able to choose which model -- and so which vendor account -- spends the
-/// operator's tokens running a delegated worker. Unlike `review.*`, which
-/// only lands in injected prompt *text*, these keys reach a real launch
-/// argv directly (`AgentAdapter::model_args`), so the same charset/length/
-/// leading-dash guard `validate_model_str` applies to `chat.model`/
-/// `review.*` applies to both keys here too -- see the call sites in
-/// `CtxConfig::load`.
-#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+/// `claude`/`codex` are `REPO_FORBIDDEN` (each its own leaf entry, not the
+/// whole table -- see `REPO_FORBIDDEN`'s own comment on this), the same
+/// trust asymmetry as `review.claude`/`review.codex` right above: a repo
+/// checkout must not be able to choose which model -- and so which vendor
+/// account -- spends the operator's tokens running a delegated worker.
+/// Unlike `review.*`, which only lands in injected prompt *text*, these keys
+/// reach a real launch argv directly (`AgentAdapter::model_args`), so the
+/// same charset/length/leading-dash guard `validate_model_str` applies to
+/// `chat.model`/`review.*` applies to both keys here too -- see the call
+/// sites in `CtxConfig::load`.
+///
+/// `default_depth`/`default_read_only`/`max_depth`/`deny_network` are issue
+/// #262's delegation-envelope defaults (`envelope::WorkerEnvelope`), added
+/// to this same table rather than a new one since they are the other half
+/// of "what governs a delegated worker".
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct WorkerConfig {
     pub claude: Option<String>,
     pub codex: Option<String>,
+    /// Issue #262: how many hops of further `zirv agent` delegation a ROOT
+    /// session's envelope starts with (`envelope::WorkerEnvelope::
+    /// delegation_depth`) -- `1` lets a top-level worker delegate exactly
+    /// once more before a nested `zirv agent` refuses. `REPO_FORBIDDEN`: a
+    /// repo checkout must not be able to grant itself more delegation reach
+    /// than the operator configured.
+    pub default_depth: u8,
+    /// Issue #262: whether a ROOT session's envelope starts read-only
+    /// (`destructive: false`, no write paths) when `--mode` was not passed.
+    /// `REPO_FORBIDDEN`, same reasoning as `default_depth`.
+    pub default_read_only: bool,
+    /// Issue #262: an operator ceiling no envelope's `delegation_depth` may
+    /// exceed, regardless of `default_depth` or any `--depth` request.
+    /// Narrow-only fold with the repo layer (`narrow_worker_max_depth`,
+    /// mirroring `narrow_max_nudges`): a repo checkout may only LOWER this,
+    /// never raise it above the operator's own value. `u8::MAX` (no extra
+    /// cap beyond `default_depth`) is the default.
+    pub max_depth: u8,
+    /// Issue #262: whether every envelope computed in this repo denies
+    /// network tools outright. Narrow-only fold with the repo layer
+    /// (`narrow_worker_deny_network`, mirroring `narrow_pace_bool`): a repo
+    /// checkout may only turn this ON, never force it back off once the
+    /// operator (or another repo layer) has denied network access.
+    pub deny_network: bool,
+}
+
+impl Default for WorkerConfig {
+    fn default() -> Self {
+        Self {
+            claude: None,
+            codex: None,
+            default_depth: 1,
+            default_read_only: false,
+            max_depth: u8::MAX,
+            deny_network: false,
+        }
+    }
 }
 
 /// One harness's three generic tiers (`handover::TIERS`), each an optional
@@ -1303,6 +1451,7 @@ pub struct CtxConfig {
     pub handoff: HandoffConfig,
     pub pace: PaceConfig,
     pub price: PriceConfig,
+    pub compact_advisory: CompactAdvisoryConfig,
     pub optimize: OptimizeConfig,
     pub verify_on_stop: VerifyOnStopConfig,
     pub diagnostics: DiagnosticsConfig,
@@ -1311,6 +1460,7 @@ pub struct CtxConfig {
     pub mail: MailConfig,
     pub workflow: WorkflowConfig,
     pub report: ReportConfig,
+    pub search: SearchConfig,
     pub memory: MemoryConfig,
     pub setup: SetupConfig,
     pub chrome: ChromeConfig,
@@ -1477,6 +1627,31 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
     (
         "ZIRV_CTX_SUPERVISE_MAX_WRITERS",
         &["supervise", "max_writers"],
+        EnvKind::Int,
+    ),
+    (
+        "ZIRV_CTX_SUPERVISE_IDLE_NO_TOOL_SECS",
+        &["supervise", "idle_no_tool_secs"],
+        EnvKind::Int,
+    ),
+    (
+        "ZIRV_CTX_SUPERVISE_IN_TOOL_SECS",
+        &["supervise", "in_tool_secs"],
+        EnvKind::Int,
+    ),
+    (
+        "ZIRV_CTX_SUPERVISE_STALL_GRACE_SECS",
+        &["supervise", "stall_grace_secs"],
+        EnvKind::Int,
+    ),
+    (
+        "ZIRV_CTX_SUPERVISE_CHAIN_MAX_RESTARTS",
+        &["supervise", "chain_max_restarts"],
+        EnvKind::Int,
+    ),
+    (
+        "ZIRV_CTX_SUPERVISE_CHAIN_MAX_GAP_SECS",
+        &["supervise", "chain_max_gap_secs"],
         EnvKind::Int,
     ),
     ("ZIRV_CTX_MODEL", &["handoff", "model"], EnvKind::Str),
@@ -1693,6 +1868,11 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         EnvKind::Str,
     ),
     (
+        "ZIRV_CTX_SEARCH_MAX_OUTPUT_BYTES",
+        &["search", "max_output_bytes"],
+        EnvKind::Int,
+    ),
+    (
         "ZIRV_CTX_WORKFLOW_TELEMETRY",
         &["workflow", "telemetry_enabled"],
         EnvKind::Bool,
@@ -1835,6 +2015,26 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         EnvKind::Str,
     ),
     (
+        "ZIRV_CTX_WORKER_DEFAULT_DEPTH",
+        &["worker", "default_depth"],
+        EnvKind::Int,
+    ),
+    (
+        "ZIRV_CTX_WORKER_DEFAULT_READ_ONLY",
+        &["worker", "default_read_only"],
+        EnvKind::Bool,
+    ),
+    (
+        "ZIRV_CTX_WORKER_MAX_DEPTH",
+        &["worker", "max_depth"],
+        EnvKind::Int,
+    ),
+    (
+        "ZIRV_CTX_WORKER_DENY_NETWORK",
+        &["worker", "deny_network"],
+        EnvKind::Bool,
+    ),
+    (
         "ZIRV_CTX_HANDOVER_CLAUDE_CHEAP",
         &["handover", "claude", "cheap"],
         EnvKind::Str,
@@ -1873,6 +2073,16 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         "ZIRV_CTX_PRICE_TABLE_PATH",
         &["price", "table_path"],
         EnvKind::Str,
+    ),
+    (
+        "ZIRV_CTX_COMPACT_ADVISORY_MIN_RECLAIM_TOKENS",
+        &["compact_advisory", "min_reclaim_tokens"],
+        EnvKind::Int,
+    ),
+    (
+        "ZIRV_CTX_COMPACT_ADVISORY_WINDOW_FRACTION",
+        &["compact_advisory", "window_fraction"],
+        EnvKind::Float,
     ),
 ];
 
@@ -2067,6 +2277,36 @@ fn narrow_max_diagnostics(home: u32, repo: Option<u32>) -> u32 {
 /// longer than the operator allows), the `u64` mirror of `narrow_max_nudges`.
 fn narrow_diagnostics_timeout_secs(home: u64, repo: Option<u64>) -> u64 {
     home.min(repo.unwrap_or(u64::MAX))
+}
+
+/// Issue #312: the repo-narrowing fold for `compact_advisory.min_reclaim_tokens`
+/// -- HIGHER is stricter here (the advisory fires less eagerly), the opposite
+/// polarity from `narrow_max_nudges`: a repo checkout may quieten the Stop
+/// hook's compact suggestion, never make it nag every turn.
+fn narrow_compact_advisory_min_reclaim(home: u64, repo: Option<u64>) -> u64 {
+    home.max(repo.unwrap_or(0))
+}
+
+/// Issue #312: the same fold for `compact_advisory.window_fraction` -- a
+/// higher fraction means the advisory waits for a fuller window.
+fn narrow_compact_advisory_window_fraction(home: f64, repo: Option<f64>) -> f64 {
+    home.max(repo.unwrap_or(0.0))
+}
+
+/// Issue #262: the repo-narrowing fold for `worker.max_depth` -- lower is
+/// stricter (fewer hops of delegation reach), the `u8` mirror of
+/// `narrow_max_nudges`.
+fn narrow_worker_max_depth(home: u8, repo: Option<u8>) -> u8 {
+    home.min(repo.unwrap_or(u8::MAX))
+}
+
+/// Issue #262: the repo-narrowing fold for `worker.deny_network` -- `true`
+/// (network denied) is the strict direction, the same polarity as
+/// `narrow_pace_bool`: a repo checkout may deny network access for every
+/// delegated worker it hosts, but may never reopen it once the operator (or
+/// another repo layer) has denied it.
+fn narrow_worker_deny_network(home: bool, repo: Option<bool>) -> bool {
+    home.max(repo.unwrap_or(false))
 }
 
 /// Finding 4 (review): the one comma-separated-list splitter shared by every
@@ -2397,6 +2637,34 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
         &["supervise", "max_writers"],
         "ZIRV_CTX_SUPERVISE_MAX_WRITERS",
     ),
+    // Issue #310: same trust asymmetry as `max_writers`/`max_heavy_
+    // operations` above -- a repo checkout raising its own stall fuse or
+    // grace period could silently defeat the 3a stall detector for a
+    // session running against it (see `SuperviseConfig::idle_no_tool_secs`'s
+    // own doc comment).
+    (
+        &["supervise", "idle_no_tool_secs"],
+        "ZIRV_CTX_SUPERVISE_IDLE_NO_TOOL_SECS",
+    ),
+    (
+        &["supervise", "in_tool_secs"],
+        "ZIRV_CTX_SUPERVISE_IN_TOOL_SECS",
+    ),
+    (
+        &["supervise", "stall_grace_secs"],
+        "ZIRV_CTX_SUPERVISE_STALL_GRACE_SECS",
+    ),
+    // Same reasoning, for the 3b restart-chain breaker: a repo checkout
+    // raising its own restart budget or gap window could silently defeat
+    // the breaker.
+    (
+        &["supervise", "chain_max_restarts"],
+        "ZIRV_CTX_SUPERVISE_CHAIN_MAX_RESTARTS",
+    ),
+    (
+        &["supervise", "chain_max_gap_secs"],
+        "ZIRV_CTX_SUPERVISE_CHAIN_MAX_GAP_SECS",
+    ),
     // Mouse capture takes over the terminal's own text selection, so which
     // way that trade goes is the operator's call about their own terminal,
     // not a checked-out repo's.
@@ -2487,10 +2755,30 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     // tokens running a delegated headless worker (`zirv ctx agent`, and the
     // dashboard's own spawn-request pane variant), which is background spend
     // an operator never explicitly launched an interactive session for. See
-    // `WorkerConfig`'s own doc comment. `value_at` matches a table node the
-    // same way it matches a leaf (see `pace.use_credits`/`review` above), so
-    // this one entry blocks both `worker.claude` and `worker.codex` together.
-    (&["worker"], "ZIRV_CTX_WORKER_MODEL_CLAUDE"),
+    // `WorkerConfig`'s own doc comment. Unlike `review`/`pace.use_credits`
+    // above, these are two LEAF entries rather than one whole-table entry:
+    // issue #262 added `worker.max_depth`/`worker.deny_network` to this same
+    // table, and those two keys are deliberately NOT `REPO_FORBIDDEN` -- a
+    // repo checkout may narrow them (see `narrow_worker_max_depth`/
+    // `narrow_worker_deny_network`), so a whole-table entry here would wrongly
+    // block that narrowing too.
+    (&["worker", "claude"], "ZIRV_CTX_WORKER_MODEL_CLAUDE"),
+    (&["worker", "codex"], "ZIRV_CTX_WORKER_MODEL_CODEX"),
+    // Issue #262: the delegation-envelope defaults a ROOT session's
+    // `envelope::WorkerEnvelope` starts from. See `WorkerConfig`'s own doc
+    // comment on each field for why these two -- unlike `max_depth`/
+    // `deny_network` right above -- are operator-only outright rather than
+    // repo-narrowable: they set the STARTING point a repo could otherwise
+    // only ever narrow away from, so letting a repo raise them would be
+    // indistinguishable from letting it widen the narrow-only fold itself.
+    (
+        &["worker", "default_depth"],
+        "ZIRV_CTX_WORKER_DEFAULT_DEPTH",
+    ),
+    (
+        &["worker", "default_read_only"],
+        "ZIRV_CTX_WORKER_DEFAULT_READ_ONLY",
+    ),
     // `handover.*` (issue #84): a repo checkout must not be able to pick
     // which model -- and so which vendor account -- the orchestrator seat
     // swaps onto via `zirv ctx handover`, the same trust asymmetry as
@@ -2560,6 +2848,13 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
         "ZIRV_CTX_PRICE_STALE_AFTER_DAYS",
     ),
     (&["price", "table_path"], "ZIRV_CTX_PRICE_TABLE_PATH"),
+    // Issue #315: a repo checkout must not be able to widen its own
+    // `zirv ctx search` output cap -- same trust asymmetry as every other
+    // byte cap in this table, see `SearchConfig`'s own doc comment.
+    (
+        &["search", "max_output_bytes"],
+        "ZIRV_CTX_SEARCH_MAX_OUTPUT_BYTES",
+    ),
 ];
 
 fn value_at<'a>(table: &'a toml::Table, path: &[&str]) -> Option<&'a toml::Value> {
@@ -2758,6 +3053,28 @@ impl CtxConfig {
             integer_at(take_nested(&mut merged, "diagnostics", "max_diagnostics"));
         let home_diagnostics_timeout =
             integer_at(take_nested(&mut merged, "diagnostics", "timeout_secs"));
+        // Issue #312: both `compact_advisory` keys are narrow-only in the
+        // "less eager" direction -- see `narrow_compact_advisory_min_reclaim`.
+        let home_compact_advisory_min_reclaim = integer_at(take_nested(
+            &mut merged,
+            "compact_advisory",
+            "min_reclaim_tokens",
+        ));
+        let home_compact_advisory_window_fraction = float_at(take_nested(
+            &mut merged,
+            "compact_advisory",
+            "window_fraction",
+        ));
+        // Issue #262: `worker.max_depth`/`worker.deny_network` get the
+        // identical lift-before-merge treatment -- see `narrow_worker_
+        // max_depth`/`narrow_worker_deny_network` below for each field's
+        // strict direction. `worker.claude`/`worker.codex`/`worker.
+        // default_depth`/`worker.default_read_only` are NOT lifted here:
+        // they are `REPO_FORBIDDEN` outright, so `reject_untrusted_keys`
+        // (below) catches a repo file naming them before a repo layer could
+        // ever reach this merge.
+        let home_worker_max_depth = integer_at(take_nested(&mut merged, "worker", "max_depth"));
+        let home_worker_deny_network = bool_at(take_nested(&mut merged, "worker", "deny_network"));
         // `supervise.heavy_command_patterns` gets the identical treatment as
         // `sandbox.extra_deny` above, for the identical reason: the field's
         // own doc comment promises a repo layer may only ADD patterns, never
@@ -2850,6 +3167,19 @@ impl CtxConfig {
         ));
         let repo_diagnostics_timeout =
             integer_at(take_nested(&mut repo_layer, "diagnostics", "timeout_secs"));
+        let repo_compact_advisory_min_reclaim = integer_at(take_nested(
+            &mut repo_layer,
+            "compact_advisory",
+            "min_reclaim_tokens",
+        ));
+        let repo_compact_advisory_window_fraction = float_at(take_nested(
+            &mut repo_layer,
+            "compact_advisory",
+            "window_fraction",
+        ));
+        let repo_worker_max_depth = integer_at(take_nested(&mut repo_layer, "worker", "max_depth"));
+        let repo_worker_deny_network =
+            bool_at(take_nested(&mut repo_layer, "worker", "deny_network"));
         let repo_heavy_patterns = string_array(take_nested(
             &mut repo_layer,
             "supervise",
@@ -3002,6 +3332,53 @@ impl CtxConfig {
                 ))
                 .unwrap_or(i64::MAX),
             ),
+        );
+
+        let default_compact_advisory = CompactAdvisoryConfig::default();
+        let home_compact_advisory_min_reclaim_tokens = home_compact_advisory_min_reclaim
+            .and_then(|v| u64::try_from(v).ok())
+            .unwrap_or(default_compact_advisory.min_reclaim_tokens);
+        insert_path(
+            &mut merged,
+            &["compact_advisory", "min_reclaim_tokens"],
+            toml::Value::Integer(
+                i64::try_from(narrow_compact_advisory_min_reclaim(
+                    home_compact_advisory_min_reclaim_tokens,
+                    repo_compact_advisory_min_reclaim.and_then(|v| u64::try_from(v).ok()),
+                ))
+                .unwrap_or(i64::MAX),
+            ),
+        );
+        insert_path(
+            &mut merged,
+            &["compact_advisory", "window_fraction"],
+            toml::Value::Float(narrow_compact_advisory_window_fraction(
+                home_compact_advisory_window_fraction
+                    .unwrap_or(default_compact_advisory.window_fraction),
+                repo_compact_advisory_window_fraction,
+            )),
+        );
+
+        let default_worker = WorkerConfig::default();
+        let home_worker_max_depth_value = home_worker_max_depth
+            .and_then(|v| u8::try_from(v).ok())
+            .unwrap_or(default_worker.max_depth);
+        let repo_worker_max_depth_value = repo_worker_max_depth.and_then(|v| u8::try_from(v).ok());
+        insert_path(
+            &mut merged,
+            &["worker", "max_depth"],
+            toml::Value::Integer(i64::from(narrow_worker_max_depth(
+                home_worker_max_depth_value,
+                repo_worker_max_depth_value,
+            ))),
+        );
+        insert_path(
+            &mut merged,
+            &["worker", "deny_network"],
+            toml::Value::Boolean(narrow_worker_deny_network(
+                home_worker_deny_network.unwrap_or(default_worker.deny_network),
+                repo_worker_deny_network,
+            )),
         );
 
         let default_fallback = FallbackConfig::default();
@@ -3478,6 +3855,31 @@ mod tests {
             "the built-in set is baked into permit::is_heavy, not duplicated here"
         );
         assert_eq!(
+            SuperviseConfig::default().idle_no_tool_secs,
+            450,
+            "issue #310: mirrors the Hermes reference's own _STALE_IDLE_SECONDS"
+        );
+        assert_eq!(
+            SuperviseConfig::default().in_tool_secs,
+            1200,
+            "issue #310: mirrors the Hermes reference's own _STALE_IN_TOOL_SECONDS"
+        );
+        assert_eq!(
+            SuperviseConfig::default().stall_grace_secs,
+            120,
+            "issue #310: mirrors the Hermes reference's own _STALL_GRACE_SECONDS"
+        );
+        assert_eq!(
+            SuperviseConfig::default().chain_max_restarts,
+            3,
+            "issue #310: mirrors the Hermes reference's own DEFAULT_MAX_RESTARTS"
+        );
+        assert_eq!(
+            SuperviseConfig::default().chain_max_gap_secs,
+            300,
+            "issue #310: mirrors the Hermes reference's own DEFAULT_MAX_GAP_SECONDS"
+        );
+        assert_eq!(
             HandoffConfig::default().model,
             None,
             "per-adapter resolution now lives in resolve_distiller_model, not a hardcoded default"
@@ -3509,6 +3911,56 @@ mod tests {
         let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
         assert_eq!(cfg.score.window, 7);
         assert_eq!(cfg.score.marker, "[env]");
+    }
+
+    /// Issue #312: `compact_advisory`'s two keys are repo-settable but
+    /// narrow-only in the "less eager" direction (see `CompactAdvisoryConfig`'s
+    /// own doc comment): a repo layer may raise either threshold, a repo value
+    /// below the operator's is ignored, and an env var still wins over the
+    /// home layer as the base the repo narrows from.
+    #[test]
+    fn compact_advisory_repo_layer_may_only_quieten_the_advisory() {
+        assert_eq!(CompactAdvisoryConfig::default().min_reclaim_tokens, 4096);
+        assert_eq!(CompactAdvisoryConfig::default().window_fraction, 0.6);
+        assert_eq!(narrow_compact_advisory_min_reclaim(4096, Some(2048)), 4096);
+        assert_eq!(narrow_compact_advisory_min_reclaim(4096, Some(8192)), 8192);
+        assert_eq!(narrow_compact_advisory_min_reclaim(4096, None), 4096);
+        assert_eq!(narrow_compact_advisory_window_fraction(0.6, Some(0.5)), 0.6);
+        assert_eq!(narrow_compact_advisory_window_fraction(0.6, Some(0.9)), 0.9);
+        assert_eq!(narrow_compact_advisory_window_fraction(0.6, None), 0.6);
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[compact_advisory]\nmin_reclaim_tokens = 2048\nwindow_fraction = 0.5\n",
+        )
+        .expect("write");
+
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert_eq!(
+            cfg.compact_advisory.min_reclaim_tokens, 4096,
+            "a repo checkout may not make the advisory fire more eagerly"
+        );
+        assert_eq!(cfg.compact_advisory.window_fraction, 0.6);
+
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[compact_advisory]\nmin_reclaim_tokens = 16384\nwindow_fraction = 0.9\n",
+        )
+        .expect("write");
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert_eq!(cfg.compact_advisory.min_reclaim_tokens, 16384);
+        assert_eq!(cfg.compact_advisory.window_fraction, 0.9);
+
+        let env = env_map(&[
+            ("ZIRV_CTX_COMPACT_ADVISORY_MIN_RECLAIM_TOKENS", "32768"),
+            ("ZIRV_CTX_COMPACT_ADVISORY_WINDOW_FRACTION", "0.95"),
+        ]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert_eq!(cfg.compact_advisory.min_reclaim_tokens, 32768);
+        assert_eq!(cfg.compact_advisory.window_fraction, 0.95);
     }
 
     /// Companion to the test above, for the token gate's own five keys
@@ -4282,6 +4734,114 @@ mod tests {
         assert_eq!(narrow_diagnostics_timeout_secs(120, None), 120);
     }
 
+    /// Issue #262: the fold rule itself, the same no-config-file, no-
+    /// `CtxConfig::load` shape as `the_diagnostics_narrowing_fold_rule_
+    /// favours_the_stricter_layer_either_direction`.
+    #[test]
+    fn the_worker_narrowing_fold_rule_favours_the_stricter_layer_either_direction() {
+        // max_depth: home 5 / repo 1 -> 1 (repo may tighten the cap).
+        assert_eq!(narrow_worker_max_depth(5, Some(1)), 1);
+        // max_depth: home 1 / repo 5 -> 1 (repo may not raise it).
+        assert_eq!(narrow_worker_max_depth(1, Some(5)), 1);
+        assert_eq!(narrow_worker_max_depth(5, None), 5);
+
+        // deny_network: home false / repo true -> true (repo may deny it).
+        assert!(narrow_worker_deny_network(false, Some(true)));
+        // deny_network: home true / repo false -> true (repo may not reopen
+        // network access an operator (or another repo layer) already denied).
+        assert!(narrow_worker_deny_network(true, Some(false)));
+        assert!(!narrow_worker_deny_network(false, None));
+        assert!(!narrow_worker_deny_network(false, Some(false)));
+    }
+
+    /// Issue #262: the full `CtxConfig::load` integration -- a repo-layer
+    /// `worker.max_depth`/`worker.deny_network` may only tighten what the
+    /// operator's own `~/.zirv/ctx.toml` allows, never loosen it.
+    #[test]
+    fn a_repo_layer_may_only_narrow_worker_max_depth_and_deny_network() {
+        let home_dir = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home_dir.path());
+        std::fs::create_dir_all(home_dir.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home_dir.path().join(".zirv/ctx.toml"),
+            "[worker]\nmax_depth = 5\ndeny_network = false\n",
+        )
+        .expect("write");
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[worker]\nmax_depth = 1\ndeny_network = true\n",
+        )
+        .expect("write");
+
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert_eq!(cfg.worker.max_depth, 1, "a repo may tighten the depth cap");
+        assert!(
+            cfg.worker.deny_network,
+            "a repo may deny network for every worker it hosts"
+        );
+
+        // The other direction: a repo trying to WIDEN either key is ignored,
+        // not honored -- narrowing works from BOTH layers' own strictness,
+        // never just "the repo wins".
+        let repo_widen = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo_widen.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo_widen.path().join(".zirv/ctx.toml"),
+            "[worker]\nmax_depth = 50\ndeny_network = false\n",
+        )
+        .expect("write");
+        let cfg = CtxConfig::load(repo_widen.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert_eq!(
+            cfg.worker.max_depth, 5,
+            "a repo may not raise the depth cap above the operator's own"
+        );
+        assert!(
+            !cfg.worker.deny_network,
+            "an operator who left network open is not affected by a repo's own false"
+        );
+    }
+
+    /// Issue #262: `worker.default_depth`/`worker.default_read_only` set the
+    /// STARTING point a repo could otherwise only narrow away from, so --
+    /// unlike `max_depth`/`deny_network` right above -- they are operator-only
+    /// outright, the same trust boundary as `workflow.review_worker_budget_
+    /// tokens`.
+    #[test]
+    fn a_repo_layer_may_not_set_worker_default_depth_or_read_only() {
+        for (toml, key, escape_hatch) in [
+            (
+                "[worker]\ndefault_depth = 9\n",
+                "worker.default_depth",
+                "ZIRV_CTX_WORKER_DEFAULT_DEPTH",
+            ),
+            (
+                "[worker]\ndefault_read_only = true\n",
+                "worker.default_read_only",
+                "ZIRV_CTX_WORKER_DEFAULT_READ_ONLY",
+            ),
+        ] {
+            let repo = tempfile::tempdir().expect("tempdir");
+            std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+            std::fs::write(repo.path().join(".zirv/ctx.toml"), toml).expect("write");
+
+            let home = tempfile::tempdir().expect("tempdir");
+            let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+            let empty = env_map(&[]);
+            let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+                .expect_err("a repo may not set its own delegation-envelope starting point")
+                .to_string();
+            assert!(err.contains(key), "names the offending key: {err}");
+            assert!(
+                err.contains(escape_hatch),
+                "names the operator escape hatch: {err}"
+            );
+        }
+    }
+
     /// Issue #309: the full `CtxConfig::load` integration -- a repo-layer
     /// `verify_on_stop.enabled = true` must not resurrect a feature the
     /// operator's own `~/.zirv/ctx.toml` turned off, and a repo layer may
@@ -4525,6 +5085,10 @@ mod tests {
         let worker = WorkerConfig::default();
         assert_eq!(worker.claude, None);
         assert_eq!(worker.codex, None);
+        assert_eq!(worker.default_depth, 1);
+        assert!(!worker.default_read_only);
+        assert_eq!(worker.max_depth, u8::MAX);
+        assert!(!worker.deny_network);
     }
 
     #[test]
@@ -4559,9 +5123,15 @@ mod tests {
     /// account running a delegated headless worker.
     #[test]
     fn a_repo_layer_may_not_touch_worker_model_keys() {
-        for toml in [
-            "[worker]\nclaude = \"opus\"\n",
-            "[worker]\ncodex = \"gpt-5.6-terra\"\n",
+        for (toml, escape_hatch) in [
+            (
+                "[worker]\nclaude = \"opus\"\n",
+                "ZIRV_CTX_WORKER_MODEL_CLAUDE",
+            ),
+            (
+                "[worker]\ncodex = \"gpt-5.6-terra\"\n",
+                "ZIRV_CTX_WORKER_MODEL_CODEX",
+            ),
         ] {
             let repo = tempfile::tempdir().expect("tempdir");
             std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
@@ -4575,7 +5145,7 @@ mod tests {
                 .to_string();
             assert!(err.contains("worker"), "names the offending key: {err}");
             assert!(
-                err.contains("ZIRV_CTX_WORKER_MODEL_CLAUDE"),
+                err.contains(escape_hatch),
                 "names the operator escape hatch: {err}"
             );
         }
@@ -5247,6 +5817,75 @@ mod tests {
         let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
             .expect_err("a repo layer must be rejected");
         assert!(err.to_string().contains("max_writers"), "got {err}");
+    }
+
+    /// Issue #310: each of the 3a/3b `[supervise]` keys reads from its own
+    /// env var like every other `supervise.*` key.
+    #[test]
+    fn idle_no_tool_secs_env_override_sets_the_key() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let env = env_map(&[("ZIRV_CTX_SUPERVISE_IDLE_NO_TOOL_SECS", "60")]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert_eq!(cfg.supervise.idle_no_tool_secs, 60);
+    }
+
+    #[test]
+    fn in_tool_secs_env_override_sets_the_key() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let env = env_map(&[("ZIRV_CTX_SUPERVISE_IN_TOOL_SECS", "600")]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert_eq!(cfg.supervise.in_tool_secs, 600);
+    }
+
+    #[test]
+    fn stall_grace_secs_env_override_sets_the_key() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let env = env_map(&[("ZIRV_CTX_SUPERVISE_STALL_GRACE_SECS", "30")]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert_eq!(cfg.supervise.stall_grace_secs, 30);
+    }
+
+    #[test]
+    fn chain_max_restarts_env_override_sets_the_key() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let env = env_map(&[("ZIRV_CTX_SUPERVISE_CHAIN_MAX_RESTARTS", "5")]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert_eq!(cfg.supervise.chain_max_restarts, 5);
+    }
+
+    #[test]
+    fn chain_max_gap_secs_env_override_sets_the_key() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let env = env_map(&[("ZIRV_CTX_SUPERVISE_CHAIN_MAX_GAP_SECS", "600")]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert_eq!(cfg.supervise.chain_max_gap_secs, 600);
+    }
+
+    /// Issue #310: every 3a/3b `[supervise]` key is `REPO_FORBIDDEN`, same
+    /// reasoning as `max_writers` -- a checked-out repo must not be able to
+    /// silently defeat the stall detector or the restart-chain breaker by
+    /// raising its own thresholds.
+    #[test]
+    fn no_supervisor_reliability_key_may_come_from_a_repo_layer() {
+        for key in [
+            "idle_no_tool_secs",
+            "in_tool_secs",
+            "stall_grace_secs",
+            "chain_max_restarts",
+            "chain_max_gap_secs",
+        ] {
+            let repo = tempfile::tempdir().expect("repo");
+            std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+            std::fs::write(
+                repo.path().join(".zirv").join(CTX_CONFIG_FILE),
+                format!("[supervise]\n{key} = 999999\n"),
+            )
+            .expect("write");
+            let empty: HashMap<String, String> = HashMap::new();
+            let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+                .expect_err("a repo layer must be rejected");
+            assert!(err.to_string().contains(key), "got {err}");
+        }
     }
 
     /// Unlike `max_heavy_operations`, `heavy_command_patterns` is not
@@ -6398,6 +7037,35 @@ mod tests {
         assert_eq!(cfg.report.repository.as_deref(), Some("operator/incidents"));
     }
 
+    /// Issue #315: `search.max_output_bytes` defaults to 2048, an operator's
+    /// env var wins, and a repository checkout may never set it at all (same
+    /// asymmetry as every other byte cap in this file -- see `SearchConfig`'s
+    /// own doc comment).
+    #[test]
+    fn search_max_output_bytes_defaults_and_is_operator_only() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tempfile::tempdir().expect("repo");
+
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|key| empty.get(key).cloned()).expect("load");
+        assert_eq!(cfg.search.max_output_bytes, 2048);
+
+        let env = env_map(&[("ZIRV_CTX_SEARCH_MAX_OUTPUT_BYTES", "4096")]);
+        let cfg = CtxConfig::load(repo.path(), &|key| env.get(key).cloned()).expect("load");
+        assert_eq!(cfg.search.max_output_bytes, 4096);
+
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[search]\nmax_output_bytes = 999999\n",
+        )
+        .expect("write");
+        let err = CtxConfig::load(repo.path(), &|key| empty.get(key).cloned())
+            .expect_err("a repository must not be able to widen its own search output cap");
+        assert!(is_repo_forbidden(err.as_ref()), "got: {err}");
+    }
+
     /// Every configurable key in `CtxConfig`'s tree, as (table path, key)
     /// pairs. `table path` is dot-joined to match how a nested table's
     /// header appears in the sample-config file (`"pace.use_credits"`); the
@@ -6417,6 +7085,10 @@ mod tests {
         ("review", "codex"),
         ("worker", "claude"),
         ("worker", "codex"),
+        ("worker", "default_depth"),
+        ("worker", "default_read_only"),
+        ("worker", "max_depth"),
+        ("worker", "deny_network"),
         ("handover.claude", "cheap"),
         ("handover.claude", "standard"),
         ("handover.claude", "deep"),
@@ -6453,6 +7125,11 @@ mod tests {
         ("supervise", "max_heavy_operations"),
         ("supervise", "max_heavy_workers"),
         ("supervise", "max_writers"),
+        ("supervise", "idle_no_tool_secs"),
+        ("supervise", "in_tool_secs"),
+        ("supervise", "stall_grace_secs"),
+        ("supervise", "chain_max_restarts"),
+        ("supervise", "chain_max_gap_secs"),
         ("handoff", "model"),
         ("handoff", "tail_items"),
         ("handoff", "timeout_secs"),
@@ -6478,6 +7155,8 @@ mod tests {
         ("pace.use_credits", "codex"),
         ("price", "stale_after_days"),
         ("price", "table_path"),
+        ("compact_advisory", "min_reclaim_tokens"),
+        ("compact_advisory", "window_fraction"),
         ("optimize", "enabled"),
         ("optimize", "sessions_sampled"),
         ("optimize", "max_surface_bytes"),
@@ -6531,6 +7210,7 @@ mod tests {
         ("workflow", "adoption"),
         ("workflow.maintain", "timeout_secs"),
         ("report", "repository"),
+        ("search", "max_output_bytes"),
         ("workflow", "telemetry_enabled"),
         ("workflow", "telemetry_max_events"),
         ("workflow", "telemetry_retention_days"),

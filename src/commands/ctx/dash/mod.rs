@@ -39,6 +39,7 @@ use super::CtxResult;
 use super::adapters;
 use super::adapters::AgentAdapter;
 use super::config::{CtxConfig, EnvLookup, validate_model_str};
+use super::envelope;
 use super::event::{SessionId, SessionRef};
 use super::policy;
 use super::state::StateDir;
@@ -890,6 +891,11 @@ fn assemble_footer_facts(
     mail: Option<(usize, usize)>,
     workflow: Option<&workflow::ActiveWorkflowSummary>,
     last_exited: Option<(&str, Option<u64>)>,
+    // Issue #310: whether the focused pane's stall latch is currently armed
+    // (`DiskFacts::stalled`, looked up by the caller the same way `mail`
+    // above is) -- see `FooterAliveFacts::stalled`'s own doc comment for how
+    // this overrides the supervision segment.
+    stalled: bool,
 ) -> ui::FooterFacts {
     let footer_workflow = match workflow {
         Some(wf) => ui::FooterWorkflow::Active {
@@ -943,6 +949,7 @@ fn assemble_footer_facts(
         // failed to bind at spawn runs genuinely unsupervised, and the
         // footer now says so instead of assuming every alive pane is fine.
         supervised: row.supervised,
+        stalled,
     })
 }
 
@@ -1023,6 +1030,15 @@ struct DiskFacts {
     /// the footer's own `✉` segment -- see [`MailMap`]'s own doc comment
     /// for why `mail` above cannot answer this.
     mail_by_session: MailMap,
+    /// Issue #310: session short ids with an armed stall latch
+    /// (`sessions::stall_marker`), read on the same throttled tick as
+    /// `mail_by_session` and populated exactly the same way -- every
+    /// attached pane by its own `short()`, plus every live registry row this
+    /// dashboard owns. Absence means "not stalled" (never armed, or already
+    /// cleared by observed progress), matching the marker's own
+    /// once-cleared-on-progress contract; there is no separate "unknown"
+    /// state to represent here.
+    stalled: HashSet<String>,
     /// Issue #264: the aggregate row's own `failed`/`cost` cells, read once
     /// per throttled tick alongside `usage`/`mail` above -- `delegations.
     /// jsonl` is a plain file read, the same no-scan/no-network discipline
@@ -1232,6 +1248,29 @@ impl FactsCache {
                         .mail_by_session
                         .insert(record.short.clone(), counts);
                 }
+            }
+        }
+
+        // Issue #310: `stalled`, mirroring `mail_by_session` right above --
+        // every attached pane by its own `short()`, then every live registry
+        // row this dashboard owns. Rebuilt rather than updated in place for
+        // the identical reason: a cleared latch (or a reaped pane) must not
+        // linger as a stale badge once something else reuses the short.
+        self.disk.stalled.clear();
+        for pane in panes {
+            if sessions::stall_marker(state, pane.short()).is_some() {
+                self.disk.stalled.insert(pane.short().to_string());
+            }
+        }
+        for (record, liveness) in &self.registry {
+            if *liveness != sessions::Liveness::Live
+                || self.disk.stalled.contains(&record.short)
+                || record.owner_pid != Some(std::process::id())
+            {
+                continue;
+            }
+            if sessions::stall_marker(state, &record.short).is_some() {
+                self.disk.stalled.insert(record.short.clone());
             }
         }
     }
@@ -3557,6 +3596,38 @@ fn fulfill_spawn_request(
     let roots = workdir_roots(cfg, repo);
     let spawn_cwd = resolved_spawn_cwd(spawn_cwd, req.workdir.as_deref(), &roots)
         .map_err(|e| SpawnRefusal::channel(e.to_string()))?;
+    // Issue #262: `req.envelope` is the REQUESTING session's own envelope
+    // (the parent), never a ready-made grant -- reconstructed and re-
+    // narrowed here exactly like `workdir` just above, rather than trusted
+    // outright. Absent `envelope` (an older request, or the human-driven
+    // Spawn overlay, which has no delegation lineage at all) reads as "this
+    // dashboard's own root" (`agent::root_envelope`). `principal` is
+    // finalised once this pane's own session id exists, further down --
+    // narrowing itself does not depend on it, only the value carried in the
+    // resulting envelope's `principal` field does.
+    let parent_envelope = match req.envelope.as_deref().filter(|s| !s.trim().is_empty()) {
+        Some(raw) => {
+            serde_json::from_str(raw).unwrap_or_else(|_| envelope::WorkerEnvelope::locked())
+        }
+        None => super::agent::root_envelope(cfg),
+    };
+    let path_scope: Vec<String> = req
+        .path_scope
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    let requested_envelope = envelope::WorkerEnvelope::requested(
+        &parent_envelope,
+        String::new(),
+        &path_scope,
+        req.no_network,
+        req.mode == super::permit::WorkerMode::ReadOnly,
+        req.depth,
+        req.budget_tokens,
+    );
+    let mut child_envelope =
+        envelope::WorkerEnvelope::narrow(&parent_envelope, &requested_envelope)
+            .map_err(|e| SpawnRefusal::channel(format!("delegation envelope refused: {e}")))?;
     // R2: every pane in the vector is a live one -- `reap_ended_panes` takes
     // an exited pane out on the very next tick -- so the cap is a plain
     // `len()` again rather than a filtered count over a vector that only ever
@@ -4064,6 +4135,26 @@ fn fulfill_spawn_request(
     if let Some(schema) = &req.result_schema {
         turn_env.push((super::agent::RESULT_SCHEMA_ENV.to_string(), schema.clone()));
     }
+    // Issue #262: `child_envelope` was already narrowed (and, on a widening
+    // request, this function already returned `Err` before ever reaching
+    // this point) -- `principal` just needed this pane's own session id,
+    // which now exists. Pushed into the pane's real process env the same
+    // way `WORK_GROUP_ENV`/`RESULT_SCHEMA_ENV` are, so a further `zirv
+    // agent` this pane's own child runs reads it back as ITS parent
+    // envelope (`agent::resolve_parent_envelope`).
+    child_envelope.principal = format!(
+        "{}/{}",
+        parent_envelope.principal,
+        super::sessions::short_id(&session_id)
+    );
+    turn_env.push((
+        super::agent::ENVELOPE_ENV.to_string(),
+        envelope::canonical_json(&child_envelope).unwrap_or_default(),
+    ));
+    turn_env.push((
+        super::agent::PRINCIPAL_ENV.to_string(),
+        child_envelope.principal.clone(),
+    ));
 
     // T10: the same launch-time pacing gate `wrap::run_with`/this dashboard's
     // own first pane apply, but *non-interactively* here: this spawn happens
@@ -6699,6 +6790,20 @@ pub fn run_dashboard(
                                                     // exactly as before
                                                     // those flags existed.
                                                     result_schema: None,
+                                                    // The overlay has no
+                                                    // `--path-scope`/
+                                                    // `--no-network`/
+                                                    // `--depth` of its own
+                                                    // either (issue #262):
+                                                    // absent `envelope`
+                                                    // reads as "this
+                                                    // dashboard's own
+                                                    // root" at the
+                                                    // fulfilment side.
+                                                    envelope: None,
+                                                    path_scope: Vec::new(),
+                                                    no_network: false,
+                                                    depth: None,
                                                 };
                                                 let panes_before_spawn = panes.len();
                                                 // `trusted_interactive: true` --
@@ -7658,6 +7763,10 @@ pub fn run_dashboard(
         // doc comment.
         let focused_mail =
             focused_row.and_then(|row| facts_cache.disk.mail_by_session.get(&row.short).copied());
+        // Issue #310: the focused pane's own stall latch, looked up the same
+        // way `focused_mail` is right above.
+        let focused_stalled =
+            focused_row.is_some_and(|row| facts_cache.disk.stalled.contains(&row.short));
         let footer_facts = assemble_footer_facts(
             focused_row,
             &facts_cache.disk.usage,
@@ -7673,6 +7782,7 @@ pub fn run_dashboard(
                     ),
                 )
             }),
+            focused_stalled,
         );
 
         // Issue #264: the aggregate row's own facts. `workers_running` is
@@ -9110,7 +9220,7 @@ mod tests {
 
     #[test]
     fn assemble_footer_facts_is_none_with_nothing_focused_and_no_exit_to_report() {
-        let facts = assemble_footer_facts(None, &[], None, None, None);
+        let facts = assemble_footer_facts(None, &[], None, None, None, false);
         assert!(matches!(facts, ui::FooterFacts::None));
     }
 
@@ -9119,7 +9229,7 @@ mod tests {
     /// the dead-pane variant instead of drawing nothing.
     #[test]
     fn assemble_footer_facts_is_dead_when_nothing_is_focused_but_something_just_exited() {
-        let facts = assemble_footer_facts(None, &[], None, None, Some(("codex", Some(720))));
+        let facts = assemble_footer_facts(None, &[], None, None, Some(("codex", Some(720))), false);
         match facts {
             ui::FooterFacts::Dead(dead) => {
                 assert_eq!(dead.harness, "codex");
@@ -9138,7 +9248,7 @@ mod tests {
             seven_day: Some(18.0),
             credits: false,
         }];
-        let facts = assemble_footer_facts(Some(&row), &usage, Some((2, 1)), None, None);
+        let facts = assemble_footer_facts(Some(&row), &usage, Some((2, 1)), None, None, false);
         match facts {
             ui::FooterFacts::Alive(alive) => {
                 assert_eq!(alive.harness, "claude");
@@ -9149,6 +9259,7 @@ mod tests {
                 assert_eq!(alive.unread_mail, 3);
                 assert!(matches!(alive.workflow, ui::FooterWorkflow::None));
                 assert!(alive.supervised);
+                assert!(!alive.stalled);
             }
             _ => panic!("expected FooterFacts::Alive"),
         }
@@ -9159,9 +9270,22 @@ mod tests {
     #[test]
     fn assemble_footer_facts_carries_unsupervised_through() {
         let row = focused_alive_row_supervised(None, false);
-        let facts = assemble_footer_facts(Some(&row), &[], None, None, None);
+        let facts = assemble_footer_facts(Some(&row), &[], None, None, None, false);
         match facts {
             ui::FooterFacts::Alive(alive) => assert!(!alive.supervised),
+            _ => panic!("expected FooterFacts::Alive"),
+        }
+    }
+
+    /// Issue #310: the caller's own `stalled` lookup reaches the footer
+    /// facts unchanged -- `footer_alive_spans`'s own test proves this then
+    /// overrides the supervision segment.
+    #[test]
+    fn assemble_footer_facts_carries_stalled_through() {
+        let row = focused_alive_row(Some(47));
+        let facts = assemble_footer_facts(Some(&row), &[], None, None, None, true);
+        match facts {
+            ui::FooterFacts::Alive(alive) => assert!(alive.stalled),
             _ => panic!("expected FooterFacts::Alive"),
         }
     }
@@ -9173,7 +9297,7 @@ mod tests {
         let mut row = focused_alive_row(Some(12));
         row.state = ui::RowState::Dead;
         row.age_secs = Some(720);
-        let facts = assemble_footer_facts(Some(&row), &[], None, None, None);
+        let facts = assemble_footer_facts(Some(&row), &[], None, None, None, false);
         match facts {
             ui::FooterFacts::Dead(dead) => {
                 assert_eq!(dead.harness, "claude");
@@ -9191,7 +9315,7 @@ mod tests {
             step: "design".to_string(),
             awaiting_approval: false,
         };
-        let facts = assemble_footer_facts(Some(&row), &[], None, Some(&summary), None);
+        let facts = assemble_footer_facts(Some(&row), &[], None, Some(&summary), None, false);
         match facts {
             ui::FooterFacts::Alive(alive) => match alive.workflow {
                 ui::FooterWorkflow::Active { kind, step, gated } => {
@@ -9213,7 +9337,7 @@ mod tests {
             step: "spec".to_string(),
             awaiting_approval: true,
         };
-        let facts = assemble_footer_facts(Some(&row), &[], None, Some(&summary), None);
+        let facts = assemble_footer_facts(Some(&row), &[], None, Some(&summary), None, false);
         match facts {
             ui::FooterFacts::Alive(alive) => match alive.workflow {
                 ui::FooterWorkflow::Active { gated, .. } => assert!(gated),
@@ -10824,6 +10948,10 @@ mod tests {
             mode: super::super::permit::WorkerMode::Writing,
             owns_workdir: false,
             result_schema: None,
+            envelope: None,
+            path_scope: Vec::new(),
+            no_network: false,
+            depth: None,
         }
     }
 
@@ -10838,6 +10966,7 @@ mod tests {
             worker: crate::commands::ctx::config::WorkerConfig {
                 claude: Some("opus".to_string()),
                 codex: None,
+                ..Default::default()
             },
             ..CtxConfig::default()
         };
