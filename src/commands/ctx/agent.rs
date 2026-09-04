@@ -2554,6 +2554,12 @@ pub fn run_with<W: Write>(
     // allocation below, which needs it to record ownership and to run
     // startup GC first.
     let state = super::state::StateDir::resolve(env)?;
+    // Issue #358 (task 4): refuses to let a session an automatic orchestrator
+    // rollover already superseded keep coordinating delegation -- see
+    // `seat::fence`'s own doc comment. A no-op for any session with no seat
+    // (every headless delegation itself, and any interactive session not yet
+    // wired to a seat by task 5).
+    super::seat::fence(&state)?;
     // Issue #228: validated and canonicalised before anything else in this
     // delegation runs -- a bad `--workdir` must fail loudly, up front, not
     // surface as a confusing sandbox error deep inside a harness's own

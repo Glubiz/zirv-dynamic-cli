@@ -400,6 +400,10 @@ pub fn run_with<W: Write>(
 ) -> CtxResult<i32> {
     let cfg = CtxConfig::load_for_launch(repo, env)?;
     let state = StateDir::resolve(env)?;
+    // Issue #358 (task 4): a session an automatic rollover already
+    // superseded must not be able to hand its (already stale) seat off
+    // again -- see `seat::fence`'s own doc comment.
+    super::seat::fence(&state)?;
 
     let session_id = env(super::adapters::SESSION_ENV)
         .filter(|s| !s.trim().is_empty())

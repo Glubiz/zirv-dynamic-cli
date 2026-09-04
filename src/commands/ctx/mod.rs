@@ -52,6 +52,7 @@ pub mod score;
 pub mod screen;
 pub mod search;
 pub mod search_index;
+pub mod seat;
 pub mod sessions;
 pub mod signal;
 pub mod snapshot;

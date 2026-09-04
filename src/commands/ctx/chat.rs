@@ -49,6 +49,15 @@ pub struct ChatArgs {
     /// `chat` launch becomes a `wrap` launch (`wrap_args_for`).
     #[arg(long, default_value_t = false)]
     pub force_pace: bool,
+    /// Issue #358 (task 4): keep this orchestrator seat off the automatic
+    /// cross-harness rollover path entirely (`fallback.auto_orchestrator_
+    /// rollover`), regardless of headroom. Folded into the same `EnvLookup`
+    /// `--quiet` already rides (`pin_env`, mirroring `quiet_env`) as
+    /// `ZIRV_CTX_SEAT_PIN=true`, so `seat::pin_from_env` reads it correctly
+    /// wherever a seat is registered downstream, without this flag having to
+    /// be threaded through `WrapArgs`/`PaneSpec` by hand.
+    #[arg(long, default_value_t = false)]
+    pub pin_harness: bool,
     /// Extra arguments passed through to the agent, after `--`.
     //
     // `allow_hyphen_values`, because what gets passed through here is the
@@ -387,6 +396,7 @@ pub fn run_with<W: Write, E: Write>(
     }
 
     let env = quiet_env(env, args.quiet);
+    let env = pin_env(&env, args.pin_harness);
 
     // Emitted here -- after `quiet_env`, before either launch path -- so the
     // dashboard branch and the `wrap` fallback disclose identically, and
@@ -688,6 +698,28 @@ pub(crate) fn quiet_env<'a>(
 ) -> impl Fn(&str) -> Option<String> + 'a {
     move |key: &str| {
         if quiet && key == "ZIRV_CTX_QUIET" {
+            Some("true".to_string())
+        } else {
+            env(key)
+        }
+    }
+}
+
+/// Issue #358 (task 4): the same fold-a-flag-into-the-shared-env-closure
+/// idiom `quiet_env` above already established for `--quiet`, this time for
+/// `--pin-harness` -> `seat::PIN_ENV`. This is deliberately how `--pin-
+/// harness` reaches `seat::pin_from_env` rather than a new field threaded
+/// through `WrapArgs`/`PaneSpec`: the actual `seat::register` call for an
+/// orchestrator session lives inside `wrap.rs`/`dash/pane.rs` (see `seat::
+/// register`'s own doc comment for exactly where), both files this task does
+/// not touch. Once task 5 wires that call in, reading `env(seat::PIN_ENV)`
+/// there already sees this override, because both launch paths this
+/// function's own caller feeds (`wrap::run_with`, `dash::run_dashboard`) are
+/// handed this SAME closure -- no further plumbing needed on the flag's own
+/// path once that call exists.
+pub(crate) fn pin_env<'a>(env: EnvLookup<'a>, pin: bool) -> impl Fn(&str) -> Option<String> + 'a {
+    move |key: &str| {
+        if pin && key == super::seat::PIN_ENV {
             Some("true".to_string())
         } else {
             env(key)
@@ -1660,6 +1692,7 @@ mod tests {
             quiet: false,
             allow_nested: false,
             force_pace: false,
+            pin_harness: false,
             extra: Vec::new(),
         };
         let mut out = Vec::new();
@@ -1703,6 +1736,7 @@ mod tests {
             quiet: false,
             allow_nested: false,
             force_pace: false,
+            pin_harness: false,
             extra: Vec::new(),
         };
         let mut out = Vec::new();
@@ -1760,6 +1794,7 @@ mod tests {
             quiet: false,
             allow_nested: false,
             force_pace: false,
+            pin_harness: false,
             extra: Vec::new(),
         };
         let mut out = Vec::new();
@@ -1789,6 +1824,7 @@ mod tests {
             quiet: false,
             allow_nested,
             force_pace: false,
+            pin_harness: false,
             extra: Vec::new(),
         }
     }
