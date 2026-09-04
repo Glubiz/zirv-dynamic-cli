@@ -1301,6 +1301,7 @@ mod tests {
                     used_percentage: percent,
                     resets_at: now + resets_in,
                     observed_at: now,
+                    overage_covered: false,
                 }),
                 seven_day: None,
             },

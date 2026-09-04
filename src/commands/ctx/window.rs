@@ -13,6 +13,13 @@ pub struct Window {
     pub used_percentage: f64,
     pub resets_at: u64,
     pub observed_at: u64,
+    /// The vendor reports paid credits behind this window and has not actually
+    /// refused a request against it, so being at 100% costs money rather than
+    /// blocking work. Only the codex rollout/poller path ever sets it (issue
+    /// #337); `#[serde(default)]` so every reading stored before this field
+    /// existed loads as "not covered", which is the pre-existing behavior.
+    #[serde(default)]
+    pub overage_covered: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -31,6 +38,7 @@ fn window_at(node: Option<&Value>, observed_at: u64) -> Option<Window> {
         used_percentage,
         resets_at: node.get("resets_at").and_then(Value::as_u64).unwrap_or(0),
         observed_at,
+        overage_covered: false,
     })
 }
 
@@ -509,6 +517,7 @@ fn estimated_window(used: u64, budget: u64, oldest: u64, span: u64, now: u64) ->
         used_percentage: percent,
         resets_at,
         observed_at: now,
+        overage_covered: false,
     })
 }
 
@@ -609,11 +618,26 @@ fn window_slot(window_secs: u64) -> Option<bool /* true = five_hour */> {
 /// Maps a codex `rate_limits` object (primary/secondary with used_percent,
 /// window_minutes, resets_at in unix seconds) onto UsageWindows. Shared by the
 /// rollout collector and the codex poller.
+///
+/// Issue #337: `credits.has_credits` plus a null/absent `rate_limit_reached_type`
+/// is the vendor saying, on the same payload, "this window is full, and I served
+/// the request anyway out of paid credits". Both halves are required -- a
+/// non-null `rate_limit_reached_type` is the vendor reporting it actually
+/// refused -- and every other payload shape leaves `overage_covered` false, so
+/// an absent `credits` node can never soften a real refusal.
 #[allow(dead_code)]
 pub fn windows_from_rate_limits(
     limits: &serde_json::Value,
     observed_at: u64,
 ) -> Option<UsageWindows> {
+    let has_credits = limits
+        .pointer("/credits/has_credits")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let not_reached = limits
+        .get("rate_limit_reached_type")
+        .is_none_or(Value::is_null);
+    let overage_covered = has_credits && not_reached;
     let mut out = UsageWindows::default();
     for key in ["primary", "secondary"] {
         let Some(w) = limits.get(key).filter(|w| w.is_object()) else {
@@ -637,6 +661,7 @@ pub fn windows_from_rate_limits(
             used_percentage: used,
             resets_at,
             observed_at,
+            overage_covered,
         };
         if five_hour {
             out.five_hour = Some(win);
@@ -977,6 +1002,7 @@ mod tests {
                 used_percentage: 14.0,
                 resets_at: 1000,
                 observed_at: 500,
+                overage_covered: false,
             }),
             seven_day: None,
         };
@@ -994,6 +1020,7 @@ mod tests {
                 used_percentage: 14.0,
                 resets_at: 1000,
                 observed_at: 500,
+                overage_covered: false,
             }),
             seven_day: None,
         };
@@ -1009,6 +1036,7 @@ mod tests {
                 used_percentage: 20.0,
                 resets_at: 0,
                 observed_at: 1000,
+                overage_covered: false,
             }),
         };
         // Just inside the seven_day span from observation.
@@ -1023,6 +1051,7 @@ mod tests {
                 used_percentage: 20.0,
                 resets_at: 0,
                 observed_at: 1000,
+                overage_covered: false,
             }),
             seven_day: None,
         };
@@ -1041,11 +1070,13 @@ mod tests {
                 used_percentage: 14.0,
                 resets_at: 100,
                 observed_at: 0,
+                overage_covered: false,
             }),
             seven_day: Some(Window {
                 used_percentage: 20.0,
                 resets_at: 100_000,
                 observed_at: 0,
+                overage_covered: false,
             }),
         };
         let out = available(&windows, 5000);
@@ -1068,6 +1099,7 @@ mod tests {
                 used_percentage: 14.0,
                 resets_at: 1000,
                 observed_at: 999,
+                overage_covered: false,
             }),
             seven_day: None,
         };
@@ -1085,6 +1117,7 @@ mod tests {
                 used_percentage: 14.0,
                 resets_at: 1000,
                 observed_at: 999,
+                overage_covered: false,
             }),
             seven_day: None,
         };
@@ -1102,6 +1135,7 @@ mod tests {
                 used_percentage: 14.0,
                 resets_at: 4_102_444_800, // year 2100, i.e. "certainly not reset"
                 observed_at: 0,
+                overage_covered: false,
             }),
             seven_day: None,
         };
@@ -1129,11 +1163,13 @@ mod tests {
                 used_percentage: 90.0,
                 resets_at: now - 1,
                 observed_at: now - 10,
+                overage_covered: false,
             }),
             seven_day: Some(Window {
                 used_percentage: 30.0,
                 resets_at: now + SEVEN_DAY_SECS,
                 observed_at: now - 10,
+                overage_covered: false,
             }),
         };
         assert_eq!(
@@ -1167,6 +1203,7 @@ mod tests {
                 used_percentage: 50.0,
                 resets_at: 100,
                 observed_at: 10,
+                overage_covered: false,
             }),
             seven_day: None,
         };
@@ -1208,6 +1245,7 @@ mod tests {
                 used_percentage: pct,
                 resets_at: 1000,
                 observed_at,
+                overage_covered: false,
             }),
             seven_day: None,
         }
@@ -1342,11 +1380,13 @@ mod tests {
                 used_percentage: 10.0,
                 resets_at: 100,
                 observed_at: 10,
+                overage_covered: false,
             }),
             seven_day: Some(Window {
                 used_percentage: 20.0,
                 resets_at: 200,
                 observed_at: 10,
+                overage_covered: false,
             }),
         };
         let fresh = UsageWindows {
@@ -1354,6 +1394,7 @@ mod tests {
                 used_percentage: 90.0,
                 resets_at: 300,
                 observed_at: 50,
+                overage_covered: false,
             }),
             seven_day: None,
         };
@@ -1374,6 +1415,7 @@ mod tests {
                 used_percentage: 90.0,
                 resets_at: 300,
                 observed_at: 50,
+                overage_covered: false,
             }),
             seven_day: None,
         };
@@ -1382,6 +1424,7 @@ mod tests {
                 used_percentage: 5.0,
                 resets_at: 100,
                 observed_at: 10,
+                overage_covered: false,
             }),
             seven_day: None,
         };
@@ -1399,6 +1442,7 @@ mod tests {
             used_percentage: 1.0,
             resets_at: 0,
             observed_at: 100,
+            overage_covered: false,
         };
         assert_eq!(age_secs(&window, 160), 60);
         assert_eq!(
@@ -1825,6 +1869,16 @@ mod tests {
     }
 
     #[test]
+    fn a_window_stored_before_overage_coverage_deserializes_as_uncovered() {
+        let window: Window = serde_json::from_str(
+            r#"{"used_percentage":99.0,"resets_at":1788758370,"observed_at":1788423353}"#,
+        )
+        .expect("old window shape");
+
+        assert!(!window.overage_covered);
+    }
+
+    #[test]
     fn scan_finds_newest_by_timestamp_not_mtime() {
         let dir = tempfile::tempdir().unwrap();
         let day = dir.path().join("2026").join("02").join("26");
@@ -1967,6 +2021,7 @@ mod tests {
                 used_percentage: 50.0,
                 resets_at: now + 100_000,
                 observed_at: now - 100, // well within max_age
+                overage_covered: false,
             }),
             seven_day: None,
         };
@@ -1986,6 +2041,7 @@ mod tests {
                 used_percentage: 20.0,
                 resets_at: 500,
                 observed_at: now - 10_000, // well beyond max_age
+                overage_covered: false,
             }),
             seven_day: None,
         };
@@ -2045,6 +2101,7 @@ mod tests {
                 used_percentage: 20.0,
                 resets_at: now - 1,
                 observed_at: now - 20,
+                overage_covered: false,
             }),
             seven_day: None,
         };
@@ -2076,6 +2133,7 @@ mod tests {
                     used_percentage: 50.0,
                     resets_at: 1000,
                     observed_at: 10,
+                    overage_covered: false,
                 }),
                 seven_day: None,
             },
@@ -2097,6 +2155,7 @@ mod tests {
                     used_percentage: 75.0,
                     resets_at: 2000,
                     observed_at: 20,
+                    overage_covered: false,
                 }),
                 seven_day: None,
             },
@@ -2170,6 +2229,90 @@ mod tests {
             before, after,
             "store_for must be skipped when the merge is unchanged"
         );
+    }
+
+    /// Issue #337: the two rollout files copied verbatim off the machine that
+    /// reported the bug, laid out the way codex itself writes them
+    /// (`<sessions>/<yyyy>/<mm>/<dd>/rollout-<local-ts>-<uuid>.jsonl`).
+    /// Returns the sessions root; `stale_openai_reading` provides the stored
+    /// reading that was on disk there.
+    fn real_rollout_sessions_dir(root: &Path, days: &[&str]) -> PathBuf {
+        const ROLLOUTS: [(&str, &str, &str); 2] = [
+            (
+                "03",
+                "rollout-2026-09-03T12-29-19-01a066d0-df70-7c21-9a93-920c7f9df2b6.jsonl",
+                include_str!(
+                    "../../../tests/fixtures/codex-rollouts/2026/09/03/rollout-2026-09-03T12-29-19-01a066d0-df70-7c21-9a93-920c7f9df2b6.jsonl"
+                ),
+            ),
+            (
+                "04",
+                "rollout-2026-09-04T07-56-26-01a06afd-63c2-7061-8bdf-2798fe10b9e2.jsonl",
+                include_str!(
+                    "../../../tests/fixtures/codex-rollouts/2026/09/04/rollout-2026-09-04T07-56-26-01a06afd-63c2-7061-8bdf-2798fe10b9e2.jsonl"
+                ),
+            ),
+        ];
+        let sessions = root.join("codex_sessions");
+        for (day, name, body) in ROLLOUTS {
+            if !days.contains(&day) {
+                continue;
+            }
+            let dir = sessions.join("2026").join("09").join(day);
+            std::fs::create_dir_all(&dir).expect("rollout day dir");
+            std::fs::write(dir.join(name), body).expect("rollout file");
+        }
+        sessions
+    }
+
+    /// The stale reading `usage-openai.json` actually held on the machine in
+    /// issue #337: seven_day 99% observed 2026-09-03T08:15:53Z.
+    fn stale_openai_reading() -> UsageWindows {
+        UsageWindows {
+            five_hour: None,
+            seven_day: Some(Window {
+                used_percentage: 99.0,
+                resets_at: 1_788_758_370,
+                observed_at: 1_788_423_353,
+                overage_covered: false,
+            }),
+        }
+    }
+
+    #[test]
+    fn a_real_codex_rollout_tree_replaces_a_day_old_stored_reading() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let sessions = real_rollout_sessions_dir(tmp.path(), &["03", "04"]);
+        store_for(&state, CODEX_USAGE_PROVIDER, &stale_openai_reading()).expect("seed stale");
+
+        // Just after the 2026-09-04T05:56:31Z event in the newer rollout.
+        refresh_codex_usage(&state, Some(sessions.as_path()), 1_788_501_500, 900);
+
+        let seven = load_for(&state, CODEX_USAGE_PROVIDER)
+            .expect("stored")
+            .seven_day
+            .expect("seven_day");
+        assert_eq!(seven.used_percentage, 0.0);
+        assert_eq!(seven.resets_at, 1_789_106_188);
+        assert_eq!(seven.observed_at, 1_788_501_391);
+    }
+
+    #[test]
+    fn a_real_codex_rollout_tree_holding_only_the_older_day_stores_that_day() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let sessions = real_rollout_sessions_dir(tmp.path(), &["03"]);
+        store_for(&state, CODEX_USAGE_PROVIDER, &stale_openai_reading()).expect("seed stale");
+
+        refresh_codex_usage(&state, Some(sessions.as_path()), 1_788_501_500, 900);
+
+        let seven = load_for(&state, CODEX_USAGE_PROVIDER)
+            .expect("stored")
+            .seven_day
+            .expect("seven_day");
+        assert_eq!(seven.used_percentage, 100.0);
+        assert_eq!(seven.resets_at, 1_788_758_371);
     }
 
     /// Issue #155, Phase 2: per-session spend in the four raw classes, over a

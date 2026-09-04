@@ -396,22 +396,18 @@ pub fn run_with<W: Write>(
             // to acquire data, not just report whatever happened to already
             // be on disk.
             let http_poller = poll::HttpPoller::new(cfg.chrome.events);
-            if provider == window::CODEX_USAGE_PROVIDER {
-                // See `pace::refresh_sources`'s own doc comment: resolved via
-                // `crate::utils::home_dir()`, not left to `refresh_codex_
-                // usage`'s internal `dirs::home_dir()` fallback, which
-                // ignores `HOME`/`USERPROFILE` on Windows and so cannot be
-                // pointed at a test fixture there.
-                let sessions_dir = crate::utils::home_dir()
-                    .ok()
-                    .map(|h| h.join(".codex").join("sessions"));
-                window::refresh_codex_usage(
-                    &state,
-                    sessions_dir.as_deref(),
-                    now,
-                    cfg.pace.collector_max_age_secs,
-                );
-            }
+            // Refresh codex independently of the provider this invocation
+            // displays: its passive rollout collector is account-scoped, not
+            // tied to the harness that happened to call this command.
+            let sessions_dir = crate::utils::home_dir()
+                .ok()
+                .map(|h| h.join(".codex").join("sessions"));
+            window::refresh_codex_usage(
+                &state,
+                sessions_dir.as_deref(),
+                now,
+                cfg.pace.collector_max_age_secs,
+            );
             // Gated on `pace.enabled` (review finding): pacing disabled means
             // zirv makes no proactive vendor request on this operator's
             // behalf -- `ZIRV_CTX_PACE=false` must not still send an OAuth
@@ -753,6 +749,7 @@ mod tests {
                 used_percentage: percent,
                 resets_at: NOW + 1800,
                 observed_at: NOW - age,
+                overage_covered: false,
             }),
             seven_day: None,
         }
@@ -828,6 +825,7 @@ mod tests {
                 used_percentage: 12.5,
                 resets_at: NOW + 600,
                 observed_at: NOW,
+                overage_covered: false,
             }),
             seven_day: None,
         };
@@ -980,6 +978,54 @@ mod tests {
         assert_eq!(printed, "openai: no usage source\n");
     }
 
+    #[test]
+    fn the_usage_verb_refreshes_codex_even_when_claude_is_the_readout_provider() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("home tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let rollout_dir = home.path().join(".codex/sessions/2026/09/04");
+        std::fs::create_dir_all(&rollout_dir).expect("rollout dir");
+        std::fs::write(
+            rollout_dir.join(
+                "rollout-2026-09-04T07-56-26-01a06afd-63c2-7061-8bdf-2798fe10b9e2.jsonl",
+            ),
+            include_str!(
+                "../../../tests/fixtures/codex-rollouts/2026/09/04/rollout-2026-09-04T07-56-26-01a06afd-63c2-7061-8bdf-2798fe10b9e2.jsonl"
+            ),
+        )
+        .expect("rollout fixture");
+        let state_dir = tmp.path().join("state");
+        let env: std::collections::HashMap<String, String> = [
+            (
+                crate::commands::ctx::state::STATE_ENV.to_string(),
+                state_dir.display().to_string(),
+            ),
+            ("ZIRV_CTX_AGENT".to_string(), "claude".to_string()),
+            ("ZIRV_CTX_PACE".to_string(), "false".to_string()),
+        ]
+        .into();
+
+        run_with(
+            &UsageArgs {
+                action: None,
+                sessions: false,
+            },
+            &mut Vec::new(),
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+        )
+        .expect("usage report");
+
+        let seven_day = window::load_for(
+            &StateDir::from_root(state_dir),
+            window::CODEX_USAGE_PROVIDER,
+        )
+        .and_then(|windows| windows.seven_day)
+        .expect("codex rollout was refreshed");
+        assert_eq!(seven_day.used_percentage, 0.0);
+        assert_eq!(seven_day.observed_at, 1_788_501_391);
+    }
+
     /// O: before this command was provider-scoped it never called `adapters::
     /// select` at all -- it read the one legacy global file directly -- so a
     /// repo whose `.settings.toml` disables its own configured agent (or any
@@ -1022,6 +1068,7 @@ mod tests {
                     used_percentage: 42.0,
                     resets_at: 1_785_509_000,
                     observed_at: now_secs(),
+                    overage_covered: false,
                 }),
                 seven_day: None,
             },
@@ -1094,6 +1141,7 @@ mod tests {
                     used_percentage: 77.0,
                     resets_at: 1_785_509_000,
                     observed_at: now_secs(),
+                    overage_covered: false,
                 }),
                 seven_day: None,
             },
