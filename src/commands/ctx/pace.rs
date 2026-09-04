@@ -650,7 +650,7 @@ pub struct SpawnHeadroom {
     pub overage_covered: bool,
 }
 
-fn spawn_bindings<'a>(
+pub(crate) fn spawn_bindings<'a>(
     collector: &'a UsageWindows,
     estimator: Option<&'a UsageWindows>,
     now: u64,

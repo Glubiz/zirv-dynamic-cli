@@ -4509,6 +4509,8 @@ mod tests {
             requested_observed_at: Some(1_700_000_000),
             selected_headroom_pct: 66.0,
             selected_headroom_assumed: false,
+            binding_window: None,
+            reserved_tokens: 0,
         };
         let message = automatic_route_message(&route, pace::Seat::Cli);
         assert!(
