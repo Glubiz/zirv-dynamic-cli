@@ -39,6 +39,7 @@ pub mod permissions;
 pub mod permit;
 pub mod policy;
 pub mod poll;
+pub mod pool;
 pub mod price;
 pub mod prompt;
 pub mod reservation;

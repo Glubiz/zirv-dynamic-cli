@@ -11,6 +11,7 @@ use super::group;
 use super::handoff::latest_for_repo;
 use super::mail;
 use super::permit;
+use super::pool;
 use super::price;
 use super::sessions::{self, Liveness};
 use super::state::{StateDir, now_secs, repo_slug};
@@ -828,6 +829,12 @@ pub struct StatusArgs {
     /// resolution (`sessions::list`) rather than a second lookup mechanism.
     #[arg(long, value_name = "SESSION")]
     pub breakdown: Option<String>,
+    /// Issue #358 (task T6a): print the harness-pool view
+    /// (`pool::PoolView`) as pretty-printed JSON instead of the ordinary
+    /// text report, and return -- `--brief`/`--diff` are ignored in this
+    /// mode, matching `--breakdown`'s own early-return shape.
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
 }
 
 /// Issue #264: the `spend:` line's own computation, factored out so a test
@@ -935,6 +942,17 @@ fn render_report<W: Write>(
         label(colour, "state dir:"),
         style::paint(&state.root().display().to_string(), Tone::Muted, colour)
     )?;
+
+    // Fetched here, once, and reused by every section below that needs it
+    // (the work-group tree, the pool section, the sessions list itself) --
+    // `sessions::list` sweeps a stale record's file off disk as a side
+    // effect of being called at all (its own doc comment), so it must run
+    // exactly once per report: a second, later call (issue #358's own pool
+    // section calls `fallback::capacity_snapshot`, which calls `list` again
+    // internally for its harness `active` counts) would otherwise find a
+    // just-swept dead record already gone from disk, before the sessions
+    // section ever got to show it as `dead`.
+    let session_records = sessions::list(&state);
 
     // Issue #309: presentation only, off the same `latest_is_fresh_and_
     // passing` call the Stop hook's own verify-on-stop nudge uses -- omitted
@@ -1119,6 +1137,27 @@ fn render_report<W: Write>(
                     )?;
                 }
             }
+
+            // Issue #358 (task T6a): the harness-pool view, right after the
+            // fallback loop above -- same underlying inputs (`cfg.fallback`,
+            // this same `state`), one level more composed: per-harness
+            // state/headroom/signal quality, the seat driving automatic
+            // rollover (if any), and the reservation ledger, all in one
+            // place. `--brief` collapses to the identical single-line
+            // summary shape every other brief section already uses.
+            let pool_view = pool::build(
+                &state,
+                cfg,
+                now_secs(),
+                mail::session_identity(env).as_deref(),
+                Some(&repo_slug(repo)),
+            );
+            if args.brief {
+                writeln!(w, "{}", pool::render_text(&pool_view, true, colour))?;
+            } else {
+                writeln!(w, "{}", header(colour, "pool"))?;
+                writeln!(w, "{}", pool::render_text(&pool_view, false, colour))?;
+            }
         }
         Err(e) if repo_forbidden => writeln!(
             w,
@@ -1195,8 +1234,6 @@ fn render_report<W: Write>(
             }
         }
     }
-
-    let session_records = sessions::list(&state);
 
     // Issue #155, Phase 5(e): the machine-wide heavy-OPERATION budget's
     // current occupancy -- live permits (`permit::live_records`), not live
@@ -1874,6 +1911,31 @@ fn render_breakdown_table(
     out
 }
 
+/// Issue #358 (task T6a): `status --json` -- one [`pool::PoolView`],
+/// pretty-printed, and nothing else. Reads its own `state`/`cfg` rather than
+/// sharing `render_report`'s: the two paths never run in the same
+/// invocation (`run_with` returns right after this one), and `--json`'s own
+/// error shape (a plain load failure, not the softened "still render the
+/// rest of the report" handling `render_report` gives a `CtxConfig::load`
+/// failure) is deliberately the ordinary `?`-propagated one -- a JSON
+/// consumer wants a real exit code and stderr message, not a degraded
+/// document.
+fn render_pool_json<W: Write>(w: &mut W, repo: &Path, env: EnvLookup<'_>) -> CtxResult<i32> {
+    let state = StateDir::resolve(env)?;
+    let cfg = CtxConfig::load(repo, env)?;
+    let view = pool::build(
+        &state,
+        &cfg,
+        now_secs(),
+        mail::session_identity(env).as_deref(),
+        Some(&repo_slug(repo)),
+    );
+    let json = serde_json::to_string_pretty(&view)
+        .map_err(|e| format!("status --json: failed to serialize the pool view: {e}"))?;
+    writeln!(w, "{json}")?;
+    Ok(0)
+}
+
 pub fn run_with<W: Write>(
     args: &StatusArgs,
     w: &mut W,
@@ -1883,6 +1945,9 @@ pub fn run_with<W: Write>(
 ) -> CtxResult<i32> {
     if let Some(session) = &args.breakdown {
         return render_breakdown(session, w, repo, env);
+    }
+    if args.json {
+        return render_pool_json(w, repo, env);
     }
     if !args.diff {
         return render_report(args, w, repo, env, colour);
@@ -2045,6 +2110,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             tmp.path(),
@@ -2061,6 +2127,74 @@ mod tests {
         );
         assert!(text.contains("no supervised sessions"), "got {text}");
         assert!(text.contains("no handoff"), "got {text}");
+    }
+
+    /// Issue #358 (task T6a): the pool section's own header appears in the
+    /// full (non-`--brief`) report, right after the fallback block --
+    /// `header(colour, "pool")`'s exact `"\npool:"` shape, matching every
+    /// other section title this report prints.
+    #[test]
+    fn pool_section_appears_in_the_full_report() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = tmp.path().join("state");
+        let env = env_for(&state);
+
+        let mut out = Vec::new();
+        let code = run_with(
+            &StatusArgs {
+                decisions: 10,
+                brief: false,
+                diff: false,
+                breakdown: None,
+                json: false,
+            },
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            false,
+        )
+        .expect("runs");
+        assert_eq!(code, 0);
+
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(text.contains("\npool:"), "got {text}");
+    }
+
+    /// Issue #358 (task T6a): `status --json` prints one `pool::PoolView` as
+    /// pretty-printed JSON -- parseable, and carrying the shape's own
+    /// `harnesses`/`seat` keys, never the ordinary text report's sections.
+    #[test]
+    fn json_flag_prints_a_parseable_pool_view() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = tmp.path().join("state");
+        let env = env_for(&state);
+
+        let mut out = Vec::new();
+        let code = run_with(
+            &StatusArgs {
+                decisions: 10,
+                brief: false,
+                diff: false,
+                breakdown: None,
+                json: true,
+            },
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            false,
+        )
+        .expect("runs");
+        assert_eq!(code, 0);
+
+        let text = String::from_utf8(out).expect("utf8");
+        let value: serde_json::Value = serde_json::from_str(&text)
+            .unwrap_or_else(|e| panic!("--json output must parse as JSON: {e}\ngot: {text}"));
+        assert!(value.get("harnesses").is_some(), "got {text}");
+        assert!(value.get("seat").is_some(), "got {text}");
+        assert!(
+            !text.contains("state dir:"),
+            "--json must never fall through to the text report: {text}"
+        );
     }
 
     /// A repository with one commit, mirroring `verification.rs`'s own
@@ -2140,6 +2274,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             repo.path(),
@@ -2171,6 +2306,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             repo.path(),
@@ -2200,6 +2336,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             repo.path(),
@@ -2233,6 +2370,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             &repo,
@@ -2278,6 +2416,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             &repo,
@@ -2322,6 +2461,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             &repo,
@@ -2383,6 +2523,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             tmp.path(),
@@ -2420,6 +2561,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             tmp.path(),
@@ -2470,6 +2612,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             &repo,
@@ -2525,6 +2668,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             &repo,
@@ -2597,6 +2741,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             &repo,
@@ -2640,6 +2785,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             &repo,
@@ -2681,6 +2827,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             &repo,
@@ -2728,6 +2875,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             &repo,
@@ -2785,6 +2933,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             &repo,
@@ -2838,6 +2987,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             tmp.path(),
@@ -2876,6 +3026,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             tmp.path(),
@@ -2950,6 +3101,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             tmp.path(),
@@ -3008,6 +3160,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             tmp.path(),
@@ -3051,6 +3204,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             tmp.path(),
@@ -3104,6 +3258,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             tmp.path(),
@@ -3140,6 +3295,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             tmp.path(),
@@ -3188,6 +3344,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             &repo,
@@ -3249,6 +3406,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             tmp.path(),
@@ -3365,6 +3523,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             tmp.path(),
@@ -3432,6 +3591,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             tmp.path(),
@@ -3482,6 +3642,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             tmp.path(),
@@ -3544,6 +3705,7 @@ mod tests {
                     brief,
                     diff: false,
                     breakdown: None,
+                    json: false,
                 },
                 &mut out,
                 tmp.path(),
@@ -3609,6 +3771,7 @@ mod tests {
                     brief,
                     diff: false,
                     breakdown: None,
+                    json: false,
                 },
                 &mut out,
                 tmp.path(),
@@ -3642,6 +3805,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             tmp.path(),
@@ -3688,6 +3852,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             tmp.path(),
@@ -3739,6 +3904,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             tmp.path(),
@@ -3789,6 +3955,7 @@ mod tests {
                 brief: true,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             tmp.path(),
@@ -3856,6 +4023,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             tmp.path(),
@@ -3865,9 +4033,18 @@ mod tests {
         .expect("runs");
         let text = String::from_utf8(out).expect("utf8");
         assert!(text.contains("openai: no usage source"), "got {text}");
+        // Issue #358 (task T6a): scoped to the `usage windows:` line itself,
+        // not the whole report -- the new pool section legitimately shows
+        // `claude`'s own usage (correctly attributed to claude, not codex)
+        // alongside every other harness `cfg.fallback.order` names, which
+        // now also happens to contain "77".
+        let usage_line = text
+            .lines()
+            .find(|l| l.contains("usage windows:"))
+            .unwrap_or("");
         assert!(
-            !text.contains("77"),
-            "the claude-only legacy file must not leak into a codex repo's usage line: {text}"
+            !usage_line.contains("77"),
+            "the claude-only legacy file must not leak into a codex repo's usage line: {usage_line}"
         );
     }
 
@@ -3908,6 +4085,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             tmp.path(),
@@ -3948,6 +4126,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             tmp.path(),
@@ -3984,6 +4163,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             tmp.path(),
@@ -4030,6 +4210,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             &repo,
@@ -4079,6 +4260,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             &repo,
@@ -4141,6 +4323,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             &repo,
@@ -4175,6 +4358,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             tmp.path(),
@@ -4216,6 +4400,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             tmp.path(),
@@ -4251,6 +4436,7 @@ mod tests {
                         brief: false,
                         diff: false,
                         breakdown: None,
+                        json: false,
                     },
                     &mut out,
                     tmp.path(),
@@ -4294,6 +4480,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             tmp.path(),
@@ -4544,6 +4731,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             tmp.path(),
@@ -4574,6 +4762,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             tmp.path(),
@@ -4627,6 +4816,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             tmp.path(),
@@ -4694,6 +4884,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             tmp.path(),
@@ -4758,6 +4949,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             tmp.path(),
@@ -4910,6 +5102,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut full_out,
             &repo,
@@ -4926,6 +5119,7 @@ mod tests {
                 brief: true,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut brief_out,
             &repo,
@@ -5058,6 +5252,7 @@ mod tests {
                 brief: false,
                 diff: true,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             tmp.path(),
@@ -5075,6 +5270,9 @@ mod tests {
             "got {text}"
         );
         assert!(text.contains("no supervised sessions"), "got {text}");
+        // Issue #358 (task T6a): the new pool section rides along with
+        // every other section `--diff`'s own full-report fallback prints.
+        assert!(text.contains("\npool:"), "got {text}");
 
         let state = StateDir::from_root(state_root);
         let files: Vec<_> = std::fs::read_dir(state.status_snapshots())
@@ -5093,6 +5291,7 @@ mod tests {
             brief: false,
             diff: true,
             breakdown: None,
+            json: false,
         };
 
         let mut first = Vec::new();
@@ -5138,6 +5337,7 @@ mod tests {
             brief: false,
             diff: true,
             breakdown: None,
+            json: false,
         };
 
         let mut first = Vec::new();
@@ -5224,6 +5424,7 @@ mod tests {
             brief: false,
             diff: true,
             breakdown: None,
+            json: false,
         };
         let mut first_out = Vec::new();
         run_with(
@@ -5250,6 +5451,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut status_out,
             &repo,
@@ -5323,6 +5525,7 @@ mod tests {
             brief: false,
             diff: true,
             breakdown: None,
+            json: false,
         };
 
         let mut out_a = Vec::new();
@@ -5368,6 +5571,7 @@ mod tests {
                 brief: false,
                 diff: true,
                 breakdown: None,
+                json: false,
             },
             &mut full_out,
             tmp.path(),
@@ -5383,6 +5587,7 @@ mod tests {
                 brief: true,
                 diff: true,
                 breakdown: None,
+                json: false,
             },
             &mut brief_out,
             tmp.path(),
@@ -5413,6 +5618,7 @@ mod tests {
                 brief: false,
                 diff: true,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             tmp.path(),

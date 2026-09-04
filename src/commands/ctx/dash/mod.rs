@@ -45,7 +45,7 @@ use super::policy;
 use super::state::StateDir;
 use super::term;
 use super::window;
-use super::{handoff, handover, mail, memory, prompt, score, sessions};
+use super::{fallback, handoff, handover, mail, memory, prompt, score, seat, sessions};
 use crate::commands::workflow;
 
 pub(crate) use pane::{Pane, PaneBudgetNotice, PaneSpec, PaneState, ScrollOutcome};
@@ -1048,6 +1048,18 @@ struct DiskFacts {
     /// both cells rather than a phantom `0`/`$0.00` that would be
     /// indistinguishable from "checked and found none".
     spend: Option<AggregateSpendFacts>,
+    /// Issue #358 (task T6a): one [`ui::HarnessStrip`] per harness `cfg.
+    /// fallback.order` names, for the aggregate row's own pool strip -- read
+    /// on the same throttled tick as `usage` right above, off the identical
+    /// `fallback::capacity_snapshot` the fallback/status surfaces already
+    /// build (a plain read of already-stored usage windows plus the
+    /// registry, never a scan/poll/network call). Empty when the repo
+    /// configures no fallback order at all.
+    pool_harnesses: Vec<ui::HarnessStrip>,
+    /// This dashboard's own orchestrator seat's `"gen N"` label (`seat::
+    /// load`, keyed by `FactsOwner::session_short`), `None` until a seat is
+    /// registered for it.
+    pool_seat: Option<String>,
 }
 
 /// Issue #264: [`DiskFacts::spend`]'s own shape.
@@ -1157,6 +1169,38 @@ impl FactsCache {
                 }
             })
             .collect();
+
+        // Issue #358 (task T6a): the aggregate row's own pool strip, same
+        // throttled tick as `usage` right above -- `fallback::capacity_
+        // snapshot` is itself a plain read of already-stored usage windows
+        // plus the session registry (`sessions::list`), never a scan, a
+        // poll, or a network call, matching every other read on this tick.
+        // `requester`/`requested` are both `None`: this is a repo-wide
+        // overview, not a placement decision for one particular unit of
+        // work, so nothing needs excluding from the live `active` count and
+        // no harness outside `cfg.fallback.order` needs to be forced in.
+        let pool_snapshot = fallback::capacity_snapshot(state, cfg, now_secs, None, None);
+        self.disk.pool_harnesses = pool_snapshot
+            .harnesses
+            .iter()
+            .map(|harness| {
+                let headroom_pct = pool_snapshot
+                    .provider(&harness.provider)
+                    .and_then(|p| p.binding.and_then(|i| p.windows.get(i)))
+                    .map(|w| w.headroom_pct);
+                ui::HarnessStrip {
+                    name: harness.name.clone(),
+                    state: harness.state.as_str().to_string(),
+                    headroom_pct,
+                }
+            })
+            .collect();
+        // The dashboard's own orchestrator seat -- `FactsOwner::session_
+        // short` is this dashboard's own registry short id (D2's own
+        // "deliberately the dashboard's own identity" convention, the same
+        // field every other per-dashboard disk read on this tick keys off).
+        self.disk.pool_seat =
+            seat::load(state, session_short).map(|s| format!("gen {}", s.generation));
 
         // Issue #264: the aggregate row's own `failed`/`cost` cells. A plain
         // file read, same as `usage` right above -- never a scan, a poll, or
@@ -8167,6 +8211,10 @@ pub fn run_dashboard(
                 .first()
                 .and_then(|u| u.five_hour)
                 .map(|pct| (pct, ui::Source::Live, facts_age)),
+            // Issue #358 (task T6a): the pool strip and seat label, same
+            // throttled tick as every other cell above.
+            harnesses: facts_cache.disk.pool_harnesses.clone(),
+            seat: facts_cache.disk.pool_seat.clone(),
         };
 
         let draw = terminal.draw(|f| {

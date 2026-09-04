@@ -42,17 +42,23 @@ use super::pane::PaneState;
 /// `dash::mod`'s `FactsCache::refresh_if_due` each throttled tick and kept
 /// here so that machinery -- and its own tests -- need no change; a future
 /// surface (the errors overlay, a status line) can read it back without
-/// re-deriving the read. `#[allow(dead_code)]`: every field is written by
-/// `refresh_if_due` and read back by that machinery's own tests, but nothing
-/// in the production render path reads one any more -- the same "landed
-/// ahead of its next call site" situation `style.rs`'s own module-level
-/// `#[allow(dead_code)]` documents for phase 1 of this issue.
+/// re-deriving the read. `five_hour`/`seven_day`/`name` are already read by
+/// `assemble_footer_facts`; issue #358 (task T6a) drops the blanket
+/// `#[allow(dead_code)]` this struct used to carry now that it is no longer
+/// landed ahead of every one of its fields' own call sites.
 #[derive(Clone)]
-#[allow(dead_code)]
 pub struct HarnessUsage {
     pub name: &'static str,
     pub five_hour: Option<f64>,
     pub seven_day: Option<f64>,
+    /// Whether this provider is currently metered by credits rather than a
+    /// subscription window (`cfg.pace.use_credits`). Filled every throttled
+    /// tick alongside its siblings, but no production render path has
+    /// consulted it since issue #202 phase 2b -- kept its own narrow
+    /// `#[allow(dead_code)]` (rather than reviving the whole struct's old
+    /// blanket one) so a future credits-aware footer/status surface can
+    /// still read it back without re-deriving the read.
+    #[allow(dead_code)]
     pub credits: bool,
 }
 
@@ -103,6 +109,20 @@ pub enum Source {
 /// behind it.
 pub type AggregateCell<T> = Option<(T, Source, Duration)>;
 
+/// Issue #358 (task T6a): one harness's condensed pool status for the
+/// aggregate row's own strip -- `allocator::HarnessState::as_str()`'s own
+/// vocabulary (`"ready"`/`"draining"`/`"hard-blocked"`/`"unknown"`/
+/// `"disabled"`), plus its binding window's raw headroom, `None` when it has
+/// none. Kept as plain strings here (not the `allocator`/`fallback` types
+/// themselves) so this module -- pure `ratatui` rendering, no state-dir or
+/// config dependency of its own -- never has to import either.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HarnessStrip {
+    pub name: String,
+    pub state: String,
+    pub headroom_pct: Option<f64>,
+}
+
 /// The dashboard's own aggregate row, drawn above the roster
 /// (`dash::mod::run_dashboard`'s own draw closure carves one row off the top
 /// of the sidebar for it, issue #264). `workers_running` is cheap in-memory
@@ -112,11 +132,20 @@ pub type AggregateCell<T> = Option<(T, Source, Duration)>;
 /// and are `None` until at least one delegation has ever completed;
 /// `five_hour_pct` reuses the same per-harness usage snapshot the header/
 /// footer already read (`DiskFacts::usage`).
+///
+/// `harnesses`/`seat` (issue #358, task T6a) are the pool strip: one
+/// [`HarnessStrip`] per harness `fallback::capacity_snapshot` names (empty
+/// when the dashboard's own repo has none configured, never a placeholder
+/// row) and this dashboard's own orchestrator seat's `"gen N"` label, `None`
+/// until a seat is registered for it. Both are throttled disk reads, the
+/// same cadence `DiskFacts::usage` already uses.
 pub struct AggregateFacts {
     pub workers_running: AggregateCell<u64>,
     pub workers_failed: AggregateCell<u64>,
     pub spend_micros: AggregateCell<u64>,
     pub five_hour_pct: AggregateCell<f64>,
+    pub harnesses: Vec<HarnessStrip>,
+    pub seat: Option<String>,
 }
 
 fn aggregate_cell_text<T: Copy>(cell: &AggregateCell<T>, render: impl Fn(T) -> String) -> String {
@@ -130,14 +159,35 @@ fn aggregate_cell_text<T: Copy>(cell: &AggregateCell<T>, render: impl Fn(T) -> S
 /// `--` in its place -- never a guessed or default number (see
 /// [`AggregateCell`]'s own doc comment for why that is structurally, not
 /// just conventionally, true).
+///
+/// Issue #358 (task T6a): the harness pool strip and seat label append after
+/// the four original cells, each behind its own `\u{b7}` separator, and only
+/// when there is something to show -- an empty `harnesses` list or a `None`
+/// seat contributes nothing at all, so a dashboard with no configured
+/// fallback order (or no registered seat) renders the identical row this
+/// function always has.
 pub fn render_aggregate_row(facts: &AggregateFacts) -> String {
-    format!(
+    let mut text = format!(
         "workers {} running \u{b7} {} failed \u{b7} {} \u{b7} five_hour {}",
         aggregate_cell_text(&facts.workers_running, |v: u64| v.to_string()),
         aggregate_cell_text(&facts.workers_failed, |v: u64| v.to_string()),
         aggregate_cell_text(&facts.spend_micros, |v: u64| price::format_usd(v, false)),
         aggregate_cell_text(&facts.five_hour_pct, |v: f64| format!("{v:.0}%")),
-    )
+    );
+    for strip in &facts.harnesses {
+        let headroom = strip
+            .headroom_pct
+            .map(|v| format!("{v:.0}%"))
+            .unwrap_or_else(|| "--".to_string());
+        text.push_str(&format!(
+            " \u{b7} {} {} {headroom}",
+            strip.name, strip.state
+        ));
+    }
+    if let Some(seat) = &facts.seat {
+        text.push_str(&format!(" \u{b7} seat {seat}"));
+    }
+    text
 }
 
 /// Draws [`render_aggregate_row`]'s text into `area`'s first row, dim -- this
@@ -2523,6 +2573,8 @@ mod tests {
             workers_failed: None,
             spend_micros: None,
             five_hour_pct: None,
+            harnesses: Vec::new(),
+            seat: None,
         }
     }
 
@@ -2552,6 +2604,8 @@ mod tests {
             workers_failed: Some((1, Source::Live, Duration::ZERO)),
             spend_micros: Some((4_200_000, Source::Live, Duration::ZERO)),
             five_hour_pct: Some((41.0, Source::Live, Duration::ZERO)),
+            harnesses: Vec::new(),
+            seat: None,
         };
         let text = render_aggregate_row(&facts);
         assert_eq!(
@@ -2569,12 +2623,70 @@ mod tests {
             workers_failed: None,
             spend_micros: None,
             five_hour_pct: Some((10.0, Source::Live, Duration::ZERO)),
+            harnesses: Vec::new(),
+            seat: None,
         };
         let text = render_aggregate_row(&facts);
         assert!(text.contains("workers 2 running"), "got {text}");
         assert!(text.contains("-- failed"), "got {text}");
         assert!(text.contains("\u{b7} -- \u{b7}"), "got {text}");
         assert!(text.contains("five_hour 10%"), "got {text}");
+    }
+
+    /// Issue #358 (task T6a): the pool strip and seat label append to the
+    /// aggregate row, each behind its own `\u{b7}` separator, in the design's
+    /// own worked shape (`claude ready 62% \u{b7} codex draining 8% \u{b7}
+    /// seat gen 3`) -- and neither one leaks into the row when both are
+    /// empty/`None` (already covered by `render_aggregate_row_renders_every_
+    /// live_cell` above, which asserts the row's exact text with an empty
+    /// `harnesses` and a `None` seat).
+    #[test]
+    fn render_aggregate_row_renders_the_harness_strip_and_seat() {
+        let facts = AggregateFacts {
+            workers_running: Some((3, Source::Live, Duration::ZERO)),
+            workers_failed: Some((1, Source::Live, Duration::ZERO)),
+            spend_micros: Some((4_200_000, Source::Live, Duration::ZERO)),
+            five_hour_pct: Some((41.0, Source::Live, Duration::ZERO)),
+            harnesses: vec![
+                HarnessStrip {
+                    name: "claude".to_string(),
+                    state: "ready".to_string(),
+                    headroom_pct: Some(62.0),
+                },
+                HarnessStrip {
+                    name: "codex".to_string(),
+                    state: "draining".to_string(),
+                    headroom_pct: Some(8.0),
+                },
+            ],
+            seat: Some("gen 3".to_string()),
+        };
+        let text = render_aggregate_row(&facts);
+        assert_eq!(
+            text,
+            "workers 3 running \u{b7} 1 failed \u{b7} $4.20 \u{b7} five_hour 41% \u{b7} claude \
+             ready 62% \u{b7} codex draining 8% \u{b7} seat gen 3"
+        );
+    }
+
+    /// A harness with no binding window (no measured/assumed headroom yet)
+    /// renders `--` in the strip, never a fabricated percentage.
+    #[test]
+    fn render_aggregate_row_harness_strip_with_no_headroom_renders_a_placeholder() {
+        let facts = AggregateFacts {
+            workers_running: None,
+            workers_failed: None,
+            spend_micros: None,
+            five_hour_pct: None,
+            harnesses: vec![HarnessStrip {
+                name: "gemini".to_string(),
+                state: "unknown".to_string(),
+                headroom_pct: None,
+            }],
+            seat: None,
+        };
+        let text = render_aggregate_row(&facts);
+        assert!(text.contains("gemini unknown --"), "got {text}");
     }
 
     /// A dialog must be opaque. `Block` paints only its border and
