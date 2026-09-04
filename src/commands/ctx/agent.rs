@@ -2023,12 +2023,27 @@ pub fn run_with<W: Write>(
         tool_calls: args.max_tool_calls,
     };
 
+    // Issue #328 fix: never let cross-harness fallback reroute a low-
+    // headroom dispatch back onto the orchestrator seat's OWN harness --
+    // that is the identical same-harness delegation `same_harness_refusal`
+    // above already refuses through the front door, just reached via the
+    // fallback back door instead (codex sitting at 100% of its 7-day window
+    // used to reroute every `zirv agent codex` straight back onto the
+    // calling claude seat). Not applied under `--force`: the operator
+    // already opted into spending on this exact harness regardless of
+    // headroom, so there is no back door left to close.
+    let same_harness_exclude = (env(adapters::SEAT_ROLE_ENV).as_deref() == Some("orchestrator")
+        && !args.force)
+        .then(|| env(adapters::AGENT_ENV))
+        .flatten();
+
     let route_request = super::fallback::RouteRequest {
         requested: &args.name,
         source_model: requested_model,
         source_model_explicit,
         bounds,
         now,
+        exclude: same_harness_exclude.as_deref(),
     };
     let route = super::fallback::route_new_delegation(&state, &cfg, route_request, args.force);
     let mut routed_args = args.clone();
@@ -2104,9 +2119,20 @@ pub fn run_with<W: Write>(
         } else {
             ""
         };
+        // Issue #328 fix: named only when `same_harness_exclude` actually
+        // kept the fallback search from landing back on the orchestrator
+        // seat's own harness -- an operator hitting this refusal for an
+        // ordinary reason (no exclusion applied at all) gets the plain
+        // message unchanged.
+        let exclusion_note = if same_harness_exclude.is_some() {
+            " Same-harness work from an orchestrator seat uses the harness's native subagent \
+              tool."
+        } else {
+            ""
+        };
         return Err(format!(
             "refusing to start new delegated work at this usage level; wait for the window to \
-             reset, or pass --force to spend anyway.{fallback_note}"
+             reset, or pass --force to spend anyway.{fallback_note}{exclusion_note}"
         )
         .into());
     }

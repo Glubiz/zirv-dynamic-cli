@@ -3686,6 +3686,10 @@ fn fulfill_spawn_request(
                 tool_calls: None,
             },
             now,
+            // The dashboard's own Spawn overlay authority path, not an
+            // `agent::run_with` orchestrator-seat delegation -- issue
+            // #328's same-harness exclusion is scoped to that call site.
+            exclude: None,
         },
         req.force,
     );
