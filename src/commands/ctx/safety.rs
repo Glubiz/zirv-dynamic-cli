@@ -4969,22 +4969,28 @@ fn resolve_repo_write_target(target: &str, cwd: &str) -> Option<String> {
 /// target is answered PER TARGET, not assumed to be the launch repo --
 /// `git repo /a` and `git repo /b/.zirv/work` are two different repos'
 /// scratch areas, and a sibling checkout's own `.zirv/work` never confines
-/// a write into the launch repo, or vice versa. A resolved form that is
-/// not filesystem-absolute at all (a `~`-prefixed target) is never even
-/// handed to `repo_root_of`: this module cannot resolve `~` to a real
-/// path, so it stays unresolvable rather than guessed at. Returns `target`
-/// unchanged (as originally written) on a violation, so a caller can
-/// report it without leaking a resolved absolute path.
+/// a write into the launch repo, or vice versa. A target under Claude Code's
+/// own harness home (`CLAUDE_CONFIG_DIR`, or `$HOME/.claude`) is likewise not
+/// a repository write. A resolved form that is not filesystem-absolute at
+/// all (a `~`-prefixed target) is never even handed to `repo_root_of`: this
+/// module cannot resolve `~` to a real path, so it stays unresolvable rather
+/// than guessed at. Returns `target` unchanged (as originally written) on a
+/// violation, so a caller can report it without leaking a resolved absolute
+/// path.
 fn repo_write_violation(
     target: &str,
     cwd: &str,
     repo_root_of: &dyn Fn(&str) -> Option<String>,
+    env: EnvLookup<'_>,
 ) -> Option<String> {
     let resolved = resolve_repo_write_target(target, cwd)?;
     let is_filesystem_absolute = resolved.starts_with('/')
         || (resolved.as_bytes().get(1) == Some(&b':')
             && matches!(resolved.as_bytes().get(2), Some(b'/')));
     if !is_filesystem_absolute {
+        return None;
+    }
+    if super::hook::target_is_under_harness_home(std::path::Path::new(&resolved), env) {
         return None;
     }
     let root = repo_root_of(&resolved)?;
@@ -5240,9 +5246,10 @@ fn inline_code_has_write_primitive(code: &str) -> bool {
 /// trailing slash; `repo_root_of(absolute_path)` returns the nearest git
 /// repository root containing `absolute_path`, or `None` when it names no
 /// repository at all -- production passes a real filesystem walk
-/// ([`filesystem_repo_root_of`]), tests pass a deterministic fake. This
-/// function itself stays pure: no clock, filesystem, or environment access
-/// of its own.
+/// ([`filesystem_repo_root_of`]), tests pass a deterministic fake.
+/// Environment lookup is injected; filesystem access is limited to the
+/// shared canonical harness-home containment check and the injected
+/// `repo_root_of` callback.
 ///
 /// Scans each of [`split_segments_with_pipe_marker`]'s segments (over the
 /// already heredoc-redacted command) for five write shapes: (a) a
@@ -5280,6 +5287,7 @@ pub(crate) fn orchestrator_repo_write_target(
     command: &str,
     cwd: &str,
     repo_root_of: &dyn Fn(&str) -> Option<String>,
+    env: EnvLookup<'_>,
 ) -> Option<String> {
     // (d)'s own approximation needs SOME allowed-roots list to check an
     // inline interpreter's code text against, but has no structured target
@@ -5346,7 +5354,7 @@ pub(crate) fn orchestrator_repo_write_target(
 
         if let Some(targets) = segment_write_targets(&neutralize_heredoc_operator(&segment)) {
             for target in &targets {
-                if let Some(hit) = repo_write_violation(target, cwd, repo_root_of) {
+                if let Some(hit) = repo_write_violation(target, cwd, repo_root_of, env) {
                     return Some(hit);
                 }
             }
@@ -5356,7 +5364,7 @@ pub(crate) fn orchestrator_repo_write_target(
             && tokens[1..].iter().any(|t| is_sed_perl_inplace_flag(t))
         {
             for target in sed_perl_inplace_targets(&program, &tokens) {
-                if let Some(hit) = repo_write_violation(&target, cwd, repo_root_of) {
+                if let Some(hit) = repo_write_violation(&target, cwd, repo_root_of, env) {
                     return Some(hit);
                 }
             }
@@ -5364,7 +5372,7 @@ pub(crate) fn orchestrator_repo_write_target(
 
         if matches!(program.as_str(), "cp" | "mv" | "install" | "rsync" | "ln")
             && let Some(target) = last_non_flag_argument(&tokens)
-            && let Some(hit) = repo_write_violation(target, cwd, repo_root_of)
+            && let Some(hit) = repo_write_violation(target, cwd, repo_root_of, env)
         {
             return Some(hit);
         }
@@ -7057,7 +7065,7 @@ fn run_check_hook_mode_with_env<W: Write>(
     .then(|| hook_repo_root(&payload.cwd))
     .flatten()
     .and_then(|cwd| {
-        orchestrator_repo_write_target(&effective_command, &cwd, &filesystem_repo_root_of)
+        orchestrator_repo_write_target(&effective_command, &cwd, &filesystem_repo_root_of, env)
     });
 
     let evidence = evaluate_with_attestation_evidence(
@@ -8426,7 +8434,8 @@ mod tests {
             "patch -p1 < .zirv/work/p.diff",
         ] {
             assert!(
-                orchestrator_repo_write_target(command, cwd, &fake_repo_root_of).is_some(),
+                orchestrator_repo_write_target(command, cwd, &fake_repo_root_of, &|_| None)
+                    .is_some(),
                 "{command}"
             );
         }
@@ -8444,7 +8453,7 @@ mod tests {
             ("cmd >| src/out.log", "src/out.log"),
         ] {
             assert_eq!(
-                orchestrator_repo_write_target(command, cwd, &fake_repo_root_of),
+                orchestrator_repo_write_target(command, cwd, &fake_repo_root_of, &|_| None),
                 Some(target.to_string()),
                 "{command}"
             );
@@ -8464,7 +8473,7 @@ mod tests {
             "for i in $(seq 1 80); do s=$(zirv ctx status --brief 2>&1); if echo \"$s\" | grep -qE 'x'; then echo READY; exit 0; fi; sleep 30; done",
         ] {
             assert_eq!(
-                orchestrator_repo_write_target(command, cwd, &fake_repo_root_of),
+                orchestrator_repo_write_target(command, cwd, &fake_repo_root_of, &|_| None),
                 None,
                 "{command}"
             );
@@ -8479,7 +8488,7 @@ mod tests {
             ("echo `cmd > src/backtick.log`", "src/backtick.log"),
         ] {
             assert_eq!(
-                orchestrator_repo_write_target(command, cwd, &fake_repo_root_of),
+                orchestrator_repo_write_target(command, cwd, &fake_repo_root_of, &|_| None),
                 Some(target.to_string()),
                 "{command}"
             );
@@ -8517,7 +8526,7 @@ mod tests {
             "git format-patch --stdout | git am",
         ] {
             assert_eq!(
-                orchestrator_repo_write_target(command, cwd, &fake_repo_root_of),
+                orchestrator_repo_write_target(command, cwd, &fake_repo_root_of, &|_| None),
                 None,
                 "{command}"
             );
@@ -8540,7 +8549,8 @@ mod tests {
             "git --git-dir=/work/repo/.git apply p.diff",
         ] {
             assert!(
-                orchestrator_repo_write_target(command, cwd, &fake_repo_root_of).is_some(),
+                orchestrator_repo_write_target(command, cwd, &fake_repo_root_of, &|_| None)
+                    .is_some(),
                 "{command}"
             );
         }
@@ -8549,7 +8559,7 @@ mod tests {
             "git -C /work/wt diff | git -C /work/repo apply",
         ] {
             assert_eq!(
-                orchestrator_repo_write_target(command, cwd, &fake_repo_root_of),
+                orchestrator_repo_write_target(command, cwd, &fake_repo_root_of, &|_| None),
                 None,
                 "{command}"
             );
@@ -8569,7 +8579,8 @@ mod tests {
             "cat p.diff | git apply",
         ] {
             assert!(
-                orchestrator_repo_write_target(command, cwd, &fake_repo_root_of).is_some(),
+                orchestrator_repo_write_target(command, cwd, &fake_repo_root_of, &|_| None)
+                    .is_some(),
                 "{command}"
             );
         }
@@ -8579,7 +8590,7 @@ mod tests {
             "git log -p -1 | git apply",
         ] {
             assert_eq!(
-                orchestrator_repo_write_target(command, cwd, &fake_repo_root_of),
+                orchestrator_repo_write_target(command, cwd, &fake_repo_root_of, &|_| None),
                 None,
                 "{command}"
             );
@@ -8597,7 +8608,7 @@ mod tests {
         let cwd = "/work/repo";
         let command = "cp /tmp/claude-501/x /work/sibling/src/a.rs";
         assert_eq!(
-            orchestrator_repo_write_target(command, cwd, &fake_repo_root_of),
+            orchestrator_repo_write_target(command, cwd, &fake_repo_root_of, &|_| None),
             Some("/work/sibling/src/a.rs".to_string())
         );
     }
@@ -8614,7 +8625,7 @@ mod tests {
             "echo x > /work/sibling/.zirv/memory/m.md",
         ] {
             assert_eq!(
-                orchestrator_repo_write_target(command, cwd, &fake_repo_root_of),
+                orchestrator_repo_write_target(command, cwd, &fake_repo_root_of, &|_| None),
                 None,
                 "{command}"
             );
@@ -8629,7 +8640,7 @@ mod tests {
         let cwd = "/work/repo";
         let command = "cp /tmp/claude-501/x /elsewhere/not-a-repo/file.txt";
         assert_eq!(
-            orchestrator_repo_write_target(command, cwd, &fake_repo_root_of),
+            orchestrator_repo_write_target(command, cwd, &fake_repo_root_of, &|_| None),
             None
         );
     }
@@ -8654,6 +8665,61 @@ mod tests {
             .trim_end_matches('/')
             .to_string();
         assert_eq!(found, expected);
+    }
+
+    #[test]
+    fn orchestrator_seat_allows_harness_memory_but_still_denies_repository_source() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = super::super::testenv::HomeGuard::set(home.path());
+        let _vars = super::super::testenv::VarGuard::set(&[("CLAUDE_CONFIG_DIR", None)]);
+        let harness_home = home.path().join(".claude");
+        let repo = home.path().join("repo");
+        for path in [&harness_home, &repo] {
+            std::fs::create_dir_all(path).expect("repo dir");
+            let status = std::process::Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(path)
+                .status()
+                .expect("run git init");
+            assert!(status.success(), "git init failed for {}", path.display());
+        }
+
+        let env = |key: &str| match key {
+            super::super::adapters::SEAT_ROLE_ENV => Some("orchestrator".to_string()),
+            "HOME" | "CLAUDE_CONFIG_DIR" => std::env::var(key).ok(),
+            _ => None,
+        };
+        let cfg = CtxConfig::load(&repo, &env).expect("loads");
+        let repo_cwd = repo.to_string_lossy().replace('\\', "/");
+
+        for (command, denied) in [
+            (
+                format!(
+                    "printf 'x' >> {}",
+                    harness_home
+                        .join("projects/slug/memory/MEMORY.md")
+                        .display()
+                ),
+                false,
+            ),
+            ("printf 'x' >> src/x.rs".to_string(), true),
+        ] {
+            let stdin = serde_json::json!({
+                "tool_name": "Bash",
+                "tool_input": {"command": command},
+                "permission_mode": "default",
+                "cwd": repo_cwd,
+            })
+            .to_string();
+            let mut out = Vec::new();
+            run_check_hook_mode_with_env(&cfg, &mut out, &stdin, &env).expect("runs");
+            let text = String::from_utf8(out).expect("utf8");
+            assert_eq!(
+                text.contains("orchestrator seat: dispatch a worker"),
+                denied,
+                "{command}: got {text}"
+            );
+        }
     }
 
     /// End-to-end: an orchestrator seat's `sed -i` on a repository file
