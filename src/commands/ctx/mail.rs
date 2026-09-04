@@ -1491,6 +1491,7 @@ pub fn consume_and_log(
             score: 0,
             action: "mail-consumed",
             detail: &format!("{file_id} claimed by {consumer}"),
+            observed_at: None,
         },
     );
     Ok(())

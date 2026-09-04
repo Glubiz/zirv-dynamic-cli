@@ -121,6 +121,7 @@ fn is_loose_limit_mention(line: &str) -> bool {
 /// itself. Fail-open: a broken state dir must not turn this into a hard
 /// failure, so a logging error is swallowed like the rest of this file's
 /// decision logging.
+#[cfg(test)]
 pub fn note_limit_wording_drift<W: Write>(
     line: &str,
     strict: bool,
@@ -132,16 +133,28 @@ pub fn note_limit_wording_drift<W: Write>(
     if strict || !is_loose_limit_mention(line) {
         return;
     }
+    emit_limit_wording_drift(line, 1, state, session, verb, stderr);
+}
+
+fn emit_limit_wording_drift<W: Write>(
+    first: &str,
+    count: usize,
+    state: &StateDir,
+    session: &str,
+    verb: &'static str,
+    stderr: &mut W,
+) {
     // Issue #227: redacted and truncated before it ever reaches stderr or the
     // decision log, so a field report can safely paste this line back into
     // an issue -- the offending text is the whole point of the breadcrumb
     // (new patterns get added from it), so it must not be dropped, only
     // scrubbed.
-    let redacted = redact_for_log(line);
+    let redacted = redact_for_log(first);
+    let detail = format!("{count} lines, first: {redacted}");
     let _ = writeln!(
         stderr,
-        "zirv ctx {verb}: possible usage-limit message not recognized by known patterns: \
-         {redacted}"
+        "zirv ctx {verb}: possible usage-limit message not recognized by known patterns \
+         ({detail})"
     );
     let _ = log::append(
         state,
@@ -152,7 +165,8 @@ pub fn note_limit_wording_drift<W: Write>(
             verdict: "n/a",
             score: 0,
             action: "limit-wording-drift",
-            detail: &redacted,
+            detail: &detail,
+            observed_at: None,
         },
     );
 }
@@ -332,27 +346,148 @@ pub fn scan_for_limit<W: Write>(
     stderr: &mut W,
 ) -> bool {
     let mut hit = false;
+    let mut drift_count = 0;
+    let mut first_drift = None;
     for line in lines {
         let strict = is_limit_hit(line);
         hit |= strict;
-        note_limit_wording_drift(line, strict, state, session, verb, stderr);
+        if !strict && is_loose_limit_mention(line) {
+            drift_count += 1;
+            first_drift.get_or_insert(line);
+        }
+    }
+    if let Some(first) = first_drift {
+        emit_limit_wording_drift(first, drift_count, state, session, verb, stderr);
     }
     hit
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LimitConfirmation {
+    Confirmed { detail: String },
+    Unconfirmed { detail: String },
+}
+
+/// Corroborates a raw output match against the provider's structured usage
+/// reading. Codex is force-scanned because the child may have written a newer
+/// rollout moments before the output tap observed its text.
+pub(crate) fn confirm_limit_hit(
+    state: &StateDir,
+    cfg: &PaceConfig,
+    now: u64,
+    provider: &str,
+) -> LimitConfirmation {
+    if provider == usage_window::CODEX_USAGE_PROVIDER
+        && let Ok(home) = crate::utils::home_dir()
+        && let Some(fresh) = usage_window::scan_codex_rollouts(
+            &home.join(".codex").join("sessions"),
+            usage_window::ROLLOUT_SCAN_FILES,
+            now,
+        )
+    {
+        let existing = usage_window::load_for(state, provider);
+        let merged = usage_window::merge(existing.clone().unwrap_or_default(), fresh);
+        if Some(&merged) != existing.as_ref() {
+            let _ = usage_window::store_for(state, provider, &merged);
+        }
+    }
+
+    let Some(collector) = usage_window::load_for(state, provider) else {
+        return LimitConfirmation::Unconfirmed {
+            detail: format!(
+                "provider={provider}, used=unknown, reached=unknown, age=unknown (no structured reading)"
+            ),
+        };
+    };
+
+    let mut confirmed = false;
+    let mut readings = Vec::new();
+    for (name, window) in [
+        ("five_hour", &collector.five_hour),
+        ("seven_day", &collector.seven_day),
+    ] {
+        let Some(reading) = window.as_ref() else {
+            continue;
+        };
+        let bound = binding(window, now, cfg).is_some();
+        let reached = provider == usage_window::CODEX_USAGE_PROVIDER && reading.limit_reached;
+        if bound
+            && (reached
+                || reading.used_percentage >= cfg.spawn_hard_pct
+                    && (provider == usage_window::CODEX_USAGE_PROVIDER
+                        || provider == usage_window::LEGACY_USAGE_PROVIDER))
+        {
+            confirmed = true;
+        }
+        readings.push(format!(
+            "{name} used={:.1}%, reached={}, age={}s, bound={bound}",
+            reading.used_percentage,
+            reading.limit_reached,
+            age_secs(reading, now)
+        ));
+    }
+
+    let detail = if readings.is_empty() {
+        format!(
+            "provider={provider}, used=unknown, reached=unknown, age=unknown (empty structured reading)"
+        )
+    } else {
+        format!("provider={provider}, {}", readings.join("; "))
+    };
+    if confirmed {
+        LimitConfirmation::Confirmed { detail }
+    } else {
+        LimitConfirmation::Unconfirmed { detail }
+    }
+}
+
+pub(crate) fn note_unconfirmed_limit_text<W: Write>(
+    state: &StateDir,
+    now: u64,
+    session: &str,
+    verb: &'static str,
+    detail: &str,
+    stderr: &mut W,
+) {
+    let _ = writeln!(
+        stderr,
+        "zirv ctx {verb}: usage-limit text seen but the provider's structured reading does not \
+         confirm it ({detail}); ignoring"
+    );
+    let _ = log::append(
+        state,
+        &log::Decision {
+            ts: now,
+            session,
+            verb,
+            verdict: "n/a",
+            score: 0,
+            action: "limit-text-unconfirmed",
+            detail,
+            observed_at: None,
+        },
+    );
+}
+
 /// Whether a collector window may drive the decision.
 ///
-/// A fresh observation always may. A stale one still may when it reported a full
-/// window whose reset has not arrived: the percentage is out of date, but a
-/// window cannot free up before its own reset time, so letting staleness clear
-/// the park would resume straight into an exhausted window. A stale reading
-/// below the ceiling is simply unknown and defers to the estimator.
+/// A fresh observation always may, except that an explicit refusal stops binding
+/// once its reported reset arrives. A stale one still may when it reported a full
+/// window or an explicit vendor refusal whose reset has not arrived: the
+/// percentage is out of date, but a window cannot free up before its own reset
+/// time, so letting staleness clear the park would resume straight into an
+/// exhausted window. A stale reading below the ceiling with no refusal is simply
+/// unknown and defers to the estimator.
 fn binding<'a>(window: &'a Option<Window>, now: u64, cfg: &PaceConfig) -> Option<&'a Window> {
     let window = window.as_ref()?;
+    if window.limit_reached && window.resets_at != 0 && window.resets_at <= now {
+        return None;
+    }
     if age_secs(window, now) <= cfg.collector_max_age_secs {
         return Some(window);
     }
-    if window.used_percentage >= cfg.max_percent && window.resets_at > now {
+    if (window.used_percentage >= cfg.max_percent || window.limit_reached) && window.resets_at > now
+    {
         return Some(window);
     }
     None
@@ -368,9 +503,11 @@ fn worst<'a>(
         .into_iter()
         .filter_map(|(name, window)| window.map(|w| (name, w)))
         .max_by(|a, b| {
-            a.1.used_percentage
-                .partial_cmp(&b.1.used_percentage)
-                .unwrap_or(std::cmp::Ordering::Equal)
+            a.1.limit_reached.cmp(&b.1.limit_reached).then_with(|| {
+                a.1.used_percentage
+                    .partial_cmp(&b.1.used_percentage)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
         })
 }
 
@@ -408,7 +545,7 @@ pub fn decide(
         return PaceDecision::Unknown;
     };
 
-    if window.used_percentage < cfg.max_percent {
+    if !window.limit_reached && window.used_percentage < cfg.max_percent {
         let band = cfg.max_percent - cfg.soft_percent;
         // Item 3: a nonzero `resets_at` at or before `now` means this
         // reading predates a completed reset -- the window genuinely rolled
@@ -480,9 +617,10 @@ pub enum SpawnGate {
         percent: f64,
         source: Source,
     },
-    /// At or above `spawn_hard_pct`: refuse by default. Only `--force`
-    /// (`agent.rs`'s own flag, threaded through `dash::SpawnRequest::force`
-    /// for a pane spawn) overrides it -- see `spawn_blocked` in `agent.rs`.
+    /// At or above `spawn_hard_pct`, or after an explicit vendor refusal:
+    /// refuse by default. Only `--force` (`agent.rs`'s own flag, threaded
+    /// through `dash::SpawnRequest::force` for a pane spawn) overrides it --
+    /// see `spawn_blocked` in `agent.rs`.
     Refuse {
         window: &'static str,
         percent: f64,
@@ -503,6 +641,9 @@ pub struct SpawnHeadroom {
     /// (issue #337). Always `0` for an estimator reading, which is computed
     /// from transcripts as of `now`.
     pub age_secs: u64,
+    /// Absolute timestamp paired with `age_secs`, for an auditable reroute
+    /// decision that remains useful after the relative age goes stale.
+    pub observed_at: u64,
     /// Issue #337: the vendor covers this window's overage from credits and
     /// has not actually refused, so being at 100% is a cost signal, not a
     /// block -- cross-harness rerouting must not fire on it.
@@ -552,9 +693,14 @@ pub fn spawn_headroom(
     picked.map(|(window, reading)| SpawnHeadroom {
         window,
         percent: reading.used_percentage,
-        headroom_pct: (100.0 - reading.used_percentage).clamp(0.0, 100.0),
+        headroom_pct: if reading.limit_reached {
+            0.0
+        } else {
+            (100.0 - reading.used_percentage).clamp(0.0, 100.0)
+        },
         source,
         age_secs: age_secs(reading, now),
+        observed_at: reading.observed_at,
         overage_covered: reading.overage_covered,
     })
 }
@@ -601,18 +747,20 @@ pub fn spawn_reset(
         .into_iter()
         .filter_map(|(window, reading)| {
             let reading = reading?;
-            (!reading.overage_covered && reading.used_percentage >= cfg.spawn_hard_pct).then(|| {
-                let reset_at = if reading.resets_at > now {
-                    reading.resets_at
-                } else {
-                    now.saturating_add(cfg.fallback_delay_secs)
-                };
-                SpawnReset {
-                    reset_at,
-                    window,
-                    source,
-                }
-            })
+            (!reading.overage_covered
+                && (reading.limit_reached || reading.used_percentage >= cfg.spawn_hard_pct))
+                .then(|| {
+                    let reset_at = if reading.resets_at > now {
+                        reading.resets_at
+                    } else {
+                        now.saturating_add(cfg.fallback_delay_secs)
+                    };
+                    SpawnReset {
+                        reset_at,
+                        window,
+                        source,
+                    }
+                })
         })
         .max_by_key(|reset| reset.reset_at)
 }
@@ -629,7 +777,9 @@ pub fn spawn_gate(
 
     let (source, five, seven) = spawn_bindings(collector, estimator, now, cfg);
     let gate_for = |name, window: &Window| {
-        if !window.overage_covered && window.used_percentage >= cfg.spawn_hard_pct {
+        if !window.overage_covered
+            && (window.limit_reached || window.used_percentage >= cfg.spawn_hard_pct)
+        {
             SpawnGate::Refuse {
                 window: name,
                 percent: window.used_percentage,
@@ -818,9 +968,9 @@ pub fn describe_spawn_gate(
             percent,
             source,
         } => Some(format!(
-            "{window} window at {percent:.1}% ({} data{observed}), at or above \
-             pace.spawn_hard_pct -- refusing to start new delegated work; this never affects a \
-             session already running; to override, {}",
+            "{window} window at {percent:.1}% ({} data{observed}), blocked by an explicit vendor \
+             refusal or pace.spawn_hard_pct -- refusing to start new delegated work; this never \
+             affects a session already running; to override, {}",
             source.as_str(),
             seat.override_hint()
         )),
@@ -846,9 +996,9 @@ pub struct PaceOutcome {
 pub struct PaceGate<'a> {
     /// Operator declaration that this harness's vendor plan covers overage
     /// from credits: when true, the proactive throttle/pause is skipped
-    /// entirely for this call. A vendor-reported limit hit (the caller's own
-    /// `scan_for_limit`/`is_limit_hit` path) still parks -- that is a
-    /// separate, untouched path.
+    /// entirely for this call. A raw limit-text match still goes through
+    /// `confirm_limit_hit`; a confirmed vendor refusal parks independently
+    /// of this proactive override.
     pub use_credits: bool,
     /// The active poll fallback for this call. `None` means `wait_for_window`
     /// never polls: polling disabled (`cfg.pace.poll_enabled == false`), or a
@@ -1091,6 +1241,7 @@ fn blind_wait<W: Write>(
                 action: "pacing-blind",
                 detail: "no usage source; applying the blind-mode safety delay instead of \
                          proceeding unthrottled",
+                observed_at: None,
             },
         );
         flags.no_source_announced = true;
@@ -1320,8 +1471,8 @@ pub fn wait_for_window<W: Write>(
 
     // Short-circuits before any source refresh or decision: an operator
     // declaring that this harness's vendor plan covers overage from credits
-    // means the proactive throttle/pause never applies to it. A
-    // vendor-reported limit hit still parks via a separate, untouched path.
+    // means the proactive throttle/pause never applies to it. A structured-
+    // confirmed vendor refusal still parks through its separate path.
     if gate.use_credits {
         if !flags.credits_announced {
             let _ = writeln!(
@@ -1338,6 +1489,7 @@ pub fn wait_for_window<W: Write>(
                     score: 0,
                     action: "use-credits-skip",
                     detail: "use_credits enabled; throttle/pause skipped for this harness",
+                    observed_at: None,
                 },
             );
             flags.credits_announced = true;
@@ -1520,6 +1672,7 @@ pub fn wait_for_window<W: Write>(
                     score: 0,
                     action: "pace-wait",
                     detail: &describe(&decision),
+                    observed_at: None,
                 },
             );
         }
@@ -1550,18 +1703,65 @@ mod tests {
                 resets_at: now + 600,
                 observed_at: now,
                 overage_covered: false,
+                limit_reached: false,
             }),
             seven_day: Some(super::Window {
                 used_percentage: 96.0,
                 resets_at: now + 3_600,
                 observed_at: now,
                 overage_covered: false,
+                limit_reached: false,
             }),
         };
         let reset = super::spawn_reset(&collector, None, now, &cfg).expect("hard refused");
         assert_eq!(reset.reset_at, now + 3_600);
         assert_eq!(reset.window, "seven_day");
         assert_eq!(reset.source, super::Source::Collector);
+    }
+
+    #[test]
+    fn an_explicit_vendor_refusal_blocks_until_reset_even_at_a_low_percentage() {
+        let now = 1_700_000_000;
+        let cfg = super::PaceConfig::default();
+        let collector = super::UsageWindows {
+            five_hour: Some(super::Window {
+                used_percentage: 2.0,
+                resets_at: now + 600,
+                observed_at: now - cfg.collector_max_age_secs - 1,
+                overage_covered: false,
+                limit_reached: true,
+            }),
+            seven_day: None,
+        };
+
+        assert!(matches!(
+            super::decide(&collector, None, now, &cfg),
+            super::PaceDecision::WaitUntil {
+                window: "five_hour",
+                percent: 2.0,
+                ..
+            }
+        ));
+        assert!(matches!(
+            super::spawn_gate(&collector, None, now, &cfg),
+            super::SpawnGate::Refuse {
+                window: "five_hour",
+                percent: 2.0,
+                ..
+            }
+        ));
+        assert_eq!(
+            super::spawn_reset(&collector, None, now, &cfg)
+                .expect("the vendor refusal has a reset")
+                .reset_at,
+            now + 600
+        );
+        assert_eq!(
+            super::spawn_headroom(&collector, None, now, &cfg)
+                .expect("the vendor refusal remains binding")
+                .headroom_pct,
+            0.0
+        );
     }
 
     #[test]
@@ -1578,6 +1778,7 @@ mod tests {
                 resets_at: 0,
                 observed_at: now,
                 overage_covered: false,
+                limit_reached: false,
             }),
             seven_day: None,
         };
@@ -1600,6 +1801,7 @@ mod tests {
             resets_at,
             observed_at,
             overage_covered: false,
+            limit_reached: false,
         })
     }
 
@@ -1615,6 +1817,131 @@ mod tests {
             five_hour: window(percent, resets_at, NOW - 10),
             seven_day: None,
         }
+    }
+
+    fn store_confirmation_reading(
+        state: &StateDir,
+        provider: &str,
+        percent: f64,
+        observed_at: u64,
+        limit_reached: bool,
+    ) {
+        window::store_for(
+            state,
+            provider,
+            &UsageWindows {
+                five_hour: Some(Window {
+                    used_percentage: percent,
+                    resets_at: NOW + 600,
+                    observed_at,
+                    overage_covered: false,
+                    limit_reached,
+                }),
+                seven_day: None,
+            },
+        )
+        .expect("store structured reading");
+    }
+
+    #[test]
+    fn codex_reached_flag_confirms_vendor_exhaustion() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = PaceConfig::default();
+        store_confirmation_reading(&state, window::CODEX_USAGE_PROVIDER, 2.0, NOW, true);
+
+        assert!(matches!(
+            confirm_limit_hit(&state, &cfg, NOW, window::CODEX_USAGE_PROVIDER),
+            LimitConfirmation::Confirmed { .. }
+        ));
+    }
+
+    #[test]
+    fn codex_high_usage_confirms_vendor_exhaustion() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = PaceConfig::default();
+        store_confirmation_reading(&state, window::CODEX_USAGE_PROVIDER, 99.0, NOW, false);
+
+        assert!(matches!(
+            confirm_limit_hit(&state, &cfg, NOW, window::CODEX_USAGE_PROVIDER),
+            LimitConfirmation::Confirmed { .. }
+        ));
+    }
+
+    #[test]
+    fn codex_fresh_low_usage_is_unconfirmed() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = PaceConfig::default();
+        store_confirmation_reading(&state, window::CODEX_USAGE_PROVIDER, 2.0, NOW, false);
+
+        assert!(matches!(
+            confirm_limit_hit(&state, &cfg, NOW, window::CODEX_USAGE_PROVIDER),
+            LimitConfirmation::Unconfirmed { .. }
+        ));
+    }
+
+    #[test]
+    fn missing_reading_is_unconfirmed() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state = StateDir::from_root(tmp.path().join("state"));
+
+        assert!(matches!(
+            confirm_limit_hit(
+                &state,
+                &PaceConfig::default(),
+                NOW,
+                window::CODEX_USAGE_PROVIDER,
+            ),
+            LimitConfirmation::Unconfirmed { .. }
+        ));
+    }
+
+    #[test]
+    fn claude_hard_ceiling_confirms_vendor_exhaustion() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = PaceConfig::default();
+        store_confirmation_reading(
+            &state,
+            window::LEGACY_USAGE_PROVIDER,
+            cfg.spawn_hard_pct,
+            NOW,
+            false,
+        );
+
+        assert!(matches!(
+            confirm_limit_hit(&state, &cfg, NOW, window::LEGACY_USAGE_PROVIDER),
+            LimitConfirmation::Confirmed { .. }
+        ));
+    }
+
+    #[test]
+    fn stale_claude_reading_is_unconfirmed() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = PaceConfig::default();
+        store_confirmation_reading(
+            &state,
+            window::LEGACY_USAGE_PROVIDER,
+            cfg.spawn_hard_pct,
+            NOW - cfg.collector_max_age_secs - 1,
+            false,
+        );
+
+        assert!(matches!(
+            confirm_limit_hit(&state, &cfg, NOW, window::LEGACY_USAGE_PROVIDER),
+            LimitConfirmation::Unconfirmed { .. }
+        ));
     }
 
     /// The `spawn_gate` tests below call with `now == 0` rather than `NOW`
@@ -1738,12 +2065,14 @@ mod tests {
                 resets_at: now + 600,
                 observed_at: now,
                 overage_covered: false,
+                limit_reached: false,
             }),
             seven_day: Some(Window {
                 used_percentage: 100.0,
                 resets_at: now + 3_600,
                 observed_at: now,
                 overage_covered: true,
+                limit_reached: false,
             }),
         };
 
@@ -1770,12 +2099,14 @@ mod tests {
                 resets_at: now + 600,
                 observed_at: now,
                 overage_covered: true,
+                limit_reached: false,
             }),
             seven_day: Some(Window {
                 used_percentage: 100.0,
                 resets_at: now + 3_600,
                 observed_at: now,
                 overage_covered: true,
+                limit_reached: false,
             }),
         };
 
@@ -2636,6 +2967,7 @@ mod tests {
         let loose_only = vec![
             "building the plan".to_string(),
             "You've reached your usage limit for this session".to_string(),
+            "The weekly usage limit was exceeded".to_string(),
         ];
         assert!(
             !scan_for_limit(&loose_only, &state, "sess-1", "loop", &mut stderr),
@@ -2647,7 +2979,17 @@ mod tests {
                 .filter(|l| l.contains("limit-wording-drift"))
                 .count(),
             1,
-            "one breadcrumb, for the one line that drifted: {log}"
+            "one breadcrumb for the whole batch: {log}"
+        );
+        let stderr_text = String::from_utf8(stderr.clone()).expect("utf8");
+        assert_eq!(
+            stderr_text.lines().count(),
+            1,
+            "one advisory per batch: {stderr_text}"
+        );
+        assert!(
+            stderr_text.contains("(2 lines, first:"),
+            "batch summary: {stderr_text}"
         );
 
         let with_strict = vec!["You've hit your weekly limit".to_string()];

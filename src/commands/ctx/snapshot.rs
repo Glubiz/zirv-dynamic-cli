@@ -810,6 +810,7 @@ mod tests {
                     score: 10,
                     action: "observe",
                     detail: "",
+                    observed_at: None,
                 },
             )
             .expect("append");
