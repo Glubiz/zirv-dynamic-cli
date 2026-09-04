@@ -464,6 +464,7 @@ pub(crate) fn note_unconfirmed_limit_text<W: Write>(
             score: 0,
             action: "limit-text-unconfirmed",
             detail,
+            observed_at: None,
         },
     );
 }

@@ -3300,6 +3300,7 @@ mod tests {
                     resets_at: now + 3_600,
                     observed_at: now.saturating_sub(901),
                     overage_covered: false,
+                    limit_reached: false,
                 }),
                 seven_day: None,
             },
