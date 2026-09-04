@@ -35,6 +35,7 @@ pub mod policy;
 pub mod poll;
 pub mod price;
 pub mod prompt;
+pub mod result_schema;
 pub mod resume;
 pub mod retrieval;
 pub mod rot;

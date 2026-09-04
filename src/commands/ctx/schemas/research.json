@@ -1,0 +1,19 @@
+{
+  "fields": [
+    {
+      "name": "status",
+      "kind": "enum",
+      "values": ["done", "blocked", "partial"],
+      "required": true
+    },
+    { "name": "findings", "kind": "str_array", "required": false },
+    { "name": "sources", "kind": "str_array", "required": false },
+    { "name": "summary", "kind": "str", "required": false }
+  ],
+  "example": {
+    "status": "done",
+    "findings": ["the config is loaded from ctx.toml"],
+    "sources": ["src/commands/ctx/config.rs"],
+    "summary": "confirmed the load order"
+  }
+}

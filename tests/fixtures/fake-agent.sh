@@ -86,6 +86,13 @@
 #   account  issue #227: writes a healthy transcript, prints an
 #            insufficient_quota/billing-exhaustion notice on stdout, then
 #            exits 1 the way a hard, non-retryable account exhaustion would
+#   contract-ok   issue #318: writes a healthy transcript, then a final
+#            assistant message whose text ends in a fenced ```json block
+#            satisfying the sample `{"fields":[{"name":"status",...}]}`
+#            OUTPUT CONTRACT tests declare (`{"status": "done"}`), exits 0
+#   contract-bad  issue #318: same shape as contract-ok, but the fenced
+#            json block's `status` value (`"bogus"`) is not one of the
+#            contract's declared enum values, exits 0
 #
 # FAKE_AGENT_MODE_FILE lets one test script a sequence across restarts, for
 # example "rot" then "healthy" to prove a restarted child is supervised on its
@@ -240,6 +247,20 @@ sleep_secs="${FAKE_AGENT_SLEEP:-0}"
 if { [ "$mode" = "rot" ] || [ "$mode" = "compact-tier" ]; } && [ "$sleep_secs" != "0" ]; then
   "$sleep_bin" "$sleep_secs"
 fi
+
+# Issue #318: one more assistant turn whose final text carries a fenced
+# json block -- written directly (not through emit_turn, whose %s
+# substitution cannot safely carry embedded quotes/backticks/newlines) so
+# the OUTPUT CONTRACT extraction/validation tests have a real transcript to
+# read a candidate out of.
+case "$mode" in
+  contract-ok)
+    printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"All done.\n\n```json\n{\"status\": \"done\"}\n```"}]}}' >> "$t"
+    ;;
+  contract-bad)
+    printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"All done.\n\n```json\n{\"status\": \"bogus\"}\n```"}]}}' >> "$t"
+    ;;
+esac
 
 case "$mode" in
   hang) while true; do "$sleep_bin" 1; done ;;

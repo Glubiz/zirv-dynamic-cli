@@ -1,0 +1,19 @@
+{
+  "fields": [
+    {
+      "name": "status",
+      "kind": "enum",
+      "values": ["done", "blocked", "partial"],
+      "required": true
+    },
+    { "name": "command", "kind": "str", "required": false },
+    { "name": "passed", "kind": "bool", "required": false },
+    { "name": "failures", "kind": "str_array", "required": false }
+  ],
+  "example": {
+    "status": "done",
+    "command": "cargo test",
+    "passed": true,
+    "failures": []
+  }
+}
