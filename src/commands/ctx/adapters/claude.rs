@@ -827,7 +827,7 @@ impl LaunchEnvironment {
             })
             .unwrap_or_default()
             .iter()
-            .map(|path| path.display().to_string())
+            .map(|path| grant_path(path))
             .collect();
         #[cfg(test)]
         let workspace_write_roots = Vec::new();
@@ -1189,8 +1189,20 @@ fn additional_worktree_roots(
 fn linked_worktree_args(repo: &Path) -> Vec<String> {
     linked_worktree_roots(repo)
         .into_iter()
-        .flat_map(|path| ["--add-dir".to_string(), path.display().to_string()])
+        .flat_map(|path| ["--add-dir".to_string(), grant_path(&path)])
         .collect()
+}
+
+/// Renders a discovered worktree or sibling root for Claude's own settings
+/// and argv. Discovery canonicalizes, which on Windows yields a `\\?\`
+/// verbatim path; Claude Code reads that prefix as a network share and
+/// rejects the directory at startup ("is a network path, which cannot be
+/// added as a working directory"), one warning per grant, so every sibling
+/// grant from issue #329 was refused on Windows. The verbatim prefix is
+/// only ever needed for Win32 calls, never for a path handed to another
+/// program, so it is stripped here.
+fn grant_path(path: &Path) -> String {
+    super::super::state::display_path(path)
 }
 
 /// The discovery half of [`linked_worktree_args`], shared with
@@ -3162,6 +3174,22 @@ mod tests {
         let settings = launch_settings_value(&policy, policy_path, &LaunchEnvironment::default())
             .expect("settings");
         assert!(settings["permissions"]["additionalDirectories"].is_null());
+    }
+
+    /// A canonicalized root (what worktree and sibling discovery produces)
+    /// carries the `\\?\` verbatim prefix on Windows; the rendered grant
+    /// must not, or Claude Code refuses it as a network path.
+    #[test]
+    fn grant_paths_never_carry_the_windows_verbatim_prefix() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let canonical = std::fs::canonicalize(tmp.path()).expect("canonical");
+        #[cfg(windows)]
+        assert!(canonical.to_string_lossy().starts_with(r"\\?\"));
+        let rendered = grant_path(&canonical);
+        assert!(!rendered.starts_with(r"\\?\"), "{rendered}");
+        // Still the same directory, just spelled the way another program
+        // can consume it.
+        assert_eq!(std::fs::canonicalize(&rendered).expect("exists"), canonical);
     }
 
     #[test]
