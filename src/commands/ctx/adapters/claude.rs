@@ -3173,11 +3173,11 @@ mod tests {
     /// A canonicalized root (what worktree and sibling discovery produces)
     /// carries the `\\?\` verbatim prefix on Windows; the rendered grant
     /// must not, or Claude Code refuses it as a network path.
-    #[cfg(windows)]
     #[test]
     fn grant_paths_never_carry_the_windows_verbatim_prefix() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let canonical = std::fs::canonicalize(tmp.path()).expect("canonical");
+        #[cfg(windows)]
         assert!(canonical.to_string_lossy().starts_with(r"\\?\"));
         let rendered = grant_path(&canonical);
         assert!(!rendered.starts_with(r"\\?\"), "{rendered}");
