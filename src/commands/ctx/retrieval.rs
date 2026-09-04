@@ -453,13 +453,13 @@ fn to_candidate(entry: Entry, shared: bool, now: u64) -> RetrievalCandidate {
     }
 }
 
-/// Gathers BOTH scopes as retrieval candidates, for session-startup
-/// retrieval -- mirrors `memory::render_for_prompt`'s own private+shared
+/// Gathers all scopes as retrieval candidates, for session-startup
+/// retrieval -- mirrors `memory::render_for_prompt`'s own private+global+shared
 /// merge, tagging provenance the same way. Each scope's own gate degrades
 /// to empty rather than erroring (`list_scoped`'s existing contract), so a
 /// disabled scope simply contributes nothing.
 ///
-/// Takes already-loaded entries (`memory::load_both_scopes`) rather than
+/// Takes already-loaded entries (`memory::load_all_scopes`) rather than
 /// reading the bank itself: the one caller, the launch-time context
 /// compiler's `gather_memory`, also needs the identical bank for the core
 /// prompt layer (`memory::render_for_prompt_from_loaded`) and must read
@@ -470,6 +470,12 @@ pub(crate) fn candidates_from_loaded(loaded: &LoadedMemory, now: u64) -> Vec<Ret
         .iter()
         .map(|(_, entry)| to_candidate(entry.clone(), false, now))
         .collect();
+    candidates.extend(
+        loaded
+            .global
+            .iter()
+            .map(|(_, entry)| to_candidate(entry.clone(), false, now)),
+    );
     candidates.extend(
         loaded
             .shared
@@ -836,7 +842,7 @@ mod tests {
     }
 
     #[test]
-    fn candidates_from_loaded_merges_both_scopes() {
+    fn candidates_from_loaded_merges_all_scopes_and_treats_global_as_trusted() {
         let repo = crate::commands::ctx::testenv::repo();
         let state = StateDir::from_root(repo.path().join("state"));
         let cfg = CtxConfig::default();
@@ -858,6 +864,24 @@ mod tests {
             &cfg,
         )
         .expect("remember private");
+        super::super::memory::remember(
+            &state,
+            super::super::memory::GLOBAL_SLUG,
+            &Entry {
+                key: "global-fact".to_string(),
+                written_by: "claude".to_string(),
+                written: 1_700_000_000,
+                verified: 1_700_000_000,
+                source: "explicit".to_string(),
+                body: "global body".to_string(),
+                importance: None,
+                confidence: None,
+                tags: Vec::new(),
+                paths: Vec::new(),
+            },
+            &cfg,
+        )
+        .expect("remember global");
 
         let shared_dir = repo.path().join(".zirv").join("memory");
         std::fs::create_dir_all(&shared_dir).expect("mkdir");
@@ -879,14 +903,18 @@ mod tests {
         )
         .expect("write shared");
 
-        let loaded =
-            super::super::memory::load_both_scopes(repo.path(), &state, "-work-repo", &cfg);
+        let loaded = super::super::memory::load_all_scopes(repo.path(), &state, "-work-repo", &cfg);
         let candidates = candidates_from_loaded(&loaded, 1_700_000_000);
-        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates.len(), 3);
         assert!(
             candidates
                 .iter()
                 .any(|c| c.entry.key == "private-fact" && !c.shared)
+        );
+        assert!(
+            candidates
+                .iter()
+                .any(|c| c.entry.key == "global-fact" && !c.shared)
         );
         assert!(
             candidates

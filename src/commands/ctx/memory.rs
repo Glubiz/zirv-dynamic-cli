@@ -18,6 +18,12 @@ use super::adapters::AGENT_ENV;
 use super::config::{CtxConfig, EnvLookup, env_from_process};
 use super::state::{StateDir, now_secs, repo_slug};
 
+/// Reserved state-directory slug for the operator-owned machine-wide bank.
+/// Repository slugs contain only ASCII alphanumerics and hyphens, so the
+/// leading underscore makes this namespace impossible for `repo_slug` to
+/// produce.
+pub const GLOBAL_SLUG: &str = "_global";
+
 /// One remembered fact: a short markdown body plus who wrote it, when, and
 /// when it was last confirmed still true.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -250,12 +256,14 @@ pub(crate) fn slug_key(key: &str) -> String {
 }
 
 /// Which memory bank an operation targets. `Private` is this operator's
-/// pre-existing machine-local bank -- `<state>/memory/<repo_slug>/`,
-/// unchanged by the introduction of scopes. `Shared` is a second,
-/// independent bank meant to be committed with the repository itself:
-/// `<repo>/.zirv/memory/`. Both scopes store the same `Entry` markdown
-/// format through the same parser; only the storage root and trust level
-/// differ. Shared content is repository-owned and therefore UNTRUSTED,
+/// repository-specific machine-local bank at `<state>/memory/<repo_slug>/`.
+/// `Global` is the operator-owned machine-wide bank at
+/// `<state>/memory/_global/`; it is trusted exactly like `Private` and is
+/// never read from a repository checkout, so none of the shared-scope
+/// hardening applies to it. `Shared` is committed with the repository at
+/// `<repo>/.zirv/memory/`. All scopes store the same `Entry` markdown format;
+/// only the storage root and trust level differ. Shared content is
+/// repository-owned and therefore UNTRUSTED,
 /// exactly like `.zirv/ctx.toml`'s repo layer: a checkout can fill it with
 /// any text it likes, but nothing here ever reads that text back as
 /// configuration (see `shared_scope_content_is_never_read_back_as_
@@ -282,16 +290,17 @@ pub(crate) fn slug_key(key: &str) -> String {
 pub enum MemoryScope {
     Shared,
     Private,
+    Global,
 }
 
 impl MemoryScope {
-    /// Maps a scope-selecting CLI boolean to the scope it selects: `zirv ctx
-    /// remember`/`recall`/`forget`'s `--repo` and `zirv memory`'s `--shared`
-    /// both boil down to exactly this mapping (issue #172 cross-review
-    /// finding 6) -- centralized here, once, rather than each CLI surface
-    /// keeping its own identical `if flag { Shared } else { Private }`.
-    pub fn of(flag: bool) -> MemoryScope {
-        if flag {
+    /// Maps the two CLI scope flags to one deterministic scope. Clap rejects
+    /// both flags together, but Global still wins if a direct caller passes
+    /// both true.
+    pub fn from_flags(shared: bool, global: bool) -> MemoryScope {
+        if global {
+            MemoryScope::Global
+        } else if shared {
             MemoryScope::Shared
         } else {
             MemoryScope::Private
@@ -299,19 +308,15 @@ impl MemoryScope {
     }
 
     /// Whether this scope may be used at all. `cfg.memory.enabled` is a
-    /// MASTER switch: `false` disables both scopes outright, so an operator
-    /// who turned memory off before the shared scope existed does not
-    /// silently start receiving repo-controlled prompt content on upgrade.
-    /// `shared_enabled` is a second, shared-only toggle underneath that
-    /// master switch -- `Shared` needs both flags on; `Private` only needs
-    /// the master switch, same as before scopes existed. Both flags are
-    /// `REPO_FORBIDDEN`.
+    /// MASTER switch: `false` disables all scopes outright. `Global`, like
+    /// `Private`, needs only this master switch; `Shared` also needs its own
+    /// narrower `shared_enabled` toggle.
     pub fn enabled(self, cfg: &CtxConfig) -> bool {
         if !cfg.memory.enabled {
             return false;
         }
         match self {
-            MemoryScope::Private => true,
+            MemoryScope::Private | MemoryScope::Global => true,
             MemoryScope::Shared => cfg.memory.shared_enabled,
         }
     }
@@ -321,13 +326,15 @@ impl MemoryScope {
     /// Callers only ever call this after already checking `!enabled(cfg)`
     /// -- meaningless otherwise, since then neither flag is actually at
     /// fault. The master switch is checked first because it always wins:
-    /// if it is off, that is the reason regardless of `shared_enabled`'s
-    /// own value.
+    /// if it is off, that is the reason regardless of `shared_enabled`.
     pub fn disabled_reason(self, cfg: &CtxConfig) -> &'static str {
         if !cfg.memory.enabled {
             "memory.enabled = false"
         } else {
-            "memory.shared_enabled = false"
+            match self {
+                MemoryScope::Private | MemoryScope::Global => "memory.enabled = false",
+                MemoryScope::Shared => "memory.shared_enabled = false",
+            }
         }
     }
 
@@ -338,6 +345,7 @@ impl MemoryScope {
     pub fn dir(self, repo: &Path, state: &StateDir, slug: &str) -> Option<PathBuf> {
         match self {
             MemoryScope::Private => Some(state.memory().join(slug)),
+            MemoryScope::Global => Some(state.memory().join(GLOBAL_SLUG)),
             MemoryScope::Shared => safe_shared_dir(repo),
         }
     }
@@ -385,15 +393,15 @@ fn safe_shared_dir(repo: &Path) -> Option<PathBuf> {
     Some(dir)
 }
 
-/// Core directory scan shared by both scopes: reads every `.md` file in
+/// Core directory scan shared by all scopes: reads every `.md` file in
 /// `dir`, parses it, and skips anything that fails to read -- the same
 /// tolerance every caller of `list` has always had. Symlinked entry files are
 /// always skipped rather than followed: a no-op for the private scope's own
 /// 0700 directory (nothing legitimate ever puts a symlink there), but
 /// load-bearing for the shared scope, where a committed symlink could
 /// otherwise make an arbitrary file on this machine read back as if it were a
-/// memory entry. One rule for both scopes rather than a per-call toggle: the
-/// private scope pays nothing for it, and the shared scope can never
+/// memory entry. One rule for all scopes rather than a per-call toggle: the
+/// trusted scopes pay nothing for it, and the shared scope can never
 /// accidentally be called without it.
 fn read_entries(dir: &Path) -> CtxResult<Vec<(PathBuf, Entry)>> {
     if !dir.is_dir() {
@@ -463,8 +471,8 @@ pub fn list_scoped(
     read_entries(&dir)
 }
 
-/// Both scopes' entries, read from disk exactly once each. `render_for_prompt`
-/// and `retrieval::candidates_for_repo` each scan the identical private+shared
+/// All scopes' entries, read from disk exactly once each. `render_for_prompt`
+/// and `retrieval::candidates_for_repo` each scan the identical three-scope
 /// bank on their own; a caller that needs both (`compile::gather_memory`, the
 /// launch-time context compiler) used to trigger the whole bank being read
 /// twice -- once per consumer -- for every single session launch. Loading it
@@ -474,14 +482,15 @@ pub fn list_scoped(
 #[derive(Debug, Clone, Default)]
 pub(crate) struct LoadedMemory {
     pub(crate) private: Vec<(PathBuf, Entry)>,
+    pub(crate) global: Vec<(PathBuf, Entry)>,
     pub(crate) shared: Vec<(PathBuf, Entry)>,
 }
 
-/// Reads both scopes for `slug`, each gated exactly the way `list_scoped`
+/// Reads all scopes for `slug`, each gated exactly the way `list_scoped`
 /// already gates it (`scope.enabled(cfg)`, plus `Shared`'s own
 /// `safe_shared_dir` check) -- a disabled or unsafe scope contributes an
 /// empty list, never an error, same as every other memory read.
-pub(crate) fn load_both_scopes(
+pub(crate) fn load_all_scopes(
     repo: &Path,
     state: &StateDir,
     slug: &str,
@@ -489,6 +498,7 @@ pub(crate) fn load_both_scopes(
 ) -> LoadedMemory {
     LoadedMemory {
         private: list_scoped(MemoryScope::Private, repo, state, slug, cfg).unwrap_or_default(),
+        global: list_scoped(MemoryScope::Global, repo, state, slug, cfg).unwrap_or_default(),
         shared: list_scoped(MemoryScope::Shared, repo, state, slug, cfg).unwrap_or_default(),
     }
 }
@@ -552,11 +562,9 @@ pub fn list_scoped_unchecked(
 /// private lookup has ever worked.
 ///
 /// `get_scoped` itself: the `_scoped` sibling of the private-only `get`
-/// above. Gated on `scope.enabled(cfg)` for both scopes (unlike
-/// `forget_scoped`/`verify_scoped`, which are deliberately ungated -- see
-/// their own doc comments): `None` (never an error) when the scope is
-/// disabled, the key's canonical file does not exist, or (for `Shared`) the
-/// key or directory is unsafe.
+/// above. Reads respect `scope.enabled(cfg)`; Global follows the same
+/// `memory.enabled` master switch as Private and routes through
+/// `get(state, GLOBAL_SLUG, key)`.
 ///
 /// Two more `Shared`-only refusals, both fix round 2: the canonical path is
 /// refused if it is a symlink rather than a regular file (`is_regular_file`
@@ -594,6 +602,7 @@ pub fn get_scoped(
     }
     match scope {
         MemoryScope::Private => get(state, slug, key),
+        MemoryScope::Global => get(state, GLOBAL_SLUG, key),
         MemoryScope::Shared => {
             let Some(path) = shared_canonical_path(repo, key) else {
                 return Ok(None);
@@ -976,14 +985,15 @@ pub fn upsert_shared_allow_sensitive(
     upsert_shared(repo, state, slug, cfg, entry, true)
 }
 
-/// Scope-aware upsert: `Private` delegates unchanged to `remember` above;
-/// `Shared` writes through the new key-addressed `upsert_shared`.
+/// Scope-aware upsert: `Private` delegates unchanged to `remember`, `Global`
+/// uses the same trusted primitive with `GLOBAL_SLUG`, and `Shared` writes
+/// through the key-addressed `upsert_shared`.
 ///
 /// **Gating asymmetry, deliberate, pin the contract before building a CLI
-/// verb on this:** `remember` (and so `Private` here) has never itself
+/// verb on this:** `remember` (and so `Private` and `Global` here) has never itself
 /// consulted `cfg.memory.enabled` -- only the `zirv ctx remember` CLI
 /// wrapper (`run_remember_with`) checks that before calling `remember`. So
-/// `upsert_scoped(Private, ...)` WRITES even while `memory.enabled` is
+/// `upsert_scoped(Private|Global, ...)` WRITES even while `memory.enabled` is
 /// false; a caller that wants the CLI's refusal behavior must check
 /// `cfg.memory.enabled` itself before calling this, the same way `run_
 /// remember_with` does. `Shared`, by contrast, DOES check its own gate
@@ -1002,6 +1012,7 @@ pub fn upsert_scoped(
 ) -> CtxResult<PathBuf> {
     match scope {
         MemoryScope::Private => remember(state, slug, entry, cfg),
+        MemoryScope::Global => remember(state, GLOBAL_SLUG, entry, cfg),
         MemoryScope::Shared => upsert_shared(repo, state, slug, cfg, entry, false),
     }
 }
@@ -1030,6 +1041,7 @@ pub fn forget_scoped(
 ) -> CtxResult<bool> {
     match scope {
         MemoryScope::Private => forget(state, slug, key),
+        MemoryScope::Global => forget(state, GLOBAL_SLUG, key),
         MemoryScope::Shared => {
             let Some(path) = shared_canonical_path(repo, key) else {
                 return Ok(false);
@@ -1118,6 +1130,7 @@ pub fn verify_scoped(
 ) -> CtxResult<bool> {
     match scope {
         MemoryScope::Private => verify(state, slug, key),
+        MemoryScope::Global => verify(state, GLOBAL_SLUG, key),
         MemoryScope::Shared => {
             let Some(path) = shared_canonical_path(repo, key) else {
                 return Ok(false);
@@ -1387,23 +1400,19 @@ pub fn verify(state: &StateDir, slug: &str, key: &str) -> CtxResult<bool> {
     Ok(false)
 }
 
-/// Loads this repo's memory bank as already-rendered prompt lines
-/// (`prompt::MemoryLine`) for the **core** layer (issue #34): both the
-/// private and shared scopes, merged, each gated on its own switch --
-/// `cfg.memory.enabled` for private (via `list`, unchanged), `list_scoped`'s
-/// own `scope.enabled(cfg)` check for shared (`cfg.memory.shared_enabled`,
-/// already returns an empty vec rather than an error when disabled or
-/// unsafe, never a hard failure).
+/// Loads this repo's memory as already-rendered prompt lines
+/// (`prompt::MemoryLine`) for the **core** layer: private, global, and shared,
+/// each gated through `list_scoped` and tagged with its source scope.
 ///
 /// Renders compact key/body pairs only -- no `Written`/`Verified` storage
 /// metadata is spent into the prompt by default (issue #34) -- but keeps the
 /// raw timestamps on `MemoryLine` for `prompt::select_memory_within_cap`'s
 /// ranking and for Task 5's retrieval ranking to reuse.
 ///
-/// Precedence between the two scopes is NOT decided here: this is a plain
+/// Precedence between the three scopes is NOT decided here: this is a plain
 /// "list everything eligible" read that tags each line with which scope it
-/// came from (`MemoryLine::shared`). `prompt::with_memory_layer`/
-/// `select_memory_within_cap` is what enforces "private outranks shared"
+/// came from (`MemoryLine::scope`). `prompt::with_memory_layer`/
+/// `select_memory_within_cap` is what enforces private-global-shared order
 /// structurally, using that tag -- see its own doc comment for why a shared
 /// entry's own `verified`/`written` fields must never be trusted to compete
 /// with a private one directly. That same function also drops any shared
@@ -1417,11 +1426,11 @@ pub fn render_for_prompt(
     slug: &str,
     cfg: &CtxConfig,
 ) -> Vec<super::prompt::MemoryLine> {
-    render_for_prompt_from_loaded(&load_both_scopes(repo, state, slug, cfg))
+    render_for_prompt_from_loaded(&load_all_scopes(repo, state, slug, cfg))
 }
 
 /// The same rendering `render_for_prompt` does, over entries a caller already
-/// loaded via [`load_both_scopes`] -- see that function's own doc comment for
+/// loaded via [`load_all_scopes`] -- see that function's own doc comment for
 /// why this split exists (`compile::gather_memory` needs the identical bank
 /// for the retrieval layer too, and must not read every file a second time to
 /// get it).
@@ -1431,24 +1440,30 @@ pub(crate) fn render_for_prompt_from_loaded(
     let mut lines: Vec<super::prompt::MemoryLine> = loaded
         .private
         .iter()
-        .map(|(_, entry)| render_prompt_line(entry.clone(), false))
+        .map(|(_, entry)| render_prompt_line(entry.clone(), MemoryScope::Private))
         .collect();
+    lines.extend(
+        loaded
+            .global
+            .iter()
+            .map(|(_, entry)| render_prompt_line(entry.clone(), MemoryScope::Global)),
+    );
     lines.extend(
         loaded
             .shared
             .iter()
-            .map(|(_, entry)| render_prompt_line(entry.clone(), true)),
+            .map(|(_, entry)| render_prompt_line(entry.clone(), MemoryScope::Shared)),
     );
     lines
 }
 
-fn render_prompt_line(entry: Entry, shared: bool) -> super::prompt::MemoryLine {
+fn render_prompt_line(entry: Entry, scope: MemoryScope) -> super::prompt::MemoryLine {
     super::prompt::MemoryLine {
         key: entry.key,
         body: entry.body,
         verified: entry.verified,
         written: entry.written,
-        shared,
+        scope,
     }
 }
 
@@ -2122,6 +2137,10 @@ pub struct RememberArgs {
     /// refreshing what is already there).
     #[arg(long, default_value_t = false)]
     pub repo: bool,
+    /// Write or verify this fact in the operator-owned global bank shared by
+    /// every repository on this machine.
+    #[arg(long, default_value_t = false, conflicts_with = "repo")]
+    pub global: bool,
     /// Store into the shared bank even though its key or body looks
     /// credential-shaped (`memory::sensitive_shared_match`). Has no effect
     /// without `--repo`, and no effect on the private bank, which the guard
@@ -2161,15 +2180,18 @@ pub struct RecallArgs {
 pub struct ForgetArgs {
     /// Key to forget. Omit when passing `--all`.
     pub key: Option<String>,
-    /// Remove every entry in this repository's memory bank.
+    /// Remove every entry in the selected trusted memory bank.
     #[arg(long, default_value_t = false)]
     pub all: bool,
     /// Forget from the shared, repository-owned bank (`<repo>/.zirv/memory/`)
     /// instead of the private, machine-local one (issue #172). Not
-    /// supported together with `--all`, since `forget_all` only ever clears
-    /// the private bank.
+    /// supported together with `--all`; use `--global --all` to clear the
+    /// machine-wide bank instead.
     #[arg(long, default_value_t = false)]
     pub repo: bool,
+    /// Forget from the operator-owned global bank shared by every repository.
+    #[arg(long, default_value_t = false, conflicts_with = "repo")]
+    pub global: bool,
 }
 
 /// `env(key)`, treating a missing or blank value as `"unknown"` -- the same
@@ -2220,7 +2242,7 @@ pub fn run_remember_with<W: Write>(
 
     let state = StateDir::resolve(env)?;
     let slug = repo_slug(repo);
-    let scope = MemoryScope::of(args.repo);
+    let scope = MemoryScope::from_flags(args.repo, args.global);
     let bank_label = ctx_scope_label(scope);
 
     match resolve_remember(args, stdin)? {
@@ -2288,15 +2310,15 @@ pub fn run_remember<W: Write>(args: &RememberArgs, w: &mut W) -> CtxResult<i32> 
 }
 
 /// Provenance label `zirv ctx remember`/`recall`/`forget` show for a scope
-/// -- `"local"`/`"repo"`, since those verbs name the flag `--repo`. A
-/// different vocabulary from `zirv memory`'s own `"private"`/`"shared"`
-/// (`memory_cli.rs`'s own `scope_label`, which names its flag `--shared`
-/// instead) -- centralizing `MemoryScope::of` (issue #172 cross-review
-/// finding 6) does not force the two surfaces to share wording, only the
-/// bool-to-scope mapping underneath it.
+/// -- `"local"`/`"global"`/`"repo"`, matching those verbs' flag names. A
+/// different vocabulary from `zirv memory`'s own
+/// `"private"`/`"global"`/`"shared"` (`memory_cli.rs`'s own `scope_label`)
+/// does not force the two surfaces to share wording, only the flag-to-scope
+/// mapping underneath it.
 fn ctx_scope_label(scope: MemoryScope) -> &'static str {
     match scope {
         MemoryScope::Private => "local",
+        MemoryScope::Global => "global",
         MemoryScope::Shared => "repo",
     }
 }
@@ -2308,7 +2330,7 @@ fn ctx_scope_label(scope: MemoryScope) -> &'static str {
 fn ctx_scope_trust_note(scope: MemoryScope) -> &'static str {
     match scope {
         MemoryScope::Shared => " -- repo: repository-owned content, not operator-verified",
-        MemoryScope::Private => "",
+        MemoryScope::Private | MemoryScope::Global => "",
     }
 }
 
@@ -2332,6 +2354,11 @@ pub fn run_recall_with<W: Write>(
             .into_iter()
             .map(|(_, e)| (e, MemoryScope::Private))
             .collect();
+    entries.extend(
+        list_scoped(MemoryScope::Global, repo, &state, &slug, &cfg)?
+            .into_iter()
+            .map(|(_, e)| (e, MemoryScope::Global)),
+    );
     entries.extend(
         list_scoped(MemoryScope::Shared, repo, &state, &slug, &cfg)?
             .into_iter()
@@ -2398,6 +2425,11 @@ pub fn run_forget_with<W: Write>(
                     .into(),
             );
         }
+        if args.global {
+            forget_all(&state, GLOBAL_SLUG)?;
+            writeln!(w, "zirv ctx forget: cleared the global memory bank")?;
+            return Ok(0);
+        }
         forget_all(&state, &slug)?;
         writeln!(w, "zirv ctx forget: cleared the memory bank")?;
         return Ok(0);
@@ -2405,7 +2437,7 @@ pub fn run_forget_with<W: Write>(
     let Some(key) = &args.key else {
         return Err("zirv ctx forget: pass a key, or --all".into());
     };
-    let scope = MemoryScope::of(args.repo);
+    let scope = MemoryScope::from_flags(args.repo, args.global);
     let bank_label = ctx_scope_label(scope);
     if forget_scoped(scope, repo, &state, &slug, key)? {
         writeln!(
@@ -2525,6 +2557,259 @@ mod tests {
             .iter()
             .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
             .collect()
+    }
+
+    #[test]
+    fn from_flags_prefers_global_then_shared_then_private() {
+        assert_eq!(MemoryScope::from_flags(false, false), MemoryScope::Private);
+        assert_eq!(MemoryScope::from_flags(true, false), MemoryScope::Shared);
+        assert_eq!(MemoryScope::from_flags(false, true), MemoryScope::Global);
+        assert_eq!(MemoryScope::from_flags(true, true), MemoryScope::Global);
+    }
+
+    #[test]
+    fn global_scope_dir_is_the_state_global_bank_and_ignores_repo_and_slug() {
+        let repo_a = tempfile::tempdir().expect("repo a");
+        let repo_b = tempfile::tempdir().expect("repo b");
+        let state = StateDir::from_root(repo_a.path().join("state"));
+        let expected = state.memory().join(GLOBAL_SLUG);
+
+        assert_eq!(
+            MemoryScope::Global.dir(repo_a.path(), &state, "repo-a"),
+            Some(expected.clone())
+        );
+        assert_eq!(
+            MemoryScope::Global.dir(repo_b.path(), &state, "repo-b"),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn remember_global_writes_under_the_global_slug_and_never_under_the_repo_slug() {
+        let repo = tempfile::tempdir().expect("repo");
+        let state = StateDir::from_root(repo.path().join("state"));
+        let cfg = CtxConfig::default();
+        let slug = repo_slug(repo.path());
+
+        let path = upsert_scoped(
+            MemoryScope::Global,
+            repo.path(),
+            &state,
+            &slug,
+            &cfg,
+            &sample("global-fact", 1),
+        )
+        .expect("remember global");
+
+        assert!(path.starts_with(state.memory().join(GLOBAL_SLUG)));
+        assert!(!state.memory().join(&slug).exists());
+    }
+
+    #[test]
+    fn an_entry_remembered_globally_from_one_repo_is_recalled_from_another_repo() {
+        let repo_a = tempfile::tempdir().expect("repo a");
+        let repo_b = tempfile::tempdir().expect("repo b");
+        let state = StateDir::from_root(repo_a.path().join("state"));
+        let cfg = CtxConfig::default();
+
+        upsert_scoped(
+            MemoryScope::Global,
+            repo_a.path(),
+            &state,
+            &repo_slug(repo_a.path()),
+            &cfg,
+            &sample("global-fact", 1),
+        )
+        .expect("remember global");
+
+        let recalled = get_scoped(
+            MemoryScope::Global,
+            repo_b.path(),
+            &state,
+            &repo_slug(repo_b.path()),
+            &cfg,
+            "global-fact",
+        )
+        .expect("recall global");
+        assert_eq!(recalled.expect("global entry").key, "global-fact");
+    }
+
+    #[test]
+    fn global_scope_follows_the_master_switch_like_private() {
+        let repo = tempfile::tempdir().expect("repo");
+        let state = StateDir::from_root(repo.path().join("state"));
+        let slug = repo_slug(repo.path());
+        let mut cfg = CtxConfig::default();
+        remember(&state, &slug, &sample("private-fact", 1), &cfg).expect("remember private");
+        remember(&state, GLOBAL_SLUG, &sample("global-fact", 1), &cfg).expect("remember global");
+
+        cfg.memory.enabled = false;
+        assert_eq!(
+            MemoryScope::Global.enabled(&cfg),
+            MemoryScope::Private.enabled(&cfg)
+        );
+        assert!(!MemoryScope::Global.enabled(&cfg));
+        assert_eq!(
+            MemoryScope::Global.disabled_reason(&cfg),
+            "memory.enabled = false"
+        );
+        assert!(
+            get_scoped(
+                MemoryScope::Global,
+                repo.path(),
+                &state,
+                &slug,
+                &cfg,
+                "global-fact",
+            )
+            .expect("get global")
+            .is_none(),
+            "global reads follow the same disabled master switch as private reads"
+        );
+
+        cfg.memory.enabled = true;
+        assert_eq!(
+            MemoryScope::Global.enabled(&cfg),
+            MemoryScope::Private.enabled(&cfg)
+        );
+        assert!(MemoryScope::Global.enabled(&cfg));
+        assert!(
+            get_scoped(
+                MemoryScope::Global,
+                repo.path(),
+                &state,
+                &slug,
+                &cfg,
+                "global-fact",
+            )
+            .expect("get global")
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn forget_all_global_clears_only_the_global_bank() {
+        let repo = tempfile::tempdir().expect("repo");
+        let state_dir = repo.path().join("state");
+        let state = StateDir::from_root(state_dir.clone());
+        let cfg = CtxConfig::default();
+        let slug = repo_slug(repo.path());
+        remember(&state, &slug, &sample("local-fact", 1), &cfg).expect("local");
+        remember(&state, GLOBAL_SLUG, &sample("global-fact", 2), &cfg).expect("global");
+        upsert_scoped(
+            MemoryScope::Shared,
+            repo.path(),
+            &state,
+            &slug,
+            &cfg,
+            &sample("shared-fact", 3),
+        )
+        .expect("shared");
+        let env = env_map(&[(state::STATE_ENV, state_dir.to_str().expect("utf8"))]);
+        let args = ForgetArgs {
+            key: None,
+            all: true,
+            repo: false,
+            global: true,
+        };
+        let mut out = Vec::new();
+
+        run_forget_with(&args, &mut out, repo.path(), &|key| env.get(key).cloned())
+            .expect("forget global");
+
+        assert!(list(&state, GLOBAL_SLUG).expect("global list").is_empty());
+        assert_eq!(list(&state, &slug).expect("local list").len(), 1);
+        assert_eq!(
+            list_scoped_unchecked(MemoryScope::Shared, repo.path(), &state, &slug)
+                .expect("shared list")
+                .len(),
+            1
+        );
+        assert_eq!(
+            String::from_utf8(out).expect("utf8"),
+            "zirv ctx forget: cleared the global memory bank\n"
+        );
+    }
+
+    #[test]
+    fn ctx_recall_lists_global_entries_with_the_global_label_and_json_scope() {
+        let repo = tempfile::tempdir().expect("repo");
+        let state_dir = repo.path().join("state");
+        let state = StateDir::from_root(state_dir.clone());
+        let cfg = CtxConfig::default();
+        let slug = repo_slug(repo.path());
+        remember(&state, &slug, &sample("local-fact", now_secs()), &cfg).expect("remember local");
+        remember(
+            &state,
+            GLOBAL_SLUG,
+            &sample("global-fact", now_secs()),
+            &cfg,
+        )
+        .expect("remember global");
+        upsert_scoped(
+            MemoryScope::Shared,
+            repo.path(),
+            &state,
+            &slug,
+            &cfg,
+            &sample("shared-fact", now_secs()),
+        )
+        .expect("remember shared");
+        let env = env_map(&[(state::STATE_ENV, state_dir.to_str().expect("utf8"))]);
+
+        let mut human = Vec::new();
+        run_recall_with(
+            &RecallArgs {
+                key: None,
+                stale: None,
+                json: false,
+            },
+            &mut human,
+            repo.path(),
+            &|key| env.get(key).cloned(),
+        )
+        .expect("human recall");
+        let human = String::from_utf8(human).expect("utf8");
+        let local_at = human.find("local-fact").expect("local entry");
+        let global_at = human.find("global-fact [global]").expect("global entry");
+        let shared_at = human.find("shared-fact").expect("shared entry");
+        assert!(local_at < global_at && global_at < shared_at, "{human}");
+
+        let mut json = Vec::new();
+        run_recall_with(
+            &RecallArgs {
+                key: None,
+                stale: None,
+                json: true,
+            },
+            &mut json,
+            repo.path(),
+            &|key| env.get(key).cloned(),
+        )
+        .expect("json recall");
+        assert!(
+            String::from_utf8(json)
+                .expect("utf8")
+                .contains("\"scope\":\"global\"")
+        );
+    }
+
+    #[test]
+    fn ctx_remember_and_forget_repo_and_global_flags_conflict() {
+        use clap::Parser as _;
+
+        assert!(
+            crate::commands::ctx::CtxCli::try_parse_from([
+                "zirv ctx", "remember", "--key", "k", "--text", "v", "--repo", "--global",
+            ])
+            .is_err()
+        );
+        assert!(
+            crate::commands::ctx::CtxCli::try_parse_from([
+                "zirv ctx", "forget", "k", "--repo", "--global",
+            ])
+            .is_err()
+        );
     }
 
     #[test]
@@ -3319,6 +3604,7 @@ This should not appear in the body.\n";
             text_file: None,
             verify: false,
             repo: false,
+            global: false,
             allow_sensitive: false,
             importance: None,
             confidence: None,
@@ -3360,6 +3646,7 @@ This should not appear in the body.\n";
             text_file: None,
             verify: false,
             repo: true,
+            global: false,
             allow_sensitive: false,
             importance: None,
             confidence: None,
@@ -3401,6 +3688,7 @@ This should not appear in the body.\n";
             text_file: None,
             verify: false,
             repo: true,
+            global: false,
             allow_sensitive: false,
             importance: None,
             confidence: None,
@@ -3447,6 +3735,7 @@ This should not appear in the body.\n";
             text_file: None,
             verify: true,
             repo: true,
+            global: false,
             allow_sensitive: false,
             importance: None,
             confidence: None,
@@ -3496,6 +3785,7 @@ This should not appear in the body.\n";
             text_file: None,
             verify: true,
             repo: false,
+            global: false,
             allow_sensitive: false,
             importance: None,
             confidence: None,
@@ -3545,6 +3835,7 @@ This should not appear in the body.\n";
             text_file: None,
             verify: false,
             repo: false,
+            global: false,
             allow_sensitive: false,
             importance: None,
             confidence: None,
@@ -3582,6 +3873,7 @@ This should not appear in the body.\n";
             key: Some("build-cmd".to_string()),
             all: false,
             repo: false,
+            global: false,
         };
         let mut forget_out = Vec::new();
         run_forget_with(&forget_args, &mut forget_out, tmp.path(), &|k| {
@@ -3603,6 +3895,7 @@ This should not appear in the body.\n";
             key: None,
             all: false,
             repo: false,
+            global: false,
         };
         let mut out = Vec::new();
         let err = run_forget_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned())
@@ -3634,6 +3927,7 @@ This should not appear in the body.\n";
             key: Some("build-cmd".to_string()),
             all: false,
             repo: true,
+            global: false,
         };
         let mut out = Vec::new();
         run_forget_with(&args, &mut out, repo.path(), &|k| env.get(k).cloned()).expect("forget");
@@ -3657,6 +3951,7 @@ This should not appear in the body.\n";
             key: None,
             all: true,
             repo: true,
+            global: false,
         };
         let mut out = Vec::new();
         let err = run_forget_with(&args, &mut out, repo.path(), &|k| env.get(k).cloned())
@@ -3665,7 +3960,7 @@ This should not appear in the body.\n";
     }
 
     // N5/issue #34: the memory prompt layer's own source, `render_for_prompt`
-    // -- now the merged **core** layer (private + shared).
+    // -- now the merged **core** layer (private + global + shared).
 
     #[test]
     fn render_for_prompt_renders_the_key_and_body_of_every_private_entry() {
@@ -3681,7 +3976,7 @@ This should not appear in the body.\n";
         assert_eq!(rendered.len(), 1);
         assert_eq!(rendered[0].key, "build-cmd");
         assert_eq!(rendered[0].body, "cargo build --release");
-        assert!(!rendered[0].shared, "a private entry is tagged as such");
+        assert_eq!(rendered[0].scope, MemoryScope::Private);
     }
 
     #[test]
@@ -3740,12 +4035,12 @@ This should not appear in the body.\n";
             .iter()
             .find(|l| l.key == "private-fact")
             .expect("private entry present");
-        assert!(!private_line.shared);
+        assert_eq!(private_line.scope, MemoryScope::Private);
         let shared_line = rendered
             .iter()
             .find(|l| l.key == "shared-fact")
             .expect("shared entry present");
-        assert!(shared_line.shared);
+        assert_eq!(shared_line.scope, MemoryScope::Shared);
     }
 
     /// `memory.enabled = false` is a MASTER switch (fix round: memory
@@ -4620,6 +4915,10 @@ This should not appear in the body.\n";
             list(&state, "-work-repo").expect("list").is_empty(),
             "a durable harvest must never write into the private scope"
         );
+        assert!(
+            list(&state, GLOBAL_SLUG).expect("list global").is_empty(),
+            "a durable harvest must never write into the global scope"
+        );
     }
 
     #[cfg(unix)]
@@ -5205,15 +5504,15 @@ This should not appear in the body.\n";
     }
 
     /// Pins the deliberate gating asymmetry documented on `upsert_scoped`:
-    /// `Private` (via `remember`) has never itself consulted
+    /// `Private` and `Global` (via `remember`) have never themselves consulted
     /// `cfg.memory.enabled` -- only the `zirv ctx remember` CLI wrapper does
     /// that before calling `remember`. `Shared` (via `upsert_shared`) DOES
     /// check its own gate internally. A future CLI verb built directly on
     /// `upsert_scoped` must add its own `memory.enabled` check for the
-    /// Private path; this test exists so that requirement is never
+    /// trusted paths; this test exists so that requirement is never
     /// "discovered" as a surprise.
     #[test]
-    fn upsert_scoped_private_writes_even_when_memory_enabled_is_false_unlike_shared() {
+    fn upsert_scoped_trusted_banks_write_even_when_memory_enabled_is_false_unlike_shared() {
         let repo = crate::commands::ctx::testenv::repo();
         let state = StateDir::from_root(repo.path().join("state"));
         let slug = repo_slug(repo.path());
@@ -5232,6 +5531,23 @@ This should not appear in the body.\n";
             "upsert_scoped(Private) writes even while memory.enabled is false, same as remember always has",
         );
         assert!(get(&state, &slug, "build-cmd").expect("get").is_some());
+
+        upsert_scoped(
+            MemoryScope::Global,
+            repo.path(),
+            &state,
+            &slug,
+            &cfg,
+            &sample("global-fact", 1),
+        )
+        .expect(
+            "upsert_scoped(Global) writes even while memory.enabled is false, same as remember always has",
+        );
+        assert!(
+            get(&state, GLOBAL_SLUG, "global-fact")
+                .expect("get")
+                .is_some()
+        );
 
         cfg.memory.shared_enabled = false;
         let err = upsert_scoped(
@@ -5551,6 +5867,7 @@ This should not appear in the body.\n";
             text_file: None,
             verify: false,
             repo: true,
+            global: false,
             allow_sensitive: false,
             importance: None,
             confidence: None,
