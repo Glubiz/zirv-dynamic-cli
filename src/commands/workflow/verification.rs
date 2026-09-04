@@ -1420,6 +1420,13 @@ fn write_baseline(repo: &Path, baseline: &TestBaseline) -> CtxResult<()> {
 /// prune-eligible, if any -- the `zirv test changed` hint the issue's design
 /// asks for.
 fn update_baseline_after_run(repo: &Path, report: &VerificationReport) -> Option<String> {
+    // No baseline, no opinion -- and no lock file either: this runs after
+    // every evaluation in every repository (test fixtures included), so it
+    // must not scatter `.lock` siblings into the operator's home for
+    // repositories that never recorded a baseline.
+    if !test_baseline_path(repo).ok()?.exists() {
+        return None;
+    }
     let _lock = lock_baseline(repo).ok()?;
     let mut baseline = load_baseline(repo).ok().flatten()?;
     if baseline.failing_tests.is_empty() {
@@ -2589,7 +2596,11 @@ fn run_baseline(repo: &Path, args: &BaselineArgs, writer: &mut impl Write) -> Ct
 /// maintenance action over evidence already accumulated by ordinary `zirv
 /// test changed`/`zirv verify` runs, not a fresh recording.
 fn run_baseline_prune(repo: &Path, writer: &mut impl Write) -> CtxResult<i32> {
-    let _lock = lock_baseline(repo)?;
+    let _lock = if test_baseline_path(repo)?.exists() {
+        Some(lock_baseline(repo)?)
+    } else {
+        None
+    };
     let Some(mut baseline) = load_baseline(repo)? else {
         writeln!(
             writer,
