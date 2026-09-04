@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-09-03
+last-verified: 2026-09-04
 ---
 
 # Ctx Supervisors
@@ -51,6 +51,8 @@ Worker budgets still reset across a restart (tracked as a residual, issue #169) 
 **Codex capacity errors and account exhaustion are now two more restart-worthy message classes, distinct from a usage-window limit (issue #227, 2026-08-31).** `exec.rs`'s tick already scanned live output for `pace::is_limit_hit`'s three window-trip phrases (park and `wait_for_window`, unchanged). A transient `CAPACITY_PATTERNS` hit (`"Selected model is at capacity"`, an overload variant — see [[Ctx Adapters]]'s "The codex adapter" section) is not a window trip at all — the account has plenty of quota, the model is momentarily unavailable — so it restarts the same-repo session in place within `--max-restarts`, with a capped 15/30/60s backoff, and deliberately never touches window/collector state, fallback routing, or any reset-time bookkeeping. Exhausting the restart budget on capacity errors alone exits `EXIT_CAPACITY_EXHAUSTED` (78) with a structured stderr reason naming the matched pattern, the attempt count, and whether the workspace has uncommitted changes. An `ACCOUNT_EXHAUSTED_PATTERNS` hit (`"insufficient_quota"`, `"exceeded your current quota"`, OpenAI's own documented billing-error shape) is the opposite case — no restart can fix a billing stop — so it is an immediate hard stop, `EXIT_ACCOUNT_EXHAUSTED` (79), spending no restart budget at all. A plain headless `zirv agent` delegation that exits non-zero for any reason (capacity/account exhaustion included) now sends a report-back mail carrying the structured reason to the spawning session — previously only a dashboard-spawned worker pane reported back at all, and only on success. See [[Known Issues]] for the residual this leaves in `zirv ctx loop`, which still only recognises the original `LIMIT_HIT_PATTERNS` class.
 
 **A usage-limit message that matches neither known class is now a redacted breadcrumb, not raw text (issue #227, 2026-08-31).** The existing `possible usage-limit message not recognized by known patterns` stderr/decision-log breadcrumb (`pace::scan_for_limit`'s loose-match arm, see [[Usage and Pacing]]) now carries the offending text through `pace::redact_for_log` first — truncated to roughly 200 characters with anything token/key/email-shaped scrubbed — instead of the raw line, since that text comes straight from a live agent child's own stdout/stderr.
+
+**Raw usage-limit text needs structured provider confirmation (issue #340, 2026-09-04).** Both the live tick and final EOF drain in `exec`/`run_loop` corroborate a strict text match through `pace::confirm_limit_hit` before stopping, parking, or routing a child. An unconfirmed line is recorded as `limit-text-unconfirmed` and ignored, so tool output that happens to contain vendor wording preserves the child's own exit status and consumes no restart budget. Transcript-derived `ProviderErrorClass::RateLimit` events remain structured evidence and keep their existing stop path.
 
 ### `wrap` — supervising an interactive TUI through a PTY
 

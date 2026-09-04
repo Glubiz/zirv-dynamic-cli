@@ -750,6 +750,7 @@ mod tests {
                 resets_at: NOW + 1800,
                 observed_at: NOW - age,
                 overage_covered: false,
+                limit_reached: false,
             }),
             seven_day: None,
         }
@@ -826,6 +827,7 @@ mod tests {
                 resets_at: NOW + 600,
                 observed_at: NOW,
                 overage_covered: false,
+                limit_reached: false,
             }),
             seven_day: None,
         };
@@ -1069,6 +1071,7 @@ mod tests {
                     resets_at: 1_785_509_000,
                     observed_at: now_secs(),
                     overage_covered: false,
+                    limit_reached: false,
                 }),
                 seven_day: None,
             },
@@ -1142,6 +1145,7 @@ mod tests {
                     resets_at: 1_785_509_000,
                     observed_at: now_secs(),
                     overage_covered: false,
+                    limit_reached: false,
                 }),
                 seven_day: None,
             },

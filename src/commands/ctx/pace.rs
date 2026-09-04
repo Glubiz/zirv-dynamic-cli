@@ -121,6 +121,7 @@ fn is_loose_limit_mention(line: &str) -> bool {
 /// itself. Fail-open: a broken state dir must not turn this into a hard
 /// failure, so a logging error is swallowed like the rest of this file's
 /// decision logging.
+#[cfg(test)]
 pub fn note_limit_wording_drift<W: Write>(
     line: &str,
     strict: bool,
@@ -132,16 +133,28 @@ pub fn note_limit_wording_drift<W: Write>(
     if strict || !is_loose_limit_mention(line) {
         return;
     }
+    emit_limit_wording_drift(line, 1, state, session, verb, stderr);
+}
+
+fn emit_limit_wording_drift<W: Write>(
+    first: &str,
+    count: usize,
+    state: &StateDir,
+    session: &str,
+    verb: &'static str,
+    stderr: &mut W,
+) {
     // Issue #227: redacted and truncated before it ever reaches stderr or the
     // decision log, so a field report can safely paste this line back into
     // an issue -- the offending text is the whole point of the breadcrumb
     // (new patterns get added from it), so it must not be dropped, only
     // scrubbed.
-    let redacted = redact_for_log(line);
+    let redacted = redact_for_log(first);
+    let detail = format!("{count} lines, first: {redacted}");
     let _ = writeln!(
         stderr,
-        "zirv ctx {verb}: possible usage-limit message not recognized by known patterns: \
-         {redacted}"
+        "zirv ctx {verb}: possible usage-limit message not recognized by known patterns \
+         ({detail})"
     );
     let _ = log::append(
         state,
@@ -152,7 +165,7 @@ pub fn note_limit_wording_drift<W: Write>(
             verdict: "n/a",
             score: 0,
             action: "limit-wording-drift",
-            detail: &redacted,
+            detail: &detail,
         },
     );
 }
@@ -332,12 +345,126 @@ pub fn scan_for_limit<W: Write>(
     stderr: &mut W,
 ) -> bool {
     let mut hit = false;
+    let mut drift_count = 0;
+    let mut first_drift = None;
     for line in lines {
         let strict = is_limit_hit(line);
         hit |= strict;
-        note_limit_wording_drift(line, strict, state, session, verb, stderr);
+        if !strict && is_loose_limit_mention(line) {
+            drift_count += 1;
+            first_drift.get_or_insert(line);
+        }
+    }
+    if let Some(first) = first_drift {
+        emit_limit_wording_drift(first, drift_count, state, session, verb, stderr);
     }
     hit
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LimitConfirmation {
+    Confirmed { detail: String },
+    Unconfirmed { detail: String },
+}
+
+/// Corroborates a raw output match against the provider's structured usage
+/// reading. Codex is force-scanned because the child may have written a newer
+/// rollout moments before the output tap observed its text.
+pub(crate) fn confirm_limit_hit(
+    state: &StateDir,
+    cfg: &PaceConfig,
+    now: u64,
+    provider: &str,
+) -> LimitConfirmation {
+    if provider == usage_window::CODEX_USAGE_PROVIDER
+        && let Ok(home) = crate::utils::home_dir()
+        && let Some(fresh) = usage_window::scan_codex_rollouts(
+            &home.join(".codex").join("sessions"),
+            usage_window::ROLLOUT_SCAN_FILES,
+            now,
+        )
+    {
+        let existing = usage_window::load_for(state, provider);
+        let merged = usage_window::merge(existing.clone().unwrap_or_default(), fresh);
+        if Some(&merged) != existing.as_ref() {
+            let _ = usage_window::store_for(state, provider, &merged);
+        }
+    }
+
+    let Some(collector) = usage_window::load_for(state, provider) else {
+        return LimitConfirmation::Unconfirmed {
+            detail: format!(
+                "provider={provider}, used=unknown, reached=unknown, age=unknown (no structured reading)"
+            ),
+        };
+    };
+
+    let mut confirmed = false;
+    let mut readings = Vec::new();
+    for (name, window) in [
+        ("five_hour", &collector.five_hour),
+        ("seven_day", &collector.seven_day),
+    ] {
+        let Some(reading) = window.as_ref() else {
+            continue;
+        };
+        let bound = binding(window, now, cfg).is_some();
+        let reached = provider == usage_window::CODEX_USAGE_PROVIDER && reading.limit_reached;
+        if bound
+            && (reached
+                || reading.used_percentage >= cfg.spawn_hard_pct
+                    && (provider == usage_window::CODEX_USAGE_PROVIDER
+                        || provider == usage_window::LEGACY_USAGE_PROVIDER))
+        {
+            confirmed = true;
+        }
+        readings.push(format!(
+            "{name} used={:.1}%, reached={}, age={}s, bound={bound}",
+            reading.used_percentage,
+            reading.limit_reached,
+            age_secs(reading, now)
+        ));
+    }
+
+    let detail = if readings.is_empty() {
+        format!(
+            "provider={provider}, used=unknown, reached=unknown, age=unknown (empty structured reading)"
+        )
+    } else {
+        format!("provider={provider}, {}", readings.join("; "))
+    };
+    if confirmed {
+        LimitConfirmation::Confirmed { detail }
+    } else {
+        LimitConfirmation::Unconfirmed { detail }
+    }
+}
+
+pub(crate) fn note_unconfirmed_limit_text<W: Write>(
+    state: &StateDir,
+    now: u64,
+    session: &str,
+    verb: &'static str,
+    detail: &str,
+    stderr: &mut W,
+) {
+    let _ = writeln!(
+        stderr,
+        "zirv ctx {verb}: usage-limit text seen but the provider's structured reading does not \
+         confirm it ({detail}); ignoring"
+    );
+    let _ = log::append(
+        state,
+        &log::Decision {
+            ts: now,
+            session,
+            verb,
+            verdict: "n/a",
+            score: 0,
+            action: "limit-text-unconfirmed",
+            detail,
+        },
+    );
 }
 
 /// Whether a collector window may drive the decision.
@@ -846,9 +973,9 @@ pub struct PaceOutcome {
 pub struct PaceGate<'a> {
     /// Operator declaration that this harness's vendor plan covers overage
     /// from credits: when true, the proactive throttle/pause is skipped
-    /// entirely for this call. A vendor-reported limit hit (the caller's own
-    /// `scan_for_limit`/`is_limit_hit` path) still parks -- that is a
-    /// separate, untouched path.
+    /// entirely for this call. A raw limit-text match still goes through
+    /// `confirm_limit_hit`; a confirmed vendor refusal parks independently
+    /// of this proactive override.
     pub use_credits: bool,
     /// The active poll fallback for this call. `None` means `wait_for_window`
     /// never polls: polling disabled (`cfg.pace.poll_enabled == false`), or a
@@ -1320,8 +1447,8 @@ pub fn wait_for_window<W: Write>(
 
     // Short-circuits before any source refresh or decision: an operator
     // declaring that this harness's vendor plan covers overage from credits
-    // means the proactive throttle/pause never applies to it. A
-    // vendor-reported limit hit still parks via a separate, untouched path.
+    // means the proactive throttle/pause never applies to it. A structured-
+    // confirmed vendor refusal still parks through its separate path.
     if gate.use_credits {
         if !flags.credits_announced {
             let _ = writeln!(
@@ -1550,12 +1677,14 @@ mod tests {
                 resets_at: now + 600,
                 observed_at: now,
                 overage_covered: false,
+                limit_reached: false,
             }),
             seven_day: Some(super::Window {
                 used_percentage: 96.0,
                 resets_at: now + 3_600,
                 observed_at: now,
                 overage_covered: false,
+                limit_reached: false,
             }),
         };
         let reset = super::spawn_reset(&collector, None, now, &cfg).expect("hard refused");
@@ -1578,6 +1707,7 @@ mod tests {
                 resets_at: 0,
                 observed_at: now,
                 overage_covered: false,
+                limit_reached: false,
             }),
             seven_day: None,
         };
@@ -1600,6 +1730,7 @@ mod tests {
             resets_at,
             observed_at,
             overage_covered: false,
+            limit_reached: false,
         })
     }
 
@@ -1615,6 +1746,131 @@ mod tests {
             five_hour: window(percent, resets_at, NOW - 10),
             seven_day: None,
         }
+    }
+
+    fn store_confirmation_reading(
+        state: &StateDir,
+        provider: &str,
+        percent: f64,
+        observed_at: u64,
+        limit_reached: bool,
+    ) {
+        window::store_for(
+            state,
+            provider,
+            &UsageWindows {
+                five_hour: Some(Window {
+                    used_percentage: percent,
+                    resets_at: NOW + 600,
+                    observed_at,
+                    overage_covered: false,
+                    limit_reached,
+                }),
+                seven_day: None,
+            },
+        )
+        .expect("store structured reading");
+    }
+
+    #[test]
+    fn codex_reached_flag_confirms_vendor_exhaustion() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = PaceConfig::default();
+        store_confirmation_reading(&state, window::CODEX_USAGE_PROVIDER, 2.0, NOW, true);
+
+        assert!(matches!(
+            confirm_limit_hit(&state, &cfg, NOW, window::CODEX_USAGE_PROVIDER),
+            LimitConfirmation::Confirmed { .. }
+        ));
+    }
+
+    #[test]
+    fn codex_high_usage_confirms_vendor_exhaustion() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = PaceConfig::default();
+        store_confirmation_reading(&state, window::CODEX_USAGE_PROVIDER, 99.0, NOW, false);
+
+        assert!(matches!(
+            confirm_limit_hit(&state, &cfg, NOW, window::CODEX_USAGE_PROVIDER),
+            LimitConfirmation::Confirmed { .. }
+        ));
+    }
+
+    #[test]
+    fn codex_fresh_low_usage_is_unconfirmed() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = PaceConfig::default();
+        store_confirmation_reading(&state, window::CODEX_USAGE_PROVIDER, 2.0, NOW, false);
+
+        assert!(matches!(
+            confirm_limit_hit(&state, &cfg, NOW, window::CODEX_USAGE_PROVIDER),
+            LimitConfirmation::Unconfirmed { .. }
+        ));
+    }
+
+    #[test]
+    fn missing_reading_is_unconfirmed() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state = StateDir::from_root(tmp.path().join("state"));
+
+        assert!(matches!(
+            confirm_limit_hit(
+                &state,
+                &PaceConfig::default(),
+                NOW,
+                window::CODEX_USAGE_PROVIDER,
+            ),
+            LimitConfirmation::Unconfirmed { .. }
+        ));
+    }
+
+    #[test]
+    fn claude_hard_ceiling_confirms_vendor_exhaustion() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = PaceConfig::default();
+        store_confirmation_reading(
+            &state,
+            window::LEGACY_USAGE_PROVIDER,
+            cfg.spawn_hard_pct,
+            NOW,
+            false,
+        );
+
+        assert!(matches!(
+            confirm_limit_hit(&state, &cfg, NOW, window::LEGACY_USAGE_PROVIDER),
+            LimitConfirmation::Confirmed { .. }
+        ));
+    }
+
+    #[test]
+    fn stale_claude_reading_is_unconfirmed() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = PaceConfig::default();
+        store_confirmation_reading(
+            &state,
+            window::LEGACY_USAGE_PROVIDER,
+            cfg.spawn_hard_pct,
+            NOW - cfg.collector_max_age_secs - 1,
+            false,
+        );
+
+        assert!(matches!(
+            confirm_limit_hit(&state, &cfg, NOW, window::LEGACY_USAGE_PROVIDER),
+            LimitConfirmation::Unconfirmed { .. }
+        ));
     }
 
     /// The `spawn_gate` tests below call with `now == 0` rather than `NOW`
@@ -1738,12 +1994,14 @@ mod tests {
                 resets_at: now + 600,
                 observed_at: now,
                 overage_covered: false,
+                limit_reached: false,
             }),
             seven_day: Some(Window {
                 used_percentage: 100.0,
                 resets_at: now + 3_600,
                 observed_at: now,
                 overage_covered: true,
+                limit_reached: false,
             }),
         };
 
@@ -1770,12 +2028,14 @@ mod tests {
                 resets_at: now + 600,
                 observed_at: now,
                 overage_covered: true,
+                limit_reached: false,
             }),
             seven_day: Some(Window {
                 used_percentage: 100.0,
                 resets_at: now + 3_600,
                 observed_at: now,
                 overage_covered: true,
+                limit_reached: false,
             }),
         };
 
@@ -2636,6 +2896,7 @@ mod tests {
         let loose_only = vec![
             "building the plan".to_string(),
             "You've reached your usage limit for this session".to_string(),
+            "The weekly usage limit was exceeded".to_string(),
         ];
         assert!(
             !scan_for_limit(&loose_only, &state, "sess-1", "loop", &mut stderr),
@@ -2647,7 +2908,17 @@ mod tests {
                 .filter(|l| l.contains("limit-wording-drift"))
                 .count(),
             1,
-            "one breadcrumb, for the one line that drifted: {log}"
+            "one breadcrumb for the whole batch: {log}"
+        );
+        let stderr_text = String::from_utf8(stderr.clone()).expect("utf8");
+        assert_eq!(
+            stderr_text.lines().count(),
+            1,
+            "one advisory per batch: {stderr_text}"
+        );
+        assert!(
+            stderr_text.contains("(2 lines, first:"),
+            "batch summary: {stderr_text}"
         );
 
         let with_strict = vec!["You've hit your weekly limit".to_string()];

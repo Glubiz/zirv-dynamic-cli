@@ -461,7 +461,7 @@ pub(crate) fn run_with_clock<W: Write>(
         let mut compact_budget = super::exec::CompactBudget::default();
         let compact_window = Duration::from_secs(cfg.supervise.interval_secs);
 
-        let (outcome, rotted, limit_hit) = loop {
+        let (outcome, rotted, limit_hit, limit_confirmation_detail) = loop {
             // P2/P3: see the matching comment in `exec.rs` -- each child in
             // this cycle is registered for the console-close sweep and held
             // in a kill-on-close job for exactly that child's life.
@@ -484,6 +484,7 @@ pub(crate) fn run_with_clock<W: Write>(
             let mut rotted = false;
             let mut compact_requested = false;
             let mut limit_hit = false;
+            let mut limit_confirmation_detail = None;
             let mut tick = || {
                 if pace::scan_for_limit(
                     &tap.try_lines(),
@@ -492,8 +493,24 @@ pub(crate) fn run_with_clock<W: Write>(
                     "loop",
                     &mut std::io::stderr(),
                 ) {
-                    limit_hit = true;
-                    return Tick::Stop("limit");
+                    let now = now_fn();
+                    match pace::confirm_limit_hit(&state, &cfg.pace, now, adapter.provider()) {
+                        pace::LimitConfirmation::Confirmed { detail } => {
+                            limit_hit = true;
+                            limit_confirmation_detail = Some(detail);
+                            return Tick::Stop("limit");
+                        }
+                        pace::LimitConfirmation::Unconfirmed { detail } => {
+                            pace::note_unconfirmed_limit_text(
+                                &state,
+                                now,
+                                session.as_str(),
+                                "loop",
+                                &detail,
+                                &mut std::io::stderr(),
+                            );
+                        }
+                    }
                 }
                 // N4: `loop` never restarts for a nudge -- each cycle is
                 // already a fresh, stateless session that re-lists mail on
@@ -574,13 +591,32 @@ pub(crate) fn run_with_clock<W: Write>(
             // See the matching comment in exec.rs: supervise_child checks
             // exit before the tick, so final output needs one bounded drain.
             if !limit_hit {
-                limit_hit = pace::scan_for_limit(
+                let limit_text_seen = pace::scan_for_limit(
                     &tap.drain_to_eof(supervise::FINAL_DRAIN_BUDGET),
                     &state,
                     session.as_str(),
                     "loop",
                     &mut std::io::stderr(),
                 );
+                if limit_text_seen {
+                    let now = now_fn();
+                    match pace::confirm_limit_hit(&state, &cfg.pace, now, adapter.provider()) {
+                        pace::LimitConfirmation::Confirmed { detail } => {
+                            limit_hit = true;
+                            limit_confirmation_detail = Some(detail);
+                        }
+                        pace::LimitConfirmation::Unconfirmed { detail } => {
+                            pace::note_unconfirmed_limit_text(
+                                &state,
+                                now,
+                                session.as_str(),
+                                "loop",
+                                &detail,
+                                &mut std::io::stderr(),
+                            );
+                        }
+                    }
+                }
             }
 
             if super::exec::should_attempt_compact(compact_requested, limit_hit) {
@@ -665,7 +701,7 @@ pub(crate) fn run_with_clock<W: Write>(
                     }
                 }
             }
-            break (outcome, rotted, limit_hit);
+            break (outcome, rotted, limit_hit, limit_confirmation_detail);
         };
 
         let (action, failed) = match outcome {
@@ -682,6 +718,15 @@ pub(crate) fn run_with_clock<W: Write>(
             Outcome::Exited(_) => ("nonzero-exit", true),
         };
 
+        let decision_detail = limit_confirmation_detail
+            .as_deref()
+            .map(|detail| {
+                format!(
+                    "{}; structured confirmation: {detail}",
+                    transcript.display()
+                )
+            })
+            .unwrap_or_else(|| transcript.display().to_string());
         let _ = log::append(
             &state,
             &log::Decision {
@@ -691,7 +736,7 @@ pub(crate) fn run_with_clock<W: Write>(
                 verdict: if rotted { "restart" } else { "n/a" },
                 score: 0,
                 action,
-                detail: &transcript.display().to_string(),
+                detail: &decision_detail,
             },
         );
 
@@ -1302,6 +1347,7 @@ mod tests {
                     resets_at: now + resets_in,
                     observed_at: now,
                     overage_covered: false,
+                    limit_reached: false,
                 }),
                 seven_day: None,
             },
@@ -1719,6 +1765,8 @@ mod tests {
         env.insert("ZIRV_CTX_PACE_JITTER_SECS".to_string(), "0".to_string());
         env.insert("ZIRV_CTX_PACE_FALLBACK_SECS".to_string(), "1".to_string());
         env.insert("ZIRV_CTX_PACE_MAX_WAIT_SECS".to_string(), "2".to_string());
+        env.insert("ZIRV_CTX_PACE".to_string(), "false".to_string());
+        store_collector(&state, 100.0, 60);
 
         let modes = tmp.path().join("modes.txt");
         std::fs::write(&modes, "limit\nhealthy\n").expect("write modes");
@@ -1747,6 +1795,33 @@ mod tests {
         assert!(log.contains("\"action\":\"limit-park\""), "got {log}");
         assert!(!log.contains("\"action\":\"give-up\""), "got {log}");
         assert_eq!(transcripts_in(&home).len(), 2, "both cycles ran");
+    }
+
+    #[test]
+    fn unconfirmed_vendor_exhaustion_text_does_not_park() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let state = tmp.path().join("state");
+        let env = base_env(&state);
+
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let _fake_agent = crate::commands::ctx::testenv::VarGuard::set(&[
+            ("FAKE_AGENT_MODE", Some("limit")),
+            ("FAKE_AGENT_TURNS", Some("1")),
+        ]);
+        let mut out = Vec::new();
+
+        assert_eq!(
+            run_with(&args_for(1), &mut out, tmp.path(), &|k| env.get(k).cloned()).expect("runs"),
+            0
+        );
+        let log = std::fs::read_to_string(state.join("logs/decisions.jsonl")).expect("log");
+        assert!(
+            log.contains("\"action\":\"limit-text-unconfirmed\""),
+            "{log}"
+        );
+        assert!(!log.contains("\"action\":\"limit-park\""), "{log}");
+        assert_eq!(transcripts_in(&home).len(), 1, "one cycle ran");
     }
 
     /// Issue #30, item 3: mail consumed on a session's behalf -- here, a
