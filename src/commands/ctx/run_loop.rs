@@ -196,6 +196,12 @@ pub(crate) fn run_with_clock<W: Write>(
     // comment for what "progress" means. `None` until the first cycle this
     // run has actually evaluated an objective for.
     let mut objective_progress = ObjectiveProgress::default();
+    // Issue #358 (T9): true for exactly the first trip through this loop --
+    // the pre-launch call that decides whether a brand-new worker gets to
+    // start at all. Cleared unconditionally right after that first call, so
+    // every later trip (an ordinary cycle, or resuming after an objective
+    // park) paces normally instead of being read as another fresh launch.
+    let mut initial_launch = true;
     loop {
         if let Some(limit) = args.cycles
             && cycle >= limit
@@ -223,9 +229,11 @@ pub(crate) fn run_with_clock<W: Write>(
                     .pace
                     .poll_enabled
                     .then_some(&http_poller as &dyn super::poll::UsagePoller),
+                initial_launch,
             },
             &mut pace_flags,
         );
+        initial_launch = false;
 
         let mail_slug = super::state::repo_slug(repo);
         // Recomposed every cycle -- the same seam as `injection_args_for_
@@ -832,6 +840,10 @@ pub(crate) fn run_with_clock<W: Write>(
                         .pace
                         .poll_enabled
                         .then_some(&http_poller as &dyn super::poll::UsagePoller),
+                    // A confirmed vendor refusal on a session already
+                    // running is exactly the mid-run pacing T9 leaves
+                    // intact -- never the pre-launch call that never blocks.
+                    initial_launch: false,
                 },
                 &mut pace_flags,
             );
@@ -1748,8 +1760,14 @@ mod tests {
         .expect("store collector state");
     }
 
+    /// Issue #358 (T9): renamed from `each_cycle_passes_the_pacing_gate_
+    /// first`, which used to pin the FIRST cycle waiting on a hard-ceiling
+    /// window before it was ever allowed to run. Now the first cycle of a
+    /// brand-new run is exactly the pre-launch call `PaceGate::initial_
+    /// launch` downgrades: it still passes through the gate first, but a
+    /// `WaitUntil` verdict there is a warning, not a wait.
     #[test]
-    fn each_cycle_passes_the_pacing_gate_first() {
+    fn the_first_cycle_passes_the_pacing_gate_without_waiting() {
         let tmp = crate::commands::ctx::testenv::repo();
         let home = tmp.path().join("home");
         let state = tmp.path().join("state");
@@ -1771,15 +1789,19 @@ mod tests {
             std::env::remove_var("FAKE_AGENT_TURNS");
         }
 
-        assert_eq!(code.expect("runs"), 0, "a pause is never an exit");
+        assert_eq!(code.expect("runs"), 0, "a warning is never an exit");
         assert!(
-            started.elapsed() >= std::time::Duration::from_secs(1),
-            "it waited"
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "usage headroom must never delay the first cycle's launch"
         );
         assert_eq!(transcripts_in(&home).len(), 1, "the cycle still ran");
 
         let log = std::fs::read_to_string(state.join("logs/decisions.jsonl")).expect("log");
-        assert!(log.contains("\"action\":\"pace-wait\""), "got {log}");
+        assert!(
+            log.contains("\"action\":\"pace-initial-launch-warn\""),
+            "got {log}"
+        );
+        assert!(!log.contains("\"action\":\"pace-wait\""), "got {log}");
     }
 
     /// T11: same seam as `exec.rs`'s own `the_blind_delay_reaches_the_

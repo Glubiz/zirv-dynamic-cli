@@ -4031,47 +4031,32 @@ fn fulfill_spawn_request(
     let capability_warnings =
         policy::evaluate(&cfg.policy, adapter.as_ref(), mode).degraded_capabilities();
 
-    // Issue #155, Phase 6(c): the spawn gate -- quota pressure refuses NEW
-    // delegated work, never rotation of a session already running (see
-    // `pace::spawn_gate`'s own doc comment). Placed right after the depth
-    // cap, ahead of the more expensive prompt-composition work below, in the
-    // same cheapest-and-most-hostile-first order this function's own doc
-    // comment promises. Re-applies the SAME check `agent.rs::run_with`
-    // already evaluated against this very request before it was ever
-    // written to disk, so a request that reaches a dashboard other than the
-    // one that check consulted (a live-dashboard fallback, a request that
-    // sat claimed for a while) is held to an equally fresh reading rather
-    // than trusting a decision that may now be stale.
-    //
-    // Security review Finding 2: `req.force` is untrusted JSON any process
-    // that can reach the requests directory can hand-write (the same
-    // premise `parent_role_for`, above, is built on) -- it does NOT carry
-    // the weight `agent.rs::run_with`'s own `args.force` does, which is an
-    // actual operator's own flag, typed at an actual terminal, checked
-    // against this SAME gate before the request was ever written. Treating
-    // the two as equivalent (via `agent::spawn_blocked`, which is correct
-    // for `run_with`'s trusted case) let any pane self-grant the >=
-    // `spawn_hard_pct` hard refusal just by writing `force: true` into its
-    // own request file. So `req.force` is honoured ONLY for the soft band
-    // (`SpawnGate::Warn`, which never blocked a spawn either way) -- the
-    // hard arm (`SpawnGate::Refuse`) is refused here unconditionally,
-    // `req.force` or not. `SpawnRefusal::policy`, never `::channel`: a
-    // headless fallback would route straight around the gate (the headless
-    // path is gated too, by the identical check in `agent::run_with`), the
-    // same reasoning the pane cap and the depth cap above already apply.
+    // Issue #155, Phase 6(c); reworked for issue #358 (T9): usage headroom
+    // ranks a delegation, it never refuses or delays one -- so this is now
+    // an informational note plus, for the ceiling band, an `Attention::Quota`
+    // row, never a `SpawnRefusal`. Placed right after the depth cap, ahead
+    // of the more expensive prompt-composition work below, in the same
+    // cheapest-and-most-hostile-first order this function's own doc comment
+    // promises. Re-applies the SAME check `agent.rs::run_with` already
+    // evaluated against this very request before it was ever written to
+    // disk, so a request that reaches a dashboard other than the one that
+    // check consulted (a live-dashboard fallback, a request that sat claimed
+    // for a while) is held to an equally fresh reading rather than trusting
+    // a decision that may now be stale.
     let (collector, estimator) =
         super::pace::current_windows(state, &cfg.pace, now, adapter.provider());
     let gate = super::pace::spawn_gate(&collector, estimator.as_ref(), now, &cfg.pace);
     let reading_age = super::pace::spawn_headroom(&collector, estimator.as_ref(), now, &cfg.pace)
         .map(|reading| reading.age_secs);
-    if let Some(note) =
-        super::pace::describe_spawn_gate(&gate, reading_age, super::pace::Seat::Pane)
-    {
+    if let Some(note) = super::pace::describe_spawn_gate(&gate, reading_age) {
         if matches!(gate, super::pace::SpawnGate::Refuse { .. }) {
             // Issue #349: filed against the REQUESTING pane's own short id
             // (`req.requested_by`) -- untrusted the same way the log line
             // right below already treats it (best-effort, informational
-            // only; a bogus value just files a stray, harmless row).
+            // only; a bogus value just files a stray, harmless row). The
+            // spawn below still proceeds regardless: this is a ranking
+            // signal, kept on the attention row because it is useful, not a
+            // reason to refuse the pane.
             let _ = super::attention::record(
                 state,
                 &req.requested_by,
@@ -4084,7 +4069,6 @@ fn fulfill_spawn_request(
                 .with_attention(super::attention::Attention::Quota),
                 now,
             );
-            return Err(SpawnRefusal::policy(note));
         }
         push_error(
             errors,
@@ -4411,20 +4395,17 @@ fn fulfill_spawn_request(
         child_envelope.principal.clone(),
     ));
 
-    // T10: the same launch-time pacing gate `wrap::run_with`/this dashboard's
-    // own first pane apply, but *non-interactively* here: this spawn happens
-    // during the dashboard's own live event loop (raw mode and the
-    // alternate screen already active), so a blocking `crossterm` keypress
-    // read -- the orchestrator pane's own gate uses one, see `run_dashboard`
-    // -- would collide with the dashboard's own input loop reading the same
-    // stream. `Launch` spawns normally; the soft band (`Pause`) is advisory
-    // here, not a wait -- it spawns anyway with a visible notice through the
-    // same `errors`/notice channel a withheld-mail advisory already uses a
-    // few lines up; the hard ceiling (`Refuse`) declines the spawn outright
-    // through the existing refusal channel, with no confirmation prompt
-    // possible from this call site -- an operator who wants to force it can
-    // still run `zirv ctx wrap --force-pace` directly, outside the
-    // dashboard.
+    // T10, reworked for issue #358 (T9): the same launch-time pacing gate
+    // `wrap::run_with`/this dashboard's own first pane apply, but
+    // *non-interactively* here: this spawn happens during the dashboard's
+    // own live event loop (raw mode and the alternate screen already
+    // active), so a blocking `crossterm` keypress read -- the orchestrator
+    // pane's own gate uses one, see `run_dashboard` -- would collide with
+    // the dashboard's own input loop reading the same stream. Usage headroom
+    // never blocks a spawn any more: `Launch` spawns normally, and both
+    // `Pause` and `Refuse` are advisory now -- the pane spawns anyway, with
+    // a visible notice through the same `errors`/notice channel a
+    // withheld-mail advisory already uses a few lines up.
     {
         // Finding 1 (review): `poll: false` -- this call happens on the
         // dashboard's single UI thread, during its own live event loop, so
@@ -4434,15 +4415,12 @@ fn fulfill_spawn_request(
         let gate = super::pace::interactive_gate(state, cfg, adapter.provider(), false);
         match gate {
             super::pace::InteractiveGate::Launch => {}
-            super::pace::InteractiveGate::Pause { message, .. } => {
+            super::pace::InteractiveGate::Pause { message, .. }
+            | super::pace::InteractiveGate::Refuse { message } => {
                 push_error(
                     errors,
                     format!("{} pane for {}: {message}", req.agent, req.requested_by),
                 );
-            }
-            super::pace::InteractiveGate::Refuse { message } => {
-                rollback_admission();
-                return Err(SpawnRefusal::policy(message));
             }
         }
     }
@@ -13419,11 +13397,13 @@ mod tests {
     /// above must be rolled back when a LATER step in this same call fails
     /// before a pane is ever actually spawned -- otherwise a group's
     /// `child_limit` slot is permanently burned for a child that never ran.
-    /// `cfg.pace.spawn_hard_pct` is raised well above the usage set below so
-    /// the EARLIER `spawn_gate` check (before `admit_child`) does not itself
-    /// refuse first; usage above the (default) `max_percent` then trips the
-    /// T10 interactive gate's `Refuse` arm, which runs strictly AFTER
-    /// admission -- exactly this finding's failure window.
+    /// Issue #358 (T9): the usage-ceiling scenario this test used to trigger
+    /// the later refusal with (the T10 interactive gate's `Refuse` arm) no
+    /// longer refuses anything -- usage headroom never blocks a spawn any
+    /// more. The writer-permit refusal (`super::permit::acquire_writer`,
+    /// also strictly after admission) still does, so this test now holds the
+    /// tree's one writer slot itself before calling `fulfill_spawn_request`,
+    /// forcing that refusal instead.
     #[test]
     fn fulfill_spawn_request_rolls_back_admission_when_a_later_step_refuses() {
         let repo = std::env::current_dir().expect("cwd");
@@ -13449,32 +13429,19 @@ mod tests {
         };
         crate::commands::ctx::group::create(&state, &group).expect("create group");
 
-        let now = crate::commands::ctx::state::now_secs();
-        window::store(
+        let cfg = CtxConfig::default();
+        let tree = std::fs::canonicalize(&repo).unwrap_or_else(|_| repo.clone());
+        let _held = super::super::permit::acquire_writer(
             &state,
-            &crate::commands::ctx::window::UsageWindows {
-                five_hour: Some(crate::commands::ctx::window::Window {
-                    used_percentage: 99.5,
-                    resets_at: now + 600,
-                    observed_at: now,
-                    overage_covered: false,
-                    limit_reached: false,
-                }),
-                seven_day: None,
-            },
+            cfg.supervise.max_writers,
+            "pre-held by test",
+            &tree,
         )
-        .expect("store collector state above max_percent, below spawn_hard_pct");
+        .expect("hold the tree's one writer slot ahead of the request");
 
-        let mut cfg = CtxConfig::default();
-        cfg.pace.spawn_hard_pct = 200.0;
-        // This pins the OLDER T10 interactive-gate refusal in isolation; the
-        // newer predictive cross-harness reroute (`route_new_delegation`,
-        // issue #186) would otherwise steer this low-headroom request to
-        // codex before that gate is ever reached, on any machine where the
-        // codex adapter resolves (`CodexAdapter::ready` fails open even when
-        // codex is not installed -- see its own doc comment).
-        cfg.fallback.enabled = false;
-
+        // `spawn_request`'s own default is `WorkerMode::Writing`, so this
+        // request's own writer-permit acquisition below finds the slot
+        // already taken.
         let mut req = spawn_request("do the work", &repo);
         req.work_group_id = Some("wg-1".to_string());
         let mut panes: Vec<Pane> = Vec::new();
@@ -13493,8 +13460,13 @@ mod tests {
             &tmp.path().join("requests"),
             &mut errors,
         )
-        .expect_err("the interactive gate refuses once usage is at max_percent");
+        .expect_err("the writer-permit gate refuses once the tree's one slot is already held");
         assert!(!refusal.retryable, "not a channel failure -- policy");
+        assert!(
+            refusal.reason.contains("already holds"),
+            "got {:?}",
+            refusal.reason
+        );
         assert!(panes.is_empty(), "no pane was ever spawned");
 
         let after_rollback = crate::commands::ctx::group::load(&state, "wg-1")
@@ -13527,7 +13499,11 @@ mod tests {
     /// Issue #349: a pacing (`SpawnGate::Refuse`) refusal files an
     /// `Attention::Quota` row against the REQUESTING pane's own short id
     /// (`req.requested_by`) -- the same "requester, not the never-spawned
-    /// worker" reasoning as the writer-permit and pane-count refusals.
+    /// worker" reasoning as the writer-permit and pane-count refusals used
+    /// to carry. Issue #358 (T9): usage headroom no longer refuses the
+    /// spawn, so the pane below actually spawns; the point of this test is
+    /// now that the `Attention::Quota` row is still filed even though the
+    /// pane went ahead.
     #[test]
     fn fulfill_spawn_request_records_quota_attention_on_a_pacing_refusal() {
         let repo = std::env::current_dir().expect("cwd");
@@ -13540,6 +13516,19 @@ mod tests {
         // own exhausted reading -- this test is about the gate itself, not
         // the reroute.
         cfg.fallback.enabled = false;
+        // Same ABSOLUTE rule every other real-pty-spawn test in this module
+        // follows: a bare `claude` is not guaranteed to resolve on a CI
+        // runner's PATH, so this only has to prove the pty spawn itself
+        // succeeds despite the ceiling note.
+        #[cfg(windows)]
+        {
+            cfg.agent_bin = Some("ping -n 3 127.0.0.1".to_string());
+        }
+        #[cfg(unix)]
+        {
+            cfg.agent_bin = Some("sleep 3".to_string());
+        }
+        cfg.pace.spawn_hard_pct = 95.0;
         let now = super::super::state::now_secs();
 
         // A fresh five-hour reading pinned at 100%, above the default
@@ -13579,18 +13568,26 @@ mod tests {
             &tmp.path().join("requests"),
             &mut errors,
         );
-        let reason = result.err().map(|e| e.reason).unwrap_or_default();
         assert!(
-            reason.contains("spawn_hard_pct"),
-            "must refuse via the spawn gate specifically, got: {reason}"
+            result.is_ok(),
+            "usage at the ceiling must never refuse the spawn: {result:?}"
+        );
+        assert!(
+            errors.iter().any(|e| e.contains("spawn_hard_pct")),
+            "the ceiling note must still be visible, got: {errors:?}"
         );
 
         let status = super::super::attention::load(&state, &req.requested_by);
         assert_eq!(
             status.attention,
             super::super::attention::Attention::Quota,
-            "the requesting pane's own attention row must show Quota"
+            "the requesting pane's own attention row must show Quota even though the spawn \
+             went ahead"
         );
+
+        for pane in &mut panes {
+            let _ = pane.shutdown("");
+        }
     }
 
     /// Issue #155, Phase 5(a): the depth cap is enforced HERE, at the
@@ -14285,17 +14282,15 @@ mod tests {
     /// before any spawn" contract).
     ///
     /// Issue #155, Phase 6(c) update: at the default config, 99.9% now trips
-    /// `pace::spawn_gate`'s own `spawn_hard_pct` (95%) before this function
-    /// ever reaches the older `pace::interactive_gate` check below (`max_
-    /// percent` 99%) -- the newer, stricter, spawn-specific gate wins, and
-    /// this test now pins ITS wording. The older gate's own `Refuse` arm is
-    /// consequently unreachable through this path at any default config
-    /// (`spawn_hard_pct` < `max_percent`); its `Pause`/advisory arm still
-    /// fires independently for the band below `spawn_hard_pct`, which is a
-    /// deliberate, currently-harmless overlap rather than a regression --
-    /// see the two gates' own doc comments for why they stay distinct knobs.
+    /// Renamed for issue #358 (T9): `pace::spawn_gate`'s own `spawn_hard_pct`
+    /// (95%) used to refuse a worker pane outright before this function ever
+    /// reached the older `pace::interactive_gate` check below (`max_percent`
+    /// 99%). Now usage headroom never refuses a spawn -- both gates are
+    /// informational -- so this pins the spawn-specific gate's own wording
+    /// (and the actual usage it names) landing in `errors` while the pane
+    /// still spawns.
     #[test]
-    fn fulfill_spawn_request_refuses_a_worker_pane_when_usage_is_at_the_ceiling() {
+    fn fulfill_spawn_request_spawns_a_worker_pane_with_a_quota_note_at_the_ceiling() {
         let repo = std::env::current_dir().expect("cwd");
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(tmp.path().join("state"));
@@ -14316,11 +14311,22 @@ mod tests {
         .expect("store collector state at the ceiling");
 
         let mut cfg = CtxConfig::default();
-        // Isolate the `spawn_hard_pct` refusal from the predictive
-        // cross-harness reroute (`route_new_delegation`, issue #186), which
-        // would otherwise steer this low-headroom request to codex first --
-        // see the sibling test above for the full explanation.
+        // Isolate the `spawn_hard_pct` note from the predictive cross-harness
+        // reroute (`route_new_delegation`, issue #186), which would
+        // otherwise steer this low-headroom request to codex first -- see
+        // the sibling test above for the full explanation.
         cfg.fallback.enabled = false;
+        // Same ABSOLUTE rule every other real-pty-spawn test in this module
+        // follows: a bare `claude` is not guaranteed to resolve on a CI
+        // runner's PATH.
+        #[cfg(windows)]
+        {
+            cfg.agent_bin = Some("ping -n 3 127.0.0.1".to_string());
+        }
+        #[cfg(unix)]
+        {
+            cfg.agent_bin = Some("sleep 3".to_string());
+        }
         let mut panes: Vec<Pane> = Vec::new();
         let mut queues: Vec<VecDeque<String>> = Vec::new();
         let mut errors = Vec::new();
@@ -14338,29 +14344,31 @@ mod tests {
             &mut errors,
         );
 
-        let refusal = result.expect_err("usage at the ceiling must refuse the spawn");
         assert!(
-            refusal.reason.contains("pace.spawn_hard_pct"),
-            "got {}",
-            refusal.reason
+            result.is_ok(),
+            "usage at the ceiling must never refuse the spawn: {result:?}"
         );
-        assert!(
-            refusal.reason.contains("99.9%"),
-            "names the actual usage: {}",
-            refusal.reason
-        );
-        assert!(!refusal.retryable, "not a channel failure -- policy");
-        assert!(panes.is_empty(), "no pane was ever spawned");
+        assert_eq!(panes.len(), 1, "the pane still spawns");
+        let note = errors
+            .iter()
+            .find(|e| e.contains("pace.spawn_hard_pct"))
+            .unwrap_or_else(|| panic!("no spawn_hard_pct note in {errors:?}"));
+        assert!(note.contains("99.9%"), "names the actual usage: {note}");
+
+        for pane in &mut panes {
+            let _ = pane.shutdown("");
+        }
     }
 
-    /// Issue #155, Phase 6(c): isolates `spawn_gate`'s own `spawn_hard_pct`
-    /// (95%) from the older `pace::interactive_gate`'s `max_percent` (99%)
-    /// -- 96% trips ONLY the new gate (the old one only `Pause`s below its
-    /// own 99% ceiling, which never blocks), proving this gate is what
-    /// actually refuses in the band between the two thresholds, not the
-    /// pre-existing one.
+    /// Renamed for issue #358 (T9): isolates `spawn_gate`'s own `spawn_hard_
+    /// pct` (95%) from the older `pace::interactive_gate`'s `max_percent`
+    /// (99%) -- 96% trips ONLY the new gate. Usage headroom never blocks a
+    /// spawn any more, so this now proves that gate is what actually
+    /// produces the note in the band between the two thresholds, not the
+    /// pre-existing one, while the pane spawns regardless.
     #[test]
-    fn fulfill_spawn_request_refuses_a_worker_pane_between_spawn_hard_pct_and_max_percent() {
+    fn fulfill_spawn_request_spawns_a_worker_pane_with_a_quota_note_between_spawn_hard_pct_and_max_percent()
+     {
         let repo = std::env::current_dir().expect("cwd");
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(tmp.path().join("state"));
@@ -14386,6 +14394,17 @@ mod tests {
         // this test for why 96% headroom would otherwise be steered to codex
         // before this gate is ever reached.
         cfg.fallback.enabled = false;
+        // Same ABSOLUTE rule every other real-pty-spawn test in this module
+        // follows: a bare `claude` is not guaranteed to resolve on a CI
+        // runner's PATH.
+        #[cfg(windows)]
+        {
+            cfg.agent_bin = Some("ping -n 3 127.0.0.1".to_string());
+        }
+        #[cfg(unix)]
+        {
+            cfg.agent_bin = Some("sleep 3".to_string());
+        }
         let mut panes: Vec<Pane> = Vec::new();
         let mut queues: Vec<VecDeque<String>> = Vec::new();
         let mut errors = Vec::new();
@@ -14403,27 +14422,32 @@ mod tests {
             &mut errors,
         );
 
-        let refusal = result.expect_err("96% must refuse via spawn_hard_pct alone");
         assert!(
-            refusal.reason.contains("pace.spawn_hard_pct"),
-            "got {}",
-            refusal.reason
+            result.is_ok(),
+            "96% must never refuse the spawn: {result:?}"
         );
-        assert!(!refusal.retryable, "not a channel failure -- policy");
-        assert!(panes.is_empty(), "no pane was ever spawned");
+        assert_eq!(panes.len(), 1, "the pane still spawns");
+        assert!(
+            errors.iter().any(|e| e.contains("pace.spawn_hard_pct")),
+            "got {errors:?}"
+        );
+
+        for pane in &mut panes {
+            let _ = pane.shutdown("");
+        }
     }
 
-    /// Security review Finding 2 (test b): `req.force` on a file-dropped
-    /// request must NEVER lift the >= `spawn_hard_pct` hard refusal -- that
-    /// override is `agent.rs::run_with`'s own trusted `--force`, evaluated
-    /// against an actual operator's own typed flag, not a byte any process
-    /// that can reach the requests directory can set for itself. Before this
-    /// fix, this exact request sailed through with only a visible "(--force:
-    /// spawning anyway)" notice -- any pane could self-grant the override
-    /// this refusal exists to withhold from it. Now it must still refuse,
-    /// exactly as an unforced request already does.
+    /// Renamed for issue #358 (T9): `req.force` on a file-dropped request
+    /// used to matter here because `SpawnGate::Refuse` was a hard block only
+    /// `agent.rs::run_with`'s own trusted `--force` could lift, and this
+    /// request's untrusted `force: true` had to be proven NOT to. Usage
+    /// headroom never blocks a spawn any more -- `force` is irrelevant to
+    /// this gate either way now -- so this proves the pane still spawns
+    /// (with the ceiling note, naming the reading age) with `req.force` set,
+    /// exactly as an unforced request already does (the sibling tests
+    /// above).
     #[test]
-    fn fulfill_spawn_request_never_lets_a_forced_request_override_the_hard_refusal() {
+    fn fulfill_spawn_request_spawns_the_pane_regardless_of_force_once_usage_is_at_the_ceiling() {
         let repo = std::env::current_dir().expect("cwd");
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(tmp.path().join("state"));
@@ -14443,13 +14467,24 @@ mod tests {
         )
         .expect("store collector state above spawn_hard_pct");
 
-        let cfg = CtxConfig::default();
+        let mut cfg = CtxConfig::default();
+        // Same ABSOLUTE rule every other real-pty-spawn test in this module
+        // follows: a bare `claude` is not guaranteed to resolve on a CI
+        // runner's PATH.
+        #[cfg(windows)]
+        {
+            cfg.agent_bin = Some("ping -n 3 127.0.0.1".to_string());
+        }
+        #[cfg(unix)]
+        {
+            cfg.agent_bin = Some("sleep 3".to_string());
+        }
         let mut panes: Vec<Pane> = Vec::new();
         let mut queues: Vec<VecDeque<String>> = Vec::new();
         let mut errors = Vec::new();
         let mut req = spawn_request("do the work", &repo);
         req.force = true;
-        let refusal = fulfill_spawn_request(
+        let result = fulfill_spawn_request(
             &req,
             false,
             None,
@@ -14461,33 +14496,25 @@ mod tests {
             (80, 24),
             &tmp.path().join("requests"),
             &mut errors,
-        )
-        .expect_err("a request's own force must never lift the hard refusal");
+        );
 
         assert!(
-            refusal.reason.contains("pace.spawn_hard_pct"),
-            "got {}",
-            refusal.reason
+            result.is_ok(),
+            "usage at the ceiling must never refuse the spawn, forced or not: {result:?}"
         );
+        assert_eq!(panes.len(), 1, "the pane still spawns");
+        let note = errors
+            .iter()
+            .find(|e| e.contains("pace.spawn_hard_pct"))
+            .unwrap_or_else(|| panic!("no spawn_hard_pct note in {errors:?}"));
         assert!(
-            refusal.reason.contains("observed 0s ago"),
-            "names the reading age: {}",
-            refusal.reason
+            note.contains("observed 0s ago"),
+            "names the reading age: {note}"
         );
-        assert!(
-            refusal.reason.contains("pass --headless --force"),
-            "names the pane-safe force path: {}",
-            refusal.reason
-        );
-        assert!(
-            refusal
-                .reason
-                .contains("raise pace.spawn_hard_pct in ~/.zirv/ctx.toml"),
-            "names the durable override: {}",
-            refusal.reason
-        );
-        assert!(!refusal.retryable, "not a channel failure -- policy");
-        assert!(panes.is_empty(), "no pane was ever spawned");
+
+        for pane in &mut panes {
+            let _ = pane.shutdown("");
+        }
     }
 
     /// Security review Finding 2 (test a): the soft band (>= `spawn_soft_pct`,

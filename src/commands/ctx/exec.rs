@@ -1392,6 +1392,13 @@ fn run_with_clock_inner<W: Write>(
     let mut screening_announced: Option<String> = None;
     let mut compact_budget = CompactBudget::default();
     let compact_window = Duration::from_secs(cfg.supervise.interval_secs);
+    // Issue #358 (T9): true for exactly the first trip through this loop --
+    // the pre-launch call that decides whether a brand-new worker gets to
+    // start at all. Cleared unconditionally right after that first call, so
+    // every later trip (an ordinary restart, a nudge restart, an in-place
+    // compact-continue) paces normally instead of being read as another
+    // fresh launch.
+    let mut initial_launch = true;
 
     loop {
         pace::wait_for_window(
@@ -1410,9 +1417,11 @@ fn run_with_clock_inner<W: Write>(
                     .pace
                     .poll_enabled
                     .then_some(&http_poller as &dyn super::poll::UsagePoller),
+                initial_launch,
             },
             &mut pace_flags,
         );
+        initial_launch = false;
 
         // P2/P3: `_child_guard` holds this cycle's child in the console-close
         // pid registry and in a kill-on-close job for as long as it is in
@@ -2374,6 +2383,10 @@ fn run_with_clock_inner<W: Write>(
                         .pace
                         .poll_enabled
                         .then_some(&http_poller as &dyn super::poll::UsagePoller),
+                    // A confirmed vendor refusal on a session already
+                    // running is exactly the mid-run pacing T9 leaves
+                    // intact -- never the pre-launch call that never blocks.
+                    initial_launch: false,
                 },
                 &mut pace_flags,
             );
@@ -5883,8 +5896,13 @@ mod tests {
         );
     }
 
+    /// Issue #358 (T9): renamed from `an_exhausted_window_delays_the_first_
+    /// spawn` -- usage headroom is a ranking signal now, never a reason to
+    /// delay the very first spawn of a fresh session. The `WaitUntil`
+    /// verdict this exhausted window used to produce is downgraded to a
+    /// one-line warning instead.
     #[test]
-    fn an_exhausted_window_delays_the_first_spawn() {
+    fn an_exhausted_window_no_longer_delays_the_first_spawn() {
         let tmp = crate::commands::ctx::testenv::repo();
         let home = tmp.path().join("home");
         let state = tmp.path().join("state");
@@ -5912,20 +5930,90 @@ mod tests {
             reservation_id: None,
             command: fake_agent_command(session),
         };
-        let started = std::time::Instant::now();
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
         unsafe {
             std::env::remove_var("FAKE_AGENT_MODE");
         }
 
-        assert_eq!(code.expect("runs"), 0, "a pause is never an exit");
+        assert_eq!(code.expect("runs"), 0, "a warning is never an exit");
+        let log = std::fs::read_to_string(state.join("logs/decisions.jsonl")).expect("log");
         assert!(
-            started.elapsed() >= std::time::Duration::from_secs(1),
-            "it should have waited before spawning"
+            log.contains("\"action\":\"pace-initial-launch-warn\""),
+            "got {log}"
+        );
+        assert!(!log.contains("\"action\":\"pace-wait\""), "got {log}");
+    }
+
+    /// Issue #358 (T9): the companion to the test above -- the initial
+    /// launch never waits, but a session already running that hits a
+    /// confirmed, structured-corroborated vendor refusal still parks before
+    /// its restart exactly as before (`initial_launch: false` on that
+    /// second, separate `PaceGate`). Fake `sleep_fn`, real clock: the
+    /// initial launch must record zero sleeps, and the confirmed-limit park
+    /// after the first child exits must record at least one.
+    #[test]
+    fn the_initial_launch_never_waits_but_a_confirmed_limit_restart_still_does() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let state = tmp.path().join("state");
+        let session = "aeaeaeae-2222-4333-8444-555555555555";
+        let modes = tmp.path().join("modes.txt");
+        std::fs::write(&modes, "limit\nhealthy\n").expect("write modes");
+        let mut env = base_env(&state);
+        env.insert("ZIRV_CTX_PACE_JITTER_SECS".to_string(), "0".to_string());
+        env.insert("ZIRV_CTX_PACE_MAX_WAIT_SECS".to_string(), "2".to_string());
+        store_collector(&state, 100.0, 1);
+
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let _fake_agent = crate::commands::ctx::testenv::VarGuard::set(&[(
+            "FAKE_AGENT_MODE_FILE",
+            modes.to_str(),
+        )]);
+        let args = ExecArgs {
+            agent: Some("claude".to_string()),
+            session_id: Some(session.to_string()),
+            transcript: Some(transcript_for(&home, tmp.path(), session)),
+            prompt: Some("do the work".to_string()),
+            max_restarts: Some(1),
+            budget_tokens: None,
+            max_tool_calls: None,
+            objective: None,
+            timeout_secs: Some(60),
+            simple: false,
+            reservation_id: None,
+            command: fake_agent_command(session),
+        };
+        let mut out = Vec::new();
+        let slept: std::cell::RefCell<Vec<u64>> = std::cell::RefCell::new(Vec::new());
+        let code = run_with_clock(
+            &args,
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            &crate::commands::ctx::state::now_secs,
+            &|d: Duration| slept.borrow_mut().push(d.as_secs()),
+        );
+
+        assert_eq!(code.expect("runs"), 0, "the restart completes healthily");
+        assert!(
+            !slept.borrow().is_empty(),
+            "the confirmed-limit restart must still pace before relaunching"
         );
         let log = std::fs::read_to_string(state.join("logs/decisions.jsonl")).expect("log");
-        assert!(log.contains("\"action\":\"pace-wait\""), "got {log}");
+        assert!(
+            log.contains("\"action\":\"pace-initial-launch-warn\""),
+            "the initial launch must be a warning, not a wait: {log}"
+        );
+        assert!(
+            log.contains("\"action\":\"limit-park\""),
+            "the confirmed limit must still park before the restart: {log}"
+        );
+        assert_eq!(
+            transcripts_in(&home).len(),
+            2,
+            "a limit-hit park mints a fresh session, same as an ordinary restart"
+        );
     }
 
     /// Bug B seam coverage (2026-08-22, fix round 3): `exec.rs` is one of

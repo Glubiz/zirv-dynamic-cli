@@ -1645,109 +1645,28 @@ fn relaunch(
     Ok((pair, child, reader, writer))
 }
 
-/// T10: how often the skippable pause and the confirmation prompt poll for a
-/// keypress -- short enough to feel responsive, long enough not to busy-loop
-/// the CPU while a human decides (or doesn't).
-const INTERACTIVE_GATE_POLL_MS: u64 = 200;
-
-/// T10: the skippable half of the interactive gate (`InteractiveGate::
-/// Pause`) -- waits up to `seconds`, returning the instant any key arrives.
-/// Best-effort: a `crossterm` raw-mode/poll/read failure degrades to "no
-/// keypress arrived", so the pause simply runs its full course rather than
-/// erroring -- the same posture every other input-detection path in this
-/// crate already takes (a spend gate must never crash a launch over a
-/// terminal quirk).
-fn interactive_skippable_pause(seconds: u64) {
-    let _ = crossterm::terminal::enable_raw_mode();
-    let deadline = Instant::now() + Duration::from_secs(seconds);
-    while Instant::now() < deadline {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        let poll_for = remaining.min(Duration::from_millis(INTERACTIVE_GATE_POLL_MS));
-        match crossterm::event::poll(poll_for) {
-            Ok(true) => {
-                if matches!(
-                    crossterm::event::read(),
-                    Ok(crossterm::event::Event::Key(_))
-                ) {
-                    break;
-                }
-            }
-            Ok(false) => {}
-            Err(_) => break,
-        }
-    }
-    let _ = crossterm::terminal::disable_raw_mode();
-}
-
-/// T10: the deliberate-confirmation half (`InteractiveGate::Refuse`) --
-/// blocks until a key arrives, since a hard ceiling has no safe timeout to
-/// fall through to (the whole point is "refuse unless a human overrides
-/// it"). Only `y`/`Y` confirms; any other key, or an input-detection
-/// failure, refuses -- the same "unknown must not be read as permission"
-/// rule `pace::decide` itself already follows for usage data.
-fn interactive_confirm() -> bool {
-    let _ = crossterm::terminal::enable_raw_mode();
-    let mut confirmed = false;
-    loop {
-        match crossterm::event::poll(Duration::from_millis(INTERACTIVE_GATE_POLL_MS)) {
-            Ok(true) => match crossterm::event::read() {
-                Ok(crossterm::event::Event::Key(key)) => {
-                    confirmed = matches!(
-                        key.code,
-                        crossterm::event::KeyCode::Char('y') | crossterm::event::KeyCode::Char('Y')
-                    );
-                    break;
-                }
-                Ok(_) => continue,
-                Err(_) => break,
-            },
-            Ok(false) => continue,
-            Err(_) => break,
-        }
-    }
-    let _ = crossterm::terminal::disable_raw_mode();
-    confirmed
-}
-
-/// T10: applies the resolved `InteractiveGate` before the pty is ever
-/// opened. `force_pace` short-circuits both wait shapes with one line naming
-/// why, never silently -- an operator who passed the flag still deserves to
-/// see what they skipped, not just a launch with no explanation. Returns
-/// `Err` to refuse (the caller returns it straight out of `run_with`, the
-/// same pattern every other pre-terminal refusal in this function already
-/// uses); every other case returns `Ok(())` to launch.
+/// T10, reworked for issue #358 (T9): applies the resolved `InteractiveGate`
+/// before the pty is ever opened. Usage headroom never blocks or delays a
+/// launch any more -- `Pause` and `Refuse` both just print `message` and
+/// return `Ok(())` to launch immediately, with no keypress wait and no
+/// confirmation prompt. `force_pace` is still accepted (every caller still
+/// passes it through) and still names itself in the line it prints, but it
+/// is now a no-op for the gate: there is nothing left for it to skip.
 pub(in crate::commands::ctx) fn apply_interactive_gate(
     gate: pace::InteractiveGate,
     force_pace: bool,
 ) -> CtxResult<()> {
-    match gate {
-        pace::InteractiveGate::Launch => Ok(()),
-        pace::InteractiveGate::Pause { message, seconds } => {
-            if force_pace {
-                eprintln!("zirv ctx wrap: {message} (--force-pace: launching now)");
-                return Ok(());
-            }
-            eprintln!("zirv ctx wrap: {message}");
-            interactive_skippable_pause(seconds);
-            Ok(())
-        }
-        pace::InteractiveGate::Refuse { message } => {
-            if force_pace {
-                eprintln!("zirv ctx wrap: {message} (--force-pace: launching anyway)");
-                return Ok(());
-            }
-            eprintln!("zirv ctx wrap: {message}");
-            if interactive_confirm() {
-                Ok(())
-            } else {
-                Err(
-                    "zirv ctx wrap: refusing to launch (usage at the ceiling); pass \
-                     --force-pace or confirm with 'y' to launch anyway"
-                        .into(),
-                )
-            }
-        }
+    let message = match gate {
+        pace::InteractiveGate::Launch => return Ok(()),
+        pace::InteractiveGate::Pause { message, .. } => message,
+        pace::InteractiveGate::Refuse { message } => message,
+    };
+    if force_pace {
+        eprintln!("zirv ctx wrap: {message} (--force-pace: launching now)");
+    } else {
+        eprintln!("zirv ctx wrap: {message} -- launching anyway");
     }
+    Ok(())
 }
 
 /// `role` is a caller-supplied parameter rather than a `WrapArgs` field: it is
@@ -1880,17 +1799,16 @@ pub fn run_with(
     // does NOT skip it (its own doc comment already promises "supervision,
     // pacing and hooks still apply").
     //
-    // Also gated on both stdin *and* stdout being real terminals: the whole
-    // design (a skippable pause, a 'y'-to-confirm refusal) assumes a human
-    // is there to answer it, exactly the same double-check `chrome::
-    // dash_eligible` already makes for the same reason. Without a real
-    // terminal there is nobody to prompt -- under `cargo test`'s piped
-    // stdio in particular, `crossterm`'s raw-mode/poll calls have no console
-    // to act on, so blocking here would either error out immediately (best
-    // case) or hang a test suite waiting for a keypress that can never
-    // arrive (worst case). A non-interactive `wrap` invocation is out of
-    // scope for this fix -- `exec`/`loop` are the supervisors for headless
-    // work, and already gate correctly.
+    // Also gated on both stdin *and* stdout being real terminals, the same
+    // double-check `chrome::dash_eligible` already makes for the same
+    // reason: this is the interactive-session launch path, and a
+    // non-interactive `wrap` invocation is out of scope for it -- `exec`/
+    // `loop` are the supervisors for headless work, and already gate
+    // correctly. Issue #358 (T9): `apply_interactive_gate` itself no longer
+    // blocks or prompts for either `Pause` or `Refuse` -- it prints the note
+    // and launches -- so this check is no longer load-bearing for avoiding a
+    // hang under piped test stdio, but the interactive/headless distinction
+    // it draws is still the right one to gate on.
     //
     // `interactive_launch` is also the real signal `compile`/`policy_
     // launch_args` below need (2026-08-24 hardening): before this, both
@@ -5151,42 +5069,43 @@ mod tests {
         assert_eq!(read_socket_path(&state, Some("cccc3333")), None);
     }
 
-    /// T10: `--force-pace` skips the interactive wait/confirmation
-    /// deterministically -- the one half of `apply_interactive_gate` that is
-    /// unit-testable without a real terminal, since the non-`force_pace`
-    /// branches call into `crossterm`'s raw-mode keypress detection
-    /// (`interactive_skippable_pause`/`interactive_confirm`), which needs an
-    /// actual console and is exercised only by hand and by the `gate ==
-    /// Launch` case reaching zero I/O at all in every other wrap test (the
-    /// terminal-presence check ahead of this function already keeps them
-    /// off this path entirely under `cargo test`'s piped stdio).
+    /// Issue #358 (T9): `apply_interactive_gate` never waits or confirms any
+    /// more, regardless of `force_pace` -- a `Pause` with an astronomical
+    /// `seconds` and a `Refuse` both return `Ok(())` immediately whether or
+    /// not `--force-pace` was passed, since usage headroom no longer blocks
+    /// or delays a launch. Renamed from `force_pace_skips_the_wait_or_
+    /// confirmation_for_both_pause_and_refuse`, which used to pin `--force-
+    /// pace` as the one thing standing between an operator and an ~11-day
+    /// block; there is no block left to skip.
     #[test]
-    fn force_pace_skips_the_wait_or_confirmation_for_both_pause_and_refuse() {
+    fn neither_pause_nor_refuse_ever_waits_or_confirms_with_or_without_force_pace() {
         assert!(apply_interactive_gate(pace::InteractiveGate::Launch, false).is_ok());
         assert!(apply_interactive_gate(pace::InteractiveGate::Launch, true).is_ok());
 
-        assert!(
-            apply_interactive_gate(
-                pace::InteractiveGate::Pause {
-                    message: "usage 85.0% of the five_hour window".to_string(),
-                    seconds: 999_999,
-                },
-                true,
-            )
-            .is_ok(),
-            "force_pace must not block on a pause that would otherwise wait ~11 days"
-        );
+        for force_pace in [false, true] {
+            assert!(
+                apply_interactive_gate(
+                    pace::InteractiveGate::Pause {
+                        message: "usage 85.0% of the five_hour window".to_string(),
+                        seconds: 999_999,
+                    },
+                    force_pace,
+                )
+                .is_ok(),
+                "a pause that would otherwise wait ~11 days must never block, force_pace={force_pace}"
+            );
 
-        assert!(
-            apply_interactive_gate(
-                pace::InteractiveGate::Refuse {
-                    message: "usage 99.9% of the five_hour window".to_string(),
-                },
-                true,
-            )
-            .is_ok(),
-            "force_pace must launch anyway even at the hard ceiling"
-        );
+            assert!(
+                apply_interactive_gate(
+                    pace::InteractiveGate::Refuse {
+                        message: "usage 99.9% of the five_hour window".to_string(),
+                    },
+                    force_pace,
+                )
+                .is_ok(),
+                "the hard ceiling must launch anyway, force_pace={force_pace}"
+            );
+        }
     }
 
     #[test]
