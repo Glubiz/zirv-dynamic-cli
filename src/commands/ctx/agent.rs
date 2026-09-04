@@ -22,11 +22,13 @@ use super::announce::{Announcer, Event};
 use super::chat::quiet_env;
 use super::config::{CtxConfig, EnvLookup, env_from_process};
 use super::dash::spawnreq;
-use super::event::{SessionId, TranscriptUsage};
+use super::event::{SessionId, SessionRef, TranscriptUsage};
 use super::exec::{self, ExecArgs};
 use super::pace;
 use super::permit::{self, WorkerMode, WriterRefusal};
 use super::policy;
+use super::result_schema::{self, Schema};
+use super::supervise;
 
 #[derive(Debug, Clone, clap::Args)]
 pub struct AgentArgs {
@@ -168,6 +170,23 @@ pub struct AgentArgs {
     /// decision`) rather than requiring an operator to type it.
     #[arg(long, value_enum)]
     pub task_class: Option<super::log::TaskClass>,
+    /// Issue #318: a structural contract this worker's final report is held
+    /// to -- a path to a JSON schema file, or the schema as inline JSON
+    /// text (see `result_schema::Schema::from_json` for the shape).
+    /// Appended to the worker's own prompt as an OUTPUT CONTRACT block
+    /// (`resolve_result_schema`/`attach_result_contract_to_prompt`) and
+    /// exported into its env (`RESULT_SCHEMA_ENV`) so a pane's own `zirv
+    /// ctx send` self-report is held to it too. Mutually exclusive with
+    /// `--result-kind`: one names a schema outright, the other names a
+    /// built-in one, and honouring both would leave it ambiguous which
+    /// actually governs the contract.
+    #[arg(long, conflicts_with = "result_kind")]
+    pub result_schema: Option<String>,
+    /// Issue #318: the same contract as `--result-schema`, named from one
+    /// of the built-in shapes (`result_schema::BUILT_IN_KINDS`) instead of
+    /// typed out by hand.
+    #[arg(long, conflicts_with = "result_schema")]
+    pub result_kind: Option<String>,
 }
 
 /// `--attach-artifact`'s CLI spelling for `workflow::engine::ArtifactStage`.
@@ -579,6 +598,31 @@ fn out_of_repo_paths_in_prompt(
         .collect()
 }
 
+/// Issue #328: the one-line nudge printed when a session delegates to the
+/// SAME harness it already runs under (`ZIRV_CTX_AGENT` names `<name>`).
+/// The operator's routing rule is that zirv reaches another harness or a
+/// work group, while same-harness delegation belongs to the harness's own
+/// native subagent tool -- visible in the session, result returned directly,
+/// no mail hop. A work-group dispatch (`--group`, or an inherited
+/// `WORK_GROUP_ENV`) is exactly the case zirv exists for, so it never hints,
+/// and neither does a sub-orchestrator scope. The hint is advice, not a
+/// refusal: the run proceeds unchanged, because refusing would strand an
+/// operator who typed the command on purpose with nobody to answer.
+fn same_harness_hint(args: &AgentArgs, env: EnvLookup<'_>) -> Option<String> {
+    if args.group.is_some() || args.scope.is_some() || env(WORK_GROUP_ENV).is_some() {
+        return None;
+    }
+    let running = env(super::adapters::AGENT_ENV)?;
+    if !running.eq_ignore_ascii_case(args.name.trim()) {
+        return None;
+    }
+    Some(format!(
+        "hint: this session already runs under {running}; for same-harness delegation use the \
+         harness's native subagent tool (visible here, result returned directly) and keep `zirv \
+         agent` for another harness or a work group -- proceeding anyway"
+    ))
+}
+
 /// Prints [`out_of_repo_paths_in_prompt`]'s findings as non-fatal stderr
 /// warnings, one line per offending path. Never called when `--workdir` was
 /// given -- an explicit `--workdir` already says the operator meant to point
@@ -845,6 +889,82 @@ pub(crate) fn parent_session_env<'a>(
         } else {
             env(key)
         }
+    }
+}
+
+/// Issue #318: the child's own env key for the canonical JSON of the
+/// [`Schema`] this delegation declared via `--result-schema`/`--result-
+/// kind`, if any. Read back by `mail::run_send_with` so a worker's own
+/// self-report through `zirv ctx send --to-session` is held to the same
+/// contract the headless retry path validates against -- one declaration,
+/// enforced on whichever fork (pane or headless) actually ran the worker.
+pub const RESULT_SCHEMA_ENV: &str = "ZIRV_CTX_RESULT_SCHEMA";
+
+/// Folds this delegation's own resolved `--result-schema`/`--result-kind`
+/// into the env lookup its launch runs under, the same unconditional-
+/// substitute shape [`parent_session_env`] already established: `schema`
+/// always wins outright, `None` included, so a stray inherited
+/// [`RESULT_SCHEMA_ENV`] from further up this process's own delegation
+/// chain can never leak into a worker whose own delegation declared none.
+fn result_schema_env<'a>(
+    env: EnvLookup<'a>,
+    schema: Option<String>,
+) -> impl Fn(&str) -> Option<String> + 'a {
+    move |key: &str| {
+        if key == RESULT_SCHEMA_ENV {
+            schema.clone()
+        } else {
+            env(key)
+        }
+    }
+}
+
+/// Issue #318: resolves `--result-schema`/`--result-kind` into the actual
+/// [`Schema`] this delegation's worker report gets held to, or `None` when
+/// neither flag was given -- today's behaviour, byte for byte unchanged.
+/// `--result-schema`'s value is read as a file path when it names one that
+/// exists, and as inline JSON text otherwise. The two flags are also
+/// enforced mutually exclusive here (`clap`'s own `conflicts_with` already
+/// refuses this on real argv, but `run_with` is called directly in tests
+/// with a hand-built `AgentArgs`, which bypasses that layer entirely).
+fn resolve_result_schema(args: &AgentArgs) -> CtxResult<Option<Schema>> {
+    if args.result_schema.is_some() && args.result_kind.is_some() {
+        return Err("--result-schema and --result-kind are mutually exclusive".into());
+    }
+    if let Some(kind) = &args.result_kind {
+        return result_schema::built_in(kind).map(Some).ok_or_else(|| {
+            format!(
+                "--result-kind '{kind}' is not one of the built-in kinds: {}",
+                result_schema::BUILT_IN_KINDS.join(", ")
+            )
+            .into()
+        });
+    }
+    if let Some(raw) = &args.result_schema {
+        let text = if Path::new(raw).is_file() {
+            std::fs::read_to_string(raw).map_err(|e| format!("--result-schema {raw}: {e}"))?
+        } else {
+            raw.clone()
+        };
+        return Schema::from_json(&text)
+            .map(Some)
+            .map_err(|e| format!("--result-schema: {e}").into());
+    }
+    Ok(None)
+}
+
+/// Appends [`result_schema::render_contract_block`] (if a schema was
+/// declared) to `prompt`, after [`attach_artifact_to_prompt`]'s own splice
+/// point -- the same "both forks read this one `prompt` binding" seam that
+/// function's own doc comment describes, so a live dashboard pane and the
+/// headless fallback both see the identical OUTPUT CONTRACT text.
+fn attach_result_contract_to_prompt(schema: Option<&Schema>, prompt: String) -> String {
+    match schema {
+        Some(schema) => format!(
+            "{prompt}\n\n{}",
+            result_schema::render_contract_block(schema)
+        ),
+        None => prompt,
     }
 }
 
@@ -1268,6 +1388,77 @@ fn report_back_message(
     }
 }
 
+/// Issue #318: runs ONE bounded resume turn against `session`, feeding it
+/// `retry_prompt` (`result_schema::build_retry_message`'s own text) so a
+/// worker whose report failed [`result_schema::validate`] gets exactly one
+/// chance to correct it before this delegation gives up and reports
+/// `contract_failed`. Reuses the identical resume-launch/supervise/drain
+/// sequence `exec::compact_in_place` already verifies a headless resume
+/// with -- not a second, independently drifting spawn path.
+///
+/// `Ok(())` says only that the command ran to some exit, not that the reply
+/// is now valid -- the caller re-reads the transcript and re-validates
+/// itself. `Err` covers the adapter having no resume support at all (never
+/// reached in practice: callers check `headless_resume_cmd(..).is_some()`
+/// first, since a resume attempt on codex would spend a retry the bounded
+/// budget never gets back) and the command failing to start or run.
+fn run_contract_retry(
+    adapter: &dyn AgentAdapter,
+    session: &SessionId,
+    extra: &[String],
+    retry_prompt: &str,
+    launch_repo: &Path,
+    timeout: Duration,
+    env_pairs: &[(String, String)],
+) -> Result<(), String> {
+    let prompt_via_stdin = exec::prompt_delivery_via_stdin(adapter, session);
+    let (mut command, stdin_prompt) =
+        exec::headless_resume_launch(adapter, retry_prompt, session, extra, prompt_via_stdin)
+            .ok_or_else(|| {
+                format!(
+                    "adapter '{}' cannot resume a headless session in place",
+                    adapter.name()
+                )
+            })?;
+    command.current_dir(launch_repo);
+    for (key, value) in env_pairs {
+        command.env(key, value);
+    }
+    let (mut child, tap, _guard) = supervise::spawn_tapped(command, stdin_prompt)
+        .map_err(|e| format!("retry command failed to start: {e}"))?;
+    let outcome = supervise::supervise_child(
+        &mut child,
+        std::time::Instant::now() + timeout,
+        Duration::from_millis(200),
+        &mut || supervise::Tick::Continue,
+    )
+    .map_err(|e| format!("retry command failed: {e}"))?;
+    let _ = tap.drain_to_eof(supervise::FINAL_DRAIN_BUDGET);
+    match outcome {
+        supervise::Outcome::Exited(_) => Ok(()),
+        supervise::Outcome::TimedOut => Err("retry command timed out".to_string()),
+        supervise::Outcome::StoppedByTick(reason) => {
+            Err(format!("retry command stopped unexpectedly: {reason}"))
+        }
+    }
+}
+
+/// Truncates `text` to at most `max` bytes on a real `char` boundary, for
+/// the capped raw-candidate excerpt a `contract_failed` report-back mail
+/// carries -- a worker's own final message is untrusted, unbounded free
+/// text, and a mail body must not grow without limit just because a worker
+/// wrote a very long non-conforming reply.
+fn cap_bytes(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.to_string();
+    }
+    let mut end = max;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...[truncated]", &text[..end])
+}
+
 /// How long a delegated run waits for the dashboard's own answer before
 /// giving up and running headless instead. Generous enough for a live
 /// dashboard's own event loop (50ms poll, plus a once-per-tick request
@@ -1510,6 +1701,13 @@ const EXIT_DASH_UNCONFIRMED: i32 = 1;
 /// `SpawnRequest` itself, see its own fields. Neither is `--workdir`: panes
 /// support it directly (`SpawnRequest::workdir`), so it never reaches this
 /// gate at all.
+// Issue #318 added `result_schema` as this function's 8th parameter, over
+// clippy's default 7-argument threshold -- every argument here is already an
+// independent, unrelated piece of one delegation's own dashboard-join
+// attempt (target, prompt, output, repo, env, two timeouts, and now the
+// declared contract), so bundling them into a struct would only move the
+// same list one level down without making the one call site clearer.
+#[allow(clippy::too_many_arguments)]
 fn try_join_dashboard<W: Write>(
     args: &AgentArgs,
     prompt: &str,
@@ -1518,6 +1716,7 @@ fn try_join_dashboard<W: Write>(
     env: EnvLookup<'_>,
     ack_timeout: Duration,
     claim_extension: Duration,
+    result_schema: Option<&Schema>,
 ) -> Option<CtxResult<i32>> {
     let inherited = env(spawnreq::DASH_REQUESTS_ENV).map(std::path::PathBuf::from)?;
     let dir = live_join_target(&inherited, env)?;
@@ -1628,6 +1827,11 @@ fn try_join_dashboard<W: Write>(
         // spawn does not yet enforce the writer-permit pool itself.
         mode: args.mode,
         owns_workdir: args.worktree,
+        // Issue #318: the same canonical JSON `RESULT_SCHEMA_ENV` carries
+        // into a headless child's env, so `dash::fulfill_spawn_request` can
+        // push it into a fulfilling pane's own child env identically --
+        // see that field's own doc comment.
+        result_schema: result_schema.map(Schema::to_canonical_json),
     };
     let path = match spawnreq::write_request(&dir, &req) {
         Ok(path) => path,
@@ -1879,6 +2083,11 @@ pub fn run_with<W: Write>(
 ) -> CtxResult<i32> {
     validate_flags(&args.flags)?;
     validate_role(&args.role)?;
+    // Issue #318: resolved up front, before anything else in this
+    // delegation runs -- a bad `--result-schema`/`--result-kind` must fail
+    // loudly here, not surface only once a worker has already burned a run
+    // reporting back into a contract that was never actually well-formed.
+    let result_schema = resolve_result_schema(args)?;
     // Issue #267: allocating a fresh tree and being told to use a specific
     // existing one are two different requests -- honouring one over the
     // other silently would surprise whichever the operator actually meant.
@@ -1928,6 +2137,12 @@ pub fn run_with<W: Write>(
             .map(PathBuf::from);
         warn_about_paths_outside_launch_repo(&prompt, repo, home.as_deref());
     }
+    // Issue #328: printed on stdout ahead of either fork (pane ack or
+    // headless result) so the delegating session reads it whichever path
+    // runs the task.
+    if let Some(hint) = same_harness_hint(args, env) {
+        writeln!(w, "{hint}")?;
+    }
 
     // Loaded here rather than after the dashboard-join attempt below (its
     // former position): the spawn gate needs `cfg.pace` before either fork
@@ -1954,6 +2169,10 @@ pub fn run_with<W: Write>(
     // `resolve_attached_artifact`'s own doc comment for exactly which cases
     // that covers.
     let prompt = attach_artifact_to_prompt(args, &state, repo, prompt)?;
+    // Issue #318: the OUTPUT CONTRACT block, when a schema was declared --
+    // same seam, same "both forks read this one binding" guarantee as
+    // `--attach-artifact` immediately above.
+    let prompt = attach_result_contract_to_prompt(result_schema.as_ref(), prompt);
 
     // Issue #223 §E: refuses before any routing/spawn decision below, so an
     // enforced session never even gets as far as picking a route or joining
@@ -2116,6 +2335,7 @@ pub fn run_with<W: Write>(
             env,
             DASH_ACK_TIMEOUT,
             DASH_CLAIM_EXTENSION,
+            result_schema.as_ref(),
         )
     {
         // Finding 4: the dashboard answered definitively, and only `Ok(0)`
@@ -2168,7 +2388,14 @@ pub fn run_with<W: Write>(
     // delegation's own group, so `exec::run_with` can export it to the child.
     let quieted = quiet_env(env, args.quiet);
     let grouped = group_env(&quieted, args.group.clone());
-    let env = parent_session_env(&grouped, worker_parent);
+    let parented = parent_session_env(&grouped, worker_parent);
+    // Issue #318: same fold, so a headless child sees `RESULT_SCHEMA_ENV`
+    // when this delegation declared a contract (`exec.rs`'s `turn_env_for`
+    // reads it back out of this exact binding).
+    let env = result_schema_env(
+        &parented,
+        result_schema.as_ref().map(Schema::to_canonical_json),
+    );
 
     // Resolved here, ahead of `exec::run_with`'s own (identical) selection
     // further down, purely to compute the default worker model this spawn
@@ -2328,7 +2555,11 @@ pub fn run_with<W: Write>(
         // whatever durable objective is already set for it, if any, via
         // `compile::compile` on its own.
         objective: None,
-        command,
+        // Issue #318: cloned, not moved -- the contract retry path below
+        // (when a schema was declared) reuses this SAME flags vector as its
+        // own `extra`, so a resume launch carries the identical policy/
+        // model/writable-root argv the original headless launch did.
+        command: command.clone(),
         simple: false,
     };
 
@@ -2413,21 +2644,198 @@ pub fn run_with<W: Write>(
         let parent_session = super::mail::session_identity(&env).unwrap_or_default();
         let outcome = delegation_outcome(code);
 
-        // Issue #227: on a supervisor-detected failure, send a report-back
-        // mail to the spawning session with the same structured reason the
-        // stderr note (`exit_note`) already carries. The worker's own
-        // self-reported "tell your requester when you're done" instruction
-        // (dash panes only, see `prompt::with_report_back_layer`) never
-        // fires when the child died before reaching it -- a plain headless
-        // failure used to leave the requester with nothing but a bare exit
-        // code, no mail at all. Best-effort: a mail failure must never turn
-        // a completed delegation into a failed one, and this never touches
-        // the success path -- a clean run already has nothing new to say
-        // here (the caller's own `Ok(code)` return is that report).
-        if code != 0
+        // Issue #318: when a schema was declared, the report-back mail and
+        // its own outcome supersede the plain success/failure report below
+        // entirely -- a worker's report is only ever "done" once it has
+        // been extracted from its own final text and validated, never a
+        // synthetic success just because the supervised run exited 0.
+        // ALWAYS sends mail here, success included: a delegator who asked
+        // for a structural contract needs the result (or exactly why it
+        // failed) whether or not it was watching this delegation
+        // synchronously.
+        if let Some(schema) = &result_schema {
+            let repo_slug = super::state::repo_slug(repo);
+            let final_session = execution_report
+                .segments
+                .last()
+                .map(|segment| segment.session.clone())
+                .unwrap_or_else(|| worker_session.clone());
+            let final_agent_name = execution_report
+                .segments
+                .last()
+                .map(|segment| segment.agent.clone())
+                .unwrap_or_else(|| args.name.clone());
+            // Re-selects only when a cross-harness fallback actually landed
+            // this delegation on a different adapter mid-run; the ordinary
+            // case (no restart, or a same-harness restart) reuses `adapter`
+            // as-is rather than paying a second, redundant `select`.
+            let reselected = if final_agent_name == args.name {
+                None
+            } else {
+                adapters::select(Some(&final_agent_name), &[], &cfg).ok()
+            };
+            let result_adapter: &dyn AgentAdapter =
+                reselected.as_deref().unwrap_or_else(|| adapter.as_ref());
+            let session_ref = SessionId::parse(&final_session);
+            let transcript_path = result_adapter.transcript_path(&SessionRef {
+                id: session_ref.clone(),
+                cwd: launch_repo.clone(),
+            });
+            let read_last_text = |path: &Path| -> Option<String> {
+                let jsonl = std::fs::read_to_string(path).unwrap_or_default();
+                result_adapter
+                    .structural_context(&jsonl, 1)
+                    .assistant_texts
+                    .last()
+                    .cloned()
+            };
+
+            let mut attempts: Vec<Vec<String>> = Vec::new();
+            let mut last_candidate = String::new();
+            let mut validated: Option<serde_json::Value> = None;
+
+            let first_text = read_last_text(&transcript_path);
+            if let Some(text) = first_text.as_deref() {
+                last_candidate = result_schema::extract_json_candidate(text).unwrap_or_default();
+            }
+            match first_text.as_deref() {
+                Some(text) => match result_schema::evaluate(schema, text) {
+                    Ok(value) => validated = Some(value),
+                    Err(errors) => attempts.push(errors),
+                },
+                None => attempts.push(vec![
+                    "no JSON object found in the worker's final message".to_string(),
+                ]),
+            }
+
+            // One bounded retry, only when the adapter that actually ran
+            // this delegation can resume a headless conversation at all
+            // (codex cannot: `CodexAdapter::headless_resume_cmd` is the
+            // trait's own honest-refusal default) -- a worker with no
+            // resume support gets exactly one attempt, never a synthetic
+            // second chance it cannot structurally receive.
+            if validated.is_none()
+                && let Some(first_errors) = attempts.first()
+                && result_adapter
+                    .headless_resume_cmd(Some("probe"), &final_session, &[])
+                    .is_some()
+            {
+                let retry_prompt = result_schema::build_retry_message(first_errors);
+                let timeout = Duration::from_secs(args.timeout_secs.unwrap_or(300));
+                let mut retry_env: Vec<(String, String)> = vec![(
+                    adapters::AGENT_ENV.to_string(),
+                    result_adapter.name().to_string(),
+                )];
+                if let Some(group) = env(WORK_GROUP_ENV).filter(|id| !id.is_empty()) {
+                    retry_env.push((WORK_GROUP_ENV.to_string(), group));
+                }
+                if let Some(parent) = env(PARENT_SESSION_ENV) {
+                    retry_env.push((PARENT_SESSION_ENV.to_string(), parent));
+                }
+                match run_contract_retry(
+                    result_adapter,
+                    &session_ref,
+                    &command,
+                    &retry_prompt,
+                    &launch_repo,
+                    timeout,
+                    &retry_env,
+                ) {
+                    Ok(()) => {
+                        let second_text = read_last_text(&transcript_path);
+                        if let Some(text) = second_text.as_deref() {
+                            last_candidate = result_schema::extract_json_candidate(text)
+                                .unwrap_or(last_candidate);
+                        }
+                        match second_text.as_deref() {
+                            Some(text) => match result_schema::evaluate(schema, text) {
+                                Ok(value) => validated = Some(value),
+                                Err(errors) => attempts.push(errors),
+                            },
+                            None => attempts.push(vec![
+                                "no JSON object found in the worker's final message".to_string(),
+                            ]),
+                        }
+                    }
+                    Err(e) => attempts.push(vec![format!("retry could not run: {e}")]),
+                }
+            }
+
+            writeln!(
+                w,
+                "result: {}",
+                if validated.is_some() {
+                    "validated".to_string()
+                } else {
+                    format!(
+                        "contract_failed ({} errors)",
+                        attempts.last().map(Vec::len).unwrap_or(0)
+                    )
+                }
+            )?;
+
+            let mut body = format!(
+                "zirv ctx agent: {} finished: {} (exit {code})",
+                args.name,
+                exec::describe_exit(code)
+            );
+            if let Some(value) = &validated {
+                let pretty = serde_json::to_string_pretty(value).unwrap_or_default();
+                body.push_str(&format!("\nresult:\n```json\n{pretty}\n```"));
+            } else {
+                body.push_str("\ncontract_failed:");
+                for (i, errors) in attempts.iter().enumerate() {
+                    for error in errors {
+                        body.push_str(&format!("\n- attempt {}: {error}", i + 1));
+                    }
+                }
+                body.push_str(&format!(
+                    "\n\nraw candidate:\n{}",
+                    cap_bytes(&last_candidate, 2048)
+                ));
+            }
+            let to_session = super::mail::session_identity(&env)
+                .filter(|id| super::prompt::is_addressable_short(id));
+            let msg = super::mail::Message {
+                from_session: worker_session.clone(),
+                from_agent: args.name.clone(),
+                to: "any".to_string(),
+                to_session,
+                sent: super::state::now_secs(),
+                body,
+            };
+            let _ = super::mail::store_to(&state_dir, &repo_slug, &repo_slug, &msg, &cfg);
+
+            let results_dir = state_dir.logs().join("delegation-results");
+            let _ = super::state::create_private_dir_all(&results_dir);
+            let record = serde_json::json!({
+                "outcome": if validated.is_some() { "validated" } else { "contract_failed" },
+                "result": validated,
+                "errors": attempts,
+                "agent": args.name,
+                "ts": super::state::now_secs(),
+            });
+            let _ = super::state::write_private(
+                &results_dir.join(format!("{worker_session}.json")),
+                &serde_json::to_string_pretty(&record).unwrap_or_default(),
+            );
+        } else if code != 0
             && let Some(parent_short) = super::mail::session_identity(&env)
             && super::prompt::is_addressable_short(&parent_short)
         {
+            // Issue #227: on a supervisor-detected failure, send a
+            // report-back mail to the spawning session with the same
+            // structured reason the stderr note (`exit_note`) already
+            // carries. The worker's own self-reported "tell your requester
+            // when you're done" instruction (dash panes only, see
+            // `prompt::with_report_back_layer`) never fires when the child
+            // died before reaching it -- a plain headless failure used to
+            // leave the requester with nothing but a bare exit code, no
+            // mail at all. Best-effort: a mail failure must never turn a
+            // completed delegation into a failed one, and this never
+            // touches the success path -- a clean run already has nothing
+            // new to say here (the caller's own `Ok(code)` return is that
+            // report).
             let msg = report_back_message(
                 code,
                 &worker_session,
@@ -2865,6 +3273,111 @@ mod tests {
             prompt.len() < huge.len(),
             "must actually be capped, not injected whole"
         );
+    }
+
+    /// Issue #318: `--result-kind` and `--result-schema` are mutually
+    /// exclusive even when `run_with` is called directly with a hand-built
+    /// `AgentArgs` (`clap`'s own `conflicts_with` only guards real argv
+    /// parsing) -- `resolve_result_schema` enforces it itself.
+    #[test]
+    fn resolve_result_schema_refuses_both_flags_together() {
+        let args = AgentArgs {
+            result_schema: Some(r#"{"fields":[]}"#.to_string()),
+            result_kind: Some("review".to_string()),
+            ..args_for("claude", "go")
+        };
+        let err = resolve_result_schema(&args).expect_err("must refuse");
+        assert!(err.to_string().contains("mutually exclusive"), "got {err}");
+    }
+
+    /// An unknown `--result-kind` names every built-in kind in its error, so
+    /// the operator does not have to go look them up.
+    #[test]
+    fn resolve_result_schema_refuses_an_unknown_result_kind() {
+        let args = AgentArgs {
+            result_kind: Some("bogus".to_string()),
+            ..args_for("claude", "go")
+        };
+        let err = resolve_result_schema(&args).expect_err("must refuse");
+        let msg = err.to_string();
+        assert!(msg.contains("bogus"), "got {msg}");
+        for kind in result_schema::BUILT_IN_KINDS {
+            assert!(msg.contains(kind), "must list {kind}: {msg}");
+        }
+    }
+
+    /// A `--result-kind` resolves to exactly the same schema `result_schema
+    /// ::built_in` returns.
+    #[test]
+    fn resolve_result_schema_resolves_a_built_in_kind() {
+        let args = AgentArgs {
+            result_kind: Some("test".to_string()),
+            ..args_for("claude", "go")
+        };
+        let resolved = resolve_result_schema(&args)
+            .expect("resolves")
+            .expect("a schema was declared");
+        assert_eq!(resolved, result_schema::built_in("test").expect("built in"));
+    }
+
+    /// `--result-schema` accepts inline JSON text directly, with no file on
+    /// disk at all.
+    #[test]
+    fn resolve_result_schema_accepts_inline_json() {
+        let args = AgentArgs {
+            result_schema: Some(
+                r#"{"fields":[{"name":"ok","kind":"bool","required":true}]}"#.to_string(),
+            ),
+            ..args_for("claude", "go")
+        };
+        let resolved = resolve_result_schema(&args)
+            .expect("resolves")
+            .expect("a schema was declared");
+        assert_eq!(resolved.fields.len(), 1);
+        assert_eq!(resolved.fields[0].name, "ok");
+    }
+
+    /// `--result-schema` also accepts a path to a JSON file on disk.
+    #[test]
+    fn resolve_result_schema_reads_a_schema_file_from_disk() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("schema.json");
+        std::fs::write(
+            &path,
+            r#"{"fields":[{"name":"ok","kind":"bool","required":true}]}"#,
+        )
+        .expect("write");
+        let args = AgentArgs {
+            result_schema: Some(path.display().to_string()),
+            ..args_for("claude", "go")
+        };
+        let resolved = resolve_result_schema(&args)
+            .expect("resolves")
+            .expect("a schema was declared");
+        assert_eq!(resolved.fields[0].name, "ok");
+    }
+
+    /// Neither flag given resolves to `None` -- today's behaviour, byte for
+    /// byte unchanged.
+    #[test]
+    fn resolve_result_schema_is_none_when_neither_flag_is_given() {
+        let args = args_for("claude", "go");
+        assert!(resolve_result_schema(&args).expect("resolves").is_none());
+    }
+
+    /// The prompt-composition helper: with a schema declared, the contract
+    /// block is appended after the operator's own prompt text; with none
+    /// declared, the prompt is returned byte for byte unchanged.
+    #[test]
+    fn attach_result_contract_to_prompt_appends_the_contract_block_only_when_declared() {
+        let schema = result_schema::built_in("test").expect("built in");
+        let with_contract =
+            attach_result_contract_to_prompt(Some(&schema), "do the thing".to_string());
+        assert!(with_contract.starts_with("do the thing\n\n"));
+        assert!(with_contract.contains("OUTPUT CONTRACT (machine-validated)"));
+
+        let without_contract = attach_result_contract_to_prompt(None, "do the thing".to_string());
+        assert_eq!(without_contract, "do the thing");
     }
 
     /// Issue #223 §E: `workflow.adoption = enforce` refuses a delegation when
@@ -3923,6 +4436,8 @@ mod tests {
             attach_artifact: None,
             workflow: None,
             task_class: None,
+            result_schema: None,
+            result_kind: None,
         }
     }
 
@@ -5162,6 +5677,199 @@ mod tests {
         );
     }
 
+    /// Issue #318: `--result-kind review` appends the OUTPUT CONTRACT block
+    /// to the worker's prompt and exports the schema into its env; a worker
+    /// whose final assistant text carries a fenced json block satisfying it
+    /// (`FAKE_AGENT_MODE=contract-ok`, see `fake-agent.sh`'s own doc
+    /// comment) is validated on the very first attempt -- no retry, and the
+    /// report-back mail carries the parsed result verbatim rather than the
+    /// bare exit-code summary a schema-less run gets.
+    #[test]
+    fn a_headless_run_with_a_valid_contract_reply_is_validated_on_the_first_attempt() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state = tmp.path().join("state");
+        let mut env = base_env(&state);
+        env.insert(
+            crate::commands::ctx::adapters::SESSION_ENV.to_string(),
+            "aaaaaaaa-1111-4222-8333-444444444444".to_string(),
+        );
+        unsafe {
+            std::env::set_var("FAKE_AGENT_MODE", "contract-ok");
+        }
+
+        let mut args = args_for("claude", "do the work");
+        args.result_kind = Some("review".to_string());
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE");
+        }
+        assert_eq!(code.expect("runs"), 0);
+        let printed = String::from_utf8_lossy(&out);
+        assert!(printed.contains("result: validated"), "got {printed}");
+
+        let state_dir = crate::commands::ctx::state::StateDir::from_root(state);
+        let repo_slug = crate::commands::ctx::state::repo_slug(tmp.path());
+        let mailbox = state_dir.mail().join(&repo_slug);
+        let entries: Vec<_> = std::fs::read_dir(&mailbox)
+            .map(|dir| dir.flatten().collect())
+            .unwrap_or_default();
+        assert_eq!(
+            entries.len(),
+            1,
+            "a schema-declared run mails back even on success"
+        );
+        let body = std::fs::read_to_string(entries[0].path()).expect("read mail");
+        assert!(body.contains("result:"), "got {body}");
+        assert!(body.contains("\"status\": \"done\""), "got {body}");
+
+        let results_dir = state_dir.logs().join("delegation-results");
+        let files: Vec<_> = std::fs::read_dir(&results_dir)
+            .expect("results dir exists")
+            .flatten()
+            .collect();
+        assert_eq!(files.len(), 1, "exactly one results file");
+        let record: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(files[0].path()).expect("read"))
+                .expect("json");
+        assert_eq!(record["outcome"], "validated");
+        assert_eq!(record["result"]["status"], "done");
+    }
+
+    /// Issue #318: a worker whose final text never satisfies the declared
+    /// contract (`FAKE_AGENT_MODE=contract-bad`: `status` is `"bogus"`, not
+    /// one of `review`'s declared enum values) gets exactly one bounded
+    /// retry on an adapter that supports resuming (claude does) -- and when
+    /// the retry ALSO fails, the delegation reports `contract_failed` with
+    /// both attempts' errors recorded, never a synthetic success.
+    #[test]
+    fn a_headless_run_whose_reply_never_satisfies_the_contract_retries_once_then_fails() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state = tmp.path().join("state");
+        let mut env = base_env(&state);
+        env.insert(
+            crate::commands::ctx::adapters::SESSION_ENV.to_string(),
+            "aaaaaaaa-1111-4222-8333-444444444444".to_string(),
+        );
+        unsafe {
+            std::env::set_var("FAKE_AGENT_MODE", "contract-bad");
+        }
+
+        let mut args = args_for("claude", "do the work");
+        args.result_kind = Some("review".to_string());
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE");
+        }
+        assert_eq!(
+            code.expect("runs"),
+            0,
+            "the supervised run itself still exits clean"
+        );
+        let printed = String::from_utf8_lossy(&out);
+        assert!(printed.contains("result: contract_failed"), "got {printed}");
+
+        let state_dir = crate::commands::ctx::state::StateDir::from_root(state);
+        let repo_slug = crate::commands::ctx::state::repo_slug(tmp.path());
+        let mailbox = state_dir.mail().join(&repo_slug);
+        let entries: Vec<_> = std::fs::read_dir(&mailbox)
+            .map(|dir| dir.flatten().collect())
+            .unwrap_or_default();
+        assert_eq!(entries.len(), 1);
+        let body = std::fs::read_to_string(entries[0].path()).expect("read mail");
+        assert!(body.contains("contract_failed:"), "got {body}");
+        assert!(
+            body.contains("not in [done, blocked, partial]"),
+            "carries the enum error verbatim: {body}"
+        );
+        assert!(body.contains("raw candidate:"), "got {body}");
+
+        let results_dir = state_dir.logs().join("delegation-results");
+        let files: Vec<_> = std::fs::read_dir(&results_dir)
+            .expect("results dir exists")
+            .flatten()
+            .collect();
+        assert_eq!(files.len(), 1);
+        let record: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(files[0].path()).expect("read"))
+                .expect("json");
+        assert_eq!(record["outcome"], "contract_failed");
+        assert!(record["result"].is_null());
+        let errors = record["errors"].as_array().expect("errors array");
+        assert_eq!(
+            errors.len(),
+            2,
+            "one bounded retry means exactly two attempts: {errors:?}"
+        );
+    }
+
+    /// Issue #318: codex has no verified `headless_resume_cmd` (the trait's
+    /// own honest-refusal default), so a worker on it gets exactly ONE
+    /// contract attempt, never a synthetic retry it cannot structurally
+    /// receive. `fake-agent.sh` always writes a claude-shaped transcript
+    /// regardless of which adapter invoked it, and codex's own
+    /// `transcript_path` looks under `.codex/sessions/`, so this run's
+    /// worker transcript is genuinely unreadable to the codex adapter --
+    /// exactly the "no final text at all" case a real codex worker that
+    /// crashed before replying would also produce.
+    #[test]
+    fn a_headless_run_on_an_adapter_with_no_resume_support_gets_exactly_one_attempt() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state = tmp.path().join("state");
+        let mut env = base_env(&state);
+        env.insert(
+            crate::commands::ctx::adapters::SESSION_ENV.to_string(),
+            "aaaaaaaa-1111-4222-8333-444444444444".to_string(),
+        );
+        unsafe {
+            std::env::set_var("FAKE_AGENT_MODE", "healthy");
+        }
+
+        let mut args = args_for("codex", "do the work");
+        args.result_kind = Some("review".to_string());
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE");
+        }
+        // Codex's own `headless_cmd` mints its own session id and passes no
+        // `--session-id` flag at all -- `fake-agent.sh` refuses outright
+        // without one (exit 64), which is exactly the "worker produced no
+        // final text" case this test wants: the exit code itself is not
+        // what is under test here, only the contract outcome below is.
+        code.expect("runs");
+        let printed = String::from_utf8_lossy(&out);
+        assert!(
+            printed.contains("result: contract_failed (1 errors)"),
+            "got {printed}"
+        );
+
+        let state_dir = crate::commands::ctx::state::StateDir::from_root(state);
+        let results_dir = state_dir.logs().join("delegation-results");
+        let files: Vec<_> = std::fs::read_dir(&results_dir)
+            .expect("results dir exists")
+            .flatten()
+            .collect();
+        assert_eq!(files.len(), 1);
+        let record: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(files[0].path()).expect("read"))
+                .expect("json");
+        assert_eq!(record["outcome"], "contract_failed");
+        let errors = record["errors"].as_array().expect("errors array");
+        assert_eq!(
+            errors.len(),
+            1,
+            "no resume support means exactly one attempt, never a synthetic retry: {errors:?}"
+        );
+    }
+
     /// A delegated run is a worker session, not an orchestrator one: it must
     /// carry zirv's own shipped default layer (proving injection happened at
     /// all) but never the harness meta-teaching layer, which only an
@@ -6082,6 +6790,53 @@ mod tests {
         );
     }
 
+    // -- same_harness_hint (issue #328) --------------------------------------
+
+    #[test]
+    fn same_harness_hint_fires_only_for_the_running_harness_outside_a_work_group() {
+        let env = env_map(&[(super::super::adapters::AGENT_ENV, "claude")]);
+        let lookup = |k: &str| env.get(k).cloned();
+        let hint = same_harness_hint(&args_for("claude", "brief"), &lookup)
+            .expect("claude from a claude seat hints");
+        assert!(hint.contains("native subagent tool"), "got: {hint}");
+        assert!(hint.contains("proceeding anyway"), "got: {hint}");
+        assert!(
+            same_harness_hint(&args_for("codex", "brief"), &lookup).is_none(),
+            "another harness is exactly what zirv agent is for"
+        );
+        assert!(
+            same_harness_hint(&args_for("Claude", "brief"), &lookup).is_some(),
+            "adapter names match case-insensitively like dispatch"
+        );
+
+        let grouped = AgentArgs {
+            group: Some("wg-1".to_string()),
+            ..args_for("claude", "brief")
+        };
+        assert!(same_harness_hint(&grouped, &lookup).is_none());
+        let scoped = AgentArgs {
+            role: Some("sub-orchestrator".to_string()),
+            scope: Some("area".to_string()),
+            ..args_for("claude", "brief")
+        };
+        assert!(same_harness_hint(&scoped, &lookup).is_none());
+
+        let inherited = env_map(&[
+            (super::super::adapters::AGENT_ENV, "claude"),
+            (WORK_GROUP_ENV, "wg-2"),
+        ]);
+        assert!(
+            same_harness_hint(&args_for("claude", "brief"), &|k| inherited.get(k).cloned())
+                .is_none(),
+            "an inherited work group is a zirv dispatch by design"
+        );
+        let unset = env_map(&[]);
+        assert!(
+            same_harness_hint(&args_for("claude", "brief"), &|k| unset.get(k).cloned()).is_none(),
+            "no running-harness evidence, no hint"
+        );
+    }
+
     // -- workdir_visibility_hint (issue #307.3) ----------------------------
 
     #[test]
@@ -6284,6 +7039,7 @@ mod tests {
             &|k| env.get(k).cloned(),
             Duration::from_millis(200),
             Duration::from_millis(200),
+            None,
         );
 
         assert!(
@@ -6359,6 +7115,7 @@ mod tests {
                 &|k| env.get(k).cloned(),
                 Duration::from_millis(200),
                 Duration::from_millis(200),
+                None,
             );
             let err = joined
                 .expect("must answer definitively, not silently fall back")
@@ -6392,6 +7149,7 @@ mod tests {
             &|k| env.get(k).cloned(),
             Duration::from_millis(200),
             Duration::from_millis(200),
+            None,
         );
         assert!(joined.is_none(), "an unanswered request still falls back");
     }
@@ -6450,6 +7208,7 @@ mod tests {
             &|k| env.get(k).cloned(),
             Duration::from_millis(200),
             Duration::from_millis(200),
+            None,
         );
         assert!(joined.is_none(), "nobody answered, so this runs headless");
 
@@ -6500,6 +7259,7 @@ mod tests {
             &|k| env.get(k).cloned(),
             Duration::from_secs(5),
             Duration::from_secs(5),
+            None,
         );
         assert!(
             joined.is_none(),
@@ -6553,6 +7313,7 @@ mod tests {
             &|k| env.get(k).cloned(),
             Duration::from_secs(5),
             Duration::from_secs(5),
+            None,
         );
         assert!(
             joined.is_none(),
@@ -6628,6 +7389,7 @@ mod tests {
             &|k| env.get(k).cloned(),
             Duration::from_millis(300),
             Duration::from_millis(300),
+            None,
         );
         taker.join().expect("taker thread");
 
@@ -6688,6 +7450,7 @@ mod tests {
             &|k| env.get(k).cloned(),
             Duration::from_millis(300),
             Duration::from_millis(300),
+            None,
         );
         claimer.join().expect("claimer thread");
 
@@ -6738,6 +7501,7 @@ mod tests {
             &|k| env.get(k).cloned(),
             Duration::from_millis(200),
             Duration::from_secs(5),
+            None,
         );
         responder.join().expect("responder thread");
 
@@ -6783,6 +7547,7 @@ mod tests {
             &|k| env.get(k).cloned(),
             Duration::from_secs(5),
             Duration::from_millis(200),
+            None,
         );
         responder.join().expect("responder thread");
 
@@ -6823,6 +7588,7 @@ mod tests {
             &|k| env.get(k).cloned(),
             Duration::from_secs(5),
             Duration::from_millis(200),
+            None,
         );
         responder.join().expect("responder thread");
 
@@ -6854,6 +7620,7 @@ mod tests {
             &|k| env.get(k).cloned(),
             Duration::from_millis(200),
             Duration::from_millis(200),
+            None,
         );
         assert!(joined.is_none());
         assert!(out.is_empty());

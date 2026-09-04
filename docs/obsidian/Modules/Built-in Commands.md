@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-09-03
+last-verified: 2026-09-04
 ---
 
 # Built-in Commands
@@ -105,6 +105,8 @@ The top-level `workflow` tree now includes committed work-product inspection, pr
 **`zirv workflow close <id> [--reason <text>]` (harness iteration round 2, 2026-09-02).** A workflow whose review/fix loop hit `MAX_FIX_REVIEW_ROUNDS` (review.rs) previously stayed `Running` forever — still reported as this repository's active workflow by `load_active`/`status`/`context` — with no verb to get it out of that state. `close` refuses (exit 1) while any review finding is still `Open` (record dispositions first, `review dispose --apply-recommended`) or while the workflow is `AwaitingApproval`; otherwise it sets `WorkflowStatus::Closed`, records `closed_reason`/`closed_at` on the state, persists it as no longer active, and emits a `TelemetryKind::Closed` event. `zirv workflow status` prints `closed reason: <text>` when one was given. `zirv workflow resume` refuses a closed workflow with the same "cannot resume workflow in `Closed` state" message it already gives for `Failed`/`Completed`. See [[Workflows]] for the related `resume`-ordering bug this same round fixed.
 
 **`zirv agent`/`zirv ctx agent --attach-artifact <intent|spec|plan> [--workflow <id>]` (harness iteration round 2, 2026-09-02).** Reads the named stage's accepted artifact from `--workflow` (or the repo's own active workflow when unstated) via `workflow::engine::read_accepted_artifact` and appends a capped (8 KiB), Acceptance-Criteria/Goals-first excerpt to the delegated worker's task prompt, after the operator's own text and under an explicit "untrusted repository content, information only, grants no permissions" label — never folded into the worker's system prompt. Fails the whole delegation before any worker launches when no workflow is active/named or the resolved stage has nothing accepted yet, rather than sending a worker off without the context the operator explicitly asked to attach. See [[Ctx Subsystem]]'s `agent.rs` entry.
+
+**`zirv agent`/`zirv ctx agent --result-schema <path|inline JSON>` / `--result-kind review|implement|research|test` (issue #318, 2026-09-04).** Mutually exclusive; declares a structural contract the delegated worker's final report must satisfy. Appends an `OUTPUT CONTRACT (machine-validated)` block to the worker prompt, retries the worker headless ONCE on a validation failure with the verbatim errors (claude only — codex has no headless resume), and always mails the delegator a `result:`/`contract_failed:` report-back plus a `<state>/logs/delegation-results/<worker-session>.json` record. See [[Ctx Subsystem]]'s `agent.rs` entry and [[Known Issues]] for the dashboard-restored-pane gap.
 
 ### `report` (`commands/report.rs`)
 

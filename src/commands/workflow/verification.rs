@@ -1303,6 +1303,31 @@ fn test_baseline_path(repo: &Path) -> CtxResult<PathBuf> {
     Ok(test_baseline_dir()?.join(format!("{}.json", repo_slug(repo))))
 }
 
+/// One advisory OS lock per repository baseline (issue #302), held across
+/// every load/modify/write of the file so two `zirv test changed` runs in
+/// sibling worktrees, or a `--prune` overlapping a run, serialize instead of
+/// each writing back its own stale copy. Same shape as `group::GroupLock`:
+/// a sibling `.lock` file that is never deleted after release, since removing
+/// a lock path can split two contenders across old and new inodes while an
+/// unlocked empty file is harmless.
+struct BaselineLock(std::fs::File);
+
+impl Drop for BaselineLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
+fn lock_baseline(repo: &Path) -> CtxResult<BaselineLock> {
+    let dir = test_baseline_dir()?;
+    create_private_dir_all(&dir)?;
+    let file = crate::commands::ctx::group::open_lock_file(
+        &dir.join(format!("{}.lock", repo_slug(repo))),
+    )?;
+    file.lock()?;
+    Ok(BaselineLock(file))
+}
+
 /// Loads the operator's recorded baseline for `repo`, or `None` when nothing
 /// has ever been recorded. Never `Err` on a plain "not there yet" -- only a
 /// genuine I/O failure or an unreadable/future schema propagates, and even
@@ -1343,6 +1368,7 @@ pub fn save_baseline(
     // itself evidence the name regressed. A name absent from the previous
     // baseline (newly recorded) starts at 0, same as before this field
     // existed.
+    let _lock = lock_baseline(repo)?;
     let previous = load_baseline(repo).unwrap_or(None);
     let green_streaks = failing_tests
         .iter()
@@ -1394,6 +1420,14 @@ fn write_baseline(repo: &Path, baseline: &TestBaseline) -> CtxResult<()> {
 /// prune-eligible, if any -- the `zirv test changed` hint the issue's design
 /// asks for.
 fn update_baseline_after_run(repo: &Path, report: &VerificationReport) -> Option<String> {
+    // No baseline, no opinion -- and no lock file either: this runs after
+    // every evaluation in every repository (test fixtures included), so it
+    // must not scatter `.lock` siblings into the operator's home for
+    // repositories that never recorded a baseline.
+    if !test_baseline_path(repo).ok()?.exists() {
+        return None;
+    }
+    let _lock = lock_baseline(repo).ok()?;
     let mut baseline = load_baseline(repo).ok().flatten()?;
     if baseline.failing_tests.is_empty() {
         return None;
@@ -2562,6 +2596,11 @@ fn run_baseline(repo: &Path, args: &BaselineArgs, writer: &mut impl Write) -> Ct
 /// maintenance action over evidence already accumulated by ordinary `zirv
 /// test changed`/`zirv verify` runs, not a fresh recording.
 fn run_baseline_prune(repo: &Path, writer: &mut impl Write) -> CtxResult<i32> {
+    let _lock = if test_baseline_path(repo)?.exists() {
+        Some(lock_baseline(repo)?)
+    } else {
+        None
+    };
     let Some(mut baseline) = load_baseline(repo)? else {
         writeln!(
             writer,
@@ -5004,6 +5043,51 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; 
             baseline.failing_tests.is_empty(),
             "both matured entries must be gone: {:?}",
             baseline.failing_tests
+        );
+    }
+
+    /// Issue #302: a streak update waits for the per-repo baseline lock
+    /// instead of racing another writer's load/modify/write.
+    #[test]
+    fn baseline_streak_updates_wait_for_the_same_interprocess_lock() {
+        let repo = git_repo();
+        let home = tempdir().unwrap();
+        let _home_guard = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        save_baseline(
+            repo.path(),
+            std::collections::BTreeSet::from(["wrap::tests::a".to_string()]),
+        )
+        .unwrap();
+        let held = lock_baseline(repo.path()).expect("hold baseline lock");
+
+        let worker_repo = repo.path().to_path_buf();
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(0);
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(0);
+        let worker = std::thread::spawn(move || {
+            let clean_report =
+                report_with_checks(vec![unit_check("test", CheckStatus::Passed, None)]);
+            started_tx.send(()).expect("announce start");
+            let note = update_baseline_after_run(&worker_repo, &clean_report);
+            done_tx.send(note).expect("announce finish");
+        });
+
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("worker started");
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(100)).is_err(),
+            "the streak update must wait while another holder owns the baseline lock"
+        );
+
+        drop(held);
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("update finished after release");
+        worker.join().expect("worker joins");
+        let baseline = load_baseline(repo.path()).unwrap().unwrap();
+        assert_eq!(
+            baseline.green_streaks.get("wrap::tests::a").copied(),
+            Some(1)
         );
     }
 

@@ -1,0 +1,39 @@
+{
+  "fields": [
+    {
+      "name": "status",
+      "kind": "enum",
+      "values": ["done", "blocked", "partial"],
+      "required": true
+    },
+    {
+      "name": "findings",
+      "kind": "obj_array",
+      "required": false,
+      "fields": [
+        { "name": "file", "kind": "str", "required": true },
+        { "name": "line", "kind": "int", "required": true },
+        {
+          "name": "severity",
+          "kind": "enum",
+          "values": ["low", "medium", "high"],
+          "required": true
+        },
+        { "name": "summary", "kind": "str", "required": true }
+      ]
+    },
+    { "name": "blockers", "kind": "str_array", "required": false }
+  ],
+  "example": {
+    "status": "done",
+    "findings": [
+      {
+        "file": "src/main.rs",
+        "line": 42,
+        "severity": "medium",
+        "summary": "unwrap on a fallible path"
+      }
+    ],
+    "blockers": []
+  }
+}

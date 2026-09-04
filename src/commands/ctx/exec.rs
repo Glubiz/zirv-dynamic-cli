@@ -528,7 +528,10 @@ fn build_command(command: &[String], repo: &Path) -> CtxResult<Command> {
 /// matching the M1 fix `dash/mod.rs`'s `task_prompt_fallback_is_safe` made
 /// for the pty path. Split out for the same reason that one was: testable
 /// without spawning anything.
-fn prompt_delivery_via_stdin(adapter: &dyn adapters::AgentAdapter, session: &SessionId) -> bool {
+pub(crate) fn prompt_delivery_via_stdin(
+    adapter: &dyn adapters::AgentAdapter,
+    session: &SessionId,
+) -> bool {
     let probe = adapters::flatten_command(adapter.headless_cmd("", session, &[]));
     adapters::launch_reparses_through_shim(&probe)
 }
@@ -1160,6 +1163,16 @@ fn run_with_clock_inner<W: Write>(
         // fold's own doc comment), so a plain re-read here is exactly right.
         if let Some(parent) = env(super::agent::PARENT_SESSION_ENV) {
             turn_env.push((super::agent::PARENT_SESSION_ENV.to_string(), parent));
+        }
+        // Issue #318: the same lineage-by-env shape as `WORK_GROUP_ENV`/
+        // `PARENT_SESSION_ENV` immediately above -- `agent::run_with` folds
+        // its resolved `--result-schema`/`--result-kind` into this run's own
+        // env lookup (`agent::result_schema_env`), so a headless child sees
+        // the OUTPUT CONTRACT it must report against, and its own `zirv ctx
+        // send --to-session` self-report (should it use one) validates
+        // against the identical contract the headless retry path enforces.
+        if let Some(schema) = env(super::agent::RESULT_SCHEMA_ENV).filter(|s| !s.is_empty()) {
+            turn_env.push((super::agent::RESULT_SCHEMA_ENV.to_string(), schema));
         }
         turn_env
     };
