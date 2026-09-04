@@ -1221,6 +1221,44 @@ fn session_identity() -> Option<(String, String)> {
     (valid_session && valid_adapter).then_some((session_id, adapter))
 }
 
+/// Issue #349: files one attention observation, under `Authority::Workflow`,
+/// against whatever `ZIRV_CTX_SESSION` currently names -- skipped silently
+/// when unset (a headless caller with no live session context, or a test),
+/// matching every other best-effort write in this codebase. Deliberately
+/// reads only `SESSION_ENV`, not the stricter [`session_identity`] (which
+/// also requires a valid `AGENT_ENV`): a workflow transition's own attention
+/// row must not go unrecorded just because the adapter-name env happens to
+/// be unset or malformed.
+fn record_workflow_attention(
+    attention: crate::commands::ctx::attention::Attention,
+    evidence: impl Into<String>,
+) {
+    let Ok(session_id) = std::env::var(crate::commands::ctx::adapters::SESSION_ENV) else {
+        return;
+    };
+    if session_id.is_empty() {
+        return;
+    }
+    let env = crate::commands::ctx::config::env_from_process();
+    let Ok(state) = crate::commands::ctx::state::StateDir::resolve(&env) else {
+        return;
+    };
+    let short = crate::commands::ctx::sessions::short_id(&session_id);
+    let now = crate::commands::ctx::state::now_secs();
+    let _ = crate::commands::ctx::attention::record(
+        &state,
+        &short,
+        crate::commands::ctx::attention::Observation::new(
+            crate::commands::ctx::attention::Authority::Workflow,
+            evidence,
+            90,
+            now,
+        )
+        .with_attention(attention),
+        now,
+    );
+}
+
 fn adapter_by_name(name: &str) -> Option<Box<dyn crate::commands::ctx::adapters::AgentAdapter>> {
     crate::commands::ctx::adapters::ADAPTERS
         .iter()
@@ -1800,6 +1838,13 @@ pub fn advance_with_evidence(
                     };
                     let announcement =
                         super::verification::gate_announcement(state_dir, &state.repo, final_only);
+                    record_workflow_attention(
+                        crate::commands::ctx::attention::Attention::VerificationFailure,
+                        format!(
+                            "step '{}' has no fresh passing evidence ({command})",
+                            current.id
+                        ),
+                    );
                     return Err(format!(
                         "step '{}' requires fresh passing evidence for the current change set; run `{command}`\n{announcement}",
                         current.id
@@ -1818,6 +1863,26 @@ pub fn advance_with_evidence(
                 Some(step) if step.approval => WorkflowStatus::AwaitingApproval,
                 Some(_) => WorkflowStatus::Running,
             };
+            // Issue #349: `state.status` just above is ALWAYS a fresh
+            // transition off `Running` here -- `advance_with_evidence`
+            // already refused (line ~1623) to reach this match at all while
+            // the previous status was `AwaitingApproval`. `AwaitingApproval`
+            // needs an operator; `Completed`/`Running` mean this advance
+            // cleared whatever gate attention a prior failed attempt left.
+            match state.status {
+                WorkflowStatus::AwaitingApproval => record_workflow_attention(
+                    crate::commands::ctx::attention::Attention::WorkflowGate,
+                    format!(
+                        "step '{}' awaiting approval",
+                        state.current().map(|step| step.id.as_str()).unwrap_or("?")
+                    ),
+                ),
+                WorkflowStatus::Running | WorkflowStatus::Completed => record_workflow_attention(
+                    crate::commands::ctx::attention::Attention::None,
+                    "step advanced successfully",
+                ),
+                WorkflowStatus::Failed | WorkflowStatus::Closed => {}
+            }
         }
         StepOutcome::Failure => {
             let attempts = state.attempts.entry(current.id.clone()).or_default();
@@ -1978,12 +2043,33 @@ pub fn approve(state_dir: &StateDir, mut state: WorkflowState) -> CtxResult<Work
             &event,
             &super::telemetry::TelemetryConfig::for_repo(&state.repo),
         );
+        // Issue #349: a chained approval-required step (`state.status` is
+        // `AwaitingApproval` again) still needs an operator, so only a
+        // genuine `Running`/`Completed` outcome clears the gate attention.
+        match state.status {
+            WorkflowStatus::AwaitingApproval => record_workflow_attention(
+                crate::commands::ctx::attention::Attention::WorkflowGate,
+                format!(
+                    "step '{}' awaiting approval",
+                    state.current().map(|step| step.id.as_str()).unwrap_or("?")
+                ),
+            ),
+            WorkflowStatus::Running | WorkflowStatus::Completed => record_workflow_attention(
+                crate::commands::ctx::attention::Attention::None,
+                "artifact approved",
+            ),
+            WorkflowStatus::Failed | WorkflowStatus::Closed => {}
+        }
         return Ok(state);
     }
 
     state.status = WorkflowStatus::Running;
     state.updated_at = now_secs();
     save(state_dir, &state, true)?;
+    record_workflow_attention(
+        crate::commands::ctx::attention::Attention::None,
+        "step approved",
+    );
     Ok(state)
 }
 
@@ -3880,6 +3966,159 @@ mod tests {
         );
         assert_eq!(phase_completed.cost_micros, Some(3_000_000));
         assert!(phase_completed.price_as_of.is_some());
+    }
+
+    /// Issue #349: chained design-gate steps (`intent` -> `spec`, both
+    /// approval-gated for a high-risk classification -- the same fixture
+    /// `reclassify_preserves_completed_steps_and_accepted_artifacts`, above,
+    /// already relies on) prove both halves of the `approve()` wiring in one
+    /// pass: approving `intent` lands on `spec`, which is ALSO gated, so
+    /// `WorkflowGate` must still be set; approving `spec` lands on `plan`,
+    /// which is not, so that second approval must clear it to `None`.
+    #[test]
+    fn approve_wires_workflow_gate_attention_across_chained_design_gates() {
+        let repo = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+        let session_id = "ffff6666aaaa4bbb8cccdddddddddddd";
+        let _vars = crate::commands::ctx::testenv::VarGuard::set(&[
+            (
+                crate::commands::ctx::adapters::SESSION_ENV,
+                Some(session_id),
+            ),
+            (
+                "ZIRV_CTX_STATE_DIR",
+                Some(root.path().to_str().expect("utf-8 tempdir path")),
+            ),
+        ]);
+        let mut classification = low_classification();
+        classification.complexity = Complexity::Bounded;
+        classification.risk = RiskBand::High;
+        let state = WorkflowState::start(
+            repo.path().to_path_buf(),
+            "bounded high-risk feature".into(),
+            WorkflowKind::Feature,
+            None,
+            true,
+            classification,
+        );
+        assert_eq!(state.status, WorkflowStatus::AwaitingApproval);
+        assert_eq!(state.current().unwrap().id, "intent");
+        let short = crate::commands::ctx::sessions::short_id(session_id);
+
+        ensure_current_artifact_template(&state).unwrap();
+        std::fs::write(
+            workflow_artifact_path(&state, ArtifactStage::Intent).unwrap(),
+            "# Intent\n\n## Problem\nConcrete problem\n\n## Desired outcome\nConcrete result\n",
+        )
+        .unwrap();
+        let state = approve(&state_dir, state).expect("approve intent");
+        assert_eq!(state.current().unwrap().id, "spec");
+        assert_eq!(
+            state.status,
+            WorkflowStatus::AwaitingApproval,
+            "spec is itself design-gated for a high-risk classification"
+        );
+        let status = crate::commands::ctx::attention::load(&state_dir, &short);
+        assert_eq!(
+            status.attention,
+            crate::commands::ctx::attention::Attention::WorkflowGate,
+            "approving intent must not clear the gate while spec is still pending approval"
+        );
+
+        ensure_current_artifact_template(&state).unwrap();
+        std::fs::write(
+            workflow_artifact_path(&state, ArtifactStage::Spec).unwrap(),
+            "# Specification\n\n## Context\nReal context\n\n## Goals\n- ship it\n",
+        )
+        .unwrap();
+        let state = approve(&state_dir, state).expect("approve spec");
+        assert_eq!(state.current().unwrap().id, "plan");
+        assert_eq!(
+            state.status,
+            WorkflowStatus::AwaitingApproval,
+            "plan is itself design-gated too for this classification"
+        );
+        let status = crate::commands::ctx::attention::load(&state_dir, &short);
+        assert_eq!(
+            status.attention,
+            crate::commands::ctx::attention::Attention::WorkflowGate,
+            "approving spec must not clear the gate while plan is still pending approval"
+        );
+
+        ensure_current_artifact_template(&state).unwrap();
+        std::fs::write(
+            workflow_artifact_path(&state, ArtifactStage::Plan).unwrap(),
+            "# Plan\n\n## Steps\n1. Ship it\n\n## Risks\nNone material\n",
+        )
+        .unwrap();
+        let state = approve(&state_dir, state).expect("approve plan");
+        assert_eq!(state.current().unwrap().id, "implement");
+        assert_eq!(
+            state.status,
+            WorkflowStatus::Running,
+            "implement is not gated, so this approval must finally clear it"
+        );
+        let status = crate::commands::ctx::attention::load(&state_dir, &short);
+        assert_eq!(
+            status.attention,
+            crate::commands::ctx::attention::Attention::None,
+            "implement is not gated, so this approval must clear the WorkflowGate attention"
+        );
+    }
+
+    /// Issue #349: a Test-phase advance with no fresh passing verification
+    /// evidence on disk at all is exactly the gate rejection this attention
+    /// source targets.
+    #[test]
+    fn advance_with_evidence_records_verification_failure_attention_on_a_stale_test_gate() {
+        let repo = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+        let session_id = "eeee5555aaaa4bbb8cccdddddddddddd";
+        let _vars = crate::commands::ctx::testenv::VarGuard::set(&[
+            (
+                crate::commands::ctx::adapters::SESSION_ENV,
+                Some(session_id),
+            ),
+            (
+                "ZIRV_CTX_STATE_DIR",
+                Some(root.path().to_str().expect("utf-8 tempdir path")),
+            ),
+        ]);
+        let mut state = skip_leading_artifact_steps(WorkflowState::start(
+            repo.path().to_path_buf(),
+            "small feature".into(),
+            WorkflowKind::Feature,
+            None,
+            true,
+            low_classification(),
+        ));
+        let test_index = state
+            .steps
+            .iter()
+            .position(|step| step.phase == WorkflowPhase::Test)
+            .expect("fixture has a Test step");
+        state.completed_steps = state.steps[..test_index]
+            .iter()
+            .map(|step| step.id.clone())
+            .collect();
+        state.current_step = test_index;
+        state.status = WorkflowStatus::Running;
+        save(&state_dir, &state, true).unwrap();
+
+        let result = advance_with_evidence(&state_dir, state, StepOutcome::Success, None, false);
+        assert!(
+            result.is_err(),
+            "no verification evidence has ever been stored, so the gate must reject"
+        );
+
+        let short = crate::commands::ctx::sessions::short_id(session_id);
+        let status = crate::commands::ctx::attention::load(&state_dir, &short);
+        assert_eq!(
+            status.attention,
+            crate::commands::ctx::attention::Attention::VerificationFailure
+        );
     }
 
     #[test]

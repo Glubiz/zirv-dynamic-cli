@@ -2835,11 +2835,49 @@ pub fn run_with<W: Write>(
         } else {
             ""
         };
+        // Issue #349: the REQUESTING session (this process's own caller) is
+        // the one pacing actually refused -- same reasoning as the writer-
+        // permit refusal below (issue #267): the worker this refusal
+        // prevented from ever existing has no attention row of its own.
+        if let Some(short) = super::mail::session_identity(env) {
+            let _ = super::attention::record(
+                &state,
+                &short,
+                super::attention::Observation::new(
+                    super::attention::Authority::Supervisor,
+                    gate_note
+                        .clone()
+                        .unwrap_or_else(|| "usage-pacing refused new work".to_string()),
+                    80,
+                    super::state::now_secs(),
+                )
+                .with_attention(super::attention::Attention::Quota),
+                super::state::now_secs(),
+            );
+        }
         return Err(format!(
             "{}.{fallback_note}{exclusion_note}",
             gate_note.unwrap_or_else(|| "refusing to start new delegated work".to_string())
         )
         .into());
+    }
+    // Issue #349: the gate did not refuse this call (`Proceed`, `Warn`, a
+    // forced `Refuse`, or a deferred cross-harness wait, all of which
+    // continue past the refusal above) -- clear any `Quota` attention a
+    // PRIOR refusal left on this same requesting session.
+    if let Some(short) = super::mail::session_identity(env) {
+        let _ = super::attention::record(
+            &state,
+            &short,
+            super::attention::Observation::new(
+                super::attention::Authority::Supervisor,
+                "usage pacing allowed new work",
+                80,
+                super::state::now_secs(),
+            )
+            .with_attention(super::attention::Attention::None),
+            super::state::now_secs(),
+        );
     }
     if let Some(choice) = deferred_reset.as_ref() {
         let detail = choice.detail();

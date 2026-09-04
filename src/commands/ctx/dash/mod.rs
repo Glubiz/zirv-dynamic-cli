@@ -3859,6 +3859,22 @@ fn fulfill_spawn_request(
         super::pace::describe_spawn_gate(&gate, reading_age, super::pace::Seat::Pane)
     {
         if matches!(gate, super::pace::SpawnGate::Refuse { .. }) {
+            // Issue #349: filed against the REQUESTING pane's own short id
+            // (`req.requested_by`) -- untrusted the same way the log line
+            // right below already treats it (best-effort, informational
+            // only; a bogus value just files a stray, harmless row).
+            let _ = super::attention::record(
+                state,
+                &req.requested_by,
+                super::attention::Observation::new(
+                    super::attention::Authority::Supervisor,
+                    note.clone(),
+                    80,
+                    now,
+                )
+                .with_attention(super::attention::Attention::Quota),
+                now,
+            );
             return Err(SpawnRefusal::policy(note));
         }
         push_error(
@@ -6036,6 +6052,63 @@ fn build_pane_rows(panes: &[Pane]) -> Vec<PaneRowMeta> {
         .collect()
 }
 
+/// Issue #349, design point 3: `PaneState` is the dashboard's own quiescence
+/// signal -- the weakest authority, [`super::attention::Authority::
+/// QuietHeuristic`] -- projected onto the shared attention model's
+/// [`super::attention::Lifecycle`]. `Working` stays `Working`; `Idle` means
+/// this pane has gone quiet at its prompt, which reads as `Settled` (the
+/// same "turn ended, waiting for the next one" fact a Claude Stop hook would
+/// report, just inferred from silence instead of told directly); `Ended`
+/// means the child process is gone, `Exited`.
+fn quiet_heuristic_lifecycle(state: PaneState) -> super::attention::Lifecycle {
+    match state {
+        PaneState::Working => super::attention::Lifecycle::Working,
+        PaneState::Idle => super::attention::Lifecycle::Settled,
+        PaneState::Ended(_) => super::attention::Lifecycle::Exited,
+    }
+}
+
+/// Files one `QuietHeuristic` observation per pane whose `PaneState` has
+/// actually changed since the last call -- `last_lifecycle` is the caller's
+/// own per-dashboard memory of what it last reported, so a pane sitting
+/// quietly at `Idle` for an hour costs exactly one write, on the tick it
+/// first went quiet, never one per tick thereafter. Best-effort, like every
+/// other attention write: a failure here must never affect the dashboard's
+/// own rendering or input handling.
+fn sync_quiet_heuristic_attention(
+    panes: &[Pane],
+    state: &StateDir,
+    last_lifecycle: &mut HashMap<String, super::attention::Lifecycle>,
+) {
+    let now = super::state::now_secs();
+    let mut seen: HashSet<&str> = HashSet::new();
+    for pane in panes {
+        let short = pane.short();
+        seen.insert(short);
+        let lifecycle = quiet_heuristic_lifecycle(pane.state());
+        if last_lifecycle.get(short) == Some(&lifecycle) {
+            continue;
+        }
+        last_lifecycle.insert(short.to_string(), lifecycle);
+        let _ = super::attention::record(
+            state,
+            short,
+            super::attention::Observation::new(
+                super::attention::Authority::QuietHeuristic,
+                format!("pane went {lifecycle:?}"),
+                50,
+                now,
+            )
+            .with_lifecycle(lifecycle),
+            now,
+        );
+    }
+    // Drop bookkeeping for a pane that no longer exists (reaped) so a short
+    // id ever reused later starts fresh rather than diffing against a stale
+    // entry from a completely different session.
+    last_lifecycle.retain(|short, _| seen.contains(short.as_str()));
+}
+
 /// Runs the dashboard until the operator quits, owning `first` (the
 /// orchestrator pane the caller already built via `build_launch`) plus
 /// whatever additional panes get spawned along the way. Nesting is the
@@ -6474,6 +6547,12 @@ pub fn run_dashboard(
     // Issue #209/v3 codex review finding 1: the footer's dead-pane fallback
     // -- see `LastExited`'s own doc comment.
     let mut last_exited: Option<LastExited> = None;
+    // Issue #349: this dashboard's own memory of what it last reported for
+    // each pane's `QuietHeuristic` lifecycle -- see `sync_quiet_heuristic_
+    // attention`'s own doc comment for why a per-tick diff against this
+    // (rather than an unconditional write) is what keeps a pane sitting
+    // quietly at `Idle` for an hour from costing more than one write.
+    let mut quiet_lifecycle: HashMap<String, super::attention::Lifecycle> = HashMap::new();
 
     let exit_code: i32 = 'main: loop {
         // Task 2: bumps the tick counter every iteration and writes a line
@@ -6643,6 +6722,12 @@ pub fn run_dashboard(
         // A pane can have gone away (or arrived) since the last tick, so both
         // indices are re-clamped before anything reads them.
         focused = focused.min(panes.len().saturating_sub(1));
+        // Issue #349: once per tick, at the same read `build_pane_rows` right
+        // below is about to make of every pane's `PaneState` -- not inside
+        // `build_pane_rows` itself, which is pure and called a second time
+        // per tick purely to re-render (see its own doc comment), so doing
+        // it there would double-fire for the same tick's own transition.
+        sync_quiet_heuristic_attention(&panes, state, &mut quiet_lifecycle);
         let rows = assemble_sidebar(
             &build_pane_rows(&panes),
             &visible_registry,
@@ -13132,6 +13217,74 @@ mod tests {
         assert!(reason.contains("dash.max_panes"), "got {reason}");
     }
 
+    /// Issue #349: a pacing (`SpawnGate::Refuse`) refusal files an
+    /// `Attention::Quota` row against the REQUESTING pane's own short id
+    /// (`req.requested_by`) -- the same "requester, not the never-spawned
+    /// worker" reasoning as the writer-permit and pane-count refusals.
+    #[test]
+    fn fulfill_spawn_request_records_quota_attention_on_a_pacing_refusal() {
+        let repo = std::env::current_dir().expect("cwd");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let mut cfg = CtxConfig::default();
+        // Cross-harness fallback is on by default and would otherwise reroute
+        // this request to a harness with no usage data of its own (`Proceed`
+        // trivially) instead of ever reaching the spawn gate for "claude"'s
+        // own exhausted reading -- this test is about the gate itself, not
+        // the reroute.
+        cfg.fallback.enabled = false;
+        let now = super::super::state::now_secs();
+
+        // A fresh five-hour reading pinned at 100%, above the default
+        // `spawn_hard_pct` (95%) -- "anthropic" is the claude adapter's own
+        // provider slug (see `refresh_if_due_reads_per_harness_usage_off_
+        // disk_only`, above, for the same key).
+        super::super::window::store_for(
+            &state,
+            "anthropic",
+            &super::super::window::UsageWindows {
+                five_hour: Some(super::super::window::Window {
+                    used_percentage: 100.0,
+                    resets_at: now + 999_999,
+                    observed_at: now,
+                    overage_covered: false,
+                }),
+                seven_day: None,
+            },
+        )
+        .expect("seed a hard-refusal usage reading");
+
+        let req = spawn_request("do the work", &repo);
+        let mut panes: Vec<Pane> = Vec::new();
+        let mut queues: Vec<VecDeque<String>> = Vec::new();
+        let mut errors = Vec::new();
+        let result = fulfill_spawn_request(
+            &req,
+            false,
+            None,
+            &mut panes,
+            &mut queues,
+            &cfg,
+            &state,
+            &repo,
+            (80, 24),
+            &tmp.path().join("requests"),
+            &mut errors,
+        );
+        let reason = result.err().map(|e| e.reason).unwrap_or_default();
+        assert!(
+            reason.contains("spawn_hard_pct"),
+            "must refuse via the spawn gate specifically, got: {reason}"
+        );
+
+        let status = super::super::attention::load(&state, &req.requested_by);
+        assert_eq!(
+            status.attention,
+            super::super::attention::Attention::Quota,
+            "the requesting pane's own attention row must show Quota"
+        );
+    }
+
     /// Issue #155, Phase 5(a): the depth cap is enforced HERE, at the
     /// authority side, not by prompt text. Orchestrator -> SubOrchestrator ->
     /// Worker is the whole tree; a SubOrchestrator asking for another
@@ -14793,6 +14946,70 @@ mod tests {
     #[cfg(unix)]
     fn trivial_argv() -> Vec<String> {
         vec!["sh".to_string(), "-c".to_string(), "exit 0".to_string()]
+    }
+
+    /// Issue #349: a pane going `Ended` files exactly one `QuietHeuristic`
+    /// `Lifecycle::Exited` observation, and a second call with nothing
+    /// changed since is a pure no-op (no repeat write, no revision bump) --
+    /// the whole point of keying off `last_lifecycle` rather than writing
+    /// unconditionally every tick.
+    #[test]
+    fn sync_quiet_heuristic_attention_fires_once_per_transition() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().to_path_buf();
+        let spec = PaneSpec {
+            agent_name: "test-agent".to_string(),
+            argv: trivial_argv(),
+            role: prompt::PromptRole::Worker,
+            verb: sessions::Verb::Dash,
+            session_id: "77778888-2222-4333-8444-555555555555".to_string(),
+            title: "wrk test".to_string(),
+        };
+        let mut pane = Pane::spawn(
+            spec,
+            &state,
+            &repo,
+            &repo,
+            (80, 24),
+            &[],
+            true,
+            pane::DEFAULT_IDLE_QUIET,
+        )
+        .expect("spawn");
+        let short = pane.short().to_string();
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline && !matches!(pane.state(), PaneState::Ended(_)) {
+            pane.drain();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            matches!(pane.state(), PaneState::Ended(_)),
+            "the trivial child must exit within the deadline, got {:?}",
+            pane.state()
+        );
+
+        let panes = vec![pane];
+        let mut cache: HashMap<String, super::super::attention::Lifecycle> = HashMap::new();
+        sync_quiet_heuristic_attention(&panes, &state, &mut cache);
+
+        let status = super::super::attention::load(&state, &short);
+        assert_eq!(status.lifecycle, super::super::attention::Lifecycle::Exited);
+        assert_eq!(
+            cache.get(&short),
+            Some(&super::super::attention::Lifecycle::Exited)
+        );
+        let revision_after_first_call = status.revision;
+
+        sync_quiet_heuristic_attention(&panes, &state, &mut cache);
+        let status_again = super::super::attention::load(&state, &short);
+        assert_eq!(
+            status_again.revision, revision_after_first_call,
+            "nothing changed, so the second call must not write again"
+        );
     }
 
     /// A trivial, immediately-exiting child -- never a real agent (the
