@@ -437,6 +437,38 @@ impl Default for VerifyOnStopConfig {
     }
 }
 
+/// Issue #308 stage 1: whether the Stop hook may run a fast local checker
+/// (`cargo check`/`tsc --noEmit`) after a turn that edited files, and inject
+/// only the diagnostics that are NEW since this session's own baseline as one
+/// bounded advisory line-block. Off by default -- unlike `verify_on_stop`
+/// above, this spawns a real compiler/type-checker process on a qualifying
+/// turn, a real cost an operator must opt into explicitly rather than one
+/// this type defaults on.
+///
+/// `enabled`/`max_diagnostics`/`timeout_secs` all go through the identical T9
+/// repo-narrowing fold `verify_on_stop.enabled`/`max_nudges` already use
+/// (`narrow_diagnostics_enabled`/`narrow_max_diagnostics`/
+/// `narrow_diagnostics_timeout_secs` below): a repo checkout may only make
+/// the feature quieter or cheaper -- turn it off, lower the cap, shorten the
+/// timeout -- never louder, larger, or longer-running.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DiagnosticsConfig {
+    pub enabled: bool,
+    pub max_diagnostics: u32,
+    pub timeout_secs: u64,
+}
+
+impl Default for DiagnosticsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_diagnostics: 10,
+            timeout_secs: 120,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PromptConfig {
@@ -1275,6 +1307,7 @@ pub struct CtxConfig {
     pub price: PriceConfig,
     pub optimize: OptimizeConfig,
     pub verify_on_stop: VerifyOnStopConfig,
+    pub diagnostics: DiagnosticsConfig,
     pub prompt: PromptConfig,
     pub context: ContextConfig,
     pub mail: MailConfig,
@@ -2017,6 +2050,27 @@ fn narrow_max_nudges(home: u32, repo: Option<u32>) -> u32 {
     home.min(repo.unwrap_or(u32::MAX))
 }
 
+/// Issue #308 stage 1: the repo-narrowing fold for `diagnostics.enabled` --
+/// the same polarity as `narrow_verify_on_stop_enabled`, since `false` (the
+/// checker never runs) is this key's strict direction.
+fn narrow_diagnostics_enabled(home: bool, repo: Option<bool>) -> bool {
+    home.min(repo.unwrap_or(true))
+}
+
+/// Issue #308 stage 1: the repo-narrowing fold for
+/// `diagnostics.max_diagnostics` -- lower is stricter, the identical shape as
+/// `narrow_max_nudges`.
+fn narrow_max_diagnostics(home: u32, repo: Option<u32>) -> u32 {
+    home.min(repo.unwrap_or(u32::MAX))
+}
+
+/// Issue #308 stage 1: the repo-narrowing fold for `diagnostics.timeout_secs`
+/// -- a shorter timeout is stricter (a repo cannot make the checker run
+/// longer than the operator allows), the `u64` mirror of `narrow_max_nudges`.
+fn narrow_diagnostics_timeout_secs(home: u64, repo: Option<u64>) -> u64 {
+    home.min(repo.unwrap_or(u64::MAX))
+}
+
 /// Finding 4 (review): the one comma-separated-list splitter shared by every
 /// caller that needs "trimmed, non-empty entries" -- this module's own
 /// `ZIRV_CTX_SANDBOX_EXTRA_ALLOW`/`_DENY` env values (the same shape
@@ -2696,6 +2750,16 @@ impl CtxConfig {
             bool_at(take_nested(&mut merged, "verify_on_stop", "enabled"));
         let home_verify_on_stop_max_nudges =
             integer_at(take_nested(&mut merged, "verify_on_stop", "max_nudges"));
+        // Issue #308 stage 1: `diagnostics.enabled`/`max_diagnostics`/
+        // `timeout_secs` get the identical lift-before-merge treatment -- see
+        // `narrow_diagnostics_enabled`/`narrow_max_diagnostics`/
+        // `narrow_diagnostics_timeout_secs` below for each field's strict
+        // direction.
+        let home_diagnostics_enabled = bool_at(take_nested(&mut merged, "diagnostics", "enabled"));
+        let home_diagnostics_max =
+            integer_at(take_nested(&mut merged, "diagnostics", "max_diagnostics"));
+        let home_diagnostics_timeout =
+            integer_at(take_nested(&mut merged, "diagnostics", "timeout_secs"));
         // `supervise.heavy_command_patterns` gets the identical treatment as
         // `sandbox.extra_deny` above, for the identical reason: the field's
         // own doc comment promises a repo layer may only ADD patterns, never
@@ -2779,6 +2843,15 @@ impl CtxConfig {
             bool_at(take_nested(&mut repo_layer, "verify_on_stop", "enabled"));
         let repo_verify_on_stop_max_nudges =
             integer_at(take_nested(&mut repo_layer, "verify_on_stop", "max_nudges"));
+        let repo_diagnostics_enabled =
+            bool_at(take_nested(&mut repo_layer, "diagnostics", "enabled"));
+        let repo_diagnostics_max = integer_at(take_nested(
+            &mut repo_layer,
+            "diagnostics",
+            "max_diagnostics",
+        ));
+        let repo_diagnostics_timeout =
+            integer_at(take_nested(&mut repo_layer, "diagnostics", "timeout_secs"));
         let repo_heavy_patterns = string_array(take_nested(
             &mut repo_layer,
             "supervise",
@@ -2893,6 +2966,44 @@ impl CtxConfig {
                 home_max_nudges,
                 repo_max_nudges,
             ))),
+        );
+
+        let default_diagnostics = DiagnosticsConfig::default();
+        insert_path(
+            &mut merged,
+            &["diagnostics", "enabled"],
+            toml::Value::Boolean(narrow_diagnostics_enabled(
+                home_diagnostics_enabled.unwrap_or(default_diagnostics.enabled),
+                repo_diagnostics_enabled,
+            )),
+        );
+        let home_max_diagnostics = home_diagnostics_max
+            .and_then(|v| u32::try_from(v).ok())
+            .unwrap_or(default_diagnostics.max_diagnostics);
+        let repo_max_diagnostics = repo_diagnostics_max.and_then(|v| u32::try_from(v).ok());
+        insert_path(
+            &mut merged,
+            &["diagnostics", "max_diagnostics"],
+            toml::Value::Integer(i64::from(narrow_max_diagnostics(
+                home_max_diagnostics,
+                repo_max_diagnostics,
+            ))),
+        );
+        let home_diagnostics_timeout_secs = home_diagnostics_timeout
+            .and_then(|v| u64::try_from(v).ok())
+            .unwrap_or(default_diagnostics.timeout_secs);
+        let repo_diagnostics_timeout_secs =
+            repo_diagnostics_timeout.and_then(|v| u64::try_from(v).ok());
+        insert_path(
+            &mut merged,
+            &["diagnostics", "timeout_secs"],
+            toml::Value::Integer(
+                i64::try_from(narrow_diagnostics_timeout_secs(
+                    home_diagnostics_timeout_secs,
+                    repo_diagnostics_timeout_secs,
+                ))
+                .unwrap_or(i64::MAX),
+            ),
         );
 
         let default_fallback = FallbackConfig::default();
@@ -4146,6 +4257,31 @@ mod tests {
             1,
             "repo may lower it below home's own"
         );
+    }
+
+    /// Issue #308 stage 1: the fold rule itself, pure and direct -- the same
+    /// no-config-file, no-`CtxConfig::load` shape as
+    /// `the_verify_on_stop_narrowing_fold_rule_favours_the_stricter_layer_either_direction`.
+    #[test]
+    fn the_diagnostics_narrowing_fold_rule_favours_the_stricter_layer_either_direction() {
+        // enabled: home true / repo false -> false (repo may disable it).
+        assert!(!narrow_diagnostics_enabled(true, Some(false)));
+        // enabled: home false / repo true -> false (repo may not re-enable an
+        // operator-disabled feature).
+        assert!(!narrow_diagnostics_enabled(false, Some(true)));
+        assert!(narrow_diagnostics_enabled(true, None));
+        assert!(narrow_diagnostics_enabled(true, Some(true)));
+
+        // max_diagnostics: home 10 / repo 5 -> 5 (repo may tighten the cap).
+        assert_eq!(narrow_max_diagnostics(10, Some(5)), 5);
+        // max_diagnostics: home 10 / repo 20 -> 10 (repo may not raise it).
+        assert_eq!(narrow_max_diagnostics(10, Some(20)), 10);
+        assert_eq!(narrow_max_diagnostics(10, None), 10);
+
+        // timeout_secs: the identical shape, one level up in width.
+        assert_eq!(narrow_diagnostics_timeout_secs(120, Some(30)), 30);
+        assert_eq!(narrow_diagnostics_timeout_secs(120, Some(600)), 120);
+        assert_eq!(narrow_diagnostics_timeout_secs(120, None), 120);
     }
 
     /// Issue #309: the full `CtxConfig::load` integration -- a repo-layer

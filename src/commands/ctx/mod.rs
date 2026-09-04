@@ -12,6 +12,7 @@ pub mod context_cli;
 pub mod context_lint;
 pub mod context_status;
 pub mod dash;
+pub mod diagnostics;
 pub mod drift;
 pub mod event;
 pub mod exec;

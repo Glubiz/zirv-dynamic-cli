@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use super::adapters::{self, SESSION_ENV, SOCKET_ENV};
 use super::config::{CtxConfig, EnvLookup, env_from_process};
+use super::diagnostics;
 use super::event::input_hash;
 use super::rot::{Score, Verdict};
 use super::state::{StateDir, now_secs};
@@ -822,11 +823,17 @@ fn save_modification_checkpoint(path: &Path, checkpoint: &ModificationCheckpoint
 /// own checkpoint here instead of that one -- see this function's own
 /// caller's doc comment for why). Once `modified` is persisted `true`, a
 /// later call short-circuits before touching the transcript at all -- a
-/// session-scoped fact never goes back to `false`. Only ever called once
-/// `cfg.verify_on_stop.enabled` is true (see the one call site in
-/// `verify_on_stop_nudge`), so a session that has the feature off never pays
-/// even this bounded parse.
-fn session_has_modification(state: &StateDir, transcript: &Path, cfg: &CtxConfig) -> bool {
+/// session-scoped fact never goes back to `false`. Originally only ever
+/// called once `cfg.verify_on_stop.enabled` is true (see the call site in
+/// `verify_on_stop_nudge`), so a session that has that feature off never
+/// pays even this bounded parse; `pub(crate)` so `diagnostics::
+/// post_edit_nudge` (issue #308) can gate its own, unrelated feature on the
+/// identical session-scoped fact rather than re-deriving it.
+pub(crate) fn session_has_modification(
+    state: &StateDir,
+    transcript: &Path,
+    cfg: &CtxConfig,
+) -> bool {
     let Ok(adapter) = adapters::select(cfg.agent.as_deref(), &[], cfg) else {
         return false;
     };
@@ -1005,6 +1012,38 @@ fn verify_on_stop_nudge(
     ))
 }
 
+/// Issue #308 stage 1: the Stop-hook wiring for `diagnostics::post_edit_nudge`
+/// -- `cfg.diagnostics.enabled` is checked here, BEFORE the transcript is
+/// re-read and re-parsed for `files_modified`, so a session with the feature
+/// off (the default) never pays even that cost, mirroring
+/// `verify_on_stop_nudge`'s own guard ordering. `structural_context`'s own
+/// `last_n` is generously large (64): unlike `handoff`'s own callers, this is
+/// not trying to bound a prompt's size, only to avoid an unbounded
+/// allocation on a pathological transcript.
+fn diagnostics_stop_nudge(
+    state: &StateDir,
+    repo: &Path,
+    session: &str,
+    cfg: &CtxConfig,
+    transcript: &Path,
+) -> Option<String> {
+    if !cfg.diagnostics.enabled {
+        return None;
+    }
+    let adapter = adapters::select(cfg.agent.as_deref(), &[], cfg).ok()?;
+    let jsonl = std::fs::read_to_string(transcript).ok()?;
+    let files_modified = adapter.structural_context(&jsonl, 64).files_modified;
+    diagnostics::post_edit_nudge(
+        state,
+        cfg,
+        transcript,
+        repo,
+        session,
+        files_modified,
+        &diagnostics::run_checker,
+    )
+}
+
 pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResult<i32> {
     // Every early return is deliberate: a hook that errors must still exit 0.
     let Ok(payload) = HookPayload::parse(stdin) else {
@@ -1055,6 +1094,7 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
     let mut optimize_recommended = None;
     let mut adoption_nudge = None;
     let mut verify_nudge = None;
+    let mut diagnostics_nudge = None;
     if let Ok(state) = StateDir::resolve(env) {
         // Issue #243: a flagged screening result rides the same
         // decision line this cycle already writes, and is persisted onto the
@@ -1143,6 +1183,7 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
             adoption_stop_nudge(&state, &repo, &session, &cfg, &score, transcript, env);
         record_speed_sample(&state, &repo, &session, &cfg, speed_sample);
         verify_nudge = verify_on_stop_nudge(&state, &repo, &session, &cfg, transcript);
+        diagnostics_nudge = diagnostics_stop_nudge(&state, &repo, &session, &cfg, transcript);
     }
 
     // Issue #309 rides the same single advisory line `adoption_nudge`
@@ -1150,12 +1191,16 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
     // generic "one more advisory line", not exclusively about workflow
     // adoption, so folding both in here (rather than widening `stop_output`
     // itself) keeps every one of its existing call sites/tests untouched.
-    let combined_nudge = match (adoption_nudge.as_deref(), verify_nudge.as_deref()) {
-        (Some(a), Some(b)) => Some(format!("{a}\n{b}")),
-        (Some(a), None) => Some(a.to_string()),
-        (None, Some(b)) => Some(b.to_string()),
-        (None, None) => None,
-    };
+    // Issue #308 rides the same fold a third time, for the identical reason.
+    let combined_nudge = [
+        adoption_nudge.as_deref(),
+        verify_nudge.as_deref(),
+        diagnostics_nudge.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    let combined_nudge = (!combined_nudge.is_empty()).then(|| combined_nudge.join("\n"));
 
     if let Some(line) = stop_output(
         &payload,
@@ -4528,6 +4573,132 @@ mod tests {
             verify_on_stop_nudge(&state, repo.path(), "sess-g", &cfg, &transcript),
             None,
             "3rd stale turn in the same session must not nudge again"
+        );
+    }
+
+    /// Issue #308 stage 1: `diagnostics::post_edit_nudge`'s modification gate
+    /// runs before the checker is ever considered -- proven here by handing
+    /// it a counting closure standing in for `diagnostics::run_checker` and
+    /// asserting it is never invoked, without needing a real `cargo`/`tsc` on
+    /// the test machine.
+    #[test]
+    fn post_edit_nudge_never_calls_the_checker_without_a_modification_tool_call() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(dir.path().to_path_buf());
+        let repo = tempfile::tempdir().expect("repo");
+        std::fs::write(repo.path().join("Cargo.toml"), "[package]\nname=\"x\"\n").expect("write");
+        let transcript = transcript_with_edits(dir.path(), 1, 0);
+        let mut cfg = CtxConfig::default();
+        cfg.diagnostics.enabled = true;
+
+        let calls = std::cell::Cell::new(0u32);
+        let run = |_repo: &Path, _checker: diagnostics::Checker, _timeout: u64| -> Option<String> {
+            calls.set(calls.get() + 1);
+            None
+        };
+        let result = diagnostics::post_edit_nudge(
+            &state,
+            &cfg,
+            &transcript,
+            repo.path(),
+            "sess-diag-a",
+            vec!["src.rs".to_string()],
+            &run,
+        );
+        assert_eq!(result, None);
+        assert_eq!(
+            calls.get(),
+            0,
+            "the checker must never run without a modification this session"
+        );
+    }
+
+    /// `[diagnostics] enabled = false` (the default) must short-circuit
+    /// before the checker closure is ever called.
+    #[test]
+    fn post_edit_nudge_is_silent_when_disabled() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(dir.path().to_path_buf());
+        let repo = tempfile::tempdir().expect("repo");
+        std::fs::write(repo.path().join("Cargo.toml"), "[package]\nname=\"x\"\n").expect("write");
+        let transcript = transcript_with_edits(dir.path(), 1, 1);
+        let cfg = CtxConfig::default();
+        assert!(!cfg.diagnostics.enabled, "test setup: off by default");
+
+        let calls = std::cell::Cell::new(0u32);
+        let run = |_repo: &Path, _checker: diagnostics::Checker, _timeout: u64| -> Option<String> {
+            calls.set(calls.get() + 1);
+            None
+        };
+        assert_eq!(
+            diagnostics::post_edit_nudge(
+                &state,
+                &cfg,
+                &transcript,
+                repo.path(),
+                "sess-diag-b",
+                vec!["src.rs".to_string()],
+                &run,
+            ),
+            None
+        );
+        assert_eq!(calls.get(), 0);
+    }
+
+    /// A diagnostic reported once must never repeat within the same session,
+    /// even though the checker itself runs (and reports the identical
+    /// finding) on every qualifying turn.
+    #[test]
+    fn post_edit_nudge_reports_the_same_diagnostic_only_once_per_session() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(dir.path().to_path_buf());
+        let repo = tempfile::tempdir().expect("repo");
+        std::fs::write(repo.path().join("Cargo.toml"), "[package]\nname=\"x\"\n").expect("write");
+        let transcript = transcript_with_edits(dir.path(), 1, 1);
+        let mut cfg = CtxConfig::default();
+        cfg.diagnostics.enabled = true;
+
+        let cargo_json = concat!(
+            r#"{"reason":"compiler-message","message":{"level":"error","message":"mismatched types","spans":[{"is_primary":true,"file_name":"src.rs","line_start":1}]}}"#,
+            "\n"
+        );
+        let run_count = std::cell::Cell::new(0u32);
+        let run = |_repo: &Path, _checker: diagnostics::Checker, _timeout: u64| -> Option<String> {
+            run_count.set(run_count.get() + 1);
+            Some(cargo_json.to_string())
+        };
+
+        let first = diagnostics::post_edit_nudge(
+            &state,
+            &cfg,
+            &transcript,
+            repo.path(),
+            "sess-diag-c",
+            vec!["src.rs".to_string()],
+            &run,
+        );
+        assert!(
+            first.is_some(),
+            "a new diagnostic on a modified file must nudge"
+        );
+
+        let second = diagnostics::post_edit_nudge(
+            &state,
+            &cfg,
+            &transcript,
+            repo.path(),
+            "sess-diag-c",
+            vec!["src.rs".to_string()],
+            &run,
+        );
+        assert_eq!(
+            second, None,
+            "the same diagnostic must not repeat within a session"
+        );
+        assert_eq!(
+            run_count.get(),
+            2,
+            "the checker runs each qualifying turn; only the render output dedupes"
         );
     }
 }
