@@ -3827,6 +3827,7 @@ mod tests {
                     // filter (covered separately), so the reading must still
                     // be inside its own five_hour span.
                     observed_at: super::super::state::now_secs(),
+                    overage_covered: false,
                 }),
                 seven_day: None,
             },
@@ -3883,6 +3884,7 @@ mod tests {
                     used_percentage: 14.0,
                     resets_at: 1, // long past any real wall clock
                     observed_at: 1,
+                    overage_covered: false,
                 }),
                 seven_day: None,
             },

@@ -36,28 +36,35 @@ pub struct Route {
     pub model: String,
     pub reason: RouteReason,
     pub requested_headroom_pct: Option<f64>,
+    pub requested_age_secs: Option<u64>,
     pub selected_headroom_pct: f64,
     pub selected_headroom_assumed: bool,
 }
 
 impl Route {
-    pub fn detail(&self) -> String {
+    pub fn detail(&self, seat: pace::Seat) -> String {
         let from = self
             .requested_headroom_pct
             .map(|v| format!("{v:.1}%"))
             .unwrap_or_else(|| "unknown".to_string());
+        let observed = self
+            .requested_age_secs
+            .map(|age| format!(", observed {} ago", crate::style::format_age(age)))
+            .unwrap_or_default();
         let assumption = if self.selected_headroom_assumed {
             " assumed"
         } else {
             ""
         };
         format!(
-            "{} -> {} ({}, source headroom {from}, target headroom {:.1}%{assumption}, model {})",
+            "{} -> {} ({}, source headroom {from}{observed}, target headroom \
+             {:.1}%{assumption}, model {}; to override, {})",
             self.requested,
             self.selected,
             self.reason.label(),
             self.selected_headroom_pct,
-            self.model
+            self.model,
+            seat.override_hint()
         )
     }
 }
@@ -171,11 +178,15 @@ fn candidate_headroom(
     (pct > 0.0 && pct >= floor).then_some(CandidateHeadroom { pct, assumed: true })
 }
 
-fn requested_headroom(state: &StateDir, cfg: &CtxConfig, name: &str, now: u64) -> Option<f64> {
+fn requested_reading(
+    state: &StateDir,
+    cfg: &CtxConfig,
+    name: &str,
+    now: u64,
+) -> Option<pace::SpawnHeadroom> {
     let provider = adapters::provider_for_agent_name(Some(name));
     let (collector, estimator) = pace::current_windows(state, &cfg.pace, now, provider);
     pace::spawn_headroom(&collector, estimator.as_ref(), now, &cfg.pace)
-        .map(|reading| reading.headroom_pct)
 }
 
 /// Pure policy question used by tests and by the runtime selector. A
@@ -258,6 +269,9 @@ pub fn route_new_delegation(
     let gate = pace::spawn_gate(&collector, estimator.as_ref(), request.now, &cfg.pace);
     let source_reading =
         pace::spawn_headroom(&collector, estimator.as_ref(), request.now, &cfg.pace);
+    if source_reading.is_some_and(|reading| reading.overage_covered) {
+        return None;
+    }
     let source_headroom = source_reading.map(|reading| reading.headroom_pct);
     let task_will_not_fit = source_reading.is_some_and(|reading| {
         request
@@ -282,6 +296,7 @@ pub fn route_new_delegation(
         model,
         reason,
         requested_headroom_pct: source_headroom,
+        requested_age_secs: source_reading.map(|reading| reading.age_secs),
         selected_headroom_pct: headroom.pct,
         selected_headroom_assumed: headroom.assumed,
     })
@@ -381,13 +396,15 @@ pub fn route_blocked_session(
     if !cfg.fallback.enabled {
         return None;
     }
+    let requested_reading = requested_reading(state, cfg, request.requested, request.now);
     let (selected, model, headroom) = best_alternate(state, cfg, request, excluded)?;
     Some(Route {
         requested: request.requested.to_string(),
         selected,
         model,
         reason: RouteReason::Exhausted,
-        requested_headroom_pct: requested_headroom(state, cfg, request.requested, request.now),
+        requested_headroom_pct: requested_reading.map(|reading| reading.headroom_pct),
+        requested_age_secs: requested_reading.map(|reading| reading.age_secs),
         selected_headroom_pct: headroom.pct,
         selected_headroom_assumed: headroom.assumed,
     })
@@ -476,6 +493,7 @@ mod tests {
                     used_percentage: percent,
                     resets_at: reset_at,
                     observed_at: now,
+                    overage_covered: false,
                 }),
                 seven_day: None,
             },
@@ -549,6 +567,94 @@ mod tests {
     }
 
     #[test]
+    fn a_credit_covered_source_reading_never_routes_new_work_away() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = test_cfg_with_ready_adapters();
+        let now = 1_700_000_000;
+        crate::commands::ctx::window::store_for(
+            &state,
+            "openai",
+            &crate::commands::ctx::window::UsageWindows {
+                five_hour: Some(crate::commands::ctx::window::Window {
+                    used_percentage: 100.0,
+                    resets_at: now + 600,
+                    observed_at: now,
+                    overage_covered: true,
+                }),
+                seven_day: None,
+            },
+        )
+        .expect("store provider usage");
+
+        let route = route_new_delegation(
+            &state,
+            &cfg,
+            RouteRequest {
+                requested: "codex",
+                source_model: Some("gpt-5.6-terra"),
+                source_model_explicit: false,
+                bounds: TaskBounds {
+                    tokens: None,
+                    tool_calls: None,
+                },
+                now,
+            },
+            false,
+        );
+
+        assert_eq!(route, None);
+    }
+
+    #[test]
+    fn a_covered_seven_day_does_not_stop_a_reroute_when_the_five_hour_is_genuinely_exhausted() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = test_cfg_with_ready_adapters();
+        let now = 1_700_000_000;
+        crate::commands::ctx::window::store_for(
+            &state,
+            "openai",
+            &crate::commands::ctx::window::UsageWindows {
+                five_hour: Some(crate::commands::ctx::window::Window {
+                    used_percentage: 96.0,
+                    resets_at: now + 600,
+                    observed_at: now,
+                    overage_covered: false,
+                }),
+                seven_day: Some(crate::commands::ctx::window::Window {
+                    used_percentage: 100.0,
+                    resets_at: now + 3_600,
+                    observed_at: now,
+                    overage_covered: true,
+                }),
+            },
+        )
+        .expect("store source usage");
+        store_usage(&state, "anthropic", 20.0, now + 3_600, now);
+
+        let route = route_new_delegation(
+            &state,
+            &cfg,
+            RouteRequest {
+                requested: "codex",
+                source_model: Some("gpt-5.6-terra"),
+                source_model_explicit: false,
+                bounds: TaskBounds {
+                    tokens: None,
+                    tool_calls: None,
+                },
+                now,
+            },
+            false,
+        )
+        .expect("the uncovered hard refusal reroutes to the admissible alternate");
+
+        assert_eq!(route.reason, RouteReason::Exhausted);
+        assert_eq!(route.selected, "claude");
+    }
+
+    #[test]
     fn tied_reset_prefers_the_requested_harness_over_an_alternate() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(tmp.path().join("state"));
@@ -607,12 +713,15 @@ mod tests {
             model: "gpt-5.6-terra".into(),
             reason: RouteReason::Exhausted,
             requested_headroom_pct: Some(0.0),
+            requested_age_secs: Some(22 * 3600),
             selected_headroom_pct: 25.0,
             selected_headroom_assumed: true,
         };
-        let detail = route.detail();
+        let detail = route.detail(pace::Seat::Cli);
         assert!(detail.contains("claude -> codex"));
+        assert!(detail.contains("observed 22h ago"));
         assert!(detail.contains("25.0% assumed"));
         assert!(detail.contains("gpt-5.6-terra"));
+        assert!(detail.contains("pass --force"));
     }
 }

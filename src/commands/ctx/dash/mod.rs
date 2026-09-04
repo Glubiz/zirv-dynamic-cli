@@ -3702,7 +3702,7 @@ fn fulfill_spawn_request(
     if let Some(route) = route {
         effective_req.agent = route.selected.clone();
         effective_req.model = Some(route.model.clone());
-        let detail = route.detail();
+        let detail = route.detail(super::pace::Seat::Pane);
         let _ = super::log::append(
             state,
             &super::log::Decision {
@@ -3772,14 +3772,13 @@ fn fulfill_spawn_request(
     let (collector, estimator) =
         super::pace::current_windows(state, &cfg.pace, now, adapter.provider());
     let gate = super::pace::spawn_gate(&collector, estimator.as_ref(), now, &cfg.pace);
-    if let Some(note) = super::pace::describe_spawn_gate(&gate) {
+    let reading_age = super::pace::spawn_headroom(&collector, estimator.as_ref(), now, &cfg.pace)
+        .map(|reading| reading.age_secs);
+    if let Some(note) =
+        super::pace::describe_spawn_gate(&gate, reading_age, super::pace::Seat::Pane)
+    {
         if matches!(gate, super::pace::SpawnGate::Refuse { .. }) {
-            return Err(SpawnRefusal::policy(format!(
-                "{note} -- the hard refusal cannot be forced from a pane (a spawn request's own \
-                 `force` is untrusted JSON, not an operator's own choice); an operator who truly \
-                 intends to override it raises pace.spawn_hard_pct in ~/.zirv/ctx.toml, or runs \
-                 `zirv ctx agent --force` directly, outside any dashboard pane"
-            )));
+            return Err(SpawnRefusal::policy(note));
         }
         push_error(
             errors,
@@ -9219,6 +9218,7 @@ mod tests {
                     used_percentage: 55.0,
                     resets_at: 0,
                     observed_at: super::super::state::now_secs(),
+                    overage_covered: false,
                 }),
                 seven_day: None,
             },
@@ -9269,6 +9269,7 @@ mod tests {
                     used_percentage: 14.0,
                     resets_at: 1, // long past any real wall clock
                     observed_at: 1,
+                    overage_covered: false,
                 }),
                 seven_day: None,
             },
@@ -12577,6 +12578,7 @@ mod tests {
                     used_percentage: 100.0,
                     resets_at: now + 3_600,
                     observed_at: now,
+                    overage_covered: false,
                 }),
                 seven_day: None,
             },
@@ -12590,6 +12592,7 @@ mod tests {
                     used_percentage: 10.0,
                     resets_at: now + 3_600,
                     observed_at: now,
+                    overage_covered: false,
                 }),
                 seven_day: None,
             },
@@ -12697,6 +12700,7 @@ mod tests {
                     used_percentage: 100.0,
                     resets_at: now + 3_600,
                     observed_at: now,
+                    overage_covered: false,
                 }),
                 seven_day: None,
             },
@@ -12710,6 +12714,7 @@ mod tests {
                     used_percentage: 10.0,
                     resets_at: now + 3_600,
                     observed_at: now,
+                    overage_covered: false,
                 }),
                 seven_day: None,
             },
@@ -12836,6 +12841,7 @@ mod tests {
                     used_percentage: 99.5,
                     resets_at: now + 600,
                     observed_at: now,
+                    overage_covered: false,
                 }),
                 seven_day: None,
             },
@@ -13615,6 +13621,7 @@ mod tests {
                     used_percentage: 99.9,
                     resets_at: now + 600,
                     observed_at: now,
+                    overage_covered: false,
                 }),
                 seven_day: None,
             },
@@ -13678,6 +13685,7 @@ mod tests {
                     used_percentage: 96.0,
                     resets_at: now + 600,
                     observed_at: now,
+                    overage_covered: false,
                 }),
                 seven_day: None,
             },
@@ -13739,6 +13747,7 @@ mod tests {
                     used_percentage: 96.0,
                     resets_at: now + 600,
                     observed_at: now,
+                    overage_covered: false,
                 }),
                 seven_day: None,
             },
@@ -13772,8 +13781,20 @@ mod tests {
             refusal.reason
         );
         assert!(
-            refusal.reason.contains("cannot be forced from a pane"),
-            "explains why force did not help: {}",
+            refusal.reason.contains("observed 0s ago"),
+            "names the reading age: {}",
+            refusal.reason
+        );
+        assert!(
+            refusal.reason.contains("pass --headless --force"),
+            "names the pane-safe force path: {}",
+            refusal.reason
+        );
+        assert!(
+            refusal
+                .reason
+                .contains("raise pace.spawn_hard_pct in ~/.zirv/ctx.toml"),
+            "names the durable override: {}",
             refusal.reason
         );
         assert!(!refusal.retryable, "not a channel failure -- policy");
@@ -13808,6 +13829,7 @@ mod tests {
                     used_percentage: 90.0,
                     resets_at: now + 600,
                     observed_at: now,
+                    overage_covered: false,
                 }),
                 seven_day: None,
             },
