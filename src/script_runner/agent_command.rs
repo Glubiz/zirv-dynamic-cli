@@ -91,18 +91,24 @@ impl AgentCommand {
         }
 
         let prompt = self.substituted_prompt(context);
-        check_unresolved(&self.prompt, &prompt)?;
+        check_unresolved(&self.prompt, context)?;
 
         let cwd = context.get("cwd").cloned();
+        // G-7: same fix as `Command::execute` -- a fallback failure used to
+        // return `Err` before `proceed_on_failure` was consulted, so the
+        // failure (agent, or agent plus fallback) is tracked instead and
+        // `proceed_on_failure` always gets the final say.
         if let Err(e) = self.invoke(&prompt, cwd.as_deref()).await {
+            let mut failure = format!("Agent '{}' failed: {}", self.agent, e);
             if let Some(options) = &self.options {
                 if let Some(commands) = &options.fallback {
                     for cmd in commands {
-                        if let Err(fallback_error) = cmd.invoke().await {
-                            return Err(format!(
+                        if let Err(fallback_error) = cmd.invoke(context).await {
+                            failure = format!(
                                 "Agent '{}' failed and fallback '{}' also failed: {}",
                                 self.agent, cmd.command, fallback_error
-                            ));
+                            );
+                            break;
                         }
                     }
                 }
@@ -113,7 +119,7 @@ impl AgentCommand {
                     ));
                 }
             }
-            return Err(format!("Agent '{}' failed: {}", self.agent, e));
+            return Err(failure);
         }
 
         if let Some(options) = &self.options
@@ -436,6 +442,44 @@ mod tests {
 
         let err = result.expect_err("a nonzero exit must fail the step");
         assert!(err.contains("claude"), "got {err}");
+    }
+
+    /// G-7: a fallback that itself fails used to short-circuit with `Err`
+    /// before `proceed_on_failure` was ever consulted, contradicting Script
+    /// Files.md's documented contract that `proceed_on_failure` still
+    /// applies after fallback runs.
+    #[tokio::test]
+    async fn proceed_on_failure_still_applies_when_the_fallback_also_fails() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let state = tmp.path().join("state");
+        let agent_bin = format!("sh {}", fixture("fake-agent.sh").display());
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let mut env = base_env(&state, &agent_bin);
+        env.push(("FAKE_AGENT_MODE", Some("fail")));
+        let _env = crate::commands::ctx::testenv::VarGuard::set(&env);
+
+        let mut cmd = agent_step("do the work");
+        cmd.options = Some(Options {
+            proceed_on_failure: true,
+            fallback: Some(vec![
+                crate::script_runner::fallback_command::FallbackCommand {
+                    command: "exit 1".to_string(),
+                    description: None,
+                    options: None,
+                },
+            ]),
+            ..Default::default()
+        });
+        let mut context = HashMap::new();
+        context.insert("cwd".to_string(), tmp.path().display().to_string());
+
+        let result = cmd.execute(&mut context).await;
+
+        assert!(
+            result.expect("proceed_on_failure must not error").is_some(),
+            "expected a skip/failure message"
+        );
     }
 
     #[tokio::test]

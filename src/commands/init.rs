@@ -1,8 +1,8 @@
 use dialoguer::Confirm;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use crate::utils::COMMANDS_DIR_NAME;
+use crate::utils::{COMMANDS_DIR_NAME, home_dir};
 
 // Default shortcuts file content.
 const DEFAULT_SHORTCUTS: &str = r#"shortcuts:
@@ -16,11 +16,10 @@ const DEFAULT_SHORTCUTS: &str = r#"shortcuts:
 /// so the first-run setup wizard (`commands::setup::run_first_run`) can
 /// scaffold the operator's home layer without duplicating this logic.
 pub fn scaffold_global_zirv() -> Result<(), Box<dyn std::error::Error>> {
-    // Instead of using dirs::home_dir(), use the HOME or USERPROFILE env variable.
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .map(PathBuf::from)
-        .map_err(|_| "Could not determine home directory")?;
+    // G-9: was its own copy of `HOME`-or-`USERPROFILE` lookup, unconditionally
+    // preferring `HOME` -- the same bug `utils::home_dir` had. Deduplicated to
+    // call the shared, now-Windows-aware implementation instead.
+    let home = home_dir()?;
     let home_zirv = home.join(".zirv");
 
     if !home_zirv.exists() {
