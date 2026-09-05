@@ -298,7 +298,29 @@ fn write_events_atomic_locked(
     let dir = state.tasks().join(repo_slug);
     create_private_dir_all(&dir)?;
     let path = dir.join(EVENTS_FILE);
-    let mut content = std::fs::read_to_string(&path).unwrap_or_default();
+    // E-4: a missing file is legitimately empty (nothing has ever been
+    // appended yet), but any OTHER read error -- e.g. one invalid UTF-8
+    // byte from a torn append -- must not be treated the same way.
+    // `unwrap_or_default()` used to collapse both cases to "empty", so a
+    // single corrupt byte anywhere in the existing log silently wiped
+    // every prior event the next time this ran.
+    let mut content = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => {
+            return Err(format!(
+                "{}: exists but cannot be read ({e}); refusing to overwrite the existing event \
+                 log with only this batch",
+                path.display()
+            )
+            .into());
+        }
+    };
+    // A prior write that did not end in a newline (e.g. a torn append)
+    // would otherwise glue its last line to the first event appended here.
+    if !content.is_empty() && !content.ends_with('\n') {
+        content.push('\n');
+    }
     for event in events {
         content.push_str(&serde_json::to_string(event)?);
         content.push('\n');
@@ -1713,6 +1735,97 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(tmp.path().to_path_buf());
         assert!(read_events(&state, "repo").is_empty());
+    }
+
+    /// E-4: `write_events_atomic_locked` used to do
+    /// `read_to_string(&path).unwrap_or_default()`, collapsing a genuine
+    /// read error (a torn append leaving one invalid UTF-8 byte) to the
+    /// SAME "empty" result a missing file gets -- silently discarding
+    /// every prior event on the next atomic append. The fix must either
+    /// fail the append outright or preserve the prior event, never write
+    /// only the new batch as if the file had never existed.
+    #[test]
+    fn a_torn_utf8_byte_never_silently_wipes_the_prior_event_log() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let repo_slug = "repo";
+        let path = events_path(&state, repo_slug);
+        create_private_dir_all(path.parent().expect("parent")).expect("mkdir");
+
+        let prior = Event::Created {
+            id: "t1".to_string(),
+            repo_slug: repo_slug.to_string(),
+            title: "t".to_string(),
+            brief: "b".to_string(),
+            parents: Vec::new(),
+            group_id: None,
+            workdir: None,
+            at: 1,
+        };
+        let mut bytes = serde_json::to_vec(&prior).expect("serialize");
+        bytes.push(b'\n');
+        bytes.push(0xFF); // a torn/invalid UTF-8 byte, no trailing newline
+        std::fs::write(&path, &bytes).expect("write raw bytes");
+
+        let new_event = Event::Readied {
+            id: "t2".to_string(),
+            at: 2,
+        };
+        match append_events_atomic(&state, repo_slug, std::slice::from_ref(&new_event)) {
+            Err(_) => {
+                let raw = std::fs::read(&path).expect("read raw");
+                assert_eq!(
+                    raw, bytes,
+                    "a refused append must leave the prior (corrupt) file untouched"
+                );
+            }
+            Ok(()) => {
+                let events = read_events(&state, repo_slug);
+                assert!(
+                    events
+                        .iter()
+                        .any(|e| matches!(e, Event::Created { id, .. } if id == "t1")),
+                    "the prior event must survive a successful append too: {events:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_append_after_a_log_with_no_trailing_newline_keeps_both_events_readable() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let repo_slug = "repo";
+        let path = events_path(&state, repo_slug);
+        create_private_dir_all(path.parent().expect("parent")).expect("mkdir");
+
+        let prior = Event::Created {
+            id: "t1".to_string(),
+            repo_slug: repo_slug.to_string(),
+            title: "t".to_string(),
+            brief: "b".to_string(),
+            parents: Vec::new(),
+            group_id: None,
+            workdir: None,
+            at: 1,
+        };
+        // No trailing newline -- simulates a torn append that stopped
+        // right after the JSON but before its own newline.
+        std::fs::write(&path, serde_json::to_string(&prior).expect("serialize"))
+            .expect("write without trailing newline");
+
+        let new_event = Event::Readied {
+            id: "t1".to_string(),
+            at: 2,
+        };
+        append_events_atomic(&state, repo_slug, std::slice::from_ref(&new_event)).expect("append");
+
+        let events = read_events(&state, repo_slug);
+        assert_eq!(
+            events.len(),
+            2,
+            "both the prior and the newly-appended event must be independently readable: {events:?}"
+        );
     }
 
     // -- claim --------------------------------------------------------------

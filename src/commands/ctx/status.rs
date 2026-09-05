@@ -52,6 +52,20 @@ fn terminal_safe_model_id(raw: &str) -> String {
     safe
 }
 
+/// I-4: same control-character scrub as `terminal_safe_model_id`, plus a
+/// hard length cap -- `memory::CadenceFinding::writer` is a shared memory
+/// entry's `Written-by` header, itself committed, repo-owned (untrusted)
+/// content, unlike a transcript-derived model id, which has neither bound.
+/// `max_chars` is a character count, not a byte count: this is display-only
+/// text, never re-parsed, so a cut mid multi-byte character is not a
+/// concern the way it would be for stored/re-read content.
+fn terminal_safe_writer_label(raw: &str, max_chars: usize) -> String {
+    terminal_safe_model_id(raw)
+        .chars()
+        .take(max_chars)
+        .collect()
+}
+
 fn model_change_status_text(change: &super::event::ModelChange) -> String {
     format!(
         "model changed mid-session {} turns ago: `{}` -> `{}`",
@@ -1079,7 +1093,8 @@ fn render_report<W: Write>(
                     style::paint(
                         &format!(
                             "memory cadence: {} looked bursty on {reason} (z={:.1})",
-                            finding.writer, finding.z_score
+                            terminal_safe_writer_label(&finding.writer, 64),
+                            finding.z_score
                         ),
                         Tone::Warn,
                         colour
@@ -5681,6 +5696,33 @@ mod tests {
         assert!(
             !text.chars().any(char::is_control),
             "no transcript-derived control character may reach status output: {text:?}"
+        );
+    }
+
+    /// I-4: `finding.writer` (`memory::CadenceFinding::writer`) is a shared
+    /// memory entry's `Written-by` header -- committed, repo-owned
+    /// (untrusted) content -- rendered straight into the `memory cadence:`
+    /// status line. Unlike a transcript-derived model id, nothing bounds
+    /// its length or forbids an embedded escape sequence.
+    #[test]
+    fn cadence_writer_label_strips_control_characters_and_a_newline() {
+        let raw = "claude\nforged\u{1b}[31m";
+        let safe = terminal_safe_writer_label(raw, 64);
+        assert!(
+            !safe.chars().any(char::is_control),
+            "no control character or newline from a shared entry's Written-by may reach status output: {safe:?}"
+        );
+        assert_eq!(safe, "claude forged [31m");
+    }
+
+    #[test]
+    fn cadence_writer_label_is_capped_to_max_chars() {
+        let raw = "w".repeat(200);
+        let safe = terminal_safe_writer_label(&raw, 64);
+        assert_eq!(
+            safe.chars().count(),
+            64,
+            "an oversized writer label must be capped"
         );
     }
 
