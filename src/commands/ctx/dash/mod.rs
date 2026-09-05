@@ -11,6 +11,7 @@
 //! (`--simple`, non-terminal stdio, too small, or the dashboard turned off
 //! in config) still reaches today's `wrap::run_with` passthrough instead.
 
+pub mod hit;
 pub mod pane;
 pub mod roster;
 pub mod spawnreq;
@@ -47,6 +48,8 @@ use super::term;
 use super::window;
 use super::{fallback, handoff, handover, mail, memory, prompt, score, seat, sessions};
 use crate::commands::workflow;
+use crate::style;
+use hit::{HintId, Hit};
 
 pub(crate) use pane::{Pane, PaneBudgetNotice, PaneSpec, PaneState, ScrollOutcome};
 
@@ -66,8 +69,19 @@ pub enum InputVerdict {
 }
 
 /// Every command the dashboard itself understands once the prefix is armed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DashAction {
+    /// Right-click on a sidebar row: open the context menu for *that* row,
+    /// which is not necessarily the selected one. The menu itself is phase 3
+    /// of issue #354; phase 1 records the target and says so.
+    ContextMenu(hit::RowId),
+    /// `Ctrl+A c`, or the header's `actions` hint: the same menu for the
+    /// selected row.
+    ContextActions,
+    /// `Ctrl+A Left`/`Ctrl+A Right`, or a click on a group header's
+    /// disclosure triangle: fold a work group shut, or open it again.
+    CollapseGroup,
+    ExpandGroup,
     Switch(usize),
     NextPane,
     SelectUp,
@@ -111,6 +125,224 @@ pub enum DashAction {
     ToggleSelectMode,
 }
 
+/// Issue #354: what one pointer event means to the dashboard, decided
+/// entirely from the last drawn frame's geometry. `Grid` is the one variant
+/// that lets the event through to the focused child; every other variant is
+/// the dashboard's own chrome and stops here.
+#[derive(Debug, PartialEq, Eq)]
+enum MouseRoute {
+    /// Hand the event on to the existing grid path unchanged: child mouse
+    /// forwarding, wheel scrollback and in-dashboard text selection.
+    Grid,
+    /// Swallowed: an overlay owns the pointer, mouse capture is off, or the
+    /// gesture means nothing where it landed.
+    Consume,
+    /// Left click on a sidebar session row (by session short id).
+    Select(String),
+    /// Left click on the roster's summary line.
+    Summary,
+    /// Left click on a group header's disclosure triangle (by work-group id).
+    Toggle(String),
+    /// Wheel over the sidebar: scroll the roster viewport by this many
+    /// entries, without moving the selection.
+    ScrollRoster(isize),
+    /// A chrome hit that maps onto a keyboard action the dash already has.
+    Action(DashAction),
+}
+
+/// Pure: the dispatch order the behaviour contract calls for, in one place.
+///
+/// 1. the select-mode / mouse-off guard (mouse capture off means the terminal
+///    itself owns the pointer, so nothing here may act on it);
+/// 2. the modal layer -- an open overlay consumes every pointer event,
+///    wheel included (phase 3 gives the overlay its own hit regions);
+/// 3. the captured gesture owner -- a drag or release that belongs to an
+///    in-progress text selection stays with the grid wherever it lands, so
+///    every `*_cancels_selection` rule keeps working;
+/// 4. the chrome hit;
+/// 5. the existing grid path, unchanged.
+///
+/// Nothing but `MouseRoute::Grid` may reach `Pane::forward_mouse_button`,
+/// `Pane::scroll_wheel` or `Pane::write_input`.
+fn route_mouse(
+    snap: &hit::FrameSnapshot,
+    mouse: event::MouseEvent,
+    capture: bool,
+    overlay_open: bool,
+    selecting: bool,
+) -> MouseRoute {
+    if !capture || overlay_open {
+        return MouseRoute::Consume;
+    }
+    let hit = hit::hit_test(snap, mouse.column, mouse.row);
+    if matches!(hit, Hit::Overlay | Hit::ModalBackdrop) {
+        return MouseRoute::Consume;
+    }
+    if selecting
+        && matches!(
+            mouse.kind,
+            MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left)
+        )
+    {
+        return MouseRoute::Grid;
+    }
+    // The wheel belongs to the whole sidebar column, not just its rows: a
+    // notch over the summary line, a group header or the padding below the
+    // last row scrolls the roster exactly the same way.
+    if !snap.zoomed
+        && snap
+            .sidebar
+            .contains(Position::new(mouse.column, mouse.row))
+    {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => return MouseRoute::ScrollRoster(-1),
+            MouseEventKind::ScrollDown => return MouseRoute::ScrollRoster(1),
+            _ => {}
+        }
+    }
+    match (hit, mouse.kind) {
+        (Hit::Grid, _) => MouseRoute::Grid,
+        (Hit::SidebarRow(id), MouseEventKind::Down(MouseButton::Left)) => MouseRoute::Select(id),
+        (Hit::SidebarRow(id), MouseEventKind::Down(MouseButton::Right)) => {
+            MouseRoute::Action(DashAction::ContextMenu(id))
+        }
+        (Hit::SidebarSummary, MouseEventKind::Down(MouseButton::Left)) => MouseRoute::Summary,
+        (Hit::GroupToggle(id), MouseEventKind::Down(MouseButton::Left)) => MouseRoute::Toggle(id),
+        (Hit::HeaderHint(id) | Hit::FooterHint(id), MouseEventKind::Down(MouseButton::Left)) => {
+            MouseRoute::Action(match id {
+                HintId::Actions => DashAction::ContextActions,
+                HintId::Nudge => DashAction::Nudge,
+                HintId::Mail => DashAction::Mail,
+                HintId::Errors => DashAction::ShowErrors,
+                HintId::Help => DashAction::Help,
+            })
+        }
+        _ => MouseRoute::Consume,
+    }
+}
+
+/// Pure: clicking a row by session short id has exactly the effect the
+/// keyboard's own select-and-focus has ([`apply_navigation`]'s `Switch`) --
+/// for a row this dashboard actually owns. A view-only registry row or an
+/// ended pane moves the cursor only, leaving input focus where it was, which
+/// is the same rule arrow navigation follows (F7). An id that named a row
+/// which has since been reaped is a no-op rather than a guess.
+fn select_row(
+    id: &str,
+    rows: &[ui::SidebarRow],
+    selected: usize,
+    focused: usize,
+) -> (usize, usize) {
+    let Some(index) = rows.iter().position(|r| r.short == id) else {
+        return (selected, focused);
+    };
+    if rows[index].attached && rows[index].state != ui::RowState::Dead {
+        apply_navigation(
+            DashAction::Switch(index),
+            selected,
+            focused,
+            rows.iter().filter(|r| r.attached).count(),
+            rows.len(),
+        )
+    } else {
+        (index, focused)
+    }
+}
+
+/// Pure: `SelectUp`/`SelectDown` over the *tree* the roster actually drew
+/// (`order`, plus the summary line that always heads it), not over the flat
+/// pane vector -- so the cursor walks onto group headers and the summary the
+/// same way a click can reach them, and skips the children of a collapsed
+/// group because they are not in `order` at all.
+///
+/// `chrome` holds the cursor whenever it is on a non-session entry; a session
+/// entry clears it and moves the real `(selected, focused)` pair. Every other
+/// navigation action (`Switch`, `NextPane`) is the pre-#354 behaviour
+/// untouched.
+fn navigate_roster(
+    action: DashAction,
+    rows: &[ui::SidebarRow],
+    order: &[Hit],
+    selected: usize,
+    focused: usize,
+    chrome: &mut Option<Hit>,
+) -> (usize, usize) {
+    if !matches!(action, DashAction::SelectUp | DashAction::SelectDown) {
+        *chrome = None;
+        return apply_navigation(
+            action,
+            selected,
+            focused,
+            rows.iter().filter(|r| r.attached).count(),
+            rows.len(),
+        );
+    }
+    let mut order = order.to_vec();
+    order.insert(0, Hit::SidebarSummary);
+    let current = chrome
+        .clone()
+        .or_else(|| rows.get(selected).map(|r| Hit::SidebarRow(r.short.clone())));
+    let index = current
+        .and_then(|id| order.iter().position(|r| *r == id))
+        .unwrap_or(0);
+    let index = if action == DashAction::SelectUp {
+        index.saturating_sub(1)
+    } else {
+        index.saturating_add(1).min(order.len().saturating_sub(1))
+    };
+    match order.get(index) {
+        Some(Hit::SidebarRow(id)) => {
+            *chrome = None;
+            select_row(id, rows, selected, focused)
+        }
+        Some(id) => {
+            *chrome = Some(id.clone());
+            (selected, focused)
+        }
+        None => (selected, focused),
+    }
+}
+
+/// Folds the throttled [`FactsCache`] reads into the rows `assemble_sidebar`
+/// built from the panes alone. Everything here comes from a value already
+/// cached on the facts cadence -- the work group's scope, when this pane last
+/// changed state, the harness's own usage window -- so a frame never reads
+/// the disk and never shells out. Keys whose fact has no cached value keep
+/// the placeholder `assemble_sidebar` put there.
+fn enrich_sidebar(rows: &mut [ui::SidebarRow], disk: &DiskFacts, now: u64) {
+    for row in rows {
+        if let Some(group) = row.group.as_mut()
+            && let Some(cached) = disk.groups.get(&group.id)
+        {
+            group.scope = cached.scope.clone();
+            if let Some((_, value)) = row.disclosure.iter_mut().find(|(key, _)| key == "group") {
+                *value = value.replacen(style::PLACEHOLDER, &group.scope, 1);
+            }
+        }
+        if let Some((_, at)) = disk.state_since.get(&row.short)
+            && let Some((_, value)) = row.disclosure.iter_mut().find(|(key, _)| key == "since")
+        {
+            *value = format!(
+                "{} {} \u{b7} started {} ago",
+                row_state_label(row.state),
+                style::format_age(now.saturating_sub(*at)),
+                row.age_secs
+                    .map(style::format_age)
+                    .unwrap_or_else(|| style::PLACEHOLDER.into())
+            );
+        }
+        if let Some(usage) = disk
+            .usage
+            .iter()
+            .find(|u| u.name == row.harness)
+            .and_then(|u| u.five_hour)
+            && let Some((_, value)) = row.disclosure.iter_mut().find(|(key, _)| key == "budget")
+        {
+            value.push_str(&format!(" \u{b7} 5h {usage:.0}%"));
+        }
+    }
+}
+
 /// Matches `PREFIX` in either shape a real terminal can deliver it in: the
 /// classic `Char('a')` (or shifted `Char('A')`) plus a `CONTROL` modifier
 /// flag, or -- per the vt100 spike's own finding
@@ -147,6 +379,11 @@ pub fn filter_key(prefix_armed: bool, key: KeyEvent) -> (bool, InputVerdict) {
         KeyCode::Tab => Some(DashAction::NextPane),
         KeyCode::Up => Some(DashAction::SelectUp),
         KeyCode::Down => Some(DashAction::SelectDown),
+        // Issue #354: the roster is a tree now, so Left/Right fold a work
+        // group shut and open it again -- the keyboard equivalent of clicking
+        // a group header's disclosure triangle. Both were unbound before.
+        KeyCode::Left => Some(DashAction::CollapseGroup),
+        KeyCode::Right => Some(DashAction::ExpandGroup),
         // Scrollback, behind the prefix only. The bare keys deliberately keep
         // passing through to the child (`encode_key` sends them as `CSI 5~`/
         // `CSI 6~`): a harness has its own paging, and stealing PageUp from it
@@ -159,6 +396,9 @@ pub fn filter_key(prefix_armed: bool, key: KeyEvent) -> (bool, InputVerdict) {
             Some(DashAction::Switch((c as u8 - b'1') as usize))
         }
         KeyCode::Char('s') => Some(DashAction::Spawn),
+        // Issue #354: the selected row's action menu -- the same one a
+        // right-click raises. `c` was unbound before.
+        KeyCode::Char('c') => Some(DashAction::ContextActions),
         KeyCode::Char('n') => Some(DashAction::Nudge),
         KeyCode::Char('m') => Some(DashAction::Mail),
         KeyCode::Char('M') => Some(DashAction::Memory),
@@ -651,6 +891,22 @@ impl KeyLog {
 /// One dashboard-owned pane's row inputs, decoupled from `Pane` itself so
 /// `assemble_sidebar` stays pure and testable without a real spawn.
 struct PaneRowMeta {
+    /// `PromptRole::label`'s own spelling; `display_role` shortens it for the
+    /// row's 8-column role field.
+    role: String,
+    /// Issue #354: `Pane::launch_model` -- what the child was actually
+    /// launched with, `None` when the argv pinned nothing.
+    model: Option<String>,
+    /// `Pane::work_group_id`, the only source of group membership.
+    group_id: Option<String>,
+    /// `Pane::parent_session`, for the `group` disclosure line.
+    parent: Option<String>,
+    /// The `budget` disclosure line, pre-rendered from the pane's ceiling and
+    /// its last measured usage -- both already cached, neither re-read here.
+    budget: String,
+    /// The `writer` disclosure line: whether this pane holds the write
+    /// permit, and for which checkout.
+    writer: String,
     short: String,
     harness: String,
     state: ui::RowState,
@@ -707,6 +963,22 @@ fn assemble_sidebar(
     let mut rows: Vec<ui::SidebarRow> = panes
         .iter()
         .map(|p| ui::SidebarRow {
+            role: display_role(&p.role).into(),
+            model: p.model.clone(),
+            group: p.group_id.as_ref().map(|id| ui::GroupRef {
+                id: id.clone(),
+                scope: style::PLACEHOLDER.into(),
+                lead_short: panes
+                    .iter()
+                    .find(|lead| {
+                        lead.group_id.as_ref() == Some(id) && lead.role == "sub-orchestrator"
+                    })
+                    .or_else(|| panes.iter().find(|lead| lead.group_id.as_ref() == Some(id)))
+                    .map(|lead| lead.short.clone())
+                    .unwrap_or_default(),
+            }),
+            tree: ui::TreePos::Flat,
+            disclosure: Vec::new(),
             short: p.short.clone(),
             harness: p.harness.clone(),
             age_secs: age_of(&p.short),
@@ -734,6 +1006,16 @@ fn assemble_sidebar(
             continue;
         }
         rows.push(ui::SidebarRow {
+            role: record
+                .role
+                .as_deref()
+                .map(display_role)
+                .unwrap_or(style::PLACEHOLDER)
+                .into(),
+            model: None,
+            group: None,
+            tree: ui::TreePos::Flat,
+            disclosure: Vec::new(),
             short: record.short.clone(),
             harness: record.agent.clone(),
             age_secs: Some(now_secs.saturating_sub(record.started_at)),
@@ -750,8 +1032,95 @@ fn assemble_sidebar(
 
     if let Some(row) = rows.get_mut(selected) {
         row.selected = true;
+        // Issue #354: the selected row's disclosure, in the spec's own key
+        // order. Every value comes from something already in hand -- the
+        // pane's own fields, the registry record, or a placeholder that
+        // `enrich_sidebar` fills in from the throttled facts cache a moment
+        // later. Nothing here reads the disk and nothing shells out: `branch`
+        // in particular stays the placeholder rather than running git, which
+        // would put a subprocess on the render path.
+        let pane = panes.iter().find(|p| p.short == row.short);
+        let state = row_state_label(row.state);
+        row.disclosure = vec![
+            ("reason".into(), format!("none · {state}")),
+            (
+                "group".into(),
+                format!(
+                    "{} · parent {}",
+                    row.group
+                        .as_ref()
+                        .map(|g| g.scope.as_str())
+                        .unwrap_or(style::PLACEHOLDER),
+                    pane.and_then(|p| p.parent.as_deref())
+                        .unwrap_or(style::PLACEHOLDER)
+                ),
+            ),
+            (
+                "model".into(),
+                format!(
+                    "{} {}",
+                    row.harness,
+                    row.model.as_deref().unwrap_or(style::PLACEHOLDER)
+                ),
+            ),
+            (
+                "budget".into(),
+                pane.map(|p| p.budget.clone())
+                    .unwrap_or_else(|| style::PLACEHOLDER.into()),
+            ),
+            ("branch".into(), style::PLACEHOLDER.into()),
+            (
+                "writer".into(),
+                pane.map(|p| p.writer.clone())
+                    .unwrap_or_else(|| style::PLACEHOLDER.into()),
+            ),
+            (
+                "since".into(),
+                format!(
+                    "{state} {} · started {} ago",
+                    style::PLACEHOLDER,
+                    row.age_secs
+                        .map(style::format_age)
+                        .unwrap_or_else(|| style::PLACEHOLDER.into())
+                ),
+            ),
+            (
+                "signal".into(),
+                if row.supervised {
+                    "socket bound"
+                } else {
+                    "unreachable"
+                }
+                .into(),
+            ),
+        ];
     }
     rows
+}
+
+/// Pure: `PromptRole::label`'s persisted spelling shortened to fit the row
+/// contract's 8-column role field. Anything else -- a role written by a
+/// future build, or one already short enough -- passes through untouched
+/// rather than being truncated into something that reads as a different role.
+fn display_role(role: &str) -> &str {
+    match role {
+        "orchestrator" => "orch",
+        "sub-orchestrator" => "sub-orch",
+        other => other,
+    }
+}
+
+/// Pure: the word a disclosure line uses for a row's state. Phase 1 has only
+/// [`ui::RowState`] to work from; phase 2 replaces this with the composed
+/// `attention::SessionStatus`, which is what makes `reason` more than
+/// `none · <state>`.
+fn row_state_label(state: ui::RowState) -> &'static str {
+    match state {
+        ui::RowState::Working => "working",
+        ui::RowState::Idle => "idle",
+        ui::RowState::Dead => "ended",
+        ui::RowState::Unknown => "unknown",
+    }
 }
 
 /// Pure: one navigation action's effect on the `(selected, focused)` pair.
@@ -849,6 +1218,7 @@ fn assemble_header_facts(
     notice: Option<String>,
 ) -> ui::HeaderFacts {
     ui::HeaderFacts {
+        hints: ui::HintContext::default(),
         harness,
         select_mode,
         live,
@@ -1060,6 +1430,15 @@ struct DiskFacts {
     /// load`, keyed by `FactsOwner::session_short`), `None` until a seat is
     /// registered for it.
     pool_seat: Option<String>,
+    /// Issue #354: every live pane's work group, by id, loaded on this same
+    /// throttled tick -- the sidebar's group headers name a scope, and
+    /// `group::load` is a disk read that must never happen per frame.
+    groups: HashMap<String, super::group::WorkGroup>,
+    /// Issue #354: when each pane last changed [`ui::RowState`], for the
+    /// `since` disclosure line. Kept here rather than on `Pane` because it is
+    /// a property of what the *dashboard* has observed across ticks, and it
+    /// is pruned to the live panes on every refresh.
+    state_since: HashMap<String, (ui::RowState, u64)>,
 }
 
 /// Issue #264: [`DiskFacts::spend`]'s own shape.
@@ -1130,6 +1509,35 @@ impl FactsCache {
         let slug = super::state::repo_slug(repo);
         self.disk.memory_count = memory::list(state, &slug).map(|v| v.len()).unwrap_or(0);
         self.registry = sessions::list(state);
+        // Issue #354: the sidebar's group headers and its `since` line, on
+        // this same throttled cadence -- one `group::load` per distinct live
+        // group, and a state-change clock that only ever moves when the state
+        // actually changed. Both are pruned to the live panes, so a reaped
+        // pane leaves nothing behind.
+        let group_ids: HashSet<_> = panes.iter().filter_map(|p| p.work_group_id()).collect();
+        self.disk.groups = group_ids
+            .into_iter()
+            .filter_map(|id| {
+                super::group::load(state, id)
+                    .ok()
+                    .flatten()
+                    .map(|g| (id.to_string(), g))
+            })
+            .collect();
+        self.disk
+            .state_since
+            .retain(|short, _| panes.iter().any(|p| p.short() == short));
+        for pane in panes {
+            let current = ui::row_state_for(&pane.state());
+            let entry = self
+                .disk
+                .state_since
+                .entry(pane.short().into())
+                .or_insert((current, super::state::now_secs()));
+            if entry.0 != current {
+                *entry = (current, super::state::now_secs());
+            }
+        }
         // Issue #209/v3 §D: same throttled tick as the reads above it, same
         // no-subprocess/no-scan discipline -- see `DiskFacts::workflow`'s
         // own doc comment. Deliberately the dashboard's own `repo`, not a
@@ -6323,6 +6731,31 @@ fn build_pane_rows(panes: &[Pane]) -> Vec<PaneRowMeta> {
     panes
         .iter()
         .map(|pane| PaneRowMeta {
+            role: pane.role().label().to_string(),
+            model: pane.launch_model().map(str::to_string),
+            group_id: pane.work_group_id().map(str::to_string),
+            parent: pane.parent_session().map(str::to_string),
+            budget: format!(
+                "{} / {}",
+                pane.measured_usage()
+                    .map(|u| u
+                        .context_total()
+                        .saturating_add(u.output_tokens)
+                        .to_string())
+                    .unwrap_or_else(|| style::PLACEHOLDER.into()),
+                pane.budget_tokens()
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| style::PLACEHOLDER.into())
+            ),
+            writer: format!(
+                "{} · {}",
+                if pane.holds_writer_permit() {
+                    "held"
+                } else {
+                    style::PLACEHOLDER
+                },
+                pane.cwd().display()
+            ),
             short: pane.short().to_string(),
             harness: pane.agent().to_string(),
             state: ui::row_state_for(&pane.state()),
@@ -6736,6 +7169,23 @@ pub fn run_dashboard(
     // names a pane. See `apply_navigation`.
     let mut selected: usize = 0;
     let mut focused: usize = 0;
+    // Issue #354's own sidebar state. `sidebar_offset` is the roster's
+    // viewport, which the wheel moves without touching the selection;
+    // `chrome_selection` holds the cursor while it is on the summary line or
+    // a group header rather than a session row; `collapsed_groups` is which
+    // work groups are folded shut; `frame_snapshot` is the geometry of the
+    // last frame that actually drew, which every pointer event is resolved
+    // against; `reveal_sidebar` asks the next frame to bring the selection
+    // back into the viewport after a keyboard navigation.
+    let mut sidebar_offset = 0usize;
+    let mut chrome_selection: Option<Hit> = None;
+    let mut collapsed_groups = HashSet::new();
+    let mut frame_snapshot = hit::FrameSnapshot::default();
+    let mut reveal_sidebar = true;
+    // The row a context menu was asked for. Phase 3 opens the menu on it;
+    // recorded now so the target is captured at the moment of the gesture
+    // rather than re-derived later from a selection that may have moved.
+    let mut _context_target: Option<String> = None;
     let mut zoomed = false;
     let mut prefix_armed = false;
     // `Ctrl+A v` (`DashAction::ToggleSelectMode`)'s own state: whether the
@@ -7081,7 +7531,8 @@ pub fn run_dashboard(
             };
             match event::poll(wait) {
                 Ok(true) => {
-                    let read = event::read();
+                    let mut read = event::read();
+                    let mut mouse_action = None;
                     // Activity, for the adaptive poll wait above: a keyboard
                     // or mouse event, whatever `filter_key`/the overlay below
                     // goes on to decide it means.
@@ -7094,6 +7545,71 @@ pub fn run_dashboard(
                     // set; see `KeyLog`.
                     if let Some(log) = keylog.as_mut() {
                         log.observe(&read, prefix_armed, &overlay);
+                    }
+                    // Issue #354: pointer ownership is decided once, here,
+                    // against the geometry of the frame the operator actually
+                    // clicked on (`frame_snapshot`) -- before the
+                    // `Ok(Event::Mouse(..))` arm further down, which is the
+                    // only path to `Pane::scroll_wheel`,
+                    // `forward_mouse_button` and the in-dashboard selection.
+                    // Anything but `MouseRoute::Grid` is fully handled here
+                    // and the event is then replaced by an inert one, so no
+                    // chrome hit can reach the child. See `route_mouse` for
+                    // the dispatch order itself.
+                    if let Ok(Event::Mouse(mouse)) = read.as_ref() {
+                        let mouse = *mouse;
+                        // A fresh left press clears the highlight wherever it
+                        // lands: the grid arm's own `selection = None` is out
+                        // of reach for a chrome click now.
+                        if mouse_capture
+                            && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+                        {
+                            selection = None;
+                        }
+                        let route = route_mouse(
+                            &frame_snapshot,
+                            mouse,
+                            mouse_capture,
+                            !matches!(overlay, ui::Overlay::None),
+                            selection.is_some(),
+                        );
+                        if route != MouseRoute::Grid {
+                            read = Ok(Event::FocusGained);
+                        }
+                        match route {
+                            MouseRoute::Grid | MouseRoute::Consume => {}
+                            MouseRoute::Select(id) => {
+                                (selected, focused) = select_row(&id, &rows, selected, focused);
+                                chrome_selection = None;
+                                if let Some(pane) = panes.get(focused) {
+                                    let _ = super::attention::mark_seen_io(state, pane.short());
+                                }
+                            }
+                            MouseRoute::Summary => chrome_selection = Some(Hit::SidebarSummary),
+                            MouseRoute::Toggle(id) => {
+                                if !collapsed_groups.remove(&id) {
+                                    collapsed_groups.insert(id.clone());
+                                }
+                                chrome_selection = Some(Hit::GroupToggle(id));
+                            }
+                            MouseRoute::ScrollRoster(delta) => {
+                                // The frame's own clamp (`ui::reveal_offset`)
+                                // trims this to the last screenful; the cap
+                                // here only keeps a held wheel from running
+                                // the counter away from the list entirely.
+                                sidebar_offset = sidebar_offset
+                                    .saturating_add_signed(delta)
+                                    .min(frame_snapshot.roster.len());
+                                reveal_sidebar = false;
+                            }
+                            MouseRoute::Action(action) => {
+                                mouse_action = Some(action);
+                                read = Ok(Event::Key(KeyEvent::new(
+                                    KeyCode::Null,
+                                    KeyModifiers::NONE,
+                                )));
+                            }
+                        }
                     }
                     match read {
                         Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => {
@@ -7519,7 +8035,10 @@ pub fn run_dashboard(
                                     log.overlay_swap(took, &overlay);
                                 }
                             } else {
-                                let (armed, verdict) = filter_key(prefix_armed, key);
+                                let (armed, verdict) = mouse_action
+                                    .take()
+                                    .map(|action| (false, InputVerdict::Dash(action)))
+                                    .unwrap_or_else(|| filter_key(prefix_armed, key));
                                 let armed_before = prefix_armed;
                                 prefix_armed = armed;
                                 // Task 2: what the loop ACTUALLY stored and
@@ -7533,6 +8052,44 @@ pub fn run_dashboard(
                                     log.dispatch(armed_before, prefix_armed, &verdict);
                                 }
                                 match verdict {
+                                    InputVerdict::Dash(DashAction::ContextMenu(id)) => {
+                                        _context_target = Some(id);
+                                        push_notice(
+                                            &mut notices,
+                                            Instant::now(),
+                                            "actions menu arrives in phase 3".into(),
+                                        );
+                                    }
+                                    InputVerdict::Dash(DashAction::ContextActions) => {
+                                        _context_target =
+                                            rows.get(selected).map(|row| row.short.clone());
+                                        push_notice(
+                                            &mut notices,
+                                            Instant::now(),
+                                            "actions menu arrives in phase 3".into(),
+                                        );
+                                    }
+                                    InputVerdict::Dash(
+                                        action @ (DashAction::CollapseGroup
+                                        | DashAction::ExpandGroup),
+                                    ) => {
+                                        let id = match &chrome_selection {
+                                            Some(Hit::GroupToggle(id)) => Some(id.clone()),
+                                            _ => rows
+                                                .get(selected)
+                                                .and_then(|row| row.group.as_ref())
+                                                .map(|g| g.id.clone()),
+                                        };
+                                        if let Some(id) = id {
+                                            if action == DashAction::CollapseGroup {
+                                                collapsed_groups.insert(id.clone());
+                                                chrome_selection = Some(Hit::GroupToggle(id));
+                                            } else {
+                                                collapsed_groups.remove(&id);
+                                            }
+                                            reveal_sidebar = true;
+                                        }
+                                    }
                                     InputVerdict::Pending => {}
                                     // Typing always reaches the *focused* pane, never
                                     // the merely selected sidebar row (F7): walking
@@ -7570,12 +8127,14 @@ pub fn run_dashboard(
                                         | DashAction::SelectUp
                                         | DashAction::SelectDown),
                                     ) => {
-                                        (selected, focused) = apply_navigation(
+                                        reveal_sidebar = true;
+                                        (selected, focused) = navigate_roster(
                                             action,
+                                            &rows,
+                                            &frame_snapshot.roster,
                                             selected,
                                             focused,
-                                            panes.len(),
-                                            total_rows,
+                                            &mut chrome_selection,
                                         );
                                         // Issue #349: the operator just looked
                                         // at this pane -- the only thing that
@@ -8207,6 +8766,8 @@ pub fn run_dashboard(
             std::process::id(),
             super::state::now_secs(),
         );
+        let mut rows = rows;
+        enrich_sidebar(&mut rows, &facts_cache.disk, super::state::now_secs());
         render_tick = render_tick.wrapping_add(1);
 
         // L13: a live notice (info) shows as plain text and takes precedence
@@ -8217,7 +8778,7 @@ pub fn run_dashboard(
             .iter()
             .filter(|r| r.state != ui::RowState::Dead)
             .count();
-        let facts = assemble_header_facts(
+        let mut facts = assemble_header_facts(
             harness_label.clone(),
             !mouse_capture,
             total_live,
@@ -8232,6 +8793,9 @@ pub fn run_dashboard(
         // doc comment). `last_exited` (codex review finding 1) is what makes
         // the dead-pane variant reachable once `reap_ended_panes` has
         // already removed the row `focused` used to name.
+        facts.hints.alive = rows
+            .get(selected)
+            .is_some_and(|r| r.state != ui::RowState::Dead);
         let focused_row = rows.iter().find(|r| r.focused);
         // Codex review finding 2: the focused pane's OWN mail queue, not
         // the dashboard's fixed launch identity's -- see `MailMap`'s own
@@ -8289,55 +8853,82 @@ pub fn run_dashboard(
             seat: facts_cache.disk.pool_seat.clone(),
         };
 
+        let summary = ui::SidebarSummary {
+            aggregate: aggregate_facts,
+        };
+        let bands = (cfg.score.advise_at, cfg.score.compact_at);
+        // Issue #354: the roster owns its own viewport now -- the wheel
+        // scrolls it without moving the cursor -- so the offset is re-pinned
+        // to the selection only when the keyboard actually navigated
+        // (`reveal_sidebar`). A group the selection lands inside is expanded
+        // first: a collapsed group must never hide the row the cursor is on.
+        if reveal_sidebar
+            && chrome_selection.is_none()
+            && let Some(group) = rows.get(selected).and_then(|row| row.group.as_ref())
+        {
+            collapsed_groups.remove(&group.id);
+        }
+        let mut view = ui::RosterView {
+            collapsed: &collapsed_groups,
+            chrome_selection: chrome_selection.as_ref(),
+            offset: sidebar_offset,
+            tick: render_tick,
+            bands,
+        };
+        let mut roster = ui::roster_frame(layout.sidebar, &rows, &summary, &view);
+        // The viewport's index space is `roster.row_ids` (tree entries), not
+        // `rows` (sessions): a group header takes a line of its own and a
+        // collapsed group swallows its children's. One row of the sidebar is
+        // the summary line, which never scrolls.
+        let capacity = layout.sidebar.height.saturating_sub(1) as usize;
+        let reveal_index = reveal_sidebar
+            .then(|| {
+                chrome_selection.clone().or_else(|| {
+                    rows.get(selected)
+                        .map(|row| Hit::SidebarRow(row.short.clone()))
+                })
+            })
+            .flatten()
+            .and_then(|target| roster.row_ids.iter().position(|id| *id == target));
+        reveal_sidebar = false;
+        // With no reveal target this is just the end-of-list clamp, so a
+        // roster that shrank under a scrolled viewport snaps back on its own.
+        let next_offset = ui::reveal_offset(
+            roster.row_ids.len(),
+            capacity,
+            reveal_index.unwrap_or(sidebar_offset),
+            sidebar_offset,
+        );
+        if next_offset != sidebar_offset {
+            sidebar_offset = next_offset;
+            view.offset = sidebar_offset;
+            roster = ui::roster_frame(layout.sidebar, &rows, &summary, &view);
+        }
+        let next_snapshot =
+            ui::frame_snapshot(frame_area, &layout, zoomed, &roster, &facts.hints, &overlay);
+        let focus_cwd = panes.get(focused).map(|p| p.cwd().display().to_string());
         let draw = terminal.draw(|f| {
             if !zoomed {
                 ui::render_header(f, layout.header, &facts);
-                ui::render_rule(f, layout.rule_top, layout.sidebar.width, true);
-                // Issue #264: one row of `layout.sidebar` is the aggregate
-                // row, drawn above the roster -- the divider just below still
-                // spans `layout.sidebar.height` in full, so the vertical rule
-                // runs continuously alongside both.
-                let aggregate_h = 1.min(layout.sidebar.height);
-                ui::render_aggregate(
+                ui::render_focus_rule(
                     f,
-                    Rect {
-                        height: aggregate_h,
-                        ..layout.sidebar
-                    },
-                    &aggregate_facts,
+                    layout.rule_top,
+                    layout.sidebar.width,
+                    focused_row,
+                    focus_cwd.as_deref(),
                 );
-                ui::render_sidebar(
-                    f,
-                    Rect {
-                        y: layout.sidebar.y + aggregate_h,
-                        height: layout.sidebar.height.saturating_sub(aggregate_h),
-                        ..layout.sidebar
-                    },
-                    &rows,
-                    render_tick,
-                    cfg.score.advise_at,
-                    cfg.score.compact_at,
-                );
-                ui::render_sidebar_divider(
-                    f,
-                    Rect {
-                        x: layout.sidebar.x + layout.sidebar.width,
-                        y: layout.sidebar.y,
-                        width: (layout
-                            .main
-                            .x
-                            .saturating_sub(layout.sidebar.x + layout.sidebar.width))
-                        .min(1),
-                        height: layout.sidebar.height,
-                    },
-                );
+                ui::render_roster(f, layout.sidebar, &roster);
+                // Straight from the snapshot the click will be tested
+                // against, so the drawn divider and `Hit::Divider` can never
+                // describe different columns.
+                ui::render_sidebar_divider(f, next_snapshot.divider);
                 ui::render_rule(f, layout.rule_bottom, layout.sidebar.width, false);
-                ui::render_footer(
+                ui::render_footer_spend(
                     f,
                     layout.footer,
                     &footer_facts,
-                    cfg.score.advise_at,
-                    cfg.score.compact_at,
+                    (cfg.score.advise_at, cfg.score.compact_at),
+                    &summary,
                 );
             }
             if let Some(pane) = panes.get(focused) {
@@ -8377,6 +8968,8 @@ pub fn run_dashboard(
         });
         if let Err(e) = draw {
             push_error(&mut errors, format!("draw: {e}"));
+        } else {
+            frame_snapshot = next_snapshot;
         }
     };
 
@@ -9452,6 +10045,12 @@ mod tests {
 
     fn pane_row(short: &str, harness: &str) -> PaneRowMeta {
         PaneRowMeta {
+            role: "worker".into(),
+            model: None,
+            group_id: None,
+            parent: None,
+            budget: style::PLACEHOLDER.into(),
+            writer: style::PLACEHOLDER.into(),
             short: short.to_string(),
             harness: harness.to_string(),
             state: ui::RowState::Idle,
@@ -9685,6 +10284,11 @@ mod tests {
 
     fn focused_alive_row_supervised(score: Option<u32>, supervised: bool) -> ui::SidebarRow {
         ui::SidebarRow {
+            role: "worker".into(),
+            model: None,
+            group: None,
+            tree: ui::TreePos::Flat,
+            disclosure: Vec::new(),
             short: "aaa11111".to_string(),
             harness: "claude".to_string(),
             age_secs: Some(90),
@@ -19268,5 +19872,187 @@ mod tests {
         let pid = child.id();
         let _ = child.wait();
         pid
+    }
+
+    #[test]
+    fn chrome_mouse_dispatch_never_reaches_child_forward_or_scroll() {
+        let snap = hit::FrameSnapshot {
+            frame: Rect::new(0, 0, 120, 40),
+            sidebar: Rect::new(0, 2, 44, 36),
+            grid: Rect::new(45, 2, 75, 36),
+            divider: Rect::new(44, 2, 1, 36),
+            rows: vec![
+                (Rect::new(0, 2, 44, 1), Hit::SidebarSummary),
+                (Rect::new(0, 3, 44, 9), Hit::SidebarRow("worker".into())),
+            ],
+            ..Default::default()
+        };
+        let mut child_calls = Vec::new();
+        for wants_mouse in [false, true] {
+            for (x, y) in [(0, 0), (5, 2), (5, 3), (5, 11), (44, 20), (60, 39)] {
+                for kind in [
+                    MouseEventKind::ScrollUp,
+                    MouseEventKind::ScrollDown,
+                    MouseEventKind::Down(MouseButton::Left),
+                    MouseEventKind::Up(MouseButton::Right),
+                ] {
+                    let mouse = event::MouseEvent {
+                        kind,
+                        column: x,
+                        row: y,
+                        modifiers: KeyModifiers::NONE,
+                    };
+                    if route_mouse(&snap, mouse, true, false, false) == MouseRoute::Grid {
+                        child_calls.push((wants_mouse, kind));
+                    }
+                }
+            }
+        }
+        assert!(
+            child_calls.is_empty(),
+            "chrome dispatched to child: {child_calls:?}"
+        );
+        let click = event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 5,
+            row: 10,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(
+            route_mouse(&snap, click, true, false, false),
+            MouseRoute::Select("worker".into())
+        );
+        assert_eq!(
+            route_mouse(
+                &snap,
+                event::MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Right),
+                    ..click
+                },
+                true,
+                false,
+                false
+            ),
+            MouseRoute::Action(DashAction::ContextMenu("worker".into()))
+        );
+        assert_eq!(
+            route_mouse(
+                &snap,
+                event::MouseEvent {
+                    kind: MouseEventKind::ScrollDown,
+                    ..click
+                },
+                true,
+                false,
+                false
+            ),
+            MouseRoute::ScrollRoster(1)
+        );
+    }
+
+    #[test]
+    fn overlay_swallows_wheel_and_grid_keeps_both_mouse_modes() {
+        let snap = hit::FrameSnapshot {
+            frame: Rect::new(0, 0, 80, 20),
+            grid: Rect::new(45, 2, 35, 16),
+            ..Default::default()
+        };
+        for wants_mouse in [false, true] {
+            let mut calls = Vec::new();
+            for kind in [
+                MouseEventKind::ScrollUp,
+                MouseEventKind::Down(MouseButton::Left),
+                MouseEventKind::Up(MouseButton::Left),
+            ] {
+                let mouse = event::MouseEvent {
+                    kind,
+                    column: 50,
+                    row: 5,
+                    modifiers: KeyModifiers::NONE,
+                };
+                assert_eq!(
+                    route_mouse(&snap, mouse, true, true, true),
+                    MouseRoute::Consume
+                );
+                assert_eq!(
+                    route_mouse(&snap, mouse, false, false, true),
+                    MouseRoute::Consume
+                );
+                if route_mouse(&snap, mouse, true, false, false) == MouseRoute::Grid {
+                    calls.push((wants_mouse, kind));
+                }
+            }
+            assert_eq!(calls.len(), 3);
+        }
+    }
+
+    #[test]
+    fn grouped_keyboard_and_pointer_selection_use_identity_and_leave_external_focus() {
+        let panes = vec![
+            pane_row("worker01", "claude"),
+            pane_row("lead0001", "codex"),
+        ];
+        let mut rows = assemble_sidebar(&panes, &[], &HashMap::new(), 0, 0, DASHBOARD_PID, 0);
+        let mut external = rows[0].clone();
+        external.short = "external".into();
+        external.attached = false;
+        external.focused = false;
+        rows.push(external);
+        let order = vec![
+            Hit::GroupToggle("g".into()),
+            Hit::SidebarRow("lead0001".into()),
+            Hit::SidebarRow("worker01".into()),
+            Hit::SidebarRow("external".into()),
+        ];
+        let mut chrome = Some(Hit::GroupToggle("g".into()));
+        assert_eq!(
+            navigate_roster(DashAction::SelectDown, &rows, &order, 0, 0, &mut chrome),
+            select_row("lead0001", &rows, 0, 0)
+        );
+        assert_eq!(chrome, None);
+        assert_eq!(select_row("external", &rows, 1, 1), (2, 1));
+        assert_eq!(select_row("reaped", &rows, 1, 1), (1, 1));
+        rows[0].state = ui::RowState::Dead;
+        assert_eq!(select_row("worker01", &rows, 1, 1), (0, 1));
+    }
+
+    #[test]
+    fn sidebar_disclosure_uses_cached_scope_usage_and_state_time() {
+        let mut pane = pane_row("lead0001", "codex");
+        pane.group_id = Some("group".into());
+        pane.role = "sub-orchestrator".into();
+        pane.model = Some("resolved-model".into());
+        pane.budget = "12000 / 80000".into();
+        let mut rows = assemble_sidebar(&[pane], &[], &HashMap::new(), 0, 0, DASHBOARD_PID, 0);
+        let mut disk = DiskFacts::default();
+        disk.state_since
+            .insert("lead0001".into(), (ui::RowState::Working, 60));
+        disk.usage.push(ui::HarnessUsage {
+            name: "codex",
+            five_hour: Some(61.0),
+            seven_day: None,
+            credits: false,
+        });
+        enrich_sidebar(&mut rows, &disk, 240);
+        assert_eq!(rows[0].model.as_deref(), Some("resolved-model"));
+        assert_eq!(rows[0].disclosure.len(), 8);
+        assert!(
+            rows[0]
+                .disclosure
+                .iter()
+                .any(|(k, v)| k == "budget" && v == "12000 / 80000 · 5h 61%")
+        );
+        assert!(
+            rows[0]
+                .disclosure
+                .iter()
+                .any(|(k, v)| k == "since" && v.contains("3m"))
+        );
+        assert!(
+            rows[0]
+                .disclosure
+                .iter()
+                .any(|(k, v)| k == "branch" && v == style::PLACEHOLDER)
+        );
     }
 }

@@ -210,7 +210,7 @@ must not raise for itself, so a repository may set it:
 ```toml
 [dash]
 enabled = true               # ZIRV_CTX_DASH
-sidebar_cols = 24            # ZIRV_CTX_DASH_SIDEBAR_COLS
+sidebar_cols = 44            # ZIRV_CTX_DASH_SIDEBAR_COLS
 roster_max_age_secs = 604800 # ZIRV_CTX_DASH_ROSTER_MAX_AGE_SECS
 max_panes = 9                 # ZIRV_CTX_DASH_MAX_PANES
 mouse = true                  # ZIRV_CTX_DASH_MOUSE

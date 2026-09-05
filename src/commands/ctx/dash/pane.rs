@@ -811,6 +811,19 @@ pub struct Pane {
     /// this pane's transcript with the same `agent::budget_state` and
     /// one-tick hard-stop grace as the headless exec supervisor.
     budget_tokens: Option<u64>,
+    /// Issue #354: the last transcript usage this pane was measured at, kept
+    /// from the budget sweep that already reads it (`apply_budget_usage`) so
+    /// the sidebar's `budget` disclosure line costs nothing extra. `None`
+    /// until the first sweep, and reset on handover -- a successor's usage is
+    /// its own, never its predecessor's.
+    measured_usage: Option<super::super::event::TranscriptUsage>,
+    /// Issue #354: the model this pane's child was actually launched with,
+    /// read back from the resolved adapter argv (`adapters::last_model_flag`)
+    /// rather than from the spawn request's text -- so the sidebar shows what
+    /// is running, not what was asked for. `None` when the argv pinned no
+    /// model at all (the harness's own default), which renders as the shared
+    /// placeholder rather than a guess.
+    launch_model: Option<String>,
     /// Issue #358 (task T3): the id of this pane's own entry in
     /// `reservation`'s per-provider ledger, if the reservation write at
     /// spawn time succeeded (best-effort, so `None` also covers a ledger
@@ -1126,6 +1139,8 @@ impl Pane {
             intake_dir: None,
             work_group_id: None,
             budget_tokens: None,
+            measured_usage: None,
+            launch_model: super::super::adapters::last_model_flag(&argv).map(str::to_string),
             reservation_id: None,
             budget_soft_warned: false,
             budget_grace_given: false,
@@ -1618,6 +1633,25 @@ impl Pane {
         self.budget_grace_given = false;
     }
 
+    /// Issue #354, the sidebar's `model` column and `model` disclosure line.
+    /// Read-only: nothing outside this module may re-point a live pane's
+    /// model, which would make the row disagree with the running child.
+    pub fn launch_model(&self) -> Option<&str> {
+        self.launch_model.as_deref()
+    }
+
+    /// Issue #354, the sidebar's `budget` disclosure line: the last usage
+    /// snapshot the budget sweep measured, or `None` before the first one.
+    pub fn measured_usage(&self) -> Option<super::super::event::TranscriptUsage> {
+        self.measured_usage
+    }
+
+    /// Issue #354, the sidebar's `writer` disclosure line: whether this pane
+    /// currently holds the repo's write permit.
+    pub fn holds_writer_permit(&self) -> bool {
+        self.writer_permit.is_some()
+    }
+
     pub fn budget_tokens(&self) -> Option<u64> {
         self.budget_tokens
     }
@@ -1644,6 +1678,12 @@ impl Pane {
         usage: &super::super::event::TranscriptUsage,
         quit_sequence: &str,
     ) -> CtxResult<Option<PaneBudgetNotice>> {
+        // Issue #354: the sweep that reads this usage is the only thing that
+        // reads it, so the sidebar's `budget` disclosure line reuses the same
+        // snapshot rather than measuring again. Recorded before the ceiling
+        // check so it reflects what was actually measured, not what the
+        // budget then decided about it.
+        self.measured_usage = Some(*usage);
         let Some(limit) = self.budget_tokens else {
             return Ok(None);
         };
@@ -2171,6 +2211,8 @@ impl Pane {
         self.turn_signal_capable = turn_signal_capable;
         self.idle_quiet = idle_quiet;
         self.last_signal_at = None;
+        self.launch_model = super::super::adapters::last_model_flag(&new_argv).map(str::to_string);
+        self.measured_usage = None;
         self.last_output_at = None;
         self.last_local_input_at = None;
         self.injected_awaiting_turn = false;

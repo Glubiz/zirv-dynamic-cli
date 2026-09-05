@@ -200,7 +200,7 @@ model = "fable"
 
 # [dash]                             # every key below is REPO-FORBIDDEN except idle_quiet_ms
 # enabled = true                     # REPO-FORBIDDEN (ZIRV_CTX_DASH): whether `zirv chat` opens the dashboard multiplexer. Default: true.
-# sidebar_cols = 24                  # REPO-FORBIDDEN (ZIRV_CTX_DASH_SIDEBAR_COLS): width, in columns, of the persistent session sidebar. Default: 24.
+# sidebar_cols = 44                  # REPO-FORBIDDEN (ZIRV_CTX_DASH_SIDEBAR_COLS): width, in columns, of the persistent session sidebar. Default: 44.
 # roster_max_age_secs = 604_800      # REPO-FORBIDDEN (ZIRV_CTX_DASH_ROSTER_MAX_AGE_SECS): how long a quit-time roster stays offered for restore. Default: 604800 (7 days).
 # max_panes = 9                      # REPO-FORBIDDEN (ZIRV_CTX_DASH_MAX_PANES): most panes one dashboard may hold at once, counting the orchestrator. Default: 9.
 # mouse = true                       # REPO-FORBIDDEN (ZIRV_CTX_DASH_MOUSE): whether the dashboard captures the mouse for wheel-scroll. Default: true.
