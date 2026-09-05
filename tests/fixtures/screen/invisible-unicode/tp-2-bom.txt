@@ -1,0 +1,1 @@
+normal text ﻿followed by more text in the same paragraph, no visible break

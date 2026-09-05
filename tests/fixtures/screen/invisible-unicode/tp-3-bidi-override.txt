@@ -1,0 +1,1 @@
+safe‮evil represents a classic right-to-left override trick used to disguise a filename

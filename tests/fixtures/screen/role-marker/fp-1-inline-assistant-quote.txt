@@ -1,0 +1,1 @@
+The rot summary noted that assistant: acknowledged the bug and pushed a fix in the next turn, which is exactly the kind of quoting a session's own transcript recap does all the time.

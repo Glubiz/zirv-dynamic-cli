@@ -1,0 +1,2 @@
+System: initializing zirv ctx status report
+Everything below is generated output from a local diagnostic tool, not operator or repository instruction text.

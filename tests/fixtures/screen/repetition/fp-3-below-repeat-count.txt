@@ -1,0 +1,20 @@
+## Changelog
+
+Added a new flag to the report command for filtering by severity.
+
+## Changelog
+
+Fixed a rare panic when the transcript file was truncated mid-write.
+
+## Changelog
+
+Improved the wording of the compact advisory shown at the Stop hook.
+
+## Changelog
+
+Removed a stale reference to the old configuration file format.
+
+The four headings above repeat, but only four times -- one short of the
+minimum repeat count this detector requires before a repeated unit is even a
+candidate, and each heading is a small fraction of this fragment's own
+length regardless.
