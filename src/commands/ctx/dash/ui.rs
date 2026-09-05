@@ -31,6 +31,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph};
 
 use crate::style;
 
+use super::super::attention::{Projection, SessionStatus, Visibility};
 use super::super::mail::Message;
 use super::super::price;
 use super::DashAction;
@@ -92,14 +93,21 @@ pub struct HeaderFacts {
     pub notice: Option<String>,
 }
 
-/// What the header's right-hand hint cluster is chosen against. One field
-/// today; the later phases of issue #354 add the rest of the selected row's
-/// state (needs-action, ended, an open overlay's own back/confirm) without
-/// any call site of [`header_hints`] having to change shape.
+/// What the header's right-hand hint cluster is chosen against. Phase 2 adds
+/// the two attention-derived states the approved contract names
+/// (`needs action` and `ended`) alongside phase 1's plain `alive`; an open
+/// overlay's own back/confirm cluster is phase 3's and still costs no call
+/// site of [`header_hints`] a shape change.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct HintContext {
     /// Whether the selected row is a live pane.
     pub alive: bool,
+    /// Whether the selected row's glyph is `▲` -- something is waiting on the
+    /// operator there.
+    pub needs_action: bool,
+    /// Whether the selected row is an ended pane (a retained completed-worker
+    /// row, or one reaped and still on screen).
+    pub ended: bool,
 }
 
 /// Pure: the `(chord, label)` pairs the header offers for `context`, in
@@ -107,12 +115,25 @@ pub struct HintContext {
 ///
 /// This is the one table the cluster, its hit regions and -- from phase 3 --
 /// the context menu are all built from, so a chord can never be drawn without
-/// a hit region or vice versa. A live pane gets the actions that apply to it;
-/// anything else falls back to the two that always exist. Phases 3 and 4 add
-/// `^A i inspect` and `^A r restore` here once those actions exist; naming
-/// them before they do would draw a hint that does nothing.
+/// a hit region or vice versa. The order is most specific first: a row that
+/// needs action, then an ended row, then any other live pane, then the two
+/// hints that always exist.
+///
+/// `^A r restore` is deliberately still absent: that action arrives in phase
+/// 3, and naming it before it exists would draw a hint that does nothing.
+/// `^A i inspect` IS offered, mapped for now onto the existing errors/evidence
+/// overlay -- see [`hint_id`].
 pub fn header_hints(context: &HintContext) -> Vec<(&'static str, &'static str)> {
-    if context.alive {
+    if context.needs_action {
+        vec![
+            ("^A i", "inspect"),
+            ("^A c", "actions"),
+            ("^A n", "nudge"),
+            ("^A ?", "help"),
+        ]
+    } else if context.ended {
+        vec![("^A i", "inspect"), ("^A c", "actions"), ("^A ?", "help")]
+    } else if context.alive {
         vec![
             ("^A c", "actions"),
             ("^A n", "nudge"),
@@ -133,39 +154,24 @@ fn hint_id(key: &str) -> HintId {
         "^A n" => HintId::Nudge,
         "^A m" => HintId::Mail,
         "^A e" => HintId::Errors,
+        "^A i" => HintId::Inspect,
         _ => HintId::Help,
     }
 }
 
-/// Pure: where [`header_spans`] draws each hint of the cluster, so a click on
-/// one can be turned back into its action.
+/// Pure: where the header actually drew each hint chord, so a click on one can
+/// be turned back into its action.
 ///
-/// Laid out exactly as `header_spans` lays it out -- right-aligned as a
-/// block, `key` + one space + `label`, two spaces between hints -- and every
-/// rect clipped to `area`, so a cluster wider than the header reports only
-/// the part that was actually drawn rather than regions off-screen.
-pub fn header_hint_regions(area: Rect, context: &HintContext) -> Vec<(Rect, HintId)> {
-    let hints = header_hints(context);
-    let width: usize = hints
-        .iter()
-        .map(|(key, label)| key.len() + 1 + label.len())
-        .sum::<usize>()
-        + hints.len().saturating_sub(1) * 2;
-    let mut x = area.right().saturating_sub(width as u16).max(area.x);
-    hints
-        .into_iter()
-        .map(|(key, label)| {
-            let width = (key.len() + 1 + label.len()) as u16;
-            let rect = Rect::new(
-                x,
-                area.y,
-                width.min(area.right().saturating_sub(x)),
-                area.height.min(1),
-            );
-            x = x.saturating_add(width + 2);
-            (rect, hint_id(key))
-        })
-        .collect()
+/// Derived from [`header_layout`]'s own single pass rather than re-deriving a
+/// right-aligned block: the drawn cluster is right-aligned only while the row
+/// has room for it, and a header shrunk below its fixed content pushes the
+/// chords rightward off the row instead. Recomputing "right edge minus cluster
+/// width" then produced rects sitting on top of the chip and the harness
+/// label, so a click on visible left-hand text fired a header action and each
+/// chord's rect named its neighbour's text (review of bf1474f). A chord no
+/// part of which was drawn gets no rect at all.
+pub fn header_hint_regions(area: Rect, facts: &HeaderFacts) -> Vec<(Rect, HintId)> {
+    header_layout(facts, area).1
 }
 
 /// Issue #264: where an aggregate-row cell's value came from -- currently
@@ -298,6 +304,87 @@ pub fn row_state_for(state: &PaneState) -> RowState {
     }
 }
 
+/// The six -- and only six -- states the sidebar's glyph column can draw
+/// (approved design, operator decision 3). Every one is a distinct *shape* as
+/// well as a distinct colour: colour alone is never the carrier.
+///
+/// This is deliberately a second, narrower enum rather than more [`RowState`]
+/// variants. `RowState` says what the *dashboard itself* can observe about a
+/// pane (its `PaneState`, or nothing at all for a view-only row); `Glyph` is
+/// what the composed [`super::super::attention`] model projects, which is a
+/// strictly richer question and answerable for a session this dashboard has no
+/// pane for. Keeping them apart is what makes the fallback in [`glyph_for`]
+/// -- no status file, no guess -- expressible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Glyph {
+    /// `⠋` cyan.
+    Working,
+    /// `●` green.
+    Idle,
+    /// `▲` yellow -- [`Projection::Blocked`].
+    NeedsAction,
+    /// `◆` magenta -- finished, and nobody has looked at it yet.
+    DoneUnread,
+    /// `✗` red.
+    Failed,
+    /// `·` dim.
+    Unknown,
+}
+
+/// The attention states, in the fixed order a rollup lists them. Any one of
+/// them present in a rollup's members suppresses the quiet set entirely
+/// (approved design's frame A vs. frame B).
+const ATTENTION_GLYPHS: [Glyph; 3] = [Glyph::NeedsAction, Glyph::Failed, Glyph::DoneUnread];
+
+/// The quiet states, in the fixed order a rollup lists them when nothing in
+/// [`ATTENTION_GLYPHS`] is present.
+const QUIET_GLYPHS: [Glyph; 3] = [Glyph::Working, Glyph::Idle, Glyph::Unknown];
+
+/// Pure: the [`Glyph`] a row draws, from its cached
+/// [`SessionStatus`](super::super::attention::SessionStatus) when one exists
+/// and from the pane's own [`RowState`] when it does not.
+///
+/// Three rules, in this order:
+///
+/// 1. **An ended pane's exit code decides, not the projection.**
+///    `attention::project` maps every `Lifecycle::Exited` to
+///    `Projection::Failed`, which would paint a worker that finished its job
+///    and exited 0 red. A nonzero exit is `✗`; a clean one is `◆` until the
+///    operator has actually seen it and `●` afterwards.
+/// 2. **Otherwise the projection decides**, one-for-one.
+/// 3. **`Projection::Unknown` -- which is exactly what a missing or
+///    never-written status file reads back as -- falls through to
+///    `RowState`**, so a dashboard with no issue #349 writers anywhere still
+///    renders precisely the phase 1 sidebar rather than a column of `·`.
+pub fn glyph_for(row: &SidebarRow) -> Glyph {
+    if let Some(code) = row.exit_code {
+        return if code != 0 {
+            Glyph::Failed
+        } else if row
+            .status
+            .as_ref()
+            .is_some_and(|s| s.visibility == Visibility::Unseen)
+        {
+            Glyph::DoneUnread
+        } else {
+            Glyph::Idle
+        };
+    }
+    match row.status.as_ref().map(super::super::attention::project) {
+        Some(Projection::Working) => Glyph::Working,
+        Some(Projection::Blocked(_)) => Glyph::NeedsAction,
+        Some(Projection::DoneUnread) => Glyph::DoneUnread,
+        Some(Projection::IdleSeen) => Glyph::Idle,
+        Some(Projection::Failed) => Glyph::Failed,
+        Some(Projection::Unknown) | None => match row.state {
+            RowState::Working => Glyph::Working,
+            RowState::Idle => Glyph::Idle,
+            RowState::Dead => Glyph::Failed,
+            RowState::Unknown => Glyph::Unknown,
+        },
+    }
+}
+
 /// One sidebar row: a dashboard pane (`attached: true`) or a view-only
 /// registry session this dashboard did not spawn (`attached: false`).
 ///
@@ -347,6 +434,17 @@ pub struct SidebarRow {
     pub age_secs: Option<u64>,
     pub score: Option<u32>,
     pub state: RowState,
+    /// Issue #354 phase 2: this session's composed attention status as of the
+    /// last `FactsCache` refresh (`attention::load`), never a per-frame read.
+    /// `None` means this row was built before the first refresh; a status that
+    /// projects `Unknown` (the shape a missing file loads back as) is treated
+    /// exactly the same way -- see [`glyph_for`].
+    pub status: Option<SessionStatus>,
+    /// `Some(code)` for a **retained ended row**: a completed pane the roster
+    /// keeps on screen after `reap_ended_panes` removed the `Pane` itself.
+    /// Never set for a live pane, and it is what makes a clean exit
+    /// distinguishable from a failure (see [`glyph_for`]).
+    pub exit_code: Option<i32>,
     pub attached: bool,
     pub selected: bool,
     pub focused: bool,
@@ -759,8 +857,8 @@ fn map_color(c: vt100::Color) -> Color {
 /// to `area` on its own -- but is not going to look polished either; that
 /// floor is well below `chrome::MIN_DASH_COLS` and is accepted the same way
 /// the old header's own extreme-width tests were.
-fn header_spans(facts: &HeaderFacts, cols: u16) -> Vec<Span<'static>> {
-    let cols = cols as usize;
+fn header_layout(facts: &HeaderFacts, area: Rect) -> (Vec<Span<'static>>, Vec<(Rect, HintId)>) {
+    let cols = area.width as usize;
 
     let chip_text = " zirv ".to_string();
     let harness_text = format!(" {}", facts.harness);
@@ -846,21 +944,35 @@ fn header_spans(facts: &HeaderFacts, cols: u16) -> Vec<Span<'static>> {
     if pad > 0 {
         spans.push(Span::raw(" ".repeat(pad)));
     }
+    // The cluster starts wherever the padding actually left it -- which is the
+    // right edge only while the row had room. `regions` is built from this
+    // same running column, so a click rect can never name a chord the row drew
+    // somewhere else, or one it never drew at all.
+    let mut column = used + pad;
+    let mut regions: Vec<(Rect, HintId)> = Vec::new();
     for (i, (key, label)) in hints.into_iter().enumerate() {
         if i > 0 {
             spans.push(Span::raw("  "));
+            column += 2;
         }
+        let width = style::display_width(key) + 1 + style::display_width(label);
+        let start = area.x.saturating_add(column.min(u16::MAX as usize) as u16);
+        let drawn = area.right().saturating_sub(start).min(width as u16);
+        if drawn > 0 && !area.is_empty() {
+            regions.push((Rect::new(start, area.y, drawn, 1), hint_id(key)));
+        }
+        column += width;
         spans.push(Span::styled(key, style::tui::hint()));
         spans.push(Span::raw(format!(" {label}")));
     }
-    spans
+    (spans, regions)
 }
 
 pub fn render_header(f: &mut Frame, area: Rect, facts: &HeaderFacts) {
     if area.is_empty() {
         return;
     }
-    let spans = header_spans(facts, area.width);
+    let (spans, _) = header_layout(facts, area);
     f.render_widget(
         Paragraph::new(Line::from(spans)),
         Rect { height: 1, ..area },
@@ -1256,25 +1368,31 @@ pub(crate) fn reveal_offset(total: usize, visible: usize, index: usize, offset: 
 /// The glyph character (never coloured on its own -- see [`glyph_style_for`])
 /// a sidebar row's state renders as. A working pane's own glyph advances one
 /// [`style::tui::SPINNER_FRAMES`] frame per render tick.
-fn glyph_char_for(state: RowState, tick: usize) -> &'static str {
-    match state {
-        RowState::Working => style::tui::SPINNER_FRAMES[tick % style::tui::SPINNER_FRAMES.len()],
-        RowState::Idle => "\u{25cf}",
-        RowState::Dead => "\u{2717}",
-        RowState::Unknown => "\u{00b7}",
+fn glyph_char_for(glyph: Glyph, tick: usize) -> &'static str {
+    match glyph {
+        Glyph::Working => style::tui::SPINNER_FRAMES[tick % style::tui::SPINNER_FRAMES.len()],
+        Glyph::Idle => "\u{25cf}",
+        Glyph::NeedsAction => "\u{25b2}",
+        Glyph::DoneUnread => "\u{25c6}",
+        Glyph::Failed => "\u{2717}",
+        Glyph::Unknown => "\u{00b7}",
     }
 }
 
 /// The glyph's own colour: cyan for a working pane's spinner, green for a
-/// live-but-idle one, red for exited/dead, and no colour at all (default
+/// live-but-idle one, yellow for one waiting on the operator, magenta for one
+/// that finished unnoticed, red for exited/dead, and no colour at all (default
 /// monochrome, matching every view-only row before this phase) for a row
-/// whose state cannot be observed from here.
-fn glyph_style_for(state: RowState) -> Style {
-    match state {
-        RowState::Working => style::tui::accent(),
-        RowState::Idle => style::tui::ok(),
-        RowState::Dead => style::tui::error(),
-        RowState::Unknown => Style::default(),
+/// whose state cannot be observed from here. Colour is never the only carrier
+/// -- every glyph above is its own shape too.
+fn glyph_style_for(glyph: Glyph) -> Style {
+    match glyph {
+        Glyph::Working => style::tui::accent(),
+        Glyph::Idle => style::tui::ok(),
+        Glyph::NeedsAction => style::tui::warning(),
+        Glyph::DoneUnread => style::tui::unread(),
+        Glyph::Failed => style::tui::error(),
+        Glyph::Unknown => Style::default(),
     }
 }
 
@@ -1405,7 +1523,7 @@ fn sidebar_row_parts(
     let glyph = if row.selected {
         base
     } else {
-        glyph_style_for(row.state).patch(base)
+        glyph_style_for(glyph_for(row)).patch(base)
     };
     let rot = if row.selected {
         base
@@ -1422,7 +1540,7 @@ fn sidebar_row_parts(
         .unwrap_or_else(|| style::PLACEHOLDER.into());
     let parts = [
         (row.tree.prefix().to_string(), muted),
-        (glyph_char_for(row.state, tick).to_string(), glyph),
+        (glyph_char_for(glyph_for(row), tick).to_string(), glyph),
         (format!(" {} ", column(&row.short, 8, false)), base),
         (column(&rot_text(row), 3, false), rot),
         (
@@ -1540,20 +1658,31 @@ pub struct RosterFrame {
     pub row_ids: Vec<Hit>,
 }
 
-/// Pure: the glyph counts a summary line or group header shows on its right
-/// -- `⠋3  ●1`, one term per state that has any members, in a fixed order so
-/// the cluster does not reshuffle as sessions change state. Attention states
-/// (`▲`, `✗`, `◆`) arrive with `SessionStatus` in phase 2; only what
-/// [`RowState`] can express today is rendered, never a guess.
+/// Pure: the glyph counts a summary line or group header shows on its right,
+/// one term per glyph that has any members, in a fixed order so the cluster
+/// does not reshuffle as sessions change state.
+///
+/// Two tiers, exactly as the approved design's two reference frames show them:
+/// as soon as anything among its members needs attention the cluster reports
+/// only that -- `▲1  ✗1  ◆1` (frame A) -- and the ordinary working/idle counts
+/// are suppressed; with nothing waiting it reports the quiet set instead --
+/// `⠋3  ●1` (frame B). The counts are the part an operator scans for, so the
+/// scarce right-hand columns go to the states that mean something is owed.
 fn rollup(rows: &[&SidebarRow], tick: usize) -> String {
-    [RowState::Working, RowState::Idle, RowState::Dead]
-        .into_iter()
-        .filter_map(|state| {
-            let count = rows.iter().filter(|r| r.state == state).count();
-            (count > 0).then(|| format!("{}{count}", glyph_char_for(state, tick)))
-        })
-        .collect::<Vec<_>>()
-        .join("  ")
+    let render = |set: &[Glyph]| -> Vec<String> {
+        set.iter()
+            .filter_map(|glyph| {
+                let count = rows.iter().filter(|r| glyph_for(r) == *glyph).count();
+                (count > 0).then(|| format!("{}{count}", glyph_char_for(*glyph, tick)))
+            })
+            .collect()
+    };
+    let attention = render(&ATTENTION_GLYPHS);
+    if attention.is_empty() {
+        render(&QUIET_GLYPHS).join("  ")
+    } else {
+        attention.join("  ")
+    }
 }
 
 /// Pure: `left` at the left edge, `right` at the right, padded to exactly
@@ -1798,7 +1927,7 @@ pub fn frame_snapshot(
     layout: &DashLayout,
     zoomed: bool,
     roster: &RosterFrame,
-    hints: &HintContext,
+    header: &HeaderFacts,
     overlay: &Overlay,
 ) -> FrameSnapshot {
     FrameSnapshot {
@@ -1823,7 +1952,10 @@ pub fn frame_snapshot(
         grid: if zoomed { frame } else { layout.main },
         rows: roster.hits.clone(),
         roster: roster.row_ids.clone(),
-        header_hints: header_hint_regions(layout.header, hints),
+        // Straight from the same layout pass `render_header` draws from, so
+        // the click rects and the drawn chords can never describe different
+        // columns (the same discipline the divider already follows).
+        header_hints: header_hint_regions(layout.header, header),
         // The footer carries no `^A x` chords today (the spend segment and
         // the status grammar are both read-only), so it owns no hit regions
         // yet; `Hit::FooterHint` exists for the phases that add them.
@@ -2797,6 +2929,18 @@ static HELP_BINDINGS: &[HelpBinding] = &[
             DashAction::Handover,
         )],
     },
+    // Issue #354 phase 2: the header's `^A i inspect` hint has to lead
+    // somewhere, so it is mapped onto the errors/evidence overlay until the
+    // real per-session inspector lands in phase 3.
+    HelpBinding {
+        label: "i",
+        description: "inspect (evidence)",
+        section: HelpSection::Prefixed,
+        checks: &[(
+            KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE),
+            DashAction::ShowErrors,
+        )],
+    },
     HelpBinding {
         label: "e",
         description: "recent errors",
@@ -3100,6 +3244,8 @@ mod tests {
                         } else {
                             RowState::Working
                         },
+                        status: None,
+                        exit_code: None,
                         attached: true,
                         selected: i == 0,
                         focused: i == 0,
@@ -3309,14 +3455,8 @@ mod tests {
                 let zoomed = scenario == "zoom";
                 let mut header = base_facts();
                 header.hints.alive = true;
-                let snapshot = frame_snapshot(
-                    area,
-                    &layout,
-                    zoomed,
-                    &roster,
-                    &header.hints,
-                    &Overlay::None,
-                );
+                let snapshot =
+                    frame_snapshot(area, &layout, zoomed, &roster, &header, &Overlay::None);
                 let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
                 terminal
                     .draw(|f| {
@@ -3472,7 +3612,7 @@ mod tests {
         terminal
             .draw(|f| render_header(f, f.area(), &facts))
             .unwrap();
-        for (rect, _) in header_hint_regions(Rect::new(0, 0, 200, 1), &facts.hints) {
+        for (rect, _) in header_hint_regions(Rect::new(0, 0, 200, 1), &facts) {
             assert_eq!(terminal.backend().buffer()[(rect.x, 0)].symbol(), "^");
             assert!(
                 terminal.backend().buffer()[(rect.x, 0)]
@@ -4058,6 +4198,82 @@ mod tests {
         assert!(text.contains("zirv"), "chip missing: {text}");
     }
 
+    /// Issue #354 phase 2 (review of bf1474f): the header's click rects come
+    /// from the same layout pass that drew the chords, so at a width where the
+    /// fixed left content plus the cluster no longer fit -- the cluster is
+    /// pushed right, off the row, instead of staying right-aligned -- every
+    /// rect still lands exactly on its own chord's `^`, and a chord that was
+    /// not drawn at all has no rect to click. The old right-aligned
+    /// recomputation put rects on top of the chip and the harness label.
+    #[test]
+    fn header_hint_rects_land_on_the_chords_that_were_actually_drawn() {
+        let mut facts = base_facts();
+        facts.hints.alive = true;
+        for width in 1..=90u16 {
+            let area = Rect::new(0, 0, width, 1);
+            let backend = TestBackend::new(width, 1);
+            let mut term = Terminal::new(backend).unwrap();
+            term.draw(|f| render_header(f, area, &facts)).unwrap();
+            let buf = term.backend().buffer().clone();
+            let regions = header_hint_regions(area, &facts);
+            for (rect, id) in &regions {
+                assert!(
+                    rect.right() <= area.right(),
+                    "width {width}: {id:?} rect {rect:?} runs past the header"
+                );
+                assert_eq!(
+                    buf[(rect.x, 0)].symbol(),
+                    "^",
+                    "width {width}: {id:?} rect {rect:?} must start on its own chord"
+                );
+            }
+            // And no rect may claim a column the chip or the harness label
+            // owns: at every width the leftmost rect starts at or after the
+            // last drawn non-hint character.
+            if let Some((first, _)) = regions.first() {
+                assert!(
+                    first.x >= style::display_width(" zirv ") as u16,
+                    "width {width}: a hint rect overlapped the brand chip"
+                );
+            }
+        }
+    }
+
+    /// The cluster is chosen by the selected row's own state, most specific
+    /// first, and never exceeds the approved four-hint cap.
+    #[test]
+    fn header_hints_follow_the_selected_rows_state() {
+        let needs_action = HintContext {
+            alive: true,
+            needs_action: true,
+            ended: false,
+        };
+        assert_eq!(
+            header_hints(&needs_action),
+            vec![
+                ("^A i", "inspect"),
+                ("^A c", "actions"),
+                ("^A n", "nudge"),
+                ("^A ?", "help"),
+            ]
+        );
+        let ended = HintContext {
+            alive: false,
+            needs_action: false,
+            ended: true,
+        };
+        // Restore is phase 3: an ended row is never offered a hint for an
+        // action that does not exist yet.
+        assert_eq!(
+            header_hints(&ended),
+            vec![("^A i", "inspect"), ("^A c", "actions"), ("^A ?", "help")]
+        );
+        assert!(!header_hints(&ended).iter().any(|(_, l)| *l == "restore"));
+        for context in [needs_action, ended, HintContext::default()] {
+            assert!(header_hints(&context).len() <= 4);
+        }
+    }
+
     fn render_and_capture_text(area: Rect, draw: impl FnOnce(&mut Frame, Rect)) -> String {
         let backend = TestBackend::new(area.width, area.height);
         let mut term = Terminal::new(backend).unwrap();
@@ -4181,11 +4397,49 @@ mod tests {
             age_secs: Some(90),
             score: None,
             state,
+            status: None,
+            exit_code: None,
             attached: true,
             selected: false,
             focused: false,
             supervised: true,
         }
+    }
+
+    /// A row whose composed attention status projects `projection` -- the
+    /// shape phase 2's glyph column actually reads.
+    fn attention_row(short: &str, projection: Projection) -> SidebarRow {
+        let mut row = sidebar_row(short, "claude", RowState::Working);
+        row.status = Some(status_for(projection));
+        row
+    }
+
+    /// The smallest `SessionStatus` that projects `projection`. Built through
+    /// the real fields rather than a fake enum so `attention::project`'s own
+    /// rules (attention beats lifecycle; the unseen latch) stay the authority.
+    fn status_for(projection: Projection) -> SessionStatus {
+        use super::super::super::attention::Lifecycle;
+        let mut status = SessionStatus {
+            revision: 7,
+            last_transition: 100,
+            ..Default::default()
+        };
+        match projection {
+            Projection::Working => status.lifecycle = Lifecycle::Working,
+            Projection::Blocked(attention) => {
+                status.lifecycle = Lifecycle::Waiting;
+                status.attention = attention;
+            }
+            Projection::DoneUnread => {
+                status.lifecycle = Lifecycle::Settled;
+                status.visibility = Visibility::Unseen;
+            }
+            Projection::IdleSeen => status.lifecycle = Lifecycle::Settled,
+            Projection::Failed => status.lifecycle = Lifecycle::Exited,
+            Projection::Unknown => {}
+        }
+        assert_eq!(super::super::super::attention::project(&status), projection);
+        status
     }
 
     #[test]
@@ -4198,9 +4452,11 @@ mod tests {
 
     #[test]
     fn glyph_char_matches_the_spec_per_state() {
-        assert_eq!(glyph_char_for(RowState::Idle, 0), "\u{25cf}");
-        assert_eq!(glyph_char_for(RowState::Dead, 0), "\u{2717}");
-        assert_eq!(glyph_char_for(RowState::Unknown, 0), "\u{00b7}");
+        assert_eq!(glyph_char_for(Glyph::Idle, 0), "\u{25cf}");
+        assert_eq!(glyph_char_for(Glyph::Failed, 0), "\u{2717}");
+        assert_eq!(glyph_char_for(Glyph::Unknown, 0), "\u{00b7}");
+        assert_eq!(glyph_char_for(Glyph::NeedsAction, 0), "\u{25b2}");
+        assert_eq!(glyph_char_for(Glyph::DoneUnread, 0), "\u{25c6}");
     }
 
     /// The working glyph advances one spinner frame per tick, wrapping back
@@ -4210,14 +4466,344 @@ mod tests {
         let frames = style::tui::SPINNER_FRAMES;
         for tick in 0..frames.len() * 2 {
             assert_eq!(
-                glyph_char_for(RowState::Working, tick),
+                glyph_char_for(Glyph::Working, tick),
                 frames[tick % frames.len()]
             );
         }
         assert_eq!(
-            glyph_char_for(RowState::Working, 0),
-            glyph_char_for(RowState::Working, frames.len())
+            glyph_char_for(Glyph::Working, 0),
+            glyph_char_for(Glyph::Working, frames.len())
         );
+    }
+
+    /// A summary with no live aggregate cells: the phase 2 tests below are
+    /// about the glyph rollups, and the aggregate row only ever draws under a
+    /// summary line the cursor is actually parked on.
+    fn test_summary() -> SidebarSummary {
+        SidebarSummary {
+            aggregate: no_live_source(),
+        }
+    }
+
+    /// The plain text of one laid-out roster line -- what an operator sees on
+    /// that row, styling aside.
+    fn roster_line_text(roster: &RosterFrame, index: usize) -> String {
+        roster.lines[index]
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    /// Every one of the six approved glyphs is reachable from a projection,
+    /// each with its own shape AND its own colour -- never colour alone.
+    #[test]
+    fn every_projection_maps_to_its_own_glyph_shape_and_colour() {
+        use super::super::super::attention::Attention;
+        let cases = [
+            (Projection::Working, Glyph::Working, "\u{280b}"),
+            (
+                Projection::Blocked(Attention::Approval),
+                Glyph::NeedsAction,
+                "\u{25b2}",
+            ),
+            (Projection::DoneUnread, Glyph::DoneUnread, "\u{25c6}"),
+            (Projection::IdleSeen, Glyph::Idle, "\u{25cf}"),
+            (Projection::Failed, Glyph::Failed, "\u{2717}"),
+        ];
+        let mut shapes = HashSet::new();
+        let mut colours = Vec::new();
+        for (projection, glyph, symbol) in cases {
+            let row = attention_row("aaa11111", projection);
+            assert_eq!(glyph_for(&row), glyph, "{projection:?}");
+            assert_eq!(glyph_char_for(glyph, 0), symbol, "{projection:?}");
+            shapes.insert(symbol);
+            colours.push(glyph_style_for(glyph).fg);
+        }
+        assert_eq!(shapes.len(), 5, "each state needs its own shape");
+        // Blocked/failed/done-unread/idle are four distinct hues; working is
+        // the fifth. Unknown is the only glyph with no colour of its own.
+        colours.sort_by_key(|c| format!("{c:?}"));
+        colours.dedup();
+        assert_eq!(colours.len(), 5, "each state needs its own colour");
+        assert_eq!(glyph_style_for(Glyph::Unknown), Style::default());
+    }
+
+    /// A row with no cached status -- no issue #349 writer has ever recorded
+    /// anything for it -- keeps exactly the phase 1 glyph. So does one whose
+    /// status projects `Unknown`, which is what a missing or corrupt file
+    /// loads back as: the two are indistinguishable and must render the same.
+    #[test]
+    fn a_row_with_no_attention_data_falls_back_to_the_pane_state() {
+        for state in [
+            RowState::Working,
+            RowState::Idle,
+            RowState::Dead,
+            RowState::Unknown,
+        ] {
+            let mut row = sidebar_row("aaa11111", "claude", state);
+            let fallback = glyph_for(&row);
+            row.status = Some(status_for(Projection::Unknown));
+            assert_eq!(
+                glyph_for(&row),
+                fallback,
+                "{state:?}: an Unknown projection must read exactly like no status at all"
+            );
+        }
+        assert_eq!(
+            glyph_for(&sidebar_row("a", "claude", RowState::Working)),
+            Glyph::Working
+        );
+        assert_eq!(
+            glyph_for(&sidebar_row("a", "claude", RowState::Unknown)),
+            Glyph::Unknown
+        );
+    }
+
+    /// A retained ended row's EXIT CODE decides its glyph. `attention::project`
+    /// maps every `Exited` lifecycle to `Failed`, so trusting the projection
+    /// here would paint a worker that finished its job and exited 0 red.
+    #[test]
+    fn an_ended_rows_exit_code_decides_its_glyph_not_the_projection() {
+        let mut row = sidebar_row("aaa11111", "claude", RowState::Dead);
+        row.attached = false;
+        row.status = Some(status_for(Projection::Failed));
+
+        row.exit_code = Some(1);
+        assert_eq!(glyph_for(&row), Glyph::Failed);
+
+        // A clean exit is done-unread until the operator has seen it...
+        row.exit_code = Some(0);
+        let mut unseen = row.status.clone().unwrap();
+        unseen.visibility = Visibility::Unseen;
+        row.status = Some(unseen);
+        assert_eq!(glyph_for(&row), Glyph::DoneUnread);
+
+        // ...and idle afterwards.
+        let mut seen = row.status.clone().unwrap();
+        seen.visibility = Visibility::Seen;
+        row.status = Some(seen);
+        assert_eq!(glyph_for(&row), Glyph::Idle);
+    }
+
+    /// Frame A vs. frame B: anything needing attention takes the rollup on its
+    /// own; with nothing waiting, the quiet counts show instead.
+    #[test]
+    fn a_rollup_reports_attention_states_alone_and_the_quiet_set_otherwise() {
+        use super::super::super::attention::Attention;
+        let quiet = [
+            attention_row("a", Projection::Working),
+            attention_row("b", Projection::Working),
+            attention_row("c", Projection::IdleSeen),
+        ];
+        assert_eq!(
+            rollup(&quiet.iter().collect::<Vec<_>>(), 0),
+            format!("{}2  \u{25cf}1", style::tui::SPINNER_FRAMES[0])
+        );
+
+        let mut loud = quiet.to_vec();
+        loud.push(attention_row("d", Projection::Blocked(Attention::Approval)));
+        loud.push(attention_row("e", Projection::Failed));
+        loud.push(attention_row("f", Projection::DoneUnread));
+        assert_eq!(
+            rollup(&loud.iter().collect::<Vec<_>>(), 0),
+            "\u{25b2}1  \u{2717}1  \u{25c6}1",
+            "one thing waiting suppresses the working/idle counts entirely"
+        );
+
+        // A roster of nothing but unobservable view-only rows still says so
+        // rather than rendering an empty cluster.
+        let unknown = [sidebar_row("g", "claude", RowState::Unknown)];
+        assert_eq!(rollup(&unknown.iter().collect::<Vec<_>>(), 0), "\u{00b7}1");
+        assert_eq!(rollup(&[], 0), "");
+    }
+
+    /// The approved 200×50 frame A, exactly: a work group of four whose lead
+    /// is selected and waiting for approval, with the orchestrator flat above
+    /// it. Asserts the summary line, the group header's rollup and the `▲`
+    /// row against the 44-column contract, character for character.
+    #[test]
+    fn the_attention_heavy_reference_frame_matches_the_column_contract() {
+        use super::super::super::attention::Attention;
+        let group = GroupRef {
+            id: "g".into(),
+            scope: "audit".into(),
+            lead_short: "a0000002".into(),
+        };
+        let member = |short: &str, role: &str, model: &str, age: u64, score: u32, p: Projection| {
+            SidebarRow {
+                role: role.into(),
+                model: Some(model.into()),
+                group: Some(group.clone()),
+                age_secs: Some(age),
+                score: Some(score),
+                ..attention_row(short, p)
+            }
+        };
+        let mut rows = vec![SidebarRow {
+            role: "orch".into(),
+            model: Some("fable".into()),
+            age_secs: Some(840),
+            score: Some(12),
+            ..attention_row("a0000001", Projection::Working)
+        }];
+        rows.push(member(
+            "a0000002",
+            "sub-orch",
+            "gpt-6-astra",
+            540,
+            21,
+            Projection::Blocked(Attention::Approval),
+        ));
+        rows.push(member(
+            "a0000003",
+            "worker",
+            "sonnet",
+            420,
+            8,
+            Projection::Failed,
+        ));
+        rows.push(member(
+            "a0000004",
+            "worker",
+            "gpt-5.6-terra",
+            360,
+            30,
+            Projection::DoneUnread,
+        ));
+        rows.push(member(
+            "a0000005",
+            "worker",
+            "haiku",
+            300,
+            4,
+            Projection::IdleSeen,
+        ));
+        rows[1].selected = true;
+
+        let nothing_collapsed = HashSet::new();
+        let roster = roster_frame(
+            Rect::new(0, 0, 44, 50),
+            &rows,
+            &test_summary(),
+            &test_roster_view(&nothing_collapsed),
+        );
+
+        // The summary line: `  <n> live` left, the attention rollup right.
+        // Every row is a live pane, so `live` counts all five even though one
+        // of them has failed verification.
+        let counts = "\u{25b2}1  \u{2717}1  \u{25c6}1";
+        assert_eq!(
+            roster_line_text(&roster, 0),
+            format!("  5 live{}{counts}", " ".repeat(44 - 8 - 10))
+        );
+
+        // Line 1 is the ungrouped orchestrator: spawn order is never re-sorted
+        // by attention, so the group header sits at its first member's own
+        // position, on line 2.
+        assert_eq!(
+            roster_line_text(&roster, 1),
+            format!(
+                "  {} a0000001 \u{273b}12 14m orch     fable         ",
+                style::tui::SPINNER_FRAMES[0]
+            )
+        );
+
+        // The group header keeps its own rollup, over its members only.
+        let header = "\u{25be} audit \u{b7} a0000002 \u{b7} 4 workers ";
+        assert_eq!(
+            roster_line_text(&roster, 2),
+            format!(
+                "{header}{}{counts}",
+                " ".repeat(44 - style::display_width(header) - 10)
+            )
+        );
+
+        // And the `▲` row itself, column for column:
+        // tree(2) glyph(1) sp short(8) sp rot(3) sp age(3) sp role(8) sp model(14).
+        assert_eq!(
+            roster_line_text(&roster, 3),
+            "\u{251c} \u{25b2} a0000002 \u{273b}21  9m sub-orch gpt-6-astra   "
+        );
+        assert_eq!(style::display_width(&roster_line_text(&roster, 3)), 44);
+    }
+
+    /// #209 §B holds for the new glyphs too: the selected row is uniformly
+    /// REVERSED and every glyph -- the `▲` included -- drops its own colour so
+    /// the reversal reads as one band; keyboard focus adds BOLD.
+    #[test]
+    fn a_selected_needs_action_row_reverses_and_drops_the_glyph_colour() {
+        use super::super::super::attention::Attention;
+        let mut row = attention_row("aaa11111", Projection::Blocked(Attention::Approval));
+        let unselected = sidebar_row_parts(&row, 0, 44, 40, 70);
+        assert_eq!(unselected[1].content, "\u{25b2}");
+        assert_eq!(unselected[1].style.fg, style::tui::warning().fg);
+
+        row.selected = true;
+        row.focused = true;
+        let selected = sidebar_row_parts(&row, 0, 44, 40, 70);
+        assert_eq!(selected[1].content, "\u{25b2}", "the shape never changes");
+        assert_eq!(
+            selected[1].style.fg, None,
+            "a selected row's glyph drops its own colour (#209 §B)"
+        );
+        for span in &selected {
+            assert!(span.style.add_modifier.contains(Modifier::REVERSED));
+            assert!(span.style.add_modifier.contains(Modifier::BOLD));
+        }
+    }
+
+    /// Every projection, flat and inside a group, at all three reference
+    /// widths: the row draws its own glyph, fills the sidebar exactly, and
+    /// nothing panics at any of them.
+    #[test]
+    fn every_projection_renders_flat_and_grouped_at_every_reference_size() {
+        use super::super::super::attention::Attention;
+        let projections = [
+            Projection::Working,
+            Projection::Blocked(Attention::Approval),
+            Projection::Blocked(Attention::None),
+            Projection::DoneUnread,
+            Projection::IdleSeen,
+            Projection::Failed,
+            Projection::Unknown,
+        ];
+        let group = GroupRef {
+            id: "g".into(),
+            scope: "audit".into(),
+            lead_short: "aaa11111".into(),
+        };
+        for (cols, rows_high) in [(80u16, 20u16), (120, 40), (200, 50)] {
+            let sidebar = Rect::new(0, 0, 44.min(cols), rows_high);
+            for projection in projections {
+                for grouped in [false, true] {
+                    let mut row = attention_row("aaa11111", projection);
+                    if grouped {
+                        row.group = Some(group.clone());
+                    }
+                    row.selected = true;
+                    let collapsed = HashSet::new();
+                    let roster = roster_frame(
+                        sidebar,
+                        std::slice::from_ref(&row),
+                        &test_summary(),
+                        &test_roster_view(&collapsed),
+                    );
+                    let line = roster_line_text(&roster, if grouped { 2 } else { 1 });
+                    assert_eq!(
+                        style::display_width(&line),
+                        sidebar.width as usize,
+                        "{cols}x{rows_high} {projection:?} grouped={grouped}: {line:?}"
+                    );
+                    let expected = glyph_char_for(glyph_for(&row), 0);
+                    assert!(
+                        line.contains(expected),
+                        "{cols}x{rows_high} {projection:?} grouped={grouped}: \
+                         {line:?} is missing {expected}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -4305,6 +4891,8 @@ mod tests {
                 age_secs: Some(5),
                 score: None,
                 state: RowState::Working,
+                status: None,
+                exit_code: None,
                 attached: true,
                 selected: false,
                 focused: true,
@@ -4321,6 +4909,8 @@ mod tests {
                 age_secs: Some(5),
                 score: None,
                 state: RowState::Unknown,
+                status: None,
+                exit_code: None,
                 attached: false,
                 selected: true,
                 focused: false,
@@ -4366,6 +4956,8 @@ mod tests {
             age_secs: None,
             score: None,
             state: RowState::Idle,
+            status: None,
+            exit_code: None,
             attached: true,
             selected,
             focused: false,
