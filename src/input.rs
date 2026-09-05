@@ -159,8 +159,18 @@ fn shortcut_target_is_confined(mapped_file: &str) -> bool {
 
 impl Input {
     pub fn get_file_path(&self) -> Result<PathBuf, Box<dyn std::error::Error>> {
+        // G-4: `exists()` alone accepted a directory (or any extensionless
+        // stray file) named after the command as a direct cwd path,
+        // preempting the real script of the same name in `.zirv/commands/`.
+        // Only a file with a script extension `parse_script_content`
+        // actually supports can take this shortcut.
         let cmd_path = PathBuf::from(&self.command);
-        if cmd_path.exists() {
+        if cmd_path.is_file()
+            && cmd_path
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|ext| SUPPORTED_EXTENSIONS.contains(&ext))
+        {
             return Ok(cmd_path.canonicalize()?);
         }
 
@@ -255,6 +265,35 @@ mod tests {
     {
         let _guard = crate::commands::ctx::testenv::EnvGuard::set(fake_home, Some(fake_cwd));
         test()
+    }
+
+    /// G-4: `get_file_path` accepted the command name as a direct cwd path
+    /// using only `exists()`, so a directory (or any extensionless stray
+    /// file) named after a script preempted the real script in `.zirv/
+    /// commands/`. It must only take the direct-path shortcut for a file
+    /// with a script extension the parser actually supports.
+    #[test]
+    fn a_same_named_directory_does_not_preempt_the_real_script() {
+        let fake_home = tempdir().unwrap();
+        let fake_cwd = tempdir().unwrap();
+        create_dir_all(fake_cwd.path().join("docs")).unwrap();
+        let commands_dir = fake_cwd
+            .path()
+            .join(SCRIPT_DIR_NAME)
+            .join(COMMANDS_DIR_NAME);
+        create_dir_all(&commands_dir).unwrap();
+        write(commands_dir.join("docs.yaml"), "name: Docs\ncommands: []\n").unwrap();
+
+        with_fake_env(fake_home.path(), fake_cwd.path(), || {
+            let input = Input {
+                command: "docs".to_string(),
+                ..Default::default()
+            };
+            let path = input
+                .get_file_path()
+                .expect("the real script must resolve despite the same-named directory");
+            assert!(path.ends_with("docs.yaml"), "got: {}", path.display());
+        });
     }
 
     /// These live on the shared `Input` struct, so clap accepts them for every
