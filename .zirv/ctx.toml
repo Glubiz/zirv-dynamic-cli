@@ -48,6 +48,12 @@ model = "fable"
 # max_cycles_without_progress = 5   # narrow-only (a repo layer may only LOWER this): consecutive no-progress cycles before the loop gives up.
 # judge = true                      # narrow-only (a repo layer may only turn this OFF): whether a cheap-model verdict is consulted once every gate is green.
 
+# [screen]                           # screen.rs round 2 (issue #272) repetition-dominated thresholds; every key below is narrow-only (a repo layer may only make detection STRICTER, never looser)
+# repetition_min_fragment = 400      # narrow-only (a repo layer may only LOWER this): a fragment shorter than this many bytes is never flagged, no matter how repetitive.
+# repetition_window = 60             # narrow-only (a repo layer may only LOWER this): the exact-match sliding-window size, in bytes, used by the window-level check.
+# repetition_min_repeats = 5         # narrow-only (a repo layer may only LOWER this): how many times one window (or line) must repeat before it is even a candidate.
+# repetition_dominance_pct = 0.5     # narrow-only (a repo layer may only LOWER this): the fraction of the fragment's own length the repeats must cover to count as dominated.
+
 # [handover.claude]                 # every key below is REPO-FORBIDDEN (ZIRV_CTX_HANDOVER_CLAUDE_CHEAP / _STANDARD / _DEEP) -- model-id override for `zirv ctx handover`'s generic tiers on a claude target.
 # cheap = "haiku"                   # Default: unset (built-in ladder default "haiku").
 # standard = "sonnet"               # Default: unset (built-in ladder default "sonnet").
