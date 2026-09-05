@@ -721,6 +721,18 @@ pub enum RolloutRecord {
         /// not understand.
         windows: Option<UsageWindows>,
         totals: Option<RolloutTokenTotals>,
+        /// `info.last_token_usage`, the SINGLE most recent request's usage
+        /// rather than the session's running total. Its `input_tokens` is
+        /// the prompt this request actually sent, i.e. the live context
+        /// occupancy -- the figure rot's token gate needs, as opposed to
+        /// `totals` above, which only ever climbs and describes cumulative
+        /// spend (what `transcript_usage` reports). `None` when the node is
+        /// absent.
+        last: Option<RolloutTokenTotals>,
+        /// `info.model_context_window`: the seat's real capacity as the
+        /// harness itself reports it, for rot's capacity-aware gates. `None`
+        /// -- never a guess -- when the line does not state one.
+        context_window: Option<u64>,
     },
     /// `event_msg` / `payload.type == "task_started"`.
     TaskStarted,
@@ -750,16 +762,20 @@ pub fn parse_rollout_record(line: &str) -> Option<RolloutRecord> {
                     .get("rate_limits")
                     .and_then(|rl| windows_from_rate_limits(rl, at))
             });
-            let totals = payload
-                .pointer("/info/total_token_usage")
-                .map(|t| RolloutTokenTotals {
+            let usage_at = |pointer: &str| {
+                payload.pointer(pointer).map(|t| RolloutTokenTotals {
                     input_tokens: t.get("input_tokens").and_then(Value::as_u64).unwrap_or(0),
                     output_tokens: t.get("output_tokens").and_then(Value::as_u64).unwrap_or(0),
-                });
+                })
+            };
             Some(RolloutRecord::TokenCount {
                 observed_at: observed_at.unwrap_or(0),
                 windows,
-                totals,
+                totals: usage_at("/info/total_token_usage"),
+                last: usage_at("/info/last_token_usage"),
+                context_window: payload
+                    .pointer("/info/model_context_window")
+                    .and_then(Value::as_u64),
             })
         }
         "task_started" => Some(RolloutRecord::TaskStarted),

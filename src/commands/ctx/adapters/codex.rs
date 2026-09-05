@@ -1472,15 +1472,28 @@ impl AgentAdapter for CodexAdapter {
     /// - `task_started` -> `TurnStart` ("task_started and task_complete
     ///   bracket a turn and share a turn_id").
     /// - `task_complete` -> `AssistantFinal { text: last_agent_message
-    ///   .unwrap_or_default(), input_tokens: <most recent cumulative total
-    ///   this parse has seen> }`. `last_agent_message` is `None` on a
-    ///   failed turn (observed as JSON `null`), which reads as empty text --
-    ///   honest, since there is nothing to report, not a guess.
-    /// - `token_count` (whenever `info.total_token_usage` is present) -> its
+    ///   .unwrap_or_default(), input_tokens: <most recent per-request
+    ///   context size this parse has seen> }`. `last_agent_message` is
+    ///   `None` on a failed turn (observed as JSON `null`), which reads as
+    ///   empty text -- honest, since there is nothing to report, not a guess.
+    /// - `token_count` (whenever `info.last_token_usage` is present) -> its
     ///   own `AssistantFinal { text: String::new(), input_tokens }`, so the
     ///   rot engine's token gate (`rot::context_tokens`, "the most recent
-    ///   AssistantFinal's `input_tokens`") tracks codex's real cumulative
-    ///   context size between turn boundaries too, not just at them. The
+    ///   AssistantFinal's `input_tokens`") tracks codex's real context size
+    ///   between turn boundaries too, not just at them. **`last_token_usage`,
+    ///   never `total_token_usage`:** the latter is the session's CUMULATIVE
+    ///   input spend, which only ever climbs, so feeding it to the gate made
+    ///   every codex session cross the token ceiling after a handful of turns
+    ///   and report `Compact` permanently however small its live context
+    ///   was. `last_token_usage` is the one request's own prompt, i.e. the
+    ///   context actually occupied. `cached_input_tokens` is deliberately NOT
+    ///   added on top: unlike claude's `usage` node (where `input_tokens`
+    ///   excludes both cache classes, hence `claude::context_tokens_of`
+    ///   summing them), codex reports `input_tokens` INCLUSIVE of the cached
+    ///   portion -- its own `non_cached_input` subtracts one from the other
+    ///   -- so adding it would double-count. `total_token_usage` is still
+    ///   what `transcript_usage` reports, which genuinely wants cumulative
+    ///   spend. The
     ///   empty text never counts as a "turn" (`rot::turn_final_texts` only
     ///   counts non-empty text) and never touches the marker signal, which
     ///   stays capability-gated off for codex regardless
@@ -1500,11 +1513,13 @@ impl AgentAdapter for CodexAdapter {
     /// "line-local" ideal: if an incremental poll's chunk boundary happens
     /// to split between a `token_count` line and the `task_complete` line
     /// for the same turn, that turn's `AssistantFinal` reports whatever
-    /// `last_tokens` this call has seen so far (`0` if nothing yet) rather
-    /// than the true cumulative count -- self-correcting at the very next
-    /// `token_count` line, which arrives frequently in practice. `rot.rs`
-    /// itself never sees or knows about this: it only ever receives the
-    /// resulting `NormalizedEvent`s.
+    /// `last_tokens` this call has seen so far -- `0` when this chunk
+    /// carried no `token_count` line at all. That `0` is a NON-reading, and
+    /// `rot::context_tokens`/`RotState::feed` both skip zeros for exactly
+    /// this reason (see `rot::context_tokens`'s own doc comment), so a split
+    /// chunk leaves the previously known context size standing instead of
+    /// resetting the token gate to zero. `rot.rs` needs no codex knowledge
+    /// for that: it only ever receives the resulting `NormalizedEvent`s.
     ///
     /// Issue #293: every mapped event's `at_ms` comes from that line's own
     /// top-level `timestamp` (`window::parse_iso8601_utc_ms`), which is
@@ -1557,10 +1572,9 @@ impl AgentAdapter for CodexAdapter {
                     });
                 }
                 Some(RolloutRecord::TokenCount {
-                    totals: Some(totals),
-                    ..
+                    last: Some(last), ..
                 }) => {
-                    last_tokens = totals.input_tokens;
+                    last_tokens = last.input_tokens;
                     events.push(NormalizedEvent::AssistantFinal {
                         text: String::new(),
                         input_tokens: last_tokens,
@@ -1604,6 +1618,22 @@ impl AgentAdapter for CodexAdapter {
             }
         }
         events
+    }
+
+    /// `info.model_context_window` off the newest `token_count` line that
+    /// states one -- the seat's real capacity as codex itself reports it,
+    /// which is what lets rot's capacity-aware gates scale instead of
+    /// falling back to the pre-#155 absolutes. Newest wins, and a fragment
+    /// that states none answers `None` rather than guessing, exactly like
+    /// `model_hint` right below.
+    fn context_window_hint(&self, jsonl: &str) -> Option<u64> {
+        jsonl
+            .lines()
+            .rev()
+            .find_map(|line| match window::parse_rollout_record(line)? {
+                RolloutRecord::TokenCount { context_window, .. } => context_window,
+                RolloutRecord::TaskStarted | RolloutRecord::TaskComplete { .. } => None,
+            })
     }
 
     fn model_hint(&self, jsonl: &str) -> Option<String> {
@@ -1892,6 +1922,72 @@ mod tests {
         );
     }
 
+    /// One synthetic rollout: `turns` turns, each reporting the SAME
+    /// per-request `last_token_usage.input_tokens` (a steady context) while
+    /// `info.total_token_usage.input_tokens` accumulates every turn's spend,
+    /// which is what a real codex session looks like.
+    fn rollout_with_steady_context(turns: u64, context: u64, window: u64) -> String {
+        let mut jsonl = String::new();
+        for turn in 1..=turns {
+            let cumulative = context * turn;
+            jsonl.push_str(&format!(
+                "{{\"timestamp\":\"2026-08-20T10:0{turn}:00.000Z\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_started\",\"turn_id\":\"turn-{turn}\"}}}}\n"
+            ));
+            jsonl.push_str(&format!(
+                "{{\"timestamp\":\"2026-08-20T10:0{turn}:05.000Z\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"token_count\",\"info\":{{\"total_token_usage\":{{\"input_tokens\":{cumulative},\"cached_input_tokens\":0,\"output_tokens\":100,\"total_tokens\":{cumulative}}},\"last_token_usage\":{{\"input_tokens\":{context},\"cached_input_tokens\":0,\"output_tokens\":100,\"total_tokens\":{context}}},\"model_context_window\":{window}}}}}}}\n"
+            ));
+            jsonl.push_str(&format!(
+                "{{\"timestamp\":\"2026-08-20T10:0{turn}:07.000Z\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_complete\",\"turn_id\":\"turn-{turn}\",\"last_agent_message\":\"done\"}}}}\n"
+            ));
+        }
+        jsonl
+    }
+
+    /// The token gate measures the CURRENT context, not the session's
+    /// cumulative input spend. `info.total_token_usage.input_tokens` only
+    /// ever climbs, so feeding it to `AssistantFinal::input_tokens` made
+    /// every codex session cross rot's token ceiling after a handful of
+    /// turns and report `Compact` permanently, however small its real
+    /// context was. `info.last_token_usage` is the per-request figure --
+    /// the real context occupancy -- and is what the gate now reads.
+    #[test]
+    fn codex_token_gate_tracks_context_not_cumulative_spend() {
+        use crate::commands::ctx::config::ScoreConfig;
+        use crate::commands::ctx::rot::{self, Verdict};
+
+        let jsonl = rollout_with_steady_context(6, 30_000, 258_400);
+        let adapter = CodexAdapter::new(None);
+        let events = adapter.parse_events(&jsonl);
+        let score = rot::score_events(&events, adapter.capabilities(), &ScoreConfig::default());
+
+        assert_eq!(
+            score.context_tokens, 30_000,
+            "the gate must read the per-request context, not the 180k cumulative spend"
+        );
+        assert_eq!(
+            score.verdict,
+            Verdict::Healthy,
+            "a 30k-context codex session is healthy, however much it has spent"
+        );
+    }
+
+    /// The same rollout line already carries the model's real context window
+    /// (`info.model_context_window`). Surfacing it is what lets rot's
+    /// capacity-aware gates scale to the seat instead of falling back to the
+    /// pre-#155 absolutes, which a 258k-window codex seat crosses at roughly
+    /// 62% of its real capacity.
+    #[test]
+    fn codex_surfaces_the_rollout_context_window() {
+        let jsonl = rollout_with_steady_context(2, 30_000, 258_400);
+        let adapter = CodexAdapter::new(None);
+        assert_eq!(adapter.context_window_hint(&jsonl), Some(258_400));
+        assert_eq!(
+            adapter.context_window_hint("{\"type\":\"event_msg\"}\n"),
+            None,
+            "a fragment that states no window must never be guessed at"
+        );
+    }
+
     /// Issue #86: the exact normalized event sequence a recorded two-turn
     /// codex rollout fixture must produce -- turn boundaries from
     /// task_started/task_complete, tokens from every token_count snapshot,
@@ -1939,14 +2035,16 @@ mod tests {
                     at_ms: t1_complete,
                 },
                 NormalizedEvent::TurnStart { at_ms: t2_start },
+                // `info.last_token_usage.input_tokens` (this request's own
+                // context), not the 3400 `total_token_usage` running total.
                 NormalizedEvent::AssistantFinal {
                     text: String::new(),
-                    input_tokens: 3400,
+                    input_tokens: 2200,
                     at_ms: t2_tokens,
                 },
                 NormalizedEvent::AssistantFinal {
                     text: String::new(),
-                    input_tokens: 3400,
+                    input_tokens: 2200,
                     at_ms: t2_complete,
                 },
                 NormalizedEvent::ProviderError {
@@ -2008,14 +2106,16 @@ mod tests {
         let jsonl = fixture("codex-rollout-turn-events.jsonl");
         let adapter = CodexAdapter::new(None);
         let events = adapter.parse_events(&jsonl);
-        assert_eq!(crate::commands::ctx::rot::context_tokens(&events), 3400);
+        // The gate reads `last_token_usage` (this turn's own context), never
+        // the 3400 cumulative `total_token_usage` figure.
+        assert_eq!(crate::commands::ctx::rot::context_tokens(&events), 2200);
 
         let score = crate::commands::ctx::rot::score_events(
             &events,
             adapter.capabilities(),
             &crate::commands::ctx::config::ScoreConfig::default(),
         );
-        assert_eq!(score.context_tokens, 3400);
+        assert_eq!(score.context_tokens, 2200);
         assert_eq!(
             score.verdict,
             crate::commands::ctx::rot::Verdict::Healthy,

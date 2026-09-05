@@ -95,12 +95,26 @@ pub fn turn_final_texts(events: &[NormalizedEvent]) -> Vec<String> {
     finals
 }
 
+/// The most recent REPORTED context size: the newest `AssistantFinal` whose
+/// `input_tokens` is non-zero, `0` when no event ever reported one.
+///
+/// Zero is "this event carried no token reading", never "the context is
+/// empty" -- an assistant message cannot occupy zero context, and an adapter
+/// that cannot state a figure for one row (a claude row with no `usage`
+/// node, or a codex `task_complete` whose own `token_count` line fell into
+/// an earlier incremental chunk) must not be read as having measured an
+/// empty window. Skipping zeros here is what keeps a fabricated reading from
+/// silently resetting the token gate to `Healthy` mid-session;
+/// `RotState::feed` holds the identical rule so the incremental fold and a
+/// full parse always agree.
 pub fn context_tokens(events: &[NormalizedEvent]) -> u64 {
     events
         .iter()
         .rev()
         .find_map(|e| match e {
-            NormalizedEvent::AssistantFinal { input_tokens, .. } => Some(*input_tokens),
+            NormalizedEvent::AssistantFinal { input_tokens, .. } if *input_tokens > 0 => {
+                Some(*input_tokens)
+            }
             _ => None,
         })
         .unwrap_or(0)
@@ -410,7 +424,13 @@ impl RotState {
             NormalizedEvent::AssistantFinal {
                 text, input_tokens, ..
             } => {
-                self.last_tokens = *input_tokens;
+                // Zero means "no reading on this event", not "empty
+                // context" -- see `context_tokens`, whose full-parse scan
+                // skips zeros for the same reason, which is what keeps the
+                // two paths in agreement.
+                if *input_tokens > 0 {
+                    self.last_tokens = *input_tokens;
+                }
                 if !text.trim().is_empty() {
                     self.open_marker = Some(has_marker(text, &self.marker));
                 }
@@ -486,6 +506,14 @@ impl RotState {
         self.in_turn = false;
         self.open_marker = None;
         self.segments = VecDeque::from([Segment::default()]);
+        // `segments` is rebuilt from a single pre-turn prefix, so the count
+        // that decides when that prefix is retired has to restart with it.
+        // A full parse reads every windowed signal off the events AFTER the
+        // last `Compaction` (`signals`' own `boundary`), where the turn count
+        // starts at zero again; a counter that kept running across the
+        // boundary retired the post-compaction pre-turn segment one turn
+        // early and dropped tool activity a full parse still sees.
+        self.turn_starts = 0;
     }
 
     /// `None` when `cfg` no longer matches the rules this state was folded
@@ -906,9 +934,26 @@ mod tests {
         same_error_interrupted_by_textless_error.extend(erroring_tool_result("error A"));
         same_error_interrupted_by_textless_error.extend(turns(3, "", "[zirv] ok", false, 120_000));
 
+        // A compaction resets what "recent" means for the FULL parse (every
+        // windowed signal reads only the events after the last `Compaction`),
+        // so the post-compaction pre-turn segment stays reachable until the
+        // post-compaction turn count itself passes the window. The
+        // incremental fold has to agree: a `turn_starts` counter that keeps
+        // counting across the boundary retires that segment a full turn
+        // early, and this fixture's pre-turn tool failure vanishes from the
+        // incremental score while a full parse still sees it.
+        let mut compaction_then_pre_turn_result = turns(12, "", "[zirv] ok", false, 170_000);
+        compaction_then_pre_turn_result.push(NormalizedEvent::Compaction);
+        compaction_then_pre_turn_result.push(NormalizedEvent::ToolResult { is_error: true });
+        compaction_then_pre_turn_result.extend(turns(10, "", "[zirv] ok", false, 120_000));
+
         vec![
             ("empty", Vec::new()),
             ("short", turns(3, "", "[zirv] ok", false, 120_000)),
+            (
+                "compaction then a pre-turn tool result",
+                compaction_then_pre_turn_result,
+            ),
             ("past the window", past_window),
             ("with a compaction", with_compaction),
             ("events before the first turn", before_first_turn),

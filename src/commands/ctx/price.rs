@@ -175,6 +175,17 @@ pub fn built_in_table() -> PriceTable {
         cache_read_micros: 3_000_000,
         output_micros: 150_000_000,
     };
+    // The orchestrator tier above opus (`claude.rs::review_model_below`'s own
+    // top rung, and the model `tests/fixtures/claude-real-session.jsonl`
+    // itself records). No public per-token rate is verifiable for it here, so
+    // it is priced AT the opus rate rather than left out of the table
+    // entirely: an unpriced model reads as `None` and silently omits the most
+    // expensive seat in the fleet from every cost line, which understates the
+    // ledger far worse than a known-approximate figure does. See this
+    // module's own doc comment -- an operator who needs exact numbers
+    // overrides via `~/.zirv/prices.toml`.
+    const FABLE: ModelPrice = OPUS;
+    const FABLE_1M: ModelPrice = OPUS_1M;
     const SONNET: ModelPrice = ModelPrice {
         input_micros: 3_000_000,
         cache_write_micros: 3_750_000,
@@ -218,10 +229,18 @@ pub fn built_in_table() -> PriceTable {
 
     let models = BTreeMap::from([
         // Tier aliases (`handover::equivalent_model`'s own vocabulary).
+        ("fable".to_string(), FABLE),
+        ("mythos".to_string(), FABLE),
         ("opus".to_string(), OPUS),
         ("sonnet".to_string(), SONNET),
         ("haiku".to_string(), HAIKU),
         // Canonical claude model ids a real transcript/`--model` flag names.
+        ("claude-fable-5".to_string(), FABLE),
+        ("claude-fable-5[1m]".to_string(), FABLE_1M),
+        ("claude-fable-5-1".to_string(), FABLE),
+        ("claude-fable-5-1[1m]".to_string(), FABLE_1M),
+        ("claude-mythos-5".to_string(), FABLE),
+        ("claude-mythos-5[1m]".to_string(), FABLE_1M),
         ("claude-opus-5".to_string(), OPUS),
         ("claude-opus-5[1m]".to_string(), OPUS_1M),
         ("claude-sonnet-5".to_string(), SONNET),
@@ -302,6 +321,32 @@ mod tests {
         PriceTable {
             as_of: BUILT_IN_AS_OF.to_string(),
             models: BTreeMap::from([(model.to_string(), rate)]),
+        }
+    }
+
+    /// The built-in table has to price the orchestrator tiers too: the
+    /// recorded real-session fixture carries `claude-fable-5`, and
+    /// `claude.rs::review_model_below` names `fable`/`mythos` as its own top
+    /// rung, so leaving them unpriced silently omitted the most expensive
+    /// seat's cost from `spend`/`status`/the dashboard.
+    #[test]
+    fn the_built_in_table_prices_the_fable_and_mythos_tiers() {
+        let table = built_in_table();
+        let spend = usage(1_000_000, 0, 0, 0);
+        for model in [
+            "fable",
+            "mythos",
+            "claude-fable-5",
+            "claude-fable-5[1m]",
+            "claude-fable-5-1",
+            "claude-fable-5-1[1m]",
+            "claude-mythos-5",
+            "claude-mythos-5[1m]",
+        ] {
+            assert!(
+                price(model, &spend, &table).is_some(),
+                "{model} must be priced, never silently omitted"
+            );
         }
     }
 
