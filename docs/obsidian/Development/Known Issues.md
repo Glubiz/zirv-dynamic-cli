@@ -129,7 +129,6 @@ Recorded 2026-09-05 (`feat/354-dash-ux-audit`, issue #354 phases 1-4). Pointer e
 - **`budget` shows the placeholder for a pane with no `--budget-tokens`.** `Pane::measured_usage` is populated by the budget sweep, which skips unbudgeted panes entirely (`enforce_pane_token_budgets`), so a pane with no ceiling has no measured usage to show either.
 - **The first-run tip is re-shown after a crash or a fast quit.** Phase 5 moved the flag write to the dismissal, which is the accepted trade: a session that never pressed anything genuinely has not read the tip, so it is shown again. Deleting `<state>/dash/tip-seen` still brings it back on purpose.
 - **The errors dialog is a snapshot.** Acknowledgement writes back to the live buffer, but new errors arriving while `^A e` is open do not appear until it is reopened — the same snapshot-on-open convention every other dialog here follows.
-- **`Esc` dismisses the first-run tip *and* still reaches the child.** `Esc` is ordinary child input with no overlay open, and stealing it to close a notice would be a regression traded for a nicety, so the dismissal is additive.
 
 ## `wrap::perform_handover_swap` quits the source process before it can probe the successor
 

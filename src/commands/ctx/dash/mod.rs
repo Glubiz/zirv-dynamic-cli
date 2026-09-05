@@ -742,6 +742,41 @@ fn overlay_identity(overlay: &ui::Overlay) -> (&'static str, String) {
     (overlay_name(overlay), subject)
 }
 
+/// Review of #354 (defect 1, HIGH): whether a mouse route computed from the
+/// tick's one shared `frame_snapshot` may still be trusted for THIS event.
+///
+/// `HIGH-2` (below, at the drain loop) processes several queued events
+/// against a single snapshot taken at the top of the tick. If an earlier
+/// event in that same drain closes -- or replaces -- the open overlay (an
+/// `Esc` that closes the palette, say), a later queued click can still land
+/// on the snapshot's now-stale overlay hint or row: `route_mouse` only knows
+/// the frozen geometry, not that the dialog it names is already gone. Acting
+/// on it anyway would synthesize the keystroke the hint names (e.g. `Enter`)
+/// with no overlay left open to consume it -- which is the one way a chrome
+/// hit could otherwise reach `Pane::write_input`.
+///
+/// Comparing `overlay_identity` -- not just "is some overlay open" -- also
+/// catches a *different* dialog opening at the exact same screen position
+/// within the same drain, the same staleness `last_overlay_click` above
+/// already guards against for the double-click clock.
+///
+/// Every non-overlay route (`Grid`, `Select`, chrome, ...) is unaffected: it
+/// was never computed from the overlay's own rows/hints, so there is nothing
+/// here for it to go stale against.
+fn overlay_route_is_current(
+    route: &MouseRoute,
+    live_overlay: &ui::Overlay,
+    snapshot_overlay_ident: &(&'static str, String),
+) -> bool {
+    if !matches!(
+        route,
+        MouseRoute::OverlayRow(_) | MouseRoute::OverlayKey(_) | MouseRoute::ScrollOverlay(_)
+    ) {
+        return true;
+    }
+    overlay_identity(live_overlay) == *snapshot_overlay_ident
+}
+
 /// The first-run tip's own flag file: `<state>/dash/tip-seen`. Operator-level
 /// and repo-independent (`StateDir::dash()` is the dashboard's own state
 /// root), deliberately NOT a config key -- it is a fact about this operator's
@@ -8946,6 +8981,12 @@ pub fn run_dashboard(
     // announced for. Pure state, fed only on the `FactsCache` cadence.
     let mut attention_notices = notify::NoticeReducer::new();
     let mut frame_snapshot = hit::FrameSnapshot::default();
+    // Review of #354 (defect 1, HIGH): the overlay's own identity at the
+    // moment `frame_snapshot` was drawn -- kept in lockstep with it (updated
+    // only where `frame_snapshot` itself is) so `overlay_route_is_current`
+    // always compares the snapshot's geometry against the overlay it was
+    // actually drawn from, never a later one.
+    let mut frame_snapshot_overlay_ident = overlay_identity(&ui::Overlay::None);
     let mut reveal_sidebar = true;
     // Issue #354 phase 3: the `spawnreq::SpawnRequest` behind every pane this
     // dashboard fulfilled, by short id -- moved onto the pane's retained
@@ -9441,6 +9482,27 @@ pub fn run_dashboard(
                             !matches!(overlay, ui::Overlay::None),
                             selection.is_some(),
                         );
+                        // Review of #354 (defect 1, HIGH): `frame_snapshot` is
+                        // shared by every event this drain processes (see
+                        // `HIGH-2` above the drain loop), but the overlay it
+                        // was drawn from can close -- or be replaced -- by an
+                        // earlier event in the very same drain. A later
+                        // queued click that still lands on that now-stale
+                        // snapshot's own overlay hint or row must never
+                        // synthesize the keystroke it names; with the overlay
+                        // it belonged to gone, that synthesized key would
+                        // otherwise fall straight through to
+                        // `write_operator_input` below. See
+                        // `overlay_route_is_current`.
+                        let route = if overlay_route_is_current(
+                            &route,
+                            &overlay,
+                            &frame_snapshot_overlay_ident,
+                        ) {
+                            route
+                        } else {
+                            MouseRoute::Consume
+                        };
                         if route != MouseRoute::Grid {
                             read = Ok(Event::FocusGained);
                         }
@@ -10284,6 +10346,23 @@ pub fn run_dashboard(
                                 // never shown again in this session, and the
                                 // flag file makes sure it is never shown in
                                 // another one either.
+                                //
+                                // Review of #354 (defect 2, MEDIUM): a bare
+                                // `Esc` with the prefix unarmed is ordinary
+                                // child input (`filter_key` hands it back as
+                                // `ToChild`), so dismissing the tip with it
+                                // used to ALSO forward that same `Esc` to the
+                                // child -- an operator's very first keystroke
+                                // in the dashboard could land in whatever the
+                                // focused pane was doing. This keystroke
+                                // happens once per operator, ever, so it is
+                                // consumed instead; an `Esc` that does not
+                                // dismiss the tip (the tip is already gone, or
+                                // the prefix is armed, whose `ToChild` bytes
+                                // are empty anyway) is unaffected.
+                                let tip_dismissed_by_esc = first_run_tip
+                                    && key.code == KeyCode::Esc
+                                    && !matches!(verdict, InputVerdict::Dash(_));
                                 if first_run_tip
                                     && (matches!(verdict, InputVerdict::Dash(_))
                                         || key.code == KeyCode::Esc)
@@ -10293,6 +10372,17 @@ pub fn run_dashboard(
                                     // at the dismissal -- never at launch.
                                     mark_first_run_tip_seen(state);
                                 }
+                                // Empty `ToChild`, not `Pending`: the prefix
+                                // itself is not armed by this Esc (`armed` is
+                                // still whatever `filter_key` decided above),
+                                // this is the same "swallowed, nothing to
+                                // forward" shape `filter_key` already uses for
+                                // an armed-but-unbound key.
+                                let verdict = if tip_dismissed_by_esc {
+                                    InputVerdict::ToChild(Vec::new())
+                                } else {
+                                    verdict
+                                };
                                 // Task 2: what the loop ACTUALLY stored and
                                 // ACTUALLY decided -- every DashAction, not
                                 // only the interesting ones. Paired with
@@ -11334,6 +11424,9 @@ pub fn run_dashboard(
             &overlay,
             render_tick,
         );
+        // Captured in the same breath as `next_snapshot` itself, from the
+        // same `&overlay` it was built from -- see `overlay_route_is_current`.
+        let next_snapshot_overlay_ident = overlay_identity(&overlay);
         let focus_cwd = panes.get(focused).map(|p| p.cwd().display().to_string());
         let draw = terminal.draw(|f| {
             if !zoomed {
@@ -11398,6 +11491,7 @@ pub fn run_dashboard(
             push_error(&mut errors, format!("draw: {e}"));
         } else {
             frame_snapshot = next_snapshot;
+            frame_snapshot_overlay_ident = next_snapshot_overlay_ident;
             // Issue #354 phase 2: this frame COMPLETED, so whatever it showed
             // the operator counts as having been seen. Only the focused pane,
             // only with no overlay over it, and only at its live scroll
@@ -24052,6 +24146,75 @@ mod tests {
         );
     }
 
+    /// Review of #354 (defect 1, HIGH): several queued events are drained
+    /// against ONE `frame_snapshot` (`HIGH-2`, above the drain loop). If an
+    /// earlier event in that drain closes the overlay the snapshot was drawn
+    /// with -- an `Esc` that closes the palette -- a later queued click that
+    /// still lands on the snapshot's own pinned hint (here, the dialog's
+    /// `Enter` hint, standing in for a palette's "run" hint) must be
+    /// consumed, never synthesized into the key it names: with the overlay
+    /// closed, that key would otherwise reach the child pane.
+    ///
+    /// `route_mouse` alone cannot see this -- it only knows the frozen
+    /// geometry -- so `overlay_route_is_current` is the guard that actually
+    /// stops it, by comparing the LIVE overlay's identity against the one the
+    /// snapshot was drawn from.
+    #[test]
+    fn a_queued_click_on_a_closed_overlays_hint_is_consumed_not_synthesized() {
+        let snap = dialog_frame();
+        // The frame was drawn with a palette (mode `Run`) open -- this is
+        // `frame_snapshot_overlay_ident` at the top of the drain.
+        let snapshot_ident =
+            overlay_identity(&ui::Overlay::Palette(open_palette(ui::PaletteMode::Run)));
+        // First event in the drain: `Esc` closed the palette. The LIVE
+        // overlay, from this point on, is `None`.
+        let live_overlay = ui::Overlay::None;
+        // Second event in the same drain: a click at the snapshot's own
+        // coordinates for the pinned `Enter` hint.
+        let route = route_mouse(
+            &snap,
+            at(MouseEventKind::Down(MouseButton::Left), 53, 28),
+            true,
+            !matches!(live_overlay, ui::Overlay::None),
+            false,
+        );
+        // `route_mouse` still names the hint: it only has the stale
+        // snapshot, and has no way to know the dialog it names already
+        // closed.
+        assert_eq!(route, MouseRoute::OverlayKey(KeyCode::Enter));
+        // The identity guard is what actually stops it: the live overlay no
+        // longer matches what the snapshot was drawn against, so the event
+        // loop must downgrade this to `Consume` -- never synthesizing
+        // `Enter`, never reaching `filter_key`, never reaching the child.
+        assert!(
+            !overlay_route_is_current(&route, &live_overlay, &snapshot_ident),
+            "a stale overlay hit must not be trusted once the overlay it named has closed"
+        );
+        // The same dialog, still open, is still trusted.
+        let still_open = ui::Overlay::Palette(open_palette(ui::PaletteMode::Run));
+        assert!(overlay_route_is_current(
+            &route,
+            &still_open,
+            &snapshot_ident
+        ));
+        // A DIFFERENT dialog opening at the very same coordinates within the
+        // same drain is stale too -- it is the identity being checked, not
+        // merely "some overlay is open".
+        let different_dialog = ui::Overlay::Errors(ui::ErrorsView::default());
+        assert!(!overlay_route_is_current(
+            &route,
+            &different_dialog,
+            &snapshot_ident
+        ));
+        // Non-overlay routes never depend on the overlay's identity at all --
+        // there is nothing here for them to go stale against.
+        assert!(overlay_route_is_current(
+            &MouseRoute::Grid,
+            &live_overlay,
+            &snapshot_ident
+        ));
+    }
+
     #[test]
     fn overlay_swallows_wheel_and_grid_keeps_both_mouse_modes() {
         let snap = hit::FrameSnapshot {
@@ -24565,23 +24728,40 @@ mod tests {
             !first_run_tip_seen(&state),
             "showing the tip must not flag it as seen"
         );
-        // The dismissal rule, applied exactly as the event loop applies it.
-        let dismiss = |armed: bool, k: KeyEvent, shown: &mut bool, state: &StateDir| {
-            let (_, verdict) = filter_key(armed, k);
-            if *shown && (matches!(verdict, InputVerdict::Dash(_)) || k.code == KeyCode::Esc) {
-                *shown = false;
-                mark_first_run_tip_seen(state);
-            }
-        };
-        // Ordinary typing to the child dismisses nothing and writes nothing.
-        dismiss(
+        // The dismissal rule, applied exactly as the event loop applies it --
+        // including defect 2's fix (review of #354, MEDIUM): the `Esc` that
+        // dismisses the tip is consumed, never also forwarded, since it
+        // happens once per operator, ever; an `Esc` that does not dismiss the
+        // tip is unaffected.
+        let dismiss =
+            |armed: bool, k: KeyEvent, shown: &mut bool, state: &StateDir| -> InputVerdict {
+                let (_, verdict) = filter_key(armed, k);
+                let dismissed_by_esc =
+                    *shown && k.code == KeyCode::Esc && !matches!(verdict, InputVerdict::Dash(_));
+                if *shown && (matches!(verdict, InputVerdict::Dash(_)) || k.code == KeyCode::Esc) {
+                    *shown = false;
+                    mark_first_run_tip_seen(state);
+                }
+                if dismissed_by_esc {
+                    InputVerdict::ToChild(Vec::new())
+                } else {
+                    verdict
+                }
+            };
+        // Ordinary typing to the child dismisses nothing, writes nothing, and
+        // still reaches the child.
+        let verdict = dismiss(
             false,
             key(KeyCode::Char('x'), KeyModifiers::NONE),
             &mut first_run_tip,
             &state,
         );
         assert!(first_run_tip && !first_run_tip_seen(&state));
-        dismiss(
+        assert!(matches!(verdict, InputVerdict::ToChild(bytes) if !bytes.is_empty()));
+        // The dismissing Esc flags the tip seen, but this exact keystroke
+        // must never also reach the child -- it used to (additively); that
+        // regression is defect 2.
+        let verdict = dismiss(
             false,
             key(KeyCode::Esc, KeyModifiers::NONE),
             &mut first_run_tip,
@@ -24589,8 +24769,23 @@ mod tests {
         );
         assert!(!first_run_tip, "Esc dismisses it");
         assert!(first_run_tip_seen(&state), "and only then is it flagged");
-        // The next launch never shows it again.
+        assert!(
+            matches!(&verdict, InputVerdict::ToChild(bytes) if bytes.is_empty()),
+            "the dismissing Esc must be consumed, not forwarded: {verdict:?}"
+        );
+        // The next launch never shows it again, and an ordinary Esc -- the
+        // tip already gone -- reaches the child exactly as before.
         assert!(!(!first_run_tip_seen(&state)));
+        let verdict = dismiss(
+            false,
+            key(KeyCode::Esc, KeyModifiers::NONE),
+            &mut first_run_tip,
+            &state,
+        );
+        assert!(
+            matches!(&verdict, InputVerdict::ToChild(bytes) if !bytes.is_empty()),
+            "Esc reaches the child once the tip is no longer showing: {verdict:?}"
+        );
     }
 
     /// The first-run tip: absent flag shows it, and the flag is written once
