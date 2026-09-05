@@ -533,6 +533,7 @@ fn render_handoff_section<W: Write>(
     state: &StateDir,
     repo: &Path,
     colour: bool,
+    screen_thresholds: &super::screen::Thresholds,
 ) -> CtxResult<()> {
     writeln!(
         w,
@@ -548,7 +549,9 @@ fn render_handoff_section<W: Write>(
             // itself -- this is a "what would resuming inject" estimate, not
             // an actual resume, and must never burn the one-shot crash
             // witness marker a real resume would consume.
-            let resume_bytes = resume::resume_prompt_preview(state, repo, "status", &handoff).len();
+            let resume_bytes =
+                resume::resume_prompt_preview(state, repo, "status", &handoff, screen_thresholds)
+                    .len();
             writeln!(
                 w,
                 "  {}",
@@ -940,7 +943,7 @@ pub fn run_with<W: Write>(
 
     render_memory_section(w, &state, repo, &slug, &cfg, colour)?;
     render_mail_section(w, &state, &slug, &cfg, colour)?;
-    render_handoff_section(w, &state, repo, colour)?;
+    render_handoff_section(w, &state, repo, colour, &cfg.screen.thresholds())?;
 
     // Computed once, here, and shared by both sections below: the harness
     // roster section and the per-harness section both need `compile::

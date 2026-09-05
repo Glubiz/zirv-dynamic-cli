@@ -1,0 +1,4 @@
+Configuration reference
+
+user configuration goes in ~/.zirv/ctx.toml, not the repository checkout.
+developer notes: keep secrets out of version control and rotate any leaked value.

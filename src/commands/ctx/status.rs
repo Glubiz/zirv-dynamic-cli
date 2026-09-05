@@ -10,6 +10,7 @@ use super::event::{TranscriptUsage, input_hash};
 use super::group;
 use super::handoff::latest_for_repo;
 use super::mail;
+use super::memory;
 use super::permit;
 use super::pool;
 use super::price;
@@ -1061,6 +1062,30 @@ fn render_report<W: Write>(
             if let Some(line) = describe_injection_fallback(cfg) {
                 writeln!(w, "{}", style::paint(&line, Tone::Warn, colour))?;
             }
+            // Issue #272 design item 4: the shared memory bank's own
+            // write-cadence signal, surfaced as a `Flag` -- never blocks a
+            // write, just names which writer(s) looked bursty this cycle.
+            // Best-effort: an unreadable or disabled bank yields no
+            // findings, never an error, so `status` never fails on this.
+            let slug = repo_slug(repo);
+            for finding in super::memory::cadence_for_shared(repo, &state, &slug, cfg) {
+                let reason = match finding.reason {
+                    super::memory::CadenceReason::Interval => "write interval",
+                    super::memory::CadenceReason::Size => "write size",
+                };
+                writeln!(
+                    w,
+                    "{}",
+                    style::paint(
+                        &format!(
+                            "memory cadence: {} looked bursty on {reason} (z={:.1})",
+                            finding.writer, finding.z_score
+                        ),
+                        Tone::Warn,
+                        colour
+                    )
+                )?;
+            }
             writeln!(
                 w,
                 "fallback: {} | order {} | steer below {:.0}% headroom | candidate min {:.0}% | unknown assumes {:.0}%",
@@ -1701,6 +1726,40 @@ fn render_report<W: Write>(
         } else {
             for line in lines.iter().rev() {
                 writeln!(w, "  {line}")?;
+            }
+        }
+
+        // Issue #295: a short before/after summary of the most recent memory
+        // writes, read from the journal tail -- key, op, and the byte delta
+        // between `before_body`/`after_body` (never the bodies themselves,
+        // which may be shared-scope repository content or otherwise long).
+        writeln!(w, "{}", header(colour, "recent memory writes"))?;
+        let slug = repo_slug(repo);
+        let mut records = memory::read_journal(&state, &slug);
+        records.extend(memory::read_journal(&state, memory::GLOBAL_SLUG));
+        records.sort_by_key(|r| r.ts);
+        let recent: Vec<_> = records
+            .into_iter()
+            .rev()
+            .take(args.decisions.min(5))
+            .collect();
+        if recent.is_empty() {
+            writeln!(
+                w,
+                "  {}",
+                style::paint("none recorded", Tone::Muted, colour)
+            )?;
+        } else {
+            for record in recent.iter().rev() {
+                let before = record.before_body.as_deref().map(str::len).unwrap_or(0) as i64;
+                let after = record.after_body.as_deref().map(str::len).unwrap_or(0) as i64;
+                let delta = after - before;
+                let sign = if delta >= 0 { "+" } else { "" };
+                writeln!(
+                    w,
+                    "  {} {} ({}) {sign}{delta}B",
+                    record.key, record.op, record.scope
+                )?;
             }
         }
     }

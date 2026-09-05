@@ -275,6 +275,29 @@ pub struct SuperviseConfig {
     /// asking for a stricter guard against its own orchestrator seat is
     /// exactly the direction that can never reproduce issues #328/#334.
     pub orchestrator_writes: OrchestratorWrites,
+    /// Issue #311 (Hermes Agent's `/loop` self-paced mode): the ceiling
+    /// `zirv ctx loop`'s own self-pacing may grow the inter-cycle wait
+    /// toward when no explicit `--interval` was given and consecutive
+    /// successful cycles keep producing the same outcome digest --
+    /// `run_loop::next_pace`'s own `ceiling` parameter. Mirrors Hermes's
+    /// `DEFAULT_SELF_PACED_CEILING_SECONDS` (900). Has no effect at all on a
+    /// run launched with an explicit `--interval`: that opts out of self-
+    /// pacing entirely, so this value is never consulted.
+    ///
+    /// Narrow-only, the same "repo may only make it stricter" shape as
+    /// `compact_advisory.min_reclaim_tokens` -- but the OPPOSITE polarity:
+    /// here LOWER is stricter (the loop checks in more often, waiting no
+    /// longer than this many seconds between cycles even when nothing has
+    /// changed), so the fold is `home.min(repo)` like `verify_on_stop.
+    /// max_nudges`, not `home.max(repo)` like `compact_advisory`'s own keys.
+    /// A repo checkout may shorten how long its own loop can go quiet, never
+    /// lengthen it past what the operator (or another layer) already
+    /// allows. Not `REPO_FORBIDDEN`: unlike `supervise.idle_no_tool_secs`/
+    /// `in_tool_secs` right above (which gate a *safety* fuse a checkout
+    /// must not be able to loosen), this only tunes how quickly a
+    /// nothing-left-to-do loop backs off, and only in the direction that
+    /// asks for MORE supervision, not less.
+    pub loop_backoff_ceiling_secs: u64,
 }
 
 impl Default for SuperviseConfig {
@@ -297,6 +320,7 @@ impl Default for SuperviseConfig {
             chain_max_restarts: 3,
             chain_max_gap_secs: 300,
             orchestrator_writes: OrchestratorWrites::Advise,
+            loop_backoff_ceiling_secs: 900,
         }
     }
 }
@@ -943,6 +967,14 @@ pub struct WorkflowConfig {
     /// `REPO_FORBIDDEN`: an untrusted checkout must not be able to declare
     /// its own missing/empty `verify.toml` a pass.
     pub allow_empty_verify: bool,
+    /// Issue #276: `zirv verify`'s built-in self-check registry
+    /// (`workflow::checks`) runs every registered id unless its dotted name
+    /// is listed here. `REPO_FORBIDDEN`, same reasoning as
+    /// `check_env_passthrough` above: the untrusted checkout these checks
+    /// exist to police (adapter argv shape, `REPO_FORBIDDEN` widening,
+    /// doc-verb drift, ...) must never be the one that turns them off.
+    /// Empty by default, so every builtin runs.
+    pub builtin_checks_exclude: Vec<String>,
 }
 
 impl Default for WorkflowConfig {
@@ -962,6 +994,7 @@ impl Default for WorkflowConfig {
             review_worker_max_tool_calls: None,
             auto_spawn_on_gate: false,
             allow_empty_verify: false,
+            builtin_checks_exclude: Vec::new(),
         }
     }
 }
@@ -1029,6 +1062,22 @@ pub struct MemoryConfig {
     /// (which caps a single entry) and of `init_max_bytes` (which caps the
     /// bootstrap corpus sent to the model, not what gets written back).
     pub harvest_max_bytes: usize,
+    /// Issue #295: gate for the **session** tier (`memory::MemoryScope::
+    /// Session`, `<state>/memory/<repo_slug>/sessions/<session-id>/`),
+    /// UNDERNEATH the master `enabled` switch above -- the same shape
+    /// `shared_enabled` already has for the shared scope. On by default: a
+    /// bare `zirv ctx remember`/`zirv memory remember` with a session id
+    /// present writes to this tier instead of the private one unless this is
+    /// turned off (or `--repo`/`--global` is given explicitly).
+    pub session_enabled: bool,
+    /// Issue #295: how many lines each memory bank's own `journal.jsonl`
+    /// (one file per `<state>/memory/<repo_slug-or-_global>/`) keeps before
+    /// the oldest are pruned, mirroring `max_entries`' own retention
+    /// discipline for the entry bank itself. Independent of `max_entries`:
+    /// a bank can hold fewer live entries than journal lines, since a
+    /// `forget`/`verify`/`promote`/`rollback` each append a record without
+    /// necessarily changing how many entries currently exist.
+    pub journal_max_entries: usize,
 }
 
 impl Default for MemoryConfig {
@@ -1045,6 +1094,8 @@ impl Default for MemoryConfig {
             retrieval_max_entries: 6,
             harvest_max_entries: 5,
             harvest_max_bytes: 2048,
+            session_enabled: true,
+            journal_max_entries: 500,
         }
     }
 }
@@ -1359,6 +1410,52 @@ impl Default for ObjectiveConfig {
     }
 }
 
+/// Issue #272 (`screen.rs` round 2): thresholds behind `screen::ScreenFlag::
+/// RepetitionDominated` (the Hermes-round comment / issue #322). Every key
+/// is narrow-only in the SAME direction: a repo checkout may only LOWER a
+/// threshold (making detection stricter -- flagging shorter fragments,
+/// smaller windows, fewer repeats, or a smaller dominance share), never
+/// raise one to make detection looser than the operator's own value
+/// (`narrow_screen_threshold`/`narrow_screen_dominance_pct`, both the same
+/// `home.min(repo.unwrap_or(MAX))` shape as `narrow_max_nudges`). `screen.rs`
+/// itself never reads `ctx.toml`; a caller resolves this table into a
+/// `screen::Thresholds` (`ScreenConfig::thresholds`) and passes that to
+/// `screen::screen_with_thresholds`, keeping `screen.rs` pure.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ScreenConfig {
+    pub repetition_min_fragment: u32,
+    pub repetition_window: u32,
+    pub repetition_min_repeats: u32,
+    pub repetition_dominance_pct: f64,
+}
+
+impl Default for ScreenConfig {
+    fn default() -> Self {
+        let defaults = super::screen::Thresholds::default();
+        Self {
+            repetition_min_fragment: defaults.repetition_min_fragment as u32,
+            repetition_window: defaults.repetition_window as u32,
+            repetition_min_repeats: defaults.repetition_min_repeats as u32,
+            repetition_dominance_pct: defaults.repetition_dominance_pct,
+        }
+    }
+}
+
+impl ScreenConfig {
+    /// This table, resolved into the `screen::Thresholds` `screen::
+    /// screen_with_thresholds` actually takes -- the one seam between this
+    /// (impure, config-reading) module and `screen.rs`'s own purity.
+    pub fn thresholds(&self) -> super::screen::Thresholds {
+        super::screen::Thresholds {
+            repetition_min_fragment: self.repetition_min_fragment as usize,
+            repetition_window: self.repetition_window as usize,
+            repetition_min_repeats: self.repetition_min_repeats as usize,
+            repetition_dominance_pct: self.repetition_dominance_pct,
+        }
+    }
+}
+
 /// One harness's three generic tiers (`handover::TIERS`), each an optional
 /// literal model id overriding that harness's own built-in ladder entry
 /// (`handover::tier_default`). `None` -- the default for all three -- defers
@@ -1666,6 +1763,7 @@ pub struct CtxConfig {
     pub fallback: FallbackConfig,
     pub sandbox: SandboxConfig,
     pub objective: ObjectiveConfig,
+    pub screen: ScreenConfig,
     /// Per-agent enable/disable state from `.settings.toml`, a file this type
     /// deliberately never deserializes (see `crate::settings`): loaded
     /// separately at the end of `load`, and rejected outright if it appears
@@ -1853,6 +1951,11 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         "ZIRV_CTX_SUPERVISE_ORCHESTRATOR_WRITES",
         &["supervise", "orchestrator_writes"],
         EnvKind::Str,
+    ),
+    (
+        "ZIRV_CTX_SUPERVISE_LOOP_BACKOFF_CEILING_SECS",
+        &["supervise", "loop_backoff_ceiling_secs"],
+        EnvKind::Int,
     ),
     ("ZIRV_CTX_MODEL", &["handoff", "model"], EnvKind::Str),
     (
@@ -2176,6 +2279,16 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
     (
         "ZIRV_CTX_MEMORY_HARVEST_MAX_BYTES",
         &["memory", "harvest_max_bytes"],
+        EnvKind::Int,
+    ),
+    (
+        "ZIRV_CTX_MEMORY_SESSION",
+        &["memory", "session_enabled"],
+        EnvKind::Bool,
+    ),
+    (
+        "ZIRV_CTX_MEMORY_JOURNAL_MAX_ENTRIES",
+        &["memory", "journal_max_entries"],
         EnvKind::Int,
     ),
     (
@@ -2605,6 +2718,15 @@ fn narrow_compact_advisory_window_fraction(home: f64, repo: Option<f64>) -> f64 
     home.max(repo.unwrap_or(0.0))
 }
 
+/// Issue #311: the repo-narrowing fold for `supervise.loop_backoff_ceiling_
+/// secs` -- lower is stricter (the self-paced loop checks in sooner), the
+/// identical shape as `narrow_max_nudges`: `repo` absent contributes nothing
+/// (folds in as `u64::MAX`, which `min` never picks over a real `home`
+/// value).
+fn narrow_loop_backoff_ceiling_secs(home: u64, repo: Option<u64>) -> u64 {
+    home.min(repo.unwrap_or(u64::MAX))
+}
+
 /// Issue #262: the repo-narrowing fold for `worker.max_depth` -- lower is
 /// stricter (fewer hops of delegation reach), the `u8` mirror of
 /// `narrow_max_nudges`.
@@ -2645,6 +2767,23 @@ fn narrow_max_cycles_without_progress(home: u32, repo: Option<u32>) -> u32 {
 /// against an operator (or another layer) that left it off.
 fn narrow_objective_judge(home: bool, repo: Option<bool>) -> bool {
     home.min(repo.unwrap_or(true))
+}
+
+/// Issue #272: the repo-narrowing fold for every `[screen]` `u32` threshold
+/// (`repetition_min_fragment`/`_window`/`_min_repeats`) -- lower is stricter
+/// (detection fires on a shorter fragment, a smaller window, or fewer
+/// repeats), the identical shape as `narrow_max_nudges`.
+fn narrow_screen_threshold(home: u32, repo: Option<u32>) -> u32 {
+    home.min(repo.unwrap_or(u32::MAX))
+}
+
+/// Issue #272: the repo-narrowing fold for `screen.repetition_dominance_pct`
+/// -- lower is stricter here too (less of the fragment needs to be repeats
+/// before it counts as dominated), the `f64` mirror of `narrow_screen_
+/// threshold` rather than `narrow_compact_advisory_window_fraction`'s
+/// opposite (higher-is-stricter) polarity.
+fn narrow_screen_dominance_pct(home: f64, repo: Option<f64>) -> f64 {
+    home.min(repo.unwrap_or(f64::MAX))
 }
 
 /// Finding 4 (review): the one comma-separated-list splitter shared by every
@@ -2879,6 +3018,13 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
         &["workflow", "allow_empty_verify"],
         "ZIRV_CTX_WORKFLOW_ALLOW_EMPTY_VERIFY",
     ),
+    // Issue #276: the untrusted checkout `zirv verify`'s builtin self-check
+    // registry exists to police must never be the one that turns a check
+    // off for itself.
+    (
+        &["workflow", "builtin_checks_exclude"],
+        "ZIRV_CTX_WORKFLOW_BUILTIN_CHECKS_EXCLUDE",
+    ),
     // A repo checkout must not be able to switch either memory scope's own
     // gate on or off for itself, grow its cap, or turn on automatic
     // harvesting -- this is about the CONFIGURATION, not the shared scope's
@@ -2935,6 +3081,19 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     (
         &["memory", "harvest_max_bytes"],
         "ZIRV_CTX_MEMORY_HARVEST_MAX_BYTES",
+    ),
+    // Issue #295: the same class of decision as `shared_enabled` above, for
+    // the newer session tier (`memory::MemoryScope::Session`) -- a repo
+    // checkout must not be able to switch that tier's own gate on or off for
+    // an operator who set it otherwise.
+    (&["memory", "session_enabled"], "ZIRV_CTX_MEMORY_SESSION"),
+    // Issue #295: a repo checkout must not be able to grow its own memory
+    // journal's retention cap, the same trust asymmetry as `max_entries`/
+    // `max_entry_bytes` above, applied to the write history rather than the
+    // entry bank itself.
+    (
+        &["memory", "journal_max_entries"],
+        "ZIRV_CTX_MEMORY_JOURNAL_MAX_ENTRIES",
     ),
     // A repo checkout must not be able to switch its own dashboard on or off,
     // resize the sidebar, change how long a quit-time roster is offered for
@@ -3440,6 +3599,23 @@ impl CtxConfig {
             "max_cycles_without_progress",
         ));
         let home_objective_judge = bool_at(take_nested(&mut merged, "objective", "judge"));
+        // Issue #272: every `[screen]` key gets the identical lift-before-
+        // merge treatment -- see `narrow_screen_threshold`/`narrow_screen_
+        // dominance_pct` below for the shared "lower is stricter" direction.
+        let home_screen_min_fragment = integer_at(take_nested(
+            &mut merged,
+            "screen",
+            "repetition_min_fragment",
+        ));
+        let home_screen_window =
+            integer_at(take_nested(&mut merged, "screen", "repetition_window"));
+        let home_screen_min_repeats =
+            integer_at(take_nested(&mut merged, "screen", "repetition_min_repeats"));
+        let home_screen_dominance_pct = float_at(take_nested(
+            &mut merged,
+            "screen",
+            "repetition_dominance_pct",
+        ));
         // `supervise.heavy_command_patterns` gets the identical treatment as
         // `sandbox.extra_deny` above, for the identical reason: the field's
         // own doc comment promises a repo layer may only ADD patterns, never
@@ -3460,6 +3636,14 @@ impl CtxConfig {
             take_nested(&mut merged, "supervise", "orchestrator_writes"),
             "supervise.orchestrator_writes",
         )?;
+        // Issue #311: `supervise.loop_backoff_ceiling_secs` gets the
+        // identical lift-before-merge treatment -- see `narrow_loop_backoff_
+        // ceiling_secs` below for the strict direction.
+        let home_loop_backoff_ceiling = integer_at(take_nested(
+            &mut merged,
+            "supervise",
+            "loop_backoff_ceiling_secs",
+        ));
 
         // Issue #186: every fallback field is lifted before the repo merge.
         // The repo may only narrow automatic vendor steering; see the
@@ -3569,6 +3753,23 @@ impl CtxConfig {
             "max_cycles_without_progress",
         ));
         let repo_objective_judge = bool_at(take_nested(&mut repo_layer, "objective", "judge"));
+        let repo_screen_min_fragment = integer_at(take_nested(
+            &mut repo_layer,
+            "screen",
+            "repetition_min_fragment",
+        ));
+        let repo_screen_window =
+            integer_at(take_nested(&mut repo_layer, "screen", "repetition_window"));
+        let repo_screen_min_repeats = integer_at(take_nested(
+            &mut repo_layer,
+            "screen",
+            "repetition_min_repeats",
+        ));
+        let repo_screen_dominance_pct = float_at(take_nested(
+            &mut repo_layer,
+            "screen",
+            "repetition_dominance_pct",
+        ));
         let repo_heavy_patterns = string_array(take_nested(
             &mut repo_layer,
             "supervise",
@@ -3578,6 +3779,11 @@ impl CtxConfig {
             take_nested(&mut repo_layer, "supervise", "orchestrator_writes"),
             "supervise.orchestrator_writes",
         )?;
+        let repo_loop_backoff_ceiling = integer_at(take_nested(
+            &mut repo_layer,
+            "supervise",
+            "loop_backoff_ceiling_secs",
+        ));
         let repo_fallback_enabled = bool_at(take_nested(&mut repo_layer, "fallback", "enabled"));
         let repo_fallback_order =
             string_array_at(take_nested(&mut repo_layer, "fallback", "order"));
@@ -3658,6 +3864,24 @@ impl CtxConfig {
                 )
                 .label()
                 .to_string(),
+            ),
+        );
+        // Issue #311: `supervise.loop_backoff_ceiling_secs` gets the
+        // identical re-insertion, narrowed by `narrow_loop_backoff_ceiling_
+        // secs`, then still overwritable by `ZIRV_CTX_SUPERVISE_LOOP_
+        // BACKOFF_CEILING_SECS` (`ENV_MAP`, below) the same as every other
+        // narrow-only key.
+        insert_path(
+            &mut merged,
+            &["supervise", "loop_backoff_ceiling_secs"],
+            toml::Value::Integer(
+                i64::try_from(narrow_loop_backoff_ceiling_secs(
+                    home_loop_backoff_ceiling
+                        .and_then(|v| u64::try_from(v).ok())
+                        .unwrap_or(default_supervise.loop_backoff_ceiling_secs),
+                    repo_loop_backoff_ceiling.and_then(|v| u64::try_from(v).ok()),
+                ))
+                .unwrap_or(i64::MAX),
             ),
         );
 
@@ -3837,6 +4061,54 @@ impl CtxConfig {
             toml::Value::Boolean(narrow_objective_judge(
                 home_objective_judge.unwrap_or(default_objective.judge),
                 repo_objective_judge,
+            )),
+        );
+
+        let default_screen = ScreenConfig::default();
+        let home_screen_min_fragment_value = home_screen_min_fragment
+            .and_then(|v| u32::try_from(v).ok())
+            .unwrap_or(default_screen.repetition_min_fragment);
+        let repo_screen_min_fragment_value =
+            repo_screen_min_fragment.and_then(|v| u32::try_from(v).ok());
+        insert_path(
+            &mut merged,
+            &["screen", "repetition_min_fragment"],
+            toml::Value::Integer(i64::from(narrow_screen_threshold(
+                home_screen_min_fragment_value,
+                repo_screen_min_fragment_value,
+            ))),
+        );
+        let home_screen_window_value = home_screen_window
+            .and_then(|v| u32::try_from(v).ok())
+            .unwrap_or(default_screen.repetition_window);
+        let repo_screen_window_value = repo_screen_window.and_then(|v| u32::try_from(v).ok());
+        insert_path(
+            &mut merged,
+            &["screen", "repetition_window"],
+            toml::Value::Integer(i64::from(narrow_screen_threshold(
+                home_screen_window_value,
+                repo_screen_window_value,
+            ))),
+        );
+        let home_screen_min_repeats_value = home_screen_min_repeats
+            .and_then(|v| u32::try_from(v).ok())
+            .unwrap_or(default_screen.repetition_min_repeats);
+        let repo_screen_min_repeats_value =
+            repo_screen_min_repeats.and_then(|v| u32::try_from(v).ok());
+        insert_path(
+            &mut merged,
+            &["screen", "repetition_min_repeats"],
+            toml::Value::Integer(i64::from(narrow_screen_threshold(
+                home_screen_min_repeats_value,
+                repo_screen_min_repeats_value,
+            ))),
+        );
+        insert_path(
+            &mut merged,
+            &["screen", "repetition_dominance_pct"],
+            toml::Value::Float(narrow_screen_dominance_pct(
+                home_screen_dominance_pct.unwrap_or(default_screen.repetition_dominance_pct),
+                repo_screen_dominance_pct,
             )),
         );
 
@@ -4096,6 +4368,14 @@ impl CtxConfig {
         // point of use, never a replacement for those built-in defaults.
         if let Some(raw) = env("ZIRV_CTX_WORKFLOW_CHECK_ENV_PASSTHROUGH") {
             cfg.workflow.check_env_passthrough = split_csv_list(&raw);
+        }
+
+        // Same operator-only override shape, for issue #276's builtin
+        // self-check exclude list: `ZIRV_CTX_WORKFLOW_BUILTIN_CHECKS_EXCLUDE`
+        // replaces whatever `workflow.builtin_checks_exclude` the merged TOML
+        // layers produced.
+        if let Some(raw) = env("ZIRV_CTX_WORKFLOW_BUILTIN_CHECKS_EXCLUDE") {
+            cfg.workflow.builtin_checks_exclude = split_csv_list(&raw);
         }
 
         // Same union as `extra_deny` above, for `heavy_command_patterns`: the
@@ -4425,6 +4705,11 @@ mod tests {
             "issue #310: mirrors the Hermes reference's own DEFAULT_MAX_RESTARTS"
         );
         assert_eq!(
+            SuperviseConfig::default().loop_backoff_ceiling_secs,
+            900,
+            "issue #311: mirrors Hermes's own DEFAULT_SELF_PACED_CEILING_SECONDS"
+        );
+        assert_eq!(
             SuperviseConfig::default().chain_max_gap_secs,
             300,
             "issue #310: mirrors the Hermes reference's own DEFAULT_MAX_GAP_SECONDS"
@@ -4511,6 +4796,45 @@ mod tests {
         let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
         assert_eq!(cfg.compact_advisory.min_reclaim_tokens, 32768);
         assert_eq!(cfg.compact_advisory.window_fraction, 0.95);
+    }
+
+    /// Issue #311: `supervise.loop_backoff_ceiling_secs` is repo-settable but
+    /// narrow-only in the OPPOSITE polarity from `compact_advisory` above --
+    /// lower is stricter here, the same shape as `verify_on_stop.max_nudges`
+    /// -- and an env var still wins over both layers as the final word.
+    #[test]
+    fn loop_backoff_ceiling_repo_layer_may_only_lower_it() {
+        assert_eq!(SuperviseConfig::default().loop_backoff_ceiling_secs, 900);
+        assert_eq!(narrow_loop_backoff_ceiling_secs(900, Some(1800)), 900);
+        assert_eq!(narrow_loop_backoff_ceiling_secs(900, Some(300)), 300);
+        assert_eq!(narrow_loop_backoff_ceiling_secs(900, None), 900);
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[supervise]\nloop_backoff_ceiling_secs = 3600\n",
+        )
+        .expect("write");
+
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert_eq!(
+            cfg.supervise.loop_backoff_ceiling_secs, 900,
+            "a repo checkout may not raise the ceiling past the operator's own"
+        );
+
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[supervise]\nloop_backoff_ceiling_secs = 120\n",
+        )
+        .expect("write");
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert_eq!(cfg.supervise.loop_backoff_ceiling_secs, 120);
+
+        let env = env_map(&[("ZIRV_CTX_SUPERVISE_LOOP_BACKOFF_CEILING_SECS", "60")]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert_eq!(cfg.supervise.loop_backoff_ceiling_secs, 60);
     }
 
     /// Companion to the test above, for the token gate's own five keys
@@ -4809,6 +5133,57 @@ mod tests {
             !is_repo_forbidden(typo_err.as_ref()),
             "a schema error is not a REPO_FORBIDDEN rejection: {typo_err}"
         );
+    }
+
+    /// Issue #295: the session tier's own gate and the journal's retention
+    /// cap join every other `memory.*` key as `REPO_FORBIDDEN` -- a repo
+    /// checkout must not be able to switch the session tier on for itself,
+    /// nor grow its own journal's retention window. Mirrors the existing
+    /// `memory.shared_enabled` precedent this same reasoning was set by.
+    #[test]
+    fn memory_session_enabled_and_journal_max_entries_are_repo_forbidden() {
+        let empty = env_map(&[]);
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        for (toml, offending_key) in [
+            ("[memory]\nsession_enabled = false\n", "session_enabled"),
+            (
+                "[memory]\njournal_max_entries = 100000\n",
+                "journal_max_entries",
+            ),
+        ] {
+            let repo = tempfile::tempdir().expect("tempdir");
+            std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+            std::fs::write(repo.path().join(".zirv/ctx.toml"), toml).expect("write");
+
+            let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect_err(
+                &format!("a repository must not be able to set memory.{offending_key}"),
+            );
+            assert!(
+                is_repo_forbidden(err.as_ref()),
+                "memory.{offending_key} must be rejected as REPO_FORBIDDEN: {err}"
+            );
+        }
+    }
+
+    /// The operator-only escape hatches for the same two keys: `~/.zirv/
+    /// ctx.toml` and `ZIRV_CTX_MEMORY_SESSION`/`ZIRV_CTX_MEMORY_JOURNAL_MAX_
+    /// ENTRIES` may still set them, exactly like every other `memory.*` key.
+    #[test]
+    fn the_operator_can_still_set_session_enabled_and_journal_max_entries_from_the_environment() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let env = env_map(&[
+            ("ZIRV_CTX_MEMORY_SESSION", "false"),
+            ("ZIRV_CTX_MEMORY_JOURNAL_MAX_ENTRIES", "42"),
+        ]);
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned())
+            .expect("the operator's own environment may set these keys");
+        assert!(!cfg.memory.session_enabled);
+        assert_eq!(cfg.memory.journal_max_entries, 42);
     }
 
     #[test]
@@ -5637,6 +6012,101 @@ mod tests {
             !cfg.objective.judge,
             "a repo may not force the judge on for an operator who turned it off"
         );
+    }
+
+    /// Issue #272: every `[screen]` narrowing fold is "lower is stricter",
+    /// the identical shape as `narrow_max_nudges` -- a repo may only lower
+    /// each threshold, never raise it above the operator's own.
+    #[test]
+    fn the_screen_narrowing_fold_rules_favour_the_stricter_lower_value() {
+        for (home, repo, expected, why) in [
+            (
+                400u32,
+                None,
+                400,
+                "an untouched repo layer leaves the operator's own value alone",
+            ),
+            (
+                400,
+                Some(4_000),
+                400,
+                "a repo may not raise a threshold above the operator's own",
+            ),
+            (
+                400,
+                Some(100),
+                100,
+                "a repo may lower a threshold below the operator's own",
+            ),
+        ] {
+            assert_eq!(narrow_screen_threshold(home, repo), expected, "{why}");
+        }
+
+        assert_eq!(narrow_screen_dominance_pct(0.5, None), 0.5);
+        assert_eq!(
+            narrow_screen_dominance_pct(0.5, Some(0.9)),
+            0.5,
+            "a repo may not raise the dominance floor above the operator's own"
+        );
+        assert_eq!(
+            narrow_screen_dominance_pct(0.5, Some(0.1)),
+            0.1,
+            "a repo may lower the dominance floor below the operator's own"
+        );
+    }
+
+    /// Issue #272: the full `CtxConfig::load` integration for `[screen]` --
+    /// a repo layer may only narrow every key, exactly like `[objective]`
+    /// above.
+    #[test]
+    fn a_repo_layer_may_only_narrow_screen_thresholds() {
+        let home_dir = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home_dir.path());
+        std::fs::create_dir_all(home_dir.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home_dir.path().join(".zirv/ctx.toml"),
+            "[screen]\nrepetition_min_fragment = 400\nrepetition_window = 60\n\
+             repetition_min_repeats = 5\nrepetition_dominance_pct = 0.5\n",
+        )
+        .expect("write");
+
+        let repo_narrows = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo_narrows.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo_narrows.path().join(".zirv/ctx.toml"),
+            "[screen]\nrepetition_min_fragment = 100\nrepetition_window = 20\n\
+             repetition_min_repeats = 2\nrepetition_dominance_pct = 0.2\n",
+        )
+        .expect("write");
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo_narrows.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert_eq!(cfg.screen.repetition_min_fragment, 100);
+        assert_eq!(cfg.screen.repetition_window, 20);
+        assert_eq!(cfg.screen.repetition_min_repeats, 2);
+        assert_eq!(cfg.screen.repetition_dominance_pct, 0.2);
+
+        let repo_widens = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo_widens.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo_widens.path().join(".zirv/ctx.toml"),
+            "[screen]\nrepetition_min_fragment = 40000\nrepetition_window = 6000\n\
+             repetition_min_repeats = 500\nrepetition_dominance_pct = 0.99\n",
+        )
+        .expect("write");
+        let cfg = CtxConfig::load(repo_widens.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert_eq!(
+            cfg.screen.repetition_min_fragment, 400,
+            "a repo may not raise repetition_min_fragment above the operator's own"
+        );
+        assert_eq!(cfg.screen.repetition_window, 60);
+        assert_eq!(cfg.screen.repetition_min_repeats, 5);
+        assert_eq!(cfg.screen.repetition_dominance_pct, 0.5);
+
+        // `ScreenConfig::thresholds` is the one seam into `screen::
+        // Thresholds` -- a narrowed config actually reaches it.
+        let thresholds = cfg.screen.thresholds();
+        assert_eq!(thresholds.repetition_min_fragment, 400);
+        assert_eq!(thresholds.repetition_dominance_pct, 0.5);
     }
 
     /// Issue #262: `worker.default_depth`/`worker.default_read_only` set the
@@ -6521,6 +6991,8 @@ mod tests {
             ("ZIRV_CTX_MEMORY_RETRIEVAL_MAX_ENTRIES", "3"),
             ("ZIRV_CTX_MEMORY_HARVEST_MAX_ENTRIES", "2"),
             ("ZIRV_CTX_MEMORY_HARVEST_MAX_BYTES", "256"),
+            ("ZIRV_CTX_MEMORY_SESSION", "false"),
+            ("ZIRV_CTX_MEMORY_JOURNAL_MAX_ENTRIES", "77"),
         ]);
         let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
         assert!(!cfg.memory.enabled);
@@ -6534,6 +7006,8 @@ mod tests {
         assert_eq!(cfg.memory.retrieval_max_entries, 3);
         assert_eq!(cfg.memory.harvest_max_entries, 2);
         assert_eq!(cfg.memory.harvest_max_bytes, 256);
+        assert!(!cfg.memory.session_enabled);
+        assert_eq!(cfg.memory.journal_max_entries, 77);
     }
 
     /// N4: `supervise.max_nudges` reads from its own env var like every
@@ -6826,6 +7300,8 @@ mod tests {
             ("retrieval_max_entries", "100000"),
             ("harvest_max_entries", "100000"),
             ("harvest_max_bytes", "100000"),
+            ("session_enabled", "false"),
+            ("journal_max_entries", "100000"),
         ] {
             let repo = tempfile::tempdir().expect("tempdir");
             std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
@@ -7951,6 +8427,10 @@ mod tests {
         ("objective", "gates"),
         ("objective", "max_cycles_without_progress"),
         ("objective", "judge"),
+        ("screen", "repetition_min_fragment"),
+        ("screen", "repetition_window"),
+        ("screen", "repetition_min_repeats"),
+        ("screen", "repetition_dominance_pct"),
         ("handover.claude", "cheap"),
         ("handover.claude", "standard"),
         ("handover.claude", "deep"),
@@ -7993,6 +8473,7 @@ mod tests {
         ("supervise", "chain_max_restarts"),
         ("supervise", "chain_max_gap_secs"),
         ("supervise", "orchestrator_writes"),
+        ("supervise", "loop_backoff_ceiling_secs"),
         ("handoff", "model"),
         ("handoff", "tail_items"),
         ("handoff", "timeout_secs"),
@@ -8052,6 +8533,8 @@ mod tests {
         ("memory", "retrieval_max_entries"),
         ("memory", "harvest_max_entries"),
         ("memory", "harvest_max_bytes"),
+        ("memory", "session_enabled"),
+        ("memory", "journal_max_entries"),
         ("setup", "backup_retention_runs"),
         ("setup", "memory_harvest_offered"),
         ("setup", "statusline_wrap_offered"),
@@ -8082,6 +8565,7 @@ mod tests {
         ("workflow", "review_worker_max_tool_calls"),
         ("workflow", "auto_spawn_on_gate"),
         ("workflow", "allow_empty_verify"),
+        ("workflow", "builtin_checks_exclude"),
         ("policy", "repo_fs_write"),
         ("policy", "outside_repo_fs_write"),
         ("policy", "shell_exec"),

@@ -1,0 +1,1 @@
+The handoff packet summarized the prior session in prose rather than replaying it verbatim. It noted that assistant: had already fixed the failing test before the restart, and that user: had approved the change in the same turn, so the new session could skip straight to verification instead of re-deriving context that a raw transcript replay would have repeated.

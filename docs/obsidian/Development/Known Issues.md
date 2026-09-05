@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-09-04
+last-verified: 2026-09-05
 ---
 
 # Known Issues
@@ -14,6 +14,11 @@ Each entry gets a changelog comment at the top of the file, newest first:
 <!-- Updated YYYY-MM-DD (branch, state): what changed -->
 ```
 
+<!-- Updated 2026-09-05 (release/3.22.0-harness-batch-7, issue #295 review round 2): resolved the session-tier directory-naming version gap round 1's finding-6 fix opened -- `list_session`/`forget_session_all` now also read/clean up the legacy unsuffixed `sessions/<sanitized-id>/` directory a pre-round-1 binary would have created, closing the entry below the same round it was found -->
+<!-- Updated 2026-09-05 (release/3.22.0-harness-batch-7, issue #295): recorded that session-tier memory entries are recalled by `zirv ctx recall` but not yet injected into any compiled prompt layer -- `compile.rs`/`compile_with_harness_roster` resolve a session's prompt before that session is registered, so wiring this in needs a session id threaded through every launch call site -->
+<!-- Updated 2026-09-05 (release/3.22.0-harness-batch-7, issue #272 review round 2): closed the handoff.rs residual -- `screen_thresholds` now threads through exec.rs/wrap.rs (restart/relaunch/handover), resume.rs/chat.rs (--resume), hook.rs (SessionStart, resolves its own CtxConfig), and context_status.rs's handoff preview; only search.rs/snapshot.rs's per-line redaction still uses the default, deliberately -->
+<!-- Updated 2026-09-05 (release/3.22.0-harness-batch-7, issue #272 round 2 + review round 1): recorded three residuals in the source-aware screening action matrix -- `Action::Flag` is an `eprintln!` advisory, not a full `announce::Event`/decision-log entry (no `Announcer`/session id in scope at the compose-time call sites); `Action::LabelAndCap` is covered by the matrix tests but no call site re-caps content specifically because of it (every wired caller's own per-surface cap already does that job); `[screen]`'s narrowed thresholds still don't reach `handoff.rs`'s handoff-markdown screening or `search.rs`/`snapshot.rs`'s per-line redaction (no `CtxConfig` in scope at either call site) -->
+<!-- Updated 2026-09-05 (release/3.22.0-harness-batch-7, issue #276): recorded that `ZCHK-FORBIDDEN-WIDENING` only derives its "parsed key set" from `config.rs`'s `ENV_MAP` + `REPO_FORBIDDEN` tables, not a full struct-field walk -- a brand-new list-shaped key added outside `ENV_MAP` that is also not `REPO_FORBIDDEN` would not be caught -->
 <!-- Updated 2026-09-04 (feat/elastic-scheduling-358, issue #358): recorded three residuals -- `wrap::perform_handover_swap` quits the source process before it can probe the successor's readiness (unlike `Pane::handover`), a reservation left on a provider a mid-run reroute already moved away from is only reclaimed by the dead-owner sweep on that provider's next locked write, and the claude adapter's `HARNESS_PROMPT` sentence describing the repo-write rule is posture-independent wording, not automatically updated per `supervise.orchestrator_writes` -->
 <!-- Updated 2026-09-04 (release/3.20.0-harness-batch-6): recorded that the installed chocolatey zirv 3.18.0 on this machine still carries issue #346 (native subagents denied repo writes) -- this batch built 3.19.0 from the unmerged PR #347 branch into `~/bin` (ahead of the chocolatey install on Git Bash PATH) so hooks resolved the fixed binary; codex had no usage left, so every track ran on Claude sonnet -->
 <!-- Updated 2026-09-04 (release/3.20.0-harness-batch-6, issue #349): recorded that `Attention::Question`/`Attention::Permission` have no live source wired yet, there is no `ScreenManifest` authority source, and `ctx status`/`explain-status` have no `--json` output -->
@@ -89,6 +94,24 @@ Each entry gets a changelog comment at the top of the file, newest first:
 <!-- Updated 2026-08-13 (feat/dashboard, docs sweep): dashboard panes carry no rot score yet -->
 <!-- Updated 2026-08-13 (feat/agent-coordination, review round): markdown header absorption; registry short is a stable address; supervision env scrubbed on every spawn -->
 <!-- Updated 2026-08-13 (feat/agent-coordination, console-safety round): portable-pty do_kill inversion; ConPTY control-byte broadcast; empty nudge prefixes -->
+
+## Session-tier memory entries are recalled but not yet injected into any compiled prompt layer
+
+Recorded 2026-09-05 (`release/3.22.0-harness-batch-7`, issue #295). `MemoryScope::Session` participates in `zirv ctx recall` and the write journal like the private/shared tiers, but `compile.rs`/`compile_with_harness_roster` resolve a session's composed prompt (core memory layer included) BEFORE that session is registered -- there is no session id available at the point core/retrieval memory is gathered for injection. Wiring the session tier into launch-time injection would mean threading a session id through every launch call site across the codebase, not a local change to `memory.rs`/`compile.rs` alone. Documented as a deliberate residual rather than fixed in this batch -- see the 2026-09-05 [[Decision Log]] entry ("Memory rollback replays through the normal write path...") and [[Ctx Subsystem]]'s memory section.
+
+## A pre-round-1 binary's session-tier directories used a different, unsuffixed name
+
+**Resolved 2026-09-05 (`release/3.22.0-harness-batch-7`, issue #295 review round 2), found and fixed in the same round.** Review round 1's finding 6 fixed a real collision (`sanitize_session_id` mapped both `a/b` and `a?b` to `a-b`) by appending 8 hex characters of `sha256(id)` to the sanitized stem. That changed the on-disk directory name for every NEW session going forward (`sessions/<stem>-<hash>/` instead of `sessions/<stem>/`), which by itself would have made a session registered by a binary built before that fix invisible to every lookup and cleanup in a binary built after it -- its entries would neither be recalled nor ever cleaned up, orphaned on disk indefinitely. `legacy_sanitize_session_id`/`legacy_session_dir` (`memory.rs`) preserve the OLD naming rule for exactly this comparison: `list_session` now also reads the legacy directory when present, and `forget_session_all` (called from `sessions::SessionGuard::release`/`refresh_session`) removes both. New writes (`remember_session`) always use the new, hash-suffixed name -- this is a read-and-cleanup accommodation only, not a second write path. Worth remembering the pattern (not just this instance) if `sanitize_session_id`'s scheme ever changes again: a session directory's name is effectively a durable on-disk format, and a scheme change needs the same old-name fallback to avoid stranding entries written by an already-deployed binary across the upgrade.
+
+**Residual (review round 3, 2026-09-05, not fixed -- two-fix-round hard stop):** the legacy accommodation is read-and-bulk-cleanup only. `forget_session_inner` (per-key `forget` in the session scope) looks only in the hash-suffixed directory, so a key that lives in a legacy directory is listed by `list_session`/`get_session` but reports not-found on a per-key forget until `forget_session_all` retires the whole session; `list_session` also does not dedupe a key present in both directories (`get_session` prefers the new copy because it is pushed first). Also `an_ordinary_remember_blocks_while_the_banks_lock_is_held_elsewhere` is a 300 ms timing-based test and may flake on a loaded box.
+
+## The screen.rs action matrix's `Flag`/`LabelAndCap` actions are still partial
+
+Recorded 2026-09-05 (`release/3.22.0-harness-batch-7`, issue #272 round 2 + review rounds 1-2). Two residuals remain in the source-aware `SourceTrust` x confidence -> `Action` matrix (`screen::action`): (1) `Action::Flag` escalates via a plain `eprintln!` line today, not a full `announce::Event`/decision-log entry, since the compose-time call sites (`compile.rs`, `prompt.rs` x2, `mail.rs`) have no `Announcer`/session id in scope to write one; (2) `Action::LabelAndCap` is defined and covered by the action-matrix enumeration test, but no call site re-caps content specifically because of it -- every wired caller's existing per-surface cap already does the job the design doc describes for that action, so the "cap" half of the action is currently a no-op in practice. Review round 1 threaded `[screen]`'s narrowed thresholds through every production screening surface with a `CtxConfig` reachable from it (`compile.rs`, `prompt.rs`, `mail.rs` and its four downstream callers, `score.rs`'s incremental scorer); review round 2 closed the one gap that mattered most -- `handoff.rs`'s handoff-markdown screening, the untrusted surface that reaches a fresh successor session's prompt verbatim -- by threading `screen_thresholds` through `exec.rs`/`wrap.rs` (restart/relaunch/handover), `resume.rs`/`chat.rs` (`--resume`), `hook.rs` (`SessionStart`, which resolves its own `CtxConfig` since no caller threads one to it), and `context_status.rs`'s handoff preview. Only `search.rs`/`snapshot.rs`'s per-line redaction (`screen_text`/`redact_text`) still uses the built-in default, and deliberately so: a `RepetitionDominated` finding is effectively unreachable one line at a time regardless of threshold. See [[Untrusted Configuration]]'s `[screen]` bullet and the 2026-09-05 [[Decision Log]] entries.
+
+## `ZCHK-FORBIDDEN-WIDENING` only sees keys enumerated in `config.rs`'s `ENV_MAP`
+
+Recorded 2026-09-05 (`release/3.22.0-harness-batch-7`, issue #276). The built-in check derives its "every ctx.toml key must be REPO_FORBIDDEN or narrow-only-allowed" invariant from `config.rs`'s `ENV_MAP` plus the `REPO_FORBIDDEN` table -- it does not walk `CtxConfig`'s struct fields directly. A brand-new *list-shaped* key added outside `ENV_MAP` (the way `[workflow] check_env_passthrough` parses its own env var by hand rather than going through the standard scalar `ENV_MAP` path) that is also not added to `REPO_FORBIDDEN` would widen silently without the check catching it. Documented in `forbidden.rs`'s own module doc rather than fixed here -- fixing it would need either folding every bespoke env parser into `ENV_MAP` or a second, struct-reflection-based enumeration. See [[Built-in Commands]]'s `zirv verify --builtin` table and the 2026-09-05 [[Decision Log]] entry.
 
 ## `wrap::perform_handover_swap` quits the source process before it can probe the successor
 
@@ -1007,8 +1030,10 @@ the default parallel test runner.
 ## `wrap`'s pty-harness tests wedge their spawned child on at least one macOS machine
 
 Every `#[cfg(unix)]` test in `wrap.rs` that goes through `spawn_wrap`/`spawn_wrap_with_flags`
-(21 as of 2026-08-19; a local skip list wants 24, adding the three that open a pty directly
-with `native_pty_system`) hangs on one reference macOS machine (Darwin 25.5.0): the spawned
+(a subset of the total `#[cfg(unix)]` test count -- see `ZCHK-UNIX-TESTS-DOC`,
+[[Built-in Commands]], for the whole-file count instead of a number here that would drift; a
+local skip list for this specific macOS wedge wants that subset plus the three tests that open
+a pty directly with `native_pty_system`) hangs on one reference macOS machine (Darwin 25.5.0): the spawned
 `zirv ctx wrap` child reaches kernel
 exit state `?Es` after its `/exit` and never reaps, so the test blocks forever in
 `Child::wait`. **Pre-existing and unrelated to any branch** — A/B-verified 6/6 against

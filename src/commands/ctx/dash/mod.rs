@@ -3558,7 +3558,13 @@ fn compose_worker_prompt(
     let mail_messages: Vec<mail::Message> = mail_entries
         .iter()
         .map(|(path, message)| {
-            mail::message_with_delivery_envelope(state, path, message, parent_short)
+            mail::message_with_delivery_envelope(
+                state,
+                path,
+                message,
+                parent_short,
+                &cfg.screen.thresholds(),
+            )
         })
         .collect();
     let composed = if system_prompt_supported {
@@ -5684,6 +5690,9 @@ fn mail_injection_label(from_agent: &str, from_session: &str, is_parent: bool) -
 /// Takes an `Injector` rather than a `Pane` so the one-per-tick rule is
 /// testable without a real pty, the same seam `deliver_and_consume` already
 /// uses.
+/// `screen_thresholds` (issue #272 review round 1) is the caller's own
+/// resolved `[screen]` config, threaded straight through to
+/// `mail::message_with_delivery_envelope` below.
 #[allow(clippy::too_many_arguments)]
 fn sweep_one_pane<I: Injector>(
     injector: &mut I,
@@ -5696,6 +5705,7 @@ fn sweep_one_pane<I: Injector>(
     // Issue #249: this pane's own `Pane::parent_session` -- server-verified
     // at spawn time, never anything read out of a message being swept.
     parent_short: Option<&str>,
+    screen_thresholds: &super::screen::Thresholds,
 ) -> bool {
     let messages = match mail::list(state, slug, Some(agent), Some(short)) {
         Ok(m) => m,
@@ -5712,7 +5722,8 @@ fn sweep_one_pane<I: Injector>(
     // D5: label and body share one budget. The label carries the sender's own
     // `from_agent`, which is untrusted and unbounded, so capping only the body
     // left the injection as a whole uncapped.
-    let delivered = mail::message_with_delivery_envelope(state, &path, &msg, parent_short);
+    let delivered =
+        mail::message_with_delivery_envelope(state, &path, &msg, parent_short, screen_thresholds);
     let (label, body) = pane::capped_injection(
         &mail_injection_label(&msg.from_agent, &msg.from_session, is_parent),
         &delivered.body,
@@ -5882,6 +5893,7 @@ fn mail_sweep(
                 cfg.mail.max_delivered_bytes,
                 errors,
                 parent_short.as_deref(),
+                &cfg.screen.thresholds(),
             );
         } else if pane.verb() == sessions::Verb::Chat && injectable {
             let agent = pane.agent().to_string();
@@ -11339,6 +11351,7 @@ mod tests {
             cfg.mail.max_delivered_bytes,
             &mut errors,
             None,
+            &super::super::screen::Thresholds::default(),
         );
 
         assert!(delivered);
@@ -11396,6 +11409,7 @@ mod tests {
             cfg.mail.max_delivered_bytes,
             &mut errors,
             None,
+            &super::super::screen::Thresholds::default(),
         );
 
         assert!(
@@ -11427,6 +11441,7 @@ mod tests {
             4096,
             &mut errors,
             None,
+            &super::super::screen::Thresholds::default()
         ));
         assert!(injector.calls.is_empty());
         assert!(errors.is_empty());
@@ -11465,6 +11480,7 @@ mod tests {
             cfg.mail.max_delivered_bytes,
             &mut errors,
             None,
+            &super::super::screen::Thresholds::default()
         ));
         assert_eq!(errors.len(), 1, "the failure is reported to the header");
         assert_eq!(
@@ -15685,6 +15701,7 @@ mod tests {
             cfg.mail.max_delivered_bytes,
             &mut errors,
             None,
+            &super::super::screen::Thresholds::default()
         ));
 
         let (label, body) = injector.calls.first().expect("one injection").clone();
@@ -15742,6 +15759,7 @@ mod tests {
             cfg.mail.max_delivered_bytes,
             &mut errors,
             None,
+            &super::super::screen::Thresholds::default()
         ));
 
         let (label, body) = injector.calls.first().expect("one injection").clone();

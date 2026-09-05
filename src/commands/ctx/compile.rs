@@ -831,7 +831,11 @@ fn with_canonical_context_layer(
         // Issue #243: each candidate's own `[label]` line is
         // extended when its text is flagged -- `CONTEXT_LAYER_HEADER` itself
         // stays byte-exact for `shrink_for_inline_argv`'s literal search.
-        let screening = super::screen::screen(&text);
+        // Issue #272: `cfg.screen.thresholds()` is the one seam a caller
+        // uses to apply a repo-narrowed `RepetitionDominated` threshold
+        // without `screen.rs` itself ever reading config.
+        let screening =
+            super::screen::screen_with_thresholds(&text, text.len(), &cfg.screen.thresholds());
         if screening.is_clean() {
             composed.text.push_str(&format!("[{}]\n", layer.label()));
         } else {
@@ -851,6 +855,28 @@ fn with_canonical_context_layer(
         // than re-deriving the same mapping a second way.
         let surface = optimize::Surface { layer, path, text }.context_surface(repo, home);
         let trust = surface.trust();
+        // Issue #272 design item 3: maps this layer's ALREADY-computed
+        // `surface::Trust` (issue #41/#39's own provenance taxonomy) onto
+        // `screen::SourceTrust` (`RepoUntrusted -> RepoOwned`, `Operator ->
+        // Operator`) rather than re-deriving trust a second way, and prints
+        // an operator-visible line for any finding whose action is `Flag`.
+        // Never changes `composed.text` (already fully composed above) or
+        // `raw_bytes`/`delivered_bytes`, so `zirv ctx compile --measure`
+        // byte totals are unaffected -- only this diagnostic line is new.
+        let source_trust = match trust {
+            Trust::RepoUntrusted => super::screen::SourceTrust::RepoOwned,
+            Trust::Operator => super::screen::SourceTrust::Operator,
+        };
+        if screening
+            .flags
+            .iter()
+            .any(|f| super::screen::action(f, source_trust) == super::screen::Action::Flag)
+        {
+            eprintln!(
+                "zirv: canonical context layer {display_path} flagged by screening: {}",
+                screening.summary()
+            );
+        }
         provenance.push(ContextProvenance {
             surface,
             trust,
@@ -1015,6 +1041,7 @@ pub fn compile_with_harness_roster(
         role,
         &harness_lines,
         cfg.context.max_harness_roster_bytes,
+        &cfg.screen.thresholds(),
     );
     // Mirrors `compose`'s own gate for `PromptSource::Harnesses` exactly
     // (role == Orchestrator, `cfg.prompt.harnesses`, a non-empty roster) plus
@@ -1070,6 +1097,7 @@ pub fn compile_with_harness_roster(
         cfg.memory
             .core_max_bytes
             .saturating_add(cfg.memory.retrieval_max_bytes),
+        &cfg.screen.thresholds(),
     );
     // Issue #285: the durable objective layer, folded in last of everything
     // this compiler composes deterministically -- its own spend/status is at

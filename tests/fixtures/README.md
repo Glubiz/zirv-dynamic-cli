@@ -37,6 +37,20 @@ Event counts derived from the fixture by the recorder. The Rust parser test
 asserts its own counts equal these, which pins parser regressions against real
 data.
 
+## measure/
+
+Small, hand-written transcripts for `zirv ctx measure` (issue #294),
+covering the cases its own Tests section names: `claude-empty.jsonl` (zero
+bytes), `claude-no-compaction.jsonl` (a ranged read and a real edit, no
+`compact_boundary` row at all), `claude-compaction-before-tool-call.jsonl`
+(`compact_boundary` appears before any `tool_use` row, so pre-compaction and
+peak context utilisation must differ), `claude-garbage-lines.jsonl` and
+`codex-garbage-lines.jsonl` (unparseable/truncated lines interleaved with
+valid ones), and `codex-basic.jsonl` (a plain two-turn rollout -- codex never
+states a context window or emits `ToolCall`/`ToolResult`/`Compaction`, so
+this fixture doubles as the "unknown context window" case). Read by
+`commands::ctx::measure::tests`.
+
 ## fake-agent.sh, fake-model.sh, stub-tui.sh
 
 Executable stand-ins used by the supervisor tests. See the header comment in

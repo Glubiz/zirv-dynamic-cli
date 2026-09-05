@@ -103,7 +103,10 @@ fn md_files_in(dir: &Path) -> Vec<PathBuf> {
 /// claude_project_dir_name`, the identical encoding `--repo`/cwd audit
 /// scoping already uses) by default; every project under `window::
 /// projects_root()` with `--all-repos`.
-fn claude_candidates(repo: &Path, all_repos: bool) -> Vec<(PathBuf, Source)> {
+///
+/// `pub(crate)` so `measure.rs` (issue #294) reuses the same discovery
+/// instead of re-walking `~/.claude/projects` a second, independent way.
+pub(crate) fn claude_candidates(repo: &Path, all_repos: bool) -> Vec<(PathBuf, Source)> {
     let Ok(root) = super::window::projects_root() else {
         return Vec::new();
     };
@@ -123,7 +126,9 @@ fn claude_candidates(repo: &Path, all_repos: bool) -> Vec<(PathBuf, Source)> {
 /// transcripts_root`'s own doc comment on `AuditAgent::Codex`), so this is
 /// always machine-wide regardless of `--all-repos`, mirroring the audit's
 /// own codex behaviour.
-fn codex_candidates() -> Vec<(PathBuf, Source)> {
+///
+/// `pub(crate)`, same reasoning as `claude_candidates`.
+pub(crate) fn codex_candidates() -> Vec<(PathBuf, Source)> {
     let Ok(home) = crate::utils::home_dir() else {
         return Vec::new();
     };
