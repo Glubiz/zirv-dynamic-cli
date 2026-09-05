@@ -1165,6 +1165,11 @@ impl Default for ChromeConfig {
 pub struct DashConfig {
     pub enabled: bool,
     /// Width, in columns, of the persistent sidebar listing every session.
+    /// Issue #354 fixed the approved default at 44 -- the width the row
+    /// contract (`dash::ui`'s `SIDEBAR_FIXED_COLS` plus a model column) is
+    /// drawn against at every terminal size. An explicit operator value is
+    /// still honoured, and the layout still clamps whatever it is to the
+    /// frame.
     pub sidebar_cols: u16,
     /// How long a quit-time roster stays offered for restore before a fresh
     /// launch treats it as stale and ignores it.
@@ -1242,7 +1247,7 @@ impl Default for DashConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            sidebar_cols: 24,
+            sidebar_cols: 44,
             roster_max_age_secs: 604_800,
             max_panes: 9,
             mouse: true,
@@ -7354,10 +7359,10 @@ mod tests {
     }
 
     #[test]
-    fn dash_defaults_are_on_with_a_24_col_sidebar() {
+    fn dash_defaults_are_on_with_a_44_col_sidebar() {
         let cfg = CtxConfig::default();
         assert!(cfg.dash.enabled);
-        assert_eq!(cfg.dash.sidebar_cols, 24);
+        assert_eq!(cfg.dash.sidebar_cols, 44);
         assert_eq!(cfg.dash.roster_max_age_secs, 604_800);
         assert_eq!(
             cfg.dash.max_panes, 9,
