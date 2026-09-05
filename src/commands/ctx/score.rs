@@ -6,7 +6,9 @@ use serde::{Deserialize, Serialize};
 use super::adapters::AgentAdapter;
 use super::breakdown::{self, BreakdownSummary};
 use super::config::{CtxConfig, EnvLookup, ScoreConfig, env_from_process};
-use super::event::{ModelChange, NormalizedEvent, SessionId, SessionRef, SpeedMetrics, input_hash};
+use super::event::{
+    Capabilities, ModelChange, NormalizedEvent, SessionId, SessionRef, SpeedMetrics, input_hash,
+};
 use super::rot::{self, RotState, Score};
 use super::screen::{self, ScreenReport};
 use super::state::StateDir;
@@ -75,6 +77,26 @@ impl ModelTracker {
         report.limit_pressure = super::pace::model_change_is_limit_pressure(adapter, &report);
         Some(report)
     }
+}
+
+/// This scoring pass's capabilities: the adapter's own answer for the live
+/// model, with the context window the SESSION's transcript reported layered
+/// on top when the adapter could read one (`AgentAdapter::
+/// context_window_hint`). A figure the harness stated for this very session
+/// is strictly better evidence than a per-model default, and it is what lets
+/// `rot::token_gates` scale for an adapter whose `context_window_tokens` is
+/// otherwise `None` (codex). The operator's own `score.model_context_tokens`
+/// still outranks both -- `token_gates` consults it first.
+fn caps_with_window(
+    adapter: &dyn AgentAdapter,
+    model: Option<&str>,
+    context_window: Option<u64>,
+) -> Capabilities {
+    let mut caps = adapter.capabilities_for_model(model);
+    if let Some(tokens) = context_window {
+        caps.context_window_tokens = Some(tokens);
+    }
+    caps
 }
 
 fn attach_model_change(
@@ -230,7 +252,11 @@ fn full_score(
     // model" default `capabilities()` always carries. A `[1m]` claude seat's
     // real 1M window now reaches rot's token gates on every full parse.
     let events = adapter.parse_events(&jsonl);
-    let caps = adapter.capabilities_for_model(adapter.model_hint(&jsonl).as_deref());
+    let caps = caps_with_window(
+        adapter,
+        adapter.model_hint(&jsonl).as_deref(),
+        adapter.context_window_hint(&jsonl),
+    );
     let mut tracker = ModelTracker::default();
     tracker.feed_all(&events);
     Ok(attach_model_change(
@@ -354,7 +380,11 @@ fn window_breakdown_core(
     state: &StateDir,
 ) -> (BreakdownSummary, Option<u64>) {
     let events = adapter.parse_events(jsonl);
-    let caps = adapter.capabilities_for_model(adapter.model_hint(jsonl).as_deref());
+    let caps = caps_with_window(
+        adapter,
+        adapter.model_hint(jsonl).as_deref(),
+        adapter.context_window_hint(jsonl),
+    );
     let total_tokens = rot::context_tokens(&events);
 
     let home = crate::utils::home_dir().ok();
@@ -408,6 +438,12 @@ pub struct IncrementalScorer {
     /// not to mention a model (e.g. a lone tool-result line) must not read
     /// as "no model at all" -- it keeps whatever was last resolved.
     model: Option<String>,
+    /// The context window this session's transcript last reported
+    /// (`AgentAdapter::context_window_hint`), carried across polls for
+    /// exactly the reason `model` right above is: a poll sees only the newly
+    /// appended bytes, and a chunk that happens not to restate the window
+    /// must not read as "no window at all".
+    context_window: Option<u64>,
     model_tracker: ModelTracker,
     provider_limit_hit: bool,
     /// Issue #293: this pass's speed sample, derived from exactly the events
@@ -427,6 +463,7 @@ impl IncrementalScorer {
             transcript,
             state: None,
             model: None,
+            context_window: None,
             model_tracker: ModelTracker::default(),
             provider_limit_hit: false,
             last_speed: None,
@@ -440,6 +477,7 @@ impl IncrementalScorer {
         consumed: u64,
         state: RotState,
         model: Option<String>,
+        context_window: Option<u64>,
         model_tracker: ModelTracker,
     ) -> Self {
         Self {
@@ -447,6 +485,7 @@ impl IncrementalScorer {
             transcript,
             state: Some(state),
             model,
+            context_window,
             model_tracker,
             provider_limit_hit: false,
             last_speed: None,
@@ -571,7 +610,10 @@ impl IncrementalScorer {
             // A restarted (truncated/rewritten) transcript may belong to a
             // different session entirely -- issue #155 D1 -- so a model
             // resolved off the old one must not linger past the rebuild.
+            // The reported context window travels with it, for the same
+            // reason.
             self.model = None;
+            self.context_window = None;
             self.model_tracker = ModelTracker::default();
         }
         // Issue #155 D1: resolved off the committed lines every poll, newest
@@ -582,7 +624,11 @@ impl IncrementalScorer {
         if let Some(model) = adapter.model_hint(&appended.lines) {
             self.model = Some(model);
         }
+        if let Some(window) = adapter.context_window_hint(&appended.lines) {
+            self.context_window = Some(window);
+        }
         let model = self.model.clone();
+        let context_window = self.context_window;
         let events = adapter.parse_events(&appended.lines);
         self.provider_limit_hit = super::pace::provider_events_hit_limit(&events);
         self.model_tracker.feed_all(&events);
@@ -597,7 +643,7 @@ impl IncrementalScorer {
         // -- a full parse would see it too -- but is never committed to the
         // state, because the next poll reads it again, complete.
         if appended.partial.is_empty() {
-            let caps = adapter.capabilities_for_model(model.as_deref());
+            let caps = caps_with_window(adapter, model.as_deref(), context_window);
             let speed = derive_speed_metrics(&events);
             self.last_speed = (!speed.is_empty()).then_some(speed);
             let score = state
@@ -615,7 +661,10 @@ impl IncrementalScorer {
         // up so far; it is never committed to `self.model` (mirroring
         // `state`/`with_partial` above), only used for this one score.
         let partial_model = adapter.model_hint(&appended.partial).or(model);
-        let caps = adapter.capabilities_for_model(partial_model.as_deref());
+        let partial_window = adapter
+            .context_window_hint(&appended.partial)
+            .or(context_window);
+        let caps = caps_with_window(adapter, partial_model.as_deref(), partial_window);
         // Issue #293: this poll's speed sample comes from BOTH the committed
         // events and the still-in-progress partial line, mirroring
         // `with_partial` itself folding both -- the fullest picture this
@@ -660,7 +709,12 @@ impl IncrementalScorer {
 /// (provider-error/model-drift handling): same rationale as every bump
 /// above -- a checkpoint written before this field existed must rebuild
 /// clean rather than resume with a silently-zeroed count.
-const CHECKPOINT_VERSION: u32 = 5;
+/// Bumped to 6 for the new `context_window` field (the session-reported
+/// model context window `AgentAdapter::context_window_hint` resolves): an
+/// older checkpoint would resume with `None` and score the next poll against
+/// the fallback token gates rather than the seat's real capacity, which is
+/// exactly the mis-gating that field exists to fix.
+const CHECKPOINT_VERSION: u32 = 6;
 
 /// What a fresh process needs to carry on folding where the last one stopped.
 #[derive(Debug, Serialize, Deserialize)]
@@ -683,6 +737,14 @@ struct Checkpoint {
     /// the version bump above.
     #[serde(default)]
     model: Option<String>,
+    /// The context window `IncrementalScorer::context_window` had last
+    /// resolved off the transcript, carried across the Stop hook's
+    /// fresh-process-per-turn restarts for exactly the reason `model` above
+    /// is: a resumed poll's own bytes may not restate it, and falling back
+    /// to the adapter's per-model default would silently re-narrow the
+    /// capacity-aware gates mid-session.
+    #[serde(default)]
+    context_window: Option<u64>,
     #[serde(default)]
     model_tracker: ModelTracker,
 }
@@ -747,6 +809,7 @@ fn save_checkpoint(path: &Path, transcript: &Path, fingerprint: u64, scorer: &In
         consumed,
         state: state.clone(),
         model: scorer.model().map(str::to_string),
+        context_window: scorer.context_window,
         model_tracker: scorer.model_tracker.clone(),
     }) else {
         return;
@@ -857,6 +920,7 @@ fn score_with_checkpoint(
             checkpoint.consumed,
             checkpoint.state,
             checkpoint.model,
+            checkpoint.context_window,
             checkpoint.model_tracker,
         ),
         None => IncrementalScorer::new(transcript.to_path_buf()),
@@ -989,14 +1053,22 @@ static RESOLVE_ATTEMPTS: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 ///
 /// Consumed by the dashboard: the header renders the focused pane's score and
 /// every sidebar row carries its own, both polled on the facts throttle.
-pub fn cached_score(state: &StateDir, repo: &Path, session_id: &str) -> Option<u32> {
-    cached_score_with(state, repo, session_id, &env_from_process())
+/// `agent` is the SESSION's own recorded agent (`sessions::Record::agent`, a
+/// dashboard pane's `Pane::agent`), never the repository's configured
+/// default: a codex session in a repo whose `ctx.toml` names claude was
+/// otherwise resolved through the claude adapter, looked for its rollout at
+/// claude's transcript path, found nothing, and reported the session as
+/// permanently unscorable. `breakdown_for_session` already reads the
+/// record's own agent for the same reason.
+pub fn cached_score(state: &StateDir, repo: &Path, session_id: &str, agent: &str) -> Option<u32> {
+    cached_score_with(state, repo, session_id, agent, &env_from_process())
 }
 
 fn cached_score_with(
     state: &StateDir,
     repo: &Path,
     session_id: &str,
+    agent: &str,
     env: EnvLookup<'_>,
 ) -> Option<u32> {
     let cached = {
@@ -1037,7 +1109,7 @@ fn cached_score_with(
 
     RESOLVE_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let cfg = CtxConfig::load(repo, env).ok()?;
-    let adapter = adapters::select(cfg.agent.as_deref(), &[], &cfg).ok()?;
+    let adapter = adapters::select(Some(agent), &[], &cfg).ok()?;
 
     // Item 12: an eventless adapter (`capabilities().events == false`; no
     // registered adapter today, but the guard has to hold for any future
@@ -1977,6 +2049,7 @@ mod tests {
             consumed: 0,
             state: RotState::new(&cfg).expect("bounded state"),
             model: None,
+            context_window: None,
             model_tracker: ModelTracker::default(),
         };
         let mut json = serde_json::to_value(checkpoint).expect("serialize checkpoint");
@@ -2222,7 +2295,7 @@ mod tests {
         let session = "5c0d0001-1111-4222-8333-444444444444";
 
         assert_eq!(
-            cached_score_with(&state, repo.path(), session, &lookup),
+            cached_score_with(&state, repo.path(), session, "claude", &lookup),
             None,
             "no transcript yet is unknown, and a renderer must show '--' rather than 0"
         );
@@ -2233,7 +2306,8 @@ mod tests {
         std::fs::write(&transcript, &body).expect("write");
 
         let before = recomputes();
-        let first = cached_score_with(&state, repo.path(), session, &lookup).expect("scores");
+        let first =
+            cached_score_with(&state, repo.path(), session, "claude", &lookup).expect("scores");
         assert_eq!(recomputes() - before, 1, "the first call has to parse");
         assert_eq!(
             first,
@@ -2245,7 +2319,7 @@ mod tests {
 
         for poll in 0..5 {
             assert_eq!(
-                cached_score_with(&state, repo.path(), session, &lookup),
+                cached_score_with(&state, repo.path(), session, "claude", &lookup),
                 Some(first),
                 "poll {poll} of an unchanged transcript"
             );
@@ -2262,7 +2336,8 @@ mod tests {
         )
         .expect("append a turn");
 
-        let after = cached_score_with(&state, repo.path(), session, &lookup).expect("scores");
+        let after =
+            cached_score_with(&state, repo.path(), session, "claude", &lookup).expect("scores");
         assert_eq!(
             recomputes() - before,
             2,
@@ -2274,6 +2349,146 @@ mod tests {
                 .expect("full")
                 .score,
             "and still agrees with a full parse of the new bytes"
+        );
+    }
+
+    /// The committed two-turn codex rollout, read the same way `codex.rs`'s
+    /// own tests read it.
+    fn codex_rollout_fixture() -> String {
+        std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests")
+                .join("fixtures")
+                .join("codex-rollout-turn-events.jsonl"),
+        )
+        .expect("fixture must be committed")
+    }
+
+    /// `CodexAdapter::parse_events` carries its own `last_tokens` across
+    /// lines within ONE call, and an incremental poll only ever sees the
+    /// bytes appended since the last one. A chunk boundary landing between a
+    /// `token_count` line and the `task_complete` line for the same turn
+    /// used to emit `AssistantFinal { input_tokens: 0 }`, and
+    /// `RotState::feed` persisted that fabricated zero (and checkpointed it)
+    /// as the session's context size -- so the token gate answered off a
+    /// reading the transcript never made, until the next `token_count` line
+    /// happened to arrive.
+    #[test]
+    fn codex_parse_events_is_line_local_for_tokens() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let transcript = dir.path().join("rollout.jsonl");
+        let adapter = super::adapters::codex::CodexAdapter::new(None);
+        let cfg = ScoreConfig::default();
+
+        let fixture = codex_rollout_fixture();
+        let lines: Vec<&str> = fixture.lines().collect();
+        let through_token_count = format!("{}\n{}\n", lines[0], lines[1]);
+        let through_task_complete = format!("{}{}\n", through_token_count, lines[2]);
+
+        let expected = rot::score_events(
+            &adapter.parse_events(&through_task_complete),
+            adapter.capabilities(),
+            &cfg,
+        )
+        .context_tokens;
+        assert_eq!(expected, 1_200, "a full parse of the same bytes");
+
+        std::fs::write(&transcript, &through_token_count).expect("write");
+        let mut scorer = IncrementalScorer::new(transcript.clone());
+        scorer
+            .poll(&adapter, &cfg, &screen::Thresholds::default())
+            .expect("no error");
+
+        // The `task_complete` line lands alone in the next poll's chunk.
+        std::fs::write(&transcript, &through_task_complete).expect("append");
+        let (score, _) = scorer
+            .poll(&adapter, &cfg, &screen::Thresholds::default())
+            .expect("no error");
+        let score = score.expect("a bounded window folds a score on every poll");
+
+        assert_eq!(
+            score.context_tokens, expected,
+            "a chunk boundary must never fabricate a zero token reading"
+        );
+    }
+
+    /// The rollout line codex's token gate already reads also carries the
+    /// model's real context window. Surfacing it scales rot's capacity-aware
+    /// gates to the seat; without it the pre-#155 absolutes apply and a
+    /// 258k-window codex seat is forced to `Compact` at roughly 62% of its
+    /// real capacity.
+    #[test]
+    fn codex_context_window_scales_the_token_gates() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = crate::commands::ctx::testenv::repo();
+        let env: HashMap<String, String> = HashMap::new();
+        let lookup = |k: &str| env.get(k).cloned();
+
+        let transcript = home.path().join("rollout.jsonl");
+        std::fs::write(
+            &transcript,
+            "{\"timestamp\":\"2026-08-20T10:00:00.000Z\",\"type\":\"event_msg\",\"payload\":\
+             {\"type\":\"task_started\",\"turn_id\":\"t1\"}}\n\
+             {\"timestamp\":\"2026-08-20T10:00:05.000Z\",\"type\":\"event_msg\",\"payload\":\
+             {\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":900000,\
+             \"cached_input_tokens\":0,\"output_tokens\":100},\"last_token_usage\":\
+             {\"input_tokens\":200000,\"cached_input_tokens\":0,\"output_tokens\":100},\
+             \"model_context_window\":258400}}}\n\
+             {\"timestamp\":\"2026-08-20T10:00:07.000Z\",\"type\":\"event_msg\",\"payload\":\
+             {\"type\":\"task_complete\",\"turn_id\":\"t1\",\"last_agent_message\":\"done\"}}\n",
+        )
+        .expect("write");
+
+        let score =
+            score_transcript(&transcript, Some("codex"), repo.path(), &lookup).expect("scores");
+        assert_eq!(score.context_tokens, 200_000);
+        assert_eq!(
+            score.verdict,
+            rot::Verdict::Healthy,
+            "200k of a 258k window is below the derived ceiling; only the 160k absolute \
+             fallback would force a compaction here"
+        );
+    }
+
+    /// The dashboard scores a session per row, and a row's agent is its OWN
+    /// recorded agent -- not `ctx.toml`'s repo-wide default. Resolving the
+    /// adapter from the config instead looked for a codex session's rollout
+    /// at claude's transcript path, found nothing, and reported the session
+    /// as permanently unscorable. The default lives in the operator's own
+    /// home config here because `agent` is `REPO_FORBIDDEN` -- a repository
+    /// cannot set it at all.
+    #[test]
+    fn cached_score_uses_the_sessions_own_agent() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(home.path().join("state"));
+        let env: HashMap<String, String> = HashMap::new();
+        let lookup = |k: &str| env.get(k).cloned();
+        let session = "5c0d0042-1111-4222-8333-444444444444";
+
+        // `agent` is REPO_FORBIDDEN, so the operator's own home config is
+        // where a repo-wide default can legitimately live at all.
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".zirv").join("ctx.toml"),
+            "agent = \"claude\"\n",
+        )
+        .expect("write ctx.toml");
+
+        let rollouts = home.path().join(".codex").join("sessions");
+        std::fs::create_dir_all(&rollouts).expect("mkdir");
+        std::fs::write(
+            rollouts.join(format!("rollout-{session}.jsonl")),
+            codex_rollout_fixture(),
+        )
+        .expect("write rollout");
+
+        assert!(
+            cached_score_with(&state, repo.path(), session, "codex", &lookup).is_some(),
+            "a codex session must be scored through the codex adapter even when the repo's \
+             own ctx.toml names a different default agent"
         );
     }
 
@@ -2315,7 +2530,7 @@ mod tests {
         let before = RESOLVE_ATTEMPTS.load(std::sync::atomic::Ordering::Relaxed);
         for poll in 0..12 {
             assert_eq!(
-                cached_score_with(&state, repo.path(), session, &lookup),
+                cached_score_with(&state, repo.path(), session, "claude", &lookup),
                 None,
                 "poll {poll}: an eventless session never reports a fabricated score"
             );
@@ -2345,13 +2560,13 @@ mod tests {
             std::fs::read_to_string(write_transcript(repo.path(), 4, true, 10_000)).expect("read"),
         )
         .expect("write");
-        assert!(cached_score_with(&state, repo.path(), session, &lookup).is_some());
+        assert!(cached_score_with(&state, repo.path(), session, "claude", &lookup).is_some());
 
         std::fs::remove_file(&transcript).expect("remove");
         let before = recomputes();
         for poll in 0..RESOLVE_RETRY_POLLS - 1 {
             assert_eq!(
-                cached_score_with(&state, repo.path(), session, &lookup),
+                cached_score_with(&state, repo.path(), session, "claude", &lookup),
                 None,
                 "poll {poll}: a stale score must not outlive the transcript it was read from"
             );
@@ -2371,7 +2586,7 @@ mod tests {
         )
         .expect("rewrite");
         assert!(
-            cached_score_with(&state, repo.path(), session, &lookup).is_some(),
+            cached_score_with(&state, repo.path(), session, "claude", &lookup).is_some(),
             "a transcript that reappears is scored again"
         );
     }
