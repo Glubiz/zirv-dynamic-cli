@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-09-04
+last-verified: 2026-09-05
 ---
 
 # Decision Log
@@ -23,6 +23,13 @@ last-verified: 2026-09-04
 - If the entry is longer than the cap, the "why" is a spec, not an ADR — write it under `docs/superpowers/specs/` and link to it.
 
 ## Decisions
+
+### 2026-09-05 -- `zirv ctx measure` is measurement first, no threshold, and `--since auto` anchors to the prompt layer's own build
+**Context:** Issue #294. Nothing in zirv answered "did a harness/prompt-layer change actually help agent behaviour" -- `compile --measure` reports what a session is *sent*, not what it *does*. Prime Agent's own offline analysers (read/edit/session-context stats scripts) answer exactly this from transcripts alone, but ship no committed baseline, no thresholds, and no tests -- a regression is only caught if someone remembers to run the script by hand.
+**Decision:** `zirv ctx measure` computes six metrics (partial-read rate, edit inflation ratio, tool-result token share, context utilisation, compaction rate, turns per user message) purely from `NormalizedEvent` streams, strictly read-only except `measure baseline`, which snapshots the ungrouped report to `~/.zirv/ctx-measure-baseline/<repo_slug>.json` for a later `--json` run to diff against (`baseline_delta`) -- no gate, no CI wiring, no exit-code failure on a regression. `--since` defaults to `auto`: the newest of every `<repo>/.zirv/context/*.md` mtime and the running zirv binary's own mtime, a runtime-visible stand-in for "when the compiled-in prompt layer last changed" (there is no runtime-visible timestamp for `prompt::DEFAULT_PROMPT_VERSION`/`HARNESS_PROMPT` changing), so a run measures only sessions produced under the CURRENT prompt layer rather than mixing in stale-prompt history.
+**Rejected:** Gating a build or workflow check on a metric threshold now -- no baseline yet exists for what "good" looks like for any of these six metrics; shipping a threshold before the metric has been observed in the wild would be a guessed number presented as policy. Anchoring `--since` to a git commit/tag naming the last prompt-layer change -- this command has no git dependency anywhere else in the crate and a binary's own mtime is available with zero new I/O.
+**Consequences:** A metric with a zero denominator (no edits this group, codex's own unverified `ToolCall`/`ToolResult`/`Compaction`/context-window shape) reports `Unavailable`, never `0.0` -- a future threshold-gate issue must treat `Unavailable` as "no verdict," not as a passing zero. `--group week` labels are Monday-anchored 7-day buckets, not true ISO-8601 calendar weeks (no year-boundary "week 1" rule) -- deliberately, to avoid a date/time crate dependency this binary has never needed.
+**Spec / link:** [[Built-in Commands]]'s `zirv ctx measure` entry, [[Ctx Subsystem]]'s `measure` verb entry, [[Ctx Adapters]]'s `ToolCallRead`/`ToolCallEdit` entry.
 
 ### 2026-09-04 -- Usage headroom ranks a spawn, it never refuses or delays one
 **Context:** Issue #358 T9. `pace::spawn_gate`'s `SpawnGate::Refuse` at the hard spawn ceiling used to be a real refusal/delay for a NEW delegation or interactive launch -- distinct from the runtime park that follows a session's own confirmed vendor refusal. Combined with `fallback::earliest_reset_choice`'s pre-launch wait-for-a-seat-to-clear, an operator whose whole `fallback.order` sat at the ceiling could not even START a session, however briefly the block might last.

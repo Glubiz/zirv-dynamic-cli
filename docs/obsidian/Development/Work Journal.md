@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-09-04
+last-verified: 2026-09-05
 ---
 
 # Work Journal
@@ -19,6 +19,11 @@ last-verified: 2026-09-04
 **Follow-up:** anything unfinished (optional).
 
 ## Entries
+
+### 2026-09-05: issue #294 -- `zirv ctx measure` transcript-derived proportionality metrics (`feat/294-measure`, harness batch 7)
+**What:** New read-only `zirv ctx measure [--since <iso|auto>] [--until <iso>] [--adapter claude|codex] [--group session|model|week] [--json]` verb: partial-read rate (per-session median), edit inflation ratio (shared-prefix/suffix stripped, pooled median/p90, no-ops reported separately), tool-result token share by tool, context utilisation (peak and pre-first-compaction), compaction rate, and turns per user message -- every metric with a zero denominator reports `Unavailable`, never a zero. `zirv ctx measure baseline [--note <text>]` snapshots the ungrouped report to `~/.zirv/ctx-measure-baseline/<repo_slug>.json` for a later `--json` run's `baseline_delta` block. Two new `NormalizedEvent` siblings (`ToolCallRead`, `ToolCallEdit`) feed it from claude's adapter (`Read`/`Edit`/`MultiEdit` tool_use blocks) -- codex has no verified shape for either and reports the affected metrics `Unavailable` accordingly.
+**Key changes:** `src/commands/ctx/measure.rs` (new), `src/commands/ctx/event.rs` (two new sibling variants), `src/commands/ctx/adapters/claude.rs` (emits them), `src/commands/ctx/{rot,score}.rs` (new catch-all arms), `src/commands/ctx/search.rs` (`claude_candidates`/`codex_candidates` widened to `pub(crate)` for reuse), `src/commands/ctx/mod.rs` (verb registration), `src/commands/command_schema.rs` (`zirv ctx measure`/`measure baseline` classified read-only/mutating), `tests/fixtures/measure/*.jsonl` (new).
+**Follow-up:** No gate/threshold yet -- measurement first, per the 2026-09-05 [[Decision Log]] entry. `baseline_delta` covers the six scalar metrics only, not a per-tool token-share breakdown.
 
 ### 2026-09-04: issue #358 -- elastic usage-window-aware harness scheduling + automatic meta-orchestrator rollover (`feat/elastic-scheduling-358`, v3.21.0, in review)
 **What:** Eight tasks off 3.20.0. A pure capacity allocator (`allocator.rs`: `HarnessState` ready/draining/hard-blocked/unknown/disabled, `CapacitySnapshot`/`Placement`/`place`/`plan`) plus a durable per-provider token-reservation ledger (`reservation.rs`) feed adaptive delegation routing when `fallback.adaptive_delegation` is on (default true). A persisted, fencing-generation logical orchestrator seat (`seat.rs`) plus an automatic rollover transaction driver (`rollover.rs`, reusing the #84 handover seams) let the meta-orchestrator itself roll over across harnesses -- gated off by default (`fallback.auto_orchestrator_rollover = false`) until the fencing invariants soak. `--pin-harness`/`ZIRV_CTX_SEAT_PIN` opt a seat out. `zirv ctx status` gains a pool section, `--json`, and a dashboard aggregate row (`pool.rs`). Two operator-facing follow-ups landed on the same branch: `supervise.orchestrator_writes` (allow/advise/deny, default advise, repo-narrow-only) replaces the unconditional repo-write deny from #328/#334; usage headroom now only ranks a spawn, never refuses/delays one (`PaceGate.initial_launch`, non-blocking interactive gate).
