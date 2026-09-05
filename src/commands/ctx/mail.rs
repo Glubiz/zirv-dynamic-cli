@@ -1795,6 +1795,10 @@ pub fn run_send_with<W: Write>(
     }
 
     let state = StateDir::resolve(env)?;
+    // Issue #358 (task 4): a session an automatic rollover already
+    // superseded must not be able to keep sending mail as if it were still
+    // the live seat -- see `seat::fence`'s own doc comment.
+    super::seat::fence(&state)?;
     let own_slug = repo_slug(repo);
     if let Some(id) = &args.status {
         return run_delivery_status(&state, id, w, args.json);

@@ -45,7 +45,7 @@ use super::policy;
 use super::state::StateDir;
 use super::term;
 use super::window;
-use super::{handoff, handover, mail, memory, prompt, score, sessions};
+use super::{fallback, handoff, handover, mail, memory, prompt, score, seat, sessions};
 use crate::commands::workflow;
 
 pub(crate) use pane::{Pane, PaneBudgetNotice, PaneSpec, PaneState, ScrollOutcome};
@@ -1048,6 +1048,18 @@ struct DiskFacts {
     /// both cells rather than a phantom `0`/`$0.00` that would be
     /// indistinguishable from "checked and found none".
     spend: Option<AggregateSpendFacts>,
+    /// Issue #358 (task T6a): one [`ui::HarnessStrip`] per harness `cfg.
+    /// fallback.order` names, for the aggregate row's own pool strip -- read
+    /// on the same throttled tick as `usage` right above, off the identical
+    /// `fallback::capacity_snapshot` the fallback/status surfaces already
+    /// build (a plain read of already-stored usage windows plus the
+    /// registry, never a scan/poll/network call). Empty when the repo
+    /// configures no fallback order at all.
+    pool_harnesses: Vec<ui::HarnessStrip>,
+    /// This dashboard's own orchestrator seat's `"gen N"` label (`seat::
+    /// load`, keyed by `FactsOwner::session_short`), `None` until a seat is
+    /// registered for it.
+    pool_seat: Option<String>,
 }
 
 /// Issue #264: [`DiskFacts::spend`]'s own shape.
@@ -1157,6 +1169,38 @@ impl FactsCache {
                 }
             })
             .collect();
+
+        // Issue #358 (task T6a): the aggregate row's own pool strip, same
+        // throttled tick as `usage` right above -- `fallback::capacity_
+        // snapshot` is itself a plain read of already-stored usage windows
+        // plus the session registry (`sessions::list`), never a scan, a
+        // poll, or a network call, matching every other read on this tick.
+        // `requester`/`requested` are both `None`: this is a repo-wide
+        // overview, not a placement decision for one particular unit of
+        // work, so nothing needs excluding from the live `active` count and
+        // no harness outside `cfg.fallback.order` needs to be forced in.
+        let pool_snapshot = fallback::capacity_snapshot(state, cfg, now_secs, None, None);
+        self.disk.pool_harnesses = pool_snapshot
+            .harnesses
+            .iter()
+            .map(|harness| {
+                let headroom_pct = pool_snapshot
+                    .provider(&harness.provider)
+                    .and_then(|p| p.binding.and_then(|i| p.windows.get(i)))
+                    .map(|w| w.headroom_pct);
+                ui::HarnessStrip {
+                    name: harness.name.clone(),
+                    state: harness.state.as_str().to_string(),
+                    headroom_pct,
+                }
+            })
+            .collect();
+        // The dashboard's own orchestrator seat -- `FactsOwner::session_
+        // short` is this dashboard's own registry short id (D2's own
+        // "deliberately the dashboard's own identity" convention, the same
+        // field every other per-dashboard disk read on this tick keys off).
+        self.disk.pool_seat =
+            seat::load(state, session_short).map(|s| format!("gen {}", s.generation));
 
         // Issue #264: the aggregate row's own `failed`/`cost` cells. A plain
         // file read, same as `usage` right above -- never a scan, a poll, or
@@ -1362,23 +1406,27 @@ fn enforce_pane_token_budgets(
 }
 
 fn account_reaped_pane_spend(pane: &Pane, cfg: &CtxConfig, state: &StateDir, repo: &Path) {
-    let Some(group_id) = pane.work_group_id() else {
-        return;
-    };
     let Some(usage) = pane_transcript_usage(pane, cfg, repo) else {
         return;
     };
-    // Issue #301: `pane.budget_tokens()` is exactly the ceiling `admit_child`
-    // reserved for this pane at spawn time (`fulfill_spawn_request` sets
-    // both from the same `admit_child` result), so settling here always
-    // releases exactly what was reserved.
-    let reserved = pane.budget_tokens().unwrap_or(0);
-    let _ = super::group::settle_reservation(
-        state,
-        group_id,
-        reserved,
-        super::agent::token_spend(&usage),
-    );
+    let actual = super::agent::token_spend(&usage);
+    if let Some(group_id) = pane.work_group_id() {
+        // Issue #301: `pane.budget_tokens()` is exactly the ceiling
+        // `admit_child` reserved for this pane at spawn time
+        // (`fulfill_spawn_request` sets both from the same `admit_child`
+        // result), so settling here always releases exactly what was
+        // reserved.
+        let reserved = pane.budget_tokens().unwrap_or(0);
+        let _ = super::group::settle_reservation(state, group_id, reserved, actual);
+    }
+    // Issue #358 (task T3): the provider-level reservation `fulfill_spawn_
+    // request` took for this pane, regardless of whether it also belonged
+    // to a work group -- settled with the same actual spend just computed
+    // above, mirroring `agent::run_with`'s own headless completion path.
+    if let Some(reservation_id) = pane.reservation_id() {
+        let provider = adapters::provider_for_agent_name(Some(pane.agent()));
+        let _ = super::reservation::settle(state, provider, reservation_id, actual);
+    }
 }
 
 /// Pure: `selected` after `new_pane_count - old_pane_count` panes were
@@ -1769,22 +1817,35 @@ fn push_error(errors: &mut Vec<String>, message: String) {
 /// actual pty swap. The pane keeps its registry short id throughout (`Pane::
 /// handover` never re-registers), which is what keeps mail and `zirv ctx
 /// nudge` addressed to it valid across the swap.
+///
+/// Issue #358 (task 5): takes an already-built `HandoverRequest` rather than
+/// a target agent/model pair, so an automatically decided rollover
+/// (`rollover::evaluate`) and the operator's own picker are executed by the
+/// exact same code -- including the seat transaction `req.generation` names.
+/// Returns whether the swap actually happened.
 fn handover_pane(
     pane: &mut Pane,
-    target_agent: &str,
-    target_model: &str,
+    req: &handover::HandoverRequest,
     cfg: &CtxConfig,
     repo: &Path,
     state: &StateDir,
     errors: &mut Vec<String>,
-) {
+) -> bool {
     let old_agent_name = pane.agent().to_string();
     let Ok(old_adapter) = adapters::select(Some(&old_agent_name), &[], cfg) else {
-        push_error(
-            errors,
-            format!("handover: could not resolve this pane's own agent '{old_agent_name}'"),
-        );
-        return;
+        let reason = format!("could not resolve this pane's own agent '{old_agent_name}'");
+        if let Some(generation) = req.generation {
+            let _ = super::rollover::fail(
+                state,
+                "dash",
+                pane.short(),
+                generation,
+                &reason,
+                super::state::now_secs(),
+            );
+        }
+        push_error(errors, format!("handover: {reason}"));
+        return false;
     };
     let transcript_path = old_adapter.transcript_path(&SessionRef {
         id: SessionId::parse(pane.session_id()),
@@ -1798,34 +1859,203 @@ fn handover_pane(
         .ok()
         .flatten()
         .map(|(_, h)| h);
-    let (note, _source) = handoff::distill_or_structural(
-        old_adapter.as_ref(),
-        &distiller_model,
-        &ctx,
-        Duration::from_secs(cfg.handoff.timeout_secs),
-        cfg.chrome.events,
-        previous.as_ref(),
-    );
-
-    let req = handover::HandoverRequest {
-        target_agent: target_agent.to_string(),
-        target_model: Some(target_model.to_string()),
-        force: false,
-        requested_at: super::state::now_secs(),
-        // `handover_pane` is only ever reached from the dashboard's own
-        // Handover overlay's `KeyCode::Enter` -- a human at this exact
-        // dashboard's live TUI just chose this swap.
-        interactive: true,
+    // Issue #358: a reactive rollover fires because this provider stopped
+    // answering; the distiller call would run against that same provider.
+    let (note, _source) = if req.structural_only {
+        (handoff::structural(&ctx), "structural")
+    } else {
+        handoff::distill_or_structural(
+            old_adapter.as_ref(),
+            &distiller_model,
+            &ctx,
+            Duration::from_secs(cfg.handoff.timeout_secs),
+            cfg.chrome.events,
+            previous.as_ref(),
+        )
     };
+
     let role = if pane.verb() == sessions::Verb::Chat {
         prompt::PromptRole::Orchestrator
     } else {
         prompt::PromptRole::Worker
     };
     let size = pane.screen().size();
-    match pane.handover(cfg, &req, &note, role, repo, (size.1, size.0)) {
-        Ok(()) => {}
-        Err(e) => push_error(errors, format!("handover: {e}")),
+    match pane.handover(cfg, req, &note, role, repo, (size.1, size.0)) {
+        Ok(()) => true,
+        Err(e) => {
+            // `Pane::handover` assembles the successor completely before it
+            // touches the old child, so a failure here leaves the pane
+            // exactly as it was -- the seat transaction is a clean abort.
+            if let Some(generation) = req.generation {
+                let _ = super::rollover::fail(
+                    state,
+                    "dash",
+                    pane.short(),
+                    generation,
+                    &e.to_string(),
+                    super::state::now_secs(),
+                );
+            }
+            push_error(errors, format!("handover: {e}"));
+            false
+        }
+    }
+}
+
+/// Issue #358 (task 5): one automatic rollover evaluation for the
+/// dashboard's own orchestrator pane. The evaluation, the seat transaction
+/// and the swap all go through the same seams a manual `Ctrl+A o` does; the
+/// only difference is who decided. A parked seat is asked first, in case its
+/// window has elapsed and the best harness is no longer its own.
+fn rollover_sweep(
+    panes: &mut [Pane],
+    cfg: &CtxConfig,
+    repo: &Path,
+    state: &StateDir,
+    pending: &mut Option<(String, u64, Instant)>,
+    errors: &mut Vec<String>,
+) {
+    let Some(idx) = panes
+        .iter()
+        .position(|pane| pane.role() == prompt::PromptRole::Orchestrator)
+    else {
+        return;
+    };
+    let short = panes[idx].short().to_string();
+    let provider = adapters::provider_for_agent_name(Some(panes[idx].agent())).to_string();
+    let idle = panes[idx].state() == PaneState::Idle;
+    let now = super::state::now_secs();
+
+    let req = match super::rollover::on_resume(state, cfg, "dash", &short, now, true) {
+        Some(req) => req,
+        None => {
+            let blocked = super::rollover::confirmed_block(state, cfg, now, &provider);
+            match super::rollover::evaluate(state, cfg, "dash", &short, now, idle, blocked, true) {
+                super::rollover::Evaluation::Rollover { request, .. } => request,
+                _ => return,
+            }
+        }
+    };
+    // The seat transaction is already open, so a pane that is no longer at a
+    // clean boundary has to close it rather than leave it prepared -- the
+    // same rule `wrap`'s own refusal arm follows.
+    if !idle && !req.force {
+        if let Some(generation) = req.generation {
+            let _ = super::rollover::fail(
+                state,
+                "dash",
+                &short,
+                generation,
+                "the orchestrator pane is mid-turn",
+                now,
+            );
+        }
+        return;
+    }
+    if handover_pane(&mut panes[idx], &req, cfg, repo, state, errors)
+        && let Some(generation) = req.generation
+    {
+        *pending = Some((short, generation, Instant::now()));
+    }
+}
+
+/// The other half: an open rollover transaction is committed only once the
+/// successor pane has actually answered, and aborted when it never does.
+/// `Pane::handover` spawns the successor before it touches the old child, so
+/// a pane that has already ENDED here is the only genuine "it never came up"
+/// case; a timeout leaves the (live but silent) successor alone rather than
+/// killing the operator's own orchestrator pane.
+fn settle_pending_rollover(
+    panes: &mut [Pane],
+    cfg: &CtxConfig,
+    state: &StateDir,
+    pending: &mut Option<(String, u64, Instant)>,
+) {
+    let Some((short, generation, started)) = pending.clone() else {
+        return;
+    };
+    let Some(pane) = panes.iter_mut().find(|pane| pane.short() == short) else {
+        let _ = super::rollover::fail(
+            state,
+            "dash",
+            &short,
+            generation,
+            "the successor pane is gone",
+            super::state::now_secs(),
+        );
+        *pending = None;
+        return;
+    };
+    let pane_state = pane.state();
+    let readiness = super::rollover::successor_readiness(
+        !matches!(pane_state, PaneState::Ended(_)),
+        true,
+        pane_state == PaneState::Idle,
+        pane_state == PaneState::Idle,
+        Instant::now().saturating_duration_since(started),
+        Duration::from_secs(cfg.handoff.timeout_secs),
+    );
+    let now = super::state::now_secs();
+    match readiness {
+        super::rollover::Readiness::Ready => {
+            let _ =
+                super::rollover::commit(state, "dash", &short, generation, pane.session_id(), now);
+            *pending = None;
+        }
+        super::rollover::Readiness::Dead => {
+            let _ = super::rollover::fail(
+                state,
+                "dash",
+                &short,
+                generation,
+                "the successor exited before it answered",
+                now,
+            );
+            *pending = None;
+        }
+        super::rollover::Readiness::TimedOut => {
+            // Finding #13 (issue #358 review): unlike `wrap`'s identical
+            // arm, this used to leave the on-disk seat naming the OLD
+            // predecessor after the transaction aborted -- the pane itself
+            // is kept alive running the SUCCESSOR (killing a live-but-
+            // silent successor here would end the operator's own dashboard
+            // pane outright, the same DEVIATION `wrap`'s own timeout arm
+            // documents), so the seat record and the actually-running pane
+            // disagreed about which agent was answering at this address
+            // until the next rollover happened to overwrite it. Peek the
+            // model `seat::prepare` recorded before `rollover::fail`/`seat::
+            // abort` discards the `Prepared` phase, then re-register onto
+            // the successor that is, in fact, running -- mirroring wrap's
+            // own re-registration exactly.
+            let successor_model =
+                super::seat::load(state, &short).and_then(|seat| match seat.phase {
+                    super::seat::Phase::Prepared {
+                        successor_model, ..
+                    } => successor_model,
+                    _ => None,
+                });
+            let _ = super::rollover::fail(
+                state,
+                "dash",
+                &short,
+                generation,
+                "the successor did not answer within handoff.timeout_secs",
+                now,
+            );
+            let _ = super::seat::register(
+                state,
+                &short,
+                pane.session_id(),
+                pane.agent(),
+                successor_model.as_deref(),
+                adapters::provider_for_agent_name(Some(pane.agent())),
+                pane.role().label(),
+                false,
+                now,
+            );
+            *pending = None;
+        }
+        super::rollover::Readiness::Waiting => {}
     }
 }
 
@@ -3799,6 +4029,10 @@ fn fulfill_spawn_request(
                 observed_at: route.requested_observed_at,
             },
         );
+        // Issue #358 (task 5): the same reroute, in the capacity-pool
+        // vocabulary, so an operator can read delegation placement and
+        // orchestrator rollover out of one story instead of two.
+        super::rollover::record_route(state, &req.requested_by, "dash", now, &route, None);
         push_error(
             errors,
             format!(
@@ -3828,47 +4062,32 @@ fn fulfill_spawn_request(
     let capability_warnings =
         policy::evaluate(&cfg.policy, adapter.as_ref(), mode).degraded_capabilities();
 
-    // Issue #155, Phase 6(c): the spawn gate -- quota pressure refuses NEW
-    // delegated work, never rotation of a session already running (see
-    // `pace::spawn_gate`'s own doc comment). Placed right after the depth
-    // cap, ahead of the more expensive prompt-composition work below, in the
-    // same cheapest-and-most-hostile-first order this function's own doc
-    // comment promises. Re-applies the SAME check `agent.rs::run_with`
-    // already evaluated against this very request before it was ever
-    // written to disk, so a request that reaches a dashboard other than the
-    // one that check consulted (a live-dashboard fallback, a request that
-    // sat claimed for a while) is held to an equally fresh reading rather
-    // than trusting a decision that may now be stale.
-    //
-    // Security review Finding 2: `req.force` is untrusted JSON any process
-    // that can reach the requests directory can hand-write (the same
-    // premise `parent_role_for`, above, is built on) -- it does NOT carry
-    // the weight `agent.rs::run_with`'s own `args.force` does, which is an
-    // actual operator's own flag, typed at an actual terminal, checked
-    // against this SAME gate before the request was ever written. Treating
-    // the two as equivalent (via `agent::spawn_blocked`, which is correct
-    // for `run_with`'s trusted case) let any pane self-grant the >=
-    // `spawn_hard_pct` hard refusal just by writing `force: true` into its
-    // own request file. So `req.force` is honoured ONLY for the soft band
-    // (`SpawnGate::Warn`, which never blocked a spawn either way) -- the
-    // hard arm (`SpawnGate::Refuse`) is refused here unconditionally,
-    // `req.force` or not. `SpawnRefusal::policy`, never `::channel`: a
-    // headless fallback would route straight around the gate (the headless
-    // path is gated too, by the identical check in `agent::run_with`), the
-    // same reasoning the pane cap and the depth cap above already apply.
+    // Issue #155, Phase 6(c); reworked for issue #358 (T9): usage headroom
+    // ranks a delegation, it never refuses or delays one -- so this is now
+    // an informational note plus, for the ceiling band, an `Attention::Quota`
+    // row, never a `SpawnRefusal`. Placed right after the depth cap, ahead
+    // of the more expensive prompt-composition work below, in the same
+    // cheapest-and-most-hostile-first order this function's own doc comment
+    // promises. Re-applies the SAME check `agent.rs::run_with` already
+    // evaluated against this very request before it was ever written to
+    // disk, so a request that reaches a dashboard other than the one that
+    // check consulted (a live-dashboard fallback, a request that sat claimed
+    // for a while) is held to an equally fresh reading rather than trusting
+    // a decision that may now be stale.
     let (collector, estimator) =
         super::pace::current_windows(state, &cfg.pace, now, adapter.provider());
     let gate = super::pace::spawn_gate(&collector, estimator.as_ref(), now, &cfg.pace);
     let reading_age = super::pace::spawn_headroom(&collector, estimator.as_ref(), now, &cfg.pace)
         .map(|reading| reading.age_secs);
-    if let Some(note) =
-        super::pace::describe_spawn_gate(&gate, reading_age, super::pace::Seat::Pane)
-    {
+    if let Some(note) = super::pace::describe_spawn_gate(&gate, reading_age) {
         if matches!(gate, super::pace::SpawnGate::Refuse { .. }) {
             // Issue #349: filed against the REQUESTING pane's own short id
             // (`req.requested_by`) -- untrusted the same way the log line
             // right below already treats it (best-effort, informational
-            // only; a bogus value just files a stray, harmless row).
+            // only; a bogus value just files a stray, harmless row). The
+            // spawn below still proceeds regardless: this is a ranking
+            // signal, kept on the attention row because it is useful, not a
+            // reason to refuse the pane.
             let _ = super::attention::record(
                 state,
                 &req.requested_by,
@@ -3881,7 +4100,6 @@ fn fulfill_spawn_request(
                 .with_attention(super::attention::Attention::Quota),
                 now,
             );
-            return Err(SpawnRefusal::policy(note));
         }
         push_error(
             errors,
@@ -3917,6 +4135,60 @@ fn fulfill_spawn_request(
     } else {
         req.budget_tokens
     };
+    let session_id = SessionId::new_v4().to_string();
+    let registry_short = sessions::short_id(&session_id);
+    let slug = super::state::repo_slug(repo);
+
+    // Issue #358 (task T3): the pane-side mirror of `agent::run_with`'s own
+    // provider reservation -- a durable, per-PROVIDER ledger entry for this
+    // pane's own token ceiling, independent of `req.work_group_id`'s own
+    // `reserved_tokens` (which protects one group's budget, not a
+    // provider's machine-wide outstanding total). Released via
+    // `reservation::release` by `rollback_admission` below on every
+    // pre-spawn refusal, or settled via `reservation::settle` once the
+    // pane's own child actually exits (`account_reaped_pane_spend`).
+    // Best-effort, like every other ledger write in this codebase: a ledger
+    // error must never refuse a spawn this dashboard already admitted.
+    // Finding #11 (issue #358 review): `reserve_within` checks "is there
+    // room" and reserves atomically under the ledger's own lock -- placement
+    // was decided against a `CapacitySnapshot`/pacing reading taken before
+    // this point, outside any lock, so a plain `reserve` here let two
+    // concurrent pane admissions both read "room enough" and both reserve,
+    // jointly over-committing the provider (mirrors `agent::run_with`'s own
+    // identical fix). `limit_tokens` is `None` (no check) when this
+    // provider has no configured token budget to convert projected headroom
+    // against.
+    let limit_tokens =
+        super::pace::headroom_limit_tokens(&collector, estimator.as_ref(), now, &cfg.pace);
+    let reservation_id = match super::reservation::reserve_within(
+        state,
+        adapter.provider(),
+        &session_id,
+        budget_tokens.unwrap_or(0),
+        limit_tokens,
+        now,
+    ) {
+        Ok(Ok(reservation)) => Some(reservation.id),
+        Ok(Err(outstanding)) => {
+            // Never refuses the pane spawn itself over a ledger accounting
+            // concern -- it simply runs unreserved, exactly like the
+            // ledger-error arm right below.
+            eprintln!(
+                "zirv ctx dash: provider '{}' is at its projected headroom limit ({outstanding} \
+                 tokens already outstanding); spawning unreserved rather than refusing",
+                adapter.provider()
+            );
+            None
+        }
+        Err(e) => {
+            eprintln!(
+                "zirv ctx dash: failed to record a token reservation for provider '{}': {e}",
+                adapter.provider()
+            );
+            None
+        }
+    };
+
     // Re-review (2026-08-27) finding 1: from here on, `req.work_group_id`
     // (if any) has genuinely been admitted -- every remaining fallible step
     // between here and the pane actually spawning must roll that admission
@@ -3926,16 +4198,16 @@ fn fulfill_spawn_request(
     // its reservation forever. Best-effort, like `rollback_admission`
     // itself: never shadows the real refusal being returned. `budget_tokens`
     // is exactly the ceiling `admit_child` just reserved (or `None` if it
-    // reserved nothing), so releasing it here always matches.
+    // reserved nothing), so releasing it here always matches. Issue #358:
+    // the provider-level reservation just above rolls back the same way.
     let rollback_admission = || {
         if let Some(group_id) = &req.work_group_id {
             super::group::rollback_admission(state, group_id, budget_tokens.unwrap_or(0));
         }
+        if let Some(reservation_id) = &reservation_id {
+            let _ = super::reservation::release(state, adapter.provider(), reservation_id);
+        }
     };
-
-    let session_id = SessionId::new_v4().to_string();
-    let registry_short = sessions::short_id(&session_id);
-    let slug = super::state::repo_slug(repo);
 
     // Issue #264 (EXTRA, Track A residual): `req.mode` used to travel on
     // `SpawnRequest` for data parity only (see that field's own doc comment)
@@ -4177,20 +4449,17 @@ fn fulfill_spawn_request(
         child_envelope.principal.clone(),
     ));
 
-    // T10: the same launch-time pacing gate `wrap::run_with`/this dashboard's
-    // own first pane apply, but *non-interactively* here: this spawn happens
-    // during the dashboard's own live event loop (raw mode and the
-    // alternate screen already active), so a blocking `crossterm` keypress
-    // read -- the orchestrator pane's own gate uses one, see `run_dashboard`
-    // -- would collide with the dashboard's own input loop reading the same
-    // stream. `Launch` spawns normally; the soft band (`Pause`) is advisory
-    // here, not a wait -- it spawns anyway with a visible notice through the
-    // same `errors`/notice channel a withheld-mail advisory already uses a
-    // few lines up; the hard ceiling (`Refuse`) declines the spawn outright
-    // through the existing refusal channel, with no confirmation prompt
-    // possible from this call site -- an operator who wants to force it can
-    // still run `zirv ctx wrap --force-pace` directly, outside the
-    // dashboard.
+    // T10, reworked for issue #358 (T9): the same launch-time pacing gate
+    // `wrap::run_with`/this dashboard's own first pane apply, but
+    // *non-interactively* here: this spawn happens during the dashboard's
+    // own live event loop (raw mode and the alternate screen already
+    // active), so a blocking `crossterm` keypress read -- the orchestrator
+    // pane's own gate uses one, see `run_dashboard` -- would collide with
+    // the dashboard's own input loop reading the same stream. Usage headroom
+    // never blocks a spawn any more: `Launch` spawns normally, and both
+    // `Pause` and `Refuse` are advisory now -- the pane spawns anyway, with
+    // a visible notice through the same `errors`/notice channel a
+    // withheld-mail advisory already uses a few lines up.
     {
         // Finding 1 (review): `poll: false` -- this call happens on the
         // dashboard's single UI thread, during its own live event loop, so
@@ -4200,15 +4469,12 @@ fn fulfill_spawn_request(
         let gate = super::pace::interactive_gate(state, cfg, adapter.provider(), false);
         match gate {
             super::pace::InteractiveGate::Launch => {}
-            super::pace::InteractiveGate::Pause { message, .. } => {
+            super::pace::InteractiveGate::Pause { message, .. }
+            | super::pace::InteractiveGate::Refuse { message } => {
                 push_error(
                     errors,
                     format!("{} pane for {}: {message}", req.agent, req.requested_by),
                 );
-            }
-            super::pace::InteractiveGate::Refuse { message } => {
-                rollback_admission();
-                return Err(SpawnRefusal::policy(message));
             }
         }
     }
@@ -4248,6 +4514,7 @@ fn fulfill_spawn_request(
     pane.set_intake_dir(pane_channel);
     pane.set_work_group_id(req.work_group_id.clone());
     pane.set_budget_tokens(budget_tokens);
+    pane.set_reservation_id(reservation_id.clone());
     // Issue #249: the same server-verified value just pushed into this
     // pane's own `turn_env` above, stored here too so this dashboard's own
     // in-process mail sweep (`sweep_one_pane`, which never spawns a new OS
@@ -6190,6 +6457,22 @@ pub fn run_dashboard(
     // Issues #328/#334: which seat role this pane runs as, for the same
     // guard -- unlike `seat_model_env`, unconditional for every role.
     turn_env.extend(super::adapters::seat_role_env(first.role));
+    // Issue #358 (task 5): the seat's fencing generation, so a session an
+    // automatic rollover later supersedes refuses to keep coordinating
+    // (`seat::fence`). The seat itself is registered by `Pane::spawn` below,
+    // which cannot run before this vector exists -- so the generation is read
+    // from whatever record this address already carries (an earlier
+    // dashboard's, restored across a crash), defaulting to the `1` a fresh
+    // `seat::register` is about to create.
+    if first.role == prompt::PromptRole::Orchestrator {
+        let generation = super::seat::load(state, &sessions::short_id(&session_id))
+            .map(|seat| seat.generation)
+            .unwrap_or(1);
+        turn_env.push((
+            super::seat::GENERATION_ENV.to_string(),
+            generation.to_string(),
+        ));
+    }
 
     // Task 10: the spawn-request channel. `dashboard_short` is derivable
     // before any pane has actually spawned -- `Record::new`'s own `short`
@@ -6515,6 +6798,12 @@ pub fn run_dashboard(
     // the whole dashboard run, not just one tick, so an unchanged inbox is
     // advised once and then left alone until genuinely new mail arrives.
     let mut advised_mail: HashMap<String, mail::AdvisedIds> = HashMap::new();
+    // Issue #358 (task 5): the orchestrator pane's automatic rollover -- its
+    // own (much coarser than `FACTS_THROTTLE`) cadence, and the one seat
+    // transaction that may be open at a time. Seeded with this dashboard's
+    // start so no usage I/O runs while it is still coming up.
+    let mut last_rollover_eval = Instant::now();
+    let mut pending_rollover: Option<(String, u64, Instant)> = None;
     // R8: see `input_stream_is_dead`.
     let mut input_errors: usize = 0;
     // D4: set by the "every pane ended" exit arm, so the closing line is
@@ -6672,6 +6961,31 @@ pub fn run_dashboard(
             // Issue #115: same cadence as the mail sweep just above -- a
             // one-shot reminder has no sub-tick latency requirement either.
             report_back_reminder_sweep(&mut panes, state, &mut errors);
+        }
+        // Issue #358 (task 5): the orchestrator pane's automatic rollover.
+        // Both halves live on their own cadence -- the readiness watch is
+        // pure in-memory state, the evaluation costs a capacity snapshot --
+        // and both are no-ops until `fallback.auto_orchestrator_rollover`
+        // is on.
+        if cfg.fallback.auto_orchestrator_rollover {
+            settle_pending_rollover(&mut panes, cfg, state, &mut pending_rollover);
+            if pending_rollover.is_none()
+                && due(
+                    last_rollover_eval,
+                    sweep_now,
+                    super::rollover::evaluate_interval(cfg),
+                )
+            {
+                last_rollover_eval = sweep_now;
+                rollover_sweep(
+                    &mut panes,
+                    cfg,
+                    repo,
+                    state,
+                    &mut pending_rollover,
+                    &mut errors,
+                );
+            }
         }
         deliver_queued_nudges(&mut panes, &mut nudge_queues, &mut errors);
         // F1/F2: every tick, not throttled -- see `drain_pending_submits`'s
@@ -7105,10 +7419,52 @@ pub fn run_dashboard(
                                                 Some(idx)
                                                     if panes[idx].state() == PaneState::Idle =>
                                                 {
+                                                    // Finding #2 (issue #358
+                                                    // review): a manual swap
+                                                    // of the very pane an
+                                                    // automatic rollover has
+                                                    // already prepared must
+                                                    // close that open
+                                                    // transaction first --
+                                                    // otherwise `settle_
+                                                    // pending_rollover` later
+                                                    // commits its generation
+                                                    // against whatever
+                                                    // session this manual
+                                                    // swap puts in the pane.
+                                                    if pending_rollover.as_ref().is_some_and(
+                                                        |(short, _, _)| short == panes[idx].short(),
+                                                    ) && let Some((short, generation, _)) =
+                                                        pending_rollover.take()
+                                                    {
+                                                        let _ = super::rollover::fail(
+                                                            state,
+                                                            "dash",
+                                                            &short,
+                                                            generation,
+                                                            "superseded by a manual handover \
+                                                             request",
+                                                            super::state::now_secs(),
+                                                        );
+                                                    }
                                                     handover_pane(
                                                         &mut panes[idx],
-                                                        &target_agent,
-                                                        &target_model,
+                                                        &handover::HandoverRequest {
+                                                            target_agent: target_agent.clone(),
+                                                            target_model: Some(
+                                                                target_model.clone(),
+                                                            ),
+                                                            force: false,
+                                                            requested_at: super::state::now_secs(),
+                                                            // Reached only from the
+                                                            // dashboard's own Handover
+                                                            // overlay: a human at this
+                                                            // live TUI just chose it.
+                                                            interactive: true,
+                                                            automatic: false,
+                                                            generation: None,
+                                                            structural_only: false,
+                                                        },
                                                         cfg,
                                                         repo,
                                                         state,
@@ -7915,6 +8271,10 @@ pub fn run_dashboard(
                 .first()
                 .and_then(|u| u.five_hour)
                 .map(|pct| (pct, ui::Source::Live, facts_age)),
+            // Issue #358 (task T6a): the pool strip and seat label, same
+            // throttled tick as every other cell above.
+            harnesses: facts_cache.disk.pool_harnesses.clone(),
+            seat: facts_cache.disk.pool_seat.clone(),
         };
 
         let draw = terminal.draw(|f| {
@@ -10271,6 +10631,92 @@ mod tests {
             listed[0].1.from_session, dashboard_short,
             "composed mail still carries the dashboard's own short"
         );
+    }
+
+    /// Finding #13 (issue #358 review): on a readiness TIMEOUT, `wrap`'s own
+    /// identical arm re-registers the seat onto the successor that is, in
+    /// fact, running (the pane is kept alive rather than killed -- see this
+    /// module's own `settle_pending_rollover` doc comment on that
+    /// DEVIATION). `settle_pending_rollover` used to skip that
+    /// re-registration entirely, leaving the on-disk seat naming the OLD
+    /// predecessor even though the pane it describes is genuinely running
+    /// the NEW successor from here on.
+    #[test]
+    fn a_readiness_timeout_reregisters_the_seat_onto_the_running_successor() {
+        use super::pane::tests::long_lived_argv;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+
+        let session_id = "77777777-3333-4444-8888-555555555555";
+        let short = sessions::short_id(session_id);
+        let spec = PaneSpec {
+            agent_name: "codex".to_string(),
+            argv: long_lived_argv(),
+            role: prompt::PromptRole::Orchestrator,
+            verb: sessions::Verb::Chat,
+            session_id: session_id.to_string(),
+            title: "orch".to_string(),
+        };
+        let pane = Pane::spawn(
+            spec,
+            &state,
+            &repo,
+            &repo,
+            (80, 24),
+            &[],
+            true,
+            pane::DEFAULT_IDLE_QUIET,
+        )
+        .expect("spawn");
+
+        // The seat as it stood right after `handover_pane` swapped this
+        // pane's pty: still naming the OLD predecessor ("claude"), with an
+        // open transaction naming "codex" as the successor.
+        super::seat::register(
+            &state,
+            &short,
+            "old-session-id",
+            "claude",
+            Some("sonnet"),
+            "anthropic",
+            prompt::PromptRole::Orchestrator.label(),
+            false,
+            1_700_000_000,
+        )
+        .expect("register seat");
+        let generation = super::seat::prepare(
+            &state,
+            &short,
+            "codex",
+            Some("gpt5"),
+            super::seat::Cause::Manual,
+            1_700_000_000,
+        )
+        .expect("prepare rollover");
+
+        let mut cfg = CtxConfig::default();
+        cfg.handoff.timeout_secs = 0;
+        let mut panes = vec![pane];
+        let mut pending = Some((short.clone(), generation, Instant::now()));
+
+        settle_pending_rollover(&mut panes, &cfg, &state, &mut pending);
+
+        assert!(pending.is_none(), "the timed-out transaction must close");
+        let seat = super::seat::load(&state, &short).expect("seat still exists");
+        assert_eq!(seat.phase, super::seat::Phase::Idle);
+        assert_eq!(
+            seat.agent, "codex",
+            "the seat must name the successor that is actually running, not the old \
+             predecessor: {seat:?}"
+        );
+        assert_eq!(seat.model.as_deref(), Some("gpt5"));
+        assert_eq!(seat.provider, "openai");
+        assert_eq!(seat.session, session_id);
+
+        panes[0].finish_shutdown().expect("shutdown");
     }
 
     /// Codex review finding 1, on the real reap path (not just the pure
@@ -13119,11 +13565,13 @@ mod tests {
     /// above must be rolled back when a LATER step in this same call fails
     /// before a pane is ever actually spawned -- otherwise a group's
     /// `child_limit` slot is permanently burned for a child that never ran.
-    /// `cfg.pace.spawn_hard_pct` is raised well above the usage set below so
-    /// the EARLIER `spawn_gate` check (before `admit_child`) does not itself
-    /// refuse first; usage above the (default) `max_percent` then trips the
-    /// T10 interactive gate's `Refuse` arm, which runs strictly AFTER
-    /// admission -- exactly this finding's failure window.
+    /// Issue #358 (T9): the usage-ceiling scenario this test used to trigger
+    /// the later refusal with (the T10 interactive gate's `Refuse` arm) no
+    /// longer refuses anything -- usage headroom never blocks a spawn any
+    /// more. The writer-permit refusal (`super::permit::acquire_writer`,
+    /// also strictly after admission) still does, so this test now holds the
+    /// tree's one writer slot itself before calling `fulfill_spawn_request`,
+    /// forcing that refusal instead.
     #[test]
     fn fulfill_spawn_request_rolls_back_admission_when_a_later_step_refuses() {
         let repo = std::env::current_dir().expect("cwd");
@@ -13149,32 +13597,19 @@ mod tests {
         };
         crate::commands::ctx::group::create(&state, &group).expect("create group");
 
-        let now = crate::commands::ctx::state::now_secs();
-        window::store(
+        let cfg = CtxConfig::default();
+        let tree = std::fs::canonicalize(&repo).unwrap_or_else(|_| repo.clone());
+        let _held = super::super::permit::acquire_writer(
             &state,
-            &crate::commands::ctx::window::UsageWindows {
-                five_hour: Some(crate::commands::ctx::window::Window {
-                    used_percentage: 99.5,
-                    resets_at: now + 600,
-                    observed_at: now,
-                    overage_covered: false,
-                    limit_reached: false,
-                }),
-                seven_day: None,
-            },
+            cfg.supervise.max_writers,
+            "pre-held by test",
+            &tree,
         )
-        .expect("store collector state above max_percent, below spawn_hard_pct");
+        .expect("hold the tree's one writer slot ahead of the request");
 
-        let mut cfg = CtxConfig::default();
-        cfg.pace.spawn_hard_pct = 200.0;
-        // This pins the OLDER T10 interactive-gate refusal in isolation; the
-        // newer predictive cross-harness reroute (`route_new_delegation`,
-        // issue #186) would otherwise steer this low-headroom request to
-        // codex before that gate is ever reached, on any machine where the
-        // codex adapter resolves (`CodexAdapter::ready` fails open even when
-        // codex is not installed -- see its own doc comment).
-        cfg.fallback.enabled = false;
-
+        // `spawn_request`'s own default is `WorkerMode::Writing`, so this
+        // request's own writer-permit acquisition below finds the slot
+        // already taken.
         let mut req = spawn_request("do the work", &repo);
         req.work_group_id = Some("wg-1".to_string());
         let mut panes: Vec<Pane> = Vec::new();
@@ -13193,8 +13628,13 @@ mod tests {
             &tmp.path().join("requests"),
             &mut errors,
         )
-        .expect_err("the interactive gate refuses once usage is at max_percent");
+        .expect_err("the writer-permit gate refuses once the tree's one slot is already held");
         assert!(!refusal.retryable, "not a channel failure -- policy");
+        assert!(
+            refusal.reason.contains("already holds"),
+            "got {:?}",
+            refusal.reason
+        );
         assert!(panes.is_empty(), "no pane was ever spawned");
 
         let after_rollback = crate::commands::ctx::group::load(&state, "wg-1")
@@ -13227,7 +13667,11 @@ mod tests {
     /// Issue #349: a pacing (`SpawnGate::Refuse`) refusal files an
     /// `Attention::Quota` row against the REQUESTING pane's own short id
     /// (`req.requested_by`) -- the same "requester, not the never-spawned
-    /// worker" reasoning as the writer-permit and pane-count refusals.
+    /// worker" reasoning as the writer-permit and pane-count refusals used
+    /// to carry. Issue #358 (T9): usage headroom no longer refuses the
+    /// spawn, so the pane below actually spawns; the point of this test is
+    /// now that the `Attention::Quota` row is still filed even though the
+    /// pane went ahead.
     #[test]
     fn fulfill_spawn_request_records_quota_attention_on_a_pacing_refusal() {
         let repo = std::env::current_dir().expect("cwd");
@@ -13240,6 +13684,19 @@ mod tests {
         // own exhausted reading -- this test is about the gate itself, not
         // the reroute.
         cfg.fallback.enabled = false;
+        // Same ABSOLUTE rule every other real-pty-spawn test in this module
+        // follows: a bare `claude` is not guaranteed to resolve on a CI
+        // runner's PATH, so this only has to prove the pty spawn itself
+        // succeeds despite the ceiling note.
+        #[cfg(windows)]
+        {
+            cfg.agent_bin = Some("ping -n 3 127.0.0.1".to_string());
+        }
+        #[cfg(unix)]
+        {
+            cfg.agent_bin = Some("sleep 3".to_string());
+        }
+        cfg.pace.spawn_hard_pct = 95.0;
         let now = super::super::state::now_secs();
 
         // A fresh five-hour reading pinned at 100%, above the default
@@ -13279,18 +13736,26 @@ mod tests {
             &tmp.path().join("requests"),
             &mut errors,
         );
-        let reason = result.err().map(|e| e.reason).unwrap_or_default();
         assert!(
-            reason.contains("spawn_hard_pct"),
-            "must refuse via the spawn gate specifically, got: {reason}"
+            result.is_ok(),
+            "usage at the ceiling must never refuse the spawn: {result:?}"
+        );
+        assert!(
+            errors.iter().any(|e| e.contains("spawn_hard_pct")),
+            "the ceiling note must still be visible, got: {errors:?}"
         );
 
         let status = super::super::attention::load(&state, &req.requested_by);
         assert_eq!(
             status.attention,
             super::super::attention::Attention::Quota,
-            "the requesting pane's own attention row must show Quota"
+            "the requesting pane's own attention row must show Quota even though the spawn \
+             went ahead"
         );
+
+        for pane in &mut panes {
+            let _ = pane.shutdown("");
+        }
     }
 
     /// Issue #155, Phase 5(a): the depth cap is enforced HERE, at the
@@ -13985,17 +14450,15 @@ mod tests {
     /// before any spawn" contract).
     ///
     /// Issue #155, Phase 6(c) update: at the default config, 99.9% now trips
-    /// `pace::spawn_gate`'s own `spawn_hard_pct` (95%) before this function
-    /// ever reaches the older `pace::interactive_gate` check below (`max_
-    /// percent` 99%) -- the newer, stricter, spawn-specific gate wins, and
-    /// this test now pins ITS wording. The older gate's own `Refuse` arm is
-    /// consequently unreachable through this path at any default config
-    /// (`spawn_hard_pct` < `max_percent`); its `Pause`/advisory arm still
-    /// fires independently for the band below `spawn_hard_pct`, which is a
-    /// deliberate, currently-harmless overlap rather than a regression --
-    /// see the two gates' own doc comments for why they stay distinct knobs.
+    /// Renamed for issue #358 (T9): `pace::spawn_gate`'s own `spawn_hard_pct`
+    /// (95%) used to refuse a worker pane outright before this function ever
+    /// reached the older `pace::interactive_gate` check below (`max_percent`
+    /// 99%). Now usage headroom never refuses a spawn -- both gates are
+    /// informational -- so this pins the spawn-specific gate's own wording
+    /// (and the actual usage it names) landing in `errors` while the pane
+    /// still spawns.
     #[test]
-    fn fulfill_spawn_request_refuses_a_worker_pane_when_usage_is_at_the_ceiling() {
+    fn fulfill_spawn_request_spawns_a_worker_pane_with_a_quota_note_at_the_ceiling() {
         let repo = std::env::current_dir().expect("cwd");
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(tmp.path().join("state"));
@@ -14016,11 +14479,22 @@ mod tests {
         .expect("store collector state at the ceiling");
 
         let mut cfg = CtxConfig::default();
-        // Isolate the `spawn_hard_pct` refusal from the predictive
-        // cross-harness reroute (`route_new_delegation`, issue #186), which
-        // would otherwise steer this low-headroom request to codex first --
-        // see the sibling test above for the full explanation.
+        // Isolate the `spawn_hard_pct` note from the predictive cross-harness
+        // reroute (`route_new_delegation`, issue #186), which would
+        // otherwise steer this low-headroom request to codex first -- see
+        // the sibling test above for the full explanation.
         cfg.fallback.enabled = false;
+        // Same ABSOLUTE rule every other real-pty-spawn test in this module
+        // follows: a bare `claude` is not guaranteed to resolve on a CI
+        // runner's PATH.
+        #[cfg(windows)]
+        {
+            cfg.agent_bin = Some("ping -n 3 127.0.0.1".to_string());
+        }
+        #[cfg(unix)]
+        {
+            cfg.agent_bin = Some("sleep 3".to_string());
+        }
         let mut panes: Vec<Pane> = Vec::new();
         let mut queues: Vec<VecDeque<String>> = Vec::new();
         let mut errors = Vec::new();
@@ -14038,29 +14512,31 @@ mod tests {
             &mut errors,
         );
 
-        let refusal = result.expect_err("usage at the ceiling must refuse the spawn");
         assert!(
-            refusal.reason.contains("pace.spawn_hard_pct"),
-            "got {}",
-            refusal.reason
+            result.is_ok(),
+            "usage at the ceiling must never refuse the spawn: {result:?}"
         );
-        assert!(
-            refusal.reason.contains("99.9%"),
-            "names the actual usage: {}",
-            refusal.reason
-        );
-        assert!(!refusal.retryable, "not a channel failure -- policy");
-        assert!(panes.is_empty(), "no pane was ever spawned");
+        assert_eq!(panes.len(), 1, "the pane still spawns");
+        let note = errors
+            .iter()
+            .find(|e| e.contains("pace.spawn_hard_pct"))
+            .unwrap_or_else(|| panic!("no spawn_hard_pct note in {errors:?}"));
+        assert!(note.contains("99.9%"), "names the actual usage: {note}");
+
+        for pane in &mut panes {
+            let _ = pane.shutdown("");
+        }
     }
 
-    /// Issue #155, Phase 6(c): isolates `spawn_gate`'s own `spawn_hard_pct`
-    /// (95%) from the older `pace::interactive_gate`'s `max_percent` (99%)
-    /// -- 96% trips ONLY the new gate (the old one only `Pause`s below its
-    /// own 99% ceiling, which never blocks), proving this gate is what
-    /// actually refuses in the band between the two thresholds, not the
-    /// pre-existing one.
+    /// Renamed for issue #358 (T9): isolates `spawn_gate`'s own `spawn_hard_
+    /// pct` (95%) from the older `pace::interactive_gate`'s `max_percent`
+    /// (99%) -- 96% trips ONLY the new gate. Usage headroom never blocks a
+    /// spawn any more, so this now proves that gate is what actually
+    /// produces the note in the band between the two thresholds, not the
+    /// pre-existing one, while the pane spawns regardless.
     #[test]
-    fn fulfill_spawn_request_refuses_a_worker_pane_between_spawn_hard_pct_and_max_percent() {
+    fn fulfill_spawn_request_spawns_a_worker_pane_with_a_quota_note_between_spawn_hard_pct_and_max_percent()
+     {
         let repo = std::env::current_dir().expect("cwd");
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(tmp.path().join("state"));
@@ -14086,6 +14562,17 @@ mod tests {
         // this test for why 96% headroom would otherwise be steered to codex
         // before this gate is ever reached.
         cfg.fallback.enabled = false;
+        // Same ABSOLUTE rule every other real-pty-spawn test in this module
+        // follows: a bare `claude` is not guaranteed to resolve on a CI
+        // runner's PATH.
+        #[cfg(windows)]
+        {
+            cfg.agent_bin = Some("ping -n 3 127.0.0.1".to_string());
+        }
+        #[cfg(unix)]
+        {
+            cfg.agent_bin = Some("sleep 3".to_string());
+        }
         let mut panes: Vec<Pane> = Vec::new();
         let mut queues: Vec<VecDeque<String>> = Vec::new();
         let mut errors = Vec::new();
@@ -14103,27 +14590,32 @@ mod tests {
             &mut errors,
         );
 
-        let refusal = result.expect_err("96% must refuse via spawn_hard_pct alone");
         assert!(
-            refusal.reason.contains("pace.spawn_hard_pct"),
-            "got {}",
-            refusal.reason
+            result.is_ok(),
+            "96% must never refuse the spawn: {result:?}"
         );
-        assert!(!refusal.retryable, "not a channel failure -- policy");
-        assert!(panes.is_empty(), "no pane was ever spawned");
+        assert_eq!(panes.len(), 1, "the pane still spawns");
+        assert!(
+            errors.iter().any(|e| e.contains("pace.spawn_hard_pct")),
+            "got {errors:?}"
+        );
+
+        for pane in &mut panes {
+            let _ = pane.shutdown("");
+        }
     }
 
-    /// Security review Finding 2 (test b): `req.force` on a file-dropped
-    /// request must NEVER lift the >= `spawn_hard_pct` hard refusal -- that
-    /// override is `agent.rs::run_with`'s own trusted `--force`, evaluated
-    /// against an actual operator's own typed flag, not a byte any process
-    /// that can reach the requests directory can set for itself. Before this
-    /// fix, this exact request sailed through with only a visible "(--force:
-    /// spawning anyway)" notice -- any pane could self-grant the override
-    /// this refusal exists to withhold from it. Now it must still refuse,
-    /// exactly as an unforced request already does.
+    /// Renamed for issue #358 (T9): `req.force` on a file-dropped request
+    /// used to matter here because `SpawnGate::Refuse` was a hard block only
+    /// `agent.rs::run_with`'s own trusted `--force` could lift, and this
+    /// request's untrusted `force: true` had to be proven NOT to. Usage
+    /// headroom never blocks a spawn any more -- `force` is irrelevant to
+    /// this gate either way now -- so this proves the pane still spawns
+    /// (with the ceiling note, naming the reading age) with `req.force` set,
+    /// exactly as an unforced request already does (the sibling tests
+    /// above).
     #[test]
-    fn fulfill_spawn_request_never_lets_a_forced_request_override_the_hard_refusal() {
+    fn fulfill_spawn_request_spawns_the_pane_regardless_of_force_once_usage_is_at_the_ceiling() {
         let repo = std::env::current_dir().expect("cwd");
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(tmp.path().join("state"));
@@ -14143,13 +14635,24 @@ mod tests {
         )
         .expect("store collector state above spawn_hard_pct");
 
-        let cfg = CtxConfig::default();
+        let mut cfg = CtxConfig::default();
+        // Same ABSOLUTE rule every other real-pty-spawn test in this module
+        // follows: a bare `claude` is not guaranteed to resolve on a CI
+        // runner's PATH.
+        #[cfg(windows)]
+        {
+            cfg.agent_bin = Some("ping -n 3 127.0.0.1".to_string());
+        }
+        #[cfg(unix)]
+        {
+            cfg.agent_bin = Some("sleep 3".to_string());
+        }
         let mut panes: Vec<Pane> = Vec::new();
         let mut queues: Vec<VecDeque<String>> = Vec::new();
         let mut errors = Vec::new();
         let mut req = spawn_request("do the work", &repo);
         req.force = true;
-        let refusal = fulfill_spawn_request(
+        let result = fulfill_spawn_request(
             &req,
             false,
             None,
@@ -14161,33 +14664,25 @@ mod tests {
             (80, 24),
             &tmp.path().join("requests"),
             &mut errors,
-        )
-        .expect_err("a request's own force must never lift the hard refusal");
+        );
 
         assert!(
-            refusal.reason.contains("pace.spawn_hard_pct"),
-            "got {}",
-            refusal.reason
+            result.is_ok(),
+            "usage at the ceiling must never refuse the spawn, forced or not: {result:?}"
         );
+        assert_eq!(panes.len(), 1, "the pane still spawns");
+        let note = errors
+            .iter()
+            .find(|e| e.contains("pace.spawn_hard_pct"))
+            .unwrap_or_else(|| panic!("no spawn_hard_pct note in {errors:?}"));
         assert!(
-            refusal.reason.contains("observed 0s ago"),
-            "names the reading age: {}",
-            refusal.reason
+            note.contains("observed 0s ago"),
+            "names the reading age: {note}"
         );
-        assert!(
-            refusal.reason.contains("pass --headless --force"),
-            "names the pane-safe force path: {}",
-            refusal.reason
-        );
-        assert!(
-            refusal
-                .reason
-                .contains("raise pace.spawn_hard_pct in ~/.zirv/ctx.toml"),
-            "names the durable override: {}",
-            refusal.reason
-        );
-        assert!(!refusal.retryable, "not a channel failure -- policy");
-        assert!(panes.is_empty(), "no pane was ever spawned");
+
+        for pane in &mut panes {
+            let _ = pane.shutdown("");
+        }
     }
 
     /// Security review Finding 2 (test a): the soft band (>= `spawn_soft_pct`,

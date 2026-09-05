@@ -7,9 +7,11 @@
 //! supervisor consults it only after the vendor has actually blocked the child.
 
 use super::adapters;
+use super::allocator;
 use super::config::CtxConfig;
 use super::handover;
 use super::pace::{self, SpawnGate};
+use super::sessions;
 use super::state::StateDir;
 
 pub const VISITED_ENV: &str = "ZIRV_CTX_FALLBACK_VISITED";
@@ -41,6 +43,16 @@ pub struct Route {
     pub requested_observed_at: Option<u64>,
     pub selected_headroom_pct: f64,
     pub selected_headroom_assumed: bool,
+    /// Issue #358: the window `allocator::place` scored the target against,
+    /// when this route came from the adaptive path. `None` on the legacy
+    /// (`adaptive_delegation = false`) path, which has no per-window
+    /// concept -- `detail()` only mentions this when it is `Some`.
+    pub binding_window: Option<String>,
+    /// Issue #358: the target provider's already-reserved tokens at
+    /// selection time (from other in-flight adaptive placements plus, once
+    /// task T3 lands, outstanding provider reservations). `0` on the legacy
+    /// path.
+    pub reserved_tokens: u64,
 }
 
 impl Route {
@@ -62,9 +74,19 @@ impl Route {
         } else {
             ""
         };
+        let binding = self
+            .binding_window
+            .as_ref()
+            .map(|window| {
+                format!(
+                    ", binding {window}, reserved {} tokens",
+                    self.reserved_tokens
+                )
+            })
+            .unwrap_or_default();
         format!(
             "{} -> {} ({}, source headroom {from}{observed}, target headroom \
-             {:.1}%{assumption}, model {}; to override, {})",
+             {:.1}%{assumption}, model {}{binding}; to override, {})",
             self.requested,
             self.selected,
             self.reason.label(),
@@ -118,7 +140,11 @@ impl TaskBounds {
                 .is_none_or(|tools| tools <= cfg.fallback.small_task_max_tool_calls)
     }
 
-    fn required_headroom_pct(self, cfg: &CtxConfig, window: &str) -> Option<f64> {
+    /// `pub(crate)`, not module-private: `allocator.rs` (issue #358) needs
+    /// this same per-window conversion to evaluate a `WorkUnit`'s bounds
+    /// against every budgeted window in a `CapacitySnapshot`, not just the
+    /// single reading `candidate_headroom` used to look at here.
+    pub(crate) fn required_headroom_pct(self, cfg: &CtxConfig, window: &str) -> Option<f64> {
         let tokens = self.tokens?;
         let budget = match window {
             "five_hour" => cfg.pace.five_hour_budget_tokens,
@@ -128,7 +154,7 @@ impl TaskBounds {
         (budget > 0).then(|| (tokens as f64 / budget as f64) * 100.0)
     }
 
-    fn required_unknown_headroom_pct(self, cfg: &CtxConfig) -> f64 {
+    pub(crate) fn required_unknown_headroom_pct(self, cfg: &CtxConfig) -> f64 {
         ["five_hour", "seven_day"]
             .into_iter()
             .filter_map(|window| self.required_headroom_pct(cfg, window))
@@ -215,6 +241,177 @@ pub fn candidate_allowed_by_capacity(cfg: &CtxConfig, name: &str, bounds: TaskBo
     !cfg.agents.is_capacity_small(name) || bounds.is_small(cfg)
 }
 
+/// Issue #358: builds a [`allocator::CapacitySnapshot`] over every harness
+/// named in `cfg.fallback.order`, plus `requested` when it names a harness
+/// not already in that list -- the only I/O in the whole adaptive scheduling
+/// path, so `allocator.rs` itself never needs a `StateDir`. A caller whose
+/// own requested harness has fallen out of (or was never in) `fallback.order`
+/// still needs a `HarnessCapacity`/`ProviderCapacity` entry for it: rule (a)
+/// of `allocator::place` (keep the requested harness when it is `Ready`) can
+/// only ever fire when `snapshot.harness(&unit.requested)` resolves.
+///
+/// `requester` is a session identity (`mail::session_identity`'s own shape),
+/// excluded from every harness's live `active` count so a session never
+/// counts its own registry row as capacity already spent -- `None` when the
+/// caller has no session identity to exclude (a dashboard authority path,
+/// for instance).
+pub fn capacity_snapshot(
+    state: &StateDir,
+    cfg: &CtxConfig,
+    now: u64,
+    requester: Option<&str>,
+    requested: Option<&str>,
+) -> allocator::CapacitySnapshot {
+    let mut names: Vec<String> = cfg.fallback.order.clone();
+    if let Some(requested) = requested
+        && !names.iter().any(|n| n.eq_ignore_ascii_case(requested))
+    {
+        names.push(requested.to_string());
+    }
+
+    let mut provider_names: Vec<String> = Vec::new();
+    let mut providers: Vec<allocator::ProviderCapacity> = Vec::new();
+    // Raw (pre-`binding()`-filter) observed_at per provider, so a divergence
+    // between two providers' collectors can be detected even when one of
+    // them is stale enough that `binding()` dropped it from `windows`
+    // entirely -- `ProviderCapacity.windows` alone cannot see that case.
+    let mut raw_observed_at: Vec<u64> = Vec::new();
+    for name in &names {
+        let provider = adapters::provider_for_agent_name(Some(name)).to_string();
+        if !provider_names.contains(&provider) {
+            provider_names.push(provider.clone());
+            let (capacity, observed) = build_provider_capacity(state, cfg, now, &provider);
+            providers.push(capacity);
+            raw_observed_at.extend(observed);
+        }
+    }
+
+    let sessions = sessions::list(state);
+    let mut harnesses = Vec::with_capacity(names.len());
+    for name in &names {
+        let provider = adapters::provider_for_agent_name(Some(name)).to_string();
+        let Some(provider_capacity) = providers.iter().find(|p| p.provider == provider) else {
+            continue;
+        };
+        let enabled = cfg.agents.is_enabled(name);
+        let capacity_small = cfg.agents.is_capacity_small(name);
+        let (ready, unready_reason, counts_tool_calls) =
+            match adapters::select(Some(name), &[], cfg) {
+                Ok(adapter) => (true, None, adapter.counts_tool_calls()),
+                Err(e) => (false, Some(e.to_string()), false),
+            };
+        let active = sessions
+            .iter()
+            .filter(|(record, liveness)| {
+                *liveness == sessions::Liveness::Live
+                    && record.agent.eq_ignore_ascii_case(name)
+                    && requester.is_none_or(|req| record.session != req)
+            })
+            .count() as u32;
+        let limits = cfg.fallback.harness_limits(name);
+
+        let mut harness = allocator::HarnessCapacity {
+            name: name.clone(),
+            provider: provider.clone(),
+            enabled,
+            ready,
+            unready_reason,
+            capacity_small,
+            counts_tool_calls,
+            active,
+            max_active: limits.max_active,
+            reserve_headroom_pct: cfg.fallback.reserve_headroom_pct(name),
+            state: allocator::HarnessState::Unknown,
+            state_reason: String::new(),
+        };
+        let (state, reason) = allocator::classify(&harness, provider_capacity, cfg);
+        harness.state = state;
+        harness.state_reason = reason;
+        harnesses.push(harness);
+    }
+
+    let degraded = providers.iter().any(|p| p.degraded)
+        || raw_observed_at
+            .iter()
+            .max()
+            .zip(raw_observed_at.iter().min())
+            .is_some_and(|(max, min)| max.saturating_sub(*min) > cfg.pace.collector_max_age_secs);
+
+    allocator::CapacitySnapshot {
+        taken_at: now,
+        providers,
+        harnesses,
+        degraded,
+    }
+}
+
+fn build_provider_capacity(
+    state: &StateDir,
+    cfg: &CtxConfig,
+    now: u64,
+    provider: &str,
+) -> (allocator::ProviderCapacity, Vec<u64>) {
+    let (collector, estimator) = pace::current_windows(state, &cfg.pace, now, provider);
+    let (source, five, seven) =
+        pace::spawn_bindings(&collector, estimator.as_ref(), now, &cfg.pace);
+    let raw_observed_at: Vec<u64> = [collector.five_hour.as_ref(), collector.seven_day.as_ref()]
+        .into_iter()
+        .flatten()
+        .map(|w| w.observed_at)
+        .collect();
+
+    let mut windows = Vec::new();
+    for (name, reading) in [("five_hour", five), ("seven_day", seven)] {
+        let Some(reading) = reading else { continue };
+        let age = super::window::age_secs(reading, now);
+        windows.push(allocator::WindowReading {
+            window: name.to_string(),
+            used_pct: reading.used_percentage,
+            headroom_pct: if reading.limit_reached {
+                0.0
+            } else {
+                (100.0 - reading.used_percentage).clamp(0.0, 100.0)
+            },
+            resets_at: reading.resets_at,
+            observed_at: reading.observed_at,
+            age_secs: age,
+            source: source.as_str().to_string(),
+            stale: age > cfg.pace.collector_max_age_secs,
+            limit_reached: reading.limit_reached,
+            overage_covered: reading.overage_covered,
+        });
+    }
+
+    let binding_window =
+        pace::spawn_headroom(&collector, estimator.as_ref(), now, &cfg.pace).map(|h| h.window);
+    let binding = binding_window.and_then(|name| windows.iter().position(|w| w.window == name));
+    let hard_refused = matches!(
+        pace::spawn_gate(&collector, estimator.as_ref(), now, &cfg.pace),
+        SpawnGate::Refuse { .. }
+    );
+    let degraded = windows.iter().any(|w| w.stale);
+
+    (
+        allocator::ProviderCapacity {
+            provider: provider.to_string(),
+            windows,
+            binding,
+            hard_refused,
+            reserved_tokens: outstanding_reserved_tokens(state, provider, now),
+            degraded,
+        },
+        raw_observed_at,
+    )
+}
+
+/// Every admitted-but-unsettled delegation's expected spend against this
+/// provider (issue #358, task T3's own ledger). A live reservation is
+/// capacity already promised to a child that has not reported yet, so a
+/// snapshot that ignored it would hand the same headroom out twice.
+fn outstanding_reserved_tokens(state: &StateDir, provider: &str, now: u64) -> u64 {
+    super::reservation::outstanding(state, provider, now)
+}
+
 fn best_alternate(
     state: &StateDir,
     cfg: &CtxConfig,
@@ -287,6 +484,23 @@ fn best_alternate(
 /// low-water mark. Unknown headroom does not trigger predictive steering:
 /// uncertainty is treated conservatively and only affects whether an alternate
 /// may be used after a real refusal/block.
+///
+/// Finding #12 (issue #358 review): in `adaptive_delegation` mode, a
+/// requested harness genuinely `Draining` on CONCURRENCY alone (already at
+/// its own `max_active`, independent of usage headroom) used to never
+/// trigger a reroute -- the `reason` gate below only ever asks "is the
+/// source's usage headroom fine", which a `max_active` harness at low usage
+/// answers "yes" to, so the old code returned `None` before the adaptive
+/// path's own `CapacitySnapshot`/`allocator::classify` (which DOES know
+/// about `max_active`) ever ran. Adaptive mode now ALSO builds that snapshot
+/// and treats the requested harness reading `Draining`/`HardBlocked` there
+/// as a second, independent trigger alongside the usual usage-based one --
+/// neither trigger is required over the other, but at least one still is:
+/// a harness with merely an `Unknown` (no usage data yet) or `Ready`
+/// classification and no usage-based trigger either must still not reroute,
+/// or every ordinary delegation with no usage source at all would
+/// unconditionally bounce to an alternate. The `overage_covered` early
+/// return stays unconditional, in every mode.
 pub fn route_new_delegation(
     state: &StateDir,
     cfg: &CtxConfig,
@@ -312,16 +526,44 @@ pub fn route_new_delegation(
             .required_headroom_pct(cfg, reading.window)
             .is_some_and(|required| reading.headroom_pct < required)
     });
-    let reason = match gate {
-        SpawnGate::Refuse { .. } => RouteReason::Exhausted,
+    let headroom_reason = match gate {
+        SpawnGate::Refuse { .. } => Some(RouteReason::Exhausted),
         _ if task_will_not_fit
             || source_headroom.is_some_and(|pct| pct <= cfg.fallback.predictive_headroom_pct) =>
         {
-            RouteReason::Predictive
+            Some(RouteReason::Predictive)
         }
-        _ => return None,
+        _ => None,
     };
 
+    if cfg.fallback.adaptive_delegation {
+        let snapshot = capacity_snapshot(state, cfg, request.now, None, Some(request.requested));
+        let concurrency_triggered = snapshot.harness(request.requested).is_some_and(|harness| {
+            matches!(
+                harness.state,
+                allocator::HarnessState::Draining | allocator::HarnessState::HardBlocked
+            )
+        });
+        if headroom_reason.is_none() && !concurrency_triggered {
+            return None;
+        }
+        let unit = work_unit_for(request);
+        let exclude = request.exclude.into_iter().collect::<Vec<_>>();
+        let models = |name: &str| translated_model_for(request, name, cfg);
+        let placement = super::allocator::place(&snapshot, cfg, &unit, &exclude, &models);
+        let candidate = placement.selected.filter(|_| !placement.keep_requested)?;
+        let reason = headroom_reason.unwrap_or(RouteReason::Predictive);
+        return Some(route_from_candidate(
+            request,
+            reason,
+            source_headroom,
+            source_reading,
+            &snapshot,
+            candidate,
+        ));
+    }
+
+    let reason = headroom_reason?;
     let (selected, model, headroom) = best_alternate(state, cfg, request, &[])?;
     Some(Route {
         requested: request.requested.to_string(),
@@ -333,7 +575,82 @@ pub fn route_new_delegation(
         requested_observed_at: source_reading.map(|reading| reading.observed_at),
         selected_headroom_pct: headroom.pct,
         selected_headroom_assumed: headroom.assumed,
+        binding_window: None,
+        reserved_tokens: 0,
     })
+}
+
+/// Builds the `allocator::WorkUnit` a `RouteRequest` maps to -- shared by
+/// every adaptive call site so the mapping cannot drift between them.
+fn work_unit_for(request: RouteRequest<'_>) -> super::allocator::WorkUnit {
+    super::allocator::WorkUnit {
+        id: "delegation".to_string(),
+        requested: request.requested.to_string(),
+        bounds: request.bounds,
+        expected_tokens: request.bounds.tokens.unwrap_or(0),
+        needs_tool_call_counting: request.bounds.tool_calls.is_some(),
+        source_model: request.source_model.map(str::to_string),
+        source_model_explicit: request.source_model_explicit,
+        delegation: request.delegation,
+    }
+}
+
+/// The same tier-mirroring/worker-model translation `best_alternate` already
+/// applies, exposed as the closure `allocator::place` needs so the pure
+/// module never touches `handover` (or any other adapter-facing code)
+/// itself.
+fn translated_model_for(
+    request: RouteRequest<'_>,
+    target: &str,
+    cfg: &CtxConfig,
+) -> Option<String> {
+    if request.delegation {
+        handover::equivalent_delegation_model(
+            request.requested,
+            request.source_model,
+            request.source_model_explicit,
+            target,
+            cfg,
+        )
+    } else {
+        handover::equivalent_model(
+            request.requested,
+            request.source_model,
+            request.source_model_explicit,
+            target,
+            cfg,
+        )
+    }
+}
+
+/// Maps an `allocator::Candidate` the adaptive path selected into the
+/// existing `Route` shape every caller already reads.
+fn route_from_candidate(
+    request: RouteRequest<'_>,
+    reason: RouteReason,
+    source_headroom: Option<f64>,
+    source_reading: Option<pace::SpawnHeadroom>,
+    snapshot: &super::allocator::CapacitySnapshot,
+    candidate: super::allocator::Candidate,
+) -> Route {
+    let reserved_tokens = snapshot
+        .harness(&candidate.name)
+        .and_then(|h| snapshot.provider(&h.provider))
+        .map(|p| p.reserved_tokens)
+        .unwrap_or(0);
+    Route {
+        requested: request.requested.to_string(),
+        selected: candidate.name,
+        model: candidate.model.unwrap_or_default(),
+        reason,
+        requested_headroom_pct: source_headroom,
+        requested_age_secs: source_reading.map(|reading| reading.age_secs),
+        requested_observed_at: source_reading.map(|reading| reading.observed_at),
+        selected_headroom_pct: candidate.headroom_pct,
+        selected_headroom_assumed: candidate.assumed,
+        binding_window: candidate.binding_window,
+        reserved_tokens,
+    }
 }
 
 /// When no admissible harness can run now, chooses the seat whose hard spawn
@@ -445,6 +762,28 @@ pub fn route_blocked_session(
         return None;
     }
     let requested_reading = requested_reading(state, cfg, request.requested, request.now);
+
+    if cfg.fallback.adaptive_delegation {
+        let snapshot = capacity_snapshot(state, cfg, request.now, None, Some(request.requested));
+        let unit = work_unit_for(request);
+        let mut exclude: Vec<&str> = excluded.iter().map(String::as_str).collect();
+        if let Some(excl) = request.exclude {
+            exclude.push(excl);
+        }
+        let models = |name: &str| translated_model_for(request, name, cfg);
+        let placement = super::allocator::place(&snapshot, cfg, &unit, &exclude, &models);
+        let candidate = placement.selected.filter(|_| !placement.keep_requested)?;
+        let requested_headroom_pct = requested_reading.map(|reading| reading.headroom_pct);
+        return Some(route_from_candidate(
+            request,
+            RouteReason::Exhausted,
+            requested_headroom_pct,
+            requested_reading,
+            &snapshot,
+            candidate,
+        ));
+    }
+
     let (selected, model, headroom) = best_alternate(state, cfg, request, excluded)?;
     Some(Route {
         requested: request.requested.to_string(),
@@ -456,6 +795,8 @@ pub fn route_blocked_session(
         requested_observed_at: requested_reading.map(|reading| reading.observed_at),
         selected_headroom_pct: headroom.pct,
         selected_headroom_assumed: headroom.assumed,
+        binding_window: None,
+        reserved_tokens: 0,
     })
 }
 
@@ -936,6 +1277,8 @@ mod tests {
             requested_observed_at: Some(1_700_000_000),
             selected_headroom_pct: 25.0,
             selected_headroom_assumed: true,
+            binding_window: None,
+            reserved_tokens: 0,
         };
         let detail = route.detail(pace::Seat::Cli);
         assert!(detail.contains("claude -> codex"));
@@ -944,6 +1287,30 @@ mod tests {
         assert!(detail.contains("25.0% assumed"));
         assert!(detail.contains("gpt-5.6-terra"));
         assert!(detail.contains("pass --force"));
+        assert!(
+            !detail.contains("binding"),
+            "legacy routes have no binding window to disclose"
+        );
+    }
+
+    #[test]
+    fn route_detail_discloses_the_binding_window_and_reservation_when_adaptive() {
+        let route = Route {
+            requested: "claude".into(),
+            selected: "codex".into(),
+            model: "gpt-5.6-terra".into(),
+            reason: RouteReason::Exhausted,
+            requested_headroom_pct: Some(0.0),
+            requested_age_secs: None,
+            requested_observed_at: None,
+            selected_headroom_pct: 25.0,
+            selected_headroom_assumed: false,
+            binding_window: Some("seven_day".to_string()),
+            reserved_tokens: 12_000,
+        };
+        let detail = route.detail(pace::Seat::Cli);
+        assert!(detail.contains("binding seven_day"));
+        assert!(detail.contains("reserved 12000 tokens"));
     }
 
     #[test]
@@ -981,5 +1348,279 @@ mod tests {
         let explicit = route_new_delegation(&state, &cfg, request(true), false)
             .expect("explicit worker model reroutes by tier");
         assert_eq!(explicit.model, "opus");
+    }
+
+    // -- Issue #358: `allocator::place`-backed adaptive path -----------------
+
+    /// Mirrors `predictive_routing_uses_the_task_budget_when_the_source_
+    /// cannot_fit_it`'s exact fixture with `adaptive_delegation` turned on:
+    /// the adaptive path must reach the identical verdict as the legacy
+    /// `best_alternate` search over the same reading.
+    #[test]
+    fn predictive_routing_matches_under_adaptive_delegation() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let mut cfg = test_cfg_with_ready_adapters();
+        cfg.fallback.adaptive_delegation = true;
+        cfg.pace.five_hour_budget_tokens = 100_000;
+        cfg.fallback.predictive_headroom_pct = 20.0;
+        let now = 1_700_000_000;
+        store_usage(&state, "anthropic", 75.0, now + 3_600, now);
+        store_usage(&state, "openai", 20.0, now + 3_600, now);
+
+        let route = route_new_delegation(
+            &state,
+            &cfg,
+            RouteRequest {
+                requested: "claude",
+                source_model: Some("sonnet"),
+                source_model_explicit: false,
+                delegation: true,
+                bounds: TaskBounds {
+                    tokens: Some(30_000),
+                    tool_calls: None,
+                },
+                now,
+                exclude: None,
+            },
+            false,
+        )
+        .expect("the bounded task does not fit the requested seat, adaptive or not");
+
+        assert_eq!(route.reason, RouteReason::Predictive);
+        assert_eq!(route.selected, "codex");
+        assert_eq!(route.binding_window.as_deref(), Some("five_hour"));
+    }
+
+    /// Same parity requirement, for the credits-covered invariant: adaptive
+    /// must never route a covered-overage source away either.
+    #[test]
+    fn a_credit_covered_source_reading_never_routes_new_work_away_under_adaptive() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let mut cfg = test_cfg_with_ready_adapters();
+        cfg.fallback.adaptive_delegation = true;
+        let now = 1_700_000_000;
+        crate::commands::ctx::window::store_for(
+            &state,
+            "openai",
+            &crate::commands::ctx::window::UsageWindows {
+                five_hour: Some(crate::commands::ctx::window::Window {
+                    used_percentage: 100.0,
+                    resets_at: now + 600,
+                    observed_at: now,
+                    overage_covered: true,
+                    limit_reached: false,
+                }),
+                seven_day: None,
+            },
+        )
+        .expect("store provider usage");
+
+        let route = route_new_delegation(
+            &state,
+            &cfg,
+            RouteRequest {
+                requested: "codex",
+                source_model: Some("gpt-5.6-terra"),
+                source_model_explicit: false,
+                delegation: true,
+                bounds: TaskBounds {
+                    tokens: None,
+                    tool_calls: None,
+                },
+                now,
+                exclude: None,
+            },
+            false,
+        );
+
+        assert_eq!(route, None);
+    }
+
+    /// `route_blocked_session` must still find an alternate under the
+    /// adaptive path -- it trusts the vendor-confirmed block rather than
+    /// re-checking the source's own gate, exactly like the legacy path.
+    #[test]
+    fn route_blocked_session_selects_under_adaptive_delegation() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let mut cfg = test_cfg_with_ready_adapters();
+        cfg.fallback.adaptive_delegation = true;
+        let now = 1_700_000_000;
+        store_usage(&state, "anthropic", 100.0, now + 3_600, now);
+        store_usage(&state, "openai", 10.0, now + 3_600, now);
+
+        let route = route_blocked_session(
+            &state,
+            &cfg,
+            RouteRequest {
+                requested: "claude",
+                source_model: Some("sonnet"),
+                source_model_explicit: false,
+                delegation: true,
+                bounds: TaskBounds {
+                    tokens: None,
+                    tool_calls: None,
+                },
+                now,
+                exclude: None,
+            },
+            &[],
+        )
+        .expect("codex is admissible");
+
+        assert_eq!(route.selected, "codex");
+        assert_eq!(route.reason, RouteReason::Exhausted);
+    }
+
+    /// Finding #12 (issue #358 review): under `adaptive_delegation`, a
+    /// harness sitting at its own `max_active` cap must reroute even when
+    /// its usage headroom is fine -- the old code's usage-headroom-only
+    /// `reason` gate returned `None` (no reroute) the moment it read "fine",
+    /// before the adaptive path's own `CapacitySnapshot`/`allocator::place`
+    /// (which DOES know about `max_active`) ever ran. `claude` is capped at
+    /// one concurrent delegation, already has one live worker running
+    /// against it, and sits at a comfortable 10% usage -- a second
+    /// delegation must still land on `codex`.
+    #[test]
+    fn adaptive_delegation_reroutes_a_harness_at_max_active_even_at_low_usage() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let mut cfg = test_cfg_with_ready_adapters();
+        cfg.fallback.adaptive_delegation = true;
+        cfg.fallback.harness.insert(
+            "claude".to_string(),
+            crate::commands::ctx::config::HarnessLimits {
+                max_active: Some(1),
+                reserve_headroom_pct: None,
+            },
+        );
+        let now = 1_700_000_000;
+        store_usage(&state, "anthropic", 10.0, now + 3_600, now);
+        store_usage(&state, "openai", 10.0, now + 3_600, now);
+
+        let record = crate::commands::ctx::sessions::Record::new(
+            "11111111-2222-4333-8444-555555555555",
+            "claude",
+            tmp.path(),
+            crate::commands::ctx::sessions::Verb::Exec,
+        );
+        let _guard = crate::commands::ctx::sessions::SessionGuard::register(&state, record);
+
+        let route = route_new_delegation(
+            &state,
+            &cfg,
+            RouteRequest {
+                requested: "claude",
+                source_model: Some("sonnet"),
+                source_model_explicit: false,
+                delegation: true,
+                bounds: TaskBounds {
+                    tokens: None,
+                    tool_calls: None,
+                },
+                now,
+                exclude: None,
+            },
+            false,
+        )
+        .expect("claude is at max_active and must reroute even though its usage is fine");
+
+        assert_eq!(route.selected, "codex");
+    }
+
+    /// A reading old enough to fall outside `pace.collector_max_age_secs`,
+    /// below the hard ceiling and never vendor-refused, must never surface
+    /// as `HardBlocked` in the capacity snapshot -- `pace::binding`'s own
+    /// staleness rule already drops it from consideration, so the harness
+    /// reads as `Unknown`, not blocked.
+    #[test]
+    fn a_stale_reading_never_produces_hard_blocked() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = test_cfg_with_ready_adapters();
+        let now = 1_700_000_000;
+        // Stored long before `now`, well past `collector_max_age_secs`
+        // (900s by default), at a percentage that would hard-block if it
+        // were still fresh.
+        store_usage(&state, "anthropic", 99.0, now - 3_600, now - 10_000);
+
+        let snapshot = capacity_snapshot(&state, &cfg, now, None, None);
+        let claude = snapshot.harness("claude").expect("claude present");
+        assert_ne!(claude.state, allocator::HarnessState::HardBlocked);
+    }
+
+    /// `capacity_snapshot.degraded` is set when providers' own readings
+    /// disagree in observation time by more than `pace.collector_max_age_
+    /// secs`.
+    #[test]
+    fn capacity_snapshot_reports_degraded_when_provider_readings_diverge() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = test_cfg_with_ready_adapters();
+        let now = 1_700_000_000;
+        store_usage(&state, "anthropic", 10.0, now + 3_600, now);
+        store_usage(&state, "openai", 10.0, now + 3_600, now - 2_000);
+
+        let snapshot = capacity_snapshot(&state, &cfg, now, None, None);
+        assert!(
+            snapshot.degraded,
+            "a 2000s observation gap exceeds the 900s default ceiling"
+        );
+    }
+
+    #[test]
+    fn capacity_snapshot_is_not_degraded_when_readings_agree() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = test_cfg_with_ready_adapters();
+        let now = 1_700_000_000;
+        store_usage(&state, "anthropic", 10.0, now + 3_600, now);
+        store_usage(&state, "openai", 10.0, now + 3_600, now);
+
+        let snapshot = capacity_snapshot(&state, &cfg, now, None, None);
+        assert!(!snapshot.degraded);
+    }
+
+    /// Follow-up to issue #358 task 2: a requested harness that has fallen
+    /// out of (or was never in) `fallback.order` still needs its own
+    /// `HarnessCapacity`/`ProviderCapacity` entry, or rule (a) of
+    /// `allocator::place` (keep the requested harness when it is `Ready`)
+    /// could never fire for it.
+    #[test]
+    fn capacity_snapshot_includes_a_requested_harness_absent_from_order() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let mut cfg = test_cfg_with_ready_adapters();
+        cfg.fallback.order = vec!["codex".to_string()];
+        let now = 1_700_000_000;
+        store_usage(&state, "anthropic", 10.0, now + 3_600, now);
+        store_usage(&state, "openai", 10.0, now + 3_600, now);
+
+        let snapshot = capacity_snapshot(&state, &cfg, now, None, Some("claude"));
+        let claude = snapshot
+            .harness("claude")
+            .expect("claude must appear even though absent from fallback.order");
+        assert_eq!(claude.provider, "anthropic");
+        assert_eq!(claude.state, allocator::HarnessState::Ready);
+
+        let unit = allocator::WorkUnit {
+            id: "u1".to_string(),
+            requested: "claude".to_string(),
+            bounds: TaskBounds {
+                tokens: None,
+                tool_calls: None,
+            },
+            expected_tokens: 0,
+            needs_tool_call_counting: false,
+            source_model: None,
+            source_model_explicit: false,
+            delegation: true,
+        };
+        let placement =
+            allocator::place(&snapshot, &cfg, &unit, &[], &|_| Some("model".to_string()));
+        assert!(placement.keep_requested);
+        assert_eq!(placement.selected.expect("kept").name, "claude");
     }
 }

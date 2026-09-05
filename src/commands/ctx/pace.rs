@@ -511,6 +511,57 @@ fn worst<'a>(
         })
 }
 
+/// The configured absolute token ceiling for one usage window -- the exact
+/// mapping `allocator::window_budget` uses, kept as a small, deliberately
+/// unshared duplicate rather than a cross-module dependency on a type
+/// (`CtxConfig`) this module otherwise never touches (every other function
+/// here takes `PaceConfig` directly).
+fn window_budget_tokens(window_name: &str, cfg: &PaceConfig) -> u64 {
+    match window_name {
+        "five_hour" => cfg.five_hour_budget_tokens,
+        "seven_day" => cfg.seven_day_budget_tokens,
+        _ => 0,
+    }
+}
+
+/// Finding #11 (issue #358 review): a provider's projected headroom,
+/// converted to a raw token count via its binding (worst, non-stale) window's
+/// configured budget -- the ceiling `reservation::reserve_within` checks a
+/// new admission against, so two racing admissions against the same
+/// provider cannot jointly over-commit it. Source priority is exactly
+/// [`decide`]'s own: a fresh (per `binding`) collector reading first, an
+/// estimator reading second, `None` third. `None` also when the binding
+/// window has no configured token budget to convert against at all (an
+/// unbounded provider, or one pacing tracks only by raw percentage) -- the
+/// caller's own contract for a `None` limit is "admit unconditionally".
+pub fn headroom_limit_tokens(
+    collector: &UsageWindows,
+    estimator: Option<&UsageWindows>,
+    now: u64,
+    cfg: &PaceConfig,
+) -> Option<u64> {
+    let collector_worst = worst(
+        binding(&collector.five_hour, now, cfg),
+        binding(&collector.seven_day, now, cfg),
+    );
+    let (window_name, window) = match collector_worst {
+        Some(found) => found,
+        None => {
+            let estimator = estimator?;
+            worst(
+                binding(&estimator.five_hour, now, cfg),
+                binding(&estimator.seven_day, now, cfg),
+            )?
+        }
+    };
+    let budget = window_budget_tokens(window_name, cfg);
+    if budget == 0 {
+        return None;
+    }
+    let headroom_pct = (100.0 - window.used_percentage).clamp(0.0, 100.0);
+    Some(((headroom_pct / 100.0) * budget as f64).round() as u64)
+}
+
 /// Collector first when fresh, estimator second, nothing third. A fresher
 /// lower-priority layer never overrides a fresh collector reading.
 pub fn decide(
@@ -591,20 +642,24 @@ pub fn decide(
     }
 }
 
-/// Issue #155, Phase 6(c): whether quota pressure permits starting NEW
-/// delegated work -- never a signal about restarting a session already
-/// running. Restarting a session because it is expensive would discard a
-/// warm cache and re-read the whole context, the single most expensive
-/// possible reaction to a cost signal, so `rot.rs`/`score.rs` deliberately
-/// never read `pace`/`window` data at all (see `rot.rs`'s own purity test)
-/// and this gate is consulted only at the two places NEW work is actually
-/// created: `agent::run_with` (before `try_join_dashboard`) and
-/// `dash::fulfill_spawn_request` (after the delegation depth cap).
+/// Issue #155, Phase 6(c); reworked for issue #358 (T9): a ranking signal for
+/// where NEW delegated work should land, never a reason to refuse or delay
+/// it -- and never a signal about restarting a session already running.
+/// Restarting a session because it is expensive would discard a warm cache
+/// and re-read the whole context, the single most expensive possible
+/// reaction to a cost signal, so `rot.rs`/`score.rs` deliberately never read
+/// `pace`/`window` data at all (see `rot.rs`'s own purity test) and this gate
+/// is consulted only at the two places NEW work is actually created:
+/// `agent::run_with` (before `try_join_dashboard`) and
+/// `dash::fulfill_spawn_request` (after the delegation depth cap) -- both
+/// read a `Refuse` as an "at the ceiling" note plus an informational
+/// `Attention::Quota` row, never as a reason to return `Err`/`SpawnRefusal`.
 /// Deliberately distinct thresholds from `max_percent`/`soft_percent`: those
 /// tune how an ALREADY-RUNNING supervised loop paces itself (throttle, then
-/// wait), while `spawn_soft_pct`/`spawn_hard_pct` tune whether a session
-/// should be allowed to start spending at all -- a stricter, earlier ceiling
-/// is the point, not a duplicate of the pacing one.
+/// wait), while `spawn_soft_pct`/`spawn_hard_pct` tune the ranking ceiling a
+/// fresh session is weighed against -- a stricter, earlier ceiling is the
+/// point, not a duplicate of the pacing one. Names and thresholds are kept
+/// exactly as before: `allocator.rs`'s ranking still reads them.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SpawnGate {
     /// Below the soft band, pacing disabled, or no binding usage data at
@@ -618,9 +673,10 @@ pub enum SpawnGate {
         source: Source,
     },
     /// At or above `spawn_hard_pct`, or after an explicit vendor refusal:
-    /// refuse by default. Only `--force` (`agent.rs`'s own flag, threaded
-    /// through `dash::SpawnRequest::force` for a pane spawn) overrides it --
-    /// see `spawn_blocked` in `agent.rs`.
+    /// informational only, same as `Warn` -- the spawn still proceeds. Kept
+    /// as its own variant (not folded into `Warn`) because the allocator's
+    /// ranking still treats it as the worse of the two, and because the
+    /// note it produces (`describe_spawn_gate`) is worded differently.
     Refuse {
         window: &'static str,
         percent: f64,
@@ -650,7 +706,7 @@ pub struct SpawnHeadroom {
     pub overage_covered: bool,
 }
 
-fn spawn_bindings<'a>(
+pub(crate) fn spawn_bindings<'a>(
     collector: &'a UsageWindows,
     estimator: Option<&'a UsageWindows>,
     now: u64,
@@ -915,10 +971,14 @@ pub fn describe(decision: &PaceDecision) -> String {
     }
 }
 
-/// Where a usage message is being written, because the override that actually
-/// works differs between the two (issue #337). A pane's own spawn request
-/// carries untrusted `force` JSON, so the only real override from there is to
-/// leave the dashboard channel (`--headless --force`) or move the ceiling.
+/// Where a usage message is being written, because the fallback reroute's own
+/// override wording differs between the two (issue #337; see `Route::detail`
+/// in `fallback.rs`, the one remaining consumer of `override_hint`). A pane's
+/// own spawn request carries untrusted `force` JSON, so the only real
+/// override from there is to leave the dashboard channel (`--headless
+/// --force`) or move the ceiling. Issue #358 (T9): no longer consulted by
+/// `describe_spawn_gate` below -- a `SpawnGate::Refuse` note has nothing left
+/// to override, since usage headroom never blocks a spawn any more.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Seat {
     /// An operator's own `zirv ctx agent`/`exec` invocation.
@@ -939,16 +999,15 @@ impl Seat {
 }
 
 /// The operator-facing line for a `SpawnGate`, or `None` for `Proceed` (which
-/// has nothing to say and nothing to print). Names the window, the
-/// percentage, the data source, how old that reading is, and -- for a refusal
-/// -- how to override it from this seat, mirroring `describe`'s own shape for
-/// `PaceDecision` above. `reading_age_secs` is `None` when the caller has no
-/// binding reading to date (nothing is claimed rather than "0m ago").
-pub fn describe_spawn_gate(
-    gate: &SpawnGate,
-    reading_age_secs: Option<u64>,
-    seat: Seat,
-) -> Option<String> {
+/// has nothing to say and nothing to print), mirroring `describe`'s own shape
+/// for `PaceDecision` above. Names the window, the percentage, the data
+/// source, and how old that reading is. `reading_age_secs` is `None` when the
+/// caller has no binding reading to date (nothing is claimed rather than "0m
+/// ago"). Issue #358 (T9): usage headroom ranks a delegation across
+/// harnesses, it never blocks one -- `SpawnGate::Refuse` is worded as "at the
+/// ceiling", not "refusing", and carries no override hint (there is nothing
+/// left to override).
+pub fn describe_spawn_gate(gate: &SpawnGate, reading_age_secs: Option<u64>) -> Option<String> {
     let observed = reading_age_secs
         .map(|age| format!(", observed {} ago", crate::style::format_age(age)))
         .unwrap_or_default();
@@ -968,11 +1027,10 @@ pub fn describe_spawn_gate(
             percent,
             source,
         } => Some(format!(
-            "{window} window at {percent:.1}% ({} data{observed}), blocked by an explicit vendor \
-             refusal or pace.spawn_hard_pct -- refusing to start new delegated work; this never \
-             affects a session already running; to override, {}",
-            source.as_str(),
-            seat.override_hint()
+            "{window} window at {percent:.1}% ({} data{observed}) is at the spawn ceiling \
+             (pace.spawn_hard_pct) or an explicit vendor refusal -- starting anyway; usage \
+             headroom ranks a delegation across harnesses, it never blocks one",
+            source.as_str()
         )),
     }
 }
@@ -1008,6 +1066,17 @@ pub struct PaceGate<'a> {
     /// `Some` lets `wait_for_window` fall back to it once the passive
     /// collector reading goes stale.
     pub poller: Option<&'a dyn super::poll::UsagePoller>,
+    /// Issue #358 (T9): true only for the one pre-launch call that decides
+    /// whether a brand-new worker gets to start at all -- never for a
+    /// restart of a session already running, and never for the confirmed-
+    /// vendor-refusal park (`exec.rs`/`run_loop.rs` both build a second,
+    /// separate `PaceGate` with this left `false` for that call). Usage
+    /// headroom is a ranking signal, not a spawn gate: `wait_for_window`
+    /// downgrades a `WaitUntil`/`Slow` verdict to a one-line warning and
+    /// returns immediately when this is set, instead of pacing. A
+    /// `Proceed`/`Unknown` verdict is unaffected either way -- there is
+    /// nothing to downgrade.
+    pub initial_launch: bool,
 }
 
 /// Once-per-run announce latches for `wait_for_window`, owned by the caller
@@ -1385,6 +1454,11 @@ fn build_gate<'a>(
     PaceGate {
         use_credits: cfg.use_credits.for_provider(provider),
         poller: (poll && cfg.poll_enabled).then_some(http_poller as &dyn super::poll::UsagePoller),
+        // `resolve_interactive_gate` never reads this flag -- it resolves a
+        // one-shot human-facing decision straight from `decide()`, not
+        // through `wait_for_window`'s loop -- so this is a harmless
+        // placeholder to satisfy the shared struct.
+        initial_launch: false,
     }
 }
 
@@ -1526,6 +1600,53 @@ pub fn wait_for_window<W: Write>(
         refresh_sources(state, cfg, now, provider, &gate, flags);
         let (collector, estimated) = current_windows(state, cfg, now, provider);
         let decision = decide(&collector, estimated.as_ref(), now, cfg);
+
+        // Issue #358 (T9): usage headroom ranks a delegation across
+        // harnesses, it never blocks or delays one -- `gate.initial_launch`
+        // is set only for the one pre-launch call that decides whether a
+        // brand-new worker gets to start at all. A hard `WaitUntil` or a
+        // soft `Slow` verdict is downgraded to a single warning line and the
+        // call returns immediately instead of pacing; a later restart of the
+        // same session (`initial_launch: false`) still waits exactly as
+        // before. `Proceed`/`Unknown` need no downgrade -- there is nothing
+        // to wait for either way.
+        if gate.initial_launch
+            && matches!(
+                decision,
+                PaceDecision::WaitUntil { .. } | PaceDecision::Slow { .. }
+            )
+        {
+            let detail = describe(&decision);
+            let _ = writeln!(
+                w,
+                "zirv ctx {verb}: {detail} -- launching the new worker anyway (usage headroom \
+                 ranks a delegation, it never blocks one); a later restart of this same session \
+                 still paces normally"
+            );
+            let _ = log::append(
+                state,
+                &log::Decision {
+                    ts: now_secs(),
+                    session,
+                    verb,
+                    verdict: "n/a",
+                    score: 0,
+                    action: "pace-initial-launch-warn",
+                    detail: &detail,
+                    observed_at: None,
+                },
+            );
+            let source = match &decision {
+                PaceDecision::WaitUntil { source, .. } | PaceDecision::Slow { source, .. } => {
+                    *source
+                }
+                _ => Source::None,
+            };
+            return PaceOutcome {
+                waited_secs: now.saturating_sub(started),
+                source,
+            };
+        }
 
         // T8: a reading that existed when the upfront shortcut ran (so it
         // did not fire) can still go stale *during* the wait -- `binding()`
@@ -1817,6 +1938,65 @@ mod tests {
             five_hour: window(percent, resets_at, NOW - 10),
             seven_day: None,
         }
+    }
+
+    /// Finding #11 (issue #358 review): the exact conversion `reservation::
+    /// reserve_within`'s caller needs -- 80% used against a 1000-token
+    /// five_hour budget leaves 20% headroom, i.e. 200 tokens of room.
+    #[test]
+    fn headroom_limit_tokens_converts_percentage_headroom_via_the_budgeted_window() {
+        let cfg = PaceConfig {
+            five_hour_budget_tokens: 1_000,
+            ..Default::default()
+        };
+        let reading = collector(80.0);
+
+        assert_eq!(headroom_limit_tokens(&reading, None, NOW, &cfg), Some(200));
+    }
+
+    #[test]
+    fn headroom_limit_tokens_is_none_without_a_configured_budget() {
+        let cfg = PaceConfig::default();
+        let reading = collector(80.0);
+
+        assert_eq!(
+            headroom_limit_tokens(&reading, None, NOW, &cfg),
+            None,
+            "no configured token budget means no ceiling to convert against"
+        );
+    }
+
+    #[test]
+    fn headroom_limit_tokens_falls_back_to_the_estimator_with_no_collector_reading() {
+        let cfg = PaceConfig {
+            five_hour_budget_tokens: 1_000,
+            ..Default::default()
+        };
+        let empty = UsageWindows::default();
+        let estimated = collector(50.0);
+
+        assert_eq!(
+            headroom_limit_tokens(&empty, Some(&estimated), NOW, &cfg),
+            Some(500)
+        );
+    }
+
+    #[test]
+    fn headroom_limit_tokens_ignores_a_stale_collector_reading() {
+        let cfg = PaceConfig {
+            five_hour_budget_tokens: 1_000,
+            ..Default::default()
+        };
+        let stale = UsageWindows {
+            five_hour: window(80.0, NOW + 600, NOW - cfg.collector_max_age_secs - 60),
+            seven_day: None,
+        };
+
+        assert_eq!(
+            headroom_limit_tokens(&stale, None, NOW, &cfg),
+            None,
+            "a stale reading is not usable, matching `decide`'s own binding rule"
+        );
     }
 
     fn store_confirmation_reading(
@@ -2259,6 +2439,8 @@ mod tests {
             PaceGate {
                 use_credits: true,
                 poller: None,
+
+                initial_launch: false,
             },
             &mut flags,
         );
@@ -2310,6 +2492,8 @@ mod tests {
             PaceGate {
                 use_credits: false,
                 poller: None,
+
+                initial_launch: false,
             },
             &mut flags,
         );
@@ -2369,6 +2553,8 @@ mod tests {
             PaceGate {
                 use_credits: false,
                 poller: None,
+
+                initial_launch: false,
             },
             &mut flags,
         );
@@ -3055,6 +3241,8 @@ mod tests {
             PaceGate {
                 use_credits: false,
                 poller: None,
+
+                initial_launch: false,
             },
             &mut PaceGateFlags::default(),
         );
@@ -3095,6 +3283,8 @@ mod tests {
             PaceGate {
                 use_credits: false,
                 poller: None,
+
+                initial_launch: false,
             },
             &mut PaceGateFlags::default(),
         );
@@ -3140,6 +3330,8 @@ mod tests {
             PaceGate {
                 use_credits: false,
                 poller: None,
+
+                initial_launch: false,
             },
             &mut PaceGateFlags::default(),
         );
@@ -3346,6 +3538,8 @@ mod tests {
             PaceGate {
                 use_credits: false,
                 poller: None,
+
+                initial_launch: false,
             },
             &mut PaceGateFlags::default(),
         );
@@ -3359,6 +3553,8 @@ mod tests {
             PaceGate {
                 use_credits: true,
                 poller: None,
+
+                initial_launch: false,
             },
             &mut PaceGateFlags::default(),
         );
@@ -3452,6 +3648,8 @@ mod tests {
             PaceGate {
                 use_credits: false,
                 poller: None,
+
+                initial_launch: false,
             },
             &mut flags,
         );
@@ -3492,6 +3690,8 @@ mod tests {
             PaceGate {
                 use_credits: false,
                 poller: None,
+
+                initial_launch: false,
             },
             &mut PaceGateFlags::default(),
         );
@@ -3535,6 +3735,8 @@ mod tests {
             PaceGate {
                 use_credits: false,
                 poller: None,
+
+                initial_launch: false,
             },
             &mut PaceGateFlags::default(),
         );
@@ -3574,6 +3776,8 @@ mod tests {
             PaceGate {
                 use_credits: false,
                 poller: None,
+
+                initial_launch: false,
             },
             &mut PaceGateFlags::default(),
         );
@@ -3642,6 +3846,8 @@ mod tests {
             PaceGate {
                 use_credits: false,
                 poller: None,
+
+                initial_launch: false,
             },
             &mut flags,
         );
@@ -3691,6 +3897,8 @@ mod tests {
             PaceGate {
                 use_credits: false,
                 poller: None,
+
+                initial_launch: false,
             },
             &mut flags,
         );
@@ -3764,6 +3972,8 @@ mod tests {
             PaceGate {
                 use_credits: false,
                 poller: None,
+
+                initial_launch: false,
             },
             &mut flags,
         );
@@ -3814,6 +4024,8 @@ mod tests {
             PaceGate {
                 use_credits: false,
                 poller: None,
+
+                initial_launch: false,
             },
             &mut PaceGateFlags::default(),
         );
@@ -3849,6 +4061,8 @@ mod tests {
             PaceGate {
                 use_credits: false,
                 poller: None,
+
+                initial_launch: false,
             },
             &mut PaceGateFlags::default(),
         );
@@ -3936,6 +4150,8 @@ mod tests {
             PaceGate {
                 use_credits: false,
                 poller: Some(&poller),
+
+                initial_launch: false,
             },
             &mut flags,
         );
@@ -3978,6 +4194,8 @@ mod tests {
             PaceGate {
                 use_credits: false,
                 poller: Some(&poller2),
+
+                initial_launch: false,
             },
             &mut flags2,
         );
@@ -4029,6 +4247,8 @@ mod tests {
             PaceGate {
                 use_credits: false,
                 poller: Some(&poller),
+
+                initial_launch: false,
             },
             &mut flags,
         );
@@ -4084,6 +4304,8 @@ mod tests {
         let gate = PaceGate {
             use_credits: false,
             poller: None,
+
+            initial_launch: false,
         };
         let mut flags = PaceGateFlags::default();
         let first_now = t1 + 60;

@@ -107,6 +107,40 @@ impl Default for WrapConfig {
     }
 }
 
+/// This seat's own posture toward its guard's repository-write refusal
+/// (issue #358 T8, superseding the unconditional `deny` of issues #328/
+/// #334). Ordered `Allow < Advise < Deny` by declaration, the same shape
+/// `workflow::deploy::DeployTier` uses for its own strictness ladder: a
+/// repository layer may only TIGHTEN this (`allow` -> `advise` -> `deny`),
+/// never loosen it -- see `narrow_orchestrator_writes`. `hook::run_pretool`
+/// and `safety::run_check_hook_mode_with_env` both resolve this through
+/// `hook::orchestrator_write_posture` before deciding what an in-scope
+/// repository write actually does.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OrchestratorWrites {
+    /// The write proceeds; no advisory, still logged so `zirv ctx status`
+    /// can count it.
+    Allow,
+    /// The write proceeds; a rate-limited advisory note rides along in the
+    /// hook's own non-blocking channel, and every occurrence is logged.
+    #[default]
+    Advise,
+    /// Today's original behaviour (issues #328/#334): the write is refused
+    /// outright, with the existing dispatch-a-worker reason text.
+    Deny,
+}
+
+impl OrchestratorWrites {
+    pub fn label(self) -> &'static str {
+        match self {
+            OrchestratorWrites::Allow => "allow",
+            OrchestratorWrites::Advise => "advise",
+            OrchestratorWrites::Deny => "deny",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SuperviseConfig {
@@ -227,6 +261,20 @@ pub struct SuperviseConfig {
     ///
     /// `REPO_FORBIDDEN`, same reasoning as `chain_max_restarts`.
     pub chain_max_gap_secs: u64,
+    /// Issue #358 T8: this seat's own posture toward its guard's refusal of
+    /// a direct repository write (issues #328/#334). Defaults to `Advise`:
+    /// the original `Deny` was found too restrictive on its own -- an
+    /// orchestrator seat could not make even a one-line fix without a full
+    /// dispatch-and-review cycle -- so the write now proceeds by default,
+    /// with a rate-limited advisory and a durable count an operator can
+    /// still see in `zirv ctx status`. NOT `REPO_FORBIDDEN`: unlike every
+    /// other key in this struct, a repository checkout MAY narrow this
+    /// (`allow` -> `advise` -> `deny`, never the reverse -- see
+    /// `narrow_orchestrator_writes`), the same repo-may-only-tighten shape
+    /// `pace.enabled`/`verify_on_stop.enabled` already get, because a repo
+    /// asking for a stricter guard against its own orchestrator seat is
+    /// exactly the direction that can never reproduce issues #328/#334.
+    pub orchestrator_writes: OrchestratorWrites,
 }
 
 impl Default for SuperviseConfig {
@@ -248,6 +296,7 @@ impl Default for SuperviseConfig {
             stall_grace_secs: 120,
             chain_max_restarts: 3,
             chain_max_gap_secs: 300,
+            orchestrator_writes: OrchestratorWrites::Advise,
         }
     }
 }
@@ -539,6 +588,19 @@ pub struct PromptConfig {
     /// operator-toggleable independent of `prompt.enabled` -- so this key
     /// only ever gates the codex adapter.
     pub codex_orchestrator: bool,
+    /// This seat's own repository-write guard posture (`SuperviseConfig::
+    /// orchestrator_writes`, `[supervise] orchestrator_writes`) -- NOT a
+    /// `[prompt]` TOML key of its own: `#[serde(skip)]` means a `[prompt]
+    /// orchestrator_writes = ...` in either config layer hard-errors as an
+    /// unknown field under this struct's own `deny_unknown_fields` rather
+    /// than silently taking effect from the wrong section. `CtxConfig::load`
+    /// copies this over from `supervise` right after the full config is
+    /// assembled, purely so `prompt::with_adapter_layer` -- which already
+    /// threads `&PromptConfig` through every launch site (`wrap`, `exec`,
+    /// `run_loop`, `resume`, `chat`) -- can read this seat's write posture
+    /// without a new parameter threaded through six more call sites.
+    #[serde(skip)]
+    pub orchestrator_writes: OrchestratorWrites,
 }
 
 impl Default for PromptConfig {
@@ -549,6 +611,7 @@ impl Default for PromptConfig {
             max_repo_bytes: 4096,
             harnesses: true,
             codex_orchestrator: true,
+            orchestrator_writes: OrchestratorWrites::Advise,
         }
     }
 }
@@ -1456,6 +1519,35 @@ pub struct FallbackConfig {
     /// Or an explicit tool-call ceiling at or below this value. At least one
     /// bounded dimension is required before a small-capacity harness qualifies.
     pub small_task_max_tool_calls: u32,
+    /// Issue #358: whether background delegation may shift work across
+    /// harnesses adaptively as measured headroom changes, rather than only at
+    /// dispatch time. Repo narrowing is AND, the same as `enabled`: a repo
+    /// checkout may disable it, never enable it for an operator who did not.
+    pub adaptive_delegation: bool,
+    /// Issue #358: whether the orchestrator seat itself may roll over onto
+    /// the next fallback candidate automatically, not just newly-dispatched
+    /// background work. Off by default -- moving the operator's own seat is
+    /// a bigger step than steering a new delegation. Repo narrowing is AND,
+    /// same as `enabled`/`adaptive_delegation`.
+    pub auto_orchestrator_rollover: bool,
+    /// Issue #358: the headroom threshold that triggers `auto_orchestrator_
+    /// rollover`. `None` (the default) means "inherit `predictive_headroom_
+    /// pct`" -- see `rollover_headroom_pct`. `REPO_FORBIDDEN`: rolling the
+    /// operator's own seat is the same class of decision `handoff.model`/
+    /// `optimize.model` already gate -- a repo checkout must not be able to
+    /// tune when that happens.
+    pub orchestrator_rollover_headroom_pct: Option<f64>,
+    /// Issue #358: the minimum gap between two automatic orchestrator
+    /// rollovers, so a harness bouncing near the threshold cannot thrash the
+    /// operator's seat back and forth. `REPO_FORBIDDEN`, same reasoning as
+    /// `orchestrator_rollover_headroom_pct`.
+    pub rollover_cooldown_secs: u64,
+    /// Issue #358: per-harness overrides of the global concurrency/headroom
+    /// limits above, keyed by adapter name (`fallback.harness.<name>`). A
+    /// repo checkout may only lower `max_active` and only raise
+    /// `reserve_headroom_pct` per harness name -- see `narrow_fallback_
+    /// harness` and `HarnessLimits`' own doc comment.
+    pub harness: std::collections::BTreeMap<String, HarnessLimits>,
 }
 
 impl Default for FallbackConfig {
@@ -1468,8 +1560,78 @@ impl Default for FallbackConfig {
             unknown_headroom_pct: 25.0,
             small_task_max_tokens: 40_000,
             small_task_max_tool_calls: 24,
+            adaptive_delegation: true,
+            auto_orchestrator_rollover: false,
+            orchestrator_rollover_headroom_pct: None,
+            rollover_cooldown_secs: 600,
+            harness: std::collections::BTreeMap::new(),
         }
     }
+}
+
+impl FallbackConfig {
+    /// The effective headroom threshold for `auto_orchestrator_rollover`:
+    /// the explicit override when set, otherwise the same threshold new
+    /// background delegation already steers on.
+    ///
+    /// Issue #358, task 1 of a multi-task rollout: this configuration
+    /// accessor lands ahead of the scheduler code (a later task) that reads
+    /// it, so it is only exercised by this module's own tests today.
+    /// `#[allow(dead_code)]` documents that as deliberate, the same way
+    /// `announce.rs`'s platform-gated variant is marked.
+    #[allow(dead_code)]
+    pub fn rollover_headroom_pct(&self) -> f64 {
+        self.orchestrator_rollover_headroom_pct
+            .unwrap_or(self.predictive_headroom_pct)
+    }
+
+    /// The per-harness limit overrides for `name`, matched case-
+    /// insensitively (adapter names are lowercase by convention, but a
+    /// hand-edited `ctx.toml` should not silently miss its own override over
+    /// a case mismatch). `HarnessLimits::default()` -- both fields `None`,
+    /// meaning "use the global limits" -- when `name` has no entry.
+    ///
+    /// Same issue #358 task-ordering note as `rollover_headroom_pct` above.
+    #[allow(dead_code)]
+    pub fn harness_limits(&self, name: &str) -> HarnessLimits {
+        self.harness
+            .iter()
+            .find(|(known, _)| known.eq_ignore_ascii_case(name))
+            .map(|(_, limits)| limits.clone())
+            .unwrap_or_default()
+    }
+
+    /// The effective reserve-headroom floor for `name`: its own per-harness
+    /// override when set, otherwise the global `min_candidate_headroom_pct`
+    /// every candidate is already held to.
+    ///
+    /// Same issue #358 task-ordering note as `rollover_headroom_pct` above.
+    #[allow(dead_code)]
+    pub fn reserve_headroom_pct(&self, name: &str) -> f64 {
+        self.harness_limits(name)
+            .reserve_headroom_pct
+            .unwrap_or(self.min_candidate_headroom_pct)
+    }
+}
+
+/// Per-harness overrides under `[fallback.harness.<name>]` (issue #358).
+/// Both fields default to `None`, meaning "use the global `fallback.*`
+/// limits unchanged" -- an entry only needs to name the field it actually
+/// wants to override. Repo narrowing (`narrow_fallback_harness`) is per
+/// field, not whole-entry: `max_active` may only be lowered, `reserve_
+/// headroom_pct` may only be raised, and a repo-only entry for a harness the
+/// home layer never mentioned simply applies, since `None` on the home side
+/// already means "no cap", and any repo value narrows that.
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HarnessLimits {
+    /// Ceiling on concurrently active delegations to this harness. `None`
+    /// means "no per-harness cap beyond whatever else limits concurrency".
+    pub max_active: Option<u32>,
+    /// Per-harness reserve-headroom floor, overriding `min_candidate_
+    /// headroom_pct` for this one harness. `None` means "use the global
+    /// floor" -- see `FallbackConfig::reserve_headroom_pct`.
+    pub reserve_headroom_pct: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
@@ -1687,6 +1849,11 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         &["supervise", "chain_max_gap_secs"],
         EnvKind::Int,
     ),
+    (
+        "ZIRV_CTX_SUPERVISE_ORCHESTRATOR_WRITES",
+        &["supervise", "orchestrator_writes"],
+        EnvKind::Str,
+    ),
     ("ZIRV_CTX_MODEL", &["handoff", "model"], EnvKind::Str),
     (
         "ZIRV_CTX_HANDOFF_TIMEOUT_SECS",
@@ -1798,6 +1965,26 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
     (
         "ZIRV_CTX_FALLBACK_SMALL_TASK_MAX_TOOL_CALLS",
         &["fallback", "small_task_max_tool_calls"],
+        EnvKind::Int,
+    ),
+    (
+        "ZIRV_CTX_FALLBACK_ADAPTIVE_DELEGATION",
+        &["fallback", "adaptive_delegation"],
+        EnvKind::Bool,
+    ),
+    (
+        "ZIRV_CTX_FALLBACK_AUTO_ORCHESTRATOR_ROLLOVER",
+        &["fallback", "auto_orchestrator_rollover"],
+        EnvKind::Bool,
+    ),
+    (
+        "ZIRV_CTX_FALLBACK_ORCHESTRATOR_ROLLOVER_HEADROOM_PCT",
+        &["fallback", "orchestrator_rollover_headroom_pct"],
+        EnvKind::Float,
+    ),
+    (
+        "ZIRV_CTX_FALLBACK_ROLLOVER_COOLDOWN_SECS",
+        &["fallback", "rollover_cooldown_secs"],
         EnvKind::Int,
     ),
     ("ZIRV_CTX_OPTIMIZE", &["optimize", "enabled"], EnvKind::Bool),
@@ -2221,6 +2408,66 @@ fn narrow_fallback_order(home: Vec<String>, repo: Option<Vec<String>>) -> Vec<St
         .collect()
 }
 
+/// A `toml::Value::Table` of per-harness `[fallback.harness.<name>]` entries
+/// (from `take_nested`) as an owned map of raw `(max_active, reserve_
+/// headroom_pct)` pairs -- absent or wrong-shaped reads as empty, same "let
+/// the real deserializer catch malformed input" contract `string_array`
+/// follows. Kept as raw `i64`/`f64` rather than `HarnessLimits` here because
+/// the narrowing fold below needs to distinguish "not present" from "present
+/// but zero" for both fields before the real deserializer's own `u32`/`f64`
+/// typing ever runs.
+fn fallback_harness_map_at(
+    value: Option<toml::Value>,
+) -> std::collections::BTreeMap<String, (Option<i64>, Option<f64>)> {
+    let Some(toml::Value::Table(table)) = value else {
+        return std::collections::BTreeMap::new();
+    };
+    table
+        .into_iter()
+        .filter_map(|(name, entry)| {
+            let entry = entry.as_table()?;
+            let max_active = entry.get("max_active").and_then(toml::Value::as_integer);
+            let reserve = float_at(entry.get("reserve_headroom_pct").cloned());
+            Some((name, (max_active, reserve)))
+        })
+        .collect()
+}
+
+/// The repo-narrowing fold for `[fallback.harness.<name>]` (issue #358): per
+/// name, `max_active` may only be lowered (`min`, repo may only tighten a
+/// concurrency ceiling) and `reserve_headroom_pct` may only be raised
+/// (`max`, repo may only demand more of a safety margin) -- the same two
+/// polarities `fallback.predictive_headroom_pct`/`fallback.min_candidate_
+/// headroom_pct` already use, applied per harness instead of globally. A
+/// harness named by only one layer keeps that layer's own values outright:
+/// `None` on the missing side already means "no override, use the global
+/// limits", so the other layer's value is itself the narrowing.
+fn narrow_fallback_harness(
+    home: std::collections::BTreeMap<String, (Option<i64>, Option<f64>)>,
+    repo: std::collections::BTreeMap<String, (Option<i64>, Option<f64>)>,
+) -> std::collections::BTreeMap<String, (Option<i64>, Option<f64>)> {
+    let mut names: std::collections::BTreeSet<String> = home.keys().cloned().collect();
+    names.extend(repo.keys().cloned());
+    names
+        .into_iter()
+        .map(|name| {
+            let (home_max, home_reserve) = home.get(&name).copied().unwrap_or((None, None));
+            let (repo_max, repo_reserve) = repo.get(&name).copied().unwrap_or((None, None));
+            let max_active = match (home_max, repo_max) {
+                (Some(h), Some(r)) => Some(h.min(r)),
+                (Some(v), None) | (None, Some(v)) => Some(v),
+                (None, None) => None,
+            };
+            let reserve = match (home_reserve, repo_reserve) {
+                (Some(h), Some(r)) => Some(h.max(r)),
+                (Some(v), None) | (None, Some(v)) => Some(v),
+                (None, None) => None,
+            };
+            (name, (max_active, reserve))
+        })
+        .collect()
+}
+
 /// A `toml::Value::Float` or `Value::Integer` (from `take_nested`) as
 /// `Option<f64>` -- TOML happily writes `max_percent = 90` with no decimal
 /// point, which parses as an `Integer`, not a `Float`; without the second
@@ -2259,6 +2506,38 @@ fn narrow_pace_bool(home: bool, repo: Option<bool>) -> bool {
 /// `unwrap_or(false)`.
 fn narrow_pace_percent(home: f64, repo: Option<f64>) -> f64 {
     home.min(repo.unwrap_or(f64::INFINITY))
+}
+
+/// Issue #358 T8: the repo-narrowing fold for `supervise.orchestrator_
+/// writes` -- `OrchestratorWrites`'s own declared `Allow < Advise < Deny`
+/// order makes `Deny` the strict end, the same shape `deploy::DeployTier`
+/// uses for `workflow.deploy.minimum_tier`, so `max` is the fold: a repo
+/// asking for a stricter posture than the operator configured wins, a repo
+/// asking for a looser one is ignored. `repo` absent contributes nothing
+/// (folds in as `Allow`, the loosest value, so an untouched repo layer never
+/// tightens a home layer that left this at `Allow`) -- the enum mirror of
+/// `narrow_pace_bool`'s own `unwrap_or(false)`.
+fn narrow_orchestrator_writes(
+    home: OrchestratorWrites,
+    repo: Option<OrchestratorWrites>,
+) -> OrchestratorWrites {
+    home.max(repo.unwrap_or(OrchestratorWrites::Allow))
+}
+
+/// A `toml::Value::String` (from `take_nested`) parsed as `OrchestratorWrites`
+/// through its own `Deserialize` impl, mirroring `deploy_tier_at`'s identical
+/// shape for `workflow.deploy.tier`/`minimum_tier`.
+fn orchestrator_writes_at(
+    value: Option<toml::Value>,
+    key: &str,
+) -> CtxResult<Option<OrchestratorWrites>> {
+    value
+        .map(|value| {
+            value
+                .try_into()
+                .map_err(|error| format!("invalid {key}: {error}").into())
+        })
+        .transpose()
 }
 
 /// Issue #155, Phase 3: the repo-narrowing fold for `context.dedupe_native`
@@ -2914,6 +3193,22 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
         &["search", "max_output_bytes"],
         "ZIRV_CTX_SEARCH_MAX_OUTPUT_BYTES",
     ),
+    // Issue #358: rolling the orchestrator seat itself onto another harness
+    // is the same class of decision `handoff.model`/`optimize.model` already
+    // gate above -- a repo checkout must not be able to tune when an
+    // automatic seat rollover fires or how soon another one may follow.
+    // `fallback.auto_orchestrator_rollover` itself (the on/off switch) stays
+    // narrowing-only, like `fallback.enabled`, because a repo may safely
+    // disable it; only the two keys that tune an ALREADY-enabled rollover's
+    // timing are forbidden outright.
+    (
+        &["fallback", "orchestrator_rollover_headroom_pct"],
+        "ZIRV_CTX_FALLBACK_ORCHESTRATOR_ROLLOVER_HEADROOM_PCT",
+    ),
+    (
+        &["fallback", "rollover_cooldown_secs"],
+        "ZIRV_CTX_FALLBACK_ROLLOVER_COOLDOWN_SECS",
+    ),
 ];
 
 fn value_at<'a>(table: &'a toml::Table, path: &[&str]) -> Option<&'a toml::Value> {
@@ -3158,6 +3453,13 @@ impl CtxConfig {
             "supervise",
             "heavy_command_patterns",
         ));
+        // Issue #358 T8: `supervise.orchestrator_writes` gets the identical
+        // lift-before-merge treatment as `pace.enabled` above -- see
+        // `narrow_orchestrator_writes` for the strict direction.
+        let home_orchestrator_writes = orchestrator_writes_at(
+            take_nested(&mut merged, "supervise", "orchestrator_writes"),
+            "supervise.orchestrator_writes",
+        )?;
 
         // Issue #186: every fallback field is lifted before the repo merge.
         // The repo may only narrow automatic vendor steering; see the
@@ -3186,6 +3488,15 @@ impl CtxConfig {
             "fallback",
             "small_task_max_tool_calls",
         ));
+        let home_fallback_adaptive =
+            bool_at(take_nested(&mut merged, "fallback", "adaptive_delegation"));
+        let home_fallback_auto_rollover = bool_at(take_nested(
+            &mut merged,
+            "fallback",
+            "auto_orchestrator_rollover",
+        ));
+        let home_fallback_harness =
+            fallback_harness_map_at(take_nested(&mut merged, "fallback", "harness"));
         let home_deploy_tier = deploy_tier_at(
             take_nested3(&mut merged, "workflow", "deploy", "tier"),
             "workflow.deploy.tier",
@@ -3263,6 +3574,10 @@ impl CtxConfig {
             "supervise",
             "heavy_command_patterns",
         ));
+        let repo_orchestrator_writes = orchestrator_writes_at(
+            take_nested(&mut repo_layer, "supervise", "orchestrator_writes"),
+            "supervise.orchestrator_writes",
+        )?;
         let repo_fallback_enabled = bool_at(take_nested(&mut repo_layer, "fallback", "enabled"));
         let repo_fallback_order =
             string_array_at(take_nested(&mut repo_layer, "fallback", "order"));
@@ -3291,6 +3606,18 @@ impl CtxConfig {
             "fallback",
             "small_task_max_tool_calls",
         ));
+        let repo_fallback_adaptive = bool_at(take_nested(
+            &mut repo_layer,
+            "fallback",
+            "adaptive_delegation",
+        ));
+        let repo_fallback_auto_rollover = bool_at(take_nested(
+            &mut repo_layer,
+            "fallback",
+            "auto_orchestrator_rollover",
+        ));
+        let repo_fallback_harness =
+            fallback_harness_map_at(take_nested(&mut repo_layer, "fallback", "harness"));
         let repo_deploy_minimum = deploy_tier_at(
             take_nested3(&mut repo_layer, "workflow", "deploy", "minimum_tier"),
             "workflow.deploy.minimum_tier",
@@ -3314,6 +3641,25 @@ impl CtxConfig {
                 toml::Value::String(minimum.to_string()),
             );
         }
+
+        // Issue #358 T8: `supervise.orchestrator_writes` gets the identical
+        // re-insertion as `pace.enabled` right below -- narrowed by `narrow_
+        // orchestrator_writes`, then still overwritable by `ZIRV_CTX_
+        // SUPERVISE_ORCHESTRATOR_WRITES` (`ENV_MAP`, below) the same as
+        // every other narrow-only key.
+        let default_supervise = SuperviseConfig::default();
+        insert_path(
+            &mut merged,
+            &["supervise", "orchestrator_writes"],
+            toml::Value::String(
+                narrow_orchestrator_writes(
+                    home_orchestrator_writes.unwrap_or(default_supervise.orchestrator_writes),
+                    repo_orchestrator_writes,
+                )
+                .label()
+                .to_string(),
+            ),
+        );
 
         // Re-inserted after the merge, before env: env (below) must still be
         // able to overwrite this outright, the same final-word precedence
@@ -3564,6 +3910,43 @@ impl CtxConfig {
                 home_small_tools.min(repo_small_tools.unwrap_or(u32::MAX)),
             )),
         );
+        let home_adaptive = home_fallback_adaptive.unwrap_or(default_fallback.adaptive_delegation);
+        insert_path(
+            &mut merged,
+            &["fallback", "adaptive_delegation"],
+            toml::Value::Boolean(home_adaptive && repo_fallback_adaptive.unwrap_or(true)),
+        );
+        let home_auto_rollover =
+            home_fallback_auto_rollover.unwrap_or(default_fallback.auto_orchestrator_rollover);
+        insert_path(
+            &mut merged,
+            &["fallback", "auto_orchestrator_rollover"],
+            toml::Value::Boolean(home_auto_rollover && repo_fallback_auto_rollover.unwrap_or(true)),
+        );
+        let merged_harness = narrow_fallback_harness(home_fallback_harness, repo_fallback_harness);
+        insert_path(
+            &mut merged,
+            &["fallback", "harness"],
+            toml::Value::Table(
+                merged_harness
+                    .into_iter()
+                    .map(|(name, (max_active, reserve_headroom_pct))| {
+                        let mut entry = toml::Table::new();
+                        if let Some(max_active) = max_active {
+                            entry
+                                .insert("max_active".to_string(), toml::Value::Integer(max_active));
+                        }
+                        if let Some(reserve_headroom_pct) = reserve_headroom_pct {
+                            entry.insert(
+                                "reserve_headroom_pct".to_string(),
+                                toml::Value::Float(reserve_headroom_pct),
+                            );
+                        }
+                        (name, toml::Value::Table(entry))
+                    })
+                    .collect(),
+            ),
+        );
 
         for (var, path, kind) in ENV_MAP {
             if let Some(raw) = env(var) {
@@ -3594,6 +3977,12 @@ impl CtxConfig {
         let mut cfg: Self = toml::Value::Table(merged)
             .try_into()
             .map_err(|e| format!("invalid ctx config: {e}"))?;
+
+        // See `PromptConfig::orchestrator_writes`'s own doc comment: copied
+        // over here, once the full config (both layers, narrowing and env
+        // already resolved) is assembled, rather than threading a new
+        // parameter through every prompt-composition call site.
+        cfg.prompt.orchestrator_writes = cfg.supervise.orchestrator_writes;
 
         if let Some(raw) = env("ZIRV_CTX_FALLBACK_ORDER") {
             cfg.fallback.order = split_csv_list(&raw);
@@ -3634,6 +4023,38 @@ impl CtxConfig {
             }
             if !seen.insert(name.clone()) {
                 return Err(format!("fallback.order contains duplicate agent '{name}'").into());
+            }
+        }
+        if let Some(value) = cfg.fallback.orchestrator_rollover_headroom_pct
+            && !(0.0..=100.0).contains(&value)
+        {
+            return Err(format!(
+                "fallback.orchestrator_rollover_headroom_pct must be between 0 and 100, got {value}"
+            )
+            .into());
+        }
+        for (name, limits) in &cfg.fallback.harness {
+            if !super::adapters::ADAPTERS
+                .iter()
+                .any(|(known, _)| known == name)
+            {
+                return Err(format!(
+                    "fallback.harness contains unknown agent '{name}'; known adapters: {}",
+                    super::adapters::ADAPTERS
+                        .iter()
+                        .map(|(known, _)| *known)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+                .into());
+            }
+            if let Some(value) = limits.reserve_headroom_pct
+                && !(0.0..=100.0).contains(&value)
+            {
+                return Err(format!(
+                    "fallback.harness.{name}.reserve_headroom_pct must be between 0 and 100, got {value}"
+                )
+                .into());
             }
         }
 
@@ -3846,12 +4267,28 @@ fn announce_unparsable_layers_once(cfg: &CtxConfig) {
 /// those two fields; every other field keeps its ordinary default, since
 /// nothing else in `CtxConfig` is a security boundary the way the gate and
 /// the policy are.
+///
+/// Finding #5 (issue #358 review): `supervise.orchestrator_writes` is a
+/// THIRD such boundary, and it is not exempt just because it defaults to
+/// `Advise` rather than the fully-permissive extreme -- an operator who set
+/// `deny` still has that narrower posture WIDENED to `Advise` the moment a
+/// config load fails, and a repository-owned layer (`ctx.toml`, `.settings.
+/// toml`) can induce that failure at will. Forced to `Deny` here for the
+/// same reason `policy` is forced `fail_closed`: a config that could not
+/// even be read must never be read as permission to write. `prompt.
+/// orchestrator_writes` is kept in lockstep (it is `CtxConfig::load`'s own
+/// synced copy of this same field -- see `PromptConfig::orchestrator_writes`'s
+/// doc comment) so every consumer, not just `hook::orchestrator_write_
+/// posture`'s own read of `supervise`, sees the same degraded posture.
 pub(crate) fn degrade_to_operator_only(env: EnvLookup<'_>) -> CtxConfig {
-    CtxConfig {
+    let mut cfg = CtxConfig {
         agents: crate::settings::AgentGate::load_operator_only(env),
         policy: super::policy::EffectivePolicy::fail_closed(),
         ..CtxConfig::default()
-    }
+    };
+    cfg.supervise.orchestrator_writes = OrchestratorWrites::Deny;
+    cfg.prompt.orchestrator_writes = OrchestratorWrites::Deny;
+    cfg
 }
 
 /// SECURITY (command-injection defense): shared charset/length/leading-dash
@@ -4790,6 +5227,142 @@ mod tests {
         }
     }
 
+    /// Issue #358 T8: the raw fold rule -- `Deny` is the strict end
+    /// regardless of which layer sets it, mirroring `narrow_pace_bool`'s own
+    /// "stricter wins" shape but for a three-way ladder instead of a bool.
+    #[test]
+    fn the_orchestrator_writes_narrowing_fold_favours_the_stricter_layer_either_direction() {
+        assert_eq!(
+            narrow_orchestrator_writes(OrchestratorWrites::Deny, None),
+            OrchestratorWrites::Deny
+        );
+        assert_eq!(
+            narrow_orchestrator_writes(OrchestratorWrites::Deny, Some(OrchestratorWrites::Allow)),
+            OrchestratorWrites::Deny,
+            "repo may not weaken"
+        );
+        assert_eq!(
+            narrow_orchestrator_writes(OrchestratorWrites::Allow, Some(OrchestratorWrites::Deny)),
+            OrchestratorWrites::Deny,
+            "repo may tighten"
+        );
+        assert_eq!(
+            narrow_orchestrator_writes(OrchestratorWrites::Allow, None),
+            OrchestratorWrites::Allow,
+            "both loose: stays loose"
+        );
+        assert_eq!(
+            narrow_orchestrator_writes(OrchestratorWrites::Advise, Some(OrchestratorWrites::Allow)),
+            OrchestratorWrites::Advise,
+            "repo asking for looser than home is ignored"
+        );
+    }
+
+    /// The default, unconfigured behaviour: `advise`, not `deny` -- the
+    /// posture change this task exists to make (issue #358 T8).
+    #[test]
+    fn orchestrator_writes_defaults_to_advise() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert_eq!(
+            cfg.supervise.orchestrator_writes,
+            OrchestratorWrites::Advise
+        );
+        assert_eq!(cfg.prompt.orchestrator_writes, OrchestratorWrites::Advise);
+    }
+
+    /// A repo `ctx.toml` layer may only narrow this key end to end through
+    /// `CtxConfig::load`, mirroring `a_repo_layer_may_only_narrow_pace_
+    /// enabled_max_percent_and_soft_percent` above.
+    #[test]
+    fn a_repo_layer_may_only_narrow_orchestrator_writes() {
+        struct Case {
+            home: &'static str,
+            repo: &'static str,
+            want: OrchestratorWrites,
+        }
+        for case in [
+            Case {
+                home: "",
+                repo: "[supervise]\norchestrator_writes = \"deny\"\n",
+                want: OrchestratorWrites::Deny,
+            },
+            Case {
+                home: "[supervise]\norchestrator_writes = \"deny\"\n",
+                repo: "[supervise]\norchestrator_writes = \"allow\"\n",
+                want: OrchestratorWrites::Deny,
+            },
+            Case {
+                home: "[supervise]\norchestrator_writes = \"allow\"\n",
+                repo: "",
+                want: OrchestratorWrites::Allow,
+            },
+        ] {
+            let home_dir = tempfile::tempdir().expect("tempdir");
+            let _home = crate::commands::ctx::testenv::HomeGuard::set(home_dir.path());
+            if !case.home.is_empty() {
+                std::fs::create_dir_all(home_dir.path().join(".zirv")).expect("mkdir");
+                std::fs::write(home_dir.path().join(".zirv/ctx.toml"), case.home).expect("write");
+            }
+            let repo = tempfile::tempdir().expect("tempdir");
+            if !case.repo.is_empty() {
+                std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+                std::fs::write(repo.path().join(".zirv/ctx.toml"), case.repo).expect("write");
+            }
+            let empty = env_map(&[]);
+            let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+                .expect("a repo narrowing supervise.orchestrator_writes must not be a load error");
+            assert_eq!(
+                cfg.supervise.orchestrator_writes, case.want,
+                "home={:?} repo={:?}",
+                case.home, case.repo
+            );
+        }
+    }
+
+    /// `ZIRV_CTX_SUPERVISE_ORCHESTRATOR_WRITES` is the operator's own final
+    /// word, same as every other `ENV_MAP` entry -- it wins over both the
+    /// home and repo layers regardless of what either says.
+    #[test]
+    fn orchestrator_writes_env_var_wins_over_both_layers() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[supervise]\norchestrator_writes = \"deny\"\n",
+        )
+        .expect("write");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".zirv/ctx.toml"),
+            "[supervise]\norchestrator_writes = \"deny\"\n",
+        )
+        .expect("write");
+        let env = env_map(&[("ZIRV_CTX_SUPERVISE_ORCHESTRATOR_WRITES", "allow")]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert_eq!(cfg.supervise.orchestrator_writes, OrchestratorWrites::Allow);
+    }
+
+    /// Serde round-trips through the documented lowercase strings, not Rust's
+    /// own `Debug`/variant-name casing.
+    #[test]
+    fn orchestrator_writes_serializes_as_lowercase_strings() {
+        for (value, text) in [
+            (OrchestratorWrites::Allow, "\"allow\""),
+            (OrchestratorWrites::Advise, "\"advise\""),
+            (OrchestratorWrites::Deny, "\"deny\""),
+        ] {
+            assert_eq!(serde_json::to_string(&value).expect("serialize"), text);
+            let parsed: OrchestratorWrites = serde_json::from_str(text).expect("deserialize");
+            assert_eq!(parsed, value);
+        }
+    }
+
     /// Issue #309: the fold rule itself, pure and direct -- the same
     /// no-config-file, no-`CtxConfig::load` shape as
     /// `the_pace_narrowing_fold_rule_favours_the_stricter_layer_either_direction`.
@@ -5641,6 +6214,31 @@ mod tests {
             degraded.policy,
             super::super::policy::EffectivePolicy::default(),
             "fail_closed must differ from the permissive default, or this test proves nothing"
+        );
+    }
+
+    /// Finding #5 (issue #358 review): `supervise.orchestrator_writes`
+    /// defaults to `Advise`, so without the fix a config-load failure would
+    /// silently WIDEN an operator's own `deny` to `Advise` -- exactly the
+    /// same fail-open shape `degrade_to_operator_only_fails_closed_on_
+    /// policy_not_open` already guards for `policy`. An untrusted repo
+    /// layer can induce a load failure at will (a malformed `ctx.toml`),
+    /// so this boundary must fail closed too, on both the field `hook::
+    /// orchestrator_write_posture` reads (`supervise`) and its synced copy
+    /// (`prompt`).
+    #[test]
+    fn degrade_to_operator_only_denies_repository_writes_not_advises_them() {
+        let empty = env_map(&[]);
+        let degraded = degrade_to_operator_only(&|k| empty.get(k).cloned());
+        assert_eq!(
+            degraded.supervise.orchestrator_writes,
+            OrchestratorWrites::Deny,
+            "a failed config load must not silently widen `deny` to the permissive default"
+        );
+        assert_eq!(
+            degraded.prompt.orchestrator_writes,
+            OrchestratorWrites::Deny,
+            "the synced `prompt` copy must agree with `supervise`"
         );
     }
 
@@ -7394,6 +7992,7 @@ mod tests {
         ("supervise", "stall_grace_secs"),
         ("supervise", "chain_max_restarts"),
         ("supervise", "chain_max_gap_secs"),
+        ("supervise", "orchestrator_writes"),
         ("handoff", "model"),
         ("handoff", "tail_items"),
         ("handoff", "timeout_secs"),
@@ -7853,6 +8452,39 @@ mod tests {
         assert_eq!(cfg.unknown_headroom_pct, 25.0);
         assert_eq!(cfg.small_task_max_tokens, 40_000);
         assert_eq!(cfg.small_task_max_tool_calls, 24);
+        // Issue #358.
+        assert!(cfg.adaptive_delegation);
+        assert!(!cfg.auto_orchestrator_rollover);
+        assert_eq!(cfg.orchestrator_rollover_headroom_pct, None);
+        assert_eq!(cfg.rollover_cooldown_secs, 600);
+        assert!(cfg.harness.is_empty());
+        assert_eq!(cfg.rollover_headroom_pct(), cfg.predictive_headroom_pct);
+        assert_eq!(cfg.harness_limits("codex"), HarnessLimits::default());
+        assert_eq!(
+            cfg.reserve_headroom_pct("codex"),
+            cfg.min_candidate_headroom_pct
+        );
+    }
+
+    /// An empty config layer deserializes into the same defaults as
+    /// `FallbackConfig::default()` above -- an existing `ctx.toml` written
+    /// before issue #358 must keep loading unchanged with every new key
+    /// silently defaulted.
+    #[test]
+    fn fallback_new_keys_default_when_absent_from_every_layer() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tempfile::tempdir().expect("repo");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[fallback]\norder = [\"claude\", \"codex\"]\n",
+        )
+        .expect("write repo");
+
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert_eq!(cfg.fallback, FallbackConfig::default());
     }
 
     #[test]
@@ -7861,7 +8493,7 @@ mod tests {
         std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
         std::fs::write(
             home.path().join(".zirv/ctx.toml"),
-            "[fallback]\nenabled = true\norder = [\"claude\", \"codex\"]\npredictive_headroom_pct = 15.0\nmin_candidate_headroom_pct = 20.0\nunknown_headroom_pct = 20.0\nsmall_task_max_tokens = 30000\nsmall_task_max_tool_calls = 20\n",
+            "[fallback]\nenabled = true\norder = [\"claude\", \"codex\"]\npredictive_headroom_pct = 15.0\nmin_candidate_headroom_pct = 20.0\nunknown_headroom_pct = 20.0\nsmall_task_max_tokens = 30000\nsmall_task_max_tool_calls = 20\nadaptive_delegation = false\nauto_orchestrator_rollover = false\n",
         )
         .expect("write home");
         let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
@@ -7873,7 +8505,7 @@ mod tests {
         // preference. None of those widenings may survive the trust fold.
         std::fs::write(
             repo.path().join(".zirv/ctx.toml"),
-            "[fallback]\nenabled = true\norder = [\"codex\", \"claude\"]\npredictive_headroom_pct = 80.0\nmin_candidate_headroom_pct = 1.0\nunknown_headroom_pct = 90.0\nsmall_task_max_tokens = 90000\nsmall_task_max_tool_calls = 90\n",
+            "[fallback]\nenabled = true\norder = [\"codex\", \"claude\"]\npredictive_headroom_pct = 80.0\nmin_candidate_headroom_pct = 1.0\nunknown_headroom_pct = 90.0\nsmall_task_max_tokens = 90000\nsmall_task_max_tool_calls = 90\nadaptive_delegation = true\nauto_orchestrator_rollover = true\n",
         )
         .expect("write repo");
         let empty = env_map(&[]);
@@ -7885,6 +8517,70 @@ mod tests {
         assert_eq!(cfg.fallback.unknown_headroom_pct, 20.0);
         assert_eq!(cfg.fallback.small_task_max_tokens, 30_000);
         assert_eq!(cfg.fallback.small_task_max_tool_calls, 20);
+        // Issue #358: a repo cannot flip either switch on for an operator
+        // who turned it off, even though both repo values above try to.
+        assert!(!cfg.fallback.adaptive_delegation);
+        assert!(!cfg.fallback.auto_orchestrator_rollover);
+    }
+
+    #[test]
+    fn a_repo_fallback_harness_table_can_only_narrow_per_harness_limits() {
+        let home = tempfile::tempdir().expect("home");
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".zirv/ctx.toml"),
+            "[fallback.harness.claude]\nmax_active = 4\nreserve_headroom_pct = 15.0\n",
+        )
+        .expect("write home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let repo = tempfile::tempdir().expect("repo");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            // claude: tries to raise max_active (denied) and lower reserve
+            // (denied); codex: a repo-only entry, which simply applies.
+            "[fallback.harness.claude]\nmax_active = 9\nreserve_headroom_pct = 5.0\n\n[fallback.harness.codex]\nmax_active = 2\nreserve_headroom_pct = 40.0\n",
+        )
+        .expect("write repo");
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+
+        let claude = cfg.fallback.harness_limits("claude");
+        assert_eq!(claude.max_active, Some(4));
+        assert_eq!(claude.reserve_headroom_pct, Some(15.0));
+
+        let codex = cfg.fallback.harness_limits("CODEX");
+        assert_eq!(codex.max_active, Some(2));
+        assert_eq!(codex.reserve_headroom_pct, Some(40.0));
+        assert_eq!(cfg.fallback.reserve_headroom_pct("codex"), 40.0);
+    }
+
+    #[test]
+    fn a_repo_harness_entry_may_only_lower_max_active_and_raise_reserve_when_home_already_set_it() {
+        let home = tempfile::tempdir().expect("home");
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".zirv/ctx.toml"),
+            "[fallback.harness.codex]\nmax_active = 6\n",
+        )
+        .expect("write home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let repo = tempfile::tempdir().expect("repo");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[fallback.harness.codex]\nmax_active = 2\nreserve_headroom_pct = 50.0\n",
+        )
+        .expect("write repo");
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+
+        let codex = cfg.fallback.harness_limits("codex");
+        assert_eq!(codex.max_active, Some(2));
+        assert_eq!(codex.reserve_headroom_pct, Some(50.0));
+        assert_eq!(cfg.fallback.reserve_headroom_pct("codex"), 50.0);
     }
 
     #[test]
@@ -7937,6 +8633,107 @@ mod tests {
         assert!(cfg.fallback.enabled);
         assert_eq!(cfg.fallback.order, vec!["codex", "claude"]);
         assert_eq!(cfg.fallback.unknown_headroom_pct, 35.0);
+    }
+
+    /// Issue #358: rolling the orchestrator seat itself is the same class of
+    /// decision `handoff.model`/`optimize.model` already gate outright, not
+    /// narrowed like `fallback.enabled` -- a repo checkout naming either
+    /// rollover-timing key at all is a hard error, mirroring the style of
+    /// `a_repo_forbidden_key_is_still_rejected_and_distinguishable_from_a_
+    /// parse_failure` above.
+    #[test]
+    fn a_repo_fallback_rollover_headroom_pct_and_cooldown_are_repo_forbidden() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let repo = tempfile::tempdir().expect("repo");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[fallback]\norchestrator_rollover_headroom_pct = 5.0\n",
+        )
+        .expect("write repo");
+        let empty = env_map(&[]);
+        let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+            .expect_err("a repository must not be able to tune rollover headroom");
+        assert!(is_repo_forbidden(err.as_ref()), "got: {err}");
+
+        let repo2 = tempfile::tempdir().expect("repo2");
+        std::fs::create_dir_all(repo2.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo2.path().join(".zirv/ctx.toml"),
+            "[fallback]\nrollover_cooldown_secs = 30\n",
+        )
+        .expect("write repo2");
+        let err = CtxConfig::load(repo2.path(), &|k| empty.get(k).cloned())
+            .expect_err("a repository must not be able to tune the rollover cooldown");
+        assert!(is_repo_forbidden(err.as_ref()), "got: {err}");
+    }
+
+    /// Issue #358: the operator's own `ZIRV_CTX_FALLBACK_*` overrides for the
+    /// new keys win over both layers, the same as every existing `fallback.*`
+    /// env var already does.
+    #[test]
+    fn fallback_new_keys_env_is_the_operator_override_above_repo_narrowing() {
+        let home = tempfile::tempdir().expect("home");
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".zirv/ctx.toml"),
+            "[fallback]\nadaptive_delegation = false\nauto_orchestrator_rollover = false\n",
+        )
+        .expect("write home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let repo = tempfile::tempdir().expect("repo");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+
+        let env = env_map(&[
+            ("ZIRV_CTX_FALLBACK_ADAPTIVE_DELEGATION", "true"),
+            ("ZIRV_CTX_FALLBACK_AUTO_ORCHESTRATOR_ROLLOVER", "true"),
+            (
+                "ZIRV_CTX_FALLBACK_ORCHESTRATOR_ROLLOVER_HEADROOM_PCT",
+                "12.5",
+            ),
+            ("ZIRV_CTX_FALLBACK_ROLLOVER_COOLDOWN_SECS", "45"),
+        ]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert!(cfg.fallback.adaptive_delegation);
+        assert!(cfg.fallback.auto_orchestrator_rollover);
+        assert_eq!(cfg.fallback.orchestrator_rollover_headroom_pct, Some(12.5));
+        assert_eq!(cfg.fallback.rollover_cooldown_secs, 45);
+        assert_eq!(cfg.fallback.rollover_headroom_pct(), 12.5);
+    }
+
+    #[test]
+    fn fallback_harness_validation_rejects_unknown_names_and_out_of_range_reserve() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let repo = tempfile::tempdir().expect("repo");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[fallback.harness.not-a-real-harness]\nmax_active = 1\n",
+        )
+        .expect("write repo");
+        let empty = env_map(&[]);
+        let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+            .expect_err("an unknown harness name in [fallback.harness] must fail validation");
+        assert!(err.to_string().contains("unknown agent"), "got: {err}");
+
+        let repo2 = tempfile::tempdir().expect("repo2");
+        std::fs::create_dir_all(repo2.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo2.path().join(".zirv/ctx.toml"),
+            "[fallback.harness.codex]\nreserve_headroom_pct = 150.0\n",
+        )
+        .expect("write repo2");
+        let err = CtxConfig::load(repo2.path(), &|k| empty.get(k).cloned())
+            .expect_err("an out-of-range reserve_headroom_pct must fail validation");
+        assert!(
+            err.to_string().contains("must be between 0 and 100"),
+            "got: {err}"
+        );
     }
 
     #[test]

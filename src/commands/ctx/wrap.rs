@@ -1192,6 +1192,97 @@ fn handover_poll_due(last: Option<Instant>, now: Instant) -> bool {
     last.is_none_or(|last| now.duration_since(last) >= MAIL_POLL)
 }
 
+/// Issue #358 (task 5): the automatic rollover's own, much coarser cadence.
+/// A rollover decision is a function of the usage collector's readings, so
+/// evaluating faster than that collector refreshes can only ever re-read the
+/// same numbers -- and each evaluation costs a capacity snapshot plus a
+/// structured limit confirmation, neither of which belongs on a ~100ms tick.
+/// Unlike [`handover_poll_due`], `None` is NOT due: the pump seeds this with
+/// its own start instant so no usage I/O happens during session startup.
+fn rollover_eval_due(last: Option<Instant>, now: Instant, cfg: &CtxConfig) -> bool {
+    last.is_some_and(|last| {
+        now.saturating_duration_since(last) >= super::rollover::evaluate_interval(cfg)
+    })
+}
+
+/// Whether this session was launched interactively, read back from the
+/// durable launch-mode pin its own `turn_env` carries -- the same derivation
+/// `dash::pane::Pane::spawn` makes from the identical vector, rather than a
+/// second copy of the fact that could drift from it. An automatic rollover's
+/// successor must launch on the same terms its predecessor did.
+fn interactive_from_turn_env(turn_env: &[(String, String)]) -> bool {
+    turn_env.iter().any(|(key, value)| {
+        key == adapters::LAUNCH_MODE_ENV && value == adapters::LAUNCH_MODE_INTERACTIVE_VALUE
+    })
+}
+
+/// One open automatic rollover: the seat generation `rollover::evaluate`
+/// reserved, the signal count at the moment the successor was launched, and
+/// when that happened -- everything [`rollover::successor_readiness`] needs
+/// to decide whether the successor has earned the seat yet.
+struct PendingRollover {
+    generation: u64,
+    signals_at_swap: u64,
+    started: Instant,
+}
+
+/// Wrap's own automatic rollover evaluation. Returns a request to be run
+/// through the exact same seam a manual `zirv ctx handover` takes; `None` --
+/// including for a parked seat -- means this tick changes nothing, and the
+/// session simply keeps running under supervision.
+#[allow(clippy::too_many_arguments)]
+fn automatic_rollover_request(
+    state_dir: &super::state::StateDir,
+    cfg: &CtxConfig,
+    session: &str,
+    short: &str,
+    provider: &str,
+    supervision: &InjectionState,
+    debounce: Duration,
+    interactive: bool,
+) -> Option<super::handover::HandoverRequest> {
+    let now = super::state::now_secs();
+    // A parked seat is asked first: its window may have elapsed, in which
+    // case the best harness may no longer be the one it is sitting on.
+    if let Some(req) = super::rollover::on_resume(state_dir, cfg, "wrap", short, now, interactive) {
+        return Some(req);
+    }
+    let idle = handover_may_act(supervision, Instant::now(), debounce, false);
+    let blocked = super::rollover::confirmed_block(state_dir, cfg, now, provider);
+    let evaluation = super::rollover::evaluate(
+        state_dir,
+        cfg,
+        "wrap",
+        short,
+        now,
+        idle,
+        blocked,
+        interactive,
+    );
+    // Anything but a plain `Skip` is worth a line: it is the only record of
+    // why the seat did (or deliberately did not) move. A `Skip` is the
+    // steady state of every healthy session and would be pure noise.
+    if !matches!(evaluation, super::rollover::Evaluation::Skip(_)) {
+        let _ = super::log::append(
+            state_dir,
+            &super::log::Decision {
+                ts: now,
+                session,
+                verb: "wrap",
+                verdict: "rollover",
+                score: 0,
+                action: "orchestrator-rollover-evaluated",
+                detail: &evaluation.summary(),
+                observed_at: None,
+            },
+        );
+    }
+    match evaluation {
+        super::rollover::Evaluation::Rollover { request, .. } => Some(request),
+        _ => None,
+    }
+}
+
 /// Thin delegate to `mail::unread_counts` (moved there in Task 7 so the
 /// dashboard's header facts can share it too): the T12b bar's own
 /// `mail 2+1` rendering reads the `(broadcast, direct-to-this-session)`
@@ -1554,109 +1645,28 @@ fn relaunch(
     Ok((pair, child, reader, writer))
 }
 
-/// T10: how often the skippable pause and the confirmation prompt poll for a
-/// keypress -- short enough to feel responsive, long enough not to busy-loop
-/// the CPU while a human decides (or doesn't).
-const INTERACTIVE_GATE_POLL_MS: u64 = 200;
-
-/// T10: the skippable half of the interactive gate (`InteractiveGate::
-/// Pause`) -- waits up to `seconds`, returning the instant any key arrives.
-/// Best-effort: a `crossterm` raw-mode/poll/read failure degrades to "no
-/// keypress arrived", so the pause simply runs its full course rather than
-/// erroring -- the same posture every other input-detection path in this
-/// crate already takes (a spend gate must never crash a launch over a
-/// terminal quirk).
-fn interactive_skippable_pause(seconds: u64) {
-    let _ = crossterm::terminal::enable_raw_mode();
-    let deadline = Instant::now() + Duration::from_secs(seconds);
-    while Instant::now() < deadline {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        let poll_for = remaining.min(Duration::from_millis(INTERACTIVE_GATE_POLL_MS));
-        match crossterm::event::poll(poll_for) {
-            Ok(true) => {
-                if matches!(
-                    crossterm::event::read(),
-                    Ok(crossterm::event::Event::Key(_))
-                ) {
-                    break;
-                }
-            }
-            Ok(false) => {}
-            Err(_) => break,
-        }
-    }
-    let _ = crossterm::terminal::disable_raw_mode();
-}
-
-/// T10: the deliberate-confirmation half (`InteractiveGate::Refuse`) --
-/// blocks until a key arrives, since a hard ceiling has no safe timeout to
-/// fall through to (the whole point is "refuse unless a human overrides
-/// it"). Only `y`/`Y` confirms; any other key, or an input-detection
-/// failure, refuses -- the same "unknown must not be read as permission"
-/// rule `pace::decide` itself already follows for usage data.
-fn interactive_confirm() -> bool {
-    let _ = crossterm::terminal::enable_raw_mode();
-    let mut confirmed = false;
-    loop {
-        match crossterm::event::poll(Duration::from_millis(INTERACTIVE_GATE_POLL_MS)) {
-            Ok(true) => match crossterm::event::read() {
-                Ok(crossterm::event::Event::Key(key)) => {
-                    confirmed = matches!(
-                        key.code,
-                        crossterm::event::KeyCode::Char('y') | crossterm::event::KeyCode::Char('Y')
-                    );
-                    break;
-                }
-                Ok(_) => continue,
-                Err(_) => break,
-            },
-            Ok(false) => continue,
-            Err(_) => break,
-        }
-    }
-    let _ = crossterm::terminal::disable_raw_mode();
-    confirmed
-}
-
-/// T10: applies the resolved `InteractiveGate` before the pty is ever
-/// opened. `force_pace` short-circuits both wait shapes with one line naming
-/// why, never silently -- an operator who passed the flag still deserves to
-/// see what they skipped, not just a launch with no explanation. Returns
-/// `Err` to refuse (the caller returns it straight out of `run_with`, the
-/// same pattern every other pre-terminal refusal in this function already
-/// uses); every other case returns `Ok(())` to launch.
+/// T10, reworked for issue #358 (T9): applies the resolved `InteractiveGate`
+/// before the pty is ever opened. Usage headroom never blocks or delays a
+/// launch any more -- `Pause` and `Refuse` both just print `message` and
+/// return `Ok(())` to launch immediately, with no keypress wait and no
+/// confirmation prompt. `force_pace` is still accepted (every caller still
+/// passes it through) and still names itself in the line it prints, but it
+/// is now a no-op for the gate: there is nothing left for it to skip.
 pub(in crate::commands::ctx) fn apply_interactive_gate(
     gate: pace::InteractiveGate,
     force_pace: bool,
 ) -> CtxResult<()> {
-    match gate {
-        pace::InteractiveGate::Launch => Ok(()),
-        pace::InteractiveGate::Pause { message, seconds } => {
-            if force_pace {
-                eprintln!("zirv ctx wrap: {message} (--force-pace: launching now)");
-                return Ok(());
-            }
-            eprintln!("zirv ctx wrap: {message}");
-            interactive_skippable_pause(seconds);
-            Ok(())
-        }
-        pace::InteractiveGate::Refuse { message } => {
-            if force_pace {
-                eprintln!("zirv ctx wrap: {message} (--force-pace: launching anyway)");
-                return Ok(());
-            }
-            eprintln!("zirv ctx wrap: {message}");
-            if interactive_confirm() {
-                Ok(())
-            } else {
-                Err(
-                    "zirv ctx wrap: refusing to launch (usage at the ceiling); pass \
-                     --force-pace or confirm with 'y' to launch anyway"
-                        .into(),
-                )
-            }
-        }
+    let message = match gate {
+        pace::InteractiveGate::Launch => return Ok(()),
+        pace::InteractiveGate::Pause { message, .. } => message,
+        pace::InteractiveGate::Refuse { message } => message,
+    };
+    if force_pace {
+        eprintln!("zirv ctx wrap: {message} (--force-pace: launching now)");
+    } else {
+        eprintln!("zirv ctx wrap: {message} -- launching anyway");
     }
+    Ok(())
 }
 
 /// `role` is a caller-supplied parameter rather than a `WrapArgs` field: it is
@@ -1789,17 +1799,16 @@ pub fn run_with(
     // does NOT skip it (its own doc comment already promises "supervision,
     // pacing and hooks still apply").
     //
-    // Also gated on both stdin *and* stdout being real terminals: the whole
-    // design (a skippable pause, a 'y'-to-confirm refusal) assumes a human
-    // is there to answer it, exactly the same double-check `chrome::
-    // dash_eligible` already makes for the same reason. Without a real
-    // terminal there is nobody to prompt -- under `cargo test`'s piped
-    // stdio in particular, `crossterm`'s raw-mode/poll calls have no console
-    // to act on, so blocking here would either error out immediately (best
-    // case) or hang a test suite waiting for a keypress that can never
-    // arrive (worst case). A non-interactive `wrap` invocation is out of
-    // scope for this fix -- `exec`/`loop` are the supervisors for headless
-    // work, and already gate correctly.
+    // Also gated on both stdin *and* stdout being real terminals, the same
+    // double-check `chrome::dash_eligible` already makes for the same
+    // reason: this is the interactive-session launch path, and a
+    // non-interactive `wrap` invocation is out of scope for it -- `exec`/
+    // `loop` are the supervisors for headless work, and already gate
+    // correctly. Issue #358 (T9): `apply_interactive_gate` itself no longer
+    // blocks or prompts for either `Pause` or `Refuse` -- it prints the note
+    // and launches -- so this check is no longer load-bearing for avoiding a
+    // hang under piped test stdio, but the interactive/headless distinction
+    // it draws is still the right one to gate on.
     //
     // `interactive_launch` is also the real signal `compile`/`policy_
     // launch_args` below need (2026-08-24 hardening): before this, both
@@ -2128,6 +2137,69 @@ pub fn run_with(
     // Issues #328/#334: which seat role this session runs as, for the same
     // guard -- unlike `seat_model_env`, unconditional for every role.
     turn_env.extend(adapters::seat_role_env(role));
+    // Issue #358 (task 5): the logical orchestrator seat this session sits
+    // in. Registered here rather than beside `SessionGuard::register` above
+    // (where `seat::register`'s own wiring note points) for one reason: the
+    // seat records which MODEL is answering at this address, and that is not
+    // resolved until `seat_model_env` just above has run. Registration still
+    // happens before the child exists, which is all the fencing generation
+    // riding in `turn_env` below actually needs. Worker sessions register no
+    // seat at all: nothing ever rolls one over.
+    if role == PromptRole::Orchestrator {
+        let seat_model = turn_env
+            .iter()
+            .find(|(key, _)| key == adapters::SEAT_MODEL_ENV)
+            .map(|(_, value)| value.clone());
+        match super::seat::register(
+            &state_dir,
+            &super::sessions::short_id(session.as_str()),
+            session.as_str(),
+            adapter.name(),
+            seat_model.as_deref(),
+            adapter.provider(),
+            role.label(),
+            super::seat::pin_from_env(env),
+            super::state::now_secs(),
+        ) {
+            Ok(seat) => {
+                // A supervisor that died mid-swap leaves the seat stuck in
+                // `Prepared`, refusing every future rollover; recovery runs
+                // before this launch's own generation is exported so the env
+                // below cannot name a generation the recovery just moved.
+                // `None` unconditionally: a supervisor is only running this
+                // line because the previous one is gone, and a successor it
+                // had prepared died with it. Nothing that outlived the crash
+                // could still be answering at this address.
+                let recovered = super::rollover::on_startup(&state_dir, &seat.short, &|_| None);
+                turn_env.push(super::seat::generation_env(
+                    recovered.as_ref().unwrap_or(&seat),
+                ));
+            }
+            // Logged, never `note_failure`: a seat that could not be
+            // registered costs this session automatic rollover and nothing
+            // else, whereas degrading the supervisor would also silence
+            // compaction, restarts and mail for a feature the operator may
+            // not even have turned on.
+            Err(e) => {
+                let _ = super::log::append(
+                    &state_dir,
+                    &super::log::Decision {
+                        ts: super::state::now_secs(),
+                        session: session.as_str(),
+                        verb: "wrap",
+                        verdict: "rollover",
+                        score: 0,
+                        action: "orchestrator-seat-unregistered",
+                        detail: &format!(
+                            "seat registration failed, so this session cannot roll over \
+                             automatically: {e}"
+                        ),
+                        observed_at: None,
+                    },
+                );
+            }
+        }
+    }
     // Scrubbed before any of it is applied -- see `apply_session_env`. When
     // the bind above failed, `turn_env` carries only `AGENT_ENV`, and the
     // scrub is the only thing standing between this child and the outer
@@ -2371,6 +2443,12 @@ pub fn run_with(
     // not linger to be picked as "the newest" by a later `read_socket_path`
     // that has no session id of its own.
     unpublish_socket_path(&state_dir, session.as_str());
+    // Issue #358: the seat is an address for a live session, and this one is
+    // over. Released at the same single point as every other per-session
+    // artifact so a dead seat record can never be read as a live one.
+    if role == PromptRole::Orchestrator {
+        super::rollover::forget(&state_dir, &super::sessions::short_id(session.as_str()));
+    }
 
     reset_bar(&bar);
     if let Some(guard) = raw.as_mut() {
@@ -2806,14 +2884,21 @@ fn perform_handover_swap(
         .ok()
         .flatten()
         .map(|(_, h)| h);
-    let (note, source) = handoff::distill_or_structural(
-        adapter.as_ref(),
-        distiller_model.as_str(),
-        &ctx,
-        distiller_timeout,
-        announcer.enabled,
-        previous.as_ref(),
-    );
+    // Issue #358: a reactive rollover fires precisely because this provider
+    // has stopped answering, and the distiller call runs against that same
+    // provider -- spending it could only ever time out and delay the swap.
+    let (note, source) = if req.structural_only {
+        (handoff::structural(&ctx), "structural")
+    } else {
+        handoff::distill_or_structural(
+            adapter.as_ref(),
+            distiller_model.as_str(),
+            &ctx,
+            distiller_timeout,
+            announcer.enabled,
+            previous.as_ref(),
+        )
+    };
     let stored = handoff::store(state_dir, repo, session.as_str(), &note);
     // N6: same rule the ordinary restart arm follows -- opt-in, and only
     // from a genuinely distilled handoff.
@@ -2834,6 +2919,15 @@ fn perform_handover_swap(
     // operator's own config change, or a stale request) fails before
     // anything is torn down.
     let (new_adapter, new_extra_flags) = super::handover::resolve_swap_launch(cfg, req)?;
+    // Finding #10 (issue #358 review): the successor must carry a fencing
+    // generation of its own. `req.generation` is the PREPARED generation an
+    // automatic swap's `seat::commit` is about to promote to `Seat::
+    // generation`; a manual swap (`req.generation: None`) opens no
+    // transaction and never changes the seat's generation at all, so it
+    // falls back to whatever is on disk right now.
+    let successor_generation = req
+        .generation
+        .or_else(|| super::seat::load(state_dir, &bar.session_short).map(|seat| seat.generation));
     let new_turn_env = super::handover::build_turn_env(
         new_adapter.as_ref(),
         server,
@@ -2841,6 +2935,7 @@ fn perform_handover_swap(
         repo,
         role,
         req.target_model.as_deref(),
+        successor_generation,
     );
 
     let (new_generation, quit) = match writer.lock() {
@@ -2984,9 +3079,30 @@ fn pump(
     // Finding #7: `handover::take_request`'s own polling cadence, tracked
     // independently of `mail_watch` -- see the check site's own doc comment.
     let mut last_handover_poll: Option<Instant> = None;
+    // Issue #358 (task 5): the automatic rollover's own cadence, seeded with
+    // this pump's start so no usage I/O runs during session startup, and the
+    // one rollover transaction that may be open at a time.
+    let mut last_rollover_eval: Option<Instant> = Some(Instant::now());
+    let mut pending_rollover: Option<PendingRollover> = None;
+    let seat_short = bar.session_short.clone();
+    let seat_rollover_enabled =
+        cfg.fallback.auto_orchestrator_rollover && role == PromptRole::Orchestrator;
 
     loop {
         if let Some(status) = child.try_wait()? {
+            // Issue #358: the successor of an automatic rollover never came
+            // up (or died before it ever answered), so the transaction that
+            // launched it is a failure, not a commit.
+            if let Some(pending) = pending_rollover.take() {
+                let _ = super::rollover::fail(
+                    state_dir,
+                    "wrap",
+                    &seat_short,
+                    pending.generation,
+                    "the successor exited before it answered",
+                    super::state::now_secs(),
+                );
+            }
             // Let the reader thread flush whatever is still buffered.
             while rx.recv_timeout(Duration::from_millis(50)).is_ok() {}
             let code = status.exit_code() as i32;
@@ -3106,21 +3222,85 @@ fn pump(
         if handover_poll_due {
             last_handover_poll = Some(now);
         }
-        if handover_poll_due
-            && let Some(req) = super::handover::take_request(state_dir, &bar.session_short)
-        {
+        // Issue #358 (task 5): the automatic rollover shares this exact
+        // seam, so an automatically decided swap and an operator's own are
+        // executed by the same code. A manual request always wins: it is
+        // claimed first, and its presence skips the automatic evaluation for
+        // this tick entirely (and clears whatever `pending` cause the seat
+        // was still carrying -- the operator just answered the question).
+        let manual_req = handover_poll_due
+            .then(|| super::handover::take_request(state_dir, &bar.session_short))
+            .flatten();
+        let swap_req = match manual_req {
+            Some(req) => {
+                // Finding #1 (issue #358 review): a manual request must not
+                // let an already-open automatic rollover transaction linger.
+                // If it did, the readiness watch below would later commit
+                // that transaction's generation against whatever session id
+                // this manual swap put in the seat -- the wrong agent for
+                // that generation. Close the open transaction first (the
+                // successor it named already lost the pty to this manual
+                // request, so it never got to prove itself ready) before
+                // honouring the manual request.
+                if let Some(pending) = pending_rollover.take() {
+                    let _ = super::rollover::fail(
+                        state_dir,
+                        "wrap",
+                        &seat_short,
+                        pending.generation,
+                        "superseded by a manual handover request",
+                        super::state::now_secs(),
+                    );
+                }
+                let _ =
+                    super::seat::clear_pending(state_dir, &seat_short, super::state::now_secs());
+                Some(req)
+            }
+            None if seat_rollover_enabled
+                && pending_rollover.is_none()
+                && rollover_eval_due(last_rollover_eval, now, cfg) =>
+            {
+                last_rollover_eval = Some(now);
+                automatic_rollover_request(
+                    state_dir,
+                    cfg,
+                    session.as_str(),
+                    &seat_short,
+                    adapter.provider(),
+                    supervision,
+                    debounce,
+                    interactive_from_turn_env(turn_env),
+                )
+            }
+            None => None,
+        };
+        if let Some(req) = swap_req {
             let may_act = handover_may_act(supervision, Instant::now(), debounce, req.force);
             if !may_act {
                 let reason = "mid-turn; retry once idle, or pass --force".to_string();
-                super::handover::write_ack(
-                    state_dir,
-                    &bar.session_short,
-                    &super::handover::HandoverAck {
-                        ok: false,
-                        reason: Some(reason.clone()),
-                        ..Default::default()
-                    },
-                );
+                // An automatic request has no waiting requester to ack, and
+                // its seat transaction is already open -- close it here so
+                // the seat is not left `Prepared` for a swap that never ran.
+                if let Some(generation) = req.generation {
+                    let _ = super::rollover::fail(
+                        state_dir,
+                        "wrap",
+                        &seat_short,
+                        generation,
+                        &reason,
+                        super::state::now_secs(),
+                    );
+                } else {
+                    super::handover::write_ack(
+                        state_dir,
+                        &bar.session_short,
+                        &super::handover::HandoverAck {
+                            ok: false,
+                            reason: Some(reason.clone()),
+                            ..Default::default()
+                        },
+                    );
+                }
                 announcer.emit(&Event::HandoverRefused {
                     reason: reason.clone(),
                 });
@@ -3180,6 +3360,18 @@ fn pump(
                             Ok(path) => path.display().to_string(),
                             Err(e) => format!("not stored: {e}"),
                         };
+                        // Issue #358: the pty now runs the successor, but the
+                        // seat is only committed once that successor has
+                        // actually answered -- watched from the tick below,
+                        // never blocked on here (a blocking probe would
+                        // freeze the operator's own terminal).
+                        if let Some(generation) = req.generation {
+                            pending_rollover = Some(PendingRollover {
+                                generation,
+                                signals_at_swap: supervision.signals_seen,
+                                started: Instant::now(),
+                            });
+                        }
                         super::handover::write_ack(
                             state_dir,
                             &bar.session_short,
@@ -3224,6 +3416,20 @@ fn pump(
                     }
                     Err(e) => {
                         let reason = e.to_string();
+                        // Issue #358: the transaction is closed against the
+                        // successor that failed, so `seat::abort`'s own visit
+                        // record keeps the next evaluation at this same epoch
+                        // from picking it again.
+                        if let Some(generation) = req.generation {
+                            let _ = super::rollover::fail(
+                                state_dir,
+                                "wrap",
+                                &seat_short,
+                                generation,
+                                &reason,
+                                super::state::now_secs(),
+                            );
+                        }
                         super::handover::write_ack(
                             state_dir,
                             &bar.session_short,
@@ -3261,6 +3467,76 @@ fn pump(
                         return Ok(code);
                     }
                 }
+            }
+        }
+
+        // Issue #358 (task 5): the open rollover transaction's readiness
+        // watch. Purely local state (a signal count, two instants), so it is
+        // cheap enough for the ordinary tick and never blocks the pty pump.
+        // Reaching this line at all means the child is alive: the loop's own
+        // `try_wait` arm above returns before it otherwise.
+        if let Some(pending) = pending_rollover.as_ref() {
+            let readiness = super::rollover::successor_readiness(
+                true,
+                adapter.capabilities().turn_signal,
+                supervision.signals_seen > pending.signals_at_swap,
+                signal_less_mail_ready(
+                    supervision,
+                    Instant::now(),
+                    Duration::from_millis(cfg.dash.idle_quiet_ms),
+                ),
+                Instant::now().saturating_duration_since(pending.started),
+                Duration::from_secs(cfg.handoff.timeout_secs),
+            );
+            match readiness {
+                super::rollover::Readiness::Ready => {
+                    let _ = super::rollover::commit(
+                        state_dir,
+                        "wrap",
+                        &seat_short,
+                        pending.generation,
+                        session.as_str(),
+                        super::state::now_secs(),
+                    );
+                    pending_rollover = None;
+                }
+                super::rollover::Readiness::TimedOut => {
+                    // DEVIATION (documented): wrap quits the predecessor
+                    // before it can launch the successor, so unlike
+                    // `Pane::handover` there is no source left to restore --
+                    // and killing a live-but-silent successor here would end
+                    // the operator's session outright, which `wrap` may never
+                    // do. The transaction is aborted (recording the visit, so
+                    // the next evaluation tries the NEXT candidate) and the
+                    // seat is re-registered onto the successor that is in
+                    // fact running, so the record still describes reality.
+                    let now_secs = super::state::now_secs();
+                    let _ = super::rollover::fail(
+                        state_dir,
+                        "wrap",
+                        &seat_short,
+                        pending.generation,
+                        "the successor did not answer within handoff.timeout_secs",
+                        now_secs,
+                    );
+                    let model = turn_env
+                        .iter()
+                        .find(|(key, _)| key == adapters::SEAT_MODEL_ENV)
+                        .map(|(_, value)| value.clone());
+                    let _ = super::seat::register(
+                        state_dir,
+                        &seat_short,
+                        session.as_str(),
+                        adapter.name(),
+                        model.as_deref(),
+                        adapter.provider(),
+                        role.label(),
+                        false,
+                        now_secs,
+                    );
+                    pending_rollover = None;
+                }
+                super::rollover::Readiness::Waiting | super::rollover::Readiness::Dead => {}
             }
         }
 
@@ -3768,6 +4044,41 @@ mod tests {
     use std::io::Read;
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn the_rollover_evaluation_cadence_never_fires_before_its_first_interval() {
+        let mut cfg = CtxConfig::default();
+        cfg.pace.collector_max_age_secs = 900;
+        let start = Instant::now();
+        assert!(
+            !rollover_eval_due(None, start, &cfg),
+            "an unseeded cadence must not evaluate during session startup"
+        );
+        assert!(!rollover_eval_due(Some(start), start, &cfg));
+        assert!(!rollover_eval_due(
+            Some(start),
+            start + Duration::from_secs(899),
+            &cfg
+        ));
+        assert!(rollover_eval_due(
+            Some(start),
+            start + Duration::from_secs(900),
+            &cfg
+        ));
+    }
+
+    #[test]
+    fn a_successor_inherits_the_launch_interactivity_its_predecessor_actually_had() {
+        let interactive = vec![(
+            adapters::LAUNCH_MODE_ENV.to_string(),
+            adapters::LAUNCH_MODE_INTERACTIVE_VALUE.to_string(),
+        )];
+        assert!(interactive_from_turn_env(&interactive));
+        assert!(
+            !interactive_from_turn_env(&[(adapters::AGENT_ENV.to_string(), "claude".to_string())]),
+            "no pin means headless, the fail-closed posture every other reader assumes"
+        );
+    }
 
     fn test_bar(size: (u16, u16)) -> BarRuntime {
         BarRuntime::new(
@@ -4787,42 +5098,43 @@ mod tests {
         assert_eq!(read_socket_path(&state, Some("cccc3333")), None);
     }
 
-    /// T10: `--force-pace` skips the interactive wait/confirmation
-    /// deterministically -- the one half of `apply_interactive_gate` that is
-    /// unit-testable without a real terminal, since the non-`force_pace`
-    /// branches call into `crossterm`'s raw-mode keypress detection
-    /// (`interactive_skippable_pause`/`interactive_confirm`), which needs an
-    /// actual console and is exercised only by hand and by the `gate ==
-    /// Launch` case reaching zero I/O at all in every other wrap test (the
-    /// terminal-presence check ahead of this function already keeps them
-    /// off this path entirely under `cargo test`'s piped stdio).
+    /// Issue #358 (T9): `apply_interactive_gate` never waits or confirms any
+    /// more, regardless of `force_pace` -- a `Pause` with an astronomical
+    /// `seconds` and a `Refuse` both return `Ok(())` immediately whether or
+    /// not `--force-pace` was passed, since usage headroom no longer blocks
+    /// or delays a launch. Renamed from `force_pace_skips_the_wait_or_
+    /// confirmation_for_both_pause_and_refuse`, which used to pin `--force-
+    /// pace` as the one thing standing between an operator and an ~11-day
+    /// block; there is no block left to skip.
     #[test]
-    fn force_pace_skips_the_wait_or_confirmation_for_both_pause_and_refuse() {
+    fn neither_pause_nor_refuse_ever_waits_or_confirms_with_or_without_force_pace() {
         assert!(apply_interactive_gate(pace::InteractiveGate::Launch, false).is_ok());
         assert!(apply_interactive_gate(pace::InteractiveGate::Launch, true).is_ok());
 
-        assert!(
-            apply_interactive_gate(
-                pace::InteractiveGate::Pause {
-                    message: "usage 85.0% of the five_hour window".to_string(),
-                    seconds: 999_999,
-                },
-                true,
-            )
-            .is_ok(),
-            "force_pace must not block on a pause that would otherwise wait ~11 days"
-        );
+        for force_pace in [false, true] {
+            assert!(
+                apply_interactive_gate(
+                    pace::InteractiveGate::Pause {
+                        message: "usage 85.0% of the five_hour window".to_string(),
+                        seconds: 999_999,
+                    },
+                    force_pace,
+                )
+                .is_ok(),
+                "a pause that would otherwise wait ~11 days must never block, force_pace={force_pace}"
+            );
 
-        assert!(
-            apply_interactive_gate(
-                pace::InteractiveGate::Refuse {
-                    message: "usage 99.9% of the five_hour window".to_string(),
-                },
-                true,
-            )
-            .is_ok(),
-            "force_pace must launch anyway even at the hard ceiling"
-        );
+            assert!(
+                apply_interactive_gate(
+                    pace::InteractiveGate::Refuse {
+                        message: "usage 99.9% of the five_hour window".to_string(),
+                    },
+                    force_pace,
+                )
+                .is_ok(),
+                "the hard ceiling must launch anyway, force_pace={force_pace}"
+            );
+        }
     }
 
     #[test]

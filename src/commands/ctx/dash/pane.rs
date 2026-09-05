@@ -811,6 +811,15 @@ pub struct Pane {
     /// this pane's transcript with the same `agent::budget_state` and
     /// one-tick hard-stop grace as the headless exec supervisor.
     budget_tokens: Option<u64>,
+    /// Issue #358 (task T3): the id of this pane's own entry in
+    /// `reservation`'s per-provider ledger, if the reservation write at
+    /// spawn time succeeded (best-effort, so `None` also covers a ledger
+    /// error that must never have refused the spawn itself). Settled by
+    /// `account_reaped_pane_spend` once this pane's own child exits, or
+    /// released by `fulfill_spawn_request`'s own `rollback_admission` on a
+    /// pre-spawn refusal -- the pane-side mirror of `work_group_id`'s own
+    /// reserve/settle lifecycle, just keyed by provider instead of group.
+    reservation_id: Option<String>,
     budget_soft_warned: bool,
     budget_grace_given: bool,
     /// Issue #249: this pane's own server-verified supervising session
@@ -1055,6 +1064,39 @@ impl Pane {
             record.unreachable()
         };
         let guard = SessionGuard::register(state, record);
+        // Issue #358 (task 5): the logical orchestrator seat this pane sits
+        // in -- only ever an orchestrator pane's, since nothing rolls a
+        // worker over. The model comes from `turn_env`, the single source of
+        // truth for what this child actually inherits (the same derivation
+        // `launch_mode` above already makes from it), and `pinned` from the
+        // dashboard process's own environment, which is where an operator's
+        // `ZIRV_CTX_SEAT_PIN` lands.
+        if role == PromptRole::Orchestrator {
+            let seat_model = turn_env
+                .iter()
+                .find(|(key, _)| key == super::super::adapters::SEAT_MODEL_ENV)
+                .map(|(_, value)| value.clone());
+            let short = sessions::short_id(&session_id);
+            if super::super::seat::register(
+                state,
+                &short,
+                &session_id,
+                &agent_name,
+                seat_model.as_deref(),
+                super::super::adapters::provider_for_agent_name(Some(&agent_name)),
+                role.label(),
+                super::super::seat::pin_from_env(&super::super::config::env_from_process()),
+                super::super::state::now_secs(),
+            )
+            .is_ok()
+            {
+                // A dashboard that died mid-swap leaves the seat `Prepared`,
+                // refusing every future rollover. Nothing that outlived that
+                // crash can still be answering at this address, so recovery
+                // always aborts rather than committing.
+                super::super::rollover::on_startup(state, &short, &|_| None);
+            }
+        }
 
         Ok(Pane {
             title,
@@ -1084,6 +1126,7 @@ impl Pane {
             intake_dir: None,
             work_group_id: None,
             budget_tokens: None,
+            reservation_id: None,
             budget_soft_warned: false,
             budget_grace_given: false,
             parent_session: None,
@@ -1579,6 +1622,20 @@ impl Pane {
         self.budget_tokens
     }
 
+    /// Issue #358 (task T3): records the provider-level token-reservation
+    /// ledger entry (`reservation::reserve`) `fulfill_spawn_request` took
+    /// for this pane at spawn time -- called right after `Pane::spawn`, the
+    /// same way [`Self::set_work_group_id`]/[`Self::set_budget_tokens`]
+    /// are, so `account_reaped_pane_spend` can settle it once this pane's
+    /// own child exits.
+    pub fn set_reservation_id(&mut self, id: Option<String>) {
+        self.reservation_id = id;
+    }
+
+    pub fn reservation_id(&self) -> Option<&str> {
+        self.reservation_id.as_deref()
+    }
+
     /// Applies the pane's transcript usage to the same budget state machine
     /// as a headless worker. A naturally failed child keeps its own exit;
     /// a clean child whose final transcript is over budget becomes exit 77.
@@ -1826,6 +1883,12 @@ impl Pane {
         // profile is `panic = "abort"`.
         self.lifecycle.release();
         wrap::unpublish_socket_path(&self.state_dir, &self.session_id);
+        // Issue #358: the seat is an address for a live session, released
+        // alongside every other per-session artifact this pane owns. A
+        // worker pane never registered one, so this is a no-op for it.
+        if self.role == PromptRole::Orchestrator {
+            super::super::rollover::forget(&self.state_dir, self.guard.short());
+        }
         self.guard.release();
         Ok(())
     }
@@ -1885,6 +1948,12 @@ impl Pane {
         }
         self.lifecycle.release();
         wrap::unpublish_socket_path(&self.state_dir, &self.session_id);
+        // Issue #358: the seat is an address for a live session, released
+        // alongside every other per-session artifact this pane owns. A
+        // worker pane never registered one, so this is a no-op for it.
+        if self.role == PromptRole::Orchestrator {
+            super::super::rollover::forget(&self.state_dir, self.guard.short());
+        }
         self.guard.release();
         Ok(())
     }
@@ -1936,6 +2005,15 @@ impl Pane {
         // first pane, `restored_pane_turn_env`), all in `dash::mod`, not
         // this one -- a pane that both underwent a handover AND survives a
         // later dashboard restore is the only case this residual reaches.
+        // Finding #10 (issue #358 review): the successor must carry a
+        // fencing generation of its own -- see `handover::build_turn_env`'s
+        // own doc comment. `req.generation` is the PREPARED generation an
+        // automatic swap's `seat::commit` is about to promote to `Seat::
+        // generation`; a manual swap opens no transaction and never changes
+        // it, so it falls back to whatever is on disk right now.
+        let successor_generation = req.generation.or_else(|| {
+            super::super::seat::load(&self.state_dir, self.short()).map(|seat| seat.generation)
+        });
         let mut turn_env = super::super::handover::build_turn_env(
             new_adapter.as_ref(),
             self.server.as_ref(),
@@ -1943,6 +2021,7 @@ impl Pane {
             repo,
             role,
             req.target_model.as_deref(),
+            successor_generation,
         );
         // Issue #249/#250 review (Fix 3): `build_turn_env` scrubs and
         // rebuilds the turn-signal/agent/seat-model env from scratch but has
@@ -2047,6 +2126,40 @@ impl Pane {
         if let Some(child_pid) = child.process_id() {
             self.guard.adopt_child_pid(child_pid);
         }
+
+        // Finding #3 (issue #358 review): this pane's provider-level token
+        // reservation (`fulfill_spawn_request`'s ledger entry, settled by
+        // `account_reaped_pane_spend` on reap) is keyed to the OLD adapter's
+        // provider. Left in place, `account_reaped_pane_spend` derives its
+        // provider from `pane.agent()` -- which from here on names the NEW
+        // adapter -- so it would look the id up in the wrong provider's
+        // ledger, find nothing, and the old entry would sit "outstanding"
+        // against the old provider for the rest of this dashboard's life.
+        // Move it: release the old entry and open a fresh one on the new
+        // provider for the same token ceiling, so exactly one settle later
+        // hits the right ledger.
+        let old_provider =
+            super::super::adapters::provider_for_agent_name(Some(&self.agent_name)).to_string();
+        if let Some(old_id) = self.reservation_id.take() {
+            let _ = super::super::reservation::release(&self.state_dir, &old_provider, &old_id);
+        }
+        let new_provider = new_adapter.provider();
+        self.reservation_id = match super::super::reservation::reserve(
+            &self.state_dir,
+            new_provider,
+            &self.session_id,
+            self.budget_tokens().unwrap_or(0),
+            super::super::state::now_secs(),
+        ) {
+            Ok(reservation) => Some(reservation.id),
+            Err(e) => {
+                eprintln!(
+                    "zirv ctx dash: failed to record a token reservation for provider \
+                     '{new_provider}' after handover: {e}"
+                );
+                None
+            }
+        };
 
         self.agent_name = new_agent_name;
         self.master = master;
@@ -3415,6 +3528,9 @@ pub(crate) mod tests {
             force: true,
             requested_at: 0,
             interactive: false,
+            automatic: false,
+            generation: None,
+            structural_only: false,
         };
         let handoff_note = crate::commands::ctx::handoff::Handoff::default();
 
@@ -3510,6 +3626,9 @@ pub(crate) mod tests {
             force: true,
             requested_at: 0,
             interactive: false,
+            automatic: false,
+            generation: None,
+            structural_only: false,
         };
         let handoff_note = crate::commands::ctx::handoff::Handoff::default();
 
@@ -3533,6 +3652,104 @@ pub(crate) mod tests {
             "grandpar",
             "the successor child's own real environment must carry the pane's own parent \
              session"
+        );
+
+        pane.finish_shutdown().expect("shutdown");
+    }
+
+    /// Finding #10 (issue #358 review): a successor spawned by `Pane::
+    /// handover` must carry its own `ZIRV_CTX_SEAT_GENERATION` in its real
+    /// process environment -- `handover::build_turn_env` never pushed it at
+    /// all before this fix, which left every post-rollover successor
+    /// permanently unfenced (`seat::fence` has nothing to compare against).
+    /// This is a MANUAL swap (`generation: None` on the request, opening no
+    /// seat transaction), so the successor must get the seat's CURRENT,
+    /// unchanged on-disk generation -- `1`, for a seat this test freshly
+    /// registers and never rolls over.
+    #[cfg(unix)]
+    #[test]
+    fn handover_carries_the_seats_current_generation_for_a_manual_swap() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+
+        let session_id = "99999999-2222-4333-8444-555555555555";
+        let mut spec = test_spec(session_id);
+        spec.argv = long_lived_argv();
+        spec.agent_name = "claude".to_string();
+        let mut pane = Pane::spawn(
+            spec,
+            &state,
+            &repo,
+            &repo,
+            (80, 24),
+            &[],
+            true,
+            DEFAULT_IDLE_QUIET,
+        )
+        .expect("spawn");
+
+        crate::commands::ctx::seat::register(
+            &state,
+            pane.short(),
+            session_id,
+            "claude",
+            None,
+            "anthropic",
+            "orchestrator",
+            false,
+            1_700_000_000,
+        )
+        .expect("register seat");
+
+        let env_log = tmp.path().join("successor-generation-env.log");
+        let script = tmp.path().join("log-generation-env.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s' \"${{ZIRV_CTX_SEAT_GENERATION:-}}\" > {}\nsleep 3\n",
+                env_log.display()
+            ),
+        )
+        .expect("write script");
+
+        let cfg = crate::commands::ctx::config::CtxConfig {
+            agent_bin: Some(format!("sh {}", script.display())),
+            ..Default::default()
+        };
+        let req = crate::commands::ctx::handover::HandoverRequest {
+            target_agent: "claude".to_string(),
+            target_model: None,
+            force: true,
+            requested_at: 0,
+            interactive: false,
+            automatic: false,
+            generation: None,
+            structural_only: false,
+        };
+        let handoff_note = crate::commands::ctx::handoff::Handoff::default();
+
+        pane.handover(
+            &cfg,
+            &req,
+            &handoff_note,
+            PromptRole::Orchestrator,
+            &repo,
+            (80, 24),
+        )
+        .expect("handover succeeds");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !env_log.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let logged = std::fs::read_to_string(&env_log).unwrap_or_default();
+        assert_eq!(
+            logged.trim(),
+            "1",
+            "a manual swap must carry the seat's current (unchanged) generation, not leave the \
+             successor unfenced"
         );
 
         pane.finish_shutdown().expect("shutdown");
@@ -3595,6 +3812,9 @@ pub(crate) mod tests {
             force: true,
             requested_at: 0,
             interactive: false,
+            automatic: false,
+            generation: None,
+            structural_only: false,
         };
         let handoff_note = crate::commands::ctx::handoff::Handoff::default();
 
@@ -3616,6 +3836,101 @@ pub(crate) mod tests {
         assert!(
             !pane.report_reminder_sent(),
             "F5: a fresh child session must be eligible for its own one-shot reminder"
+        );
+
+        // finish_shutdown: immediate, no QUIT_GRACE wait -- see the identical
+        // comment on `handover_failure_in_successor_setup_leaves_the_old_pane_untouched`.
+        pane.finish_shutdown().expect("shutdown");
+    }
+
+    /// Finding #3 (issue #358 review): a handover across providers must move
+    /// this pane's provider-level token reservation, not silently orphan it.
+    /// Before the fix, `Pane::handover` never touched `reservation_id` -- it
+    /// still named the OLD provider's ledger entry after the swap, and
+    /// `account_reaped_pane_spend` (`dash::mod`) derives its provider from
+    /// `pane.agent()`, which by then names the NEW adapter -- so settle on
+    /// reap would look the id up in the wrong ledger, find nothing, and leak
+    /// the old entry for the rest of this dashboard's life.
+    #[test]
+    fn handover_moves_the_token_reservation_to_the_new_providers_ledger() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+
+        let session_id = "66666666-2222-4333-8444-555555555555";
+        let mut spec = test_spec(session_id);
+        spec.argv = long_lived_argv();
+        spec.agent_name = "claude".to_string();
+        let mut pane = Pane::spawn(
+            spec,
+            &state,
+            &repo,
+            &repo,
+            (80, 24),
+            &[],
+            true,
+            DEFAULT_IDLE_QUIET,
+        )
+        .expect("spawn");
+
+        pane.set_budget_tokens(Some(4_200));
+        let old_reservation = crate::commands::ctx::reservation::reserve(
+            &state,
+            "anthropic",
+            session_id,
+            4_200,
+            1_700_000_000,
+        )
+        .expect("seed old reservation");
+        pane.set_reservation_id(Some(old_reservation.id.clone()));
+
+        let cfg = crate::commands::ctx::config::CtxConfig {
+            #[cfg(windows)]
+            agent_bin: Some("ping -n 3 127.0.0.1".to_string()),
+            #[cfg(unix)]
+            agent_bin: Some("sleep 3".to_string()),
+            ..Default::default()
+        };
+        let req = crate::commands::ctx::handover::HandoverRequest {
+            target_agent: "codex".to_string(),
+            target_model: None,
+            force: true,
+            requested_at: 0,
+            interactive: false,
+            automatic: false,
+            generation: None,
+            structural_only: false,
+        };
+        let handoff_note = crate::commands::ctx::handoff::Handoff::default();
+
+        pane.handover(
+            &cfg,
+            &req,
+            &handoff_note,
+            PromptRole::Worker,
+            &repo,
+            (80, 24),
+        )
+        .expect("the swap must succeed against a trivially spawnable program");
+
+        assert_eq!(
+            crate::commands::ctx::reservation::outstanding(&state, "anthropic", 1_700_000_100),
+            0,
+            "the old provider's reservation must be released on handover"
+        );
+        let new_id = pane
+            .reservation_id()
+            .expect("a fresh reservation must be opened on the new provider")
+            .to_string();
+        assert_ne!(
+            new_id, old_reservation.id,
+            "the moved reservation must get a fresh id"
+        );
+        assert_eq!(
+            crate::commands::ctx::reservation::outstanding(&state, "openai", 1_700_000_100),
+            4_200,
+            "the new provider's ledger must carry the same token ceiling"
         );
 
         // finish_shutdown: immediate, no QUIT_GRACE wait -- see the identical

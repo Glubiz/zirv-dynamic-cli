@@ -154,6 +154,18 @@ pub struct ExecArgs {
     /// default. Supervision, pacing and hooks still apply.
     #[arg(long, default_value_t = false)]
     pub simple: bool,
+    /// NOT a CLI flag -- `#[arg(skip)]` always leaves this at its default
+    /// (`None`) on `zirv ctx exec`'s own command line, the same reasoning
+    /// `memory::RememberArgs::importance`'s own doc comment gives. Issue
+    /// #358 (task T3): the id of the calling delegation's own entry in
+    /// `reservation`'s per-provider ledger (`agent::run_with` sets it when
+    /// building this struct for a headless worker's launch), carried
+    /// through so a harness-handover restart, below, can release it against
+    /// the OLD provider and reserve a fresh one against the NEW provider it
+    /// is about to continue on -- `None` for a plain `zirv ctx exec` with no
+    /// delegation reservation of its own, which this never creates one for.
+    #[arg(skip)]
+    pub reservation_id: Option<String>,
 }
 
 /// One vendor-backed portion of a logical supervised execution. A cross-harness
@@ -172,6 +184,16 @@ pub struct ExecutionSegment {
 #[derive(Debug, Clone, Default)]
 pub struct ExecutionReport {
     pub segments: Vec<ExecutionSegment>,
+    /// Issue #358 review finding #4: a harness-handover restart (below)
+    /// moves this run's own token reservation to the NEW provider's ledger
+    /// mid-recursion, inside `run_with_clock_inner`'s own tail call --
+    /// `ExecArgs::reservation_id`/its caller's `provider` local only ever
+    /// name the FIRST provider a delegation reserved against. Set every
+    /// time such a swap happens (the last one wins across however many
+    /// further handovers follow), so a caller that settles once the whole
+    /// chain returns reads the ledger the run actually finished on, never
+    /// the one it started on.
+    pub final_reservation: Option<(String, &'static str)>,
 }
 
 /// Flags that pin a launch to a conversation that already exists. A restart is
@@ -651,6 +673,7 @@ pub fn run_with_report<W: Write>(
         &super::state::now_secs,
         &|d: Duration| std::thread::sleep(d),
         None,
+        true,
         &mut report,
     )?;
     Ok((code, report))
@@ -668,7 +691,17 @@ pub(crate) fn run_with_clock<W: Write>(
     sleep_fn: &dyn Fn(Duration),
 ) -> CtxResult<i32> {
     let mut report = ExecutionReport::default();
-    run_with_clock_inner(args, w, repo, env, now_fn, sleep_fn, None, &mut report)
+    run_with_clock_inner(
+        args,
+        w,
+        repo,
+        env,
+        now_fn,
+        sleep_fn,
+        None,
+        true,
+        &mut report,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -680,6 +713,16 @@ fn run_with_clock_inner<W: Write>(
     now_fn: &dyn Fn() -> u64,
     sleep_fn: &dyn Fn(Duration),
     stable_short: Option<&str>,
+    // Issue #358 review finding #7: `true` for the very first launch of a
+    // WHOLE delegation, `false` for a recursive re-entry this same function
+    // makes on a provider-switch harness-handover restart (below). Without
+    // this, that recursive call's own `initial_launch` local (T9) would
+    // re-initialise to `true` on its own first loop iteration -- a brand
+    // fresh `run_with_clock_inner` call frame has no memory of the frame
+    // that tail-called it -- so a mid-delegation provider switch would skip
+    // the pacing wait exactly like a genuine first launch, even into a
+    // provider that is `WaitUntil`.
+    initial_launch_allowed: bool,
     report: &mut ExecutionReport,
 ) -> CtxResult<i32> {
     let cfg = CtxConfig::load_for_launch(repo, env)?;
@@ -1380,6 +1423,19 @@ fn run_with_clock_inner<W: Write>(
     let mut screening_announced: Option<String> = None;
     let mut compact_budget = CompactBudget::default();
     let compact_window = Duration::from_secs(cfg.supervise.interval_secs);
+    // Issue #358 (T9): true for exactly the first trip through this loop --
+    // the pre-launch call that decides whether a brand-new worker gets to
+    // start at all. Cleared unconditionally right after that first call, so
+    // every later trip (an ordinary restart, a nudge restart, an in-place
+    // compact-continue) paces normally instead of being read as another
+    // fresh launch.
+    //
+    // Issue #358 review finding #7: seeded from `initial_launch_allowed`,
+    // not hardcoded -- a recursive re-entry of this same function (a
+    // provider-switch harness-handover restart) passes `false`, since that
+    // is never this delegation's own first launch even though it is this
+    // CALL FRAME's first loop iteration.
+    let mut initial_launch = initial_launch_allowed;
 
     loop {
         pace::wait_for_window(
@@ -1398,9 +1454,11 @@ fn run_with_clock_inner<W: Write>(
                     .pace
                     .poll_enabled
                     .then_some(&http_poller as &dyn super::poll::UsagePoller),
+                initial_launch,
             },
             &mut pace_flags,
         );
+        initial_launch = false;
 
         // P2/P3: `_child_guard` holds this cycle's child in the console-close
         // pid registry and in a kill-on-close job for as long as it is in
@@ -2227,6 +2285,48 @@ fn run_with_clock_inner<W: Write>(
                     handoff::labeled_for_injection(&note)
                 );
                 let target = adapters::select(Some(&selected_agent), &[], &cfg)?;
+                // Issue #358 (task T3): this run's own token reservation, if
+                // any (`args.reservation_id`, set only when this is a
+                // delegated worker's launch -- see `ExecArgs::reservation_id`'s
+                // own doc comment), moves providers right here along with the
+                // harness itself: released against the OLD provider and
+                // re-reserved against the NEW one for the remaining token
+                // ceiling, so the per-provider ledger never keeps counting
+                // outstanding spend against a harness this run has already
+                // left. `None` when this run carries no reservation to begin
+                // with (a plain `zirv ctx exec` with no delegation) -- never
+                // minting one here that nothing downstream would ever settle.
+                // Best-effort, matching every other reservation write in this
+                // codebase: a ledger error must never block an otherwise-
+                // legitimate harness handover.
+                let mut reservation_id = None;
+                if let Some(old_id) = args.reservation_id.as_deref() {
+                    let _ = super::reservation::release(&state, adapter.provider(), old_id);
+                    reservation_id = match super::reservation::reserve(
+                        &state,
+                        target.provider(),
+                        session.as_str(),
+                        remaining_tokens.unwrap_or(0),
+                        now_fn(),
+                    ) {
+                        Ok(reservation) => Some(reservation.id),
+                        Err(e) => {
+                            eprintln!(
+                                "zirv ctx exec: failed to record a token reservation for \
+                                 provider '{}': {e}",
+                                target.provider()
+                            );
+                            None
+                        }
+                    };
+                    // Finding #4 (issue #358 review): surface exactly which
+                    // ledger this delegation's reservation now lives on, so
+                    // whichever caller settles once the whole recursive
+                    // handover chain returns settles the right one -- not
+                    // the provider (and id) it started this run on.
+                    report.final_reservation =
+                        reservation_id.clone().map(|id| (id, target.provider()));
+                }
                 let nested_args = ExecArgs {
                     agent: Some(selected_agent.clone()),
                     session_id: None,
@@ -2244,6 +2344,7 @@ fn run_with_clock_inner<W: Write>(
                     objective: None,
                     command: target.model_args(&selected_model),
                     simple: args.simple,
+                    reservation_id,
                 };
 
                 let mut next_visited = visited;
@@ -2271,6 +2372,7 @@ fn run_with_clock_inner<W: Write>(
                     now_fn,
                     sleep_fn,
                     Some(&registry_short),
+                    false,
                     report,
                 );
             }
@@ -2326,6 +2428,10 @@ fn run_with_clock_inner<W: Write>(
                         .pace
                         .poll_enabled
                         .then_some(&http_poller as &dyn super::poll::UsagePoller),
+                    // A confirmed vendor refusal on a session already
+                    // running is exactly the mid-run pacing T9 leaves
+                    // intact -- never the pre-launch call that never blocks.
+                    initial_launch: false,
                 },
                 &mut pace_flags,
             );
@@ -4007,6 +4113,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(60),
             simple: true,
+            reservation_id: None,
             command,
         };
         let mut out = Vec::new();
@@ -4043,6 +4150,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(60),
             simple: false,
+            reservation_id: None,
             command: fake_agent_command(session),
         };
         let mut out = Vec::new();
@@ -4090,6 +4198,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(60),
             simple: false,
+            reservation_id: None,
             command: fake_agent_command(session),
         };
         let mut out = Vec::new();
@@ -4137,6 +4246,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(60),
             simple: false,
+            reservation_id: None,
             command: fake_agent_command(session),
         };
         let mut out = Vec::new();
@@ -4173,6 +4283,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(60),
             simple: false,
+            reservation_id: None,
             command: fake_agent_command(session),
         };
         let mut out = Vec::new();
@@ -4235,6 +4346,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(60),
             simple: false,
+            reservation_id: None,
             command: fake_agent_command(session),
         };
         let mut out = Vec::new();
@@ -4320,6 +4432,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(60),
             simple: false,
+            reservation_id: None,
             command: fake_agent_command(session),
         };
         let mut out = Vec::new();
@@ -4375,6 +4488,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(60),
             simple: false,
+            reservation_id: None,
             command,
         };
         let mut out = Vec::new();
@@ -4429,6 +4543,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(60),
             simple: false,
+            reservation_id: None,
             command,
         };
         let mut out = Vec::new();
@@ -4478,6 +4593,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(60),
             simple: false,
+            reservation_id: None,
             command,
         };
         let mut out = Vec::new();
@@ -4513,6 +4629,7 @@ mod tests {
             objective: None,
             timeout_secs: None,
             simple: false,
+            reservation_id: None,
             command: Vec::new(),
         };
         let mut out = Vec::new();
@@ -4547,6 +4664,7 @@ mod tests {
             objective: None,
             timeout_secs: None,
             simple: false,
+            reservation_id: None,
             command: vec!["true".to_string()],
         };
         let mut out = Vec::new();
@@ -4722,6 +4840,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(60),
             simple: false,
+            reservation_id: None,
             command: fake_agent_command(session),
         };
         let mut out = Vec::new();
@@ -4787,6 +4906,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(60),
             simple: false,
+            reservation_id: None,
             command: fake_agent_command(session),
         };
         let mut out = Vec::new();
@@ -4838,6 +4958,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(60),
             simple: false,
+            reservation_id: None,
             command: fake_agent_command(session),
         };
         let mut out = Vec::new();
@@ -4896,6 +5017,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(1),
             simple: false,
+            reservation_id: None,
             command: fake_agent_command(session),
         };
         let started = std::time::Instant::now();
@@ -4949,6 +5071,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(30),
             simple: false,
+            reservation_id: None,
             command: fake_agent_command(session),
         };
         let started = std::time::Instant::now();
@@ -5005,6 +5128,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(30),
             simple: false,
+            reservation_id: None,
             command: fake_agent_command(session),
         };
         let mut out = Vec::new();
@@ -5049,6 +5173,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(30),
             simple: false,
+            reservation_id: None,
             command: fake_agent_command(session),
         };
         let mut out = Vec::new();
@@ -5091,6 +5216,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(30),
             simple: false,
+            reservation_id: None,
             command: fake_agent_command(session),
         };
         let mut out = Vec::new();
@@ -5131,6 +5257,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(30),
             simple: false,
+            reservation_id: None,
             command: vec!["codex".to_string(), "exec".to_string()],
         };
         let mut out = Vec::new();
@@ -5170,6 +5297,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(30),
             simple: false,
+            reservation_id: None,
             command: fake_agent_command(session),
         };
         let mut out = Vec::new();
@@ -5213,6 +5341,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(30),
             simple: false,
+            reservation_id: None,
             command,
         };
         let mut out = Vec::new();
@@ -5248,6 +5377,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(30),
             simple: false,
+            reservation_id: None,
             command: fake_agent_command(session),
         };
         let mut out = Vec::new();
@@ -5335,6 +5465,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(30),
             simple: false,
+            reservation_id: None,
             command: Vec::new(),
         };
         let mut out = Vec::new();
@@ -5399,6 +5530,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(30),
             simple: false,
+            reservation_id: None,
             command: Vec::new(),
         };
         let mut out = Vec::new();
@@ -5422,6 +5554,170 @@ mod tests {
         assert!(
             argv.contains("finish the requested work"),
             "the logical task must survive the handoff: {argv}"
+        );
+    }
+
+    /// Finding #4 (issue #358 review): a mid-run harness-handover restart
+    /// moves this delegation's token reservation to the NEW provider's
+    /// ledger deep inside the recursive `run_with_clock_inner` call --
+    /// `ExecArgs::reservation_id`'s own ORIGINAL provider is stale the
+    /// moment that happens. `ExecutionReport::final_reservation` must
+    /// surface the actual, final `(id, provider)` pair so a caller (like
+    /// `agent::run_with`) that only settles once this whole chain returns
+    /// hits the ledger the run actually finished on.
+    #[test]
+    fn a_harness_handover_moves_the_reservation_and_reports_the_final_ledger() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let state_dir = tmp.path().join("state");
+        let argv_log = tmp.path().join("argv.log");
+        let mut env = base_env(&state_dir);
+        env.insert("ZIRV_CTX_PACE".to_string(), "false".to_string());
+        env.insert(
+            "ZIRV_CTX_AGENT_BIN".to_string(),
+            format!("sh {}", fixture("fake-codex-agent.sh").display()),
+        );
+
+        let modes = tmp.path().join("modes.txt");
+        std::fs::write(&modes, "limit\nhealthy\n").expect("write modes");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        store_provider_collector(&state_dir, window::CODEX_USAGE_PROVIDER, 2.0, true);
+        let _fake_agent = crate::commands::ctx::testenv::VarGuard::set(&[
+            ("FAKE_AGENT_MODE_FILE", modes.to_str()),
+            ("FAKE_AGENT_ARGV_LOG", argv_log.to_str()),
+        ]);
+
+        let state = crate::commands::ctx::state::StateDir::from_root(state_dir.clone());
+        let seeded = crate::commands::ctx::reservation::reserve(
+            &state,
+            "openai",
+            "seed-session",
+            1_000,
+            1_700_000_000,
+        )
+        .expect("seed reservation");
+
+        let args = ExecArgs {
+            agent: Some("codex".to_string()),
+            session_id: None,
+            transcript: None,
+            prompt: Some("finish the requested work".to_string()),
+            max_restarts: Some(0),
+            budget_tokens: None,
+            max_tool_calls: None,
+            objective: None,
+            timeout_secs: Some(30),
+            simple: false,
+            reservation_id: Some(seeded.id.clone()),
+            command: Vec::new(),
+        };
+        let mut out = Vec::new();
+        let (code, report) =
+            run_with_report(&args, &mut out, tmp.path(), &|k| env.get(k).cloned()).expect("runs");
+        assert_eq!(code, 0);
+
+        let (final_id, final_provider) = report
+            .final_reservation
+            .expect("a harness handover must surface the moved reservation");
+        assert_eq!(final_provider, "anthropic");
+        assert_ne!(
+            final_id, seeded.id,
+            "the moved reservation must get a fresh id"
+        );
+        assert_eq!(
+            crate::commands::ctx::reservation::outstanding(&state, "openai", 1_700_000_100),
+            0,
+            "the old provider's reservation must be released"
+        );
+        assert_eq!(
+            crate::commands::ctx::reservation::entries(&state, "anthropic").len(),
+            1,
+            "the new provider's ledger must carry exactly the moved reservation"
+        );
+    }
+
+    /// Finding #7 (issue #358 review): a harness-handover restart re-enters
+    /// `run_with_clock_inner` recursively -- a brand new call frame, with its
+    /// own fresh `initial_launch` local (T9). Without threading `initial_
+    /// launch_allowed` through that recursive call, this second launch would
+    /// be (wrongly) treated as the WHOLE delegation's first launch and skip
+    /// pacing entirely, even into a provider already inside pacing's soft
+    /// throttle band. Same fixture as `a_limit_hit_hands_over_to_an_enabled_
+    /// alternate_before_parking` (codex reports a confirmed limit, reroutes
+    /// to claude), but this time claude's own usage is ALSO inside the soft
+    /// band (85%, between `soft_percent` 80% and the hard `max_percent` 99%
+    /// -- high enough to trigger a real `Slow` pace decision, but not so
+    /// high it reads as hard-refused and gets excluded as a reroute target
+    /// itself), and pacing stays enabled (not disabled like that other test)
+    /// so the claude leg's own pre-launch gate is exercised for real.
+    #[test]
+    fn a_provider_switch_restart_still_paces_into_a_throttled_provider() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let state_dir = tmp.path().join("state");
+        let argv_log = tmp.path().join("argv.log");
+        let mut env = base_env(&state_dir);
+        env.insert("ZIRV_CTX_PACE_JITTER_SECS".to_string(), "0".to_string());
+        env.insert("ZIRV_CTX_PACE_MAX_WAIT_SECS".to_string(), "2".to_string());
+        env.insert(
+            "ZIRV_CTX_AGENT_BIN".to_string(),
+            format!("sh {}", fixture("fake-codex-agent.sh").display()),
+        );
+
+        let modes = tmp.path().join("modes.txt");
+        std::fs::write(&modes, "limit\nhealthy\n").expect("write modes");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        // codex: a confirmed hard limit, so the reroute to claude fires.
+        store_provider_collector(&state_dir, window::CODEX_USAGE_PROVIDER, 2.0, true);
+        // claude: inside the soft throttle band -- the provider this
+        // delegation is about to switch ONTO -- but not hard-refused, so it
+        // still qualifies as an admissible reroute target.
+        store_provider_collector(&state_dir, window::LEGACY_USAGE_PROVIDER, 85.0, false);
+        let _fake_agent = crate::commands::ctx::testenv::VarGuard::set(&[
+            ("FAKE_AGENT_MODE_FILE", modes.to_str()),
+            ("FAKE_AGENT_ARGV_LOG", argv_log.to_str()),
+        ]);
+
+        let args = ExecArgs {
+            agent: Some("codex".to_string()),
+            session_id: None,
+            transcript: None,
+            prompt: Some("finish the requested work".to_string()),
+            max_restarts: Some(0),
+            budget_tokens: None,
+            max_tool_calls: None,
+            objective: None,
+            timeout_secs: Some(30),
+            simple: false,
+            reservation_id: None,
+            command: Vec::new(),
+        };
+        let mut out = Vec::new();
+        let slept: std::cell::RefCell<Vec<u64>> = std::cell::RefCell::new(Vec::new());
+        let code = run_with_clock(
+            &args,
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            &crate::commands::ctx::state::now_secs,
+            &|d: Duration| slept.borrow_mut().push(d.as_secs()),
+        );
+        assert_eq!(code.expect("runs"), 0);
+
+        let log = std::fs::read_to_string(state_dir.join("logs/decisions.jsonl")).expect("log");
+        assert!(
+            log.contains("codex -> claude"),
+            "sanity: the reroute must have happened: {log}"
+        );
+        assert!(
+            !slept.borrow().is_empty(),
+            "the provider-switch restart must actually pace into a throttled provider, not skip \
+             the gate as if this were the delegation's own first launch: {log}"
+        );
+        assert!(
+            log.contains("\"action\":\"pace-wait\""),
+            "the claude leg's own pacing must be a real wait, not `pace-initial-launch-warn`: \
+             {log}"
         );
     }
 
@@ -5462,6 +5758,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(30),
             simple: false,
+            reservation_id: None,
             command: Vec::new(),
         };
         let clock = std::cell::Cell::new(crate::commands::ctx::state::now_secs());
@@ -5534,6 +5831,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(60),
             simple: false,
+            reservation_id: None,
             command: fake_agent_command(session),
         };
         let mut out = Vec::new();
@@ -5587,6 +5885,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(60),
             simple: false,
+            reservation_id: None,
             command: fake_agent_command(session),
         };
         let mut out = Vec::new();
@@ -5641,6 +5940,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(60),
             simple: false,
+            reservation_id: None,
             command: fake_agent_command(session),
         };
         let mut out = Vec::new();
@@ -5715,6 +6015,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(60),
             simple: false,
+            reservation_id: None,
             command: fake_agent_command(session),
         };
         let mut out = Vec::new();
@@ -5773,6 +6074,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(60),
             simple: false,
+            reservation_id: None,
             command: fake_agent_command(session),
         };
         let mut out = Vec::new();
@@ -5803,8 +6105,13 @@ mod tests {
         );
     }
 
+    /// Issue #358 (T9): renamed from `an_exhausted_window_delays_the_first_
+    /// spawn` -- usage headroom is a ranking signal now, never a reason to
+    /// delay the very first spawn of a fresh session. The `WaitUntil`
+    /// verdict this exhausted window used to produce is downgraded to a
+    /// one-line warning instead.
     #[test]
-    fn an_exhausted_window_delays_the_first_spawn() {
+    fn an_exhausted_window_no_longer_delays_the_first_spawn() {
         let tmp = crate::commands::ctx::testenv::repo();
         let home = tmp.path().join("home");
         let state = tmp.path().join("state");
@@ -5829,22 +6136,93 @@ mod tests {
             objective: None,
             timeout_secs: Some(60),
             simple: false,
+            reservation_id: None,
             command: fake_agent_command(session),
         };
-        let started = std::time::Instant::now();
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
         unsafe {
             std::env::remove_var("FAKE_AGENT_MODE");
         }
 
-        assert_eq!(code.expect("runs"), 0, "a pause is never an exit");
+        assert_eq!(code.expect("runs"), 0, "a warning is never an exit");
+        let log = std::fs::read_to_string(state.join("logs/decisions.jsonl")).expect("log");
         assert!(
-            started.elapsed() >= std::time::Duration::from_secs(1),
-            "it should have waited before spawning"
+            log.contains("\"action\":\"pace-initial-launch-warn\""),
+            "got {log}"
+        );
+        assert!(!log.contains("\"action\":\"pace-wait\""), "got {log}");
+    }
+
+    /// Issue #358 (T9): the companion to the test above -- the initial
+    /// launch never waits, but a session already running that hits a
+    /// confirmed, structured-corroborated vendor refusal still parks before
+    /// its restart exactly as before (`initial_launch: false` on that
+    /// second, separate `PaceGate`). Fake `sleep_fn`, real clock: the
+    /// initial launch must record zero sleeps, and the confirmed-limit park
+    /// after the first child exits must record at least one.
+    #[test]
+    fn the_initial_launch_never_waits_but_a_confirmed_limit_restart_still_does() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let state = tmp.path().join("state");
+        let session = "aeaeaeae-2222-4333-8444-555555555555";
+        let modes = tmp.path().join("modes.txt");
+        std::fs::write(&modes, "limit\nhealthy\n").expect("write modes");
+        let mut env = base_env(&state);
+        env.insert("ZIRV_CTX_PACE_JITTER_SECS".to_string(), "0".to_string());
+        env.insert("ZIRV_CTX_PACE_MAX_WAIT_SECS".to_string(), "2".to_string());
+        store_collector(&state, 100.0, 1);
+
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let _fake_agent = crate::commands::ctx::testenv::VarGuard::set(&[(
+            "FAKE_AGENT_MODE_FILE",
+            modes.to_str(),
+        )]);
+        let args = ExecArgs {
+            agent: Some("claude".to_string()),
+            session_id: Some(session.to_string()),
+            transcript: Some(transcript_for(&home, tmp.path(), session)),
+            prompt: Some("do the work".to_string()),
+            max_restarts: Some(1),
+            budget_tokens: None,
+            max_tool_calls: None,
+            objective: None,
+            timeout_secs: Some(60),
+            simple: false,
+            reservation_id: None,
+            command: fake_agent_command(session),
+        };
+        let mut out = Vec::new();
+        let slept: std::cell::RefCell<Vec<u64>> = std::cell::RefCell::new(Vec::new());
+        let code = run_with_clock(
+            &args,
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            &crate::commands::ctx::state::now_secs,
+            &|d: Duration| slept.borrow_mut().push(d.as_secs()),
+        );
+
+        assert_eq!(code.expect("runs"), 0, "the restart completes healthily");
+        assert!(
+            !slept.borrow().is_empty(),
+            "the confirmed-limit restart must still pace before relaunching"
         );
         let log = std::fs::read_to_string(state.join("logs/decisions.jsonl")).expect("log");
-        assert!(log.contains("\"action\":\"pace-wait\""), "got {log}");
+        assert!(
+            log.contains("\"action\":\"pace-initial-launch-warn\""),
+            "the initial launch must be a warning, not a wait: {log}"
+        );
+        assert!(
+            log.contains("\"action\":\"limit-park\""),
+            "the confirmed limit must still park before the restart: {log}"
+        );
+        assert_eq!(
+            transcripts_in(&home).len(),
+            2,
+            "a limit-hit park mints a fresh session, same as an ordinary restart"
+        );
     }
 
     /// Bug B seam coverage (2026-08-22, fix round 3): `exec.rs` is one of
@@ -5879,6 +6257,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(60),
             simple: false,
+            reservation_id: None,
             command: fake_agent_command(session),
         };
         let mut out = Vec::new();
@@ -5929,6 +6308,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(60),
             simple: false,
+            reservation_id: None,
             command: fake_agent_command(session),
         };
         let mut out = Vec::new();
@@ -6003,6 +6383,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(60),
             simple: false,
+            reservation_id: None,
             command: fake_agent_command(session),
         };
         let mut out = Vec::new();
@@ -6074,6 +6455,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(60),
             simple: false,
+            reservation_id: None,
             command,
         };
         let mut out = Vec::new();
@@ -6135,6 +6517,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(60),
             simple: false,
+            reservation_id: None,
             command: fake_agent_command(session),
         };
         let mut out = Vec::new();
@@ -6212,6 +6595,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(60),
             simple: false,
+            reservation_id: None,
             command: fake_agent_command(session),
         };
         let mut out = Vec::new();
@@ -6296,6 +6680,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(60),
             simple: false,
+            reservation_id: None,
             command: fake_agent_command(session),
         };
         let mut out = Vec::new();
@@ -6382,6 +6767,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(60),
             simple: false,
+            reservation_id: None,
             // No trailing command: zirv builds the launch itself
             // (`adapter_builds_launch`), which is the shape both
             // `zirv ctx agent codex <prompt>` and a bare `zirv ctx exec
@@ -6475,6 +6861,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(60),
             simple: true,
+            reservation_id: None,
             command: Vec::new(),
         };
         let mut out = Vec::new();
@@ -6547,6 +6934,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(60),
             simple: false,
+            reservation_id: None,
             command: vec![
                 "sh".to_string(),
                 fixture("fake-codex-agent.sh").display().to_string(),
@@ -6643,6 +7031,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(30),
             simple: false,
+            reservation_id: None,
             command: vec![
                 "sh".to_string(),
                 fixture("fake-codex-agent.sh").display().to_string(),
@@ -6751,6 +7140,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(30),
             simple: false,
+            reservation_id: None,
             command: vec![
                 "sh".to_string(),
                 fixture("fake-codex-agent.sh").display().to_string(),
@@ -6830,6 +7220,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(30),
             simple: true,
+            reservation_id: None,
             command: Vec::new(),
         };
         let mut out = Vec::new();
@@ -6899,6 +7290,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(30),
             simple: true,
+            reservation_id: None,
             command: Vec::new(),
         };
         let mut out = Vec::new();
@@ -7052,6 +7444,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(30),
             simple: false,
+            reservation_id: None,
             command: Vec::new(),
         };
         let mut out = Vec::new();
@@ -7123,6 +7516,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(60),
             simple: false,
+            reservation_id: None,
             command: fake_agent_command(session),
         };
         let mut out = Vec::new();
@@ -7196,6 +7590,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(60),
             simple: false,
+            reservation_id: None,
             command: fake_agent_command(session1),
         };
         let mut out1 = Vec::new();
@@ -7226,6 +7621,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(60),
             simple: false,
+            reservation_id: None,
             command: fake_agent_command(session2),
         };
         let mut out2 = Vec::new();
@@ -7290,6 +7686,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(60),
             simple: false,
+            reservation_id: None,
             command: fake_agent_command(session),
         };
         let mut out = Vec::new();
@@ -7349,6 +7746,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(60),
             simple: false,
+            reservation_id: None,
             // `adapters::select` still resolves and readies "claude" (via
             // `ZIRV_CTX_AGENT_BIN` in `base_env`, unaffected by this); only
             // the actual spawn of *this* program has to fail, deterministically
@@ -7425,6 +7823,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(60),
             simple: false,
+            reservation_id: None,
             command: fake_agent_command(session),
         };
         let mut out = Vec::new();
@@ -7473,6 +7872,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(60),
             simple: false,
+            reservation_id: None,
             command,
         };
         let mut out = Vec::new();
@@ -7534,6 +7934,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(60),
             simple: false,
+            reservation_id: None,
             command: fake_agent_command(session),
         };
         let mut out = Vec::new();
@@ -7740,6 +8141,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(30),
             simple: false,
+            reservation_id: None,
             command: fake_agent_command(session),
         };
         let mut out = Vec::new();
@@ -7825,6 +8227,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(30),
             simple: false,
+            reservation_id: None,
             command: fake_agent_command(session),
         };
         let mut out = Vec::new();
@@ -7902,6 +8305,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(30),
             simple: false,
+            reservation_id: None,
             command: fake_agent_command(session),
         };
         let mut out = Vec::new();
@@ -8001,6 +8405,7 @@ mod tests {
             objective: None,
             timeout_secs: Some(30),
             simple: false,
+            reservation_id: None,
             command: fake_agent_command(session),
         };
         let mut out = Vec::new();
@@ -8107,6 +8512,7 @@ mod tests {
             // hanging the test forever.
             timeout_secs: Some(3),
             simple: false,
+            reservation_id: None,
             command: fake_agent_command(session),
         };
         let mut out = Vec::new();

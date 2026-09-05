@@ -1191,19 +1191,6 @@ fn attach_result_contract_to_prompt(schema: Option<&Schema>, prompt: String) -> 
     }
 }
 
-/// Issue #155, Phase 6(c): whether this spawn must not start. Only a
-/// `Refuse` blocks, and only without `--force`: a `Warn` is information, not
-/// a gate, and a `Proceed` has nothing to override. `pub(crate)`, not
-/// private: `dash::mod::fulfill_spawn_request` reuses this exact rule
-/// (`SpawnRequest::force` carrying forward whatever this process already
-/// decided) so a pane spawn is held to the identical override, never a
-/// second, independently-drifting copy of it. Deliberately NOT a rot
-/// signal -- see `pace::spawn_gate`'s own doc comment for why quota pressure
-/// must never reach rotation.
-pub(crate) fn spawn_blocked(gate: &pace::SpawnGate, force: bool) -> bool {
-    matches!(gate, pace::SpawnGate::Refuse { .. }) && !force
-}
-
 pub(crate) fn automatic_route_message(route: &super::fallback::Route, seat: pace::Seat) -> String {
     format!(
         "automatically routed {} (pass --force to keep {})",
@@ -2554,6 +2541,12 @@ pub fn run_with<W: Write>(
     // allocation below, which needs it to record ownership and to run
     // startup GC first.
     let state = super::state::StateDir::resolve(env)?;
+    // Issue #358 (task 4): refuses to let a session an automatic orchestrator
+    // rollover already superseded keep coordinating delegation -- see
+    // `seat::fence`'s own doc comment. A no-op for any session with no seat
+    // (every headless delegation itself, and any interactive session not yet
+    // wired to a seat by task 5).
+    super::seat::fence(&state)?;
     // Issue #228: validated and canonicalised before anything else in this
     // delegation runs -- a bad `--workdir` must fail loudly, up front, not
     // surface as a confusing sandbox error deep inside a harness's own
@@ -2708,6 +2701,7 @@ pub fn run_with<W: Write>(
         &pace::PaceGate {
             use_credits: false,
             poller: None,
+            initial_launch: false,
         },
         &mut refresh_flags,
     );
@@ -2773,69 +2767,39 @@ pub fn run_with<W: Write>(
                 observed_at: route.requested_observed_at,
             },
         );
+        // Issue #358 (task 5): the same reroute, in the capacity-pool
+        // vocabulary, so an operator can read delegation placement and
+        // orchestrator rollover out of one story instead of two.
+        super::rollover::record_route(&state, &parent_session, "agent", now, &route, bounds.tokens);
         eprintln!("zirv ctx agent: {}", automatic_route_message(&route, seat));
         route_applied = Some(route);
     }
 
-    // If no harness can run immediately, select the admissible seat whose
-    // hard gate clears first. A deferred cross-harness choice still obeys the
-    // same argv portability rule as an immediate reroute; if vendor-specific
-    // flags cannot be translated, waiting stays on the requested harness.
-    let mut deferred_reset = None;
-    if route_applied.is_none()
-        && !args.force
-        && let Some(choice) =
-            super::fallback::earliest_reset_choice(&state, &cfg, route_request, &[])
-    {
-        if choice.is_cross_harness() {
-            if let Some(model) = choice.model.as_deref()
-                && let Ok(target_adapter) = adapters::select(Some(&choice.selected), &[], &cfg)
-                && let Some(flags) =
-                    translated_route_flags(&args.flags, target_adapter.as_ref(), model)
-            {
-                routed_args.name = choice.selected.clone();
-                routed_args.flags = flags;
-                deferred_reset = Some(choice);
-            }
-        } else {
-            deferred_reset = Some(choice);
-        }
-    }
-
-    // The ordinary spawn gate still owns the final decision for whichever
-    // harness will actually launch. A deferred reset is the one exception:
-    // the headless exec pacing gate below will wait until that exact seat is
-    // usable rather than treating the hard gate as a permanent refusal.
+    // Issue #358 (T9): usage headroom is a ranking signal for
+    // `route_new_delegation` above, never a reason to refuse or delay a
+    // spawn -- the pre-launch "harness-reset-wait" deferral that used to sit
+    // here (`earliest_reset_choice`, waiting for an admissible seat's hard
+    // gate to clear before ever reaching a launch) is gone. That same
+    // function still runs the runtime reroute in `exec.rs` (a session that
+    // hits a confirmed limit mid-run) and the seat exhaustion park in
+    // `rollover.rs` -- both genuinely different situations: a session
+    // already spending that the provider itself just refused, not a
+    // delegation that has not started yet.
     let provider = adapters::provider_for_agent_name(Some(&routed_args.name));
     let (collector, estimator) = pace::current_windows(&state, &cfg.pace, now, provider);
     let gate = pace::spawn_gate(&collector, estimator.as_ref(), now, &cfg.pace);
     let reading_age = pace::spawn_headroom(&collector, estimator.as_ref(), now, &cfg.pace)
         .map(|reading| reading.age_secs);
-    let gate_note = pace::describe_spawn_gate(&gate, reading_age, seat);
+    let gate_note = pace::describe_spawn_gate(&gate, reading_age);
     if let Some(note) = gate_note.as_deref() {
         eprintln!("zirv ctx agent: {note}");
     }
-    if spawn_blocked(&gate, args.force) && deferred_reset.is_none() {
-        let fallback_note = if route_applied.is_none() && cfg.fallback.enabled {
-            " No admissible fallback harness had enough trusted/assumed headroom."
-        } else {
-            ""
-        };
-        // Issue #328 fix: named only when `same_harness_exclude` actually
-        // kept the fallback search from landing back on the orchestrator
-        // seat's own harness -- an operator hitting this refusal for an
-        // ordinary reason (no exclusion applied at all) gets the plain
-        // message unchanged.
-        let exclusion_note = if same_harness_exclude.is_some() {
-            " Same-harness work from an orchestrator seat uses the harness's native subagent \
-              tool."
-        } else {
-            ""
-        };
+    if matches!(gate, pace::SpawnGate::Refuse { .. }) {
         // Issue #349: the REQUESTING session (this process's own caller) is
-        // the one pacing actually refused -- same reasoning as the writer-
-        // permit refusal below (issue #267): the worker this refusal
-        // prevented from ever existing has no attention row of its own.
+        // the one pacing is informing here -- same reasoning as the writer-
+        // permit note below (issue #267). Informational only, kept on the
+        // row because it is a useful signal: the spawn below still happens
+        // regardless of `args.force`, which is now a no-op for this gate.
         if let Some(short) = super::mail::session_identity(env) {
             let _ = super::attention::record(
                 &state,
@@ -2844,7 +2808,7 @@ pub fn run_with<W: Write>(
                     super::attention::Authority::Supervisor,
                     gate_note
                         .clone()
-                        .unwrap_or_else(|| "usage-pacing refused new work".to_string()),
+                        .unwrap_or_else(|| "usage at the spawn ceiling".to_string()),
                     80,
                     super::state::now_secs(),
                 )
@@ -2852,17 +2816,20 @@ pub fn run_with<W: Write>(
                 super::state::now_secs(),
             );
         }
-        return Err(format!(
-            "{}.{fallback_note}{exclusion_note}",
-            gate_note.unwrap_or_else(|| "refusing to start new delegated work".to_string())
-        )
-        .into());
-    }
-    // Issue #349: the gate did not refuse this call (`Proceed`, `Warn`, a
-    // forced `Refuse`, or a deferred cross-harness wait, all of which
-    // continue past the refusal above) -- clear any `Quota` attention a
-    // PRIOR refusal left on this same requesting session.
-    if let Some(short) = super::mail::session_identity(env) {
+        // `route_new_delegation` (above) already prefers a healthier
+        // harness when one exists; this note only fires when the requested
+        // harness is the one actually about to launch.
+        if route_applied.is_none() {
+            eprintln!(
+                "zirv ctx agent: usage at the ceiling on {}; launching anyway -- the provider \
+                 may refuse, in which case the worker is rerouted or parked",
+                routed_args.name
+            );
+        }
+    } else if let Some(short) = super::mail::session_identity(env) {
+        // Issue #349: the gate did not flag this call (`Proceed`/`Warn`) --
+        // clear any `Quota` attention a PRIOR at-the-ceiling call left on
+        // this same requesting session.
         let _ = super::attention::record(
             &state,
             &short,
@@ -2875,25 +2842,6 @@ pub fn run_with<W: Write>(
             .with_attention(super::attention::Attention::None),
             super::state::now_secs(),
         );
-    }
-    if let Some(choice) = deferred_reset.as_ref() {
-        let detail = choice.detail();
-        let parent_session =
-            super::mail::session_identity(env).unwrap_or_else(|| "delegation".to_string());
-        let _ = super::log::append(
-            &state,
-            &super::log::Decision {
-                ts: now,
-                session: &parent_session,
-                verb: "agent",
-                verdict: "wait",
-                score: 0,
-                action: "harness-reset-wait",
-                detail: &detail,
-                observed_at: None,
-            },
-        );
-        eprintln!("zirv ctx agent: {detail}; pacing until that seat is available");
     }
 
     // Issue #170: resolved once, here, before the dashboard-join fork below,
@@ -2923,8 +2871,7 @@ pub fn run_with<W: Write>(
     // `try_join_dashboard` would otherwise hard-error on (restart budget,
     // wall-clock timeout, tool-call ceilings, arbitrary trailing flags) while
     // still asking for a pane-capable session to host the supervised run.
-    if deferred_reset.is_none()
-        && !args.headless
+    if !args.headless
         && let Some(result) = try_join_dashboard(
             args,
             &prompt,
@@ -3088,6 +3035,57 @@ pub fn run_with<W: Write>(
             return Err(e);
         }
     };
+    // Issue #358 (task T3): a durable, per-PROVIDER reservation of this
+    // delegation's own token ceiling, independent of `--group`'s own
+    // `reserved_tokens` (which protects one group's budget, not a
+    // provider's machine-wide outstanding total) -- released via
+    // `reservation::release` on every failure path between here and a
+    // genuinely running child, or settled via `reservation::settle` once
+    // the delegation actually completes, mirroring `reserved_ceiling`'s own
+    // reserve/rollback/settle lifecycle exactly. Best-effort like every
+    // other ledger write in this codebase (`group::rollback_admission`'s own
+    // doc comment): a ledger error must never abort a launch this session
+    // already committed to.
+    // Finding #11 (issue #358 review): `reserve_within` checks "is there
+    // room" and reserves atomically, under the SAME ledger lock -- a plain
+    // `reserve` here (placement was computed against a `CapacitySnapshot`
+    // taken well before this point, outside any lock) let two concurrent
+    // admissions both read "room enough" and both reserve, jointly
+    // over-committing the provider. `limit_tokens` is `None` (no check) when
+    // this provider has no configured token budget to convert projected
+    // headroom against.
+    let limit_tokens = pace::headroom_limit_tokens(&collector, estimator.as_ref(), now, &cfg.pace);
+    let reservation_id = match super::reservation::reserve_within(
+        &state,
+        provider,
+        &worker_session,
+        worker_budget.tokens.unwrap_or(0),
+        limit_tokens,
+        super::state::now_secs(),
+    ) {
+        Ok(Ok(reservation)) => Some(reservation.id),
+        Ok(Err(outstanding)) => {
+            // Never refuses the delegation itself over a ledger accounting
+            // concern -- it simply runs unreserved (like the ledger-error
+            // arm right below), rather than a wrong-provider reservation a
+            // caller-side reroute could not safely commit to from here
+            // without re-deriving the adapter/argv this launch already
+            // settled on above.
+            eprintln!(
+                "zirv ctx agent: provider '{provider}' is at its projected headroom limit \
+                 ({outstanding} tokens already outstanding); running unreserved rather than \
+                 refusing"
+            );
+            None
+        }
+        Err(e) => {
+            eprintln!(
+                "zirv ctx agent: failed to record a token reservation for provider \
+                 '{provider}': {e}"
+            );
+            None
+        }
+    };
 
     // Issue #262: this worker's own delegation envelope, computed by
     // narrowing `parent_envelope` against what THIS delegation is asking
@@ -3213,6 +3211,10 @@ pub fn run_with<W: Write>(
         // model/writable-root argv the original headless launch did.
         command: command.clone(),
         simple: false,
+        // Issue #358 (task T3): carried through so `exec.rs`'s own
+        // harness-handover restart can move it to the new provider mid-run
+        // -- see `ExecArgs::reservation_id`'s own doc comment.
+        reservation_id: reservation_id.clone(),
     };
 
     announcer.emit(&Event::DelegatedStart {
@@ -3232,6 +3234,9 @@ pub fn run_with<W: Write>(
         Err(e) => {
             if let Some(id) = &args.group {
                 super::group::rollback_admission(&state, id, reserved_ceiling.unwrap_or(0));
+            }
+            if let Some(reservation_id) = &reservation_id {
+                let _ = super::reservation::release(&state, provider, reservation_id);
             }
             // Finding 4: with the admission rolled back the group is pristine
             // again, so a group this invocation minted for a launch that
@@ -3563,6 +3568,23 @@ pub fn run_with<W: Write>(
                 reserved_ceiling.unwrap_or(0),
                 token_spend(&total),
             );
+        }
+        // Finding #4 (issue #358 review): a mid-run harness-handover
+        // restart (`exec::run_with_clock_inner`'s own usage-limit arm) moves
+        // this delegation's reservation to a NEW provider's ledger deep in
+        // the recursive call this `execution_report` came back from --
+        // `provider`/`reservation_id` above only ever name the FIRST
+        // provider this delegation reserved against. `final_reservation`
+        // carries the actual last one when a swap happened at all, so
+        // settling reads it first and falls back to the original pair only
+        // when the run never changed providers.
+        let settle_reservation = execution_report
+            .final_reservation
+            .as_ref()
+            .map(|(id, provider)| (id.as_str(), *provider))
+            .or_else(|| reservation_id.as_deref().map(|id| (id, provider)));
+        if let Some((id, provider)) = settle_reservation {
+            let _ = super::reservation::settle(&state_dir, provider, id, token_spend(&total));
         }
         let route: Vec<String> = execution_report
             .segments
@@ -4279,30 +4301,38 @@ mod tests {
         );
     }
 
-    /// `--force` is the operator saying they accept the spend. Only a
-    /// Refuse is overridable; a Warn was never blocking, and a Proceed has
-    /// nothing to override.
+    /// Issue #358 (T9): usage headroom never blocks a spawn -- renamed from
+    /// `only_a_refusal_is_overridable_and_only_by_force`, which used to pin
+    /// `spawn_blocked` (now deleted: nothing in `run_with` gates on
+    /// `SpawnGate` any more) as the single place a `Refuse` stopped a
+    /// delegation, overridable only by `--force`. Now `Refuse` carries
+    /// exactly the same operational weight as `Warn` and `Proceed` -- none
+    /// of them stop anything -- with or without `--force`, which is why this
+    /// test no longer has a `force` parameter to pin either.
     #[test]
-    fn only_a_refusal_is_overridable_and_only_by_force() {
+    fn a_refuse_gate_never_blocks_a_spawn() {
         let refuse = pace::SpawnGate::Refuse {
             window: "five_hour",
             percent: 97.0,
             source: pace::Source::Collector,
         };
-        assert!(spawn_blocked(&refuse, false));
-        assert!(!spawn_blocked(&refuse, true), "--force proceeds");
-
-        let warn = pace::SpawnGate::Warn {
-            window: "five_hour",
-            percent: 85.0,
-            source: pace::Source::Collector,
-        };
-        assert!(!spawn_blocked(&warn, false), "a warning never blocks");
-        assert!(!spawn_blocked(&pace::SpawnGate::Proceed, false));
+        // `describe_spawn_gate` still names the ceiling for the operator,
+        // but the note is informational: nothing downstream reads `matches!
+        // (gate, SpawnGate::Refuse { .. })` as a reason to return `Err`.
+        let note = pace::describe_spawn_gate(&refuse, None).expect("a note for the ceiling");
+        assert!(note.contains("at the spawn ceiling"), "got {note}");
+        assert!(!note.contains("refusing"), "got {note}");
     }
 
+    /// Issue #358 (T9): renamed from `a_stale_dashboard_env_yields_the_cli_
+    /// override_hint`, which used to pin `run_with`'s hard refusal (and its
+    /// `--force`-specific wording) on exactly this 96%-usage setup. Now the
+    /// same setup must reach the launch path regardless -- with or without
+    /// `--force`, which is why `args.force` is exercised both ways here
+    /// rather than pinning one value the way the old override-hint assertion
+    /// implicitly did.
     #[test]
-    fn a_stale_dashboard_env_yields_the_cli_override_hint() {
+    fn a_spawn_at_the_ceiling_launches_anyway_with_or_without_force() {
         let tmp = crate::commands::ctx::testenv::repo();
         let home = tmp.path().join("home");
         let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
@@ -4334,18 +4364,17 @@ mod tests {
                 .to_string(),
         );
 
-        let result = run_with(
-            &joinable_args("claude", "go"),
-            &mut Vec::new(),
-            tmp.path(),
-            &|key| env.get(key).cloned(),
-        );
-        let message = result.expect_err("the hard spawn gate refuses").to_string();
-        assert!(
-            message.contains("to override, pass --force"),
-            "got {message}"
-        );
-        assert!(!message.contains("--headless --force"), "got {message}");
+        for force in [false, true] {
+            let mut args = joinable_args("claude", "go");
+            args.force = force;
+            let result = run_with(&args, &mut Vec::new(), tmp.path(), &|key| {
+                env.get(key).cloned()
+            });
+            assert!(
+                result.is_ok(),
+                "usage at the ceiling must never refuse the spawn (force={force}): {result:?}"
+            );
+        }
     }
 
     #[test]
@@ -4509,6 +4538,8 @@ mod tests {
             requested_observed_at: Some(1_700_000_000),
             selected_headroom_pct: 66.0,
             selected_headroom_assumed: false,
+            binding_window: None,
+            reserved_tokens: 0,
         };
         let message = automatic_route_message(&route, pace::Seat::Cli);
         assert!(
@@ -4851,6 +4882,44 @@ mod tests {
         );
     }
 
+    /// Issue #358 (task T3): the same failed launch above must also release
+    /// this delegation's own provider-level token reservation -- the pane-
+    /// less, headless-only mirror of `group::rollback_admission`'s own
+    /// group-slot rollback, written by `run_with` right after `resolve_
+    /// worker_budget` succeeds and released on the identical `exec::
+    /// run_with_report` failure path.
+    #[test]
+    fn a_failed_delegation_after_admission_releases_the_provider_reservation() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state_path = tmp.path().join("state");
+        let state = crate::commands::ctx::state::StateDir::from_root(state_path.clone());
+        crate::commands::ctx::group::create(&state, &sample_work_group("wg-1", 3, 0))
+            .expect("create group");
+
+        let env = base_env(&state_path);
+        let mut args = args_for("codex", "go");
+        args.group = Some("wg-1".to_string());
+        args.max_tool_calls = Some(5);
+
+        let mut out = Vec::new();
+        let err = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned())
+            .expect_err("codex + --max-tool-calls is refused by exec::run_with");
+        assert!(err.to_string().contains("--max-tool-calls"), "got {err}");
+
+        let provider = crate::commands::ctx::adapters::provider_for_agent_name(Some("codex"));
+        assert_eq!(
+            crate::commands::ctx::reservation::outstanding(&state, provider, 1_700_000_000),
+            0,
+            "the failed launch must have released its own provider reservation"
+        );
+        assert!(
+            crate::commands::ctx::reservation::entries(&state, provider).is_empty(),
+            "the released reservation must be gone from the ledger, not merely excluded"
+        );
+    }
+
     /// A successful delegation still counts exactly once against its group --
     /// the rollback added for the failure path above must never also undo a
     /// genuine admission for a child that actually ran.
@@ -4880,6 +4949,65 @@ mod tests {
                 .admitted_children,
             1,
             "a successful spawn must still count exactly one admission"
+        );
+    }
+
+    /// Finding #11 (issue #358 review): admitting this delegation's own
+    /// token ceiling would push the provider's ledger past its projected
+    /// headroom (a comfortable 1000-token budget, 95% already used, this
+    /// delegation asking for 600 more) -- `reserve_within` must refuse to
+    /// write that reservation, but the delegation itself must still run:
+    /// usage headroom ranks and ceiling-checks a delegation, it never
+    /// refuses one outright (issue #358 T9's own rule, one layer up).
+    #[test]
+    fn a_delegation_over_the_ledger_limit_runs_unreserved_rather_than_refusing() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state_dir = tmp.path().join("state");
+        let state = StateDir::from_root(state_dir.clone());
+        let now = crate::commands::ctx::state::now_secs();
+        window::store_for(
+            &state,
+            "anthropic",
+            &window::UsageWindows {
+                five_hour: Some(window::Window {
+                    used_percentage: 95.0,
+                    resets_at: now + 600,
+                    observed_at: now,
+                    overage_covered: false,
+                    limit_reached: false,
+                }),
+                seven_day: None,
+            },
+        )
+        .expect("store usage");
+
+        let mut env = base_env(&state_dir);
+        env.insert(
+            "ZIRV_CTX_PACE_FIVE_HOUR_BUDGET_TOKENS".to_string(),
+            "1000".to_string(),
+        );
+        // Rerouting is orthogonal to this test: with cross-harness fallback
+        // on, claude's own low headroom here would otherwise steer this
+        // delegation onto codex before reservation is ever reached.
+        env.insert("ZIRV_CTX_FALLBACK".to_string(), "false".to_string());
+        let mut args = args_for("claude", "go");
+        // 5% headroom of a 1000-token budget is 50 tokens; this delegation's
+        // own ceiling asks for far more than that -- large enough to also
+        // clear the fake agent's own reported usage, so the run genuinely
+        // completes rather than being stopped by an unrelated budget-
+        // exhausted check.
+        args.budget_tokens = Some(500_000);
+
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned())
+            .expect("the delegation must still run, not be refused");
+        assert_eq!(code, 0);
+
+        assert!(
+            crate::commands::ctx::reservation::entries(&state, "anthropic").is_empty(),
+            "an over-limit admission must leave no reservation behind, not a wrong-amount one"
         );
     }
 
@@ -7183,6 +7311,7 @@ mod tests {
                     wall_ms: 200,
                 },
             ],
+            final_reservation: None,
         };
 
         let total = append_execution_segments(

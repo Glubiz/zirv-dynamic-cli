@@ -935,6 +935,7 @@ pub fn run_create<W: Write>(
     args: &CreateArgs,
     now: u64,
 ) -> CtxResult<String> {
+    super::seat::fence(state)?;
     let repo_slug = resolve_repo_slug()?;
     let id = format!("task-{}", uuid::Uuid::new_v4());
     let event = Event::Created {
@@ -1174,6 +1175,7 @@ pub fn run_claim<W: Write>(
     env: EnvLookup<'_>,
     now: u64,
 ) -> CtxResult<i32> {
+    super::seat::fence(state)?;
     let repo_slug = resolve_repo_slug()?;
     let session = resolve_session(&args.session, env);
     let pid = std::process::id();
@@ -1213,6 +1215,7 @@ pub fn run_heartbeat<W: Write>(
     env: EnvLookup<'_>,
     now: u64,
 ) -> CtxResult<i32> {
+    super::seat::fence(state)?;
     let repo_slug = resolve_repo_slug()?;
     let session = resolve_session(&args.session, env);
     let outcome = with_task_lock(state, &repo_slug, |cards| {
@@ -1252,6 +1255,7 @@ pub fn run_complete<W: Write>(
     args: &CompleteArgs,
     now: u64,
 ) -> CtxResult<i32> {
+    super::seat::fence(state)?;
     let repo_slug = resolve_repo_slug()?;
     let outcome = with_task_lock(state, &repo_slug, |cards| {
         let card = cards.get(&args.id)?;
@@ -1287,6 +1291,7 @@ pub fn run_block<W: Write>(
     args: &BlockArgs,
     now: u64,
 ) -> CtxResult<i32> {
+    super::seat::fence(state)?;
     let repo_slug = resolve_repo_slug()?;
     let by = args.by.clone().unwrap_or_else(|| "operator".to_string());
     let outcome = with_task_lock(state, &repo_slug, |cards| {
@@ -1327,6 +1332,7 @@ pub fn run_unblock<W: Write>(
     args: &UnblockArgs,
     now: u64,
 ) -> CtxResult<i32> {
+    super::seat::fence(state)?;
     let repo_slug = resolve_repo_slug()?;
     let outcome = with_task_lock(state, &repo_slug, |cards| {
         let card = cards.get(&args.id)?;
@@ -1363,6 +1369,7 @@ pub fn run_comment<W: Write>(
     args: &CommentArgs,
     now: u64,
 ) -> CtxResult<i32> {
+    super::seat::fence(state)?;
     let repo_slug = resolve_repo_slug()?;
     let by = args.by.clone().unwrap_or_else(|| "operator".to_string());
     let outcome = with_task_lock(state, &repo_slug, |cards| {
@@ -1400,6 +1407,7 @@ pub fn run_archive<W: Write>(
     args: &ArchiveArgs,
     now: u64,
 ) -> CtxResult<i32> {
+    super::seat::fence(state)?;
     let repo_slug = resolve_repo_slug()?;
     let outcome = with_task_lock(state, &repo_slug, |cards| {
         let card = cards.get(&args.id)?;
@@ -1544,6 +1552,7 @@ pub fn run_swarm_with<W: Write>(
     args: &SwarmArgs,
     now: u64,
 ) -> CtxResult<i32> {
+    super::seat::fence(state)?;
     let repo_slug = resolve_repo_slug()?;
     let (events, ids) = match build_swarm_events(
         &args.scope,

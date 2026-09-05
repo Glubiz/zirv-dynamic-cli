@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 use super::CtxResult;
-use super::config::PromptConfig;
+use super::config::{OrchestratorWrites, PromptConfig};
 
 /// Bumped whenever the composed text changes **shape**, so a transcript in the
 /// decision log can be attributed to the exact prompt that shaped it. v2
@@ -320,6 +320,69 @@ pass, or a step was skipped, say so and show the output. Never call unverified w
 /// text` by searching for the exact same literal `compose` writes here,
 /// rather than a second, independently-typed copy of it that could drift.
 pub(super) const HARNESS_ROSTER_LAYER_HEADER: &str = "\n\n---\n\nzirv harness roster (session)\n\n";
+
+/// The write-guard sentence each adapter's own `ORCHESTRATOR_PROMPT` splices
+/// into its delegation bullet (`claude::orchestrator_prompt_for`, `codex::
+/// orchestrator_prompt_for`), selected by this seat's own repository-write
+/// posture (issue #358 T8: `SuperviseConfig::orchestrator_writes`,
+/// `[supervise] orchestrator_writes`, threaded here via `PromptConfig::
+/// orchestrator_writes`).
+///
+/// `HARNESS_PROMPT` itself stays posture-INDEPENDENT and unchanged: its own
+/// "this seat coordinates and integrates" bullet is forward-looking
+/// delegation guidance, true regardless of posture, unlike each adapter's
+/// own layer, which names the actual enforcement mechanism (a PreToolUse
+/// hook that denies) and would be actively wrong left describing `deny`
+/// under a different posture. Splicing `HARNESS_PROMPT` itself would also
+/// mean `compile.rs`'s several `prompt::HARNESS_PROMPT.len()`-based layer-
+/// range computations (`CompiledContext::emitted_layers` and friends) would
+/// need to become posture-aware too, for one sentence that does not
+/// actually need to change.
+///
+/// `deny` reproduces the wording each adapter's own const already carried
+/// before this task (kept there verbatim, per-adapter, rather than
+/// reconstructed here) -- this function's own `Deny` arm exists for
+/// completeness and is exercised directly by this module's own tests, not
+/// spliced into either adapter's layer (see each adapter's own
+/// `orchestrator_prompt_for`).
+///
+/// `hook_enforced` (issue #358 review, finding #6): whether THIS adapter's
+/// own harness actually has a PreToolUse-style hook that records a repository
+/// write and lets zirv nudge on it (`hook::run_pretool` -- claude only; see
+/// that module's own doc comment). `Advise`'s last sentence claims exactly
+/// that mechanism, so codex -- which has no hook at all -- must not carry it:
+/// a write from a codex orchestrator seat under `advise` is never recorded or
+/// nudged, so claiming otherwise would be a bare falsehood in the prompt.
+/// `Deny`/`Allow` are unaffected: neither makes a hook-specific claim in the
+/// first place.
+pub fn orchestrator_write_lines(posture: OrchestratorWrites, hook_enforced: bool) -> &'static str {
+    match posture {
+        OrchestratorWrites::Deny => {
+            "This seat coordinates; it does not implement. Every repository change -- code, \
+             tests, docs, manifests, a one-line fix included -- is made by a delegated worker, \
+             never by this seat's own Edit/Write or a shell write: a PreToolUse hook denies \
+             repository writes from this seat, and that denial is the cue to dispatch, not to \
+             retry another way. Size the task only to decide how many workers and how large a \
+             brief."
+        }
+        OrchestratorWrites::Advise if hook_enforced => {
+            "This seat coordinates. Delegate substantial implementation, tests and docs to \
+             workers; make trivial edits (a few lines, a doc or config line, an integration \
+             fix) directly rather than dispatching for them. Repository writes from this seat \
+             are recorded; zirv nudges when they pile up."
+        }
+        OrchestratorWrites::Advise => {
+            "This seat coordinates. Delegate substantial implementation, tests and docs to \
+             workers; make trivial edits (a few lines, a doc or config line, an integration \
+             fix) directly rather than dispatching for them."
+        }
+        OrchestratorWrites::Allow => {
+            "This seat coordinates. Delegate substantial implementation, tests and docs to \
+             workers; make trivial edits (a few lines, a doc or config line, an integration \
+             fix) directly rather than dispatching for them."
+        }
+    }
+}
 
 pub const HARNESS_PROMPT: &str = "\
 zirv meta-harness (v17)
@@ -1771,15 +1834,23 @@ fn with_adapter_layer(
     let mut composed = composed?;
     let codex_orchestrator_suppressed =
         role == PromptRole::Orchestrator && adapter.name() == "codex" && !cfg.codex_orchestrator;
+    // Issue #358 T8: only the Orchestrator layer is posture-dependent (it is
+    // the one that names the actual enforcement mechanism) -- the other two
+    // roles' own layers are `&'static str` still, widened to `String` here
+    // purely so all three match arms share one type.
     let layer = match role {
         PromptRole::Orchestrator if codex_orchestrator_suppressed => None,
-        PromptRole::Orchestrator => adapter.base_system_prompt(),
-        PromptRole::SubOrchestrator => adapter.sub_orchestrator_system_prompt(),
-        PromptRole::Worker => adapter.worker_system_prompt(),
+        PromptRole::Orchestrator => adapter.base_system_prompt(cfg.orchestrator_writes),
+        PromptRole::SubOrchestrator => adapter.sub_orchestrator_system_prompt().map(str::to_string),
+        PromptRole::Worker => adapter.worker_system_prompt().map(str::to_string),
     };
-    let Some(layer) = layer.map(str::trim).filter(|layer| !layer.is_empty()) else {
+    let Some(layer) = layer else {
         return Some(composed);
     };
+    let layer = layer.trim();
+    if layer.is_empty() {
+        return Some(composed);
+    }
 
     debug_assert!(composed.text.starts_with(DEFAULT_PROMPT));
     let tail = composed.text.split_off(DEFAULT_PROMPT.len());
@@ -3597,16 +3668,24 @@ mod tests {
     /// Issues #328/#334: the composed text a claude Orchestrator session
     /// actually receives must carry the never-implement rule and route
     /// same-harness delegation to the native Agent tool, and must have fully
-    /// dropped the old size-based "implement it yourself" carve-out.
+    /// dropped the old size-based "implement it yourself" carve-out. Pinned
+    /// to `OrchestratorWrites::Deny` explicitly (issue #358 T8: the default
+    /// posture is now `advise`, which no longer says "it does not
+    /// implement" -- see `the_composed_claude_prompt_follows_this_seats_
+    /// write_posture` for the actual default-posture behaviour).
     #[test]
     fn an_orchestrator_never_implements_on_the_composed_claude_prompt() {
         let adapter = ClaudeAdapter::new(None);
         let (_tmp, home, repo) = tree();
+        let deny_cfg = PromptConfig {
+            orchestrator_writes: OrchestratorWrites::Deny,
+            ..PromptConfig::default()
+        };
         let composed = compose(
             Some(&home),
             &repo,
             false,
-            &PromptConfig::default(),
+            &deny_cfg,
             PromptRole::Orchestrator,
             &[],
             usize::MAX,
@@ -3618,7 +3697,7 @@ mod tests {
             composed,
             None,
             PromptRole::Orchestrator,
-            &PromptConfig::default(),
+            &deny_cfg,
         );
 
         let merged = merged.expect("composed");
@@ -3633,6 +3712,64 @@ mod tests {
             assert!(
                 !merged.text.contains(old_phrase),
                 "the old size-based carve-out '{old_phrase}' must be gone:\n{}",
+                merged.text
+            );
+        }
+    }
+
+    /// Issue #358 T8, end to end through `compose` + `merge_command_line_
+    /// prompt`: `CtxConfig::load` copies `supervise.orchestrator_writes`
+    /// onto `PromptConfig::orchestrator_writes` (see that field's own doc
+    /// comment), so a `PromptConfig` built directly, as every test in this
+    /// file does, must set the field itself to exercise a non-default
+    /// posture -- `PromptConfig::default()` is `advise`.
+    #[test]
+    fn the_composed_claude_prompt_follows_this_seats_write_posture() {
+        let adapter = ClaudeAdapter::new(None);
+        let (_tmp, home, repo) = tree();
+
+        for (posture, want_present, want_absent) in [
+            (
+                OrchestratorWrites::Advise,
+                "Repository writes from this seat are recorded",
+                "it does not implement",
+            ),
+            (
+                OrchestratorWrites::Allow,
+                "make trivial edits",
+                "Repository writes from this seat are recorded",
+            ),
+        ] {
+            let cfg = PromptConfig {
+                orchestrator_writes: posture,
+                ..PromptConfig::default()
+            };
+            let composed = compose(
+                Some(&home),
+                &repo,
+                false,
+                &cfg,
+                PromptRole::Orchestrator,
+                &[],
+                usize::MAX,
+            );
+            let (_, merged) = merge_command_line_prompt(
+                &adapter,
+                &["claude".to_string()],
+                composed,
+                None,
+                PromptRole::Orchestrator,
+                &cfg,
+            );
+            let merged = merged.expect("composed");
+            assert!(
+                merged.text.contains(want_present),
+                "posture={posture:?}: expected '{want_present}':\n{}",
+                merged.text
+            );
+            assert!(
+                !merged.text.contains(want_absent),
+                "posture={posture:?}: did not expect '{want_absent}':\n{}",
                 merged.text
             );
         }

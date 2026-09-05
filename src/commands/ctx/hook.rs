@@ -1904,8 +1904,9 @@ fn normalized_write_target(payload: &PreToolPayload, cwd: &Path) -> Option<PathB
 }
 
 /// What the model is told when an orchestrator seat's own guard refuses a
-/// repository write. Names the exact path so the model can see why, and the
-/// remedy: dispatch a worker rather than retry the same tool call.
+/// repository write (`OrchestratorWrites::Deny`). Names the exact path so
+/// the model can see why, and the remedy: dispatch a worker rather than
+/// retry the same tool call.
 fn orchestrator_write_deny_reason(target: &Path) -> String {
     format!(
         "orchestrator seat: dispatch a worker -- this seat coordinates and never edits \
@@ -1914,6 +1915,86 @@ fn orchestrator_write_deny_reason(target: &Path) -> String {
          .zirv/work and .zirv/memory stay allowed.",
         target.display()
     )
+}
+
+/// What the model is told, non-blocking, when an orchestrator seat's own
+/// guard lets a repository write through under `OrchestratorWrites::Advise`
+/// (issue #358 T8). Never denies -- the write already proceeded -- only
+/// names the target and the standing guidance to delegate anything larger
+/// than a trivial edit.
+fn orchestrator_write_advise_note(target: &Path) -> String {
+    format!(
+        "orchestrator seat wrote to {}: fine for a trivial edit; delegate substantial changes \
+         to a worker",
+        target.display()
+    )
+}
+
+/// This seat's own repository-write guard posture -- `cfg.supervise.
+/// orchestrator_writes`, already narrowed (repo may only tighten) and
+/// env-overridden by `CtxConfig::load`. One place both `hook::run_pretool`
+/// and `safety::run_check_hook_mode_with_env` resolve it from, so the two
+/// PreToolUse guards (Edit/Write/MultiEdit/NotebookEdit here, Bash/
+/// PowerShell in `safety.rs`) can never read a different posture for the
+/// same session.
+pub(crate) fn orchestrator_write_posture(cfg: &CtxConfig) -> super::config::OrchestratorWrites {
+    cfg.supervise.orchestrator_writes
+}
+
+/// One orchestrator-write guard decision, resolved against this seat's own
+/// posture. `Deny`/`Advise` carry the text for their own channel (a blocking
+/// reason, a non-blocking advisory); `Allow` carries nothing -- the write
+/// proceeds silently, though the caller still logs it so `zirv ctx status`
+/// can count it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OrchestratorWriteOutcome {
+    Deny(String),
+    Advise(String),
+    Allow,
+}
+
+impl OrchestratorWriteOutcome {
+    /// The `log::OrchestratorBlock::outcome` label for this decision --
+    /// "denied"/"advised"/"allowed", matching `OrchestratorWrites::label`'s
+    /// own three postures one-for-one.
+    pub(crate) fn log_label(&self) -> &'static str {
+        match self {
+            OrchestratorWriteOutcome::Deny(_) => "denied",
+            OrchestratorWriteOutcome::Advise(_) => "advised",
+            OrchestratorWriteOutcome::Allow => "allowed",
+        }
+    }
+}
+
+/// How many prior "advised" rows this session already has in `log::
+/// read_orchestrator_blocks` before an advisory note surfaces again (issue
+/// #358 T8): the write itself is never blocked by this -- only whether the
+/// hook's own non-blocking note rides along -- so a rate limit here trades
+/// visibility for quiet, never safety for quiet. `0`, `N`, `2N`, ... each
+/// surface a note; everything between stays silent. Shared by both
+/// `hook::run_pretool` (Edit/Write/MultiEdit/NotebookEdit) and `safety::
+/// run_check_hook_mode_with_env` (Bash/PowerShell), which count the SAME
+/// session's rows in the SAME log, so an operator alternating between tool
+/// families still only sees a note every fifth orchestrator write, not
+/// every fifth per family.
+const ORCHESTRATOR_ADVISORY_RATE: usize = 5;
+
+/// Whether this session's next `Advise`-posture write should carry a
+/// surfaced advisory note, based on how many `outcome == "advised"` rows it
+/// already has. Best-effort like every other log read here: a `StateDir`
+/// that fails to resolve, or a log that fails to read, degrades to `true`
+/// (surface it) rather than silently going quiet -- the annoyance of an
+/// extra note is a far cheaper failure mode than a session that never
+/// learns it should be delegating more.
+pub(crate) fn orchestrator_advisory_should_surface(env: EnvLookup<'_>, session: &str) -> bool {
+    let Ok(state) = StateDir::resolve(env) else {
+        return true;
+    };
+    let count = log::read_orchestrator_blocks(&state)
+        .iter()
+        .filter(|row| row.session == session && row.outcome == "advised")
+        .count();
+    count % ORCHESTRATOR_ADVISORY_RATE == 0
 }
 
 /// The nearest git repository the write TARGET itself sits in, or `None`
@@ -1931,33 +2012,33 @@ fn repo_root_for_target(target: &Path) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
-/// The whole orchestrator-write decision, with environment lookup injected
-/// and filesystem access limited to repository discovery plus canonical path
-/// comparison: `Some(reason)` denies, `None` allows. `role` is
-/// `SEAT_ROLE_ENV`'s value.
+/// The resolved write TARGET when `payload` is an orchestrator seat's own
+/// in-scope repository write, or `None` when it is outside this guard's
+/// scope entirely (and so gets no [`OrchestratorWriteOutcome`] at all --
+/// not even `Allow` -- because there is nothing here for a posture to act
+/// on). `role` is `SEAT_ROLE_ENV`'s value.
 ///
 /// Confinement is anchored on the resolved TARGET, never on `cwd` or the
 /// launch repo: an orchestrator seat has no business editing source in ANY
 /// git repository, including a sibling checkout or a linked worktree of a
 /// repository entirely unrelated to the one it was launched in (review
 /// finding on issue #334) -- so `repo_root_for_target` finds the repo the
-/// target itself sits in, and the deny is narrowed only against THAT
+/// target itself sits in, and the exemption is narrowed only against THAT
 /// repo's own `<target_repo>/.zirv/work`/`<target_repo>/.zirv/memory` --
 /// the two roots a worker's own dispatch/handoff/memory writes still need
 /// from this seat. Claude Code's own harness home (`CLAUDE_CONFIG_DIR`, or
 /// `$HOME/.claude`/`%USERPROFILE%\\.claude`) is outside repository-write
 /// classification even when an ancestor carries `.git`. A target that sits in no git repository at all
-/// is outside this guard's scope and is allowed. Every other gate below is
-/// also a reason to allow: a non-orchestrator role, a native subagent call
-/// (`agent_id` is non-empty), a tool that is not a
-/// [`FILE_MODIFICATION_TOOLS`] entry, or an empty target (schema drift, not a
-/// real write).
-pub fn orchestrator_write_decision(
+/// is outside this guard's scope. Every other gate below is also out of
+/// scope: a non-orchestrator role, a native subagent call (`agent_id` is
+/// non-empty), a tool that is not a [`FILE_MODIFICATION_TOOLS`] entry, or an
+/// empty target (schema drift, not a real write).
+fn orchestrator_write_target(
     role: Option<&str>,
     payload: &PreToolPayload,
     cwd: &Path,
     env: EnvLookup<'_>,
-) -> Option<String> {
+) -> Option<PathBuf> {
     if role != Some("orchestrator") {
         return None;
     }
@@ -1976,7 +2057,34 @@ pub fn orchestrator_write_decision(
     if allowed_roots.iter().any(|root| target.starts_with(root)) {
         return None;
     }
-    Some(orchestrator_write_deny_reason(&target))
+    Some(target)
+}
+
+/// The whole orchestrator-write guard decision (issue #358 T8): `None` when
+/// [`orchestrator_write_target`] finds this call outside the guard's scope
+/// (nothing to log, nothing to decide); otherwise `Some` of this seat's own
+/// posture applied to that target -- `Deny`/`Advise` carry their own
+/// channel's text, `Allow` carries nothing. `role`/`cwd`/`env` are exactly
+/// [`orchestrator_write_target`]'s own; `posture` is `hook::
+/// orchestrator_write_posture`'s resolved value.
+pub fn orchestrator_write_decision(
+    role: Option<&str>,
+    payload: &PreToolPayload,
+    cwd: &Path,
+    env: EnvLookup<'_>,
+    posture: super::config::OrchestratorWrites,
+) -> Option<OrchestratorWriteOutcome> {
+    use super::config::OrchestratorWrites;
+    let target = orchestrator_write_target(role, payload, cwd, env)?;
+    Some(match posture {
+        OrchestratorWrites::Deny => {
+            OrchestratorWriteOutcome::Deny(orchestrator_write_deny_reason(&target))
+        }
+        OrchestratorWrites::Advise => {
+            OrchestratorWriteOutcome::Advise(orchestrator_write_advise_note(&target))
+        }
+        OrchestratorWrites::Allow => OrchestratorWriteOutcome::Allow,
+    })
 }
 
 /// The documented PreToolUse deny envelope. Printed on stdout with exit 0:
@@ -1989,6 +2097,22 @@ pub fn pretool_output(reason: &str) -> String {
             "hookEventName": "PreToolUse",
             "permissionDecision": "deny",
             "permissionDecisionReason": reason
+        }
+    })
+    .to_string()
+}
+
+/// The `OrchestratorWrites::Advise` envelope: the write is ALLOWED, and
+/// `note` rides along in the same `additionalContext` channel `safety.rs`'s
+/// own identical-command guard already uses for a non-blocking note on an
+/// `Allow` verdict. Never emitted for `OrchestratorWrites::Allow`, which
+/// surfaces nothing at all.
+fn pretool_advise_output(note: &str) -> String {
+    serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "allow",
+            "additionalContext": note
         }
     })
     .to_string()
@@ -2032,17 +2156,31 @@ pub fn run_pretool<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxR
         cwd
     };
     let role = env(adapters::SEAT_ROLE_ENV);
-    let Some(reason) = orchestrator_write_decision(role.as_deref(), &payload, &cwd, env) else {
+    let cfg = cfg_or_operator_only_gate(&cwd, env);
+    let posture = orchestrator_write_posture(&cfg);
+    let Some(outcome) = orchestrator_write_decision(role.as_deref(), &payload, &cwd, env, posture)
+    else {
         return Ok(0);
     };
-    let _ = writeln!(w, "{}", pretool_output(&reason));
+
+    let session = super::mail::session_identity(env).unwrap_or_else(|| payload.session_id.clone());
+    match &outcome {
+        OrchestratorWriteOutcome::Deny(reason) => {
+            let _ = writeln!(w, "{}", pretool_output(reason));
+        }
+        OrchestratorWriteOutcome::Advise(note) => {
+            if orchestrator_advisory_should_surface(env, &session) {
+                let _ = writeln!(w, "{}", pretool_advise_output(note));
+            }
+        }
+        OrchestratorWriteOutcome::Allow => {}
+    }
 
     // Best-effort: a block record that fails to write costs an operator one
-    // audit-log row, never a hook failure -- the deny above already stands.
+    // audit-log row, never a hook failure -- the decision above already
+    // stands regardless.
     if let Ok(state) = StateDir::resolve(env) {
         let target = normalized_write_target(&payload, &cwd).unwrap_or_default();
-        let session =
-            super::mail::session_identity(env).unwrap_or_else(|| payload.session_id.clone());
         let _ = log::append_orchestrator_block(
             &state,
             &log::OrchestratorBlock {
@@ -2051,6 +2189,7 @@ pub fn run_pretool<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxR
                 tool: &payload.tool_name,
                 target: &target.display().to_string(),
                 reason: "repository write",
+                outcome: outcome.log_label(),
             },
         );
     }
@@ -2253,6 +2392,7 @@ pub fn run<W: Write>(args: &HookArgs, w: &mut W) -> CtxResult<i32> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::config::OrchestratorWrites;
     use super::*;
     use crate::commands::ctx::rot::{Score, Signals, Verdict};
 
@@ -5004,9 +5144,17 @@ mod tests {
     fn orchestrator_write_decision_denies_an_edit_under_the_repo() {
         let repo = orchestrator_repo();
         let payload = edit_payload(repo.path(), "src/x.rs");
-        let reason =
-            orchestrator_write_decision(Some("orchestrator"), &payload, repo.path(), &|_| None)
-                .expect("an orchestrator editing a repo file must be denied");
+        let outcome = orchestrator_write_decision(
+            Some("orchestrator"),
+            &payload,
+            repo.path(),
+            &|_| None,
+            OrchestratorWrites::Deny,
+        )
+        .expect("an orchestrator editing a repo file must be denied");
+        let OrchestratorWriteOutcome::Deny(reason) = outcome else {
+            panic!("expected a Deny outcome, got {outcome:?}");
+        };
         assert!(
             reason.contains("orchestrator seat: dispatch a worker"),
             "{reason}"
@@ -5031,7 +5179,13 @@ mod tests {
         let env = env_from_process();
 
         assert_eq!(
-            orchestrator_write_decision(Some("orchestrator"), &payload, home.path(), &env),
+            orchestrator_write_decision(
+                Some("orchestrator"),
+                &payload,
+                home.path(),
+                &env,
+                OrchestratorWrites::Deny,
+            ),
             None
         );
     }
@@ -5073,7 +5227,13 @@ mod tests {
         let env = env_from_process();
 
         assert_eq!(
-            orchestrator_write_decision(Some("orchestrator"), &payload, home.path(), &env),
+            orchestrator_write_decision(
+                Some("orchestrator"),
+                &payload,
+                home.path(),
+                &env,
+                OrchestratorWrites::Deny,
+            ),
             None
         );
     }
@@ -5096,7 +5256,14 @@ mod tests {
         let env = env_from_process();
 
         assert!(
-            orchestrator_write_decision(Some("orchestrator"), &payload, &repo, &env).is_some(),
+            orchestrator_write_decision(
+                Some("orchestrator"),
+                &payload,
+                &repo,
+                &env,
+                OrchestratorWrites::Deny,
+            )
+            .is_some(),
             "a repository outside the harness home must stay denied"
         );
     }
@@ -5123,12 +5290,24 @@ mod tests {
         payload.agent_id = "a1b2".to_string();
 
         assert_eq!(
-            orchestrator_write_decision(Some("orchestrator"), &payload, repo.path(), &|_| None),
+            orchestrator_write_decision(
+                Some("orchestrator"),
+                &payload,
+                repo.path(),
+                &|_| None,
+                OrchestratorWrites::Deny,
+            ),
             None,
             "a native subagent is the worker this guard asks the seat to dispatch"
         );
         assert_eq!(
-            orchestrator_write_decision(Some("worker"), &payload, repo.path(), &|_| None),
+            orchestrator_write_decision(
+                Some("worker"),
+                &payload,
+                repo.path(),
+                &|_| None,
+                OrchestratorWrites::Deny,
+            ),
             None,
             "subagent identity must not change non-orchestrator behavior"
         );
@@ -5140,7 +5319,13 @@ mod tests {
         let payload = edit_payload(repo.path(), "src/x.rs");
         for role in [None, Some("worker"), Some("sub-orchestrator")] {
             assert_eq!(
-                orchestrator_write_decision(role, &payload, repo.path(), &|_| None),
+                orchestrator_write_decision(
+                    role,
+                    &payload,
+                    repo.path(),
+                    &|_| None,
+                    OrchestratorWrites::Deny,
+                ),
                 None,
                 "{role:?} must never be blocked from editing"
             );
@@ -5153,7 +5338,13 @@ mod tests {
         for relative in [".zirv/work/notes.md", ".zirv/memory/x.md"] {
             let payload = edit_payload(repo.path(), relative);
             assert_eq!(
-                orchestrator_write_decision(Some("orchestrator"), &payload, repo.path(), &|_| None,),
+                orchestrator_write_decision(
+                    Some("orchestrator"),
+                    &payload,
+                    repo.path(),
+                    &|_| None,
+                    OrchestratorWrites::Deny,
+                ),
                 None,
                 "{relative} must stay allowed"
             );
@@ -5171,8 +5362,14 @@ mod tests {
         ))
         .expect("payload parses");
         assert!(
-            orchestrator_write_decision(Some("orchestrator"), &inside, repo.path(), &|_| None,)
-                .is_some(),
+            orchestrator_write_decision(
+                Some("orchestrator"),
+                &inside,
+                repo.path(),
+                &|_| None,
+                OrchestratorWrites::Deny,
+            )
+            .is_some(),
             "a relative target must resolve against cwd, landing inside the repo"
         );
 
@@ -5184,7 +5381,13 @@ mod tests {
         ))
         .expect("payload parses");
         assert_eq!(
-            orchestrator_write_decision(Some("orchestrator"), &outside, repo.path(), &|_| None,),
+            orchestrator_write_decision(
+                Some("orchestrator"),
+                &outside,
+                repo.path(),
+                &|_| None,
+                OrchestratorWrites::Deny,
+            ),
             None,
             "a relative target that climbs outside the repo must be allowed"
         );
@@ -5201,7 +5404,13 @@ mod tests {
         ))
         .expect("payload parses");
         assert_eq!(
-            orchestrator_write_decision(Some("orchestrator"), &payload, repo.path(), &|_| None,),
+            orchestrator_write_decision(
+                Some("orchestrator"),
+                &payload,
+                repo.path(),
+                &|_| None,
+                OrchestratorWrites::Deny,
+            ),
             None,
             "an empty target is schema drift, not a real write"
         );
@@ -5219,8 +5428,14 @@ mod tests {
         ))
         .expect("payload parses");
         assert!(
-            orchestrator_write_decision(Some("orchestrator"), &payload, repo.path(), &|_| None,)
-                .is_some()
+            orchestrator_write_decision(
+                Some("orchestrator"),
+                &payload,
+                repo.path(),
+                &|_| None,
+                OrchestratorWrites::Deny,
+            )
+            .is_some()
         );
     }
 
@@ -5243,7 +5458,13 @@ mod tests {
             ))
             .expect("payload parses");
             assert_eq!(
-                orchestrator_write_decision(Some("orchestrator"), &payload, repo.path(), &|_| None,),
+                orchestrator_write_decision(
+                    Some("orchestrator"),
+                    &payload,
+                    repo.path(),
+                    &|_| None,
+                    OrchestratorWrites::Deny,
+                ),
                 None,
                 "{tool} is not a file-modification tool"
             );
@@ -5274,13 +5495,17 @@ mod tests {
         ))
         .expect("payload parses");
 
-        let reason = orchestrator_write_decision(
+        let outcome = orchestrator_write_decision(
             Some("orchestrator"),
             &payload,
             launch_repo.path(),
             &|_| None,
+            OrchestratorWrites::Deny,
         )
         .expect("a sibling checkout's own source must be denied too");
+        let OrchestratorWriteOutcome::Deny(reason) = outcome else {
+            panic!("expected a Deny outcome, got {outcome:?}");
+        };
         assert!(
             reason.contains("orchestrator seat: dispatch a worker"),
             "{reason}"
@@ -5311,6 +5536,7 @@ mod tests {
                 &payload,
                 launch_repo.path(),
                 &|_| None,
+                OrchestratorWrites::Deny,
             ),
             None,
             "a target outside any git repository is outside this guard's scope"
@@ -5340,6 +5566,7 @@ mod tests {
                 &payload,
                 launch_repo.path(),
                 &|_| None,
+                OrchestratorWrites::Deny,
             ),
             None,
             "a sibling repo's own .zirv/work stays allowed"
@@ -5378,13 +5605,25 @@ mod tests {
         assert_eq!(repo_root_for_target(&target), None);
     }
 
+    /// Issue #358 T8: the default posture is `advise`, not `deny` -- this
+    /// end-to-end test pins `deny` explicitly via
+    /// `ZIRV_CTX_SUPERVISE_ORCHESTRATOR_WRITES` so it keeps proving the
+    /// original guard behaviour (issues #328/#334) regardless of the
+    /// default. See `run_pretool_advises_an_orchestrator_edit_by_default`
+    /// for the actual default-posture behaviour.
     #[test]
     fn run_pretool_denies_an_orchestrator_edit_with_no_seat_model_env_at_all() {
         let repo = orchestrator_repo();
-        let env: std::collections::HashMap<String, String> = [(
-            adapters::SEAT_ROLE_ENV.to_string(),
-            "orchestrator".to_string(),
-        )]
+        let env: std::collections::HashMap<String, String> = [
+            (
+                adapters::SEAT_ROLE_ENV.to_string(),
+                "orchestrator".to_string(),
+            ),
+            (
+                "ZIRV_CTX_SUPERVISE_ORCHESTRATOR_WRITES".to_string(),
+                "deny".to_string(),
+            ),
+        ]
         .into();
         let mut out = Vec::new();
         let code = run_pretool(
@@ -5474,6 +5713,145 @@ mod tests {
             rows[0].session,
             crate::commands::ctx::sessions::short_id("zirv-sess-42")
         );
+    }
+
+    /// Issue #358 T8: the default posture is `advise`, not `deny` -- an
+    /// orchestrator's own direct edit is ALLOWED, with a rate-limited
+    /// advisory note riding along in `additionalContext`, and the logged
+    /// row's own `outcome` is "advised". A fresh, empty home directory rules
+    /// out an ambient `~/.zirv/ctx.toml` changing the posture under test.
+    #[test]
+    fn run_pretool_advises_an_orchestrator_edit_by_default() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = orchestrator_repo();
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let env: std::collections::HashMap<String, String> = [
+            (
+                adapters::SEAT_ROLE_ENV.to_string(),
+                "orchestrator".to_string(),
+            ),
+            (
+                crate::commands::ctx::state::STATE_ENV.to_string(),
+                state_dir.path().display().to_string(),
+            ),
+        ]
+        .into();
+        let mut out = Vec::new();
+        let code = run_pretool(
+            &mut out,
+            &edit_payload_stdin(repo.path(), "src/x.rs"),
+            &|k| env.get(k).cloned(),
+        )
+        .expect("never errors");
+        assert_eq!(code, 0);
+
+        let printed = String::from_utf8(out).expect("utf8");
+        let parsed: serde_json::Value = serde_json::from_str(printed.trim()).expect("json");
+        assert_eq!(parsed["hookSpecificOutput"]["permissionDecision"], "allow");
+        assert!(
+            parsed["hookSpecificOutput"]["additionalContext"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("fine for a trivial edit; delegate substantial changes to a worker"),
+            "got {parsed}"
+        );
+
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+        let rows = log::read_orchestrator_blocks(&state);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].outcome, "advised");
+    }
+
+    /// `OrchestratorWrites::Allow`: the write is silent (nothing printed at
+    /// all) but still logged, so `zirv ctx status` can still count it.
+    #[test]
+    fn run_pretool_allow_posture_is_silent_but_still_logs() {
+        let repo = orchestrator_repo();
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let env: std::collections::HashMap<String, String> = [
+            (
+                adapters::SEAT_ROLE_ENV.to_string(),
+                "orchestrator".to_string(),
+            ),
+            (
+                crate::commands::ctx::state::STATE_ENV.to_string(),
+                state_dir.path().display().to_string(),
+            ),
+            (
+                "ZIRV_CTX_SUPERVISE_ORCHESTRATOR_WRITES".to_string(),
+                "allow".to_string(),
+            ),
+        ]
+        .into();
+        let mut out = Vec::new();
+        let code = run_pretool(
+            &mut out,
+            &edit_payload_stdin(repo.path(), "src/x.rs"),
+            &|k| env.get(k).cloned(),
+        )
+        .expect("never errors");
+        assert_eq!(code, 0);
+        assert!(out.is_empty(), "allow posture must print nothing: {out:?}");
+
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+        let rows = log::read_orchestrator_blocks(&state);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].outcome, "allowed");
+    }
+
+    /// Issue #358 T8: the advisory note surfaces on the 1st write, stays
+    /// silent for the next `ORCHESTRATOR_ADVISORY_RATE - 1`, then surfaces
+    /// again on the `ORCHESTRATOR_ADVISORY_RATE`th -- every write is still
+    /// logged regardless.
+    #[test]
+    fn run_pretool_advisory_note_is_rate_limited_across_repeated_writes() {
+        let repo = orchestrator_repo();
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let env: std::collections::HashMap<String, String> = [
+            (
+                adapters::SEAT_ROLE_ENV.to_string(),
+                "orchestrator".to_string(),
+            ),
+            (
+                crate::commands::ctx::state::STATE_ENV.to_string(),
+                state_dir.path().display().to_string(),
+            ),
+            (SESSION_ENV.to_string(), "zirv-sess-rate".to_string()),
+        ]
+        .into();
+
+        let mut surfaced = Vec::new();
+        for n in 0..ORCHESTRATOR_ADVISORY_RATE + 1 {
+            let mut out = Vec::new();
+            let code = run_pretool(
+                &mut out,
+                &edit_payload_stdin(repo.path(), &format!("src/x{n}.rs")),
+                &|k| env.get(k).cloned(),
+            )
+            .expect("never errors");
+            assert_eq!(code, 0);
+            surfaced.push(!out.is_empty());
+        }
+
+        let mut expected = vec![false; ORCHESTRATOR_ADVISORY_RATE + 1];
+        expected[0] = true;
+        expected[ORCHESTRATOR_ADVISORY_RATE] = true;
+        assert_eq!(
+            surfaced,
+            expected,
+            "the note must surface on write 1 and write {}, silent between",
+            ORCHESTRATOR_ADVISORY_RATE + 1
+        );
+
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+        let rows = log::read_orchestrator_blocks(&state);
+        assert_eq!(
+            rows.len(),
+            ORCHESTRATOR_ADVISORY_RATE + 1,
+            "every write is logged regardless of whether the note surfaced: {rows:?}"
+        );
+        assert!(rows.iter().all(|row| row.outcome == "advised"));
     }
 
     // -- the seat env the orchestrator exports ------------------------------

@@ -11,6 +11,7 @@ use super::group;
 use super::handoff::latest_for_repo;
 use super::mail;
 use super::permit;
+use super::pool;
 use super::price;
 use super::sessions::{self, Liveness};
 use super::state::{StateDir, now_secs, repo_slug};
@@ -828,6 +829,12 @@ pub struct StatusArgs {
     /// resolution (`sessions::list`) rather than a second lookup mechanism.
     #[arg(long, value_name = "SESSION")]
     pub breakdown: Option<String>,
+    /// Issue #358 (task T6a): print the harness-pool view
+    /// (`pool::PoolView`) as pretty-printed JSON instead of the ordinary
+    /// text report, and return -- `--brief`/`--diff` are ignored in this
+    /// mode, matching `--breakdown`'s own early-return shape.
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
 }
 
 /// Issue #264: the `spend:` line's own computation, factored out so a test
@@ -885,14 +892,16 @@ fn spend_status_line(
     )
 }
 
-/// Issues #328/#334: one line naming how many writes an orchestrator seat's
-/// own guard has refused -- `None` when `log::read_orchestrator_blocks`
-/// returns nothing, so an unmodified report's bytes stay byte-identical.
-/// "This session" sums rows whose `session` matches `mail::
-/// session_identity(env)`, the identical rule `spend_status_line` uses for
-/// its own "this session" figure; "total" is every row ever logged, and
-/// "last" is the newest row (`log::read_orchestrator_blocks` returns oldest
-/// first).
+/// Issues #328/#334, posture-aware since issue #358 T8: one line naming how
+/// many writes an orchestrator seat's own guard has decided on -- `None`
+/// when `log::read_orchestrator_blocks` returns nothing, so an unmodified
+/// report's bytes stay byte-identical. "This session" sums rows whose
+/// `session` matches `mail::session_identity(env)`, the identical rule
+/// `spend_status_line` uses for its own "this session" figure; "total" is
+/// every row ever logged, "denied" is every row whose `outcome == "denied"`
+/// (a pre-#358 row with no `outcome` field at all defaults to "denied" --
+/// see `log::OrchestratorBlockRecord`), and "last" is the newest row
+/// (`log::read_orchestrator_blocks` returns oldest first).
 fn orchestrator_blocks_status_line(
     state: &StateDir,
     env: EnvLookup<'_>,
@@ -905,12 +914,13 @@ fn orchestrator_blocks_status_line(
         .iter()
         .filter(|row| session_ident.as_deref() == Some(row.session.as_str()))
         .count();
+    let denied = rows.iter().filter(|row| row.outcome == "denied").count();
     Some(format!(
         "{} {}",
-        label(colour, "orchestrator writes blocked:"),
+        label(colour, "orchestrator writes:"),
         style::paint(
             &format!(
-                "{this_session} this session \u{b7} {} total (last: {} {})",
+                "{this_session} this session \u{b7} {} total ({denied} denied; last: {} {})",
                 rows.len(),
                 last.tool,
                 last.target,
@@ -935,6 +945,17 @@ fn render_report<W: Write>(
         label(colour, "state dir:"),
         style::paint(&state.root().display().to_string(), Tone::Muted, colour)
     )?;
+
+    // Fetched here, once, and reused by every section below that needs it
+    // (the work-group tree, the pool section, the sessions list itself) --
+    // `sessions::list` sweeps a stale record's file off disk as a side
+    // effect of being called at all (its own doc comment), so it must run
+    // exactly once per report: a second, later call (issue #358's own pool
+    // section calls `fallback::capacity_snapshot`, which calls `list` again
+    // internally for its harness `active` counts) would otherwise find a
+    // just-swept dead record already gone from disk, before the sessions
+    // section ever got to show it as `dead`.
+    let session_records = sessions::list(&state);
 
     // Issue #309: presentation only, off the same `latest_is_fresh_and_
     // passing` call the Stop hook's own verify-on-stop nudge uses -- omitted
@@ -1072,6 +1093,19 @@ fn render_report<W: Write>(
             // rate-limit window (`pace::current_windows` tracks that
             // separately, in tokens, not dollars).
             writeln!(w, "{}", spend_status_line(&state, cfg, env, colour))?;
+            // Issue #358 T8: this seat's own current write-guard posture,
+            // unconditional (present in `--brief` too, the same allowance
+            // `spend:`/`orchestrator writes:` (the counts line right below)
+            // both get) -- an operator should not need `zirv ctx status
+            // --diff` or to re-read `.zirv/ctx.toml` just to see whether
+            // this session's own direct edits are denied, advised, or
+            // silently allowed.
+            writeln!(
+                w,
+                "{} {}",
+                label(colour, "orchestrator write posture:"),
+                cfg.supervise.orchestrator_writes.label()
+            )?;
             // Issues #328/#334: present in `--brief` too, the same allowance
             // `spend:` gets, and silent (no line at all) when nothing has
             // ever been blocked -- see `orchestrator_blocks_status_line`.
@@ -1118,6 +1152,27 @@ fn render_report<W: Write>(
                         style::paint(&headroom, Tone::Muted, colour),
                     )?;
                 }
+            }
+
+            // Issue #358 (task T6a): the harness-pool view, right after the
+            // fallback loop above -- same underlying inputs (`cfg.fallback`,
+            // this same `state`), one level more composed: per-harness
+            // state/headroom/signal quality, the seat driving automatic
+            // rollover (if any), and the reservation ledger, all in one
+            // place. `--brief` collapses to the identical single-line
+            // summary shape every other brief section already uses.
+            let pool_view = pool::build(
+                &state,
+                cfg,
+                now_secs(),
+                mail::session_identity(env).as_deref(),
+                Some(&repo_slug(repo)),
+            );
+            if args.brief {
+                writeln!(w, "{}", pool::render_text(&pool_view, true, colour))?;
+            } else {
+                writeln!(w, "{}", header(colour, "pool"))?;
+                writeln!(w, "{}", pool::render_text(&pool_view, false, colour))?;
             }
         }
         Err(e) if repo_forbidden => writeln!(
@@ -1195,8 +1250,6 @@ fn render_report<W: Write>(
             }
         }
     }
-
-    let session_records = sessions::list(&state);
 
     // Issue #155, Phase 5(e): the machine-wide heavy-OPERATION budget's
     // current occupancy -- live permits (`permit::live_records`), not live
@@ -1874,6 +1927,31 @@ fn render_breakdown_table(
     out
 }
 
+/// Issue #358 (task T6a): `status --json` -- one [`pool::PoolView`],
+/// pretty-printed, and nothing else. Reads its own `state`/`cfg` rather than
+/// sharing `render_report`'s: the two paths never run in the same
+/// invocation (`run_with` returns right after this one), and `--json`'s own
+/// error shape (a plain load failure, not the softened "still render the
+/// rest of the report" handling `render_report` gives a `CtxConfig::load`
+/// failure) is deliberately the ordinary `?`-propagated one -- a JSON
+/// consumer wants a real exit code and stderr message, not a degraded
+/// document.
+fn render_pool_json<W: Write>(w: &mut W, repo: &Path, env: EnvLookup<'_>) -> CtxResult<i32> {
+    let state = StateDir::resolve(env)?;
+    let cfg = CtxConfig::load(repo, env)?;
+    let view = pool::build(
+        &state,
+        &cfg,
+        now_secs(),
+        mail::session_identity(env).as_deref(),
+        Some(&repo_slug(repo)),
+    );
+    let json = serde_json::to_string_pretty(&view)
+        .map_err(|e| format!("status --json: failed to serialize the pool view: {e}"))?;
+    writeln!(w, "{json}")?;
+    Ok(0)
+}
+
 pub fn run_with<W: Write>(
     args: &StatusArgs,
     w: &mut W,
@@ -1883,6 +1961,9 @@ pub fn run_with<W: Write>(
 ) -> CtxResult<i32> {
     if let Some(session) = &args.breakdown {
         return render_breakdown(session, w, repo, env);
+    }
+    if args.json {
+        return render_pool_json(w, repo, env);
     }
     if !args.diff {
         return render_report(args, w, repo, env, colour);
@@ -2045,6 +2126,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             tmp.path(),
@@ -2061,6 +2143,74 @@ mod tests {
         );
         assert!(text.contains("no supervised sessions"), "got {text}");
         assert!(text.contains("no handoff"), "got {text}");
+    }
+
+    /// Issue #358 (task T6a): the pool section's own header appears in the
+    /// full (non-`--brief`) report, right after the fallback block --
+    /// `header(colour, "pool")`'s exact `"\npool:"` shape, matching every
+    /// other section title this report prints.
+    #[test]
+    fn pool_section_appears_in_the_full_report() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = tmp.path().join("state");
+        let env = env_for(&state);
+
+        let mut out = Vec::new();
+        let code = run_with(
+            &StatusArgs {
+                decisions: 10,
+                brief: false,
+                diff: false,
+                breakdown: None,
+                json: false,
+            },
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            false,
+        )
+        .expect("runs");
+        assert_eq!(code, 0);
+
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(text.contains("\npool:"), "got {text}");
+    }
+
+    /// Issue #358 (task T6a): `status --json` prints one `pool::PoolView` as
+    /// pretty-printed JSON -- parseable, and carrying the shape's own
+    /// `harnesses`/`seat` keys, never the ordinary text report's sections.
+    #[test]
+    fn json_flag_prints_a_parseable_pool_view() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = tmp.path().join("state");
+        let env = env_for(&state);
+
+        let mut out = Vec::new();
+        let code = run_with(
+            &StatusArgs {
+                decisions: 10,
+                brief: false,
+                diff: false,
+                breakdown: None,
+                json: true,
+            },
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            false,
+        )
+        .expect("runs");
+        assert_eq!(code, 0);
+
+        let text = String::from_utf8(out).expect("utf8");
+        let value: serde_json::Value = serde_json::from_str(&text)
+            .unwrap_or_else(|e| panic!("--json output must parse as JSON: {e}\ngot: {text}"));
+        assert!(value.get("harnesses").is_some(), "got {text}");
+        assert!(value.get("seat").is_some(), "got {text}");
+        assert!(
+            !text.contains("state dir:"),
+            "--json must never fall through to the text report: {text}"
+        );
     }
 
     /// A repository with one commit, mirroring `verification.rs`'s own
@@ -2140,6 +2290,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             repo.path(),
@@ -2171,6 +2322,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             repo.path(),
@@ -2200,6 +2352,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             repo.path(),
@@ -2233,6 +2386,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             &repo,
@@ -2278,6 +2432,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             &repo,
@@ -2322,6 +2477,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             &repo,
@@ -2383,6 +2539,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             tmp.path(),
@@ -2420,6 +2577,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             tmp.path(),
@@ -2470,6 +2628,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             &repo,
@@ -2525,6 +2684,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             &repo,
@@ -2597,6 +2757,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             &repo,
@@ -2640,6 +2801,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             &repo,
@@ -2681,6 +2843,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             &repo,
@@ -2728,6 +2891,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             &repo,
@@ -2785,6 +2949,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             &repo,
@@ -2838,6 +3003,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             tmp.path(),
@@ -2876,6 +3042,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             tmp.path(),
@@ -2950,6 +3117,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             tmp.path(),
@@ -3008,6 +3176,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             tmp.path(),
@@ -3051,6 +3220,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             tmp.path(),
@@ -3104,6 +3274,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             tmp.path(),
@@ -3140,6 +3311,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             tmp.path(),
@@ -3188,6 +3360,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             &repo,
@@ -3249,6 +3422,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             tmp.path(),
@@ -3365,6 +3539,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             tmp.path(),
@@ -3432,6 +3607,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             tmp.path(),
@@ -3482,6 +3658,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             tmp.path(),
@@ -3544,6 +3721,7 @@ mod tests {
                     brief,
                     diff: false,
                     breakdown: None,
+                    json: false,
                 },
                 &mut out,
                 tmp.path(),
@@ -3562,9 +3740,10 @@ mod tests {
         }
     }
 
-    /// Issues #328/#334: `orchestrator writes blocked:` names both this
-    /// session's own refused count and the all-time total, plus the newest
-    /// blocked call -- and appears in `--brief` too, the same allowance
+    /// Issues #328/#334, posture-aware since issue #358 T8: `orchestrator
+    /// writes:` names both this session's own count and the all-time total
+    /// (plus how many of those were denied) and the newest logged call --
+    /// and appears in `--brief` too, the same allowance
     /// `spend:` gets.
     #[test]
     fn status_reports_orchestrator_blocks_this_session_and_total() {
@@ -3580,6 +3759,7 @@ mod tests {
                 tool: "Edit",
                 target: "/work/repo/src/main.rs",
                 reason: "orchestrator seats may not edit repository files",
+                outcome: "denied",
             },
         )
         .expect("append");
@@ -3591,6 +3771,7 @@ mod tests {
                 tool: "Bash",
                 target: "sed -i",
                 reason: "orchestrator seats may not edit repository files",
+                outcome: "denied",
             },
         )
         .expect("append");
@@ -3609,6 +3790,7 @@ mod tests {
                     brief,
                     diff: false,
                     breakdown: None,
+                    json: false,
                 },
                 &mut out,
                 tmp.path(),
@@ -3619,15 +3801,112 @@ mod tests {
             let text = String::from_utf8(out).expect("utf8");
             assert!(
                 text.contains(
-                    "orchestrator writes blocked: 1 this session \u{b7} 2 total (last: Bash sed -i)"
+                    "orchestrator writes: 1 this session \u{b7} 2 total (2 denied; last: Bash sed -i)"
                 ),
                 "brief={brief}: got {text}"
             );
         }
     }
 
-    /// Nothing blocked yet must render byte-identical to before this line
-    /// existed -- no `orchestrator writes blocked:` text at all.
+    /// Issue #358 T8: a mix of `denied`/`advised`/`allowed` rows counts each
+    /// correctly -- `denied` is scoped to `outcome == "denied"`, distinct
+    /// from the plain totals `status_reports_orchestrator_blocks_this_
+    /// session_and_total` already covers for an all-denied log.
+    #[test]
+    fn status_reports_the_denied_count_separately_from_the_total() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(tmp.path().join("state"));
+        state.ensure().expect("ensure");
+
+        for (session, tool, target, outcome) in [
+            ("aaaa1111", "Edit", "/work/repo/src/main.rs", "denied"),
+            ("aaaa1111", "Edit", "/work/repo/src/lib.rs", "advised"),
+            ("aaaa1111", "Bash", "sed -i", "allowed"),
+        ] {
+            log::append_orchestrator_block(
+                &state,
+                &log::OrchestratorBlock {
+                    ts: crate::commands::ctx::state::now_secs(),
+                    session,
+                    tool,
+                    target,
+                    reason: "repository write",
+                    outcome,
+                },
+            )
+            .expect("append");
+        }
+
+        let mut env = env_for(state.root());
+        env.insert(
+            crate::commands::ctx::adapters::SESSION_ENV.to_string(),
+            "aaaa1111".to_string(),
+        );
+
+        let mut out = Vec::new();
+        run_with(
+            &StatusArgs {
+                decisions: 5,
+                brief: false,
+                diff: false,
+                breakdown: None,
+                json: false,
+            },
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            false,
+        )
+        .expect("runs");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            text.contains(
+                "orchestrator writes: 3 this session \u{b7} 3 total (1 denied; last: Bash sed -i)"
+            ),
+            "got {text}"
+        );
+    }
+
+    /// Issue #358 T8: `orchestrator write posture:` is unconditional --
+    /// present with no rows logged at all, and names the configured
+    /// posture, not the built-in default, when the repo narrows it.
+    #[test]
+    fn status_reports_the_orchestrator_write_posture() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        std::fs::create_dir_all(tmp.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            tmp.path().join(".zirv/ctx.toml"),
+            "[supervise]\norchestrator_writes = \"deny\"\n",
+        )
+        .expect("write");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        state.ensure().expect("ensure");
+        let env = env_for(state.root());
+
+        let mut out = Vec::new();
+        run_with(
+            &StatusArgs {
+                decisions: 5,
+                brief: false,
+                diff: false,
+                breakdown: None,
+                json: false,
+            },
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            false,
+        )
+        .expect("runs");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            text.contains("orchestrator write posture: deny"),
+            "got {text}"
+        );
+    }
+
+    /// Nothing logged yet must render byte-identical to before this line
+    /// existed -- no `orchestrator writes:` text at all.
     #[test]
     fn status_omits_the_orchestrator_blocks_line_with_no_rows() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -3642,6 +3921,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             tmp.path(),
@@ -3650,7 +3930,7 @@ mod tests {
         )
         .expect("runs");
         let text = String::from_utf8(out).expect("utf8");
-        assert!(!text.contains("orchestrator writes blocked"), "got {text}");
+        assert!(!text.contains("orchestrator writes:"), "got {text}");
     }
 
     /// The fourth surface change: a window whose `resets_at` has provably
@@ -3688,6 +3968,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             tmp.path(),
@@ -3739,6 +4020,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             tmp.path(),
@@ -3789,6 +4071,7 @@ mod tests {
                 brief: true,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             tmp.path(),
@@ -3856,6 +4139,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             tmp.path(),
@@ -3865,9 +4149,18 @@ mod tests {
         .expect("runs");
         let text = String::from_utf8(out).expect("utf8");
         assert!(text.contains("openai: no usage source"), "got {text}");
+        // Issue #358 (task T6a): scoped to the `usage windows:` line itself,
+        // not the whole report -- the new pool section legitimately shows
+        // `claude`'s own usage (correctly attributed to claude, not codex)
+        // alongside every other harness `cfg.fallback.order` names, which
+        // now also happens to contain "77".
+        let usage_line = text
+            .lines()
+            .find(|l| l.contains("usage windows:"))
+            .unwrap_or("");
         assert!(
-            !text.contains("77"),
-            "the claude-only legacy file must not leak into a codex repo's usage line: {text}"
+            !usage_line.contains("77"),
+            "the claude-only legacy file must not leak into a codex repo's usage line: {usage_line}"
         );
     }
 
@@ -3908,6 +4201,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             tmp.path(),
@@ -3948,6 +4242,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             tmp.path(),
@@ -3984,6 +4279,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             tmp.path(),
@@ -4030,6 +4326,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             &repo,
@@ -4079,6 +4376,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             &repo,
@@ -4141,6 +4439,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             &repo,
@@ -4175,6 +4474,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             tmp.path(),
@@ -4216,6 +4516,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             tmp.path(),
@@ -4251,6 +4552,7 @@ mod tests {
                         brief: false,
                         diff: false,
                         breakdown: None,
+                        json: false,
                     },
                     &mut out,
                     tmp.path(),
@@ -4294,6 +4596,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             tmp.path(),
@@ -4544,6 +4847,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             tmp.path(),
@@ -4574,6 +4878,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             tmp.path(),
@@ -4627,6 +4932,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             tmp.path(),
@@ -4694,6 +5000,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             tmp.path(),
@@ -4758,6 +5065,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             tmp.path(),
@@ -4910,6 +5218,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut full_out,
             &repo,
@@ -4926,6 +5235,7 @@ mod tests {
                 brief: true,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut brief_out,
             &repo,
@@ -5058,6 +5368,7 @@ mod tests {
                 brief: false,
                 diff: true,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             tmp.path(),
@@ -5075,6 +5386,9 @@ mod tests {
             "got {text}"
         );
         assert!(text.contains("no supervised sessions"), "got {text}");
+        // Issue #358 (task T6a): the new pool section rides along with
+        // every other section `--diff`'s own full-report fallback prints.
+        assert!(text.contains("\npool:"), "got {text}");
 
         let state = StateDir::from_root(state_root);
         let files: Vec<_> = std::fs::read_dir(state.status_snapshots())
@@ -5093,6 +5407,7 @@ mod tests {
             brief: false,
             diff: true,
             breakdown: None,
+            json: false,
         };
 
         let mut first = Vec::new();
@@ -5138,6 +5453,7 @@ mod tests {
             brief: false,
             diff: true,
             breakdown: None,
+            json: false,
         };
 
         let mut first = Vec::new();
@@ -5224,6 +5540,7 @@ mod tests {
             brief: false,
             diff: true,
             breakdown: None,
+            json: false,
         };
         let mut first_out = Vec::new();
         run_with(
@@ -5250,6 +5567,7 @@ mod tests {
                 brief: false,
                 diff: false,
                 breakdown: None,
+                json: false,
             },
             &mut status_out,
             &repo,
@@ -5323,6 +5641,7 @@ mod tests {
             brief: false,
             diff: true,
             breakdown: None,
+            json: false,
         };
 
         let mut out_a = Vec::new();
@@ -5368,6 +5687,7 @@ mod tests {
                 brief: false,
                 diff: true,
                 breakdown: None,
+                json: false,
             },
             &mut full_out,
             tmp.path(),
@@ -5383,6 +5703,7 @@ mod tests {
                 brief: true,
                 diff: true,
                 breakdown: None,
+                json: false,
             },
             &mut brief_out,
             tmp.path(),
@@ -5413,6 +5734,7 @@ mod tests {
                 brief: false,
                 diff: true,
                 breakdown: None,
+                json: false,
             },
             &mut out,
             tmp.path(),

@@ -119,6 +119,62 @@ by ONE designated integrator worker; a writer touching one says so in its report
 integration -- branching, merging worker results, committing, opening the PR -- stays on this \
 seat.";
 
+/// Everything in [`ORCHESTRATOR_PROMPT`] AFTER its own first (write-guard)
+/// bullet -- shared verbatim by [`orchestrator_prompt_for`]'s `Advise`/
+/// `Allow` arms, which splice a different first bullet in front of it.
+const ORCHESTRATOR_PROMPT_TAIL_AFTER_WRITE_GUARD_BULLET: &str = "\n\
+- Delegation inside this harness uses native codex subagent threads (worker/explorer roles), \
+each pinned to the cheapest fitting tier -- the smallest tier for mechanical and bulk work \
+(currently gpt-5.6-luna), a mid tier for ordinary exploration, implementation and tests \
+(currently gpt-5.6-terra), this seat's own tier only for hard debugging and design. Never spawn \
+a subagent without an explicit cheaper model unless the operator's `[agents] \
+default_subagent_model` names one; an omitted model inherits this seat. `zirv agent <name> \
+\"<prompt>\" -- --model <m>` exists to reach a DIFFERENT harness and is refused for your own \
+harness from this seat, except as the fallback when native subagents are off (`[agents] \
+enabled = false`; pass --force); `zirv ctx agent --role sub-orchestrator --scope \"<area>\"` \
+creates a work group for work that splits into several coherently-scoped areas each needing its \
+own coordination.
+- Bundle small related items into one checklist brief with a per-item output format; continue a \
+worker you already briefed for follow-ups in its area instead of spawning a fresh one.
+- Briefs are self-contained -- goal, constraints, relevant paths, exact output format -- and \
+tell the worker not to delegate further and to reply with compact structured findings, never \
+raw file dumps. A delegated worker shares none of your context.
+- Decide rather than let a worker loop: choices between valid designs, architecture changes, \
+and anything a worker has failed at twice come back to you. Hold implementers to the \
+repository's standards and to the engineering standard above: reuse before adding, minimal \
+diff, one focused test per behaviour change, format, lint and test before reporting back.
+- Reviews follow the meta-harness rule: in proportion, once. You own the final integration: \
+resolve conflicts between worker outputs and report outcomes, including failures, plainly.
+- Shared manifests and lockfiles (Cargo.toml, Cargo.lock, package.json, lockfiles) are edited \
+by ONE designated integrator worker; a writer touching one says so in its report. Git \
+integration -- branching, merging worker results, committing, opening the PR -- stays on this \
+seat.";
+
+/// The same layer as [`ORCHESTRATOR_PROMPT`], but with the write-guard
+/// bullet (its own first bullet, above) posture-dependent (issue #358 T8)
+/// instead of hardcoded to `deny`'s wording, mirroring `claude::
+/// orchestrator_prompt_for`. `Deny` returns [`ORCHESTRATOR_PROMPT`] itself,
+/// unchanged; `Advise`/`Allow` splice `prompt::orchestrator_write_lines`'s
+/// text in front of [`ORCHESTRATOR_PROMPT_TAIL_AFTER_WRITE_GUARD_BULLET`].
+/// Codex has no PreToolUse-style hook at all (`hook::run_pretool` is
+/// claude-only), so unlike `claude::orchestrator_prompt_for` this passes
+/// `false`: `Advise`'s claim that a write is "recorded" and nudged on would
+/// be false for a harness with no mechanism to record anything (issue #358
+/// review, finding #6).
+fn orchestrator_prompt_for(posture: super::super::config::OrchestratorWrites) -> String {
+    use super::super::config::OrchestratorWrites;
+    if posture == OrchestratorWrites::Deny {
+        return ORCHESTRATOR_PROMPT.to_string();
+    }
+    format!(
+        "zirv orchestrator conventions (codex)\n\n\
+         This seat runs the top tier; spend it on judgment -- sizing, design choices, \
+         integration, the final call -- never on implementation.\n\n\
+         - {}{ORCHESTRATOR_PROMPT_TAIL_AFTER_WRITE_GUARD_BULLET}",
+        super::super::prompt::orchestrator_write_lines(posture, false)
+    )
+}
+
 /// Codex's own layer for a delegated **Worker** session (see
 /// `AgentAdapter::worker_system_prompt`), spliced in place of
 /// [`ORCHESTRATOR_PROMPT`] for `PromptRole::Worker`, mirroring
@@ -919,8 +975,11 @@ impl AgentAdapter for CodexAdapter {
     /// own doc comment for why the two layers read so differently. The
     /// operator-facing on/off switch (`PromptConfig::codex_orchestrator`)
     /// lives in `prompt::with_adapter_layer`, not here.
-    fn base_system_prompt(&self) -> Option<&'static str> {
-        Some(ORCHESTRATOR_PROMPT)
+    fn base_system_prompt(
+        &self,
+        posture: super::super::config::OrchestratorWrites,
+    ) -> Option<String> {
+        Some(orchestrator_prompt_for(posture))
     }
 
     /// See [`WORKER_PROMPT`]'s own doc comment for why this differs from
@@ -1708,7 +1767,7 @@ impl AgentAdapter for CodexAdapter {
 mod tests {
     use super::*;
     use crate::commands::ctx::adapters::{AgentAdapter, select};
-    use crate::commands::ctx::config::CtxConfig;
+    use crate::commands::ctx::config::{CtxConfig, OrchestratorWrites};
 
     /// I: `super::super::built_args` (`adapters/mod.rs`) takes the program
     /// string rather than the whole adapter, since `program` is private to
@@ -2208,9 +2267,52 @@ mod tests {
     #[test]
     fn codex_contributes_its_own_orchestrator_layer() {
         assert_eq!(
-            CodexAdapter::new(None).base_system_prompt(),
-            Some(ORCHESTRATOR_PROMPT)
+            CodexAdapter::new(None).base_system_prompt(OrchestratorWrites::Deny),
+            Some(ORCHESTRATOR_PROMPT.to_string())
         );
+    }
+
+    /// Issue #358 T8: the default posture (`advise`) no longer says "it does
+    /// not implement" -- mirrors `claude::tests::the_orchestrator_layer_
+    /// follows_this_seats_write_posture`, minus claude-only vocabulary.
+    ///
+    /// Issue #358 review finding #6: unlike claude's, codex's own `advise`
+    /// text must NOT claim writes from this seat "are recorded" and nudged
+    /// on -- codex has no PreToolUse-style hook at all, so nothing here ever
+    /// records or nudges anything; that sentence would be a bare falsehood
+    /// in a codex session's own system prompt.
+    #[test]
+    fn the_orchestrator_layer_follows_this_seats_write_posture() {
+        let deny = CodexAdapter::new(None)
+            .base_system_prompt(OrchestratorWrites::Deny)
+            .expect("deny has a base layer");
+        assert_eq!(deny, ORCHESTRATOR_PROMPT);
+        assert!(deny.contains("it does not implement"));
+
+        let advise = CodexAdapter::new(None)
+            .base_system_prompt(OrchestratorWrites::Advise)
+            .expect("advise has a base layer");
+        assert!(
+            !advise.contains("it does not implement"),
+            "advise no longer claims writes are technically blocked: {advise}"
+        );
+        assert!(advise.contains("make trivial edits"), "got:\n{advise}");
+        assert!(
+            !advise.contains("Repository writes from this seat are recorded"),
+            "codex has no hook to record or nudge on a write -- claiming one would be false: \
+             {advise}"
+        );
+        assert!(advise.contains("native codex subagent threads"));
+
+        let allow = CodexAdapter::new(None)
+            .base_system_prompt(OrchestratorWrites::Allow)
+            .expect("allow has a base layer");
+        assert!(allow.contains("make trivial edits"), "got:\n{allow}");
+        assert!(
+            !allow.contains("Repository writes from this seat are recorded"),
+            "allow drops advise's own last sentence: {allow}"
+        );
+        assert!(allow.contains("native codex subagent threads"));
     }
 
     /// Mirrors claude's `the_orchestrator_layer_is_short_enough_to_ship_on_
