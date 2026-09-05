@@ -214,7 +214,13 @@ pub fn extract_claude(jsonl: &str) -> ExtractedFile {
         ordinal += 1;
     }
     ExtractedFile {
-        lineage_root: lineage_fingerprint(jsonl),
+        // E-2: `lineage_fingerprint` looks for the literal `"## Task\n"`
+        // (a real newline byte), but a JSONL line's own newline is escaped
+        // as the two-character sequence `\n` -- so searching the RAW line
+        // text never matches, and lineage_root was always `None` for a
+        // transcript. Extraction has already unescaped that JSON string
+        // into `messages[].text`'s real bytes; fingerprint that instead.
+        lineage_root: messages.iter().find_map(|m| lineage_fingerprint(&m.text)),
         messages,
     }
 }
@@ -300,7 +306,9 @@ pub fn extract_codex(jsonl: &str) -> ExtractedFile {
         ordinal += 1;
     }
     ExtractedFile {
-        lineage_root: lineage_fingerprint(jsonl),
+        // E-2: same fix as `extract_claude` -- fingerprint the extracted,
+        // unescaped message text, never the raw JSONL line.
+        lineage_root: messages.iter().find_map(|m| lineage_fingerprint(&m.text)),
         messages,
     }
 }
@@ -496,6 +504,23 @@ mod tests {
         let jsonl =
             "not json at all\n{\"type\":\"permission-mode\",\"permissionMode\":\"default\"}\n";
         assert!(extract_claude(jsonl).messages.is_empty());
+    }
+
+    /// E-2: `lineage_fingerprint` used to be called on the RAW JSONL line,
+    /// where a JSON string's newline is escaped as the two-character
+    /// sequence `\n`, not a real newline byte -- so the literal
+    /// `"## Task\n"` marker never matched and `lineage_root` was always
+    /// `None` for every transcript, silently disabling restart-chain
+    /// dedupe (issue #315). Fingerprinting the extracted, already-unescaped
+    /// message text fixes it.
+    #[test]
+    fn extract_claude_fingerprints_lineage_from_the_extracted_message_text() {
+        let jsonl = r###"{"type":"user","timestamp":"2026-08-20T10:00:00Z","message":{"content":"## Task\nfix the flaky test\n\nmore"}}"###;
+        let extracted = extract_claude(jsonl);
+        assert_eq!(
+            extracted.lineage_root,
+            Some("fix the flaky test".to_string())
+        );
     }
 
     // -- extract_codex ---------------------------------------------------
