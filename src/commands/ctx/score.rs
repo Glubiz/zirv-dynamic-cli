@@ -797,6 +797,13 @@ const SCREEN_FALLBACK_CAP_BYTES: usize = 64 * 1024;
 
 /// Screens the last `cap` bytes of `path`. `ScreenReport::default()` (clean)
 /// on any read failure -- a screening miss must never fail a scoring cycle.
+///
+/// Issue #272 design item 1: the tail actually screened is a truncated view
+/// of the whole file whenever the file is bigger than `cap`, so this calls
+/// `screen::screen_prefix` (not `screen::screen`) with the FULL file length
+/// as `total_bytes` -- the report then carries a `ScanTruncated` finding
+/// with the correct byte counts whenever `start > 0`, instead of the
+/// unscanned head silently reading as clean.
 fn screen_tail(path: &Path, cap: usize) -> ScreenReport {
     let Ok(text) = std::fs::read_to_string(path) else {
         return ScreenReport::default();
@@ -805,7 +812,7 @@ fn screen_tail(path: &Path, cap: usize) -> ScreenReport {
     let start = (start..=text.len())
         .find(|&i| text.is_char_boundary(i))
         .unwrap_or(text.len());
-    screen::screen(&text[start..])
+    screen::screen_prefix(&text[start..], text.len())
 }
 
 /// The body of [`score_transcript_cached`], against a state
@@ -1513,6 +1520,55 @@ mod tests {
         let (_, report, _) =
             score_transcript_cached(&flagged, None, dir.path(), &lookup).expect("scores");
         assert!(!report.is_clean(), "expected flags, got none");
+    }
+
+    /// Issue #272 design item 1: a transcript file well over the fallback
+    /// tail-screening cap reports `ScanTruncated` with the correct byte
+    /// counts -- the unscanned head is a finding, not an implicit "clean".
+    #[test]
+    fn screen_tail_of_a_transcript_over_one_mebibyte_reports_scan_truncated() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        const MIB: usize = 1024 * 1024;
+        // Padding well past 1 MiB, plus a clean trailing line so the tail
+        // actually screened is unremarkable on its own -- this test is about
+        // the truncation finding, not about content in the tail.
+        let mut text = "x".repeat(MIB);
+        text.push_str("\ntail line with nothing interesting in it\n");
+        let path = dir.path().join("huge.jsonl");
+        std::fs::write(&path, &text).expect("write huge transcript");
+
+        let report = screen_tail(&path, SCREEN_FALLBACK_CAP_BYTES);
+        assert_eq!(report.scanned_bytes, SCREEN_FALLBACK_CAP_BYTES);
+        assert_eq!(report.total_bytes, text.len());
+        let expected_remaining = text.len() - SCREEN_FALLBACK_CAP_BYTES;
+        assert!(
+            report.flags.iter().any(|f| matches!(
+                f,
+                screen::ScreenFlag::ScanTruncated { remaining } if *remaining == expected_remaining
+            )),
+            "got {:?}",
+            report.flags
+        );
+    }
+
+    /// Issue #272: a transcript entirely under the fallback cap never
+    /// reports truncation -- `scanned_bytes == total_bytes`.
+    #[test]
+    fn screen_tail_of_a_small_transcript_reports_no_truncation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("small.jsonl");
+        std::fs::write(&path, "a short transcript, nowhere near the cap\n").expect("write");
+
+        let report = screen_tail(&path, SCREEN_FALLBACK_CAP_BYTES);
+        assert_eq!(report.scanned_bytes, report.total_bytes);
+        assert!(
+            !report
+                .flags
+                .iter()
+                .any(|f| matches!(f, screen::ScreenFlag::ScanTruncated { .. })),
+            "got {:?}",
+            report.flags
+        );
     }
 
     /// Issue #243: screening is a side channel, never a rot input --

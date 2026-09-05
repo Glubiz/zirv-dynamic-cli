@@ -711,6 +711,19 @@ fn render_delivery_message(
     let screening_suffix = if screening.is_clean() {
         String::new()
     } else {
+        // Issue #272 design item 3: a mail body is peer-session content, so
+        // an operator-visible line is printed for any finding whose action
+        // is `Flag` under `SourceTrust::PeerSession`, on top of the inline
+        // `Trust:` line note below. Never changes the rendered body itself.
+        if screening.flags.iter().any(|f| {
+            super::screen::action(f, super::screen::SourceTrust::PeerSession)
+                == super::screen::Action::Flag
+        }) {
+            eprintln!(
+                "zirv: mail body flagged by screening: {}",
+                screening.summary()
+            );
+        }
         format!(" -- screening: {}", screening.summary())
     };
     format!(

@@ -1410,6 +1410,52 @@ impl Default for ObjectiveConfig {
     }
 }
 
+/// Issue #272 (`screen.rs` round 2): thresholds behind `screen::ScreenFlag::
+/// RepetitionDominated` (the Hermes-round comment / issue #322). Every key
+/// is narrow-only in the SAME direction: a repo checkout may only LOWER a
+/// threshold (making detection stricter -- flagging shorter fragments,
+/// smaller windows, fewer repeats, or a smaller dominance share), never
+/// raise one to make detection looser than the operator's own value
+/// (`narrow_screen_threshold`/`narrow_screen_dominance_pct`, both the same
+/// `home.min(repo.unwrap_or(MAX))` shape as `narrow_max_nudges`). `screen.rs`
+/// itself never reads `ctx.toml`; a caller resolves this table into a
+/// `screen::Thresholds` (`ScreenConfig::thresholds`) and passes that to
+/// `screen::screen_with_thresholds`, keeping `screen.rs` pure.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ScreenConfig {
+    pub repetition_min_fragment: u32,
+    pub repetition_window: u32,
+    pub repetition_min_repeats: u32,
+    pub repetition_dominance_pct: f64,
+}
+
+impl Default for ScreenConfig {
+    fn default() -> Self {
+        let defaults = super::screen::Thresholds::default();
+        Self {
+            repetition_min_fragment: defaults.repetition_min_fragment as u32,
+            repetition_window: defaults.repetition_window as u32,
+            repetition_min_repeats: defaults.repetition_min_repeats as u32,
+            repetition_dominance_pct: defaults.repetition_dominance_pct,
+        }
+    }
+}
+
+impl ScreenConfig {
+    /// This table, resolved into the `screen::Thresholds` `screen::
+    /// screen_with_thresholds` actually takes -- the one seam between this
+    /// (impure, config-reading) module and `screen.rs`'s own purity.
+    pub fn thresholds(&self) -> super::screen::Thresholds {
+        super::screen::Thresholds {
+            repetition_min_fragment: self.repetition_min_fragment as usize,
+            repetition_window: self.repetition_window as usize,
+            repetition_min_repeats: self.repetition_min_repeats as usize,
+            repetition_dominance_pct: self.repetition_dominance_pct,
+        }
+    }
+}
+
 /// One harness's three generic tiers (`handover::TIERS`), each an optional
 /// literal model id overriding that harness's own built-in ladder entry
 /// (`handover::tier_default`). `None` -- the default for all three -- defers
@@ -1717,6 +1763,7 @@ pub struct CtxConfig {
     pub fallback: FallbackConfig,
     pub sandbox: SandboxConfig,
     pub objective: ObjectiveConfig,
+    pub screen: ScreenConfig,
     /// Per-agent enable/disable state from `.settings.toml`, a file this type
     /// deliberately never deserializes (see `crate::settings`): loaded
     /// separately at the end of `load`, and rejected outright if it appears
@@ -2722,6 +2769,23 @@ fn narrow_objective_judge(home: bool, repo: Option<bool>) -> bool {
     home.min(repo.unwrap_or(true))
 }
 
+/// Issue #272: the repo-narrowing fold for every `[screen]` `u32` threshold
+/// (`repetition_min_fragment`/`_window`/`_min_repeats`) -- lower is stricter
+/// (detection fires on a shorter fragment, a smaller window, or fewer
+/// repeats), the identical shape as `narrow_max_nudges`.
+fn narrow_screen_threshold(home: u32, repo: Option<u32>) -> u32 {
+    home.min(repo.unwrap_or(u32::MAX))
+}
+
+/// Issue #272: the repo-narrowing fold for `screen.repetition_dominance_pct`
+/// -- lower is stricter here too (less of the fragment needs to be repeats
+/// before it counts as dominated), the `f64` mirror of `narrow_screen_
+/// threshold` rather than `narrow_compact_advisory_window_fraction`'s
+/// opposite (higher-is-stricter) polarity.
+fn narrow_screen_dominance_pct(home: f64, repo: Option<f64>) -> f64 {
+    home.min(repo.unwrap_or(f64::MAX))
+}
+
 /// Finding 4 (review): the one comma-separated-list splitter shared by every
 /// caller that needs "trimmed, non-empty entries" -- this module's own
 /// `ZIRV_CTX_SANDBOX_EXTRA_ALLOW`/`_DENY` env values (the same shape
@@ -3535,6 +3599,23 @@ impl CtxConfig {
             "max_cycles_without_progress",
         ));
         let home_objective_judge = bool_at(take_nested(&mut merged, "objective", "judge"));
+        // Issue #272: every `[screen]` key gets the identical lift-before-
+        // merge treatment -- see `narrow_screen_threshold`/`narrow_screen_
+        // dominance_pct` below for the shared "lower is stricter" direction.
+        let home_screen_min_fragment = integer_at(take_nested(
+            &mut merged,
+            "screen",
+            "repetition_min_fragment",
+        ));
+        let home_screen_window =
+            integer_at(take_nested(&mut merged, "screen", "repetition_window"));
+        let home_screen_min_repeats =
+            integer_at(take_nested(&mut merged, "screen", "repetition_min_repeats"));
+        let home_screen_dominance_pct = float_at(take_nested(
+            &mut merged,
+            "screen",
+            "repetition_dominance_pct",
+        ));
         // `supervise.heavy_command_patterns` gets the identical treatment as
         // `sandbox.extra_deny` above, for the identical reason: the field's
         // own doc comment promises a repo layer may only ADD patterns, never
@@ -3672,6 +3753,23 @@ impl CtxConfig {
             "max_cycles_without_progress",
         ));
         let repo_objective_judge = bool_at(take_nested(&mut repo_layer, "objective", "judge"));
+        let repo_screen_min_fragment = integer_at(take_nested(
+            &mut repo_layer,
+            "screen",
+            "repetition_min_fragment",
+        ));
+        let repo_screen_window =
+            integer_at(take_nested(&mut repo_layer, "screen", "repetition_window"));
+        let repo_screen_min_repeats = integer_at(take_nested(
+            &mut repo_layer,
+            "screen",
+            "repetition_min_repeats",
+        ));
+        let repo_screen_dominance_pct = float_at(take_nested(
+            &mut repo_layer,
+            "screen",
+            "repetition_dominance_pct",
+        ));
         let repo_heavy_patterns = string_array(take_nested(
             &mut repo_layer,
             "supervise",
@@ -3963,6 +4061,54 @@ impl CtxConfig {
             toml::Value::Boolean(narrow_objective_judge(
                 home_objective_judge.unwrap_or(default_objective.judge),
                 repo_objective_judge,
+            )),
+        );
+
+        let default_screen = ScreenConfig::default();
+        let home_screen_min_fragment_value = home_screen_min_fragment
+            .and_then(|v| u32::try_from(v).ok())
+            .unwrap_or(default_screen.repetition_min_fragment);
+        let repo_screen_min_fragment_value =
+            repo_screen_min_fragment.and_then(|v| u32::try_from(v).ok());
+        insert_path(
+            &mut merged,
+            &["screen", "repetition_min_fragment"],
+            toml::Value::Integer(i64::from(narrow_screen_threshold(
+                home_screen_min_fragment_value,
+                repo_screen_min_fragment_value,
+            ))),
+        );
+        let home_screen_window_value = home_screen_window
+            .and_then(|v| u32::try_from(v).ok())
+            .unwrap_or(default_screen.repetition_window);
+        let repo_screen_window_value = repo_screen_window.and_then(|v| u32::try_from(v).ok());
+        insert_path(
+            &mut merged,
+            &["screen", "repetition_window"],
+            toml::Value::Integer(i64::from(narrow_screen_threshold(
+                home_screen_window_value,
+                repo_screen_window_value,
+            ))),
+        );
+        let home_screen_min_repeats_value = home_screen_min_repeats
+            .and_then(|v| u32::try_from(v).ok())
+            .unwrap_or(default_screen.repetition_min_repeats);
+        let repo_screen_min_repeats_value =
+            repo_screen_min_repeats.and_then(|v| u32::try_from(v).ok());
+        insert_path(
+            &mut merged,
+            &["screen", "repetition_min_repeats"],
+            toml::Value::Integer(i64::from(narrow_screen_threshold(
+                home_screen_min_repeats_value,
+                repo_screen_min_repeats_value,
+            ))),
+        );
+        insert_path(
+            &mut merged,
+            &["screen", "repetition_dominance_pct"],
+            toml::Value::Float(narrow_screen_dominance_pct(
+                home_screen_dominance_pct.unwrap_or(default_screen.repetition_dominance_pct),
+                repo_screen_dominance_pct,
             )),
         );
 
@@ -5866,6 +6012,101 @@ mod tests {
             !cfg.objective.judge,
             "a repo may not force the judge on for an operator who turned it off"
         );
+    }
+
+    /// Issue #272: every `[screen]` narrowing fold is "lower is stricter",
+    /// the identical shape as `narrow_max_nudges` -- a repo may only lower
+    /// each threshold, never raise it above the operator's own.
+    #[test]
+    fn the_screen_narrowing_fold_rules_favour_the_stricter_lower_value() {
+        for (home, repo, expected, why) in [
+            (
+                400u32,
+                None,
+                400,
+                "an untouched repo layer leaves the operator's own value alone",
+            ),
+            (
+                400,
+                Some(4_000),
+                400,
+                "a repo may not raise a threshold above the operator's own",
+            ),
+            (
+                400,
+                Some(100),
+                100,
+                "a repo may lower a threshold below the operator's own",
+            ),
+        ] {
+            assert_eq!(narrow_screen_threshold(home, repo), expected, "{why}");
+        }
+
+        assert_eq!(narrow_screen_dominance_pct(0.5, None), 0.5);
+        assert_eq!(
+            narrow_screen_dominance_pct(0.5, Some(0.9)),
+            0.5,
+            "a repo may not raise the dominance floor above the operator's own"
+        );
+        assert_eq!(
+            narrow_screen_dominance_pct(0.5, Some(0.1)),
+            0.1,
+            "a repo may lower the dominance floor below the operator's own"
+        );
+    }
+
+    /// Issue #272: the full `CtxConfig::load` integration for `[screen]` --
+    /// a repo layer may only narrow every key, exactly like `[objective]`
+    /// above.
+    #[test]
+    fn a_repo_layer_may_only_narrow_screen_thresholds() {
+        let home_dir = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home_dir.path());
+        std::fs::create_dir_all(home_dir.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home_dir.path().join(".zirv/ctx.toml"),
+            "[screen]\nrepetition_min_fragment = 400\nrepetition_window = 60\n\
+             repetition_min_repeats = 5\nrepetition_dominance_pct = 0.5\n",
+        )
+        .expect("write");
+
+        let repo_narrows = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo_narrows.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo_narrows.path().join(".zirv/ctx.toml"),
+            "[screen]\nrepetition_min_fragment = 100\nrepetition_window = 20\n\
+             repetition_min_repeats = 2\nrepetition_dominance_pct = 0.2\n",
+        )
+        .expect("write");
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo_narrows.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert_eq!(cfg.screen.repetition_min_fragment, 100);
+        assert_eq!(cfg.screen.repetition_window, 20);
+        assert_eq!(cfg.screen.repetition_min_repeats, 2);
+        assert_eq!(cfg.screen.repetition_dominance_pct, 0.2);
+
+        let repo_widens = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo_widens.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo_widens.path().join(".zirv/ctx.toml"),
+            "[screen]\nrepetition_min_fragment = 40000\nrepetition_window = 6000\n\
+             repetition_min_repeats = 500\nrepetition_dominance_pct = 0.99\n",
+        )
+        .expect("write");
+        let cfg = CtxConfig::load(repo_widens.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert_eq!(
+            cfg.screen.repetition_min_fragment, 400,
+            "a repo may not raise repetition_min_fragment above the operator's own"
+        );
+        assert_eq!(cfg.screen.repetition_window, 60);
+        assert_eq!(cfg.screen.repetition_min_repeats, 5);
+        assert_eq!(cfg.screen.repetition_dominance_pct, 0.5);
+
+        // `ScreenConfig::thresholds` is the one seam into `screen::
+        // Thresholds` -- a narrowed config actually reaches it.
+        let thresholds = cfg.screen.thresholds();
+        assert_eq!(thresholds.repetition_min_fragment, 400);
+        assert_eq!(thresholds.repetition_dominance_pct, 0.5);
     }
 
     /// Issue #262: `worker.default_depth`/`worker.default_read_only` set the
@@ -8186,6 +8427,10 @@ mod tests {
         ("objective", "gates"),
         ("objective", "max_cycles_without_progress"),
         ("objective", "judge"),
+        ("screen", "repetition_min_fragment"),
+        ("screen", "repetition_window"),
+        ("screen", "repetition_min_repeats"),
+        ("screen", "repetition_dominance_pct"),
         ("handover.claude", "cheap"),
         ("handover.claude", "standard"),
         ("handover.claude", "deep"),

@@ -1062,6 +1062,30 @@ fn render_report<W: Write>(
             if let Some(line) = describe_injection_fallback(cfg) {
                 writeln!(w, "{}", style::paint(&line, Tone::Warn, colour))?;
             }
+            // Issue #272 design item 4: the shared memory bank's own
+            // write-cadence signal, surfaced as a `Flag` -- never blocks a
+            // write, just names which writer(s) looked bursty this cycle.
+            // Best-effort: an unreadable or disabled bank yields no
+            // findings, never an error, so `status` never fails on this.
+            let slug = repo_slug(repo);
+            for finding in super::memory::cadence_for_shared(repo, &state, &slug, cfg) {
+                let reason = match finding.reason {
+                    super::memory::CadenceReason::Interval => "write interval",
+                    super::memory::CadenceReason::Size => "write size",
+                };
+                writeln!(
+                    w,
+                    "{}",
+                    style::paint(
+                        &format!(
+                            "memory cadence: {} looked bursty on {reason} (z={:.1})",
+                            finding.writer, finding.z_score
+                        ),
+                        Tone::Warn,
+                        colour
+                    )
+                )?;
+            }
             writeln!(
                 w,
                 "fallback: {} | order {} | steer below {:.0}% headroom | candidate min {:.0}% | unknown assumes {:.0}%",

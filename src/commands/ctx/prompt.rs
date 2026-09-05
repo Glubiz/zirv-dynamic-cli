@@ -1045,6 +1045,22 @@ pub fn with_memory_layer(
             composed
                 .text
                 .push_str(&format!("[screening: {}]\n\n", screening.summary()));
+            // Issue #272 design item 3: shared memory is peer-session-
+            // written content, never a repo checkout's own file -- an
+            // operator-visible line for whichever findings the source-aware
+            // matrix says warrant a `Flag`, mirroring how a truncated layer
+            // is already surfaced (`compile.rs`'s own eprintln for that).
+            // Never changes `composed.text` itself, so injection byte
+            // totals are unaffected.
+            if screening.flags.iter().any(|f| {
+                super::screen::action(f, super::screen::SourceTrust::PeerSession)
+                    == super::screen::Action::Flag
+            }) {
+                eprintln!(
+                    "zirv: shared memory layer flagged by screening: {}",
+                    screening.summary()
+                );
+            }
         }
         composed.text.push_str(&shared_delivered);
         composed.text.push_str("\n\n");
@@ -1199,6 +1215,20 @@ pub fn compose(
             let screening_suffix = if screening.is_clean() {
                 String::new()
             } else {
+                // Issue #272 design item 3: this layer is committed to the
+                // repository checkout -- the harshest `SourceTrust` -- so an
+                // operator-visible line is printed for any finding whose
+                // action is `Flag`, on top of the inline label below. Never
+                // changes `composed.text` itself.
+                if screening.flags.iter().any(|f| {
+                    super::screen::action(f, super::screen::SourceTrust::RepoOwned)
+                        == super::screen::Action::Flag
+                }) {
+                    eprintln!(
+                        "zirv: repo-owned prompt layer flagged by screening: {}",
+                        screening.summary()
+                    );
+                }
                 format!(" -- screening: {}", screening.summary())
             };
             composed.text.push_str(&format!(

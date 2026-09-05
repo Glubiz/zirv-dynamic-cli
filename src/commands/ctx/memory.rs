@@ -3499,6 +3499,167 @@ pub fn run_forget<W: Write>(args: &ForgetArgs, w: &mut W) -> CtxResult<i32> {
     run_forget_with(args, w, &repo, &env)
 }
 
+// ---------------------------------------------------------------------
+// Write-cadence signal (issue #272 design item 4): a compromised or
+// looping worker flooding a shared bank is otherwise only caught by size
+// caps. Pure, report-only, never blocks a write -- the same posture
+// `screen.rs` uses for its own findings, and surfaced the same way (a
+// `Flag` in `zirv ctx status`/the dashboard).
+// ---------------------------------------------------------------------
+
+/// Rolling window of samples `cadence` folds over, per writer.
+const CADENCE_WINDOW: usize = 50;
+/// Samples needed before a writer's own baseline is trusted enough to test
+/// anything against -- the first `CADENCE_BASELINE` samples for a writer
+/// only ever feed the baseline, never trigger a finding themselves.
+const CADENCE_BASELINE: usize = 5;
+/// `|z| > CADENCE_Z_THRESHOLD` on either signal is a finding.
+const CADENCE_Z_THRESHOLD: f64 = 2.0;
+/// The one writer identity `cadence` never flags, regardless of how bursty
+/// or large its writes are -- a human operator doing a deliberate bulk
+/// import is not the "looping worker" shape this signal exists to catch.
+const CADENCE_EXEMPT_WRITER: &str = "operator";
+
+/// Which signal one [`CadenceFinding`] fired on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CadenceReason {
+    /// The gap since this writer's previous write was an outlier (too
+    /// short OR too long) relative to that writer's own recent baseline.
+    Interval,
+    /// This write's own byte length was an outlier relative to that
+    /// writer's own recent baseline.
+    Size,
+}
+
+/// One outlier write [`cadence`] found. Carries the writer identity (already
+/// known to the caller -- entries are attributed by `written_by`, itself
+/// untrusted shared-memory content, but this module already treats that
+/// field as an opaque label everywhere else it is displayed, never as
+/// executable or injectable text) and the z-score that tripped it, never
+/// the write's own body.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CadenceFinding {
+    pub writer: String,
+    pub reason: CadenceReason,
+    pub z_score: f64,
+}
+
+/// Every index `i >= baseline_len` in `values` whose z-score against the
+/// mean/stddev of `values[0..i]` (a baseline that grows to include every
+/// prior sample as `i` advances, capturing "rolling window" without a fixed
+/// re-slice) exceeds [`CADENCE_Z_THRESHOLD`] in absolute value. A baseline
+/// with zero variance (every prior sample identical) never flags anything --
+/// division by zero would otherwise make the very next differing sample an
+/// automatic, meaningless outlier.
+fn z_outliers(values: &[f64], baseline_len: usize) -> Vec<(usize, f64)> {
+    let mut out = Vec::new();
+    for i in baseline_len..values.len() {
+        let prior = &values[..i];
+        let mean = prior.iter().sum::<f64>() / prior.len() as f64;
+        let variance = prior.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / prior.len() as f64;
+        let stddev = variance.sqrt();
+        if stddev <= f64::EPSILON {
+            continue;
+        }
+        let z = (values[i] - mean) / stddev;
+        if z.abs() > CADENCE_Z_THRESHOLD {
+            out.push((i, z));
+        }
+    }
+    out
+}
+
+/// Write-cadence anomaly detection over `window`, a chronological
+/// `(written_unix_secs, body_bytes, written_by)` sample per write -- exactly
+/// the three fields already on every [`Entry`] (`written`, `body.len()`,
+/// `written_by`), so no new persistence is needed to call this. Pure: no
+/// clock, fs, env or net (this module's read side does all three; this
+/// function reads none of them).
+///
+/// Per writer (`written_by == "operator"`, case-sensitive, is exempt
+/// outright): the newest [`CADENCE_WINDOW`] samples are kept; the first
+/// [`CADENCE_BASELINE`] establish a baseline with no verdict; every sample
+/// after that is tested against the (growing) baseline on both its
+/// inter-write interval and its own byte length, and `|z| >
+/// CADENCE_Z_THRESHOLD` on either flags a [`CadenceFinding`]. Never blocks a
+/// write -- report-only, the same posture `screen.rs` uses.
+pub fn cadence(window: &[(u64, usize, String)]) -> Vec<CadenceFinding> {
+    let mut writers: Vec<&str> = Vec::new();
+    for (_, _, writer) in window {
+        if !writers.contains(&writer.as_str()) {
+            writers.push(writer.as_str());
+        }
+    }
+
+    let mut findings = Vec::new();
+    for writer in writers {
+        if writer == CADENCE_EXEMPT_WRITER {
+            continue;
+        }
+        let mut samples: Vec<(u64, usize)> = window
+            .iter()
+            .filter(|(_, _, w)| w == writer)
+            .map(|(ts, bytes, _)| (*ts, *bytes))
+            .collect();
+        if samples.len() > CADENCE_WINDOW {
+            let cut = samples.len() - CADENCE_WINDOW;
+            samples.drain(..cut);
+        }
+        // Need at least one sample beyond the baseline to test anything.
+        if samples.len() <= CADENCE_BASELINE {
+            continue;
+        }
+
+        let sizes: Vec<f64> = samples.iter().map(|(_, bytes)| *bytes as f64).collect();
+        for (_, z) in z_outliers(&sizes, CADENCE_BASELINE) {
+            findings.push(CadenceFinding {
+                writer: writer.to_string(),
+                reason: CadenceReason::Size,
+                z_score: z,
+            });
+        }
+
+        let intervals: Vec<f64> = samples
+            .windows(2)
+            .map(|pair| pair[1].0.saturating_sub(pair[0].0) as f64)
+            .collect();
+        // An interval at data-index `k` is the gap ENDING at sample `k + 1`,
+        // so the interval baseline needs one fewer sample than the size
+        // baseline to cover the same set of tested writes.
+        let interval_baseline = CADENCE_BASELINE.saturating_sub(1);
+        for (_, z) in z_outliers(&intervals, interval_baseline) {
+            findings.push(CadenceFinding {
+                writer: writer.to_string(),
+                reason: CadenceReason::Interval,
+                z_score: z,
+            });
+        }
+    }
+    findings
+}
+
+/// [`cadence`] over the repository's own `Shared` memory bank, oldest write
+/// first (the order `cadence`'s own rolling window assumes) -- the real-data
+/// wiring `zirv ctx status`/the dashboard call, reading whatever `Entry::
+/// written`/`written_by`/`body.len()` the bank already has on disk. `cfg` and
+/// `slug` are passed straight to `list_scoped`, so this is gated by `memory.
+/// shared_enabled` exactly like every other `Shared`-scope read; an empty or
+/// disabled bank yields an empty finding list, never an error.
+pub fn cadence_for_shared(
+    repo: &Path,
+    state: &StateDir,
+    slug: &str,
+    cfg: &CtxConfig,
+) -> Vec<CadenceFinding> {
+    let mut entries = list_scoped(MemoryScope::Shared, repo, state, slug, cfg).unwrap_or_default();
+    entries.sort_by_key(|(_, entry)| entry.written);
+    let window: Vec<(u64, usize, String)> = entries
+        .into_iter()
+        .map(|(_, entry)| (entry.written, entry.body.len(), entry.written_by))
+        .collect();
+    cadence(&window)
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::state;
@@ -8515,5 +8676,131 @@ This should not appear in the body.\n";
             get(&state, slug, "cred-key").expect("get").is_some(),
             "a refused promotion must not remove the origin"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #272 design item 4: memory write-cadence signal.
+    // -----------------------------------------------------------------
+
+    /// A steady stream of regular writes, one per writer, never flags
+    /// anything -- both signals stay within a couple of standard deviations
+    /// of the writer's own baseline throughout.
+    #[test]
+    fn a_perfectly_regular_writer_is_never_flagged() {
+        let window: Vec<(u64, usize, String)> = (0..40)
+            .map(|i| (1_000 + i * 60, 200, "worker-a".to_string()))
+            .collect();
+        assert!(cadence(&window).is_empty(), "got {:?}", cadence(&window));
+    }
+
+    /// Issue #272 acceptance criterion: 40 regular writes (one per minute,
+    /// 200 bytes each) followed by 10 rapid-fire bursts (one per second,
+    /// much larger) flags the burst writer on its interval, its size, or
+    /// both -- never silently absorbed into an unchanging baseline.
+    #[test]
+    fn forty_regular_writes_then_ten_bursts_flags_the_burst_writer() {
+        let mut window: Vec<(u64, usize, String)> = Vec::new();
+        let mut ts = 1_000u64;
+        for _ in 0..40 {
+            window.push((ts, 200, "worker-a".to_string()));
+            ts += 60; // one per minute
+        }
+        for _ in 0..10 {
+            window.push((ts, 20_000, "worker-a".to_string()));
+            ts += 1; // one per second: a burst, both shorter interval and much larger
+        }
+        let findings = cadence(&window);
+        assert!(
+            !findings.is_empty(),
+            "expected the burst writer to be flagged"
+        );
+        assert!(
+            findings.iter().all(|f| f.writer == "worker-a"),
+            "got {findings:?}"
+        );
+        assert!(
+            findings.iter().any(|f| f.reason == CadenceReason::Interval),
+            "expected at least one Interval finding, got {findings:?}"
+        );
+    }
+
+    /// Issue #272 acceptance criterion: a bulk import attributed to the
+    /// operator never flags, no matter how bursty or large the writes are --
+    /// `writer == "operator"` is exempt by trust, not by behavior.
+    #[test]
+    fn a_bulk_import_from_the_operator_is_never_flagged() {
+        let mut window: Vec<(u64, usize, String)> = Vec::new();
+        let mut ts = 1_000u64;
+        for _ in 0..40 {
+            window.push((ts, 200, "operator".to_string()));
+            ts += 60;
+        }
+        for _ in 0..10 {
+            window.push((ts, 50_000, "operator".to_string()));
+            ts += 1;
+        }
+        assert!(cadence(&window).is_empty(), "got {:?}", cadence(&window));
+    }
+
+    /// A writer with fewer than `CADENCE_BASELINE + 1` samples has no
+    /// verdict either way -- there is not enough data for a baseline to mean
+    /// anything.
+    #[test]
+    fn a_writer_with_too_few_samples_is_never_flagged() {
+        let window: Vec<(u64, usize, String)> = vec![
+            (1_000, 200, "worker-a".to_string()),
+            (1_060, 200, "worker-a".to_string()),
+            (1_120, 50_000, "worker-a".to_string()), // would be a huge outlier, if tested
+        ];
+        assert!(cadence(&window).is_empty(), "got {:?}", cadence(&window));
+    }
+
+    /// Each writer gets its own independent baseline: a burst from one
+    /// writer never causes another writer's own regular cadence to flag.
+    #[test]
+    fn writers_are_scored_independently() {
+        let mut window: Vec<(u64, usize, String)> = Vec::new();
+        let mut ts = 1_000u64;
+        for _ in 0..40 {
+            window.push((ts, 200, "worker-a".to_string()));
+            window.push((ts, 200, "worker-b".to_string()));
+            ts += 60;
+        }
+        for _ in 0..10 {
+            window.push((ts, 50_000, "worker-a".to_string()));
+            ts += 1;
+        }
+        let findings = cadence(&window);
+        assert!(
+            !findings.iter().any(|f| f.writer == "worker-b"),
+            "worker-b's regular cadence must never be flagged by worker-a's burst: {findings:?}"
+        );
+        assert!(
+            findings.iter().any(|f| f.writer == "worker-a"),
+            "worker-a's burst must still be flagged: {findings:?}"
+        );
+    }
+
+    /// `cadence` never blocks or mutates anything -- it is a pure function
+    /// of its input, purely a fact-finding pass. Determinism doubles as the
+    /// closest thing this module has to a purity smoke test.
+    #[test]
+    fn cadence_is_deterministic() {
+        let window: Vec<(u64, usize, String)> = (0..20)
+            .map(|i| (1_000 + i * 60, 200 + (i as usize % 3) * 5, "w".to_string()))
+            .collect();
+        assert_eq!(cadence(&window), cadence(&window));
+    }
+
+    /// `cadence_for_shared` is the real-data wiring: an empty or disabled
+    /// bank yields no findings, never an error.
+    #[test]
+    fn cadence_for_shared_is_empty_for_an_empty_bank() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let state = StateDir::from_root(dir.path().join("state"));
+        let cfg = CtxConfig::default();
+        assert!(cadence_for_shared(&repo, &state, "slug", &cfg).is_empty());
     }
 }

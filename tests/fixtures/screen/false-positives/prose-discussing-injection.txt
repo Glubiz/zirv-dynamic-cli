@@ -1,0 +1,4 @@
+As part of this review we should test for prompt injection in any user-supplied text
+before it reaches the model, including role markers, invisible unicode, and long opaque
+runs. None of those shapes should appear literally in a design document that only
+discusses them, since discussing a pattern in prose is not the same as containing it.
