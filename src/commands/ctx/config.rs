@@ -275,6 +275,29 @@ pub struct SuperviseConfig {
     /// asking for a stricter guard against its own orchestrator seat is
     /// exactly the direction that can never reproduce issues #328/#334.
     pub orchestrator_writes: OrchestratorWrites,
+    /// Issue #311 (Hermes Agent's `/loop` self-paced mode): the ceiling
+    /// `zirv ctx loop`'s own self-pacing may grow the inter-cycle wait
+    /// toward when no explicit `--interval` was given and consecutive
+    /// successful cycles keep producing the same outcome digest --
+    /// `run_loop::next_pace`'s own `ceiling` parameter. Mirrors Hermes's
+    /// `DEFAULT_SELF_PACED_CEILING_SECONDS` (900). Has no effect at all on a
+    /// run launched with an explicit `--interval`: that opts out of self-
+    /// pacing entirely, so this value is never consulted.
+    ///
+    /// Narrow-only, the same "repo may only make it stricter" shape as
+    /// `compact_advisory.min_reclaim_tokens` -- but the OPPOSITE polarity:
+    /// here LOWER is stricter (the loop checks in more often, waiting no
+    /// longer than this many seconds between cycles even when nothing has
+    /// changed), so the fold is `home.min(repo)` like `verify_on_stop.
+    /// max_nudges`, not `home.max(repo)` like `compact_advisory`'s own keys.
+    /// A repo checkout may shorten how long its own loop can go quiet, never
+    /// lengthen it past what the operator (or another layer) already
+    /// allows. Not `REPO_FORBIDDEN`: unlike `supervise.idle_no_tool_secs`/
+    /// `in_tool_secs` right above (which gate a *safety* fuse a checkout
+    /// must not be able to loosen), this only tunes how quickly a
+    /// nothing-left-to-do loop backs off, and only in the direction that
+    /// asks for MORE supervision, not less.
+    pub loop_backoff_ceiling_secs: u64,
 }
 
 impl Default for SuperviseConfig {
@@ -297,6 +320,7 @@ impl Default for SuperviseConfig {
             chain_max_restarts: 3,
             chain_max_gap_secs: 300,
             orchestrator_writes: OrchestratorWrites::Advise,
+            loop_backoff_ceiling_secs: 900,
         }
     }
 }
@@ -1854,6 +1878,11 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         &["supervise", "orchestrator_writes"],
         EnvKind::Str,
     ),
+    (
+        "ZIRV_CTX_SUPERVISE_LOOP_BACKOFF_CEILING_SECS",
+        &["supervise", "loop_backoff_ceiling_secs"],
+        EnvKind::Int,
+    ),
     ("ZIRV_CTX_MODEL", &["handoff", "model"], EnvKind::Str),
     (
         "ZIRV_CTX_HANDOFF_TIMEOUT_SECS",
@@ -2603,6 +2632,15 @@ fn narrow_compact_advisory_min_reclaim(home: u64, repo: Option<u64>) -> u64 {
 /// higher fraction means the advisory waits for a fuller window.
 fn narrow_compact_advisory_window_fraction(home: f64, repo: Option<f64>) -> f64 {
     home.max(repo.unwrap_or(0.0))
+}
+
+/// Issue #311: the repo-narrowing fold for `supervise.loop_backoff_ceiling_
+/// secs` -- lower is stricter (the self-paced loop checks in sooner), the
+/// identical shape as `narrow_max_nudges`: `repo` absent contributes nothing
+/// (folds in as `u64::MAX`, which `min` never picks over a real `home`
+/// value).
+fn narrow_loop_backoff_ceiling_secs(home: u64, repo: Option<u64>) -> u64 {
+    home.min(repo.unwrap_or(u64::MAX))
 }
 
 /// Issue #262: the repo-narrowing fold for `worker.max_depth` -- lower is
@@ -3460,6 +3498,14 @@ impl CtxConfig {
             take_nested(&mut merged, "supervise", "orchestrator_writes"),
             "supervise.orchestrator_writes",
         )?;
+        // Issue #311: `supervise.loop_backoff_ceiling_secs` gets the
+        // identical lift-before-merge treatment -- see `narrow_loop_backoff_
+        // ceiling_secs` below for the strict direction.
+        let home_loop_backoff_ceiling = integer_at(take_nested(
+            &mut merged,
+            "supervise",
+            "loop_backoff_ceiling_secs",
+        ));
 
         // Issue #186: every fallback field is lifted before the repo merge.
         // The repo may only narrow automatic vendor steering; see the
@@ -3578,6 +3624,11 @@ impl CtxConfig {
             take_nested(&mut repo_layer, "supervise", "orchestrator_writes"),
             "supervise.orchestrator_writes",
         )?;
+        let repo_loop_backoff_ceiling = integer_at(take_nested(
+            &mut repo_layer,
+            "supervise",
+            "loop_backoff_ceiling_secs",
+        ));
         let repo_fallback_enabled = bool_at(take_nested(&mut repo_layer, "fallback", "enabled"));
         let repo_fallback_order =
             string_array_at(take_nested(&mut repo_layer, "fallback", "order"));
@@ -3658,6 +3709,24 @@ impl CtxConfig {
                 )
                 .label()
                 .to_string(),
+            ),
+        );
+        // Issue #311: `supervise.loop_backoff_ceiling_secs` gets the
+        // identical re-insertion, narrowed by `narrow_loop_backoff_ceiling_
+        // secs`, then still overwritable by `ZIRV_CTX_SUPERVISE_LOOP_
+        // BACKOFF_CEILING_SECS` (`ENV_MAP`, below) the same as every other
+        // narrow-only key.
+        insert_path(
+            &mut merged,
+            &["supervise", "loop_backoff_ceiling_secs"],
+            toml::Value::Integer(
+                i64::try_from(narrow_loop_backoff_ceiling_secs(
+                    home_loop_backoff_ceiling
+                        .and_then(|v| u64::try_from(v).ok())
+                        .unwrap_or(default_supervise.loop_backoff_ceiling_secs),
+                    repo_loop_backoff_ceiling.and_then(|v| u64::try_from(v).ok()),
+                ))
+                .unwrap_or(i64::MAX),
             ),
         );
 
@@ -4425,6 +4494,11 @@ mod tests {
             "issue #310: mirrors the Hermes reference's own DEFAULT_MAX_RESTARTS"
         );
         assert_eq!(
+            SuperviseConfig::default().loop_backoff_ceiling_secs,
+            900,
+            "issue #311: mirrors Hermes's own DEFAULT_SELF_PACED_CEILING_SECONDS"
+        );
+        assert_eq!(
             SuperviseConfig::default().chain_max_gap_secs,
             300,
             "issue #310: mirrors the Hermes reference's own DEFAULT_MAX_GAP_SECONDS"
@@ -4511,6 +4585,45 @@ mod tests {
         let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
         assert_eq!(cfg.compact_advisory.min_reclaim_tokens, 32768);
         assert_eq!(cfg.compact_advisory.window_fraction, 0.95);
+    }
+
+    /// Issue #311: `supervise.loop_backoff_ceiling_secs` is repo-settable but
+    /// narrow-only in the OPPOSITE polarity from `compact_advisory` above --
+    /// lower is stricter here, the same shape as `verify_on_stop.max_nudges`
+    /// -- and an env var still wins over both layers as the final word.
+    #[test]
+    fn loop_backoff_ceiling_repo_layer_may_only_lower_it() {
+        assert_eq!(SuperviseConfig::default().loop_backoff_ceiling_secs, 900);
+        assert_eq!(narrow_loop_backoff_ceiling_secs(900, Some(1800)), 900);
+        assert_eq!(narrow_loop_backoff_ceiling_secs(900, Some(300)), 300);
+        assert_eq!(narrow_loop_backoff_ceiling_secs(900, None), 900);
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[supervise]\nloop_backoff_ceiling_secs = 3600\n",
+        )
+        .expect("write");
+
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert_eq!(
+            cfg.supervise.loop_backoff_ceiling_secs, 900,
+            "a repo checkout may not raise the ceiling past the operator's own"
+        );
+
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[supervise]\nloop_backoff_ceiling_secs = 120\n",
+        )
+        .expect("write");
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert_eq!(cfg.supervise.loop_backoff_ceiling_secs, 120);
+
+        let env = env_map(&[("ZIRV_CTX_SUPERVISE_LOOP_BACKOFF_CEILING_SECS", "60")]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert_eq!(cfg.supervise.loop_backoff_ceiling_secs, 60);
     }
 
     /// Companion to the test above, for the token gate's own five keys
@@ -7993,6 +8106,7 @@ mod tests {
         ("supervise", "chain_max_restarts"),
         ("supervise", "chain_max_gap_secs"),
         ("supervise", "orchestrator_writes"),
+        ("supervise", "loop_backoff_ceiling_secs"),
         ("handoff", "model"),
         ("handoff", "tail_items"),
         ("handoff", "timeout_secs"),
