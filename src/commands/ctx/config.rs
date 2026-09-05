@@ -4267,12 +4267,28 @@ fn announce_unparsable_layers_once(cfg: &CtxConfig) {
 /// those two fields; every other field keeps its ordinary default, since
 /// nothing else in `CtxConfig` is a security boundary the way the gate and
 /// the policy are.
+///
+/// Finding #5 (issue #358 review): `supervise.orchestrator_writes` is a
+/// THIRD such boundary, and it is not exempt just because it defaults to
+/// `Advise` rather than the fully-permissive extreme -- an operator who set
+/// `deny` still has that narrower posture WIDENED to `Advise` the moment a
+/// config load fails, and a repository-owned layer (`ctx.toml`, `.settings.
+/// toml`) can induce that failure at will. Forced to `Deny` here for the
+/// same reason `policy` is forced `fail_closed`: a config that could not
+/// even be read must never be read as permission to write. `prompt.
+/// orchestrator_writes` is kept in lockstep (it is `CtxConfig::load`'s own
+/// synced copy of this same field -- see `PromptConfig::orchestrator_writes`'s
+/// doc comment) so every consumer, not just `hook::orchestrator_write_
+/// posture`'s own read of `supervise`, sees the same degraded posture.
 pub(crate) fn degrade_to_operator_only(env: EnvLookup<'_>) -> CtxConfig {
-    CtxConfig {
+    let mut cfg = CtxConfig {
         agents: crate::settings::AgentGate::load_operator_only(env),
         policy: super::policy::EffectivePolicy::fail_closed(),
         ..CtxConfig::default()
-    }
+    };
+    cfg.supervise.orchestrator_writes = OrchestratorWrites::Deny;
+    cfg.prompt.orchestrator_writes = OrchestratorWrites::Deny;
+    cfg
 }
 
 /// SECURITY (command-injection defense): shared charset/length/leading-dash
@@ -6198,6 +6214,31 @@ mod tests {
             degraded.policy,
             super::super::policy::EffectivePolicy::default(),
             "fail_closed must differ from the permissive default, or this test proves nothing"
+        );
+    }
+
+    /// Finding #5 (issue #358 review): `supervise.orchestrator_writes`
+    /// defaults to `Advise`, so without the fix a config-load failure would
+    /// silently WIDEN an operator's own `deny` to `Advise` -- exactly the
+    /// same fail-open shape `degrade_to_operator_only_fails_closed_on_
+    /// policy_not_open` already guards for `policy`. An untrusted repo
+    /// layer can induce a load failure at will (a malformed `ctx.toml`),
+    /// so this boundary must fail closed too, on both the field `hook::
+    /// orchestrator_write_posture` reads (`supervise`) and its synced copy
+    /// (`prompt`).
+    #[test]
+    fn degrade_to_operator_only_denies_repository_writes_not_advises_them() {
+        let empty = env_map(&[]);
+        let degraded = degrade_to_operator_only(&|k| empty.get(k).cloned());
+        assert_eq!(
+            degraded.supervise.orchestrator_writes,
+            OrchestratorWrites::Deny,
+            "a failed config load must not silently widen `deny` to the permissive default"
+        );
+        assert_eq!(
+            degraded.prompt.orchestrator_writes,
+            OrchestratorWrites::Deny,
+            "the synced `prompt` copy must agree with `supervise`"
         );
     }
 

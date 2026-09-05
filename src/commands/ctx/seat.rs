@@ -618,14 +618,17 @@ pub struct RolloverInputs<'a> {
     pub source_observed_at: u64,
     /// Whether the source session is actively, definitely blocked right now
     /// (a hard rate-limit/quota refusal), as opposed to merely low on
-    /// projected headroom. Takes the reactive path, which ignores the idle
-    /// boundary and the cooldown.
+    /// projected headroom. Takes the reactive path, which skips the
+    /// cooldown but NOT the idle boundary (issue #358 review, finding #14).
     pub source_hard_blocked: bool,
     pub auto_enabled: bool,
     /// Whether the orchestrator session is at a clean turn boundary right
-    /// now. The proactive path refuses to move a seat mid-turn; the reactive
-    /// path does not wait for one (a hard block does not care what the
-    /// session was doing when it happened).
+    /// now. BOTH the proactive and the reactive path refuse to move a seat
+    /// mid-turn (finding #14) -- a hard block is real evidence the seat
+    /// SHOULD move once idle, but it says nothing about whether this
+    /// session's own in-flight turn has stopped, and swapping the pty out
+    /// from under one that has not is exactly the kind of session-worsening
+    /// `wrap`/`dash::pane` may never do.
     pub idle: bool,
     pub candidates: &'a [CandidateHeadroom],
 }
@@ -655,18 +658,25 @@ pub enum RolloverDecision {
 ///    seat that is disabled, pinned, or already mid-transaction/parked is
 ///    never correct regardless of headroom.
 /// 2. The reactive path (`source_hard_blocked`) is taken over the proactive
-///    one whenever both could apply; it ignores the idle boundary and the
-///    cooldown (a hard block already happened -- waiting for a clean
-///    boundary that may never come, or a cooldown meant to prevent thrashing
-///    near a soft threshold, both miss the point).
+///    one whenever both could apply. Issue #358 review, finding #14: it does
+///    NOT skip `inputs.idle` -- a hard block already happened, but the
+///    session's own in-flight turn did not stop because of it, and swapping
+///    the pty out from under a turn that is still actively producing output
+///    is exactly the kind of session-worsening `wrap`/`dash::pane` may never
+///    do; a fresh ACCOUNT-WIDE reading can report the provider hard-blocked
+///    at any moment, entirely independent of whether THIS child ever
+///    yielded. It still skips `rollover_cooldown_secs` -- a hard block is
+///    real evidence a soft-threshold cooldown was never meant to gate, and
+///    unlike the idle boundary a cooldown is this seat's own hysteresis, not
+///    a live turn's correctness.
 /// 3. Otherwise, the proactive path triggers only from a KNOWN reading at or
 ///    under `cfg.fallback.rollover_headroom_pct()` -- `None` (unknown/stale)
 ///    never triggers it, matching this codebase's existing "never migrate on
 ///    missing data" convention (`fallback.unknown_headroom_pct` is the
 ///    opposite, deliberately conservative, choice for background delegation,
-///    not this seat). Proactive additionally requires `inputs.idle` (else
-///    `Wait("idle boundary")`) and respects `rollover_cooldown_secs` against
-///    `seat.last_rollover_at` (else `Wait("cooldown")`).
+///    not this seat). Both paths require `inputs.idle` (else `Wait("idle
+///    boundary")`); proactive additionally respects `rollover_cooldown_secs`
+///    against `seat.last_rollover_at` (else `Wait("cooldown")`).
 /// 4. Candidates are filtered: the current agent is never its own successor;
 ///    one already [`Visit`]ed at the SAME epoch this decision's cause would
 ///    carry is excluded (unchanged evidence, already tried), but a visit at
@@ -716,15 +726,21 @@ pub fn decide(inputs: &RolloverInputs<'_>, cfg: &CtxConfig) -> RolloverDecision 
         );
     }
 
-    if !reactive {
-        if !inputs.idle {
-            return RolloverDecision::Wait("idle boundary".to_string());
-        }
-        if let Some(last) = inputs.seat.last_rollover_at
-            && inputs.now.saturating_sub(last) < cfg.fallback.rollover_cooldown_secs
-        {
-            return RolloverDecision::Wait("cooldown".to_string());
-        }
+    // Finding #14 (issue #358 review): the idle boundary applies to BOTH
+    // paths -- a hard block is real evidence, but it says nothing about
+    // whether THIS session's own in-flight turn has actually stopped, and
+    // interrupting one that has not is never correct. Only the cooldown
+    // below stays proactive-only: it is this seat's own hysteresis against
+    // threshold noise, not a live turn's correctness, and a hard block is
+    // exactly the kind of evidence that hysteresis was never meant to gate.
+    if !inputs.idle {
+        return RolloverDecision::Wait("idle boundary".to_string());
+    }
+    if !reactive
+        && let Some(last) = inputs.seat.last_rollover_at
+        && inputs.now.saturating_sub(last) < cfg.fallback.rollover_cooldown_secs
+    {
+        return RolloverDecision::Wait("cooldown".to_string());
     }
 
     let epoch = inputs.source_observed_at;
@@ -1243,6 +1259,10 @@ mod tests {
         );
     }
 
+    /// Finding #14 (issue #358 review): reactive skips the COOLDOWN, but --
+    /// unlike before this fix -- it does not skip the idle boundary, so
+    /// `idle: true` here is load-bearing: without it this would now read
+    /// `Wait("idle boundary")` regardless of the cooldown at all.
     #[test]
     fn decide_reactive_ignores_the_cooldown() {
         let cfg = cfg();
@@ -1256,13 +1276,40 @@ mod tests {
             source_observed_at: 500,
             source_hard_blocked: true,
             auto_enabled: true,
-            idle: false,
+            idle: true,
             candidates: &candidates,
         };
         assert!(matches!(
             decide(&inputs, &cfg),
             RolloverDecision::Proceed { .. }
         ));
+    }
+
+    /// Finding #14 (issue #358 review): the reactive path must NOT proceed
+    /// mid-turn -- a hard block is real evidence, but it says nothing about
+    /// whether this session's own in-flight turn has stopped. A mid-turn
+    /// reactive trigger reads `Wait("idle boundary")`, the exact same verdict
+    /// a mid-turn proactive one already got; `rollover::evaluate` maps that
+    /// to `Evaluation::Pending`, not `Evaluation::Rollover`.
+    #[test]
+    fn decide_reactive_still_waits_for_the_idle_boundary() {
+        let cfg = cfg();
+        let seat = base_seat();
+        let candidates = vec![candidate("codex", 90.0)];
+        let inputs = RolloverInputs {
+            seat: &seat,
+            now: 2_000,
+            source_headroom_pct: Some(1.0),
+            source_observed_at: 500,
+            source_hard_blocked: true,
+            auto_enabled: true,
+            idle: false,
+            candidates: &candidates,
+        };
+        assert_eq!(
+            decide(&inputs, &cfg),
+            RolloverDecision::Wait("idle boundary".to_string())
+        );
     }
 
     #[test]
@@ -1282,7 +1329,12 @@ mod tests {
             source_observed_at: 500,
             source_hard_blocked: true,
             auto_enabled: true,
-            idle: false,
+            // Finding #14 (issue #358 review): `true`, not `false` -- this
+            // test is about the visited-epoch exclusion, not the idle
+            // boundary; `false` here would now read `Wait("idle boundary")`
+            // before candidate filtering ever ran, proving nothing about
+            // epochs at all.
+            idle: true,
             candidates: &candidates,
         };
         assert!(matches!(decide(&inputs, &cfg), RolloverDecision::Refuse(_)));
@@ -1398,7 +1450,10 @@ mod tests {
             source_observed_at: 500,
             source_hard_blocked: true,
             auto_enabled: true,
-            idle: false,
+            // Finding #14 (issue #358 review): `true`, not `false` -- this
+            // test is about the visited-epoch flap invariant, not the idle
+            // boundary (the reactive path no longer skips it).
+            idle: true,
             candidates: &candidates,
         };
         let RolloverDecision::Proceed { agent, cause, .. } = decide(&inputs, &cfg) else {
@@ -1419,7 +1474,7 @@ mod tests {
             source_observed_at: 500,
             source_hard_blocked: true,
             auto_enabled: true,
-            idle: false,
+            idle: true,
             candidates: &candidates_back,
         };
         assert!(matches!(

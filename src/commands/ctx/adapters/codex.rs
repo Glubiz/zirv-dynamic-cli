@@ -155,8 +155,12 @@ seat.";
 /// instead of hardcoded to `deny`'s wording, mirroring `claude::
 /// orchestrator_prompt_for`. `Deny` returns [`ORCHESTRATOR_PROMPT`] itself,
 /// unchanged; `Advise`/`Allow` splice `prompt::orchestrator_write_lines`'s
-/// shared, adapter-neutral text in front of
-/// [`ORCHESTRATOR_PROMPT_TAIL_AFTER_WRITE_GUARD_BULLET`].
+/// text in front of [`ORCHESTRATOR_PROMPT_TAIL_AFTER_WRITE_GUARD_BULLET`].
+/// Codex has no PreToolUse-style hook at all (`hook::run_pretool` is
+/// claude-only), so unlike `claude::orchestrator_prompt_for` this passes
+/// `false`: `Advise`'s claim that a write is "recorded" and nudged on would
+/// be false for a harness with no mechanism to record anything (issue #358
+/// review, finding #6).
 fn orchestrator_prompt_for(posture: super::super::config::OrchestratorWrites) -> String {
     use super::super::config::OrchestratorWrites;
     if posture == OrchestratorWrites::Deny {
@@ -167,7 +171,7 @@ fn orchestrator_prompt_for(posture: super::super::config::OrchestratorWrites) ->
          This seat runs the top tier; spend it on judgment -- sizing, design choices, \
          integration, the final call -- never on implementation.\n\n\
          - {}{ORCHESTRATOR_PROMPT_TAIL_AFTER_WRITE_GUARD_BULLET}",
-        super::super::prompt::orchestrator_write_lines(posture)
+        super::super::prompt::orchestrator_write_lines(posture, false)
     )
 }
 
@@ -2271,6 +2275,12 @@ mod tests {
     /// Issue #358 T8: the default posture (`advise`) no longer says "it does
     /// not implement" -- mirrors `claude::tests::the_orchestrator_layer_
     /// follows_this_seats_write_posture`, minus claude-only vocabulary.
+    ///
+    /// Issue #358 review finding #6: unlike claude's, codex's own `advise`
+    /// text must NOT claim writes from this seat "are recorded" and nudged
+    /// on -- codex has no PreToolUse-style hook at all, so nothing here ever
+    /// records or nudges anything; that sentence would be a bare falsehood
+    /// in a codex session's own system prompt.
     #[test]
     fn the_orchestrator_layer_follows_this_seats_write_posture() {
         let deny = CodexAdapter::new(None)
@@ -2288,8 +2298,9 @@ mod tests {
         );
         assert!(advise.contains("make trivial edits"), "got:\n{advise}");
         assert!(
-            advise.contains("Repository writes from this seat are recorded"),
-            "got:\n{advise}"
+            !advise.contains("Repository writes from this seat are recorded"),
+            "codex has no hook to record or nudge on a write -- claiming one would be false: \
+             {advise}"
         );
         assert!(advise.contains("native codex subagent threads"));
 

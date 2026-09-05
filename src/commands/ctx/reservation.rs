@@ -182,6 +182,66 @@ pub fn reserve(
     Ok(reservation)
 }
 
+/// Finding #11 (issue #358 review): like [`reserve`], but atomic against a
+/// CONCURRENT reservation on the same provider ledger. Placement (`agent::
+/// run_with`'s own routing, `dash::fulfill_spawn_request`) is computed
+/// against a `CapacitySnapshot` taken BEFORE this call, outside any lock --
+/// two admissions racing the same provider can both read "room enough" from
+/// that stale snapshot and both call [`reserve`], jointly over-committing
+/// it. Here the "is there room" check and the reservation itself happen
+/// under the SAME lock acquisition (the one [`lock_ledger`] already
+/// serializes every mutation through), so only one of two racing callers
+/// against a tight `limit_tokens` can ever win.
+///
+/// `limit_tokens` is the caller's own ceiling -- typically the provider's
+/// projected headroom for its binding window, converted to a raw token
+/// count via that window's configured budget (`pace.five_hour_budget_
+/// tokens`/`seven_day_budget_tokens`) -- checked as `outstanding + tokens <=
+/// limit`. `None` disables the check entirely (no configured budget to
+/// convert headroom against, or a caller that does not want one), in which
+/// case this behaves exactly like [`reserve`] wrapped in `Ok`.
+///
+/// Returns `Ok(Ok(reservation))` on success, or `Ok(Err(outstanding))` --
+/// the ledger's own current outstanding total, for the caller to report or
+/// retry a placement against -- when admitting `tokens` would push the
+/// ledger over `limit_tokens`. Nothing is written to the ledger on the
+/// `Err` branch; the caller is expected to retry placement excluding this
+/// provider and reserve there instead, never to refuse the delegation
+/// outright.
+pub fn reserve_within(
+    state: &StateDir,
+    provider: &str,
+    session: &str,
+    tokens: u64,
+    limit_tokens: Option<u64>,
+    now: u64,
+) -> CtxResult<Result<Reservation, u64>> {
+    let _lock = lock_ledger(state, provider)?;
+    let mut ledger = load(state, provider);
+    prune_dead(&mut ledger);
+    let outstanding = ledger
+        .entries
+        .iter()
+        .fold(0u64, |sum, entry| sum.saturating_add(entry.tokens));
+    if let Some(limit) = limit_tokens
+        && outstanding.saturating_add(tokens) > limit
+    {
+        return Ok(Err(outstanding));
+    }
+    let pid = std::process::id();
+    let reservation = Reservation {
+        id: uuid::Uuid::new_v4().to_string(),
+        session: session.to_string(),
+        pid,
+        pid_start_time: sessions::process_start_secs(pid),
+        tokens,
+        created_at: now,
+    };
+    ledger.entries.push(reservation.clone());
+    save(state, provider, &ledger)?;
+    Ok(Ok(reservation))
+}
+
 /// Removes `id`'s reservation exactly once, returning the tokens it had
 /// reserved -- `Ok(None)` both for an id that never existed and for one
 /// already settled/released, so a caller cannot double-count a reservation
@@ -487,5 +547,106 @@ mod tests {
         assert_eq!(ledger.schema_version, 1);
         assert_eq!(ledger.entries.len(), 1);
         assert_eq!(ledger.entries[0].pid_start_time, None);
+    }
+
+    #[test]
+    fn reserve_within_admits_under_the_limit_and_refuses_over_it() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+
+        let first = reserve_within(&state, "claude", "sess-a", 60, Some(100), 1_700_000_000)
+            .expect("reserve_within")
+            .expect("60 of 100 fits");
+        assert_eq!(outstanding(&state, "claude", 1_700_000_100), 60);
+
+        let refused = reserve_within(&state, "claude", "sess-b", 60, Some(100), 1_700_000_000)
+            .expect("reserve_within");
+        assert_eq!(
+            refused,
+            Err(60),
+            "60 + 60 exceeds the 100-token limit; the outstanding total is reported, nothing \
+             written"
+        );
+        assert_eq!(
+            outstanding(&state, "claude", 1_700_000_100),
+            60,
+            "a refused reserve_within must not mutate the ledger"
+        );
+
+        let second = reserve_within(&state, "claude", "sess-c", 40, Some(100), 1_700_000_000)
+            .expect("reserve_within")
+            .expect("60 + 40 == 100, exactly at the limit, still fits");
+        assert_eq!(outstanding(&state, "claude", 1_700_000_100), 100);
+        assert_ne!(first.id, second.id);
+    }
+
+    #[test]
+    fn reserve_within_with_no_limit_never_refuses() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+
+        reserve_within(&state, "claude", "sess-a", 1_000_000, None, 1_700_000_000)
+            .expect("reserve_within")
+            .expect("no limit means no refusal, however large");
+        assert_eq!(outstanding(&state, "claude", 1_700_000_100), 1_000_000);
+    }
+
+    /// Finding #11 (issue #358 review): the actual race the whole function
+    /// exists to close. 8 threads each try to reserve 60% of a shared
+    /// 100-token limit on the same provider at once -- only ONE can ever
+    /// fit (60 + 60 > 100), so at most one of the 8 may succeed. A bare
+    /// `outstanding()` read followed by a separate `reserve()` call would
+    /// let several of these racers all read "40 tokens of room" against the
+    /// stale pre-race total and all admit, jointly blowing through the
+    /// limit -- exactly `group.rs`'s own Finding-B1 admission race, one
+    /// level up.
+    #[test]
+    fn concurrent_reserve_within_eight_threads_admits_at_most_one_of_eight_racers() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        const THREADS: u64 = 8;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(THREADS as usize));
+
+        let outcomes: Vec<Result<Reservation, u64>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..THREADS)
+                .map(|i| {
+                    let state = state.clone();
+                    let barrier = barrier.clone();
+                    scope.spawn(move || {
+                        barrier.wait();
+                        reserve_within(
+                            &state,
+                            "claude",
+                            &format!("sess-{i}"),
+                            60,
+                            Some(100),
+                            1_700_000_000,
+                        )
+                        .expect("reserve_within")
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("racer thread must not panic"))
+                .collect()
+        });
+
+        let admitted = outcomes.iter().filter(|o| o.is_ok()).count();
+        assert_eq!(
+            admitted, 1,
+            "60-token reservations against a 100-token limit: at most one of eight racers may \
+             ever fit, and the barrier guarantees at least one tries"
+        );
+        assert_eq!(
+            outstanding(&state, "claude", 1_700_000_100),
+            60,
+            "the ledger's own total must match exactly the one admitted reservation"
+        );
+        assert_eq!(
+            entries(&state, "claude").len(),
+            1,
+            "no refused racer may have left a stray entry behind"
+        );
     }
 }

@@ -269,10 +269,14 @@ pub fn evaluate_interval(cfg: &CtxConfig) -> Duration {
 /// `idle` is the supervisor's own verified-idle answer (`wrap::
 /// handover_may_act`, `dash::pane::Pane::state() == Idle`) -- never inferred
 /// here. `confirmed_block` is [`confirmed_block`]'s output: `Some` takes the
-/// reactive path, which ignores the idle boundary and the cooldown.
-/// `interactive` is the seat's own launch interactivity, carried onto the
-/// request so the successor's permission posture matches the predecessor's
-/// (`handover::resolve_swap_launch`).
+/// reactive path (issue #358 review, finding #14: it skips `rollover_
+/// cooldown_secs`, but it never skips the idle boundary -- a hard block is
+/// real evidence, but a turn this session has not yielded from is not
+/// interrupted just because the account is blocked elsewhere; a mid-turn
+/// reactive trigger is instead recorded as `Evaluation::Pending` and retried
+/// once idle). `interactive` is the seat's own launch interactivity, carried
+/// onto the request so the successor's permission posture matches the
+/// predecessor's (`handover::resolve_swap_launch`).
 #[allow(clippy::too_many_arguments)]
 pub fn evaluate(
     state: &StateDir,
@@ -1079,15 +1083,21 @@ mod tests {
         ));
     }
 
+    /// Finding #14 (issue #358 review) narrowed this test's own scope: the
+    /// reactive path still ignores the COOLDOWN, but no longer the idle
+    /// boundary -- `idle: true` here is load-bearing (see the companion
+    /// `a_confirmed_block_mid_turn_is_pending_not_a_rollover` for the
+    /// mid-turn case, which this test used to also cover, incorrectly, by
+    /// asserting a `Rollover`).
     #[test]
-    fn a_confirmed_block_rolls_over_even_inside_the_cooldown_and_mid_turn() {
+    fn a_confirmed_block_rolls_over_even_inside_the_cooldown_once_idle() {
         let (_dir, state) = temp_state();
         let mut cfg = cfg();
         cfg.fallback.rollover_cooldown_secs = 86_400;
         register_seat(&state);
         // Below the hard spawn ceiling, so nothing but the caller's own
-        // confirmation makes this reactive -- and mid-turn inside a day-long
-        // cooldown, both of which the proactive path would refuse.
+        // confirmation makes this reactive -- and inside a day-long
+        // cooldown, which the proactive path would refuse.
         store_usage(&state, "anthropic", 92.0, NOW);
         store_usage(&state, "openai", 5.0, NOW);
         let mut seat = seat::load(&state, SHORT).expect("seat");
@@ -1097,10 +1107,10 @@ mod tests {
         let Evaluation::Rollover { request, .. } = evaluate_now(
             &state,
             &cfg,
-            false,
+            true,
             Some("provider=anthropic, five_hour reached=true".to_string()),
         ) else {
-            panic!("a confirmed block ignores both the idle boundary and the cooldown");
+            panic!("a confirmed block ignores the cooldown once idle");
         };
         assert_eq!(request.target_agent, "codex");
         assert!(request.force);
@@ -1108,6 +1118,36 @@ mod tests {
             request.structural_only,
             "a blocked vendor cannot answer a distiller call"
         );
+    }
+
+    /// Finding #14 (issue #358 review): a confirmed block must NOT roll over
+    /// mid-turn. A fresh, account-wide hard-ceiling reading can report the
+    /// provider blocked at any moment, entirely independent of whether THIS
+    /// child ever yielded -- swapping the pty out from under a turn that has
+    /// not is exactly the session-worsening move supervision may never make.
+    /// It is remembered (`Evaluation::Pending`) exactly like a mid-turn
+    /// proactive trigger already was, and retried once idle.
+    #[test]
+    fn a_confirmed_block_mid_turn_is_pending_not_a_rollover() {
+        let (_dir, state) = temp_state();
+        let mut cfg = cfg();
+        cfg.fallback.rollover_cooldown_secs = 86_400;
+        register_seat(&state);
+        store_usage(&state, "anthropic", 92.0, NOW);
+        store_usage(&state, "openai", 5.0, NOW);
+
+        let Evaluation::Pending(cause) = evaluate_now(
+            &state,
+            &cfg,
+            false,
+            Some("provider=anthropic, five_hour reached=true".to_string()),
+        ) else {
+            panic!("a mid-turn confirmed block must be remembered, not acted on");
+        };
+        assert!(matches!(cause, seat::Cause::Reactive { .. }));
+        let seat = seat::load(&state, SHORT).expect("seat");
+        assert!(seat.pending.is_some());
+        assert!(matches!(seat.phase, seat::Phase::Idle));
     }
 
     #[test]
@@ -1215,6 +1255,21 @@ mod tests {
         );
         let seat = seat::load(&state2, SHORT).expect("seat");
         assert!(matches!(seat.phase, seat::Phase::Idle));
+
+        // Finding #15 (issue #358 review): the in-place branch (no
+        // `HandoverRequest` to hand a live-swap seam -- the still-running
+        // child simply continues) must still leave the SAME durable trail a
+        // real rollover would: `seat::resume` (just asserted above via
+        // `Phase::Idle`) and a `capacity-resumed` `PoolEvent` on the
+        // ordinary decision log, so an operator reading `zirv ctx status`/
+        // the decision log can see the seat came back rather than silently
+        // wondering why a parked seat's own dashboard entry ever changed at
+        // all.
+        let log = std::fs::read_to_string(state2.logs().join("decisions.jsonl")).expect("log");
+        assert!(
+            log.contains(&format!("\"action\":\"{RESUMED}\"")),
+            "the in-place resume must still record a capacity-resumed event: {log}"
+        );
     }
 
     #[test]

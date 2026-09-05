@@ -143,7 +143,10 @@ seat.";
 /// from it; `Advise`/`Allow` splice `prompt::orchestrator_write_lines`'s
 /// shared, adapter-neutral text in front of
 /// [`ORCHESTRATOR_PROMPT_TAIL_AFTER_WRITE_GUARD_BULLET`], the same tail
-/// [`ORCHESTRATOR_PROMPT`] carries either way.
+/// [`ORCHESTRATOR_PROMPT`] carries either way. Claude's own PreToolUse hook
+/// (`hook::run_pretool`) is what makes `orchestrator_write_lines`'s
+/// `Advise` sentence about writes being "recorded" true here (issue #358
+/// review, finding #6) -- passed `true`, unlike codex's own splice.
 fn orchestrator_prompt_for(posture: super::super::config::OrchestratorWrites) -> String {
     use super::super::config::OrchestratorWrites;
     if posture == OrchestratorWrites::Deny {
@@ -154,7 +157,7 @@ fn orchestrator_prompt_for(posture: super::super::config::OrchestratorWrites) ->
          This seat runs the most capable model; spend it on judgment -- sizing, design \
          choices, integration, the final call -- never on implementation.\n\n\
          - {}{ORCHESTRATOR_PROMPT_TAIL_AFTER_WRITE_GUARD_BULLET}",
-        super::super::prompt::orchestrator_write_lines(posture)
+        super::super::prompt::orchestrator_write_lines(posture, true)
     )
 }
 

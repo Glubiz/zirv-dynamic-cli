@@ -484,6 +484,23 @@ fn best_alternate(
 /// low-water mark. Unknown headroom does not trigger predictive steering:
 /// uncertainty is treated conservatively and only affects whether an alternate
 /// may be used after a real refusal/block.
+///
+/// Finding #12 (issue #358 review): in `adaptive_delegation` mode, a
+/// requested harness genuinely `Draining` on CONCURRENCY alone (already at
+/// its own `max_active`, independent of usage headroom) used to never
+/// trigger a reroute -- the `reason` gate below only ever asks "is the
+/// source's usage headroom fine", which a `max_active` harness at low usage
+/// answers "yes" to, so the old code returned `None` before the adaptive
+/// path's own `CapacitySnapshot`/`allocator::classify` (which DOES know
+/// about `max_active`) ever ran. Adaptive mode now ALSO builds that snapshot
+/// and treats the requested harness reading `Draining`/`HardBlocked` there
+/// as a second, independent trigger alongside the usual usage-based one --
+/// neither trigger is required over the other, but at least one still is:
+/// a harness with merely an `Unknown` (no usage data yet) or `Ready`
+/// classification and no usage-based trigger either must still not reroute,
+/// or every ordinary delegation with no usage source at all would
+/// unconditionally bounce to an alternate. The `overage_covered` early
+/// return stays unconditional, in every mode.
 pub fn route_new_delegation(
     state: &StateDir,
     cfg: &CtxConfig,
@@ -509,23 +526,33 @@ pub fn route_new_delegation(
             .required_headroom_pct(cfg, reading.window)
             .is_some_and(|required| reading.headroom_pct < required)
     });
-    let reason = match gate {
-        SpawnGate::Refuse { .. } => RouteReason::Exhausted,
+    let headroom_reason = match gate {
+        SpawnGate::Refuse { .. } => Some(RouteReason::Exhausted),
         _ if task_will_not_fit
             || source_headroom.is_some_and(|pct| pct <= cfg.fallback.predictive_headroom_pct) =>
         {
-            RouteReason::Predictive
+            Some(RouteReason::Predictive)
         }
-        _ => return None,
+        _ => None,
     };
 
     if cfg.fallback.adaptive_delegation {
         let snapshot = capacity_snapshot(state, cfg, request.now, None, Some(request.requested));
+        let concurrency_triggered = snapshot.harness(request.requested).is_some_and(|harness| {
+            matches!(
+                harness.state,
+                allocator::HarnessState::Draining | allocator::HarnessState::HardBlocked
+            )
+        });
+        if headroom_reason.is_none() && !concurrency_triggered {
+            return None;
+        }
         let unit = work_unit_for(request);
         let exclude = request.exclude.into_iter().collect::<Vec<_>>();
         let models = |name: &str| translated_model_for(request, name, cfg);
         let placement = super::allocator::place(&snapshot, cfg, &unit, &exclude, &models);
         let candidate = placement.selected.filter(|_| !placement.keep_requested)?;
+        let reason = headroom_reason.unwrap_or(RouteReason::Predictive);
         return Some(route_from_candidate(
             request,
             reason,
@@ -536,6 +563,7 @@ pub fn route_new_delegation(
         ));
     }
 
+    let reason = headroom_reason?;
     let (selected, model, headroom) = best_alternate(state, cfg, request, &[])?;
     Some(Route {
         requested: request.requested.to_string(),
@@ -1444,6 +1472,62 @@ mod tests {
 
         assert_eq!(route.selected, "codex");
         assert_eq!(route.reason, RouteReason::Exhausted);
+    }
+
+    /// Finding #12 (issue #358 review): under `adaptive_delegation`, a
+    /// harness sitting at its own `max_active` cap must reroute even when
+    /// its usage headroom is fine -- the old code's usage-headroom-only
+    /// `reason` gate returned `None` (no reroute) the moment it read "fine",
+    /// before the adaptive path's own `CapacitySnapshot`/`allocator::place`
+    /// (which DOES know about `max_active`) ever ran. `claude` is capped at
+    /// one concurrent delegation, already has one live worker running
+    /// against it, and sits at a comfortable 10% usage -- a second
+    /// delegation must still land on `codex`.
+    #[test]
+    fn adaptive_delegation_reroutes_a_harness_at_max_active_even_at_low_usage() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let mut cfg = test_cfg_with_ready_adapters();
+        cfg.fallback.adaptive_delegation = true;
+        cfg.fallback.harness.insert(
+            "claude".to_string(),
+            crate::commands::ctx::config::HarnessLimits {
+                max_active: Some(1),
+                reserve_headroom_pct: None,
+            },
+        );
+        let now = 1_700_000_000;
+        store_usage(&state, "anthropic", 10.0, now + 3_600, now);
+        store_usage(&state, "openai", 10.0, now + 3_600, now);
+
+        let record = crate::commands::ctx::sessions::Record::new(
+            "11111111-2222-4333-8444-555555555555",
+            "claude",
+            tmp.path(),
+            crate::commands::ctx::sessions::Verb::Exec,
+        );
+        let _guard = crate::commands::ctx::sessions::SessionGuard::register(&state, record);
+
+        let route = route_new_delegation(
+            &state,
+            &cfg,
+            RouteRequest {
+                requested: "claude",
+                source_model: Some("sonnet"),
+                source_model_explicit: false,
+                delegation: true,
+                bounds: TaskBounds {
+                    tokens: None,
+                    tool_calls: None,
+                },
+                now,
+                exclude: None,
+            },
+            false,
+        )
+        .expect("claude is at max_active and must reroute even though its usage is fine");
+
+        assert_eq!(route.selected, "codex");
     }
 
     /// A reading old enough to fall outside `pace.collector_max_age_secs`,

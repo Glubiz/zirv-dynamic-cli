@@ -3046,14 +3046,38 @@ pub fn run_with<W: Write>(
     // other ledger write in this codebase (`group::rollback_admission`'s own
     // doc comment): a ledger error must never abort a launch this session
     // already committed to.
-    let reservation_id = match super::reservation::reserve(
+    // Finding #11 (issue #358 review): `reserve_within` checks "is there
+    // room" and reserves atomically, under the SAME ledger lock -- a plain
+    // `reserve` here (placement was computed against a `CapacitySnapshot`
+    // taken well before this point, outside any lock) let two concurrent
+    // admissions both read "room enough" and both reserve, jointly
+    // over-committing the provider. `limit_tokens` is `None` (no check) when
+    // this provider has no configured token budget to convert projected
+    // headroom against.
+    let limit_tokens = pace::headroom_limit_tokens(&collector, estimator.as_ref(), now, &cfg.pace);
+    let reservation_id = match super::reservation::reserve_within(
         &state,
         provider,
         &worker_session,
         worker_budget.tokens.unwrap_or(0),
+        limit_tokens,
         super::state::now_secs(),
     ) {
-        Ok(reservation) => Some(reservation.id),
+        Ok(Ok(reservation)) => Some(reservation.id),
+        Ok(Err(outstanding)) => {
+            // Never refuses the delegation itself over a ledger accounting
+            // concern -- it simply runs unreserved (like the ledger-error
+            // arm right below), rather than a wrong-provider reservation a
+            // caller-side reroute could not safely commit to from here
+            // without re-deriving the adapter/argv this launch already
+            // settled on above.
+            eprintln!(
+                "zirv ctx agent: provider '{provider}' is at its projected headroom limit \
+                 ({outstanding} tokens already outstanding); running unreserved rather than \
+                 refusing"
+            );
+            None
+        }
         Err(e) => {
             eprintln!(
                 "zirv ctx agent: failed to record a token reservation for provider \
@@ -3545,13 +3569,22 @@ pub fn run_with<W: Write>(
                 token_spend(&total),
             );
         }
-        if let Some(reservation_id) = &reservation_id {
-            let _ = super::reservation::settle(
-                &state_dir,
-                provider,
-                reservation_id,
-                token_spend(&total),
-            );
+        // Finding #4 (issue #358 review): a mid-run harness-handover
+        // restart (`exec::run_with_clock_inner`'s own usage-limit arm) moves
+        // this delegation's reservation to a NEW provider's ledger deep in
+        // the recursive call this `execution_report` came back from --
+        // `provider`/`reservation_id` above only ever name the FIRST
+        // provider this delegation reserved against. `final_reservation`
+        // carries the actual last one when a swap happened at all, so
+        // settling reads it first and falls back to the original pair only
+        // when the run never changed providers.
+        let settle_reservation = execution_report
+            .final_reservation
+            .as_ref()
+            .map(|(id, provider)| (id.as_str(), *provider))
+            .or_else(|| reservation_id.as_deref().map(|id| (id, provider)));
+        if let Some((id, provider)) = settle_reservation {
+            let _ = super::reservation::settle(&state_dir, provider, id, token_spend(&total));
         }
         let route: Vec<String> = execution_report
             .segments
@@ -4916,6 +4949,65 @@ mod tests {
                 .admitted_children,
             1,
             "a successful spawn must still count exactly one admission"
+        );
+    }
+
+    /// Finding #11 (issue #358 review): admitting this delegation's own
+    /// token ceiling would push the provider's ledger past its projected
+    /// headroom (a comfortable 1000-token budget, 95% already used, this
+    /// delegation asking for 600 more) -- `reserve_within` must refuse to
+    /// write that reservation, but the delegation itself must still run:
+    /// usage headroom ranks and ceiling-checks a delegation, it never
+    /// refuses one outright (issue #358 T9's own rule, one layer up).
+    #[test]
+    fn a_delegation_over_the_ledger_limit_runs_unreserved_rather_than_refusing() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state_dir = tmp.path().join("state");
+        let state = StateDir::from_root(state_dir.clone());
+        let now = crate::commands::ctx::state::now_secs();
+        window::store_for(
+            &state,
+            "anthropic",
+            &window::UsageWindows {
+                five_hour: Some(window::Window {
+                    used_percentage: 95.0,
+                    resets_at: now + 600,
+                    observed_at: now,
+                    overage_covered: false,
+                    limit_reached: false,
+                }),
+                seven_day: None,
+            },
+        )
+        .expect("store usage");
+
+        let mut env = base_env(&state_dir);
+        env.insert(
+            "ZIRV_CTX_PACE_FIVE_HOUR_BUDGET_TOKENS".to_string(),
+            "1000".to_string(),
+        );
+        // Rerouting is orthogonal to this test: with cross-harness fallback
+        // on, claude's own low headroom here would otherwise steer this
+        // delegation onto codex before reservation is ever reached.
+        env.insert("ZIRV_CTX_FALLBACK".to_string(), "false".to_string());
+        let mut args = args_for("claude", "go");
+        // 5% headroom of a 1000-token budget is 50 tokens; this delegation's
+        // own ceiling asks for far more than that -- large enough to also
+        // clear the fake agent's own reported usage, so the run genuinely
+        // completes rather than being stopped by an unrelated budget-
+        // exhausted check.
+        args.budget_tokens = Some(500_000);
+
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned())
+            .expect("the delegation must still run, not be refused");
+        assert_eq!(code, 0);
+
+        assert!(
+            crate::commands::ctx::reservation::entries(&state, "anthropic").is_empty(),
+            "an over-limit admission must leave no reservation behind, not a wrong-amount one"
         );
     }
 
@@ -7219,6 +7311,7 @@ mod tests {
                     wall_ms: 200,
                 },
             ],
+            final_reservation: None,
         };
 
         let total = append_execution_segments(

@@ -345,7 +345,17 @@ pub(super) const HARNESS_ROSTER_LAYER_HEADER: &str = "\n\n---\n\nzirv harness ro
 /// completeness and is exercised directly by this module's own tests, not
 /// spliced into either adapter's layer (see each adapter's own
 /// `orchestrator_prompt_for`).
-pub fn orchestrator_write_lines(posture: OrchestratorWrites) -> &'static str {
+///
+/// `hook_enforced` (issue #358 review, finding #6): whether THIS adapter's
+/// own harness actually has a PreToolUse-style hook that records a repository
+/// write and lets zirv nudge on it (`hook::run_pretool` -- claude only; see
+/// that module's own doc comment). `Advise`'s last sentence claims exactly
+/// that mechanism, so codex -- which has no hook at all -- must not carry it:
+/// a write from a codex orchestrator seat under `advise` is never recorded or
+/// nudged, so claiming otherwise would be a bare falsehood in the prompt.
+/// `Deny`/`Allow` are unaffected: neither makes a hook-specific claim in the
+/// first place.
+pub fn orchestrator_write_lines(posture: OrchestratorWrites, hook_enforced: bool) -> &'static str {
     match posture {
         OrchestratorWrites::Deny => {
             "This seat coordinates; it does not implement. Every repository change -- code, \
@@ -355,11 +365,16 @@ pub fn orchestrator_write_lines(posture: OrchestratorWrites) -> &'static str {
              retry another way. Size the task only to decide how many workers and how large a \
              brief."
         }
-        OrchestratorWrites::Advise => {
+        OrchestratorWrites::Advise if hook_enforced => {
             "This seat coordinates. Delegate substantial implementation, tests and docs to \
              workers; make trivial edits (a few lines, a doc or config line, an integration \
              fix) directly rather than dispatching for them. Repository writes from this seat \
              are recorded; zirv nudges when they pile up."
+        }
+        OrchestratorWrites::Advise => {
+            "This seat coordinates. Delegate substantial implementation, tests and docs to \
+             workers; make trivial edits (a few lines, a doc or config line, an integration \
+             fix) directly rather than dispatching for them."
         }
         OrchestratorWrites::Allow => {
             "This seat coordinates. Delegate substantial implementation, tests and docs to \

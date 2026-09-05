@@ -511,6 +511,57 @@ fn worst<'a>(
         })
 }
 
+/// The configured absolute token ceiling for one usage window -- the exact
+/// mapping `allocator::window_budget` uses, kept as a small, deliberately
+/// unshared duplicate rather than a cross-module dependency on a type
+/// (`CtxConfig`) this module otherwise never touches (every other function
+/// here takes `PaceConfig` directly).
+fn window_budget_tokens(window_name: &str, cfg: &PaceConfig) -> u64 {
+    match window_name {
+        "five_hour" => cfg.five_hour_budget_tokens,
+        "seven_day" => cfg.seven_day_budget_tokens,
+        _ => 0,
+    }
+}
+
+/// Finding #11 (issue #358 review): a provider's projected headroom,
+/// converted to a raw token count via its binding (worst, non-stale) window's
+/// configured budget -- the ceiling `reservation::reserve_within` checks a
+/// new admission against, so two racing admissions against the same
+/// provider cannot jointly over-commit it. Source priority is exactly
+/// [`decide`]'s own: a fresh (per `binding`) collector reading first, an
+/// estimator reading second, `None` third. `None` also when the binding
+/// window has no configured token budget to convert against at all (an
+/// unbounded provider, or one pacing tracks only by raw percentage) -- the
+/// caller's own contract for a `None` limit is "admit unconditionally".
+pub fn headroom_limit_tokens(
+    collector: &UsageWindows,
+    estimator: Option<&UsageWindows>,
+    now: u64,
+    cfg: &PaceConfig,
+) -> Option<u64> {
+    let collector_worst = worst(
+        binding(&collector.five_hour, now, cfg),
+        binding(&collector.seven_day, now, cfg),
+    );
+    let (window_name, window) = match collector_worst {
+        Some(found) => found,
+        None => {
+            let estimator = estimator?;
+            worst(
+                binding(&estimator.five_hour, now, cfg),
+                binding(&estimator.seven_day, now, cfg),
+            )?
+        }
+    };
+    let budget = window_budget_tokens(window_name, cfg);
+    if budget == 0 {
+        return None;
+    }
+    let headroom_pct = (100.0 - window.used_percentage).clamp(0.0, 100.0);
+    Some(((headroom_pct / 100.0) * budget as f64).round() as u64)
+}
+
 /// Collector first when fresh, estimator second, nothing third. A fresher
 /// lower-priority layer never overrides a fresh collector reading.
 pub fn decide(
@@ -1887,6 +1938,65 @@ mod tests {
             five_hour: window(percent, resets_at, NOW - 10),
             seven_day: None,
         }
+    }
+
+    /// Finding #11 (issue #358 review): the exact conversion `reservation::
+    /// reserve_within`'s caller needs -- 80% used against a 1000-token
+    /// five_hour budget leaves 20% headroom, i.e. 200 tokens of room.
+    #[test]
+    fn headroom_limit_tokens_converts_percentage_headroom_via_the_budgeted_window() {
+        let cfg = PaceConfig {
+            five_hour_budget_tokens: 1_000,
+            ..Default::default()
+        };
+        let reading = collector(80.0);
+
+        assert_eq!(headroom_limit_tokens(&reading, None, NOW, &cfg), Some(200));
+    }
+
+    #[test]
+    fn headroom_limit_tokens_is_none_without_a_configured_budget() {
+        let cfg = PaceConfig::default();
+        let reading = collector(80.0);
+
+        assert_eq!(
+            headroom_limit_tokens(&reading, None, NOW, &cfg),
+            None,
+            "no configured token budget means no ceiling to convert against"
+        );
+    }
+
+    #[test]
+    fn headroom_limit_tokens_falls_back_to_the_estimator_with_no_collector_reading() {
+        let cfg = PaceConfig {
+            five_hour_budget_tokens: 1_000,
+            ..Default::default()
+        };
+        let empty = UsageWindows::default();
+        let estimated = collector(50.0);
+
+        assert_eq!(
+            headroom_limit_tokens(&empty, Some(&estimated), NOW, &cfg),
+            Some(500)
+        );
+    }
+
+    #[test]
+    fn headroom_limit_tokens_ignores_a_stale_collector_reading() {
+        let cfg = PaceConfig {
+            five_hour_budget_tokens: 1_000,
+            ..Default::default()
+        };
+        let stale = UsageWindows {
+            five_hour: window(80.0, NOW + 600, NOW - cfg.collector_max_age_secs - 60),
+            seven_day: None,
+        };
+
+        assert_eq!(
+            headroom_limit_tokens(&stale, None, NOW, &cfg),
+            None,
+            "a stale reading is not usable, matching `decide`'s own binding rule"
+        );
     }
 
     fn store_confirmation_reading(

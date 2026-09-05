@@ -677,18 +677,35 @@ pub fn plan(
                 {
                     harness.active = harness.active.saturating_add(1);
                 }
-                if let (Some(harness), Some(provider)) = (
-                    scratch.harness(&candidate.name).cloned(),
-                    scratch.provider(&provider_name).cloned(),
-                ) {
-                    let (state, reason) = classify(&harness, &provider, cfg);
-                    if let Some(harness_mut) = scratch
+                // Finding #8 (issue #358 review): `reserved_tokens` just
+                // moved on the WHOLE provider, not just the harness that was
+                // placed -- every sibling harness sharing this provider has
+                // stale `state`/`state_reason` the moment that happens (a
+                // second harness on the same provider can flip Ready ->
+                // Draining purely from a sibling's admission, with no
+                // capacity change of its own). Reclassify every harness on
+                // this provider, not only `candidate.name`, so the NEXT
+                // unit's own `place` call sees an accurate snapshot.
+                if let Some(provider) = scratch.provider(&provider_name).cloned() {
+                    let siblings: Vec<String> = scratch
                         .harnesses
-                        .iter_mut()
-                        .find(|h| h.name.eq_ignore_ascii_case(&candidate.name))
-                    {
-                        harness_mut.state = state;
-                        harness_mut.state_reason = reason;
+                        .iter()
+                        .filter(|h| h.provider.eq_ignore_ascii_case(&provider_name))
+                        .map(|h| h.name.clone())
+                        .collect();
+                    for sibling_name in siblings {
+                        let Some(harness) = scratch.harness(&sibling_name).cloned() else {
+                            continue;
+                        };
+                        let (state, reason) = classify(&harness, &provider, cfg);
+                        if let Some(harness_mut) = scratch
+                            .harnesses
+                            .iter_mut()
+                            .find(|h| h.name.eq_ignore_ascii_case(&sibling_name))
+                        {
+                            harness_mut.state = state;
+                            harness_mut.state_reason = reason;
+                        }
                     }
                 }
             }
@@ -1053,6 +1070,66 @@ mod tests {
             .map(|c| c.projected_headroom_pct);
         assert!(second_provider.is_some());
         assert!(second_provider.unwrap() < 30.0);
+    }
+
+    /// Finding #8 (issue #358 review): `plan()` used to reclassify only the
+    /// harness it had just placed after moving `reserved_tokens` onto the
+    /// shared provider -- a SIBLING harness on that same provider kept its
+    /// stale `state`, so `place()`'s own requested-harness fast path (`state
+    /// == Ready`) would keep handing it out long after the provider's real
+    /// projected headroom had crossed below its own `reserve_headroom_pct`.
+    /// Two harnesses share one provider here; the first unit's own
+    /// reservation alone (600 of the provider's 1000-token five-hour budget,
+    /// against 15% raw headroom) is enough to push projected headroom to 0%,
+    /// under BOTH harnesses' 10% reserve floor -- so the second unit's
+    /// requested harness must already read Draining, not a stale Ready.
+    #[test]
+    fn a_sibling_harness_is_reclassified_after_a_plan_admission_on_its_shared_provider() {
+        let mut cfg = base_cfg();
+        cfg.fallback.order = vec!["claude-a".to_string(), "claude-b".to_string()];
+        cfg.pace.five_hour_budget_tokens = 1_000;
+        let snapshot = classify_all(
+            &cfg,
+            vec![provider(
+                "anthropic",
+                vec![window("five_hour", 15.0)],
+                Some(0),
+            )],
+            vec![
+                harness("claude-a", "anthropic", 0, None),
+                harness("claude-b", "anthropic", 0, None),
+            ],
+        );
+        let units = vec![unit("u1", "claude-a", 600), unit("u2", "claude-b", 0)];
+        let placements = plan(&snapshot, &cfg, &units, &|_, name| always_model(name));
+
+        assert_eq!(
+            placements[0].selected.as_ref().map(|c| c.name.as_str()),
+            Some("claude-a"),
+            "sanity: the first unit lands on the harness it requested"
+        );
+
+        assert!(
+            !placements[1].keep_requested,
+            "claude-b must no longer be kept as a fresh Ready candidate once the shared \
+             provider's headroom has drained below its own reserve: {:?}",
+            placements[1]
+        );
+        assert!(
+            placements[1].selected.is_none(),
+            "no other harness is eligible either (claude-a is also draining): {:?}",
+            placements[1]
+        );
+        let claude_b_reason = placements[1]
+            .exclusions
+            .iter()
+            .find(|(name, _)| name == "claude-b")
+            .map(|(_, reason)| reason.clone());
+        assert!(
+            matches!(claude_b_reason, Some(Exclusion::Draining(_))),
+            "got {claude_b_reason:?} in {:?}",
+            placements[1]
+        );
     }
 
     #[test]

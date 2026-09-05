@@ -2014,12 +2014,43 @@ fn settle_pending_rollover(
             *pending = None;
         }
         super::rollover::Readiness::TimedOut => {
+            // Finding #13 (issue #358 review): unlike `wrap`'s identical
+            // arm, this used to leave the on-disk seat naming the OLD
+            // predecessor after the transaction aborted -- the pane itself
+            // is kept alive running the SUCCESSOR (killing a live-but-
+            // silent successor here would end the operator's own dashboard
+            // pane outright, the same DEVIATION `wrap`'s own timeout arm
+            // documents), so the seat record and the actually-running pane
+            // disagreed about which agent was answering at this address
+            // until the next rollover happened to overwrite it. Peek the
+            // model `seat::prepare` recorded before `rollover::fail`/`seat::
+            // abort` discards the `Prepared` phase, then re-register onto
+            // the successor that is, in fact, running -- mirroring wrap's
+            // own re-registration exactly.
+            let successor_model =
+                super::seat::load(state, &short).and_then(|seat| match seat.phase {
+                    super::seat::Phase::Prepared {
+                        successor_model, ..
+                    } => successor_model,
+                    _ => None,
+                });
             let _ = super::rollover::fail(
                 state,
                 "dash",
                 &short,
                 generation,
                 "the successor did not answer within handoff.timeout_secs",
+                now,
+            );
+            let _ = super::seat::register(
+                state,
+                &short,
+                pane.session_id(),
+                pane.agent(),
+                successor_model.as_deref(),
+                adapters::provider_for_agent_name(Some(pane.agent())),
+                pane.role().label(),
+                false,
                 now,
             );
             *pending = None;
@@ -4118,14 +4149,37 @@ fn fulfill_spawn_request(
     // pane's own child actually exits (`account_reaped_pane_spend`).
     // Best-effort, like every other ledger write in this codebase: a ledger
     // error must never refuse a spawn this dashboard already admitted.
-    let reservation_id = match super::reservation::reserve(
+    // Finding #11 (issue #358 review): `reserve_within` checks "is there
+    // room" and reserves atomically under the ledger's own lock -- placement
+    // was decided against a `CapacitySnapshot`/pacing reading taken before
+    // this point, outside any lock, so a plain `reserve` here let two
+    // concurrent pane admissions both read "room enough" and both reserve,
+    // jointly over-committing the provider (mirrors `agent::run_with`'s own
+    // identical fix). `limit_tokens` is `None` (no check) when this
+    // provider has no configured token budget to convert projected headroom
+    // against.
+    let limit_tokens =
+        super::pace::headroom_limit_tokens(&collector, estimator.as_ref(), now, &cfg.pace);
+    let reservation_id = match super::reservation::reserve_within(
         state,
         adapter.provider(),
         &session_id,
         budget_tokens.unwrap_or(0),
+        limit_tokens,
         now,
     ) {
-        Ok(reservation) => Some(reservation.id),
+        Ok(Ok(reservation)) => Some(reservation.id),
+        Ok(Err(outstanding)) => {
+            // Never refuses the pane spawn itself over a ledger accounting
+            // concern -- it simply runs unreserved, exactly like the
+            // ledger-error arm right below.
+            eprintln!(
+                "zirv ctx dash: provider '{}' is at its projected headroom limit ({outstanding} \
+                 tokens already outstanding); spawning unreserved rather than refusing",
+                adapter.provider()
+            );
+            None
+        }
         Err(e) => {
             eprintln!(
                 "zirv ctx dash: failed to record a token reservation for provider '{}': {e}",
@@ -7365,6 +7419,34 @@ pub fn run_dashboard(
                                                 Some(idx)
                                                     if panes[idx].state() == PaneState::Idle =>
                                                 {
+                                                    // Finding #2 (issue #358
+                                                    // review): a manual swap
+                                                    // of the very pane an
+                                                    // automatic rollover has
+                                                    // already prepared must
+                                                    // close that open
+                                                    // transaction first --
+                                                    // otherwise `settle_
+                                                    // pending_rollover` later
+                                                    // commits its generation
+                                                    // against whatever
+                                                    // session this manual
+                                                    // swap puts in the pane.
+                                                    if pending_rollover.as_ref().is_some_and(
+                                                        |(short, _, _)| short == panes[idx].short(),
+                                                    ) && let Some((short, generation, _)) =
+                                                        pending_rollover.take()
+                                                    {
+                                                        let _ = super::rollover::fail(
+                                                            state,
+                                                            "dash",
+                                                            &short,
+                                                            generation,
+                                                            "superseded by a manual handover \
+                                                             request",
+                                                            super::state::now_secs(),
+                                                        );
+                                                    }
                                                     handover_pane(
                                                         &mut panes[idx],
                                                         &handover::HandoverRequest {
@@ -10549,6 +10631,92 @@ mod tests {
             listed[0].1.from_session, dashboard_short,
             "composed mail still carries the dashboard's own short"
         );
+    }
+
+    /// Finding #13 (issue #358 review): on a readiness TIMEOUT, `wrap`'s own
+    /// identical arm re-registers the seat onto the successor that is, in
+    /// fact, running (the pane is kept alive rather than killed -- see this
+    /// module's own `settle_pending_rollover` doc comment on that
+    /// DEVIATION). `settle_pending_rollover` used to skip that
+    /// re-registration entirely, leaving the on-disk seat naming the OLD
+    /// predecessor even though the pane it describes is genuinely running
+    /// the NEW successor from here on.
+    #[test]
+    fn a_readiness_timeout_reregisters_the_seat_onto_the_running_successor() {
+        use super::pane::tests::long_lived_argv;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+
+        let session_id = "77777777-3333-4444-8888-555555555555";
+        let short = sessions::short_id(session_id);
+        let spec = PaneSpec {
+            agent_name: "codex".to_string(),
+            argv: long_lived_argv(),
+            role: prompt::PromptRole::Orchestrator,
+            verb: sessions::Verb::Chat,
+            session_id: session_id.to_string(),
+            title: "orch".to_string(),
+        };
+        let pane = Pane::spawn(
+            spec,
+            &state,
+            &repo,
+            &repo,
+            (80, 24),
+            &[],
+            true,
+            pane::DEFAULT_IDLE_QUIET,
+        )
+        .expect("spawn");
+
+        // The seat as it stood right after `handover_pane` swapped this
+        // pane's pty: still naming the OLD predecessor ("claude"), with an
+        // open transaction naming "codex" as the successor.
+        super::seat::register(
+            &state,
+            &short,
+            "old-session-id",
+            "claude",
+            Some("sonnet"),
+            "anthropic",
+            prompt::PromptRole::Orchestrator.label(),
+            false,
+            1_700_000_000,
+        )
+        .expect("register seat");
+        let generation = super::seat::prepare(
+            &state,
+            &short,
+            "codex",
+            Some("gpt5"),
+            super::seat::Cause::Manual,
+            1_700_000_000,
+        )
+        .expect("prepare rollover");
+
+        let mut cfg = CtxConfig::default();
+        cfg.handoff.timeout_secs = 0;
+        let mut panes = vec![pane];
+        let mut pending = Some((short.clone(), generation, Instant::now()));
+
+        settle_pending_rollover(&mut panes, &cfg, &state, &mut pending);
+
+        assert!(pending.is_none(), "the timed-out transaction must close");
+        let seat = super::seat::load(&state, &short).expect("seat still exists");
+        assert_eq!(seat.phase, super::seat::Phase::Idle);
+        assert_eq!(
+            seat.agent, "codex",
+            "the seat must name the successor that is actually running, not the old \
+             predecessor: {seat:?}"
+        );
+        assert_eq!(seat.model.as_deref(), Some("gpt5"));
+        assert_eq!(seat.provider, "openai");
+        assert_eq!(seat.session, session_id);
+
+        panes[0].finish_shutdown().expect("shutdown");
     }
 
     /// Codex review finding 1, on the real reap path (not just the pure

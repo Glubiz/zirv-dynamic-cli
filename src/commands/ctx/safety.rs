@@ -7234,10 +7234,18 @@ fn run_check_hook_mode_with_env<W: Write>(
     );
     let mut outcome = evidence.outcome.clone();
     let mut orchestrator_advisory: Option<String> = None;
+    // Finding #9 (issue #358 review): `session`/`target` are captured here,
+    // but the audit row itself is NOT written until `outcome` is final (see
+    // the deferred block right before `audit_hook_decision` below) -- a
+    // later guard (the identical-failing-command breaker, specifically) can
+    // still turn an `Allow` from `Advise`/`Allow` posture into a `Deny`
+    // AFTER this point, and logging "advised"/"allowed" here would leave a
+    // permanently wrong audit row for a write that was, in fact, denied.
+    let mut orchestrator_block_pending: Option<(String, String)> = None;
     if let Some(target) = orchestrator_repo_write {
         let session =
             super::mail::session_identity(env).unwrap_or_else(|| payload.session_id.clone());
-        let outcome_label = match orchestrator_posture {
+        match orchestrator_posture {
             super::config::OrchestratorWrites::Deny => {
                 outcome = Outcome {
                     verdict: Verdict::Deny,
@@ -7248,7 +7256,6 @@ fn run_check_hook_mode_with_env<W: Write>(
                         origin: Origin::BuiltIn,
                     }),
                 };
-                "denied"
             }
             super::config::OrchestratorWrites::Advise => {
                 if super::hook::orchestrator_advisory_should_surface(env, &session) {
@@ -7257,24 +7264,10 @@ fn run_check_hook_mode_with_env<W: Write>(
                          delegate substantial changes to a worker"
                     ));
                 }
-                "advised"
             }
-            super::config::OrchestratorWrites::Allow => "allowed",
-        };
-        if let Ok(state) = super::state::StateDir::resolve(env) {
-            let tool_family = orchestrator_block_tool_family(&effective_command);
-            let _ = super::log::append_orchestrator_block(
-                &state,
-                &super::log::OrchestratorBlock {
-                    ts: super::state::now_secs(),
-                    session: &session,
-                    tool: &payload.tool_name,
-                    target: &tool_family,
-                    reason: "repository write",
-                    outcome: outcome_label,
-                },
-            );
+            super::config::OrchestratorWrites::Allow => {}
         }
+        orchestrator_block_pending = Some((session, target));
     }
     // Issue #168, design decision (d): a compound whose every write target
     // is confined to the session scratchpad is treated as `Allow` even when
@@ -7502,6 +7495,39 @@ fn run_check_hook_mode_with_env<W: Write>(
     // note riding alongside an actual refusal.
     if outcome.verdict != Verdict::Allow {
         additional_context = None;
+    }
+
+    // Finding #9 (issue #358 review): the orchestrator-write audit row, now
+    // that `outcome.verdict` can no longer change underneath it. `Deny` wins
+    // regardless of `orchestrator_posture` -- it is the actual, final
+    // disposition, whether it came from posture `Deny` itself (forced above)
+    // or from a later guard (the identical-failing-command breaker) turning
+    // an `Advise`/`Allow` posture's `Allow` into a `Deny` after this write
+    // was already provisionally logged as "advised"/"allowed" under the old
+    // ordering.
+    if let Some((session, _target)) = orchestrator_block_pending {
+        let outcome_label = if outcome.verdict == Verdict::Deny {
+            "denied"
+        } else {
+            match orchestrator_posture {
+                super::config::OrchestratorWrites::Advise => "advised",
+                _ => "allowed",
+            }
+        };
+        if let Ok(state) = super::state::StateDir::resolve(env) {
+            let tool_family = orchestrator_block_tool_family(&effective_command);
+            let _ = super::log::append_orchestrator_block(
+                &state,
+                &super::log::OrchestratorBlock {
+                    ts: super::state::now_secs(),
+                    session: &session,
+                    tool: &payload.tool_name,
+                    target: &tool_family,
+                    reason: "repository write",
+                    outcome: outcome_label,
+                },
+            );
+        }
     }
 
     let extras = HookOutputExtras {
@@ -9173,6 +9199,66 @@ mod tests {
             !records[0].target.contains(command),
             "target must not carry the full command text: {:?}",
             records[0].target
+        );
+    }
+
+    /// Finding #9 (issue #358 review): the orchestrator-write audit row must
+    /// reflect the FINAL verdict, not a label computed from `orchestrator_
+    /// posture` alone before a LATER guard gets a chance to turn the
+    /// `advise` posture's own `Allow` into a `Deny`. Here the later guard is
+    /// the unsandboxed-retry escalation (`dangerouslyDisableSandbox`): under
+    /// `advise` this repository write is not itself denied, but a headless
+    /// retry outside the OS sandbox that clears none of that guard's own
+    /// carve-outs still falls through to its `Deny` catch-all. The logged
+    /// row must say "denied", never the stale "advised" the old ordering
+    /// would have written before that guard ran.
+    #[test]
+    fn an_advised_write_later_denied_by_a_guard_logs_the_final_denied_outcome() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".git")).expect("fake git marker");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = super::super::testenv::HomeGuard::set(home.path());
+        let state_dir = tempfile::tempdir().expect("tempdir");
+
+        let mut env_map: HashMap<String, String> = HashMap::new();
+        env_map.insert(
+            super::super::adapters::SEAT_ROLE_ENV.to_string(),
+            "orchestrator".to_string(),
+        );
+        env_map.insert(
+            super::super::state::STATE_ENV.to_string(),
+            state_dir.path().to_string_lossy().to_string(),
+        );
+        env_map.insert(
+            "ZIRV_CTX_SUPERVISE_ORCHESTRATOR_WRITES".to_string(),
+            "advise".to_string(),
+        );
+        let cfg = CtxConfig::load(repo.path(), &|k| env_map.get(k).cloned()).expect("loads");
+        let repo_cwd = repo.path().to_string_lossy().replace('\\', "/");
+
+        let command = "sed -i 's/a/b/' src/main.rs";
+        // `permission_mode: "dontAsk"` -> headless (see `run_check_hook_
+        // mode_with_env`'s own mode derivation), which is what turns the
+        // sandbox-bypass guard's catch-all into `Deny` rather than `Ask`.
+        let stdin = format!(
+            r#"{{"tool_name":"Bash","tool_input":{{"command":"{command}","dangerouslyDisableSandbox":true}},"permission_mode":"dontAsk","cwd":"{repo_cwd}"}}"#
+        );
+        let mut out = Vec::new();
+        run_check_hook_mode_with_env(&cfg, &mut out, &stdin, &|k| env_map.get(k).cloned())
+            .expect("runs");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            text.contains(r#""permissionDecision":"deny""#),
+            "sanity: the sandbox-bypass retry guard must be the one denying this: got {text}"
+        );
+
+        let state = super::super::state::StateDir::from_root(state_dir.path().to_path_buf());
+        let records = super::super::log::read_orchestrator_blocks(&state);
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert_eq!(
+            records[0].outcome, "denied",
+            "the audit row must reflect the FINAL verdict, not the \"advised\" label computed \
+             before the sandbox-bypass guard ran: {records:?}"
         );
     }
 

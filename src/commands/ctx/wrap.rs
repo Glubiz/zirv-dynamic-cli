@@ -2919,6 +2919,15 @@ fn perform_handover_swap(
     // operator's own config change, or a stale request) fails before
     // anything is torn down.
     let (new_adapter, new_extra_flags) = super::handover::resolve_swap_launch(cfg, req)?;
+    // Finding #10 (issue #358 review): the successor must carry a fencing
+    // generation of its own. `req.generation` is the PREPARED generation an
+    // automatic swap's `seat::commit` is about to promote to `Seat::
+    // generation`; a manual swap (`req.generation: None`) opens no
+    // transaction and never changes the seat's generation at all, so it
+    // falls back to whatever is on disk right now.
+    let successor_generation = req
+        .generation
+        .or_else(|| super::seat::load(state_dir, &bar.session_short).map(|seat| seat.generation));
     let new_turn_env = super::handover::build_turn_env(
         new_adapter.as_ref(),
         server,
@@ -2926,6 +2935,7 @@ fn perform_handover_swap(
         repo,
         role,
         req.target_model.as_deref(),
+        successor_generation,
     );
 
     let (new_generation, quit) = match writer.lock() {
@@ -3223,6 +3233,25 @@ fn pump(
             .flatten();
         let swap_req = match manual_req {
             Some(req) => {
+                // Finding #1 (issue #358 review): a manual request must not
+                // let an already-open automatic rollover transaction linger.
+                // If it did, the readiness watch below would later commit
+                // that transaction's generation against whatever session id
+                // this manual swap put in the seat -- the wrong agent for
+                // that generation. Close the open transaction first (the
+                // successor it named already lost the pty to this manual
+                // request, so it never got to prove itself ready) before
+                // honouring the manual request.
+                if let Some(pending) = pending_rollover.take() {
+                    let _ = super::rollover::fail(
+                        state_dir,
+                        "wrap",
+                        &seat_short,
+                        pending.generation,
+                        "superseded by a manual handover request",
+                        super::state::now_secs(),
+                    );
+                }
                 let _ =
                     super::seat::clear_pending(state_dir, &seat_short, super::state::now_secs());
                 Some(req)

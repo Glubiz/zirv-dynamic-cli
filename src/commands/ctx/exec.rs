@@ -184,6 +184,16 @@ pub struct ExecutionSegment {
 #[derive(Debug, Clone, Default)]
 pub struct ExecutionReport {
     pub segments: Vec<ExecutionSegment>,
+    /// Issue #358 review finding #4: a harness-handover restart (below)
+    /// moves this run's own token reservation to the NEW provider's ledger
+    /// mid-recursion, inside `run_with_clock_inner`'s own tail call --
+    /// `ExecArgs::reservation_id`/its caller's `provider` local only ever
+    /// name the FIRST provider a delegation reserved against. Set every
+    /// time such a swap happens (the last one wins across however many
+    /// further handovers follow), so a caller that settles once the whole
+    /// chain returns reads the ledger the run actually finished on, never
+    /// the one it started on.
+    pub final_reservation: Option<(String, &'static str)>,
 }
 
 /// Flags that pin a launch to a conversation that already exists. A restart is
@@ -663,6 +673,7 @@ pub fn run_with_report<W: Write>(
         &super::state::now_secs,
         &|d: Duration| std::thread::sleep(d),
         None,
+        true,
         &mut report,
     )?;
     Ok((code, report))
@@ -680,7 +691,17 @@ pub(crate) fn run_with_clock<W: Write>(
     sleep_fn: &dyn Fn(Duration),
 ) -> CtxResult<i32> {
     let mut report = ExecutionReport::default();
-    run_with_clock_inner(args, w, repo, env, now_fn, sleep_fn, None, &mut report)
+    run_with_clock_inner(
+        args,
+        w,
+        repo,
+        env,
+        now_fn,
+        sleep_fn,
+        None,
+        true,
+        &mut report,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -692,6 +713,16 @@ fn run_with_clock_inner<W: Write>(
     now_fn: &dyn Fn() -> u64,
     sleep_fn: &dyn Fn(Duration),
     stable_short: Option<&str>,
+    // Issue #358 review finding #7: `true` for the very first launch of a
+    // WHOLE delegation, `false` for a recursive re-entry this same function
+    // makes on a provider-switch harness-handover restart (below). Without
+    // this, that recursive call's own `initial_launch` local (T9) would
+    // re-initialise to `true` on its own first loop iteration -- a brand
+    // fresh `run_with_clock_inner` call frame has no memory of the frame
+    // that tail-called it -- so a mid-delegation provider switch would skip
+    // the pacing wait exactly like a genuine first launch, even into a
+    // provider that is `WaitUntil`.
+    initial_launch_allowed: bool,
     report: &mut ExecutionReport,
 ) -> CtxResult<i32> {
     let cfg = CtxConfig::load_for_launch(repo, env)?;
@@ -1398,7 +1429,13 @@ fn run_with_clock_inner<W: Write>(
     // every later trip (an ordinary restart, a nudge restart, an in-place
     // compact-continue) paces normally instead of being read as another
     // fresh launch.
-    let mut initial_launch = true;
+    //
+    // Issue #358 review finding #7: seeded from `initial_launch_allowed`,
+    // not hardcoded -- a recursive re-entry of this same function (a
+    // provider-switch harness-handover restart) passes `false`, since that
+    // is never this delegation's own first launch even though it is this
+    // CALL FRAME's first loop iteration.
+    let mut initial_launch = initial_launch_allowed;
 
     loop {
         pace::wait_for_window(
@@ -2282,6 +2319,13 @@ fn run_with_clock_inner<W: Write>(
                             None
                         }
                     };
+                    // Finding #4 (issue #358 review): surface exactly which
+                    // ledger this delegation's reservation now lives on, so
+                    // whichever caller settles once the whole recursive
+                    // handover chain returns settles the right one -- not
+                    // the provider (and id) it started this run on.
+                    report.final_reservation =
+                        reservation_id.clone().map(|id| (id, target.provider()));
                 }
                 let nested_args = ExecArgs {
                     agent: Some(selected_agent.clone()),
@@ -2328,6 +2372,7 @@ fn run_with_clock_inner<W: Write>(
                     now_fn,
                     sleep_fn,
                     Some(&registry_short),
+                    false,
                     report,
                 );
             }
@@ -5509,6 +5554,170 @@ mod tests {
         assert!(
             argv.contains("finish the requested work"),
             "the logical task must survive the handoff: {argv}"
+        );
+    }
+
+    /// Finding #4 (issue #358 review): a mid-run harness-handover restart
+    /// moves this delegation's token reservation to the NEW provider's
+    /// ledger deep inside the recursive `run_with_clock_inner` call --
+    /// `ExecArgs::reservation_id`'s own ORIGINAL provider is stale the
+    /// moment that happens. `ExecutionReport::final_reservation` must
+    /// surface the actual, final `(id, provider)` pair so a caller (like
+    /// `agent::run_with`) that only settles once this whole chain returns
+    /// hits the ledger the run actually finished on.
+    #[test]
+    fn a_harness_handover_moves_the_reservation_and_reports_the_final_ledger() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let state_dir = tmp.path().join("state");
+        let argv_log = tmp.path().join("argv.log");
+        let mut env = base_env(&state_dir);
+        env.insert("ZIRV_CTX_PACE".to_string(), "false".to_string());
+        env.insert(
+            "ZIRV_CTX_AGENT_BIN".to_string(),
+            format!("sh {}", fixture("fake-codex-agent.sh").display()),
+        );
+
+        let modes = tmp.path().join("modes.txt");
+        std::fs::write(&modes, "limit\nhealthy\n").expect("write modes");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        store_provider_collector(&state_dir, window::CODEX_USAGE_PROVIDER, 2.0, true);
+        let _fake_agent = crate::commands::ctx::testenv::VarGuard::set(&[
+            ("FAKE_AGENT_MODE_FILE", modes.to_str()),
+            ("FAKE_AGENT_ARGV_LOG", argv_log.to_str()),
+        ]);
+
+        let state = crate::commands::ctx::state::StateDir::from_root(state_dir.clone());
+        let seeded = crate::commands::ctx::reservation::reserve(
+            &state,
+            "openai",
+            "seed-session",
+            1_000,
+            1_700_000_000,
+        )
+        .expect("seed reservation");
+
+        let args = ExecArgs {
+            agent: Some("codex".to_string()),
+            session_id: None,
+            transcript: None,
+            prompt: Some("finish the requested work".to_string()),
+            max_restarts: Some(0),
+            budget_tokens: None,
+            max_tool_calls: None,
+            objective: None,
+            timeout_secs: Some(30),
+            simple: false,
+            reservation_id: Some(seeded.id.clone()),
+            command: Vec::new(),
+        };
+        let mut out = Vec::new();
+        let (code, report) =
+            run_with_report(&args, &mut out, tmp.path(), &|k| env.get(k).cloned()).expect("runs");
+        assert_eq!(code, 0);
+
+        let (final_id, final_provider) = report
+            .final_reservation
+            .expect("a harness handover must surface the moved reservation");
+        assert_eq!(final_provider, "anthropic");
+        assert_ne!(
+            final_id, seeded.id,
+            "the moved reservation must get a fresh id"
+        );
+        assert_eq!(
+            crate::commands::ctx::reservation::outstanding(&state, "openai", 1_700_000_100),
+            0,
+            "the old provider's reservation must be released"
+        );
+        assert_eq!(
+            crate::commands::ctx::reservation::entries(&state, "anthropic").len(),
+            1,
+            "the new provider's ledger must carry exactly the moved reservation"
+        );
+    }
+
+    /// Finding #7 (issue #358 review): a harness-handover restart re-enters
+    /// `run_with_clock_inner` recursively -- a brand new call frame, with its
+    /// own fresh `initial_launch` local (T9). Without threading `initial_
+    /// launch_allowed` through that recursive call, this second launch would
+    /// be (wrongly) treated as the WHOLE delegation's first launch and skip
+    /// pacing entirely, even into a provider already inside pacing's soft
+    /// throttle band. Same fixture as `a_limit_hit_hands_over_to_an_enabled_
+    /// alternate_before_parking` (codex reports a confirmed limit, reroutes
+    /// to claude), but this time claude's own usage is ALSO inside the soft
+    /// band (85%, between `soft_percent` 80% and the hard `max_percent` 99%
+    /// -- high enough to trigger a real `Slow` pace decision, but not so
+    /// high it reads as hard-refused and gets excluded as a reroute target
+    /// itself), and pacing stays enabled (not disabled like that other test)
+    /// so the claude leg's own pre-launch gate is exercised for real.
+    #[test]
+    fn a_provider_switch_restart_still_paces_into_a_throttled_provider() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let state_dir = tmp.path().join("state");
+        let argv_log = tmp.path().join("argv.log");
+        let mut env = base_env(&state_dir);
+        env.insert("ZIRV_CTX_PACE_JITTER_SECS".to_string(), "0".to_string());
+        env.insert("ZIRV_CTX_PACE_MAX_WAIT_SECS".to_string(), "2".to_string());
+        env.insert(
+            "ZIRV_CTX_AGENT_BIN".to_string(),
+            format!("sh {}", fixture("fake-codex-agent.sh").display()),
+        );
+
+        let modes = tmp.path().join("modes.txt");
+        std::fs::write(&modes, "limit\nhealthy\n").expect("write modes");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        // codex: a confirmed hard limit, so the reroute to claude fires.
+        store_provider_collector(&state_dir, window::CODEX_USAGE_PROVIDER, 2.0, true);
+        // claude: inside the soft throttle band -- the provider this
+        // delegation is about to switch ONTO -- but not hard-refused, so it
+        // still qualifies as an admissible reroute target.
+        store_provider_collector(&state_dir, window::LEGACY_USAGE_PROVIDER, 85.0, false);
+        let _fake_agent = crate::commands::ctx::testenv::VarGuard::set(&[
+            ("FAKE_AGENT_MODE_FILE", modes.to_str()),
+            ("FAKE_AGENT_ARGV_LOG", argv_log.to_str()),
+        ]);
+
+        let args = ExecArgs {
+            agent: Some("codex".to_string()),
+            session_id: None,
+            transcript: None,
+            prompt: Some("finish the requested work".to_string()),
+            max_restarts: Some(0),
+            budget_tokens: None,
+            max_tool_calls: None,
+            objective: None,
+            timeout_secs: Some(30),
+            simple: false,
+            reservation_id: None,
+            command: Vec::new(),
+        };
+        let mut out = Vec::new();
+        let slept: std::cell::RefCell<Vec<u64>> = std::cell::RefCell::new(Vec::new());
+        let code = run_with_clock(
+            &args,
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            &crate::commands::ctx::state::now_secs,
+            &|d: Duration| slept.borrow_mut().push(d.as_secs()),
+        );
+        assert_eq!(code.expect("runs"), 0);
+
+        let log = std::fs::read_to_string(state_dir.join("logs/decisions.jsonl")).expect("log");
+        assert!(
+            log.contains("codex -> claude"),
+            "sanity: the reroute must have happened: {log}"
+        );
+        assert!(
+            !slept.borrow().is_empty(),
+            "the provider-switch restart must actually pace into a throttled provider, not skip \
+             the gate as if this were the delegation's own first launch: {log}"
+        );
+        assert!(
+            log.contains("\"action\":\"pace-wait\""),
+            "the claude leg's own pacing must be a real wait, not `pace-initial-launch-warn`: \
+             {log}"
         );
     }
 
