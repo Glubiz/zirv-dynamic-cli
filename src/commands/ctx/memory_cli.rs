@@ -626,27 +626,6 @@ pub fn run_remember_with<W: Write>(
     if body.is_empty() {
         return Err("zirv memory remember: no text given".into());
     }
-    // Review round 1, finding 2: same advisory lock `zirv ctx remember`'s
-    // own `--if-unchanged` path takes, held from the check through the
-    // write below (`_if_unchanged_lock` stays in scope until this function
-    // returns), so two concurrent `zirv memory remember --shared
-    // --if-unchanged` calls cannot both pass the check before either
-    // writes.
-    let _if_unchanged_lock = if args.if_unchanged.is_some() {
-        match memory::lock_dir_for_if_unchanged(scope, repo, &state, &slug, None) {
-            Some(dir) => Some(
-                memory::lock_bank_dir(&dir).map_err(|e| format!("zirv memory remember: {e}"))?,
-            ),
-            None => None,
-        }
-    } else {
-        None
-    };
-    if let Some(expected) = &args.if_unchanged {
-        let existing = memory::get_scoped(scope, repo, &state, &slug, &cfg, &args.key)?;
-        memory::check_if_unchanged(existing.as_ref(), expected)
-            .map_err(|e| format!("zirv memory remember: {e}"))?;
-    }
     let written_by = env(AGENT_ENV)
         .filter(|v| !v.trim().is_empty())
         .unwrap_or_else(|| "unknown".to_string());
@@ -667,7 +646,31 @@ pub fn run_remember_with<W: Write>(
         // yet.
         paths: Vec::new(),
     };
-    let path = if scope == MemoryScope::Shared && args.allow_sensitive {
+    // Review round 2, finding 1: `--if-unchanged` needs the check and the
+    // write under the SAME held bank lock (else a second writer could land
+    // in between), so that path takes the lock itself and calls
+    // `upsert_shared_inner` directly -- the public `upsert_shared_allow_
+    // sensitive`/`upsert_scoped` wrappers below would try to acquire a
+    // second lock on the same file and deadlock (`BankLock`'s own doc
+    // comment). Without `--if-unchanged`, their own internal locking is
+    // enough. This call site is Shared only, guaranteed by the `scope !=
+    // Shared` return above.
+    let path = if let Some(expected) = &args.if_unchanged {
+        let lock = memory::lock_bank(scope, &state, &slug)?;
+        let existing = memory::get_scoped(scope, repo, &state, &slug, &cfg, &args.key)?;
+        memory::check_if_unchanged(existing.as_ref(), expected)
+            .map_err(|e| format!("zirv memory remember: {e}"))?;
+        memory::upsert_shared_inner(
+            repo,
+            &state,
+            &slug,
+            &cfg,
+            &entry,
+            args.allow_sensitive,
+            true,
+            &lock,
+        )?
+    } else if args.allow_sensitive {
         memory::upsert_shared_allow_sensitive(repo, &state, &slug, &cfg, &entry)?
     } else {
         memory::upsert_scoped(scope, repo, &state, &slug, &cfg, &entry)?
