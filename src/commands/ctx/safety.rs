@@ -791,6 +791,15 @@ fn evaluate_single(policy: &SafetyPolicy, command: &str, fallback: Verdict) -> O
             matched: Some(rule),
         };
     }
+    // The third payload of the same shape: `zirv ctx permissions compile`
+    // WRITES the operator's own `[safety] allow`/`escape_allow` -- see
+    // `permissions_compile_write_deny_rule`'s own doc comment.
+    if let Some(rule) = permissions_compile_write_deny_rule(command) {
+        return Outcome {
+            verdict: Verdict::Deny,
+            matched: Some(rule),
+        };
+    }
     Outcome {
         verdict: fallback,
         matched: None,
@@ -880,12 +889,72 @@ fn reserved_zirv_auto_allow_rule(command: &str) -> Option<Rule> {
         });
     }
     let verb = tokens.get(2)?.to_ascii_lowercase();
+    if is_permissions_compile_write(&tokens) {
+        return None;
+    }
     ctx_base_allow_verbs()
         .any(|safe| safe == verb)
         .then(|| Rule {
             pattern: format!("zirv ctx {verb} *"),
             origin: Origin::BuiltIn,
         })
+}
+
+/// Whether `tokens` (the whole argv of a `zirv ctx ...` invocation) is the
+/// WRITING form of `zirv ctx permissions compile` -- i.e. `compile` without
+/// `--dry-run`.
+///
+/// `compile` is the one `permissions` subcommand that mutates the operator's
+/// own `~/.zirv/ctx.toml`: it unions new `[safety] allow` patterns (and,
+/// with `--escape`, `[safety] escape_allow`) into the home layer, the single
+/// layer a repository is forbidden from contributing to at all. A supervised
+/// model that can run it silently can therefore permanently widen the
+/// operator's policy with no prompt -- the exact escalation `safety.allow`'s
+/// operator-only layering exists to prevent, reached through a command whose
+/// reserved name made it auto-allow. `audit`, `propose` and `compile
+/// --dry-run` write nothing and stay silent.
+///
+/// Shared by [`reserved_zirv_auto_allow_rule`] (so the shortcut withholds
+/// `Allow` in the first place), [`permissions_compile_write_deny_rule`] (so
+/// the fallthrough denies rather than reaching the interactive `Allow`
+/// default) and [`is_reserved_zirv_escape_safe_segment`] (so it cannot ride
+/// an unsandboxed retry either), the same three-surface treatment `zirv
+/// artifact --server-command` already gets, so they cannot drift apart.
+fn is_permissions_compile_write(tokens: &[String]) -> bool {
+    if tokens
+        .get(2)
+        .is_none_or(|t| !t.eq_ignore_ascii_case("permissions"))
+    {
+        return false;
+    }
+    if tokens
+        .get(3)
+        .is_none_or(|t| !t.eq_ignore_ascii_case("compile"))
+    {
+        return false;
+    }
+    !tokens.iter().skip(4).any(|token| token == "--dry-run")
+}
+
+/// The same hard-floor treatment as [`artifact_present_server_command_deny_
+/// rule`], for the writing form of `zirv ctx permissions compile` -- see
+/// [`is_permissions_compile_write`]'s own doc comment for what it writes and
+/// why a supervised model must not reach it silently. `Deny` rather than
+/// `Ask` for the identical reason `agent_or_chat_posture_pinning_deny_rule`
+/// documents: `reserved_zirv_command_patterns` still has to carry a blanket
+/// `Bash(zirv ctx permissions *)` native rule for `audit`/`propose`/`--dry-
+/// run`, which a headless-silenced `Ask` would be outrun by. The operator's
+/// own shell is unaffected -- this classifier only ever governs commands a
+/// supervised harness proposes.
+fn permissions_compile_write_deny_rule(command: &str) -> Option<Rule> {
+    let (name, tokens) = reserved_zirv_invocation(command)?;
+    if name != "ctx" {
+        return None;
+    }
+    is_permissions_compile_write(&tokens).then(|| Rule {
+        pattern: "zirv ctx permissions *".to_string(),
+        origin: Origin::BuiltIn,
+    })
 }
 
 /// The hard floor `evaluate_single` applies to a `zirv agent`/`zirv chat`
@@ -2911,6 +2980,15 @@ const KUBE_HELM_VALUE_FLAGS: &[&str] = &[
 /// `helm -n prod uninstall ...` would misread the namespace argument itself
 /// (`prod`) as the verb and never reach the real one.
 fn first_positional<'a>(tokens: &'a [String], value_flags: &[&str]) -> Option<&'a str> {
+    first_positional_index(tokens, value_flags).map(|index| tokens[index].as_str())
+}
+
+/// [`first_positional`]'s own answer as an INDEX. A caller that needs to
+/// slice `tokens` at the positional it found must use this rather than
+/// searching the returned text back up with `position`: a preceding flag
+/// VALUE can spell the same word (`kubectl -n get get secrets`), and the
+/// text search then slices at the namespace instead of the verb.
+fn first_positional_index(tokens: &[String], value_flags: &[&str]) -> Option<usize> {
     let mut index = 1usize;
     while index < tokens.len() {
         let token = &tokens[index];
@@ -2929,7 +3007,7 @@ fn first_positional<'a>(tokens: &'a [String], value_flags: &[&str]) -> Option<&'
             };
             continue;
         }
-        return Some(token.as_str());
+        return Some(index);
     }
     None
 }
@@ -3229,9 +3307,22 @@ fn is_destructive_vcs_action(command: &str, scratchpad_roots: &[String]) -> bool
             force && !dry_run && (excludes_ignored || !has_concrete_paths)
         }
         "branch" => {
-            args.iter().any(|token| token == "-D")
-                || (lower.iter().any(|token| token == "--delete")
-                    && lower.iter().any(|token| token == "--force"))
+            // A FORCED delete, in every spelling of the same operation --
+            // `-D` is only its most compact one, and the pre-existing
+            // `--delete` + `--force` pair only its most verbose. A plain,
+            // non-forced delete is deliberately still silent: git refuses it
+            // outright for an unmerged branch, so it is recoverable work,
+            // not a loss.
+            let short_cluster_has = |wanted: char| {
+                args.iter().any(|token| {
+                    token.starts_with('-') && !token.starts_with("--") && token.contains(wanted)
+                })
+            };
+            // `-D` is a forced delete on its own, bundled (`-Dr`) or not.
+            let force_deletes = short_cluster_has('D');
+            let deletes = short_cluster_has('d') || lower.iter().any(|token| token == "--delete");
+            let forces = short_cluster_has('f') || lower.iter().any(|token| token == "--force");
+            force_deletes || (deletes && forces)
         }
         "stash" => lower
             .first()
@@ -4662,7 +4753,9 @@ const READ_ONLY_ESCAPE_SAFE_GLAB_FORMS: &[(&str, &str)] = &[
 ];
 
 /// Whether `tokens` is a read-only `gh`/`glab` invocation: `gh api` with no
-/// method other than `GET` and no body flag (`-f`/`-F`/`--input`), or a
+/// method other than `GET` (in the whole-token, `=`-joined and glued
+/// `-X<METHOD>` spellings alike) and no body flag (`-f`/`-F`/`--field`/
+/// `--raw-field`/`--input`, attached or separate), or a
 /// `(noun, verb)` pair from [`READ_ONLY_ESCAPE_SAFE_GH_FORMS`]/[`READ_ONLY_
 /// ESCAPE_SAFE_GLAB_FORMS`]. `--web`/`-w` always disqualifies (an external
 /// browser process), mirroring [`is_sandbox_bypass_safe_gh_command`].
@@ -4692,9 +4785,33 @@ fn is_gh_or_glab_read_only(tokens: &[String]) -> bool {
                     }
                     i += 1;
                 }
-                "-f" | "-F" | "--input" => has_body_flag = true,
                 _ if token.starts_with("--method=")
                     && !token["--method=".len()..].eq_ignore_ascii_case("GET") =>
+                {
+                    method_is_get = false;
+                }
+                // Every body-carrying spelling, attached or separate:
+                // `-f`/`-F` (also glued, `-fname=value`), `--field`/`--raw-
+                // field`/`--input` and each of their `=`-joined forms. A
+                // prefix test rather than an exact-token list, so a form
+                // this classifier has not enumerated fails CLOSED (treated
+                // as a body flag) instead of falling through as read-only.
+                _ if token.starts_with("--field")
+                    || token.starts_with("--raw-field")
+                    || token.starts_with("--input") =>
+                {
+                    has_body_flag = true;
+                }
+                _ if !token.starts_with("--")
+                    && (token.starts_with("-f") || token.starts_with("-F")) =>
+                {
+                    has_body_flag = true;
+                }
+                // Glued `-XPOST` -- curl/gh both accept the method attached
+                // to the flag, which the whole-token arm above never saw.
+                _ if !token.starts_with("--")
+                    && token.starts_with("-X")
+                    && !token[2..].eq_ignore_ascii_case("GET") =>
                 {
                     method_is_get = false;
                 }
@@ -4717,10 +4834,43 @@ fn is_gh_or_glab_read_only(tokens: &[String]) -> bool {
         .any(|&(n, v)| n == noun.as_str() && v == verb.as_str())
 }
 
+/// Whether one `git branch` argument mutates rather than lists: delete
+/// (`-d`/`-D`/`--delete`), rename (`-m`/`-M`/`--move`), copy (`-c`/`-C`/
+/// `--copy`), force (`-f`/`--force`), upstream (`-u`/`--set-upstream`/
+/// `--set-upstream-to`/`--unset-upstream`) and `--edit-description` (which
+/// opens an editor on the branch's stored description). Bundled short
+/// clusters (`-dr`, `-Df`) are scanned character by character, the same
+/// getopt rule [`is_curl_or_wget_get_only`] already applies to its own
+/// short options; every long flag is matched exactly (or `=`-joined), so a
+/// read-only neighbour like `--contains`/`--color`/`--format` is untouched.
+fn is_git_branch_mutation_flag(token: &str) -> bool {
+    if let Some(long) = token.strip_prefix("--") {
+        let name = long.split('=').next().unwrap_or(long);
+        return matches!(
+            name,
+            "delete"
+                | "move"
+                | "copy"
+                | "force"
+                | "set-upstream"
+                | "set-upstream-to"
+                | "unset-upstream"
+                | "edit-description"
+        );
+    }
+    let Some(short) = token.strip_prefix('-') else {
+        return false;
+    };
+    !short.is_empty() && short.chars().any(|c| "dDmMcCfu".contains(c))
+}
+
 /// Issue #168, design decision (a): git subcommands that can only read --
 /// `branch`/`remote`/`tag` are further restricted to their non-mutating
 /// forms, since the bare subcommand name also accepts destructive flags
-/// (`branch -d`, `remote add`, ...).
+/// (`branch -d`, `remote add`, ...). `branch`'s own flag screen is
+/// [`is_git_branch_mutation_flag`], which covers every delete/rename/copy/
+/// force/upstream spelling rather than the four short forms this arm
+/// originally listed.
 fn is_git_read_only(tokens: &[String]) -> bool {
     if tokens.first().map(|t| sql_program_name(t)).as_deref() != Some("git") {
         return false;
@@ -4731,11 +4881,10 @@ fn is_git_read_only(tokens: &[String]) -> bool {
     match sub {
         "status" | "log" | "diff" | "show" | "fetch" | "ls-remote" | "rev-parse" | "describe"
         | "blame" | "shortlog" => true,
-        "branch" => !tokens.iter().skip(2).any(|t| {
-            matches!(t.as_str(), "-d" | "-D" | "-m" | "-M")
-                || t == "--set-upstream"
-                || t.starts_with("--set-upstream=")
-        }),
+        "branch" => !tokens
+            .iter()
+            .skip(2)
+            .any(|t| is_git_branch_mutation_flag(t)),
         "remote" => {
             let rest: Vec<&str> = tokens.iter().skip(2).map(String::as_str).collect();
             rest.is_empty()
@@ -5587,7 +5736,8 @@ fn is_curl_or_wget_get_only(tokens: &[String], scratchpad_roots: &[String]) -> b
     while i < tokens.len() {
         let token = tokens[i].as_str();
         match token {
-            "-X" | "--request" => {
+            // `--method` is wget's own spelling of curl's `-X`/`--request`.
+            "-X" | "--request" | "--method" => {
                 match tokens.get(i + 1) {
                     Some(value) if value.eq_ignore_ascii_case("GET") => {}
                     _ => return false,
@@ -5619,8 +5769,32 @@ fn is_curl_or_wget_get_only(tokens: &[String], scratchpad_roots: &[String]) -> b
                     return false;
                 }
             }
+            // The `=`-joined spelling of the method flags above: only an
+            // explicit `GET` survives, anything else (including a malformed
+            // `--request=`) disqualifies.
+            _ if token.starts_with("--request=") || token.starts_with("--method=") => {
+                let value = token.split_once('=').map(|(_, v)| v).unwrap_or_default();
+                if !value.eq_ignore_ascii_case("GET") {
+                    return false;
+                }
+            }
             _ if token.starts_with("--config") => return false,
             _ if token.starts_with("--data") => return false,
+            // Every remaining body/upload family, in BOTH tools and in the
+            // separate-token, `=`-joined and suffixed spellings at once:
+            // curl's `--form`/`--form-string`/`--upload-file` and wget's
+            // `--post-data`/`--post-file`/`--body-data`/`--body-file`. A
+            // prefix test, so an unenumerated variant of one of these
+            // families fails CLOSED rather than falling through as GET-only.
+            _ if token.starts_with("--form")
+                || token.starts_with("--upload-file")
+                || token.starts_with("--post-data")
+                || token.starts_with("--post-file")
+                || token.starts_with("--body-data")
+                || token.starts_with("--body-file") =>
+            {
+                return false;
+            }
             // Bundled/glued POSIX short-option cluster: `-LO`, `-sO`,
             // `-Lo FILE`, `-oFILE`, `-KFILE`, ... -- any leading-`-`,
             // non-`--` token, scanned character by character.
@@ -5687,10 +5861,14 @@ fn is_kubectl_read_only(tokens: &[String]) -> bool {
     if tokens.first().map(|t| sql_program_name(t)).as_deref() != Some("kubectl") {
         return false;
     }
-    let Some(verb) = first_positional(tokens, KUBE_HELM_VALUE_FLAGS) else {
+    // Code review fix: the verb's own INDEX, never a `position` search for
+    // its text -- a preceding flag value spelling the same word (`kubectl -n
+    // get get secrets`) otherwise sliced `rest` at the namespace, so the
+    // Secret narrowing below inspected the wrong operand.
+    let Some(verb_index) = first_positional_index(tokens, KUBE_HELM_VALUE_FLAGS) else {
         return false;
     };
-    let verb_index = tokens.iter().position(|t| t == verb).unwrap_or(0);
+    let verb = tokens[verb_index].as_str();
     let rest = &tokens[verb_index..];
     if rest.iter().any(|t| t == "--raw") {
         return false;
@@ -5829,14 +6007,7 @@ fn is_confined_write_segment(
     {
         return false;
     }
-    // `split_segments` keeps each segment's original surrounding whitespace
-    // (the text right after a `&&`/`;`, say) -- collapse it the same way
-    // `normalize_segments`'s own `push_executable_candidate` does before any
-    // OTHER caller in this module ever glob-matches a segment, or a leading
-    // space would silently defeat a pattern like `"gh *"`.
-    let collapsed = collapse_whitespace(segment);
-    let outcome = evaluate_candidate_outcome(policy, &collapsed, fallback, scratchpad_roots);
-    outcome.verdict == Verdict::Allow || (outcome.verdict == fallback && outcome.matched.is_none())
+    segment_verdict_is_allow_or_unmatched(policy, segment, fallback, scratchpad_roots)
 }
 
 /// Issue #321 item 2: whether EVERY top-level executable segment of
@@ -5848,7 +6019,18 @@ fn is_confined_write_segment(
 /// ([`is_confined_write_segment`]) or read-only-escape-safe entirely on its
 /// own ([`is_read_only_escape_safe`] applied to that ONE segment -- which
 /// already covers the read-only `gh`/`glab`, git, curl/wget, and kubectl
-/// forms). Used ONLY by the `--dangerously-disable-sandbox` retry chain
+/// forms) AND whose own verdict clears [`segment_verdict_is_allow_or_
+/// unmatched`], and that at least ONE segment is a confined write.
+///
+/// Code review fix: those last two requirements are what keep this from
+/// being a general "read-only commands escape the sandbox silently" rule.
+/// This is the one carve-out not gated on the WHOLE command's base verdict
+/// already being `Allow` (see the call site's own comment for why), so
+/// without the write requirement ANY single read-only-whitelisted command
+/// reached it -- including one an operator's own `[safety] ask` rule
+/// explicitly asked for -- and without the per-segment verdict check the
+/// read-only half never consulted the policy at all.
+/// Used ONLY by the `--dangerously-disable-sandbox` retry chain
 /// (`run_check_hook_mode_with_env`), alongside the existing `<sandbox: ...>`
 /// carve-outs, and never when the base verdict is already `Deny` (see the
 /// call site) -- a segment already caught by a whole-command classifier like
@@ -5878,10 +6060,42 @@ fn is_mixed_confined_write_and_read_only_escape_safe(
     if segments.is_empty() {
         return false;
     }
-    segments.iter().all(|segment| {
-        is_confined_write_segment(policy, segment, fallback, scratchpad_roots)
-            || is_read_only_escape_safe(segment, scratchpad_roots)
-    })
+    let mut writes = 0usize;
+    for segment in &segments {
+        if is_confined_write_segment(policy, segment, fallback, scratchpad_roots) {
+            writes += 1;
+            continue;
+        }
+        if is_read_only_escape_safe(segment, scratchpad_roots)
+            && segment_verdict_is_allow_or_unmatched(policy, segment, fallback, scratchpad_roots)
+        {
+            continue;
+        }
+        return false;
+    }
+    writes > 0
+}
+
+/// Whether ONE segment's own ordinary verdict is `Allow`, or the plain
+/// mode default with no rule matched at all -- the identical standard
+/// [`is_confined_write_segment`] holds its own half of the carve-out to,
+/// factored out so the read-only half cannot skip the policy entirely.
+///
+/// Code review fix: [`is_mixed_confined_write_and_read_only_escape_safe`] is
+/// the one escape carve-out NOT gated on the WHOLE command's verdict already
+/// being `Allow` (by design -- see its doc comment), so without this the
+/// read-only half turned any base-`Ask` command the read-only whitelist
+/// happens to accept into a silent, unsandboxed `Allow`, overriding an
+/// operator's own explicit `ask` rule.
+fn segment_verdict_is_allow_or_unmatched(
+    policy: &SafetyPolicy,
+    segment: &str,
+    fallback: Verdict,
+    scratchpad_roots: &[String],
+) -> bool {
+    let collapsed = collapse_whitespace(segment);
+    let outcome = evaluate_candidate_outcome(policy, &collapsed, fallback, scratchpad_roots);
+    outcome.verdict == Verdict::Allow || (outcome.verdict == fallback && outcome.matched.is_none())
 }
 
 /// Code review fix (CRITICAL, issue #168 follow-up), retained under issue
@@ -6011,6 +6225,13 @@ fn is_reserved_zirv_escape_safe_segment(candidate: &str) -> bool {
                 return false;
             };
             if !ZIRV_CTX_ESCAPE_SAFE_VERBS.contains(&verb.as_str()) {
+                return false;
+            }
+            // `permissions compile` (without `--dry-run`) writes the
+            // operator's own `[safety] allow`/`escape_allow`, the same
+            // subcommand-level exception `usage tee` gets below -- see
+            // `is_permissions_compile_write`'s own doc comment.
+            if is_permissions_compile_write(&tokens) {
                 return false;
             }
             // `usage`'s own `tee` subcommand runs an arbitrary trailing
@@ -7356,8 +7577,12 @@ fn run_check_hook_mode_with_env<W: Write>(
             // write segment (an unmatched `mkdir -p <scratch>/x`) with a
             // read-only escape segment can fold to `Ask` at the whole-command
             // level even though every individual segment is independently
-            // safe; see `is_mixed_confined_write_and_read_only_escape_safe`'s
-            // own doc comment.
+            // safe. The combinator carries the equivalent gate per SEGMENT
+            // instead (each segment's own verdict must be `Allow` or the
+            // plain unmatched default), plus a requirement that at least one
+            // segment actually be a confined write, so a command with no
+            // write at all still falls through to the base-`Allow`-gated
+            // carve-outs above; see its own doc comment.
             Outcome {
                 verdict: Verdict::Allow,
                 matched: Some(Rule {
@@ -7864,6 +8089,222 @@ mod tests {
                 !is_read_only_escape_safe(command, &roots),
                 "{command} should not qualify"
             );
+        }
+    }
+
+    /// `gh api`'s body/method screen only recognized `-f`/`-F`/`--input` and
+    /// the whole-token `-X`/`--method` spellings, so every attached or
+    /// long-form equivalent classified a MUTATING API call as read-only and
+    /// rode the unsandboxed retry with no prompt.
+    #[test]
+    fn read_only_escape_safe_rejects_gh_api_body_and_glued_method_flags() {
+        let roots = vec!["/tmp/claude".to_string()];
+        for command in [
+            "gh api --field title=x /repos/o/r/issues",
+            "gh api -XPOST /repos/o/r/issues",
+            "gh api --raw-field a=b /x",
+            "gh api --input=body.json /x",
+            "gh api --method=POST /x",
+            "gh api -fname=value /x",
+        ] {
+            assert!(
+                !is_read_only_escape_safe(command, &roots),
+                "{command} should not qualify"
+            );
+        }
+        for command in ["gh api /repos/o/r/issues", "gh api --method GET /x"] {
+            assert!(
+                is_read_only_escape_safe(command, &roots),
+                "{command} should still qualify"
+            );
+        }
+    }
+
+    /// The `curl`/`wget` GET-only screen only handled separate-token
+    /// spellings, so `--request=DELETE`, `--form=`, `--upload-file=` and
+    /// every `wget` mutation flag fell through to the unmatched arm and the
+    /// function still answered "GET only".
+    #[test]
+    fn read_only_escape_safe_rejects_attached_curl_and_wget_mutation_flags() {
+        let roots = vec!["/tmp/claude".to_string()];
+        for command in [
+            "curl --request=DELETE https://x",
+            "curl --form=a=b https://x",
+            "curl --upload-file=/etc/passwd https://x",
+            "wget --method=DELETE --body-data=x https://x",
+            "wget --post-data=x https://x",
+            "wget --post-file=/etc/passwd https://x",
+            "wget --body-file=/etc/passwd https://x",
+        ] {
+            assert!(
+                !is_read_only_escape_safe(command, &roots),
+                "{command} should not qualify"
+            );
+        }
+        for command in [
+            "curl --request=GET https://x",
+            "wget --method=GET https://x",
+        ] {
+            assert!(
+                is_read_only_escape_safe(command, &roots),
+                "{command} should still qualify"
+            );
+        }
+    }
+
+    /// `is_git_read_only`'s `branch` arm listed only the short delete/rename
+    /// spellings, so every long-form mutation (`--delete`, `--move`,
+    /// `--copy`, `--force`, `--unset-upstream`) counted as read-only.
+    #[test]
+    fn read_only_escape_safe_rejects_long_form_git_branch_mutations() {
+        let roots = vec!["/tmp/claude".to_string()];
+        for command in [
+            "git branch --delete x",
+            "git branch --move a b",
+            "git branch -c a b",
+            "git branch -C a b",
+            "git branch --copy a b",
+            "git branch --force x main",
+            "git branch -f x main",
+            "git branch --unset-upstream",
+            "git branch -u origin/main",
+            "git branch --edit-description",
+        ] {
+            assert!(
+                !is_read_only_escape_safe(command, &roots),
+                "{command} should not qualify"
+            );
+        }
+        for command in ["git branch", "git branch -a", "git branch -vv"] {
+            assert!(
+                is_read_only_escape_safe(command, &roots),
+                "{command} should still qualify"
+            );
+        }
+    }
+
+    /// `is_destructive_vcs_action`'s `branch` arm recognized a FORCED delete
+    /// only as `-D` or `--delete --force`, so the mixed short/long spellings
+    /// of the identical operation were silent. A plain, non-forced delete
+    /// stays silent (git refuses it outright for an unmerged branch): this
+    /// closes spelling gaps in the existing ask, it does not widen the ask
+    /// set to a new operation.
+    #[test]
+    fn forced_git_branch_deletion_asks_in_every_spelling() {
+        let policy = SafetyPolicy::default();
+        for command in [
+            "git branch -D old",
+            "git branch --delete --force old",
+            "git branch --delete -f old",
+            "git branch -d --force old",
+            "git branch -d -f old",
+        ] {
+            assert_eq!(
+                evaluate(&policy, command, LaunchMode::Interactive).verdict,
+                Verdict::Ask,
+                "{command} must ask"
+            );
+        }
+        for command in ["git branch -d old", "git branch --delete old", "git branch"] {
+            assert_eq!(
+                evaluate(&policy, command, LaunchMode::Interactive).verdict,
+                Verdict::Allow,
+                "{command} must stay silent"
+            );
+        }
+    }
+
+    /// `is_kubectl_read_only` located the verb with a plain `position`
+    /// search, which matches a preceding flag VALUE that happens to spell
+    /// the verb -- `kubectl -n get get secrets` sliced `rest` at the
+    /// namespace value, so the Secret narrowing inspected `get` instead of
+    /// `secrets`.
+    #[test]
+    fn read_only_escape_safe_rejects_kubectl_verb_shadowed_by_a_flag_value() {
+        let roots = vec!["/tmp/claude".to_string()];
+        assert!(
+            !is_read_only_escape_safe("kubectl -n get get secrets", &roots),
+            "a namespace literally named `get` must not shadow the verb"
+        );
+        assert!(
+            is_read_only_escape_safe("kubectl -n get get pods", &roots),
+            "the same shape over a non-Secret resource still qualifies"
+        );
+    }
+
+    /// `is_mixed_confined_write_and_read_only_escape_safe` is the only
+    /// escape carve-out not gated on a base `Allow`, and its read-only half
+    /// never consulted the policy -- so ANY command the read-only whitelist
+    /// accepts, with no write target at all and an explicit operator `ask`
+    /// against it, folded to a silent unsandboxed `Allow`.
+    #[test]
+    fn mixed_confined_write_escape_requires_a_confined_write_segment() {
+        let roots = vec!["/tmp/claude".to_string()];
+        let mut policy = SafetyPolicy::default();
+        policy.ask.push(Rule {
+            pattern: "git log*".to_string(),
+            origin: Origin::Operator,
+        });
+        assert!(
+            !is_mixed_confined_write_and_read_only_escape_safe(
+                &policy,
+                "git log",
+                Verdict::Allow,
+                &roots
+            ),
+            "a single read-only segment with no write target must not reach the carve-out"
+        );
+        assert!(
+            !is_mixed_confined_write_and_read_only_escape_safe(
+                &policy,
+                "mkdir -p /tmp/claude/x && git log",
+                Verdict::Allow,
+                &roots
+            ),
+            "a read-only segment the operator explicitly asked for must not ride the carve-out"
+        );
+        assert!(
+            is_mixed_confined_write_and_read_only_escape_safe(
+                &policy,
+                "mkdir -p /tmp/claude/x && gh issue view 1 --json body",
+                Verdict::Allow,
+                &roots
+            ),
+            "the shape issue #321 added this carve-out for must still qualify"
+        );
+    }
+
+    /// `zirv ctx permissions compile` WRITES new `[safety] allow` entries
+    /// into the operator's own `~/.zirv/ctx.toml`, so the reserved
+    /// auto-allow must not let a supervised model widen the operator's
+    /// policy with no prompt. `--dry-run`, `audit` and `propose` stay
+    /// silent.
+    #[test]
+    fn permissions_compile_write_is_never_auto_allowed() {
+        let policy = SafetyPolicy::default();
+        for mode in [LaunchMode::Interactive, LaunchMode::Headless] {
+            for command in [
+                "zirv ctx permissions compile",
+                "zirv ctx permissions compile --agent claude --escape",
+                "ZIRV ctx PERMISSIONS Compile",
+            ] {
+                assert_ne!(
+                    evaluate(&policy, command, mode).verdict,
+                    Verdict::Allow,
+                    "{command} ({mode:?}) must not auto-allow"
+                );
+            }
+            for command in [
+                "zirv ctx permissions compile --dry-run",
+                "zirv ctx permissions audit",
+                "zirv ctx permissions propose",
+            ] {
+                assert_eq!(
+                    evaluate(&policy, command, mode).verdict,
+                    Verdict::Allow,
+                    "{command} ({mode:?}) must stay silent"
+                );
+            }
         }
     }
 
