@@ -259,14 +259,22 @@ fn generate_one(path: &Path, content: &str, force: bool) -> std::io::Result<Gene
             if !is_managed(&existing) && !force {
                 return Ok(GenerateOutcome::Refused);
             }
-            fs::write(path, content)?;
+            // E-5: `fs::write` truncates in place and follows a symlink,
+            // writing straight through to wherever a symlinked native path
+            // points -- exactly the "silently destroy hand-maintained
+            // content" hazard this module otherwise treats as its central
+            // safety property. `state::write_shared`'s temp-sibling-then-
+            // rename swap replaces the directory entry itself instead
+            // (see its own doc comment), so a symlinked path is replaced
+            // by a regular file rather than written through.
+            state::write_shared(path, content)?;
             Ok(GenerateOutcome::Written { created: false })
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent)?;
             }
-            fs::write(path, content)?;
+            state::write_shared(path, content)?;
             Ok(GenerateOutcome::Written { created: true })
         }
         Err(e) => Err(e),
@@ -1282,6 +1290,40 @@ mod tests {
         assert_eq!(code, 0);
         let content = fs::read_to_string(&claude_native).expect("read");
         assert!(is_managed(&content));
+        assert!(content.contains("Always run the full test suite."));
+    }
+
+    /// E-5: `generate_one` used to write through `fs::write`, which follows
+    /// a symlink and truncates whatever it points at in place. A native
+    /// path that is a symlink to a file OUTSIDE the repo must never have
+    /// that external file's content clobbered -- `--force` only ever
+    /// authorizes replacing the (managed-or-unmanaged) NATIVE file itself.
+    #[cfg(unix)]
+    #[test]
+    fn generate_with_force_never_writes_through_a_symlinked_native_file() {
+        let (dir, _guard) = repo();
+        write_canonical(dir.path(), "common.md", "Always run the full test suite.");
+        let claude_native = native_claude_path(dir.path());
+        let outside = dir.path().join("outside-claude-target.md");
+        fs::write(&outside, "do not touch this external file\n").expect("write outside");
+        std::os::unix::fs::symlink(&outside, &claude_native).expect("symlink");
+
+        let (code, _out) = run_sync(&generate_args(true), dir.path());
+
+        assert_eq!(code, 0);
+        assert_eq!(
+            fs::read_to_string(&outside).expect("read outside"),
+            "do not touch this external file\n",
+            "a symlinked native file's target must never be written through"
+        );
+        assert!(
+            !fs::symlink_metadata(&claude_native)
+                .expect("symlink_metadata")
+                .file_type()
+                .is_symlink(),
+            "the symlink itself must be replaced by a regular file"
+        );
+        let content = fs::read_to_string(&claude_native).expect("read generated");
         assert!(content.contains("Always run the full test suite."));
     }
 

@@ -285,6 +285,17 @@ pub fn extract_json_candidate(text: &str) -> Option<String> {
     last_fenced_json_block(text).or_else(|| last_balanced_object(text))
 }
 
+/// E-3: pairs fence delimiters from the END of the text backward -- a
+/// block's own open/close pair is always its two nearest fence delimiters
+/// -- instead of forward from index 0 in fixed steps of two. Forward
+/// pairing assumed every fence was part of a complete, sequential pair: a
+/// single stray/unclosed ``` anywhere before the real last block shifts
+/// every pairing after it by one, so the genuinely-paired closing fence of
+/// the LAST block was left with no partner and silently dropped (the
+/// contract example this fixes). Pairing from the right instead means an
+/// unmatched fence -- wherever it falls -- is simply the one left over
+/// once pairing runs out, never something that desyncs a LATER, otherwise
+/// well-formed pair.
 fn last_fenced_json_block(text: &str) -> Option<String> {
     const FENCE: &str = "```";
     let mut positions = Vec::new();
@@ -293,11 +304,14 @@ fn last_fenced_json_block(text: &str) -> Option<String> {
         positions.push(search_from + pos);
         search_from += pos + FENCE.len();
     }
-    let mut result = None;
-    let mut i = 0;
-    while i + 1 < positions.len() {
-        let start = positions[i] + FENCE.len();
-        let end = positions[i + 1];
+    // Each candidate is `(is_json_tagged, body)`, collected nearest-block-
+    // first (i.e. in reverse text order): the LAST block in the text is
+    // `candidates[0]`.
+    let mut candidates: Vec<(bool, String)> = Vec::new();
+    let mut i = positions.len();
+    while i >= 2 {
+        let start = positions[i - 2] + FENCE.len();
+        let end = positions[i - 1];
         if start <= end {
             let segment = &text[start..end];
             let (tag, body) = match segment.find('\n') {
@@ -305,13 +319,22 @@ fn last_fenced_json_block(text: &str) -> Option<String> {
                 None => (segment.trim(), ""),
             };
             let tag_lower = tag.to_ascii_lowercase();
-            if tag_lower == "json" || (tag.is_empty() && body.trim_start().starts_with('{')) {
-                result = Some(body.to_string());
+            if tag_lower == "json" {
+                candidates.push((true, body.to_string()));
+            } else if tag.is_empty() && body.trim_start().starts_with('{') {
+                candidates.push((false, body.to_string()));
             }
         }
-        i += 2;
+        i -= 2;
     }
-    result
+    // Prefer the LAST json-tagged block; fall back to the last matching
+    // block of any shape (untagged-but-object-shaped included) when no
+    // json-tagged block was found at all.
+    candidates
+        .iter()
+        .find(|(is_json, _)| *is_json)
+        .or_else(|| candidates.first())
+        .map(|(_, body)| body.clone())
 }
 
 fn last_balanced_object(text: &str) -> Option<String> {
@@ -703,6 +726,19 @@ mod tests {
     #[test]
     fn extract_json_candidate_is_none_for_text_with_no_json_shape() {
         assert_eq!(extract_json_candidate("just prose, nothing else"), None);
+    }
+
+    /// E-3: a stray, unmatched ``` earlier in the message used to shift
+    /// forward index-parity pairing so the LAST fenced block's own closing
+    /// fence had no partner and was silently dropped, returning an earlier
+    /// block instead. Pairing from the end of the text fixes it.
+    #[test]
+    fn extract_json_candidate_survives_a_stray_fence_before_the_real_block() {
+        let text = "```json\n{\"status\":\"<status>\"}\n```\nstray: ```\nreal:\n```json\n{\"status\":\"done\"}\n```";
+        assert_eq!(
+            extract_json_candidate(text),
+            Some("{\"status\":\"done\"}".to_string())
+        );
     }
 
     fn sample_schema() -> Schema {
