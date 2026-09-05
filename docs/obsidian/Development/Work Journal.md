@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-09-04
+last-verified: 2026-09-05
 ---
 
 # Work Journal
@@ -19,6 +19,11 @@ last-verified: 2026-09-04
 **Follow-up:** anything unfinished (optional).
 
 ## Entries
+
+### 2026-09-05: issue #311 -- `zirv ctx loop` self-pacing cadence (`feat/311-loop-pacing`)
+**What:** `zirv ctx loop` now backs off its own inter-cycle wait geometrically while consecutive successful cycles keep producing the same outcome, snapping back to the floor on a digest change or new mail -- Hermes Agent's own self-paced `/loop` mode, ported. Only engages when no explicit `--interval` was given; explicit `--interval` stays byte-for-byte the old fixed sleep. Pure `next_pace` handles the floor/ceiling/growth/reset math; `cycle_outcome_digest` reuses the transcript body `run_with_clock` already reads for spend roll-up (no second file read) and hashes the last non-empty `AssistantFinal::text`. A failing cycle bypasses growth (`backoff_for` unchanged, takes priority) but resets the self-paced wait to the floor. New `[supervise] loop_backoff_ceiling_secs` (default 900, narrow-only downward).
+**Key changes:** `src/commands/ctx/run_loop.rs` (`next_pace`/`PaceReason`/`SelfPaceState`/`SelfPaceInput`/`cycle_outcome_digest`, `handle_cycle_outcome` now takes `session`/`sleep_fn`/`self_pace`), `src/commands/ctx/config.rs` (`SuperviseConfig::loop_backoff_ceiling_secs`, its narrow fold, `ENV_MAP`/`ALL_CONFIG_KEYS` entries), `.zirv/ctx.toml`, `docs/obsidian/{Modules/Ctx Supervisors,Concepts/Untrusted Configuration,Development/Decision Log}.md`.
+**Follow-up:** None outstanding; full five gates run before the PR.
 
 ### 2026-09-04: issue #358 -- elastic usage-window-aware harness scheduling + automatic meta-orchestrator rollover (`feat/elastic-scheduling-358`, v3.21.0, in review)
 **What:** Eight tasks off 3.20.0. A pure capacity allocator (`allocator.rs`: `HarnessState` ready/draining/hard-blocked/unknown/disabled, `CapacitySnapshot`/`Placement`/`place`/`plan`) plus a durable per-provider token-reservation ledger (`reservation.rs`) feed adaptive delegation routing when `fallback.adaptive_delegation` is on (default true). A persisted, fencing-generation logical orchestrator seat (`seat.rs`) plus an automatic rollover transaction driver (`rollover.rs`, reusing the #84 handover seams) let the meta-orchestrator itself roll over across harnesses -- gated off by default (`fallback.auto_orchestrator_rollover = false`) until the fencing invariants soak. `--pin-harness`/`ZIRV_CTX_SEAT_PIN` opt a seat out. `zirv ctx status` gains a pool section, `--json`, and a dashboard aggregate row (`pool.rs`). Two operator-facing follow-ups landed on the same branch: `supervise.orchestrator_writes` (allow/advise/deny, default advise, repo-narrow-only) replaces the unconditional repo-write deny from #328/#334; usage headroom now only ranks a spawn, never refuses/delays one (`PaceGate.initial_launch`, non-blocking interactive gate).
