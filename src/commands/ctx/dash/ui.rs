@@ -95,9 +95,9 @@ pub struct HeaderFacts {
 
 /// What the header's right-hand hint cluster is chosen against. Phase 2 adds
 /// the two attention-derived states the approved contract names
-/// (`needs action` and `ended`) alongside phase 1's plain `alive`; an open
-/// overlay's own back/confirm cluster is phase 3's and still costs no call
-/// site of [`header_hints`] a shape change.
+/// (`needs action` and `ended`) alongside phase 1's plain `alive`; phase 3
+/// adds `restorable`, which is what decides whether the ended cluster's own
+/// `^A r restore` is drawn at all.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct HintContext {
     /// Whether the selected row is a live pane.
@@ -108,6 +108,12 @@ pub struct HintContext {
     /// Whether the selected row is an ended pane (a retained completed-worker
     /// row, or one reaped and still on screen).
     pub ended: bool,
+    /// Whether the selected row can actually be relaunched -- an ended row
+    /// for which the dashboard still holds the spawn request that created it.
+    /// A row that cannot be restored is not offered `^A r`: phase 3's own
+    /// rule is that a drawn hint always does something (the context menu is
+    /// where an unavailable action is named *and* explained instead).
+    pub restorable: bool,
 }
 
 /// Pure: the `(chord, label)` pairs the header offers for `context`, in
@@ -119,10 +125,9 @@ pub struct HintContext {
 /// needs action, then an ended row, then any other live pane, then the two
 /// hints that always exist.
 ///
-/// `^A r restore` is deliberately still absent: that action arrives in phase
-/// 3, and naming it before it exists would draw a hint that does nothing.
-/// `^A i inspect` IS offered, mapped for now onto the existing errors/evidence
-/// overlay -- see [`hint_id`].
+/// Phase 3: the ended cluster is the approved design's own four -- inspect,
+/// restore, actions, help -- with `^A r restore` drawn only for a row that
+/// really can be restored (`HintContext::restorable`).
 pub fn header_hints(context: &HintContext) -> Vec<(&'static str, &'static str)> {
     if context.needs_action {
         vec![
@@ -132,7 +137,13 @@ pub fn header_hints(context: &HintContext) -> Vec<(&'static str, &'static str)> 
             ("^A ?", "help"),
         ]
     } else if context.ended {
-        vec![("^A i", "inspect"), ("^A c", "actions"), ("^A ?", "help")]
+        let mut hints = vec![("^A i", "inspect")];
+        if context.restorable {
+            hints.push(("^A r", "restore"));
+        }
+        hints.push(("^A c", "actions"));
+        hints.push(("^A ?", "help"));
+        hints
     } else if context.alive {
         vec![
             ("^A c", "actions"),
@@ -155,6 +166,7 @@ fn hint_id(key: &str) -> HintId {
         "^A m" => HintId::Mail,
         "^A e" => HintId::Errors,
         "^A i" => HintId::Inspect,
+        "^A r" => HintId::Restore,
         _ => HintId::Help,
     }
 }
@@ -550,6 +562,11 @@ pub struct ComposeDraft {
 pub struct MailView {
     pub items: Vec<(PathBuf, String, String)>,
     pub cursor: usize,
+    /// Issue #354 phase 3: the shared list viewport's first drawn row. The
+    /// reducer keeps it, `list_dialog_layout` clamps it so the cursor is
+    /// always visible, and it is what makes a 40-message inbox readable in a
+    /// dialog with room for twelve rows.
+    pub offset: usize,
     pub compose: Option<ComposeDraft>,
 }
 
@@ -575,6 +592,8 @@ pub enum MailEffect {
 pub struct HandoverDraft {
     pub items: Vec<(String, String, String)>,
     pub cursor: usize,
+    /// The shared list viewport's first drawn row (issue #354 phase 3).
+    pub offset: usize,
     pub target_short: String,
 }
 
@@ -587,6 +606,8 @@ pub struct HandoverDraft {
 pub struct MemoryView {
     pub entries: Vec<(String, String, String)>,
     pub cursor: usize,
+    /// The shared list viewport's first drawn row (issue #354 phase 3).
+    pub offset: usize,
     pub input: Option<String>,
 }
 
@@ -623,6 +644,8 @@ pub struct RestoreEntry {
 pub struct RestoreView {
     pub entries: Vec<RestoreEntry>,
     pub cursor: usize,
+    /// The shared list viewport's first drawn row (issue #354 phase 3).
+    pub offset: usize,
 }
 
 /// `Ctrl+A e`'s own state: the kept errors from `push_error`'s buffer
@@ -633,6 +656,195 @@ pub struct RestoreView {
 pub struct ErrorsView {
     pub items: Vec<String>,
     pub cursor: usize,
+    /// The shared list viewport's first drawn row (issue #354 phase 3).
+    pub offset: usize,
+}
+
+/// Issue #354 phase 3: one thing the context menu can do to its target row.
+///
+/// Every variant maps onto machinery the dashboard already has -- an overlay
+/// the keyboard can already open, the roster's own selection/focus move, the
+/// pane shutdown the quit path uses, or a relaunch of the very
+/// `spawnreq::SpawnRequest` that created the row. Nothing here builds an
+/// argv, and nothing here is a new process-launch path (`Command Safety`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MenuAction {
+    /// Open the inspector on the target row.
+    Inspect,
+    /// Give the target row the keyboard.
+    Focus,
+    /// Open the nudge composer aimed at the target row.
+    Nudge,
+    /// Open the mail overlay.
+    Mail,
+    /// Open the handover picker for the target row.
+    Handover,
+    /// Ask the target pane's harness to quit (the quit path's own
+    /// `Pane::request_quit`), after an inline confirmation.
+    Stop,
+    /// Relaunch an ended row from the spawn request kept for it.
+    Restore,
+    /// Show the target row's checkout path in the header notice, and open the
+    /// inspector on it. Deliberately NOT a shell or editor launch: spawning
+    /// one would be a new process-launch path outside the spawn machinery.
+    OpenWorktree,
+    /// Open the inspector scrolled to its evidence section.
+    Evidence,
+    /// Exactly [`MenuAction::Restore`], named for the failure case: an ended
+    /// row whose child exited non-zero.
+    Retry,
+    /// Drop a retained ended row from the roster.
+    Dismiss,
+}
+
+impl MenuAction {
+    /// The entry's own label, which is also what its letter jump is derived
+    /// from (see `menu_letters`).
+    pub fn label(self) -> &'static str {
+        match self {
+            MenuAction::Inspect => "inspect",
+            MenuAction::Focus => "focus",
+            MenuAction::Nudge => "nudge",
+            MenuAction::Mail => "mail",
+            MenuAction::Handover => "handover",
+            MenuAction::Stop => "stop",
+            MenuAction::Restore => "restore",
+            MenuAction::OpenWorktree => "open worktree",
+            MenuAction::Evidence => "evidence",
+            MenuAction::Retry => "retry",
+            MenuAction::Dismiss => "dismiss",
+        }
+    }
+}
+
+/// One context-menu row: what it does, and -- when it cannot be done for this
+/// target -- the short reason, which is rendered dim on the same row rather
+/// than the entry being hidden. An operator who cannot see that `restore`
+/// exists cannot learn why it is unavailable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MenuEntry {
+    pub action: MenuAction,
+    /// `None` when the entry is available.
+    pub disabled: Option<String>,
+    /// The letter that jumps to this entry, unique within the menu; `None`
+    /// when every letter of the label was already taken.
+    pub letter: Option<char>,
+}
+
+impl MenuEntry {
+    pub fn enabled(&self) -> bool {
+        self.disabled.is_none()
+    }
+}
+
+/// Pure: one jump letter per entry, unique within the menu.
+///
+/// The first letter of the label wherever it is still free, otherwise the
+/// next free letter of that same label -- so `restore` keeps `r` and `retry`,
+/// which follows `evidence`, takes `t`. `None` only when every letter of a
+/// label was already claimed, which no menu this phase builds reaches; a
+/// letterless entry is still selectable with the caret.
+pub fn menu_letters(actions: &[MenuAction]) -> Vec<Option<char>> {
+    let mut taken: HashSet<char> = HashSet::new();
+    actions
+        .iter()
+        .map(|action| {
+            let letter = action
+                .label()
+                .chars()
+                .find(|c| c.is_ascii_alphabetic() && !taken.contains(c));
+            if let Some(c) = letter {
+                taken.insert(c);
+            }
+            letter
+        })
+        .collect()
+}
+
+/// `Ctrl+A c`, a right-click on a row, or the header's `actions` hint: the
+/// menu for ONE row, named in the title, which is not necessarily the
+/// selected one (a right-click targets whatever it landed on).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MenuView {
+    /// The target row's session short id, captured when the menu opened.
+    pub target: String,
+    /// `<short> · <role>` -- what the title says the menu applies to.
+    pub subject: String,
+    pub entries: Vec<MenuEntry>,
+    pub cursor: usize,
+    /// First entry drawn; moved only by the shared list viewport.
+    pub offset: usize,
+    /// Set while an inline confirmation is up for the entry at this index
+    /// (`stop`, the one destructive action here). `y`/Enter confirms, `n`/Esc
+    /// backs out; nothing is killed until it does.
+    pub confirm: Option<usize>,
+}
+
+/// One titled block of the inspector. `lines` are already formatted
+/// `key  value` strings -- the inspector is a read-only report, so there is
+/// nothing for the renderer to decide per line.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InspectorSection {
+    pub name: String,
+    pub lines: Vec<String>,
+}
+
+/// `Ctrl+A i`, or the context menu's `inspect`/`evidence`: everything the
+/// dashboard already knows about one row, in sections, read-only.
+///
+/// Every fact comes from something already cached on the `FactsCache`
+/// cadence (the composed `attention::SessionStatus`, the row's own
+/// disclosure values, the kept-errors buffer) -- the inspector never reads
+/// the disk, never shells out, and costs nothing per frame.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InspectorView {
+    /// The row this inspects, by session short id.
+    pub target: String,
+    pub subject: String,
+    pub sections: Vec<InspectorSection>,
+    /// The line the caret sits on, in the flattened row list -- which is what
+    /// "opened at the evidence section" means mechanically.
+    pub cursor: usize,
+    pub offset: usize,
+}
+
+impl InspectorView {
+    /// Pure: this inspector's sections flattened into the rows the list
+    /// dialog draws -- one header line per section, then its lines indented.
+    /// The single source of truth for both the render and `section_start`
+    /// below, so a caret aimed at a section can never land somewhere else.
+    pub fn rows(&self) -> Vec<String> {
+        let mut rows = Vec::new();
+        for (i, section) in self.sections.iter().enumerate() {
+            if i > 0 {
+                rows.push(String::new());
+            }
+            rows.push(format!("{}:", section.name));
+            if section.lines.is_empty() {
+                rows.push(format!("  {}", style::PLACEHOLDER));
+            } else {
+                rows.extend(section.lines.iter().map(|line| format!("  {line}")));
+            }
+        }
+        rows
+    }
+
+    /// Pure: the flattened row index a named section's header sits on, or
+    /// `0` when it has none -- so `evidence` opening "scrolled to evidence"
+    /// is a caret position, not a second layout pass.
+    pub fn section_start(&self, name: &str) -> usize {
+        let mut index = 0usize;
+        for (i, section) in self.sections.iter().enumerate() {
+            if i > 0 {
+                index += 1;
+            }
+            if section.name == name {
+                return index;
+            }
+            index += 1 + self.sections[i].lines.len().max(1);
+        }
+        0
+    }
 }
 
 /// What, if anything, sits drawn on top of the grid right now. `QuitConfirm`
@@ -660,6 +872,76 @@ pub enum Overlay {
     Help,
     /// `Ctrl+A e`: the kept-errors overlay.
     Errors(ErrorsView),
+    /// Issue #354 phase 3: `Ctrl+A c`, a right-click on a row, or the
+    /// header's `actions` hint -- the target row's action menu.
+    Menu(MenuView),
+    /// Issue #354 phase 3: `Ctrl+A i`, or the menu's `inspect`/`evidence` --
+    /// the per-row inspector.
+    Inspector(InspectorView),
+}
+
+impl Overlay {
+    /// Pure: `(cursor, offset, len)` of whichever list this overlay is
+    /// currently showing, or `None` when it is not showing one (a compose or
+    /// edit buffer, a free-text prompt, a cursor-less dialog like help or
+    /// the quit confirmation).
+    ///
+    /// Issue #354 phase 3: this is what lets the shared viewport keys --
+    /// PageUp/PageDown/Home/End and the wheel -- be handled ONCE, for every
+    /// list dialog, without every per-dialog reducer growing a capacity
+    /// argument. Each reducer keeps its own semantics for its own keys.
+    pub fn list_state(&self) -> Option<(usize, usize, usize)> {
+        match self {
+            Overlay::Mail(view) if view.compose.is_none() => {
+                Some((view.cursor, view.offset, view.items.len()))
+            }
+            Overlay::Memory(view) if view.input.is_none() => {
+                Some((view.cursor, view.offset, view.entries.len()))
+            }
+            Overlay::Restore(view) => Some((view.cursor, view.offset, view.entries.len())),
+            Overlay::Handover(view) => Some((view.cursor, view.offset, view.items.len())),
+            Overlay::Errors(view) => Some((view.cursor, view.offset, view.items.len())),
+            Overlay::Menu(view) => Some((view.cursor, view.offset, view.entries.len())),
+            Overlay::Inspector(view) => Some((view.cursor, view.offset, view.rows().len())),
+            _ => None,
+        }
+    }
+
+    /// Pure: writes a caret/viewport pair back. A no-op for an overlay with
+    /// no list of its own.
+    pub fn set_list_state(&mut self, cursor: usize, offset: usize) {
+        match self {
+            Overlay::Mail(view) => {
+                view.cursor = cursor;
+                view.offset = offset;
+            }
+            Overlay::Memory(view) => {
+                view.cursor = cursor;
+                view.offset = offset;
+            }
+            Overlay::Restore(view) => {
+                view.cursor = cursor;
+                view.offset = offset;
+            }
+            Overlay::Handover(view) => {
+                view.cursor = cursor;
+                view.offset = offset;
+            }
+            Overlay::Errors(view) => {
+                view.cursor = cursor;
+                view.offset = offset;
+            }
+            Overlay::Menu(view) => {
+                view.cursor = cursor;
+                view.offset = offset;
+            }
+            Overlay::Inspector(view) => {
+                view.cursor = cursor;
+                view.offset = offset;
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Pure: how many rows the header gets in an `area_height`-row frame.
@@ -1929,7 +2211,16 @@ pub fn frame_snapshot(
     roster: &RosterFrame,
     header: &HeaderFacts,
     overlay: &Overlay,
+    tick: usize,
 ) -> FrameSnapshot {
+    // Phase 3: the open dialog's own rows and hints, from the same spec and
+    // the same layout function `render_overlay` draws through.
+    let overlay_geom = overlay_geometry(
+        frame,
+        if zoomed { frame } else { layout.main },
+        overlay,
+        tick,
+    );
     FrameSnapshot {
         frame,
         sidebar: if zoomed {
@@ -1961,8 +2252,18 @@ pub fn frame_snapshot(
         // yet; `Hit::FooterHint` exists for the phases that add them.
         footer_hints: Vec::new(),
         zoomed,
-        overlay: (!matches!(overlay, Overlay::None))
-            .then(|| overlay_area(frame, if zoomed { frame } else { layout.main })),
+        overlay: overlay_geom.as_ref().map(|(rect, ..)| *rect),
+        overlay_rows: overlay_geom
+            .as_ref()
+            .map(|(_, rows, ..)| rows.clone())
+            .unwrap_or_default(),
+        overlay_hints: overlay_geom
+            .as_ref()
+            .map(|(_, _, hints, _)| hints.clone())
+            .unwrap_or_default(),
+        overlay_capacity: overlay_geom
+            .map(|(_, _, _, capacity)| capacity)
+            .unwrap_or_default(),
     }
 }
 
@@ -2373,12 +2674,23 @@ fn preview(text: &str, max_cols: usize) -> String {
 
 /// One list-dialog row: plain text, an optional leading colour glyph (the
 /// QuitConfirm spinner, in practice -- nothing else in this phase needs
-/// one), and an optional checkbox (`Some(_)` shows `[x]`/`[ ]`, `None` shows
-/// neither -- most dialogs have no checkbox at all).
+/// one), an optional checkbox (`Some(_)` shows `[x]`/`[ ]`, `None` shows
+/// neither -- most dialogs have no checkbox at all), and -- phase 3 -- an
+/// optional dim `reason` drawn on the same row after the text, which is how
+/// the context menu says an entry exists but cannot be used right now
+/// without hiding it.
 pub struct ListDialogRow {
     pub text: String,
     pub checked: Option<bool>,
     pub glyph: Option<(String, Style)>,
+    /// Rendered dim, after `text`, on the same row. Never hidden and never
+    /// its own line: an operator scanning the menu must see the entry and
+    /// its reason together.
+    pub reason: Option<String>,
+    /// Whether the whole row renders dim (an unavailable menu entry). The
+    /// cursor row still reverses uniformly on top of this, exactly as every
+    /// other row does.
+    pub dim: bool,
 }
 
 impl ListDialogRow {
@@ -2387,26 +2699,36 @@ impl ListDialogRow {
             text,
             checked: None,
             glyph: None,
+            reason: None,
+            dim: false,
         }
     }
 }
 
 /// The shared list-dialog primitive's own input: everything [`render_list_
 /// dialog`] needs to draw one dialog, decoupled from which real overlay it
-/// is drawing -- QuitConfirm, mail/memory browsing, restore, handover, and
-/// the help overlay all build one of these rather than each hand-rolling
-/// its own `Block`/`Paragraph` pair.
+/// is drawing -- QuitConfirm, mail/memory browsing, restore, handover, the
+/// help overlay, and phase 3's context menu and inspector all build one of
+/// these rather than each hand-rolling its own `Block`/`Paragraph` pair.
 pub struct ListDialogSpec<'a> {
-    pub title: &'a str,
+    /// Owned rather than borrowed since phase 3: [`list_spec_for`] builds
+    /// every dialog's spec in one place and some titles are formatted
+    /// (`handover → pane a0000003`), which a `&str` field cannot outlive.
+    pub title: String,
     pub count: Option<usize>,
     pub rows: Vec<ListDialogRow>,
     /// The row rendered REVERSED across the full row width. `None` when
     /// nothing in the dialog is cursor-addressable (the help overlay, an
     /// empty list).
     pub cursor: Option<usize>,
+    /// First row of `rows` drawn. Phase 3: every list dialog scrolls, so a
+    /// 60-entry mail list is no longer a dialog whose bottom half is off the
+    /// screen. Clamped by [`list_dialog_layout`] so `cursor` is always
+    /// visible however stale this is.
+    pub offset: usize,
     /// `(key, action)` pairs, rendered two-tone (key bold, action dim,
-    /// three spaces between pairs) on the dialog's own last row, one blank
-    /// row below the last list row.
+    /// three spaces between pairs) on the dialog's own PINNED last row, one
+    /// blank row below the list viewport -- neither scrolls away.
     pub footer: &'a [(&'a str, &'a str)],
     /// The warn variant: border and title render in `style::tui::warning()`
     /// (yellow) instead of `style::tui::accent()` (cyan).
@@ -2416,19 +2738,180 @@ pub struct ListDialogSpec<'a> {
     pub empty_message: &'a str,
 }
 
+/// The exact `Block` every list dialog draws, with the title and border
+/// style it was given. Shared by the renderer and [`list_dialog_layout`] so
+/// the interior rect a hit is tested against is the *same* rect the rows are
+/// drawn into -- computing it twice by hand is how a click ends up one
+/// column off.
+fn list_dialog_block(title: Line<'static>, border_style: Style) -> Block<'static> {
+    Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(border_style)
+        .padding(Padding::horizontal(1))
+        .title(title)
+}
+
+/// Where one list dialog's pieces land: the frame, the interior, which slice
+/// of the list is on screen, the rect of each visible row (paired with its
+/// index into the FULL row list, not its screen line), and the rect of each
+/// hint span on the pinned hint row.
+///
+/// Pure, and the single source of truth for both drawing and hit-testing.
+pub struct ListDialogLayout {
+    pub rect: Rect,
+    pub inner: Rect,
+    /// How many list rows fit between the pinned title and the pinned hint
+    /// row. Zero on a dialog with no room for a single row.
+    pub capacity: usize,
+    pub rows: Vec<(Rect, usize)>,
+    pub hints: Vec<(Rect, HintId)>,
+    /// `3–12 of 40`, only when the list does not fit.
+    pub indicator: Option<String>,
+}
+
+/// Pure: `first–last of total`, or `None` when the whole list is on screen.
+/// An en dash, matching the approved mock's own typography.
+fn scroll_indicator(offset: usize, capacity: usize, total: usize) -> Option<String> {
+    if capacity == 0 || total <= capacity {
+        return None;
+    }
+    let first = offset.saturating_add(1);
+    let last = offset.saturating_add(capacity).min(total);
+    Some(format!("{first}\u{2013}{last} of {total}"))
+}
+
+/// Pure: the `KeyCode` a dialog hint's key label stands for, or `None` when
+/// it stands for more than one key (`j/k`, `↑↓`) or for none at all
+/// (`any key`). A hint with no single key gets no clickable region rather
+/// than a guessed one -- a pointer must never reach a code path the keyboard
+/// could not.
+fn footer_key_code(key: &str) -> Option<KeyCode> {
+    match key {
+        "\u{23ce}" => Some(KeyCode::Enter),
+        "esc" | "esc/q" => Some(KeyCode::Esc),
+        "space" => Some(KeyCode::Char(' ')),
+        _ => {
+            let mut chars = key.chars();
+            match (chars.next(), chars.next()) {
+                (Some(c), None) if c.is_ascii_alphanumeric() => Some(KeyCode::Char(c)),
+                _ => None,
+            }
+        }
+    }
+}
+
+/// Pure: the whole geometry of one list dialog inside `area`. `None` when
+/// there is nothing to draw into at all.
+pub fn list_dialog_layout(area: Rect, spec: &ListDialogSpec) -> Option<ListDialogLayout> {
+    if area.is_empty() {
+        return None;
+    }
+    let content_rows = spec.rows.len().max(1);
+    // +1 blank row above the hint row, +1 the hint row itself, +2 for the
+    // block's own top/bottom border.
+    let h = dialog_row_count(content_rows, 2 + 2).min(area.height);
+    let w = dialog_width(area.width);
+    let rect = centered(area, w, h);
+    let inner = list_dialog_block(Line::default(), Style::default()).inner(rect);
+    if inner.is_empty() {
+        return Some(ListDialogLayout {
+            rect,
+            inner,
+            capacity: 0,
+            rows: Vec::new(),
+            hints: Vec::new(),
+            indicator: None,
+        });
+    }
+
+    // Reserved in the same priority order `chrome_rows` uses: the hint row
+    // first (it is the dialog's own key list, and a modal whose keys are not
+    // on screen is a modal an operator is stuck in), then the blank spacer,
+    // and whatever is left is the list viewport.
+    let hint_h = 1.min(inner.height);
+    let blank_h = 1.min(inner.height.saturating_sub(hint_h));
+    let capacity = inner.height.saturating_sub(hint_h + blank_h) as usize;
+
+    let total = spec.rows.len();
+    // Selection is always kept visible: the caller's own offset is honoured
+    // only as far as it does not hide the caret.
+    let offset = reveal_offset(
+        total,
+        capacity,
+        spec.cursor.unwrap_or(spec.offset),
+        spec.offset,
+    );
+
+    let mut rows = Vec::new();
+    for slot in 0..capacity {
+        let Some(index) = offset.checked_add(slot).filter(|i| *i < total) else {
+            break;
+        };
+        rows.push((
+            Rect {
+                x: inner.x,
+                y: inner.y.saturating_add(slot as u16),
+                width: inner.width,
+                height: 1,
+            },
+            index,
+        ));
+    }
+
+    let mut hints = Vec::new();
+    if hint_h > 0 {
+        let hint_y = inner.y.saturating_add(inner.height.saturating_sub(1));
+        let mut x = inner.x;
+        for (i, (key, action)) in spec.footer.iter().enumerate() {
+            if i > 0 {
+                x = x.saturating_add(3);
+            }
+            let width = u16::try_from(style::display_width(key) + 1 + style::display_width(action))
+                .unwrap_or(u16::MAX);
+            let clipped = width.min(inner.right().saturating_sub(x.min(inner.right())));
+            if clipped > 0
+                && let Some(code) = footer_key_code(key)
+            {
+                hints.push((
+                    Rect {
+                        x,
+                        y: hint_y,
+                        width: clipped,
+                        height: 1,
+                    },
+                    HintId::DialogKey(code),
+                ));
+            }
+            x = x.saturating_add(width);
+        }
+    }
+
+    Some(ListDialogLayout {
+        rect,
+        inner,
+        capacity,
+        rows,
+        hints,
+        indicator: scroll_indicator(offset, capacity, total),
+    })
+}
+
 /// The shared list-dialog primitive: a rounded, opaque, `Clear`-first frame
-/// with one column of horizontal interior padding, a title (accent, or
-/// warning-yellow for the warn variant) with an optional muted count beside
-/// it, one row per `spec.rows` (the cursor row REVERSED across the full row
-/// width), a blank row, and a two-tone footer.
+/// with one column of horizontal interior padding, a pinned title (accent,
+/// or warning-yellow for the warn variant) with an optional muted count
+/// beside it, a scrolling viewport of `spec.rows` (the cursor row REVERSED
+/// across the full row width, always kept visible), a blank row, and a
+/// pinned two-tone hint row carrying the dialog's own keys plus, when the
+/// list does not fit, a right-aligned `3–12 of 40` scroll indicator.
 ///
 /// Every dialog in the dashboard except Nudge's free-text prompt and a
 /// mail/memory compose-or-edit buffer (see [`render_dialog`]'s own doc
 /// comment) is built through this.
 pub fn render_list_dialog(f: &mut Frame, area: Rect, spec: &ListDialogSpec) {
-    if area.is_empty() {
+    let Some(geom) = list_dialog_layout(area, spec) else {
         return;
-    }
+    };
 
     let title_style = if spec.warn {
         style::tui::warning()
@@ -2448,29 +2931,16 @@ pub fn render_list_dialog(f: &mut Frame, area: Rect, spec: &ListDialogSpec) {
     // weight as the title itself.
     let title_spans: Vec<Span<'static>> = match spec.count {
         Some(n) => vec![
-            Span::styled(spec.title.to_string(), title_style),
+            Span::styled(spec.title.clone(), title_style),
             Span::styled(format!(" \u{b7} {n}"), style::tui::muted()),
         ],
-        None => vec![Span::styled(spec.title.to_string(), title_style)],
+        None => vec![Span::styled(spec.title.clone(), title_style)],
     };
 
-    let content_rows = spec.rows.len().max(1);
-    // +1 blank row above the footer, +1 the footer row itself, +2 for the
-    // block's own top/bottom border.
-    let h = dialog_row_count(content_rows, 2 + 2).min(area.height);
-    let w = dialog_width(area.width);
-    let rect = centered(area, w, h);
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(border_style)
-        .padding(Padding::horizontal(1))
-        .title(Line::from(title_spans));
-
-    f.render_widget(Clear, rect);
-    let inner = block.inner(rect);
-    f.render_widget(block, rect);
+    let block = list_dialog_block(Line::from(title_spans), border_style);
+    f.render_widget(Clear, geom.rect);
+    f.render_widget(block, geom.rect);
+    let inner = geom.inner;
     if inner.is_empty() {
         return;
     }
@@ -2478,21 +2948,38 @@ pub fn render_list_dialog(f: &mut Frame, area: Rect, spec: &ListDialogSpec) {
 
     let mut lines: Vec<Line> = Vec::new();
     if spec.rows.is_empty() {
-        lines.push(Line::from(Span::styled(
-            spec.empty_message.to_string(),
-            style::tui::muted(),
-        )));
+        if geom.capacity > 0 {
+            lines.push(Line::from(Span::styled(
+                spec.empty_message.to_string(),
+                style::tui::muted(),
+            )));
+        }
     } else {
-        for (i, row) in spec.rows.iter().enumerate() {
-            let is_cursor = spec.cursor == Some(i);
+        for (_, i) in &geom.rows {
+            let row = &spec.rows[*i];
+            let is_cursor = spec.cursor == Some(*i);
+            let base = if row.dim {
+                style::tui::muted()
+            } else {
+                Style::default()
+            };
             let mut spans: Vec<Span> = Vec::new();
             if let Some((glyph, glyph_style)) = &row.glyph {
                 spans.push(Span::styled(format!("{glyph} "), *glyph_style));
             }
             if let Some(checked) = row.checked {
-                spans.push(Span::raw(if checked { "[x] " } else { "[ ] " }));
+                spans.push(Span::styled(
+                    if checked { "[x] " } else { "[ ] " }.to_string(),
+                    base,
+                ));
             }
-            spans.push(Span::raw(row.text.clone()));
+            spans.push(Span::styled(row.text.clone(), base));
+            if let Some(reason) = &row.reason {
+                spans.push(Span::styled(
+                    format!("  \u{b7} {reason}"),
+                    style::tui::muted(),
+                ));
+            }
 
             if is_cursor {
                 let raw_width: usize = spans
@@ -2523,173 +3010,336 @@ pub fn render_list_dialog(f: &mut Frame, area: Rect, spec: &ListDialogSpec) {
         }
     }
 
-    lines.push(Line::from(""));
-    let mut footer_spans: Vec<Span> = Vec::new();
+    // The viewport is padded out to its full height so the hint row stays
+    // pinned to the bottom of the frame rather than floating up under a
+    // short list.
+    while lines.len() < geom.capacity {
+        lines.push(Line::from(""));
+    }
+    if geom.capacity < inner.height as usize {
+        lines.push(Line::from(""));
+    }
+    let mut hint_spans: Vec<Span> = Vec::new();
+    let mut hint_width = 0usize;
     for (i, (key, action)) in spec.footer.iter().enumerate() {
         if i > 0 {
-            footer_spans.push(Span::raw("   "));
+            hint_spans.push(Span::raw("   "));
+            hint_width += 3;
         }
-        footer_spans.push(Span::styled(
-            key.to_string(),
+        hint_spans.push(Span::styled(
+            (*key).to_string(),
             Style::default().add_modifier(Modifier::BOLD),
         ));
-        footer_spans.push(Span::raw(" "));
-        footer_spans.push(Span::styled(action.to_string(), style::tui::hint()));
+        hint_spans.push(Span::raw(" "));
+        hint_spans.push(Span::styled((*action).to_string(), style::tui::hint()));
+        hint_width += style::display_width(key) + 1 + style::display_width(action);
     }
-    lines.push(Line::from(footer_spans));
+    if let Some(indicator) = &geom.indicator {
+        let pad = inner_width
+            .saturating_sub(hint_width)
+            .saturating_sub(style::display_width(indicator));
+        if pad > 0 {
+            hint_spans.push(Span::raw(" ".repeat(pad)));
+        } else {
+            hint_spans.push(Span::raw("  "));
+        }
+        hint_spans.push(Span::styled(indicator.clone(), style::tui::muted()));
+    }
+    lines.push(Line::from(hint_spans));
 
     f.render_widget(Paragraph::new(Text::from(lines)), inner);
 }
 
-fn render_mail_dialog(f: &mut Frame, area: Rect, view: &MailView) {
-    if let Some(draft) = &view.compose {
-        let mut lines = vec![format!(
-            "compose to: {}",
-            if draft.to.trim().is_empty() {
-                "any"
-            } else {
-                draft.to.as_str()
-            }
-        )];
-        lines.extend(draft_lines(&draft.body));
-        lines.push("Enter to send, Esc to cancel".to_string());
-        render_dialog(f, area, "mail", &lines);
-        return;
-    }
+/// Which way one of the SHARED viewport keys moves a list dialog's caret.
+/// Single-row motion is deliberately absent: `j/k` and the arrows belong to
+/// each dialog's own reducer (`move_cursor`), and mean something else again
+/// in a compose buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListMove {
+    PageUp,
+    PageDown,
+    Home,
+    End,
+}
 
-    let rows: Vec<ListDialogRow> = view
-        .items
-        .iter()
-        .map(|(_, from, body)| ListDialogRow::plain(format!("{from}: {}", preview(body, 60))))
-        .collect();
-    let cursor = if rows.is_empty() {
-        None
-    } else {
-        Some(view.cursor)
-    };
-    render_list_dialog(
-        f,
-        area,
-        &ListDialogSpec {
-            title: "mail",
+/// Pure: the viewport move a key means for EVERY list dialog alike, or
+/// `None` when the key is that dialog's own business.
+///
+/// Deliberately only the paging keys: `j/k` and the arrows already move the
+/// caret inside each dialog's own reducer (and mean something else entirely
+/// in a compose buffer), while PageUp/PageDown/Home/End were unbound in
+/// every dialog before phase 3 and are pure viewport motion everywhere.
+pub fn list_page_move(key: KeyEvent) -> Option<ListMove> {
+    match key.code {
+        KeyCode::PageUp => Some(ListMove::PageUp),
+        KeyCode::PageDown => Some(ListMove::PageDown),
+        KeyCode::Home => Some(ListMove::Home),
+        KeyCode::End => Some(ListMove::End),
+        _ => None,
+    }
+}
+
+/// Pure: where a caret at `cursor` lands in a `len`-row list with `capacity`
+/// rows on screen. Every arithmetic step is saturating -- `capacity` is `0`
+/// on a dialog with no room and the release profile is `panic = "abort"`.
+pub fn list_move(cursor: usize, len: usize, capacity: usize, mv: ListMove) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    let last = len - 1;
+    let page = capacity.max(1);
+    match mv {
+        ListMove::PageUp => cursor.saturating_sub(page),
+        ListMove::PageDown => cursor.saturating_add(page).min(last),
+        ListMove::Home => 0,
+        ListMove::End => last,
+    }
+    .min(last)
+}
+
+/// Pure: the offset a wheel notch or a caret move leaves the viewport at --
+/// [`reveal_offset`]'s own clamp, exposed for the overlay reducers so a
+/// dialog's scroll state can never run past the end of its list.
+pub fn list_scroll(len: usize, capacity: usize, cursor: usize, offset: usize) -> usize {
+    reveal_offset(len, capacity, cursor, offset)
+}
+
+/// Pure: the one place every list-shaped overlay's [`ListDialogSpec`] is
+/// built. `None` for an overlay that is not list-shaped at all -- Nudge's
+/// free-text prompt, and a mail/memory compose-or-edit buffer, which go
+/// through [`render_dialog`] instead.
+///
+/// Phase 3 exists because the spec is now needed TWICE per frame: once to
+/// draw the dialog, and once (through [`list_dialog_layout`], from
+/// [`frame_snapshot`]) to say where its rows and hints landed so a click can
+/// address them. Building it in one function is what keeps the drawn dialog
+/// and the clickable dialog the same dialog.
+pub fn list_spec_for(overlay: &Overlay, tick: usize) -> Option<ListDialogSpec<'static>> {
+    let cursor_of = |len: usize, cursor: usize| if len == 0 { None } else { Some(cursor) };
+    match overlay {
+        Overlay::None | Overlay::Spawn(_) | Overlay::Nudge(_) => None,
+        Overlay::Mail(view) if view.compose.is_some() => None,
+        Overlay::Memory(view) if view.input.is_some() => None,
+        Overlay::QuitConfirm(working) => Some(ListDialogSpec {
+            title: "\u{26a0} quit zirv dash".to_string(),
+            count: Some(working.len()),
+            rows: working
+                .iter()
+                .map(|title| ListDialogRow {
+                    text: title.clone(),
+                    checked: None,
+                    glyph: Some((
+                        style::tui::SPINNER_FRAMES[tick % style::tui::SPINNER_FRAMES.len()]
+                            .to_string(),
+                        style::tui::accent(),
+                    )),
+                    reason: None,
+                    dim: false,
+                })
+                .collect(),
+            // No cursor: nothing here is keyboard-navigable (there is no
+            // j/k on this dialog, only Enter/Esc), so reversing a row would
+            // read as a selection that does not exist.
+            cursor: None,
+            offset: 0,
+            footer: QUIT_FOOTER,
+            warn: true,
+            empty_message: "nothing is still working",
+        }),
+        Overlay::Mail(view) => Some(ListDialogSpec {
+            title: "mail".to_string(),
             count: Some(view.items.len()),
-            rows,
-            cursor,
+            rows: view
+                .items
+                .iter()
+                .map(|(_, from, body)| {
+                    ListDialogRow::plain(format!("{from}: {}", preview(body, 60)))
+                })
+                .collect(),
+            cursor: cursor_of(view.items.len(), view.cursor),
+            offset: view.offset,
             // Issue #209/v3 §A5: shares `MAIL_FOOTER` with the help overlay's
             // own "dialogs:" listing rather than a second, easily-drifting
             // copy of the same four hints.
             footer: MAIL_FOOTER,
             warn: false,
             empty_message: "(no mail)",
-        },
-    );
-}
-
-fn render_memory_dialog(f: &mut Frame, area: Rect, view: &MemoryView) {
-    if let Some(input) = &view.input {
-        let mut lines = draft_lines(input);
-        lines.push("Enter to save, Esc to cancel".to_string());
-        render_dialog(f, area, "memory", &lines);
-        return;
-    }
-
-    let rows: Vec<ListDialogRow> = view
-        .entries
-        .iter()
-        .map(|(key, age, body)| {
-            ListDialogRow::plain(format!("{key} ({age}) {}", preview(body, 40)))
-        })
-        .collect();
-    let cursor = if rows.is_empty() {
-        None
-    } else {
-        Some(view.cursor)
-    };
-    render_list_dialog(
-        f,
-        area,
-        &ListDialogSpec {
-            title: "memory",
+        }),
+        Overlay::Memory(view) => Some(ListDialogSpec {
+            title: "memory".to_string(),
             count: Some(view.entries.len()),
-            rows,
-            cursor,
-            footer: &[
-                ("r", "remember"),
-                ("d", "forget"),
-                ("v", "verify"),
-                ("esc", "close"),
-            ],
+            rows: view
+                .entries
+                .iter()
+                .map(|(key, age, body)| {
+                    ListDialogRow::plain(format!("{key} ({age}) {}", preview(body, 40)))
+                })
+                .collect(),
+            cursor: cursor_of(view.entries.len(), view.cursor),
+            offset: view.offset,
+            footer: MEMORY_FOOTER,
             warn: false,
             empty_message: "(no memory entries)",
-        },
-    );
-}
-
-fn render_restore_dialog(f: &mut Frame, area: Rect, view: &RestoreView) {
-    let rows: Vec<ListDialogRow> = view
-        .entries
-        .iter()
-        .map(|entry| ListDialogRow {
-            text: entry.label.clone(),
-            checked: Some(entry.checked),
-            glyph: None,
-        })
-        .collect();
-    let cursor = if rows.is_empty() {
-        None
-    } else {
-        Some(view.cursor)
-    };
-    render_list_dialog(
-        f,
-        area,
-        &ListDialogSpec {
-            title: "restore",
+        }),
+        Overlay::Restore(view) => Some(ListDialogSpec {
+            title: "restore".to_string(),
             count: Some(view.entries.len()),
-            rows,
-            cursor,
-            footer: &[
-                ("space", "toggle"),
-                ("\u{23ce}", "restore checked"),
-                ("esc", "skip"),
-            ],
+            rows: view
+                .entries
+                .iter()
+                .map(|entry| ListDialogRow {
+                    text: entry.label.clone(),
+                    checked: Some(entry.checked),
+                    glyph: None,
+                    reason: None,
+                    dim: false,
+                })
+                .collect(),
+            cursor: cursor_of(view.entries.len(), view.cursor),
+            offset: view.offset,
+            footer: RESTORE_FOOTER,
             warn: false,
             empty_message: "(nothing to restore)",
-        },
-    );
-}
-
-/// Issue #84: `draft.items` is already fully resolved (agent/tier/model), so
-/// this only ever formats and marks the cursor row -- no tier resolution or
-/// config reads happen here, matching this module's own no-I/O contract.
-/// The swap's target pane goes in the title (`handover -> pane {short}`)
-/// rather than a trailing body row, so it stays visible even once the item
-/// list scrolls.
-fn render_handover_dialog(f: &mut Frame, area: Rect, draft: &HandoverDraft) {
-    let title = format!("handover \u{2192} pane {}", draft.target_short);
-    let rows: Vec<ListDialogRow> = draft
-        .items
-        .iter()
-        .map(|(agent, tier, model)| ListDialogRow::plain(format!("{agent} / {tier} ({model})")))
-        .collect();
-    let cursor = if rows.is_empty() {
-        None
-    } else {
-        Some(draft.cursor)
-    };
-    render_list_dialog(
-        f,
-        area,
-        &ListDialogSpec {
-            title: &title,
+        }),
+        // Issue #84: `draft.items` is already fully resolved
+        // (agent/tier/model), so this only ever formats and marks the cursor
+        // row -- no tier resolution or config reads happen here, matching
+        // this module's own no-I/O contract. The swap's target pane goes in
+        // the title rather than a trailing body row, so it stays visible even
+        // once the item list scrolls.
+        Overlay::Handover(draft) => Some(ListDialogSpec {
+            title: format!("handover \u{2192} pane {}", draft.target_short),
             count: None,
-            rows,
-            cursor,
-            footer: &[("\u{23ce}", "swap"), ("esc", "cancel")],
+            rows: draft
+                .items
+                .iter()
+                .map(|(agent, tier, model)| {
+                    ListDialogRow::plain(format!("{agent} / {tier} ({model})"))
+                })
+                .collect(),
+            cursor: cursor_of(draft.items.len(), draft.cursor),
+            offset: draft.offset,
+            footer: HANDOVER_FOOTER,
             warn: false,
             empty_message: "no enabled, ready harness available to swap to",
-        },
-    );
+        }),
+        Overlay::Help => Some(ListDialogSpec {
+            title: "help".to_string(),
+            count: None,
+            rows: help_lines().into_iter().map(ListDialogRow::plain).collect(),
+            cursor: None,
+            offset: 0,
+            footer: HELP_FOOTER,
+            warn: false,
+            empty_message: "",
+        }),
+        Overlay::Errors(view) => Some(ListDialogSpec {
+            title: "errors".to_string(),
+            count: Some(view.items.len()),
+            rows: view
+                .items
+                .iter()
+                .map(|msg| ListDialogRow::plain(format!("\u{26a0} {msg}")))
+                .collect(),
+            cursor: cursor_of(view.items.len(), view.cursor),
+            offset: view.offset,
+            footer: ERRORS_FOOTER,
+            warn: false,
+            empty_message: "no recent errors",
+        }),
+        Overlay::Menu(view) => Some(ListDialogSpec {
+            title: format!("actions \u{b7} {}", view.subject),
+            count: None,
+            rows: view
+                .entries
+                .iter()
+                .enumerate()
+                .map(|(i, entry)| ListDialogRow {
+                    text: match entry.letter {
+                        Some(letter) => format!("{}  {}", letter, entry.action.label()),
+                        None => format!("   {}", entry.action.label()),
+                    },
+                    checked: None,
+                    glyph: None,
+                    reason: if view.confirm == Some(i) {
+                        Some("confirm? y / n".to_string())
+                    } else {
+                        entry.disabled.clone()
+                    },
+                    dim: !entry.enabled(),
+                })
+                .collect(),
+            cursor: cursor_of(view.entries.len(), view.cursor),
+            offset: view.offset,
+            footer: MENU_FOOTER,
+            warn: false,
+            empty_message: "(nothing to do here)",
+        }),
+        Overlay::Inspector(view) => {
+            let rows = view.rows();
+            Some(ListDialogSpec {
+                title: format!("inspect \u{b7} {}", view.subject),
+                count: None,
+                rows: rows.iter().cloned().map(ListDialogRow::plain).collect(),
+                cursor: cursor_of(rows.len(), view.cursor),
+                offset: view.offset,
+                footer: INSPECTOR_FOOTER,
+                warn: false,
+                empty_message: "(nothing recorded for this row)",
+            })
+        }
+    }
+}
+
+/// What [`overlay_geometry`] hands `frame_snapshot`: the dialog's own rect,
+/// the rect of each VISIBLE list row paired with its index into the full
+/// list, the rect of each clickable hint on the pinned hint row, and how many
+/// rows the viewport had room for (its page size).
+pub type OverlayGeometry = (Rect, Vec<(Rect, usize)>, Vec<(Rect, HintId)>, usize);
+
+/// Pure: the geometry of whatever overlay is open, in the shape
+/// [`hit::hit_test`] answers questions about.
+///
+/// A non-list overlay (a compose buffer, the nudge prompt) has a rect and
+/// nothing addressable inside it, which is exactly `Hit::Overlay`: consumed,
+/// and a no-op.
+pub fn overlay_geometry(
+    frame: Rect,
+    main: Rect,
+    overlay: &Overlay,
+    tick: usize,
+) -> Option<OverlayGeometry> {
+    if matches!(overlay, Overlay::None) {
+        return None;
+    }
+    let area = overlay_area(frame, main);
+    let Some(spec) = list_spec_for(overlay, tick) else {
+        return Some((area, Vec::new(), Vec::new(), 0));
+    };
+    match list_dialog_layout(area, &spec) {
+        Some(geom) => Some((geom.rect, geom.rows, geom.hints, geom.capacity)),
+        None => Some((area, Vec::new(), Vec::new(), 0)),
+    }
+}
+
+fn render_mail_compose(f: &mut Frame, area: Rect, draft: &ComposeDraft) {
+    let mut lines = vec![format!(
+        "compose to: {}",
+        if draft.to.trim().is_empty() {
+            "any"
+        } else {
+            draft.to.as_str()
+        }
+    )];
+    lines.extend(draft_lines(&draft.body));
+    lines.push("Enter to send, Esc to cancel".to_string());
+    render_dialog(f, area, "mail", &lines);
+}
+
+fn render_memory_edit(f: &mut Frame, area: Rect, input: &str) {
+    let mut lines = draft_lines(input);
+    lines.push("Enter to save, Esc to cancel".to_string());
+    render_dialog(f, area, "memory", &lines);
 }
 
 fn render_nudge_dialog(f: &mut Frame, area: Rect, draft: &NudgeDraft) {
@@ -2832,7 +3482,7 @@ static HELP_BINDINGS: &[HelpBinding] = &[
     },
     HelpBinding {
         label: "c / right click",
-        description: "actions (arrives in phase 3)",
+        description: "actions for the selected row",
         section: HelpSection::Prefixed,
         checks: &[(
             KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
@@ -2929,16 +3579,23 @@ static HELP_BINDINGS: &[HelpBinding] = &[
             DashAction::Handover,
         )],
     },
-    // Issue #354 phase 2: the header's `^A i inspect` hint has to lead
-    // somewhere, so it is mapped onto the errors/evidence overlay until the
-    // real per-session inspector lands in phase 3.
+    // Issue #354 phase 3: `^A i` opens the real per-session inspector now.
     HelpBinding {
         label: "i",
         description: "inspect (evidence)",
         section: HelpSection::Prefixed,
         checks: &[(
             KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE),
-            DashAction::ShowErrors,
+            DashAction::Inspect,
+        )],
+    },
+    HelpBinding {
+        label: "r",
+        description: "restore an ended row",
+        section: HelpSection::Prefixed,
+        checks: &[(
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+            DashAction::RestoreRow,
         )],
     },
     HelpBinding {
@@ -3049,6 +3706,17 @@ const RESTORE_FOOTER: &[(&str, &str)] = &[
 ];
 const HANDOVER_FOOTER: &[(&str, &str)] = &[("\u{23ce}", "swap"), ("esc", "cancel")];
 const ERRORS_FOOTER: &[(&str, &str)] = &[("j/k", "scroll"), ("esc/q", "close")];
+const HELP_FOOTER: &[(&str, &str)] = &[("any key", "close")];
+/// Issue #354 phase 3: the context menu's own keys. `esc` says `back`
+/// rather than `close` because that is what it does -- the previously
+/// focused pane keeps the keyboard, and nothing about the row changed.
+const MENU_FOOTER: &[(&str, &str)] = &[
+    ("\u{23ce}", "do"),
+    ("esc", "back"),
+    ("j/k", "move"),
+    ("a-z", "jump"),
+];
+const INSPECTOR_FOOTER: &[(&str, &str)] = &[("j/k", "scroll"), ("esc", "back")];
 
 const DIALOG_FOOTERS: &[(&str, &[(&str, &str)])] = &[
     ("quit", QUIT_FOOTER),
@@ -3057,6 +3725,8 @@ const DIALOG_FOOTERS: &[(&str, &[(&str, &str)])] = &[
     ("restore", RESTORE_FOOTER),
     ("handover", HANDOVER_FOOTER),
     ("errors", ERRORS_FOOTER),
+    ("actions", MENU_FOOTER),
+    ("inspect", INSPECTOR_FOOTER),
 ];
 
 /// Pure: the help overlay's rows, grouped by [`HelpSection`] so the dialog
@@ -3109,86 +3779,28 @@ pub fn render_overlay(f: &mut Frame, area: Rect, overlay: &Overlay, tick: usize)
     // frame with no cells at all leaves nothing to draw into, and
     // `render_dialog`/`render_list_dialog`'s own guards cover that.
     let area = overlay_area(f.area(), area);
+    // Phase 3: every list-shaped overlay goes through the one shared
+    // scrollable viewport, built from the one shared spec factory -- which
+    // is also what `frame_snapshot` hit-tests against.
+    if let Some(spec) = list_spec_for(overlay, tick) {
+        render_list_dialog(f, area, &spec);
+        return;
+    }
     match overlay {
-        Overlay::None => {}
-        Overlay::QuitConfirm(working) => {
-            let rows: Vec<ListDialogRow> = working
-                .iter()
-                .map(|title| ListDialogRow {
-                    text: title.clone(),
-                    checked: None,
-                    glyph: Some((
-                        style::tui::SPINNER_FRAMES[tick % style::tui::SPINNER_FRAMES.len()]
-                            .to_string(),
-                        style::tui::accent(),
-                    )),
-                })
-                .collect();
-            // No cursor: nothing here is keyboard-navigable (there is no
-            // j/k on this dialog, only Enter/Esc), so reversing a row would
-            // read as a selection that does not exist.
-            render_list_dialog(
-                f,
-                area,
-                &ListDialogSpec {
-                    title: "\u{26a0} quit zirv dash",
-                    count: Some(working.len()),
-                    rows,
-                    cursor: None,
-                    footer: QUIT_FOOTER,
-                    warn: true,
-                    empty_message: "nothing is still working",
-                },
-            );
-        }
         Overlay::Spawn(d) => render_draft_dialog(f, area, "spawn", &d.input, &d.items, d.cursor),
         Overlay::Nudge(d) => render_nudge_dialog(f, area, d),
-        Overlay::Handover(d) => render_handover_dialog(f, area, d),
-        Overlay::Mail(d) => render_mail_dialog(f, area, d),
-        Overlay::Memory(d) => render_memory_dialog(f, area, d),
-        Overlay::Restore(d) => render_restore_dialog(f, area, d),
-        Overlay::Help => {
-            let rows: Vec<ListDialogRow> =
-                help_lines().into_iter().map(ListDialogRow::plain).collect();
-            render_list_dialog(
-                f,
-                area,
-                &ListDialogSpec {
-                    title: "help",
-                    count: None,
-                    rows,
-                    cursor: None,
-                    footer: &[("any key", "close")],
-                    warn: false,
-                    empty_message: "",
-                },
-            );
+        Overlay::Mail(view) => {
+            if let Some(draft) = &view.compose {
+                render_mail_compose(f, area, draft);
+            }
         }
-        Overlay::Errors(view) => {
-            let rows: Vec<ListDialogRow> = view
-                .items
-                .iter()
-                .map(|msg| ListDialogRow::plain(format!("\u{26a0} {msg}")))
-                .collect();
-            let cursor = if rows.is_empty() {
-                None
-            } else {
-                Some(view.cursor)
-            };
-            render_list_dialog(
-                f,
-                area,
-                &ListDialogSpec {
-                    title: "errors",
-                    count: Some(view.items.len()),
-                    rows,
-                    cursor,
-                    footer: ERRORS_FOOTER,
-                    warn: false,
-                    empty_message: "no recent errors",
-                },
-            );
+        Overlay::Memory(view) => {
+            if let Some(input) = &view.input {
+                render_memory_edit(f, area, input);
+            }
         }
+        // Every other variant is list-shaped and was handled above.
+        _ => {}
     }
 }
 
@@ -3298,6 +3910,7 @@ mod tests {
                             })
                             .collect(),
                         cursor: 17,
+                        offset: 0,
                     }),
                     _ => Overlay::None,
                 };
@@ -3357,12 +3970,35 @@ mod tests {
                     captures.push_str(&line);
                     captures.push('\n');
                 }
+                // Issue #354 phase 3 closed the audit's own dialog findings:
+                // an 18-entry restore dialog in a 20-row terminal used to
+                // draw its list straight off the bottom of the frame, taking
+                // both the caret's own row and the dialog's key hints with
+                // it. The shared viewport scrolls to the caret and pins the
+                // hint row, so both are on screen now.
                 if width == 80 && scenario == "restore" {
-                    assert!(!frame_text.contains("worker 18"));
-                    assert!(!frame_text.contains("restore checked"));
+                    assert!(
+                        frame_text.contains("worker 18"),
+                        "the caret row must be revealed: {frame_text}"
+                    );
+                    // The hint row is pinned but still only as wide as the
+                    // dialog: in an 80-column frame with the 44-column
+                    // sidebar the dialog's interior is ~27 columns, so the
+                    // row is clipped after its first hint rather than
+                    // wrapping or pushing the list around.
+                    assert!(
+                        frame_text.contains("space toggle"),
+                        "the hint row must stay pinned: {frame_text}"
+                    );
                 }
                 if width == 80 && scenario == "help" {
-                    assert!(!frame_text.contains("any key"));
+                    assert!(
+                        frame_text.contains("any key"),
+                        "the hint row must stay pinned: {frame_text}"
+                    );
+                    // Help has no caret of its own, so its later sections are
+                    // still below the fold -- reachable now with PageDown,
+                    // which is what the phase 4 palette builds on.
                     assert!(!frame_text.contains("dialogs:"));
                 }
                 captures.push_str("```\n\n");
@@ -3456,7 +4092,7 @@ mod tests {
                 let mut header = base_facts();
                 header.hints.alive = true;
                 let snapshot =
-                    frame_snapshot(area, &layout, zoomed, &roster, &header, &Overlay::None);
+                    frame_snapshot(area, &layout, zoomed, &roster, &header, &Overlay::None, 0);
                 let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
                 terminal
                     .draw(|f| {
@@ -3814,10 +4450,11 @@ mod tests {
         let backend = TestBackend::new(40, 10);
         let mut term = Terminal::new(backend).expect("terminal");
         let spec = ListDialogSpec {
-            title: "mail",
+            title: "mail".to_string(),
             count: Some(1),
             rows: vec![ListDialogRow::plain("claude: hi".to_string())],
             cursor: Some(0),
+            offset: 0,
             footer: MAIL_FOOTER,
             warn: false,
             empty_message: "(no mail)",
@@ -4247,6 +4884,7 @@ mod tests {
             alive: true,
             needs_action: true,
             ended: false,
+            restorable: false,
         };
         assert_eq!(
             header_hints(&needs_action),
@@ -4261,16 +4899,50 @@ mod tests {
             alive: false,
             needs_action: false,
             ended: true,
+            restorable: false,
         };
-        // Restore is phase 3: an ended row is never offered a hint for an
-        // action that does not exist yet.
+        // Issue #354 phase 3: an ended row whose spawn request the dashboard
+        // no longer holds is still never offered `^A r` -- the hint would do
+        // nothing, and the context menu is where the reason lives.
         assert_eq!(
             header_hints(&ended),
             vec![("^A i", "inspect"), ("^A c", "actions"), ("^A ?", "help")]
         );
         assert!(!header_hints(&ended).iter().any(|(_, l)| *l == "restore"));
-        for context in [needs_action, ended, HintContext::default()] {
+        // With the request kept, the approved ended cluster is all four.
+        let restorable = HintContext {
+            restorable: true,
+            ..ended
+        };
+        assert_eq!(
+            header_hints(&restorable),
+            vec![
+                ("^A i", "inspect"),
+                ("^A r", "restore"),
+                ("^A c", "actions"),
+                ("^A ?", "help"),
+            ]
+        );
+        for context in [
+            needs_action,
+            ended,
+            restorable,
+            HintContext::default(),
+            HintContext {
+                alive: true,
+                ..HintContext::default()
+            },
+        ] {
             assert!(header_hints(&context).len() <= 4);
+            // Every drawn chord but `^A ?` itself resolves to a hit id of its
+            // own, so a click can never fall through to the always-safe
+            // `Help` by accident.
+            for (key, _) in header_hints(&context)
+                .into_iter()
+                .filter(|(k, _)| *k != "^A ?")
+            {
+                assert_ne!(hint_id(key), HintId::Help, "{key} has no hit id of its own");
+            }
         }
     }
 
@@ -5091,14 +5763,17 @@ mod tests {
     #[test]
     fn a_list_dialog_cursor_rows_glyph_carries_no_explicit_fg() {
         let spec = ListDialogSpec {
-            title: "quit",
+            title: "quit".to_string(),
             count: None,
             rows: vec![ListDialogRow {
                 text: "wrk claude".to_string(),
                 checked: None,
                 glyph: Some(("\u{2807}".to_string(), style::tui::accent())),
+                reason: None,
+                dim: false,
             }],
             cursor: Some(0),
+            offset: 0,
             footer: &[],
             warn: false,
             empty_message: "",
@@ -5628,6 +6303,7 @@ mod tests {
                 "the webhook route moved".to_string(),
             )],
             cursor: 0,
+            offset: 0,
             compose: None,
         };
         let overlay = Overlay::Mail(view);
@@ -5645,6 +6321,7 @@ mod tests {
         let view = MailView {
             items: Vec::new(),
             cursor: 0,
+            offset: 0,
             compose: Some(ComposeDraft {
                 to: String::new(),
                 body: "heads up".to_string(),
@@ -5668,6 +6345,7 @@ mod tests {
                 "cargo build --release".to_string(),
             )],
             cursor: 0,
+            offset: 0,
             input: None,
         };
         let overlay = Overlay::Memory(view);
@@ -5707,6 +6385,7 @@ mod tests {
                 },
             ],
             cursor: 0,
+            offset: 0,
         };
         let overlay = Overlay::Restore(view);
         let area = Rect::new(0, 0, 60, 10);
@@ -5741,6 +6420,7 @@ mod tests {
                 "handover: timed out".to_string(),
             ],
             cursor: 0,
+            offset: 0,
         };
         let overlay = Overlay::Errors(view);
         let area = Rect::new(0, 0, 60, 10);
@@ -5786,6 +6466,7 @@ mod tests {
                     "a body".to_string(),
                 )],
                 cursor: 0,
+                offset: 0,
                 compose: Some(ComposeDraft {
                     to: "any".to_string(),
                     body: "drafting".to_string(),
@@ -5794,6 +6475,7 @@ mod tests {
             Overlay::Memory(MemoryView {
                 entries: vec![("k".to_string(), "age".to_string(), "body".to_string())],
                 cursor: 0,
+                offset: 0,
                 input: Some("typing".to_string()),
             }),
             Overlay::Restore(RestoreView {
@@ -5802,11 +6484,44 @@ mod tests {
                     checked: true,
                 }],
                 cursor: 0,
+                offset: 0,
             }),
             Overlay::Help,
             Overlay::Errors(ErrorsView {
                 items: vec!["an error".to_string()],
                 cursor: 0,
+                offset: 0,
+            }),
+            // Issue #354 phase 3: the two new list-shaped overlays go through
+            // every degenerate-area and opacity test the others do.
+            Overlay::Menu(MenuView {
+                target: "aaaa1111".to_string(),
+                subject: "aaaa1111 \u{b7} worker".to_string(),
+                entries: vec![
+                    MenuEntry {
+                        action: MenuAction::Inspect,
+                        disabled: None,
+                        letter: Some('i'),
+                    },
+                    MenuEntry {
+                        action: MenuAction::Restore,
+                        disabled: Some("still running".to_string()),
+                        letter: Some('r'),
+                    },
+                ],
+                cursor: 0,
+                offset: 0,
+                confirm: None,
+            }),
+            Overlay::Inspector(InspectorView {
+                target: "aaaa1111".to_string(),
+                subject: "aaaa1111 \u{b7} worker".to_string(),
+                sections: vec![InspectorSection {
+                    name: "identity".to_string(),
+                    lines: vec!["short       aaaa1111".to_string()],
+                }],
+                cursor: 0,
+                offset: 0,
             }),
         ]
     }
@@ -5858,11 +6573,16 @@ mod tests {
         rows.push(ListDialogRow::plain("x".repeat(200_000)));
         let cursor = Some(rows.len() - 1);
 
+        let total = rows.len();
         let spec = ListDialogSpec {
-            title: "mail",
-            count: Some(rows.len()),
+            title: "mail".to_string(),
+            count: Some(total),
             rows,
             cursor,
+            // Issue #354 phase 3: an offset far past the end of the list, so
+            // the viewport's own clamp is exercised at the same pathological
+            // size the height clamp is.
+            offset: usize::MAX,
             footer: MAIL_FOOTER,
             warn: false,
             empty_message: "(no mail)",
@@ -5880,7 +6600,363 @@ mod tests {
             let buf = term.backend().buffer();
             assert_eq!(buf.area.width, area.width);
             assert_eq!(buf.area.height, area.height);
+            // The shared viewport draws only what fits, and never a row
+            // outside the list -- the caret is on the very last row, so the
+            // window has to be the last screenful.
+            let geom = list_dialog_layout(area, &spec).expect("layout");
+            assert!(geom.rows.len() <= geom.capacity, "{:?}", geom.rows.len());
+            assert!(
+                geom.rows.iter().all(|(_, i)| *i < total),
+                "a drawn row addressed past the end of the list"
+            );
+            if geom.capacity > 0 {
+                // The first drawn row IS the clamped viewport offset, and
+                // with the caret on the very last row the window has to be
+                // the last screenful.
+                assert_eq!(
+                    geom.rows.first().map(|(_, i)| *i),
+                    Some(total - geom.capacity)
+                );
+                assert!(
+                    geom.rows.iter().any(|(_, i)| *i == total - 1),
+                    "the caret row must be on screen"
+                );
+                assert_eq!(
+                    geom.indicator,
+                    Some(format!(
+                        "{}\u{2013}{total} of {total}",
+                        total - geom.capacity + 1
+                    ))
+                );
+            }
         }
+    }
+
+    // -- issue #354 phase 3: the shared scrollable list viewport ------------
+
+    /// One dialog render, captured row by row, so a test can say which line
+    /// something landed on rather than only that it is somewhere on screen.
+    fn capture_rows(area: Rect, draw: impl FnOnce(&mut Frame, Rect)) -> Vec<String> {
+        let backend = TestBackend::new(area.width, area.height);
+        let mut term = Terminal::new(backend).expect("terminal");
+        term.draw(|f| draw(f, area)).expect("draw");
+        let buf = term.backend().buffer();
+        (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    fn list_spec(rows: usize, cursor: usize, offset: usize) -> ListDialogSpec<'static> {
+        ListDialogSpec {
+            title: "mail".to_string(),
+            count: Some(rows),
+            rows: (0..rows)
+                .map(|i| ListDialogRow::plain(format!("entry-{i:03}")))
+                .collect(),
+            cursor: (rows > 0).then_some(cursor),
+            offset,
+            footer: MAIL_FOOTER,
+            warn: false,
+            empty_message: "(no mail)",
+        }
+    }
+
+    /// The pure scrolling reducer: paging moves by a screenful and clamps at
+    /// both ends, Home/End jump, and the caret is always brought back into
+    /// the window by the minimum distance.
+    #[test]
+    fn the_shared_list_viewport_pages_jumps_and_reveals_the_caret() {
+        // 40 rows, 12 on screen.
+        assert_eq!(list_move(0, 40, 12, ListMove::PageDown), 12);
+        assert_eq!(list_move(12, 40, 12, ListMove::PageDown), 24);
+        assert_eq!(list_move(36, 40, 12, ListMove::PageDown), 39, "clamps");
+        assert_eq!(list_move(20, 40, 12, ListMove::PageUp), 8);
+        assert_eq!(list_move(3, 40, 12, ListMove::PageUp), 0, "clamps");
+        assert_eq!(list_move(20, 40, 12, ListMove::Home), 0);
+        assert_eq!(list_move(0, 40, 12, ListMove::End), 39);
+        // A dialog with no room for a single row still pages by at least one
+        // entry rather than dividing by zero or standing still forever.
+        assert_eq!(list_move(0, 40, 0, ListMove::PageDown), 1);
+        // An empty list has nowhere to go, at any capacity.
+        for mv in [
+            ListMove::PageUp,
+            ListMove::PageDown,
+            ListMove::Home,
+            ListMove::End,
+        ] {
+            assert_eq!(list_move(9, 0, 12, mv), 0);
+        }
+        // Reveal-on-move: the window follows the caret the minimum distance.
+        assert_eq!(list_scroll(40, 12, 20, 0), 9);
+        assert_eq!(list_scroll(40, 12, 20, 15), 15, "already visible");
+        assert_eq!(list_scroll(40, 12, 2, 15), 2);
+        assert_eq!(list_scroll(40, 12, 39, usize::MAX), 28, "last screenful");
+        assert_eq!(list_scroll(3, 12, 2, 9), 0, "everything fits");
+    }
+
+    /// The indicator only appears when the list does not fit, and reads as
+    /// the approved `first–last of total`.
+    #[test]
+    fn the_scroll_indicator_names_the_window_only_when_one_exists() {
+        assert_eq!(scroll_indicator(0, 12, 3), None);
+        assert_eq!(scroll_indicator(0, 12, 12), None);
+        assert_eq!(scroll_indicator(0, 0, 40), None);
+        assert_eq!(
+            scroll_indicator(2, 10, 40),
+            Some("3\u{2013}12 of 40".to_string())
+        );
+        assert_eq!(
+            scroll_indicator(35, 10, 40),
+            Some("36\u{2013}40 of 40".to_string())
+        );
+    }
+
+    /// A 3-row and a 60-row list, at all three reference sizes: the title
+    /// stays on the frame's own top border, the hint row stays on its last
+    /// interior line, the caret is always drawn, and only the list that does
+    /// not fit gets an indicator.
+    #[test]
+    fn a_list_dialog_pins_its_title_and_hint_row_at_every_size() {
+        for (width, height) in [(80u16, 20u16), (120, 40), (200, 50)] {
+            for total in [3usize, 60] {
+                let area = Rect::new(0, 0, width, height);
+                // Caret near the end, so a 60-row list has genuinely scrolled.
+                let cursor = total - 1;
+                let spec = list_spec(total, cursor, 0);
+                let geom = list_dialog_layout(area, &spec).expect("layout");
+                let lines = capture_rows(area, |f, area| render_list_dialog(f, area, &spec));
+
+                let top = &lines[geom.rect.y as usize];
+                assert!(top.contains("mail"), "{width}x{height}/{total}: {top}");
+                let hint_y = geom.inner.y + geom.inner.height - 1;
+                let hint = &lines[hint_y as usize];
+                assert!(
+                    hint.contains("read+consume"),
+                    "{width}x{height}/{total}: the hint row must be pinned to the last \
+                     interior line, got {hint}"
+                );
+                // The caret row is on screen, and is one of the rects a click
+                // is tested against.
+                assert!(
+                    geom.rows.iter().any(|(_, i)| *i == cursor),
+                    "{width}x{height}/{total}: the caret scrolled off"
+                );
+                let caret_y = geom
+                    .rows
+                    .iter()
+                    .find(|(_, i)| *i == cursor)
+                    .map(|(rect, _)| rect.y)
+                    .expect("caret rect");
+                assert!(
+                    lines[caret_y as usize].contains(&format!("entry-{cursor:03}")),
+                    "{width}x{height}/{total}: the caret rect and the drawn row disagree"
+                );
+                // Nothing the viewport drew may sit on the pinned hint row.
+                assert!(
+                    geom.rows.iter().all(|(rect, _)| rect.y < hint_y),
+                    "{width}x{height}/{total}: a list row overwrote the hint row"
+                );
+                if total > geom.capacity {
+                    let indicator = geom
+                        .indicator
+                        .clone()
+                        .expect("a scrolled list says where it is");
+                    assert!(
+                        hint.contains(&indicator),
+                        "{width}x{height}/{total}: {hint} is missing {indicator}"
+                    );
+                } else {
+                    assert_eq!(geom.indicator, None, "{width}x{height}/{total}");
+                }
+            }
+        }
+    }
+
+    /// Degenerate areas: no room for a row, no height at all, no width at
+    /// all. The release profile is `panic = "abort"`, so every one of these
+    /// has to produce a frame rather than an exit.
+    #[test]
+    fn a_list_dialog_with_no_room_for_a_row_still_draws_and_never_panics() {
+        for area in [
+            Rect::new(0, 0, 0, 0),
+            Rect::new(0, 0, 40, 0),
+            Rect::new(0, 0, 0, 20),
+            Rect::new(0, 0, 3, 3),
+            Rect::new(0, 0, 40, 3),
+            Rect::new(0, 0, 40, 4),
+        ] {
+            let spec = list_spec(60, 59, 0);
+            let backend = TestBackend::new(area.width.max(1), area.height.max(1));
+            let mut term = Terminal::new(backend).expect("terminal");
+            term.draw(|f| render_list_dialog(f, area, &spec))
+                .expect("draw must not panic");
+            if let Some(geom) = list_dialog_layout(area, &spec) {
+                assert!(geom.rows.len() <= geom.capacity);
+                assert!(geom.rect.height <= area.height);
+                assert!(geom.rect.width <= area.width.max(1));
+            }
+        }
+    }
+
+    /// A dialog hint is only clickable when it stands for exactly one key --
+    /// `j/k` and `any key` get no region rather than a guessed one, so a
+    /// pointer can never reach a path the keyboard could not.
+    #[test]
+    fn only_single_key_dialog_hints_get_a_clickable_region() {
+        assert_eq!(footer_key_code("\u{23ce}"), Some(KeyCode::Enter));
+        assert_eq!(footer_key_code("esc"), Some(KeyCode::Esc));
+        assert_eq!(footer_key_code("esc/q"), Some(KeyCode::Esc));
+        assert_eq!(footer_key_code("space"), Some(KeyCode::Char(' ')));
+        assert_eq!(footer_key_code("c"), Some(KeyCode::Char('c')));
+        assert_eq!(footer_key_code("j/k"), None);
+        assert_eq!(footer_key_code("a-z"), None);
+        assert_eq!(footer_key_code("any key"), None);
+        assert_eq!(footer_key_code(""), None);
+
+        let area = Rect::new(0, 0, 80, 20);
+        let spec = list_spec(3, 0, 0);
+        let geom = list_dialog_layout(area, &spec).expect("layout");
+        // MAIL_FOOTER is ⏎ / c / j-k / esc: three clickable, `j/k` not.
+        assert_eq!(
+            geom.hints.iter().map(|(_, id)| *id).collect::<Vec<_>>(),
+            vec![
+                HintId::DialogKey(KeyCode::Enter),
+                HintId::DialogKey(KeyCode::Char('c')),
+                HintId::DialogKey(KeyCode::Esc),
+            ]
+        );
+        // Every hint rect sits on the one pinned hint row, inside the dialog.
+        let hint_y = geom.inner.y + geom.inner.height - 1;
+        for (rect, id) in &geom.hints {
+            assert_eq!(rect.y, hint_y, "{id:?}");
+            assert!(rect.right() <= geom.inner.right(), "{id:?} ran off the row");
+        }
+    }
+
+    /// `frame_snapshot` carries exactly the geometry `render_overlay` drew,
+    /// for every list-shaped overlay -- including the two phase 3 adds.
+    #[test]
+    fn frame_snapshot_carries_the_open_dialogs_own_rows_and_hints() {
+        let area = Rect::new(0, 0, 120, 40);
+        let layout = layout(area, 44);
+        let rows: Vec<SidebarRow> = vec![sidebar_row("aaaa1111", "claude", RowState::Idle)];
+        let summary = test_summary();
+        let nothing_collapsed = HashSet::new();
+        let roster = roster_frame(
+            layout.sidebar,
+            &rows,
+            &summary,
+            &test_roster_view(&nothing_collapsed),
+        );
+        let header = base_facts();
+        for overlay in every_overlay() {
+            let snap = frame_snapshot(area, &layout, false, &roster, &header, &overlay, 0);
+            if matches!(overlay, Overlay::None) {
+                assert!(snap.overlay.is_none());
+                assert!(snap.overlay_rows.is_empty());
+                assert!(snap.overlay_hints.is_empty());
+                assert_eq!(snap.overlay_capacity, 0);
+                continue;
+            }
+            let rect = snap.overlay.expect("an open overlay has a rect");
+            for (row, index) in &snap.overlay_rows {
+                assert!(
+                    rect.union(*row) == rect,
+                    "row {index} at {row:?} escaped the dialog {rect:?}"
+                );
+            }
+            for (hint, id) in &snap.overlay_hints {
+                assert!(
+                    rect.union(*hint) == rect,
+                    "hint {id:?} at {hint:?} escaped the dialog {rect:?}"
+                );
+            }
+            // A list-shaped overlay reports a capacity; a compose buffer does
+            // not, and reports no rows either.
+            if list_spec_for(&overlay, 0).is_some() {
+                assert!(snap.overlay_capacity > 0, "{overlay:?}");
+            } else {
+                assert!(snap.overlay_rows.is_empty(), "{overlay:?}");
+                assert!(snap.overlay_hints.is_empty(), "{overlay:?}");
+            }
+        }
+    }
+
+    /// Every menu entry keeps the first free letter of its own label, so
+    /// `restore` keeps `r` and `retry` -- which follows `evidence` -- takes
+    /// `t`. No two entries ever share one.
+    #[test]
+    fn menu_letters_are_unique_and_prefer_the_first_free_letter() {
+        let order = [
+            MenuAction::Inspect,
+            MenuAction::Focus,
+            MenuAction::Nudge,
+            MenuAction::Mail,
+            MenuAction::Handover,
+            MenuAction::Stop,
+            MenuAction::Restore,
+            MenuAction::OpenWorktree,
+            MenuAction::Evidence,
+            MenuAction::Retry,
+            MenuAction::Dismiss,
+        ];
+        let letters = menu_letters(&order);
+        assert_eq!(
+            letters,
+            vec![
+                Some('i'),
+                Some('f'),
+                Some('n'),
+                Some('m'),
+                Some('h'),
+                Some('s'),
+                Some('r'),
+                Some('o'),
+                Some('e'),
+                Some('t'),
+                Some('d'),
+            ]
+        );
+        let mut seen = HashSet::new();
+        for letter in letters.into_iter().flatten() {
+            assert!(seen.insert(letter), "{letter} was handed out twice");
+        }
+    }
+
+    /// A disabled menu entry is drawn, dim, WITH its reason -- never hidden.
+    #[test]
+    fn a_disabled_menu_entry_is_drawn_with_its_reason() {
+        let overlay = Overlay::Menu(MenuView {
+            target: "aaaa1111".to_string(),
+            subject: "aaaa1111 \u{b7} worker".to_string(),
+            entries: vec![
+                MenuEntry {
+                    action: MenuAction::Inspect,
+                    disabled: None,
+                    letter: Some('i'),
+                },
+                MenuEntry {
+                    action: MenuAction::Restore,
+                    disabled: Some("no spawn request kept".to_string()),
+                    letter: Some('r'),
+                },
+            ],
+            cursor: 0,
+            offset: 0,
+            confirm: None,
+        });
+        let area = Rect::new(0, 0, 80, 20);
+        let text = render_and_capture_text(area, |f, area| render_overlay(f, area, &overlay, 0));
+        assert!(text.contains("aaaa1111"), "the menu names its target");
+        assert!(text.contains("restore"), "the entry is never hidden");
+        assert!(
+            text.contains("nospawnrequestkept") || text.contains("no spawn request kept"),
+            "the reason is on the same row: {text}"
+        );
     }
 
     #[test]
@@ -5969,6 +7045,8 @@ mod tests {
         context_actions: bool,
         collapse_group: bool,
         expand_group: bool,
+        inspect: bool,
+        restore_row: bool,
     }
 
     /// Completeness, not just correctness: the test above proves every
@@ -6005,6 +7083,8 @@ mod tests {
                     DashAction::LiteralPrefix => cov.literal_prefix = true,
                     DashAction::Help => cov.help = true,
                     DashAction::ToggleSelectMode => cov.toggle_select_mode = true,
+                    DashAction::Inspect => cov.inspect = true,
+                    DashAction::RestoreRow => cov.restore_row = true,
                 }
             }
         }
@@ -6030,7 +7110,9 @@ mod tests {
                 && cov.toggle_select_mode
                 && cov.context_actions
                 && cov.collapse_group
-                && cov.expand_group,
+                && cov.expand_group
+                && cov.inspect
+                && cov.restore_row,
             "help table is missing a row for at least one DashAction variant"
         );
     }
