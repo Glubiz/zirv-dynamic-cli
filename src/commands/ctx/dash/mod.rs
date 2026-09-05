@@ -72,12 +72,21 @@ pub enum InputVerdict {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DashAction {
     /// Right-click on a sidebar row: open the context menu for *that* row,
-    /// which is not necessarily the selected one. The menu itself is phase 3
-    /// of issue #354; phase 1 records the target and says so.
+    /// which is not necessarily the selected one.
     ContextMenu(hit::RowId),
     /// `Ctrl+A c`, or the header's `actions` hint: the same menu for the
     /// selected row.
     ContextActions,
+    /// `Ctrl+A i`, or the header's `inspect` hint (issue #354 phase 3): the
+    /// per-row inspector over the selected row. Replaces phase 1/2's mapping
+    /// of this chord onto the errors overlay; `^A e errors` is unchanged.
+    Inspect,
+    /// `Ctrl+A r`, or the header's `restore` hint (issue #354 phase 3):
+    /// relaunch the selected ended/reaped row from the spawn request the
+    /// dashboard kept for it. A no-op with a notice when the selected row is
+    /// not restorable -- the hint is not drawn for such a row in the first
+    /// place, and the context menu says why.
+    RestoreRow,
     /// `Ctrl+A Left`/`Ctrl+A Right`, or a click on a group header's
     /// disclosure triangle: fold a work group shut, or open it again.
     CollapseGroup,
@@ -148,14 +157,30 @@ enum MouseRoute {
     ScrollRoster(isize),
     /// A chrome hit that maps onto a keyboard action the dash already has.
     Action(DashAction),
+    /// Issue #354 phase 3: a left click on one visible row of the open list
+    /// dialog, by its index into that dialog's own full row list. Selecting
+    /// vs activating is decided by the loop, which is the only thing holding
+    /// a clock ([`DOUBLE_CLICK`]); this stays pure.
+    OverlayRow(usize),
+    /// Issue #354 phase 3: a click on the open dialog's own pinned hint row,
+    /// fed to that dialog's reducer as exactly the key the hint names -- so
+    /// the pointer can never reach a code path the keyboard could not.
+    OverlayKey(KeyCode),
+    /// Issue #354 phase 3: the wheel over an open dialog, in list rows.
+    ScrollOverlay(isize),
 }
 
 /// Pure: the dispatch order the behaviour contract calls for, in one place.
 ///
 /// 1. the select-mode / mouse-off guard (mouse capture off means the terminal
 ///    itself owns the pointer, so nothing here may act on it);
-/// 2. the modal layer -- an open overlay consumes every pointer event,
-///    wheel included (phase 3 gives the overlay its own hit regions);
+/// 2. the modal layer -- an open overlay owns every pointer event, wheel
+///    included. Phase 3 refines "owns" from "swallows" to "owns its own
+///    targets": a click on one of the dialog's visible rows selects (or, on a
+///    double-click, activates) it, a click on its pinned hint row is fed to
+///    its reducer as that key, the wheel scrolls its list, and everything
+///    else inside or around it is consumed and does nothing. Nothing under a
+///    dialog is ever reachable;
 /// 3. the captured gesture owner -- a drag or release that belongs to an
 ///    in-progress text selection stays with the grid wherever it lands, so
 ///    every `*_cancels_selection` rule keeps working;
@@ -171,12 +196,27 @@ fn route_mouse(
     overlay_open: bool,
     selecting: bool,
 ) -> MouseRoute {
-    if !capture || overlay_open {
+    if !capture {
         return MouseRoute::Consume;
     }
     let hit = hit::hit_test(snap, mouse.column, mouse.row);
-    if matches!(hit, Hit::Overlay | Hit::ModalBackdrop) {
-        return MouseRoute::Consume;
+    let inside_dialog = matches!(hit, Hit::Overlay | Hit::OverlayRow(_) | Hit::OverlayHint(_));
+    if overlay_open || inside_dialog || matches!(hit, Hit::ModalBackdrop) {
+        return match (hit, mouse.kind) {
+            (
+                Hit::OverlayHint(HintId::DialogKey(code)),
+                MouseEventKind::Down(MouseButton::Left),
+            ) => MouseRoute::OverlayKey(code),
+            (Hit::OverlayRow(index), MouseEventKind::Down(MouseButton::Left)) => {
+                MouseRoute::OverlayRow(index)
+            }
+            // The wheel scrolls the dialog's own list, but only with the
+            // pointer actually inside it: a notch on the backdrop is
+            // consumed, exactly like a click there.
+            (_, MouseEventKind::ScrollUp) if inside_dialog => MouseRoute::ScrollOverlay(-1),
+            (_, MouseEventKind::ScrollDown) if inside_dialog => MouseRoute::ScrollOverlay(1),
+            _ => MouseRoute::Consume,
+        };
     }
     if selecting
         && matches!(
@@ -214,11 +254,11 @@ fn route_mouse(
                 HintId::Nudge => DashAction::Nudge,
                 HintId::Mail => DashAction::Mail,
                 HintId::Errors => DashAction::ShowErrors,
-                // Phase 3 gives `^A i` its own inspector; until then it lands
-                // on the same errors/evidence overlay the keyboard's own
-                // `^A i` does, so the drawn hint is never inert.
-                HintId::Inspect => DashAction::ShowErrors,
-                HintId::Help => DashAction::Help,
+                HintId::Inspect => DashAction::Inspect,
+                HintId::Restore => DashAction::RestoreRow,
+                // A dialog hint is never in the header/footer cluster; a
+                // stray one is the always-safe action rather than a panic.
+                HintId::Help | HintId::DialogKey(_) => DashAction::Help,
             })
         }
         _ => MouseRoute::Consume,
@@ -441,13 +481,14 @@ pub fn filter_key(prefix_armed: bool, key: KeyEvent) -> (bool, InputVerdict) {
         KeyCode::Char('M') => Some(DashAction::Memory),
         KeyCode::Char('o') => Some(DashAction::Handover),
         KeyCode::Char('e') => Some(DashAction::ShowErrors),
-        // Issue #354 phase 2: the header offers `^A i inspect` for a row that
-        // needs action or has ended, so the chord has to lead somewhere. The
-        // real per-session inspector is phase 3; until then it opens the
-        // errors/evidence overlay -- the closest thing the dashboard has to
-        // "show me what happened here" -- rather than being drawn and doing
-        // nothing. See [[Known Issues]].
-        KeyCode::Char('i') => Some(DashAction::ShowErrors),
+        // Issue #354 phase 3: the real per-session inspector. Phase 1/2
+        // mapped this chord onto the errors overlay so the drawn hint was
+        // never inert; it now leads to the surface it always named.
+        KeyCode::Char('i') => Some(DashAction::Inspect),
+        // Issue #354 phase 3: the dead footer has advertised `^A r restore`
+        // since #209 with nothing behind it. It relaunches the selected
+        // ended row now.
+        KeyCode::Char('r') => Some(DashAction::RestoreRow),
         KeyCode::Char('z') => Some(DashAction::Zoom),
         KeyCode::Char('v') => Some(DashAction::ToggleSelectMode),
         KeyCode::Char('q') => Some(DashAction::Quit),
@@ -662,6 +703,8 @@ fn overlay_name(overlay: &ui::Overlay) -> &'static str {
         ui::Overlay::Restore(_) => "restore",
         ui::Overlay::Help => "help",
         ui::Overlay::Errors(_) => "errors",
+        ui::Overlay::Menu(_) => "actions",
+        ui::Overlay::Inspector(_) => "inspect",
     }
 }
 
@@ -1001,6 +1044,21 @@ struct EndedRow {
     /// was dropped rather than re-derived from a `Pane` that no longer exists.
     budget: String,
     writer: String,
+    /// The checkout the pane ran in, captured for the same reason -- the
+    /// inspector's `cwd` line and the menu's `open worktree` entry both read
+    /// it, and there is no `Pane` left to ask.
+    cwd: String,
+    /// Issue #354 phase 3: the very `spawnreq::SpawnRequest` that created
+    /// this pane, kept so `restore`/`retry` can relaunch it VERBATIM through
+    /// the existing `fulfill_spawn_request` machinery -- never a
+    /// reconstructed argv (`Command Safety`). `None` for a pane this
+    /// dashboard did not spawn from a request (the orchestrator itself, and
+    /// a startup-restored pane), which is exactly what disables the two
+    /// entries with `no spawn request kept`.
+    request: Option<spawnreq::SpawnRequest>,
+    /// Who asked for that request, so a relaunch is attributed to the same
+    /// lineage the original spawn was rather than to the dashboard itself.
+    requested_by: Option<String>,
     meta: EndedMeta,
 }
 
@@ -1011,6 +1069,80 @@ struct EndedRow {
 /// `reap_fixup`'s own doc comment on R2). Eight is one screenful's worth of
 /// recent history on the smallest dashboard-eligible terminal.
 const MAX_RETAINED_ENDED_ROWS: usize = 8;
+
+/// Pure: the `budget` disclosure text for a pane -- `used / ceiling`, with
+/// the shared placeholder for whichever half nothing has measured.
+///
+/// Review of 5c1b6c3, finding 2: shared by [`build_pane_rows`] (a live pane)
+/// and [`reap_ended_panes`] (the retained row frozen at the reap), so the two
+/// can never disagree about what a pane's budget line says.
+fn budget_text(used: Option<u64>, ceiling: Option<u64>) -> String {
+    format!(
+        "{} / {}",
+        used.map(|v| v.to_string())
+            .unwrap_or_else(|| style::PLACEHOLDER.into()),
+        ceiling
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| style::PLACEHOLDER.into())
+    )
+}
+
+/// Pure: the `writer` disclosure text for a pane -- whether it holds the
+/// write permit, and for which checkout. Shared for the same reason
+/// [`budget_text`] is.
+fn writer_text(holds_permit: bool, cwd: &Path) -> String {
+    format!(
+        "{} \u{b7} {}",
+        if holds_permit {
+            "held"
+        } else {
+            style::PLACEHOLDER
+        },
+        cwd.display()
+    )
+}
+
+/// Pure: the attention observations a reap owes the session it is retiring,
+/// in the order they must be recorded.
+///
+/// Review of 5c1b6c3, finding 1: a CLEAN exit gets a `Settled` observation
+/// FIRST whenever nothing had already settled the session, because
+/// `attention::compose` latches `Visibility::Unseen` only on a genuine
+/// `Working -> Settled` transition -- and a worker with no Stop hook that
+/// works right up to a fast, clean exit never spends a tick `Settled` for the
+/// quiet heuristic to observe (`PaneState` reports `Ended` the instant
+/// `child_exit` is set, so the idle debounce never elapses). Without it the
+/// retained row rendered `●` immediately and the operator was never told the
+/// worker had finished. A nonzero exit is `✗` regardless of visibility, so it
+/// gets the exit observation alone.
+fn reap_observations(
+    prior: super::attention::Lifecycle,
+    code: i32,
+    at: u64,
+) -> Vec<super::attention::Observation> {
+    let mut observations = Vec::new();
+    if code == 0 && prior != super::attention::Lifecycle::Settled {
+        observations.push(
+            super::attention::Observation::new(
+                super::attention::Authority::Supervisor,
+                "pane finished its work and exited cleanly",
+                90,
+                at,
+            )
+            .with_lifecycle(super::attention::Lifecycle::Settled),
+        );
+    }
+    observations.push(
+        super::attention::Observation::new(
+            super::attention::Authority::Supervisor,
+            format!("pane exited with code {code}"),
+            90,
+            at,
+        )
+        .with_lifecycle(super::attention::Lifecycle::Exited),
+    );
+    observations
+}
 
 /// Pure: appends `row` to the retained list, dropping the oldest once the list
 /// is over [`MAX_RETAINED_ENDED_ROWS`]. Split out so the cap is testable
@@ -2103,6 +2235,21 @@ impl DoneUnreadAck {
         self.pending = candidate.filter(|key| !self.acked.contains(key));
     }
 
+    /// Pure: latches an acknowledgement earned OFF the render path, returning
+    /// the short id whose `mark_seen_io` is owed -- at most once per
+    /// `(short, revision)`, exactly like [`Self::take_due`].
+    ///
+    /// Issue #354 phase 3: the render path's own rule requires the pane to be
+    /// FOCUSED, which a retained ended row can never be -- there is no child
+    /// left to type into. Opening the inspector on such a row is the operator
+    /// reading it, and is the only way its `◆` can ever clear.
+    fn acknowledge(&mut self, candidate: Option<(String, u64)>) -> Option<String> {
+        let (short, revision) = candidate?;
+        self.acked
+            .insert((short.clone(), revision))
+            .then_some(short)
+    }
+
     /// Pure: the short id whose `mark_seen_io` is now due, at most once per
     /// `(short, revision)`.
     fn take_due(&mut self) -> Option<String> {
@@ -2137,6 +2284,20 @@ fn ack_candidate(
         return None;
     }
     Some((short.to_string(), status.revision))
+}
+
+/// Pure: the `(short, revision)` opening the inspector on `row` qualifies for.
+///
+/// Keyed off the glyph the roster actually drew rather than the projection
+/// alone, because a retained ended row's `◆` comes from `glyph_for`'s own
+/// exit-code rule (a clean exit with `Visibility::Unseen`), which
+/// `attention::project` maps to `Failed` and so would never match here.
+fn inspect_ack_candidate(row: &ui::SidebarRow) -> Option<(String, u64)> {
+    let status = row.status.as_ref()?;
+    if ui::glyph_for(row) != ui::Glyph::DoneUnread {
+        return None;
+    }
+    Some((row.short.clone(), status.revision))
 }
 
 /// Pure: `(focused, selected)` after the pane at `removed` has been taken out
@@ -2317,6 +2478,7 @@ fn reap_ended_panes(
     reaped_recent: &mut HashSet<String>,
     last_exited: &mut Option<LastExited>,
     retained: &mut VecDeque<EndedRow>,
+    kept_requests: &mut HashMap<String, (spawnreq::SpawnRequest, Option<String>)>,
 ) {
     let mut index = 0;
     while index < panes.len() {
@@ -2336,25 +2498,42 @@ fn reap_ended_panes(
             age_secs: sessions::load_record(state, panes[index].short())
                 .map(|record| now_secs.saturating_sub(record.started_at)),
         };
+        // Review of 5c1b6c3, finding 2: `budget`/`writer` are read off the
+        // LIVE pane here, through the very same helpers `build_pane_rows`
+        // uses for a running one. They used to be hardcoded placeholders, so
+        // a retained row's disclosure claimed nothing was ever known about a
+        // worker's token usage or its write permit -- while the doc comment
+        // on `EndedRow` promised the opposite.
+        let retained_budget = budget_text(
+            panes[index]
+                .measured_usage()
+                .map(|u| u.context_total().saturating_add(u.output_tokens)),
+            panes[index].budget_tokens(),
+        );
+        let retained_writer = writer_text(panes[index].holds_writer_permit(), panes[index].cwd());
         let quit_sequence = adapters::select(Some(panes[index].agent()), &[], cfg)
             .map(|adapter| adapter.quit_sequence())
             .unwrap_or("");
         if let Err(e) = panes[index].shutdown(quit_sequence) {
             push_error(errors, format!("reap {}: {e}", panes[index].short()));
         }
+        let short = panes[index].short().to_string();
+        let (request, requested_by) = match kept_requests.remove(&short) {
+            Some((req, by)) => (Some(req), by),
+            None => (None, None),
+        };
         let retained_row = EndedRow {
-            short: panes[index].short().to_string(),
             role: panes[index].role().label().to_string(),
             model: panes[index].launch_model().map(str::to_string),
             harness: panes[index].agent().to_string(),
             group_id: panes[index].work_group_id().map(str::to_string),
             parent: panes[index].parent_session().map(str::to_string),
-            budget: style::PLACEHOLDER.to_string(),
-            writer: format!(
-                "{} \u{b7} {}",
-                style::PLACEHOLDER,
-                panes[index].cwd().display()
-            ),
+            budget: retained_budget,
+            writer: retained_writer,
+            cwd: panes[index].cwd().display().to_string(),
+            request,
+            requested_by,
+            short,
             meta: ended_meta,
         };
         // Issue #349: the dashboard's own quiet-heuristic sync never sees this
@@ -2362,19 +2541,18 @@ fn reap_ended_panes(
         // can say the child is gone files it here instead -- a `Supervisor`
         // observation, the same rank `exec`/`wrap` use for a process exit.
         // Without it the retained row's cached status would still claim the
-        // session was working.
-        let _ = super::attention::record(
-            state,
-            &retained_row.short,
-            super::attention::Observation::new(
-                super::attention::Authority::Supervisor,
-                format!("pane exited with code {code}"),
-                90,
+        // session was working. Review of 5c1b6c3, finding 1: a clean exit is
+        // preceded by the `Settled` observation that latches `Unseen` -- see
+        // [`reap_observations`].
+        let prior_lifecycle = super::attention::load(state, &retained_row.short).lifecycle;
+        for observation in reap_observations(prior_lifecycle, code, ended_meta.exited_at) {
+            let _ = super::attention::record(
+                state,
+                &retained_row.short,
+                observation,
                 ended_meta.exited_at,
-            )
-            .with_lifecycle(super::attention::Lifecycle::Exited),
-            ended_meta.exited_at,
-        );
+            );
+        }
         push_retained_ended(retained, retained_row, MAX_RETAINED_ENDED_ROWS);
         let pane = panes.remove(index);
         // Review finding (2026-09), finding 2a: captured before `pane` is
@@ -2926,6 +3104,12 @@ fn settle_pending_rollover(
 }
 
 /// How long a transient header notice stays on screen before it expires (L13).
+/// Issue #354 phase 3: how close together two clicks on the same dialog row
+/// have to be to count as a double-click (activate) rather than two
+/// selections. The usual desktop default; a slow second click simply
+/// re-selects the row it is already on, which is a no-op.
+const DOUBLE_CLICK: Duration = Duration::from_millis(400);
+
 const NOTICE_TTL: Duration = Duration::from_secs(4);
 
 /// One informational, auto-expiring header notice: its text and the instant it
@@ -5503,6 +5687,7 @@ fn handle_spawn_requests(
     repo: &Path,
     size: (u16, u16),
     errors: &mut Vec<String>,
+    kept_requests: &mut HashMap<String, (spawnreq::SpawnRequest, Option<String>)>,
 ) {
     for (dir, requester) in intake_channels(requests_dir, panes) {
         drain_one_channel(
@@ -5516,6 +5701,7 @@ fn handle_spawn_requests(
             repo,
             size,
             errors,
+            kept_requests,
         );
     }
 }
@@ -5538,6 +5724,7 @@ fn drain_one_channel(
     repo: &Path,
     size: (u16, u16),
     errors: &mut Vec<String>,
+    kept_requests: &mut HashMap<String, (spawnreq::SpawnRequest, Option<String>)>,
 ) {
     let batch = claim_batch(spawnreq::take_requests(dir));
     for (stem, req) in batch {
@@ -5563,14 +5750,22 @@ fn drain_one_channel(
             requests_dir,
             errors,
         ) {
-            Ok((short, capability_warnings)) => spawnreq::SpawnAck {
-                ok: true,
-                short: Some(short),
-                reason: None,
-                retryable: false,
-                budget_exhausted: false,
-                capability_warnings,
-            },
+            Ok((short, capability_warnings)) => {
+                // Issue #354 phase 3: the request that actually produced this
+                // pane, kept verbatim so `restore`/`retry` can replay THIS --
+                // never a reconstructed argv. It is moved onto the pane's
+                // retained ended row when the pane is reaped, and dropped
+                // with that row.
+                kept_requests.insert(short.clone(), (req.clone(), requester.map(str::to_string)));
+                spawnreq::SpawnAck {
+                    ok: true,
+                    short: Some(short),
+                    reason: None,
+                    retryable: false,
+                    budget_exhausted: false,
+                    capability_warnings,
+                }
+            }
             Err(refusal) => {
                 // R6: a refusal means no pane exists and none ever will, so
                 // the claim no longer stands for anything. Left in place, a
@@ -5602,6 +5797,67 @@ fn drain_one_channel(
 // the effect (a mail send/consume, a memory remember/forget/verify) touches
 // disk, and only from `run_dashboard`'s own loop, through the exact same
 // library functions the CLI verbs call.
+
+/// Issue #354 phase 3: relaunches one retained ended row from the very
+/// `spawnreq::SpawnRequest` that created it, through the existing
+/// [`fulfill_spawn_request`] machinery -- the same call `drain_one_channel`
+/// makes for a request that arrives on disk, with the same
+/// `FILE_DROP_TRUSTED_INTERACTIVE` posture and the same requester identity
+/// the original spawn was granted.
+///
+/// Deliberately NOT a stored argv replay and NOT a new process-launch path:
+/// every gate `fulfill_spawn_request` applies (the argv guard, the repo/cwd
+/// acceptance check, workdir confinement, the envelope re-narrowing, the
+/// depth cap, admission and pacing) is re-applied to the relaunch exactly as
+/// it was to the original. The row is dropped from the retained list only
+/// once the relaunch succeeds -- a refusal leaves it on screen with its
+/// reason in the error channel, still restorable.
+#[allow(clippy::too_many_arguments)]
+fn restore_ended_row(
+    short: &str,
+    panes: &mut Vec<Pane>,
+    nudge_queues: &mut Vec<VecDeque<String>>,
+    retained: &mut VecDeque<EndedRow>,
+    kept_requests: &mut HashMap<String, (spawnreq::SpawnRequest, Option<String>)>,
+    cfg: &CtxConfig,
+    state: &StateDir,
+    repo: &Path,
+    size: (u16, u16),
+    requests_dir: &Path,
+    errors: &mut Vec<String>,
+    notices: &mut Vec<Notice>,
+    now: Instant,
+) {
+    let Some(index) = retained.iter().position(|row| row.short == short) else {
+        push_notice(notices, now, format!("restore: no ended row named {short}"));
+        return;
+    };
+    let Some(request) = retained[index].request.clone() else {
+        push_notice(notices, now, format!("restore {short}: {MENU_NO_REQUEST}"));
+        return;
+    };
+    let requested_by = retained[index].requested_by.clone();
+    match fulfill_spawn_request(
+        &request,
+        FILE_DROP_TRUSTED_INTERACTIVE,
+        requested_by.as_deref(),
+        panes,
+        nudge_queues,
+        cfg,
+        state,
+        repo,
+        size,
+        requests_dir,
+        errors,
+    ) {
+        Ok((new_short, _)) => {
+            retained.remove(index);
+            kept_requests.insert(new_short.clone(), (request, requested_by));
+            push_notice(notices, now, format!("restored {short} as {new_short}"));
+        }
+        Err(refusal) => push_error(errors, format!("restore {short}: {}", refusal.reason)),
+    }
+}
 
 /// Clamps a cursor into `0..len` (or `0` on an empty list) -- shared by every
 /// browsing-mode reducer below so "move past the last row" and "the list
@@ -5982,6 +6238,7 @@ fn build_mail_view(state: &StateDir, repo: &Path) -> ui::MailView {
     ui::MailView {
         items,
         cursor: 0,
+        offset: 0,
         compose: None,
     }
 }
@@ -6008,6 +6265,7 @@ fn build_memory_view(state: &StateDir, repo: &Path) -> ui::MemoryView {
     ui::MemoryView {
         entries,
         cursor: 0,
+        offset: 0,
         input: None,
     }
 }
@@ -6095,6 +6353,437 @@ fn build_errors_view(errors: &[String]) -> ui::ErrorsView {
     ui::ErrorsView {
         items: errors.iter().rev().cloned().collect(),
         cursor: 0,
+        offset: 0,
+    }
+}
+
+// ---------------------------------------------------------------------
+// Issue #354 phase 3: the context menu and the inspector.
+// ---------------------------------------------------------------------
+
+/// Everything the context menu decides ONE row's entries from. Assembled at
+/// the moment the menu opens, from values already in hand -- the row the
+/// roster built, the pane behind it (if any), and whether a spawn request was
+/// kept for it -- so the entry matrix itself stays a pure function.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct MenuFacts {
+    short: String,
+    role: String,
+    /// This dashboard owns a live `Pane` for the row.
+    attached: bool,
+    /// The row is a live session (attached, or a view-only registry row).
+    alive: bool,
+    /// The row is an ended pane -- a retained completed worker.
+    ended: bool,
+    /// The exit code of an ended row, when one was recorded.
+    exit_code: Option<i32>,
+    /// The row is one of the retained ended rows the roster keeps, so it can
+    /// be dropped from that list.
+    retained: bool,
+    /// The dashboard still holds the `spawnreq::SpawnRequest` that created
+    /// this row, so it can be relaunched verbatim.
+    has_request: bool,
+    /// The checkout this row runs (or ran) in, when it is known.
+    cwd: Option<String>,
+}
+
+/// Reasons, once, so the menu and its tests cannot drift.
+const MENU_NOT_ATTACHED: &str = "not a pane this dashboard owns";
+const MENU_ENDED: &str = "this pane has ended";
+const MENU_STILL_RUNNING: &str = "still running";
+const MENU_NO_REQUEST: &str = "no spawn request kept";
+const MENU_NO_CWD: &str = "no cwd known";
+const MENU_EXITED_CLEAN: &str = "exited cleanly";
+const MENU_NOT_RETAINED: &str = "only a finished row can be dismissed";
+
+/// Pure: the context menu's entries for one row, in the approved order, each
+/// either available or disabled with a short reason.
+///
+/// Every entry is ALWAYS present. An operator who cannot see that `restore`
+/// exists cannot learn why it is unavailable, and a menu whose shape changes
+/// per row is a menu whose letters move under the operator's fingers.
+fn menu_entries(facts: &MenuFacts) -> Vec<ui::MenuEntry> {
+    use ui::MenuAction as A;
+    let order = [
+        A::Inspect,
+        A::Focus,
+        A::Nudge,
+        A::Mail,
+        A::Handover,
+        A::Stop,
+        A::Restore,
+        A::OpenWorktree,
+        A::Evidence,
+        A::Retry,
+        A::Dismiss,
+    ];
+    let restore_reason = || {
+        if !facts.ended {
+            Some(MENU_STILL_RUNNING.to_string())
+        } else if !facts.has_request {
+            Some(MENU_NO_REQUEST.to_string())
+        } else {
+            None
+        }
+    };
+    let letters = ui::menu_letters(&order);
+    order
+        .iter()
+        .zip(letters)
+        .map(|(action, letter)| {
+            let disabled = match action {
+                // The inspector and its evidence section are read-only reports
+                // over cached facts: there is no row they cannot describe.
+                A::Inspect | A::Evidence | A::Mail => None,
+                A::Focus | A::Handover | A::Stop => (!(facts.attached && !facts.ended))
+                    .then_some(if facts.ended {
+                        MENU_ENDED
+                    } else {
+                        MENU_NOT_ATTACHED
+                    })
+                    .map(str::to_string),
+                // A nudge reaches a view-only registry session too
+                // (`sessions::run_nudge_with`'s headless marker path), so
+                // "alive" is the real gate here, not "attached".
+                A::Nudge => (!facts.alive).then(|| MENU_ENDED.to_string()),
+                A::Restore => restore_reason(),
+                A::Retry => match restore_reason() {
+                    Some(reason) => Some(reason),
+                    None if facts.exit_code.unwrap_or(0) == 0 => {
+                        Some(MENU_EXITED_CLEAN.to_string())
+                    }
+                    None => None,
+                },
+                A::OpenWorktree => facts.cwd.is_none().then(|| MENU_NO_CWD.to_string()),
+                A::Dismiss => (!facts.retained).then(|| MENU_NOT_RETAINED.to_string()),
+            };
+            ui::MenuEntry {
+                action: *action,
+                disabled,
+                letter,
+            }
+        })
+        .collect()
+}
+
+/// Builds the context menu for one row. `subject` is what the dialog title
+/// names, so a right-click menu is never mistaken for the selected row's.
+fn build_menu_view(facts: &MenuFacts) -> ui::MenuView {
+    ui::MenuView {
+        target: facts.short.clone(),
+        subject: format!("{} \u{b7} {}", facts.short, facts.role),
+        entries: menu_entries(facts),
+        cursor: 0,
+        offset: 0,
+        confirm: None,
+    }
+}
+
+/// The checkout one row runs (or ran) in: the live pane's own `cwd`, else
+/// the one frozen onto its retained ended row at the reap. `None` for a
+/// view-only registry row, which this dashboard never spawned and whose
+/// working directory it has no record of.
+fn row_cwd(short: &str, panes: &[Pane], retained: &VecDeque<EndedRow>) -> Option<String> {
+    panes
+        .iter()
+        .find(|p| p.short() == short)
+        .map(|p| p.cwd().display().to_string())
+        .or_else(|| {
+            retained
+                .iter()
+                .find(|e| e.short == short)
+                .map(|e| e.cwd.clone())
+        })
+}
+
+/// Assembles the context menu's facts for one already-built roster row.
+fn menu_facts_for(
+    row: &ui::SidebarRow,
+    panes: &[Pane],
+    retained: &VecDeque<EndedRow>,
+) -> MenuFacts {
+    let ended_row = retained.iter().find(|e| e.short == row.short);
+    MenuFacts {
+        short: row.short.clone(),
+        role: row.role.clone(),
+        attached: row.attached,
+        alive: row.state != ui::RowState::Dead && row.exit_code.is_none(),
+        ended: row.state == ui::RowState::Dead || row.exit_code.is_some(),
+        exit_code: row.exit_code,
+        retained: ended_row.is_some(),
+        has_request: ended_row.is_some_and(|e| e.request.is_some()),
+        cwd: row_cwd(&row.short, panes, retained),
+    }
+}
+
+/// What activating a context-menu entry means. The menu itself stays pure:
+/// looking a pane up, opening another overlay, quitting a child or
+/// relaunching a request all happen at the call site, which is the only place
+/// with the panes, the state directory and the kept requests in hand.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MenuEffect {
+    pub target: String,
+    pub action: ui::MenuAction,
+}
+
+/// Pure: one keystroke against the context menu.
+///
+/// `Enter` activates the entry under the caret -- except `stop`, the one
+/// destructive entry, which first raises an inline confirmation on its own
+/// row and only acts on `y` (or a second `Enter`). A disabled entry does
+/// nothing at all: its reason is already on screen. `Esc` closes the menu
+/// without touching focus, and a letter jumps straight to its entry.
+pub fn menu_overlay_reduce(
+    mut view: ui::MenuView,
+    key: KeyEvent,
+) -> (Option<ui::MenuView>, Option<MenuEffect>) {
+    let len = view.entries.len();
+    let activate = |view: ui::MenuView| -> (Option<ui::MenuView>, Option<MenuEffect>) {
+        match view.entries.get(view.cursor) {
+            Some(entry) if entry.enabled() => {
+                let effect = MenuEffect {
+                    target: view.target.clone(),
+                    action: entry.action,
+                };
+                (None, Some(effect))
+            }
+            // A disabled entry is inert: the row already says why.
+            _ => (Some(view), None),
+        }
+    };
+    // The inline stop confirmation owns the keyboard while it is up, so a
+    // stray `j` cannot walk the caret off the entry that is being confirmed
+    // and leave the confirmation pointing at a different row.
+    if let Some(index) = view.confirm {
+        return match key.code {
+            KeyCode::Char('y') | KeyCode::Enter => {
+                view.cursor = index;
+                view.confirm = None;
+                activate(view)
+            }
+            _ => {
+                view.confirm = None;
+                (Some(view), None)
+            }
+        };
+    }
+    match key.code {
+        KeyCode::Esc => (None, None),
+        KeyCode::Up | KeyCode::Char('k') => {
+            view.cursor = move_cursor(view.cursor, len, -1);
+            (Some(view), None)
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            view.cursor = move_cursor(view.cursor, len, 1);
+            (Some(view), None)
+        }
+        KeyCode::Enter => {
+            if view
+                .entries
+                .get(view.cursor)
+                .is_some_and(|e| e.action == ui::MenuAction::Stop && e.enabled())
+            {
+                view.confirm = Some(view.cursor);
+                return (Some(view), None);
+            }
+            activate(view)
+        }
+        KeyCode::Char(c) => match view.entries.iter().position(|e| e.letter == Some(c)) {
+            Some(index) => {
+                view.cursor = index;
+                if view.entries[index].action == ui::MenuAction::Stop
+                    && view.entries[index].enabled()
+                {
+                    view.confirm = Some(index);
+                    return (Some(view), None);
+                }
+                activate(view)
+            }
+            None => (Some(view), None),
+        },
+        _ => (Some(view), None),
+    }
+}
+
+/// The inspector's own section names, once, so `build_inspector_view`, the
+/// `evidence` menu entry and the tests all name the same strings.
+const INSPECT_IDENTITY: &str = "identity";
+const INSPECT_STATUS: &str = "status";
+const INSPECT_EVIDENCE: &str = "evidence";
+const INSPECT_BUDGET: &str = "budget";
+const INSPECT_WRITER: &str = "writer";
+const INSPECT_SIGNAL: &str = "signal";
+const INSPECT_ERRORS: &str = "errors";
+
+/// One `key  value` inspector line, with the shared placeholder standing in
+/// for a fact nothing has recorded yet -- never a fabricated value.
+fn inspect_line(key: &str, value: Option<String>) -> String {
+    format!(
+        "{key:<12}{}",
+        value
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| style::PLACEHOLDER.to_string())
+    )
+}
+
+/// Builds the inspector over one row, from facts that are already cached.
+///
+/// Nothing here reads the disk, runs git or shells out: `row` is what the
+/// roster already assembled this frame, `status` is the composed
+/// `attention::SessionStatus` the `FactsCache` cadence loaded, `cwd` comes
+/// from the pane (or the retained row) the caller already has, and `errors`
+/// is `push_error`'s own kept buffer.
+fn build_inspector_view(
+    row: &ui::SidebarRow,
+    cwd: Option<&str>,
+    errors: &[String],
+) -> ui::InspectorView {
+    let disclosure = |key: &str| {
+        row.disclosure
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.clone())
+    };
+    let status = row.status.as_ref();
+    let identity = ui::InspectorSection {
+        name: INSPECT_IDENTITY.to_string(),
+        lines: vec![
+            inspect_line("short", Some(row.short.clone())),
+            inspect_line("harness", Some(row.harness.clone())),
+            inspect_line("model", row.model.clone()),
+            inspect_line("role", Some(row.role.clone())),
+            inspect_line(
+                "group",
+                row.group.as_ref().map(|g| {
+                    format!(
+                        "{} ({})",
+                        g.scope,
+                        if g.lead_short.is_empty() {
+                            style::PLACEHOLDER
+                        } else {
+                            g.lead_short.as_str()
+                        }
+                    )
+                }),
+            ),
+            inspect_line("parent", disclosure("group")),
+            inspect_line("cwd", cwd.map(str::to_string)),
+            // Never run: `branch` stays whatever the roster cached, which is
+            // the placeholder until something else fills it in. Shelling out
+            // to git here would put a subprocess behind a keystroke.
+            inspect_line("branch", disclosure("branch")),
+        ],
+    };
+    let status_section = ui::InspectorSection {
+        name: INSPECT_STATUS.to_string(),
+        lines: vec![
+            inspect_line(
+                "lifecycle",
+                status.map(|s| spaced_lowercase(&format!("{:?}", s.lifecycle))),
+            ),
+            inspect_line(
+                "attention",
+                status.map(|s| spaced_lowercase(&format!("{:?}", s.attention))),
+            ),
+            inspect_line(
+                "projection",
+                status.map(|s| projection_word(super::attention::project(s))),
+            ),
+            inspect_line(
+                "authority",
+                status.map(|s| spaced_lowercase(&format!("{:?}", s.authority))),
+            ),
+            inspect_line("confidence", status.map(|s| s.confidence.to_string())),
+            inspect_line("since", disclosure("since")),
+            inspect_line("revision", status.map(|s| s.revision.to_string())),
+            inspect_line("exit", row.exit_code.map(|code| format!("exit {code}"))),
+        ],
+    };
+    // The whole point of the inspector: WHY the dashboard believes what it
+    // shows. Both the winning observation's evidence and every authority that
+    // lost this tick's vote, with its own reason.
+    let mut evidence_lines = Vec::new();
+    if let Some(status) = status {
+        if !status.evidence.trim().is_empty() {
+            evidence_lines.push(inspect_line("evidence", Some(status.evidence.clone())));
+        }
+        for skipped in &status.skipped {
+            evidence_lines.push(format!(
+                "skipped     {} \u{b7} {}",
+                spaced_lowercase(&format!("{:?}", skipped.authority)),
+                skipped.reason
+            ));
+        }
+    }
+    let evidence = ui::InspectorSection {
+        name: INSPECT_EVIDENCE.to_string(),
+        lines: evidence_lines,
+    };
+    let budget = ui::InspectorSection {
+        name: INSPECT_BUDGET.to_string(),
+        lines: vec![inspect_line("usage", disclosure("budget"))],
+    };
+    let writer = ui::InspectorSection {
+        name: INSPECT_WRITER.to_string(),
+        lines: vec![inspect_line("permit", disclosure("writer"))],
+    };
+    let signal = ui::InspectorSection {
+        name: INSPECT_SIGNAL.to_string(),
+        lines: vec![
+            inspect_line("transport", disclosure("signal")),
+            inspect_line(
+                "attached",
+                Some(if row.attached { "yes" } else { "no" }.to_string()),
+            ),
+        ],
+    };
+    // Only this pane's own kept errors: the buffer is shared, and every line
+    // `push_error` writes for a pane names its short id.
+    let pane_errors = ui::InspectorSection {
+        name: INSPECT_ERRORS.to_string(),
+        lines: errors
+            .iter()
+            .rev()
+            .filter(|e| e.contains(&row.short))
+            .take(MAX_KEPT_ERRORS)
+            .cloned()
+            .collect(),
+    };
+    ui::InspectorView {
+        target: row.short.clone(),
+        subject: format!("{} \u{b7} {}", row.short, row.role),
+        sections: vec![
+            identity,
+            status_section,
+            evidence,
+            budget,
+            writer,
+            signal,
+            pane_errors,
+        ],
+        cursor: 0,
+        offset: 0,
+    }
+}
+
+/// Pure: one keystroke against the inspector. Read-only, like the errors
+/// overlay -- there is no effect type, only "still open" or "closed".
+pub fn inspector_overlay_reduce(
+    mut view: ui::InspectorView,
+    key: KeyEvent,
+) -> Option<ui::InspectorView> {
+    let len = view.rows().len();
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => None,
+        KeyCode::Down | KeyCode::Char('j') => {
+            view.cursor = move_cursor(view.cursor, len, 1);
+            Some(view)
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            view.cursor = move_cursor(view.cursor, len, -1);
+            Some(view)
+        }
+        _ => Some(view),
     }
 }
 
@@ -6180,6 +6869,7 @@ fn build_restore_view(candidates: &[roster::RosterPane]) -> ui::RestoreView {
             })
             .collect(),
         cursor: 0,
+        offset: 0,
     }
 }
 
@@ -7201,27 +7891,12 @@ fn build_pane_rows(panes: &[Pane], ended: &VecDeque<EndedRow>) -> Vec<PaneRowMet
             model: pane.launch_model().map(str::to_string),
             group_id: pane.work_group_id().map(str::to_string),
             parent: pane.parent_session().map(str::to_string),
-            budget: format!(
-                "{} / {}",
+            budget: budget_text(
                 pane.measured_usage()
-                    .map(|u| u
-                        .context_total()
-                        .saturating_add(u.output_tokens)
-                        .to_string())
-                    .unwrap_or_else(|| style::PLACEHOLDER.into()),
-                pane.budget_tokens()
-                    .map(|v| v.to_string())
-                    .unwrap_or_else(|| style::PLACEHOLDER.into())
+                    .map(|u| u.context_total().saturating_add(u.output_tokens)),
+                pane.budget_tokens(),
             ),
-            writer: format!(
-                "{} · {}",
-                if pane.holds_writer_permit() {
-                    "held"
-                } else {
-                    style::PLACEHOLDER
-                },
-                pane.cwd().display()
-            ),
+            writer: writer_text(pane.holds_writer_permit(), pane.cwd()),
             short: pane.short().to_string(),
             harness: pane.agent().to_string(),
             state: ui::row_state_for(&pane.state()),
@@ -7670,10 +8345,18 @@ pub fn run_dashboard(
     let mut done_unread_ack = DoneUnreadAck::default();
     let mut frame_snapshot = hit::FrameSnapshot::default();
     let mut reveal_sidebar = true;
-    // The row a context menu was asked for. Phase 3 opens the menu on it;
-    // recorded now so the target is captured at the moment of the gesture
-    // rather than re-derived later from a selection that may have moved.
-    let mut _context_target: Option<String> = None;
+    // Issue #354 phase 3: the `spawnreq::SpawnRequest` behind every pane this
+    // dashboard fulfilled, by short id -- moved onto the pane's retained
+    // ended row when it is reaped, which is what `restore`/`retry` replay.
+    // The orchestrator pane and a startup-restored pane are deliberately
+    // absent: neither came from a request, and neither can be restored this
+    // way (the menu says `no spawn request kept`).
+    let mut kept_requests: HashMap<String, (spawnreq::SpawnRequest, Option<String>)> =
+        HashMap::new();
+    // Issue #354 phase 3: the last click on a dialog row, for the
+    // double-click-activates rule. `route_mouse` stays pure; this is the only
+    // thing holding a clock.
+    let mut last_overlay_click: Option<(usize, Instant)> = None;
     let mut zoomed = false;
     let mut prefix_armed = false;
     // `Ctrl+A v` (`DashAction::ToggleSelectMode`)'s own state: whether the
@@ -7839,6 +8522,7 @@ pub fn run_dashboard(
             &mut reaped_recent,
             &mut last_exited,
             &mut retained_ended,
+            &mut kept_requests,
         );
 
         // The geometry any pane spawned during this tick gets -- the terminal
@@ -7867,6 +8551,7 @@ pub fn run_dashboard(
             repo,
             pane_size,
             &mut errors,
+            &mut kept_requests,
         );
         // M4: a request fulfilled this tick appended panes, shifting every
         // view-only sidebar row (and any selection on one) down.
@@ -8047,6 +8732,13 @@ pub fn run_dashboard(
                 Ok(true) => {
                     let mut read = event::read();
                     let mut mouse_action = None;
+                    // Issue #354 phase 3: what the context menu decided, if
+                    // anything. Carried out of the overlay dispatch's own
+                    // `match` (which holds `overlay` by value through
+                    // `mem::take`) and applied right after it, where `panes`,
+                    // the retained rows and the kept requests are all
+                    // reachable again.
+                    let mut apply_menu_action: Option<(String, ui::MenuAction)> = None;
                     // Activity, for the adaptive poll wait above: a keyboard
                     // or mouse event, whatever `filter_key`/the overlay below
                     // goes on to decide it means.
@@ -8122,11 +8814,85 @@ pub fn run_dashboard(
                                     KeyModifiers::NONE,
                                 )));
                             }
+                            // Issue #354 phase 3: the open dialog's own
+                            // targets. A click moves its caret; a second
+                            // click on the same row inside `DOUBLE_CLICK`
+                            // activates it, by handing the dialog exactly
+                            // the `Enter` the keyboard would have.
+                            MouseRoute::OverlayRow(index) => {
+                                let now = Instant::now();
+                                let double = last_overlay_click.is_some_and(|(last, at)| {
+                                    last == index
+                                        && now.saturating_duration_since(at) <= DOUBLE_CLICK
+                                });
+                                if let Some((_, offset, len)) = overlay.list_state() {
+                                    overlay.set_list_state(
+                                        index.min(len.saturating_sub(1)),
+                                        ui::list_scroll(
+                                            len,
+                                            frame_snapshot.overlay_capacity,
+                                            index,
+                                            offset,
+                                        ),
+                                    );
+                                }
+                                last_overlay_click = Some((index, now));
+                                if double {
+                                    last_overlay_click = None;
+                                    read = Ok(Event::Key(KeyEvent::new(
+                                        KeyCode::Enter,
+                                        KeyModifiers::NONE,
+                                    )));
+                                }
+                            }
+                            // A hint on the dialog's pinned hint row IS its
+                            // key: the reducer sees the same keystroke the
+                            // keyboard would have delivered, so a pointer can
+                            // never reach a path the keyboard could not.
+                            MouseRoute::OverlayKey(code) => {
+                                last_overlay_click = None;
+                                read = Ok(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)));
+                            }
+                            MouseRoute::ScrollOverlay(delta) => {
+                                if let Some((cursor, offset, len)) = overlay.list_state() {
+                                    let capacity = frame_snapshot.overlay_capacity;
+                                    let next = cursor
+                                        .saturating_add_signed(delta * WHEEL_STEP)
+                                        .min(len.saturating_sub(1));
+                                    overlay.set_list_state(
+                                        next,
+                                        ui::list_scroll(len, capacity, next, offset),
+                                    );
+                                }
+                            }
                         }
                     }
                     match read {
                         Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => {
                             input_errors = 0;
+                            // Issue #354 phase 3: the shared list viewport's
+                            // own keys, handled ONCE for every list dialog
+                            // before its reducer ever sees them --
+                            // PageUp/PageDown page, Home/End jump, and the
+                            // caret is always revealed. Every dialog's own
+                            // keys (Enter, Esc, j/k, space, letters) stay
+                            // exactly where they were.
+                            //
+                            // Consumed by swapping the keystroke for an inert
+                            // one rather than by `continue`, which would skip
+                            // this drain loop's own `drained += 1`.
+                            let key = match (ui::list_page_move(key), overlay.list_state()) {
+                                (Some(mv), Some((cursor, offset, len))) => {
+                                    let capacity = frame_snapshot.overlay_capacity;
+                                    let next = ui::list_move(cursor, len, capacity, mv);
+                                    overlay.set_list_state(
+                                        next,
+                                        ui::list_scroll(len, capacity, next, offset),
+                                    );
+                                    KeyEvent::new(KeyCode::Null, KeyModifiers::NONE)
+                                }
+                                _ => key,
+                            };
                             if !matches!(overlay, ui::Overlay::None) {
                                 let current = std::mem::take(&mut overlay);
                                 // Task 2: what the slot held on the way in, so
@@ -8538,6 +9304,27 @@ pub fn run_dashboard(
                                             None => ui::Overlay::None,
                                         };
                                     }
+                                    // Issue #354 phase 3: read-only, so there
+                                    // is nothing to apply -- only "still
+                                    // open" or "closed". Closing returns the
+                                    // keyboard to whichever pane already had
+                                    // it: `focused` was never touched.
+                                    ui::Overlay::Inspector(view) => {
+                                        overlay = match inspector_overlay_reduce(view, key) {
+                                            Some(v) => ui::Overlay::Inspector(v),
+                                            None => ui::Overlay::None,
+                                        };
+                                    }
+                                    ui::Overlay::Menu(view) => {
+                                        let (next, effect) = menu_overlay_reduce(view, key);
+                                        overlay = match next {
+                                            Some(v) => ui::Overlay::Menu(v),
+                                            None => ui::Overlay::None,
+                                        };
+                                        if let Some(MenuEffect { target, action }) = effect {
+                                            apply_menu_action = Some((target, action));
+                                        }
+                                    }
                                 }
                                 // Task 2: the take/assign pair. An overlay that
                                 // reopens itself (`took=X now=X`) is a key
@@ -8546,6 +9333,189 @@ pub fn run_dashboard(
                                 // having acted.
                                 if let Some(log) = keylog.as_mut() {
                                     log.overlay_swap(took, &overlay);
+                                }
+                                // Issue #354 phase 3: the context menu's own
+                                // effect. Every arm reuses machinery that
+                                // already exists -- another overlay the
+                                // keyboard can open, the roster's own
+                                // selection move, the quit path's
+                                // `request_quit`, or a replay of the kept
+                                // spawn request through
+                                // `fulfill_spawn_request`. No new
+                                // process-launch path, and no argv is ever
+                                // rebuilt here.
+                                if let Some((target, action)) = apply_menu_action.take() {
+                                    let now = Instant::now();
+                                    let row = rows.iter().find(|r| r.short == target).cloned();
+                                    let cwd = row_cwd(&target, &panes, &retained_ended);
+                                    match action {
+                                        ui::MenuAction::Inspect
+                                        | ui::MenuAction::Evidence
+                                        | ui::MenuAction::OpenWorktree => {
+                                            match row.as_ref() {
+                                                Some(row) => {
+                                                    if action == ui::MenuAction::OpenWorktree {
+                                                        push_notice(
+                                                            &mut notices,
+                                                            now,
+                                                            match cwd.as_deref() {
+                                                                Some(path) => {
+                                                                    format!(
+                                                                        "{target} runs in {path}"
+                                                                    )
+                                                                }
+                                                                None => format!(
+                                                                    "{target}: {MENU_NO_CWD}"
+                                                                ),
+                                                            },
+                                                        );
+                                                    }
+                                                    let mut view = build_inspector_view(
+                                                        row,
+                                                        cwd.as_deref(),
+                                                        &errors,
+                                                    );
+                                                    if action == ui::MenuAction::Evidence {
+                                                        view.cursor =
+                                                            view.section_start(INSPECT_EVIDENCE);
+                                                    }
+                                                    // Opening the inspector on
+                                                    // a retained done-unread
+                                                    // row IS reading it -- the
+                                                    // render path's own rule
+                                                    // needs focus, which such a
+                                                    // row can never have.
+                                                    if let Some(short) = done_unread_ack
+                                                        .acknowledge(inspect_ack_candidate(row))
+                                                    {
+                                                        let acked = super::attention::mark_seen_io(
+                                                            state, &short,
+                                                        );
+                                                        facts_cache
+                                                            .disk
+                                                            .attention
+                                                            .insert(short, acked);
+                                                    }
+                                                    overlay = ui::Overlay::Inspector(view);
+                                                }
+                                                None => push_notice(
+                                                    &mut notices,
+                                                    now,
+                                                    format!("{target} is no longer on the roster"),
+                                                ),
+                                            }
+                                        }
+                                        ui::MenuAction::Focus => {
+                                            (selected, focused) =
+                                                select_row(&target, &rows, selected, focused);
+                                            chrome_selection = None;
+                                            reveal_sidebar = true;
+                                        }
+                                        ui::MenuAction::Nudge => {
+                                            let attached =
+                                                panes.iter().any(|p| p.short() == target);
+                                            overlay = ui::Overlay::Nudge(ui::NudgeDraft {
+                                                target: if attached {
+                                                    ui::NudgeTarget::AttachedPane(target.clone())
+                                                } else {
+                                                    ui::NudgeTarget::ViewOnlySession(target.clone())
+                                                },
+                                                input: String::new(),
+                                            });
+                                        }
+                                        ui::MenuAction::Mail => {
+                                            overlay =
+                                                ui::Overlay::Mail(build_mail_view(state, repo));
+                                        }
+                                        ui::MenuAction::Handover => {
+                                            let mut items = Vec::new();
+                                            for agent in adapters::available_adapter_names(cfg) {
+                                                for tier in handover::TIERS {
+                                                    if let Ok(model) =
+                                                        handover::resolve_model(agent, tier, cfg)
+                                                    {
+                                                        items.push((
+                                                            agent.to_string(),
+                                                            tier.to_string(),
+                                                            model,
+                                                        ));
+                                                    }
+                                                }
+                                            }
+                                            overlay = ui::Overlay::Handover(ui::HandoverDraft {
+                                                items,
+                                                cursor: 0,
+                                                offset: 0,
+                                                target_short: target.clone(),
+                                            });
+                                        }
+                                        // Exactly the quit path's own first
+                                        // half (`shutdown_all`): ask the
+                                        // harness to quit and let this tick's
+                                        // `reap_ended_panes` do the rest, so
+                                        // the row is retained, the spend
+                                        // accounted and the group closed by
+                                        // the one code path that knows how.
+                                        ui::MenuAction::Stop => {
+                                            match panes.iter_mut().find(|p| p.short() == target) {
+                                                Some(pane) => {
+                                                    let quit_sequence = adapters::select(
+                                                        Some(pane.agent()),
+                                                        &[],
+                                                        cfg,
+                                                    )
+                                                    .map(|adapter| adapter.quit_sequence())
+                                                    .unwrap_or("");
+                                                    pane.request_quit(quit_sequence);
+                                                    push_notice(
+                                                        &mut notices,
+                                                        now,
+                                                        format!("asked {target} to quit"),
+                                                    );
+                                                }
+                                                None => push_notice(
+                                                    &mut notices,
+                                                    now,
+                                                    format!("{target} is no longer running"),
+                                                ),
+                                            }
+                                        }
+                                        ui::MenuAction::Restore | ui::MenuAction::Retry => {
+                                            restore_ended_row(
+                                                &target,
+                                                &mut panes,
+                                                &mut nudge_queues,
+                                                &mut retained_ended,
+                                                &mut kept_requests,
+                                                cfg,
+                                                state,
+                                                repo,
+                                                pane_size,
+                                                &requests_dir,
+                                                &mut errors,
+                                                &mut notices,
+                                                now,
+                                            );
+                                        }
+                                        ui::MenuAction::Dismiss => {
+                                            let before = retained_ended.len();
+                                            retained_ended.retain(|row| row.short != target);
+                                            if retained_ended.len() < before {
+                                                // The row left the middle of
+                                                // the combined roster, so the
+                                                // cursor has to come back
+                                                // inside it.
+                                                selected =
+                                                    selected.min(rows.len().saturating_sub(2));
+                                                reveal_sidebar = true;
+                                                push_notice(
+                                                    &mut notices,
+                                                    now,
+                                                    format!("dismissed {target}"),
+                                                );
+                                            }
+                                        }
+                                    }
                                 }
                             } else {
                                 let (armed, verdict) = mouse_action
@@ -8565,22 +9535,96 @@ pub fn run_dashboard(
                                     log.dispatch(armed_before, prefix_armed, &verdict);
                                 }
                                 match verdict {
-                                    InputVerdict::Dash(DashAction::ContextMenu(id)) => {
-                                        _context_target = Some(id);
-                                        push_notice(
-                                            &mut notices,
-                                            Instant::now(),
-                                            "actions menu arrives in phase 3".into(),
-                                        );
+                                    // Issue #354 phase 3: the target is
+                                    // captured at the moment of the gesture --
+                                    // a right-click names whatever row it
+                                    // landed on, which is not necessarily the
+                                    // selected one, and the menu's own title
+                                    // says which.
+                                    InputVerdict::Dash(
+                                        action @ (DashAction::ContextMenu(_)
+                                        | DashAction::ContextActions),
+                                    ) => {
+                                        let target = match action {
+                                            DashAction::ContextMenu(id) => Some(id),
+                                            _ => rows.get(selected).map(|row| row.short.clone()),
+                                        };
+                                        match target
+                                            .as_ref()
+                                            .and_then(|id| rows.iter().find(|r| r.short == *id))
+                                        {
+                                            Some(row) => {
+                                                let facts =
+                                                    menu_facts_for(row, &panes, &retained_ended);
+                                                overlay =
+                                                    ui::Overlay::Menu(build_menu_view(&facts));
+                                            }
+                                            None => push_notice(
+                                                &mut notices,
+                                                Instant::now(),
+                                                "no session row is selected".into(),
+                                            ),
+                                        }
                                     }
-                                    InputVerdict::Dash(DashAction::ContextActions) => {
-                                        _context_target =
-                                            rows.get(selected).map(|row| row.short.clone());
-                                        push_notice(
-                                            &mut notices,
-                                            Instant::now(),
-                                            "actions menu arrives in phase 3".into(),
-                                        );
+                                    // Issue #354 phase 3: the inspector over
+                                    // the selected row. Opening it on a
+                                    // retained done-unread row counts as
+                                    // reading that row (see `acknowledge`).
+                                    InputVerdict::Dash(DashAction::Inspect) => {
+                                        match rows.get(selected) {
+                                            Some(row) => {
+                                                let cwd =
+                                                    row_cwd(&row.short, &panes, &retained_ended);
+                                                let view = build_inspector_view(
+                                                    row,
+                                                    cwd.as_deref(),
+                                                    &errors,
+                                                );
+                                                if let Some(short) = done_unread_ack
+                                                    .acknowledge(inspect_ack_candidate(row))
+                                                {
+                                                    let acked = super::attention::mark_seen_io(
+                                                        state, &short,
+                                                    );
+                                                    facts_cache.disk.attention.insert(short, acked);
+                                                }
+                                                overlay = ui::Overlay::Inspector(view);
+                                            }
+                                            None => push_notice(
+                                                &mut notices,
+                                                Instant::now(),
+                                                "no session row is selected".into(),
+                                            ),
+                                        }
+                                    }
+                                    // Issue #354 phase 3: `^A r` -- the dead
+                                    // footer's own hint, with a binding at
+                                    // last. The hint is not drawn for a row
+                                    // that cannot be restored, so this only
+                                    // has to say so rather than guess.
+                                    InputVerdict::Dash(DashAction::RestoreRow) => {
+                                        match rows.get(selected).map(|row| row.short.clone()) {
+                                            Some(short) => restore_ended_row(
+                                                &short,
+                                                &mut panes,
+                                                &mut nudge_queues,
+                                                &mut retained_ended,
+                                                &mut kept_requests,
+                                                cfg,
+                                                state,
+                                                repo,
+                                                pane_size,
+                                                &requests_dir,
+                                                &mut errors,
+                                                &mut notices,
+                                                Instant::now(),
+                                            ),
+                                            None => push_notice(
+                                                &mut notices,
+                                                Instant::now(),
+                                                "no session row is selected".into(),
+                                            ),
+                                        }
                                     }
                                     InputVerdict::Dash(
                                         action @ (DashAction::CollapseGroup
@@ -8848,6 +9892,7 @@ pub fn run_dashboard(
                                                     ui::Overlay::Handover(ui::HandoverDraft {
                                                         items,
                                                         cursor: 0,
+                                                        offset: 0,
                                                         target_short,
                                                     });
                                             }
@@ -9325,6 +10370,17 @@ pub fn run_dashboard(
         facts.hints.ended = rows
             .get(selected)
             .is_some_and(|r| r.state == ui::RowState::Dead);
+        // Issue #354 phase 3: `^A r restore` is only drawn for a row that
+        // really can be relaunched -- one whose own spawn request the
+        // dashboard still holds. The context menu is where an unavailable
+        // restore is named AND explained; the header only ever offers hints
+        // that do something.
+        facts.hints.restorable = facts.hints.ended
+            && rows.get(selected).is_some_and(|r| {
+                retained_ended
+                    .iter()
+                    .any(|e| e.short == r.short && e.request.is_some())
+            });
         let focused_row = rows.iter().find(|r| r.focused);
         // Codex review finding 2: the focused pane's OWN mail queue, not
         // the dashboard's fixed launch identity's -- see `MailMap`'s own
@@ -9433,8 +10489,15 @@ pub fn run_dashboard(
             view.offset = sidebar_offset;
             roster = ui::roster_frame(layout.sidebar, &rows, &summary, &view);
         }
-        let next_snapshot =
-            ui::frame_snapshot(frame_area, &layout, zoomed, &roster, &facts, &overlay);
+        let next_snapshot = ui::frame_snapshot(
+            frame_area,
+            &layout,
+            zoomed,
+            &roster,
+            &facts,
+            &overlay,
+            render_tick,
+        );
         let focus_cwd = panes.get(focused).map(|p| p.cwd().display().to_string());
         let draw = terminal.draw(|f| {
             if !zoomed {
@@ -11000,6 +12063,160 @@ mod tests {
         assert_eq!(ui::glyph_for(&rows[0]), ui::Glyph::Idle);
     }
 
+    /// Review of 5c1b6c3, finding 1: a worker that is `Working` right up to a
+    /// fast, clean exit -- no Stop hook, no other authority, no intervening
+    /// `Settled` tick for the quiet heuristic to observe -- must still latch
+    /// `Unseen`, so its retained row reads `◆` and the operator is told it
+    /// finished. Before the fix `reap_ended_panes` recorded only `Exited`,
+    /// which is not a `Working -> Settled` transition, and the row went
+    /// straight to `●`.
+    #[test]
+    fn a_fast_clean_exit_from_working_still_latches_done_unread() {
+        use super::super::attention::{Lifecycle, Observation, Visibility, compose};
+        // Exactly what the quiet heuristic files for a busy pane, and nothing
+        // else -- the reported failure case.
+        let working = compose(
+            None,
+            &[Observation::new(
+                super::super::attention::Authority::QuietHeuristic,
+                "pane is producing output",
+                40,
+                100,
+            )
+            .with_lifecycle(Lifecycle::Working)],
+            100,
+        );
+        assert_eq!(working.lifecycle, Lifecycle::Working);
+
+        let mut status = working.clone();
+        for observation in reap_observations(status.lifecycle, 0, 200) {
+            status = compose(Some(&status), std::slice::from_ref(&observation), 200);
+        }
+        assert_eq!(status.lifecycle, Lifecycle::Exited);
+        assert_eq!(
+            status.visibility,
+            Visibility::Unseen,
+            "a clean exit out of Working has to latch Unseen"
+        );
+
+        // ... and that is what the roster actually draws for the retained row.
+        let panes = vec![ended_pane_row("bbb22222", 0, 190)];
+        let mut rows = assemble_sidebar(&panes, &[], &HashMap::new(), 0, 0, DASHBOARD_PID, 900);
+        let mut disk = DiskFacts::default();
+        disk.attention.insert("bbb22222".into(), status.clone());
+        enrich_sidebar(&mut rows, &disk, 900);
+        assert_eq!(ui::glyph_for(&rows[0]), ui::Glyph::DoneUnread);
+
+        // It stays `◆` until it is acknowledged -- which, for a row that can
+        // never be focused, only opening the inspector on it can do, once per
+        // revision.
+        let mut ack = DoneUnreadAck::default();
+        let candidate = inspect_ack_candidate(&rows[0]);
+        assert_eq!(
+            candidate,
+            Some(("bbb22222".to_string(), status.revision)),
+            "the inspector's own acknowledgement path must see this row"
+        );
+        assert_eq!(
+            ack.acknowledge(candidate.clone()),
+            Some("bbb22222".to_string())
+        );
+        assert_eq!(
+            ack.acknowledge(candidate),
+            None,
+            "the same revision is never acknowledged twice"
+        );
+        disk.attention.insert(
+            "bbb22222".into(),
+            super::super::attention::mark_seen(status),
+        );
+        let mut rows = assemble_sidebar(&panes, &[], &HashMap::new(), 0, 0, DASHBOARD_PID, 900);
+        enrich_sidebar(&mut rows, &disk, 900);
+        assert_eq!(ui::glyph_for(&rows[0]), ui::Glyph::Idle);
+    }
+
+    /// A nonzero exit is `✗` whatever its visibility, so it gets the exit
+    /// observation alone -- and a session something already settled is not
+    /// re-settled behind that authority's back.
+    #[test]
+    fn a_reap_only_settles_a_clean_exit_that_nothing_settled_already() {
+        use super::super::attention::Lifecycle;
+        let clean = reap_observations(Lifecycle::Working, 0, 5);
+        assert_eq!(
+            clean.iter().map(|o| o.lifecycle).collect::<Vec<_>>(),
+            vec![Some(Lifecycle::Settled), Some(Lifecycle::Exited)]
+        );
+        for (prior, code) in [
+            (Lifecycle::Working, 1),
+            (Lifecycle::Settled, 0),
+            (Lifecycle::Settled, 3),
+        ] {
+            let observations = reap_observations(prior, code, 5);
+            assert_eq!(
+                observations.iter().map(|o| o.lifecycle).collect::<Vec<_>>(),
+                vec![Some(Lifecycle::Exited)],
+                "{prior:?}/{code}"
+            );
+        }
+    }
+
+    /// Review of 5c1b6c3, finding 2: a retained row keeps the budget text and
+    /// writer state its pane had, not a pair of placeholders -- through the
+    /// very same helpers the live row uses, so the two can never drift.
+    #[test]
+    fn a_retained_row_keeps_its_panes_last_budget_and_writer_state() {
+        assert_eq!(budget_text(Some(40_000), Some(200_000)), "40000 / 200000");
+        assert_eq!(
+            budget_text(None, Some(200_000)),
+            format!("{} / 200000", style::PLACEHOLDER)
+        );
+        assert_eq!(
+            budget_text(Some(40_000), None),
+            format!("40000 / {}", style::PLACEHOLDER)
+        );
+        let cwd = Path::new("D:/repo");
+        assert_eq!(writer_text(true, cwd), "held \u{b7} D:/repo");
+        assert_eq!(
+            writer_text(false, cwd),
+            format!("{} \u{b7} D:/repo", style::PLACEHOLDER)
+        );
+
+        // And the retained row carries them into its own disclosure rather
+        // than reporting "nothing was ever known about this worker".
+        let retained = EndedRow {
+            short: "bbb22222".into(),
+            role: "worker".into(),
+            model: None,
+            harness: "claude".into(),
+            group_id: None,
+            parent: None,
+            budget: budget_text(Some(40_000), Some(200_000)),
+            writer: writer_text(true, cwd),
+            cwd: cwd.display().to_string(),
+            request: None,
+            requested_by: None,
+            meta: EndedMeta {
+                exit_code: 0,
+                exited_at: 600,
+                age_secs: Some(300),
+            },
+        };
+        let mut queue: VecDeque<EndedRow> = VecDeque::new();
+        push_retained_ended(&mut queue, retained, MAX_RETAINED_ENDED_ROWS);
+        let metas = build_pane_rows(&[], &queue);
+        let rows = assemble_sidebar(&metas, &[], &HashMap::new(), 0, 0, DASHBOARD_PID, 900);
+        let value = |key: &str| {
+            rows[0]
+                .disclosure
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_default()
+        };
+        assert_eq!(value("budget"), "40000 / 200000");
+        assert_eq!(value("writer"), "held \u{b7} D:/repo");
+    }
+
     /// The retained list is capped, oldest dropped first, so a long session
     /// cannot push every live pane off the bottom of the sidebar.
     #[test]
@@ -11017,6 +12234,9 @@ mod tests {
                     parent: None,
                     budget: style::PLACEHOLDER.into(),
                     writer: style::PLACEHOLDER.into(),
+                    cwd: String::new(),
+                    request: None,
+                    requested_by: None,
                     meta: EndedMeta {
                         exit_code: 0,
                         exited_at: i as u64,
@@ -11181,10 +12401,18 @@ mod tests {
             filter_key(true, KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)).1,
             InputVerdict::Dash(DashAction::ExpandGroup)
         );
-        // Issue #354 phase 2: `^A i` is the header's `inspect` hint, mapped
-        // onto the errors/evidence overlay until phase 3's real inspector.
+        // Issue #354 phase 3: `^A i` is the real inspector, `^A r` restores
+        // an ended row, and `^A e` still opens the kept-errors overlay.
         assert_eq!(
             filter_key(true, KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE)).1,
+            InputVerdict::Dash(DashAction::Inspect)
+        );
+        assert_eq!(
+            filter_key(true, KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE)).1,
+            InputVerdict::Dash(DashAction::RestoreRow)
+        );
+        assert_eq!(
+            filter_key(true, KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE)).1,
             InputVerdict::Dash(DashAction::ShowErrors)
         );
     }
@@ -11205,6 +12433,9 @@ mod tests {
                 parent: None,
                 budget: style::PLACEHOLDER.into(),
                 writer: style::PLACEHOLDER.into(),
+                cwd: String::new(),
+                request: None,
+                requested_by: None,
                 meta: EndedMeta {
                     exit_code: 0,
                     exited_at: 1,
@@ -11801,6 +13032,7 @@ mod tests {
                 (PathBuf::from("/b"), "codex".to_string(), "two".to_string()),
             ],
             cursor: 0,
+            offset: 0,
             compose: None,
         };
 
@@ -11947,6 +13179,7 @@ mod tests {
         let view = ui::MailView {
             items: vec![(PathBuf::from("/a"), "claude".to_string(), "one".to_string())],
             cursor: 0,
+            offset: 0,
             compose: None,
         };
         let (next, effect) = mail_overlay_reduce(view, key(KeyCode::Enter, KeyModifiers::NONE));
@@ -11975,6 +13208,7 @@ mod tests {
                 .map(|(k, a, b)| (k.to_string(), a.to_string(), b.to_string()))
                 .collect(),
             cursor: 0,
+            offset: 0,
             input: None,
         }
     }
@@ -12259,6 +13493,7 @@ mod tests {
                 &mut HashSet::new(),
                 &mut None,
                 &mut VecDeque::new(),
+                &mut HashMap::new(),
             );
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -12443,6 +13678,7 @@ mod tests {
                 &mut HashSet::new(),
                 &mut last_exited,
                 &mut VecDeque::new(),
+                &mut HashMap::new(),
             );
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -17026,6 +18262,7 @@ mod tests {
         let view = ui::RestoreView {
             entries: vec![restore_entry("a", true)],
             cursor: 0,
+            offset: 0,
         };
         let (next, effect) = restore_overlay_reduce(view, key(KeyCode::Esc, KeyModifiers::NONE));
         assert!(next.is_none());
@@ -17037,6 +18274,7 @@ mod tests {
         let view = ui::RestoreView {
             entries: vec![restore_entry("a", true), restore_entry("b", true)],
             cursor: 1,
+            offset: 0,
         };
         let (next, effect) = restore_overlay_reduce(view, press(' '));
         let next = next.expect("stays open");
@@ -17057,6 +18295,7 @@ mod tests {
                 restore_entry("c", true),
             ],
             cursor: 0,
+            offset: 0,
         };
         let (next, effect) = restore_overlay_reduce(view, key(KeyCode::Enter, KeyModifiers::NONE));
         assert!(next.is_none(), "confirming closes the dialog");
@@ -17068,6 +18307,7 @@ mod tests {
         let view = ui::RestoreView {
             entries: vec![restore_entry("a", false)],
             cursor: 0,
+            offset: 0,
         };
         let (next, effect) = restore_overlay_reduce(view, key(KeyCode::Enter, KeyModifiers::NONE));
         assert!(next.is_none());
@@ -17079,6 +18319,7 @@ mod tests {
         let view = ui::RestoreView {
             entries: vec![restore_entry("a", true), restore_entry("b", true)],
             cursor: 0,
+            offset: 0,
         };
         let (next, _) = restore_overlay_reduce(view, key(KeyCode::Down, KeyModifiers::NONE));
         let next = next.expect("stays open");
@@ -17090,6 +18331,532 @@ mod tests {
             1,
             "past the last row clamps rather than overflowing"
         );
+    }
+
+    // -- issue #354 phase 3: the context menu ------------------------------
+
+    fn menu_facts(short: &str) -> MenuFacts {
+        MenuFacts {
+            short: short.to_string(),
+            role: "worker".to_string(),
+            attached: true,
+            alive: true,
+            ended: false,
+            exit_code: None,
+            retained: false,
+            has_request: false,
+            cwd: Some("D:/repo".to_string()),
+        }
+    }
+
+    fn entry(entries: &[ui::MenuEntry], action: ui::MenuAction) -> &ui::MenuEntry {
+        entries
+            .iter()
+            .find(|e| e.action == action)
+            .unwrap_or_else(|| panic!("{action:?} must always be offered"))
+    }
+
+    /// The enabled/disabled matrix, per row state. Every entry is always
+    /// present -- an operator who cannot see that `restore` exists cannot
+    /// learn why it is unavailable -- and every unavailable one carries a
+    /// reason.
+    #[test]
+    fn the_context_menu_offers_every_entry_and_says_why_each_is_unavailable() {
+        use ui::MenuAction as A;
+
+        // An alive, attached pane: everything that acts on a running child.
+        let alive = menu_entries(&menu_facts("aaaa1111"));
+        for action in [
+            A::Inspect,
+            A::Focus,
+            A::Nudge,
+            A::Mail,
+            A::Handover,
+            A::Stop,
+            A::OpenWorktree,
+            A::Evidence,
+        ] {
+            assert!(entry(&alive, action).enabled(), "{action:?}");
+        }
+        assert_eq!(
+            entry(&alive, A::Restore).disabled.as_deref(),
+            Some(MENU_STILL_RUNNING)
+        );
+        assert_eq!(
+            entry(&alive, A::Retry).disabled.as_deref(),
+            Some(MENU_STILL_RUNNING)
+        );
+        assert_eq!(
+            entry(&alive, A::Dismiss).disabled.as_deref(),
+            Some(MENU_NOT_RETAINED)
+        );
+
+        // A view-only registry row: no pane to focus, stop or swap, but a
+        // nudge still reaches it through the headless marker path.
+        let view_only = MenuFacts {
+            attached: false,
+            cwd: None,
+            ..menu_facts("cccc3333")
+        };
+        let entries = menu_entries(&view_only);
+        for action in [A::Focus, A::Handover, A::Stop] {
+            assert_eq!(
+                entry(&entries, action).disabled.as_deref(),
+                Some(MENU_NOT_ATTACHED),
+                "{action:?}"
+            );
+        }
+        assert!(entry(&entries, A::Nudge).enabled());
+        assert_eq!(
+            entry(&entries, A::OpenWorktree).disabled.as_deref(),
+            Some(MENU_NO_CWD)
+        );
+
+        // An ended row with no kept request: restore and retry both say so.
+        let ended_no_request = MenuFacts {
+            attached: false,
+            alive: false,
+            ended: true,
+            exit_code: Some(0),
+            retained: true,
+            has_request: false,
+            ..menu_facts("bbbb2222")
+        };
+        let entries = menu_entries(&ended_no_request);
+        assert_eq!(
+            entry(&entries, A::Restore).disabled.as_deref(),
+            Some(MENU_NO_REQUEST)
+        );
+        assert_eq!(
+            entry(&entries, A::Retry).disabled.as_deref(),
+            Some(MENU_NO_REQUEST)
+        );
+        assert_eq!(
+            entry(&entries, A::Nudge).disabled.as_deref(),
+            Some(MENU_ENDED)
+        );
+        assert_eq!(
+            entry(&entries, A::Stop).disabled.as_deref(),
+            Some(MENU_ENDED)
+        );
+        assert!(entry(&entries, A::Dismiss).enabled());
+        // The inspector and its evidence section describe any row at all.
+        assert!(entry(&entries, A::Inspect).enabled());
+        assert!(entry(&entries, A::Evidence).enabled());
+
+        // An ended row with a kept request: restore is on, retry is not --
+        // it exited cleanly, so there is no failure to retry.
+        let ended_clean = MenuFacts {
+            has_request: true,
+            ..ended_no_request
+        };
+        let entries = menu_entries(&ended_clean);
+        assert!(entry(&entries, A::Restore).enabled());
+        assert_eq!(
+            entry(&entries, A::Retry).disabled.as_deref(),
+            Some(MENU_EXITED_CLEAN)
+        );
+
+        // An ended row that failed: both are on.
+        let ended_failed = MenuFacts {
+            exit_code: Some(1),
+            ..ended_clean.clone()
+        };
+        let entries = menu_entries(&ended_failed);
+        assert!(entry(&entries, A::Restore).enabled());
+        assert!(entry(&entries, A::Retry).enabled());
+
+        // Whatever the row, the menu is the same shape in the same order.
+        for facts in [alive_facts(), ended_clean.clone(), view_only.clone()] {
+            let entries = menu_entries(&facts);
+            assert_eq!(entries.len(), 11);
+            assert_eq!(
+                entries.iter().map(|e| e.action).collect::<Vec<_>>(),
+                vec![
+                    A::Inspect,
+                    A::Focus,
+                    A::Nudge,
+                    A::Mail,
+                    A::Handover,
+                    A::Stop,
+                    A::Restore,
+                    A::OpenWorktree,
+                    A::Evidence,
+                    A::Retry,
+                    A::Dismiss,
+                ]
+            );
+            for e in &entries {
+                assert!(
+                    e.enabled() || e.disabled.as_ref().is_some_and(|r| !r.trim().is_empty()),
+                    "{:?} is disabled with no reason",
+                    e.action
+                );
+            }
+        }
+    }
+
+    fn alive_facts() -> MenuFacts {
+        menu_facts("aaaa1111")
+    }
+
+    /// The menu is opened for whatever row the gesture named, which is not
+    /// necessarily the selected one -- and the title says which.
+    #[test]
+    fn a_right_click_menu_targets_its_own_row_not_the_selection() {
+        let panes = vec![
+            pane_row("aaaa1111", "claude"),
+            pane_row("bbbb2222", "codex"),
+        ];
+        // Row 0 is selected; the menu is raised on row 1.
+        let rows = assemble_sidebar(&panes, &[], &HashMap::new(), 0, 0, DASHBOARD_PID, 0);
+        let target = menu_facts_for(&rows[1], &[], &VecDeque::new());
+        let view = build_menu_view(&target);
+        assert_eq!(view.target, "bbbb2222");
+        assert!(
+            view.subject.contains("bbbb2222"),
+            "the menu title names its target: {}",
+            view.subject
+        );
+        assert_eq!(view.cursor, 0);
+        assert!(view.confirm.is_none());
+        // And `^A c` on the selection raises the menu for THAT row instead.
+        let selected = menu_facts_for(&rows[0], &[], &VecDeque::new());
+        assert_eq!(build_menu_view(&selected).target, "aaaa1111");
+    }
+
+    /// Enter activates, a letter jumps AND activates, a disabled entry is
+    /// inert, and Esc closes with no effect at all.
+    #[test]
+    fn the_menu_activates_on_enter_and_on_its_own_letters() {
+        let view = build_menu_view(&alive_facts());
+        // Enter on the first entry (`inspect`).
+        let (next, effect) = menu_overlay_reduce(view.clone(), press('\0'));
+        assert!(next.is_some(), "an unknown key leaves the menu open");
+        assert!(effect.is_none());
+
+        let (next, effect) =
+            menu_overlay_reduce(view.clone(), key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(next.is_none(), "activating closes the menu");
+        assert_eq!(
+            effect,
+            Some(MenuEffect {
+                target: "aaaa1111".to_string(),
+                action: ui::MenuAction::Inspect,
+            })
+        );
+
+        // `e` jumps to `evidence` and fires it in one keystroke.
+        let (next, effect) = menu_overlay_reduce(view.clone(), press('e'));
+        assert!(next.is_none());
+        assert_eq!(effect.map(|e| e.action), Some(ui::MenuAction::Evidence));
+
+        // `r` is `restore`, which is disabled for a live pane: the menu stays
+        // open on it and nothing happens.
+        let (next, effect) = menu_overlay_reduce(view.clone(), press('r'));
+        let next = next.expect("a disabled entry leaves the menu open");
+        assert_eq!(next.entries[next.cursor].action, ui::MenuAction::Restore);
+        assert!(effect.is_none());
+
+        // A letter no entry claims moves nothing.
+        let (next, effect) = menu_overlay_reduce(view.clone(), press('x'));
+        assert_eq!(next.expect("stays open").cursor, 0);
+        assert!(effect.is_none());
+
+        // Esc closes with no effect -- and the caller never touches focus.
+        let (next, effect) =
+            menu_overlay_reduce(view.clone(), key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(next.is_none());
+        assert!(effect.is_none());
+
+        // j/k walk the menu, clamped at both ends.
+        let (down, _) = menu_overlay_reduce(view.clone(), press('j'));
+        assert_eq!(down.expect("stays open").cursor, 1);
+        let (up, _) = menu_overlay_reduce(view, press('k'));
+        assert_eq!(up.expect("stays open").cursor, 0, "clamps at the top");
+    }
+
+    /// `stop` is the one destructive entry, so it confirms inline first --
+    /// and backing out of the confirmation kills nothing.
+    #[test]
+    fn stop_confirms_inline_before_anything_is_killed() {
+        let view = build_menu_view(&alive_facts());
+        let (armed, effect) = menu_overlay_reduce(view, press('s'));
+        let armed = armed.expect("the confirmation keeps the menu open");
+        assert!(effect.is_none(), "nothing is stopped by arming it");
+        let index = armed.confirm.expect("the confirmation is armed");
+        assert_eq!(armed.entries[index].action, ui::MenuAction::Stop);
+
+        // `n` backs out: still open, still nothing stopped.
+        let (backed_out, effect) = menu_overlay_reduce(armed.clone(), press('n'));
+        let backed_out = backed_out.expect("stays open");
+        assert!(backed_out.confirm.is_none());
+        assert!(effect.is_none());
+        // ... and so does Esc.
+        let (escaped, effect) =
+            menu_overlay_reduce(armed.clone(), key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(escaped.expect("stays open").confirm.is_none());
+        assert!(effect.is_none());
+
+        // `y` confirms.
+        let (next, effect) = menu_overlay_reduce(armed.clone(), press('y'));
+        assert!(next.is_none());
+        assert_eq!(effect.map(|e| e.action), Some(ui::MenuAction::Stop));
+        // A second Enter confirms too.
+        let (next, effect) = menu_overlay_reduce(armed, key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(next.is_none());
+        assert_eq!(effect.map(|e| e.action), Some(ui::MenuAction::Stop));
+    }
+
+    // -- issue #354 phase 3: restore -----------------------------------------
+
+    /// A retained row that kept its spawn request is restorable and its cwd
+    /// is known, so `restore`, `retry` (it failed) and `open worktree` are
+    /// all on; one that kept nothing says exactly why.
+    #[test]
+    fn a_retained_row_is_restorable_only_while_its_spawn_request_is_kept() {
+        let request = spawn_request("do the work", Path::new("D:/repo"));
+        let mut retained: VecDeque<EndedRow> = VecDeque::new();
+        push_retained_ended(
+            &mut retained,
+            EndedRow {
+                short: "bbb22222".into(),
+                role: "worker".into(),
+                model: None,
+                harness: "claude".into(),
+                group_id: None,
+                parent: None,
+                budget: style::PLACEHOLDER.into(),
+                writer: style::PLACEHOLDER.into(),
+                cwd: "D:/repo".into(),
+                request: Some(request.clone()),
+                requested_by: Some("aaa11111".into()),
+                meta: EndedMeta {
+                    exit_code: 1,
+                    exited_at: 600,
+                    age_secs: Some(300),
+                },
+            },
+            MAX_RETAINED_ENDED_ROWS,
+        );
+        let metas = build_pane_rows(&[], &retained);
+        let rows = assemble_sidebar(&metas, &[], &HashMap::new(), 0, 0, DASHBOARD_PID, 900);
+        assert_eq!(
+            row_cwd("bbb22222", &[], &retained).as_deref(),
+            Some("D:/repo")
+        );
+        assert_eq!(row_cwd("nobody", &[], &retained), None);
+
+        let facts = menu_facts_for(&rows[0], &[], &retained);
+        assert!(facts.ended && facts.retained && facts.has_request);
+        let entries = menu_entries(&facts);
+        assert!(entry(&entries, ui::MenuAction::Restore).enabled());
+        assert!(entry(&entries, ui::MenuAction::Retry).enabled());
+        assert!(entry(&entries, ui::MenuAction::Dismiss).enabled());
+        assert!(entry(&entries, ui::MenuAction::OpenWorktree).enabled());
+
+        // Drop the kept request and the two relaunch entries say so, while
+        // the row itself is still there to be inspected and dismissed.
+        retained[0].request = None;
+        let facts = menu_facts_for(&rows[0], &[], &retained);
+        let entries = menu_entries(&facts);
+        assert_eq!(
+            entry(&entries, ui::MenuAction::Restore).disabled.as_deref(),
+            Some(MENU_NO_REQUEST)
+        );
+        assert_eq!(
+            entry(&entries, ui::MenuAction::Retry).disabled.as_deref(),
+            Some(MENU_NO_REQUEST)
+        );
+        assert!(entry(&entries, ui::MenuAction::Dismiss).enabled());
+    }
+
+    /// `^A r` on a row that cannot be restored says so and changes nothing --
+    /// no pane is spawned, and the row stays on the roster to be inspected.
+    /// (The hint is not even drawn for such a row; see
+    /// `header_hints_follow_the_selected_rows_state`.)
+    #[test]
+    fn restoring_a_row_with_no_kept_request_is_a_notice_and_no_spawn() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = std::env::current_dir().expect("cwd");
+        let cfg = CtxConfig::default();
+        let mut retained: VecDeque<EndedRow> = VecDeque::new();
+        push_retained_ended(
+            &mut retained,
+            EndedRow {
+                short: "bbb22222".into(),
+                role: "worker".into(),
+                model: None,
+                harness: "claude".into(),
+                group_id: None,
+                parent: None,
+                budget: style::PLACEHOLDER.into(),
+                writer: style::PLACEHOLDER.into(),
+                cwd: "D:/repo".into(),
+                request: None,
+                requested_by: None,
+                meta: EndedMeta {
+                    exit_code: 0,
+                    exited_at: 600,
+                    age_secs: None,
+                },
+            },
+            MAX_RETAINED_ENDED_ROWS,
+        );
+        let mut panes: Vec<Pane> = Vec::new();
+        let mut queues: Vec<VecDeque<String>> = Vec::new();
+        let mut kept: HashMap<String, (spawnreq::SpawnRequest, Option<String>)> = HashMap::new();
+        let mut errors = Vec::new();
+        let mut notices = Vec::new();
+        let now = Instant::now();
+        for short in ["bbb22222", "not-a-row"] {
+            restore_ended_row(
+                short,
+                &mut panes,
+                &mut queues,
+                &mut retained,
+                &mut kept,
+                &cfg,
+                &state,
+                &repo,
+                (80, 24),
+                &tmp.path().join("requests"),
+                &mut errors,
+                &mut notices,
+                now,
+            );
+        }
+        assert!(panes.is_empty(), "nothing may be spawned");
+        assert_eq!(retained.len(), 1, "the row stays on the roster");
+        assert!(errors.is_empty(), "this is a notice, not an error");
+        assert!(
+            notices.iter().any(|n| n.text.contains(MENU_NO_REQUEST)),
+            "{:?}",
+            notices.iter().map(|n| n.text.clone()).collect::<Vec<_>>()
+        );
+        assert!(
+            notices
+                .iter()
+                .any(|n| n.text.contains("no ended row named")),
+            "{:?}",
+            notices.iter().map(|n| n.text.clone()).collect::<Vec<_>>()
+        );
+    }
+
+    // -- issue #354 phase 3: the inspector ---------------------------------
+
+    fn inspected_row() -> ui::SidebarRow {
+        let panes = vec![pane_row("aaaa1111", "claude")];
+        let mut rows = assemble_sidebar(&panes, &[], &HashMap::new(), 0, 0, DASHBOARD_PID, 900);
+        let mut status = super::super::attention::SessionStatus {
+            lifecycle: super::super::attention::Lifecycle::Waiting,
+            attention: super::super::attention::Attention::Approval,
+            evidence: "workflow gate is waiting on approval".to_string(),
+            confidence: 90,
+            revision: 7,
+            last_transition: 800,
+            ..Default::default()
+        };
+        status.skipped = vec![
+            super::super::attention::Skipped {
+                authority: super::super::attention::Authority::QuietHeuristic,
+                reason: "lifecycle: outranked by Harness (stop hook)".to_string(),
+            },
+            super::super::attention::Skipped {
+                authority: super::super::attention::Authority::Supervisor,
+                reason: "attention: outranked by Harness (stop hook)".to_string(),
+            },
+        ];
+        rows[0].status = Some(status);
+        rows.remove(0)
+    }
+
+    /// Every section is present, missing facts read as the shared placeholder
+    /// rather than a fabricated value, and the evidence section lists both
+    /// the winning evidence and every skipped authority's reason.
+    #[test]
+    fn the_inspector_reports_every_section_with_evidence_and_skipped_reasons() {
+        let row = inspected_row();
+        let view = build_inspector_view(
+            &row,
+            Some("D:/repo"),
+            &["aaaa1111 write_input: EPIPE".to_string()],
+        );
+        let names: Vec<&str> = view.sections.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                INSPECT_IDENTITY,
+                INSPECT_STATUS,
+                INSPECT_EVIDENCE,
+                INSPECT_BUDGET,
+                INSPECT_WRITER,
+                INSPECT_SIGNAL,
+                INSPECT_ERRORS,
+            ]
+        );
+        let section = |name: &str| {
+            view.sections
+                .iter()
+                .find(|s| s.name == name)
+                .expect("section")
+                .lines
+                .join("\n")
+        };
+        assert!(section(INSPECT_IDENTITY).contains("aaaa1111"));
+        assert!(section(INSPECT_IDENTITY).contains("claude"));
+        assert!(section(INSPECT_IDENTITY).contains("D:/repo"));
+        // `model` was never pinned and `branch` is never resolved on the
+        // render path: both read as the placeholder, not as a guess.
+        assert!(
+            section(INSPECT_IDENTITY).contains(style::PLACEHOLDER),
+            "a missing fact must read as the placeholder"
+        );
+        assert!(section(INSPECT_STATUS).contains("waiting"));
+        assert!(section(INSPECT_STATUS).contains('7'), "revision");
+        let evidence = section(INSPECT_EVIDENCE);
+        assert!(evidence.contains("workflow gate is waiting on approval"));
+        assert!(evidence.contains("quiet heuristic"), "got {evidence}");
+        assert!(evidence.contains("outranked by Harness"), "got {evidence}");
+        assert!(section(INSPECT_ERRORS).contains("EPIPE"));
+
+        // Opening it "at evidence" is a caret position in the same flattened
+        // row list the dialog draws -- never a second layout.
+        let rows = view.rows();
+        let start = view.section_start(INSPECT_EVIDENCE);
+        assert_eq!(rows[start], format!("{INSPECT_EVIDENCE}:"));
+        assert!(rows[start + 1].contains("workflow gate"));
+        assert_eq!(view.section_start("nothing-like-this"), 0);
+    }
+
+    /// A row with no cached status at all still inspects: every section is
+    /// there, filled with the placeholder rather than missing.
+    #[test]
+    fn the_inspector_on_a_row_with_no_facts_yet_is_all_placeholders() {
+        let panes = vec![pane_row("aaaa1111", "claude")];
+        let rows = assemble_sidebar(&panes, &[], &HashMap::new(), 0, 0, DASHBOARD_PID, 0);
+        let view = build_inspector_view(&rows[0], None, &[]);
+        assert_eq!(view.sections.len(), 7);
+        let evidence = view
+            .sections
+            .iter()
+            .find(|s| s.name == INSPECT_EVIDENCE)
+            .expect("evidence section is never dropped");
+        assert!(evidence.lines.is_empty());
+        // An empty section still draws one placeholder row, so the dialog
+        // never silently loses a heading.
+        let drawn = view.rows();
+        let start = view.section_start(INSPECT_EVIDENCE);
+        assert_eq!(drawn[start], format!("{INSPECT_EVIDENCE}:"));
+        assert_eq!(drawn[start + 1], format!("  {}", style::PLACEHOLDER));
+        // Read-only: Esc closes, j/k scroll, nothing else does anything.
+        let (moved, _) = (
+            inspector_overlay_reduce(view.clone(), press('j')).expect("stays open"),
+            (),
+        );
+        assert_eq!(moved.cursor, 1);
+        assert!(inspector_overlay_reduce(view, key(KeyCode::Esc, KeyModifiers::NONE)).is_none());
     }
 
     #[test]
@@ -18244,6 +20011,7 @@ mod tests {
                 &mut reaped_recent,
                 &mut None,
                 &mut VecDeque::new(),
+                &mut HashMap::new(),
             );
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -18374,6 +20142,7 @@ mod tests {
                 &mut HashSet::new(),
                 &mut None,
                 &mut VecDeque::new(),
+                &mut HashMap::new(),
             );
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -18484,6 +20253,7 @@ mod tests {
                 &mut HashSet::new(),
                 &mut None,
                 &mut VecDeque::new(),
+                &mut HashMap::new(),
             );
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -19100,6 +20870,7 @@ mod tests {
             &repo,
             (80, 24),
             &mut errors,
+            &mut HashMap::new(),
         );
 
         assert!(
@@ -19198,6 +20969,7 @@ mod tests {
         let mut panes: Vec<Pane> = Vec::new();
         let mut queues: Vec<VecDeque<String>> = Vec::new();
         let mut errors = Vec::new();
+        let mut kept: HashMap<String, (spawnreq::SpawnRequest, Option<String>)> = HashMap::new();
         handle_spawn_requests(
             &dir,
             &mut panes,
@@ -19207,12 +20979,21 @@ mod tests {
             &repo,
             (80, 24),
             &mut errors,
+            &mut kept,
         );
         assert_eq!(
             panes.len(),
             1,
             "the forged request still spawns a pane -- forging is about the pin, not the spawn \
              itself: {errors:?}"
+        );
+        // Issue #354 phase 3: the request that produced the pane is kept
+        // verbatim, keyed by the short id the spawn actually minted -- which
+        // is what `restore`/`retry` later replay.
+        assert_eq!(
+            kept.get(panes[0].short()).map(|(request, _)| request),
+            Some(&req),
+            "the fulfilled request is kept unchanged for a later restore"
         );
 
         for pane in &mut panes {
@@ -19678,6 +21459,7 @@ mod tests {
                 &mut HashSet::new(),
                 &mut None,
                 &mut VecDeque::new(),
+                &mut HashMap::new(),
             );
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -21003,6 +22785,136 @@ mod tests {
                 false
             ),
             MouseRoute::ScrollRoster(1)
+        );
+    }
+
+    // -- issue #354 phase 3: overlay pointer dispatch -----------------------
+
+    /// A frame with a scrolled list dialog over it: three visible rows
+    /// (entries 30-32), a pinned hint row with `⏎`/`esc`, and a roster
+    /// underneath that must stay unreachable.
+    fn dialog_frame() -> hit::FrameSnapshot {
+        hit::FrameSnapshot {
+            frame: Rect::new(0, 0, 120, 40),
+            sidebar: Rect::new(0, 2, 44, 36),
+            grid: Rect::new(45, 2, 75, 36),
+            divider: Rect::new(44, 2, 1, 36),
+            rows: vec![
+                (Rect::new(0, 2, 44, 1), Hit::SidebarSummary),
+                (Rect::new(0, 3, 44, 9), Hit::SidebarRow("worker".into())),
+            ],
+            header_hints: vec![(Rect::new(100, 0, 20, 1), HintId::Actions)],
+            overlay: Some(Rect::new(50, 10, 60, 20)),
+            overlay_rows: vec![
+                (Rect::new(52, 11, 56, 1), 30),
+                (Rect::new(52, 12, 56, 1), 31),
+                (Rect::new(52, 13, 56, 1), 32),
+            ],
+            overlay_hints: vec![
+                (Rect::new(52, 28, 6, 1), HintId::DialogKey(KeyCode::Enter)),
+                (Rect::new(61, 28, 8, 1), HintId::DialogKey(KeyCode::Esc)),
+            ],
+            overlay_capacity: 3,
+            ..Default::default()
+        }
+    }
+
+    fn at(kind: MouseEventKind, column: u16, row: u16) -> event::MouseEvent {
+        event::MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    /// A click on one of the dialog's visible rows names that row's index
+    /// into the FULL list (so a scrolled dialog addresses the right entry),
+    /// a click on a hint is fed back as exactly that key, the wheel inside
+    /// scrolls the list, and the backdrop is consumed without closing
+    /// anything. Nothing underneath is reachable at any point.
+    #[test]
+    fn an_open_dialog_owns_the_pointer_and_addresses_its_own_rows_and_hints() {
+        let snap = dialog_frame();
+        assert_eq!(
+            route_mouse(
+                &snap,
+                at(MouseEventKind::Down(MouseButton::Left), 60, 12),
+                true,
+                true,
+                false
+            ),
+            MouseRoute::OverlayRow(31)
+        );
+        assert_eq!(
+            route_mouse(
+                &snap,
+                at(MouseEventKind::Down(MouseButton::Left), 53, 28),
+                true,
+                true,
+                false
+            ),
+            MouseRoute::OverlayKey(KeyCode::Enter)
+        );
+        assert_eq!(
+            route_mouse(
+                &snap,
+                at(MouseEventKind::Down(MouseButton::Left), 63, 28),
+                true,
+                true,
+                false
+            ),
+            MouseRoute::OverlayKey(KeyCode::Esc)
+        );
+        assert_eq!(
+            route_mouse(
+                &snap,
+                at(MouseEventKind::ScrollDown, 60, 15),
+                true,
+                true,
+                false
+            ),
+            MouseRoute::ScrollOverlay(1)
+        );
+        assert_eq!(
+            route_mouse(
+                &snap,
+                at(MouseEventKind::ScrollUp, 60, 15),
+                true,
+                true,
+                false
+            ),
+            MouseRoute::ScrollOverlay(-1)
+        );
+        // The backdrop -- over the sidebar, over the grid, over the header's
+        // own `actions` hint -- is consumed, never a click on what is under
+        // it and never a dismissal of the dialog.
+        for (x, y) in [(5u16, 3u16), (80, 35), (105, 0), (44, 20)] {
+            for kind in [
+                MouseEventKind::Down(MouseButton::Left),
+                MouseEventKind::Down(MouseButton::Right),
+                MouseEventKind::ScrollUp,
+                MouseEventKind::ScrollDown,
+                MouseEventKind::Up(MouseButton::Left),
+            ] {
+                assert_eq!(
+                    route_mouse(&snap, at(kind, x, y), true, true, false),
+                    MouseRoute::Consume,
+                    "({x}, {y}) {kind:?} escaped the modal"
+                );
+            }
+        }
+        // And a drag that belongs to an in-progress selection does not get to
+        // fall through to the grid while a dialog is up either.
+        assert_eq!(
+            route_mouse(
+                &snap,
+                at(MouseEventKind::Drag(MouseButton::Left), 80, 30),
+                true,
+                true,
+                true
+            ),
+            MouseRoute::Consume
         );
     }
 

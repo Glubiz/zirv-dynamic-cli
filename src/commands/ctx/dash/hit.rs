@@ -9,6 +9,7 @@
 //!
 //! The dispatch that acts on a [`Hit`] lives in `dash::route_mouse`; this only
 //! answers *what is there*.
+use crossterm::event::KeyCode;
 use ratatui::layout::{Position, Rect};
 
 /// A sidebar session row's stable identity: the session short id. Stable
@@ -28,12 +29,20 @@ pub enum HintId {
     Nudge,
     Mail,
     Errors,
-    /// `^A i` -- the per-session inspector. The full evidence inspector is
-    /// phase 3; until it exists this resolves to the errors/evidence overlay
-    /// the dashboard already has, so the hint never names an action that does
-    /// nothing (see `dash::route_mouse` and [[Known Issues]]).
+    /// `^A i` -- the per-session inspector (phase 3).
     Inspect,
+    /// `^A r` -- relaunch an ended/reaped row from the spawn request the
+    /// dashboard kept for it (phase 3). Only ever drawn for a row that can
+    /// actually be restored; see `ui::HintContext::restorable`.
+    Restore,
     Help,
+    /// A hint on an OPEN DIALOG's own pinned hint row (`⏎ open`, `esc back`,
+    /// `space toggle`, ...), carrying the key it stands for rather than a
+    /// dashboard-level action: clicking it feeds exactly that keystroke to
+    /// whichever overlay reducer is up, so a pointer can never reach a code
+    /// path the keyboard could not. Hints that stand for more than one key
+    /// (`j/k`, `↑↓`) get no region at all -- see `ui::footer_key_code`.
+    DialogKey(KeyCode),
 }
 
 /// What sits under the pointer.
@@ -59,9 +68,19 @@ pub enum Hit {
     Grid,
     /// A footer hint chord (none exist yet; see `ui::frame_snapshot`).
     FooterHint(HintId),
-    /// Inside an open overlay.
+    /// One visible row of an open list dialog, by its index into that
+    /// dialog's own full row list (NOT its screen line): click selects,
+    /// double-click or Enter activates.
+    OverlayRow(usize),
+    /// One hint on an open dialog's pinned hint row.
+    OverlayHint(HintId),
+    /// Inside an open overlay, but on none of its own targets -- its border,
+    /// its blank line, a row past the end of a short list. Consumed, and a
+    /// no-op.
     Overlay,
-    /// Outside an open overlay, while one is open.
+    /// Outside an open overlay, while one is open. Consumed, and a no-op:
+    /// a stray click next to a modal never closes it and never reaches the
+    /// child underneath.
     ModalBackdrop,
     /// Outside the frame, or a gap that owns nothing.
     None,
@@ -101,14 +120,31 @@ pub struct FrameSnapshot {
     pub zoomed: bool,
     /// The open overlay's own rect, if one was open.
     pub overlay: Option<Rect>,
+    /// The open list dialog's visible rows, in draw order, each paired with
+    /// its index into that dialog's own full row list. Empty for a dialog
+    /// with no rows (a draft/compose buffer), and for no overlay at all.
+    pub overlay_rows: Vec<(Rect, usize)>,
+    /// The open dialog's own pinned hint row, span by span.
+    pub overlay_hints: Vec<(Rect, HintId)>,
+    /// How many list rows the open dialog had room for -- the page size its
+    /// PageUp/PageDown and its wheel move by. Zero with no dialog open, and
+    /// for one with no room for a single row.
+    pub overlay_capacity: usize,
 }
 
 /// Pure: what `(x, y)` landed on in the frame `snap` describes.
 ///
 /// Order is the behaviour contract's own layering, outside in: outside the
-/// frame owns nothing; an open overlay owns the entire frame (itself, and the
-/// backdrop around it); then the chrome, nearest-drawn first -- header hints,
-/// footer hints, roster entries, divider -- and finally the grid.
+/// frame owns nothing; an open overlay owns the entire frame (its own hint
+/// row, its own visible rows, the rest of itself, and the backdrop around
+/// it); then the chrome, nearest-drawn first -- header hints, footer hints,
+/// roster entries, divider -- and finally the grid.
+///
+/// Phase 3 refines the phase-1 "an overlay consumes everything" rule: the
+/// dialog's own targets are addressable (`OverlayHint` first, since a hint
+/// span sits inside the dialog rect, then `OverlayRow`), everything else
+/// inside it is `Overlay` and everything outside it is `ModalBackdrop` --
+/// both still consumed, neither ever reaching the child.
 pub fn hit_test(snap: &FrameSnapshot, x: u16, y: u16) -> Hit {
     let point = Position::new(x, y);
     let contains = |rect: Rect| !rect.is_empty() && rect.contains(point);
@@ -116,11 +152,20 @@ pub fn hit_test(snap: &FrameSnapshot, x: u16, y: u16) -> Hit {
         return Hit::None;
     }
     if let Some(overlay) = snap.overlay {
-        return if contains(overlay) {
-            Hit::Overlay
-        } else {
-            Hit::ModalBackdrop
-        };
+        if !contains(overlay) {
+            return Hit::ModalBackdrop;
+        }
+        for (rect, id) in &snap.overlay_hints {
+            if contains(*rect) {
+                return Hit::OverlayHint(*id);
+            }
+        }
+        for (rect, index) in &snap.overlay_rows {
+            if contains(*rect) {
+                return Hit::OverlayRow(*index);
+            }
+        }
+        return Hit::Overlay;
     }
     if !snap.zoomed {
         for (rect, id) in &snap.header_hints {
@@ -252,6 +297,61 @@ mod tests {
                 assert_eq!(hit_test(&snap, x, y), expected, "({x}, {y})");
             }
         }
+    }
+
+    /// Issue #354 phase 3: an open list dialog's own targets. Its hint row
+    /// wins over its rows (a hint span sits inside the dialog rect), its
+    /// visible rows answer with their index into the FULL list -- so a
+    /// scrolled dialog names the right entry, not the right screen line --
+    /// and every other cell inside it is `Overlay`.
+    #[test]
+    fn an_open_dialogs_rows_and_hints_are_each_their_own_target() {
+        let mut snap = group_frame();
+        snap.overlay = Some(Rect::new(50, 10, 100, 20));
+        // A dialog scrolled to entry 30: three visible rows, then the pinned
+        // hint row two lines below them.
+        snap.overlay_rows = vec![
+            (Rect::new(52, 11, 96, 1), 30),
+            (Rect::new(52, 12, 96, 1), 31),
+            (Rect::new(52, 13, 96, 1), 32),
+        ];
+        snap.overlay_hints = vec![
+            (Rect::new(52, 28, 6, 1), HintId::DialogKey(KeyCode::Enter)),
+            (Rect::new(61, 28, 8, 1), HintId::DialogKey(KeyCode::Esc)),
+        ];
+        assert_eq!(hit_test(&snap, 52, 11), Hit::OverlayRow(30));
+        assert_eq!(hit_test(&snap, 147, 13), Hit::OverlayRow(32));
+        assert_eq!(
+            hit_test(&snap, 53, 28),
+            Hit::OverlayHint(HintId::DialogKey(KeyCode::Enter))
+        );
+        assert_eq!(
+            hit_test(&snap, 68, 28),
+            Hit::OverlayHint(HintId::DialogKey(KeyCode::Esc))
+        );
+        // The gap between two hints, the blank line under the last row, and
+        // the dialog's own border are all inside it and all inert.
+        for (x, y) in [(59, 28), (52, 20), (50, 10), (149, 29)] {
+            assert_eq!(hit_test(&snap, x, y), Hit::Overlay, "({x}, {y})");
+        }
+        // And nothing under the dialog is reachable, however many roster
+        // rows and header hints the frame also drew.
+        assert_eq!(hit_test(&snap, 10, 2), Hit::ModalBackdrop);
+        assert_eq!(hit_test(&snap, 6, 4), Hit::ModalBackdrop);
+        assert_eq!(hit_test(&snap, 185, 0), Hit::ModalBackdrop);
+        assert_eq!(hit_test(&snap, 185, 49), Hit::ModalBackdrop);
+    }
+
+    /// A row rect that survived a resize with zero size hits nothing, and the
+    /// dialog still owns the cell -- never the grid underneath it.
+    #[test]
+    fn a_zero_size_overlay_row_or_hint_never_escapes_the_modal() {
+        let mut snap = group_frame();
+        snap.overlay = Some(Rect::new(50, 10, 100, 20));
+        snap.overlay_rows = vec![(Rect::new(52, 11, 0, 1), 4)];
+        snap.overlay_hints = vec![(Rect::new(52, 28, 6, 0), HintId::DialogKey(KeyCode::Esc))];
+        assert_eq!(hit_test(&snap, 52, 11), Hit::Overlay);
+        assert_eq!(hit_test(&snap, 52, 28), Hit::Overlay);
     }
 
     /// Zero-size rects hit nothing, everywhere: an empty frame, an empty
