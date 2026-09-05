@@ -1,0 +1,6 @@
+not json, a truncated rollout line from a crashed process
+{"timestamp":"2026-08-05T09:00:00.000Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}
+
+{"totally": "unrecognized shape"}
+{"timestamp":"2026-08-05T09:00:07.000Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","last_agent_message":"done","started_at":"2026-08-05T09:00:00.000Z","completed_at":"2026-08-05T09:00:07.000Z","duration_ms":7000}}
+{"timestamp": "2026-08-05T09:00:08.000Z", "type": "event_msg", "payload": {"type": "task_started"

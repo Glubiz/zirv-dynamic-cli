@@ -456,7 +456,7 @@ pub fn parse_events(jsonl: &str) -> Vec<NormalizedEvent> {
                             .any(|t| name.eq_ignore_ascii_case(t));
                         let raw = block.get("input").map(Value::to_string).unwrap_or_default();
                         events.push(NormalizedEvent::ToolCall {
-                            name,
+                            name: name.clone(),
                             input_hash: input_hash(&raw),
                             at_ms,
                         });
@@ -474,6 +474,56 @@ pub fn parse_events(jsonl: &str) -> Vec<NormalizedEvent> {
                             events.push(NormalizedEvent::ToolCallPath {
                                 path: path.to_string(),
                                 is_modification,
+                            });
+                        }
+                        // Issue #294 (`zirv ctx measure`): a sibling of
+                        // `ToolCall`, never a field on it, for the same
+                        // reason `ToolCallPath` is one -- see
+                        // `NormalizedEvent::ToolCallRead`/`ToolCallEdit`'s
+                        // own doc comments.
+                        if name.eq_ignore_ascii_case("Read") {
+                            let ranged = block.get("input").is_some_and(|input| {
+                                input.get("offset").is_some() || input.get("limit").is_some()
+                            });
+                            events.push(NormalizedEvent::ToolCallRead { ranged });
+                        } else if name.eq_ignore_ascii_case("Edit") {
+                            if let Some(input) = block.get("input") {
+                                let old = input
+                                    .get("old_string")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("");
+                                let new = input
+                                    .get("new_string")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("");
+                                events.push(NormalizedEvent::ToolCallEdit {
+                                    old_bytes: old.len() as u64,
+                                    new_bytes: new.len() as u64,
+                                    core_bytes: super::super::measure::core_change_bytes(old, new),
+                                });
+                            }
+                        } else if name.eq_ignore_ascii_case("MultiEdit")
+                            && let Some(edits) = block
+                                .get("input")
+                                .and_then(|input| input.get("edits"))
+                                .and_then(Value::as_array)
+                        {
+                            let mut old_bytes = 0u64;
+                            let mut new_bytes = 0u64;
+                            let mut core_bytes = 0u64;
+                            for edit in edits {
+                                let old =
+                                    edit.get("old_string").and_then(Value::as_str).unwrap_or("");
+                                let new =
+                                    edit.get("new_string").and_then(Value::as_str).unwrap_or("");
+                                old_bytes += old.len() as u64;
+                                new_bytes += new.len() as u64;
+                                core_bytes += super::super::measure::core_change_bytes(old, new);
+                            }
+                            events.push(NormalizedEvent::ToolCallEdit {
+                                old_bytes,
+                                new_bytes,
+                                core_bytes,
                             });
                         }
                     }

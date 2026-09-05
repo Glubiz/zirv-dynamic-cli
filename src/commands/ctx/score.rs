@@ -157,7 +157,12 @@ pub fn derive_speed_metrics(events: &[NormalizedEvent]) -> SpeedMetrics {
             | NormalizedEvent::UserText { .. }
             | NormalizedEvent::AssistantThinking { .. }
             | NormalizedEvent::ToolResultSize { .. }
-            | NormalizedEvent::ToolCallPath { .. } => {}
+            | NormalizedEvent::ToolCallPath { .. }
+            // Issue #294: `zirv ctx measure`-only siblings of `ToolCall`,
+            // irrelevant to speed metrics for the same reason the #312
+            // siblings right above are.
+            | NormalizedEvent::ToolCallRead { .. }
+            | NormalizedEvent::ToolCallEdit { .. } => {}
         }
     }
     close_turn(turn_start, turn_last_assistant, &mut turn_latencies);

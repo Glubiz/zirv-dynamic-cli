@@ -456,7 +456,12 @@ impl RotState {
             | NormalizedEvent::UserText { .. }
             | NormalizedEvent::AssistantThinking { .. }
             | NormalizedEvent::ToolResultSize { .. }
-            | NormalizedEvent::ToolCallPath { .. } => {}
+            | NormalizedEvent::ToolCallPath { .. }
+            // Issue #294: `zirv ctx measure`-only siblings of `ToolCall`.
+            // `RotState` scores rot signals only, same reasoning as the
+            // #312 siblings right above -- neither carries a rot signal.
+            | NormalizedEvent::ToolCallRead { .. }
+            | NormalizedEvent::ToolCallEdit { .. } => {}
             NormalizedEvent::Compaction => self.reset_behavioral_window(),
         }
     }
