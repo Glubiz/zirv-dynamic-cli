@@ -99,6 +99,7 @@ pub const NARROW_ONLY_ALLOWLIST: &[&str] = &[
     "score.min_turns",
     "score.window",
     "supervise.interval_secs",
+    "supervise.loop_backoff_ceiling_secs", // #311: repo may only lower the self-pacing ceiling (min-merge).
     "supervise.max_cycle_secs",
     "supervise.max_failures",
     "supervise.max_nudges",
