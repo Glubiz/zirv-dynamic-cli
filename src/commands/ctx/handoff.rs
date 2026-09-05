@@ -114,9 +114,18 @@ impl Handoff {
 /// screening: <summary>` suffix, never stripped or blocked. The one place
 /// both `resume::resume_prompt` and `hook::run_session_start` build this
 /// text, so the two injection paths cannot drift.
-pub fn labeled_for_injection(handoff: &Handoff) -> String {
+/// `screen_thresholds` (issue #272 review round 2) is the caller's own
+/// resolved `[screen]` config -- this is the one untrusted surface that
+/// reaches a fresh successor session's prompt verbatim, so a repo-narrowed
+/// threshold must apply here too. Pass `&super::screen::Thresholds::default()`
+/// for the built-in set.
+pub fn labeled_for_injection(
+    handoff: &Handoff,
+    screen_thresholds: &super::screen::Thresholds,
+) -> String {
     let markdown = handoff.to_markdown();
-    let screening = super::screen::screen(&markdown);
+    let screening =
+        super::screen::screen_with_thresholds(&markdown, markdown.len(), screen_thresholds);
     let screening_suffix = if screening.is_clean() {
         String::new()
     } else {
@@ -481,8 +490,9 @@ pub fn labeled_for_injection_with_working_set(
     handoff: &Handoff,
     working_set: Option<&WorkingSet>,
     crash_witness: Option<&str>,
+    screen_thresholds: &super::screen::Thresholds,
 ) -> String {
-    let mut out = labeled_for_injection(handoff);
+    let mut out = labeled_for_injection(handoff, screen_thresholds);
     if let Some(working_set) = working_set {
         out.push_str("\n\n");
         out.push_str(&render_working_set(working_set));
@@ -2758,7 +2768,12 @@ mod tests {
             workflow_artifacts: Vec::new(),
             branch_changed_paths: Some(vec!["src/lib.rs".to_string()]),
         };
-        let out = labeled_for_injection_with_working_set(&handoff, Some(&ws), None);
+        let out = labeled_for_injection_with_working_set(
+            &handoff,
+            Some(&ws),
+            None,
+            &super::super::screen::Thresholds::default(),
+        );
         let envelope_at = out
             .find("The following is a handoff from a previous session")
             .expect("envelope opening must be present");
@@ -2782,7 +2797,12 @@ mod tests {
             since: 0,
         };
         let witness = render_crash_witness(&in_flight);
-        let out = labeled_for_injection_with_working_set(&handoff, None, Some(&witness));
+        let out = labeled_for_injection_with_working_set(
+            &handoff,
+            None,
+            Some(&witness),
+            &super::super::screen::Thresholds::default(),
+        );
         assert!(out.contains("<zirv_interrupted>"), "got {out}");
         assert!(out.contains("turn 7"), "got {out}");
         assert!(out.contains("wrap"), "got {out}");
@@ -2801,9 +2821,71 @@ mod tests {
     fn with_no_extras_the_composed_text_matches_plain_labeled_for_injection() {
         let handoff = sample();
         assert_eq!(
-            labeled_for_injection_with_working_set(&handoff, None, None),
-            labeled_for_injection(&handoff)
+            labeled_for_injection_with_working_set(
+                &handoff,
+                None,
+                None,
+                &super::super::screen::Thresholds::default(),
+            ),
+            labeled_for_injection(&handoff, &super::super::screen::Thresholds::default())
         );
+    }
+
+    /// Issue #272 review round 2: the handoff body is the one untrusted
+    /// surface that reaches a fresh successor session's prompt verbatim, so
+    /// a repo-narrowed `[screen]` threshold must reach it too, exactly like
+    /// every other screening surface. A `next_step` repeating one line six
+    /// times stays clean under the built-in default (the whole rendered
+    /// markdown is deliberately kept under the default 400-byte fragment
+    /// floor), but a narrowed `repetition_min_fragment`/`_dominance_pct`
+    /// flags it as `RepetitionDominated`.
+    #[test]
+    fn a_narrowed_repetition_threshold_flags_a_repeated_handoff_body_the_default_would_not() {
+        let repeated_line = "same repeated line here";
+        let mut handoff = Handoff {
+            task: "Wire the payments webhook".to_string(),
+            verification: "last run (`cargo test`) passed".to_string(),
+            next_step: String::new(),
+            ..Handoff::default()
+        };
+        let overhead = handoff.to_markdown().len();
+
+        let body = format!("{repeated_line}\n").repeat(6);
+        handoff.next_step = body;
+        let markdown = handoff.to_markdown();
+        assert_eq!(
+            markdown.len(),
+            overhead + handoff.next_step.len(),
+            "sanity: the next_step field is interpolated verbatim, contributing exactly its own \
+             byte length -- if this fails the fixture's own arithmetic below is unreliable"
+        );
+        assert!(
+            markdown.len() < super::super::screen::MIN_FRAGMENT_LENGTH,
+            "fixture must stay under the built-in fragment floor so the default config excludes \
+             it outright: {} bytes",
+            markdown.len()
+        );
+
+        let default_text =
+            labeled_for_injection(&handoff, &super::super::screen::Thresholds::default());
+        assert!(
+            !default_text.contains("repetition-dominated"),
+            "the built-in default must not flag this handoff: {default_text}"
+        );
+
+        let narrowed = super::super::screen::Thresholds {
+            repetition_min_fragment: 100,
+            repetition_dominance_pct: 0.3,
+            ..super::super::screen::Thresholds::default()
+        };
+        let narrowed_text = labeled_for_injection(&handoff, &narrowed);
+        assert!(
+            narrowed_text.contains("repetition-dominated fragment"),
+            "a repo-narrowed [screen] threshold must reach the handoff-injection surface: \
+             {narrowed_text}"
+        );
+        // The content itself is still never touched, narrowed or not.
+        assert!(narrowed_text.contains(repeated_line));
     }
 
     /// Acceptance criterion: `resume` must still succeed (here: `working_set`

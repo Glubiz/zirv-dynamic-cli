@@ -1631,10 +1631,20 @@ fn latest_handoff_for_injection(payload: &HookPayload, env: EnvLookup<'_>) -> Op
     let working_set = super::handoff::working_set(&state, &repo, &payload.session_id);
     let crash_witness = super::sessions::take_interrupted_in_flight(&state, &repo)
         .map(|in_flight| super::handoff::render_crash_witness(&in_flight));
+    // Issue #272 review round 2: this function has no `CtxConfig` threaded
+    // to it (unlike `resume::resume_prompt`, its sibling on the other
+    // injection path), so it resolves one itself here, the same
+    // `CtxConfig::load` every other call site uses -- falling back to the
+    // built-in default on any load error, never failing the injection over
+    // a screening-threshold lookup.
+    let screen_thresholds = CtxConfig::load(&repo, env)
+        .map(|cfg| cfg.screen.thresholds())
+        .unwrap_or_default();
     Some(super::handoff::labeled_for_injection_with_working_set(
         &handoff,
         Some(&working_set),
         crash_witness.as_deref(),
+        &screen_thresholds,
     ))
 }
 

@@ -217,6 +217,7 @@ pub fn resolve_initial_prompt<W: Write>(
     state: &StateDir,
     repo: &Path,
     w: &mut W,
+    screen_thresholds: &super::screen::Thresholds,
 ) -> CtxResult<Option<String>> {
     if !resume_requested {
         return Ok(None);
@@ -227,7 +228,13 @@ pub fn resolve_initial_prompt<W: Write>(
         // now mints its session before composing this same prompt) --
         // `resume_prompt`'s `session` parameter is unused by `working_set`
         // today, so an empty string costs nothing real.
-        Some((_path, found)) => Ok(Some(resume::resume_prompt(state, repo, "", &found))),
+        Some((_path, found)) => Ok(Some(resume::resume_prompt(
+            state,
+            repo,
+            "",
+            &found,
+            screen_thresholds,
+        ))),
         None => {
             writeln!(
                 w,
@@ -334,7 +341,8 @@ pub fn run_with<W: Write, E: Write>(
         }
     };
     let state = StateDir::resolve(env)?;
-    let initial_prompt = resolve_initial_prompt(args.resume, &state, repo, w)?;
+    let initial_prompt =
+        resolve_initial_prompt(args.resume, &state, repo, w, &cfg.screen.thresholds())?;
     let resuming = args.resume && initial_prompt.is_some();
     let session = SessionId::new_v4();
 
@@ -1622,14 +1630,26 @@ mod tests {
             .expect("store");
 
         let mut out = Vec::new();
-        let prompt = resolve_initial_prompt(true, &state, tmp.path(), &mut out)
-            .expect("resolves")
-            .expect("a handoff was stored");
+        let prompt = resolve_initial_prompt(
+            true,
+            &state,
+            tmp.path(),
+            &mut out,
+            &super::super::screen::Thresholds::default(),
+        )
+        .expect("resolves")
+        .expect("a handoff was stored");
 
         assert!(prompt.contains("Wire the payments webhook"), "got {prompt}");
         assert_eq!(
             prompt,
-            resume::resume_prompt(&state, tmp.path(), "", &handoff()),
+            resume::resume_prompt(
+                &state,
+                tmp.path(),
+                "",
+                &handoff(),
+                &super::super::screen::Thresholds::default(),
+            ),
             "chat must fold the handoff the same way `zirv ctx resume` does"
         );
         assert!(
@@ -1644,7 +1664,14 @@ mod tests {
         let state = StateDir::from_root(tmp.path().join("state"));
 
         let mut out = Vec::new();
-        let prompt = resolve_initial_prompt(true, &state, tmp.path(), &mut out).expect("resolves");
+        let prompt = resolve_initial_prompt(
+            true,
+            &state,
+            tmp.path(),
+            &mut out,
+            &super::super::screen::Thresholds::default(),
+        )
+        .expect("resolves");
 
         assert_eq!(prompt, None, "nothing to fold in, so a fresh session");
         let printed = String::from_utf8(out).expect("utf8");
@@ -1659,7 +1686,14 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(tmp.path().join("state"));
         let mut out = Vec::new();
-        let prompt = resolve_initial_prompt(false, &state, tmp.path(), &mut out).expect("resolves");
+        let prompt = resolve_initial_prompt(
+            false,
+            &state,
+            tmp.path(),
+            &mut out,
+            &super::super::screen::Thresholds::default(),
+        )
+        .expect("resolves");
         assert_eq!(prompt, None);
         assert!(out.is_empty());
     }

@@ -2082,7 +2082,10 @@ fn run_with_clock_inner<W: Write>(
                 cfg.supervise.max_nudges
             )?;
 
-            let combined = format!("{prompt_text}\n\n{}", handoff::labeled_for_injection(&note));
+            let combined = format!(
+                "{prompt_text}\n\n{}",
+                handoff::labeled_for_injection(&note, &cfg.screen.thresholds())
+            );
             let combined = super::prompt::task_prompt_with_composed_fallback(
                 &combined,
                 relaunch_system_prompt_supported,
@@ -2289,7 +2292,7 @@ fn run_with_clock_inner<W: Write>(
                 let prompt_text = prompt.clone().expect("route requires a known prompt");
                 let continuation = format!(
                     "{prompt_text}\n\nThe previous harness exhausted its usage window. Continue from this handoff without redoing completed work:\n\n{}",
-                    handoff::labeled_for_injection(&note)
+                    handoff::labeled_for_injection(&note, &cfg.screen.thresholds())
                 );
                 let target = adapters::select(Some(&selected_agent), &[], &cfg)?;
                 // Issue #358 (task T3): this run's own token reservation, if
@@ -2820,7 +2823,10 @@ fn run_with_clock_inner<W: Write>(
             composed.as_ref(),
             relaunch_system_prompt_supported,
         ));
-        let combined = format!("{prompt_text}\n\n{}", handoff::labeled_for_injection(&note));
+        let combined = format!(
+            "{prompt_text}\n\n{}",
+            handoff::labeled_for_injection(&note, &cfg.screen.thresholds())
+        );
         let combined = match &objective_block {
             Some(text) => format!("{combined}{text}"),
             None => combined,
