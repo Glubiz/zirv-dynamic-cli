@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-09-02
+last-verified: 2026-09-04
 ---
 
 # _system-context
@@ -39,10 +39,10 @@ Dispatch order matters: `ctx` and top-level `--help` are matched on **raw argv**
 | Utilities | `src/utils.rs` | [[Utilities]] | File parsing, reserved names, shortcuts struct, home dir, Levenshtein "did you mean" |
 | Ctx hub / verb tree | `src/commands/ctx/{mod,config,state,log}.rs` | [[Ctx Subsystem]] | `CtxCli`/`CtxVerb`, dispatch + parse-failure classification, layered `CtxConfig`, `StateDir`, decision log |
 | Ctx verb modules | `src/commands/ctx/{score,screen,handoff,resume,hook,status,chat,agent,mail,sessions,memory,memory_cli,safety,permissions,handover}.rs` | [[Ctx Subsystem]] | One module per verb: read-transcript/decide/maybe-write-state, the meta-harness verbs (chat/agent/mail, `mail`'s `send --all` fan-out via per-session read markers), the session registry + nudge, the memory bank, its top-level `zirv memory` management surface, the harness-neutral command safety classifier ([[Command Safety]], issue #83), the escalated/denied permission-request audit (`permissions audit`, issue #132), `handover` (swaps the orchestrator seat's model/harness in place under the same registry short id, issue #84), and `screen` (pure prompt-injection/credential-shape/high-entropy screening reused by mail, repo context layers, and transcript ingestion, issue #243) |
-| Ctx supervisors | `src/commands/ctx/{run_loop,exec,wrap}.rs` + `{signal,supervise,term}.rs` + `dash/{mod,pane,ui,spawnreq,roster}.rs` | [[Ctx Supervisors]] | The three process supervisors, turn-signal sockets, shared process/terminal primitives, and the `dash` session multiplexer `zirv chat` opens on a capable terminal |
+| Ctx supervisors | `src/commands/ctx/{run_loop,exec,wrap}.rs` + `{signal,supervise,term}.rs` + `dash/{mod,pane,ui,spawnreq,roster}.rs` + `{seat,rollover}.rs` | [[Ctx Supervisors]] | The three process supervisors, turn-signal sockets, shared process/terminal primitives, the `dash` session multiplexer `zirv chat` opens on a capable terminal, and (issue #358) the persisted logical orchestrator seat plus the automatic cross-harness rollover transaction built on the #84 handover seams |
 | Ctx adapters | `src/commands/ctx/adapters/{mod,claude,codex}.rs` | [[Ctx Adapters]] | `AgentAdapter` trait; claude (full capabilities) and codex (launch-supported; turn-boundary/token event parsing and rot scoring now derived from its rollout JSON, issue #86; tool-call/tool-result/compaction mapping and turn signal remain issue #11) |
 | Rot engine | `src/commands/ctx/{event,rot}.rs` | [[Rot Engine]] | Pure normalized-event scoring → `Verdict` |
-| Usage & pacing | `src/commands/ctx/{window,usage,pace}.rs` | [[Usage and Pacing]] | Rolling rate-limit windows, the pacing gate, `usage` verb + statusline tee |
+| Usage & pacing | `src/commands/ctx/{window,usage,pace,fallback,allocator,reservation,pool}.rs` | [[Usage and Pacing]] | Rolling rate-limit windows, the pacing gate, `usage` verb + statusline tee, cross-harness fallback routing, and (issue #358) the pure capacity allocator, the durable per-provider reservation ledger, and the `zirv ctx status` pool view |
 | Config analysis & prompt | `src/commands/ctx/{optimize,prompt}.rs` | [[Utilities]] | Report-only config analysis; the layered injected session prompt |
 | Concepts (cross-cutting) | n/a — describe conventions, not modules | [[Script Files]], [[Shortcuts]], [[Context Management]], [[Untrusted Configuration]] | The file format contract, the shortcut-lookup convention, the ctx philosophy, and the repo-trust boundary that spans several modules |
 

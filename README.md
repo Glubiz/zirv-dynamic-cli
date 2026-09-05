@@ -1095,10 +1095,10 @@ including `score`, `handoff` and `status`, works on all three platforms.
 | `zirv ctx handoff --transcript <path>` | Distills a handoff and stores it |
 | `zirv ctx resume` | Starts a clean session with the latest handoff injected |
 | `zirv ctx hook <stop\|prompt\|pre-compact\|pretool\|notify\|session-start>` | Agent hook entrypoints |
-| `zirv ctx status` | Shows supervised sessions, the resolved chat agent, unread mail, recent decisions and handoffs |
+| `zirv ctx status [--json]` | Shows supervised sessions, the resolved chat agent, unread mail, recent decisions, handoffs, and (issue #358) a cross-harness capacity/pool section; `--json` emits the pool view plus the orchestrator seat as structured JSON |
 | `zirv ctx usage` | Shows usage-window state, or `usage tee` to collect it from the statusline |
 | `zirv ctx optimize` | Reports redundancy, contradictions and dead references in the files that steer your sessions |
-| `zirv ctx chat` | Starts an interactive orchestrator session on the resolved adapter (also `zirv chat`, or bare `zirv`; see [Just Run `zirv`](#just-run-zirv)) |
+| `zirv ctx chat [--pin-harness]` | Starts an interactive orchestrator session on the resolved adapter (also `zirv chat`, or bare `zirv`; see [Just Run `zirv`](#just-run-zirv)). `--pin-harness` (same as `ZIRV_CTX_SEAT_PIN=1`) opts this session's orchestrator seat out of automatic rollover (issue #358) — a manual `zirv ctx handover` still works on a pinned seat |
 | `zirv ctx agent <name> <prompt>` | Delegates one task to a supervised headless worker on another enabled harness (also `zirv agent`) |
 | `zirv ctx send [--to-session <prefix>]` / `zirv ctx inbox` | Leaves or reads short notes between agent sessions on this machine, scoped to the repo, optionally addressed to one live session |
 | `zirv ctx nudge <prefix> --message <text>` | Wakes a live supervised session early with a message, instead of waiting for it to poll |
@@ -1677,11 +1677,35 @@ min_candidate_headroom_pct = 10.0     # a candidate needs at least this much hea
 unknown_headroom_pct = 25.0           # assumed headroom when no reading exists (0 opts out)
 small_task_max_tokens = 40000
 small_task_max_tool_calls = 24
+adaptive_delegation = true            # issue #358: route new delegations through the pure capacity allocator
+auto_orchestrator_rollover = false    # issue #358: let the orchestrator seat itself roll over automatically (off by default)
+orchestrator_rollover_headroom_pct = 20.0  # issue #358: threshold that arms a proactive rollover (defaults to predictive_headroom_pct)
+rollover_cooldown_secs = 600          # issue #358: minimum gap between two automatic rollovers
+
+[fallback.harness.codex]              # issue #358: per-harness overrides, both optional
+max_active = 3
+reserve_headroom_pct = 15.0
 ```
 
 A repository checkout may only narrow these values (see [Trust
 boundary](#trust-boundary) above); `ZIRV_CTX_FALLBACK*` environment variables
-are the operator's final override.
+are the operator's final override. `orchestrator_rollover_headroom_pct` and
+`rollover_cooldown_secs` are repo-forbidden outright (see the table above) —
+tuning an already-enabled rollover's timing is an operator decision, the same
+as `handoff.model`.
+
+**Cross-harness capacity, at a glance.** `zirv ctx status` (and `zirv ctx
+status --json` for machine-readable output) reports a pool section built on
+the same pure allocator: each harness's scheduling state (`ready` /
+`draining` / `hard-blocked` / `unknown` / `disabled`), its provider's
+headroom after outstanding reservations, and — when `auto_orchestrator_
+rollover` is on — the orchestrator seat's own fencing generation. Provider
+token reservations are tracked in a small durable ledger
+(`<state>/reservations/<provider>.json`) so two admitted-but-unsettled
+delegations against the same billed account are never double-counted. See
+`docs/obsidian/Modules/Usage and Pacing.md` and `docs/obsidian/Modules/Ctx
+Supervisors.md` for the full mechanism (capacity snapshot formula, the
+fenced rollover transaction, anti-flap rules).
 
 **`zirv ctx handover`** performs the swap directly, on demand, mid-session —
 the same mechanism the dashboard's `Ctrl+A o` picker and automatic fallback
