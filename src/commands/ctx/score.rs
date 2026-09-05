@@ -532,10 +532,18 @@ impl IncrementalScorer {
     /// -- never re-derived from whether a `Score` happened to come out the
     /// other end, since the bounded-state fold can still answer `None`
     /// (or, for an empty read, a stale-but-real `Some`) independently.
+    /// `screen_thresholds` is the caller's own resolved `[screen]` config
+    /// (review round 1, issue #272: a repo-narrowed threshold used to reach
+    /// every screening surface except this one, since `poll` only ever
+    /// received `&ScoreConfig` -- a deliberately narrow, purpose-specific
+    /// parameter, the same shape `score_cfg`/`pace_cfg` already take in
+    /// `exec.rs::supervise_run` rather than the whole `CtxConfig`). Pass
+    /// `&screen::Thresholds::default()` for the built-in set.
     pub fn poll(
         &mut self,
         adapter: &dyn AgentAdapter,
         cfg: &ScoreConfig,
+        screen_thresholds: &screen::Thresholds,
     ) -> CtxResult<(Option<Score>, Option<ScreenReport>)> {
         self.provider_limit_hit = false;
         self.last_speed = None;
@@ -552,7 +560,11 @@ impl IncrementalScorer {
         let screening = if combined.is_empty() && !appended.restarted {
             None
         } else {
-            Some(screen::screen(&combined))
+            Some(screen::screen_with_thresholds(
+                &combined,
+                combined.len(),
+                screen_thresholds,
+            ))
         };
         if appended.restarted || self.state.as_ref().is_none_or(|s| !s.built_for(cfg)) {
             self.state = RotState::new(cfg);
@@ -778,15 +790,22 @@ pub fn score_transcript_cached(
 ) -> CtxResult<(Score, ScreenReport, Option<SpeedMetrics>)> {
     let cfg = CtxConfig::load(repo, env)?;
     let adapter = adapters::select(agent.or(cfg.agent.as_deref()), &[], &cfg)?;
+    let screen_thresholds = cfg.screen.thresholds();
     let Ok(state_dir) = StateDir::resolve(env) else {
         let score = full_score(adapter.as_ref(), transcript, &cfg.score)?;
         return Ok((
             score,
-            screen_tail(transcript, SCREEN_FALLBACK_CAP_BYTES),
+            screen_tail(transcript, SCREEN_FALLBACK_CAP_BYTES, &screen_thresholds),
             None,
         ));
     };
-    score_with_checkpoint(&state_dir, transcript, adapter.as_ref(), &cfg.score)
+    score_with_checkpoint(
+        &state_dir,
+        transcript,
+        adapter.as_ref(),
+        &cfg.score,
+        &screen_thresholds,
+    )
 }
 
 /// Issue #243: how much of a transcript's tail is screened when a
@@ -800,11 +819,14 @@ const SCREEN_FALLBACK_CAP_BYTES: usize = 64 * 1024;
 ///
 /// Issue #272 design item 1: the tail actually screened is a truncated view
 /// of the whole file whenever the file is bigger than `cap`, so this calls
-/// `screen::screen_prefix` (not `screen::screen`) with the FULL file length
-/// as `total_bytes` -- the report then carries a `ScanTruncated` finding
-/// with the correct byte counts whenever `start > 0`, instead of the
-/// unscanned head silently reading as clean.
-fn screen_tail(path: &Path, cap: usize) -> ScreenReport {
+/// `screen::screen_with_thresholds` (not `screen::screen`) with the FULL
+/// file length as `total_bytes` -- the report then carries a `ScanTruncated`
+/// finding with the correct byte counts whenever `start > 0`, instead of the
+/// unscanned head silently reading as clean. `thresholds` is the caller's
+/// own resolved `[screen]` config (review round 1: this fallback used to
+/// hardcode `Thresholds::default()` via `screen::screen_prefix`, so a
+/// repo-narrowed `RepetitionDominated` threshold never reached it).
+fn screen_tail(path: &Path, cap: usize, thresholds: &screen::Thresholds) -> ScreenReport {
     let Ok(text) = std::fs::read_to_string(path) else {
         return ScreenReport::default();
     };
@@ -812,7 +834,7 @@ fn screen_tail(path: &Path, cap: usize) -> ScreenReport {
     let start = (start..=text.len())
         .find(|&i| text.is_char_boundary(i))
         .unwrap_or(text.len());
-    screen::screen_prefix(&text[start..], text.len())
+    screen::screen_with_thresholds(&text[start..], text.len(), thresholds)
 }
 
 /// The body of [`score_transcript_cached`], against a state
@@ -824,6 +846,7 @@ fn score_with_checkpoint(
     transcript: &Path,
     adapter: &dyn AgentAdapter,
     cfg: &ScoreConfig,
+    screen_thresholds: &screen::Thresholds,
 ) -> CtxResult<(Score, ScreenReport, Option<SpeedMetrics>)> {
     let path = checkpoint_path(state_dir, transcript);
     let fingerprint = fingerprint(adapter, cfg);
@@ -847,11 +870,11 @@ fn score_with_checkpoint(
     // appended bytes), so matching on `Some(score)` alone already implies
     // `Some(screening)` here -- this fallback runs a fresh tail scan either
     // way, never forwarding a stale/idle `None`.
-    let Ok((Some(score), Some(screening))) = scorer.poll(adapter, cfg) else {
+    let Ok((Some(score), Some(screening))) = scorer.poll(adapter, cfg, screen_thresholds) else {
         let score = full_score(adapter, transcript, cfg)?;
         return Ok((
             score,
-            screen_tail(transcript, SCREEN_FALLBACK_CAP_BYTES),
+            screen_tail(transcript, SCREEN_FALLBACK_CAP_BYTES, screen_thresholds),
             None,
         ));
     };
@@ -1044,12 +1067,18 @@ fn cached_score_with(
     // Stamped before the parse, so a line appended while it runs invalidates
     // this entry on the next poll instead of being missed forever.
     let scored = match stamp_of(&transcript) {
-        Some(stamp) => score_with_checkpoint(state, &transcript, adapter.as_ref(), &cfg.score)
-            .ok()
-            .map(|(score, _, _)| {
-                SCORE_RECOMPUTES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                (stamp, score.score)
-            }),
+        Some(stamp) => score_with_checkpoint(
+            state,
+            &transcript,
+            adapter.as_ref(),
+            &cfg.score,
+            &cfg.screen.thresholds(),
+        )
+        .ok()
+        .map(|(score, _, _)| {
+            SCORE_RECOMPUTES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            (stamp, score.score)
+        }),
         None => None,
     };
 
@@ -1342,7 +1371,11 @@ mod tests {
         let adapter = EventlessAdapter;
         let mut scorer = IncrementalScorer::new(transcript);
         let (score, screening) = scorer
-            .poll(&adapter, &ScoreConfig::default())
+            .poll(
+                &adapter,
+                &ScoreConfig::default(),
+                &screen::Thresholds::default(),
+            )
             .expect("no error");
         assert_eq!(score, None, "no data, not a fabricated healthy score");
         assert_eq!(
@@ -1376,7 +1409,9 @@ mod tests {
         )
         .expect("write transcript");
         let mut scorer = IncrementalScorer::new(transcript.clone());
-        let (first_score, first_screening) = scorer.poll(&adapter, &cfg).expect("no error");
+        let (first_score, first_screening) = scorer
+            .poll(&adapter, &cfg, &screen::Thresholds::default())
+            .expect("no error");
         assert!(first_score.is_some(), "fixture must produce a real score");
         assert!(
             first_screening.is_some(),
@@ -1384,7 +1419,9 @@ mod tests {
         );
 
         // No append at all: the second poll has nothing new to read.
-        let (idle_score, idle_screening) = scorer.poll(&adapter, &cfg).expect("no error");
+        let (idle_score, idle_screening) = scorer
+            .poll(&adapter, &cfg, &screen::Thresholds::default())
+            .expect("no error");
         assert_eq!(idle_score, None, "nothing new was appended");
         assert_eq!(
             idle_screening, None,
@@ -1421,7 +1458,9 @@ mod tests {
                              1}}}\n";
         std::fs::write(&transcript, flagged_line).expect("write transcript");
         let mut scorer = IncrementalScorer::new(transcript.clone());
-        let (_, first_screening) = scorer.poll(&adapter, &cfg).expect("no error");
+        let (_, first_screening) = scorer
+            .poll(&adapter, &cfg, &screen::Thresholds::default())
+            .expect("no error");
         let first_screening = first_screening.expect("fixture must have consumed real bytes");
         assert!(!first_screening.is_clean(), "fixture must actually flag");
         let announced_first = super::super::sessions::record_screening(
@@ -1437,7 +1476,9 @@ mod tests {
         // Truncate to empty: a real, observed change (`restarted`), not an
         // idle poll.
         std::fs::write(&transcript, "").expect("truncate transcript");
-        let (_, restart_screening) = scorer.poll(&adapter, &cfg).expect("no error");
+        let (_, restart_screening) = scorer
+            .poll(&adapter, &cfg, &screen::Thresholds::default())
+            .expect("no error");
         let restart_screening =
             restart_screening.expect("a restarted read must not be treated as idle");
         assert!(
@@ -1461,7 +1502,9 @@ mod tests {
 
         // The same finding reappears in the replacement transcript.
         std::fs::write(&transcript, flagged_line).expect("write the replacement transcript");
-        let (_, second_screening) = scorer.poll(&adapter, &cfg).expect("no error");
+        let (_, second_screening) = scorer
+            .poll(&adapter, &cfg, &screen::Thresholds::default())
+            .expect("no error");
         let second_screening = second_screening.expect("the replacement transcript has bytes");
         assert!(!second_screening.is_clean());
         let announced_second = super::super::sessions::record_screening(
@@ -1492,8 +1535,14 @@ mod tests {
         let transcript = write_transcript(dir.path(), 12, true, 20_000);
         let state = StateDir::from_root(dir.path().join("state"));
         let adapter = EventlessAdapter;
-        let err = score_with_checkpoint(&state, &transcript, &adapter, &ScoreConfig::default())
-            .expect_err("no verified event parsing");
+        let err = score_with_checkpoint(
+            &state,
+            &transcript,
+            &adapter,
+            &ScoreConfig::default(),
+            &screen::Thresholds::default(),
+        )
+        .expect_err("no verified event parsing");
         assert!(err.to_string().contains("eventless"), "got {err}");
     }
 
@@ -1537,7 +1586,11 @@ mod tests {
         let path = dir.path().join("huge.jsonl");
         std::fs::write(&path, &text).expect("write huge transcript");
 
-        let report = screen_tail(&path, SCREEN_FALLBACK_CAP_BYTES);
+        let report = screen_tail(
+            &path,
+            SCREEN_FALLBACK_CAP_BYTES,
+            &screen::Thresholds::default(),
+        );
         assert_eq!(report.scanned_bytes, SCREEN_FALLBACK_CAP_BYTES);
         assert_eq!(report.total_bytes, text.len());
         let expected_remaining = text.len() - SCREEN_FALLBACK_CAP_BYTES;
@@ -1559,7 +1612,11 @@ mod tests {
         let path = dir.path().join("small.jsonl");
         std::fs::write(&path, "a short transcript, nowhere near the cap\n").expect("write");
 
-        let report = screen_tail(&path, SCREEN_FALLBACK_CAP_BYTES);
+        let report = screen_tail(
+            &path,
+            SCREEN_FALLBACK_CAP_BYTES,
+            &screen::Thresholds::default(),
+        );
         assert_eq!(report.scanned_bytes, report.total_bytes);
         assert!(
             !report
@@ -1669,7 +1726,11 @@ mod tests {
         let mut scorer = IncrementalScorer::new(transcript);
 
         scorer
-            .poll(&adapter, &ScoreConfig::default())
+            .poll(
+                &adapter,
+                &ScoreConfig::default(),
+                &screen::Thresholds::default(),
+            )
             .expect("poll");
         assert!(scorer.provider_limit_hit());
     }
@@ -1689,7 +1750,9 @@ mod tests {
         let first_turn = "{\"type\":\"assistant\",\"message\":{\"model\":\"claude-opus-5[1m]\",\"content\":[{\"type\":\"text\",\"text\":\"[zirv] one\"}],\"usage\":{\"input_tokens\":1}}}\n";
         std::fs::write(&transcript, first_turn).expect("write transcript");
         let mut scorer = IncrementalScorer::new(transcript.clone());
-        scorer.poll(&adapter, &cfg).expect("no error");
+        scorer
+            .poll(&adapter, &cfg, &screen::Thresholds::default())
+            .expect("no error");
 
         let tokens = 170_000u64;
         let second_turn = format!(
@@ -1698,7 +1761,7 @@ mod tests {
         std::fs::write(&transcript, format!("{first_turn}{second_turn}")).expect("append");
 
         let score = scorer
-            .poll(&adapter, &cfg)
+            .poll(&adapter, &cfg, &screen::Thresholds::default())
             .expect("no error")
             .0
             .expect("a score");

@@ -19,7 +19,7 @@
 //! (`PromptInjectionMarker`/`CredentialShape`/`HighEntropyRun`):
 //!
 //! 1. Truncation is itself a finding (`ScanTruncated`), not an implicit
-//!    "the unscanned tail is clean" -- see [`screen_prefix`].
+//!    "the unscanned tail is clean" -- see [`screen_with_thresholds`].
 //! 2. Four new, cheap, high-precision markers: [`ScreenFlag::RoleMarkerMidText`],
 //!    [`ScreenFlag::InvisibleUnicode`], [`ScreenFlag::LongOpaqueRun`], and
 //!    [`ScreenFlag::RepetitionDominated`] (the last from the Hermes-round
@@ -253,8 +253,9 @@ fn detect_invisible_unicode(text: &str) -> Option<(usize, usize)> {
 /// (`config.rs`'s `ScreenConfig`, `narrow_screen_*`): a repo checkout may
 /// only make detection STRICTER (lower `repetition_min_fragment`/`_window`/
 /// `_min_repeats`/`_dominance_pct`), never looser. `Thresholds::default()`
-/// is the built-in, un-narrowed set every bare [`screen`]/[`screen_prefix`]
-/// call uses.
+/// is the built-in, un-narrowed set every bare [`screen`] call uses, and
+/// what a [`screen_with_thresholds`] caller with no narrowed config passes
+/// explicitly.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Thresholds {
     /// A fragment shorter than this (in bytes) is never flagged
@@ -399,8 +400,8 @@ pub enum ScreenFlag {
     RepetitionDominated,
     /// This report screened fewer bytes than the text actually contains
     /// (`ScreenReport::scanned_bytes < ScreenReport::total_bytes`, see
-    /// [`screen_prefix`]). `remaining` is the byte count that was NOT
-    /// screened. Truncation is itself a finding, not an implicit "the
+    /// [`screen_with_thresholds`]). `remaining` is the byte count that was
+    /// NOT screened. Truncation is itself a finding, not an implicit "the
     /// unscanned tail is clean" -- issue #272 design item 1.
     ScanTruncated { remaining: usize },
 }
@@ -469,8 +470,9 @@ impl ScreenFlag {
 /// anything from the text itself -- see this module's own doc comment.
 ///
 /// `scanned_bytes`/`total_bytes` (issue #272) are equal for a plain
-/// [`screen`] call; they differ only via [`screen_prefix`], whose caller
-/// knows the text handed in is a truncated view of a larger whole.
+/// [`screen`] call; they differ only via [`screen_with_thresholds`] with a
+/// `total_bytes` larger than `text.len()`, for a caller that knows the text
+/// handed in is a truncated view of a larger whole.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ScreenReport {
     pub flags: Vec<ScreenFlag>,
@@ -517,8 +519,8 @@ impl ScreenReport {
 /// Screens `text` for every marker this module knows, against `thresholds`,
 /// stamping `scanned_bytes = text.len()` and `total_bytes` as given by the
 /// caller (equal to `scanned_bytes` for a plain [`screen`] call; larger, via
-/// [`screen_prefix`], when `text` is a truncated view of something bigger).
-/// Pure: see this module's own doc comment.
+/// [`screen_with_thresholds`], when `text` is a truncated view of something
+/// bigger). Pure: see this module's own doc comment.
 ///
 /// Order: every injection marker is checked first (cheapest, most specific
 /// to this module's own purpose), then the credential-shape detector, then
@@ -585,26 +587,23 @@ fn screen_core(text: &str, total_bytes: usize, thresholds: &Thresholds) -> Scree
 
 /// Screens the whole of `text` against the built-in [`Thresholds::default`].
 /// `scanned_bytes == total_bytes == text.len()`, so [`ScreenFlag::ScanTruncated`]
-/// never appears in the result -- for that, see [`screen_prefix`].
+/// never appears in the result -- for that, see [`screen_with_thresholds`].
 pub fn screen(text: &str) -> ScreenReport {
     screen_core(text, text.len(), &Thresholds::default())
 }
 
-/// Screens `text` -- a truncated prefix OR tail of a larger blob whose real
-/// size is `total_bytes` -- against the built-in [`Thresholds::default`].
-/// `total_bytes < text.len()` is a caller bug (clamped to `text.len()`
-/// rather than panicking, since a screening miscount must never crash a
-/// scoring or compile cycle); the normal case is `total_bytes >=
-/// text.len()`, which stamps [`ScreenFlag::ScanTruncated`] with the
+/// Screens `text` -- the whole of a blob, or a truncated prefix/tail of one
+/// whose real size is `total_bytes` -- against `thresholds` instead of the
+/// built-in default. `total_bytes < text.len()` is a caller bug (clamped to
+/// `text.len()` rather than panicking, since a screening miscount must
+/// never crash a scoring or compile cycle); the normal case is `total_bytes
+/// >= text.len()`, which stamps [`ScreenFlag::ScanTruncated`] with the
 /// difference whenever the two differ. Used by `score.rs`'s capped
-/// transcript-tail screening (issue #272 design item 1).
-pub fn screen_prefix(text: &str, total_bytes: usize) -> ScreenReport {
-    screen_core(text, total_bytes.max(text.len()), &Thresholds::default())
-}
-
-/// The `screen`/`screen_prefix` pair, parameterized on `thresholds` instead
-/// of the built-in default -- for a caller that has resolved a repo-
-/// narrowed `[screen]` config (`config.rs`'s `ScreenConfig::thresholds`).
+/// transcript-tail screening (issue #272 design item 1) and by every other
+/// screening surface that has resolved a repo-narrowed `[screen]` config
+/// (`config.rs`'s `ScreenConfig::thresholds`, review round 1) -- pass
+/// `text.len()` for `total_bytes` and `&Thresholds::default()` for
+/// `thresholds` to recover plain [`screen`]'s own behavior exactly.
 pub fn screen_with_thresholds(
     text: &str,
     total_bytes: usize,
@@ -893,7 +892,7 @@ mod tests {
         // A representative 64 KiB tail of a much larger (1 MiB) transcript --
         // the exact shape `score.rs`'s fallback tail-screening cap produces.
         let tail = "x".repeat(64 * 1024);
-        let report = screen_prefix(&tail, MIB);
+        let report = screen_with_thresholds(&tail, MIB, &Thresholds::default());
         assert_eq!(report.scanned_bytes, 64 * 1024);
         assert_eq!(report.total_bytes, MIB);
         assert!(
@@ -912,16 +911,16 @@ mod tests {
     }
 
     #[test]
-    fn screen_prefix_with_total_bytes_equal_to_text_len_never_flags_truncation() {
-        let report = screen_prefix("hello world", 11);
+    fn screen_with_thresholds_with_total_bytes_equal_to_text_len_never_flags_truncation() {
+        let report = screen_with_thresholds("hello world", 11, &Thresholds::default());
         assert!(report.is_clean(), "got {:?}", report.flags);
     }
 
     #[test]
-    fn screen_prefix_clamps_a_total_bytes_smaller_than_the_text_itself() {
+    fn screen_with_thresholds_clamps_a_total_bytes_smaller_than_the_text_itself() {
         // A caller bug (total_bytes < text.len()) must never panic or
         // report a negative/underflowed remaining count.
-        let report = screen_prefix("hello world", 3);
+        let report = screen_with_thresholds("hello world", 3, &Thresholds::default());
         assert_eq!(report.total_bytes, 11);
         assert!(report.is_clean(), "got {:?}", report.flags);
     }

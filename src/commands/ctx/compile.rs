@@ -1041,6 +1041,7 @@ pub fn compile_with_harness_roster(
         role,
         &harness_lines,
         cfg.context.max_harness_roster_bytes,
+        &cfg.screen.thresholds(),
     );
     // Mirrors `compose`'s own gate for `PromptSource::Harnesses` exactly
     // (role == Orchestrator, `cfg.prompt.harnesses`, a non-empty roster) plus
@@ -1096,6 +1097,7 @@ pub fn compile_with_harness_roster(
         cfg.memory
             .core_max_bytes
             .saturating_add(cfg.memory.retrieval_max_bytes),
+        &cfg.screen.thresholds(),
     );
     // Issue #285: the durable objective layer, folded in last of everything
     // this compiler composes deterministically -- its own spend/status is at

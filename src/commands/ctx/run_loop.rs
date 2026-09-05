@@ -307,6 +307,7 @@ pub(crate) fn run_with_clock<W: Write>(
                     path,
                     msg,
                     parent_short.as_deref(),
+                    &cfg.screen.thresholds(),
                 )
             })
             .collect();
@@ -560,7 +561,8 @@ pub(crate) fn run_with_clock<W: Write>(
                         disposition: super::announce::NudgeDisposition::NextCycle,
                     });
                 }
-                let poll_result = scorer.poll(adapter.as_ref(), &cfg.score);
+                let poll_result =
+                    scorer.poll(adapter.as_ref(), &cfg.score, &cfg.screen.thresholds());
                 // Issue #243 (review round, F4/F5): same shared helper the
                 // Stop hook and `exec`'s own supervision loop use -- a
                 // codex/wrap-supervised cycle (no Claude Stop hook at all)
@@ -615,7 +617,7 @@ pub(crate) fn run_with_clock<W: Write>(
             )?;
 
             if !limit_hit {
-                let _ = scorer.poll(adapter.as_ref(), &cfg.score);
+                let _ = scorer.poll(adapter.as_ref(), &cfg.score, &cfg.screen.thresholds());
                 limit_hit = scorer.provider_limit_hit();
             }
 

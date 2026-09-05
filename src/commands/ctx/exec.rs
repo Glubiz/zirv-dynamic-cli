@@ -960,7 +960,13 @@ fn run_with_clock_inner<W: Write>(
     let mut mail_messages: Vec<super::mail::Message> = mail_entries
         .iter()
         .map(|(path, msg)| {
-            super::mail::message_with_delivery_envelope(&state, path, msg, parent_short.as_deref())
+            super::mail::message_with_delivery_envelope(
+                &state,
+                path,
+                msg,
+                parent_short.as_deref(),
+                &cfg.screen.thresholds(),
+            )
         })
         .collect();
     if !mail_messages.is_empty() {
@@ -1521,6 +1527,7 @@ fn run_with_clock_inner<W: Write>(
             adapter.as_ref(),
             &cfg.score,
             &cfg.pace,
+            &cfg.screen.thresholds(),
             &state,
             server.as_ref(),
             session.as_str(),
@@ -3001,6 +3008,11 @@ fn supervise_run(
     adapter: &dyn adapters::AgentAdapter,
     score_cfg: &super::config::ScoreConfig,
     pace_cfg: &super::config::PaceConfig,
+    // Issue #272 review round 1: the caller's own resolved `[screen]`
+    // config, the same narrow-purpose-parameter shape as `score_cfg`/
+    // `pace_cfg` right above -- so a repo-narrowed threshold reaches the
+    // live supervision poll below, not just the Stop hook's own fallback.
+    screen_thresholds: &super::screen::Thresholds,
     state: &StateDir,
     server: Option<&signal::SignalServer>,
     session: &str,
@@ -3313,7 +3325,7 @@ fn supervise_run(
             Some(agent::BudgetState::SoftWarn { .. } | agent::BudgetState::Ok) | None => {}
         }
         // A scoring failure must never kill a healthy run.
-        let poll_result = scorer.poll(adapter, score_cfg);
+        let poll_result = scorer.poll(adapter, score_cfg, screen_thresholds);
         // Issue #243 (review round, F3/F5): consumes the screening half of
         // every poll that actually read new bytes -- persisted and, when
         // it changed, announced -- through the same shared helper the Stop
@@ -3367,7 +3379,7 @@ fn supervise_run(
     // drain. Give the transcript one last incremental read before deciding
     // whether this was an ordinary exit.
     if !*limit_hit {
-        let _ = scorer.poll(adapter, score_cfg);
+        let _ = scorer.poll(adapter, score_cfg, screen_thresholds);
         *limit_hit = scorer.provider_limit_hit();
     }
 
