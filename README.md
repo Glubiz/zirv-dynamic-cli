@@ -1305,6 +1305,7 @@ checkout:
 | `workflow.review_worker_max_tool_calls` | `ZIRV_CTX_WORKFLOW_REVIEW_WORKER_MAX_TOOL_CALLS` |
 | `workflow.auto_spawn_on_gate` | `ZIRV_CTX_WORKFLOW_AUTO_SPAWN_ON_GATE` |
 | `workflow.allow_empty_verify` | `ZIRV_CTX_WORKFLOW_ALLOW_EMPTY_VERIFY` |
+| `workflow.builtin_checks_exclude` | `ZIRV_CTX_WORKFLOW_BUILTIN_CHECKS_EXCLUDE` |
 | `price.stale_after_days` | `ZIRV_CTX_PRICE_STALE_AFTER_DAYS` |
 | `price.table_path` | `ZIRV_CTX_PRICE_TABLE_PATH` |
 | `search.max_output_bytes` | `ZIRV_CTX_SEARCH_MAX_OUTPUT_BYTES` |
