@@ -706,7 +706,24 @@ impl SessionGuard {
         if self.released {
             return;
         }
-        self.record.session = new_session.to_string();
+        // Review round 1, finding 7: the OLD session id's own memory tier
+        // (`memory::MemoryScope::Session`, issue #295) is not this run's
+        // stable address -- `short` is -- so a `loop`/`exec` cycle that
+        // rotates `record.session` would otherwise leave that tier's
+        // directory behind forever, cleaned up only when `release()`
+        // eventually fires for whichever session id happens to be current
+        // at that point. Purged here instead, best-effort, the same way
+        // every other memory cleanup in this module is: a failed removal
+        // costs a leaked directory, never data loss for anything still
+        // live (a no-op if the old id never wrote anything there).
+        let old_session = std::mem::replace(&mut self.record.session, new_session.to_string());
+        if old_session != new_session {
+            let _ = super::memory::forget_session_all(
+                &self.state,
+                &self.record.repo_slug,
+                &old_session,
+            );
+        }
         self.record.started_at = super::state::now_secs();
         self.path = write_record(&self.state, &self.record);
     }
@@ -2781,6 +2798,56 @@ mod tests {
 
         guard.release();
         assert!(!record_file.exists());
+    }
+
+    /// Review round 1, finding 7: `refresh_session` used to overwrite
+    /// `record.session` with no cleanup at all, leaving the OLD session
+    /// id's own memory tier (`memory::MemoryScope::Session`) behind forever
+    /// -- it is not addressed by `short` (the stable delivery address that
+    /// survives a refresh, proven above) and so was never reachable by any
+    /// later `release()`, which only ever cleans up the CURRENT session id.
+    #[test]
+    fn refresh_session_purges_the_previous_cycles_own_memory_tier() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = state_in(tmp.path());
+        let repo = tmp.path().join("repo");
+        let first_session = "11111111-2222-4333-8444-555555555555";
+        let record = record_for(first_session, &repo, Verb::Exec);
+        let slug = record.repo_slug.clone();
+        let cfg = super::super::config::CtxConfig::default();
+
+        let entry = super::super::memory::Entry {
+            key: "cycle-one-key".to_string(),
+            written_by: "claude".to_string(),
+            written: 1,
+            verified: 1,
+            source: "explicit".to_string(),
+            body: "left behind by the first cycle".to_string(),
+            importance: None,
+            confidence: None,
+            tags: Vec::new(),
+            paths: Vec::new(),
+        };
+        super::super::memory::remember_session(&state, &slug, first_session, &entry, &cfg)
+            .expect("remember into the first cycle's session tier");
+
+        let mut guard = SessionGuard::register(&state, record);
+        assert_eq!(
+            super::super::memory::list_session(&state, &slug, first_session)
+                .expect("list before refresh")
+                .len(),
+            1
+        );
+
+        let second_session = "22222222-2222-4333-8444-555555555555";
+        guard.refresh_session(second_session);
+
+        assert!(
+            super::super::memory::list_session(&state, &slug, first_session)
+                .expect("list after refresh")
+                .is_empty(),
+            "the previous cycle's own memory tier must be purged on refresh"
+        );
     }
 
     /// The point of the stable address, stated as the delivery property it

@@ -626,6 +626,22 @@ pub fn run_remember_with<W: Write>(
     if body.is_empty() {
         return Err("zirv memory remember: no text given".into());
     }
+    // Review round 1, finding 2: same advisory lock `zirv ctx remember`'s
+    // own `--if-unchanged` path takes, held from the check through the
+    // write below (`_if_unchanged_lock` stays in scope until this function
+    // returns), so two concurrent `zirv memory remember --shared
+    // --if-unchanged` calls cannot both pass the check before either
+    // writes.
+    let _if_unchanged_lock = if args.if_unchanged.is_some() {
+        match memory::lock_dir_for_if_unchanged(scope, repo, &state, &slug, None) {
+            Some(dir) => Some(
+                memory::lock_bank_dir(&dir).map_err(|e| format!("zirv memory remember: {e}"))?,
+            ),
+            None => None,
+        }
+    } else {
+        None
+    };
     if let Some(expected) = &args.if_unchanged {
         let existing = memory::get_scoped(scope, repo, &state, &slug, &cfg, &args.key)?;
         memory::check_if_unchanged(existing.as_ref(), expected)
