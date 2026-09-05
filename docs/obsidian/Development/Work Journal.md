@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-09-04
+last-verified: 2026-09-05
 ---
 
 # Work Journal
@@ -19,6 +19,11 @@ last-verified: 2026-09-04
 **Follow-up:** anything unfinished (optional).
 
 ## Entries
+
+### 2026-09-05: issue #295 -- journaled reversible memory writes, a session-scoped tier, `--if-unchanged`, and a round-trip guard (`feat/295-memory-journal`)
+**What:** Every `remember`/`forget`/`verify` (plus new `promote`/`rollback`) appends one record to a per-bank `journal.jsonl`; `zirv memory rollback <id>` replays the inverse through the ordinary write path so caps/secret-screen still apply, and rolling back an id twice is a no-op. `MemoryScope::Session` (`<state>/memory/<repo_slug>/sessions/<session-id>/`) is the new default `remember` target when a session id is present, isolated from `recall --repo` and removed when the session's registry entry retires. `--if-unchanged <sha256>`/`--if-unchanged=absent` on both `zirv ctx remember` and `zirv memory remember` replaces silent last-writer-wins. The Hermes-round addendum (#322) adds a round-trip guard on shared-scope overwrites (compares against the journal's own last-written baseline; a mismatch backs up the foreign file and refuses) and treats an unreadable-but-existing shared file as an error, never an empty entry.
+**Key changes:** `src/commands/ctx/{memory,memory_cli,sessions,config,status}.rs`; two new `[memory]` keys (`session_enabled`, `journal_max_entries`), both `REPO_FORBIDDEN`.
+**Follow-up:** The session tier is not yet wired into `compile.rs`'s launch-time core/retrieval injection (would require threading a session id through every launch call site) -- recorded as a residual, not implemented here. `rollback` of a session-tier CREATE record written before this build's `session_id` journal field existed cannot resolve which directory to restore into. See the 2026-09-05 [[Decision Log]] entry.
 
 ### 2026-09-04: issue #358 -- elastic usage-window-aware harness scheduling + automatic meta-orchestrator rollover (`feat/elastic-scheduling-358`, v3.21.0, in review)
 **What:** Eight tasks off 3.20.0. A pure capacity allocator (`allocator.rs`: `HarnessState` ready/draining/hard-blocked/unknown/disabled, `CapacitySnapshot`/`Placement`/`place`/`plan`) plus a durable per-provider token-reservation ledger (`reservation.rs`) feed adaptive delegation routing when `fallback.adaptive_delegation` is on (default true). A persisted, fencing-generation logical orchestrator seat (`seat.rs`) plus an automatic rollover transaction driver (`rollover.rs`, reusing the #84 handover seams) let the meta-orchestrator itself roll over across harnesses -- gated off by default (`fallback.auto_orchestrator_rollover = false`) until the fencing invariants soak. `--pin-harness`/`ZIRV_CTX_SEAT_PIN` opt a seat out. `zirv ctx status` gains a pool section, `--json`, and a dashboard aggregate row (`pool.rs`). Two operator-facing follow-ups landed on the same branch: `supervise.orchestrator_writes` (allow/advise/deny, default advise, repo-narrow-only) replaces the unconditional repo-write deny from #328/#334; usage headroom now only ranks a spawn, never refuses/delays one (`PaceGate.initial_launch`, non-blocking interactive gate).
