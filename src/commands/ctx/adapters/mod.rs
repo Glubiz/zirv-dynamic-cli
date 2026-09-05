@@ -1398,6 +1398,26 @@ pub trait AgentAdapter: std::fmt::Debug {
         None
     }
 
+    /// The model context window this session's own transcript states, or
+    /// `None` when this adapter's transcript shape carries no such figure
+    /// (the default) or the fragment happens not to state one. Line-local
+    /// for the same reason [`model_hint`](Self::model_hint) is, and carried
+    /// across polls by the same caller.
+    ///
+    /// The counterpart to
+    /// [`context_window_tokens`](Self::context_window_tokens), which answers
+    /// from a model id alone: this answers from what the harness itself
+    /// reported for THIS session, which is strictly better evidence when it
+    /// exists, so `score.rs` lets it override the capability before the
+    /// capacity-aware gates (`rot::token_gates`) are computed. An operator's
+    /// own `score.model_context_tokens` still outranks both -- they know
+    /// their seat. `rot.rs` learns nothing new: the figure arrives inside
+    /// `Capabilities`, which it already receives, so the engine stays pure.
+    fn context_window_hint(&self, jsonl: &str) -> Option<u64> {
+        let _ = jsonl;
+        None
+    }
+
     /// Cumulative input/output usage exposed by this harness's transcript.
     /// This is deliberately separate from rot's latest-context token signal:
     /// workflow telemetry needs phase cost, not current context occupancy.

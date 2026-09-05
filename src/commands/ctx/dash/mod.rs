@@ -2114,7 +2114,7 @@ impl FactsCache {
         // readable by short id and repo just like a pane's.
         self.disk.scores.clear();
         for pane in panes {
-            if let Some(score) = score::cached_score(state, repo, pane.session_id()) {
+            if let Some(score) = score::cached_score(state, repo, pane.session_id(), pane.agent()) {
                 self.disk.scores.insert(pane.short().to_string(), score);
             }
         }
@@ -2128,7 +2128,9 @@ impl FactsCache {
             {
                 continue;
             }
-            if let Some(score) = score::cached_score(state, &record.repo, &record.session) {
+            if let Some(score) =
+                score::cached_score(state, &record.repo, &record.session, &record.agent)
+            {
                 self.disk.scores.insert(record.short.clone(), score);
             }
         }
