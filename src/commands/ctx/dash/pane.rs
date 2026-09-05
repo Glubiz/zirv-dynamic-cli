@@ -1989,7 +1989,7 @@ impl Pane {
     ) -> CtxResult<()> {
         let (new_adapter, extra) = super::super::handover::resolve_swap_launch(cfg, req)?;
         let new_argv: Vec<String> = {
-            let prompt_text = wrap::restart_prompt(handoff_note);
+            let prompt_text = wrap::restart_prompt(handoff_note, &cfg.screen.thresholds());
             let command = new_adapter.interactive_cmd(Some(&prompt_text), &extra);
             std::iter::once(command.get_program().to_string_lossy().to_string())
                 .chain(command.get_args().map(|a| a.to_string_lossy().to_string()))
