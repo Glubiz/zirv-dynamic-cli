@@ -21366,7 +21366,7 @@ mod tests {
                 &mut focused,
                 &mut selected,
                 &mut errors,
-                &mut ErrorLog::default(),
+                &mut Vec::new(),
                 &mut HashSet::new(),
                 &mut None,
                 &mut VecDeque::new(),
@@ -21477,7 +21477,7 @@ mod tests {
                 &mut focused,
                 &mut selected,
                 &mut errors,
-                &mut ErrorLog::default(),
+                &mut Vec::new(),
                 &mut HashSet::new(),
                 &mut None,
                 &mut VecDeque::new(),
@@ -22509,7 +22509,7 @@ mod tests {
 
         let group_id = super::super::group::run_create(
             &state,
-            &mut ErrorLog::default(),
+            &mut Vec::new(),
             &super::super::group::CreateArgs {
                 scope: "the forged batch".to_string(),
                 child_limit: 4,
@@ -22541,6 +22541,7 @@ mod tests {
             &repo,
             (80, 24),
             &mut errors,
+            &mut HashMap::new(),
         );
 
         assert_eq!(panes.len(), 2, "no pane was spawned for the forgery");
@@ -22607,7 +22608,7 @@ mod tests {
 
         let group_id = super::super::group::run_create(
             &state,
-            &mut ErrorLog::default(),
+            &mut Vec::new(),
             &super::super::group::CreateArgs {
                 scope: "the batch".to_string(),
                 child_limit: 4,
@@ -22637,6 +22638,7 @@ mod tests {
             &repo,
             (80, 24),
             &mut errors,
+            &mut HashMap::new(),
         );
         assert_eq!(panes.len(), 3, "the coordinator pane spawned: {errors:?}");
         let coordinator_short = panes[2].short().to_string();
@@ -22683,7 +22685,7 @@ mod tests {
                 &mut focused,
                 &mut selected,
                 &mut errors,
-                &mut ErrorLog::default(),
+                &mut Vec::new(),
                 &mut HashSet::new(),
                 &mut None,
                 &mut VecDeque::new(),
@@ -22772,6 +22774,7 @@ mod tests {
             &repo,
             (80, 24),
             &mut errors,
+            &mut HashMap::new(),
         );
 
         let worker_ack =
