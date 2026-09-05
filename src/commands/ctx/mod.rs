@@ -29,6 +29,7 @@ pub mod hook;
 pub mod judge;
 pub mod log;
 pub mod mail;
+pub mod measure;
 pub mod memory;
 pub mod memory_cli;
 pub mod memory_optimize;
@@ -482,6 +483,12 @@ pub enum CtxVerb {
     /// Mints a root + N worker + verifier + synthesizer task-card batch, all
     /// as one atomic write (issue #317).
     Swarm(task::SwarmArgs),
+    /// Transcript-derived proportionality metrics -- partial-read rate, edit
+    /// inflation, tool-result token share, context utilisation, compaction
+    /// rate, turns per user message -- with an optional committed baseline
+    /// to diff against (issue #294). Strictly read-only outside `measure
+    /// baseline`.
+    Measure(measure::MeasureArgs),
 }
 
 /// What a clap parse failure costs, which is not the same for every verb.
@@ -582,6 +589,7 @@ pub fn dispatch(args: &[String]) -> i32 {
         CtxVerb::Worktree(a) => worktree::run(a, &mut out),
         CtxVerb::Task(a) => task::run(a, &mut out),
         CtxVerb::Swarm(a) => task::run_swarm(a, &mut out),
+        CtxVerb::Measure(a) => measure::run(a, &mut out),
     };
 
     match result {

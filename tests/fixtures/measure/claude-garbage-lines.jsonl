@@ -1,0 +1,6 @@
+not json at all, just a truncated line from a crashed writer
+{"parentUuid":null,"isSidechain":false,"type":"user","promptId":"p1","message":{"role":"user","content":[{"type":"text","text":"quick check"}]},"uuid":"u1","timestamp":"2026-08-03T11:00:00.000Z","sessionId":"measure-garbage-lines"}
+
+{"this is": "valid json but not a recognizable transcript row shape"}
+{"parentUuid":"u1","isSidechain":false,"type":"assistant","message":{"model":"claude-fable-5","id":"m1","type":"message","role":"assistant","content":[{"type":"text","text":"All good."}],"usage":{"input_tokens":50,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":5}},"uuid":"a1","timestamp":"2026-08-03T11:00:01.000Z","sessionId":"measure-garbage-lines"}
+{"parentUuid": "a1", "isSidechain": false, "type": "assistant"
