@@ -17,4 +17,3 @@ docs/obsidian/.obsidian/workspace*.json
 # removed by the reclamation step in agent.rs when clean, left in place
 # (still ignored) when dirty for the operator to inspect.
 .zirv/worktrees/
-.zirv/memory/.lock

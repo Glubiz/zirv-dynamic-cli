@@ -983,15 +983,20 @@ fn upsert_shared(
     entry: &Entry,
     allow_sensitive: bool,
 ) -> CtxResult<PathBuf> {
-    upsert_shared_inner(repo, state, slug, cfg, entry, allow_sensitive, true)
+    let lock = lock_bank(MemoryScope::Shared, state, slug)?;
+    upsert_shared_inner(repo, state, slug, cfg, entry, allow_sensitive, true, &lock)
 }
 
 /// `upsert_shared`'s real body, with journaling made optional -- see
 /// `remember_inner`'s own doc comment for why `promote` needs this (the same
 /// "exactly one journal record" reasoning, for a promotion into the shared
-/// tier instead of the global one).
+/// tier instead of the global one). `_lock` is the same lock-proof
+/// parameter `remember_inner` documents. `pub(crate)` (review round 2) so
+/// `memory_cli::run_remember_with`'s Shared arm can call it directly under
+/// its own already-held lock, the same reason every other `_inner`/
+/// `_locked` helper here is reachable from outside this module.
 #[allow(clippy::too_many_arguments)]
-fn upsert_shared_inner(
+pub(crate) fn upsert_shared_inner(
     repo: &Path,
     state: &StateDir,
     slug: &str,
@@ -999,6 +1004,7 @@ fn upsert_shared_inner(
     entry: &Entry,
     allow_sensitive: bool,
     journal: bool,
+    _lock: &BankLock,
 ) -> CtxResult<PathBuf> {
     if !MemoryScope::Shared.enabled(cfg) {
         let reason = MemoryScope::Shared.disabled_reason(cfg);
@@ -1121,7 +1127,8 @@ pub fn upsert_shared_allow_sensitive(
     cfg: &CtxConfig,
     entry: &Entry,
 ) -> CtxResult<PathBuf> {
-    upsert_shared(repo, state, slug, cfg, entry, true)
+    let lock = lock_bank(MemoryScope::Shared, state, slug)?;
+    upsert_shared_inner(repo, state, slug, cfg, entry, true, true, &lock)
 }
 
 /// Scope-aware upsert: `Private` delegates unchanged to `remember`, `Global`
@@ -1195,47 +1202,65 @@ pub fn forget_scoped(
         // a directory from here. Callers use `forget_session` directly.
         MemoryScope::Session => Ok(false),
         MemoryScope::Shared => {
-            let Some(path) = shared_canonical_path(repo, key) else {
-                return Ok(false);
-            };
-            let removed = if path.is_file() {
-                std::fs::remove_file(&path)?;
-                true
-            } else {
-                false
-            };
-
-            if let Some(dir) = safe_shared_dir(repo) {
-                // Best-effort (fix round 2): this is an ADVISORY scan after
-                // the canonical delete already succeeded -- a scan failure
-                // (e.g. the directory becomes unreadable mid-call) must not
-                // turn an already-completed forget into an `Err`.
-                let stray: Vec<String> = read_entries(&dir)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter(|(other_path, other)| other.key == key && *other_path != path)
-                    .map(|(other_path, _)| other_path.display().to_string())
-                    .collect();
-                if !stray.is_empty() {
-                    let _ = super::log::append(
-                        state,
-                        &super::log::Decision {
-                            ts: now_secs(),
-                            session: "n/a",
-                            verb: "memory",
-                            verdict: "n/a",
-                            score: 0,
-                            action: "forget-collision-left",
-                            detail: &format!("'{key}' still claimed by: {}", stray.join(", ")),
-                            observed_at: None,
-                        },
-                    );
-                }
-            }
-
-            Ok(removed)
+            // Review round 2, finding 1: a shared-bank writer, so it takes
+            // the same bank lock every other shared writer does.
+            let lock = lock_bank(MemoryScope::Shared, state, slug)?;
+            forget_shared_locked(repo, state, key, &lock)
         }
     }
+}
+
+/// `forget_scoped`'s Shared arm, factored out so `rollback` (review round
+/// 2, finding 2) can call it while already holding the SAME `BankLock` it
+/// acquired for its own check-then-inverse, rather than going through the
+/// public `forget_scoped` (which would try to acquire a second lock on the
+/// same file and deadlock -- `BankLock`'s own doc comment). `_lock` is the
+/// same lock-proof parameter every other `_inner`/`_locked` helper takes.
+fn forget_shared_locked(
+    repo: &Path,
+    state: &StateDir,
+    key: &str,
+    _lock: &BankLock,
+) -> CtxResult<bool> {
+    let Some(path) = shared_canonical_path(repo, key) else {
+        return Ok(false);
+    };
+    let removed = if path.is_file() {
+        std::fs::remove_file(&path)?;
+        true
+    } else {
+        false
+    };
+
+    if let Some(dir) = safe_shared_dir(repo) {
+        // Best-effort (fix round 2): this is an ADVISORY scan after
+        // the canonical delete already succeeded -- a scan failure
+        // (e.g. the directory becomes unreadable mid-call) must not
+        // turn an already-completed forget into an `Err`.
+        let stray: Vec<String> = read_entries(&dir)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(other_path, other)| other.key == key && *other_path != path)
+            .map(|(other_path, _)| other_path.display().to_string())
+            .collect();
+        if !stray.is_empty() {
+            let _ = super::log::append(
+                state,
+                &super::log::Decision {
+                    ts: now_secs(),
+                    session: "n/a",
+                    verb: "memory",
+                    verdict: "n/a",
+                    score: 0,
+                    action: "forget-collision-left",
+                    detail: &format!("'{key}' still claimed by: {}", stray.join(", ")),
+                    observed_at: None,
+                },
+            );
+        }
+    }
+
+    Ok(removed)
 }
 
 /// Scope-aware verify: `Private` delegates unchanged to `verify` above,
@@ -1294,6 +1319,9 @@ pub fn verify_scoped(
             if !is_regular_file(&path) {
                 return Ok(false);
             }
+            // Review round 2, finding 1: held across the read-decide-write
+            // below, same as every other shared writer.
+            let _lock = lock_bank(MemoryScope::Shared, state, slug)?;
             // Hermes round (issue #295/#322): a file that EXISTS but cannot
             // be read (permissions, encoding, a partial write caught
             // mid-flight) is an error that stops the operation, never
@@ -1728,7 +1756,8 @@ pub fn remember(
     entry: &Entry,
     cfg: &CtxConfig,
 ) -> CtxResult<PathBuf> {
-    remember_inner(state, slug, entry, cfg, true)
+    let lock = lock_bank(private_or_global_scope(slug), state, slug)?;
+    remember_inner(state, slug, entry, cfg, true, &lock)
 }
 
 /// `remember`'s real body, with journaling made optional: `promote` (issue
@@ -1737,12 +1766,21 @@ pub fn remember(
 /// getting an extra `"remember"` one for free -- "every remember/forget/
 /// verify/promote/rollback appends EXACTLY ONE journal record" would
 /// otherwise be double-counted for every promotion into the global tier.
+///
+/// `_lock` (review round 2, finding 1) is never read -- its only job is to
+/// PROVE, at the type level, that the caller already holds this bank's
+/// `BankLock` before any read-decide-write happens here. Every caller
+/// reachable from outside this module goes through the public `remember`
+/// above, which acquires it; internal callers (`promote`, `rollback`)
+/// already hold the SAME lock for the same reason and pass it through
+/// rather than this function acquiring a second, deadlocking one.
 fn remember_inner(
     state: &StateDir,
     slug: &str,
     entry: &Entry,
     cfg: &CtxConfig,
     journal: bool,
+    _lock: &BankLock,
 ) -> CtxResult<PathBuf> {
     let dir = state.memory().join(slug);
     super::state::create_private_dir_all(&dir)?;
@@ -1859,7 +1897,8 @@ pub fn get(state: &StateDir, slug: &str, key: &str) -> CtxResult<Option<Entry>> 
 /// actually removed; a no-op forget of an absent key writes no record, same
 /// as it always wrote nothing to the bank itself.
 pub fn forget(state: &StateDir, slug: &str, key: &str) -> CtxResult<bool> {
-    forget_inner(state, slug, key, true)
+    let lock = lock_bank(private_or_global_scope(slug), state, slug)?;
+    forget_inner(state, slug, key, true, &lock)
 }
 
 /// `forget`'s real body, with journaling made optional -- see
@@ -1867,7 +1906,14 @@ pub fn forget(state: &StateDir, slug: &str, key: &str) -> CtxResult<bool> {
 /// 5) uses this with `journal = false` for the inverse of a CREATE record,
 /// so undoing a create appends only the rollback's own single journal
 /// record rather than one from this delete plus one from the rollback.
-fn forget_inner(state: &StateDir, slug: &str, key: &str, journal: bool) -> CtxResult<bool> {
+/// `_lock` is the same lock-proof parameter `remember_inner` documents.
+fn forget_inner(
+    state: &StateDir,
+    slug: &str,
+    key: &str,
+    journal: bool,
+    _lock: &BankLock,
+) -> CtxResult<bool> {
     let mut removed = false;
     for (path, entry) in list(state, slug)? {
         if entry.key == key {
@@ -1918,6 +1964,7 @@ pub fn forget_all(state: &StateDir, slug: &str) -> CtxResult<()> {
 /// entry was found. Journals a `"verify"` record (issue #295) whose
 /// `before_body`/`after_body` differ only in the `Verified` bullet.
 pub fn verify(state: &StateDir, slug: &str, key: &str) -> CtxResult<bool> {
+    let _lock = lock_bank(private_or_global_scope(slug), state, slug)?;
     for (path, mut entry) in list(state, slug)? {
         if entry.key == key {
             let before_body = entry.to_markdown();
@@ -1997,14 +2044,63 @@ pub fn session_dir(state: &StateDir, slug: &str, session_id: &str) -> PathBuf {
         .join(sanitize_session_id(session_id))
 }
 
+/// The pre-review-round-1 sanitize rule: charset substitution only, no
+/// `sha256` suffix. A binary built before round 1's finding-6 fix creates
+/// session directories under this name; review round 2's finding 4 exists
+/// because those directories are otherwise invisible to (and unreachable
+/// by) every post-fix lookup and cleanup. `session_dir`'s own doc comment
+/// covers why the NEW name has the suffix at all -- this function exists
+/// only so `list_session`/`forget_session_all` can also check the OLD one.
+fn legacy_sanitize_session_id(id: &str) -> String {
+    let raw: String = id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .take(80)
+        .collect();
+    if raw.trim_matches('-').is_empty() {
+        "session".to_string()
+    } else {
+        raw
+    }
+}
+
+/// The legacy (pre-round-1) unsuffixed session directory -- see
+/// `legacy_sanitize_session_id`'s own doc comment.
+fn legacy_session_dir(state: &StateDir, slug: &str, session_id: &str) -> PathBuf {
+    state
+        .memory()
+        .join(slug)
+        .join("sessions")
+        .join(legacy_sanitize_session_id(session_id))
+}
+
 /// Lists every entry stored in one session's own tier, oldest-written-first
 /// -- the `list`/`list_scoped` analogue for `MemoryScope::Session`.
+///
+/// Review round 2, finding 4: also reads the LEGACY unsuffixed directory
+/// (`legacy_session_dir`) when it exists, so a session registered by a
+/// pre-round-1 binary -- whose entries live there, not under the new
+/// hash-suffixed name -- still recalls its own entries across the upgrade
+/// rather than finding an empty tier. New writes always go to the new
+/// directory (`remember_session_inner`); this is a read-side (and, via
+/// `forget_session_all`, cleanup-side) accommodation only.
 pub fn list_session(
     state: &StateDir,
     slug: &str,
     session_id: &str,
 ) -> CtxResult<Vec<(PathBuf, Entry)>> {
-    read_entries(&session_dir(state, slug, session_id))
+    let mut entries = read_entries(&session_dir(state, slug, session_id))?;
+    let legacy = legacy_session_dir(state, slug, session_id);
+    if legacy.is_dir() {
+        entries.extend(read_entries(&legacy)?);
+    }
+    Ok(entries)
 }
 
 /// The single entry for `key` in one session's own tier, if any.
@@ -2032,13 +2128,19 @@ pub fn remember_session(
     entry: &Entry,
     cfg: &CtxConfig,
 ) -> CtxResult<PathBuf> {
-    remember_session_inner(state, slug, session_id, entry, cfg, true)
+    let lock = lock_bank(MemoryScope::Session, state, slug)?;
+    remember_session_inner(state, slug, session_id, entry, cfg, true, &lock)
 }
 
 /// `remember_session`'s real body, with journaling made optional -- see
 /// `remember_inner`'s own doc comment; `rollback` replays a restored
 /// session-tier entry through this with `journal = false` so it can append
 /// its own single `"rollback"` record instead of an extra `"remember"` one.
+/// `_lock` is the same lock-proof parameter `remember_inner` documents --
+/// `Private`/`Session` share one lock per slug (`bank_lock_path`'s own doc
+/// comment), so this and `remember_inner` never run concurrently for the
+/// same repository either.
+#[allow(clippy::too_many_arguments)]
 fn remember_session_inner(
     state: &StateDir,
     slug: &str,
@@ -2046,6 +2148,7 @@ fn remember_session_inner(
     entry: &Entry,
     cfg: &CtxConfig,
     journal: bool,
+    _lock: &BankLock,
 ) -> CtxResult<PathBuf> {
     let dir = session_dir(state, slug, session_id);
     super::state::create_private_dir_all(&dir)?;
@@ -2127,6 +2230,7 @@ fn forget_session_inner(
     session_id: &str,
     key: &str,
     journal: bool,
+    _lock: &BankLock,
 ) -> CtxResult<bool> {
     let dir = session_dir(state, slug, session_id);
     let mut removed = false;
@@ -2170,10 +2274,20 @@ fn forget_session_inner(
 /// #295): a session-scoped entry must never outlive the session it belongs
 /// to. Not journaled per-entry, the same "a bulk clear is not a per-key
 /// operation" reasoning `forget_all` already follows.
+///
+/// Review round 2, finding 4: also removes the LEGACY unsuffixed directory
+/// (`legacy_session_dir`) when present, so a mid-upgrade session's entries
+/// are actually cleaned up on retirement/rotation instead of becoming
+/// permanently invisible (per `list_session`'s own fix) AND permanently
+/// orphaned on disk.
 pub fn forget_session_all(state: &StateDir, slug: &str, session_id: &str) -> CtxResult<()> {
     let dir = session_dir(state, slug, session_id);
     if dir.is_dir() {
         std::fs::remove_dir_all(&dir)?;
+    }
+    let legacy = legacy_session_dir(state, slug, session_id);
+    if legacy.is_dir() {
+        std::fs::remove_dir_all(&legacy)?;
     }
     Ok(())
 }
@@ -2186,6 +2300,7 @@ pub fn verify_session(
     session_id: &str,
     key: &str,
 ) -> CtxResult<bool> {
+    let _lock = lock_bank(MemoryScope::Session, state, slug)?;
     let dir = session_dir(state, slug, session_id);
     for (path, mut entry) in read_entries(&dir)? {
         if entry.key == key {
@@ -2963,50 +3078,67 @@ pub fn check_if_unchanged(existing: Option<&Entry>, expected: &str) -> CtxResult
     }
 }
 
-/// One advisory OS lock per memory-bank directory, held across `--if-unchanged`'s
-/// check-then-write (review round 1, finding 2): without it, two concurrent
-/// `remember --if-unchanged <hash>` calls against the same key could each
-/// read the same pre-write body, each pass the hash check, and both write --
-/// exactly the silent-last-writer-wins race the flag exists to close.
-/// Mirrors `group::open_lock_file`/`task::lock_tasks`'s own advisory-lock
-/// shape exactly (same lock-file idiom, same "leave the file behind on
-/// drop" reasoning) rather than reinventing one. `unlock()` on drop is
-/// best-effort, like `GroupLock`'s/`TaskLock`'s own.
-pub(crate) struct IfUnchangedLock(std::fs::File);
+/// A held, per-memory-bank advisory OS lock (review round 2, findings 1 and
+/// 3). Acquired ONCE at each PUBLIC write entry point (`remember`, `forget`,
+/// `verify`, `upsert_shared`, `remember_session`, `verify_session`,
+/// `promote`, `rollback`, and the Shared-scope arms of `forget_scoped`/
+/// `verify_scoped`) and threaded down into every `_inner` helper as
+/// `&BankLock`, so a function that already holds the lock never tries to
+/// acquire it a second time: `std::fs::File::lock` is not re-entrant within
+/// one process -- a second lock on a second handle for the same path BLOCKS
+/// (deadlocking the caller against itself on Windows in particular), it
+/// does not silently succeed the way a re-entrant mutex would. This closes
+/// review round 1's residual gap: that round only ever locked the
+/// `--if-unchanged` path, so an ordinary unconditional `remember`/`forget`/
+/// `verify`/`promote` racing an `--if-unchanged` writer still clobbered it --
+/// the conflict check was a check, not a compare-and-swap, without every
+/// writer serializing on the same lock.
+///
+/// Lives entirely in the trusted state dir, never in the repo checkout
+/// (review round 2, finding 3): see `bank_lock_path` for the exact three
+/// paths. Mirrors `group::open_lock_file`/`task::lock_tasks`'s own
+/// advisory-lock shape exactly (same lock-file idiom, same "leave the file
+/// behind on drop" reasoning) rather than reinventing one. `unlock()` on
+/// drop is best-effort, like `GroupLock`'s/`TaskLock`'s own.
+pub(crate) struct BankLock(std::fs::File);
 
-impl Drop for IfUnchangedLock {
+impl Drop for BankLock {
     fn drop(&mut self) {
         let _ = self.0.unlock();
     }
 }
 
-/// Locks `<dir>/.lock`, creating `dir` first if it does not exist yet (a
-/// fresh bank with no entries yet still needs somewhere to put the lock
-/// file). `dir` is whichever directory the target scope's key actually
-/// lives under -- `lock_dir_for_if_unchanged` resolves that per scope.
-pub(crate) fn lock_bank_dir(dir: &Path) -> CtxResult<IfUnchangedLock> {
-    std::fs::create_dir_all(dir)?;
-    let file = super::group::open_lock_file(&dir.join(".lock"))?;
-    file.lock()?;
-    Ok(IfUnchangedLock(file))
+/// The lock file path for `scope`'s bank -- ALWAYS inside the trusted state
+/// dir, never the repo checkout (review round 2, finding 3: the shared
+/// bank's lock used to live at `<repo>/.zirv/memory/.lock`, a
+/// repo-controlled path a hostile checkout could commit as a symlink
+/// pointing anywhere on the machine, since `open_lock_file` follows one).
+/// `Private`/`Session` share one lock (`<state>/memory/<slug>/.lock`) --
+/// the slug already identifies which repository, and both tiers live under
+/// the same bank root; `Shared` gets its own file in the same directory
+/// (`shared.lock`) rather than a `.lock` inside the repo-owned
+/// `<repo>/.zirv/memory/` directory itself; `Global` gets
+/// `<state>/memory/_global/.lock`.
+fn bank_lock_path(scope: MemoryScope, state: &StateDir, slug: &str) -> PathBuf {
+    match scope {
+        MemoryScope::Global => state.memory().join(GLOBAL_SLUG).join(".lock"),
+        MemoryScope::Shared => state.memory().join(slug).join("shared.lock"),
+        MemoryScope::Private | MemoryScope::Session => state.memory().join(slug).join(".lock"),
+    }
 }
 
-/// The directory `--if-unchanged`'s lock must be taken on for `scope`, or
-/// `None` when the scope cannot resolve one at all (`Shared` behind a
-/// symlinked `.zirv`/`.zirv/memory` -- the write itself will refuse with
-/// its own error in that case, so skipping the lock costs nothing).
-/// `session_id` is required (and only meaningful) for `Session`.
-pub(crate) fn lock_dir_for_if_unchanged(
-    scope: MemoryScope,
-    repo: &Path,
-    state: &StateDir,
-    slug: &str,
-    session_id: Option<&str>,
-) -> Option<PathBuf> {
-    match scope {
-        MemoryScope::Session => session_id.map(|id| session_dir(state, slug, id)),
-        _ => scope.dir(repo, state, slug),
+/// Acquires `scope`'s bank lock (see `BankLock`/`bank_lock_path`'s own doc
+/// comments), creating its parent directory first if it does not exist yet
+/// (a fresh bank with no entries yet still needs somewhere to put the lock
+/// file).
+pub(crate) fn lock_bank(scope: MemoryScope, state: &StateDir, slug: &str) -> CtxResult<BankLock> {
+    let path = bank_lock_path(scope, state, slug);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
     }
+    let file = super::group::open_lock_file(&path)?;
+    file.lock()?;
+    Ok(BankLock(file))
 }
 
 /// Moves an entry up a tier (issue #295): `zirv memory promote <key>
@@ -3037,6 +3169,16 @@ pub fn promote(
     if !matches!(target, MemoryScope::Shared | MemoryScope::Global) {
         return Err("zirv memory promote: pass --shared or --global".into());
     }
+
+    // Review round 2, finding 1: lock BOTH banks this operation touches for
+    // its whole read-decide-write -- the origin (`Private`/`Session` share
+    // one lock per slug, so `MemoryScope::Private` here locks the same file
+    // a session-tier origin would) and the destination (`Shared`/`Global`)
+    // -- acquired in a FIXED order (origin, then destination) every single
+    // call, so two concurrent `promote`s can never deadlock by acquiring
+    // the same pair of locks in opposite order.
+    let origin_lock = lock_bank(MemoryScope::Private, state, slug)?;
+    let dest_lock = lock_bank(target, state, slug)?;
 
     let from_session = session_id
         .filter(|id| !id.trim().is_empty())
@@ -3071,8 +3213,10 @@ pub fn promote(
         .map(|existing| existing.to_markdown());
 
     let path = match target {
-        MemoryScope::Shared => upsert_shared_inner(repo, state, slug, cfg, &entry, false, false)?,
-        MemoryScope::Global => remember_inner(state, GLOBAL_SLUG, &entry, cfg, false)?,
+        MemoryScope::Shared => {
+            upsert_shared_inner(repo, state, slug, cfg, &entry, false, false, &dest_lock)?
+        }
+        MemoryScope::Global => remember_inner(state, GLOBAL_SLUG, &entry, cfg, false, &dest_lock)?,
         MemoryScope::Private | MemoryScope::Session => {
             unreachable!("checked by the match!(...) guard above")
         }
@@ -3086,10 +3230,10 @@ pub fn promote(
     // `"forget"` record for the same operation.
     match origin_session {
         Some(id) => {
-            let _ = forget_session_inner(state, slug, id, key, false);
+            let _ = forget_session_inner(state, slug, id, key, false, &origin_lock);
         }
         None => {
-            let _ = forget_inner(state, slug, key, false);
+            let _ = forget_inner(state, slug, key, false, &origin_lock);
         }
     }
 
@@ -3220,6 +3364,14 @@ pub fn rollback(
         let key = record.key.clone();
         let session_id = record.session_id.as_deref();
 
+        // Review round 2, finding 1 + 2: acquired ONCE, before the
+        // conflict-check read, and held through the inverse write and the
+        // rollback's own journal append below -- the whole
+        // read-decide-write is now a single critical section, so a
+        // concurrent write between the check and the inverse is impossible
+        // by construction, not merely unlikely.
+        let lock = lock_bank(scope, state, journal_slug)?;
+
         let current = current_raw_body(scope, repo, state, journal_slug, session_id, &key)?;
         let unchanged_since = match (&record.after_body, &current) {
             (None, None) => true,
@@ -3242,10 +3394,11 @@ pub fn rollback(
                 // its own `"forget"` record -- one rollback, one record.
                 match scope {
                     MemoryScope::Shared => {
-                        // `forget_scoped`'s Shared arm never journals on
-                        // its own (unlike its Private/Global arms), so no
-                        // separate non-journaling variant is needed here.
-                        forget_scoped(MemoryScope::Shared, repo, state, journal_slug, &key)?;
+                        // `forget_shared_locked`, not the public
+                        // `forget_scoped` -- this call already holds
+                        // `lock`, and `forget_scoped` would try to acquire
+                        // a second lock on the same file and deadlock.
+                        forget_shared_locked(repo, state, &key, &lock)?;
                     }
                     MemoryScope::Session => {
                         let Some(session_id) = session_id else {
@@ -3254,10 +3407,10 @@ pub fn rollback(
                                     .into(),
                             );
                         };
-                        forget_session_inner(state, journal_slug, session_id, &key, false)?;
+                        forget_session_inner(state, journal_slug, session_id, &key, false, &lock)?;
                     }
                     MemoryScope::Private | MemoryScope::Global => {
-                        forget_inner(state, journal_slug, &key, false)?;
+                        forget_inner(state, journal_slug, &key, false, &lock)?;
                     }
                 }
             }
@@ -3273,6 +3426,7 @@ pub fn rollback(
                             &restored,
                             false,
                             false,
+                            &lock,
                         )?;
                     }
                     MemoryScope::Session => {
@@ -3289,10 +3443,11 @@ pub fn rollback(
                             &restored,
                             cfg,
                             false,
+                            &lock,
                         )?;
                     }
                     MemoryScope::Private | MemoryScope::Global => {
-                        remember_inner(state, journal_slug, &restored, cfg, false)?;
+                        remember_inner(state, journal_slug, &restored, cfg, false, &lock)?;
                     }
                 }
             }
@@ -3538,37 +3693,6 @@ pub fn run_remember_with<W: Write>(
                         .into(),
                 );
             }
-            // Review round 1, finding 2: held from the check below through
-            // the write further down (still in scope at the end of this
-            // match arm, dropped only once this whole arm returns) so two
-            // concurrent `--if-unchanged` commands cannot both read the
-            // same pre-write body, both pass the check, and both write.
-            // Scoped to the `--if-unchanged` path only, per the finding --
-            // a bare `remember` with no conflict check keeps its existing,
-            // unlocked behavior.
-            let _if_unchanged_lock = if args.if_unchanged.is_some() {
-                match lock_dir_for_if_unchanged(scope, repo, &state, &slug, session_id.as_deref()) {
-                    Some(dir) => {
-                        Some(lock_bank_dir(&dir).map_err(|e| format!("zirv ctx remember: {e}"))?)
-                    }
-                    None => None,
-                }
-            } else {
-                None
-            };
-            if let Some(expected) = &args.if_unchanged {
-                let existing = match scope {
-                    MemoryScope::Session => get_session(
-                        &state,
-                        &slug,
-                        session_id.as_deref().unwrap_or_default(),
-                        &args.key,
-                    )?,
-                    _ => get_scoped(scope, repo, &state, &slug, &cfg, &args.key)?,
-                };
-                check_if_unchanged(existing.as_ref(), expected)
-                    .map_err(|e| format!("zirv ctx remember: {e}"))?;
-            }
             let now = now_secs();
             let entry = Entry {
                 key: args.key.clone(),
@@ -3586,7 +3710,62 @@ pub fn run_remember_with<W: Write>(
                 // exists to set it yet.
                 paths: Vec::new(),
             };
-            let path = if scope == MemoryScope::Session {
+            // Review round 2, finding 1: every write acquires this bank's
+            // lock now. `--if-unchanged` needs the check and the write
+            // under the SAME held lock (else a second writer could land in
+            // between), so that path takes the lock itself here and calls
+            // the `_inner` functions directly -- the public wrappers below
+            // would try to acquire a second lock on the same file and
+            // deadlock (`BankLock`'s own doc comment). Without
+            // `--if-unchanged`, the public wrappers' own internal locking
+            // is enough.
+            let path = if let Some(expected) = &args.if_unchanged {
+                let lock = lock_bank(scope, &state, &slug)?;
+                let existing = match scope {
+                    MemoryScope::Session => get_session(
+                        &state,
+                        &slug,
+                        session_id.as_deref().unwrap_or_default(),
+                        &args.key,
+                    )?,
+                    _ => get_scoped(scope, repo, &state, &slug, &cfg, &args.key)?,
+                };
+                check_if_unchanged(existing.as_ref(), expected)
+                    .map_err(|e| format!("zirv ctx remember: {e}"))?;
+                if scope == MemoryScope::Session {
+                    remember_session_inner(
+                        &state,
+                        &slug,
+                        session_id.as_deref().unwrap_or_default(),
+                        &entry,
+                        &cfg,
+                        true,
+                        &lock,
+                    )
+                } else if scope == MemoryScope::Shared {
+                    upsert_shared_inner(
+                        repo,
+                        &state,
+                        &slug,
+                        &cfg,
+                        &entry,
+                        args.allow_sensitive,
+                        true,
+                        &lock,
+                    )
+                } else {
+                    // Private or Global -- Global writes under GLOBAL_SLUG,
+                    // not this repository's own slug (mirrors
+                    // `upsert_scoped`'s own `Global => remember(state,
+                    // GLOBAL_SLUG, ...)` arm).
+                    let write_slug = if scope == MemoryScope::Global {
+                        GLOBAL_SLUG
+                    } else {
+                        slug.as_str()
+                    };
+                    remember_inner(&state, write_slug, &entry, &cfg, true, &lock)
+                }
+            } else if scope == MemoryScope::Session {
                 remember_session(
                     &state,
                     &slug,
@@ -9075,12 +9254,13 @@ This should not appear in the body.\n";
         );
     }
 
-    /// Finding 2: two concurrent `--if-unchanged` remembers on the same key
-    /// must not both succeed. The lock is exercised directly here (spawning
-    /// real concurrent processes is out of scope for a unit test): holding
-    /// it externally must make a second `run_remember_with` call see the
-    /// first's write and refuse via the ordinary hash-mismatch path, not
-    /// silently race past it.
+    /// Finding 2 (review round 1): two concurrent `--if-unchanged`
+    /// remembers on the same key must not both succeed. The lock is
+    /// exercised directly here (spawning real concurrent processes is out
+    /// of scope for a unit test): holding the exact `BankLock` any writer
+    /// for this scope would acquire (review round 2's `lock_bank`, not a
+    /// directory-specific lock any more -- see `bank_lock_path`) must make
+    /// a second, independent handle on the same lock file refuse to lock.
     #[test]
     fn if_unchanged_lock_is_held_across_the_check_and_the_write() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -9098,10 +9278,7 @@ This should not appear in the body.\n";
         // Hold the same lock `run_remember_with` would take for this key's
         // scope (Private) for the duration of this block, simulating a
         // concurrent writer already mid-check-then-write.
-        let dir = MemoryScope::Private
-            .dir(tmp.path(), &state, &slug)
-            .expect("private dir resolves");
-        let _held = lock_bank_dir(&dir).expect("lock");
+        let _held = lock_bank(MemoryScope::Private, &state, &slug).expect("lock");
 
         // A second writer trying to acquire the same lock (rather than
         // proceeding unlocked) would block here in a real concurrent
@@ -9112,13 +9289,93 @@ This should not appear in the body.\n";
         // (Windows/unix both refuse a second exclusive lock on the same
         // file from the same process for a plain `File::lock`/`try_lock`
         // pair opened independently).
-        let second_file =
-            super::super::group::open_lock_file(&dir.join(".lock")).expect("open second handle");
+        let path = bank_lock_path(MemoryScope::Private, &state, &slug);
+        let second_file = super::super::group::open_lock_file(&path).expect("open second handle");
         let contended = second_file.try_lock().is_err();
         assert!(
             contended,
             "a second handle must not be able to take the lock while the first holds it"
         );
+    }
+
+    /// Review round 2, finding 1: an ORDINARY `remember` (no
+    /// `--if-unchanged` at all) must acquire the same bank lock every
+    /// other writer does, not just the `--if-unchanged` path -- that was
+    /// exactly the gap review round 1 left open. Proven with a real second
+    /// thread: while this bank's lock is held here, a plain `remember` call
+    /// on another thread must actually BLOCK (not silently write past the
+    /// lock), and only complete once the lock is released.
+    #[test]
+    fn an_ordinary_remember_blocks_while_the_banks_lock_is_held_elsewhere() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = CtxConfig::default();
+        let slug = "-repo".to_string();
+
+        let held = lock_bank(MemoryScope::Private, &state, &slug).expect("lock");
+
+        let state2 = state.clone();
+        let cfg2 = cfg.clone();
+        let slug2 = slug.clone();
+        let handle = std::thread::spawn(move || {
+            remember(&state2, &slug2, &sample("blocked-key", 1), &cfg2).map_err(|e| e.to_string())
+        });
+
+        // Give the other thread time to reach (and block on) its own
+        // `lock_bank` call -- generous enough that a slow CI machine
+        // cannot mistake "still starting up" for "genuinely blocked".
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(
+            !handle.is_finished(),
+            "an ordinary remember must block while this bank's lock is held elsewhere, not write past it"
+        );
+
+        drop(held);
+        handle
+            .join()
+            .expect("thread must not panic")
+            .expect("remember succeeds once the lock is released");
+        assert!(
+            get(&state, &slug, "blocked-key").expect("get").is_some(),
+            "the blocked write must have completed once unblocked"
+        );
+    }
+
+    /// Review round 2, finding 2: `rollback`'s conflict check (finding 3)
+    /// is check-then-act unless the SAME lock is held across the check and
+    /// the inverse write it decides to perform. Proven directly: while a
+    /// lock for the record's own scope is held externally (simulating
+    /// `rollback` mid-operation), a second independent handle on that
+    /// exact lock file can never also lock it -- the property that makes
+    /// `rollback`'s own read-decide-write a single atomic critical section
+    /// rather than three independent steps another writer could interleave
+    /// with.
+    #[test]
+    fn rollback_holds_the_bank_lock_across_its_own_check_and_inverse() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = CtxConfig::default();
+        let repo = crate::commands::ctx::testenv::repo();
+
+        remember(&state, "-repo", &sample("locked-rollback-key", 1), &cfg).expect("remember");
+        let id = read_journal(&state, "-repo")[0].id.clone();
+
+        // Hold the exact lock `rollback` itself acquires for this record's
+        // scope (Private) before it does anything else.
+        let held = lock_bank(MemoryScope::Private, &state, "-repo").expect("lock");
+        let path = bank_lock_path(MemoryScope::Private, &state, "-repo");
+        let second = super::super::group::open_lock_file(&path).expect("open second handle");
+        assert!(
+            second.try_lock().is_err(),
+            "a second handle must not be able to take the bank lock while rollback's own critical section is open"
+        );
+        drop(second);
+        drop(held);
+
+        // Once released, `rollback` (which acquires the SAME lock
+        // internally) proceeds normally.
+        let rolled = rollback(repo.path(), &state, "-repo", &cfg, &id, "tester").expect("rollback");
+        assert!(rolled);
     }
 
     /// Finding 3: rolling back an OLDER record after a LATER write touched
@@ -9254,6 +9511,93 @@ This should not appear in the body.\n";
             list_session(&state, slug, "a?b").expect("list a?b").len(),
             1,
             "a colliding-prefix session's entries must survive the other's retirement"
+        );
+    }
+
+    /// Review round 2, finding 4: a session directory created by a
+    /// PRE-round-1 binary uses the unsuffixed sanitized name
+    /// (`legacy_sanitize_session_id`) -- simulated here by writing directly
+    /// under `legacy_session_dir` rather than through `remember_session`
+    /// (which always writes the new, hash-suffixed name). `list_session`
+    /// must still surface that entry so a mid-upgrade session recalls its
+    /// own prior facts instead of finding an apparently-empty tier.
+    #[test]
+    fn list_session_also_reads_a_legacy_unsuffixed_directory() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let slug = "-repo";
+        let session_id = "legacy-session-id";
+
+        let legacy_dir = legacy_session_dir(&state, slug, session_id);
+        std::fs::create_dir_all(&legacy_dir).expect("mkdir legacy dir");
+        let mut entry = sample("legacy-key", 1);
+        entry.body = "written by a pre-fix binary".to_string();
+        std::fs::write(
+            legacy_dir.join("0000000001-legacy-key.md"),
+            entry.to_markdown(),
+        )
+        .expect("write legacy entry file");
+
+        let listed = list_session(&state, slug, session_id).expect("list_session");
+        assert!(
+            listed.iter().any(|(_, e)| e.key == "legacy-key"),
+            "a legacy-directory entry must still be recalled: {listed:?}"
+        );
+
+        // A NEW write for the same session id must land in the new,
+        // hash-suffixed directory, not the legacy one -- `list_session`
+        // must then surface both.
+        let cfg = CtxConfig::default();
+        remember_session(&state, slug, session_id, &sample("new-key", 2), &cfg)
+            .expect("remember into the new directory");
+        let listed = list_session(&state, slug, session_id).expect("list_session again");
+        assert!(listed.iter().any(|(_, e)| e.key == "legacy-key"));
+        assert!(listed.iter().any(|(_, e)| e.key == "new-key"));
+        assert_ne!(
+            session_dir(&state, slug, session_id),
+            legacy_dir,
+            "the new and legacy directories must actually be different paths"
+        );
+    }
+
+    /// Review round 2, finding 4: `forget_session_all` must remove BOTH the
+    /// new hash-suffixed directory and the legacy unsuffixed one, so a
+    /// mid-upgrade session's entries are actually cleaned up on
+    /// retirement/rotation rather than becoming permanently orphaned on
+    /// disk once `list_session` stops being the only thing that can see
+    /// them.
+    #[test]
+    fn forget_session_all_removes_both_the_new_and_the_legacy_directory() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = CtxConfig::default();
+        let slug = "-repo";
+        let session_id = "legacy-session-id-2";
+
+        let legacy_dir = legacy_session_dir(&state, slug, session_id);
+        std::fs::create_dir_all(&legacy_dir).expect("mkdir legacy dir");
+        std::fs::write(
+            legacy_dir.join("0000000001-legacy-key.md"),
+            sample("legacy-key", 1).to_markdown(),
+        )
+        .expect("write legacy entry file");
+        remember_session(&state, slug, session_id, &sample("new-key", 2), &cfg)
+            .expect("remember into the new directory");
+
+        assert!(legacy_dir.is_dir());
+        assert!(session_dir(&state, slug, session_id).is_dir());
+
+        forget_session_all(&state, slug, session_id).expect("forget_session_all");
+
+        assert!(
+            !legacy_dir.exists(),
+            "the legacy directory must be removed too"
+        );
+        assert!(!session_dir(&state, slug, session_id).exists());
+        assert!(
+            list_session(&state, slug, session_id)
+                .expect("list after forget_session_all")
+                .is_empty()
         );
     }
 
