@@ -178,6 +178,8 @@ model = "fable"
 # retrieval_max_entries = 6          # REPO-FORBIDDEN (ZIRV_CTX_MEMORY_RETRIEVAL_MAX_ENTRIES): max number of retrieved entries, independent of bytes. Default: 6.
 # harvest_max_entries = 5            # REPO-FORBIDDEN (ZIRV_CTX_MEMORY_HARVEST_MAX_ENTRIES): most durable entries one session's own automatic harvest may store. Default: 5.
 # harvest_max_bytes = 2048           # REPO-FORBIDDEN (ZIRV_CTX_MEMORY_HARVEST_MAX_BYTES): cumulative byte budget for one session's own automatic harvest. Default: 2048.
+# session_enabled = true             # REPO-FORBIDDEN (ZIRV_CTX_MEMORY_SESSION): whether the per-session ephemeral tier is read at all, underneath the enabled master switch above. Default: true.
+# journal_max_entries = 500          # REPO-FORBIDDEN (ZIRV_CTX_MEMORY_JOURNAL_MAX_ENTRIES): lines each memory bank's own journal.jsonl keeps before the oldest are pruned. Default: 500.
 
 # [setup]                            # not REPO-FORBIDDEN: bookkeeping for the guided `zirv setup` flow, written only to ~/.zirv/ctx.toml.
 # backup_retention_runs = 20         # count cap on .zirv/backups/ai-reset runs, applied on the next write; the oldest run is always pinned outside this cap. Default: 20.

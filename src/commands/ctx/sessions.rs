@@ -818,6 +818,21 @@ impl SessionGuard {
         // supervisor's own leftover is still cleaned up by `list()`'s own
         // `sweep_orphaned_screening_summaries`.
         let _ = std::fs::remove_file(screening_path(&self.state, &self.record.short));
+        // Issue #295: a session-tier memory entry must never outlive the
+        // session it belongs to -- best-effort, like every other cleanup
+        // here; a failed removal leaves an orphaned directory, never data
+        // loss for anything still live. Keyed on `record.session` (the
+        // CURRENT session id this guard's record carries at release time,
+        // which may have rotated since `remember_session` was actually
+        // called for a `loop`/`exec` supervisor's earlier cycle -- see
+        // `memory::MemoryScope::Session`'s own doc comment for this
+        // accepted residual): an id that never held any session-tier
+        // entries removes nothing.
+        let _ = super::memory::forget_session_all(
+            &self.state,
+            &self.record.repo_slug,
+            &self.record.session,
+        );
     }
 }
 
@@ -2099,6 +2114,63 @@ mod tests {
         assert!(
             !path.exists(),
             "the record file is gone once the supervisor exits"
+        );
+    }
+
+    /// Issue #295: a session-scoped memory entry must never outlive the
+    /// session it belongs to -- `SessionGuard::release` (also reached via
+    /// `Drop`) removes the whole `sessions/<session-id>/` tier for this
+    /// record's `repo_slug`/`session` the moment the registry entry retires.
+    #[test]
+    fn retiring_a_session_removes_its_own_memory_tier_but_leaves_other_sessions_alone() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = state_in(tmp.path());
+        let repo = tmp.path().join("repo");
+        let session_id = "11111111-2222-4333-8444-555555555555";
+        let record = record_for(session_id, &repo, Verb::Wrap);
+        let slug = record.repo_slug.clone();
+        let cfg = super::super::config::CtxConfig::default();
+
+        let mut entry = super::super::memory::Entry {
+            key: "retiring-key".to_string(),
+            written_by: "claude".to_string(),
+            written: 1,
+            verified: 1,
+            source: "explicit".to_string(),
+            body: "gone once the session retires".to_string(),
+            importance: None,
+            confidence: None,
+            tags: Vec::new(),
+            paths: Vec::new(),
+        };
+        super::super::memory::remember_session(&state, &slug, session_id, &entry, &cfg)
+            .expect("remember into the session tier");
+        entry.key = "other-session-key".to_string();
+        super::super::memory::remember_session(&state, &slug, "another-session", &entry, &cfg)
+            .expect("remember into a different session's tier");
+
+        let guard = SessionGuard::register(&state, record);
+        assert_eq!(
+            super::super::memory::list_session(&state, &slug, session_id)
+                .expect("list before release")
+                .len(),
+            1
+        );
+
+        drop(guard);
+
+        assert!(
+            super::super::memory::list_session(&state, &slug, session_id)
+                .expect("list after release")
+                .is_empty(),
+            "the retired session's own memory tier must be gone"
+        );
+        assert_eq!(
+            super::super::memory::list_session(&state, &slug, "another-session")
+                .expect("list the other session")
+                .len(),
+            1,
+            "retiring one session must never touch another session's tier"
         );
     }
 

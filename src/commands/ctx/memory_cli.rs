@@ -93,6 +93,39 @@ pub enum MemoryVerb {
     /// `Source: explicit` entry is never auto-applied. Never deletes or
     /// forgets anything, and never touches git.
     Optimize(OptimizeArgs),
+    /// Reverses one journaled write by id (issue #295): restores the exact
+    /// prior body for an overwrite, recreates a forgotten entry, or deletes
+    /// an entry a create introduced. Replays through the normal write path,
+    /// so a restored shared entry still runs the secret screen and a
+    /// restored body over `max_entry_bytes` still truncates. Rolling back
+    /// the same id twice is a no-op, not a double-inverse.
+    Rollback(RollbackArgs),
+    /// Moves an entry up a tier (issue #295): from the session tier (if a
+    /// session id is present and the key lives there) or the private tier,
+    /// into `--shared` or `--global`. Re-runs the destination scope's own
+    /// caps and, for `--shared`, the secret screen -- a body that looks
+    /// credential-shaped is refused, not silently promoted.
+    Promote(PromoteArgs),
+}
+
+#[derive(Debug, clap::Args)]
+pub struct RollbackArgs {
+    /// The journal record id to reverse (`zirv ctx status` and this
+    /// module's own journal reads print it).
+    pub id: String,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct PromoteArgs {
+    /// Key to promote.
+    pub key: String,
+    /// Promote into the shared, repository-owned bank.
+    #[arg(long, default_value_t = false)]
+    pub shared: bool,
+    /// Promote into the operator-owned global bank shared by every
+    /// repository on this machine.
+    #[arg(long, default_value_t = false, conflicts_with = "shared")]
+    pub global: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -185,6 +218,12 @@ pub struct RememberArgs {
     /// uses).
     #[arg(long, default_value_t = false)]
     pub allow_sensitive: bool,
+    /// Issue #295: refuses the write (exit non-zero, nothing stored) unless
+    /// the entry's CURRENT body hash matches this SHA-256 hex digest, or the
+    /// literal value `absent`, which instead requires no entry exist yet for
+    /// this key. See `zirv ctx remember --if-unchanged`'s own doc comment.
+    #[arg(long)]
+    pub if_unchanged: Option<String>,
 }
 
 /// The only values `--importance`/`--confidence` accept -- the same two
@@ -264,6 +303,7 @@ fn scope_label(scope: MemoryScope) -> &'static str {
         MemoryScope::Private => "private",
         MemoryScope::Global => "global",
         MemoryScope::Shared => "shared",
+        MemoryScope::Session => "session",
     }
 }
 
@@ -399,7 +439,7 @@ fn render_entries<W: Write>(
         let verified_days = now.saturating_sub(entry.verified) / 86_400;
         let trust_note = match scope {
             MemoryScope::Shared => " -- shared: repository-owned content, not operator-verified",
-            MemoryScope::Private | MemoryScope::Global => "",
+            MemoryScope::Private | MemoryScope::Global | MemoryScope::Session => "",
         };
         writeln!(
             w,
@@ -451,7 +491,7 @@ fn render_ranked<W: Write>(
         let verified_days = now.saturating_sub(entry.verified) / 86_400;
         let trust_note = match scope {
             MemoryScope::Shared => " -- shared: repository-owned content, not operator-verified",
-            MemoryScope::Private | MemoryScope::Global => "",
+            MemoryScope::Private | MemoryScope::Global | MemoryScope::Session => "",
         };
         let reasons = if r.reasons.is_empty() {
             "no signal matched".to_string()
@@ -571,6 +611,7 @@ pub fn run_remember_with<W: Write>(
             repo: false,
             global: scope == MemoryScope::Global,
             allow_sensitive: false,
+            if_unchanged: args.if_unchanged.clone(),
             importance,
             confidence,
             tags: args.tags.clone(),
@@ -584,6 +625,11 @@ pub fn run_remember_with<W: Write>(
     let body = args.text.trim().to_string();
     if body.is_empty() {
         return Err("zirv memory remember: no text given".into());
+    }
+    if let Some(expected) = &args.if_unchanged {
+        let existing = memory::get_scoped(scope, repo, &state, &slug, &cfg, &args.key)?;
+        memory::check_if_unchanged(existing.as_ref(), expected)
+            .map_err(|e| format!("zirv memory remember: {e}"))?;
     }
     let written_by = env(AGENT_ENV)
         .filter(|v| !v.trim().is_empty())
@@ -772,6 +818,79 @@ pub fn run_optimize<W: Write>(args: &OptimizeArgs, w: &mut W) -> CtxResult<i32> 
     let env = env_from_process();
     run_optimize_with(args, w, &repo, &env)
 }
+
+pub fn run_rollback_with<W: Write>(
+    args: &RollbackArgs,
+    w: &mut W,
+    repo: &Path,
+    env: EnvLookup<'_>,
+) -> CtxResult<i32> {
+    let cfg = CtxConfig::load(repo, env)?;
+    let state = StateDir::resolve(env)?;
+    let slug = repo_slug(repo);
+    let written_by = env(AGENT_ENV)
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| "unknown".to_string());
+    if memory::rollback(repo, &state, &slug, &cfg, &args.id, &written_by)? {
+        writeln!(w, "zirv memory rollback: reversed record '{}'", args.id)?;
+    } else {
+        writeln!(
+            w,
+            "zirv memory rollback: record '{}' was already rolled back; nothing changed",
+            args.id
+        )?;
+    }
+    Ok(0)
+}
+
+pub fn run_rollback<W: Write>(args: &RollbackArgs, w: &mut W) -> CtxResult<i32> {
+    let repo = std::env::current_dir()?;
+    let env = env_from_process();
+    run_rollback_with(args, w, &repo, &env)
+}
+
+pub fn run_promote_with<W: Write>(
+    args: &PromoteArgs,
+    w: &mut W,
+    repo: &Path,
+    env: EnvLookup<'_>,
+) -> CtxResult<i32> {
+    let cfg = CtxConfig::load(repo, env)?;
+    let state = StateDir::resolve(env)?;
+    let slug = repo_slug(repo);
+    let session_id = env(super::adapters::SESSION_ENV).filter(|v| !v.trim().is_empty());
+    let target = if args.global {
+        MemoryScope::Global
+    } else if args.shared {
+        MemoryScope::Shared
+    } else {
+        return Err("zirv memory promote: pass --shared or --global".into());
+    };
+    let path = memory::promote(
+        repo,
+        &state,
+        &slug,
+        session_id.as_deref(),
+        &cfg,
+        &args.key,
+        target,
+    )?;
+    writeln!(
+        w,
+        "zirv memory promote: promoted '{}' to the {} bank at {}",
+        args.key,
+        scope_label(target),
+        path.display()
+    )?;
+    Ok(0)
+}
+
+pub fn run_promote<W: Write>(args: &PromoteArgs, w: &mut W) -> CtxResult<i32> {
+    let repo = std::env::current_dir()?;
+    let env = env_from_process();
+    run_promote_with(args, w, &repo, &env)
+}
+
 /// `args[0]` is the literal "memory" as it appeared in argv (discarded below,
 /// same as `ctx::dispatch`'s own `args[0]`: clap gets a synthetic program
 /// name instead, so the case the user actually typed never matters here).
@@ -798,6 +917,8 @@ pub fn dispatch(args: &[String]) -> i32 {
         MemoryVerb::Forget(a) => run_forget(a, &mut out),
         MemoryVerb::Verify(a) => run_verify(a, &mut out),
         MemoryVerb::Optimize(a) => run_optimize(a, &mut out),
+        MemoryVerb::Rollback(a) => run_rollback(a, &mut out),
+        MemoryVerb::Promote(a) => run_promote(a, &mut out),
     };
 
     match result {
@@ -1043,6 +1164,7 @@ mod tests {
                 confidence: None,
                 tags: Vec::new(),
                 allow_sensitive: false,
+                if_unchanged: None,
             },
             &mut Vec::new(),
             repo.path(),
@@ -1060,6 +1182,7 @@ mod tests {
                 confidence: None,
                 tags: Vec::new(),
                 allow_sensitive: false,
+                if_unchanged: None,
             },
             &mut Vec::new(),
             repo.path(),
@@ -1077,6 +1200,7 @@ mod tests {
                 confidence: None,
                 tags: Vec::new(),
                 allow_sensitive: false,
+                if_unchanged: None,
             },
             &mut Vec::new(),
             repo.path(),
@@ -1160,6 +1284,7 @@ mod tests {
             confidence: None,
             tags: Vec::new(),
             allow_sensitive: false,
+            if_unchanged: None,
         };
         let mut stdin = std::io::Cursor::new(Vec::<u8>::new());
         run_remember_with(
@@ -1180,6 +1305,7 @@ mod tests {
             confidence: None,
             tags: Vec::new(),
             allow_sensitive: false,
+            if_unchanged: None,
         };
         run_remember_with(
             &shared_args,
@@ -1285,6 +1411,7 @@ mod tests {
                 confidence: None,
                 tags: Vec::new(),
                 allow_sensitive: false,
+                if_unchanged: None,
             },
             &mut Vec::new(),
             repo.path(),
@@ -1302,6 +1429,7 @@ mod tests {
                 confidence: None,
                 tags: Vec::new(),
                 allow_sensitive: false,
+                if_unchanged: None,
             },
             &mut Vec::new(),
             repo.path(),
@@ -1438,6 +1566,7 @@ mod tests {
                 confidence: None,
                 tags: Vec::new(),
                 allow_sensitive: false,
+                if_unchanged: None,
             },
             &mut Vec::new(),
             repo.path(),
@@ -1455,6 +1584,7 @@ mod tests {
                 confidence: None,
                 tags: Vec::new(),
                 allow_sensitive: false,
+                if_unchanged: None,
             },
             &mut Vec::new(),
             repo.path(),
@@ -1510,6 +1640,7 @@ mod tests {
                     confidence: None,
                     tags: Vec::new(),
                     allow_sensitive: false,
+                    if_unchanged: None,
                 },
                 &mut Vec::new(),
                 repo.path(),
@@ -1565,6 +1696,7 @@ mod tests {
                     confidence: None,
                     tags: Vec::new(),
                     allow_sensitive: false,
+                    if_unchanged: None,
                 },
                 &mut Vec::new(),
                 repo.path(),
@@ -1615,6 +1747,7 @@ mod tests {
                 confidence: None,
                 tags: Vec::new(),
                 allow_sensitive: false,
+                if_unchanged: None,
             },
             &mut Vec::new(),
             repo.path(),
@@ -1664,6 +1797,7 @@ mod tests {
                 confidence: None,
                 tags: Vec::new(),
                 allow_sensitive: false,
+                if_unchanged: None,
             },
             &mut out,
             repo.path(),
@@ -1693,6 +1827,7 @@ mod tests {
                 confidence: None,
                 tags: Vec::new(),
                 allow_sensitive: false,
+                if_unchanged: None,
             },
             &mut Vec::new(),
             repo.path(),
@@ -1722,6 +1857,7 @@ mod tests {
                 confidence: None,
                 tags: Vec::new(),
                 allow_sensitive: false,
+                if_unchanged: None,
             },
             &mut Vec::new(),
             repo.path(),
@@ -1749,6 +1885,7 @@ mod tests {
                 confidence: None,
                 tags: Vec::new(),
                 allow_sensitive: true,
+                if_unchanged: None,
             },
             &mut out,
             repo.path(),
@@ -1786,6 +1923,7 @@ mod tests {
                 confidence: None,
                 tags: Vec::new(),
                 allow_sensitive: false,
+                if_unchanged: None,
             },
             &mut Vec::new(),
             repo.path(),
@@ -1819,6 +1957,7 @@ mod tests {
                 confidence: Some("high".to_string()),
                 tags: vec!["release".to_string(), "deploy".to_string()],
                 allow_sensitive: false,
+                if_unchanged: None,
             },
             &mut Vec::new(),
             repo.path(),
@@ -1836,6 +1975,7 @@ mod tests {
                 confidence: None,
                 tags: Vec::new(),
                 allow_sensitive: false,
+                if_unchanged: None,
             },
             &mut Vec::new(),
             repo.path(),
@@ -1905,6 +2045,7 @@ mod tests {
                 confidence: None,
                 tags: Vec::new(),
                 allow_sensitive: false,
+                if_unchanged: None,
             },
             &mut Vec::new(),
             repo.path(),
@@ -1944,6 +2085,7 @@ mod tests {
                 confidence: None,
                 tags: Vec::new(),
                 allow_sensitive: false,
+                if_unchanged: None,
             },
             &mut Vec::new(),
             repo.path(),
@@ -1961,6 +2103,7 @@ mod tests {
                 confidence: None,
                 tags: Vec::new(),
                 allow_sensitive: false,
+                if_unchanged: None,
             },
             &mut Vec::new(),
             repo.path(),
@@ -1978,6 +2121,7 @@ mod tests {
                 confidence: None,
                 tags: Vec::new(),
                 allow_sensitive: false,
+                if_unchanged: None,
             },
             &mut Vec::new(),
             repo.path(),
@@ -2151,6 +2295,7 @@ mod tests {
                 confidence: None,
                 tags: Vec::new(),
                 allow_sensitive: false,
+                if_unchanged: None,
             },
             &mut Vec::new(),
             repo,

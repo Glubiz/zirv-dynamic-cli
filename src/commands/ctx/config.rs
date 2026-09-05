@@ -1029,6 +1029,22 @@ pub struct MemoryConfig {
     /// (which caps a single entry) and of `init_max_bytes` (which caps the
     /// bootstrap corpus sent to the model, not what gets written back).
     pub harvest_max_bytes: usize,
+    /// Issue #295: gate for the **session** tier (`memory::MemoryScope::
+    /// Session`, `<state>/memory/<repo_slug>/sessions/<session-id>/`),
+    /// UNDERNEATH the master `enabled` switch above -- the same shape
+    /// `shared_enabled` already has for the shared scope. On by default: a
+    /// bare `zirv ctx remember`/`zirv memory remember` with a session id
+    /// present writes to this tier instead of the private one unless this is
+    /// turned off (or `--repo`/`--global` is given explicitly).
+    pub session_enabled: bool,
+    /// Issue #295: how many lines each memory bank's own `journal.jsonl`
+    /// (one file per `<state>/memory/<repo_slug-or-_global>/`) keeps before
+    /// the oldest are pruned, mirroring `max_entries`' own retention
+    /// discipline for the entry bank itself. Independent of `max_entries`:
+    /// a bank can hold fewer live entries than journal lines, since a
+    /// `forget`/`verify`/`promote`/`rollback` each append a record without
+    /// necessarily changing how many entries currently exist.
+    pub journal_max_entries: usize,
 }
 
 impl Default for MemoryConfig {
@@ -1045,6 +1061,8 @@ impl Default for MemoryConfig {
             retrieval_max_entries: 6,
             harvest_max_entries: 5,
             harvest_max_bytes: 2048,
+            session_enabled: true,
+            journal_max_entries: 500,
         }
     }
 }
@@ -2179,6 +2197,16 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         EnvKind::Int,
     ),
     (
+        "ZIRV_CTX_MEMORY_SESSION",
+        &["memory", "session_enabled"],
+        EnvKind::Bool,
+    ),
+    (
+        "ZIRV_CTX_MEMORY_JOURNAL_MAX_ENTRIES",
+        &["memory", "journal_max_entries"],
+        EnvKind::Int,
+    ),
+    (
         "ZIRV_CTX_CHROME_BANNER",
         &["chrome", "banner"],
         EnvKind::Bool,
@@ -2935,6 +2963,19 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     (
         &["memory", "harvest_max_bytes"],
         "ZIRV_CTX_MEMORY_HARVEST_MAX_BYTES",
+    ),
+    // Issue #295: the same class of decision as `shared_enabled` above, for
+    // the newer session tier (`memory::MemoryScope::Session`) -- a repo
+    // checkout must not be able to switch that tier's own gate on or off for
+    // an operator who set it otherwise.
+    (&["memory", "session_enabled"], "ZIRV_CTX_MEMORY_SESSION"),
+    // Issue #295: a repo checkout must not be able to grow its own memory
+    // journal's retention cap, the same trust asymmetry as `max_entries`/
+    // `max_entry_bytes` above, applied to the write history rather than the
+    // entry bank itself.
+    (
+        &["memory", "journal_max_entries"],
+        "ZIRV_CTX_MEMORY_JOURNAL_MAX_ENTRIES",
     ),
     // A repo checkout must not be able to switch its own dashboard on or off,
     // resize the sidebar, change how long a quit-time roster is offered for
@@ -4811,6 +4852,57 @@ mod tests {
         );
     }
 
+    /// Issue #295: the session tier's own gate and the journal's retention
+    /// cap join every other `memory.*` key as `REPO_FORBIDDEN` -- a repo
+    /// checkout must not be able to switch the session tier on for itself,
+    /// nor grow its own journal's retention window. Mirrors the existing
+    /// `memory.shared_enabled` precedent this same reasoning was set by.
+    #[test]
+    fn memory_session_enabled_and_journal_max_entries_are_repo_forbidden() {
+        let empty = env_map(&[]);
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        for (toml, offending_key) in [
+            ("[memory]\nsession_enabled = false\n", "session_enabled"),
+            (
+                "[memory]\njournal_max_entries = 100000\n",
+                "journal_max_entries",
+            ),
+        ] {
+            let repo = tempfile::tempdir().expect("tempdir");
+            std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+            std::fs::write(repo.path().join(".zirv/ctx.toml"), toml).expect("write");
+
+            let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect_err(
+                &format!("a repository must not be able to set memory.{offending_key}"),
+            );
+            assert!(
+                is_repo_forbidden(err.as_ref()),
+                "memory.{offending_key} must be rejected as REPO_FORBIDDEN: {err}"
+            );
+        }
+    }
+
+    /// The operator-only escape hatches for the same two keys: `~/.zirv/
+    /// ctx.toml` and `ZIRV_CTX_MEMORY_SESSION`/`ZIRV_CTX_MEMORY_JOURNAL_MAX_
+    /// ENTRIES` may still set them, exactly like every other `memory.*` key.
+    #[test]
+    fn the_operator_can_still_set_session_enabled_and_journal_max_entries_from_the_environment() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let env = env_map(&[
+            ("ZIRV_CTX_MEMORY_SESSION", "false"),
+            ("ZIRV_CTX_MEMORY_JOURNAL_MAX_ENTRIES", "42"),
+        ]);
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned())
+            .expect("the operator's own environment may set these keys");
+        assert!(!cfg.memory.session_enabled);
+        assert_eq!(cfg.memory.journal_max_entries, 42);
+    }
+
     #[test]
     fn the_operator_can_still_set_those_keys_from_the_environment() {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -6521,6 +6613,8 @@ mod tests {
             ("ZIRV_CTX_MEMORY_RETRIEVAL_MAX_ENTRIES", "3"),
             ("ZIRV_CTX_MEMORY_HARVEST_MAX_ENTRIES", "2"),
             ("ZIRV_CTX_MEMORY_HARVEST_MAX_BYTES", "256"),
+            ("ZIRV_CTX_MEMORY_SESSION", "false"),
+            ("ZIRV_CTX_MEMORY_JOURNAL_MAX_ENTRIES", "77"),
         ]);
         let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
         assert!(!cfg.memory.enabled);
@@ -6534,6 +6628,8 @@ mod tests {
         assert_eq!(cfg.memory.retrieval_max_entries, 3);
         assert_eq!(cfg.memory.harvest_max_entries, 2);
         assert_eq!(cfg.memory.harvest_max_bytes, 256);
+        assert!(!cfg.memory.session_enabled);
+        assert_eq!(cfg.memory.journal_max_entries, 77);
     }
 
     /// N4: `supervise.max_nudges` reads from its own env var like every
@@ -6826,6 +6922,8 @@ mod tests {
             ("retrieval_max_entries", "100000"),
             ("harvest_max_entries", "100000"),
             ("harvest_max_bytes", "100000"),
+            ("session_enabled", "false"),
+            ("journal_max_entries", "100000"),
         ] {
             let repo = tempfile::tempdir().expect("tempdir");
             std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
@@ -8052,6 +8150,8 @@ mod tests {
         ("memory", "retrieval_max_entries"),
         ("memory", "harvest_max_entries"),
         ("memory", "harvest_max_bytes"),
+        ("memory", "session_enabled"),
+        ("memory", "journal_max_entries"),
         ("setup", "backup_retention_runs"),
         ("setup", "memory_harvest_offered"),
         ("setup", "statusline_wrap_offered"),
