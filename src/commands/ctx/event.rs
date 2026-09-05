@@ -315,6 +315,35 @@ pub enum NormalizedEvent {
         path: String,
         is_modification: bool,
     },
+    /// Whether the immediately preceding `ToolCall`'s read-shaped invocation
+    /// was ranged -- an explicit `offset` and/or `limit` argument -- rather
+    /// than a whole-file read (issue #294, `zirv ctx measure`'s partial-read
+    /// rate). Emitted right after `ToolCall` whenever the adapter recognizes
+    /// the call as a read-shaped tool with a verified ranged-argument shape;
+    /// omitted entirely for a non-read tool call, never a guessed `false`. A
+    /// sibling variant, never a field on `ToolCall`, for the same reason
+    /// `ToolCallPath` is one (see that variant's own doc comment).
+    ToolCallRead {
+        ranged: bool,
+    },
+    /// The old/new/core byte counts of the immediately preceding `ToolCall`'s
+    /// edit-shaped invocation (issue #294, `zirv ctx measure`'s edit
+    /// inflation ratio). `old_bytes`/`new_bytes` are the raw replaced/
+    /// replacement text lengths -- for a multi-edit tool, the sum across
+    /// every element's own pair -- and `core_bytes` is what remains of both
+    /// after stripping their shared prefix and suffix
+    /// (`measure::core_change_bytes`): `0` for a genuine no-op edit
+    /// (identical old/new text), which a consumer must report as a no-op
+    /// rather than fold into an inflation ratio of 1. Emitted right after
+    /// `ToolCall` whenever the adapter recognizes the call as an edit-shaped
+    /// tool with a verified old/new-text shape; omitted entirely for a
+    /// non-edit tool call. A sibling variant, never a field on `ToolCall`,
+    /// for the same reason `ToolCallPath` is one.
+    ToolCallEdit {
+        old_bytes: u64,
+        new_bytes: u64,
+        core_bytes: u64,
+    },
     ProviderError {
         class: ProviderErrorClass,
     },
