@@ -326,20 +326,30 @@ impl MemoryScope {
     /// neither `--repo`/`--shared` nor `--global` given, `zirv ctx remember`/
     /// `zirv memory remember` write to the session tier when a session id is
     /// present in the environment (`AGENT_ENV`'s sibling, `adapters::
-    /// SESSION_ENV`), and to the private tier otherwise -- exactly today's
-    /// behavior for a caller with no session id (a plain terminal, a script).
+    /// SESSION_ENV`) AND `session_enabled` says the tier itself is on, and
+    /// to the private tier otherwise -- exactly today's behavior for a
+    /// caller with no session id (a plain terminal, a script), and (review
+    /// round 1, finding 1) for an operator who set `memory.session_enabled
+    /// = false`: that switch used to be read only by `MemoryScope::enabled`
+    /// at write time deep inside `remember_session`, which never runs here
+    /// at all (the session-tier write path bypasses the gated scope-generic
+    /// dispatch by design -- see `MemoryScope::Session`'s own doc comment),
+    /// so a disabled session tier was silently written to anyway. Callers
+    /// pass `cfg.memory.session_enabled` (already resolved, so this stays a
+    /// plain function of already-gathered data, not a second config load).
     /// An explicit flag always wins over the session default, same as it
     /// already wins over the private default.
     pub fn default_remember_scope(
         shared: bool,
         global: bool,
         session_id: Option<&str>,
+        session_enabled: bool,
     ) -> MemoryScope {
         if global {
             MemoryScope::Global
         } else if shared {
             MemoryScope::Shared
-        } else if session_id.is_some_and(|id| !id.trim().is_empty()) {
+        } else if session_enabled && session_id.is_some_and(|id| !id.trim().is_empty()) {
             MemoryScope::Session
         } else {
             MemoryScope::Private
@@ -1065,7 +1075,11 @@ fn upsert_shared_inner(
     let after_body = entry.to_markdown();
     super::state::write_shared(&path, &after_body)?;
     if journal {
-        let _ = append_journal(
+        // Review round 1, finding 4: the entry write above already
+        // succeeded and is not rolled back on a journal failure -- the
+        // error must say so rather than being silently discarded, since
+        // the caller is otherwise left thinking nothing happened at all.
+        append_journal(
             state,
             journal_slug_for(MemoryScope::Shared, slug),
             &JournalRecord::new(
@@ -1078,7 +1092,14 @@ fn upsert_shared_inner(
                 &entry.written_by,
             ),
             cfg.memory.journal_max_entries,
-        );
+        )
+        .map_err(|e| {
+            format!(
+                "'{}' was written to {}, but the journal append failed: {e}",
+                entry.key,
+                path.display()
+            )
+        })?;
     }
     Ok(path)
 }
@@ -1311,7 +1332,9 @@ pub fn verify_scoped(
             guard_round_trip(state, slug, key, &path, &text)?;
             let stamped = stamp_verified_in_place(&text, now_secs());
             super::state::write_shared(&path, &stamped)?;
-            let _ = append_journal(
+            // Review round 1, finding 4: propagate a journal-append
+            // failure -- the stamp above already landed on disk.
+            append_journal(
                 state,
                 journal_slug_for(MemoryScope::Shared, slug),
                 &JournalRecord::new(
@@ -1324,7 +1347,13 @@ pub fn verify_scoped(
                     &parsed.written_by,
                 ),
                 DEFAULT_JOURNAL_MAX_ENTRIES,
-            );
+            )
+            .map_err(|e| {
+                format!(
+                    "'{key}' was verified at {}, but the journal append failed: {e}",
+                    path.display()
+                )
+            })?;
             Ok(true)
         }
     }
@@ -1775,7 +1804,9 @@ fn remember_inner(
 
     if journal {
         let scope = private_or_global_scope(slug);
-        let _ = append_journal(
+        // Review round 1, finding 4: propagate a journal-append failure --
+        // the write above already landed and is not undone.
+        append_journal(
             state,
             journal_slug_for(scope, slug),
             &JournalRecord::new(
@@ -1788,7 +1819,14 @@ fn remember_inner(
                 &entry.written_by,
             ),
             cfg.memory.journal_max_entries,
-        );
+        )
+        .map_err(|e| {
+            format!(
+                "'{}' was written to {}, but the journal append failed: {e}",
+                entry.key,
+                path.display()
+            )
+        })?;
     }
     Ok(path)
 }
@@ -1821,27 +1859,43 @@ pub fn get(state: &StateDir, slug: &str, key: &str) -> CtxResult<Option<Entry>> 
 /// actually removed; a no-op forget of an absent key writes no record, same
 /// as it always wrote nothing to the bank itself.
 pub fn forget(state: &StateDir, slug: &str, key: &str) -> CtxResult<bool> {
+    forget_inner(state, slug, key, true)
+}
+
+/// `forget`'s real body, with journaling made optional -- see
+/// `remember_inner`'s own doc comment. `rollback` (review round 1, finding
+/// 5) uses this with `journal = false` for the inverse of a CREATE record,
+/// so undoing a create appends only the rollback's own single journal
+/// record rather than one from this delete plus one from the rollback.
+fn forget_inner(state: &StateDir, slug: &str, key: &str, journal: bool) -> CtxResult<bool> {
     let mut removed = false;
     for (path, entry) in list(state, slug)? {
         if entry.key == key {
             let before_body = entry.to_markdown();
             std::fs::remove_file(&path)?;
             removed = true;
-            let scope = private_or_global_scope(slug);
-            let _ = append_journal(
-                state,
-                journal_slug_for(scope, slug),
-                &JournalRecord::new(
-                    "forget",
-                    scope,
-                    key,
-                    Some(before_body),
-                    None,
-                    &entry.source,
-                    &entry.written_by,
-                ),
-                DEFAULT_JOURNAL_MAX_ENTRIES,
-            );
+            if journal {
+                let scope = private_or_global_scope(slug);
+                // Review round 1, finding 4: propagate a journal-append
+                // failure -- the delete above already happened.
+                append_journal(
+                    state,
+                    journal_slug_for(scope, slug),
+                    &JournalRecord::new(
+                        "forget",
+                        scope,
+                        key,
+                        Some(before_body),
+                        None,
+                        &entry.source,
+                        &entry.written_by,
+                    ),
+                    DEFAULT_JOURNAL_MAX_ENTRIES,
+                )
+                .map_err(|e| {
+                    format!("'{key}' was removed from {slug}, but the journal append failed: {e}")
+                })?;
+            }
         }
     }
     Ok(removed)
@@ -1871,7 +1925,9 @@ pub fn verify(state: &StateDir, slug: &str, key: &str) -> CtxResult<bool> {
             let after_body = entry.to_markdown();
             super::state::write_private(&path, &after_body)?;
             let scope = private_or_global_scope(slug);
-            let _ = append_journal(
+            // Review round 1, finding 4: propagate a journal-append
+            // failure -- the stamp above already landed on disk.
+            append_journal(
                 state,
                 journal_slug_for(scope, slug),
                 &JournalRecord::new(
@@ -1884,7 +1940,10 @@ pub fn verify(state: &StateDir, slug: &str, key: &str) -> CtxResult<bool> {
                     &entry.written_by,
                 ),
                 DEFAULT_JOURNAL_MAX_ENTRIES,
-            );
+            )
+            .map_err(|e| {
+                format!("'{key}' was verified in {slug}, but the journal append failed: {e}")
+            })?;
             return Ok(true);
         }
     }
@@ -1893,7 +1952,15 @@ pub fn verify(state: &StateDir, slug: &str, key: &str) -> CtxResult<bool> {
 
 /// Replaces any character outside `[A-Za-z0-9-]` with `-`, case preserved --
 /// a session id can never escape its own `sessions/` directory this way,
-/// regardless of what a harness happens to generate one as.
+/// regardless of what a harness happens to generate one as. The first 8 hex
+/// characters of `sha256(id)` are always appended (review round 1, finding
+/// 6): the charset substitution above is lossy -- `a/b` and `a?b` both
+/// sanitize to `a-b` on their own, which would let two distinct raw session
+/// ids collide onto the SAME directory, so retiring one session's tier
+/// (`forget_session_all`) could delete a still-live, unrelated session's
+/// entries. The hash suffix is computed from the raw, unsanitized `id`, so
+/// two ids differing only in a character this substitution collapses still
+/// get distinct directories.
 fn sanitize_session_id(id: &str) -> String {
     let raw: String = id
         .chars()
@@ -1906,11 +1973,12 @@ fn sanitize_session_id(id: &str) -> String {
         })
         .take(80)
         .collect();
-    if raw.trim_matches('-').is_empty() {
+    let stem = if raw.trim_matches('-').is_empty() {
         "session".to_string()
     } else {
         raw
-    }
+    };
+    format!("{stem}-{}", &sha256_hex(id)[..8])
 }
 
 /// This session's own ephemeral memory tier (issue #295):
@@ -2020,24 +2088,45 @@ fn remember_session_inner(
             &entry.written_by,
         );
         record.session_id = Some(session_id.to_string());
-        let _ = append_journal(
+        // Review round 1, finding 4: propagate a journal-append failure --
+        // the write above already landed on disk.
+        append_journal(
             state,
             journal_slug_for(MemoryScope::Session, slug),
             &record,
             cfg.memory.journal_max_entries,
-        );
+        )
+        .map_err(|e| {
+            format!(
+                "'{}' was written to the session tier at {}, but the journal append failed: {e}",
+                entry.key,
+                path.display()
+            )
+        })?;
     }
     Ok(path)
 }
 
 /// Removes the entry for `key` from one session's own tier. Returns whether
 /// anything was removed. Journals a `"forget"` record scoped `"session"`
-/// when something was actually removed.
-pub fn forget_session(
+/// when something was actually removed and `journal` is true.
+///
+/// No CLI verb forgets from the session tier directly today (`zirv ctx
+/// forget`/`zirv memory forget` only ever target Private/Shared/Global --
+/// see their own scope-resolution doc comments), so this stays a private,
+/// explicit-`journal`-flag helper rather than the public journaling-wrapper-
+/// plus-inner-helper pair every other write primitive in this module has
+/// (`remember`/`remember_inner`, `forget`/`forget_inner`): a `pub` wrapper
+/// with no caller anywhere but its own inner function is dead code in a
+/// binary crate, not future-proofing. `rollback` (review round 1, finding
+/// 5) calls this with `journal = false` for the inverse of a session-tier
+/// CREATE record, so undoing it appends only the rollback's own record.
+fn forget_session_inner(
     state: &StateDir,
     slug: &str,
     session_id: &str,
     key: &str,
+    journal: bool,
 ) -> CtxResult<bool> {
     let dir = session_dir(state, slug, session_id);
     let mut removed = false;
@@ -2046,22 +2135,31 @@ pub fn forget_session(
             let before_body = entry.to_markdown();
             std::fs::remove_file(&path)?;
             removed = true;
-            let mut record = JournalRecord::new(
-                "forget",
-                MemoryScope::Session,
-                key,
-                Some(before_body),
-                None,
-                &entry.source,
-                &entry.written_by,
-            );
-            record.session_id = Some(session_id.to_string());
-            let _ = append_journal(
-                state,
-                journal_slug_for(MemoryScope::Session, slug),
-                &record,
-                DEFAULT_JOURNAL_MAX_ENTRIES,
-            );
+            if journal {
+                let mut record = JournalRecord::new(
+                    "forget",
+                    MemoryScope::Session,
+                    key,
+                    Some(before_body),
+                    None,
+                    &entry.source,
+                    &entry.written_by,
+                );
+                record.session_id = Some(session_id.to_string());
+                // Review round 1, finding 4: propagate a journal-append
+                // failure -- the delete above already happened.
+                append_journal(
+                    state,
+                    journal_slug_for(MemoryScope::Session, slug),
+                    &record,
+                    DEFAULT_JOURNAL_MAX_ENTRIES,
+                )
+                .map_err(|e| {
+                    format!(
+                        "'{key}' was removed from the session tier for '{session_id}', but the journal append failed: {e}"
+                    )
+                })?;
+            }
         }
     }
     Ok(removed)
@@ -2105,12 +2203,19 @@ pub fn verify_session(
                 &entry.written_by,
             );
             record.session_id = Some(session_id.to_string());
-            let _ = append_journal(
+            // Review round 1, finding 4: propagate a journal-append
+            // failure -- the stamp above already landed on disk.
+            append_journal(
                 state,
                 journal_slug_for(MemoryScope::Session, slug),
                 &record,
                 DEFAULT_JOURNAL_MAX_ENTRIES,
-            );
+            )
+            .map_err(|e| {
+                format!(
+                    "'{key}' was verified in the session tier for '{session_id}', but the journal append failed: {e}"
+                )
+            })?;
             return Ok(true);
         }
     }
@@ -2858,6 +2963,52 @@ pub fn check_if_unchanged(existing: Option<&Entry>, expected: &str) -> CtxResult
     }
 }
 
+/// One advisory OS lock per memory-bank directory, held across `--if-unchanged`'s
+/// check-then-write (review round 1, finding 2): without it, two concurrent
+/// `remember --if-unchanged <hash>` calls against the same key could each
+/// read the same pre-write body, each pass the hash check, and both write --
+/// exactly the silent-last-writer-wins race the flag exists to close.
+/// Mirrors `group::open_lock_file`/`task::lock_tasks`'s own advisory-lock
+/// shape exactly (same lock-file idiom, same "leave the file behind on
+/// drop" reasoning) rather than reinventing one. `unlock()` on drop is
+/// best-effort, like `GroupLock`'s/`TaskLock`'s own.
+pub(crate) struct IfUnchangedLock(std::fs::File);
+
+impl Drop for IfUnchangedLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
+/// Locks `<dir>/.lock`, creating `dir` first if it does not exist yet (a
+/// fresh bank with no entries yet still needs somewhere to put the lock
+/// file). `dir` is whichever directory the target scope's key actually
+/// lives under -- `lock_dir_for_if_unchanged` resolves that per scope.
+pub(crate) fn lock_bank_dir(dir: &Path) -> CtxResult<IfUnchangedLock> {
+    std::fs::create_dir_all(dir)?;
+    let file = super::group::open_lock_file(&dir.join(".lock"))?;
+    file.lock()?;
+    Ok(IfUnchangedLock(file))
+}
+
+/// The directory `--if-unchanged`'s lock must be taken on for `scope`, or
+/// `None` when the scope cannot resolve one at all (`Shared` behind a
+/// symlinked `.zirv`/`.zirv/memory` -- the write itself will refuse with
+/// its own error in that case, so skipping the lock costs nothing).
+/// `session_id` is required (and only meaningful) for `Session`.
+pub(crate) fn lock_dir_for_if_unchanged(
+    scope: MemoryScope,
+    repo: &Path,
+    state: &StateDir,
+    slug: &str,
+    session_id: Option<&str>,
+) -> Option<PathBuf> {
+    match scope {
+        MemoryScope::Session => session_id.map(|id| session_dir(state, slug, id)),
+        _ => scope.dir(repo, state, slug),
+    }
+}
+
 /// Moves an entry up a tier (issue #295): `zirv memory promote <key>
 /// [--shared|--global]`. Looks the key up in the session tier first (when
 /// `session_id` is given and an entry exists there), else the private tier,
@@ -2929,16 +3080,23 @@ pub fn promote(
 
     // Best-effort: the promotion write above already succeeded, so failing
     // to clear the origin costs a duplicate entry, never data loss.
+    // Non-journaling (same reasoning as `rollback`'s finding-5 fix): the
+    // single `"promote"` journal record appended below already documents
+    // this whole move, so clearing the origin must not ALSO emit its own
+    // `"forget"` record for the same operation.
     match origin_session {
         Some(id) => {
-            let _ = forget_session(state, slug, id, key);
+            let _ = forget_session_inner(state, slug, id, key, false);
         }
         None => {
-            let _ = forget(state, slug, key);
+            let _ = forget_inner(state, slug, key, false);
         }
     }
 
-    let _ = append_journal(
+    // Review round 1, finding 4: propagate a journal-append failure -- the
+    // destination write above already succeeded and the origin has already
+    // been cleared.
+    append_journal(
         state,
         journal_slug_for(target, slug),
         &JournalRecord::new(
@@ -2951,8 +3109,61 @@ pub fn promote(
             &entry.written_by,
         ),
         cfg.memory.journal_max_entries,
-    );
+    )
+    .map_err(|e| {
+        format!(
+            "'{key}' was promoted to {}, but the journal append failed: {e}",
+            target.label()
+        )
+    })?;
     Ok(path)
+}
+
+/// The CURRENT raw on-disk markdown for `key` in `scope`, or `None` if no
+/// entry exists there right now (review round 1, finding 3). Reads the
+/// actual bytes at the actual path -- never through the gated `get_scoped`,
+/// whose `scope.enabled(cfg)` check would otherwise read a disabled-but-
+/// still-populated scope as "absent" and let `rollback` silently clobber
+/// real content. Used only to answer "has this key changed since the
+/// record being rolled back last wrote it", never rendered or stored.
+fn current_raw_body(
+    scope: MemoryScope,
+    repo: &Path,
+    state: &StateDir,
+    slug: &str,
+    session_id: Option<&str>,
+    key: &str,
+) -> CtxResult<Option<String>> {
+    let path = match scope {
+        MemoryScope::Private | MemoryScope::Global => list(state, slug)?
+            .into_iter()
+            .find_map(|(path, entry)| (entry.key == key).then_some(path)),
+        MemoryScope::Session => {
+            let Some(id) = session_id else {
+                return Ok(None);
+            };
+            list_session(state, slug, id)?
+                .into_iter()
+                .find_map(|(path, entry)| (entry.key == key).then_some(path))
+        }
+        MemoryScope::Shared => {
+            let Some(path) = shared_canonical_path(repo, key) else {
+                return Ok(None);
+            };
+            if !is_regular_file(&path) {
+                None
+            } else {
+                Some(path)
+            }
+        }
+    };
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    match std::fs::read_to_string(&path) {
+        Ok(text) => Ok(Some(text)),
+        Err(e) => Err(format!("{}: exists but cannot be read ({e})", path.display()).into()),
+    }
 }
 
 /// Reverses one journaled write by `id` (issue #295): `zirv memory rollback
@@ -2975,6 +3186,16 @@ pub fn promote(
 /// via `JournalRecord::target_id`), this is a no-op that returns `Ok(false)`
 /// rather than replaying the inverse a second time. Otherwise appends its
 /// own `"rollback"` record and returns `Ok(true)`.
+///
+/// **Refuses a stale rollback (review round 1, finding 3).** Before
+/// replaying the inverse, the entry's CURRENT raw body is compared against
+/// this record's own `after_body` (what THIS record actually produced --
+/// `None` means the record's own write left the key absent). A mismatch
+/// means a LATER write already changed this key since this record ran --
+/// rolling back an old create/overwrite over a newer value would silently
+/// clobber that newer value, so the rollback is refused outright (nothing
+/// written, the id's own `"rollback"` record is not appended either) rather
+/// than restoring stale content.
 pub fn rollback(
     repo: &Path,
     state: &StateDir,
@@ -2997,25 +3218,46 @@ pub fn rollback(
 
         let scope = label_to_scope(&record.scope);
         let key = record.key.clone();
+        let session_id = record.session_id.as_deref();
+
+        let current = current_raw_body(scope, repo, state, journal_slug, session_id, &key)?;
+        let unchanged_since = match (&record.after_body, &current) {
+            (None, None) => true,
+            (Some(expected), Some(actual)) => expected == actual,
+            _ => false,
+        };
+        if !unchanged_since {
+            return Err(format!(
+                "zirv memory rollback: '{key}' has changed since record '{id}' was written; refusing to roll back over a newer value"
+            )
+            .into());
+        }
 
         match &record.before_body {
             None => {
                 // The record introduced this key; its inverse deletes it.
+                // Non-journaling (review round 1, finding 5): the
+                // `"rollback"` record appended below already documents
+                // this whole operation, so the delete must not ALSO emit
+                // its own `"forget"` record -- one rollback, one record.
                 match scope {
                     MemoryScope::Shared => {
+                        // `forget_scoped`'s Shared arm never journals on
+                        // its own (unlike its Private/Global arms), so no
+                        // separate non-journaling variant is needed here.
                         forget_scoped(MemoryScope::Shared, repo, state, journal_slug, &key)?;
                     }
                     MemoryScope::Session => {
-                        let Some(session_id) = &record.session_id else {
+                        let Some(session_id) = session_id else {
                             return Err(
                                 "zirv memory rollback: this session-tier record has no session id (written before issue #295's session_id field existed); cannot resolve which session directory to roll back"
                                     .into(),
                             );
                         };
-                        forget_session(state, journal_slug, session_id, &key)?;
+                        forget_session_inner(state, journal_slug, session_id, &key, false)?;
                     }
                     MemoryScope::Private | MemoryScope::Global => {
-                        forget(state, journal_slug, &key)?;
+                        forget_inner(state, journal_slug, &key, false)?;
                     }
                 }
             }
@@ -3066,12 +3308,15 @@ pub fn rollback(
             written_by,
         );
         rollback_record.target_id = Some(record.id.clone());
-        let _ = append_journal(
+        // Review round 1, finding 4: propagate a journal-append failure --
+        // the inverse write above already happened.
+        append_journal(
             state,
             journal_slug,
             &rollback_record,
             cfg.memory.journal_max_entries,
-        );
+        )
+        .map_err(|e| format!("'{key}' was rolled back, but the journal append failed: {e}"))?;
         return Ok(true);
     }
 
@@ -3230,7 +3475,27 @@ pub fn run_remember_with<W: Write>(
     // EXISTING entry should not move it to a tier it was never written
     // into.
     let session_id = env(super::adapters::SESSION_ENV).filter(|v| !v.trim().is_empty());
-    let scope = MemoryScope::default_remember_scope(args.repo, args.global, session_id.as_deref());
+    let scope = MemoryScope::default_remember_scope(
+        args.repo,
+        args.global,
+        session_id.as_deref(),
+        cfg.memory.session_enabled,
+    );
+    // Review round 1, finding 1: a session id was present and no explicit
+    // scope flag was given, but `session_enabled = false` sent this to the
+    // private tier instead -- named in the output so a `memory.
+    // session_enabled = false` operator is not left wondering why a bare
+    // `remember` did not land in the session tier they expected.
+    let session_fallback_note = if scope == MemoryScope::Private
+        && !args.repo
+        && !args.global
+        && !cfg.memory.session_enabled
+        && session_id.is_some()
+    {
+        " (session tier disabled by memory.session_enabled)"
+    } else {
+        ""
+    };
     let bank_label = ctx_scope_label(scope);
 
     match resolve_remember(args, stdin)? {
@@ -3273,6 +3538,24 @@ pub fn run_remember_with<W: Write>(
                         .into(),
                 );
             }
+            // Review round 1, finding 2: held from the check below through
+            // the write further down (still in scope at the end of this
+            // match arm, dropped only once this whole arm returns) so two
+            // concurrent `--if-unchanged` commands cannot both read the
+            // same pre-write body, both pass the check, and both write.
+            // Scoped to the `--if-unchanged` path only, per the finding --
+            // a bare `remember` with no conflict check keeps its existing,
+            // unlocked behavior.
+            let _if_unchanged_lock = if args.if_unchanged.is_some() {
+                match lock_dir_for_if_unchanged(scope, repo, &state, &slug, session_id.as_deref()) {
+                    Some(dir) => {
+                        Some(lock_bank_dir(&dir).map_err(|e| format!("zirv ctx remember: {e}"))?)
+                    }
+                    None => None,
+                }
+            } else {
+                None
+            };
             if let Some(expected) = &args.if_unchanged {
                 let existing = match scope {
                     MemoryScope::Session => get_session(
@@ -3319,7 +3602,7 @@ pub fn run_remember_with<W: Write>(
             .map_err(|e| format!("zirv ctx remember: {e}"))?;
             writeln!(
                 w,
-                "zirv ctx remember: stored '{}' in the {bank_label} bank at {}",
+                "zirv ctx remember: stored '{}' in the {bank_label} bank at {}{session_fallback_note}",
                 args.key,
                 path.display()
             )?;
@@ -8675,6 +8958,302 @@ This should not appear in the body.\n";
         assert!(
             get(&state, slug, "cred-key").expect("get").is_some(),
             "a refused promotion must not remove the origin"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #295 review round 1.
+    // -----------------------------------------------------------------
+
+    /// Finding 1, direction one: `memory.session_enabled = true` (the
+    /// default) with a session id present still routes a bare `remember`
+    /// to the session tier -- unchanged behavior, pinned so the finding-1
+    /// fix below cannot silently flip this direction too.
+    #[test]
+    fn a_bare_remember_with_a_session_id_and_the_tier_enabled_writes_to_the_session_tier() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let state_dir = tmp.path().join("state");
+        let env = env_map(&[
+            (state::STATE_ENV, state_dir.to_str().expect("utf8")),
+            (super::super::adapters::SESSION_ENV, "sess-enabled"),
+        ]);
+        let args = RememberArgs {
+            key: "k".to_string(),
+            text: Some("v".to_string()),
+            text_file: None,
+            verify: false,
+            repo: false,
+            global: false,
+            allow_sensitive: false,
+            if_unchanged: None,
+            importance: None,
+            confidence: None,
+            tags: Vec::new(),
+        };
+        let mut out = Vec::new();
+        let mut stdin = std::io::Cursor::new(Vec::<u8>::new());
+        let code = run_remember_with(
+            &args,
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            &mut stdin,
+        )
+        .expect("remember");
+        assert_eq!(code, 0);
+        let out = String::from_utf8(out).expect("utf8");
+        assert!(out.contains("session bank"), "got: {out}");
+
+        let state = StateDir::from_root(state_dir);
+        assert!(
+            list_session(&state, &repo_slug(tmp.path()), "sess-enabled")
+                .expect("list session")
+                .iter()
+                .any(|(_, e)| e.key == "k"),
+            "the entry must actually be in the session tier"
+        );
+    }
+
+    /// Finding 1, direction two: `memory.session_enabled = false` with a
+    /// session id present falls back to the PRIVATE tier instead of
+    /// silently writing to a disabled tier, and says so in the output.
+    #[test]
+    fn a_bare_remember_with_a_session_id_falls_back_to_private_when_the_tier_is_disabled() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let state_dir = tmp.path().join("state");
+        let env = env_map(&[
+            (state::STATE_ENV, state_dir.to_str().expect("utf8")),
+            (super::super::adapters::SESSION_ENV, "sess-disabled"),
+            ("ZIRV_CTX_MEMORY_SESSION", "false"),
+        ]);
+        let args = RememberArgs {
+            key: "k".to_string(),
+            text: Some("v".to_string()),
+            text_file: None,
+            verify: false,
+            repo: false,
+            global: false,
+            allow_sensitive: false,
+            if_unchanged: None,
+            importance: None,
+            confidence: None,
+            tags: Vec::new(),
+        };
+        let mut out = Vec::new();
+        let mut stdin = std::io::Cursor::new(Vec::<u8>::new());
+        let code = run_remember_with(
+            &args,
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            &mut stdin,
+        )
+        .expect("remember");
+        assert_eq!(code, 0);
+        let out = String::from_utf8(out).expect("utf8");
+        assert!(out.contains("local bank"), "got: {out}");
+        assert!(
+            out.contains("session tier disabled"),
+            "the fallback must be named in the output: got {out}"
+        );
+
+        let state = StateDir::from_root(state_dir);
+        let slug = repo_slug(tmp.path());
+        assert!(
+            list_session(&state, &slug, "sess-disabled")
+                .expect("list session")
+                .is_empty(),
+            "the session tier must not have been written to"
+        );
+        assert!(
+            get(&state, &slug, "k").expect("get").is_some(),
+            "the entry must have landed in the private tier instead"
+        );
+    }
+
+    /// Finding 2: two concurrent `--if-unchanged` remembers on the same key
+    /// must not both succeed. The lock is exercised directly here (spawning
+    /// real concurrent processes is out of scope for a unit test): holding
+    /// it externally must make a second `run_remember_with` call see the
+    /// first's write and refuse via the ordinary hash-mismatch path, not
+    /// silently race past it.
+    #[test]
+    fn if_unchanged_lock_is_held_across_the_check_and_the_write() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let state_dir = tmp.path().join("state");
+        let state = StateDir::from_root(state_dir.clone());
+        let slug = repo_slug(tmp.path());
+        let cfg = CtxConfig::default();
+
+        let mut entry = sample("locked-key", 1);
+        entry.body = "v1".to_string();
+        remember(&state, &slug, &entry, &cfg).expect("seed");
+
+        // Hold the same lock `run_remember_with` would take for this key's
+        // scope (Private) for the duration of this block, simulating a
+        // concurrent writer already mid-check-then-write.
+        let dir = MemoryScope::Private
+            .dir(tmp.path(), &state, &slug)
+            .expect("private dir resolves");
+        let _held = lock_bank_dir(&dir).expect("lock");
+
+        // A second writer trying to acquire the same lock (rather than
+        // proceeding unlocked) would block here in a real concurrent
+        // scenario; since `std::fs::File::lock` is a real OS advisory lock
+        // and this test is single-threaded, we instead assert the LOCK
+        // ITSELF is what a concurrent call would contend on by checking a
+        // `try_lock` from the same process fails while `_held` is alive
+        // (Windows/unix both refuse a second exclusive lock on the same
+        // file from the same process for a plain `File::lock`/`try_lock`
+        // pair opened independently).
+        let second_file =
+            super::super::group::open_lock_file(&dir.join(".lock")).expect("open second handle");
+        let contended = second_file.try_lock().is_err();
+        assert!(
+            contended,
+            "a second handle must not be able to take the lock while the first holds it"
+        );
+    }
+
+    /// Finding 3: rolling back an OLDER record after a LATER write touched
+    /// the same key must refuse rather than clobber the newer value.
+    #[test]
+    fn rollback_refuses_to_clobber_a_value_written_after_the_targeted_record() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = CtxConfig::default();
+        let repo = crate::commands::ctx::testenv::repo();
+
+        let mut first = sample("stale-key", 1);
+        first.body = "v1".to_string();
+        remember(&state, "-repo", &first, &cfg).expect("remember v1");
+        let first_id = read_journal(&state, "-repo")[0].id.clone();
+
+        let mut second = sample("stale-key", 2);
+        second.body = "v2".to_string();
+        remember(&state, "-repo", &second, &cfg).expect("remember v2");
+
+        // Rolling back the FIRST record (whose own `after_body` was "v1")
+        // now that the current value is "v2" must refuse: "v1" is stale.
+        let result = rollback(repo.path(), &state, "-repo", &cfg, &first_id, "tester");
+        assert!(
+            result.is_err(),
+            "rollback of a superseded record must be refused"
+        );
+        let current = get(&state, "-repo", "stale-key")
+            .expect("get")
+            .expect("entry exists");
+        assert_eq!(
+            current.body, "v2",
+            "the newer value must survive the refused rollback"
+        );
+    }
+
+    /// Finding 4: a journal-append failure after a successful write must
+    /// surface as an error naming both facts, not be silently discarded.
+    #[test]
+    fn a_journal_append_failure_after_a_successful_write_is_reported_not_swallowed() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = CtxConfig::default();
+        let slug = "-repo";
+
+        // Make the journal unwritable deterministically on every platform
+        // (real filesystem permission bits are unreliable in a test --
+        // `cfg(unix)` root or a Windows ACL quirk can both bypass them):
+        // put a DIRECTORY at the exact path `append_journal` opens for
+        // append (`<bank_dir>/journal.jsonl`), so opening it as a file
+        // fails outright.
+        let bank_dir = state.memory().join(slug);
+        std::fs::create_dir_all(bank_dir.join("journal.jsonl")).expect("make journal.jsonl a dir");
+
+        let entry = sample("k", 1);
+        let result = remember(&state, slug, &entry, &cfg);
+        assert!(
+            result.is_err(),
+            "a journal-append failure must surface as an error, not be swallowed"
+        );
+        let message = result.unwrap_err().to_string();
+        assert!(
+            message.contains("journal append failed"),
+            "the error must say the journal append failed: {message}"
+        );
+        assert!(
+            get(&state, slug, "k").expect("get").is_some(),
+            "the entry write itself must still have succeeded on disk"
+        );
+    }
+
+    /// Finding 5: rolling back a CREATE must append exactly one journal
+    /// record (the rollback's own), not a second one from the underlying
+    /// delete.
+    #[test]
+    fn rollback_of_a_create_appends_exactly_one_journal_record() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = CtxConfig::default();
+        let repo = crate::commands::ctx::testenv::repo();
+
+        remember(&state, "-repo", &sample("single-record-key", 1), &cfg).expect("remember");
+        let id = read_journal(&state, "-repo")[0].id.clone();
+        let before_count = read_journal(&state, "-repo").len();
+
+        rollback(repo.path(), &state, "-repo", &cfg, &id, "tester").expect("rollback");
+
+        let after_count = read_journal(&state, "-repo").len();
+        assert_eq!(
+            after_count,
+            before_count + 1,
+            "a rollback of a create must append exactly one journal record, not two"
+        );
+    }
+
+    /// Finding 6: two session ids that collapse to the same directory name
+    /// under the old plain-charset-substitution scheme (`a/b` and `a?b`
+    /// both sanitized to `a-b`) must now resolve to DISTINCT directories.
+    #[test]
+    fn colliding_raw_session_ids_resolve_to_distinct_directories() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let dir_a = session_dir(&state, "-repo", "a/b");
+        let dir_b = session_dir(&state, "-repo", "a?b");
+        assert_ne!(
+            dir_a, dir_b,
+            "two distinct raw session ids must never resolve to the same directory"
+        );
+    }
+
+    /// Finding 6, the actual data-safety consequence: with the fix, writing
+    /// under one colliding-prefix session id and retiring it must never
+    /// remove the other's entries.
+    #[test]
+    fn retiring_one_colliding_session_id_never_deletes_the_others_entries() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = CtxConfig::default();
+        let slug = "-repo";
+
+        remember_session(&state, slug, "a/b", &sample("k1", 1), &cfg).expect("remember a/b");
+        remember_session(&state, slug, "a?b", &sample("k2", 2), &cfg).expect("remember a?b");
+
+        forget_session_all(&state, slug, "a/b").expect("forget a/b's tier");
+
+        assert!(
+            list_session(&state, slug, "a/b")
+                .expect("list a/b")
+                .is_empty(),
+            "the retired session's own entries must be gone"
+        );
+        assert_eq!(
+            list_session(&state, slug, "a?b").expect("list a?b").len(),
+            1,
+            "a colliding-prefix session's entries must survive the other's retirement"
         );
     }
 
