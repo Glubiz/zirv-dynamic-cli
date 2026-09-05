@@ -2567,6 +2567,183 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
+    /// Issue #354: real current-renderer frames with deterministic synthetic facts.
+    /// The audit embeds this artifact; no PTY, harness, or state directory is used.
+    #[test]
+    fn capture_current_dashboard_for_354_audit() {
+        let mut captures = String::new();
+        for (width, height) in [(80, 20), (120, 40), (200, 50)] {
+            for scenario in [
+                "normal",
+                "nine-panes",
+                "zoomed",
+                "help",
+                "restore",
+                "empty",
+                "dead-footer",
+            ] {
+                let area = Rect::new(0, 0, width, height);
+                let layout = layout(area, 24);
+                let zoomed = scenario == "zoomed";
+                let empty = matches!(scenario, "empty" | "dead-footer");
+                let main = if zoomed { area } else { layout.main };
+                let count = if empty {
+                    0
+                } else if scenario == "nine-panes" {
+                    9
+                } else {
+                    3
+                };
+                let mut rows: Vec<SidebarRow> = (0..count)
+                    .map(|i| SidebarRow {
+                        short: format!("a{:07}", i + 1),
+                        harness: if i % 2 == 0 { "claude" } else { "codex" }.to_string(),
+                        age_secs: Some(90 + i * 60),
+                        score: Some(12 + i as u32 * 9),
+                        state: if scenario == "nine-panes" && i == 7 {
+                            RowState::Dead
+                        } else if i == 2 {
+                            RowState::Idle
+                        } else {
+                            RowState::Working
+                        },
+                        attached: true,
+                        selected: i == 0,
+                        focused: i == 0,
+                        supervised: true,
+                    })
+                    .collect();
+                if scenario == "nine-panes" {
+                    let mut external = sidebar_row("b0000010", "codex", RowState::Unknown);
+                    external.attached = false;
+                    rows.push(external);
+                }
+                let mut header = base_facts();
+                header.harness = "claude (opus)".to_string();
+                header.total = rows.len();
+                header.live = rows.iter().filter(|r| r.state != RowState::Dead).count();
+                let aggregate = AggregateFacts {
+                    workers_running: Some((header.live as u64, Source::Live, Duration::ZERO)),
+                    workers_failed: Some((1, Source::Live, Duration::ZERO)),
+                    spend_micros: Some((2_340_000, Source::Live, Duration::ZERO)),
+                    five_hour_pct: Some((61.0, Source::Live, Duration::ZERO)),
+                    harnesses: vec![HarnessStrip {
+                        name: "claude".to_string(),
+                        state: "ready".to_string(),
+                        headroom_pct: Some(39.0),
+                    }],
+                    seat: Some("gen 2".to_string()),
+                };
+                let footer = if scenario == "dead-footer" {
+                    FooterFacts::Dead(FooterDeadFacts {
+                        harness: "claude".to_string(),
+                        exited_age_secs: Some(42),
+                        workflow: FooterWorkflow::None,
+                    })
+                } else if empty {
+                    FooterFacts::None
+                } else {
+                    let mut facts = alive_footer_facts();
+                    facts.score = rows[0].score;
+                    facts.unread_mail = 3;
+                    FooterFacts::Alive(facts)
+                };
+                let overlay = match scenario {
+                    "help" => Overlay::Help,
+                    "restore" => Overlay::Restore(RestoreView {
+                        entries: (1..=18)
+                            .map(|i| RestoreEntry {
+                                label: format!("worker {i:02} codex resume saved session"),
+                                checked: i != 2,
+                            })
+                            .collect(),
+                        cursor: 17,
+                    }),
+                    _ => Overlay::None,
+                };
+                let mut parser = vt100::Parser::new(main.height, main.width, 100);
+                parser.process(b"Harness terminal (synthetic audit fixture)\r\n\r\nTask: review dashboard interaction\r\nReading source files...\r\n\r\n> ");
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                terminal
+                    .draw(|f| {
+                        if !zoomed {
+                            render_header(f, layout.header, &header);
+                            render_rule(f, layout.rule_top, layout.sidebar.width, true);
+                            render_aggregate(
+                                f,
+                                Rect {
+                                    height: 1,
+                                    ..layout.sidebar
+                                },
+                                &aggregate,
+                            );
+                            render_sidebar(
+                                f,
+                                Rect {
+                                    y: layout.sidebar.y + 1,
+                                    height: layout.sidebar.height - 1,
+                                    ..layout.sidebar
+                                },
+                                &rows,
+                                0,
+                                40,
+                                70,
+                            );
+                            render_sidebar_divider(
+                                f,
+                                Rect {
+                                    x: layout.sidebar.x + layout.sidebar.width,
+                                    width: 1,
+                                    ..layout.sidebar
+                                },
+                            );
+                            render_rule(f, layout.rule_bottom, layout.sidebar.width, false);
+                            render_footer(f, layout.footer, &footer, 40, 70);
+                        }
+                        if !empty {
+                            render_grid(f, main, parser.screen(), None);
+                            render_scroll_marker(f, main, 0);
+                            if matches!(overlay, Overlay::None)
+                                && let Some(pos) = grid_cursor_position(main, parser.screen())
+                            {
+                                f.set_cursor_position(pos);
+                            }
+                        }
+                        render_overlay(f, main, &overlay, 0);
+                    })
+                    .unwrap();
+                captures.push_str(&format!(
+                    "### CURRENT {width}x{height} — {scenario}\n\n```text\n"
+                ));
+                let buffer = terminal.backend().buffer();
+                let mut frame_text = String::new();
+                for y in 0..height {
+                    let mut line = String::new();
+                    for x in 0..width {
+                        line.push_str(buffer[(x, y)].symbol());
+                    }
+                    assert_eq!(style::display_width(&line), usize::from(width));
+                    frame_text.push_str(&line);
+                    frame_text.push('\n');
+                    captures.push_str(&line);
+                    captures.push('\n');
+                }
+                if width == 80 && scenario == "restore" {
+                    assert!(!frame_text.contains("worker 18"));
+                    assert!(!frame_text.contains("restore checked"));
+                }
+                if width == 80 && scenario == "help" {
+                    assert!(!frame_text.contains("any key"));
+                    assert!(!frame_text.contains("dialogs:"));
+                }
+                captures.push_str("```\n\n");
+            }
+        }
+        let output = std::path::Path::new("target/dash-ux-current-captures.md");
+        std::fs::create_dir_all(output.parent().unwrap()).unwrap();
+        std::fs::write(output, captures).unwrap();
+    }
+
     fn no_live_source() -> AggregateFacts {
         AggregateFacts {
             workers_running: None,
