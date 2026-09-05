@@ -3507,9 +3507,13 @@ impl CtxConfig {
         // Issue #272: every `[screen]` key gets the identical lift-before-
         // merge treatment -- see `narrow_screen_threshold`/`narrow_screen_
         // dominance_pct` below for the shared "lower is stricter" direction.
-        let home_screen_min_fragment =
-            integer_at(take_nested(&mut merged, "screen", "repetition_min_fragment"));
-        let home_screen_window = integer_at(take_nested(&mut merged, "screen", "repetition_window"));
+        let home_screen_min_fragment = integer_at(take_nested(
+            &mut merged,
+            "screen",
+            "repetition_min_fragment",
+        ));
+        let home_screen_window =
+            integer_at(take_nested(&mut merged, "screen", "repetition_window"));
         let home_screen_min_repeats =
             integer_at(take_nested(&mut merged, "screen", "repetition_min_repeats"));
         let home_screen_dominance_pct = float_at(take_nested(
@@ -5787,9 +5791,24 @@ mod tests {
     #[test]
     fn the_screen_narrowing_fold_rules_favour_the_stricter_lower_value() {
         for (home, repo, expected, why) in [
-            (400u32, None, 400, "an untouched repo layer leaves the operator's own value alone"),
-            (400, Some(4_000), 400, "a repo may not raise a threshold above the operator's own"),
-            (400, Some(100), 100, "a repo may lower a threshold below the operator's own"),
+            (
+                400u32,
+                None,
+                400,
+                "an untouched repo layer leaves the operator's own value alone",
+            ),
+            (
+                400,
+                Some(4_000),
+                400,
+                "a repo may not raise a threshold above the operator's own",
+            ),
+            (
+                400,
+                Some(100),
+                100,
+                "a repo may lower a threshold below the operator's own",
+            ),
         ] {
             assert_eq!(narrow_screen_threshold(home, repo), expected, "{why}");
         }

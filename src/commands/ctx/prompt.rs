@@ -1052,11 +1052,10 @@ pub fn with_memory_layer(
             // is already surfaced (`compile.rs`'s own eprintln for that).
             // Never changes `composed.text` itself, so injection byte
             // totals are unaffected.
-            if screening
-                .flags
-                .iter()
-                .any(|f| super::screen::action(f, super::screen::SourceTrust::PeerSession) == super::screen::Action::Flag)
-            {
+            if screening.flags.iter().any(|f| {
+                super::screen::action(f, super::screen::SourceTrust::PeerSession)
+                    == super::screen::Action::Flag
+            }) {
                 eprintln!(
                     "zirv: shared memory layer flagged by screening: {}",
                     screening.summary()

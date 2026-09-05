@@ -335,7 +335,8 @@ fn window_dominant_repeat(text: &str, t: &Thresholds) -> bool {
     }
     let total = n as f64;
     counts.into_iter().any(|(_, count)| {
-        count >= t.repetition_min_repeats && (window * count) as f64 >= t.repetition_dominance_pct * total
+        count >= t.repetition_min_repeats
+            && (window * count) as f64 >= t.repetition_dominance_pct * total
     })
 }
 
@@ -444,9 +445,14 @@ impl ScreenFlag {
             ScreenFlag::RoleMarkerMidText(marker) => {
                 format!("role marker mid-text (\"{marker}\")")
             }
-            ScreenFlag::InvisibleUnicode { count, first_offset } => {
+            ScreenFlag::InvisibleUnicode {
+                count,
+                first_offset,
+            } => {
                 let plural = if *count == 1 { "" } else { "s" };
-                format!("invisible unicode ({count} codepoint{plural}, first at byte {first_offset})")
+                format!(
+                    "invisible unicode ({count} codepoint{plural}, first at byte {first_offset})"
+                )
             }
             ScreenFlag::LongOpaqueRun(kind) => {
                 format!("long opaque run ({})", kind.label())
@@ -553,7 +559,10 @@ fn screen_core(text: &str, total_bytes: usize, thresholds: &Thresholds) -> Scree
         }
     }
     if let Some((count, first_offset)) = detect_invisible_unicode(text) {
-        flags.push(ScreenFlag::InvisibleUnicode { count, first_offset });
+        flags.push(ScreenFlag::InvisibleUnicode {
+            count,
+            first_offset,
+        });
     }
     if let Some(kind) = detect_long_opaque_run(text) {
         flags.push(ScreenFlag::LongOpaqueRun(kind));
@@ -596,7 +605,11 @@ pub fn screen_prefix(text: &str, total_bytes: usize) -> ScreenReport {
 /// The `screen`/`screen_prefix` pair, parameterized on `thresholds` instead
 /// of the built-in default -- for a caller that has resolved a repo-
 /// narrowed `[screen]` config (`config.rs`'s `ScreenConfig::thresholds`).
-pub fn screen_with_thresholds(text: &str, total_bytes: usize, thresholds: &Thresholds) -> ScreenReport {
+pub fn screen_with_thresholds(
+    text: &str,
+    total_bytes: usize,
+    thresholds: &Thresholds,
+) -> ScreenReport {
     screen_core(text, total_bytes.max(text.len()), thresholds)
 }
 
@@ -1022,12 +1035,10 @@ mod tests {
         let text = "abc\u{200B}def\u{200B}ghi";
         let report = screen(text);
         assert!(
-            report
-                .flags
-                .contains(&ScreenFlag::InvisibleUnicode {
-                    count: 2,
-                    first_offset: 3
-                }),
+            report.flags.contains(&ScreenFlag::InvisibleUnicode {
+                count: 2,
+                first_offset: 3
+            }),
             "got {:?}",
             report.flags
         );

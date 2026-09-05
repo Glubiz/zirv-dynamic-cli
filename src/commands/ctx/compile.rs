@@ -834,7 +834,8 @@ fn with_canonical_context_layer(
         // Issue #272: `cfg.screen.thresholds()` is the one seam a caller
         // uses to apply a repo-narrowed `RepetitionDominated` threshold
         // without `screen.rs` itself ever reading config.
-        let screening = super::screen::screen_with_thresholds(&text, text.len(), &cfg.screen.thresholds());
+        let screening =
+            super::screen::screen_with_thresholds(&text, text.len(), &cfg.screen.thresholds());
         if screening.is_clean() {
             composed.text.push_str(&format!("[{}]\n", layer.label()));
         } else {

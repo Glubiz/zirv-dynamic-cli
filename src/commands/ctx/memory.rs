@@ -7265,9 +7265,7 @@ This should not appear in the body.\n";
             "got {findings:?}"
         );
         assert!(
-            findings
-                .iter()
-                .any(|f| f.reason == CadenceReason::Interval),
+            findings.iter().any(|f| f.reason == CadenceReason::Interval),
             "expected at least one Interval finding, got {findings:?}"
         );
     }
