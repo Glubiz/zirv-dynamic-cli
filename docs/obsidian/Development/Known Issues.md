@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-09-04
+last-verified: 2026-09-05
 ---
 
 # Known Issues
@@ -14,6 +14,9 @@ Each entry gets a changelog comment at the top of the file, newest first:
 <!-- Updated YYYY-MM-DD (branch, state): what changed -->
 ```
 
+<!-- Updated 2026-09-05 (release/3.22.0-harness-batch-7, issue #295): recorded that session-tier memory entries are recalled by `zirv ctx recall` but not yet injected into any compiled prompt layer -- `compile.rs`/`compile_with_harness_roster` resolve a session's prompt before that session is registered, so wiring this in needs a session id threaded through every launch call site -->
+<!-- Updated 2026-09-05 (release/3.22.0-harness-batch-7, issue #272 round 2 + review round 1): recorded three residuals in the source-aware screening action matrix -- `Action::Flag` is an `eprintln!` advisory, not a full `announce::Event`/decision-log entry (no `Announcer`/session id in scope at the compose-time call sites); `Action::LabelAndCap` is covered by the matrix tests but no call site re-caps content specifically because of it (every wired caller's own per-surface cap already does that job); `[screen]`'s narrowed thresholds still don't reach `handoff.rs`'s handoff-markdown screening or `search.rs`/`snapshot.rs`'s per-line redaction (no `CtxConfig` in scope at either call site) -->
+<!-- Updated 2026-09-05 (release/3.22.0-harness-batch-7, issue #276): recorded that `ZCHK-FORBIDDEN-WIDENING` only derives its "parsed key set" from `config.rs`'s `ENV_MAP` + `REPO_FORBIDDEN` tables, not a full struct-field walk -- a brand-new list-shaped key added outside `ENV_MAP` that is also not `REPO_FORBIDDEN` would not be caught -->
 <!-- Updated 2026-09-04 (feat/elastic-scheduling-358, issue #358): recorded three residuals -- `wrap::perform_handover_swap` quits the source process before it can probe the successor's readiness (unlike `Pane::handover`), a reservation left on a provider a mid-run reroute already moved away from is only reclaimed by the dead-owner sweep on that provider's next locked write, and the claude adapter's `HARNESS_PROMPT` sentence describing the repo-write rule is posture-independent wording, not automatically updated per `supervise.orchestrator_writes` -->
 <!-- Updated 2026-09-04 (release/3.20.0-harness-batch-6): recorded that the installed chocolatey zirv 3.18.0 on this machine still carries issue #346 (native subagents denied repo writes) -- this batch built 3.19.0 from the unmerged PR #347 branch into `~/bin` (ahead of the chocolatey install on Git Bash PATH) so hooks resolved the fixed binary; codex had no usage left, so every track ran on Claude sonnet -->
 <!-- Updated 2026-09-04 (release/3.20.0-harness-batch-6, issue #349): recorded that `Attention::Question`/`Attention::Permission` have no live source wired yet, there is no `ScreenManifest` authority source, and `ctx status`/`explain-status` have no `--json` output -->
@@ -89,6 +92,18 @@ Each entry gets a changelog comment at the top of the file, newest first:
 <!-- Updated 2026-08-13 (feat/dashboard, docs sweep): dashboard panes carry no rot score yet -->
 <!-- Updated 2026-08-13 (feat/agent-coordination, review round): markdown header absorption; registry short is a stable address; supervision env scrubbed on every spawn -->
 <!-- Updated 2026-08-13 (feat/agent-coordination, console-safety round): portable-pty do_kill inversion; ConPTY control-byte broadcast; empty nudge prefixes -->
+
+## Session-tier memory entries are recalled but not yet injected into any compiled prompt layer
+
+Recorded 2026-09-05 (`release/3.22.0-harness-batch-7`, issue #295). `MemoryScope::Session` participates in `zirv ctx recall` and the write journal like the private/shared tiers, but `compile.rs`/`compile_with_harness_roster` resolve a session's composed prompt (core memory layer included) BEFORE that session is registered -- there is no session id available at the point core/retrieval memory is gathered for injection. Wiring the session tier into launch-time injection would mean threading a session id through every launch call site across the codebase, not a local change to `memory.rs`/`compile.rs` alone. Documented as a deliberate residual rather than fixed in this batch -- see the 2026-09-05 [[Decision Log]] entry ("Memory rollback replays through the normal write path...") and [[Ctx Subsystem]]'s memory section.
+
+## The screen.rs action matrix's `Flag`/`LabelAndCap` actions, and two screening call sites, are still partial
+
+Recorded 2026-09-05 (`release/3.22.0-harness-batch-7`, issue #272 round 2 + review round 1). Three residuals in the source-aware `SourceTrust` x confidence -> `Action` matrix (`screen::action`): (1) `Action::Flag` escalates via a plain `eprintln!` line today, not a full `announce::Event`/decision-log entry, since the compose-time call sites (`compile.rs`, `prompt.rs` x2, `mail.rs`) have no `Announcer`/session id in scope to write one; (2) `Action::LabelAndCap` is defined and covered by the action-matrix enumeration test, but no call site re-caps content specifically because of it -- every wired caller's existing per-surface cap already does the job the design doc describes for that action, so the "cap" half of the action is currently a no-op in practice; (3) the round-1 fix threaded `[screen]`'s narrowed thresholds through every production screening surface EXCEPT `handoff.rs`'s handoff-markdown screening (a whole distilled packet, where narrowing would matter) and `search.rs`/`snapshot.rs`'s per-line redaction (`screen_text`/`redact_text`, where a `RepetitionDominated` finding is effectively unreachable one line at a time regardless of threshold) -- neither has a `CtxConfig` in scope at its current call site. See [[Untrusted Configuration]]'s `[screen]` bullet and the 2026-09-05 [[Decision Log]] entries.
+
+## `ZCHK-FORBIDDEN-WIDENING` only sees keys enumerated in `config.rs`'s `ENV_MAP`
+
+Recorded 2026-09-05 (`release/3.22.0-harness-batch-7`, issue #276). The built-in check derives its "every ctx.toml key must be REPO_FORBIDDEN or narrow-only-allowed" invariant from `config.rs`'s `ENV_MAP` plus the `REPO_FORBIDDEN` table -- it does not walk `CtxConfig`'s struct fields directly. A brand-new *list-shaped* key added outside `ENV_MAP` (the way `[workflow] check_env_passthrough` parses its own env var by hand rather than going through the standard scalar `ENV_MAP` path) that is also not added to `REPO_FORBIDDEN` would widen silently without the check catching it. Documented in `forbidden.rs`'s own module doc rather than fixed here -- fixing it would need either folding every bespoke env parser into `ENV_MAP` or a second, struct-reflection-based enumeration. See [[Built-in Commands]]'s `zirv verify --builtin` table and the 2026-09-05 [[Decision Log]] entry.
 
 ## `wrap::perform_handover_swap` quits the source process before it can probe the successor
 
