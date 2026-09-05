@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use super::config::{CtxConfig, EnvLookup, env_from_process};
-use super::event::{SessionId, SessionRef};
+use super::event::{NormalizedEvent, SessionId, SessionRef, input_hash};
 use super::judge::{GateOutcome, Step, WaitOn};
 use super::pace;
 use super::state::{StateDir, now_secs};
@@ -196,6 +196,16 @@ pub(crate) fn run_with_clock<W: Write>(
     // comment for what "progress" means. `None` until the first cycle this
     // run has actually evaluated an objective for.
     let mut objective_progress = ObjectiveProgress::default();
+    // Issue #311: this run's own self-pacing memory, owned across every
+    // cycle the identical way `objective_progress` right above is --
+    // `Some` only when self-pacing is engaged at all (no explicit
+    // `--interval`, the opt-in condition the design calls for), so an
+    // explicit `--interval` run carries `None` for its whole life and
+    // `handle_cycle_outcome` is byte-for-byte what it was before this issue.
+    let mut self_pace_state = args
+        .interval_secs
+        .is_none()
+        .then(|| SelfPaceState::new(interval));
     // Issue #358 (T9): true for exactly the first trip through this loop --
     // the pre-launch call that decides whether a brand-new worker gets to
     // start at all. Cleared unconditionally right after that first call, so
@@ -767,8 +777,15 @@ pub(crate) fn run_with_clock<W: Write>(
         // Issue #285 (review): fold this cycle's spend into the durable
         // objective so its soft budget can trip; the next cycle's own
         // `compile::compile` reloads the record and renders the wrap-up.
-        if let Ok(body) = std::fs::read_to_string(&transcript)
-            && let Some(usage) = adapter.transcript_usage(&body)
+        //
+        // Issue #311: the SAME read also feeds `cycle_outcome_digest` below
+        // -- self-pacing must never add a second read of this transcript on
+        // top of the one this cycle already needed for spend roll-up, so the
+        // body is captured once here and shared, regardless of whether
+        // `transcript_usage` happens to parse it.
+        let transcript_body = std::fs::read_to_string(&transcript).ok();
+        if let Some(body) = transcript_body.as_deref()
+            && let Some(usage) = adapter.transcript_usage(body)
         {
             objective::roll_up_spend(
                 &state,
@@ -777,6 +794,13 @@ pub(crate) fn run_with_clock<W: Write>(
                 now_fn(),
             );
         }
+        // Issue #311: `None` only when the transcript itself could not be
+        // read at all -- `handle_cycle_outcome` treats that the same as a
+        // digest CHANGE (never as "unchanged"), since an unreadable
+        // transcript is never evidence of repetition.
+        let cycle_digest = transcript_body
+            .as_deref()
+            .map(|body| cycle_outcome_digest(adapter.as_ref(), body));
 
         // Issue #314: deterministic gates first, a cheap-model verdict
         // second, for an active durable objective -- see `judge.rs`'s own
@@ -849,6 +873,29 @@ pub(crate) fn run_with_clock<W: Write>(
             );
         }
 
+        // Issue #311: new mail is a reset trigger alongside a digest change,
+        // but is only worth the extra `mail::list` scan when self-pacing is
+        // actually engaged and the cycle succeeded -- a failing cycle resets
+        // the self-paced wait unconditionally inside `handle_cycle_outcome`
+        // regardless of mail, and a run launched with an explicit
+        // `--interval` never consults this at all.
+        let new_mail = self_pace_state.is_some()
+            && !failed
+            && mail::unread_counts(
+                &state,
+                repo,
+                adapter.name(),
+                &nudge_address,
+                cfg.mail.enabled,
+            )
+            .is_some_and(|(broadcast, direct)| broadcast + direct > 0);
+        let self_pace = self_pace_state.as_mut().map(|pace_state| SelfPaceInput {
+            state: pace_state,
+            ceiling: Duration::from_secs(cfg.supervise.loop_backoff_ceiling_secs),
+            digest: cycle_digest,
+            new_mail,
+        });
+
         if let Some(code) = handle_cycle_outcome(
             args,
             &cfg,
@@ -860,6 +907,9 @@ pub(crate) fn run_with_clock<W: Write>(
             cycle,
             interval,
             &mut failures,
+            session.as_str(),
+            sleep_fn,
+            self_pace,
         )? {
             if let Some(guard) = session_guard.as_mut() {
                 guard.release();
@@ -1216,6 +1266,146 @@ pub fn backoff_for(failures: u32, base: Duration, interval: Duration) -> Duratio
     if scaled > cap { cap } else { scaled }
 }
 
+/// Issue #311: a normalized digest of one cycle's outcome, derived from the
+/// SAME transcript read `run_with_clock` already performs for its spend
+/// roll-up (`adapter.transcript_usage`) -- never a second file read for
+/// self-pacing's own sake, see the call site's own comment.
+///
+/// Walks `adapter.parse_events` for the LAST non-empty `NormalizedEvent::
+/// AssistantFinal::text` in the cycle and hashes just that text with
+/// [`input_hash`]. `AssistantFinal::text` is already exactly "the
+/// concatenated text blocks of one assistant turn" -- no id, timestamp, or
+/// session-specific data rides along with it -- so two cycles that ended on
+/// the same reply digest identically regardless of session id, wall-clock
+/// time, or anything else that happened earlier in either transcript. Falls
+/// back to hashing the whole transcript body when no assistant text could be
+/// found at all (a cycle that produced no assistant turns, or a transcript
+/// shape `parse_events` does not recognise) -- a coarser digest still
+/// changes whenever the cycle's raw output does, which is all self-pacing
+/// needs from it.
+fn cycle_outcome_digest(adapter: &dyn adapters::AgentAdapter, body: &str) -> u64 {
+    let last_text = adapter
+        .parse_events(body)
+        .into_iter()
+        .rev()
+        .find_map(|event| match event {
+            NormalizedEvent::AssistantFinal { text, .. } if !text.is_empty() => Some(text),
+            _ => None,
+        });
+    match last_text {
+        Some(text) => input_hash(&text),
+        None => input_hash(body),
+    }
+}
+
+/// Issue #311 (Hermes Agent's own `/loop` self-paced mode): why `next_pace`
+/// chose the wait it did, carried into the decision-log detail `handle_
+/// cycle_outcome` writes under `action: "loop-pace"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaceReason {
+    /// This cycle's digest differs from the previous one, or there was no
+    /// previous one at all (the first cycle self-pacing ever evaluated, or
+    /// one whose transcript could not be read): reset straight to the
+    /// floor.
+    Changed,
+    /// New mail arrived for this run since the last cycle: reset to the
+    /// floor even though the digest itself did not change.
+    Mail,
+    /// The digest matched the previous cycle's and no new mail arrived: the
+    /// wait grows geometrically toward the ceiling.
+    Unchanged,
+}
+
+/// Issue #311: the next wait between `zirv ctx loop` cycles when no explicit
+/// `--interval` was given, mirroring Hermes's own self-paced `/loop` mode
+/// (`_digest_response` + `s.current_delay = min(max(s.current_delay, floor)
+/// * 2, ceiling)` on a match, reset to `floor` on any change). Pure and
+/// clock/digest-source-free so every curve is a plain unit test: `prev`/
+/// `curr` are the previous and current cycle's own outcome digest
+/// ([`cycle_outcome_digest`]), `new_mail` is whether `mail::unread_counts`
+/// saw anything new for this run since the last cycle, `current_wait` is the
+/// wait this same function chose last time (or `floor` before the first
+/// call), and `floor`/`ceiling` bound the result.
+///
+/// - `prev != Some(curr)` (a genuine change, OR no previous digest at all)
+///   -- reset to `floor`, [`PaceReason::Changed`].
+/// - otherwise, `new_mail` -- also reset to `floor`, [`PaceReason::Mail`]:
+///   checked second so a cycle that is BOTH a digest change AND carries new
+///   mail still reports the more specific `Changed` reason (the wait is
+///   `floor` either way).
+/// - otherwise -- `min(max(current_wait, floor) * 2, ceiling)`,
+///   [`PaceReason::Unchanged`]. `floor == 0` (an `--interval` that resolved
+///   to a literal `0`, e.g. every inline test in this module) never grows:
+///   `max(0, 0) * 2 == 0`, so a run that opted out of any inter-cycle wait
+///   at all stays at zero forever instead of drifting upward from nothing.
+pub fn next_pace(
+    prev: Option<u64>,
+    curr: u64,
+    new_mail: bool,
+    current_wait: Duration,
+    floor: Duration,
+    ceiling: Duration,
+) -> (Duration, PaceReason) {
+    if prev != Some(curr) {
+        return (floor, PaceReason::Changed);
+    }
+    if new_mail {
+        return (floor, PaceReason::Mail);
+    }
+    let doubled = current_wait.max(floor).saturating_mul(2);
+    (doubled.min(ceiling), PaceReason::Unchanged)
+}
+
+/// Issue #311: this run's own self-pacing memory, owned across every cycle
+/// by `run_with_clock` the identical way `ObjectiveProgress` is -- see that
+/// struct's own doc comment. Constructed only when self-pacing is engaged at
+/// all (`args.interval_secs.is_none()`), so an explicit `--interval` run
+/// never allocates one and `handle_cycle_outcome` sees `None` for its whole
+/// life.
+#[derive(Debug)]
+struct SelfPaceState {
+    /// The previous cycle's outcome digest self-pacing actually compared
+    /// against, `None` before the first cycle this run has evaluated (or
+    /// right after a failure -- see `handle_cycle_outcome`'s own comment on
+    /// why that is left untouched, not reset, by a failed cycle).
+    last_digest: Option<u64>,
+    /// The wait `next_pace` chose last time, starting at the floor
+    /// (`interval`) and only ever changed by `next_pace`'s own return value
+    /// or a failure-path reset back to the floor.
+    wait: Duration,
+    /// Consecutive [`PaceReason::Unchanged`] decisions in a row, purely for
+    /// the decision-log detail ("unchanged x3, ..."); `next_pace` itself
+    /// never sees or needs this.
+    unchanged_streak: u32,
+}
+
+impl SelfPaceState {
+    fn new(floor: Duration) -> Self {
+        Self {
+            last_digest: None,
+            wait: floor,
+            unchanged_streak: 0,
+        }
+    }
+}
+
+/// Issue #311: everything `handle_cycle_outcome` needs to run self-pacing
+/// for one cycle, bundled into a single argument so that function's already-
+/// long parameter list does not grow by four more scalars for one opt-in
+/// feature. Passing `None` for the whole `handle_cycle_outcome` call (the
+/// call site's own `args.interval_secs.is_none()` check) is what disables
+/// self-pacing entirely -- `state` is a mutable borrow of the run's own
+/// [`SelfPaceState`], `ceiling` is `cfg.supervise.loop_backoff_ceiling_secs`,
+/// `digest` is this cycle's own [`cycle_outcome_digest`] (`None` only when
+/// the transcript could not be read), and `new_mail` is whether `mail::
+/// unread_counts` saw anything new for this run since the last cycle.
+struct SelfPaceInput<'a> {
+    state: &'a mut SelfPaceState,
+    ceiling: Duration,
+    digest: Option<u64>,
+    new_mail: bool,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_cycle_outcome<W: Write>(
     args: &LoopArgs,
@@ -1228,11 +1418,64 @@ fn handle_cycle_outcome<W: Write>(
     cycle: u32,
     interval: Duration,
     failures: &mut u32,
+    session: &str,
+    sleep_fn: &dyn Fn(Duration),
+    self_pace: Option<SelfPaceInput<'_>>,
 ) -> CtxResult<Option<i32>> {
     if !failed {
         *failures = 0;
-        if !interval.is_zero() {
-            std::thread::sleep(interval);
+        let wait = match self_pace {
+            Some(pace) => {
+                // Issue #311: an unreadable transcript is never evidence of
+                // repetition, so it is treated exactly like a digest change
+                // -- reset to the floor -- without ever calling `next_pace`
+                // with a fabricated `curr` value.
+                let (wait, reason) = match pace.digest {
+                    Some(curr) => next_pace(
+                        pace.state.last_digest,
+                        curr,
+                        pace.new_mail,
+                        pace.state.wait,
+                        interval,
+                        pace.ceiling,
+                    ),
+                    None => (interval, PaceReason::Changed),
+                };
+                pace.state.last_digest = pace.digest;
+                pace.state.wait = wait;
+                pace.state.unchanged_streak = if reason == PaceReason::Unchanged {
+                    pace.state.unchanged_streak + 1
+                } else {
+                    0
+                };
+                let detail = match reason {
+                    PaceReason::Changed => "changed, reset to floor".to_string(),
+                    PaceReason::Mail => "mail, reset to floor".to_string(),
+                    PaceReason::Unchanged => format!(
+                        "unchanged x{}, backing off to {}s",
+                        pace.state.unchanged_streak,
+                        wait.as_secs()
+                    ),
+                };
+                let _ = log::append(
+                    state,
+                    &log::Decision {
+                        ts: now_secs(),
+                        session,
+                        verb: "loop",
+                        verdict: "n/a",
+                        score: 0,
+                        action: "loop-pace",
+                        detail: &detail,
+                        observed_at: None,
+                    },
+                );
+                wait
+            }
+            None => interval,
+        };
+        if !wait.is_zero() {
+            sleep_fn(wait);
         }
         return Ok(None);
     }
@@ -1243,6 +1486,19 @@ fn handle_cycle_outcome<W: Write>(
         "zirv ctx loop: cycle {cycle} failed ({}/{max_failures} consecutive)",
         *failures
     )?;
+
+    // Issue #311: a failing cycle proves nothing about repetition, so it
+    // never grows the self-paced wait -- the existing `backoff_for` path
+    // right below is unchanged and takes priority (see `next_pace`'s own
+    // doc comment: this function never even calls it here). The self-paced
+    // wait itself resets to the floor so the NEXT success starts fresh
+    // rather than resuming the growth curve this failure interrupted;
+    // `last_digest` is deliberately left untouched, since it still reflects
+    // the last cycle that actually produced output worth comparing against.
+    if let Some(pace) = self_pace {
+        pace.state.wait = interval;
+        pace.state.unchanged_streak = 0;
+    }
 
     if *failures >= max_failures {
         let on_failure = args
@@ -1284,7 +1540,7 @@ fn handle_cycle_outcome<W: Write>(
     );
     if !wait.is_zero() {
         writeln!(w, "zirv ctx loop: backing off {}s", wait.as_secs())?;
-        std::thread::sleep(wait);
+        sleep_fn(wait);
     }
     Ok(None)
 }
@@ -1641,6 +1897,393 @@ mod tests {
         assert_eq!(capped, Duration::from_secs(3600));
     }
 
+    /// Issue #311: repeated identical digests double the wait from the floor
+    /// toward the ceiling, then clamp -- Hermes's own `min(max(current,
+    /// floor) * 2, ceiling)` curve, threaded through `next_pace` the same way
+    /// `handle_cycle_outcome` does (each call's `current_wait` is the
+    /// previous call's own return value).
+    #[test]
+    fn next_pace_doubles_from_the_floor_and_clamps_at_the_ceiling() {
+        let floor = Duration::from_secs(60);
+        let ceiling = Duration::from_secs(900);
+        let digest = 42u64;
+
+        // Seeded as already having ONE matching previous cycle (`prev =
+        // Some(digest)`): the very first cycle a digest is ever compared
+        // against is unconditionally `Changed` (see `next_pace_resets_to_
+        // the_floor_on_a_digest_change` below), so the growth curve itself
+        // only begins from the second consecutive match onward.
+        let mut wait = floor;
+        let expected = [120u64, 240, 480, 900, 900];
+        for want in expected {
+            let (next, reason) = next_pace(Some(digest), digest, false, wait, floor, ceiling);
+            assert_eq!(reason, PaceReason::Unchanged);
+            assert_eq!(next, Duration::from_secs(want), "wait sequence diverged");
+            wait = next;
+        }
+    }
+
+    /// Issue #311: a genuine digest change resets straight to the floor on
+    /// the very next cycle, regardless of how far the wait had already
+    /// grown.
+    #[test]
+    fn next_pace_resets_to_the_floor_on_a_digest_change() {
+        let floor = Duration::from_secs(60);
+        let ceiling = Duration::from_secs(900);
+        let grown = Duration::from_secs(480);
+
+        let (wait, reason) = next_pace(Some(1), 2, false, grown, floor, ceiling);
+        assert_eq!(wait, floor);
+        assert_eq!(reason, PaceReason::Changed);
+
+        // No previous digest at all (the first cycle self-pacing ever
+        // evaluated) is the identical case: nothing to compare against, so
+        // it is a change too.
+        let (wait, reason) = next_pace(None, 2, false, grown, floor, ceiling);
+        assert_eq!(wait, floor);
+        assert_eq!(reason, PaceReason::Changed);
+    }
+
+    /// Issue #311: new mail resets to the floor even when the digest itself
+    /// is unchanged -- an external event is exactly as significant as a
+    /// changed reply.
+    #[test]
+    fn next_pace_resets_to_the_floor_on_new_mail_even_with_an_unchanged_digest() {
+        let floor = Duration::from_secs(60);
+        let ceiling = Duration::from_secs(900);
+        let grown = Duration::from_secs(480);
+
+        let (wait, reason) = next_pace(Some(1), 1, true, grown, floor, ceiling);
+        assert_eq!(wait, floor);
+        assert_eq!(reason, PaceReason::Mail);
+    }
+
+    /// Issue #311: a digest change that ALSO carries new mail still reports
+    /// the more specific `Changed` reason -- the wait is the floor either
+    /// way, but the decision log should name the real cause.
+    #[test]
+    fn next_pace_prefers_the_changed_reason_over_mail_when_both_are_true() {
+        let floor = Duration::from_secs(60);
+        let ceiling = Duration::from_secs(900);
+        let (_, reason) = next_pace(Some(1), 2, true, floor, floor, ceiling);
+        assert_eq!(reason, PaceReason::Changed);
+    }
+
+    /// Issue #311: a floor of zero (`--interval 0`, or the zero-interval test
+    /// default) never grows -- `max(0, 0) * 2 == 0` -- so a run that opted
+    /// out of any inter-cycle wait stays at zero instead of drifting upward
+    /// from nothing.
+    #[test]
+    fn next_pace_with_a_zero_floor_never_grows() {
+        let floor = Duration::ZERO;
+        let ceiling = Duration::from_secs(900);
+        let mut wait = floor;
+        for _ in 0..5 {
+            let (next, reason) = next_pace(Some(1), 1, false, wait, floor, ceiling);
+            assert_eq!(next, Duration::ZERO);
+            assert_eq!(reason, PaceReason::Unchanged);
+            wait = next;
+        }
+    }
+
+    /// Issue #311: an explicit `--interval` (`self_pace: None`, the call
+    /// site's own `args.interval_secs.is_none()` gate) leaves `handle_cycle_
+    /// outcome` byte-for-byte what it was before this issue -- the sleep is
+    /// exactly `interval` and no `"loop-pace"` decision is ever logged.
+    #[test]
+    fn an_explicit_interval_disables_self_pacing_entirely() {
+        let mut failures = 0u32;
+        let mut out = Vec::new();
+        let tmp = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = CtxConfig::default();
+        let args = args_for(1);
+        let slept: std::cell::RefCell<Vec<u64>> = std::cell::RefCell::new(Vec::new());
+
+        let code = handle_cycle_outcome(
+            &args,
+            &cfg,
+            &state,
+            &mut out,
+            tmp.path(),
+            false,
+            5,
+            1,
+            Duration::from_secs(42),
+            &mut failures,
+            "session",
+            &|d| slept.borrow_mut().push(d.as_secs()),
+            None,
+        )
+        .expect("handled");
+        assert_eq!(code, None);
+        assert_eq!(
+            slept.borrow().as_slice(),
+            &[42],
+            "no explicit --interval means the fixed interval, unmodified"
+        );
+
+        let log = std::fs::read_to_string(state.logs().join("decisions.jsonl")).unwrap_or_default();
+        assert!(
+            !log.contains("\"action\":\"loop-pace\""),
+            "self-pacing must never engage without --interval being omitted, got {log}"
+        );
+    }
+
+    /// Issue #311: a successful cycle whose digest matches the previous
+    /// one's grows the wait geometrically and logs the decision, all through
+    /// the injected `sleep_fn` -- never a real sleep.
+    #[test]
+    fn a_successful_cycle_with_an_unchanged_digest_grows_the_self_paced_wait() {
+        let mut failures = 0u32;
+        let mut out = Vec::new();
+        let tmp = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = CtxConfig::default();
+        let args = args_for(1);
+        let floor = Duration::from_secs(60);
+        let ceiling = Duration::from_secs(900);
+        let mut pace_state = SelfPaceState {
+            last_digest: Some(7),
+            wait: floor,
+            unchanged_streak: 0,
+        };
+        let slept: std::cell::RefCell<Vec<u64>> = std::cell::RefCell::new(Vec::new());
+
+        let code = handle_cycle_outcome(
+            &args,
+            &cfg,
+            &state,
+            &mut out,
+            tmp.path(),
+            false,
+            5,
+            1,
+            floor,
+            &mut failures,
+            "session-a",
+            &|d| slept.borrow_mut().push(d.as_secs()),
+            Some(SelfPaceInput {
+                state: &mut pace_state,
+                ceiling,
+                digest: Some(7),
+                new_mail: false,
+            }),
+        )
+        .expect("handled");
+        assert_eq!(code, None);
+        assert_eq!(slept.borrow().as_slice(), &[120]);
+        assert_eq!(pace_state.wait, Duration::from_secs(120));
+        assert_eq!(pace_state.unchanged_streak, 1);
+
+        let log = std::fs::read_to_string(state.logs().join("decisions.jsonl")).expect("log");
+        assert!(
+            log.contains("\"action\":\"loop-pace\"") && log.contains("unchanged x1"),
+            "got {log}"
+        );
+    }
+
+    /// Issue #311: a digest change resets the self-paced wait to the floor
+    /// on the very next cycle and logs the "changed" reason.
+    #[test]
+    fn a_successful_cycle_with_a_changed_digest_resets_the_self_paced_wait() {
+        let mut failures = 0u32;
+        let mut out = Vec::new();
+        let tmp = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = CtxConfig::default();
+        let args = args_for(1);
+        let floor = Duration::from_secs(60);
+        let mut pace_state = SelfPaceState {
+            last_digest: Some(7),
+            wait: Duration::from_secs(480),
+            unchanged_streak: 3,
+        };
+        let slept: std::cell::RefCell<Vec<u64>> = std::cell::RefCell::new(Vec::new());
+
+        handle_cycle_outcome(
+            &args,
+            &cfg,
+            &state,
+            &mut out,
+            tmp.path(),
+            false,
+            5,
+            1,
+            floor,
+            &mut failures,
+            "session-a",
+            &|d| slept.borrow_mut().push(d.as_secs()),
+            Some(SelfPaceInput {
+                state: &mut pace_state,
+                ceiling: Duration::from_secs(900),
+                digest: Some(8),
+                new_mail: false,
+            }),
+        )
+        .expect("handled");
+        assert_eq!(slept.borrow().as_slice(), &[60]);
+        assert_eq!(pace_state.wait, floor);
+        assert_eq!(pace_state.unchanged_streak, 0);
+
+        let log = std::fs::read_to_string(state.logs().join("decisions.jsonl")).expect("log");
+        assert!(
+            log.contains("\"action\":\"loop-pace\"") && log.contains("changed, reset to floor"),
+            "got {log}"
+        );
+    }
+
+    /// Issue #311: new mail resets the self-paced wait to the floor even
+    /// with an unchanged digest, and logs the "mail" reason.
+    #[test]
+    fn a_successful_cycle_with_new_mail_resets_the_self_paced_wait() {
+        let mut failures = 0u32;
+        let mut out = Vec::new();
+        let tmp = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = CtxConfig::default();
+        let args = args_for(1);
+        let floor = Duration::from_secs(60);
+        let mut pace_state = SelfPaceState {
+            last_digest: Some(7),
+            wait: Duration::from_secs(240),
+            unchanged_streak: 2,
+        };
+        let slept: std::cell::RefCell<Vec<u64>> = std::cell::RefCell::new(Vec::new());
+
+        handle_cycle_outcome(
+            &args,
+            &cfg,
+            &state,
+            &mut out,
+            tmp.path(),
+            false,
+            5,
+            1,
+            floor,
+            &mut failures,
+            "session-a",
+            &|d| slept.borrow_mut().push(d.as_secs()),
+            Some(SelfPaceInput {
+                state: &mut pace_state,
+                ceiling: Duration::from_secs(900),
+                digest: Some(7),
+                new_mail: true,
+            }),
+        )
+        .expect("handled");
+        assert_eq!(slept.borrow().as_slice(), &[60]);
+        assert_eq!(pace_state.wait, floor);
+
+        let log = std::fs::read_to_string(state.logs().join("decisions.jsonl")).expect("log");
+        assert!(
+            log.contains("\"action\":\"loop-pace\"") && log.contains("mail, reset to floor"),
+            "got {log}"
+        );
+    }
+
+    /// Issue #311: a failing cycle never grows the self-paced wait -- the
+    /// existing `backoff_for` path is unchanged and takes priority -- but it
+    /// DOES reset the self-paced wait back to the floor, so the next success
+    /// starts fresh instead of resuming the interrupted growth curve.
+    /// `last_digest` is left untouched.
+    #[test]
+    fn a_failing_cycle_bypasses_self_pacing_and_resets_its_wait_to_the_floor() {
+        let mut failures = 0u32;
+        let mut out = Vec::new();
+        let tmp = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = CtxConfig::default();
+        let mut args = args_for(1);
+        args.on_failure = None;
+        let floor = Duration::from_secs(60);
+        let mut pace_state = SelfPaceState {
+            last_digest: Some(7),
+            wait: Duration::from_secs(480),
+            unchanged_streak: 3,
+        };
+        let slept: std::cell::RefCell<Vec<u64>> = std::cell::RefCell::new(Vec::new());
+
+        let code = handle_cycle_outcome(
+            &args,
+            &cfg,
+            &state,
+            &mut out,
+            tmp.path(),
+            true,
+            5,
+            1,
+            floor,
+            &mut failures,
+            "session-a",
+            &|d| slept.borrow_mut().push(d.as_secs()),
+            Some(SelfPaceInput {
+                state: &mut pace_state,
+                ceiling: Duration::from_secs(900),
+                // Even an "unchanged" digest must not matter on a failure:
+                // the self-paced wait resets regardless.
+                digest: Some(7),
+                new_mail: false,
+            }),
+        )
+        .expect("handled");
+        assert_eq!(code, None);
+        assert_eq!(
+            pace_state.wait, floor,
+            "a failure resets the self-paced wait so the next success starts fresh"
+        );
+        assert_eq!(pace_state.unchanged_streak, 0);
+        assert_eq!(
+            pace_state.last_digest,
+            Some(7),
+            "a failure says nothing about the last real digest, so it is left alone"
+        );
+        // `backoff_for(1, base=60s, interval=60s)` is 60s -- the ordinary
+        // failure-backoff path, never the self-paced wait computation.
+        assert_eq!(slept.borrow().as_slice(), &[60]);
+
+        let log = std::fs::read_to_string(state.logs().join("decisions.jsonl")).unwrap_or_default();
+        assert!(
+            !log.contains("\"action\":\"loop-pace\""),
+            "a failing cycle never logs a self-pacing decision, got {log}"
+        );
+    }
+
+    #[test]
+    fn cycle_outcome_digest_hashes_the_last_assistant_text_and_falls_back_to_the_whole_body() {
+        let adapter = super::super::adapters::claude::ClaudeAdapter::new(None);
+        let turn = |text: &str| {
+            format!(
+                "{{\"type\":\"assistant\",\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"{text}\"}}]}}}}\n"
+            )
+        };
+        let body = format!("{}{}{}", turn("first"), turn("second"), turn("third"));
+        let digest_a = cycle_outcome_digest(&adapter, &body);
+        assert_eq!(
+            digest_a,
+            input_hash("third"),
+            "the LAST assistant text wins"
+        );
+
+        let body_same_last = format!("{}{}", turn("different-first"), turn("third"));
+        assert_eq!(
+            cycle_outcome_digest(&adapter, &body_same_last),
+            digest_a,
+            "two transcripts ending on the same reply digest identically"
+        );
+
+        let body_changed_last = format!("{}{}{}", turn("first"), turn("second"), turn("fourth"));
+        assert_ne!(cycle_outcome_digest(&adapter, &body_changed_last), digest_a);
+
+        // No assistant text at all (a transcript with only a user turn):
+        // falls back to hashing the whole raw body.
+        let no_assistant_text = "{\"type\":\"user\",\"message\":{\"content\":\"do the thing\"}}\n";
+        assert_eq!(
+            cycle_outcome_digest(&adapter, no_assistant_text),
+            input_hash(no_assistant_text),
+        );
+    }
+
     #[test]
     fn repeated_failures_run_on_failure_and_exit_nonzero() {
         let tmp = crate::commands::ctx::testenv::repo();
@@ -1697,6 +2340,9 @@ mod tests {
             1,
             Duration::ZERO,
             &mut failures,
+            "session",
+            &|_| {},
+            None,
         )
         .expect("handled");
         assert_eq!(code, None, "keep looping");
@@ -1724,6 +2370,9 @@ mod tests {
             1,
             Duration::ZERO,
             &mut failures,
+            "session",
+            &|_| {},
+            None,
         )
         .expect("handled");
         assert_eq!(code, None);
