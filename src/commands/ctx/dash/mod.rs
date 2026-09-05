@@ -11,6 +11,9 @@
 //! (`--simple`, non-terminal stdio, too small, or the dashboard turned off
 //! in config) still reaches today's `wrap::run_with` passthrough instead.
 
+pub mod actions;
+pub mod hit;
+pub mod notify;
 pub mod pane;
 pub mod roster;
 pub mod spawnreq;
@@ -47,6 +50,9 @@ use super::term;
 use super::window;
 use super::{fallback, handoff, handover, mail, memory, prompt, score, seat, sessions};
 use crate::commands::workflow;
+use crate::style;
+use actions::{MENU_NO_CWD, MENU_NO_REQUEST};
+use hit::{HintId, Hit};
 
 pub(crate) use pane::{Pane, PaneBudgetNotice, PaneSpec, PaneState, ScrollOutcome};
 
@@ -66,8 +72,28 @@ pub enum InputVerdict {
 }
 
 /// Every command the dashboard itself understands once the prefix is armed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DashAction {
+    /// Right-click on a sidebar row: open the context menu for *that* row,
+    /// which is not necessarily the selected one.
+    ContextMenu(hit::RowId),
+    /// `Ctrl+A c`, or the header's `actions` hint: the same menu for the
+    /// selected row.
+    ContextActions,
+    /// `Ctrl+A i`, or the header's `inspect` hint (issue #354 phase 3): the
+    /// per-row inspector over the selected row. Replaces phase 1/2's mapping
+    /// of this chord onto the errors overlay; `^A e errors` is unchanged.
+    Inspect,
+    /// `Ctrl+A r`, or the header's `restore` hint (issue #354 phase 3):
+    /// relaunch the selected ended/reaped row from the spawn request the
+    /// dashboard kept for it. A no-op with a notice when the selected row is
+    /// not restorable -- the hint is not drawn for such a row in the first
+    /// place, and the context menu says why.
+    RestoreRow,
+    /// `Ctrl+A Left`/`Ctrl+A Right`, or a click on a group header's
+    /// disclosure triangle: fold a work group shut, or open it again.
+    CollapseGroup,
+    ExpandGroup,
     Switch(usize),
     NextPane,
     SelectUp,
@@ -90,6 +116,11 @@ pub enum DashAction {
     /// `Ctrl+A ?` or `Ctrl+A h`/`H` -- opens the help overlay listing every
     /// binding below.
     Help,
+    /// `Ctrl+A p` (issue #354 phase 4) -- opens the searchable palette over
+    /// the one action-descriptor table (`dash::actions::ACTIONS`). The same
+    /// dialog the help overlay is, with Enter wired to run the caret's own
+    /// action against the current selection.
+    Palette,
     /// Scroll the focused pane a half-screen back into its history
     /// (`Ctrl+A PageUp`) or toward the live view (`Ctrl+A PageDown`).
     ScrollPageUp,
@@ -109,6 +140,292 @@ pub enum DashAction {
     /// child that does *not* want mouse (`Pane::wants_mouse`, see
     /// `Selection`'s doc comment). See `term::dash_mouse_off_bytes`.
     ToggleSelectMode,
+}
+
+/// Issue #354: what one pointer event means to the dashboard, decided
+/// entirely from the last drawn frame's geometry. `Grid` is the one variant
+/// that lets the event through to the focused child; every other variant is
+/// the dashboard's own chrome and stops here.
+#[derive(Debug, PartialEq, Eq)]
+enum MouseRoute {
+    /// Hand the event on to the existing grid path unchanged: child mouse
+    /// forwarding, wheel scrollback and in-dashboard text selection.
+    Grid,
+    /// Swallowed: an overlay owns the pointer, mouse capture is off, or the
+    /// gesture means nothing where it landed.
+    Consume,
+    /// Left click on a sidebar session row (by session short id).
+    Select(String),
+    /// Left click on the roster's summary line.
+    Summary,
+    /// Left click on a group header's disclosure triangle (by work-group id).
+    Toggle(String),
+    /// Wheel over the sidebar: scroll the roster viewport by this many
+    /// entries, without moving the selection.
+    ScrollRoster(isize),
+    /// A chrome hit that maps onto a keyboard action the dash already has.
+    Action(DashAction),
+    /// Issue #354 phase 3: a left click on one visible row of the open list
+    /// dialog, by its index into that dialog's own full row list. Selecting
+    /// vs activating is decided by the loop, which is the only thing holding
+    /// a clock ([`DOUBLE_CLICK`]); this stays pure.
+    OverlayRow(usize),
+    /// Issue #354 phase 3: a click on the open dialog's own pinned hint row,
+    /// fed to that dialog's reducer as exactly the key the hint names -- so
+    /// the pointer can never reach a code path the keyboard could not.
+    OverlayKey(KeyCode),
+    /// Issue #354 phase 3: the wheel over an open dialog, in list rows.
+    ScrollOverlay(isize),
+}
+
+/// Pure: the dispatch order the behaviour contract calls for, in one place.
+///
+/// 1. the select-mode / mouse-off guard (mouse capture off means the terminal
+///    itself owns the pointer, so nothing here may act on it);
+/// 2. the modal layer -- an open overlay owns every pointer event, wheel
+///    included. Phase 3 refines "owns" from "swallows" to "owns its own
+///    targets": a click on one of the dialog's visible rows selects (or, on a
+///    double-click, activates) it, a click on its pinned hint row is fed to
+///    its reducer as that key, the wheel scrolls its list, and everything
+///    else inside or around it is consumed and does nothing. Nothing under a
+///    dialog is ever reachable;
+/// 3. the captured gesture owner -- a drag or release that belongs to an
+///    in-progress text selection stays with the grid wherever it lands, so
+///    every `*_cancels_selection` rule keeps working;
+/// 4. the chrome hit;
+/// 5. the existing grid path, unchanged.
+///
+/// Nothing but `MouseRoute::Grid` may reach `Pane::forward_mouse_button`,
+/// `Pane::scroll_wheel` or `Pane::write_input`.
+fn route_mouse(
+    snap: &hit::FrameSnapshot,
+    mouse: event::MouseEvent,
+    capture: bool,
+    overlay_open: bool,
+    selecting: bool,
+) -> MouseRoute {
+    if !capture {
+        return MouseRoute::Consume;
+    }
+    let hit = hit::hit_test(snap, mouse.column, mouse.row);
+    let inside_dialog = matches!(hit, Hit::Overlay | Hit::OverlayRow(_) | Hit::OverlayHint(_));
+    if overlay_open || inside_dialog || matches!(hit, Hit::ModalBackdrop) {
+        return match (hit, mouse.kind) {
+            (
+                Hit::OverlayHint(HintId::DialogKey(code)),
+                MouseEventKind::Down(MouseButton::Left),
+            ) => MouseRoute::OverlayKey(code),
+            (Hit::OverlayRow(index), MouseEventKind::Down(MouseButton::Left)) => {
+                MouseRoute::OverlayRow(index)
+            }
+            // The wheel scrolls the dialog's own list, but only with the
+            // pointer actually inside it: a notch on the backdrop is
+            // consumed, exactly like a click there.
+            (_, MouseEventKind::ScrollUp) if inside_dialog => MouseRoute::ScrollOverlay(-1),
+            (_, MouseEventKind::ScrollDown) if inside_dialog => MouseRoute::ScrollOverlay(1),
+            _ => MouseRoute::Consume,
+        };
+    }
+    if selecting
+        && matches!(
+            mouse.kind,
+            MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left)
+        )
+    {
+        return MouseRoute::Grid;
+    }
+    // The wheel belongs to the whole sidebar column, not just its rows: a
+    // notch over the summary line, a group header or the padding below the
+    // last row scrolls the roster exactly the same way.
+    if !snap.zoomed
+        && snap
+            .sidebar
+            .contains(Position::new(mouse.column, mouse.row))
+    {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => return MouseRoute::ScrollRoster(-1),
+            MouseEventKind::ScrollDown => return MouseRoute::ScrollRoster(1),
+            _ => {}
+        }
+    }
+    match (hit, mouse.kind) {
+        (Hit::Grid, _) => MouseRoute::Grid,
+        (Hit::SidebarRow(id), MouseEventKind::Down(MouseButton::Left)) => MouseRoute::Select(id),
+        (Hit::SidebarRow(id), MouseEventKind::Down(MouseButton::Right)) => {
+            MouseRoute::Action(DashAction::ContextMenu(id))
+        }
+        (Hit::SidebarSummary, MouseEventKind::Down(MouseButton::Left)) => MouseRoute::Summary,
+        (Hit::GroupToggle(id), MouseEventKind::Down(MouseButton::Left)) => MouseRoute::Toggle(id),
+        (Hit::HeaderHint(id) | Hit::FooterHint(id), MouseEventKind::Down(MouseButton::Left)) => {
+            MouseRoute::Action(match id {
+                HintId::Actions => DashAction::ContextActions,
+                HintId::Nudge => DashAction::Nudge,
+                HintId::Mail => DashAction::Mail,
+                HintId::Errors => DashAction::ShowErrors,
+                HintId::Inspect => DashAction::Inspect,
+                HintId::Restore => DashAction::RestoreRow,
+                // A dialog hint is never in the header/footer cluster; a
+                // stray one is the always-safe action rather than a panic.
+                HintId::Help | HintId::DialogKey(_) => DashAction::Help,
+            })
+        }
+        _ => MouseRoute::Consume,
+    }
+}
+
+/// Pure: clicking a row by session short id has exactly the effect the
+/// keyboard's own select-and-focus has ([`apply_navigation`]'s `Switch`) --
+/// for a row this dashboard actually owns. A view-only registry row or an
+/// ended pane moves the cursor only, leaving input focus where it was, which
+/// is the same rule arrow navigation follows (F7). An id that named a row
+/// which has since been reaped is a no-op rather than a guess.
+fn select_row(
+    id: &str,
+    rows: &[ui::SidebarRow],
+    selected: usize,
+    focused: usize,
+) -> (usize, usize) {
+    let Some(index) = rows.iter().position(|r| r.short == id) else {
+        return (selected, focused);
+    };
+    if rows[index].attached && rows[index].state != ui::RowState::Dead {
+        apply_navigation(
+            DashAction::Switch(index),
+            selected,
+            focused,
+            rows.iter().filter(|r| r.attached).count(),
+            rows.len(),
+        )
+    } else {
+        (index, focused)
+    }
+}
+
+/// Pure: `SelectUp`/`SelectDown` over the *tree* the roster actually drew
+/// (`order`, plus the summary line that always heads it), not over the flat
+/// pane vector -- so the cursor walks onto group headers and the summary the
+/// same way a click can reach them, and skips the children of a collapsed
+/// group because they are not in `order` at all.
+///
+/// `chrome` holds the cursor whenever it is on a non-session entry; a session
+/// entry clears it and moves the real `(selected, focused)` pair. Every other
+/// navigation action (`Switch`, `NextPane`) is the pre-#354 behaviour
+/// untouched.
+fn navigate_roster(
+    action: DashAction,
+    rows: &[ui::SidebarRow],
+    order: &[Hit],
+    selected: usize,
+    focused: usize,
+    chrome: &mut Option<Hit>,
+) -> (usize, usize) {
+    if !matches!(action, DashAction::SelectUp | DashAction::SelectDown) {
+        *chrome = None;
+        return apply_navigation(
+            action,
+            selected,
+            focused,
+            rows.iter().filter(|r| r.attached).count(),
+            rows.len(),
+        );
+    }
+    let mut order = order.to_vec();
+    order.insert(0, Hit::SidebarSummary);
+    let current = chrome
+        .clone()
+        .or_else(|| rows.get(selected).map(|r| Hit::SidebarRow(r.short.clone())));
+    let index = current
+        .and_then(|id| order.iter().position(|r| *r == id))
+        .unwrap_or(0);
+    let index = if action == DashAction::SelectUp {
+        index.saturating_sub(1)
+    } else {
+        index.saturating_add(1).min(order.len().saturating_sub(1))
+    };
+    match order.get(index) {
+        Some(Hit::SidebarRow(id)) => {
+            *chrome = None;
+            select_row(id, rows, selected, focused)
+        }
+        Some(id) => {
+            *chrome = Some(id.clone());
+            (selected, focused)
+        }
+        None => (selected, focused),
+    }
+}
+
+/// Folds the throttled [`FactsCache`] reads into the rows `assemble_sidebar`
+/// built from the panes alone. Everything here comes from a value already
+/// cached on the facts cadence -- the work group's scope, when this pane last
+/// changed state, the harness's own usage window -- so a frame never reads
+/// the disk and never shells out. Keys whose fact has no cached value keep
+/// the placeholder `assemble_sidebar` put there.
+fn enrich_sidebar(rows: &mut [ui::SidebarRow], disk: &DiskFacts, now: u64) {
+    for row in rows {
+        // Issue #354 phase 2: the glyph column, the rollups and the `reason`
+        // line all read this one cached value. It is looked up here, on the
+        // facts cadence's own output -- never loaded per frame.
+        row.status = disk.attention.get(&row.short).cloned();
+        if let Some(group) = row.group.as_mut()
+            && let Some(cached) = disk.groups.get(&group.id)
+        {
+            group.scope = cached.scope.clone();
+            if let Some((_, value)) = row.disclosure.iter_mut().find(|(key, _)| key == "group") {
+                *value = value.replacen(style::PLACEHOLDER, &group.scope, 1);
+            }
+        }
+        // Issue #354 phase 2: `reason` is the composed status's own explanation
+        // rather than phase 1's `none · <state>`. A row with no status (or one
+        // that projects `Unknown`, which is what a missing file reads back as)
+        // keeps the phase 1 text -- never a fabricated reason.
+        if let Some(status) = row.status.as_ref()
+            && let Some((_, value)) = row.disclosure.iter_mut().find(|(key, _)| key == "reason")
+            && let Some(text) = disclosure_reason(status)
+        {
+            *value = text;
+        }
+        // A retained ended row's `since` is already final (`exited <age> ·
+        // exit <code>`, built by `assemble_sidebar` from facts frozen at the
+        // reap); nothing cached may overwrite it.
+        if row.exit_code.is_some() {
+            continue;
+        }
+        // `since` prefers the attention model's own last transition -- the
+        // moment the projection actually changed, which is what "waiting 1m"
+        // in the approved frame means -- and falls back to the dashboard's own
+        // observed `RowState` clock when no status has ever been recorded.
+        let transition = row
+            .status
+            .as_ref()
+            .filter(|s| s.last_transition > 0)
+            .map(|s| (lifecycle_word(s.lifecycle), s.last_transition))
+            .or_else(|| {
+                disk.state_since
+                    .get(&row.short)
+                    .map(|(_, at)| (row_state_label(row.state), *at))
+            });
+        if let Some((word, at)) = transition
+            && let Some((_, value)) = row.disclosure.iter_mut().find(|(key, _)| key == "since")
+        {
+            *value = format!(
+                "{word} {} \u{b7} started {} ago",
+                style::format_age(now.saturating_sub(at)),
+                row.age_secs
+                    .map(style::format_age)
+                    .unwrap_or_else(|| style::PLACEHOLDER.into())
+            );
+        }
+        if let Some(usage) = disk
+            .usage
+            .iter()
+            .find(|u| u.name == row.harness)
+            .and_then(|u| u.five_hour)
+            && let Some((_, value)) = row.disclosure.iter_mut().find(|(key, _)| key == "budget")
+        {
+            value.push_str(&format!(" \u{b7} 5h {usage:.0}%"));
+        }
+    }
 }
 
 /// Matches `PREFIX` in either shape a real terminal can deliver it in: the
@@ -147,6 +464,11 @@ pub fn filter_key(prefix_armed: bool, key: KeyEvent) -> (bool, InputVerdict) {
         KeyCode::Tab => Some(DashAction::NextPane),
         KeyCode::Up => Some(DashAction::SelectUp),
         KeyCode::Down => Some(DashAction::SelectDown),
+        // Issue #354: the roster is a tree now, so Left/Right fold a work
+        // group shut and open it again -- the keyboard equivalent of clicking
+        // a group header's disclosure triangle. Both were unbound before.
+        KeyCode::Left => Some(DashAction::CollapseGroup),
+        KeyCode::Right => Some(DashAction::ExpandGroup),
         // Scrollback, behind the prefix only. The bare keys deliberately keep
         // passing through to the child (`encode_key` sends them as `CSI 5~`/
         // `CSI 6~`): a harness has its own paging, and stealing PageUp from it
@@ -159,11 +481,25 @@ pub fn filter_key(prefix_armed: bool, key: KeyEvent) -> (bool, InputVerdict) {
             Some(DashAction::Switch((c as u8 - b'1') as usize))
         }
         KeyCode::Char('s') => Some(DashAction::Spawn),
+        // Issue #354: the selected row's action menu -- the same one a
+        // right-click raises. `c` was unbound before.
+        KeyCode::Char('c') => Some(DashAction::ContextActions),
         KeyCode::Char('n') => Some(DashAction::Nudge),
         KeyCode::Char('m') => Some(DashAction::Mail),
         KeyCode::Char('M') => Some(DashAction::Memory),
         KeyCode::Char('o') => Some(DashAction::Handover),
         KeyCode::Char('e') => Some(DashAction::ShowErrors),
+        // Issue #354 phase 3: the real per-session inspector. Phase 1/2
+        // mapped this chord onto the errors overlay so the drawn hint was
+        // never inert; it now leads to the surface it always named.
+        KeyCode::Char('i') => Some(DashAction::Inspect),
+        // Issue #354 phase 3: the dead footer has advertised `^A r restore`
+        // since #209 with nothing behind it. It relaunches the selected
+        // ended row now.
+        KeyCode::Char('r') => Some(DashAction::RestoreRow),
+        // Issue #354 phase 4: the searchable palette over the one
+        // action-descriptor table. `p` was unbound before.
+        KeyCode::Char('p') => Some(DashAction::Palette),
         KeyCode::Char('z') => Some(DashAction::Zoom),
         KeyCode::Char('v') => Some(DashAction::ToggleSelectMode),
         KeyCode::Char('q') => Some(DashAction::Quit),
@@ -376,9 +712,96 @@ fn overlay_name(overlay: &ui::Overlay) -> &'static str {
         ui::Overlay::Mail(_) => "mail",
         ui::Overlay::Memory(_) => "memory",
         ui::Overlay::Restore(_) => "restore",
-        ui::Overlay::Help => "help",
+        ui::Overlay::Palette(view) => view.mode.title(),
         ui::Overlay::Errors(_) => "errors",
+        ui::Overlay::Menu(_) => "actions",
+        ui::Overlay::Inspector(_) => "inspect",
     }
+}
+
+/// Pure: a cheap identity for the open overlay -- its name plus, for the
+/// dialogs that are opened against one particular row, that row's short id.
+///
+/// Review of 9314156 (finding 2): this is what the pending double-click is
+/// tagged with. Two different dialogs never share an identity, and neither
+/// does the same dialog opened on a different row; `Overlay::None` in
+/// between makes a close-then-reopen a change too.
+fn overlay_identity(overlay: &ui::Overlay) -> (&'static str, String) {
+    let subject = match overlay {
+        ui::Overlay::Menu(view) => view.target.clone(),
+        ui::Overlay::Inspector(view) => view.target.clone(),
+        ui::Overlay::Handover(draft) => draft.target_short.clone(),
+        // Review of cc92a56 (finding 2): the palette's own row list is a
+        // function of its query, so the query IS part of its identity. Without
+        // it, a click on row 3, one keystroke that re-filters the list, and a
+        // second click on row 3 inside the double-click window activated
+        // whatever action had moved under the pointer.
+        ui::Overlay::Palette(view) => view.query.clone(),
+        _ => String::new(),
+    };
+    (overlay_name(overlay), subject)
+}
+
+/// Review of #354 (defect 1, HIGH): whether a mouse route computed from the
+/// tick's one shared `frame_snapshot` may still be trusted for THIS event.
+///
+/// `HIGH-2` (below, at the drain loop) processes several queued events
+/// against a single snapshot taken at the top of the tick. If an earlier
+/// event in that same drain closes -- or replaces -- the open overlay (an
+/// `Esc` that closes the palette, say), a later queued click can still land
+/// on the snapshot's now-stale overlay hint or row: `route_mouse` only knows
+/// the frozen geometry, not that the dialog it names is already gone. Acting
+/// on it anyway would synthesize the keystroke the hint names (e.g. `Enter`)
+/// with no overlay left open to consume it -- which is the one way a chrome
+/// hit could otherwise reach `Pane::write_input`.
+///
+/// Comparing `overlay_identity` -- not just "is some overlay open" -- also
+/// catches a *different* dialog opening at the exact same screen position
+/// within the same drain, the same staleness `last_overlay_click` above
+/// already guards against for the double-click clock.
+///
+/// Every non-overlay route (`Grid`, `Select`, chrome, ...) is unaffected: it
+/// was never computed from the overlay's own rows/hints, so there is nothing
+/// here for it to go stale against.
+fn overlay_route_is_current(
+    route: &MouseRoute,
+    live_overlay: &ui::Overlay,
+    snapshot_overlay_ident: &(&'static str, String),
+) -> bool {
+    if !matches!(
+        route,
+        MouseRoute::OverlayRow(_) | MouseRoute::OverlayKey(_) | MouseRoute::ScrollOverlay(_)
+    ) {
+        return true;
+    }
+    overlay_identity(live_overlay) == *snapshot_overlay_ident
+}
+
+/// The first-run tip's own flag file: `<state>/dash/tip-seen`. Operator-level
+/// and repo-independent (`StateDir::dash()` is the dashboard's own state
+/// root), deliberately NOT a config key -- it is a fact about this operator's
+/// history, not something to configure.
+fn first_run_tip_flag(state: &StateDir) -> PathBuf {
+    state.dash().join("tip-seen")
+}
+
+/// Impure, best effort: has this operator seen the first-run tip already?
+/// A missing or unreadable state directory answers "no", which shows the tip
+/// again -- the harmless direction.
+fn first_run_tip_seen(state: &StateDir) -> bool {
+    first_run_tip_flag(state).exists()
+}
+
+/// Impure, best effort: record that the tip has been shown. Every error is
+/// deliberately swallowed -- a read-only state directory must cost the
+/// operator a repeated tip, never an error line, and certainly never a panic
+/// on the dashboard's own launch path.
+fn mark_first_run_tip_seen(state: &StateDir) {
+    let path = first_run_tip_flag(state);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&path, b"1\n");
 }
 
 /// Set `ZIRV_CTX_DASH_KEYLOG` to a path and the dashboard appends one line per
@@ -651,6 +1074,22 @@ impl KeyLog {
 /// One dashboard-owned pane's row inputs, decoupled from `Pane` itself so
 /// `assemble_sidebar` stays pure and testable without a real spawn.
 struct PaneRowMeta {
+    /// `PromptRole::label`'s own spelling; `display_role` shortens it for the
+    /// row's 8-column role field.
+    role: String,
+    /// Issue #354: `Pane::launch_model` -- what the child was actually
+    /// launched with, `None` when the argv pinned nothing.
+    model: Option<String>,
+    /// `Pane::work_group_id`, the only source of group membership.
+    group_id: Option<String>,
+    /// `Pane::parent_session`, for the `group` disclosure line.
+    parent: Option<String>,
+    /// The `budget` disclosure line, pre-rendered from the pane's ceiling and
+    /// its last measured usage -- both already cached, neither re-read here.
+    budget: String,
+    /// The `writer` disclosure line: whether this pane holds the write
+    /// permit, and for which checkout.
+    writer: String,
     short: String,
     harness: String,
     state: ui::RowState,
@@ -658,6 +1097,157 @@ struct PaneRowMeta {
     /// through so the footer's supervision segment can render the truth
     /// instead of an assumed `supervised`.
     supervised: bool,
+    /// Issue #354 phase 2: `Some` for a **retained ended row** -- a completed
+    /// pane whose `Pane` `reap_ended_panes` has already dropped but whose row
+    /// the roster keeps. `None` for every live pane.
+    ended: Option<EndedMeta>,
+}
+
+/// Issue #354 phase 2: what a retained ended row knows that a live pane's row
+/// does not. Frozen at the moment of the reap: the session's registry record
+/// is released there, so nothing can be re-derived from it afterwards.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EndedMeta {
+    /// The child's own exit code. A nonzero one is `✗`; a clean one is `◆`
+    /// until seen and `●` afterwards -- see `ui::glyph_for`.
+    exit_code: i32,
+    /// When the pane exited, in epoch seconds -- what the `since` disclosure
+    /// counts up from.
+    exited_at: u64,
+    /// The row's age at the instant it exited, frozen: a finished worker's
+    /// "how long did it run" must not keep ticking up after it stopped
+    /// running. `None` when no registry record was found for it at reap time.
+    age_secs: Option<u64>,
+}
+
+/// Issue #354 phase 2: one completed pane's retained sidebar row.
+///
+/// A reaped pane used to vanish from the roster in the same tick its child
+/// exited, which is exactly when an operator wants to see what happened to it.
+/// The row survives the `Pane` -- glyph from the exit code, age frozen, role
+/// and model retained -- until the cap below drops it or the dashboard exits.
+/// It is deliberately *not* attached: it is selectable (so its disclosure can
+/// be read) and never focusable, since there is no child left to type into.
+#[derive(Debug, Clone)]
+struct EndedRow {
+    short: String,
+    role: String,
+    model: Option<String>,
+    harness: String,
+    group_id: Option<String>,
+    parent: Option<String>,
+    /// The pane's last `budget`/`writer` disclosure values, captured before it
+    /// was dropped rather than re-derived from a `Pane` that no longer exists.
+    budget: String,
+    writer: String,
+    /// The checkout the pane ran in, captured for the same reason -- the
+    /// inspector's `cwd` line and the menu's `open worktree` entry both read
+    /// it, and there is no `Pane` left to ask.
+    cwd: String,
+    /// Issue #354 phase 3: the very `spawnreq::SpawnRequest` that created
+    /// this pane, kept so `restore`/`retry` can relaunch it VERBATIM through
+    /// the existing `fulfill_spawn_request` machinery -- never a
+    /// reconstructed argv (`Command Safety`). `None` for a pane this
+    /// dashboard did not spawn from a request (the orchestrator itself, and
+    /// a startup-restored pane), which is exactly what disables the two
+    /// entries with `no spawn request kept`.
+    request: Option<spawnreq::SpawnRequest>,
+    /// Who asked for that request, so a relaunch is attributed to the same
+    /// lineage the original spawn was rather than to the dashboard itself.
+    requested_by: Option<String>,
+    meta: EndedMeta,
+}
+
+/// How many retained ended rows the roster keeps at once, oldest dropped
+/// first. A long orchestration session can reap dozens of workers, and an
+/// unbounded list would push every live pane off the bottom of the sidebar --
+/// the exact failure the pre-#354 reap was introduced to avoid (see
+/// `reap_fixup`'s own doc comment on R2). Eight is one screenful's worth of
+/// recent history on the smallest dashboard-eligible terminal.
+const MAX_RETAINED_ENDED_ROWS: usize = 8;
+
+/// Pure: the `budget` disclosure text for a pane -- `used / ceiling`, with
+/// the shared placeholder for whichever half nothing has measured.
+///
+/// Review of 5c1b6c3, finding 2: shared by [`build_pane_rows`] (a live pane)
+/// and [`reap_ended_panes`] (the retained row frozen at the reap), so the two
+/// can never disagree about what a pane's budget line says.
+fn budget_text(used: Option<u64>, ceiling: Option<u64>) -> String {
+    format!(
+        "{} / {}",
+        used.map(|v| v.to_string())
+            .unwrap_or_else(|| style::PLACEHOLDER.into()),
+        ceiling
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| style::PLACEHOLDER.into())
+    )
+}
+
+/// Pure: the `writer` disclosure text for a pane -- whether it holds the
+/// write permit, and for which checkout. Shared for the same reason
+/// [`budget_text`] is.
+fn writer_text(holds_permit: bool, cwd: &Path) -> String {
+    format!(
+        "{} \u{b7} {}",
+        if holds_permit {
+            "held"
+        } else {
+            style::PLACEHOLDER
+        },
+        cwd.display()
+    )
+}
+
+/// Pure: the attention observations a reap owes the session it is retiring,
+/// in the order they must be recorded.
+///
+/// Review of 5c1b6c3, finding 1: a CLEAN exit gets a `Settled` observation
+/// FIRST whenever nothing had already settled the session, because
+/// `attention::compose` latches `Visibility::Unseen` only on a genuine
+/// `Working -> Settled` transition -- and a worker with no Stop hook that
+/// works right up to a fast, clean exit never spends a tick `Settled` for the
+/// quiet heuristic to observe (`PaneState` reports `Ended` the instant
+/// `child_exit` is set, so the idle debounce never elapses). Without it the
+/// retained row rendered `●` immediately and the operator was never told the
+/// worker had finished. A nonzero exit is `✗` regardless of visibility, so it
+/// gets the exit observation alone.
+fn reap_observations(
+    prior: super::attention::Lifecycle,
+    code: i32,
+    at: u64,
+) -> Vec<super::attention::Observation> {
+    let mut observations = Vec::new();
+    if code == 0 && prior != super::attention::Lifecycle::Settled {
+        observations.push(
+            super::attention::Observation::new(
+                super::attention::Authority::Supervisor,
+                "pane finished its work and exited cleanly",
+                90,
+                at,
+            )
+            .with_lifecycle(super::attention::Lifecycle::Settled),
+        );
+    }
+    observations.push(
+        super::attention::Observation::new(
+            super::attention::Authority::Supervisor,
+            format!("pane exited with code {code}"),
+            90,
+            at,
+        )
+        .with_lifecycle(super::attention::Lifecycle::Exited),
+    );
+    observations
+}
+
+/// Pure: appends `row` to the retained list, dropping the oldest once the list
+/// is over [`MAX_RETAINED_ENDED_ROWS`]. Split out so the cap is testable
+/// without reaping a real pane.
+fn push_retained_ended(retained: &mut VecDeque<EndedRow>, row: EndedRow, cap: usize) {
+    retained.push_back(row);
+    while retained.len() > cap {
+        retained.pop_front();
+    }
 }
 
 /// Combines this dashboard's own panes (attached, in pane order) with every
@@ -704,20 +1294,54 @@ fn assemble_sidebar(
         .collect();
     let age_of = |short: &str| started_at.get(short).map(|at| now_secs.saturating_sub(*at));
 
-    let mut rows: Vec<ui::SidebarRow> = panes
-        .iter()
-        .map(|p| ui::SidebarRow {
-            short: p.short.clone(),
-            harness: p.harness.clone(),
-            age_secs: age_of(&p.short),
-            score: scores.get(&p.short).copied(),
-            state: p.state,
-            attached: true,
-            selected: false,
-            focused: false,
-            supervised: p.supervised,
-        })
-        .collect();
+    // Issue #354 phase 2: the retained ended rows sit at the very END of the
+    // roster -- after the view-only registry rows, not immediately after the
+    // live panes. That keeps `reap_fixup`'s index arithmetic exactly right:
+    // reaping still removes one row from the middle and shifts everything
+    // after it down by one, and the row retained in its place is appended
+    // where no existing selection points. A retained row that still carries a
+    // work group is drawn under that group's header regardless
+    // (`ui::roster_frame` gathers a group's members from the whole row list),
+    // so only an ungrouped one actually sits at the bottom.
+    let (live_panes, ended_panes): (Vec<&PaneRowMeta>, Vec<&PaneRowMeta>) =
+        panes.iter().partition(|p| p.ended.is_none());
+    let row_of = |p: &PaneRowMeta| ui::SidebarRow {
+        role: display_role(&p.role).into(),
+        model: p.model.clone(),
+        group: p.group_id.as_ref().map(|id| ui::GroupRef {
+            id: id.clone(),
+            scope: style::PLACEHOLDER.into(),
+            lead_short: panes
+                .iter()
+                .find(|lead| lead.group_id.as_ref() == Some(id) && lead.role == "sub-orchestrator")
+                .or_else(|| panes.iter().find(|lead| lead.group_id.as_ref() == Some(id)))
+                .map(|lead| lead.short.clone())
+                .unwrap_or_default(),
+        }),
+        tree: ui::TreePos::Flat,
+        disclosure: Vec::new(),
+        short: p.short.clone(),
+        harness: p.harness.clone(),
+        // Issue #354 phase 2: a retained ended row's age is frozen at the
+        // instant it exited. Its registry record was released by the same
+        // reap that retained it, so `age_of` would report the placeholder
+        // here anyway -- but frozen is the honest answer either way.
+        age_secs: match &p.ended {
+            Some(ended) => ended.age_secs,
+            None => age_of(&p.short),
+        },
+        score: scores.get(&p.short).copied(),
+        state: p.state,
+        status: None,
+        exit_code: p.ended.map(|e| e.exit_code),
+        // A retained ended row is selectable but never focusable: there is
+        // no child left to receive a keystroke.
+        attached: p.ended.is_none(),
+        selected: false,
+        focused: false,
+        supervised: p.supervised,
+    };
+    let mut rows: Vec<ui::SidebarRow> = live_panes.iter().copied().map(row_of).collect();
 
     if let Some(row) = rows.get_mut(focused) {
         row.focused = true;
@@ -734,11 +1358,23 @@ fn assemble_sidebar(
             continue;
         }
         rows.push(ui::SidebarRow {
+            role: record
+                .role
+                .as_deref()
+                .map(display_role)
+                .unwrap_or(style::PLACEHOLDER)
+                .into(),
+            model: None,
+            group: None,
+            tree: ui::TreePos::Flat,
+            disclosure: Vec::new(),
             short: record.short.clone(),
             harness: record.agent.clone(),
             age_secs: Some(now_secs.saturating_sub(record.started_at)),
             score: scores.get(&record.short).copied(),
             state: ui::RowState::Unknown,
+            status: None,
+            exit_code: None,
             attached: false,
             selected: false,
             focused: false,
@@ -748,10 +1384,186 @@ fn assemble_sidebar(
         });
     }
 
+    rows.extend(ended_panes.into_iter().map(row_of));
+
     if let Some(row) = rows.get_mut(selected) {
         row.selected = true;
+        // Issue #354: the selected row's disclosure, in the spec's own key
+        // order. Every value comes from something already in hand -- the
+        // pane's own fields, the registry record, or a placeholder that
+        // `enrich_sidebar` fills in from the throttled facts cache a moment
+        // later. Nothing here reads the disk and nothing shells out: `branch`
+        // in particular stays the placeholder rather than running git, which
+        // would put a subprocess on the render path.
+        let pane = panes.iter().find(|p| p.short == row.short);
+        let state = row_state_label(row.state);
+        row.disclosure = vec![
+            ("reason".into(), format!("none · {state}")),
+            (
+                "group".into(),
+                format!(
+                    "{} · parent {}",
+                    row.group
+                        .as_ref()
+                        .map(|g| g.scope.as_str())
+                        .unwrap_or(style::PLACEHOLDER),
+                    pane.and_then(|p| p.parent.as_deref())
+                        .unwrap_or(style::PLACEHOLDER)
+                ),
+            ),
+            (
+                "model".into(),
+                format!(
+                    "{} {}",
+                    row.harness,
+                    row.model.as_deref().unwrap_or(style::PLACEHOLDER)
+                ),
+            ),
+            (
+                "budget".into(),
+                pane.map(|p| p.budget.clone())
+                    .unwrap_or_else(|| style::PLACEHOLDER.into()),
+            ),
+            ("branch".into(), style::PLACEHOLDER.into()),
+            (
+                "writer".into(),
+                pane.map(|p| p.writer.clone())
+                    .unwrap_or_else(|| style::PLACEHOLDER.into()),
+            ),
+            (
+                "since".into(),
+                // Issue #354 phase 2: a retained ended row says how long ago
+                // it exited and with what -- the two facts that are actually
+                // still true about it. A live row keeps the placeholder
+                // `enrich_sidebar` fills in from the cached attention status
+                // (or, with none, from `DiskFacts::state_since`).
+                match pane.and_then(|p| p.ended) {
+                    Some(ended) => format!(
+                        "exited {} \u{b7} exit {}",
+                        style::format_age(now_secs.saturating_sub(ended.exited_at)),
+                        ended.exit_code
+                    ),
+                    None => format!(
+                        "{state} {} · started {} ago",
+                        style::PLACEHOLDER,
+                        row.age_secs
+                            .map(style::format_age)
+                            .unwrap_or_else(|| style::PLACEHOLDER.into())
+                    ),
+                },
+            ),
+            (
+                "signal".into(),
+                if row.supervised {
+                    "socket bound"
+                } else {
+                    "unreachable"
+                }
+                .into(),
+            ),
+        ];
     }
     rows
+}
+
+/// Pure: `PromptRole::label`'s persisted spelling shortened to fit the row
+/// contract's 8-column role field. Anything else -- a role written by a
+/// future build, or one already short enough -- passes through untouched
+/// rather than being truncated into something that reads as a different role.
+fn display_role(role: &str) -> &str {
+    match role {
+        "orchestrator" => "orch",
+        "sub-orchestrator" => "sub-orch",
+        other => other,
+    }
+}
+
+/// Pure: the word a disclosure line uses for a row's state when the composed
+/// attention model has nothing to say about it. Phase 2's [`lifecycle_word`]
+/// is the richer answer whenever a `SessionStatus` exists; this stays the
+/// fallback for a row that has never been observed by an issue #349 writer.
+fn row_state_label(state: ui::RowState) -> &'static str {
+    match state {
+        ui::RowState::Working => "working",
+        ui::RowState::Idle => "idle",
+        ui::RowState::Dead => "ended",
+        ui::RowState::Unknown => "unknown",
+    }
+}
+
+/// Pure: the word the `since` disclosure line leads with, from the composed
+/// model's own lifecycle axis -- `waiting 1m · started 9m ago` in the approved
+/// frame. Deliberately the LIFECYCLE, not the projection: "waiting" and
+/// "working" are what an operator reads as elapsed-time-in-state, whereas the
+/// projection (which folds attention in) is what the `reason` line says.
+fn lifecycle_word(lifecycle: super::attention::Lifecycle) -> &'static str {
+    use super::attention::Lifecycle;
+    match lifecycle {
+        Lifecycle::Starting => "starting",
+        Lifecycle::Working => "working",
+        Lifecycle::Waiting => "waiting",
+        Lifecycle::Settled => "idle",
+        Lifecycle::Exited => "exited",
+        Lifecycle::Unknown => "unknown",
+    }
+}
+
+/// Pure: the word the `reason` disclosure line leads with -- the projection's
+/// own name, with `Blocked`'s payload spelled out (that IS the reason, and
+/// `blocked` on its own says nothing an operator can act on).
+fn projection_word(projection: super::attention::Projection) -> String {
+    use super::attention::{Attention, Projection};
+    match projection {
+        Projection::Blocked(Attention::None) => "waiting".to_string(),
+        Projection::Blocked(attention) => spaced_lowercase(&format!("{attention:?}")),
+        other => other.label().to_string(),
+    }
+}
+
+/// Pure: `WorkflowGate` -> `workflow gate`. The composed model's enums are
+/// `CamelCase` on the wire; a sidebar reads in words.
+fn spaced_lowercase(camel: &str) -> String {
+    let mut out = String::with_capacity(camel.len() + 2);
+    for (i, ch) in camel.chars().enumerate() {
+        if ch.is_uppercase() && i > 0 {
+            out.push(' ');
+        }
+        out.extend(ch.to_lowercase());
+    }
+    out
+}
+
+/// Pure: the `reason` disclosure line for `status` -- `approval · workflow
+/// gate`: the projection's own word, then whatever evidence the winning
+/// authority recorded, capped at the 30 display columns the disclosure
+/// contract allows.
+///
+/// `None` for a status that projects `Unknown`, which is exactly what a
+/// missing or never-written attention file loads back as: the caller then
+/// keeps phase 1's `none · <state>` rather than printing a reason nobody
+/// recorded.
+fn disclosure_reason(status: &super::attention::SessionStatus) -> Option<String> {
+    let projection = super::attention::project(status);
+    if projection == super::attention::Projection::Unknown {
+        return None;
+    }
+    let word = projection_word(projection);
+    // `attention::reason` is the one place the "prefer recorded evidence,
+    // else a generic sentence" rule lives; this only re-shapes its answer for
+    // a 30-column field. Its `Attention: evidence` prefix is dropped because
+    // `word` already carries that half.
+    let detail = super::attention::reason(status);
+    let prefix = format!("{:?}: ", status.attention);
+    let detail = detail
+        .strip_prefix(&prefix)
+        .map(str::to_string)
+        .unwrap_or(detail);
+    let text = if detail.is_empty() || detail.eq_ignore_ascii_case(&word) {
+        word
+    } else {
+        format!("{word} \u{b7} {detail}")
+    };
+    Some(style::truncate_display(&text, 30).into_owned())
 }
 
 /// Pure: one navigation action's effect on the `(selected, focused)` pair.
@@ -849,6 +1661,7 @@ fn assemble_header_facts(
     notice: Option<String>,
 ) -> ui::HeaderFacts {
     ui::HeaderFacts {
+        hints: ui::HintContext::default(),
         harness,
         select_mode,
         live,
@@ -856,6 +1669,10 @@ fn assemble_header_facts(
         error_count,
         latest_error,
         notice,
+        // Issue #354 phase 4: set by the event loop right after this, the
+        // same way the hint context is -- it is session state, not a fact
+        // this assembly step has any way to know.
+        tip: None,
     }
 }
 
@@ -1060,6 +1877,26 @@ struct DiskFacts {
     /// load`, keyed by `FactsOwner::session_short`), `None` until a seat is
     /// registered for it.
     pool_seat: Option<String>,
+    /// Issue #354: every live pane's work group, by id, loaded on this same
+    /// throttled tick -- the sidebar's group headers name a scope, and
+    /// `group::load` is a disk read that must never happen per frame.
+    groups: HashMap<String, super::group::WorkGroup>,
+    /// Issue #354: when each pane last changed [`ui::RowState`], for the
+    /// `since` disclosure line. Kept here rather than on `Pane` because it is
+    /// a property of what the *dashboard* has observed across ticks, and it
+    /// is pruned to the live panes on every refresh.
+    state_since: HashMap<String, (ui::RowState, u64)>,
+    /// Issue #354 phase 2: the composed `attention::SessionStatus` behind
+    /// every row's glyph, its rollups and its `reason` line -- one
+    /// `attention::load` (a single small JSON read) per drawable row, on this
+    /// same throttled tick and NEVER per frame. Filled by
+    /// [`FactsCache::refresh_attention`], which the event loop calls only on a
+    /// tick where [`FactsCache::refresh_if_due`] actually re-read. A missing
+    /// or corrupt file loads back as `SessionStatus::default()`, which
+    /// projects `Unknown` -- and `ui::glyph_for` treats that exactly like no
+    /// entry at all, so a dashboard with no issue #349 writers renders the
+    /// phase 1 sidebar unchanged.
+    attention: HashMap<String, super::attention::SessionStatus>,
 }
 
 /// Issue #264: [`DiskFacts::spend`]'s own shape.
@@ -1106,6 +1943,12 @@ impl FactsCache {
     /// Every disk read the header and sidebar need, at most once per
     /// `FACTS_THROTTLE`. `panes` is only walked when a refresh is actually
     /// due, so a throttled tick costs the `due` comparison and nothing else.
+    ///
+    /// Returns whether it actually re-read. Issue #354 phase 2 hangs
+    /// [`FactsCache::refresh_attention`] off that answer rather than off a
+    /// second throttle of its own: the attention statuses have to be exactly
+    /// as fresh as the registry listing they are keyed against, and a second
+    /// clock could only ever drift them apart.
     fn refresh_if_due(
         &mut self,
         cfg: &CtxConfig,
@@ -1113,9 +1956,9 @@ impl FactsCache {
         owner: FactsOwner<'_>,
         panes: &[Pane],
         now: Instant,
-    ) {
+    ) -> bool {
         if !due(self.last_refresh, now, FACTS_THROTTLE) {
-            return;
+            return false;
         }
         self.last_refresh = now;
 
@@ -1130,6 +1973,35 @@ impl FactsCache {
         let slug = super::state::repo_slug(repo);
         self.disk.memory_count = memory::list(state, &slug).map(|v| v.len()).unwrap_or(0);
         self.registry = sessions::list(state);
+        // Issue #354: the sidebar's group headers and its `since` line, on
+        // this same throttled cadence -- one `group::load` per distinct live
+        // group, and a state-change clock that only ever moves when the state
+        // actually changed. Both are pruned to the live panes, so a reaped
+        // pane leaves nothing behind.
+        let group_ids: HashSet<_> = panes.iter().filter_map(|p| p.work_group_id()).collect();
+        self.disk.groups = group_ids
+            .into_iter()
+            .filter_map(|id| {
+                super::group::load(state, id)
+                    .ok()
+                    .flatten()
+                    .map(|g| (id.to_string(), g))
+            })
+            .collect();
+        self.disk
+            .state_since
+            .retain(|short, _| panes.iter().any(|p| p.short() == short));
+        for pane in panes {
+            let current = ui::row_state_for(&pane.state());
+            let entry = self
+                .disk
+                .state_since
+                .entry(pane.short().into())
+                .or_insert((current, super::state::now_secs()));
+            if entry.0 != current {
+                *entry = (current, super::state::now_secs());
+            }
+        }
         // Issue #209/v3 §D: same throttled tick as the reads above it, same
         // no-subprocess/no-scan discipline -- see `DiskFacts::workflow`'s
         // own doc comment. Deliberately the dashboard's own `repo`, not a
@@ -1317,7 +2189,230 @@ impl FactsCache {
                 self.disk.stalled.insert(record.short.clone());
             }
         }
+        true
     }
+
+    /// Issue #354 phase 2: re-reads the composed attention status for exactly
+    /// the rows the sidebar can draw. Called only on a tick where
+    /// [`FactsCache::refresh_if_due`] returned `true`, so a frame never costs
+    /// a read; `load` is a seam purely so a test can count how often that
+    /// actually happens.
+    ///
+    /// Rebuilt rather than updated in place, for the same reason `scores` and
+    /// `mail_by_session` are: a reaped, un-retained pane's status must drop
+    /// out of the map rather than linger against a short id something else may
+    /// reuse.
+    /// Issue #354 phase 5: returns the map it replaced, which is exactly the
+    /// "previous projection" half the notice reducer needs -- handed over
+    /// rather than cloned, so watching for transitions costs nothing.
+    fn refresh_attention(
+        &mut self,
+        shorts: &[String],
+        load: &dyn Fn(&str) -> super::attention::SessionStatus,
+    ) -> HashMap<String, super::attention::SessionStatus> {
+        let previous = std::mem::take(&mut self.disk.attention);
+        for short in shorts {
+            self.disk.attention.insert(short.clone(), load(short));
+        }
+        previous
+    }
+}
+
+/// Pure: every session short id the sidebar can draw a glyph for, deduped and
+/// in row order -- this dashboard's own panes, its retained ended rows, and
+/// every live registry session it owns. Exactly the rows `assemble_sidebar`
+/// builds, so no status is ever read for a row that will not be drawn.
+fn attention_row_shorts(
+    pane_shorts: &[String],
+    retained: &VecDeque<EndedRow>,
+    registry: &[(sessions::Record, sessions::Liveness)],
+    dashboard_pid: u32,
+) -> Vec<String> {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut shorts = Vec::new();
+    let push = |short: &str, seen: &mut HashSet<String>, shorts: &mut Vec<String>| {
+        if seen.insert(short.to_string()) {
+            shorts.push(short.to_string());
+        }
+    };
+    for short in pane_shorts {
+        push(short, &mut seen, &mut shorts);
+    }
+    for row in retained {
+        push(&row.short, &mut seen, &mut shorts);
+    }
+    for (record, liveness) in registry {
+        if *liveness == sessions::Liveness::Live && record.owner_pid == Some(dashboard_pid) {
+            push(&record.short, &mut seen, &mut shorts);
+        }
+    }
+    shorts
+}
+
+/// Which way [`fold_group`] moves a work group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GroupFold {
+    Collapse,
+    Expand,
+    Toggle,
+}
+
+/// Pure: folds a work group shut or open again, returning whether it is
+/// collapsed afterwards.
+///
+/// The single reducer both `^A Left`/`^A Right` and a click on a group
+/// header's disclosure triangle go through, so the keyboard and the pointer
+/// can never disagree about what "collapsed" means. Collapsing never touches
+/// focus -- the group's children stop being drawn, but whichever pane owns the
+/// keyboard keeps it.
+fn fold_group(collapsed: &mut HashSet<String>, id: &str, fold: GroupFold) -> bool {
+    match fold {
+        GroupFold::Collapse => {
+            collapsed.insert(id.to_string());
+            true
+        }
+        GroupFold::Expand => {
+            collapsed.remove(id);
+            false
+        }
+        GroupFold::Toggle => {
+            if collapsed.remove(id) {
+                false
+            } else {
+                collapsed.insert(id.to_string());
+                true
+            }
+        }
+    }
+}
+
+/// Pure: which work group `^A Left`/`^A Right` acts on -- the one the cursor
+/// is parked on when it sits on a group header, else the one the selected
+/// session belongs to. `None` on a flat (ungrouped) row or the summary line,
+/// which is what makes both keys no-ops there rather than folding whichever
+/// group happened to be nearby.
+fn group_under_cursor(
+    chrome: Option<&Hit>,
+    rows: &[ui::SidebarRow],
+    selected: usize,
+) -> Option<String> {
+    match chrome {
+        Some(Hit::GroupToggle(id)) => Some(id.clone()),
+        Some(_) => None,
+        None => rows
+            .get(selected)
+            .and_then(|row| row.group.as_ref())
+            .map(|group| group.id.clone()),
+    }
+}
+
+/// Issue #354 phase 2: the done-unread (`◆`) acknowledgement gate.
+///
+/// `Visibility::Unseen` is latched by a `Working -> Settled` transition and
+/// only [`super::attention::mark_seen`] ever clears it, so whatever calls it
+/// is asserting "an operator has actually looked at this session". Phase 1
+/// called it on every focus change, which asserts something weaker and often
+/// false: arrowing past a pane, or clicking it while a modal covers the whole
+/// grid, cleared a badge nobody read.
+///
+/// The rule now is a *render* rule, not an input rule: the pane must be the
+/// focused one, no overlay may be covering it, and it must be at its live
+/// scroll position (a pane scrolled back into history is showing something
+/// else entirely). [`ack_candidate`] decides that against one drawn frame;
+/// this remembers the `(short, revision)` it qualified at and hands it back
+/// exactly once, on the next tick, so the write happens off the render path.
+#[derive(Debug, Default)]
+struct DoneUnreadAck {
+    /// The `(short, revision)` a qualifying render observed, waiting for the
+    /// next tick to act on.
+    pending: Option<(String, u64)>,
+    /// Every `(short, revision)` already acknowledged. Keyed by revision, so a
+    /// session that settles again later latches `Unseen` again at a NEW
+    /// revision and is acknowledged again -- while the same revision is never
+    /// written twice, however many frames it survives.
+    acked: HashSet<(String, u64)>,
+}
+
+impl DoneUnreadAck {
+    /// Pure: records what the frame just drawn qualifies for.
+    fn observe(&mut self, candidate: Option<(String, u64)>) {
+        self.pending = candidate.filter(|key| !self.acked.contains(key));
+    }
+
+    /// Pure: latches an acknowledgement earned OFF the render path, returning
+    /// the short id whose `mark_seen_io` is owed -- at most once per
+    /// `(short, revision)`, exactly like [`Self::take_due`].
+    ///
+    /// Issue #354 phase 3: the render path's own rule requires the pane to be
+    /// FOCUSED, which a retained ended row can never be -- there is no child
+    /// left to type into. Opening the inspector on such a row is the operator
+    /// reading it, and is the only way its `◆` can ever clear.
+    fn acknowledge(&mut self, candidate: Option<(String, u64)>) -> Option<String> {
+        let (short, revision) = candidate?;
+        self.acked
+            .insert((short.clone(), revision))
+            .then_some(short)
+    }
+
+    /// Pure: the short id whose `mark_seen_io` is now due, at most once per
+    /// `(short, revision)`.
+    fn take_due(&mut self) -> Option<String> {
+        let (short, revision) = self.pending.take()?;
+        self.acked.insert((short.clone(), revision));
+        Some(short)
+    }
+}
+
+/// Pure: the `(short, revision)` one completed, unoccluded render of the
+/// focused pane qualifies for acknowledgement -- `None` for every render that
+/// does not.
+///
+/// `focused` is `(short, scrollback)` for the pane the frame actually drew;
+/// `status` is that pane's cached status. Note what is deliberately absent:
+/// there is no path here from *selection*. A row the cursor merely walked onto
+/// is not a row anybody read.
+fn ack_candidate(
+    overlay_open: bool,
+    focused: Option<(&str, usize)>,
+    status: Option<&super::attention::SessionStatus>,
+) -> Option<(String, u64)> {
+    if overlay_open {
+        return None;
+    }
+    let (short, scrollback) = focused?;
+    if scrollback != 0 {
+        return None;
+    }
+    let status = status?;
+    if super::attention::project(status) != super::attention::Projection::DoneUnread {
+        return None;
+    }
+    Some((short.to_string(), status.revision))
+}
+
+/// Pure: the `(short, revision)` opening the inspector on `row` qualifies for.
+///
+/// Keyed off the glyph the roster actually drew rather than the projection
+/// alone, because a retained ended row's `◆` comes from `glyph_for`'s own
+/// exit-code rule (a clean exit with `Visibility::Unseen`), which
+/// `attention::project` maps to `Failed` and so would never match here.
+///
+/// Review of 9314156 (finding 1, HIGH): restricted to rows the render path
+/// can NEVER acknowledge on its own -- an ended row (`exit_code`), or one
+/// this dashboard owns no pane for. Done-unread clears only after the
+/// operator actually views a pane, which means focus plus one unoccluded
+/// render at live scroll; a live attached pane that is merely *selected* has
+/// not been viewed, and opening the inspector on it used to clear its `◆`
+/// anyway. Those rows are left to the render path's own rule.
+fn inspect_ack_candidate(row: &ui::SidebarRow) -> Option<(String, u64)> {
+    let status = row.status.as_ref()?;
+    if row.exit_code.is_none() && row.attached {
+        return None;
+    }
+    if ui::glyph_for(row) != ui::Glyph::DoneUnread {
+        return None;
+    }
+    Some((row.short.clone(), status.revision))
 }
 
 /// Pure: `(focused, selected)` after the pane at `removed` has been taken out
@@ -1366,7 +2461,7 @@ fn enforce_pane_token_budgets(
     panes: &mut [Pane],
     cfg: &CtxConfig,
     repo: &Path,
-    errors: &mut Vec<String>,
+    errors: &mut ErrorLog,
 ) {
     for pane in panes {
         if pane.budget_tokens().is_none() {
@@ -1493,10 +2588,12 @@ fn reap_ended_panes(
     repo: &Path,
     focused: &mut usize,
     selected: &mut usize,
-    errors: &mut Vec<String>,
+    errors: &mut ErrorLog,
     reaped_codes: &mut Vec<i32>,
     reaped_recent: &mut HashSet<String>,
     last_exited: &mut Option<LastExited>,
+    retained: &mut VecDeque<EndedRow>,
+    kept_requests: &mut HashMap<String, (spawnreq::SpawnRequest, Option<String>)>,
 ) {
     let mut index = 0;
     while index < panes.len() {
@@ -1504,12 +2601,74 @@ fn reap_ended_panes(
             index += 1;
             continue;
         };
+        // Issue #354 phase 2: the row survives the pane, so everything it will
+        // ever need is captured HERE -- before `shutdown` below releases the
+        // registry record the age comes from, and before the `Pane` itself is
+        // dropped. Nothing about a finished worker can be re-derived a tick
+        // later.
+        let now_secs = super::state::now_secs();
+        let ended_meta = EndedMeta {
+            exit_code: code,
+            exited_at: now_secs,
+            age_secs: sessions::load_record(state, panes[index].short())
+                .map(|record| now_secs.saturating_sub(record.started_at)),
+        };
+        // Review of 5c1b6c3, finding 2: `budget`/`writer` are read off the
+        // LIVE pane here, through the very same helpers `build_pane_rows`
+        // uses for a running one. They used to be hardcoded placeholders, so
+        // a retained row's disclosure claimed nothing was ever known about a
+        // worker's token usage or its write permit -- while the doc comment
+        // on `EndedRow` promised the opposite.
+        let retained_budget = budget_text(
+            panes[index]
+                .measured_usage()
+                .map(|u| u.context_total().saturating_add(u.output_tokens)),
+            panes[index].budget_tokens(),
+        );
+        let retained_writer = writer_text(panes[index].holds_writer_permit(), panes[index].cwd());
         let quit_sequence = adapters::select(Some(panes[index].agent()), &[], cfg)
             .map(|adapter| adapter.quit_sequence())
             .unwrap_or("");
         if let Err(e) = panes[index].shutdown(quit_sequence) {
             push_error(errors, format!("reap {}: {e}", panes[index].short()));
         }
+        let short = panes[index].short().to_string();
+        let (request, requested_by) = match kept_requests.remove(&short) {
+            Some((req, by)) => (Some(req), by),
+            None => (None, None),
+        };
+        let retained_row = EndedRow {
+            role: panes[index].role().label().to_string(),
+            model: panes[index].launch_model().map(str::to_string),
+            harness: panes[index].agent().to_string(),
+            group_id: panes[index].work_group_id().map(str::to_string),
+            parent: panes[index].parent_session().map(str::to_string),
+            budget: retained_budget,
+            writer: retained_writer,
+            cwd: panes[index].cwd().display().to_string(),
+            request,
+            requested_by,
+            short,
+            meta: ended_meta,
+        };
+        // Issue #349: the dashboard's own quiet-heuristic sync never sees this
+        // pane again (it is about to leave `panes`), so the one authority that
+        // can say the child is gone files it here instead -- a `Supervisor`
+        // observation, the same rank `exec`/`wrap` use for a process exit.
+        // Without it the retained row's cached status would still claim the
+        // session was working. Review of 5c1b6c3, finding 1: a clean exit is
+        // preceded by the `Settled` observation that latches `Unseen` -- see
+        // [`reap_observations`].
+        let prior_lifecycle = super::attention::load(state, &retained_row.short).lifecycle;
+        for observation in reap_observations(prior_lifecycle, code, ended_meta.exited_at) {
+            let _ = super::attention::record(
+                state,
+                &retained_row.short,
+                observation,
+                ended_meta.exited_at,
+            );
+        }
+        push_retained_ended(retained, retained_row, MAX_RETAINED_ENDED_ROWS);
         let pane = panes.remove(index);
         // Review finding (2026-09), finding 2a: captured before `pane` is
         // consumed below, so the worktree-reclaim check after this pane is
@@ -1801,12 +2960,139 @@ fn remove_request_dir(requests_dir: &Path) {
 /// to be shown anyway.
 const MAX_KEPT_ERRORS: usize = 5;
 
-fn push_error(errors: &mut Vec<String>, message: String) {
-    errors.push(message);
-    if errors.len() > MAX_KEPT_ERRORS {
-        let drop = errors.len() - MAX_KEPT_ERRORS;
-        errors.drain(0..drop);
+/// Issue #354 phase 5: one kept error, collapsed over identical CONSECUTIVE
+/// repeats. A supervisor that fails the same way once a second used to evict
+/// the whole five-entry buffer in five seconds, taking every other error with
+/// it and telling the operator nothing they did not already know; one entry
+/// with a count says strictly more in one line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ErrorEntry {
+    text: String,
+    /// How many times in a row this exact message was pushed. `1` is the
+    /// ordinary case and renders no count at all.
+    count: usize,
+    /// When the most recent repeat arrived -- the age the dialog shows.
+    last: Instant,
+    /// Acknowledged by the operator (`Esc`/`a` on the errors dialog). An
+    /// acknowledged entry is never deleted: it stays listed, dimmed, until
+    /// the buffer cap drops it, and only stops holding the sticky header
+    /// line.
+    acked: bool,
+}
+
+/// The dashboard's kept-errors buffer: `push_error`'s storage, the sticky
+/// `\u{26a0}` header line's source, and what `Ctrl+A e` lists.
+///
+/// The whole decision half is pure and clock-injected ([`ErrorLog::record`]);
+/// `push_error` is the thin impure wrapper the hot path calls, so the collapse
+/// and acknowledgement rules are testable without a terminal.
+#[derive(Debug, Default)]
+struct ErrorLog {
+    entries: Vec<ErrorEntry>,
+}
+
+impl ErrorLog {
+    /// Pure: records one error as of `now`.
+    ///
+    /// Collapses onto the newest entry when it is the same message AND has
+    /// not been acknowledged. The acknowledgement check is what makes "the
+    /// same failure, again, after I said I had seen it" news again rather
+    /// than a silent `\u{d7}n` bump nothing draws the operator's eye to.
+    fn record(&mut self, message: String, now: Instant) {
+        if let Some(last) = self.entries.last_mut()
+            && !last.acked
+            && last.text == message
+        {
+            last.count += 1;
+            last.last = now;
+            return;
+        }
+        self.entries.push(ErrorEntry {
+            text: message,
+            count: 1,
+            last: now,
+            acked: false,
+        });
+        if self.entries.len() > MAX_KEPT_ERRORS {
+            let drop = self.entries.len() - MAX_KEPT_ERRORS;
+            self.entries.drain(0..drop);
+        }
     }
+
+    /// Pure: marks every entry acknowledged. Never deletes anything.
+    fn acknowledge(&mut self) {
+        for entry in &mut self.entries {
+            entry.acked = true;
+        }
+    }
+
+    /// Pure: how many unacknowledged entries the sticky header line counts.
+    fn sticky_count(&self) -> usize {
+        self.entries.iter().filter(|e| !e.acked).count()
+    }
+
+    /// Pure: the sticky header line's own text -- the newest unacknowledged
+    /// message, with its repeat count when it has one. `None` once everything
+    /// has been acknowledged, which is exactly how the line clears.
+    fn sticky_line(&self) -> Option<String> {
+        self.entries
+            .iter()
+            .rev()
+            .find(|e| !e.acked)
+            .map(|e| ui::error_line(&e.text, e.count))
+    }
+
+    /// Every kept message, oldest first, with its repeat count folded in --
+    /// what the all-panes-ended scrollback dump prints.
+    fn messages(&self) -> impl Iterator<Item = String> + '_ {
+        self.entries
+            .iter()
+            .map(|e| ui::error_line(&e.text, e.count))
+    }
+
+    /// The raw messages, oldest first, without their counts -- what a caller
+    /// filtering for one session's own lines matches against.
+    fn iter(&self) -> impl DoubleEndedIterator<Item = &str> {
+        self.entries.iter().map(|e| e.text.as_str())
+    }
+}
+
+/// The shorthands the tests read the buffer back with -- the production code
+/// only ever pushes, acknowledges and renders, so these live behind
+/// `cfg(test)` rather than as dead public surface.
+#[cfg(test)]
+impl ErrorLog {
+    /// How many distinct messages are kept (repeats of one message are one).
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    fn first(&self) -> Option<&str> {
+        self.entries.first().map(|e| e.text.as_str())
+    }
+
+    fn last(&self) -> Option<&str> {
+        self.entries.last().map(|e| e.text.as_str())
+    }
+}
+
+#[cfg(test)]
+impl std::ops::Index<usize> for ErrorLog {
+    type Output = str;
+
+    fn index(&self, index: usize) -> &str {
+        &self.entries[index].text
+    }
+}
+
+/// Impure only in its clock: the hot path's own entry point, kept at the
+/// exact signature every call site already uses.
+fn push_error(errors: &mut ErrorLog, message: String) {
+    errors.record(message, Instant::now());
 }
 
 /// Issue #84: the `Ctrl+A o` picker's confirm action. Distills a handoff
@@ -1829,7 +3115,7 @@ fn handover_pane(
     cfg: &CtxConfig,
     repo: &Path,
     state: &StateDir,
-    errors: &mut Vec<String>,
+    errors: &mut ErrorLog,
 ) -> bool {
     let old_agent_name = pane.agent().to_string();
     let Ok(old_adapter) = adapters::select(Some(&old_agent_name), &[], cfg) else {
@@ -1913,7 +3199,7 @@ fn rollover_sweep(
     repo: &Path,
     state: &StateDir,
     pending: &mut Option<(String, u64, Instant)>,
-    errors: &mut Vec<String>,
+    errors: &mut ErrorLog,
 ) {
     let Some(idx) = panes
         .iter()
@@ -2060,7 +3346,22 @@ fn settle_pending_rollover(
 }
 
 /// How long a transient header notice stays on screen before it expires (L13).
+/// Issue #354 phase 3: how close together two clicks on the same dialog row
+/// have to be to count as a double-click (activate) rather than two
+/// selections. The usual desktop default; a slow second click simply
+/// re-selects the row it is already on, which is a no-op.
+const DOUBLE_CLICK: Duration = Duration::from_millis(400);
+
 const NOTICE_TTL: Duration = Duration::from_secs(4);
+
+/// Issue #354 phase 5: how wide an attention notice may be built.
+///
+/// The header's middle slot is whatever is left after the fixed chrome and
+/// the hint cluster, which `header_layout` truncates to anyway -- this is the
+/// reducer's own clamp so a notice is never *composed* longer than the middle
+/// can ever be at the dashboard's minimum eligible width. Anything wider
+/// would only be ellipsised twice.
+const NOTICE_MAX_COLS: usize = 48;
 
 /// One informational, auto-expiring header notice: its text and the instant it
 /// stops being shown.
@@ -2587,7 +3888,7 @@ fn apply_terminal_resize(
     term_rows: &mut u16,
     full: &mut Rect,
     panes: &mut [Pane],
-    errors: &mut Vec<String>,
+    errors: &mut ErrorLog,
     selection: &mut Option<Selection>,
 ) {
     *term_cols = cols;
@@ -2742,7 +4043,7 @@ fn spawn_token() -> String {
 /// this dashboard's own shared channel, where it can still ask for a plain
 /// worker), which is the never-make-it-worse degradation this module holds
 /// everywhere else.
-fn mint_pane_channel(requests_dir: &Path, errors: &mut Vec<String>) -> PathBuf {
+fn mint_pane_channel(requests_dir: &Path, errors: &mut ErrorLog) -> PathBuf {
     let dir = spawnreq::pane_request_dir_for(requests_dir, &spawn_token());
     if let Err(e) = super::state::create_private_dir_all(&dir) {
         push_error(
@@ -3794,7 +5095,7 @@ fn fulfill_spawn_request(
     repo: &Path,
     size: (u16, u16),
     requests_dir: &Path,
-    errors: &mut Vec<String>,
+    errors: &mut ErrorLog,
 ) -> Result<(String, Vec<policy::CapabilityWarning>), SpawnRefusal> {
     // Every one of these is checked before anything is spawned, resolved or
     // written, in cheapest-and-most-hostile-first order.
@@ -4636,7 +5937,8 @@ fn handle_spawn_requests(
     state: &StateDir,
     repo: &Path,
     size: (u16, u16),
-    errors: &mut Vec<String>,
+    errors: &mut ErrorLog,
+    kept_requests: &mut HashMap<String, (spawnreq::SpawnRequest, Option<String>)>,
 ) {
     for (dir, requester) in intake_channels(requests_dir, panes) {
         drain_one_channel(
@@ -4650,6 +5952,7 @@ fn handle_spawn_requests(
             repo,
             size,
             errors,
+            kept_requests,
         );
     }
 }
@@ -4671,7 +5974,8 @@ fn drain_one_channel(
     state: &StateDir,
     repo: &Path,
     size: (u16, u16),
-    errors: &mut Vec<String>,
+    errors: &mut ErrorLog,
+    kept_requests: &mut HashMap<String, (spawnreq::SpawnRequest, Option<String>)>,
 ) {
     let batch = claim_batch(spawnreq::take_requests(dir));
     for (stem, req) in batch {
@@ -4697,14 +6001,22 @@ fn drain_one_channel(
             requests_dir,
             errors,
         ) {
-            Ok((short, capability_warnings)) => spawnreq::SpawnAck {
-                ok: true,
-                short: Some(short),
-                reason: None,
-                retryable: false,
-                budget_exhausted: false,
-                capability_warnings,
-            },
+            Ok((short, capability_warnings)) => {
+                // Issue #354 phase 3: the request that actually produced this
+                // pane, kept verbatim so `restore`/`retry` can replay THIS --
+                // never a reconstructed argv. It is moved onto the pane's
+                // retained ended row when the pane is reaped, and dropped
+                // with that row.
+                kept_requests.insert(short.clone(), (req.clone(), requester.map(str::to_string)));
+                spawnreq::SpawnAck {
+                    ok: true,
+                    short: Some(short),
+                    reason: None,
+                    retryable: false,
+                    budget_exhausted: false,
+                    capability_warnings,
+                }
+            }
             Err(refusal) => {
                 // R6: a refusal means no pane exists and none ever will, so
                 // the claim no longer stands for anything. Left in place, a
@@ -4736,6 +6048,67 @@ fn drain_one_channel(
 // the effect (a mail send/consume, a memory remember/forget/verify) touches
 // disk, and only from `run_dashboard`'s own loop, through the exact same
 // library functions the CLI verbs call.
+
+/// Issue #354 phase 3: relaunches one retained ended row from the very
+/// `spawnreq::SpawnRequest` that created it, through the existing
+/// [`fulfill_spawn_request`] machinery -- the same call `drain_one_channel`
+/// makes for a request that arrives on disk, with the same
+/// `FILE_DROP_TRUSTED_INTERACTIVE` posture and the same requester identity
+/// the original spawn was granted.
+///
+/// Deliberately NOT a stored argv replay and NOT a new process-launch path:
+/// every gate `fulfill_spawn_request` applies (the argv guard, the repo/cwd
+/// acceptance check, workdir confinement, the envelope re-narrowing, the
+/// depth cap, admission and pacing) is re-applied to the relaunch exactly as
+/// it was to the original. The row is dropped from the retained list only
+/// once the relaunch succeeds -- a refusal leaves it on screen with its
+/// reason in the error channel, still restorable.
+#[allow(clippy::too_many_arguments)]
+fn restore_ended_row(
+    short: &str,
+    panes: &mut Vec<Pane>,
+    nudge_queues: &mut Vec<VecDeque<String>>,
+    retained: &mut VecDeque<EndedRow>,
+    kept_requests: &mut HashMap<String, (spawnreq::SpawnRequest, Option<String>)>,
+    cfg: &CtxConfig,
+    state: &StateDir,
+    repo: &Path,
+    size: (u16, u16),
+    requests_dir: &Path,
+    errors: &mut ErrorLog,
+    notices: &mut Vec<Notice>,
+    now: Instant,
+) {
+    let Some(index) = retained.iter().position(|row| row.short == short) else {
+        push_notice(notices, now, format!("restore: no ended row named {short}"));
+        return;
+    };
+    let Some(request) = retained[index].request.clone() else {
+        push_notice(notices, now, format!("restore {short}: {MENU_NO_REQUEST}"));
+        return;
+    };
+    let requested_by = retained[index].requested_by.clone();
+    match fulfill_spawn_request(
+        &request,
+        FILE_DROP_TRUSTED_INTERACTIVE,
+        requested_by.as_deref(),
+        panes,
+        nudge_queues,
+        cfg,
+        state,
+        repo,
+        size,
+        requests_dir,
+        errors,
+    ) {
+        Ok((new_short, _)) => {
+            retained.remove(index);
+            kept_requests.insert(new_short.clone(), (request, requested_by));
+            push_notice(notices, now, format!("restored {short} as {new_short}"));
+        }
+        Err(refusal) => push_error(errors, format!("restore {short}: {}", refusal.reason)),
+    }
+}
 
 /// Clamps a cursor into `0..len` (or `0` on an empty list) -- shared by every
 /// browsing-mode reducer below so "move past the last row" and "the list
@@ -5020,7 +6393,7 @@ fn apply_mail_effect(
     cfg: &CtxConfig,
     from_session: &str,
     from_agent: &str,
-    errors: &mut Vec<String>,
+    errors: &mut ErrorLog,
 ) {
     let slug = super::state::repo_slug(repo);
     match effect {
@@ -5059,7 +6432,7 @@ fn apply_memory_effect(
     repo: &Path,
     cfg: &CtxConfig,
     written_by: &str,
-    errors: &mut Vec<String>,
+    errors: &mut ErrorLog,
 ) {
     let slug = super::state::repo_slug(repo);
     match effect {
@@ -5116,6 +6489,7 @@ fn build_mail_view(state: &StateDir, repo: &Path) -> ui::MailView {
     ui::MailView {
         items,
         cursor: 0,
+        offset: 0,
         compose: None,
     }
 }
@@ -5142,6 +6516,7 @@ fn build_memory_view(state: &StateDir, repo: &Path) -> ui::MemoryView {
     ui::MemoryView {
         entries,
         cursor: 0,
+        offset: 0,
         input: None,
     }
 }
@@ -5201,22 +6576,46 @@ pub fn restore_overlay_reduce(
     }
 }
 
-/// What confirming/cancelling the `Ctrl+A e` errors overlay means. Read-only
-/// -- browsing the kept errors touches no storage -- so unlike every other
-/// reducer here there is no effect type at all: `None` closes it, `Some`
-/// carries the (possibly cursor-moved) view back.
-pub fn errors_overlay_reduce(mut view: ui::ErrorsView, key: KeyEvent) -> Option<ui::ErrorsView> {
+/// Issue #354 phase 5: what browsing the kept errors asks the caller to do.
+///
+/// Exactly one thing -- acknowledge the entries this dialog was opened over.
+/// The dialog itself stays pure; the buffer it names lives in the event loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ErrorsAck;
+
+/// Pure: one keystroke against the `Ctrl+A e` errors overlay.
+///
+/// Issue #354 phase 5: an operator who has read the list has, by definition,
+/// seen the errors in it -- so the closing keys acknowledge on the way out,
+/// and `a` acknowledges in place (the entries stay, dimmed, so the list an
+/// operator is still reading does not rearrange under them). Acknowledgement
+/// never deletes: it only stops the sticky header line, until a NEW error --
+/// a different message, or the same one again after the acknowledgement --
+/// arrives.
+pub fn errors_overlay_reduce(
+    mut view: ui::ErrorsView,
+    key: KeyEvent,
+) -> (Option<ui::ErrorsView>, Option<ErrorsAck>) {
     match key.code {
-        KeyCode::Esc | KeyCode::Char('q') => None,
+        // Issue #354 phase 4 (deliverable D): `Enter` closes it too -- a
+        // read-only list has nothing to activate, and an `Enter` that does
+        // nothing at all is the inconsistency that phase removed.
+        KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => (None, Some(ErrorsAck)),
+        KeyCode::Char('a') => {
+            for item in &mut view.items {
+                item.acked = true;
+            }
+            (Some(view), Some(ErrorsAck))
+        }
         KeyCode::Down | KeyCode::Char('j') => {
             view.cursor = move_cursor(view.cursor, view.items.len(), 1);
-            Some(view)
+            (Some(view), None)
         }
         KeyCode::Up | KeyCode::Char('k') => {
             view.cursor = move_cursor(view.cursor, view.items.len(), -1);
-            Some(view)
+            (Some(view), None)
         }
-        _ => Some(view),
+        _ => (Some(view), None),
     }
 }
 
@@ -5225,11 +6624,797 @@ pub fn errors_overlay_reduce(mut view: ui::ErrorsView, key: KeyEvent) -> Option<
 /// taken once when the overlay opens, the same convention every other
 /// overlay here already follows (mail/memory/restore do not live-update
 /// while open either).
-fn build_errors_view(errors: &[String]) -> ui::ErrorsView {
+///
+/// Issue #354 phase 5: each row carries its own repeat count, the age of its
+/// most recent repeat and whether it has been acknowledged. `now` is injected
+/// so the age is the caller's clock, not a second one read in here.
+fn build_errors_view(errors: &ErrorLog, now: Instant) -> ui::ErrorsView {
     ui::ErrorsView {
-        items: errors.iter().rev().cloned().collect(),
+        items: errors
+            .entries
+            .iter()
+            .rev()
+            .map(|e| ui::ErrorItem {
+                text: e.text.clone(),
+                count: e.count,
+                age_secs: now.saturating_duration_since(e.last).as_secs(),
+                acked: e.acked,
+            })
+            .collect(),
         cursor: 0,
+        offset: 0,
     }
+}
+
+// ---------------------------------------------------------------------
+// Issue #354 phase 3: the context menu and the inspector.
+// ---------------------------------------------------------------------
+
+/// Everything the context menu decides ONE row's entries from. Assembled at
+/// the moment the menu opens, from values already in hand -- the row the
+/// roster built, the pane behind it (if any), and whether a spawn request was
+/// kept for it -- so the entry matrix itself stays a pure function.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct MenuFacts {
+    short: String,
+    role: String,
+    /// This dashboard owns a live `Pane` for the row.
+    attached: bool,
+    /// The row is a live session (attached, or a view-only registry row).
+    alive: bool,
+    /// The row is an ended pane -- a retained completed worker.
+    ended: bool,
+    /// The exit code of an ended row, when one was recorded.
+    exit_code: Option<i32>,
+    /// The row is one of the retained ended rows the roster keeps, so it can
+    /// be dropped from that list.
+    retained: bool,
+    /// The dashboard still holds the `spawnreq::SpawnRequest` that created
+    /// this row, so it can be relaunched verbatim.
+    has_request: bool,
+    /// The checkout this row runs (or ran) in, when it is known.
+    cwd: Option<String>,
+}
+
+impl MenuFacts {
+    /// The availability slice of these facts, in the shape the one
+    /// action-descriptor table decides against.
+    fn action_context(&self) -> actions::ActionContext {
+        actions::ActionContext {
+            selected: true,
+            attached: self.attached,
+            alive: self.alive,
+            ended: self.ended,
+            // The menu never chooses its own entries by the glyph -- every
+            // entry is always present -- so this stays false here.
+            needs_action: false,
+            retained: self.retained,
+            has_request: self.has_request,
+            clean_exit: self.exit_code.unwrap_or(0) == 0,
+            has_cwd: self.cwd.is_some(),
+            // A `MenuFacts` is always a real session row; the summary line
+            // never goes through here (see `selected_action_context`).
+            summary: false,
+        }
+    }
+}
+
+/// Pure: the context menu's entries for one row, in the approved order, each
+/// either available or disabled with a short reason.
+///
+/// Issue #354 phase 4: the order, the entries and every disable reason now
+/// come out of the one action-descriptor table (`actions::menu_actions`)
+/// rather than a second matrix written down here -- so the menu, the header
+/// cluster, the help screen and the palette cannot disagree about what an
+/// action is called or why it is unavailable.
+///
+/// Every entry is ALWAYS present. An operator who cannot see that `restore`
+/// exists cannot learn why it is unavailable, and a menu whose shape changes
+/// per row is a menu whose letters move under the operator's fingers.
+fn menu_entries(facts: &MenuFacts) -> Vec<ui::MenuEntry> {
+    let available = actions::menu_actions(&facts.action_context());
+    let order: Vec<ui::MenuAction> = available.iter().map(|(action, _)| *action).collect();
+    let letters = ui::menu_letters(&order);
+    available
+        .into_iter()
+        .zip(letters)
+        .map(|((action, availability), letter)| ui::MenuEntry {
+            action,
+            disabled: availability.reason().map(str::to_string),
+            letter,
+        })
+        .collect()
+}
+
+/// Builds the context menu for one row. `subject` is what the dialog title
+/// names, so a right-click menu is never mistaken for the selected row's.
+fn build_menu_view(facts: &MenuFacts) -> ui::MenuView {
+    ui::MenuView {
+        target: facts.short.clone(),
+        subject: format!("{} \u{b7} {}", facts.short, facts.role),
+        entries: menu_entries(facts),
+        cursor: 0,
+        offset: 0,
+        confirm: None,
+    }
+}
+
+/// Issue #354 phase 5: the context menu over the sidebar's summary line --
+/// the dashboard itself. Same entries in the same order as every other menu
+/// (an operator must never have to learn a second shape), with `inspect` the
+/// one that applies and the rest inert behind [`actions::MENU_SUMMARY_LINE`].
+fn build_summary_menu_view() -> ui::MenuView {
+    let ctx = actions::ActionContext {
+        summary: true,
+        ..actions::ActionContext::default()
+    };
+    let available = actions::menu_actions(&ctx);
+    let order: Vec<ui::MenuAction> = available.iter().map(|(action, _)| *action).collect();
+    let letters = ui::menu_letters(&order);
+    ui::MenuView {
+        target: DASHBOARD_TARGET.to_string(),
+        subject: "the dashboard".to_string(),
+        entries: available
+            .into_iter()
+            .zip(letters)
+            .map(|((action, availability), letter)| ui::MenuEntry {
+                action,
+                disabled: availability.reason().map(str::to_string),
+                letter,
+            })
+            .collect(),
+        cursor: 0,
+        offset: 0,
+        confirm: None,
+    }
+}
+
+/// The checkout one row runs (or ran) in: the live pane's own `cwd`, else
+/// the one frozen onto its retained ended row at the reap. `None` for a
+/// view-only registry row, which this dashboard never spawned and whose
+/// working directory it has no record of.
+fn row_cwd(short: &str, panes: &[Pane], retained: &VecDeque<EndedRow>) -> Option<String> {
+    panes
+        .iter()
+        .find(|p| p.short() == short)
+        .map(|p| p.cwd().display().to_string())
+        .or_else(|| {
+            retained
+                .iter()
+                .find(|e| e.short == short)
+                .map(|e| e.cwd.clone())
+        })
+}
+
+/// Assembles the context menu's facts for one already-built roster row.
+fn menu_facts_for(
+    row: &ui::SidebarRow,
+    panes: &[Pane],
+    retained: &VecDeque<EndedRow>,
+) -> MenuFacts {
+    let ended_row = retained.iter().find(|e| e.short == row.short);
+    MenuFacts {
+        short: row.short.clone(),
+        role: row.role.clone(),
+        attached: row.attached,
+        alive: row.state != ui::RowState::Dead && row.exit_code.is_none(),
+        ended: row.state == ui::RowState::Dead || row.exit_code.is_some(),
+        exit_code: row.exit_code,
+        retained: ended_row.is_some(),
+        has_request: ended_row.is_some_and(|e| e.request.is_some()),
+        cwd: row_cwd(&row.short, panes, retained),
+    }
+}
+
+/// What activating a context-menu entry means. The menu itself stays pure:
+/// looking a pane up, opening another overlay, quitting a child or
+/// relaunching a request all happen at the call site, which is the only place
+/// with the panes, the state directory and the kept requests in hand.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MenuEffect {
+    pub target: String,
+    pub action: ui::MenuAction,
+}
+
+/// Pure: one keystroke against the context menu.
+///
+/// `Enter` activates the entry under the caret -- except `stop`, the one
+/// destructive entry, which first raises an inline confirmation on its own
+/// row and only acts on `y` (or a second `Enter`). A disabled entry does
+/// nothing at all: its reason is already on screen. `Esc` closes the menu
+/// without touching focus, and a letter jumps straight to its entry.
+pub fn menu_overlay_reduce(
+    mut view: ui::MenuView,
+    key: KeyEvent,
+) -> (Option<ui::MenuView>, Option<MenuEffect>) {
+    let len = view.entries.len();
+    let activate = |view: ui::MenuView| -> (Option<ui::MenuView>, Option<MenuEffect>) {
+        match view.entries.get(view.cursor) {
+            Some(entry) if entry.enabled() => {
+                let effect = MenuEffect {
+                    target: view.target.clone(),
+                    action: entry.action,
+                };
+                (None, Some(effect))
+            }
+            // A disabled entry is inert: the row already says why.
+            _ => (Some(view), None),
+        }
+    };
+    // The inline stop confirmation owns the keyboard while it is up, so a
+    // stray `j` cannot walk the caret off the entry that is being confirmed
+    // and leave the confirmation pointing at a different row.
+    if let Some(index) = view.confirm {
+        return match key.code {
+            KeyCode::Char('y') | KeyCode::Enter => {
+                view.cursor = index;
+                view.confirm = None;
+                activate(view)
+            }
+            _ => {
+                view.confirm = None;
+                (Some(view), None)
+            }
+        };
+    }
+    match key.code {
+        KeyCode::Esc => (None, None),
+        KeyCode::Up | KeyCode::Char('k') => {
+            view.cursor = move_cursor(view.cursor, len, -1);
+            (Some(view), None)
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            view.cursor = move_cursor(view.cursor, len, 1);
+            (Some(view), None)
+        }
+        KeyCode::Enter => {
+            if view
+                .entries
+                .get(view.cursor)
+                .is_some_and(|e| e.action == ui::MenuAction::Stop && e.enabled())
+            {
+                view.confirm = Some(view.cursor);
+                return (Some(view), None);
+            }
+            activate(view)
+        }
+        KeyCode::Char(c) => match view.entries.iter().position(|e| e.letter == Some(c)) {
+            Some(index) => {
+                view.cursor = index;
+                if view.entries[index].action == ui::MenuAction::Stop
+                    && view.entries[index].enabled()
+                {
+                    view.confirm = Some(index);
+                    return (Some(view), None);
+                }
+                activate(view)
+            }
+            None => (Some(view), None),
+        },
+        _ => (Some(view), None),
+    }
+}
+
+/// The inspector's own section names, once, so `build_inspector_view`, the
+/// `evidence` menu entry and the tests all name the same strings.
+const INSPECT_IDENTITY: &str = "identity";
+const INSPECT_STATUS: &str = "status";
+const INSPECT_EVIDENCE: &str = "evidence";
+const INSPECT_BUDGET: &str = "budget";
+const INSPECT_WRITER: &str = "writer";
+const INSPECT_SIGNAL: &str = "signal";
+const INSPECT_ERRORS: &str = "errors";
+
+/// Issue #354 phase 5: the DASHBOARD-level inspector's own section names.
+/// Same dialog, same viewport, same `Esc`; a different subject.
+const INSPECT_DASH_HARNESS: &str = "harness";
+const INSPECT_DASH_SESSIONS: &str = "sessions";
+const INSPECT_DASH_SPEND: &str = "spend";
+const INSPECT_DASH_USAGE: &str = "usage";
+const INSPECT_DASH_REPO: &str = "repo";
+const INSPECT_DASH_DASHBOARD: &str = "dashboard";
+
+/// The `target` a dashboard-level inspector or action menu carries.
+///
+/// Session short ids are exactly eight characters (`sessions::short_id`), so
+/// a nine-character literal can never collide with one -- which is what lets
+/// the menu effect and the inspector both say "this is the dashboard, not a
+/// row" without a second `Option` threaded through every arm.
+const DASHBOARD_TARGET: &str = "dashboard";
+
+/// One `key  value` inspector line, with the shared placeholder standing in
+/// for a fact nothing has recorded yet -- never a fabricated value.
+fn inspect_line(key: &str, value: Option<String>) -> String {
+    format!(
+        "{key:<12}{}",
+        value
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| style::PLACEHOLDER.to_string())
+    )
+}
+
+/// Builds the inspector over one row, from facts that are already cached.
+///
+/// Nothing here reads the disk, runs git or shells out: `row` is what the
+/// roster already assembled this frame, `status` is the composed
+/// `attention::SessionStatus` the `FactsCache` cadence loaded, `cwd` comes
+/// from the pane (or the retained row) the caller already has, and `errors`
+/// is `push_error`'s own kept buffer.
+fn build_inspector_view(
+    row: &ui::SidebarRow,
+    cwd: Option<&str>,
+    errors: &ErrorLog,
+) -> ui::InspectorView {
+    let disclosure = |key: &str| {
+        row.disclosure
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.clone())
+    };
+    let status = row.status.as_ref();
+    let identity = ui::InspectorSection {
+        name: INSPECT_IDENTITY.to_string(),
+        lines: vec![
+            inspect_line("short", Some(row.short.clone())),
+            inspect_line("harness", Some(row.harness.clone())),
+            inspect_line("model", row.model.clone()),
+            inspect_line("role", Some(row.role.clone())),
+            inspect_line(
+                "group",
+                row.group.as_ref().map(|g| {
+                    format!(
+                        "{} ({})",
+                        g.scope,
+                        if g.lead_short.is_empty() {
+                            style::PLACEHOLDER
+                        } else {
+                            g.lead_short.as_str()
+                        }
+                    )
+                }),
+            ),
+            inspect_line("parent", disclosure("group")),
+            inspect_line("cwd", cwd.map(str::to_string)),
+            // Never run: `branch` stays whatever the roster cached, which is
+            // the placeholder until something else fills it in. Shelling out
+            // to git here would put a subprocess behind a keystroke.
+            inspect_line("branch", disclosure("branch")),
+        ],
+    };
+    let status_section = ui::InspectorSection {
+        name: INSPECT_STATUS.to_string(),
+        lines: vec![
+            inspect_line(
+                "lifecycle",
+                status.map(|s| spaced_lowercase(&format!("{:?}", s.lifecycle))),
+            ),
+            inspect_line(
+                "attention",
+                status.map(|s| spaced_lowercase(&format!("{:?}", s.attention))),
+            ),
+            inspect_line(
+                "projection",
+                status.map(|s| projection_word(super::attention::project(s))),
+            ),
+            inspect_line(
+                "authority",
+                status.map(|s| spaced_lowercase(&format!("{:?}", s.authority))),
+            ),
+            inspect_line("confidence", status.map(|s| s.confidence.to_string())),
+            inspect_line("since", disclosure("since")),
+            inspect_line("revision", status.map(|s| s.revision.to_string())),
+            inspect_line("exit", row.exit_code.map(|code| format!("exit {code}"))),
+        ],
+    };
+    // The whole point of the inspector: WHY the dashboard believes what it
+    // shows. Both the winning observation's evidence and every authority that
+    // lost this tick's vote, with its own reason.
+    let mut evidence_lines = Vec::new();
+    if let Some(status) = status {
+        if !status.evidence.trim().is_empty() {
+            evidence_lines.push(inspect_line("evidence", Some(status.evidence.clone())));
+        }
+        for skipped in &status.skipped {
+            evidence_lines.push(format!(
+                "skipped     {} \u{b7} {}",
+                spaced_lowercase(&format!("{:?}", skipped.authority)),
+                skipped.reason
+            ));
+        }
+    }
+    let evidence = ui::InspectorSection {
+        name: INSPECT_EVIDENCE.to_string(),
+        lines: evidence_lines,
+    };
+    let budget = ui::InspectorSection {
+        name: INSPECT_BUDGET.to_string(),
+        lines: vec![inspect_line("usage", disclosure("budget"))],
+    };
+    let writer = ui::InspectorSection {
+        name: INSPECT_WRITER.to_string(),
+        lines: vec![inspect_line("permit", disclosure("writer"))],
+    };
+    let signal = ui::InspectorSection {
+        name: INSPECT_SIGNAL.to_string(),
+        lines: vec![
+            inspect_line("transport", disclosure("signal")),
+            inspect_line(
+                "attached",
+                Some(if row.attached { "yes" } else { "no" }.to_string()),
+            ),
+        ],
+    };
+    // Only this pane's own kept errors: the buffer is shared, and every line
+    // `push_error` writes for a pane names its short id.
+    let pane_errors = ui::InspectorSection {
+        name: INSPECT_ERRORS.to_string(),
+        lines: errors
+            .iter()
+            .rev()
+            .filter(|e| e.contains(&row.short))
+            .take(MAX_KEPT_ERRORS)
+            .map(str::to_string)
+            .collect(),
+    };
+    ui::InspectorView {
+        target: row.short.clone(),
+        subject: format!("{} \u{b7} {}", row.short, row.role),
+        sections: vec![
+            identity,
+            status_section,
+            evidence,
+            budget,
+            writer,
+            signal,
+            pane_errors,
+        ],
+        cursor: 0,
+        offset: 0,
+    }
+}
+
+/// Everything the DASHBOARD-level inspector reports (issue #354 phase 5),
+/// all of it already cached: nothing here reads the disk, runs git or shells
+/// out, and a fact that has not been read yet renders the shared placeholder
+/// rather than a fabricated zero.
+struct DashboardFacts<'a> {
+    harness: &'a str,
+    short: &'a str,
+    /// This dashboard's own orchestrator seat label (`gen N`).
+    seat: Option<&'a str>,
+    state_dir: String,
+    uptime_secs: u64,
+    /// Mouse reporting is on (the pointer drives the chrome); `false` is
+    /// select mode, where the terminal owns the pointer for text selection.
+    mouse: bool,
+    sidebar_cols: u16,
+    /// How stale the throttled disk facts below are.
+    facts_age_secs: u64,
+    rows: &'a [ui::SidebarRow],
+    spend: Option<AggregateSpendFacts>,
+    usage: &'a [ui::HarnessUsage],
+    pool: &'a [ui::HarnessStrip],
+    /// `(broadcast, direct)` unread for the dashboard's own identity.
+    mail: Option<(usize, usize)>,
+    workflow: Option<&'a workflow::ActiveWorkflowSummary>,
+    /// `(panes whose turn-signal socket bound, attached panes)`.
+    supervised: (usize, usize),
+}
+
+/// Pure: the inspector over the DASHBOARD itself -- what `^A i` opens while
+/// the sidebar's summary line is selected (issue #354 phase 5).
+///
+/// The same [`ui::InspectorView`] the per-row inspector produces, so it draws
+/// through the identical phase-3 scrollable dialog and obeys the identical
+/// `Esc`/`Enter` rule. The summary line's own one-line disclosure (phase 1)
+/// is unchanged: this is the long form, on demand.
+fn build_dashboard_inspector(facts: &DashboardFacts<'_>) -> ui::InspectorView {
+    let age = |secs: u64| format!("read {} ago", style::format_age(secs));
+    let harness = ui::InspectorSection {
+        name: INSPECT_DASH_HARNESS.to_string(),
+        lines: vec![
+            inspect_line("harness", Some(facts.harness.to_string())),
+            inspect_line("short", Some(facts.short.to_string())),
+            inspect_line("seat", facts.seat.map(str::to_string)),
+            inspect_line("uptime", Some(style::format_age(facts.uptime_secs))),
+        ],
+    };
+    let live = facts
+        .rows
+        .iter()
+        .filter(|r| r.state != ui::RowState::Dead)
+        .count();
+    let mut session_lines = vec![
+        inspect_line("live", Some(live.to_string())),
+        inspect_line("ended", Some((facts.rows.len() - live).to_string())),
+    ];
+    // One line per glyph, always all six: a zero here is a fact (nothing is
+    // waiting), not a missing reading.
+    for glyph in ui::ALL_GLYPHS {
+        let count = facts
+            .rows
+            .iter()
+            .filter(|r| ui::glyph_for(r) == glyph)
+            .count();
+        session_lines.push(inspect_line(
+            glyph.name(),
+            Some(format!("{} {count}", glyph.symbol())),
+        ));
+    }
+    let sessions = ui::InspectorSection {
+        name: INSPECT_DASH_SESSIONS.to_string(),
+        lines: session_lines,
+    };
+    let mut spend_lines = vec![
+        inspect_line(
+            "delegated",
+            facts.spend.map(|s| format!("{} failed", s.failed)),
+        ),
+        inspect_line(
+            "cost",
+            facts
+                .spend
+                .map(|s| super::price::format_usd(s.cost_micros, false)),
+        ),
+    ];
+    for strip in facts.pool {
+        spend_lines.push(inspect_line(
+            &strip.name,
+            Some(match strip.headroom_pct {
+                Some(pct) => format!("{} \u{b7} headroom {pct:.0}%", strip.state),
+                None => strip.state.clone(),
+            }),
+        ));
+    }
+    if facts.spend.is_some() || !facts.pool.is_empty() {
+        spend_lines.push(inspect_line("as of", Some(age(facts.facts_age_secs))));
+    }
+    let spend = ui::InspectorSection {
+        name: INSPECT_DASH_SPEND.to_string(),
+        lines: spend_lines,
+    };
+    let usage = ui::InspectorSection {
+        name: INSPECT_DASH_USAGE.to_string(),
+        lines: facts
+            .usage
+            .iter()
+            .map(|u| {
+                let pct = |v: Option<f64>| match v {
+                    Some(v) => format!("{v:.0}%"),
+                    None => style::PLACEHOLDER.to_string(),
+                };
+                inspect_line(
+                    u.name,
+                    Some(format!(
+                        "5h {} \u{b7} 7d {}",
+                        pct(u.five_hour),
+                        pct(u.seven_day)
+                    )),
+                )
+            })
+            .collect(),
+    };
+    let repo = ui::InspectorSection {
+        name: INSPECT_DASH_REPO.to_string(),
+        lines: vec![
+            inspect_line(
+                "mail",
+                facts.mail.map(|(broadcast, direct)| {
+                    format!("{broadcast} broadcast \u{b7} {direct} direct")
+                }),
+            ),
+            inspect_line(
+                "workflow",
+                facts.workflow.map(|w| {
+                    let gate = if w.awaiting_approval {
+                        " \u{b7} awaits approval"
+                    } else {
+                        ""
+                    };
+                    format!("{} \u{b7} {}{gate}", w.kind, w.step)
+                }),
+            ),
+            inspect_line(
+                "supervision",
+                Some(format!(
+                    "{} of {} panes",
+                    facts.supervised.0, facts.supervised.1
+                )),
+            ),
+        ],
+    };
+    let dashboard = ui::InspectorSection {
+        name: INSPECT_DASH_DASHBOARD.to_string(),
+        lines: vec![
+            inspect_line("state dir", Some(facts.state_dir.clone())),
+            inspect_line(
+                "mouse",
+                Some(if facts.mouse { "on" } else { "select mode" }.to_string()),
+            ),
+            inspect_line("sidebar", Some(format!("{} cols", facts.sidebar_cols))),
+            inspect_line("facts", Some(age(facts.facts_age_secs))),
+        ],
+    };
+    ui::InspectorView {
+        target: DASHBOARD_TARGET.to_string(),
+        subject: format!("dashboard \u{b7} {}", facts.short),
+        sections: vec![harness, sessions, spend, usage, repo, dashboard],
+        cursor: 0,
+        offset: 0,
+    }
+}
+
+/// Gathers the dashboard-level inspector's facts out of what is already in
+/// hand: this tick's roster, the throttled [`FactsCache`], and the loop's own
+/// in-memory state. No read of any kind happens here.
+#[allow(clippy::too_many_arguments)]
+fn dashboard_facts<'a>(
+    harness: &'a str,
+    short: &'a str,
+    rows: &'a [ui::SidebarRow],
+    panes: &[Pane],
+    cache: &'a FactsCache,
+    state: &StateDir,
+    launched_at: Instant,
+    mouse: bool,
+    sidebar_cols: u16,
+    now: Instant,
+) -> DashboardFacts<'a> {
+    DashboardFacts {
+        harness,
+        short,
+        seat: cache.disk.pool_seat.as_deref(),
+        state_dir: state.root().display().to_string(),
+        uptime_secs: now.saturating_duration_since(launched_at).as_secs(),
+        mouse,
+        sidebar_cols,
+        facts_age_secs: now.saturating_duration_since(cache.last_refresh).as_secs(),
+        rows,
+        spend: cache.disk.spend,
+        usage: &cache.disk.usage,
+        pool: &cache.disk.pool_harnesses,
+        mail: cache.disk.mail,
+        workflow: cache.disk.workflow.as_ref(),
+        supervised: (panes.iter().filter(|p| p.reachable()).count(), panes.len()),
+    }
+}
+
+/// Pure: one keystroke against the inspector. Read-only, like the errors
+/// overlay -- there is no effect type, only "still open" or "closed".
+///
+/// Issue #354 phase 4 (deliverable D): `Enter` closes it too. A read-only
+/// report has nothing to activate, and the one rule that now holds in every
+/// dialog is that `Esc` closes and `Enter` confirms -- an `Enter` that does
+/// nothing at all is exactly the inconsistency this phase removes.
+pub fn inspector_overlay_reduce(
+    mut view: ui::InspectorView,
+    key: KeyEvent,
+) -> Option<ui::InspectorView> {
+    let len = view.rows().len();
+    match key.code {
+        KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => None,
+        KeyCode::Down | KeyCode::Char('j') => {
+            view.cursor = move_cursor(view.cursor, len, 1);
+            Some(view)
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            view.cursor = move_cursor(view.cursor, len, -1);
+            Some(view)
+        }
+        _ => Some(view),
+    }
+}
+
+/// What activating a palette row asks the caller to do: run the descriptor
+/// under the caret. The palette itself stays pure -- turning an
+/// [`actions::ActionId`] into either a `DashAction` (a global chord, replayed
+/// through the exact dispatch the keyboard uses) or a `ui::MenuAction`
+/// (a row action, replayed through the exact path the context menu uses)
+/// happens at the call site, which is the only place with the roster, the
+/// panes and the state directory in hand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PaletteEffect(pub actions::ActionId);
+
+/// Pure: one keystroke against the palette (`^A p`) or the help screen
+/// (`^A ?`), which is the same dialog in read-only mode.
+///
+/// `Esc` closes without running anything. `Enter` runs the caret's own action
+/// -- and in help mode simply closes, since a key reference must never fire
+/// an action an operator only meant to read about. Up/Down move the caret,
+/// skipping section headings; Backspace edits the query and every other
+/// printable character extends it. Nothing typed here is ever forwarded to
+/// the child: an open overlay owns every keystroke, and the palette's query
+/// is the clearest case of why that rule exists.
+pub fn palette_overlay_reduce(
+    mut view: ui::PaletteView,
+    key: KeyEvent,
+) -> (Option<ui::PaletteView>, Option<PaletteEffect>) {
+    let refresh = |view: &mut ui::PaletteView| {
+        let rows = view.rows();
+        // A query that no longer matches what the caret was on puts the
+        // caret back on the first row that does -- never off the end of the
+        // list, and never parked on a heading.
+        if !rows
+            .get(view.cursor)
+            .is_some_and(actions::PaletteRow::selectable)
+        {
+            view.cursor = actions::palette_first(&rows);
+        }
+        // A new query is a new list: back to the top of it.
+        view.offset = 0;
+    };
+    match key.code {
+        KeyCode::Esc => (None, None),
+        KeyCode::Enter => match view.activated() {
+            Some(id) => (None, Some(PaletteEffect(id))),
+            // Help mode, a section heading, a disabled row, or an empty
+            // result: Enter closes rather than doing nothing at all.
+            None => (None, None),
+        },
+        KeyCode::Up => {
+            let rows = view.rows();
+            view.cursor = actions::palette_step(&rows, view.cursor, -1);
+            (Some(view), None)
+        }
+        KeyCode::Down => {
+            let rows = view.rows();
+            view.cursor = actions::palette_step(&rows, view.cursor, 1);
+            (Some(view), None)
+        }
+        KeyCode::Backspace => {
+            view.query.pop();
+            refresh(&mut view);
+            (Some(view), None)
+        }
+        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            view.query.push(c);
+            refresh(&mut view);
+            (Some(view), None)
+        }
+        _ => (Some(view), None),
+    }
+}
+
+/// The availability snapshot for whatever row the sidebar cursor is on --
+/// exactly the facts the context menu decides from, so the palette can never
+/// offer an action the menu says is unavailable (or the other way round).
+/// An empty roster yields the default context, in which every row action is
+/// `Hidden` and only the dashboard-wide ones are listed.
+/// Issue #354 phase 5: `summary` is "the cursor is parked on the sidebar's
+/// summary line", where the target is the dashboard itself -- `inspect` still
+/// applies, every per-session action is listed inert with its reason.
+fn selected_action_context(
+    rows: &[ui::SidebarRow],
+    selected: usize,
+    panes: &[Pane],
+    retained: &VecDeque<EndedRow>,
+    summary: bool,
+) -> actions::ActionContext {
+    if summary {
+        return actions::ActionContext {
+            summary: true,
+            ..actions::ActionContext::default()
+        };
+    }
+    match rows.get(selected) {
+        Some(row) => menu_facts_for(row, panes, retained).action_context(),
+        None => actions::ActionContext::default(),
+    }
+}
+
+/// Builds the palette (or the help screen, which is the same list read-only)
+/// over whatever row is selected right now. `ctx` is snapshotted here, the
+/// same convention every other overlay follows.
+fn build_palette_view(mode: ui::PaletteMode, ctx: actions::ActionContext) -> ui::PaletteView {
+    let mut view = ui::PaletteView {
+        mode,
+        query: String::new(),
+        ctx,
+        cursor: 0,
+        offset: 0,
+    };
+    view.cursor = actions::palette_first(&view.rows());
+    view
 }
 
 /// What confirming/cancelling the quit confirmation dialog means -- pulled
@@ -5314,6 +7499,7 @@ fn build_restore_view(candidates: &[roster::RosterPane]) -> ui::RestoreView {
             })
             .collect(),
         cursor: 0,
+        offset: 0,
     }
 }
 
@@ -5399,7 +7585,7 @@ fn restored_pane_turn_env(
     repo: &Path,
     candidate: &roster::RosterPane,
     requests_dir: &Path,
-    errors: &mut Vec<String>,
+    errors: &mut ErrorLog,
 ) -> (Vec<(String, String)>, PathBuf) {
     let mode = if candidate.interactive {
         adapters::LaunchMode::Interactive
@@ -5474,7 +7660,7 @@ fn spawn_restored_pane(
     repo: &Path,
     size: (u16, u16),
     requests_dir: &Path,
-    errors: &mut Vec<String>,
+    errors: &mut ErrorLog,
     deferred_restore: &mut Vec<roster::RosterPane>,
 ) {
     let adapter = match adapters::select(Some(&candidate.agent), &[], cfg) {
@@ -5701,7 +7887,7 @@ fn sweep_one_pane<I: Injector>(
     agent: &str,
     short: &str,
     cap: usize,
-    errors: &mut Vec<String>,
+    errors: &mut ErrorLog,
     // Issue #249: this pane's own `Pane::parent_session` -- server-verified
     // at spawn time, never anything read out of a message being swept.
     parent_short: Option<&str>,
@@ -5807,7 +7993,7 @@ fn advise_one_pane<I: Injector>(
     agent: &str,
     short: &str,
     advised: &mut HashMap<String, mail::AdvisedIds>,
-    errors: &mut Vec<String>,
+    errors: &mut ErrorLog,
 ) -> bool {
     let messages = match mail::list(state, slug, Some(agent), Some(short)) {
         Ok(m) => m,
@@ -5870,7 +8056,7 @@ fn mail_sweep(
     state: &StateDir,
     repo: &Path,
     advised: &mut HashMap<String, mail::AdvisedIds>,
-    errors: &mut Vec<String>,
+    errors: &mut ErrorLog,
 ) {
     if !cfg.mail.enabled {
         return;
@@ -5972,7 +8158,7 @@ fn report_back_reminder_body(report_to: &str) -> String {
 /// suppress), so it would trade a rare harmless duplicate reminder for a
 /// silent gap whenever the requester's own session had already consumed the
 /// report before this sweep ever ran.
-fn report_back_reminder_sweep(panes: &mut [Pane], state: &StateDir, errors: &mut Vec<String>) {
+fn report_back_reminder_sweep(panes: &mut [Pane], state: &StateDir, errors: &mut ErrorLog) {
     for pane in panes.iter_mut() {
         if pane.verb() != sessions::Verb::Dash || pane.report_reminder_sent() {
             continue;
@@ -6019,7 +8205,7 @@ fn report_back_reminder_sweep(panes: &mut [Pane], state: &StateDir, errors: &mut
 fn deliver_queued_nudges(
     panes: &mut [Pane],
     queues: &mut [VecDeque<String>],
-    errors: &mut Vec<String>,
+    errors: &mut ErrorLog,
 ) {
     for (pane, queue) in panes.iter_mut().zip(queues.iter_mut()) {
         if let Some(text) = next_deliverable(queue, pane.injectable())
@@ -6048,7 +8234,7 @@ fn deliver_queued_nudges(
 /// pane's `pending_submit` set for the next tick to retry -- see
 /// `dash::pane::write_submit_cr`'s own doc comment for why a retried lone
 /// `\r` is always safe.
-fn drain_pending_submits(panes: &mut [Pane], errors: &mut Vec<String>) {
+fn drain_pending_submits(panes: &mut [Pane], errors: &mut ErrorLog) {
     let now = Instant::now();
     for pane in panes.iter_mut() {
         if pane.pending_submit_due(now)
@@ -6094,7 +8280,7 @@ fn submit_nudge(
     queues: &mut [VecDeque<String>],
     repo: &Path,
     env: EnvLookup<'_>,
-    errors: &mut Vec<String>,
+    errors: &mut ErrorLog,
     notices: &mut Vec<Notice>,
     now: Instant,
 ) {
@@ -6316,18 +8502,53 @@ fn restorable_candidates(taken: roster::Roster) -> Vec<roster::RosterPane> {
         .collect()
 }
 
-/// The `PaneRowMeta` list for every pane this dashboard currently owns, in
-/// pane order -- shared by the pre-input (routing) and post-input
-/// (rendering) calls to `assemble_sidebar` each tick.
-fn build_pane_rows(panes: &[Pane]) -> Vec<PaneRowMeta> {
+/// The `PaneRowMeta` list for every row this dashboard owns, in pane order
+/// followed by its retained ended rows (issue #354 phase 2) in reap order --
+/// shared by the pre-input (routing) and post-input (rendering) calls to
+/// `assemble_sidebar` each tick.
+///
+/// The retained rows come after the live panes rather than staying at the
+/// index the pane held: `focused` indexes into `panes` alone, so anything
+/// appended past its end cannot disturb it, and a completed worker reading as
+/// the most recent thing to have finished is what an operator scanning the
+/// bottom of the roster expects. A retained row that still carries its work
+/// group is still drawn under that group's header, wherever the header sits.
+fn build_pane_rows(panes: &[Pane], ended: &VecDeque<EndedRow>) -> Vec<PaneRowMeta> {
     panes
         .iter()
         .map(|pane| PaneRowMeta {
+            role: pane.role().label().to_string(),
+            model: pane.launch_model().map(str::to_string),
+            group_id: pane.work_group_id().map(str::to_string),
+            parent: pane.parent_session().map(str::to_string),
+            budget: budget_text(
+                pane.measured_usage()
+                    .map(|u| u.context_total().saturating_add(u.output_tokens)),
+                pane.budget_tokens(),
+            ),
+            writer: writer_text(pane.holds_writer_permit(), pane.cwd()),
             short: pane.short().to_string(),
             harness: pane.agent().to_string(),
             state: ui::row_state_for(&pane.state()),
             supervised: pane.reachable(),
+            ended: None,
         })
+        .chain(ended.iter().map(|row| PaneRowMeta {
+            role: row.role.clone(),
+            model: row.model.clone(),
+            group_id: row.group_id.clone(),
+            parent: row.parent.clone(),
+            budget: row.budget.clone(),
+            writer: row.writer.clone(),
+            short: row.short.clone(),
+            harness: row.harness.clone(),
+            state: ui::RowState::Dead,
+            // There is no socket left to be reachable on; the footer only ever
+            // reads this off the FOCUSED row, which a retained row can never
+            // be, but the honest value is the one to carry.
+            supervised: false,
+            ended: Some(row.meta),
+        }))
         .collect()
 }
 
@@ -6401,7 +8622,11 @@ pub fn run_dashboard(
     first: PaneSpec,
     force_pace: bool,
 ) -> CtxResult<i32> {
-    let mut errors: Vec<String> = Vec::new();
+    let mut errors = ErrorLog::default();
+    // Issue #354 phase 5: what the dashboard-level inspector reports as
+    // `uptime`. Taken before any setup so it measures the session, not the
+    // event loop.
+    let launched_at = Instant::now();
 
     // Issue #319, design item 4: a conservative startup GC of any `--worktree`
     // trees this repo's own dead sessions left behind. Best-effort and never
@@ -6736,6 +8961,53 @@ pub fn run_dashboard(
     // names a pane. See `apply_navigation`.
     let mut selected: usize = 0;
     let mut focused: usize = 0;
+    // Issue #354's own sidebar state. `sidebar_offset` is the roster's
+    // viewport, which the wheel moves without touching the selection;
+    // `chrome_selection` holds the cursor while it is on the summary line or
+    // a group header rather than a session row; `collapsed_groups` is which
+    // work groups are folded shut; `frame_snapshot` is the geometry of the
+    // last frame that actually drew, which every pointer event is resolved
+    // against; `reveal_sidebar` asks the next frame to bring the selection
+    // back into the viewport after a keyboard navigation.
+    let mut sidebar_offset = 0usize;
+    let mut chrome_selection: Option<Hit> = None;
+    let mut collapsed_groups = HashSet::new();
+    // Issue #354 phase 2: completed panes keep a row (oldest dropped past
+    // `MAX_RETAINED_ENDED_ROWS`), and `◆` is only cleared by a render that
+    // actually showed the operator the pane -- see `DoneUnreadAck`.
+    let mut retained_ended: VecDeque<EndedRow> = VecDeque::new();
+    let mut done_unread_ack = DoneUnreadAck::default();
+    // Issue #354 phase 5: which attention episode each session was last
+    // announced for. Pure state, fed only on the `FactsCache` cadence.
+    let mut attention_notices = notify::NoticeReducer::new();
+    let mut frame_snapshot = hit::FrameSnapshot::default();
+    // Review of #354 (defect 1, HIGH): the overlay's own identity at the
+    // moment `frame_snapshot` was drawn -- kept in lockstep with it (updated
+    // only where `frame_snapshot` itself is) so `overlay_route_is_current`
+    // always compares the snapshot's geometry against the overlay it was
+    // actually drawn from, never a later one.
+    let mut frame_snapshot_overlay_ident = overlay_identity(&ui::Overlay::None);
+    let mut reveal_sidebar = true;
+    // Issue #354 phase 3: the `spawnreq::SpawnRequest` behind every pane this
+    // dashboard fulfilled, by short id -- moved onto the pane's retained
+    // ended row when it is reaped, which is what `restore`/`retry` replay.
+    // The orchestrator pane and a startup-restored pane are deliberately
+    // absent: neither came from a request, and neither can be restored this
+    // way (the menu says `no spawn request kept`).
+    let mut kept_requests: HashMap<String, (spawnreq::SpawnRequest, Option<String>)> =
+        HashMap::new();
+    // Issue #354 phase 3: the last click on a dialog row, for the
+    // double-click-activates rule. `route_mouse` stays pure; this is the only
+    // thing holding a clock.
+    let mut last_overlay_click: Option<(usize, Instant)> = None;
+    // Review of 9314156 (finding 2, MEDIUM): the double-click state above is
+    // keyed on a row INDEX, which means nothing outside the dialog it was
+    // clicked in. Without this, single-clicking entry N in one dialog,
+    // closing it and single-clicking entry N in a different one within
+    // `DOUBLE_CLICK` replayed `Enter` and activated an entry the operator
+    // had clicked exactly once. The identity is re-read before every event
+    // and any change -- opened, replaced, closed -- drops the pending click.
+    let mut last_overlay_ident = overlay_identity(&ui::Overlay::None);
     let mut zoomed = false;
     let mut prefix_armed = false;
     // `Ctrl+A v` (`DashAction::ToggleSelectMode`)'s own state: whether the
@@ -6768,6 +9040,19 @@ pub fn run_dashboard(
     // itself counts as activity and the dashboard starts in the hot window
     // rather than the flat 50ms idle wait.
     let mut last_activity = Instant::now();
+    // Issue #354 phase 4 (finding F15): the first-run tip. Shown once, in the
+    // header's middle slot, until any prefixed key is used or Esc dismisses
+    // it.
+    //
+    // Issue #354 phase 5 (phase-4 residual): the flag is written when the tip
+    // is actually DISMISSED, not when it is decided to be shown. A session
+    // that was launched and quit without a single keystroke never read the
+    // tip, and marking it seen at launch is how a first-time operator got
+    // exactly one chance to notice a line they may never have looked at.
+    // Still best effort and still once: a read-only or missing state
+    // directory costs nothing but the tip shown again next launch, never an
+    // error and never a panic.
+    let mut first_run_tip = !first_run_tip_seen(state);
     let mut overlay = if restore_candidates.is_empty() {
         ui::Overlay::None
     } else {
@@ -6900,6 +9185,8 @@ pub fn run_dashboard(
             &mut reaped_codes,
             &mut reaped_recent,
             &mut last_exited,
+            &mut retained_ended,
+            &mut kept_requests,
         );
 
         // The geometry any pane spawned during this tick gets -- the terminal
@@ -6928,6 +9215,7 @@ pub fn run_dashboard(
             repo,
             pane_size,
             &mut errors,
+            &mut kept_requests,
         );
         // M4: a request fulfilled this tick appended panes, shifting every
         // view-only sidebar row (and any selection on one) down.
@@ -7018,7 +9306,19 @@ pub fn run_dashboard(
         // onto its own spawn requests (`requested_by`) and onto the header's
         // per-session counts -- or, with no panes left at all, an empty
         // string.
-        facts_cache.refresh_if_due(
+        // Issue #354 phase 2: the acknowledgement the LAST frame earned, acted
+        // on here -- off the render path, before this tick's own reads, and at
+        // most once per `(session, revision)`. A write inside `terminal.draw`
+        // would put a state-dir round trip on the hot path for every frame a
+        // done-unread pane stayed focused.
+        if let Some(short) = done_unread_ack.take_due() {
+            let acked = super::attention::mark_seen_io(state, &short);
+            // Keep the cached copy in step rather than waiting up to a full
+            // `FACTS_THROTTLE` for the glyph to stop saying `◆` at something
+            // the operator has demonstrably now read.
+            facts_cache.disk.attention.insert(short, acked);
+        }
+        let facts_refreshed = facts_cache.refresh_if_due(
             cfg,
             state,
             FactsOwner {
@@ -7029,6 +9329,48 @@ pub fn run_dashboard(
             &panes,
             Instant::now(),
         );
+        if facts_refreshed {
+            // Exactly the rows the sidebar can draw, and only on the tick the
+            // rest of the facts were re-read: the glyph column must never put
+            // a file read on a frame.
+            let pane_shorts: Vec<String> = panes.iter().map(|p| p.short().to_string()).collect();
+            let shorts = attention_row_shorts(
+                &pane_shorts,
+                &retained_ended,
+                &facts_cache.registry,
+                std::process::id(),
+            );
+            let previous_attention = facts_cache
+                .refresh_attention(&shorts, &|short| super::attention::load(state, short));
+            // Issue #354 phase 5: one compact notice per transition INTO a
+            // state that owes the operator something. Driven here, on the
+            // cache's own cadence, never per frame -- and through the pure,
+            // clock-injected reducer, so what it decides is a function of the
+            // samples alone. The notice itself goes through the existing
+            // header-middle channel: no toast, no popup, no second row.
+            let focused_short = panes.get(focused).map(|p| p.short().to_string());
+            let sample_now = super::state::now_secs();
+            for short in &shorts {
+                let Some(status) = facts_cache.disk.attention.get(short) else {
+                    continue;
+                };
+                let reason = super::attention::reason(status);
+                let sample = notify::AttentionSample {
+                    short,
+                    previous: previous_attention.get(short).map(super::attention::project),
+                    next: super::attention::project(status),
+                    reason: &reason,
+                    revision: status.revision,
+                    last_transition: status.last_transition,
+                    focused: focused_short.as_deref() == Some(short.as_str()),
+                };
+                if let Some(text) = attention_notices.observe(&sample, sample_now, NOTICE_MAX_COLS)
+                {
+                    push_notice(&mut notices, Instant::now(), text);
+                }
+            }
+            attention_notices.retain(&shorts);
+        }
         // L19: drop any recently-reaped short the registry snapshot no longer
         // carries -- once a refresh clears the released record, the exclusion
         // is no longer needed. What remains is the set the (still-stale)
@@ -7055,7 +9397,7 @@ pub fn run_dashboard(
         // it there would double-fire for the same tick's own transition.
         sync_quiet_heuristic_attention(&panes, state, &mut quiet_lifecycle);
         let rows = assemble_sidebar(
-            &build_pane_rows(&panes),
+            &build_pane_rows(&panes, &retained_ended),
             &visible_registry,
             &facts_cache.disk.scores,
             selected,
@@ -7081,7 +9423,25 @@ pub fn run_dashboard(
             };
             match event::poll(wait) {
                 Ok(true) => {
-                    let read = event::read();
+                    let mut read = event::read();
+                    let mut mouse_action = None;
+                    // Issue #354 phase 3: what the context menu decided, if
+                    // anything. Carried out of the overlay dispatch's own
+                    // `match` (which holds `overlay` by value through
+                    // `mem::take`) and applied right after it, where `panes`,
+                    // the retained rows and the kept requests are all
+                    // reachable again.
+                    let mut apply_menu_action: Option<(String, ui::MenuAction)> = None;
+                    // Review of 9314156 (finding 2): a pending single click
+                    // belongs to the dialog it was made in. The instant that
+                    // dialog is opened, replaced or closed, the click is
+                    // stale and must never be able to complete a
+                    // double-click somewhere else.
+                    let overlay_ident = overlay_identity(&overlay);
+                    if overlay_ident != last_overlay_ident {
+                        last_overlay_click = None;
+                        last_overlay_ident = overlay_ident;
+                    }
                     // Activity, for the adaptive poll wait above: a keyboard
                     // or mouse event, whatever `filter_key`/the overlay below
                     // goes on to decide it means.
@@ -7095,10 +9455,175 @@ pub fn run_dashboard(
                     if let Some(log) = keylog.as_mut() {
                         log.observe(&read, prefix_armed, &overlay);
                     }
+                    // Issue #354: pointer ownership is decided once, here,
+                    // against the geometry of the frame the operator actually
+                    // clicked on (`frame_snapshot`) -- before the
+                    // `Ok(Event::Mouse(..))` arm further down, which is the
+                    // only path to `Pane::scroll_wheel`,
+                    // `forward_mouse_button` and the in-dashboard selection.
+                    // Anything but `MouseRoute::Grid` is fully handled here
+                    // and the event is then replaced by an inert one, so no
+                    // chrome hit can reach the child. See `route_mouse` for
+                    // the dispatch order itself.
+                    if let Ok(Event::Mouse(mouse)) = read.as_ref() {
+                        let mouse = *mouse;
+                        // A fresh left press clears the highlight wherever it
+                        // lands: the grid arm's own `selection = None` is out
+                        // of reach for a chrome click now.
+                        if mouse_capture
+                            && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+                        {
+                            selection = None;
+                        }
+                        let route = route_mouse(
+                            &frame_snapshot,
+                            mouse,
+                            mouse_capture,
+                            !matches!(overlay, ui::Overlay::None),
+                            selection.is_some(),
+                        );
+                        // Review of #354 (defect 1, HIGH): `frame_snapshot` is
+                        // shared by every event this drain processes (see
+                        // `HIGH-2` above the drain loop), but the overlay it
+                        // was drawn from can close -- or be replaced -- by an
+                        // earlier event in the very same drain. A later
+                        // queued click that still lands on that now-stale
+                        // snapshot's own overlay hint or row must never
+                        // synthesize the keystroke it names; with the overlay
+                        // it belonged to gone, that synthesized key would
+                        // otherwise fall straight through to
+                        // `write_operator_input` below. See
+                        // `overlay_route_is_current`.
+                        let route = if overlay_route_is_current(
+                            &route,
+                            &overlay,
+                            &frame_snapshot_overlay_ident,
+                        ) {
+                            route
+                        } else {
+                            MouseRoute::Consume
+                        };
+                        if route != MouseRoute::Grid {
+                            read = Ok(Event::FocusGained);
+                        }
+                        match route {
+                            MouseRoute::Grid | MouseRoute::Consume => {}
+                            MouseRoute::Select(id) => {
+                                // Issue #354 phase 2: selecting (or focusing)
+                                // a pane no longer clears its `◆` on its own
+                                // -- only a render that actually showed it
+                                // does, via `DoneUnreadAck`.
+                                (selected, focused) = select_row(&id, &rows, selected, focused);
+                                chrome_selection = None;
+                            }
+                            MouseRoute::Summary => chrome_selection = Some(Hit::SidebarSummary),
+                            MouseRoute::Toggle(id) => {
+                                fold_group(&mut collapsed_groups, &id, GroupFold::Toggle);
+                                chrome_selection = Some(Hit::GroupToggle(id));
+                            }
+                            MouseRoute::ScrollRoster(delta) => {
+                                // The frame's own clamp (`ui::reveal_offset`)
+                                // trims this to the last screenful; the cap
+                                // here only keeps a held wheel from running
+                                // the counter away from the list entirely.
+                                sidebar_offset = sidebar_offset
+                                    .saturating_add_signed(delta)
+                                    .min(frame_snapshot.roster.len());
+                                reveal_sidebar = false;
+                            }
+                            MouseRoute::Action(action) => {
+                                mouse_action = Some(action);
+                                read = Ok(Event::Key(KeyEvent::new(
+                                    KeyCode::Null,
+                                    KeyModifiers::NONE,
+                                )));
+                            }
+                            // Issue #354 phase 3: the open dialog's own
+                            // targets. A click moves its caret; a second
+                            // click on the same row inside `DOUBLE_CLICK`
+                            // activates it, by handing the dialog exactly
+                            // the `Enter` the keyboard would have.
+                            MouseRoute::OverlayRow(index) => {
+                                let now = Instant::now();
+                                let double = last_overlay_click.is_some_and(|(last, at)| {
+                                    last == index
+                                        && now.saturating_duration_since(at) <= DOUBLE_CLICK
+                                });
+                                if let Some((_, offset, len)) = overlay.list_state() {
+                                    overlay.set_list_state(
+                                        index.min(len.saturating_sub(1)),
+                                        ui::list_scroll(
+                                            len,
+                                            frame_snapshot.overlay_capacity,
+                                            index,
+                                            offset,
+                                        ),
+                                    );
+                                }
+                                last_overlay_click = Some((index, now));
+                                if double {
+                                    last_overlay_click = None;
+                                    read = Ok(Event::Key(KeyEvent::new(
+                                        KeyCode::Enter,
+                                        KeyModifiers::NONE,
+                                    )));
+                                }
+                            }
+                            // A hint on the dialog's pinned hint row IS its
+                            // key: the reducer sees the same keystroke the
+                            // keyboard would have delivered, so a pointer can
+                            // never reach a path the keyboard could not.
+                            MouseRoute::OverlayKey(code) => {
+                                last_overlay_click = None;
+                                read = Ok(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)));
+                            }
+                            MouseRoute::ScrollOverlay(delta) => {
+                                if let Some((cursor, offset, len)) = overlay.list_state() {
+                                    let capacity = frame_snapshot.overlay_capacity;
+                                    let next = cursor
+                                        .saturating_add_signed(delta * WHEEL_STEP)
+                                        .min(len.saturating_sub(1));
+                                    overlay.set_list_state(
+                                        next,
+                                        ui::list_scroll(len, capacity, next, offset),
+                                    );
+                                }
+                            }
+                        }
+                    }
                     match read {
                         Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => {
                             input_errors = 0;
-                            if !matches!(overlay, ui::Overlay::None) {
+                            // Issue #354 phase 3: the shared list viewport's
+                            // own keys, handled ONCE for every list dialog
+                            // before its reducer ever sees them --
+                            // PageUp/PageDown page, Home/End jump, and the
+                            // caret is always revealed. Every dialog's own
+                            // keys (Enter, Esc, j/k, space, letters) stay
+                            // exactly where they were.
+                            //
+                            // Consumed by swapping the keystroke for an inert
+                            // one rather than by `continue`, which would skip
+                            // this drain loop's own `drained += 1`.
+                            let key = match (ui::list_page_move(key), overlay.list_state()) {
+                                (Some(mv), Some((cursor, offset, len))) => {
+                                    let capacity = frame_snapshot.overlay_capacity;
+                                    let next = ui::list_move(cursor, len, capacity, mv);
+                                    overlay.set_list_state(
+                                        next,
+                                        ui::list_scroll(len, capacity, next, offset),
+                                    );
+                                    KeyEvent::new(KeyCode::Null, KeyModifiers::NONE)
+                                }
+                                _ => key,
+                            };
+                            // Issue #354 phase 4: an open overlay still owns the
+                            // keystroke, but the palette can hand ONE action
+                            // back out (as `mouse_action`) to be run by the
+                            // dispatch below in this same tick -- which is why
+                            // this is two `if`s rather than an if/else.
+                            let overlay_was_open = !matches!(overlay, ui::Overlay::None);
+                            if overlay_was_open {
                                 let current = std::mem::take(&mut overlay);
                                 // Task 2: what the slot held on the way in, so
                                 // the `OVERLAY` line below can report the swap
@@ -7498,16 +10023,81 @@ pub fn run_dashboard(
                                             }
                                         }
                                     }
-                                    // Any key closes it (tmux's own key-list
-                                    // convention): `overlay` was already reset
-                                    // to `None` by the `mem::take` above, so
-                                    // there is nothing to reassign here.
-                                    ui::Overlay::Help => {}
+                                    // Issue #354 phase 4: the palette and the
+                                    // help screen. Enter on a runnable row
+                                    // replays that descriptor through the
+                                    // EXACT path the keyboard or the context
+                                    // menu already takes -- `mouse_action`
+                                    // for a global chord (the dispatch below
+                                    // runs in the same tick), `apply_menu_
+                                    // action` for a row action. No third
+                                    // dispatch, and nothing the palette can
+                                    // reach that a chord could not.
+                                    ui::Overlay::Palette(view) => {
+                                        let (next, effect) = palette_overlay_reduce(view, key);
+                                        overlay = match next {
+                                            Some(v) => ui::Overlay::Palette(v),
+                                            None => ui::Overlay::None,
+                                        };
+                                        if let Some(PaletteEffect(id)) = effect
+                                            && let Some(descriptor) = actions::descriptor(id)
+                                        {
+                                            match (descriptor.dash_action(), descriptor.menu) {
+                                                (Some(action), _) => mouse_action = Some(action),
+                                                (None, Some(menu)) => {
+                                                    match rows
+                                                        .get(selected)
+                                                        .map(|row| row.short.clone())
+                                                    {
+                                                        Some(target) => {
+                                                            apply_menu_action =
+                                                                Some((target, menu));
+                                                        }
+                                                        None => push_notice(
+                                                            &mut notices,
+                                                            Instant::now(),
+                                                            "no session row is selected".into(),
+                                                        ),
+                                                    }
+                                                }
+                                                (None, None) => {}
+                                            }
+                                        }
+                                    }
+                                    // Issue #354 phase 5: closing (or `a`)
+                                    // acknowledges the kept errors -- the
+                                    // sticky header line clears until a new
+                                    // one arrives; nothing is deleted.
                                     ui::Overlay::Errors(view) => {
-                                        overlay = match errors_overlay_reduce(view, key) {
+                                        let (next, ack) = errors_overlay_reduce(view, key);
+                                        overlay = match next {
                                             Some(v) => ui::Overlay::Errors(v),
                                             None => ui::Overlay::None,
                                         };
+                                        if ack.is_some() {
+                                            errors.acknowledge();
+                                        }
+                                    }
+                                    // Issue #354 phase 3: read-only, so there
+                                    // is nothing to apply -- only "still
+                                    // open" or "closed". Closing returns the
+                                    // keyboard to whichever pane already had
+                                    // it: `focused` was never touched.
+                                    ui::Overlay::Inspector(view) => {
+                                        overlay = match inspector_overlay_reduce(view, key) {
+                                            Some(v) => ui::Overlay::Inspector(v),
+                                            None => ui::Overlay::None,
+                                        };
+                                    }
+                                    ui::Overlay::Menu(view) => {
+                                        let (next, effect) = menu_overlay_reduce(view, key);
+                                        overlay = match next {
+                                            Some(v) => ui::Overlay::Menu(v),
+                                            None => ui::Overlay::None,
+                                        };
+                                        if let Some(MenuEffect { target, action }) = effect {
+                                            apply_menu_action = Some((target, action));
+                                        }
                                     }
                                 }
                                 // Task 2: the take/assign pair. An overlay that
@@ -7518,10 +10108,281 @@ pub fn run_dashboard(
                                 if let Some(log) = keylog.as_mut() {
                                     log.overlay_swap(took, &overlay);
                                 }
-                            } else {
-                                let (armed, verdict) = filter_key(prefix_armed, key);
+                                // Issue #354 phase 3: the context menu's own
+                                // effect. Every arm reuses machinery that
+                                // already exists -- another overlay the
+                                // keyboard can open, the roster's own
+                                // selection move, the quit path's
+                                // `request_quit`, or a replay of the kept
+                                // spawn request through
+                                // `fulfill_spawn_request`. No new
+                                // process-launch path, and no argv is ever
+                                // rebuilt here.
+                                if let Some((target, action)) = apply_menu_action.take() {
+                                    let now = Instant::now();
+                                    let row = rows.iter().find(|r| r.short == target).cloned();
+                                    let cwd = row_cwd(&target, &panes, &retained_ended);
+                                    // Issue #354 phase 5: the summary line's
+                                    // menu. Only the two dashboard-wide
+                                    // entries are ever enabled there, so this
+                                    // is the whole dispatch; everything else
+                                    // is inert with its reason on screen.
+                                    if target == DASHBOARD_TARGET {
+                                        match action {
+                                            ui::MenuAction::Inspect => {
+                                                overlay = ui::Overlay::Inspector(
+                                                    build_dashboard_inspector(&dashboard_facts(
+                                                        &harness_label,
+                                                        &dashboard_short,
+                                                        &rows,
+                                                        &panes,
+                                                        &facts_cache,
+                                                        state,
+                                                        launched_at,
+                                                        mouse_capture,
+                                                        sidebar_cols,
+                                                        now,
+                                                    )),
+                                                );
+                                            }
+                                            ui::MenuAction::Mail => {
+                                                overlay =
+                                                    ui::Overlay::Mail(build_mail_view(state, repo));
+                                            }
+                                            _ => {}
+                                        }
+                                    } else {
+                                        match action {
+                                            ui::MenuAction::Inspect
+                                            | ui::MenuAction::Evidence
+                                            | ui::MenuAction::OpenWorktree => {
+                                                match row.as_ref() {
+                                                    Some(row) => {
+                                                        if action == ui::MenuAction::OpenWorktree {
+                                                            push_notice(
+                                                                &mut notices,
+                                                                now,
+                                                                match cwd.as_deref() {
+                                                                    Some(path) => {
+                                                                        format!(
+                                                                            "{target} runs in {path}"
+                                                                        )
+                                                                    }
+                                                                    None => format!(
+                                                                        "{target}: {MENU_NO_CWD}"
+                                                                    ),
+                                                                },
+                                                            );
+                                                        }
+                                                        let mut view = build_inspector_view(
+                                                            row,
+                                                            cwd.as_deref(),
+                                                            &errors,
+                                                        );
+                                                        if action == ui::MenuAction::Evidence {
+                                                            view.cursor = view
+                                                                .section_start(INSPECT_EVIDENCE);
+                                                        }
+                                                        // Opening the inspector on
+                                                        // a retained done-unread
+                                                        // row IS reading it -- the
+                                                        // render path's own rule
+                                                        // needs focus, which such a
+                                                        // row can never have.
+                                                        if let Some(short) = done_unread_ack
+                                                            .acknowledge(inspect_ack_candidate(row))
+                                                        {
+                                                            let acked =
+                                                                super::attention::mark_seen_io(
+                                                                    state, &short,
+                                                                );
+                                                            facts_cache
+                                                                .disk
+                                                                .attention
+                                                                .insert(short, acked);
+                                                        }
+                                                        overlay = ui::Overlay::Inspector(view);
+                                                    }
+                                                    None => push_notice(
+                                                        &mut notices,
+                                                        now,
+                                                        format!(
+                                                            "{target} is no longer on the roster"
+                                                        ),
+                                                    ),
+                                                }
+                                            }
+                                            ui::MenuAction::Focus => {
+                                                (selected, focused) =
+                                                    select_row(&target, &rows, selected, focused);
+                                                chrome_selection = None;
+                                                reveal_sidebar = true;
+                                            }
+                                            ui::MenuAction::Nudge => {
+                                                let attached =
+                                                    panes.iter().any(|p| p.short() == target);
+                                                overlay = ui::Overlay::Nudge(ui::NudgeDraft {
+                                                    target: if attached {
+                                                        ui::NudgeTarget::AttachedPane(
+                                                            target.clone(),
+                                                        )
+                                                    } else {
+                                                        ui::NudgeTarget::ViewOnlySession(
+                                                            target.clone(),
+                                                        )
+                                                    },
+                                                    input: String::new(),
+                                                });
+                                            }
+                                            ui::MenuAction::Mail => {
+                                                overlay =
+                                                    ui::Overlay::Mail(build_mail_view(state, repo));
+                                            }
+                                            ui::MenuAction::Handover => {
+                                                let mut items = Vec::new();
+                                                for agent in adapters::available_adapter_names(cfg)
+                                                {
+                                                    for tier in handover::TIERS {
+                                                        if let Ok(model) = handover::resolve_model(
+                                                            agent, tier, cfg,
+                                                        ) {
+                                                            items.push((
+                                                                agent.to_string(),
+                                                                tier.to_string(),
+                                                                model,
+                                                            ));
+                                                        }
+                                                    }
+                                                }
+                                                overlay =
+                                                    ui::Overlay::Handover(ui::HandoverDraft {
+                                                        items,
+                                                        cursor: 0,
+                                                        offset: 0,
+                                                        target_short: target.clone(),
+                                                    });
+                                            }
+                                            // Exactly the quit path's own first
+                                            // half (`shutdown_all`): ask the
+                                            // harness to quit and let this tick's
+                                            // `reap_ended_panes` do the rest, so
+                                            // the row is retained, the spend
+                                            // accounted and the group closed by
+                                            // the one code path that knows how.
+                                            ui::MenuAction::Stop => {
+                                                match panes.iter_mut().find(|p| p.short() == target)
+                                                {
+                                                    Some(pane) => {
+                                                        let quit_sequence = adapters::select(
+                                                            Some(pane.agent()),
+                                                            &[],
+                                                            cfg,
+                                                        )
+                                                        .map(|adapter| adapter.quit_sequence())
+                                                        .unwrap_or("");
+                                                        pane.request_quit(quit_sequence);
+                                                        push_notice(
+                                                            &mut notices,
+                                                            now,
+                                                            format!("asked {target} to quit"),
+                                                        );
+                                                    }
+                                                    None => push_notice(
+                                                        &mut notices,
+                                                        now,
+                                                        format!("{target} is no longer running"),
+                                                    ),
+                                                }
+                                            }
+                                            ui::MenuAction::Restore | ui::MenuAction::Retry => {
+                                                restore_ended_row(
+                                                    &target,
+                                                    &mut panes,
+                                                    &mut nudge_queues,
+                                                    &mut retained_ended,
+                                                    &mut kept_requests,
+                                                    cfg,
+                                                    state,
+                                                    repo,
+                                                    pane_size,
+                                                    &requests_dir,
+                                                    &mut errors,
+                                                    &mut notices,
+                                                    now,
+                                                );
+                                            }
+                                            ui::MenuAction::Dismiss => {
+                                                let before = retained_ended.len();
+                                                retained_ended.retain(|row| row.short != target);
+                                                if retained_ended.len() < before {
+                                                    // The row left the middle of
+                                                    // the combined roster, so the
+                                                    // cursor has to come back
+                                                    // inside it.
+                                                    selected =
+                                                        selected.min(rows.len().saturating_sub(2));
+                                                    reveal_sidebar = true;
+                                                    push_notice(
+                                                        &mut notices,
+                                                        now,
+                                                        format!("dismissed {target}"),
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            if !overlay_was_open || mouse_action.is_some() {
+                                let (armed, verdict) = mouse_action
+                                    .take()
+                                    .map(|action| (false, InputVerdict::Dash(action)))
+                                    .unwrap_or_else(|| filter_key(prefix_armed, key));
                                 let armed_before = prefix_armed;
                                 prefix_armed = armed;
+                                // Issue #354 phase 4: the first-run tip has
+                                // done its job the moment the operator uses a
+                                // prefixed key -- or says so with Esc. It is
+                                // never shown again in this session, and the
+                                // flag file makes sure it is never shown in
+                                // another one either.
+                                //
+                                // Review of #354 (defect 2, MEDIUM): a bare
+                                // `Esc` with the prefix unarmed is ordinary
+                                // child input (`filter_key` hands it back as
+                                // `ToChild`), so dismissing the tip with it
+                                // used to ALSO forward that same `Esc` to the
+                                // child -- an operator's very first keystroke
+                                // in the dashboard could land in whatever the
+                                // focused pane was doing. This keystroke
+                                // happens once per operator, ever, so it is
+                                // consumed instead; an `Esc` that does not
+                                // dismiss the tip (the tip is already gone, or
+                                // the prefix is armed, whose `ToChild` bytes
+                                // are empty anyway) is unaffected.
+                                let tip_dismissed_by_esc = first_run_tip
+                                    && key.code == KeyCode::Esc
+                                    && !matches!(verdict, InputVerdict::Dash(_));
+                                if first_run_tip
+                                    && (matches!(verdict, InputVerdict::Dash(_))
+                                        || key.code == KeyCode::Esc)
+                                {
+                                    first_run_tip = false;
+                                    // Phase 5: the write happens HERE, once,
+                                    // at the dismissal -- never at launch.
+                                    mark_first_run_tip_seen(state);
+                                }
+                                // Empty `ToChild`, not `Pending`: the prefix
+                                // itself is not armed by this Esc (`armed` is
+                                // still whatever `filter_key` decided above),
+                                // this is the same "swallowed, nothing to
+                                // forward" shape `filter_key` already uses for
+                                // an armed-but-unbound key.
+                                let verdict = if tip_dismissed_by_esc {
+                                    InputVerdict::ToChild(Vec::new())
+                                } else {
+                                    verdict
+                                };
                                 // Task 2: what the loop ACTUALLY stored and
                                 // ACTUALLY decided -- every DashAction, not
                                 // only the interesting ones. Paired with
@@ -7533,6 +10394,163 @@ pub fn run_dashboard(
                                     log.dispatch(armed_before, prefix_armed, &verdict);
                                 }
                                 match verdict {
+                                    // Issue #354 phase 3: the target is
+                                    // captured at the moment of the gesture --
+                                    // a right-click names whatever row it
+                                    // landed on, which is not necessarily the
+                                    // selected one, and the menu's own title
+                                    // says which.
+                                    InputVerdict::Dash(
+                                        action @ (DashAction::ContextMenu(_)
+                                        | DashAction::ContextActions),
+                                    ) => {
+                                        // Issue #354 phase 5: the summary
+                                        // line's own menu -- `inspect` opens
+                                        // the dashboard inspector, every
+                                        // per-session entry is listed with
+                                        // its reason.
+                                        let summary_selected = action == DashAction::ContextActions
+                                            && chrome_selection == Some(Hit::SidebarSummary);
+                                        let target = match action {
+                                            DashAction::ContextMenu(id) => Some(id),
+                                            _ => rows.get(selected).map(|row| row.short.clone()),
+                                        };
+                                        if summary_selected {
+                                            overlay = ui::Overlay::Menu(build_summary_menu_view());
+                                        } else {
+                                            match target
+                                                .as_ref()
+                                                .and_then(|id| rows.iter().find(|r| r.short == *id))
+                                            {
+                                                Some(row) => {
+                                                    let facts = menu_facts_for(
+                                                        row,
+                                                        &panes,
+                                                        &retained_ended,
+                                                    );
+                                                    overlay =
+                                                        ui::Overlay::Menu(build_menu_view(&facts));
+                                                }
+                                                None => push_notice(
+                                                    &mut notices,
+                                                    Instant::now(),
+                                                    "no session row is selected".into(),
+                                                ),
+                                            }
+                                        }
+                                    }
+                                    // Issue #354 phase 3: the inspector over
+                                    // the selected row. Opening it on a
+                                    // retained done-unread row counts as
+                                    // reading that row (see `acknowledge`).
+                                    // Issue #354 phase 5: with the cursor on
+                                    // the summary line the subject is the
+                                    // DASHBOARD, not a row -- same dialog,
+                                    // same viewport, same Esc.
+                                    InputVerdict::Dash(DashAction::Inspect)
+                                        if chrome_selection == Some(Hit::SidebarSummary) =>
+                                    {
+                                        overlay = ui::Overlay::Inspector(
+                                            build_dashboard_inspector(&dashboard_facts(
+                                                &harness_label,
+                                                &dashboard_short,
+                                                &rows,
+                                                &panes,
+                                                &facts_cache,
+                                                state,
+                                                launched_at,
+                                                mouse_capture,
+                                                sidebar_cols,
+                                                Instant::now(),
+                                            )),
+                                        );
+                                    }
+                                    InputVerdict::Dash(DashAction::Inspect) => {
+                                        match rows.get(selected) {
+                                            Some(row) => {
+                                                let cwd =
+                                                    row_cwd(&row.short, &panes, &retained_ended);
+                                                let view = build_inspector_view(
+                                                    row,
+                                                    cwd.as_deref(),
+                                                    &errors,
+                                                );
+                                                if let Some(short) = done_unread_ack
+                                                    .acknowledge(inspect_ack_candidate(row))
+                                                {
+                                                    let acked = super::attention::mark_seen_io(
+                                                        state, &short,
+                                                    );
+                                                    facts_cache.disk.attention.insert(short, acked);
+                                                }
+                                                overlay = ui::Overlay::Inspector(view);
+                                            }
+                                            None => push_notice(
+                                                &mut notices,
+                                                Instant::now(),
+                                                "no session row is selected".into(),
+                                            ),
+                                        }
+                                    }
+                                    // Issue #354 phase 3: `^A r` -- the dead
+                                    // footer's own hint, with a binding at
+                                    // last. The hint is not drawn for a row
+                                    // that cannot be restored, so this only
+                                    // has to say so rather than guess.
+                                    InputVerdict::Dash(DashAction::RestoreRow) => {
+                                        match rows.get(selected).map(|row| row.short.clone()) {
+                                            Some(short) => restore_ended_row(
+                                                &short,
+                                                &mut panes,
+                                                &mut nudge_queues,
+                                                &mut retained_ended,
+                                                &mut kept_requests,
+                                                cfg,
+                                                state,
+                                                repo,
+                                                pane_size,
+                                                &requests_dir,
+                                                &mut errors,
+                                                &mut notices,
+                                                Instant::now(),
+                                            ),
+                                            None => push_notice(
+                                                &mut notices,
+                                                Instant::now(),
+                                                "no session row is selected".into(),
+                                            ),
+                                        }
+                                    }
+                                    InputVerdict::Dash(
+                                        action @ (DashAction::CollapseGroup
+                                        | DashAction::ExpandGroup),
+                                    ) => {
+                                        let id = group_under_cursor(
+                                            chrome_selection.as_ref(),
+                                            &rows,
+                                            selected,
+                                        );
+                                        // The same reducer a click on the
+                                        // header's disclosure triangle goes
+                                        // through, so the two can never drift.
+                                        // A flat row (no group) is a no-op.
+                                        if let Some(id) = id {
+                                            let fold = if action == DashAction::CollapseGroup {
+                                                GroupFold::Collapse
+                                            } else {
+                                                GroupFold::Expand
+                                            };
+                                            if fold_group(&mut collapsed_groups, &id, fold) {
+                                                // Collapsing folds the cursor's
+                                                // own row away, so the cursor
+                                                // moves up onto the header --
+                                                // never onto another session,
+                                                // and never touching focus.
+                                                chrome_selection = Some(Hit::GroupToggle(id));
+                                            }
+                                            reveal_sidebar = true;
+                                        }
+                                    }
                                     InputVerdict::Pending => {}
                                     // Typing always reaches the *focused* pane, never
                                     // the merely selected sidebar row (F7): walking
@@ -7570,23 +10588,24 @@ pub fn run_dashboard(
                                         | DashAction::SelectUp
                                         | DashAction::SelectDown),
                                     ) => {
-                                        (selected, focused) = apply_navigation(
+                                        reveal_sidebar = true;
+                                        (selected, focused) = navigate_roster(
                                             action,
+                                            &rows,
+                                            &frame_snapshot.roster,
                                             selected,
                                             focused,
-                                            panes.len(),
-                                            total_rows,
+                                            &mut chrome_selection,
                                         );
-                                        // Issue #349: the operator just looked
-                                        // at this pane -- the only thing that
-                                        // may ever clear the `Unseen` latch.
-                                        // Best-effort, like every other
-                                        // attention write: a focus change must
-                                        // never fail just because this did.
-                                        if let Some(pane) = panes.get(focused) {
-                                            let _ =
-                                                super::attention::mark_seen_io(state, pane.short());
-                                        }
+                                        // Issue #354 phase 2: navigation no
+                                        // longer clears the `Unseen` latch.
+                                        // Arrowing past a pane is not reading
+                                        // it, and the old unconditional
+                                        // `mark_seen_io` here cleared `◆` for
+                                        // every row the cursor merely passed
+                                        // over. `DoneUnreadAck` now waits for
+                                        // an unoccluded render of the focused
+                                        // pane instead.
                                     }
                                     // Scrollback, on the focused pane, for every
                                     // terminal that does not deliver wheel events
@@ -7768,6 +10787,7 @@ pub fn run_dashboard(
                                                     ui::Overlay::Handover(ui::HandoverDraft {
                                                         items,
                                                         cursor: 0,
+                                                        offset: 0,
                                                         target_short,
                                                     });
                                             }
@@ -7785,10 +10805,34 @@ pub fn run_dashboard(
                                             ui::Overlay::Memory(build_memory_view(state, repo));
                                     }
                                     InputVerdict::Dash(DashAction::ShowErrors) => {
-                                        overlay = ui::Overlay::Errors(build_errors_view(&errors));
+                                        overlay = ui::Overlay::Errors(build_errors_view(
+                                            &errors,
+                                            Instant::now(),
+                                        ));
                                     }
-                                    InputVerdict::Dash(DashAction::Help) => {
-                                        overlay = ui::Overlay::Help;
+                                    // Issue #354 phase 4: help and the palette
+                                    // are one dialog over one table. Both
+                                    // snapshot the selected row's own
+                                    // availability as they open, so a row
+                                    // action is listed with the reason it
+                                    // cannot be used on THIS row.
+                                    InputVerdict::Dash(
+                                        action @ (DashAction::Help | DashAction::Palette),
+                                    ) => {
+                                        let mode = if action == DashAction::Help {
+                                            ui::PaletteMode::Help
+                                        } else {
+                                            ui::PaletteMode::Run
+                                        };
+                                        let ctx = selected_action_context(
+                                            &rows,
+                                            selected,
+                                            &panes,
+                                            &retained_ended,
+                                            chrome_selection == Some(Hit::SidebarSummary),
+                                        );
+                                        overlay =
+                                            ui::Overlay::Palette(build_palette_view(mode, ctx));
                                     }
                                     InputVerdict::Dash(DashAction::ToggleSelectMode) => {
                                         if !cfg.dash.mouse {
@@ -8199,7 +11243,7 @@ pub fn run_dashboard(
         // `visible_registry` (L19: ghost-reaped rows filtered) is reused from
         // the pre-input pass -- the snapshot has not changed within the tick.
         let rows = assemble_sidebar(
-            &build_pane_rows(&panes),
+            &build_pane_rows(&panes, &retained_ended),
             &visible_registry,
             &facts_cache.disk.scores,
             selected,
@@ -8207,6 +11251,8 @@ pub fn run_dashboard(
             std::process::id(),
             super::state::now_secs(),
         );
+        let mut rows = rows;
+        enrich_sidebar(&mut rows, &facts_cache.disk, super::state::now_secs());
         render_tick = render_tick.wrapping_add(1);
 
         // L13: a live notice (info) shows as plain text and takes precedence
@@ -8217,13 +11263,13 @@ pub fn run_dashboard(
             .iter()
             .filter(|r| r.state != ui::RowState::Dead)
             .count();
-        let facts = assemble_header_facts(
+        let mut facts = assemble_header_facts(
             harness_label.clone(),
             !mouse_capture,
             total_live,
             rows.len(),
-            errors.len(),
-            errors.last().cloned(),
+            errors.sticky_count(),
+            errors.sticky_line(),
             live_notice(&notices, Instant::now()).map(str::to_string),
         );
         // Issue #209/v3 §D: the footer describes whichever pane is focused
@@ -8232,6 +11278,35 @@ pub fn run_dashboard(
         // doc comment). `last_exited` (codex review finding 1) is what makes
         // the dead-pane variant reachable once `reap_ended_panes` has
         // already removed the row `focused` used to name.
+        // Issue #354 phase 4: the first-run tip, lowest precedence of the
+        // three things the header's middle slot can carry.
+        facts.tip = first_run_tip.then(|| ui::FIRST_RUN_TIP.as_str());
+        facts.hints.alive = rows
+            .get(selected)
+            .is_some_and(|r| r.state != ui::RowState::Dead);
+        // Issue #354 phase 2: the cluster follows the selected row's own
+        // glyph, so a row waiting on the operator offers `^A i`/`^A n` and an
+        // ended one offers only what still applies to it.
+        facts.hints.needs_action =
+            rows.get(selected).map(ui::glyph_for) == Some(ui::Glyph::NeedsAction);
+        facts.hints.ended = rows
+            .get(selected)
+            .is_some_and(|r| r.state == ui::RowState::Dead);
+        // Issue #354 phase 3: `^A r restore` is only drawn for a row that
+        // really can be relaunched -- one whose own spawn request the
+        // dashboard still holds. The context menu is where an unavailable
+        // restore is named AND explained; the header only ever offers hints
+        // that do something.
+        facts.hints.restorable = facts.hints.ended
+            && rows.get(selected).is_some_and(|r| {
+                retained_ended
+                    .iter()
+                    .any(|e| e.short == r.short && e.request.is_some())
+            });
+        // Issue #354 phase 5: with the cursor parked on the summary line the
+        // cluster describes the dashboard instead, and offers the one chord
+        // that applies there.
+        facts.hints.summary = chrome_selection == Some(Hit::SidebarSummary);
         let focused_row = rows.iter().find(|r| r.focused);
         // Codex review finding 2: the focused pane's OWN mail queue, not
         // the dashboard's fixed launch identity's -- see `MailMap`'s own
@@ -8289,55 +11364,92 @@ pub fn run_dashboard(
             seat: facts_cache.disk.pool_seat.clone(),
         };
 
+        let summary = ui::SidebarSummary {
+            aggregate: aggregate_facts,
+        };
+        let bands = (cfg.score.advise_at, cfg.score.compact_at);
+        // Issue #354: the roster owns its own viewport now -- the wheel
+        // scrolls it without moving the cursor -- so the offset is re-pinned
+        // to the selection only when the keyboard actually navigated
+        // (`reveal_sidebar`). A group the selection lands inside is expanded
+        // first: a collapsed group must never hide the row the cursor is on.
+        if reveal_sidebar
+            && chrome_selection.is_none()
+            && let Some(group) = rows.get(selected).and_then(|row| row.group.as_ref())
+        {
+            collapsed_groups.remove(&group.id);
+        }
+        let mut view = ui::RosterView {
+            collapsed: &collapsed_groups,
+            chrome_selection: chrome_selection.as_ref(),
+            offset: sidebar_offset,
+            tick: render_tick,
+            bands,
+        };
+        let mut roster = ui::roster_frame(layout.sidebar, &rows, &summary, &view);
+        // The viewport's index space is `roster.row_ids` (tree entries), not
+        // `rows` (sessions): a group header takes a line of its own and a
+        // collapsed group swallows its children's. One row of the sidebar is
+        // the summary line, which never scrolls.
+        let capacity = layout.sidebar.height.saturating_sub(1) as usize;
+        let reveal_index = reveal_sidebar
+            .then(|| {
+                chrome_selection.clone().or_else(|| {
+                    rows.get(selected)
+                        .map(|row| Hit::SidebarRow(row.short.clone()))
+                })
+            })
+            .flatten()
+            .and_then(|target| roster.row_ids.iter().position(|id| *id == target));
+        reveal_sidebar = false;
+        // With no reveal target this is just the end-of-list clamp, so a
+        // roster that shrank under a scrolled viewport snaps back on its own.
+        let next_offset = ui::reveal_offset(
+            roster.row_ids.len(),
+            capacity,
+            reveal_index.unwrap_or(sidebar_offset),
+            sidebar_offset,
+        );
+        if next_offset != sidebar_offset {
+            sidebar_offset = next_offset;
+            view.offset = sidebar_offset;
+            roster = ui::roster_frame(layout.sidebar, &rows, &summary, &view);
+        }
+        let next_snapshot = ui::frame_snapshot(
+            frame_area,
+            &layout,
+            zoomed,
+            &roster,
+            &facts,
+            &overlay,
+            render_tick,
+        );
+        // Captured in the same breath as `next_snapshot` itself, from the
+        // same `&overlay` it was built from -- see `overlay_route_is_current`.
+        let next_snapshot_overlay_ident = overlay_identity(&overlay);
+        let focus_cwd = panes.get(focused).map(|p| p.cwd().display().to_string());
         let draw = terminal.draw(|f| {
             if !zoomed {
                 ui::render_header(f, layout.header, &facts);
-                ui::render_rule(f, layout.rule_top, layout.sidebar.width, true);
-                // Issue #264: one row of `layout.sidebar` is the aggregate
-                // row, drawn above the roster -- the divider just below still
-                // spans `layout.sidebar.height` in full, so the vertical rule
-                // runs continuously alongside both.
-                let aggregate_h = 1.min(layout.sidebar.height);
-                ui::render_aggregate(
+                ui::render_focus_rule(
                     f,
-                    Rect {
-                        height: aggregate_h,
-                        ..layout.sidebar
-                    },
-                    &aggregate_facts,
+                    layout.rule_top,
+                    layout.sidebar.width,
+                    focused_row,
+                    focus_cwd.as_deref(),
                 );
-                ui::render_sidebar(
-                    f,
-                    Rect {
-                        y: layout.sidebar.y + aggregate_h,
-                        height: layout.sidebar.height.saturating_sub(aggregate_h),
-                        ..layout.sidebar
-                    },
-                    &rows,
-                    render_tick,
-                    cfg.score.advise_at,
-                    cfg.score.compact_at,
-                );
-                ui::render_sidebar_divider(
-                    f,
-                    Rect {
-                        x: layout.sidebar.x + layout.sidebar.width,
-                        y: layout.sidebar.y,
-                        width: (layout
-                            .main
-                            .x
-                            .saturating_sub(layout.sidebar.x + layout.sidebar.width))
-                        .min(1),
-                        height: layout.sidebar.height,
-                    },
-                );
+                ui::render_roster(f, layout.sidebar, &roster);
+                // Straight from the snapshot the click will be tested
+                // against, so the drawn divider and `Hit::Divider` can never
+                // describe different columns.
+                ui::render_sidebar_divider(f, next_snapshot.divider);
                 ui::render_rule(f, layout.rule_bottom, layout.sidebar.width, false);
-                ui::render_footer(
+                ui::render_footer_spend(
                     f,
                     layout.footer,
                     &footer_facts,
-                    cfg.score.advise_at,
-                    cfg.score.compact_at,
+                    (cfg.score.advise_at, cfg.score.compact_at),
+                    &summary,
                 );
             }
             if let Some(pane) = panes.get(focused) {
@@ -8377,6 +11489,22 @@ pub fn run_dashboard(
         });
         if let Err(e) = draw {
             push_error(&mut errors, format!("draw: {e}"));
+        } else {
+            frame_snapshot = next_snapshot;
+            frame_snapshot_overlay_ident = next_snapshot_overlay_ident;
+            // Issue #354 phase 2: this frame COMPLETED, so whatever it showed
+            // the operator counts as having been seen. Only the focused pane,
+            // only with no overlay over it, and only at its live scroll
+            // position -- and the acknowledgement itself happens on the next
+            // tick, never here (see `DoneUnreadAck`).
+            let focused_pane = panes
+                .get(focused)
+                .map(|pane| (pane.short(), pane.scrollback()));
+            done_unread_ack.observe(ack_candidate(
+                !matches!(overlay, ui::Overlay::None),
+                focused_pane,
+                focused_pane.and_then(|(short, _)| facts_cache.disk.attention.get(short)),
+            ));
         }
     };
 
@@ -8391,7 +11519,7 @@ pub fn run_dashboard(
         // operator whose panes all died learned nothing about how or why. The
         // most recent handful (`MAX_KEPT_ERRORS`) is what the channel kept;
         // they land in the scrollback, one per line, ahead of the closing line.
-        for notice in &errors {
+        for notice in errors.messages() {
             eprintln!("{notice}");
         }
         eprintln!("all sessions ended; dashboard closed");
@@ -8426,7 +11554,7 @@ pub fn run_dashboard(
 /// directory removal the quit path does, so a failed startup leaves nothing
 /// under `<state>/dash/` either.
 fn abort_setup(panes: &mut [Pane], cfg: &CtxConfig, requests_dir: &Path) {
-    let mut discarded = Vec::new();
+    let mut discarded = ErrorLog::default();
     shutdown_all(panes, cfg, &mut discarded);
     remove_request_dir(requests_dir);
 }
@@ -8457,7 +11585,7 @@ fn render_shutting_down(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, p
 /// turn. Now every pane is asked to quit first (`request_quit`, no wait), then
 /// all are polled for exit within one `SHUTDOWN_GRACE` window, and any
 /// straggler is killed at the end (`finish_shutdown`).
-fn shutdown_all(panes: &mut [Pane], cfg: &CtxConfig, errors: &mut Vec<String>) {
+fn shutdown_all(panes: &mut [Pane], cfg: &CtxConfig, errors: &mut ErrorLog) {
     for pane in panes.iter_mut() {
         let quit_sequence = adapters::select(Some(pane.agent()), &[], cfg)
             .map(|adapter| adapter.quit_sequence())
@@ -8480,11 +11608,24 @@ fn shutdown_all(panes: &mut [Pane], cfg: &CtxConfig, errors: &mut Vec<String>) {
 
 #[cfg(test)]
 mod tests {
+    use super::actions::{
+        MENU_ENDED, MENU_EXITED_CLEAN, MENU_NOT_ATTACHED, MENU_NOT_RETAINED, MENU_STILL_RUNNING,
+    };
     use super::*;
     use std::path::PathBuf;
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, modifiers)
+    }
+
+    /// One never-repeated, never-acknowledged errors-dialog row.
+    fn err_item(text: &str) -> ui::ErrorItem {
+        ui::ErrorItem {
+            text: text.to_string(),
+            count: 1,
+            age_secs: 0,
+            acked: false,
+        }
     }
 
     #[test]
@@ -8738,7 +11879,17 @@ mod tests {
             overlay_name(&ui::Overlay::Restore(ui::RestoreView::default())),
             "restore"
         );
-        assert_eq!(overlay_name(&ui::Overlay::Help), "help");
+        assert_eq!(
+            overlay_name(&ui::Overlay::Palette(ui::PaletteView {
+                mode: ui::PaletteMode::Help,
+                ..ui::PaletteView::default()
+            })),
+            "help"
+        );
+        assert_eq!(
+            overlay_name(&ui::Overlay::Palette(ui::PaletteView::default())),
+            "palette"
+        );
     }
 
     /// The diagnostic must be completely inert unless the env var names a
@@ -9439,7 +12590,7 @@ mod tests {
 
     #[test]
     fn push_error_keeps_only_the_most_recent_handful() {
-        let mut errors = Vec::new();
+        let mut errors = ErrorLog::default();
         for i in 0..10 {
             push_error(&mut errors, format!("err{i}"));
         }
@@ -9448,14 +12599,130 @@ mod tests {
         assert_eq!(errors.first().unwrap(), "err5");
     }
 
+    /// Issue #354 phase 5: identical CONSECUTIVE messages collapse into one
+    /// entry with a count and the latest timestamp -- so a failure repeating
+    /// once a second can no longer evict every other kept error, and the
+    /// sticky line says how often it happened.
+    #[test]
+    fn identical_consecutive_errors_collapse_into_one_counted_entry() {
+        let t0 = Instant::now();
+        let mut errors = ErrorLog::default();
+        errors.record("mail send: disk full".into(), t0);
+        errors.record("mail send: disk full".into(), t0 + Duration::from_secs(1));
+        errors.record("mail send: disk full".into(), t0 + Duration::from_secs(2));
+        assert_eq!(errors.len(), 1, "one entry, not three");
+        assert_eq!(errors.entries[0].count, 3);
+        assert_eq!(errors.entries[0].last, t0 + Duration::from_secs(2));
+        assert_eq!(errors.sticky_count(), 1);
+        assert_eq!(
+            errors.sticky_line().as_deref(),
+            Some("mail send: disk full \u{d7}3")
+        );
+        // A different message starts its own entry; the older one survives.
+        errors.record("handover: timed out".into(), t0 + Duration::from_secs(3));
+        assert_eq!(errors.len(), 2);
+        assert_eq!(errors.sticky_count(), 2);
+        assert_eq!(errors.sticky_line().as_deref(), Some("handover: timed out"));
+        // And the cap still counts entries, not repeats.
+        for i in 0..10 {
+            errors.record(format!("err{i}"), t0 + Duration::from_secs(10 + i));
+        }
+        assert_eq!(errors.len(), MAX_KEPT_ERRORS);
+    }
+
+    /// Acknowledgement clears the sticky line without deleting anything, and
+    /// the SAME message arriving again afterwards raises it back.
+    #[test]
+    fn acknowledgement_clears_the_sticky_line_until_a_new_error_arrives() {
+        let t0 = Instant::now();
+        let mut errors = ErrorLog::default();
+        errors.record("mail send: disk full".into(), t0);
+        errors.record("mail send: disk full".into(), t0 + Duration::from_secs(1));
+        assert!(errors.sticky_line().is_some());
+
+        errors.acknowledge();
+        assert_eq!(errors.sticky_count(), 0);
+        assert_eq!(errors.sticky_line(), None, "the header line clears");
+        assert_eq!(errors.len(), 1, "acknowledgement is never a delete");
+        assert!(errors.entries.iter().all(|e| e.acked));
+
+        // The same text again is news, not a silent count bump.
+        errors.record("mail send: disk full".into(), t0 + Duration::from_secs(9));
+        assert_eq!(errors.len(), 2);
+        assert_eq!(errors.entries[1].count, 1);
+        assert_eq!(errors.sticky_count(), 1);
+        assert_eq!(
+            errors.sticky_line().as_deref(),
+            Some("mail send: disk full")
+        );
+
+        // The dialog still lists the acknowledged one, dimmed, with its age.
+        let view = build_errors_view(&errors, t0 + Duration::from_secs(69));
+        assert_eq!(view.items.len(), 2);
+        assert_eq!(view.items[0].text, "mail send: disk full");
+        assert!(!view.items[0].acked, "newest first: the unacked repeat");
+        assert_eq!(view.items[0].age_secs, 60);
+        assert!(view.items[1].acked);
+        assert_eq!(view.items[1].count, 2);
+    }
+
+    /// `Esc`, `Enter`, `q` and `a` all acknowledge; only `a` keeps the dialog
+    /// open, and the caret keys acknowledge nothing.
+    #[test]
+    fn the_errors_dialog_acknowledges_on_close_and_on_the_a_hint() {
+        let view = ui::ErrorsView {
+            items: vec![err_item("boom"), err_item("bang")],
+            cursor: 0,
+            offset: 0,
+        };
+        for code in [KeyCode::Esc, KeyCode::Enter, KeyCode::Char('q')] {
+            let (next, ack) = errors_overlay_reduce(view.clone(), key(code, KeyModifiers::NONE));
+            assert!(next.is_none(), "{code:?} closes");
+            assert!(ack.is_some(), "{code:?} acknowledges");
+        }
+        let (next, ack) =
+            errors_overlay_reduce(view.clone(), key(KeyCode::Char('a'), KeyModifiers::NONE));
+        let next = next.expect("`a` acknowledges in place, without closing");
+        assert!(ack.is_some());
+        assert!(
+            next.items.iter().all(|i| i.acked),
+            "the rows go dim where they are"
+        );
+        let (next, ack) = errors_overlay_reduce(view, key(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(next.expect("still open").cursor, 1);
+        assert!(ack.is_none(), "moving the caret is not reading them");
+    }
+
     // Task 7: sidebar row assembly + header facts.
 
     fn pane_row(short: &str, harness: &str) -> PaneRowMeta {
         PaneRowMeta {
+            role: "worker".into(),
+            model: None,
+            group_id: None,
+            parent: None,
+            budget: style::PLACEHOLDER.into(),
+            writer: style::PLACEHOLDER.into(),
             short: short.to_string(),
             harness: harness.to_string(),
             state: ui::RowState::Idle,
             supervised: true,
+            ended: None,
+        }
+    }
+
+    /// Issue #354 phase 2: the same row, retained after its pane exited with
+    /// `code` -- what `build_pane_rows` appends for an `EndedRow`.
+    fn ended_pane_row(short: &str, code: i32, exited_at: u64) -> PaneRowMeta {
+        PaneRowMeta {
+            state: ui::RowState::Dead,
+            supervised: false,
+            ended: Some(EndedMeta {
+                exit_code: code,
+                exited_at,
+                age_secs: Some(300),
+            }),
+            ..pane_row(short, "claude")
         }
     }
 
@@ -9638,6 +12905,664 @@ mod tests {
         assert_eq!(rows[2].score, Some(12), "view-only registry row, scored");
     }
 
+    // ------------------------------------------------------------------
+    // Issue #354 phase 2: attention glyphs, done-unread acknowledgement,
+    // retained completed-worker rows, group collapse keys.
+    // ------------------------------------------------------------------
+
+    /// A `SessionStatus` that projects `Blocked(WorkflowGate)` with recorded
+    /// evidence -- the approved frame's own `approval · workflow gate` case.
+    fn blocked_status(revision: u64) -> super::super::attention::SessionStatus {
+        super::super::attention::SessionStatus {
+            lifecycle: super::super::attention::Lifecycle::Waiting,
+            attention: super::super::attention::Attention::Approval,
+            authority: super::super::attention::Authority::Workflow,
+            evidence: "workflow gate".into(),
+            last_transition: 200,
+            revision,
+            ..Default::default()
+        }
+    }
+
+    fn done_unread_status(revision: u64) -> super::super::attention::SessionStatus {
+        super::super::attention::SessionStatus {
+            lifecycle: super::super::attention::Lifecycle::Settled,
+            visibility: super::super::attention::Visibility::Unseen,
+            last_transition: 200,
+            revision,
+            ..Default::default()
+        }
+    }
+
+    /// The `reason` line is the projection's own word plus the winning
+    /// authority's evidence -- `approval · workflow gate` -- capped at the 30
+    /// display columns the disclosure contract allows.
+    #[test]
+    fn the_reason_line_names_the_attention_and_its_evidence() {
+        assert_eq!(
+            disclosure_reason(&blocked_status(1)).as_deref(),
+            Some("approval \u{b7} workflow gate")
+        );
+        // A camel-cased attention variant reads as words.
+        let mut gate = blocked_status(1);
+        gate.attention = super::super::attention::Attention::WorkflowGate;
+        gate.evidence = "verify step 3".into();
+        assert_eq!(
+            disclosure_reason(&gate).as_deref(),
+            Some("workflow gate \u{b7} verify step 3")
+        );
+        // No evidence recorded: the word alone, never a duplicated sentence.
+        let mut bare = blocked_status(1);
+        bare.evidence.clear();
+        assert_eq!(disclosure_reason(&bare).as_deref(), Some("approval"));
+        // Never wider than the 30-column disclosure field.
+        let mut long = blocked_status(1);
+        long.evidence = "a".repeat(200);
+        assert_eq!(style::display_width(&disclosure_reason(&long).unwrap()), 30);
+        // And a status nobody has ever written keeps phase 1's own text.
+        assert_eq!(
+            disclosure_reason(&super::super::attention::SessionStatus::default()),
+            None
+        );
+    }
+
+    #[test]
+    fn the_lifecycle_word_is_the_axis_the_since_line_counts_from() {
+        use super::super::attention::Lifecycle;
+        assert_eq!(lifecycle_word(Lifecycle::Waiting), "waiting");
+        assert_eq!(lifecycle_word(Lifecycle::Working), "working");
+        assert_eq!(lifecycle_word(Lifecycle::Settled), "idle");
+        assert_eq!(lifecycle_word(Lifecycle::Exited), "exited");
+        assert_eq!(spaced_lowercase("WriterConflict"), "writer conflict");
+        assert_eq!(spaced_lowercase("Approval"), "approval");
+    }
+
+    /// `enrich_sidebar` folds the cached status onto the row: the glyph's own
+    /// source, the `reason` line and the `since` line's `<lifecycle word>
+    /// <age since last_transition> · started <age>` shape.
+    #[test]
+    fn enrich_sidebar_folds_the_cached_attention_status_onto_the_row() {
+        let panes = vec![pane_row("aaa11111", "claude")];
+        let mut record = registry_record("aaa11111", "claude", Some(DASHBOARD_PID));
+        record.started_at = 100;
+        let registry = vec![(record, sessions::Liveness::Live)];
+        let mut rows =
+            assemble_sidebar(&panes, &registry, &HashMap::new(), 0, 0, DASHBOARD_PID, 740);
+        let mut disk = DiskFacts::default();
+        disk.attention.insert("aaa11111".into(), blocked_status(3));
+        enrich_sidebar(&mut rows, &disk, 740);
+
+        assert_eq!(ui::glyph_for(&rows[0]), ui::Glyph::NeedsAction);
+        let value = |key: &str| {
+            rows[0]
+                .disclosure
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.clone())
+                .unwrap()
+        };
+        assert_eq!(value("reason"), "approval \u{b7} workflow gate");
+        // 740 - 200 = 9m in state; 740 - 100 = 10m since it started.
+        assert_eq!(value("since"), "waiting 9m \u{b7} started 10m ago");
+    }
+
+    /// With nothing cached, every disclosure line and the glyph stay exactly
+    /// what phase 1 produced -- a dashboard with no issue #349 writers sees no
+    /// change at all.
+    #[test]
+    fn enrich_sidebar_leaves_a_row_with_no_status_exactly_as_phase_one_drew_it() {
+        let panes = vec![pane_row("aaa11111", "claude")];
+        let mut rows = assemble_sidebar(&panes, &[], &HashMap::new(), 0, 0, DASHBOARD_PID, 740);
+        let before = rows[0].disclosure.clone();
+        enrich_sidebar(&mut rows, &DiskFacts::default(), 740);
+        assert_eq!(rows[0].disclosure, before);
+        assert!(rows[0].status.is_none());
+        assert_eq!(ui::glyph_for(&rows[0]), ui::Glyph::Idle);
+    }
+
+    /// A retained ended row is selectable but never focusable, keeps its role
+    /// and model, freezes its age, and says how it ended.
+    #[test]
+    fn a_retained_ended_row_is_selectable_but_never_focusable() {
+        let panes = vec![
+            pane_row("aaa11111", "claude"),
+            ended_pane_row("bbb22222", 2, 600),
+        ];
+        let rows = assemble_sidebar(&panes, &[], &HashMap::new(), 1, 0, DASHBOARD_PID, 900);
+        assert_eq!(rows.len(), 2);
+        assert!(rows[1].selected, "the cursor may sit on it");
+        assert!(!rows[1].attached, "but the keyboard can never follow");
+        assert!(!rows[1].focused);
+        assert_eq!(rows[1].role, "worker", "role is retained");
+        assert_eq!(rows[1].age_secs, Some(300), "age is frozen at the exit");
+        assert_eq!(rows[1].exit_code, Some(2));
+        assert_eq!(ui::glyph_for(&rows[1]), ui::Glyph::Failed);
+        let since = rows[1]
+            .disclosure
+            .iter()
+            .find(|(k, _)| k == "since")
+            .map(|(_, v)| v.clone())
+            .unwrap();
+        assert_eq!(since, "exited 5m \u{b7} exit 2");
+
+        // Clicking it selects only -- `focused` never moves off the live pane.
+        let (selected, focused) = select_row("bbb22222", &rows, 0, 0);
+        assert_eq!((selected, focused), (1, 0));
+    }
+
+    /// Retained rows go LAST, after the view-only registry rows: a reap then
+    /// still removes one row from the middle and shifts everything after it
+    /// down by exactly one (`reap_fixup`), and the row retained in its place
+    /// lands where no existing selection points.
+    #[test]
+    fn retained_ended_rows_sit_after_the_view_only_rows_so_reap_fixup_still_holds() {
+        let panes = vec![
+            pane_row("aaa11111", "claude"),
+            ended_pane_row("bbb22222", 0, 600),
+        ];
+        let registry = vec![(
+            registry_record("ccc33333", "claude", Some(DASHBOARD_PID)),
+            sessions::Liveness::Live,
+        )];
+        let rows = assemble_sidebar(&panes, &registry, &HashMap::new(), 0, 0, DASHBOARD_PID, 900);
+        let order: Vec<&str> = rows.iter().map(|r| r.short.as_str()).collect();
+        assert_eq!(order, vec!["aaa11111", "ccc33333", "bbb22222"]);
+        assert!(rows[0].focused, "focused still indexes the live pane block");
+        assert!(!rows[2].attached);
+        // And the retained row's own short is never re-listed as a view-only
+        // registry row.
+        let registry = vec![(
+            registry_record("bbb22222", "claude", Some(DASHBOARD_PID)),
+            sessions::Liveness::Live,
+        )];
+        let rows = assemble_sidebar(&panes, &registry, &HashMap::new(), 0, 0, DASHBOARD_PID, 900);
+        assert_eq!(rows.len(), 2);
+    }
+
+    /// A clean exit is `◆` until it has been seen and `●` afterwards, and its
+    /// `since` line is never overwritten by the cached status's own clock.
+    #[test]
+    fn a_cleanly_ended_retained_row_reads_done_unread_then_idle() {
+        let panes = vec![ended_pane_row("bbb22222", 0, 600)];
+        let mut rows = assemble_sidebar(&panes, &[], &HashMap::new(), 0, 0, DASHBOARD_PID, 900);
+        let mut disk = DiskFacts::default();
+        // What `reap_ended_panes` files: an `Exited` lifecycle, still unseen.
+        let mut exited = done_unread_status(4);
+        exited.lifecycle = super::super::attention::Lifecycle::Exited;
+        disk.attention.insert("bbb22222".into(), exited.clone());
+        enrich_sidebar(&mut rows, &disk, 900);
+        assert_eq!(ui::glyph_for(&rows[0]), ui::Glyph::DoneUnread);
+        let since = |rows: &[ui::SidebarRow]| {
+            rows[0]
+                .disclosure
+                .iter()
+                .find(|(k, _)| k == "since")
+                .map(|(_, v)| v.clone())
+                .unwrap()
+        };
+        assert_eq!(since(&rows), "exited 5m \u{b7} exit 0");
+
+        let mut seen = exited;
+        seen.visibility = super::super::attention::Visibility::Seen;
+        disk.attention.insert("bbb22222".into(), seen);
+        let mut rows = assemble_sidebar(&panes, &[], &HashMap::new(), 0, 0, DASHBOARD_PID, 900);
+        enrich_sidebar(&mut rows, &disk, 900);
+        assert_eq!(ui::glyph_for(&rows[0]), ui::Glyph::Idle);
+    }
+
+    /// Review of 5c1b6c3, finding 1: a worker that is `Working` right up to a
+    /// fast, clean exit -- no Stop hook, no other authority, no intervening
+    /// `Settled` tick for the quiet heuristic to observe -- must still latch
+    /// `Unseen`, so its retained row reads `◆` and the operator is told it
+    /// finished. Before the fix `reap_ended_panes` recorded only `Exited`,
+    /// which is not a `Working -> Settled` transition, and the row went
+    /// straight to `●`.
+    #[test]
+    fn a_fast_clean_exit_from_working_still_latches_done_unread() {
+        use super::super::attention::{Lifecycle, Observation, Visibility, compose};
+        // Exactly what the quiet heuristic files for a busy pane, and nothing
+        // else -- the reported failure case.
+        let working = compose(
+            None,
+            &[Observation::new(
+                super::super::attention::Authority::QuietHeuristic,
+                "pane is producing output",
+                40,
+                100,
+            )
+            .with_lifecycle(Lifecycle::Working)],
+            100,
+        );
+        assert_eq!(working.lifecycle, Lifecycle::Working);
+
+        let mut status = working.clone();
+        for observation in reap_observations(status.lifecycle, 0, 200) {
+            status = compose(Some(&status), std::slice::from_ref(&observation), 200);
+        }
+        assert_eq!(status.lifecycle, Lifecycle::Exited);
+        assert_eq!(
+            status.visibility,
+            Visibility::Unseen,
+            "a clean exit out of Working has to latch Unseen"
+        );
+
+        // ... and that is what the roster actually draws for the retained row.
+        let panes = vec![ended_pane_row("bbb22222", 0, 190)];
+        let mut rows = assemble_sidebar(&panes, &[], &HashMap::new(), 0, 0, DASHBOARD_PID, 900);
+        let mut disk = DiskFacts::default();
+        disk.attention.insert("bbb22222".into(), status.clone());
+        enrich_sidebar(&mut rows, &disk, 900);
+        assert_eq!(ui::glyph_for(&rows[0]), ui::Glyph::DoneUnread);
+
+        // It stays `◆` until it is acknowledged -- which, for a row that can
+        // never be focused, only opening the inspector on it can do, once per
+        // revision.
+        let mut ack = DoneUnreadAck::default();
+        let candidate = inspect_ack_candidate(&rows[0]);
+        assert_eq!(
+            candidate,
+            Some(("bbb22222".to_string(), status.revision)),
+            "the inspector's own acknowledgement path must see this row"
+        );
+        assert_eq!(
+            ack.acknowledge(candidate.clone()),
+            Some("bbb22222".to_string())
+        );
+        assert_eq!(
+            ack.acknowledge(candidate),
+            None,
+            "the same revision is never acknowledged twice"
+        );
+        disk.attention.insert(
+            "bbb22222".into(),
+            super::super::attention::mark_seen(status),
+        );
+        let mut rows = assemble_sidebar(&panes, &[], &HashMap::new(), 0, 0, DASHBOARD_PID, 900);
+        enrich_sidebar(&mut rows, &disk, 900);
+        assert_eq!(ui::glyph_for(&rows[0]), ui::Glyph::Idle);
+    }
+
+    /// A nonzero exit is `✗` whatever its visibility, so it gets the exit
+    /// observation alone -- and a session something already settled is not
+    /// re-settled behind that authority's back.
+    #[test]
+    fn a_reap_only_settles_a_clean_exit_that_nothing_settled_already() {
+        use super::super::attention::Lifecycle;
+        let clean = reap_observations(Lifecycle::Working, 0, 5);
+        assert_eq!(
+            clean.iter().map(|o| o.lifecycle).collect::<Vec<_>>(),
+            vec![Some(Lifecycle::Settled), Some(Lifecycle::Exited)]
+        );
+        for (prior, code) in [
+            (Lifecycle::Working, 1),
+            (Lifecycle::Settled, 0),
+            (Lifecycle::Settled, 3),
+        ] {
+            let observations = reap_observations(prior, code, 5);
+            assert_eq!(
+                observations.iter().map(|o| o.lifecycle).collect::<Vec<_>>(),
+                vec![Some(Lifecycle::Exited)],
+                "{prior:?}/{code}"
+            );
+        }
+    }
+
+    /// Review of 5c1b6c3, finding 2: a retained row keeps the budget text and
+    /// writer state its pane had, not a pair of placeholders -- through the
+    /// very same helpers the live row uses, so the two can never drift.
+    #[test]
+    fn a_retained_row_keeps_its_panes_last_budget_and_writer_state() {
+        assert_eq!(budget_text(Some(40_000), Some(200_000)), "40000 / 200000");
+        assert_eq!(
+            budget_text(None, Some(200_000)),
+            format!("{} / 200000", style::PLACEHOLDER)
+        );
+        assert_eq!(
+            budget_text(Some(40_000), None),
+            format!("40000 / {}", style::PLACEHOLDER)
+        );
+        let cwd = Path::new("D:/repo");
+        assert_eq!(writer_text(true, cwd), "held \u{b7} D:/repo");
+        assert_eq!(
+            writer_text(false, cwd),
+            format!("{} \u{b7} D:/repo", style::PLACEHOLDER)
+        );
+
+        // And the retained row carries them into its own disclosure rather
+        // than reporting "nothing was ever known about this worker".
+        let retained = EndedRow {
+            short: "bbb22222".into(),
+            role: "worker".into(),
+            model: None,
+            harness: "claude".into(),
+            group_id: None,
+            parent: None,
+            budget: budget_text(Some(40_000), Some(200_000)),
+            writer: writer_text(true, cwd),
+            cwd: cwd.display().to_string(),
+            request: None,
+            requested_by: None,
+            meta: EndedMeta {
+                exit_code: 0,
+                exited_at: 600,
+                age_secs: Some(300),
+            },
+        };
+        let mut queue: VecDeque<EndedRow> = VecDeque::new();
+        push_retained_ended(&mut queue, retained, MAX_RETAINED_ENDED_ROWS);
+        let metas = build_pane_rows(&[], &queue);
+        let rows = assemble_sidebar(&metas, &[], &HashMap::new(), 0, 0, DASHBOARD_PID, 900);
+        let value = |key: &str| {
+            rows[0]
+                .disclosure
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_default()
+        };
+        assert_eq!(value("budget"), "40000 / 200000");
+        assert_eq!(value("writer"), "held \u{b7} D:/repo");
+    }
+
+    /// The retained list is capped, oldest dropped first, so a long session
+    /// cannot push every live pane off the bottom of the sidebar.
+    #[test]
+    fn retained_ended_rows_are_capped_oldest_first() {
+        let mut retained: VecDeque<EndedRow> = VecDeque::new();
+        for i in 0..MAX_RETAINED_ENDED_ROWS + 4 {
+            push_retained_ended(
+                &mut retained,
+                EndedRow {
+                    short: format!("sess{i:04}"),
+                    role: "worker".into(),
+                    model: None,
+                    harness: "claude".into(),
+                    group_id: None,
+                    parent: None,
+                    budget: style::PLACEHOLDER.into(),
+                    writer: style::PLACEHOLDER.into(),
+                    cwd: String::new(),
+                    request: None,
+                    requested_by: None,
+                    meta: EndedMeta {
+                        exit_code: 0,
+                        exited_at: i as u64,
+                        age_secs: Some(10),
+                    },
+                },
+                MAX_RETAINED_ENDED_ROWS,
+            );
+        }
+        assert_eq!(retained.len(), MAX_RETAINED_ENDED_ROWS);
+        assert_eq!(retained.front().unwrap().short, "sess0004");
+        assert_eq!(retained.back().unwrap().short, "sess0011");
+        // And they are rows, not panes: the final-pane auto-exit reads the
+        // live pane vector alone, so a roster full of retained rows still
+        // closes the dashboard when the last real pane goes.
+        assert_eq!(
+            build_pane_rows(&[], &retained).len(),
+            MAX_RETAINED_ENDED_ROWS
+        );
+        assert!(should_exit_empty(0, false));
+    }
+
+    // -- done-unread acknowledgement --------------------------------------
+
+    #[test]
+    fn done_unread_is_acknowledged_only_by_an_unoccluded_render_of_the_focused_pane() {
+        let status = done_unread_status(5);
+        // The qualifying case: focused, no overlay, live scroll.
+        assert_eq!(
+            ack_candidate(false, Some(("aaa11111", 0)), Some(&status)),
+            Some(("aaa11111".to_string(), 5))
+        );
+        // An open dialog covers the grid: nothing was read.
+        assert_eq!(
+            ack_candidate(true, Some(("aaa11111", 0)), Some(&status)),
+            None
+        );
+        // Scrolled back into history: the pane is showing something else.
+        assert_eq!(
+            ack_candidate(false, Some(("aaa11111", 12)), Some(&status)),
+            None
+        );
+        // Nothing focused at all, and a pane that is not done-unread.
+        assert_eq!(ack_candidate(false, None, Some(&status)), None);
+        assert_eq!(
+            ack_candidate(false, Some(("aaa11111", 0)), Some(&blocked_status(5))),
+            None
+        );
+        assert_eq!(ack_candidate(false, Some(("aaa11111", 0)), None), None);
+    }
+
+    /// One write per revision, however many frames the pane stays focused --
+    /// and a fresh `Unseen` latch at a NEW revision is acknowledged again.
+    #[test]
+    fn done_unread_acknowledgement_fires_once_per_revision() {
+        let mut ack = DoneUnreadAck::default();
+        let focused = Some(("aaa11111", 0usize));
+        let status = done_unread_status(5);
+
+        for _ in 0..10 {
+            ack.observe(ack_candidate(false, focused, Some(&status)));
+        }
+        assert_eq!(ack.take_due().as_deref(), Some("aaa11111"));
+        // Every later frame at the same revision is a no-op.
+        for _ in 0..10 {
+            ack.observe(ack_candidate(false, focused, Some(&status)));
+            assert_eq!(ack.take_due(), None);
+        }
+        // The session works and settles again: a new revision, acknowledged
+        // on its own.
+        let again = done_unread_status(6);
+        ack.observe(ack_candidate(false, focused, Some(&again)));
+        assert_eq!(ack.take_due().as_deref(), Some("aaa11111"));
+    }
+
+    /// Selecting a row is not reading it: only the pane the frame actually
+    /// drew can be acknowledged, and a frame drawn under an overlay
+    /// acknowledges nothing at all.
+    #[test]
+    fn selecting_a_row_never_acknowledges_it() {
+        let mut ack = DoneUnreadAck::default();
+        let status = done_unread_status(5);
+        // The cursor is on `bbb22222` while `aaa11111` is focused: the render
+        // can only ever qualify the focused pane.
+        ack.observe(ack_candidate(false, Some(("aaa11111", 0)), Some(&status)));
+        assert_eq!(ack.take_due().as_deref(), Some("aaa11111"));
+        // And with a dialog open, nothing qualifies however long it is up.
+        let mut ack = DoneUnreadAck::default();
+        for _ in 0..5 {
+            ack.observe(ack_candidate(true, Some(("bbb22222", 0)), Some(&status)));
+        }
+        assert_eq!(ack.take_due(), None);
+    }
+
+    // -- group collapse ----------------------------------------------------
+
+    #[test]
+    fn fold_group_is_one_reducer_for_the_keyboard_and_the_pointer() {
+        let mut collapsed = HashSet::new();
+        assert!(fold_group(&mut collapsed, "g", GroupFold::Collapse));
+        assert!(collapsed.contains("g"));
+        // Collapsing an already-collapsed group is idempotent, not a toggle.
+        assert!(fold_group(&mut collapsed, "g", GroupFold::Collapse));
+        assert!(!fold_group(&mut collapsed, "g", GroupFold::Expand));
+        assert!(!collapsed.contains("g"));
+        assert!(!fold_group(&mut collapsed, "g", GroupFold::Expand));
+        // The header click's own toggle shares the same state.
+        assert!(fold_group(&mut collapsed, "g", GroupFold::Toggle));
+        assert!(!fold_group(&mut collapsed, "g", GroupFold::Toggle));
+    }
+
+    /// `^A Left`/`^A Right` act on the group the cursor is in -- the header it
+    /// is parked on, else the selected session's own group -- and are no-ops
+    /// on a flat row or the summary line.
+    #[test]
+    fn the_collapse_keys_resolve_the_group_under_the_cursor_and_no_ops_elsewhere() {
+        let mut grouped = pane_row("aaa11111", "claude");
+        grouped.group_id = Some("g".into());
+        let rows = assemble_sidebar(
+            &[grouped, pane_row("bbb22222", "claude")],
+            &[],
+            &HashMap::new(),
+            0,
+            0,
+            DASHBOARD_PID,
+            0,
+        );
+        assert_eq!(
+            group_under_cursor(None, &rows, 0).as_deref(),
+            Some("g"),
+            "a grouped row folds its own group"
+        );
+        assert_eq!(
+            group_under_cursor(None, &rows, 1),
+            None,
+            "a flat row is a no-op"
+        );
+        assert_eq!(
+            group_under_cursor(Some(&Hit::GroupToggle("g".into())), &rows, 1).as_deref(),
+            Some("g"),
+            "the cursor parked on a header folds that header's group"
+        );
+        assert_eq!(
+            group_under_cursor(Some(&Hit::SidebarSummary), &rows, 0),
+            None,
+            "the summary line owns no group"
+        );
+        // A collapsed group stays addressable from its own header, so `^A
+        // Right` can open it again.
+        let mut collapsed = HashSet::from(["g".to_string()]);
+        let id = group_under_cursor(Some(&Hit::GroupToggle("g".into())), &rows, 0).unwrap();
+        assert!(!fold_group(&mut collapsed, &id, GroupFold::Expand));
+    }
+
+    #[test]
+    fn ctrl_a_left_and_right_are_bound_to_the_fold_actions() {
+        assert_eq!(
+            filter_key(true, KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)).1,
+            InputVerdict::Dash(DashAction::CollapseGroup)
+        );
+        assert_eq!(
+            filter_key(true, KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)).1,
+            InputVerdict::Dash(DashAction::ExpandGroup)
+        );
+        // Issue #354 phase 3: `^A i` is the real inspector, `^A r` restores
+        // an ended row, and `^A e` still opens the kept-errors overlay.
+        assert_eq!(
+            filter_key(true, KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE)).1,
+            InputVerdict::Dash(DashAction::Inspect)
+        );
+        assert_eq!(
+            filter_key(true, KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE)).1,
+            InputVerdict::Dash(DashAction::RestoreRow)
+        );
+        assert_eq!(
+            filter_key(true, KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE)).1,
+            InputVerdict::Dash(DashAction::ShowErrors)
+        );
+    }
+
+    // -- attention reads stay on the facts cadence -------------------------
+
+    #[test]
+    fn attention_row_shorts_covers_every_drawable_row_once() {
+        let mut retained: VecDeque<EndedRow> = VecDeque::new();
+        push_retained_ended(
+            &mut retained,
+            EndedRow {
+                short: "bbb22222".into(),
+                role: "worker".into(),
+                model: None,
+                harness: "claude".into(),
+                group_id: None,
+                parent: None,
+                budget: style::PLACEHOLDER.into(),
+                writer: style::PLACEHOLDER.into(),
+                cwd: String::new(),
+                request: None,
+                requested_by: None,
+                meta: EndedMeta {
+                    exit_code: 0,
+                    exited_at: 1,
+                    age_secs: None,
+                },
+            },
+            MAX_RETAINED_ENDED_ROWS,
+        );
+        let registry = vec![
+            // Already a pane: never listed twice.
+            (
+                registry_record("aaa11111", "claude", Some(DASHBOARD_PID)),
+                sessions::Liveness::Live,
+            ),
+            (
+                registry_record("ccc33333", "claude", Some(DASHBOARD_PID)),
+                sessions::Liveness::Live,
+            ),
+            // Another dashboard's session, and a stale one: neither is drawn,
+            // so neither is read.
+            (
+                registry_record("ddd44444", "claude", Some(DASHBOARD_PID + 1)),
+                sessions::Liveness::Live,
+            ),
+            (
+                registry_record("eee55555", "claude", Some(DASHBOARD_PID)),
+                sessions::Liveness::Stale,
+            ),
+        ];
+        let shorts = attention_row_shorts(
+            &["aaa11111".to_string()],
+            &retained,
+            &registry,
+            DASHBOARD_PID,
+        );
+        assert_eq!(shorts, vec!["aaa11111", "bbb22222", "ccc33333"]);
+    }
+
+    /// The glyph column must never put a file read on a frame: the statuses
+    /// are loaded exactly as often as the rest of the throttled facts are,
+    /// however many frames the dashboard draws in between.
+    #[test]
+    fn attention_statuses_are_read_on_the_facts_cadence_never_per_frame() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        let cfg = CtxConfig::default();
+        let shorts = vec!["aaa11111".to_string()];
+        let loads = std::cell::Cell::new(0usize);
+        let counting = |_: &str| -> super::super::attention::SessionStatus {
+            loads.set(loads.get() + 1);
+            super::super::attention::SessionStatus::default()
+        };
+
+        let start = Instant::now();
+        let mut cache = FactsCache::new(start);
+        // 40 frames inside one throttle window -- the dashboard's own poll is
+        // 10-50ms, so this is well under a second of real time.
+        for _ in 0..40 {
+            if cache.refresh_if_due(&cfg, &state, owner(&repo), &[], start) {
+                cache.refresh_attention(&shorts, &counting);
+            }
+        }
+        assert_eq!(
+            loads.get(),
+            1,
+            "one read per throttle window, not per frame"
+        );
+
+        // The next window reads again, and only once more.
+        let later = start + FACTS_THROTTLE + Duration::from_millis(1);
+        for _ in 0..40 {
+            if cache.refresh_if_due(&cfg, &state, owner(&repo), &[], later) {
+                cache.refresh_attention(&shorts, &counting);
+            }
+        }
+        assert_eq!(loads.get(), 2);
+        assert!(cache.disk.attention.contains_key("aaa11111"));
+    }
+
     #[test]
     fn assemble_header_facts_carries_select_mode_live_and_total_through() {
         let facts = assemble_header_facts("claude".to_string(), false, 2, 5, 0, None, None);
@@ -9685,11 +13610,18 @@ mod tests {
 
     fn focused_alive_row_supervised(score: Option<u32>, supervised: bool) -> ui::SidebarRow {
         ui::SidebarRow {
+            role: "worker".into(),
+            model: None,
+            group: None,
+            tree: ui::TreePos::Flat,
+            disclosure: Vec::new(),
             short: "aaa11111".to_string(),
             harness: "claude".to_string(),
             age_secs: Some(90),
             score,
             state: ui::RowState::Idle,
+            status: None,
+            exit_code: None,
             attached: true,
             selected: false,
             focused: true,
@@ -10147,6 +14079,7 @@ mod tests {
                 (PathBuf::from("/b"), "codex".to_string(), "two".to_string()),
             ],
             cursor: 0,
+            offset: 0,
             compose: None,
         };
 
@@ -10293,6 +14226,7 @@ mod tests {
         let view = ui::MailView {
             items: vec![(PathBuf::from("/a"), "claude".to_string(), "one".to_string())],
             cursor: 0,
+            offset: 0,
             compose: None,
         };
         let (next, effect) = mail_overlay_reduce(view, key(KeyCode::Enter, KeyModifiers::NONE));
@@ -10321,6 +14255,7 @@ mod tests {
                 .map(|(k, a, b)| (k.to_string(), a.to_string(), b.to_string()))
                 .collect(),
             cursor: 0,
+            offset: 0,
             input: None,
         }
     }
@@ -10513,7 +14448,7 @@ mod tests {
         let state = StateDir::from_root(tmp.path().join("state"));
         let repo = tmp.path().join("repo");
         let cfg = CtxConfig::default();
-        let mut errors = Vec::new();
+        let mut errors = ErrorLog::default();
 
         let session_id = "77777777-2222-4333-8444-555555555555";
         let dashboard_short = sessions::short_id(session_id);
@@ -10585,7 +14520,7 @@ mod tests {
         ];
         let mut queues: Vec<VecDeque<String>> = vec![VecDeque::new()];
         let (mut focused, mut selected) = (0usize, 0usize);
-        let mut errors = Vec::new();
+        let mut errors = ErrorLog::default();
 
         let deadline = Instant::now() + Duration::from_secs(30);
         while Instant::now() < deadline && !panes.is_empty() {
@@ -10604,6 +14539,8 @@ mod tests {
                 &mut Vec::new(),
                 &mut HashSet::new(),
                 &mut None,
+                &mut VecDeque::new(),
+                &mut HashMap::new(),
             );
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -10617,7 +14554,7 @@ mod tests {
             "the old pane-derived identity is empty here -- which is the bug"
         );
 
-        let mut errors = Vec::new();
+        let mut errors = ErrorLog::default();
         apply_mail_effect(
             ui::MailEffect::Send(mail::Message {
                 from_session: String::new(),
@@ -10767,7 +14704,7 @@ mod tests {
         ];
         let mut queues: Vec<VecDeque<String>> = vec![VecDeque::new()];
         let (mut focused, mut selected) = (0usize, 0usize);
-        let mut errors = Vec::new();
+        let mut errors = ErrorLog::default();
         let mut last_exited: Option<LastExited> = None;
 
         let deadline = Instant::now() + Duration::from_secs(30);
@@ -10787,6 +14724,8 @@ mod tests {
                 &mut Vec::new(),
                 &mut HashSet::new(),
                 &mut last_exited,
+                &mut VecDeque::new(),
+                &mut HashMap::new(),
             );
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -10817,7 +14756,7 @@ mod tests {
         )
         .expect("store");
 
-        let mut errors = Vec::new();
+        let mut errors = ErrorLog::default();
         apply_mail_effect(
             ui::MailEffect::Consume(path.clone()),
             &state,
@@ -10842,7 +14781,7 @@ mod tests {
         let state = StateDir::from_root(tmp.path().join("state"));
         let repo = tmp.path().join("repo");
         let cfg = CtxConfig::default();
-        let mut errors = Vec::new();
+        let mut errors = ErrorLog::default();
 
         apply_memory_effect(
             ui::MemoryEffect::Remember {
@@ -11098,7 +15037,7 @@ mod tests {
             "claude",
             "short0000",
             &mut advised,
-            &mut Vec::new(),
+            &mut ErrorLog::default(),
         );
 
         assert!(delivered);
@@ -11136,7 +15075,7 @@ mod tests {
             "claude",
             "short0000",
             &mut advised,
-            &mut Vec::new(),
+            &mut ErrorLog::default(),
         ));
         assert!(
             !advise_one_pane(
@@ -11147,7 +15086,7 @@ mod tests {
                 "claude",
                 "short0000",
                 &mut advised,
-                &mut Vec::new(),
+                &mut ErrorLog::default(),
             ),
             "an unchanged inbox must not be re-advised"
         );
@@ -11174,7 +15113,7 @@ mod tests {
             "claude",
             "short0000",
             &mut advised,
-            &mut Vec::new(),
+            &mut ErrorLog::default(),
         ));
 
         // A second, later message: distinct filename (a later timestamp
@@ -11191,7 +15130,7 @@ mod tests {
                 "claude",
                 "short0000",
                 &mut advised,
-                &mut Vec::new(),
+                &mut ErrorLog::default(),
             ),
             "new mail must trigger a fresh advisory"
         );
@@ -11218,7 +15157,7 @@ mod tests {
             "claude",
             "short0000",
             &mut advised,
-            &mut Vec::new(),
+            &mut ErrorLog::default(),
         );
         assert!(!delivered);
         assert!(injector.calls.is_empty());
@@ -11254,7 +15193,7 @@ mod tests {
             "claude",
             "short0000",
             &mut advised,
-            &mut Vec::new(),
+            &mut ErrorLog::default(),
         ));
 
         // Consume the message (an orchestrator's own `zirv ctx inbox` would
@@ -11276,7 +15215,7 @@ mod tests {
             "claude",
             "short0000",
             &mut advised,
-            &mut Vec::new(),
+            &mut ErrorLog::default(),
         ));
 
         // A brand-new message that reuses the first message's exact freed
@@ -11300,7 +15239,7 @@ mod tests {
                 "claude",
                 "short0000",
                 &mut advised,
-                &mut Vec::new(),
+                &mut ErrorLog::default(),
             ),
             "a message reusing a consumed message's filename must still be advised"
         );
@@ -11341,7 +15280,7 @@ mod tests {
         }
 
         let mut injector = SucceedingInjector { calls: Vec::new() };
-        let mut errors = Vec::new();
+        let mut errors = ErrorLog::default();
         let delivered = sweep_one_pane(
             &mut injector,
             &state,
@@ -11399,7 +15338,7 @@ mod tests {
         .expect("store");
 
         let mut injector = SucceedingInjector { calls: Vec::new() };
-        let mut errors = Vec::new();
+        let mut errors = ErrorLog::default();
         let delivered = sweep_one_pane(
             &mut injector,
             &state,
@@ -11431,7 +15370,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(tmp.path().join("state"));
         let mut injector = SucceedingInjector { calls: Vec::new() };
-        let mut errors = Vec::new();
+        let mut errors = ErrorLog::default();
         assert!(!sweep_one_pane(
             &mut injector,
             &state,
@@ -11470,7 +15409,7 @@ mod tests {
         )
         .expect("store");
 
-        let mut errors = Vec::new();
+        let mut errors = ErrorLog::default();
         assert!(!sweep_one_pane(
             &mut FailingInjector,
             &state,
@@ -11937,7 +15876,7 @@ mod tests {
         let state = StateDir::from_root(tmp.path().join("state"));
         let mut panes: Vec<Pane> = Vec::new();
         let mut queues: Vec<VecDeque<String>> = Vec::new();
-        let mut errors = Vec::new();
+        let mut errors = ErrorLog::default();
         fulfill_spawn_request(
             req,
             false,
@@ -12063,7 +16002,7 @@ mod tests {
         let mut queues: Vec<VecDeque<String>> = Vec::new();
 
         let req = spawn_request("do the work", &repo);
-        let mut errors = Vec::new();
+        let mut errors = ErrorLog::default();
         fulfill_spawn_request(
             &req,
             true,
@@ -13137,7 +17076,7 @@ mod tests {
         let cfg = CtxConfig::default();
         let mut panes: Vec<Pane> = Vec::new();
         let mut queues: Vec<VecDeque<String>> = Vec::new();
-        let mut errors = Vec::new();
+        let mut errors = ErrorLog::default();
         let err = fulfill_spawn_request(
             &req,
             false,
@@ -13195,7 +17134,7 @@ mod tests {
         let cfg = CtxConfig::default();
         let mut panes = Vec::new();
         let mut queues = Vec::new();
-        let mut errors = Vec::new();
+        let mut errors = ErrorLog::default();
         let refusal = fulfill_spawn_request(
             &req,
             false,
@@ -13257,7 +17196,7 @@ mod tests {
         };
         let mut panes = Vec::new();
         let mut queues = Vec::new();
-        let mut errors = Vec::new();
+        let mut errors = ErrorLog::default();
 
         fulfill_spawn_request(
             &req,
@@ -13310,7 +17249,7 @@ mod tests {
         let cfg = CtxConfig::default();
         let mut panes = Vec::new();
         let mut queues = Vec::new();
-        let mut errors = Vec::new();
+        let mut errors = ErrorLog::default();
         let refusal = fulfill_spawn_request(
             &req,
             false,
@@ -13408,7 +17347,7 @@ mod tests {
         req.work_group_id = Some("wg-routing-stop".to_string());
         let mut panes: Vec<Pane> = Vec::new();
         let mut queues: Vec<VecDeque<String>> = Vec::new();
-        let mut errors = Vec::new();
+        let mut errors = ErrorLog::default();
 
         let refusal = fulfill_spawn_request(
             &req,
@@ -13526,7 +17465,7 @@ mod tests {
 
         let mut panes: Vec<Pane> = Vec::new();
         let mut queues: Vec<VecDeque<String>> = Vec::new();
-        let mut errors = Vec::new();
+        let mut errors = ErrorLog::default();
 
         let (_, capability_warnings) = fulfill_spawn_request(
             &req,
@@ -13630,7 +17569,7 @@ mod tests {
         req.work_group_id = Some("wg-1".to_string());
         let mut panes: Vec<Pane> = Vec::new();
         let mut queues: Vec<VecDeque<String>> = Vec::new();
-        let mut errors = Vec::new();
+        let mut errors = ErrorLog::default();
         let refusal = fulfill_spawn_request(
             &req,
             false,
@@ -13738,7 +17677,7 @@ mod tests {
         let req = spawn_request("do the work", &repo);
         let mut panes: Vec<Pane> = Vec::new();
         let mut queues: Vec<VecDeque<String>> = Vec::new();
-        let mut errors = Vec::new();
+        let mut errors = ErrorLog::default();
         let result = fulfill_spawn_request(
             &req,
             false,
@@ -14042,7 +17981,7 @@ mod tests {
             .expect("spawn"),
         ];
         let mut queues: Vec<VecDeque<String>> = vec![VecDeque::new()];
-        let mut errors = Vec::new();
+        let mut errors = ErrorLog::default();
 
         let worker_short = sessions::short_id("33333333-4444-5555-8666-777777777777");
         let mut req = spawn_request("do the work", &repo);
@@ -14191,7 +18130,7 @@ mod tests {
         let orch_short = sessions::short_id(orch_session);
         let mut worker_req = spawn_request("do the work", &repo);
         worker_req.parent_session = Some(orch_short.clone());
-        let mut errors = Vec::new();
+        let mut errors = ErrorLog::default();
         fulfill_spawn_request(
             &worker_req,
             false,
@@ -14282,7 +18221,7 @@ mod tests {
         // only source, and it still resolves correctly.
         let mut unclaimed_req = spawn_request("do the work", &repo);
         unclaimed_req.parent_session = None;
-        let mut errors = Vec::new();
+        let mut errors = ErrorLog::default();
         fulfill_spawn_request(
             &unclaimed_req,
             false,
@@ -14386,7 +18325,7 @@ mod tests {
             .expect("spawn"),
         ];
         let mut queues: Vec<VecDeque<String>> = vec![VecDeque::new()];
-        let mut errors = Vec::new();
+        let mut errors = ErrorLog::default();
 
         let orch_short = sessions::short_id(orch_session);
         let mut sub_req = spawn_request("own this scope", &repo);
@@ -14513,7 +18452,7 @@ mod tests {
         }
         let mut panes: Vec<Pane> = Vec::new();
         let mut queues: Vec<VecDeque<String>> = Vec::new();
-        let mut errors = Vec::new();
+        let mut errors = ErrorLog::default();
         let result = fulfill_spawn_request(
             &spawn_request("do the work", &repo),
             false,
@@ -14591,7 +18530,7 @@ mod tests {
         }
         let mut panes: Vec<Pane> = Vec::new();
         let mut queues: Vec<VecDeque<String>> = Vec::new();
-        let mut errors = Vec::new();
+        let mut errors = ErrorLog::default();
         let result = fulfill_spawn_request(
             &spawn_request("do the work", &repo),
             false,
@@ -14665,7 +18604,7 @@ mod tests {
         }
         let mut panes: Vec<Pane> = Vec::new();
         let mut queues: Vec<VecDeque<String>> = Vec::new();
-        let mut errors = Vec::new();
+        let mut errors = ErrorLog::default();
         let mut req = spawn_request("do the work", &repo);
         req.force = true;
         let result = fulfill_spawn_request(
@@ -14748,7 +18687,7 @@ mod tests {
 
         let mut panes: Vec<Pane> = Vec::new();
         let mut queues: Vec<VecDeque<String>> = Vec::new();
-        let mut errors = Vec::new();
+        let mut errors = ErrorLog::default();
         let result = fulfill_spawn_request(
             &req,
             false,
@@ -14819,7 +18758,7 @@ mod tests {
 
         let mut panes: Vec<Pane> = Vec::new();
         let mut queues: Vec<VecDeque<String>> = Vec::new();
-        let mut errors = Vec::new();
+        let mut errors = ErrorLog::default();
         let result = fulfill_spawn_request(
             &req,
             false,
@@ -14855,7 +18794,7 @@ mod tests {
         assert!(
             errors[0].contains("cannot reach argv"),
             "got {:?}",
-            errors[0]
+            &errors[0]
         );
 
         // Let the trivial `@echo off` child exit on its own rather than
@@ -14915,7 +18854,7 @@ mod tests {
 
         let mut panes: Vec<Pane> = Vec::new();
         let mut queues: Vec<VecDeque<String>> = Vec::new();
-        let mut errors = Vec::new();
+        let mut errors = ErrorLog::default();
         let result = fulfill_spawn_request(
             &req,
             false,
@@ -15114,7 +19053,7 @@ mod tests {
 
         let mut panes: Vec<Pane> = Vec::new();
         let mut queues: Vec<VecDeque<String>> = Vec::new();
-        let mut errors = Vec::new();
+        let mut errors = ErrorLog::default();
         let result = fulfill_spawn_request(
             &req,
             false,
@@ -15370,6 +19309,7 @@ mod tests {
         let view = ui::RestoreView {
             entries: vec![restore_entry("a", true)],
             cursor: 0,
+            offset: 0,
         };
         let (next, effect) = restore_overlay_reduce(view, key(KeyCode::Esc, KeyModifiers::NONE));
         assert!(next.is_none());
@@ -15381,6 +19321,7 @@ mod tests {
         let view = ui::RestoreView {
             entries: vec![restore_entry("a", true), restore_entry("b", true)],
             cursor: 1,
+            offset: 0,
         };
         let (next, effect) = restore_overlay_reduce(view, press(' '));
         let next = next.expect("stays open");
@@ -15401,6 +19342,7 @@ mod tests {
                 restore_entry("c", true),
             ],
             cursor: 0,
+            offset: 0,
         };
         let (next, effect) = restore_overlay_reduce(view, key(KeyCode::Enter, KeyModifiers::NONE));
         assert!(next.is_none(), "confirming closes the dialog");
@@ -15412,6 +19354,7 @@ mod tests {
         let view = ui::RestoreView {
             entries: vec![restore_entry("a", false)],
             cursor: 0,
+            offset: 0,
         };
         let (next, effect) = restore_overlay_reduce(view, key(KeyCode::Enter, KeyModifiers::NONE));
         assert!(next.is_none());
@@ -15423,6 +19366,7 @@ mod tests {
         let view = ui::RestoreView {
             entries: vec![restore_entry("a", true), restore_entry("b", true)],
             cursor: 0,
+            offset: 0,
         };
         let (next, _) = restore_overlay_reduce(view, key(KeyCode::Down, KeyModifiers::NONE));
         let next = next.expect("stays open");
@@ -15434,6 +19378,713 @@ mod tests {
             1,
             "past the last row clamps rather than overflowing"
         );
+    }
+
+    // -- issue #354 phase 3: the context menu ------------------------------
+
+    fn menu_facts(short: &str) -> MenuFacts {
+        MenuFacts {
+            short: short.to_string(),
+            role: "worker".to_string(),
+            attached: true,
+            alive: true,
+            ended: false,
+            exit_code: None,
+            retained: false,
+            has_request: false,
+            cwd: Some("D:/repo".to_string()),
+        }
+    }
+
+    fn entry(entries: &[ui::MenuEntry], action: ui::MenuAction) -> &ui::MenuEntry {
+        entries
+            .iter()
+            .find(|e| e.action == action)
+            .unwrap_or_else(|| panic!("{action:?} must always be offered"))
+    }
+
+    /// The enabled/disabled matrix, per row state. Every entry is always
+    /// present -- an operator who cannot see that `restore` exists cannot
+    /// learn why it is unavailable -- and every unavailable one carries a
+    /// reason.
+    #[test]
+    fn the_context_menu_offers_every_entry_and_says_why_each_is_unavailable() {
+        use ui::MenuAction as A;
+
+        // An alive, attached pane: everything that acts on a running child.
+        let alive = menu_entries(&menu_facts("aaaa1111"));
+        for action in [
+            A::Inspect,
+            A::Focus,
+            A::Nudge,
+            A::Mail,
+            A::Handover,
+            A::Stop,
+            A::OpenWorktree,
+            A::Evidence,
+        ] {
+            assert!(entry(&alive, action).enabled(), "{action:?}");
+        }
+        assert_eq!(
+            entry(&alive, A::Restore).disabled.as_deref(),
+            Some(MENU_STILL_RUNNING)
+        );
+        assert_eq!(
+            entry(&alive, A::Retry).disabled.as_deref(),
+            Some(MENU_STILL_RUNNING)
+        );
+        assert_eq!(
+            entry(&alive, A::Dismiss).disabled.as_deref(),
+            Some(MENU_NOT_RETAINED)
+        );
+
+        // A view-only registry row: no pane to focus, stop or swap, but a
+        // nudge still reaches it through the headless marker path.
+        let view_only = MenuFacts {
+            attached: false,
+            cwd: None,
+            ..menu_facts("cccc3333")
+        };
+        let entries = menu_entries(&view_only);
+        for action in [A::Focus, A::Handover, A::Stop] {
+            assert_eq!(
+                entry(&entries, action).disabled.as_deref(),
+                Some(MENU_NOT_ATTACHED),
+                "{action:?}"
+            );
+        }
+        assert!(entry(&entries, A::Nudge).enabled());
+        assert_eq!(
+            entry(&entries, A::OpenWorktree).disabled.as_deref(),
+            Some(MENU_NO_CWD)
+        );
+
+        // An ended row with no kept request: restore and retry both say so.
+        let ended_no_request = MenuFacts {
+            attached: false,
+            alive: false,
+            ended: true,
+            exit_code: Some(0),
+            retained: true,
+            has_request: false,
+            ..menu_facts("bbbb2222")
+        };
+        let entries = menu_entries(&ended_no_request);
+        assert_eq!(
+            entry(&entries, A::Restore).disabled.as_deref(),
+            Some(MENU_NO_REQUEST)
+        );
+        assert_eq!(
+            entry(&entries, A::Retry).disabled.as_deref(),
+            Some(MENU_NO_REQUEST)
+        );
+        assert_eq!(
+            entry(&entries, A::Nudge).disabled.as_deref(),
+            Some(MENU_ENDED)
+        );
+        assert_eq!(
+            entry(&entries, A::Stop).disabled.as_deref(),
+            Some(MENU_ENDED)
+        );
+        assert!(entry(&entries, A::Dismiss).enabled());
+        // The inspector and its evidence section describe any row at all.
+        assert!(entry(&entries, A::Inspect).enabled());
+        assert!(entry(&entries, A::Evidence).enabled());
+
+        // An ended row with a kept request: restore is on, retry is not --
+        // it exited cleanly, so there is no failure to retry.
+        let ended_clean = MenuFacts {
+            has_request: true,
+            ..ended_no_request
+        };
+        let entries = menu_entries(&ended_clean);
+        assert!(entry(&entries, A::Restore).enabled());
+        assert_eq!(
+            entry(&entries, A::Retry).disabled.as_deref(),
+            Some(MENU_EXITED_CLEAN)
+        );
+
+        // An ended row that failed: both are on.
+        let ended_failed = MenuFacts {
+            exit_code: Some(1),
+            ..ended_clean.clone()
+        };
+        let entries = menu_entries(&ended_failed);
+        assert!(entry(&entries, A::Restore).enabled());
+        assert!(entry(&entries, A::Retry).enabled());
+
+        // Whatever the row, the menu is the same shape in the same order.
+        for facts in [alive_facts(), ended_clean.clone(), view_only.clone()] {
+            let entries = menu_entries(&facts);
+            assert_eq!(entries.len(), 11);
+            assert_eq!(
+                entries.iter().map(|e| e.action).collect::<Vec<_>>(),
+                vec![
+                    A::Inspect,
+                    A::Focus,
+                    A::Nudge,
+                    A::Mail,
+                    A::Handover,
+                    A::Stop,
+                    A::Restore,
+                    A::OpenWorktree,
+                    A::Evidence,
+                    A::Retry,
+                    A::Dismiss,
+                ]
+            );
+            for e in &entries {
+                assert!(
+                    e.enabled() || e.disabled.as_ref().is_some_and(|r| !r.trim().is_empty()),
+                    "{:?} is disabled with no reason",
+                    e.action
+                );
+            }
+        }
+    }
+
+    fn alive_facts() -> MenuFacts {
+        menu_facts("aaaa1111")
+    }
+
+    /// The menu is opened for whatever row the gesture named, which is not
+    /// necessarily the selected one -- and the title says which.
+    #[test]
+    fn a_right_click_menu_targets_its_own_row_not_the_selection() {
+        let panes = vec![
+            pane_row("aaaa1111", "claude"),
+            pane_row("bbbb2222", "codex"),
+        ];
+        // Row 0 is selected; the menu is raised on row 1.
+        let rows = assemble_sidebar(&panes, &[], &HashMap::new(), 0, 0, DASHBOARD_PID, 0);
+        let target = menu_facts_for(&rows[1], &[], &VecDeque::new());
+        let view = build_menu_view(&target);
+        assert_eq!(view.target, "bbbb2222");
+        assert!(
+            view.subject.contains("bbbb2222"),
+            "the menu title names its target: {}",
+            view.subject
+        );
+        assert_eq!(view.cursor, 0);
+        assert!(view.confirm.is_none());
+        // And `^A c` on the selection raises the menu for THAT row instead.
+        let selected = menu_facts_for(&rows[0], &[], &VecDeque::new());
+        assert_eq!(build_menu_view(&selected).target, "aaaa1111");
+    }
+
+    /// Enter activates, a letter jumps AND activates, a disabled entry is
+    /// inert, and Esc closes with no effect at all.
+    #[test]
+    fn the_menu_activates_on_enter_and_on_its_own_letters() {
+        let view = build_menu_view(&alive_facts());
+        // Enter on the first entry (`inspect`).
+        let (next, effect) = menu_overlay_reduce(view.clone(), press('\0'));
+        assert!(next.is_some(), "an unknown key leaves the menu open");
+        assert!(effect.is_none());
+
+        let (next, effect) =
+            menu_overlay_reduce(view.clone(), key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(next.is_none(), "activating closes the menu");
+        assert_eq!(
+            effect,
+            Some(MenuEffect {
+                target: "aaaa1111".to_string(),
+                action: ui::MenuAction::Inspect,
+            })
+        );
+
+        // `e` jumps to `evidence` and fires it in one keystroke.
+        let (next, effect) = menu_overlay_reduce(view.clone(), press('e'));
+        assert!(next.is_none());
+        assert_eq!(effect.map(|e| e.action), Some(ui::MenuAction::Evidence));
+
+        // `r` is `restore`, which is disabled for a live pane: the menu stays
+        // open on it and nothing happens.
+        let (next, effect) = menu_overlay_reduce(view.clone(), press('r'));
+        let next = next.expect("a disabled entry leaves the menu open");
+        assert_eq!(next.entries[next.cursor].action, ui::MenuAction::Restore);
+        assert!(effect.is_none());
+
+        // A letter no entry claims moves nothing.
+        let (next, effect) = menu_overlay_reduce(view.clone(), press('x'));
+        assert_eq!(next.expect("stays open").cursor, 0);
+        assert!(effect.is_none());
+
+        // Esc closes with no effect -- and the caller never touches focus.
+        let (next, effect) =
+            menu_overlay_reduce(view.clone(), key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(next.is_none());
+        assert!(effect.is_none());
+
+        // j/k walk the menu, clamped at both ends.
+        let (down, _) = menu_overlay_reduce(view.clone(), press('j'));
+        assert_eq!(down.expect("stays open").cursor, 1);
+        let (up, _) = menu_overlay_reduce(view, press('k'));
+        assert_eq!(up.expect("stays open").cursor, 0, "clamps at the top");
+    }
+
+    /// `stop` is the one destructive entry, so it confirms inline first --
+    /// and backing out of the confirmation kills nothing.
+    #[test]
+    fn stop_confirms_inline_before_anything_is_killed() {
+        let view = build_menu_view(&alive_facts());
+        let (armed, effect) = menu_overlay_reduce(view, press('s'));
+        let armed = armed.expect("the confirmation keeps the menu open");
+        assert!(effect.is_none(), "nothing is stopped by arming it");
+        let index = armed.confirm.expect("the confirmation is armed");
+        assert_eq!(armed.entries[index].action, ui::MenuAction::Stop);
+
+        // `n` backs out: still open, still nothing stopped.
+        let (backed_out, effect) = menu_overlay_reduce(armed.clone(), press('n'));
+        let backed_out = backed_out.expect("stays open");
+        assert!(backed_out.confirm.is_none());
+        assert!(effect.is_none());
+        // ... and so does Esc.
+        let (escaped, effect) =
+            menu_overlay_reduce(armed.clone(), key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(escaped.expect("stays open").confirm.is_none());
+        assert!(effect.is_none());
+
+        // `y` confirms.
+        let (next, effect) = menu_overlay_reduce(armed.clone(), press('y'));
+        assert!(next.is_none());
+        assert_eq!(effect.map(|e| e.action), Some(ui::MenuAction::Stop));
+        // A second Enter confirms too.
+        let (next, effect) = menu_overlay_reduce(armed, key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(next.is_none());
+        assert_eq!(effect.map(|e| e.action), Some(ui::MenuAction::Stop));
+    }
+
+    // -- issue #354 phase 3: restore -----------------------------------------
+
+    /// A retained row that kept its spawn request is restorable and its cwd
+    /// is known, so `restore`, `retry` (it failed) and `open worktree` are
+    /// all on; one that kept nothing says exactly why.
+    #[test]
+    fn a_retained_row_is_restorable_only_while_its_spawn_request_is_kept() {
+        let request = spawn_request("do the work", Path::new("D:/repo"));
+        let mut retained: VecDeque<EndedRow> = VecDeque::new();
+        push_retained_ended(
+            &mut retained,
+            EndedRow {
+                short: "bbb22222".into(),
+                role: "worker".into(),
+                model: None,
+                harness: "claude".into(),
+                group_id: None,
+                parent: None,
+                budget: style::PLACEHOLDER.into(),
+                writer: style::PLACEHOLDER.into(),
+                cwd: "D:/repo".into(),
+                request: Some(request.clone()),
+                requested_by: Some("aaa11111".into()),
+                meta: EndedMeta {
+                    exit_code: 1,
+                    exited_at: 600,
+                    age_secs: Some(300),
+                },
+            },
+            MAX_RETAINED_ENDED_ROWS,
+        );
+        let metas = build_pane_rows(&[], &retained);
+        let rows = assemble_sidebar(&metas, &[], &HashMap::new(), 0, 0, DASHBOARD_PID, 900);
+        assert_eq!(
+            row_cwd("bbb22222", &[], &retained).as_deref(),
+            Some("D:/repo")
+        );
+        assert_eq!(row_cwd("nobody", &[], &retained), None);
+
+        let facts = menu_facts_for(&rows[0], &[], &retained);
+        assert!(facts.ended && facts.retained && facts.has_request);
+        let entries = menu_entries(&facts);
+        assert!(entry(&entries, ui::MenuAction::Restore).enabled());
+        assert!(entry(&entries, ui::MenuAction::Retry).enabled());
+        assert!(entry(&entries, ui::MenuAction::Dismiss).enabled());
+        assert!(entry(&entries, ui::MenuAction::OpenWorktree).enabled());
+
+        // Drop the kept request and the two relaunch entries say so, while
+        // the row itself is still there to be inspected and dismissed.
+        retained[0].request = None;
+        let facts = menu_facts_for(&rows[0], &[], &retained);
+        let entries = menu_entries(&facts);
+        assert_eq!(
+            entry(&entries, ui::MenuAction::Restore).disabled.as_deref(),
+            Some(MENU_NO_REQUEST)
+        );
+        assert_eq!(
+            entry(&entries, ui::MenuAction::Retry).disabled.as_deref(),
+            Some(MENU_NO_REQUEST)
+        );
+        assert!(entry(&entries, ui::MenuAction::Dismiss).enabled());
+    }
+
+    /// `^A r` on a row that cannot be restored says so and changes nothing --
+    /// no pane is spawned, and the row stays on the roster to be inspected.
+    /// (The hint is not even drawn for such a row; see
+    /// `header_hints_follow_the_selected_rows_state`.)
+    #[test]
+    fn restoring_a_row_with_no_kept_request_is_a_notice_and_no_spawn() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = std::env::current_dir().expect("cwd");
+        let cfg = CtxConfig::default();
+        let mut retained: VecDeque<EndedRow> = VecDeque::new();
+        push_retained_ended(
+            &mut retained,
+            EndedRow {
+                short: "bbb22222".into(),
+                role: "worker".into(),
+                model: None,
+                harness: "claude".into(),
+                group_id: None,
+                parent: None,
+                budget: style::PLACEHOLDER.into(),
+                writer: style::PLACEHOLDER.into(),
+                cwd: "D:/repo".into(),
+                request: None,
+                requested_by: None,
+                meta: EndedMeta {
+                    exit_code: 0,
+                    exited_at: 600,
+                    age_secs: None,
+                },
+            },
+            MAX_RETAINED_ENDED_ROWS,
+        );
+        let mut panes: Vec<Pane> = Vec::new();
+        let mut queues: Vec<VecDeque<String>> = Vec::new();
+        let mut kept: HashMap<String, (spawnreq::SpawnRequest, Option<String>)> = HashMap::new();
+        let mut errors = ErrorLog::default();
+        let mut notices = Vec::new();
+        let now = Instant::now();
+        for short in ["bbb22222", "not-a-row"] {
+            restore_ended_row(
+                short,
+                &mut panes,
+                &mut queues,
+                &mut retained,
+                &mut kept,
+                &cfg,
+                &state,
+                &repo,
+                (80, 24),
+                &tmp.path().join("requests"),
+                &mut errors,
+                &mut notices,
+                now,
+            );
+        }
+        assert!(panes.is_empty(), "nothing may be spawned");
+        assert_eq!(retained.len(), 1, "the row stays on the roster");
+        assert!(errors.is_empty(), "this is a notice, not an error");
+        assert!(
+            notices.iter().any(|n| n.text.contains(MENU_NO_REQUEST)),
+            "{:?}",
+            notices.iter().map(|n| n.text.clone()).collect::<Vec<_>>()
+        );
+        assert!(
+            notices
+                .iter()
+                .any(|n| n.text.contains("no ended row named")),
+            "{:?}",
+            notices.iter().map(|n| n.text.clone()).collect::<Vec<_>>()
+        );
+    }
+
+    // -- issue #354 phase 3: the inspector ---------------------------------
+
+    fn inspected_row() -> ui::SidebarRow {
+        let panes = vec![pane_row("aaaa1111", "claude")];
+        let mut rows = assemble_sidebar(&panes, &[], &HashMap::new(), 0, 0, DASHBOARD_PID, 900);
+        let mut status = super::super::attention::SessionStatus {
+            lifecycle: super::super::attention::Lifecycle::Waiting,
+            attention: super::super::attention::Attention::Approval,
+            evidence: "workflow gate is waiting on approval".to_string(),
+            confidence: 90,
+            revision: 7,
+            last_transition: 800,
+            ..Default::default()
+        };
+        status.skipped = vec![
+            super::super::attention::Skipped {
+                authority: super::super::attention::Authority::QuietHeuristic,
+                reason: "lifecycle: outranked by Harness (stop hook)".to_string(),
+            },
+            super::super::attention::Skipped {
+                authority: super::super::attention::Authority::Supervisor,
+                reason: "attention: outranked by Harness (stop hook)".to_string(),
+            },
+        ];
+        rows[0].status = Some(status);
+        rows.remove(0)
+    }
+
+    /// Renders one overlay into a `width x height` frame and returns what
+    /// landed on the cells -- the same technique `ui`'s own render tests use,
+    /// reached from here so the dashboard inspector can be checked end to end.
+    fn render_overlay_text(width: u16, height: u16, overlay: &ui::Overlay) -> String {
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut term = Terminal::new(backend).expect("terminal");
+        term.draw(|f| ui::render_overlay(f, f.area(), overlay, 0))
+            .expect("draw");
+        let buf = term.backend().buffer().clone();
+        (0..height)
+            .map(|y| (0..width).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Issue #354 phase 5: the DASHBOARD-level inspector -- every section the
+    /// approved design names, filled from cached facts only.
+    #[test]
+    fn the_dashboard_inspector_reports_every_section_from_cached_facts() {
+        let panes = vec![pane_row("aaaa1111", "claude")];
+        let rows = assemble_sidebar(&panes, &[], &HashMap::new(), 0, 0, DASHBOARD_PID, 0);
+        let usage = vec![ui::HarnessUsage {
+            name: "claude",
+            five_hour: Some(61.0),
+            seven_day: Some(18.0),
+            credits: false,
+        }];
+        let pool = vec![ui::HarnessStrip {
+            name: "claude".to_string(),
+            state: "ready".to_string(),
+            headroom_pct: Some(64.0),
+        }];
+        let workflow = workflow::ActiveWorkflowSummary {
+            kind: "feature",
+            step: "design".to_string(),
+            awaiting_approval: true,
+        };
+        let facts = DashboardFacts {
+            harness: "claude \u{b7} fable",
+            short: "a0000001",
+            seat: Some("gen 3"),
+            state_dir: "D:/state".to_string(),
+            uptime_secs: 840,
+            mouse: true,
+            sidebar_cols: 44,
+            facts_age_secs: 1,
+            rows: &rows,
+            spend: Some(AggregateSpendFacts {
+                failed: 2,
+                cost_micros: 420_000,
+            }),
+            usage: &usage,
+            pool: &pool,
+            mail: Some((1, 0)),
+            workflow: Some(&workflow),
+            supervised: (1, 1),
+        };
+        let view = build_dashboard_inspector(&facts);
+        assert_eq!(view.target, DASHBOARD_TARGET);
+        assert_eq!(view.subject, "dashboard \u{b7} a0000001");
+        let names: Vec<&str> = view.sections.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                INSPECT_DASH_HARNESS,
+                INSPECT_DASH_SESSIONS,
+                INSPECT_DASH_SPEND,
+                INSPECT_DASH_USAGE,
+                INSPECT_DASH_REPO,
+                INSPECT_DASH_DASHBOARD,
+            ]
+        );
+        let all = view.rows().join("\n");
+        assert!(all.contains("gen 3"), "{all}");
+        assert!(all.contains("14m"), "uptime reads as an age: {all}");
+        // Live/ended plus one line per glyph, every one of the six.
+        for glyph in ui::ALL_GLYPHS {
+            assert!(
+                all.contains(glyph.name()),
+                "missing {}: {all}",
+                glyph.name()
+            );
+        }
+        assert!(all.contains("headroom 64%"), "{all}");
+        assert!(all.contains("$0.42"), "{all}");
+        assert!(all.contains("5h 61%"), "{all}");
+        assert!(all.contains("1 broadcast"), "{all}");
+        assert!(all.contains("awaits approval"), "{all}");
+        assert!(all.contains("1 of 1 panes"), "{all}");
+        assert!(all.contains("D:/state"), "{all}");
+        assert!(all.contains("44 cols"), "{all}");
+    }
+
+    /// Nothing read yet: every unknown cell is the shared placeholder, never
+    /// a fabricated zero, and the dialog still draws at all three approved
+    /// frame sizes.
+    #[test]
+    fn the_dashboard_inspector_is_all_placeholders_and_renders_at_every_frame_size() {
+        let facts = DashboardFacts {
+            harness: "claude",
+            short: "a0000001",
+            seat: None,
+            state_dir: "D:/state".to_string(),
+            uptime_secs: 0,
+            mouse: false,
+            sidebar_cols: 44,
+            facts_age_secs: 0,
+            rows: &[],
+            spend: None,
+            usage: &[],
+            pool: &[],
+            mail: None,
+            workflow: None,
+            supervised: (0, 0),
+        };
+        let view = build_dashboard_inspector(&facts);
+        let all = view.rows().join("\n");
+        assert!(all.contains(style::PLACEHOLDER), "{all}");
+        assert!(all.contains("select mode"), "mouse off says so: {all}");
+        // The usage section has no harnesses at all, so it draws the shared
+        // empty-section placeholder rather than vanishing.
+        assert!(
+            view.sections
+                .iter()
+                .any(|s| s.name == INSPECT_DASH_USAGE && s.lines.is_empty())
+        );
+        let overlay = ui::Overlay::Inspector(view);
+        for (w, h) in [(80u16, 20u16), (120, 40), (200, 50)] {
+            let text = render_overlay_text(w, h, &overlay);
+            assert!(
+                text.contains("dashboard") || text.contains("dashboard"),
+                "{w}x{h}: {text}"
+            );
+            assert!(text.contains("harness"), "{w}x{h}: {text}");
+        }
+    }
+
+    /// Both entry points the approved design names: `^A i` while the summary
+    /// line holds the cursor, and the summary line's own action menu.
+    #[test]
+    fn the_summary_line_opens_the_dashboard_inspector_by_key_and_by_menu() {
+        // The key: `^A i` is the same chord, and the availability table says
+        // it applies with the summary selected.
+        let ctx = selected_action_context(&[], 0, &[], &VecDeque::new(), true);
+        assert!(ctx.summary);
+        assert!(
+            actions::descriptor(actions::ActionId::Inspect)
+                .map(|d| (d.availability)(&ctx))
+                .is_some_and(|a| a.is_enabled())
+        );
+        assert_eq!(
+            actions::descriptor(actions::ActionId::Nudge)
+                .map(|d| (d.availability)(&ctx))
+                .and_then(|a| a.reason()),
+            Some(actions::MENU_SUMMARY_LINE),
+            "a per-session action stays listed, with its reason"
+        );
+        // The menu: every entry is present, `inspect` is the only live one,
+        // and activating it names the dashboard rather than a row.
+        let menu = build_summary_menu_view();
+        assert_eq!(menu.target, DASHBOARD_TARGET);
+        assert_eq!(menu.subject, "the dashboard");
+        assert_eq!(menu.entries.len(), 11);
+        let live: Vec<ui::MenuAction> = menu
+            .entries
+            .iter()
+            .filter(|e| e.enabled())
+            .map(|e| e.action)
+            .collect();
+        // `mail` is dashboard-wide, so it stays live here; every entry that
+        // needs a session is inert with its reason.
+        assert_eq!(live, vec![ui::MenuAction::Inspect, ui::MenuAction::Mail]);
+        let (next, effect) = menu_overlay_reduce(menu, key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(next.is_none());
+        assert_eq!(
+            effect,
+            Some(MenuEffect {
+                target: DASHBOARD_TARGET.to_string(),
+                action: ui::MenuAction::Inspect,
+            })
+        );
+    }
+
+    /// Every section is present, missing facts read as the shared placeholder
+    /// rather than a fabricated value, and the evidence section lists both
+    /// the winning evidence and every skipped authority's reason.
+    #[test]
+    fn the_inspector_reports_every_section_with_evidence_and_skipped_reasons() {
+        let row = inspected_row();
+        let mut kept = ErrorLog::default();
+        push_error(&mut kept, "aaaa1111 write_input: EPIPE".to_string());
+        let view = build_inspector_view(&row, Some("D:/repo"), &kept);
+        let names: Vec<&str> = view.sections.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                INSPECT_IDENTITY,
+                INSPECT_STATUS,
+                INSPECT_EVIDENCE,
+                INSPECT_BUDGET,
+                INSPECT_WRITER,
+                INSPECT_SIGNAL,
+                INSPECT_ERRORS,
+            ]
+        );
+        let section = |name: &str| {
+            view.sections
+                .iter()
+                .find(|s| s.name == name)
+                .expect("section")
+                .lines
+                .join("\n")
+        };
+        assert!(section(INSPECT_IDENTITY).contains("aaaa1111"));
+        assert!(section(INSPECT_IDENTITY).contains("claude"));
+        assert!(section(INSPECT_IDENTITY).contains("D:/repo"));
+        // `model` was never pinned and `branch` is never resolved on the
+        // render path: both read as the placeholder, not as a guess.
+        assert!(
+            section(INSPECT_IDENTITY).contains(style::PLACEHOLDER),
+            "a missing fact must read as the placeholder"
+        );
+        assert!(section(INSPECT_STATUS).contains("waiting"));
+        assert!(section(INSPECT_STATUS).contains('7'), "revision");
+        let evidence = section(INSPECT_EVIDENCE);
+        assert!(evidence.contains("workflow gate is waiting on approval"));
+        assert!(evidence.contains("quiet heuristic"), "got {evidence}");
+        assert!(evidence.contains("outranked by Harness"), "got {evidence}");
+        assert!(section(INSPECT_ERRORS).contains("EPIPE"));
+
+        // Opening it "at evidence" is a caret position in the same flattened
+        // row list the dialog draws -- never a second layout.
+        let rows = view.rows();
+        let start = view.section_start(INSPECT_EVIDENCE);
+        assert_eq!(rows[start], format!("{INSPECT_EVIDENCE}:"));
+        assert!(rows[start + 1].contains("workflow gate"));
+        assert_eq!(view.section_start("nothing-like-this"), 0);
+    }
+
+    /// A row with no cached status at all still inspects: every section is
+    /// there, filled with the placeholder rather than missing.
+    #[test]
+    fn the_inspector_on_a_row_with_no_facts_yet_is_all_placeholders() {
+        let panes = vec![pane_row("aaaa1111", "claude")];
+        let rows = assemble_sidebar(&panes, &[], &HashMap::new(), 0, 0, DASHBOARD_PID, 0);
+        let view = build_inspector_view(&rows[0], None, &ErrorLog::default());
+        assert_eq!(view.sections.len(), 7);
+        let evidence = view
+            .sections
+            .iter()
+            .find(|s| s.name == INSPECT_EVIDENCE)
+            .expect("evidence section is never dropped");
+        assert!(evidence.lines.is_empty());
+        // An empty section still draws one placeholder row, so the dialog
+        // never silently loses a heading.
+        let drawn = view.rows();
+        let start = view.section_start(INSPECT_EVIDENCE);
+        assert_eq!(drawn[start], format!("{INSPECT_EVIDENCE}:"));
+        assert_eq!(drawn[start + 1], format!("  {}", style::PLACEHOLDER));
+        // Read-only: Esc closes, j/k scroll, nothing else does anything.
+        let (moved, _) = (
+            inspector_overlay_reduce(view.clone(), press('j')).expect("stays open"),
+            (),
+        );
+        assert_eq!(moved.cursor, 1);
+        assert!(inspector_overlay_reduce(view, key(KeyCode::Esc, KeyModifiers::NONE)).is_none());
     }
 
     #[test]
@@ -15691,7 +20342,7 @@ mod tests {
         .expect("store");
 
         let mut injector = SucceedingInjector { calls: Vec::new() };
-        let mut errors = Vec::new();
+        let mut errors = ErrorLog::default();
         assert!(sweep_one_pane(
             &mut injector,
             &state,
@@ -15749,7 +20400,7 @@ mod tests {
         .expect("store");
 
         let mut injector = SucceedingInjector { calls: Vec::new() };
-        let mut errors = Vec::new();
+        let mut errors = ErrorLog::default();
         assert!(sweep_one_pane(
             &mut injector,
             &state,
@@ -15885,7 +20536,7 @@ mod tests {
         // `shutdown` ask-then-wait always burns the full grace for nothing.
         let _ = reaped.finish_shutdown();
         let mut queues: Vec<VecDeque<String>> = vec![VecDeque::new()];
-        let mut errors = Vec::new();
+        let mut errors = ErrorLog::default();
         let env = |_: &str| None;
 
         submit_nudge(
@@ -15933,7 +20584,7 @@ mod tests {
         // B has reported no turn boundary, so a nudge for it queues rather
         // than injecting -- which is exactly the observable this needs.
         let mut queues: Vec<VecDeque<String>> = vec![VecDeque::new()];
-        let mut errors = Vec::new();
+        let mut errors = ErrorLog::default();
         let env = |_: &str| None;
 
         submit_nudge(
@@ -16021,7 +20672,7 @@ mod tests {
         );
 
         let mut queues: Vec<VecDeque<String>> = vec![VecDeque::new()];
-        let mut errors = Vec::new();
+        let mut errors = ErrorLog::default();
         let env = |_: &str| None;
 
         submit_nudge(
@@ -16101,7 +20752,7 @@ mod tests {
             )
             .expect("spawn"),
         ];
-        let mut errors = Vec::new();
+        let mut errors = ErrorLog::default();
 
         panes[0]
             .inject_visible("nudge from operator", "hello")
@@ -16256,7 +20907,7 @@ mod tests {
         assert!(!pane.report_reminder_sent(), "not yet reminded");
 
         let mut panes = vec![pane];
-        let mut errors = Vec::new();
+        let mut errors = ErrorLog::default();
         report_back_reminder_sweep(&mut panes, &state, &mut errors);
 
         assert!(errors.is_empty(), "the injection must succeed: {errors:?}");
@@ -16286,7 +20937,7 @@ mod tests {
         );
 
         let mut panes = vec![pane];
-        let mut errors = Vec::new();
+        let mut errors = ErrorLog::default();
         report_back_reminder_sweep(&mut panes, &state, &mut errors);
 
         assert!(errors.is_empty(), "got {errors:?}");
@@ -16316,7 +20967,7 @@ mod tests {
         pane.set_report_to(Some("aaaa1111".to_string()));
 
         let mut panes = vec![pane];
-        let mut errors = Vec::new();
+        let mut errors = ErrorLog::default();
         report_back_reminder_sweep(&mut panes, &state, &mut errors);
         assert!(
             panes[0].report_reminder_sent(),
@@ -16567,7 +21218,7 @@ mod tests {
 
         let cfg = CtxConfig::default();
         let (mut focused, mut selected) = (0usize, 0usize);
-        let mut errors = Vec::new();
+        let mut errors = ErrorLog::default();
         let mut reaped_codes: Vec<i32> = Vec::new();
         let mut reaped_recent: HashSet<String> = HashSet::new();
         let deadline = Instant::now() + Duration::from_secs(30);
@@ -16587,6 +21238,8 @@ mod tests {
                 &mut reaped_codes,
                 &mut reaped_recent,
                 &mut None,
+                &mut VecDeque::new(),
+                &mut HashMap::new(),
             );
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -16696,7 +21349,7 @@ mod tests {
 
         let mut panes = vec![pane];
         let mut queues = vec![VecDeque::new()];
-        let mut errors = Vec::new();
+        let mut errors = ErrorLog::default();
         let mut focused = 0;
         let mut selected = 0;
         let deadline = Instant::now() + Duration::from_secs(30);
@@ -16716,6 +21369,8 @@ mod tests {
                 &mut Vec::new(),
                 &mut HashSet::new(),
                 &mut None,
+                &mut VecDeque::new(),
+                &mut HashMap::new(),
             );
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -16805,7 +21460,7 @@ mod tests {
 
         let mut panes = vec![pane];
         let mut queues = vec![VecDeque::new()];
-        let mut errors = Vec::new();
+        let mut errors = ErrorLog::default();
         let mut focused = 0;
         let mut selected = 0;
         let deadline = Instant::now() + Duration::from_secs(30);
@@ -16825,6 +21480,8 @@ mod tests {
                 &mut Vec::new(),
                 &mut HashSet::new(),
                 &mut None,
+                &mut VecDeque::new(),
+                &mut HashMap::new(),
             );
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -16888,7 +21545,7 @@ mod tests {
         .expect("write transcript");
 
         let mut panes = vec![pane];
-        let mut errors = Vec::new();
+        let mut errors = ErrorLog::default();
         enforce_pane_token_budgets(&mut panes, &cfg, &repo, &mut errors);
         assert!(
             !matches!(panes[0].state(), PaneState::Ended(_)),
@@ -17055,7 +21712,7 @@ mod tests {
         )
         .expect("store");
         let mut queues: Vec<VecDeque<String>> = vec![VecDeque::from(vec!["ping".to_string()])];
-        let mut errors = Vec::new();
+        let mut errors = ErrorLog::default();
         let mut advised = HashMap::new();
 
         mail_sweep(&mut panes, &cfg, &state, &repo, &mut advised, &mut errors);
@@ -17162,7 +21819,7 @@ mod tests {
         .expect("store");
 
         let mut queues: Vec<VecDeque<String>> = vec![VecDeque::from(vec!["ping".to_string()])];
-        let mut errors = Vec::new();
+        let mut errors = ErrorLog::default();
         let mut advised = HashMap::new();
 
         mail_sweep(&mut panes, &cfg, &state, &repo, &mut advised, &mut errors);
@@ -17312,7 +21969,7 @@ mod tests {
         .expect("store");
 
         let mut advised = HashMap::new();
-        let mut errors = Vec::new();
+        let mut errors = ErrorLog::default();
         mail_sweep(&mut panes, &cfg, &state, &repo, &mut advised, &mut errors);
 
         assert!(
@@ -17431,7 +22088,7 @@ mod tests {
 
         let mut panes: Vec<Pane> = Vec::new();
         let mut queues: Vec<VecDeque<String>> = Vec::new();
-        let mut errors = Vec::new();
+        let mut errors = ErrorLog::default();
         handle_spawn_requests(
             &dir,
             &mut panes,
@@ -17441,6 +22098,7 @@ mod tests {
             &repo,
             (80, 24),
             &mut errors,
+            &mut HashMap::new(),
         );
 
         assert!(
@@ -17538,7 +22196,8 @@ mod tests {
 
         let mut panes: Vec<Pane> = Vec::new();
         let mut queues: Vec<VecDeque<String>> = Vec::new();
-        let mut errors = Vec::new();
+        let mut errors = ErrorLog::default();
+        let mut kept: HashMap<String, (spawnreq::SpawnRequest, Option<String>)> = HashMap::new();
         handle_spawn_requests(
             &dir,
             &mut panes,
@@ -17548,12 +22207,21 @@ mod tests {
             &repo,
             (80, 24),
             &mut errors,
+            &mut kept,
         );
         assert_eq!(
             panes.len(),
             1,
             "the forged request still spawns a pane -- forging is about the pin, not the spawn \
              itself: {errors:?}"
+        );
+        // Issue #354 phase 3: the request that produced the pane is kept
+        // verbatim, keyed by the short id the spawn actually minted -- which
+        // is what `restore`/`retry` later replay.
+        assert_eq!(
+            kept.get(panes[0].short()).map(|(request, _)| request),
+            Some(&req),
+            "the fulfilled request is kept unchanged for a later restore"
         );
 
         for pane in &mut panes {
@@ -17598,7 +22266,7 @@ mod tests {
         let req = spawn_request("do the work", &repo);
         let mut panes: Vec<Pane> = Vec::new();
         let mut queues: Vec<VecDeque<String>> = Vec::new();
-        let mut errors = Vec::new();
+        let mut errors = ErrorLog::default();
         let requests_dir = tmp.path().join("requests");
         let first = fulfill_spawn_request(
             &req,
@@ -17713,7 +22381,7 @@ mod tests {
         let mut sub_req = spawn_request("own this scope", &repo);
         sub_req.parent_session = Some(orch_short.clone());
         sub_req.role = Some("sub-orchestrator".to_string());
-        let mut errors = Vec::new();
+        let mut errors = ErrorLog::default();
         let requests_dir = tmp.path().join("requests");
         let sub = fulfill_spawn_request(
             &sub_req,
@@ -17769,7 +22437,7 @@ mod tests {
         repo: &Path,
         requests_dir: &Path,
     ) -> (Vec<Pane>, Vec<VecDeque<String>>, PathBuf, PathBuf) {
-        let mut errors = Vec::new();
+        let mut errors = ErrorLog::default();
         let mut panes = Vec::new();
         let mut channels = Vec::new();
         for (session_id, role, verb, title) in [
@@ -17863,7 +22531,7 @@ mod tests {
         let path = spawnreq::write_request(&worker_channel, &req).expect("write");
         let stem = spawnreq::request_stem(&path).expect("stem");
 
-        let mut errors = Vec::new();
+        let mut errors = ErrorLog::default();
         handle_spawn_requests(
             &requests_dir,
             &mut panes,
@@ -17873,6 +22541,7 @@ mod tests {
             &repo,
             (80, 24),
             &mut errors,
+            &mut HashMap::new(),
         );
 
         assert_eq!(panes.len(), 2, "no pane was spawned for the forgery");
@@ -17959,7 +22628,7 @@ mod tests {
         req.work_group_id = Some(group_id.clone());
         spawnreq::write_request(&orch_channel, &req).expect("write");
 
-        let mut errors = Vec::new();
+        let mut errors = ErrorLog::default();
         handle_spawn_requests(
             &requests_dir,
             &mut panes,
@@ -17969,6 +22638,7 @@ mod tests {
             &repo,
             (80, 24),
             &mut errors,
+            &mut HashMap::new(),
         );
         assert_eq!(panes.len(), 3, "the coordinator pane spawned: {errors:?}");
         let coordinator_short = panes[2].short().to_string();
@@ -18018,6 +22688,8 @@ mod tests {
                 &mut Vec::new(),
                 &mut HashSet::new(),
                 &mut None,
+                &mut VecDeque::new(),
+                &mut HashMap::new(),
             );
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -18092,7 +22764,7 @@ mod tests {
         let orch_path = spawnreq::write_request(&orch_channel, &orch_req).expect("write");
         let orch_stem = spawnreq::request_stem(&orch_path).expect("stem");
 
-        let mut errors = Vec::new();
+        let mut errors = ErrorLog::default();
         handle_spawn_requests(
             &requests_dir,
             &mut panes,
@@ -18102,6 +22774,7 @@ mod tests {
             &repo,
             (80, 24),
             &mut errors,
+            &mut HashMap::new(),
         );
 
         let worker_ack =
@@ -18325,7 +22998,7 @@ mod tests {
         candidate.interactive = true;
         candidate.work_group_id = Some("wg-42".to_string());
         let cfg = CtxConfig::default();
-        let mut errors = Vec::new();
+        let mut errors = ErrorLog::default();
 
         let (turn_env, pane_channel) =
             restored_pane_turn_env(&cfg, &state, &repo, &candidate, &requests_dir, &mut errors);
@@ -18372,7 +23045,7 @@ mod tests {
         let mut candidate = restore_pane("cccc3333", "33333333-2222-4333-8444-555555555555");
         candidate.parent_session = Some("orch0001".to_string());
         let cfg = CtxConfig::default();
-        let mut errors = Vec::new();
+        let mut errors = ErrorLog::default();
 
         let (turn_env, _pane_channel) =
             restored_pane_turn_env(&cfg, &state, &repo, &candidate, &requests_dir, &mut errors);
@@ -18404,7 +23077,7 @@ mod tests {
         let candidate = restore_pane("dddd4444", "44444444-2222-4333-8444-555555555555");
         assert_eq!(candidate.parent_session, None, "sanity: no recorded parent");
         let cfg = CtxConfig::default();
-        let mut errors = Vec::new();
+        let mut errors = ErrorLog::default();
 
         let (turn_env, _pane_channel) =
             restored_pane_turn_env(&cfg, &state, &repo, &candidate, &requests_dir, &mut errors);
@@ -18443,7 +23116,7 @@ mod tests {
             "sanity: the fixture is non-interactive"
         );
         let cfg = CtxConfig::default();
-        let mut errors = Vec::new();
+        let mut errors = ErrorLog::default();
 
         let (turn_env, pane_channel) =
             restored_pane_turn_env(&cfg, &state, &repo, &candidate, &requests_dir, &mut errors);
@@ -18493,7 +23166,7 @@ mod tests {
 
         let mut panes = Vec::new();
         let mut nudge_queues = Vec::new();
-        let mut errors = Vec::new();
+        let mut errors = ErrorLog::default();
         let mut deferred_restore = Vec::new();
 
         spawn_restored_pane(
@@ -18565,7 +23238,7 @@ mod tests {
 
         let mut panes = Vec::new();
         let mut nudge_queues = Vec::new();
-        let mut errors = Vec::new();
+        let mut errors = ErrorLog::default();
         let mut deferred_restore = Vec::new();
 
         spawn_restored_pane(
@@ -18667,7 +23340,7 @@ mod tests {
         };
         let mut restored = Vec::new();
         let mut nudge_queues = Vec::new();
-        let mut errors = Vec::new();
+        let mut errors = ErrorLog::default();
         let mut deferred_restore = Vec::new();
         spawn_restored_pane(
             &written.panes[0],
@@ -18752,7 +23425,7 @@ mod tests {
         };
         let mut restored = Vec::new();
         let mut nudge_queues = Vec::new();
-        let mut errors = Vec::new();
+        let mut errors = ErrorLog::default();
         let mut deferred_restore = Vec::new();
         spawn_restored_pane(
             &written.panes[0],
@@ -19088,7 +23761,7 @@ mod tests {
         let mut term_cols = 80u16;
         let mut term_rows = 24u16;
         let mut full = Rect::new(0, 0, 80, 24);
-        let mut errors = Vec::new();
+        let mut errors = ErrorLog::default();
         // sidebar 20, not zoomed: main width = 100 - 20 - 1 = 79, height =
         // 40 - 4 (issue #209/v3 §A4/§D: one header row, one top rule, one
         // bottom rule, one footer row -- `ui::chrome_rows`).
@@ -19268,5 +23941,1077 @@ mod tests {
         let pid = child.id();
         let _ = child.wait();
         pid
+    }
+
+    #[test]
+    fn chrome_mouse_dispatch_never_reaches_child_forward_or_scroll() {
+        let snap = hit::FrameSnapshot {
+            frame: Rect::new(0, 0, 120, 40),
+            sidebar: Rect::new(0, 2, 44, 36),
+            grid: Rect::new(45, 2, 75, 36),
+            divider: Rect::new(44, 2, 1, 36),
+            rows: vec![
+                (Rect::new(0, 2, 44, 1), Hit::SidebarSummary),
+                (Rect::new(0, 3, 44, 9), Hit::SidebarRow("worker".into())),
+            ],
+            ..Default::default()
+        };
+        let mut child_calls = Vec::new();
+        for wants_mouse in [false, true] {
+            for (x, y) in [(0, 0), (5, 2), (5, 3), (5, 11), (44, 20), (60, 39)] {
+                for kind in [
+                    MouseEventKind::ScrollUp,
+                    MouseEventKind::ScrollDown,
+                    MouseEventKind::Down(MouseButton::Left),
+                    MouseEventKind::Up(MouseButton::Right),
+                ] {
+                    let mouse = event::MouseEvent {
+                        kind,
+                        column: x,
+                        row: y,
+                        modifiers: KeyModifiers::NONE,
+                    };
+                    if route_mouse(&snap, mouse, true, false, false) == MouseRoute::Grid {
+                        child_calls.push((wants_mouse, kind));
+                    }
+                }
+            }
+        }
+        assert!(
+            child_calls.is_empty(),
+            "chrome dispatched to child: {child_calls:?}"
+        );
+        let click = event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 5,
+            row: 10,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(
+            route_mouse(&snap, click, true, false, false),
+            MouseRoute::Select("worker".into())
+        );
+        assert_eq!(
+            route_mouse(
+                &snap,
+                event::MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Right),
+                    ..click
+                },
+                true,
+                false,
+                false
+            ),
+            MouseRoute::Action(DashAction::ContextMenu("worker".into()))
+        );
+        assert_eq!(
+            route_mouse(
+                &snap,
+                event::MouseEvent {
+                    kind: MouseEventKind::ScrollDown,
+                    ..click
+                },
+                true,
+                false,
+                false
+            ),
+            MouseRoute::ScrollRoster(1)
+        );
+    }
+
+    // -- issue #354 phase 3: overlay pointer dispatch -----------------------
+
+    /// A frame with a scrolled list dialog over it: three visible rows
+    /// (entries 30-32), a pinned hint row with `⏎`/`esc`, and a roster
+    /// underneath that must stay unreachable.
+    fn dialog_frame() -> hit::FrameSnapshot {
+        hit::FrameSnapshot {
+            frame: Rect::new(0, 0, 120, 40),
+            sidebar: Rect::new(0, 2, 44, 36),
+            grid: Rect::new(45, 2, 75, 36),
+            divider: Rect::new(44, 2, 1, 36),
+            rows: vec![
+                (Rect::new(0, 2, 44, 1), Hit::SidebarSummary),
+                (Rect::new(0, 3, 44, 9), Hit::SidebarRow("worker".into())),
+            ],
+            header_hints: vec![(Rect::new(100, 0, 20, 1), HintId::Actions)],
+            overlay: Some(Rect::new(50, 10, 60, 20)),
+            overlay_rows: vec![
+                (Rect::new(52, 11, 56, 1), 30),
+                (Rect::new(52, 12, 56, 1), 31),
+                (Rect::new(52, 13, 56, 1), 32),
+            ],
+            overlay_hints: vec![
+                (Rect::new(52, 28, 6, 1), HintId::DialogKey(KeyCode::Enter)),
+                (Rect::new(61, 28, 8, 1), HintId::DialogKey(KeyCode::Esc)),
+            ],
+            overlay_capacity: 3,
+            ..Default::default()
+        }
+    }
+
+    fn at(kind: MouseEventKind, column: u16, row: u16) -> event::MouseEvent {
+        event::MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    /// A click on one of the dialog's visible rows names that row's index
+    /// into the FULL list (so a scrolled dialog addresses the right entry),
+    /// a click on a hint is fed back as exactly that key, the wheel inside
+    /// scrolls the list, and the backdrop is consumed without closing
+    /// anything. Nothing underneath is reachable at any point.
+    #[test]
+    fn an_open_dialog_owns_the_pointer_and_addresses_its_own_rows_and_hints() {
+        let snap = dialog_frame();
+        assert_eq!(
+            route_mouse(
+                &snap,
+                at(MouseEventKind::Down(MouseButton::Left), 60, 12),
+                true,
+                true,
+                false
+            ),
+            MouseRoute::OverlayRow(31)
+        );
+        assert_eq!(
+            route_mouse(
+                &snap,
+                at(MouseEventKind::Down(MouseButton::Left), 53, 28),
+                true,
+                true,
+                false
+            ),
+            MouseRoute::OverlayKey(KeyCode::Enter)
+        );
+        assert_eq!(
+            route_mouse(
+                &snap,
+                at(MouseEventKind::Down(MouseButton::Left), 63, 28),
+                true,
+                true,
+                false
+            ),
+            MouseRoute::OverlayKey(KeyCode::Esc)
+        );
+        assert_eq!(
+            route_mouse(
+                &snap,
+                at(MouseEventKind::ScrollDown, 60, 15),
+                true,
+                true,
+                false
+            ),
+            MouseRoute::ScrollOverlay(1)
+        );
+        assert_eq!(
+            route_mouse(
+                &snap,
+                at(MouseEventKind::ScrollUp, 60, 15),
+                true,
+                true,
+                false
+            ),
+            MouseRoute::ScrollOverlay(-1)
+        );
+        // The backdrop -- over the sidebar, over the grid, over the header's
+        // own `actions` hint -- is consumed, never a click on what is under
+        // it and never a dismissal of the dialog.
+        for (x, y) in [(5u16, 3u16), (80, 35), (105, 0), (44, 20)] {
+            for kind in [
+                MouseEventKind::Down(MouseButton::Left),
+                MouseEventKind::Down(MouseButton::Right),
+                MouseEventKind::ScrollUp,
+                MouseEventKind::ScrollDown,
+                MouseEventKind::Up(MouseButton::Left),
+            ] {
+                assert_eq!(
+                    route_mouse(&snap, at(kind, x, y), true, true, false),
+                    MouseRoute::Consume,
+                    "({x}, {y}) {kind:?} escaped the modal"
+                );
+            }
+        }
+        // And a drag that belongs to an in-progress selection does not get to
+        // fall through to the grid while a dialog is up either.
+        assert_eq!(
+            route_mouse(
+                &snap,
+                at(MouseEventKind::Drag(MouseButton::Left), 80, 30),
+                true,
+                true,
+                true
+            ),
+            MouseRoute::Consume
+        );
+    }
+
+    /// Review of #354 (defect 1, HIGH): several queued events are drained
+    /// against ONE `frame_snapshot` (`HIGH-2`, above the drain loop). If an
+    /// earlier event in that drain closes the overlay the snapshot was drawn
+    /// with -- an `Esc` that closes the palette -- a later queued click that
+    /// still lands on the snapshot's own pinned hint (here, the dialog's
+    /// `Enter` hint, standing in for a palette's "run" hint) must be
+    /// consumed, never synthesized into the key it names: with the overlay
+    /// closed, that key would otherwise reach the child pane.
+    ///
+    /// `route_mouse` alone cannot see this -- it only knows the frozen
+    /// geometry -- so `overlay_route_is_current` is the guard that actually
+    /// stops it, by comparing the LIVE overlay's identity against the one the
+    /// snapshot was drawn from.
+    #[test]
+    fn a_queued_click_on_a_closed_overlays_hint_is_consumed_not_synthesized() {
+        let snap = dialog_frame();
+        // The frame was drawn with a palette (mode `Run`) open -- this is
+        // `frame_snapshot_overlay_ident` at the top of the drain.
+        let snapshot_ident =
+            overlay_identity(&ui::Overlay::Palette(open_palette(ui::PaletteMode::Run)));
+        // First event in the drain: `Esc` closed the palette. The LIVE
+        // overlay, from this point on, is `None`.
+        let live_overlay = ui::Overlay::None;
+        // Second event in the same drain: a click at the snapshot's own
+        // coordinates for the pinned `Enter` hint.
+        let route = route_mouse(
+            &snap,
+            at(MouseEventKind::Down(MouseButton::Left), 53, 28),
+            true,
+            !matches!(live_overlay, ui::Overlay::None),
+            false,
+        );
+        // `route_mouse` still names the hint: it only has the stale
+        // snapshot, and has no way to know the dialog it names already
+        // closed.
+        assert_eq!(route, MouseRoute::OverlayKey(KeyCode::Enter));
+        // The identity guard is what actually stops it: the live overlay no
+        // longer matches what the snapshot was drawn against, so the event
+        // loop must downgrade this to `Consume` -- never synthesizing
+        // `Enter`, never reaching `filter_key`, never reaching the child.
+        assert!(
+            !overlay_route_is_current(&route, &live_overlay, &snapshot_ident),
+            "a stale overlay hit must not be trusted once the overlay it named has closed"
+        );
+        // The same dialog, still open, is still trusted.
+        let still_open = ui::Overlay::Palette(open_palette(ui::PaletteMode::Run));
+        assert!(overlay_route_is_current(
+            &route,
+            &still_open,
+            &snapshot_ident
+        ));
+        // A DIFFERENT dialog opening at the very same coordinates within the
+        // same drain is stale too -- it is the identity being checked, not
+        // merely "some overlay is open".
+        let different_dialog = ui::Overlay::Errors(ui::ErrorsView::default());
+        assert!(!overlay_route_is_current(
+            &route,
+            &different_dialog,
+            &snapshot_ident
+        ));
+        // Non-overlay routes never depend on the overlay's identity at all --
+        // there is nothing here for them to go stale against.
+        assert!(overlay_route_is_current(
+            &MouseRoute::Grid,
+            &live_overlay,
+            &snapshot_ident
+        ));
+    }
+
+    #[test]
+    fn overlay_swallows_wheel_and_grid_keeps_both_mouse_modes() {
+        let snap = hit::FrameSnapshot {
+            frame: Rect::new(0, 0, 80, 20),
+            grid: Rect::new(45, 2, 35, 16),
+            ..Default::default()
+        };
+        for wants_mouse in [false, true] {
+            let mut calls = Vec::new();
+            for kind in [
+                MouseEventKind::ScrollUp,
+                MouseEventKind::Down(MouseButton::Left),
+                MouseEventKind::Up(MouseButton::Left),
+            ] {
+                let mouse = event::MouseEvent {
+                    kind,
+                    column: 50,
+                    row: 5,
+                    modifiers: KeyModifiers::NONE,
+                };
+                assert_eq!(
+                    route_mouse(&snap, mouse, true, true, true),
+                    MouseRoute::Consume
+                );
+                assert_eq!(
+                    route_mouse(&snap, mouse, false, false, true),
+                    MouseRoute::Consume
+                );
+                if route_mouse(&snap, mouse, true, false, false) == MouseRoute::Grid {
+                    calls.push((wants_mouse, kind));
+                }
+            }
+            assert_eq!(calls.len(), 3);
+        }
+    }
+
+    #[test]
+    fn grouped_keyboard_and_pointer_selection_use_identity_and_leave_external_focus() {
+        let panes = vec![
+            pane_row("worker01", "claude"),
+            pane_row("lead0001", "codex"),
+        ];
+        let mut rows = assemble_sidebar(&panes, &[], &HashMap::new(), 0, 0, DASHBOARD_PID, 0);
+        let mut external = rows[0].clone();
+        external.short = "external".into();
+        external.attached = false;
+        external.focused = false;
+        rows.push(external);
+        let order = vec![
+            Hit::GroupToggle("g".into()),
+            Hit::SidebarRow("lead0001".into()),
+            Hit::SidebarRow("worker01".into()),
+            Hit::SidebarRow("external".into()),
+        ];
+        let mut chrome = Some(Hit::GroupToggle("g".into()));
+        assert_eq!(
+            navigate_roster(DashAction::SelectDown, &rows, &order, 0, 0, &mut chrome),
+            select_row("lead0001", &rows, 0, 0)
+        );
+        assert_eq!(chrome, None);
+        assert_eq!(select_row("external", &rows, 1, 1), (2, 1));
+        assert_eq!(select_row("reaped", &rows, 1, 1), (1, 1));
+        rows[0].state = ui::RowState::Dead;
+        assert_eq!(select_row("worker01", &rows, 1, 1), (0, 1));
+    }
+
+    #[test]
+    fn sidebar_disclosure_uses_cached_scope_usage_and_state_time() {
+        let mut pane = pane_row("lead0001", "codex");
+        pane.group_id = Some("group".into());
+        pane.role = "sub-orchestrator".into();
+        pane.model = Some("resolved-model".into());
+        pane.budget = "12000 / 80000".into();
+        let mut rows = assemble_sidebar(&[pane], &[], &HashMap::new(), 0, 0, DASHBOARD_PID, 0);
+        let mut disk = DiskFacts::default();
+        disk.state_since
+            .insert("lead0001".into(), (ui::RowState::Working, 60));
+        disk.usage.push(ui::HarnessUsage {
+            name: "codex",
+            five_hour: Some(61.0),
+            seven_day: None,
+            credits: false,
+        });
+        enrich_sidebar(&mut rows, &disk, 240);
+        assert_eq!(rows[0].model.as_deref(), Some("resolved-model"));
+        assert_eq!(rows[0].disclosure.len(), 8);
+        assert!(
+            rows[0]
+                .disclosure
+                .iter()
+                .any(|(k, v)| k == "budget" && v == "12000 / 80000 · 5h 61%")
+        );
+        assert!(
+            rows[0]
+                .disclosure
+                .iter()
+                .any(|(k, v)| k == "since" && v.contains("3m"))
+        );
+        assert!(
+            rows[0]
+                .disclosure
+                .iter()
+                .any(|(k, v)| k == "branch" && v == style::PLACEHOLDER)
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Issue #354 phase 4: the palette/help overlay, the Esc/Enter contract
+    // and the first-run tip.
+    // ------------------------------------------------------------------
+
+    fn live_ctx() -> actions::ActionContext {
+        actions::ActionContext {
+            selected: true,
+            attached: true,
+            alive: true,
+            ..actions::ActionContext::default()
+        }
+    }
+
+    fn open_palette(mode: ui::PaletteMode) -> ui::PaletteView {
+        build_palette_view(mode, live_ctx())
+    }
+
+    fn typed(mut view: ui::PaletteView, text: &str) -> ui::PaletteView {
+        for c in text.chars() {
+            let (next, effect) =
+                palette_overlay_reduce(view, key(KeyCode::Char(c), KeyModifiers::NONE));
+            assert!(effect.is_none(), "typing must never run an action");
+            view = next.expect("typing never closes the palette");
+        }
+        view
+    }
+
+    /// `^A p` and `^A ?` are real bindings, and `p` did not used to be one.
+    #[test]
+    fn ctrl_a_p_opens_the_palette_and_ctrl_a_question_opens_help() {
+        assert_eq!(
+            filter_key(true, key(KeyCode::Char('p'), KeyModifiers::NONE)).1,
+            InputVerdict::Dash(DashAction::Palette)
+        );
+        for code in [KeyCode::Char('?'), KeyCode::Char('h'), KeyCode::Char('H')] {
+            assert_eq!(
+                filter_key(true, key(code, KeyModifiers::NONE)).1,
+                InputVerdict::Dash(DashAction::Help)
+            );
+        }
+    }
+
+    /// Typing filters; Enter runs the caret's own descriptor, and the effect
+    /// resolves to exactly the `DashAction` the chord would have produced.
+    #[test]
+    fn enter_runs_the_selected_palette_row_as_its_own_chord_would() {
+        let view = typed(open_palette(ui::PaletteMode::Run), "spawn");
+        let rows = view.rows();
+        assert!(
+            rows.iter().all(|r| match r {
+                actions::PaletteRow::Action { label, .. } => *label == "spawn",
+                actions::PaletteRow::Note { .. } | actions::PaletteRow::Section(_) => false,
+            }),
+            "the query must filter the list: {rows:?}"
+        );
+        let (next, effect) = palette_overlay_reduce(view, key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(next.is_none(), "running an action closes the palette");
+        let id = effect.expect("an effect").0;
+        let descriptor = actions::descriptor(id).expect("descriptor");
+        assert_eq!(descriptor.dash_action(), Some(DashAction::Spawn));
+        // And that action is exactly what the keyboard produces, so the
+        // palette can reach no code path a chord could not.
+        assert_eq!(
+            filter_key(true, key(KeyCode::Char('s'), KeyModifiers::NONE)).1,
+            InputVerdict::Dash(DashAction::Spawn)
+        );
+    }
+
+    /// A row action with no chord of its own comes back as a menu action --
+    /// the same effect the context menu produces for the same entry.
+    #[test]
+    fn a_chordless_palette_row_runs_through_the_context_menu_path() {
+        let view = typed(
+            open_palette(ui::PaletteMode::Run),
+            "give this row the keyboard",
+        );
+        let (_, effect) = palette_overlay_reduce(view, key(KeyCode::Enter, KeyModifiers::NONE));
+        let descriptor = actions::descriptor(effect.expect("an effect").0).expect("descriptor");
+        assert_eq!(descriptor.dash_action(), None);
+        assert_eq!(descriptor.menu, Some(ui::MenuAction::Focus));
+    }
+
+    /// A disabled row is inert: Enter on it closes the palette with nothing
+    /// to run, exactly as a disabled context-menu entry does nothing.
+    #[test]
+    fn enter_on_a_disabled_palette_row_runs_nothing() {
+        let view = typed(open_palette(ui::PaletteMode::Run), "relaunch an ended row");
+        assert!(
+            view.rows().iter().any(|r| matches!(
+                r,
+                actions::PaletteRow::Action {
+                    disabled: Some(_),
+                    ..
+                }
+            )),
+            "a live row cannot be restored, so the row must be disabled"
+        );
+        assert_eq!(view.activated(), None);
+        let (next, effect) = palette_overlay_reduce(view, key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(next.is_none());
+        assert!(effect.is_none());
+    }
+
+    /// Esc closes with nothing run. Focus is never touched by any overlay --
+    /// the palette owns no pane index at all, which is what makes "returns
+    /// focus to the previously focused pane" structurally true.
+    #[test]
+    fn esc_closes_the_palette_without_running_anything() {
+        let view = typed(open_palette(ui::PaletteMode::Run), "quit");
+        let (next, effect) = palette_overlay_reduce(view, key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(next.is_none());
+        assert!(effect.is_none());
+    }
+
+    /// Backspace edits the query, and a query that no longer matches the
+    /// caret's row moves the caret rather than leaving it off the list.
+    #[test]
+    fn backspace_edits_the_query_and_keeps_the_caret_on_a_real_row() {
+        let mut view = typed(open_palette(ui::PaletteMode::Run), "spawn");
+        assert_eq!(view.query, "spawn");
+        for _ in 0..3 {
+            let (next, _) =
+                palette_overlay_reduce(view, key(KeyCode::Backspace, KeyModifiers::NONE));
+            view = next.expect("backspace never closes the palette");
+        }
+        assert_eq!(view.query, "sp");
+        let rows = view.rows();
+        assert!(rows[view.cursor].selectable(), "{rows:?}");
+    }
+
+    /// Up/Down walk only real rows, never the section headings an empty
+    /// query draws.
+    #[test]
+    fn the_palette_caret_never_lands_on_a_section_heading() {
+        let mut view = open_palette(ui::PaletteMode::Run);
+        for _ in 0..40 {
+            let (next, _) = palette_overlay_reduce(view, key(KeyCode::Down, KeyModifiers::NONE));
+            view = next.expect("still open");
+            assert!(view.rows()[view.cursor].selectable());
+        }
+        for _ in 0..60 {
+            let (next, _) = palette_overlay_reduce(view, key(KeyCode::Up, KeyModifiers::NONE));
+            view = next.expect("still open");
+            assert!(view.rows()[view.cursor].selectable());
+        }
+    }
+
+    /// Finding F06's own rule, extended to the palette: while it is open the
+    /// pointer reaches nothing underneath it, so a query typed into it
+    /// cannot possibly be routed to a child. (The keyboard half is
+    /// structural -- the event loop's overlay branch never calls
+    /// `write_operator_input` -- and every reducer above returns the query
+    /// in its own view rather than any bytes.)
+    #[test]
+    fn nothing_reaches_the_child_while_the_palette_is_open() {
+        let snap = hit::FrameSnapshot {
+            frame: Rect::new(0, 0, 120, 40),
+            sidebar: Rect::new(0, 2, 44, 36),
+            grid: Rect::new(45, 2, 75, 36),
+            divider: Rect::new(44, 2, 1, 36),
+            overlay: Some(Rect::new(30, 5, 60, 30)),
+            ..Default::default()
+        };
+        for (x, y) in [(0u16, 0u16), (5, 3), (50, 10), (119, 39), (44, 20)] {
+            for kind in [
+                MouseEventKind::ScrollUp,
+                MouseEventKind::ScrollDown,
+                MouseEventKind::Down(MouseButton::Left),
+                MouseEventKind::Down(MouseButton::Right),
+            ] {
+                let route = route_mouse(
+                    &snap,
+                    event::MouseEvent {
+                        kind,
+                        column: x,
+                        row: y,
+                        modifiers: KeyModifiers::NONE,
+                    },
+                    true,
+                    true,
+                    false,
+                );
+                assert_ne!(
+                    route,
+                    MouseRoute::Grid,
+                    "({x}, {y}) {kind:?} reached the child"
+                );
+            }
+        }
+        // And every printable key the palette is given comes back inside its
+        // own view -- there is no byte path out of the reducer at all.
+        let view = typed(open_palette(ui::PaletteMode::Run), "rm -rf /");
+        assert_eq!(view.query, "rm -rf /");
+    }
+
+    /// Deliverable D: the Esc/Enter matrix, one assertion pair per overlay.
+    ///
+    /// Esc always closes the topmost layer (or cancels an inline confirm or
+    /// compose buffer); Enter always confirms or activates. Deliberately
+    /// left as they are, and asserted here as such: mail/memory compose
+    /// buffers and the menu's inline stop confirmation, where Esc cancels
+    /// that inner layer rather than the whole dialog, and Restore, whose Esc
+    /// is labelled `skip` because closing it IS skipping the restore.
+    #[test]
+    fn every_overlay_closes_on_esc_and_confirms_on_enter() {
+        let esc = key(KeyCode::Esc, KeyModifiers::NONE);
+        let enter = key(KeyCode::Enter, KeyModifiers::NONE);
+
+        // QuitConfirm.
+        assert!(quit_confirm_reduce(vec!["w".into()], esc).0.is_none());
+        assert_eq!(
+            quit_confirm_reduce(vec!["w".into()], enter).1,
+            Some(QuitConfirmEffect::Confirm)
+        );
+
+        // Spawn.
+        let draft = ui::SpawnDraft {
+            input: "claude do the thing".into(),
+            items: Vec::new(),
+            cursor: 0,
+        };
+        assert!(spawn_overlay_reduce(draft.clone(), esc).0.is_none());
+        assert!(matches!(
+            spawn_overlay_reduce(draft, enter).1,
+            Some(SpawnEffect::Submit { .. })
+        ));
+
+        // Nudge.
+        let nudge = ui::NudgeDraft {
+            target: ui::NudgeTarget::AttachedPane("aaaa1111".into()),
+            input: "go".into(),
+        };
+        assert!(nudge_overlay_reduce(nudge.clone(), esc).0.is_none());
+        assert!(nudge_overlay_reduce(nudge, enter).1.is_some());
+
+        // Mail: browsing, then its compose buffer (Esc cancels the buffer,
+        // not the overlay -- deliberate, and asserted).
+        let mail = ui::MailView {
+            items: vec![(PathBuf::from("/mail/1.md"), "claude".into(), "body".into())],
+            cursor: 0,
+            offset: 0,
+            compose: None,
+        };
+        assert!(mail_overlay_reduce(mail.clone(), esc).0.is_none());
+        assert!(matches!(
+            mail_overlay_reduce(mail.clone(), enter).1,
+            Some(ui::MailEffect::Consume(_))
+        ));
+        let composing = ui::MailView {
+            compose: Some(ui::ComposeDraft {
+                to: "any".into(),
+                body: "hi".into(),
+            }),
+            ..mail
+        };
+        let (back, _) = mail_overlay_reduce(composing.clone(), esc);
+        assert!(
+            back.is_some_and(|v| v.compose.is_none()),
+            "Esc cancels the compose buffer, not the whole dialog"
+        );
+        assert!(matches!(
+            mail_overlay_reduce(composing, enter).1,
+            Some(ui::MailEffect::Send(_))
+        ));
+
+        // Memory: the same shape, including its edit buffer.
+        let memory = ui::MemoryView {
+            entries: vec![("k".into(), "1m".into(), "body".into())],
+            cursor: 0,
+            offset: 0,
+            input: None,
+        };
+        assert!(memory_overlay_reduce(memory.clone(), esc).0.is_none());
+        let editing = ui::MemoryView {
+            input: Some("new".into()),
+            ..memory
+        };
+        let (back, _) = memory_overlay_reduce(editing.clone(), esc);
+        assert!(back.is_some_and(|v| v.input.is_none()));
+        assert!(matches!(
+            memory_overlay_reduce(editing, enter).1,
+            Some(ui::MemoryEffect::Remember { .. })
+        ));
+
+        // Restore: Esc closes with no effect (that is what `skip` means),
+        // Enter confirms whatever is checked.
+        let restore = ui::RestoreView {
+            entries: vec![ui::RestoreEntry {
+                label: "w".into(),
+                checked: true,
+            }],
+            cursor: 0,
+            offset: 0,
+        };
+        let (next, effect) = restore_overlay_reduce(restore.clone(), esc);
+        assert!(next.is_none() && effect.is_none());
+        assert_eq!(
+            restore_overlay_reduce(restore, enter).1,
+            Some(RestoreEffect::Confirm(vec![0]))
+        );
+
+        // Handover.
+        let handover = ui::HandoverDraft {
+            items: vec![("claude".into(), "worker".into(), "sonnet".into())],
+            cursor: 0,
+            offset: 0,
+            target_short: "aaaa1111".into(),
+        };
+        assert!(handover_overlay_reduce(handover.clone(), esc).0.is_none());
+        assert!(handover_overlay_reduce(handover, enter).1.is_some());
+
+        // Errors: read-only, so Enter closes rather than doing nothing.
+        let errors = ui::ErrorsView {
+            items: vec![err_item("boom")],
+            cursor: 0,
+            offset: 0,
+        };
+        assert!(errors_overlay_reduce(errors.clone(), esc).0.is_none());
+        assert!(errors_overlay_reduce(errors, enter).0.is_none());
+
+        // Inspector: likewise.
+        let inspector = ui::InspectorView {
+            target: "aaaa1111".into(),
+            subject: "aaaa1111 \u{b7} worker".into(),
+            sections: vec![ui::InspectorSection {
+                name: "identity".into(),
+                lines: vec!["short  aaaa1111".into()],
+            }],
+            cursor: 0,
+            offset: 0,
+        };
+        assert!(inspector_overlay_reduce(inspector.clone(), esc).is_none());
+        assert!(inspector_overlay_reduce(inspector, enter).is_none());
+
+        // Menu: Esc backs out, Enter activates -- and Esc on the inline stop
+        // confirmation cancels only that confirmation.
+        let menu = ui::MenuView {
+            target: "aaaa1111".into(),
+            subject: "aaaa1111 \u{b7} worker".into(),
+            entries: vec![
+                ui::MenuEntry {
+                    action: ui::MenuAction::Inspect,
+                    disabled: None,
+                    letter: Some('i'),
+                },
+                ui::MenuEntry {
+                    action: ui::MenuAction::Stop,
+                    disabled: None,
+                    letter: Some('s'),
+                },
+            ],
+            cursor: 0,
+            offset: 0,
+            confirm: None,
+        };
+        assert!(menu_overlay_reduce(menu.clone(), esc).0.is_none());
+        assert_eq!(
+            menu_overlay_reduce(menu.clone(), enter).1,
+            Some(MenuEffect {
+                target: "aaaa1111".into(),
+                action: ui::MenuAction::Inspect,
+            })
+        );
+        let armed = ui::MenuView {
+            confirm: Some(1),
+            cursor: 1,
+            ..menu
+        };
+        let (back, effect) = menu_overlay_reduce(armed, esc);
+        assert!(
+            back.is_some_and(|v| v.confirm.is_none()) && effect.is_none(),
+            "Esc cancels the inline stop confirmation, not the menu"
+        );
+
+        // Palette and help.
+        assert!(
+            palette_overlay_reduce(open_palette(ui::PaletteMode::Run), esc)
+                .0
+                .is_none()
+        );
+        assert!(
+            palette_overlay_reduce(open_palette(ui::PaletteMode::Run), enter)
+                .1
+                .is_some()
+        );
+        let (next, effect) = palette_overlay_reduce(open_palette(ui::PaletteMode::Help), enter);
+        assert!(
+            next.is_none() && effect.is_none(),
+            "help confirms by closing, and never runs anything"
+        );
+    }
+
+    /// Issue #354 phase 5 (phase-4 residual): the flag records DISMISSAL, not
+    /// display. A launch that never dismissed the tip must leave the flag
+    /// unset, so the same operator is shown it again.
+    #[test]
+    fn the_first_run_tip_flag_is_written_only_when_the_tip_is_dismissed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(dir.path().to_path_buf());
+        // The launch decision alone -- exactly what `run_dashboard` does now.
+        let mut first_run_tip = !first_run_tip_seen(&state);
+        assert!(first_run_tip, "a fresh operator is shown the tip");
+        assert!(
+            !first_run_tip_seen(&state),
+            "showing the tip must not flag it as seen"
+        );
+        // The dismissal rule, applied exactly as the event loop applies it --
+        // including defect 2's fix (review of #354, MEDIUM): the `Esc` that
+        // dismisses the tip is consumed, never also forwarded, since it
+        // happens once per operator, ever; an `Esc` that does not dismiss the
+        // tip is unaffected.
+        let dismiss =
+            |armed: bool, k: KeyEvent, shown: &mut bool, state: &StateDir| -> InputVerdict {
+                let (_, verdict) = filter_key(armed, k);
+                let dismissed_by_esc =
+                    *shown && k.code == KeyCode::Esc && !matches!(verdict, InputVerdict::Dash(_));
+                if *shown && (matches!(verdict, InputVerdict::Dash(_)) || k.code == KeyCode::Esc) {
+                    *shown = false;
+                    mark_first_run_tip_seen(state);
+                }
+                if dismissed_by_esc {
+                    InputVerdict::ToChild(Vec::new())
+                } else {
+                    verdict
+                }
+            };
+        // Ordinary typing to the child dismisses nothing, writes nothing, and
+        // still reaches the child.
+        let verdict = dismiss(
+            false,
+            key(KeyCode::Char('x'), KeyModifiers::NONE),
+            &mut first_run_tip,
+            &state,
+        );
+        assert!(first_run_tip && !first_run_tip_seen(&state));
+        assert!(matches!(verdict, InputVerdict::ToChild(bytes) if !bytes.is_empty()));
+        // The dismissing Esc flags the tip seen, but this exact keystroke
+        // must never also reach the child -- it used to (additively); that
+        // regression is defect 2.
+        let verdict = dismiss(
+            false,
+            key(KeyCode::Esc, KeyModifiers::NONE),
+            &mut first_run_tip,
+            &state,
+        );
+        assert!(!first_run_tip, "Esc dismisses it");
+        assert!(first_run_tip_seen(&state), "and only then is it flagged");
+        assert!(
+            matches!(&verdict, InputVerdict::ToChild(bytes) if bytes.is_empty()),
+            "the dismissing Esc must be consumed, not forwarded: {verdict:?}"
+        );
+        // The next launch never shows it again, and an ordinary Esc -- the
+        // tip already gone -- reaches the child exactly as before.
+        assert!(!(!first_run_tip_seen(&state)));
+        let verdict = dismiss(
+            false,
+            key(KeyCode::Esc, KeyModifiers::NONE),
+            &mut first_run_tip,
+            &state,
+        );
+        assert!(
+            matches!(&verdict, InputVerdict::ToChild(bytes) if !bytes.is_empty()),
+            "Esc reaches the child once the tip is no longer showing: {verdict:?}"
+        );
+    }
+
+    /// The first-run tip: absent flag shows it, and the flag is written once
+    /// so the next launch never shows it again.
+    #[test]
+    fn the_first_run_tip_is_shown_once_and_then_flagged() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(dir.path().to_path_buf());
+        assert!(
+            !first_run_tip_seen(&state),
+            "a fresh operator has not seen it"
+        );
+        mark_first_run_tip_seen(&state);
+        assert!(first_run_tip_seen(&state));
+        let flag = first_run_tip_flag(&state);
+        assert!(flag.starts_with(state.dash()), "{flag:?}");
+        assert_eq!(flag.file_name().and_then(|n| n.to_str()), Some("tip-seen"));
+        // Writing it twice is idempotent, never an error.
+        mark_first_run_tip_seen(&state);
+        assert!(first_run_tip_seen(&state));
+    }
+
+    /// A state directory that cannot be created (a plain FILE where the
+    /// state root should be) must cost nothing: no panic, no error, the tip
+    /// simply shows again next launch.
+    #[test]
+    fn an_unwritable_state_dir_never_fails_the_first_run_tip() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let blocked = dir.path().join("not-a-dir");
+        std::fs::write(&blocked, b"i am a file").expect("write");
+        let state = StateDir::from_root(blocked);
+        assert!(!first_run_tip_seen(&state));
+        mark_first_run_tip_seen(&state);
+        assert!(
+            !first_run_tip_seen(&state),
+            "an unwritable state dir must leave the flag unset, not error"
+        );
+    }
+
+    /// The dismissal rule, as the event loop applies it: any prefixed key
+    /// (anything `filter_key` turns into a `DashAction`) or a bare `Esc`
+    /// clears the tip; ordinary typing to the child does not.
+    #[test]
+    fn the_first_run_tip_is_dismissed_by_a_prefixed_key_or_esc() {
+        let dismisses = |armed: bool, k: KeyEvent| {
+            let (_, verdict) = filter_key(armed, k);
+            matches!(verdict, InputVerdict::Dash(_)) || k.code == KeyCode::Esc
+        };
+        assert!(dismisses(true, key(KeyCode::Char('?'), KeyModifiers::NONE)));
+        assert!(dismisses(true, key(KeyCode::Char('p'), KeyModifiers::NONE)));
+        assert!(dismisses(false, key(KeyCode::Esc, KeyModifiers::NONE)));
+        assert!(!dismisses(
+            false,
+            key(KeyCode::Char('x'), KeyModifiers::NONE)
+        ));
+        assert!(!dismisses(
+            false,
+            key(KeyCode::Char('a'), KeyModifiers::CONTROL)
+        ));
+    }
+
+    /// Review of 9314156, finding 1: opening the inspector on a LIVE
+    /// attached pane that is merely selected must not clear its `◆`. Only
+    /// focus plus an unoccluded render does that, and a row that can never
+    /// be focused (ended, or not attached) is the only one the inspector may
+    /// acknowledge on its own.
+    #[test]
+    fn the_inspector_never_acknowledges_a_live_attached_pane() {
+        use super::super::attention::{Authority, Lifecycle, Observation, compose};
+        let done = compose(
+            Some(&compose(
+                None,
+                &[Observation::new(Authority::QuietHeuristic, "busy", 40, 100)
+                    .with_lifecycle(Lifecycle::Working)],
+                100,
+            )),
+            &[
+                Observation::new(Authority::QuietHeuristic, "quiet", 40, 200)
+                    .with_lifecycle(Lifecycle::Settled),
+            ],
+            200,
+        );
+
+        // A live, attached, selected-but-unfocused pane showing `◆`.
+        let panes = vec![pane_row("aaa11111", "claude")];
+        let mut rows = assemble_sidebar(&panes, &[], &HashMap::new(), 0, 1, DASHBOARD_PID, 900);
+        let mut disk = DiskFacts::default();
+        disk.attention.insert("aaa11111".into(), done.clone());
+        enrich_sidebar(&mut rows, &disk, 900);
+        assert_eq!(ui::glyph_for(&rows[0]), ui::Glyph::DoneUnread);
+        assert!(rows[0].attached && rows[0].exit_code.is_none());
+        assert_eq!(
+            inspect_ack_candidate(&rows[0]),
+            None,
+            "a live attached pane is acknowledged by viewing it, not by the inspector"
+        );
+
+        // The same status on a RETAINED ENDED row -- one that can never be
+        // focused, so no render of it can ever acknowledge it. That row is
+        // the inspector's to clear, and still is.
+        let ended = vec![ended_pane_row("bbb22222", 0, 190)];
+        let mut rows = assemble_sidebar(&ended, &[], &HashMap::new(), 0, 0, DASHBOARD_PID, 900);
+        disk.attention.insert("bbb22222".into(), done.clone());
+        enrich_sidebar(&mut rows, &disk, 900);
+        assert_eq!(ui::glyph_for(&rows[0]), ui::Glyph::DoneUnread);
+        assert_eq!(
+            inspect_ack_candidate(&rows[0]),
+            Some(("bbb22222".to_string(), done.revision)),
+            "a row this dashboard cannot focus is the inspector's to acknowledge"
+        );
+    }
+
+    /// Review of 9314156, finding 2: a pending single click belongs to the
+    /// dialog it was made in. Two different dialogs -- and the same dialog
+    /// reopened -- never share an identity, so the loop's identity check
+    /// drops the stale click before a second click anywhere else can
+    /// complete a double.
+    #[test]
+    fn a_pending_overlay_click_never_survives_into_another_dialog() {
+        let menu = |target: &str| {
+            ui::Overlay::Menu(ui::MenuView {
+                target: target.into(),
+                subject: format!("{target} \u{b7} worker"),
+                entries: Vec::new(),
+                cursor: 0,
+                offset: 0,
+                confirm: None,
+            })
+        };
+        let errors = ui::Overlay::Errors(ui::ErrorsView {
+            items: vec![err_item("boom")],
+            cursor: 0,
+            offset: 0,
+        });
+        let none = ui::Overlay::None;
+
+        // Different dialogs, the same dialog on a different row, and the
+        // closed state in between are each their own identity.
+        assert_ne!(overlay_identity(&menu("aaa")), overlay_identity(&errors));
+        assert_ne!(
+            overlay_identity(&menu("aaa")),
+            overlay_identity(&menu("bbb"))
+        );
+        assert_ne!(overlay_identity(&menu("aaa")), overlay_identity(&none));
+        assert_eq!(
+            overlay_identity(&menu("aaa")),
+            overlay_identity(&menu("aaa"))
+        );
+
+        // Review of cc92a56 (finding 2): the palette's rows are a function of
+        // its query, so a keystroke that re-filters the list is a new
+        // identity -- otherwise a click on row 3, one keystroke, and a second
+        // click on row 3 activated whatever had moved under the pointer.
+        let palette = |query: &str| {
+            ui::Overlay::Palette(ui::PaletteView {
+                mode: ui::PaletteMode::Run,
+                query: query.to_string(),
+                ctx: actions::ActionContext::default(),
+                cursor: 0,
+                offset: 0,
+            })
+        };
+        assert_ne!(
+            overlay_identity(&palette("")),
+            overlay_identity(&palette("n"))
+        );
+        assert_ne!(
+            overlay_identity(&palette("n")),
+            overlay_identity(&palette("nu"))
+        );
+        assert_eq!(
+            overlay_identity(&palette("nu")),
+            overlay_identity(&palette("nu"))
+        );
+
+        // The loop's own rule, replayed: a click made in one dialog is
+        // dropped the moment the identity changes -- which includes the
+        // `Overlay::None` a close leaves behind, so close-then-reopen never
+        // completes a double-click either.
+        let mut last_click: Option<(usize, Instant)> = None;
+        let mut last_ident = overlay_identity(&none);
+        let mut step = |overlay: &ui::Overlay,
+                        click: Option<usize>,
+                        last_click: &mut Option<(usize, Instant)>|
+         -> bool {
+            let ident = overlay_identity(overlay);
+            if ident != last_ident {
+                *last_click = None;
+                last_ident = ident;
+            }
+            match click {
+                Some(index) => {
+                    let double = last_click.is_some_and(|(last, at)| {
+                        last == index
+                            && Instant::now().saturating_duration_since(at) <= DOUBLE_CLICK
+                    });
+                    // Exactly the loop's own bookkeeping: a completed
+                    // double-click consumes the pending one.
+                    *last_click = if double {
+                        None
+                    } else {
+                        Some((index, Instant::now()))
+                    };
+                    double
+                }
+                None => false,
+            }
+        };
+        assert!(!step(&menu("aaa"), Some(3), &mut last_click));
+        assert!(
+            step(&menu("aaa"), Some(3), &mut last_click),
+            "same dialog doubles"
+        );
+        assert!(!step(&menu("aaa"), Some(3), &mut last_click));
+        // Close it, then open a different dialog within the double-click
+        // window and click the same index once: not a double.
+        assert!(!step(&none, None, &mut last_click));
+        assert!(
+            !step(&errors, Some(3), &mut last_click),
+            "a click from another dialog must not complete a double here"
+        );
+        // Same dialog, reopened: still not a double.
+        assert!(!step(&none, None, &mut last_click));
+        assert!(!step(&errors, Some(3), &mut last_click));
     }
 }

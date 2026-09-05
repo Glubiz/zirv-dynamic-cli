@@ -305,6 +305,15 @@ pub mod tui {
         Style::default().fg(Color::Green)
     }
 
+    /// Finished, but nobody has looked at it yet (issue #354 phase 2's
+    /// done-unread `◆`). Deliberately its own hue rather than a reuse of
+    /// [`ok`]: "done" and "done, and you have already seen it" are two
+    /// different things to an operator scanning a roster, and the approved
+    /// design distinguishes them by colour *and* shape.
+    pub fn unread() -> Style {
+        Style::default().fg(Color::Magenta)
+    }
+
     /// A value the reader should notice first. Bold (issue #209/v3): the
     /// approved v3 mock sharpens every accent-toned surface at once --
     /// spinners, frame titles, focused borders -- rather than leaving cyan
