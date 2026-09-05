@@ -37,6 +37,11 @@ pub const MENU_NO_REQUEST: &str = "no spawn request kept";
 pub const MENU_NO_CWD: &str = "no cwd known";
 pub const MENU_EXITED_CLEAN: &str = "exited cleanly";
 pub const MENU_NOT_RETAINED: &str = "only a finished row can be dismissed";
+/// Issue #354 phase 5: the sidebar's summary line is a real action target --
+/// `inspect` opens the dashboard-level inspector over it -- but it is not a
+/// session, so every per-session action is listed there inert with this
+/// reason rather than hidden.
+pub const MENU_SUMMARY_LINE: &str = "the dashboard, not a session";
 
 /// A stable identity for one row of [`ACTIONS`].
 ///
@@ -170,25 +175,53 @@ pub struct ActionContext {
     pub clean_exit: bool,
     /// Its checkout is known.
     pub has_cwd: bool,
+    /// Issue #354 phase 5: the target is the sidebar's summary line -- the
+    /// dashboard itself. `selected` is false there (there is no session row),
+    /// but `inspect` still has something to open, so this is its own bit
+    /// rather than an overload of `selected`.
+    pub summary: bool,
 }
 
 fn always(_: &ActionContext) -> Availability {
     Availability::Enabled
 }
 
-/// Needs a row, and nothing more.
-fn needs_row(ctx: &ActionContext) -> Availability {
-    if ctx.selected {
+/// Needs a target of any kind -- a session row, or the summary line. The
+/// actions that work on both (`inspect`, and the menu that offers it).
+fn needs_target(ctx: &ActionContext) -> Availability {
+    if ctx.selected || ctx.summary {
         Availability::Enabled
     } else {
         Availability::Hidden
     }
 }
 
+/// Needs an actual session row, and nothing more.
+fn needs_row(ctx: &ActionContext) -> Availability {
+    match session_gate(ctx) {
+        Some(refusal) => refusal,
+        None => Availability::Enabled,
+    }
+}
+
+/// The one rule every per-session action starts with: the summary line names
+/// no session (inert, with a reason -- an operator must be able to see that
+/// `nudge` exists and why it does not apply here), and nothing selected at
+/// all means the action does not apply and is not listed.
+fn session_gate(ctx: &ActionContext) -> Option<Availability> {
+    if ctx.summary {
+        Some(Availability::Disabled(MENU_SUMMARY_LINE))
+    } else if ctx.selected {
+        None
+    } else {
+        Some(Availability::Hidden)
+    }
+}
+
 /// Needs a live pane this dashboard owns: focus, handover, stop.
 fn needs_attached(ctx: &ActionContext) -> Availability {
-    if !ctx.selected {
-        Availability::Hidden
+    if let Some(refusal) = session_gate(ctx) {
+        refusal
     } else if ctx.attached && !ctx.ended {
         Availability::Enabled
     } else if ctx.ended {
@@ -202,8 +235,8 @@ fn needs_attached(ctx: &ActionContext) -> Availability {
 /// run_nudge_with`'s headless marker path), so "alive" is the real gate here,
 /// not "attached".
 fn needs_alive(ctx: &ActionContext) -> Availability {
-    if !ctx.selected {
-        Availability::Hidden
+    if let Some(refusal) = session_gate(ctx) {
+        refusal
     } else if ctx.alive {
         Availability::Enabled
     } else {
@@ -212,8 +245,8 @@ fn needs_alive(ctx: &ActionContext) -> Availability {
 }
 
 fn needs_request(ctx: &ActionContext) -> Availability {
-    if !ctx.selected {
-        Availability::Hidden
+    if let Some(refusal) = session_gate(ctx) {
+        refusal
     } else if !ctx.ended {
         Availability::Disabled(MENU_STILL_RUNNING)
     } else if !ctx.has_request {
@@ -233,8 +266,8 @@ fn needs_failed_request(ctx: &ActionContext) -> Availability {
 }
 
 fn needs_cwd(ctx: &ActionContext) -> Availability {
-    if !ctx.selected {
-        Availability::Hidden
+    if let Some(refusal) = session_gate(ctx) {
+        refusal
     } else if ctx.has_cwd {
         Availability::Enabled
     } else {
@@ -243,8 +276,8 @@ fn needs_cwd(ctx: &ActionContext) -> Availability {
 }
 
 fn needs_retained(ctx: &ActionContext) -> Availability {
-    if !ctx.selected {
-        Availability::Hidden
+    if let Some(refusal) = session_gate(ctx) {
+        refusal
     } else if ctx.retained {
         Availability::Enabled
     } else {
@@ -283,6 +316,15 @@ impl ActionDescriptor {
     /// "select row" out of a list means.
     pub fn dash_action(&self) -> Option<DashAction> {
         self.checks.first().map(|(_, action)| action.clone())
+    }
+
+    /// Whether this descriptor documents something rather than binding it:
+    /// nothing dispatches it and no menu entry runs it. Review of cc92a56
+    /// (finding 1): these used to be listed in the palette as ordinary
+    /// enabled rows, so Enter on one closed the palette and did nothing at
+    /// all. They are [`PaletteRow::Note`]s now.
+    pub fn informational(&self) -> bool {
+        self.checks.is_empty() && self.menu.is_none()
     }
 
     /// What the fuzzy filter matches against: label, description and chord,
@@ -400,7 +442,7 @@ pub static ACTIONS: &[ActionDescriptor] = &[
         label: "actions",
         description: "action menu (or right click)",
         section: ActionSection::Session,
-        availability: needs_row,
+        availability: needs_target,
         menu: None,
         checks: &[(ch('c'), DashAction::ContextActions)],
     },
@@ -408,9 +450,11 @@ pub static ACTIONS: &[ActionDescriptor] = &[
         id: ActionId::Inspect,
         chord: "^A i",
         label: "inspect",
+        // Issue #354 phase 5: "this row" includes the summary line, where it
+        // opens the dashboard-level inspector instead.
         description: "evidence for this row",
         section: ActionSection::Session,
-        availability: needs_row,
+        availability: needs_target,
         menu: Some(MenuAction::Inspect),
         checks: &[(ch('i'), DashAction::Inspect)],
     },
@@ -671,7 +715,16 @@ pub fn menu_actions(ctx: &ActionContext) -> Vec<(MenuAction, Availability)> {
 /// used is *named and explained* in the context menu instead, never offered
 /// inert here.
 pub fn header_ids(ctx: &ActionContext) -> Vec<ActionId> {
-    let wanted: &[ActionId] = if ctx.needs_action {
+    let wanted: &[ActionId] = if ctx.summary {
+        // Issue #354 phase 5: the cursor is on the summary line -- the two
+        // things that still apply there, then the two that always do.
+        &[
+            ActionId::Inspect,
+            ActionId::ContextActions,
+            ActionId::Mail,
+            ActionId::Help,
+        ]
+    } else if ctx.needs_action {
         &[
             ActionId::Inspect,
             ActionId::ContextActions,
@@ -733,6 +786,16 @@ pub fn fuzzy_match(query: &str, haystack: &str) -> bool {
 pub enum PaletteRow {
     /// A section heading. Never activatable, and skipped by the caret.
     Section(&'static str),
+    /// Review of cc92a56 (finding 1): a descriptor that documents something
+    /// rather than binding it -- the mouse wheel, and the one Esc/Enter rule
+    /// every dialog holds. Both are worth listing (that is the whole point of
+    /// the help screen) and neither can be run, so they are their own kind:
+    /// drawn dim, never taking the caret, and never claiming to be "disabled"
+    /// -- there is nothing to enable.
+    Note {
+        label: &'static str,
+        chord: &'static str,
+    },
     Action {
         id: ActionId,
         label: &'static str,
@@ -772,6 +835,12 @@ pub fn palette_rows(ctx: &ActionContext, query: &str) -> Vec<PaletteRow> {
         }
         if !grouped && !fuzzy_match(query, &d.haystack()) {
             return None;
+        }
+        if d.informational() {
+            return Some(PaletteRow::Note {
+                label: d.label,
+                chord: d.chord,
+            });
         }
         Some(PaletteRow::Action {
             id: d.id,
@@ -1063,6 +1132,7 @@ mod tests {
             clean_exit: true,
             has_cwd: true,
             needs_action: false,
+            summary: false,
         };
         assert_eq!(reason(&ended, MenuAction::Focus), Some(MENU_ENDED));
         assert_eq!(reason(&ended, MenuAction::Nudge), Some(MENU_ENDED));
@@ -1166,10 +1236,18 @@ mod tests {
         assert!(all.contains(&PaletteRow::Section("navigate")));
         assert!(all.contains(&PaletteRow::Section("the selected row")));
         // Everything the table has, minus nothing (a live selected row hides
-        // no descriptor).
+        // no descriptor) -- except the informational notes, which are listed
+        // but never take the caret.
+        let notes = ACTIONS.iter().filter(|d| d.informational()).count();
+        assert_eq!(
+            all.iter()
+                .filter(|r| matches!(r, PaletteRow::Note { .. }))
+                .count(),
+            notes
+        );
         assert_eq!(
             all.iter().filter(|r| r.selectable()).count(),
-            ACTIONS.len(),
+            ACTIONS.len() - notes,
             "an empty query must list the whole table"
         );
 
@@ -1256,6 +1334,105 @@ mod tests {
         // A caret parked on a heading is pulled back onto a real row.
         assert!(rows[palette_step(&rows, 0, -1)].selectable());
         assert!(palette_step(&[], 0, 1) == 0);
+    }
+
+    /// Review of cc92a56 (finding 1): every row the palette lets the caret
+    /// rest on and Enter activate must have something to run. The wheel and
+    /// the Esc/Enter note are listed as notes instead -- visible, dim, inert,
+    /// and never claiming to be "disabled".
+    #[test]
+    fn every_activatable_palette_row_has_a_runnable_action() {
+        for ctx in [live_row(), ActionContext::default(), summary_line()] {
+            for row in palette_rows(&ctx, "") {
+                let PaletteRow::Action { id, .. } = row else {
+                    continue;
+                };
+                if !row.activatable() {
+                    continue;
+                }
+                let d = descriptor(id).expect("descriptor");
+                assert!(
+                    d.dash_action().is_some() || d.menu.is_some(),
+                    "{} is activatable in the palette but nothing runs it",
+                    d.label
+                );
+            }
+        }
+        let notes: Vec<&ActionDescriptor> = ACTIONS.iter().filter(|d| d.informational()).collect();
+        assert_eq!(notes.len(), 2, "only the wheel and the Esc/Enter note");
+        for d in notes {
+            assert!(matches!(d.id, ActionId::Wheel | ActionId::EscEnter));
+        }
+        let rows = palette_rows(&live_row(), "");
+        let wheel = rows
+            .iter()
+            .find(|r| {
+                matches!(
+                    r,
+                    PaletteRow::Note {
+                        label: "scroll",
+                        ..
+                    }
+                )
+            })
+            .expect("the wheel is still listed");
+        assert!(!wheel.activatable() && !wheel.selectable());
+    }
+
+    fn summary_line() -> ActionContext {
+        ActionContext {
+            summary: true,
+            ..ActionContext::default()
+        }
+    }
+
+    /// Issue #354 phase 5: the summary line is a valid target for `inspect`
+    /// (and for the menu that offers it); every per-session action is listed
+    /// there with a reason rather than hidden or, worse, enabled.
+    #[test]
+    fn the_summary_line_offers_inspect_and_explains_every_session_action() {
+        let ctx = summary_line();
+        assert_eq!(
+            (descriptor(ActionId::Inspect).unwrap().availability)(&ctx),
+            Availability::Enabled
+        );
+        assert_eq!(
+            (descriptor(ActionId::ContextActions).unwrap().availability)(&ctx),
+            Availability::Enabled
+        );
+        for id in [
+            ActionId::Focus,
+            ActionId::Nudge,
+            ActionId::Handover,
+            ActionId::Stop,
+            ActionId::Restore,
+            ActionId::OpenWorktree,
+            ActionId::Evidence,
+            ActionId::Retry,
+            ActionId::Dismiss,
+        ] {
+            assert_eq!(
+                (descriptor(id).unwrap().availability)(&ctx),
+                Availability::Disabled(MENU_SUMMARY_LINE),
+                "{id:?} must be inert on the summary line, with a reason"
+            );
+        }
+        // The menu still lists every entry, and the header offers inspect.
+        assert_eq!(menu_actions(&ctx).len(), 11);
+        assert_eq!(
+            header_ids(&ctx),
+            vec![
+                ActionId::Inspect,
+                ActionId::ContextActions,
+                ActionId::Mail,
+                ActionId::Help
+            ]
+        );
+        // Nothing selected at all is still "does not apply", not "inert".
+        assert_eq!(
+            (descriptor(ActionId::Focus).unwrap().availability)(&ActionContext::default()),
+            Availability::Hidden
+        );
     }
 
     /// Every descriptor that has a chord can be run from the palette, and

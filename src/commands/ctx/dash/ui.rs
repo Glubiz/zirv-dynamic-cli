@@ -102,7 +102,25 @@ pub struct HeaderFacts {
 /// Issue #354 phase 4 (finding F15): what a brand-new operator is told, once.
 /// Three facts, in the order they are worth learning -- where the key
 /// reference is, where every action is, and that the roster is clickable.
-pub const FIRST_RUN_TIP: &str = "^A ? help \u{b7} ^A p palette \u{b7} click a row to focus";
+///
+/// Review of cc92a56 (finding 3): the two chords are READ OFF the one
+/// action-descriptor table rather than spelled out here. A tip that hard-codes
+/// `^A ?` is a fifth place a chord is written down, and the chord-audit test
+/// (`every_chord_drawn_anywhere_comes_from_the_action_table`) now renders a
+/// header with the tip up, so a rebinding that did not reach this string would
+/// fail the audit instead of misleading a first-time operator.
+pub static FIRST_RUN_TIP: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    let hint = |id: actions::ActionId| match actions::descriptor(id) {
+        Some(d) => format!("{} {}", d.chord, d.label),
+        // Unreachable: the table's own exhaustiveness tests pin both ids.
+        None => String::new(),
+    };
+    format!(
+        "{} \u{b7} {} \u{b7} click a row to focus",
+        hint(actions::ActionId::Help),
+        hint(actions::ActionId::Palette)
+    )
+});
 
 /// What the header's right-hand hint cluster is chosen against. Phase 2 adds
 /// the two attention-derived states the approved contract names
@@ -125,6 +143,10 @@ pub struct HintContext {
     /// rule is that a drawn hint always does something (the context menu is
     /// where an unavailable action is named *and* explained instead).
     pub restorable: bool,
+    /// Issue #354 phase 5: the cursor is on the sidebar's summary line, so
+    /// the cluster describes the DASHBOARD -- `inspect` opens the
+    /// dashboard-level inspector, and every per-session chord is dropped.
+    pub summary: bool,
 }
 
 impl HintContext {
@@ -144,6 +166,7 @@ impl HintContext {
             has_request: self.restorable,
             clean_exit: false,
             has_cwd: true,
+            summary: self.summary,
         }
     }
 }
@@ -361,6 +384,39 @@ const ATTENTION_GLYPHS: [Glyph; 3] = [Glyph::NeedsAction, Glyph::Failed, Glyph::
 /// The quiet states, in the fixed order a rollup lists them when nothing in
 /// [`ATTENTION_GLYPHS`] is present.
 const QUIET_GLYPHS: [Glyph; 3] = [Glyph::Working, Glyph::Idle, Glyph::Unknown];
+
+/// Every glyph, attention first -- the order the dashboard inspector's own
+/// counts section lists them in (issue #354 phase 5), which is the two rollup
+/// tiers concatenated rather than a third hand-written order.
+pub const ALL_GLYPHS: [Glyph; 6] = [
+    Glyph::NeedsAction,
+    Glyph::Failed,
+    Glyph::DoneUnread,
+    Glyph::Working,
+    Glyph::Idle,
+    Glyph::Unknown,
+];
+
+impl Glyph {
+    /// The glyph's own word, for a surface that has room for one (the
+    /// inspector) rather than a single column.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Glyph::Working => "working",
+            Glyph::Idle => "idle",
+            Glyph::NeedsAction => "needs action",
+            Glyph::DoneUnread => "done-unread",
+            Glyph::Failed => "failed",
+            Glyph::Unknown => "unknown",
+        }
+    }
+
+    /// The glyph's own character, spinner frame 0 for `Working` -- a static
+    /// report is not animated.
+    pub fn symbol(self) -> &'static str {
+        glyph_char_for(self, 0)
+    }
+}
 
 /// Pure: the [`Glyph`] a row draws, from its cached
 /// [`SessionStatus`](super::super::attention::SessionStatus) when one exists
@@ -658,13 +714,32 @@ pub struct RestoreView {
     pub offset: usize,
 }
 
+/// One row of the `Ctrl+A e` dialog: an error message, how many times it
+/// repeated consecutively, how long ago the most recent repeat was, and
+/// whether the operator has acknowledged it (issue #354 phase 5).
+///
+/// A snapshot of `dash::mod`'s own `ErrorLog` entry, taken when the overlay
+/// opens -- the dialog does not re-read the buffer while it is up, the same
+/// convention every other overlay here follows.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ErrorItem {
+    pub text: String,
+    /// `1` for a message seen once; `3` renders as `\u{d7}3`.
+    pub count: usize,
+    /// Seconds since the most recent repeat.
+    pub age_secs: u64,
+    /// Acknowledged entries stay listed, dimmed, until the buffer cap drops
+    /// them -- acknowledgement is never a delete.
+    pub acked: bool,
+}
+
 /// `Ctrl+A e`'s own state: the kept errors from `push_error`'s buffer
 /// (`MAX_KEPT_ERRORS`), newest first -- built once when the overlay opens
 /// (`dash::mod::build_errors_view`), not re-read live while it is up, the
 /// same snapshot-on-open convention every other overlay here already uses.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ErrorsView {
-    pub items: Vec<String>,
+    pub items: Vec<ErrorItem>,
     pub cursor: usize,
     /// The shared list viewport's first drawn row (issue #354 phase 3).
     pub offset: usize,
@@ -3362,14 +3437,14 @@ pub fn list_spec_for(overlay: &Overlay, tick: usize) -> Option<ListDialogSpec<'s
                 input: Some(view.query.clone()),
             })
         }
+        // Issue #354 phase 5: each entry carries its own repeat count and the
+        // age of its most recent repeat in the same dim trailing slot the
+        // context menu uses for a disable reason, and an acknowledged entry
+        // renders dim rather than disappearing.
         Overlay::Errors(view) => Some(ListDialogSpec {
             title: "errors".to_string(),
             count: Some(view.items.len()),
-            rows: view
-                .items
-                .iter()
-                .map(|msg| ListDialogRow::plain(format!("\u{26a0} {msg}")))
-                .collect(),
+            rows: view.items.iter().map(error_dialog_row).collect(),
             cursor: cursor_of(view.items.len(), view.cursor),
             offset: view.offset,
             footer: ERRORS_FOOTER,
@@ -3533,6 +3608,36 @@ fn overlay_area(frame: Rect, main: Rect) -> Rect {
 /// overlapping it.
 const PALETTE_LABEL_COLS: usize = 16;
 
+/// Pure: one errors-dialog row (issue #354 phase 5). The `\u{d7}n` repeat
+/// count is part of the message itself -- it is the news -- while the age
+/// sits in the dim trailing slot; an acknowledged entry dims whole.
+fn error_dialog_row(item: &ErrorItem) -> ListDialogRow {
+    let repeats = if item.count > 1 {
+        format!(" \u{d7}{}", item.count)
+    } else {
+        String::new()
+    };
+    ListDialogRow {
+        text: format!("\u{26a0} {}{repeats}", item.text),
+        checked: None,
+        glyph: None,
+        reason: Some(style::format_age(item.age_secs)),
+        dim: item.acked,
+    }
+}
+
+/// Pure: the sticky header line's own text for one unacknowledged error --
+/// the message, plus its repeat count when it has repeated. Shared by the
+/// header and by `dash::mod`'s own `ErrorLog`, so the two can never disagree
+/// about how a repeat is spelled.
+pub fn error_line(text: &str, count: usize) -> String {
+    if count > 1 {
+        format!("{text} \u{d7}{count}")
+    } else {
+        text.to_string()
+    }
+}
+
 /// Pure: one palette/help row as the shared list dialog draws it --
 /// `label  chord`, with a section heading rendered as a dim standalone line
 /// and a disabled action carrying its reason in the muted trailing slot every
@@ -3546,6 +3651,19 @@ fn palette_dialog_row(row: &PaletteRow) -> ListDialogRow {
             reason: None,
             dim: true,
         },
+        // Review of cc92a56 (finding 1): drawn exactly like an action row so
+        // the listing keeps one shape, but dim and with no reason -- it is
+        // documentation, not a disabled binding.
+        PaletteRow::Note { label, chord } => {
+            let pad = PALETTE_LABEL_COLS.saturating_sub(style::display_width(label));
+            ListDialogRow {
+                text: format!("  {label}{}{chord}", " ".repeat(pad)),
+                checked: None,
+                glyph: None,
+                reason: None,
+                dim: true,
+            }
+        }
         PaletteRow::Action {
             label,
             chord,
@@ -3590,7 +3708,11 @@ const RESTORE_FOOTER: &[(&str, &str)] = &[
     ("esc", "skip"),
 ];
 const HANDOVER_FOOTER: &[(&str, &str)] = &[("\u{23ce}", "swap"), ("esc", "cancel")];
-const ERRORS_FOOTER: &[(&str, &str)] = &[("j/k", "scroll"), ("esc/q", "close")];
+/// Issue #354 phase 5: `a` acknowledges in place (the entries stay, dimmed,
+/// and the sticky header line clears); `esc`/`enter`/`q` acknowledge and
+/// close, which is what an operator who has read the list has done.
+const ERRORS_FOOTER: &[(&str, &str)] =
+    &[("j/k", "scroll"), ("a", "acknowledge"), ("esc/q", "close")];
 /// Issue #354 phase 3: the context menu's own keys. `esc` says `back`
 /// rather than `close` because that is what it does -- the previously
 /// focused pane keeps the keyboard, and nothing about the row changed.
@@ -4693,36 +4815,58 @@ mod tests {
     /// rect still lands exactly on its own chord's `^`, and a chord that was
     /// not drawn at all has no rect to click. The old right-aligned
     /// recomputation put rects on top of the chip and the harness label.
+    /// Issue #354 phase 5 extends the same sweep over the three things the
+    /// header's middle slot can carry: an attention notice, a sticky error
+    /// line with a repeat count, and the first-run tip. None of them may push
+    /// a chord off the row or land a click rect on anything but its own `^`.
     #[test]
     fn header_hint_rects_land_on_the_chords_that_were_actually_drawn() {
-        let mut facts = base_facts();
-        facts.hints.alive = true;
-        for width in 1..=90u16 {
-            let area = Rect::new(0, 0, width, 1);
-            let backend = TestBackend::new(width, 1);
-            let mut term = Terminal::new(backend).unwrap();
-            term.draw(|f| render_header(f, area, &facts)).unwrap();
-            let buf = term.backend().buffer().clone();
-            let regions = header_hint_regions(area, &facts);
-            for (rect, id) in &regions {
-                assert!(
-                    rect.right() <= area.right(),
-                    "width {width}: {id:?} rect {rect:?} runs past the header"
-                );
-                assert_eq!(
-                    buf[(rect.x, 0)].symbol(),
-                    "^",
-                    "width {width}: {id:?} rect {rect:?} must start on its own chord"
-                );
-            }
-            // And no rect may claim a column the chip or the harness label
-            // owns: at every width the leftmost rect starts at or after the
-            // last drawn non-hint character.
-            if let Some((first, _)) = regions.first() {
-                assert!(
-                    first.x >= style::display_width(" zirv ") as u16,
-                    "width {width}: a hint rect overlapped the brand chip"
-                );
+        /// One way of filling the header's flexible middle slot.
+        type FillMiddle = fn(&mut HeaderFacts);
+        let middles: [(&str, FillMiddle); 4] = [
+            ("nothing", |_| {}),
+            ("a notice", |f| {
+                f.notice = Some("\u{25b2} a0000002 needs approval".to_string());
+            }),
+            ("a sticky error", |f| {
+                f.error_count = 3;
+                f.latest_error = Some(error_line("mail send: disk full", 4));
+            }),
+            ("the first-run tip", |f| {
+                f.tip = Some(FIRST_RUN_TIP.as_str());
+            }),
+        ];
+        for (what, fill) in middles {
+            let mut facts = base_facts();
+            facts.hints.alive = true;
+            fill(&mut facts);
+            for width in 1..=90u16 {
+                let area = Rect::new(0, 0, width, 1);
+                let backend = TestBackend::new(width, 1);
+                let mut term = Terminal::new(backend).unwrap();
+                term.draw(|f| render_header(f, area, &facts)).unwrap();
+                let buf = term.backend().buffer().clone();
+                let regions = header_hint_regions(area, &facts);
+                for (rect, id) in &regions {
+                    assert!(
+                        rect.right() <= area.right(),
+                        "{what}, width {width}: {id:?} rect {rect:?} runs past the header"
+                    );
+                    assert_eq!(
+                        buf[(rect.x, 0)].symbol(),
+                        "^",
+                        "{what}, width {width}: {id:?} rect {rect:?} must start on its own chord"
+                    );
+                }
+                // And no rect may claim a column the chip or the harness label
+                // owns: at every width the leftmost rect starts at or after the
+                // last drawn non-hint character.
+                if let Some((first, _)) = regions.first() {
+                    assert!(
+                        first.x >= style::display_width(" zirv ") as u16,
+                        "{what}, width {width}: a hint rect overlapped the brand chip"
+                    );
+                }
             }
         }
     }
@@ -4736,6 +4880,7 @@ mod tests {
             needs_action: true,
             ended: false,
             restorable: false,
+            summary: false,
         };
         assert_eq!(
             header_hints(&needs_action),
@@ -4751,6 +4896,7 @@ mod tests {
             needs_action: false,
             ended: true,
             restorable: false,
+            summary: false,
         };
         // Issue #354 phase 3: an ended row whose spawn request the dashboard
         // no longer holds is still never offered `^A r` -- the hint would do
@@ -6264,12 +6410,23 @@ mod tests {
         );
     }
 
+    /// One never-repeated, never-acknowledged error -- the ordinary case
+    /// every pre-phase-5 test was written against.
+    fn err_item(text: &str) -> ErrorItem {
+        ErrorItem {
+            text: text.to_string(),
+            count: 1,
+            age_secs: 0,
+            acked: false,
+        }
+    }
+
     #[test]
     fn errors_overlay_lists_kept_errors_newest_first_with_a_warning_glyph() {
         let view = ErrorsView {
             items: vec![
-                "mail send: disk full".to_string(),
-                "handover: timed out".to_string(),
+                err_item("mail send: disk full"),
+                err_item("handover: timed out"),
             ],
             cursor: 0,
             offset: 0,
@@ -6282,6 +6439,83 @@ mod tests {
             text.contains("mailsend") || text.contains("mail send"),
             "got {text}"
         );
+    }
+
+    /// Issue #354 phase 5: a repeated error is ONE row carrying `\u{d7}n`
+    /// and the age of its most recent repeat; an acknowledged one stays in
+    /// the list, dim, rather than disappearing; and the footer says how to
+    /// acknowledge.
+    #[test]
+    fn the_errors_dialog_shows_repeat_counts_ages_and_dims_acknowledged_rows() {
+        let repeated = ErrorItem {
+            text: "mail send: disk full".to_string(),
+            count: 4,
+            age_secs: 125,
+            acked: false,
+        };
+        let acked = ErrorItem {
+            text: "handover: timed out".to_string(),
+            count: 1,
+            age_secs: 3600,
+            acked: true,
+        };
+        assert_eq!(
+            error_dialog_row(&repeated).text,
+            "\u{26a0} mail send: disk full \u{d7}4"
+        );
+        assert_eq!(
+            error_dialog_row(&repeated).reason.as_deref(),
+            Some(style::format_age(125).as_str())
+        );
+        assert!(!error_dialog_row(&repeated).dim);
+        assert_eq!(
+            error_dialog_row(&acked).text,
+            "\u{26a0} handover: timed out"
+        );
+        assert!(
+            error_dialog_row(&acked).dim,
+            "an acknowledged entry is dim, never dropped"
+        );
+        let overlay = Overlay::Errors(ErrorsView {
+            items: vec![repeated, acked],
+            cursor: 0,
+            offset: 0,
+        });
+        let text = render_and_capture_text(Rect::new(0, 0, 70, 12), |f, area| {
+            render_overlay(f, area, &overlay, 0)
+        });
+        assert!(text.contains('\u{d7}'), "the repeat count is drawn: {text}");
+        assert!(
+            text.contains("acknowledge"),
+            "the footer names the key: {text}"
+        );
+    }
+
+    /// The sticky header line spells a repeat the same way the dialog does.
+    #[test]
+    fn the_sticky_error_line_carries_its_repeat_count() {
+        assert_eq!(error_line("boom", 1), "boom");
+        assert_eq!(error_line("boom", 3), "boom \u{d7}3");
+    }
+
+    /// Issue #354 phase 5: with the cursor on the summary line the cluster
+    /// describes the dashboard -- `^A i` first, no per-session chord.
+    #[test]
+    fn the_summary_line_gets_its_own_header_cluster() {
+        let summary = HintContext {
+            summary: true,
+            ..HintContext::default()
+        };
+        assert_eq!(
+            header_hints(&summary),
+            vec![
+                ("^A i", "inspect"),
+                ("^A c", "actions"),
+                ("^A m", "mail"),
+                ("^A ?", "help"),
+            ]
+        );
+        assert!(!header_hints(&summary).iter().any(|(_, l)| *l == "nudge"));
     }
 
     #[test]
@@ -6355,7 +6589,7 @@ mod tests {
                 offset: 0,
             }),
             Overlay::Errors(ErrorsView {
-                items: vec!["an error".to_string()],
+                items: vec![err_item("an error")],
                 cursor: 0,
                 offset: 0,
             }),
@@ -6948,6 +7182,15 @@ mod tests {
                 render_header(f, area, &facts)
             });
             check(&drawn, "the header");
+            // Review of cc92a56 (finding 3): the first-run tip draws two
+            // chords of its own in the same slot, and used to be the one
+            // surface this audit never rendered.
+            facts.tip = Some(FIRST_RUN_TIP.as_str());
+            let with_tip = render_and_capture_text(Rect::new(0, 0, 160, 1), |f, area| {
+                render_header(f, area, &facts)
+            });
+            check(&with_tip, "the first-run tip");
+            facts.tip = None;
         }
         check(
             &draw_overlay(120, 40, &Overlay::Palette(palette(PaletteMode::Help, ""))),
@@ -7110,7 +7353,7 @@ mod tests {
             })
         };
         let mut facts = base_facts();
-        facts.tip = Some(FIRST_RUN_TIP);
+        facts.tip = Some(FIRST_RUN_TIP.as_str());
         assert!(render(&facts).contains("^A p palette"));
         // Visible at every approved frame width -- truncated with an ellipsis
         // where the row is too narrow to hold it, never dropped silently and
