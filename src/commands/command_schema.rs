@@ -193,6 +193,8 @@ const MUTATING: &[&str] = &[
     "zirv memory forget",
     "zirv memory verify",
     "zirv memory optimize",
+    "zirv memory promote",
+    "zirv memory rollback",
     "zirv workflow start",
     "zirv workflow resume",
     "zirv workflow reclassify",

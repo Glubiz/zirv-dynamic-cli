@@ -18,7 +18,7 @@ last-verified: 2026-09-05
 The complete set of `zirv ctx <verb>` names, kept in sync with `CtxVerb` (`src/commands/ctx/mod.rs`) by the built-in self-check `ZCHK-DOC-VERBS` (issue #276, `src/commands/workflow/checks/docs.rs`): it reads the real subcommand names straight off `CtxCli::command()` (the same `clap::CommandFactory` introspection `zirv commands` uses) and fails `zirv verify`/`zirv verify --builtin` the moment this list and the clap tree disagree in either direction. Alphabetical, one word or hyphenated verb per backtick span; edit this list, don't hand-copy it elsewhere.
 
 <!-- zchk-doc-verbs:start -->
-`agent`, `chat`, `compile`, `exec`, `explain-status`, `forget`, `group`, `handoff`, `handover`, `hook`, `inbox`, `kill`, `loop`, `nudge`, `objective`, `optimize`, `permissions`, `recall`, `remember`, `resume`, `safety`, `score`, `search`, `send`, `snapshot`, `spend`, `status`, `swarm`, `task`, `usage`, `wait`, `worktree`, `wrap`
+`agent`, `chat`, `compile`, `exec`, `explain-status`, `forget`, `group`, `handoff`, `handover`, `hook`, `inbox`, `kill`, `loop`, `measure`, `nudge`, `objective`, `optimize`, `permissions`, `recall`, `remember`, `resume`, `safety`, `score`, `search`, `send`, `snapshot`, `spend`, `status`, `swarm`, `task`, `usage`, `wait`, `worktree`, `wrap`
 <!-- zchk-doc-verbs:end -->
 
 ## `zirv verify --builtin`: the built-in self-check registry (issue #276)
