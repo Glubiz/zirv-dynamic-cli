@@ -22,7 +22,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -34,7 +34,7 @@ use crate::style;
 use super::super::attention::{Projection, SessionStatus, Visibility};
 use super::super::mail::Message;
 use super::super::price;
-use super::DashAction;
+use super::actions::{self, ActionContext, ActionId, PaletteRow};
 use super::hit::{FrameSnapshot, HintId, Hit};
 use super::pane::PaneState;
 
@@ -91,7 +91,18 @@ pub struct HeaderFacts {
     pub error_count: usize,
     pub latest_error: Option<String>,
     pub notice: Option<String>,
+    /// Issue #354 phase 4: the first-run tip ([`FIRST_RUN_TIP`]), shown in the
+    /// same middle slot as a notice and with the same dim weight, but only on
+    /// this operator's very first dashboard launch and only until any
+    /// prefixed key is used or `Esc` dismisses it. Lowest precedence of the
+    /// three: a real error or a live notice always wins the slot.
+    pub tip: Option<&'static str>,
 }
+
+/// Issue #354 phase 4 (finding F15): what a brand-new operator is told, once.
+/// Three facts, in the order they are worth learning -- where the key
+/// reference is, where every action is, and that the roster is clickable.
+pub const FIRST_RUN_TIP: &str = "^A ? help \u{b7} ^A p palette \u{b7} click a row to focus";
 
 /// What the header's right-hand hint cluster is chosen against. Phase 2 adds
 /// the two attention-derived states the approved contract names
@@ -116,44 +127,43 @@ pub struct HintContext {
     pub restorable: bool,
 }
 
+impl HintContext {
+    /// The header's own slice of an [`ActionContext`]: the cluster only ever
+    /// needs to know whether the selected row is alive, ended, waiting on the
+    /// operator, and whether its spawn request is still held. Everything else
+    /// an availability rule can ask about is either irrelevant to the four
+    /// chords the cluster draws, or (`attached`, `retained`) implied by them.
+    pub fn action_context(&self) -> ActionContext {
+        ActionContext {
+            selected: self.alive || self.ended,
+            attached: self.alive,
+            alive: self.alive,
+            ended: self.ended,
+            needs_action: self.needs_action,
+            retained: self.ended,
+            has_request: self.restorable,
+            clean_exit: false,
+            has_cwd: true,
+        }
+    }
+}
+
 /// Pure: the `(chord, label)` pairs the header offers for `context`, in
 /// display order, at most four (the approved design's own cap).
 ///
-/// This is the one table the cluster, its hit regions and -- from phase 3 --
-/// the context menu are all built from, so a chord can never be drawn without
-/// a hit region or vice versa. The order is most specific first: a row that
-/// needs action, then an ended row, then any other live pane, then the two
-/// hints that always exist.
-///
-/// Phase 3: the ended cluster is the approved design's own four -- inspect,
-/// restore, actions, help -- with `^A r restore` drawn only for a row that
-/// really can be restored (`HintContext::restorable`).
+/// Issue #354 phase 4: the cluster no longer keeps its own four hard-coded
+/// lists. It picks at most four ids out of the one action-descriptor table
+/// ([`actions::header_ids`]) and prints each descriptor's own `chord`/`label`
+/// -- so a chord drawn here is, by construction, the same chord the help
+/// screen, the palette and the context menu name for the same action, and
+/// it can never be drawn for an action that is currently unavailable.
 pub fn header_hints(context: &HintContext) -> Vec<(&'static str, &'static str)> {
-    if context.needs_action {
-        vec![
-            ("^A i", "inspect"),
-            ("^A c", "actions"),
-            ("^A n", "nudge"),
-            ("^A ?", "help"),
-        ]
-    } else if context.ended {
-        let mut hints = vec![("^A i", "inspect")];
-        if context.restorable {
-            hints.push(("^A r", "restore"));
-        }
-        hints.push(("^A c", "actions"));
-        hints.push(("^A ?", "help"));
-        hints
-    } else if context.alive {
-        vec![
-            ("^A c", "actions"),
-            ("^A n", "nudge"),
-            ("^A m", "mail"),
-            ("^A ?", "help"),
-        ]
-    } else {
-        vec![("^A e", "errors"), ("^A ?", "help")]
-    }
+    let ctx = context.action_context();
+    actions::header_ids(&ctx)
+        .into_iter()
+        .filter_map(actions::descriptor)
+        .map(|d| (d.chord, d.label))
+        .collect()
 }
 
 /// The `HintId` a chord from [`header_hints`] reports when clicked. Unknown
@@ -847,6 +857,64 @@ impl InspectorView {
     }
 }
 
+/// Which of the two faces the one palette overlay is wearing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PaletteMode {
+    /// `Ctrl+A p`: Enter runs the selected action.
+    #[default]
+    Run,
+    /// `Ctrl+A ?`/`h`/`H`: the same list, the same filter, but read-only --
+    /// Enter closes rather than running, so the key reference can never fire
+    /// an action an operator only meant to read about.
+    Help,
+}
+
+impl PaletteMode {
+    pub fn title(self) -> &'static str {
+        match self {
+            PaletteMode::Run => "palette",
+            PaletteMode::Help => "help",
+        }
+    }
+}
+
+/// Issue #354 phase 4: the palette/help overlay's own state.
+///
+/// `ctx` is the availability snapshot taken when the overlay opened -- the
+/// same convention every other overlay here already follows (mail, memory and
+/// restore do not live-update while open either), and what keeps the rows a
+/// pure function of the view.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PaletteView {
+    pub mode: PaletteMode,
+    /// What the operator has typed. Never forwarded to the child: an open
+    /// overlay owns every keystroke.
+    pub query: String,
+    pub ctx: ActionContext,
+    pub cursor: usize,
+    pub offset: usize,
+}
+
+impl PaletteView {
+    /// Pure: the rows this view draws right now.
+    pub fn rows(&self) -> Vec<PaletteRow> {
+        actions::palette_rows(&self.ctx, &self.query)
+    }
+
+    /// Pure: the action under the caret, when there is one that can be run.
+    /// A section heading, a disabled row and a read-only (help) view all
+    /// yield `None` -- the caller has nothing to do.
+    pub fn activated(&self) -> Option<ActionId> {
+        if self.mode == PaletteMode::Help {
+            return None;
+        }
+        match self.rows().get(self.cursor) {
+            Some(row @ PaletteRow::Action { id, .. }) if row.activatable() => Some(*id),
+            _ => None,
+        }
+    }
+}
+
 /// What, if anything, sits drawn on top of the grid right now. `QuitConfirm`
 /// carries the titles of every pane still `Working`, so the confirmation
 /// text can name what the operator is about to interrupt.
@@ -866,10 +934,12 @@ pub enum Overlay {
     /// roster (`dash::mod::run_dashboard`); never re-opened later in a
     /// session's life the way the other overlays are.
     Restore(RestoreView),
-    /// `Ctrl+A ?`/`h`/`H`: the key-binding reference. No payload -- its
-    /// content is the static [`HELP_BINDINGS`] table, not per-session state,
-    /// and any key closes it.
-    Help,
+    /// Issue #354 phase 4: `Ctrl+A p` (the searchable palette) and
+    /// `Ctrl+A ?`/`h`/`H` (the same list, read-only, as the key reference).
+    /// One overlay for both: the help screen IS the palette without
+    /// Enter-to-run, which is strictly less code than two dialogs that have
+    /// to agree about the same table.
+    Palette(PaletteView),
     /// `Ctrl+A e`: the kept-errors overlay.
     Errors(ErrorsView),
     /// Issue #354 phase 3: `Ctrl+A c`, a right-click on a row, or the
@@ -903,6 +973,7 @@ impl Overlay {
             Overlay::Errors(view) => Some((view.cursor, view.offset, view.items.len())),
             Overlay::Menu(view) => Some((view.cursor, view.offset, view.entries.len())),
             Overlay::Inspector(view) => Some((view.cursor, view.offset, view.rows().len())),
+            Overlay::Palette(view) => Some((view.cursor, view.offset, view.rows().len())),
             _ => None,
         }
     }
@@ -936,6 +1007,10 @@ impl Overlay {
                 view.offset = offset;
             }
             Overlay::Inspector(view) => {
+                view.cursor = cursor;
+                view.offset = offset;
+            }
+            Overlay::Palette(view) => {
                 view.cursor = cursor;
                 view.offset = offset;
             }
@@ -1203,7 +1278,7 @@ fn header_layout(facts: &HeaderFacts, area: Rect) -> (Vec<Span<'static>>, Vec<(R
                 }
             }
         }
-    } else if let Some(note) = &facts.notice {
+    } else if let Some(note) = facts.notice.as_deref().or(facts.tip) {
         let prefix = "  ".to_string();
         let prefix_w = style::display_width(&prefix);
         if prefix_w <= middle_budget {
@@ -2736,6 +2811,11 @@ pub struct ListDialogSpec<'a> {
     /// Shown, cursor-less, in place of `rows` when it is empty -- "(no
     /// mail)", "(nothing to restore)", and the like.
     pub empty_message: &'a str,
+    /// Issue #354 phase 4: a one-line query input PINNED between the title
+    /// and the list viewport, mirroring the pinned hint row at the bottom.
+    /// `None` for every dialog that has no query of its own -- which is all
+    /// of them except the palette/help overlay.
+    pub input: Option<String>,
 }
 
 /// The exact `Block` every list dialog draws, with the title and border
@@ -2764,6 +2844,11 @@ pub struct ListDialogLayout {
     /// How many list rows fit between the pinned title and the pinned hint
     /// row. Zero on a dialog with no room for a single row.
     pub capacity: usize,
+    /// `1` when this dialog's pinned query input was actually given a row,
+    /// `0` otherwise -- including a dialog that HAS an input but had no room
+    /// left for it. The renderer reads this rather than re-deriving it, so
+    /// the drawn line count and the row rects can never disagree.
+    pub input_rows: u16,
     pub rows: Vec<(Rect, usize)>,
     pub hints: Vec<(Rect, HintId)>,
     /// `3–12 of 40`, only when the list does not fit.
@@ -2809,8 +2894,10 @@ pub fn list_dialog_layout(area: Rect, spec: &ListDialogSpec) -> Option<ListDialo
     }
     let content_rows = spec.rows.len().max(1);
     // +1 blank row above the hint row, +1 the hint row itself, +2 for the
-    // block's own top/bottom border.
-    let h = dialog_row_count(content_rows, 2 + 2).min(area.height);
+    // block's own top/bottom border, and +1 more for a pinned query input
+    // when the dialog has one (issue #354 phase 4).
+    let extra = 2 + 2 + u16::from(spec.input.is_some());
+    let h = dialog_row_count(content_rows, extra).min(area.height);
     let w = dialog_width(area.width);
     let rect = centered(area, w, h);
     let inner = list_dialog_block(Line::default(), Style::default()).inner(rect);
@@ -2819,6 +2906,7 @@ pub fn list_dialog_layout(area: Rect, spec: &ListDialogSpec) -> Option<ListDialo
             rect,
             inner,
             capacity: 0,
+            input_rows: 0,
             rows: Vec::new(),
             hints: Vec::new(),
             indicator: None,
@@ -2831,7 +2919,16 @@ pub fn list_dialog_layout(area: Rect, spec: &ListDialogSpec) -> Option<ListDialo
     // and whatever is left is the list viewport.
     let hint_h = 1.min(inner.height);
     let blank_h = 1.min(inner.height.saturating_sub(hint_h));
-    let capacity = inner.height.saturating_sub(hint_h + blank_h) as usize;
+    // Phase 4: the query input is pinned directly under the title, reserved
+    // after the hint row and its spacer -- a palette whose keys are off
+    // screen is the same trap as a modal whose keys are, and the query line
+    // is what the operator is looking at while they type.
+    let input_h = if spec.input.is_some() {
+        1.min(inner.height.saturating_sub(hint_h + blank_h))
+    } else {
+        0
+    };
+    let capacity = inner.height.saturating_sub(hint_h + blank_h + input_h) as usize;
 
     let total = spec.rows.len();
     // Selection is always kept visible: the caller's own offset is honoured
@@ -2851,7 +2948,7 @@ pub fn list_dialog_layout(area: Rect, spec: &ListDialogSpec) -> Option<ListDialo
         rows.push((
             Rect {
                 x: inner.x,
-                y: inner.y.saturating_add(slot as u16),
+                y: inner.y.saturating_add(input_h).saturating_add(slot as u16),
                 width: inner.width,
                 height: 1,
             },
@@ -2891,6 +2988,7 @@ pub fn list_dialog_layout(area: Rect, spec: &ListDialogSpec) -> Option<ListDialo
         rect,
         inner,
         capacity,
+        input_rows: input_h,
         rows,
         hints,
         indicator: scroll_indicator(offset, capacity, total),
@@ -2947,6 +3045,18 @@ pub fn render_list_dialog(f: &mut Frame, area: Rect, spec: &ListDialogSpec) {
     let inner_width = inner.width as usize;
 
     let mut lines: Vec<Line> = Vec::new();
+    // Phase 4: the pinned query line, drawn before the viewport and counted
+    // by `list_dialog_layout` so the row rects below it are the rects a
+    // click is tested against.
+    if let Some(query) = &spec.input
+        && geom.input_rows > 0
+    {
+        lines.push(Line::from(vec![
+            Span::styled("\u{203a} ", style::tui::accent()),
+            Span::raw(query.clone()),
+            Span::styled("\u{2588}", style::tui::muted()),
+        ]));
+    }
     if spec.rows.is_empty() {
         if geom.capacity > 0 {
             lines.push(Line::from(Span::styled(
@@ -3013,10 +3123,11 @@ pub fn render_list_dialog(f: &mut Frame, area: Rect, spec: &ListDialogSpec) {
     // The viewport is padded out to its full height so the hint row stays
     // pinned to the bottom of the frame rather than floating up under a
     // short list.
-    while lines.len() < geom.capacity {
+    let body_rows = geom.capacity + geom.input_rows as usize;
+    while lines.len() < body_rows {
         lines.push(Line::from(""));
     }
-    if geom.capacity < inner.height as usize {
+    if body_rows < inner.height as usize {
         lines.push(Line::from(""));
     }
     let mut hint_spans: Vec<Span> = Vec::new();
@@ -3145,6 +3256,7 @@ pub fn list_spec_for(overlay: &Overlay, tick: usize) -> Option<ListDialogSpec<'s
             footer: QUIT_FOOTER,
             warn: true,
             empty_message: "nothing is still working",
+            input: None,
         }),
         Overlay::Mail(view) => Some(ListDialogSpec {
             title: "mail".to_string(),
@@ -3164,6 +3276,7 @@ pub fn list_spec_for(overlay: &Overlay, tick: usize) -> Option<ListDialogSpec<'s
             footer: MAIL_FOOTER,
             warn: false,
             empty_message: "(no mail)",
+            input: None,
         }),
         Overlay::Memory(view) => Some(ListDialogSpec {
             title: "memory".to_string(),
@@ -3180,6 +3293,7 @@ pub fn list_spec_for(overlay: &Overlay, tick: usize) -> Option<ListDialogSpec<'s
             footer: MEMORY_FOOTER,
             warn: false,
             empty_message: "(no memory entries)",
+            input: None,
         }),
         Overlay::Restore(view) => Some(ListDialogSpec {
             title: "restore".to_string(),
@@ -3200,6 +3314,7 @@ pub fn list_spec_for(overlay: &Overlay, tick: usize) -> Option<ListDialogSpec<'s
             footer: RESTORE_FOOTER,
             warn: false,
             empty_message: "(nothing to restore)",
+            input: None,
         }),
         // Issue #84: `draft.items` is already fully resolved
         // (agent/tier/model), so this only ever formats and marks the cursor
@@ -3222,17 +3337,31 @@ pub fn list_spec_for(overlay: &Overlay, tick: usize) -> Option<ListDialogSpec<'s
             footer: HANDOVER_FOOTER,
             warn: false,
             empty_message: "no enabled, ready harness available to swap to",
+            input: None,
         }),
-        Overlay::Help => Some(ListDialogSpec {
-            title: "help".to_string(),
-            count: None,
-            rows: help_lines().into_iter().map(ListDialogRow::plain).collect(),
-            cursor: None,
-            offset: 0,
-            footer: HELP_FOOTER,
-            warn: false,
-            empty_message: "",
-        }),
+        // Issue #354 phase 4: the palette and the help screen are one dialog
+        // over one table -- the only difference is whether Enter runs the
+        // selected row or just closes.
+        Overlay::Palette(view) => {
+            let rows = view.rows();
+            Some(ListDialogSpec {
+                title: view.mode.title().to_string(),
+                count: Some(rows.iter().filter(|r| r.selectable()).count()),
+                rows: rows.iter().map(palette_dialog_row).collect(),
+                cursor: rows
+                    .get(view.cursor)
+                    .filter(|row| row.selectable())
+                    .map(|_| view.cursor),
+                offset: view.offset,
+                footer: match view.mode {
+                    PaletteMode::Run => PALETTE_FOOTER,
+                    PaletteMode::Help => HELP_FOOTER,
+                },
+                warn: false,
+                empty_message: "(nothing matches)",
+                input: Some(view.query.clone()),
+            })
+        }
         Overlay::Errors(view) => Some(ListDialogSpec {
             title: "errors".to_string(),
             count: Some(view.items.len()),
@@ -3246,6 +3375,7 @@ pub fn list_spec_for(overlay: &Overlay, tick: usize) -> Option<ListDialogSpec<'s
             footer: ERRORS_FOOTER,
             warn: false,
             empty_message: "no recent errors",
+            input: None,
         }),
         Overlay::Menu(view) => Some(ListDialogSpec {
             title: format!("actions \u{b7} {}", view.subject),
@@ -3274,6 +3404,7 @@ pub fn list_spec_for(overlay: &Overlay, tick: usize) -> Option<ListDialogSpec<'s
             footer: MENU_FOOTER,
             warn: false,
             empty_message: "(nothing to do here)",
+            input: None,
         }),
         Overlay::Inspector(view) => {
             let rows = view.rows();
@@ -3286,6 +3417,7 @@ pub fn list_spec_for(overlay: &Overlay, tick: usize) -> Option<ListDialogSpec<'s
                 footer: INSPECTOR_FOOTER,
                 warn: false,
                 empty_message: "(nothing recorded for this row)",
+                input: None,
             })
         }
     }
@@ -3395,289 +3527,42 @@ fn overlay_area(frame: Rect, main: Rect) -> Rect {
     }
 }
 
-/// Which section of the help overlay a row belongs to -- `help_lines` groups
-/// by this so the dialog says outright which keys need `Ctrl+A` first and
-/// which don't, rather than one flat list that never mentions the prefix.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum HelpSection {
-    /// Needs the `Ctrl+A` prefix first.
-    Prefixed,
-    /// No prefix -- reaches the dashboard directly.
-    Unprefixed,
-    /// Not a keybinding: a closing reminder for whatever dialog is open.
-    Note,
+/// How wide the palette's own label column is before the chord starts.
+/// Every label in [`actions::ACTIONS`] fits inside it, which a test pins; a
+/// longer one simply pushes its chord one column right rather than
+/// overlapping it.
+const PALETTE_LABEL_COLS: usize = 16;
+
+/// Pure: one palette/help row as the shared list dialog draws it --
+/// `label  chord`, with a section heading rendered as a dim standalone line
+/// and a disabled action carrying its reason in the muted trailing slot every
+/// other list dialog already uses.
+fn palette_dialog_row(row: &PaletteRow) -> ListDialogRow {
+    match row {
+        PaletteRow::Section(name) => ListDialogRow {
+            text: format!("{name}:"),
+            checked: None,
+            glyph: None,
+            reason: None,
+            dim: true,
+        },
+        PaletteRow::Action {
+            label,
+            chord,
+            disabled,
+            ..
+        } => {
+            let pad = PALETTE_LABEL_COLS.saturating_sub(style::display_width(label));
+            ListDialogRow {
+                text: format!("  {label}{}{chord}", " ".repeat(pad)),
+                checked: None,
+                glyph: None,
+                reason: disabled.map(|reason| format!("disabled: {reason}")),
+                dim: disabled.is_some(),
+            }
+        }
+    }
 }
-
-/// One row of the `Ctrl+A ?` help overlay: what is shown, and -- for a row
-/// that is itself one or more real armed keystrokes -- the `filter_key`
-/// outcome each one must produce. `checks` is the single source of truth a
-/// sync test walks against the real dispatch, so this table can never drift
-/// from what `Ctrl+A <key>` actually does; it is empty for a row that is not
-/// one `filter_key` outcome (the unprefixed mouse wheel, or the closing note).
-struct HelpBinding {
-    label: &'static str,
-    description: &'static str,
-    section: HelpSection,
-    // Only the sync tests below read this outside `#[cfg(test)]`, which the
-    // plain bin target does not build.
-    #[allow(dead_code)]
-    checks: &'static [(KeyEvent, DashAction)],
-}
-
-/// The help overlay's content, in display order -- see [`HelpBinding`]. A
-/// `static`, not a function rebuilding a `Vec` on every call: `render_overlay`
-/// reaches this on every frame, which during the adaptive poll's hot window
-/// (`input_poll_wait`) is up to ~100/s. `KeyEvent::new` is `const fn` in
-/// crossterm 0.29, so the whole table is built once at compile time.
-static HELP_BINDINGS: &[HelpBinding] = &[
-    HelpBinding {
-        label: "Ctrl+A",
-        description: "send a literal Ctrl+A",
-        section: HelpSection::Prefixed,
-        checks: &[(
-            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL),
-            DashAction::LiteralPrefix,
-        )],
-    },
-    HelpBinding {
-        label: "Tab",
-        description: "next pane",
-        section: HelpSection::Prefixed,
-        checks: &[(
-            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
-            DashAction::NextPane,
-        )],
-    },
-    HelpBinding {
-        label: "Up / Down",
-        description: "select pane",
-        section: HelpSection::Prefixed,
-        checks: &[
-            (
-                KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
-                DashAction::SelectUp,
-            ),
-            (
-                KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
-                DashAction::SelectDown,
-            ),
-        ],
-    },
-    // Issue #354: the roster's own tree navigation, next to the arrows that
-    // walk it.
-    HelpBinding {
-        label: "Left / Right",
-        description: "collapse / expand group",
-        section: HelpSection::Prefixed,
-        checks: &[
-            (
-                KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
-                DashAction::CollapseGroup,
-            ),
-            (
-                KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
-                DashAction::ExpandGroup,
-            ),
-        ],
-    },
-    HelpBinding {
-        label: "c / right click",
-        description: "actions for the selected row",
-        section: HelpSection::Prefixed,
-        checks: &[(
-            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
-            DashAction::ContextActions,
-        )],
-    },
-    HelpBinding {
-        label: "1-9",
-        description: "jump to pane",
-        section: HelpSection::Prefixed,
-        checks: &[
-            (
-                KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE),
-                DashAction::Switch(0),
-            ),
-            (
-                KeyEvent::new(KeyCode::Char('9'), KeyModifiers::NONE),
-                DashAction::Switch(8),
-            ),
-        ],
-    },
-    HelpBinding {
-        label: "PageUp / PageDown",
-        description: "scroll",
-        section: HelpSection::Prefixed,
-        checks: &[
-            (
-                KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
-                DashAction::ScrollPageUp,
-            ),
-            (
-                KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
-                DashAction::ScrollPageDown,
-            ),
-        ],
-    },
-    HelpBinding {
-        label: "Home / End",
-        description: "scroll top / live",
-        section: HelpSection::Prefixed,
-        checks: &[
-            (
-                KeyEvent::new(KeyCode::Home, KeyModifiers::NONE),
-                DashAction::ScrollTop,
-            ),
-            (
-                KeyEvent::new(KeyCode::End, KeyModifiers::NONE),
-                DashAction::ScrollLive,
-            ),
-        ],
-    },
-    HelpBinding {
-        label: "s",
-        description: "spawn",
-        section: HelpSection::Prefixed,
-        checks: &[(
-            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE),
-            DashAction::Spawn,
-        )],
-    },
-    HelpBinding {
-        label: "n",
-        description: "nudge",
-        section: HelpSection::Prefixed,
-        checks: &[(
-            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
-            DashAction::Nudge,
-        )],
-    },
-    HelpBinding {
-        label: "m",
-        description: "mail",
-        section: HelpSection::Prefixed,
-        checks: &[(
-            KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE),
-            DashAction::Mail,
-        )],
-    },
-    HelpBinding {
-        label: "M",
-        description: "memory",
-        section: HelpSection::Prefixed,
-        checks: &[(
-            KeyEvent::new(KeyCode::Char('M'), KeyModifiers::NONE),
-            DashAction::Memory,
-        )],
-    },
-    HelpBinding {
-        label: "o",
-        description: "handover (swap model/harness)",
-        section: HelpSection::Prefixed,
-        checks: &[(
-            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE),
-            DashAction::Handover,
-        )],
-    },
-    // Issue #354 phase 3: `^A i` opens the real per-session inspector now.
-    HelpBinding {
-        label: "i",
-        description: "inspect (evidence)",
-        section: HelpSection::Prefixed,
-        checks: &[(
-            KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE),
-            DashAction::Inspect,
-        )],
-    },
-    HelpBinding {
-        label: "r",
-        description: "restore an ended row",
-        section: HelpSection::Prefixed,
-        checks: &[(
-            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
-            DashAction::RestoreRow,
-        )],
-    },
-    HelpBinding {
-        label: "e",
-        description: "recent errors",
-        section: HelpSection::Prefixed,
-        checks: &[(
-            KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
-            DashAction::ShowErrors,
-        )],
-    },
-    HelpBinding {
-        label: "z",
-        description: "zoom",
-        section: HelpSection::Prefixed,
-        checks: &[(
-            KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE),
-            DashAction::Zoom,
-        )],
-    },
-    HelpBinding {
-        label: "v",
-        description: "toggle text selection",
-        section: HelpSection::Prefixed,
-        checks: &[(
-            KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE),
-            DashAction::ToggleSelectMode,
-        )],
-    },
-    HelpBinding {
-        label: "q",
-        description: "quit",
-        section: HelpSection::Prefixed,
-        checks: &[(
-            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
-            DashAction::Quit,
-        )],
-    },
-    HelpBinding {
-        label: "? / h",
-        description: "this help screen",
-        section: HelpSection::Prefixed,
-        // A real terminal delivers SHIFT alongside both '?' (shift-slash on
-        // most layouts) and 'H' itself; `filter_key` matches on `key.code`
-        // alone, so all five must (and do) land on the same action.
-        checks: &[
-            (
-                KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE),
-                DashAction::Help,
-            ),
-            (
-                KeyEvent::new(KeyCode::Char('?'), KeyModifiers::SHIFT),
-                DashAction::Help,
-            ),
-            (
-                KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE),
-                DashAction::Help,
-            ),
-            (
-                KeyEvent::new(KeyCode::Char('H'), KeyModifiers::NONE),
-                DashAction::Help,
-            ),
-            (
-                KeyEvent::new(KeyCode::Char('H'), KeyModifiers::SHIFT),
-                DashAction::Help,
-            ),
-        ],
-    },
-    HelpBinding {
-        label: "(mouse wheel)",
-        description: "scroll the focused pane",
-        section: HelpSection::Unprefixed,
-        checks: &[],
-    },
-    HelpBinding {
-        label: "",
-        description: "Esc closes, Enter confirms",
-        section: HelpSection::Note,
-        checks: &[],
-    },
-];
-
 /// Every other dialog's own footer hints, named once here and reused both to
 /// build that dialog's [`ListDialogSpec`] and to list it in the help
 /// overlay's own "dialogs:" section (`help_dialog_rows`) -- a static table
@@ -3706,7 +3591,6 @@ const RESTORE_FOOTER: &[(&str, &str)] = &[
 ];
 const HANDOVER_FOOTER: &[(&str, &str)] = &[("\u{23ce}", "swap"), ("esc", "cancel")];
 const ERRORS_FOOTER: &[(&str, &str)] = &[("j/k", "scroll"), ("esc/q", "close")];
-const HELP_FOOTER: &[(&str, &str)] = &[("any key", "close")];
 /// Issue #354 phase 3: the context menu's own keys. `esc` says `back`
 /// rather than `close` because that is what it does -- the previously
 /// focused pane keeps the keyboard, and nothing about the row changed.
@@ -3718,61 +3602,22 @@ const MENU_FOOTER: &[(&str, &str)] = &[
 ];
 const INSPECTOR_FOOTER: &[(&str, &str)] = &[("j/k", "scroll"), ("esc", "back")];
 
-const DIALOG_FOOTERS: &[(&str, &[(&str, &str)])] = &[
-    ("quit", QUIT_FOOTER),
-    ("mail", MAIL_FOOTER),
-    ("memory", MEMORY_FOOTER),
-    ("restore", RESTORE_FOOTER),
-    ("handover", HANDOVER_FOOTER),
-    ("errors", ERRORS_FOOTER),
-    ("actions", MENU_FOOTER),
-    ("inspect", INSPECTOR_FOOTER),
+/// Issue #354 phase 4. The palette runs what the caret is on; the help
+/// screen is the same list read-only, so its Enter closes instead. Both say
+/// outright that typing filters -- the one thing an operator cannot guess
+/// from a list of rows, and finding F08's whole complaint about the old
+/// static help screen.
+const PALETTE_FOOTER: &[(&str, &str)] = &[
+    ("\u{23ce}", "run"),
+    ("esc", "close"),
+    ("\u{2191}\u{2193}", "move"),
+    ("type", "to filter"),
 ];
-
-/// Pure: the help overlay's rows, grouped by [`HelpSection`] so the dialog
-/// reads as "here's what's behind Ctrl+A", then "here's what needs no
-/// prefix", then which key closes/confirms whatever dialog is open, then a
-/// "dialogs:" section listing every other dialog's own footer hints
-/// ([`DIALOG_FOOTERS`]) -- see [`HELP_BINDINGS`].
-fn help_lines() -> Vec<String> {
-    let row = |b: &HelpBinding| format!("{:<18} {}", b.label, b.description);
-    let mut lines = vec!["Ctrl+A, then:".to_string()];
-    lines.extend(
-        HELP_BINDINGS
-            .iter()
-            .filter(|b| b.section == HelpSection::Prefixed)
-            .map(row),
-    );
-    lines.push(String::new());
-    lines.push("no prefix:".to_string());
-    lines.extend(
-        HELP_BINDINGS
-            .iter()
-            .filter(|b| b.section == HelpSection::Unprefixed)
-            .map(row),
-    );
-    lines.push(String::new());
-    lines.extend(
-        HELP_BINDINGS
-            .iter()
-            .filter(|b| b.section == HelpSection::Note)
-            .map(|b| b.description.to_string()),
-    );
-    lines.push(String::new());
-    lines.push("dialogs:".to_string());
-    for (name, footer) in DIALOG_FOOTERS {
-        let hints: Vec<String> = footer
-            .iter()
-            .map(|(key, action)| format!("{key} {action}"))
-            .collect();
-        // A single-space separator (rather than the dialogs' own two-space
-        // footer spacing) to fit the 80-column budget every help line holds
-        // itself to -- see `every_help_line_fits_an_eighty_column_terminal_
-        // with_the_default_sidebar`.
-        lines.push(format!("{:<8} {}", name, hints.join(" ")));
-    }
-    lines
-}
+const HELP_FOOTER: &[(&str, &str)] = &[
+    ("esc", "close"),
+    ("\u{2191}\u{2193}", "move"),
+    ("type", "to filter"),
+];
 
 pub fn render_overlay(f: &mut Frame, area: Rect, overlay: &Overlay, tick: usize) {
     // Never an early return on a too-small `area`: see `overlay_area`. Only a
@@ -3806,7 +3651,7 @@ pub fn render_overlay(f: &mut Frame, area: Rect, overlay: &Overlay, tick: usize)
 
 #[cfg(test)]
 mod tests {
-    use super::super::{InputVerdict, filter_key};
+    use super::actions::ActionSection;
     use super::*;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -3901,7 +3746,10 @@ mod tests {
                     FooterFacts::Alive(facts)
                 };
                 let overlay = match scenario {
-                    "help" => Overlay::Help,
+                    "help" => Overlay::Palette(PaletteView {
+                        mode: PaletteMode::Help,
+                        ..PaletteView::default()
+                    }),
                     "restore" => Overlay::Restore(RestoreView {
                         entries: (1..=18)
                             .map(|i| RestoreEntry {
@@ -3992,14 +3840,15 @@ mod tests {
                     );
                 }
                 if width == 80 && scenario == "help" {
+                    // Issue #354 phase 4: help is the palette in read-only
+                    // mode, so its pinned hint row is `esc close` plus the
+                    // `type to filter` affordance -- clipped to the dialog's
+                    // ~27-column interior at this width, exactly as the
+                    // restore dialog above is.
                     assert!(
-                        frame_text.contains("any key"),
+                        frame_text.contains("esc close"),
                         "the hint row must stay pinned: {frame_text}"
                     );
-                    // Help has no caret of its own, so its later sections are
-                    // still below the fold -- reachable now with PageDown,
-                    // which is what the phase 4 palette builds on.
-                    assert!(!frame_text.contains("dialogs:"));
                 }
                 captures.push_str("```\n\n");
             }
@@ -4458,6 +4307,7 @@ mod tests {
             footer: MAIL_FOOTER,
             warn: false,
             empty_message: "(no mail)",
+            input: None,
         };
         term.draw(|f| {
             let area = f.area();
@@ -4768,6 +4618,7 @@ mod tests {
             error_count: 0,
             latest_error: None,
             notice: None,
+            tip: None,
         }
     }
 
@@ -5777,6 +5628,7 @@ mod tests {
             footer: &[],
             warn: false,
             empty_message: "",
+            input: None,
         };
         let backend = TestBackend::new(40, 10);
         let mut term = Terminal::new(backend).expect("terminal");
@@ -6486,7 +6338,22 @@ mod tests {
                 cursor: 0,
                 offset: 0,
             }),
-            Overlay::Help,
+            Overlay::Palette(PaletteView {
+                mode: PaletteMode::Help,
+                ..PaletteView::default()
+            }),
+            Overlay::Palette(PaletteView {
+                mode: PaletteMode::Run,
+                query: "na".to_string(),
+                ctx: ActionContext {
+                    selected: true,
+                    attached: true,
+                    alive: true,
+                    ..ActionContext::default()
+                },
+                cursor: 0,
+                offset: 0,
+            }),
             Overlay::Errors(ErrorsView {
                 items: vec!["an error".to_string()],
                 cursor: 0,
@@ -6586,6 +6453,7 @@ mod tests {
             footer: MAIL_FOOTER,
             warn: false,
             empty_message: "(no mail)",
+            input: None,
         };
 
         for area in [
@@ -6662,6 +6530,7 @@ mod tests {
             footer: MAIL_FOOTER,
             warn: false,
             empty_message: "(no mail)",
+            input: None,
         }
     }
 
@@ -6998,189 +6867,271 @@ mod tests {
         }
     }
 
-    /// The help table's own ground truth: every `checks` entry must produce
-    /// exactly the `filter_key` outcome it claims, in the armed state, so the
-    /// help overlay can never drift from what `Ctrl+A <key>` actually does.
+    /// Issue #354 phase 4: the palette/help pair. The sync tests that used
+    /// to live here (`help_bindings_match_the_real_filter_key_dispatch` and
+    /// `help_bindings_cover_every_dash_action`) moved to `actions.rs`, next
+    /// to the one table they now prove.
+    fn palette(mode: PaletteMode, query: &str) -> PaletteView {
+        let ctx = ActionContext {
+            selected: true,
+            attached: true,
+            alive: true,
+            ..ActionContext::default()
+        };
+        let mut view = PaletteView {
+            mode,
+            query: query.to_string(),
+            ctx,
+            cursor: 0,
+            offset: 0,
+        };
+        view.cursor = actions::palette_first(&view.rows());
+        view
+    }
+
+    fn draw_overlay(width: u16, height: u16, overlay: &Overlay) -> String {
+        render_and_capture_text(Rect::new(0, 0, width, height), |f, area| {
+            render_overlay(f, area, overlay, 0)
+        })
+    }
+
+    /// Every `^A` chord any surface draws is one the table defines: the
+    /// header cluster, the rendered context menu and the rendered help
+    /// screen are each scanned for `^A x` tokens and checked against
+    /// [`actions::ACTIONS`]. A chord drawn anywhere else than the table is
+    /// exactly the drift (findings F08/F09) this phase closes.
     #[test]
-    fn help_bindings_match_the_real_filter_key_dispatch() {
-        for binding in HELP_BINDINGS {
-            for (event, expected) in binding.checks {
-                let (_, verdict) = filter_key(true, *event);
-                assert_eq!(
-                    verdict,
-                    InputVerdict::Dash(expected.clone()),
-                    "help row {:?}: filter_key({event:?}) disagreed",
-                    binding.label
+    fn every_chord_drawn_anywhere_comes_from_the_action_table() {
+        let known: Vec<&str> = actions::ACTIONS
+            .iter()
+            .map(|d| d.chord)
+            .filter(|c| !c.is_empty())
+            .collect();
+        let check = |text: &str, what: &str| {
+            for (i, _) in text.match_indices("^A ") {
+                // `^A ^A` (send the child a literal prefix) contains a second
+                // `^A ` of its own; only the first is a chord start.
+                if i >= 3 && &text[i - 3..i] == "^A " {
+                    continue;
+                }
+                let rest = &text[i..];
+                assert!(
+                    known.iter().any(|chord| rest.starts_with(chord)),
+                    "{what} drew a chord the action table does not define: {:?}",
+                    rest.chars().take(12).collect::<String>()
                 );
             }
-        }
-    }
-
-    /// One flag per [`DashAction`] variant, all false until the test below
-    /// sees that action in some row's `checks`. The match against it (in the
-    /// test) has no wildcard arm, so adding a `DashAction` variant without
-    /// giving it a flag here -- and a help row that sets it -- is a compile
-    /// error, not a silently-uncovered help row.
-    #[derive(Default)]
-    struct DashActionCoverage {
-        switch: bool,
-        next_pane: bool,
-        select_up: bool,
-        select_down: bool,
-        spawn: bool,
-        nudge: bool,
-        mail: bool,
-        memory: bool,
-        handover: bool,
-        show_errors: bool,
-        zoom: bool,
-        quit: bool,
-        scroll_page_up: bool,
-        scroll_page_down: bool,
-        scroll_top: bool,
-        scroll_live: bool,
-        literal_prefix: bool,
-        help: bool,
-        toggle_select_mode: bool,
-        context_actions: bool,
-        collapse_group: bool,
-        expand_group: bool,
-        inspect: bool,
-        restore_row: bool,
-    }
-
-    /// Completeness, not just correctness: the test above proves every
-    /// claimed row is right, this one proves no `DashAction` variant is
-    /// missing a row at all.
-    #[test]
-    fn help_bindings_cover_every_dash_action() {
-        let mut cov = DashActionCoverage::default();
-        for binding in HELP_BINDINGS {
-            for (_, action) in binding.checks {
-                match action {
-                    DashAction::ContextMenu(_) => {
-                        panic!("pointer targets are covered by route_mouse tests")
-                    }
-                    DashAction::ContextActions => cov.context_actions = true,
-                    DashAction::CollapseGroup => cov.collapse_group = true,
-                    DashAction::ExpandGroup => cov.expand_group = true,
-                    DashAction::Switch(_) => cov.switch = true,
-                    DashAction::NextPane => cov.next_pane = true,
-                    DashAction::SelectUp => cov.select_up = true,
-                    DashAction::SelectDown => cov.select_down = true,
-                    DashAction::Spawn => cov.spawn = true,
-                    DashAction::Nudge => cov.nudge = true,
-                    DashAction::Mail => cov.mail = true,
-                    DashAction::Memory => cov.memory = true,
-                    DashAction::Handover => cov.handover = true,
-                    DashAction::ShowErrors => cov.show_errors = true,
-                    DashAction::Zoom => cov.zoom = true,
-                    DashAction::Quit => cov.quit = true,
-                    DashAction::ScrollPageUp => cov.scroll_page_up = true,
-                    DashAction::ScrollPageDown => cov.scroll_page_down = true,
-                    DashAction::ScrollTop => cov.scroll_top = true,
-                    DashAction::ScrollLive => cov.scroll_live = true,
-                    DashAction::LiteralPrefix => cov.literal_prefix = true,
-                    DashAction::Help => cov.help = true,
-                    DashAction::ToggleSelectMode => cov.toggle_select_mode = true,
-                    DashAction::Inspect => cov.inspect = true,
-                    DashAction::RestoreRow => cov.restore_row = true,
-                }
+        };
+        for context in [
+            HintContext::default(),
+            HintContext {
+                alive: true,
+                ..HintContext::default()
+            },
+            HintContext {
+                alive: true,
+                needs_action: true,
+                ..HintContext::default()
+            },
+            HintContext {
+                ended: true,
+                restorable: true,
+                ..HintContext::default()
+            },
+        ] {
+            for (chord, _) in header_hints(&context) {
+                assert!(known.contains(&chord), "header drew {chord:?}");
             }
+            let mut facts = base_facts();
+            facts.hints = context;
+            let drawn = render_and_capture_text(Rect::new(0, 0, 120, 1), |f, area| {
+                render_header(f, area, &facts)
+            });
+            check(&drawn, "the header");
         }
-        assert!(
-            cov.switch
-                && cov.next_pane
-                && cov.select_up
-                && cov.select_down
-                && cov.spawn
-                && cov.nudge
-                && cov.mail
-                && cov.memory
-                && cov.handover
-                && cov.show_errors
-                && cov.zoom
-                && cov.quit
-                && cov.scroll_page_up
-                && cov.scroll_page_down
-                && cov.scroll_top
-                && cov.scroll_live
-                && cov.literal_prefix
-                && cov.help
-                && cov.toggle_select_mode
-                && cov.context_actions
-                && cov.collapse_group
-                && cov.expand_group
-                && cov.inspect
-                && cov.restore_row,
-            "help table is missing a row for at least one DashAction variant"
+        check(
+            &draw_overlay(120, 40, &Overlay::Palette(palette(PaletteMode::Help, ""))),
+            "help",
         );
+        check(
+            &draw_overlay(120, 40, &Overlay::Palette(palette(PaletteMode::Run, ""))),
+            "the palette",
+        );
+        let menu = Overlay::Menu(MenuView {
+            target: "aaaa1111".to_string(),
+            subject: "aaaa1111 \u{b7} worker".to_string(),
+            entries: vec![MenuEntry {
+                action: MenuAction::Inspect,
+                disabled: None,
+                letter: Some('i'),
+            }],
+            cursor: 0,
+            offset: 0,
+            confirm: None,
+        });
+        check(&draw_overlay(120, 40, &menu), "the context menu");
     }
 
+    /// The help screen is the palette in read-only mode: same rows, same
+    /// filter, same sections -- and it says so in its own pinned footer.
     #[test]
-    fn help_lines_is_non_empty_and_documents_the_prefix() {
-        let lines = help_lines();
-        assert!(!lines.is_empty());
-        assert!(lines.iter().any(|l| l == "Ctrl+A, then:"));
-        assert!(lines.iter().any(|l| l == "no prefix:"));
-        assert!(lines.iter().any(|l| l.contains("quit")));
-        assert!(lines.iter().any(|l| l.contains("Esc closes")));
-        assert!(lines.iter().any(|l| l == "dialogs:"));
-        assert!(lines.iter().any(|l| l.contains("errors")));
-    }
-
-    #[test]
-    fn every_help_line_fits_an_eighty_column_terminal_with_the_default_sidebar() {
-        // Issue #209/v3 §A5: `MAIL_FOOTER` grew a `j/k move` hint, widening
-        // the "dialogs:" section's own `mail` row from 43 to 52 chars --
-        // still comfortably inside the ~74-column interior a `dialog_
-        // width(80)` overlay actually has (`render_list_dialog`'s own
-        // horizontal padding), so the cap moves with it rather than the
-        // hint being dropped to keep an arbitrary old number.
-        for line in help_lines() {
+    fn the_help_screen_lists_every_section_and_says_typing_filters() {
+        let text = draw_overlay(120, 40, &Overlay::Palette(palette(PaletteMode::Help, "")));
+        assert!(text.contains("help"), "{text}");
+        for section in ActionSection::ORDER {
             assert!(
-                line.chars().count() <= 55,
-                "help line too long for an 80-col terminal: {line:?} ({} chars)",
-                line.chars().count()
+                text.contains(section.title()),
+                "help is missing the {:?} section: {text}",
+                section.title()
             );
         }
+        assert!(text.contains("to filter"), "{text}");
+        assert!(text.contains("esc"), "{text}");
     }
 
-    /// The old `render_dialog`-based help overlay fit a standard 24-row
-    /// terminal with exactly zero rows of slack (`lines.len() + 2 == 23`,
-    /// the main area's own height there). Issue #202 phase 2b's mandatory
-    /// additions -- the `Ctrl+A e` binding and the new "dialogs:" section
-    /// (item 7) -- grow it past that already-zero margin, so a bare 24-row
-    /// terminal now clips the tail of the dialogs section. That is accepted
-    /// rather than solved with scrolling (not in this phase's scope), the
-    /// same trade-off already documented for terminals shorter than ~22
-    /// rows; `render_list_dialog`'s own height clamp (`min(.., area.height)`)
-    /// makes the clip safe, never a panic (see the degenerate-area overlay
-    /// tests). This pins the current row count so a future content change
-    /// that shrinks it back under budget is visible here, not silently lost.
+    /// A query filters both faces the same way, and the query itself is
+    /// drawn on the dialog's own pinned input row.
     #[test]
-    fn the_help_overlay_no_longer_fits_a_bare_24_row_terminal_and_clips_safely() {
-        let content_rows = help_lines().len();
-        // render_list_dialog's own height formula: content + 1 blank + 1
-        // footer + 2 borders.
-        let dialog_height = content_rows as u16 + 4;
-        assert!(
-            dialog_height > 23,
-            "if this now fits a 24-row terminal again, restore the tighter \
-             fit test instead of this one"
+    fn a_typed_query_filters_the_palette_and_is_echoed_on_its_input_row() {
+        let text = draw_overlay(
+            120,
+            40,
+            &Overlay::Palette(palette(PaletteMode::Run, "hndv")),
         );
+        assert!(text.contains("handover"), "{text}");
+        assert!(text.contains("\u{203a} hndv"), "{text}");
+        assert!(!text.contains("quit"), "{text}");
+        let empty = draw_overlay(
+            120,
+            40,
+            &Overlay::Palette(palette(PaletteMode::Run, "zzqqxx")),
+        );
+        assert!(empty.contains("(nothing matches)"), "{empty}");
+    }
 
-        // And the clip itself is safe at every height down to a genuinely
-        // tiny terminal -- no panic, some content still visible.
-        for height in [1u16, 3, 8, 23, 24, 40] {
-            let backend = TestBackend::new(80, height);
-            let mut term = Terminal::new(backend).expect("terminal");
-            term.draw(|f| {
-                let area = f.area();
-                render_overlay(f, area, &Overlay::Help, 0);
-            })
-            .expect("draw");
+    /// A disabled row is listed with its reason and rendered dim, and the
+    /// view refuses to activate it.
+    #[test]
+    fn a_disabled_palette_row_shows_its_reason_and_cannot_be_activated() {
+        let mut view = palette(PaletteMode::Run, "restore");
+        let rows = view.rows();
+        let index = rows
+            .iter()
+            .position(|r| matches!(r, PaletteRow::Action { chord: "^A r", .. }))
+            .expect("restore row");
+        view.cursor = index;
+        assert_eq!(view.activated(), None);
+        let text = draw_overlay(120, 40, &Overlay::Palette(view));
+        assert!(text.contains("disabled: still running"), "{text}");
+    }
+
+    /// Help never runs anything, however runnable the caret's row is --
+    /// that is the whole difference between the two modes.
+    #[test]
+    fn help_mode_never_activates_a_row() {
+        let mut view = palette(PaletteMode::Help, "close the dashboard");
+        view.cursor = actions::palette_first(&view.rows());
+        assert!(view.rows()[view.cursor].activatable());
+        assert_eq!(view.activated(), None);
+        assert_eq!(
+            palette(PaletteMode::Run, "close the dashboard").activated(),
+            Some(ActionId::Quit)
+        );
+    }
+
+    /// The pinned query row is counted by the layout, so the row rects a
+    /// click is tested against are the rows that were actually drawn -- one
+    /// line lower than a dialog without an input.
+    #[test]
+    fn the_pinned_query_row_shifts_the_list_viewport_down_by_exactly_one() {
+        let area = Rect::new(0, 0, 60, 20);
+        let spec = |input: Option<String>| ListDialogSpec {
+            title: "t".to_string(),
+            count: None,
+            rows: (0..40)
+                .map(|i| ListDialogRow::plain(format!("row {i}")))
+                .collect(),
+            cursor: Some(0),
+            offset: 0,
+            footer: PALETTE_FOOTER,
+            warn: false,
+            empty_message: "",
+            input,
+        };
+        let base = spec(None);
+        let with_input = spec(Some("q".to_string()));
+        let plain = list_dialog_layout(area, &base).expect("layout");
+        let query = list_dialog_layout(area, &with_input).expect("layout");
+        assert_eq!(plain.input_rows, 0);
+        assert_eq!(query.input_rows, 1);
+        assert_eq!(query.capacity + 1, plain.capacity);
+        assert_eq!(query.rows[0].0.y, plain.rows[0].0.y + 1);
+    }
+
+    /// The palette renders at every approved frame size, with a handful of
+    /// results and with the whole table, without panicking and with the
+    /// pinned footer still on screen.
+    #[test]
+    fn the_palette_renders_at_every_frame_size_with_few_and_many_results() {
+        for (width, height) in [(80u16, 20u16), (120, 40), (200, 50)] {
+            let few = draw_overlay(
+                width,
+                height,
+                &Overlay::Palette(palette(PaletteMode::Run, "sc")),
+            );
+            assert!(few.contains("scroll"), "{width}x{height}: {few}");
+            let many = draw_overlay(
+                width,
+                height,
+                &Overlay::Palette(palette(PaletteMode::Run, "")),
+            );
+            assert!(many.contains("\u{203a}"), "{width}x{height}: {many}");
+            let help = draw_overlay(
+                width,
+                height,
+                &Overlay::Palette(palette(PaletteMode::Help, "")),
+            );
+            assert!(help.contains("esc"), "{width}x{height}: {help}");
         }
+        assert!(
+            palette(PaletteMode::Run, "").rows().len() > 3,
+            "the table should have more rows than one viewport"
+        );
+    }
+
+    /// The first-run tip takes the header's middle slot, dim, and yields it
+    /// to a real notice or a sticky error -- both of which are news, and the
+    /// tip is not.
+    #[test]
+    fn the_first_run_tip_takes_the_middle_slot_only_when_nothing_else_needs_it() {
+        let render = |facts: &HeaderFacts| {
+            render_and_capture_text(Rect::new(0, 0, 200, 1), |f, area| {
+                render_header(f, area, facts)
+            })
+        };
+        let mut facts = base_facts();
+        facts.tip = Some(FIRST_RUN_TIP);
+        assert!(render(&facts).contains("^A p palette"));
+        // Visible at every approved frame width -- truncated with an ellipsis
+        // where the row is too narrow to hold it, never dropped silently and
+        // never pushing the hint cluster off the row.
+        for width in [80u16, 120, 200] {
+            let drawn = render_and_capture_text(Rect::new(0, 0, width, 1), |f, area| {
+                render_header(f, area, &facts)
+            });
+            assert!(drawn.contains("^A ?"), "{width}: {drawn}");
+            assert!(drawn.contains("zirv"), "{width}: {drawn}");
+        }
+        facts.notice = Some("spawned claude as aaaa1111".to_string());
+        let with_notice = render(&facts);
+        assert!(with_notice.contains("spawned claude"));
+        assert!(!with_notice.contains("^A p palette"));
+        facts.notice = None;
+        facts.error_count = 1;
+        facts.latest_error = Some("something broke".to_string());
+        let with_error = render(&facts);
+        assert!(with_error.contains("something broke"));
+        assert!(!with_error.contains("^A p palette"));
     }
 
     /// `tests/fixtures/claude-session.raw` is a gitignored capture of a real

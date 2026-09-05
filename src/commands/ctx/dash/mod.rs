@@ -11,6 +11,7 @@
 //! (`--simple`, non-terminal stdio, too small, or the dashboard turned off
 //! in config) still reaches today's `wrap::run_with` passthrough instead.
 
+pub mod actions;
 pub mod hit;
 pub mod pane;
 pub mod roster;
@@ -49,6 +50,7 @@ use super::window;
 use super::{fallback, handoff, handover, mail, memory, prompt, score, seat, sessions};
 use crate::commands::workflow;
 use crate::style;
+use actions::{MENU_NO_CWD, MENU_NO_REQUEST};
 use hit::{HintId, Hit};
 
 pub(crate) use pane::{Pane, PaneBudgetNotice, PaneSpec, PaneState, ScrollOutcome};
@@ -113,6 +115,11 @@ pub enum DashAction {
     /// `Ctrl+A ?` or `Ctrl+A h`/`H` -- opens the help overlay listing every
     /// binding below.
     Help,
+    /// `Ctrl+A p` (issue #354 phase 4) -- opens the searchable palette over
+    /// the one action-descriptor table (`dash::actions::ACTIONS`). The same
+    /// dialog the help overlay is, with Enter wired to run the caret's own
+    /// action against the current selection.
+    Palette,
     /// Scroll the focused pane a half-screen back into its history
     /// (`Ctrl+A PageUp`) or toward the live view (`Ctrl+A PageDown`).
     ScrollPageUp,
@@ -489,6 +496,9 @@ pub fn filter_key(prefix_armed: bool, key: KeyEvent) -> (bool, InputVerdict) {
         // since #209 with nothing behind it. It relaunches the selected
         // ended row now.
         KeyCode::Char('r') => Some(DashAction::RestoreRow),
+        // Issue #354 phase 4: the searchable palette over the one
+        // action-descriptor table. `p` was unbound before.
+        KeyCode::Char('p') => Some(DashAction::Palette),
         KeyCode::Char('z') => Some(DashAction::Zoom),
         KeyCode::Char('v') => Some(DashAction::ToggleSelectMode),
         KeyCode::Char('q') => Some(DashAction::Quit),
@@ -701,11 +711,55 @@ fn overlay_name(overlay: &ui::Overlay) -> &'static str {
         ui::Overlay::Mail(_) => "mail",
         ui::Overlay::Memory(_) => "memory",
         ui::Overlay::Restore(_) => "restore",
-        ui::Overlay::Help => "help",
+        ui::Overlay::Palette(view) => view.mode.title(),
         ui::Overlay::Errors(_) => "errors",
         ui::Overlay::Menu(_) => "actions",
         ui::Overlay::Inspector(_) => "inspect",
     }
+}
+
+/// Pure: a cheap identity for the open overlay -- its name plus, for the
+/// dialogs that are opened against one particular row, that row's short id.
+///
+/// Review of 9314156 (finding 2): this is what the pending double-click is
+/// tagged with. Two different dialogs never share an identity, and neither
+/// does the same dialog opened on a different row; `Overlay::None` in
+/// between makes a close-then-reopen a change too.
+fn overlay_identity(overlay: &ui::Overlay) -> (&'static str, String) {
+    let subject = match overlay {
+        ui::Overlay::Menu(view) => view.target.clone(),
+        ui::Overlay::Inspector(view) => view.target.clone(),
+        ui::Overlay::Handover(draft) => draft.target_short.clone(),
+        _ => String::new(),
+    };
+    (overlay_name(overlay), subject)
+}
+
+/// The first-run tip's own flag file: `<state>/dash/tip-seen`. Operator-level
+/// and repo-independent (`StateDir::dash()` is the dashboard's own state
+/// root), deliberately NOT a config key -- it is a fact about this operator's
+/// history, not something to configure.
+fn first_run_tip_flag(state: &StateDir) -> PathBuf {
+    state.dash().join("tip-seen")
+}
+
+/// Impure, best effort: has this operator seen the first-run tip already?
+/// A missing or unreadable state directory answers "no", which shows the tip
+/// again -- the harmless direction.
+fn first_run_tip_seen(state: &StateDir) -> bool {
+    first_run_tip_flag(state).exists()
+}
+
+/// Impure, best effort: record that the tip has been shown. Every error is
+/// deliberately swallowed -- a read-only state directory must cost the
+/// operator a repeated tip, never an error line, and certainly never a panic
+/// on the dashboard's own launch path.
+fn mark_first_run_tip_seen(state: &StateDir) {
+    let path = first_run_tip_flag(state);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&path, b"1\n");
 }
 
 /// Set `ZIRV_CTX_DASH_KEYLOG` to a path and the dashboard appends one line per
@@ -1573,6 +1627,10 @@ fn assemble_header_facts(
         error_count,
         latest_error,
         notice,
+        // Issue #354 phase 4: set by the event loop right after this, the
+        // same way the hint context is -- it is session state, not a fact
+        // this assembly step has any way to know.
+        tip: None,
     }
 }
 
@@ -2292,8 +2350,19 @@ fn ack_candidate(
 /// alone, because a retained ended row's `◆` comes from `glyph_for`'s own
 /// exit-code rule (a clean exit with `Visibility::Unseen`), which
 /// `attention::project` maps to `Failed` and so would never match here.
+///
+/// Review of 9314156 (finding 1, HIGH): restricted to rows the render path
+/// can NEVER acknowledge on its own -- an ended row (`exit_code`), or one
+/// this dashboard owns no pane for. Done-unread clears only after the
+/// operator actually views a pane, which means focus plus one unoccluded
+/// render at live scroll; a live attached pane that is merely *selected* has
+/// not been viewed, and opening the inspector on it used to clear its `◆`
+/// anyway. Those rows are left to the render path's own rule.
 fn inspect_ack_candidate(row: &ui::SidebarRow) -> Option<(String, u64)> {
     let status = row.status.as_ref()?;
+    if row.exit_code.is_none() && row.attached {
+        return None;
+    }
     if ui::glyph_for(row) != ui::Glyph::DoneUnread {
         return None;
     }
@@ -6331,7 +6400,10 @@ pub fn restore_overlay_reduce(
 /// carries the (possibly cursor-moved) view back.
 pub fn errors_overlay_reduce(mut view: ui::ErrorsView, key: KeyEvent) -> Option<ui::ErrorsView> {
     match key.code {
-        KeyCode::Esc | KeyCode::Char('q') => None,
+        // Issue #354 phase 4 (deliverable D): `Enter` closes it too -- a
+        // read-only list has nothing to activate, and an `Enter` that does
+        // nothing at all is the inconsistency this phase removes.
+        KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => None,
         KeyCode::Down | KeyCode::Char('j') => {
             view.cursor = move_cursor(view.cursor, view.items.len(), 1);
             Some(view)
@@ -6387,81 +6459,49 @@ struct MenuFacts {
     cwd: Option<String>,
 }
 
-/// Reasons, once, so the menu and its tests cannot drift.
-const MENU_NOT_ATTACHED: &str = "not a pane this dashboard owns";
-const MENU_ENDED: &str = "this pane has ended";
-const MENU_STILL_RUNNING: &str = "still running";
-const MENU_NO_REQUEST: &str = "no spawn request kept";
-const MENU_NO_CWD: &str = "no cwd known";
-const MENU_EXITED_CLEAN: &str = "exited cleanly";
-const MENU_NOT_RETAINED: &str = "only a finished row can be dismissed";
+impl MenuFacts {
+    /// The availability slice of these facts, in the shape the one
+    /// action-descriptor table decides against.
+    fn action_context(&self) -> actions::ActionContext {
+        actions::ActionContext {
+            selected: true,
+            attached: self.attached,
+            alive: self.alive,
+            ended: self.ended,
+            // The menu never chooses its own entries by the glyph -- every
+            // entry is always present -- so this stays false here.
+            needs_action: false,
+            retained: self.retained,
+            has_request: self.has_request,
+            clean_exit: self.exit_code.unwrap_or(0) == 0,
+            has_cwd: self.cwd.is_some(),
+        }
+    }
+}
 
 /// Pure: the context menu's entries for one row, in the approved order, each
 /// either available or disabled with a short reason.
+///
+/// Issue #354 phase 4: the order, the entries and every disable reason now
+/// come out of the one action-descriptor table (`actions::menu_actions`)
+/// rather than a second matrix written down here -- so the menu, the header
+/// cluster, the help screen and the palette cannot disagree about what an
+/// action is called or why it is unavailable.
 ///
 /// Every entry is ALWAYS present. An operator who cannot see that `restore`
 /// exists cannot learn why it is unavailable, and a menu whose shape changes
 /// per row is a menu whose letters move under the operator's fingers.
 fn menu_entries(facts: &MenuFacts) -> Vec<ui::MenuEntry> {
-    use ui::MenuAction as A;
-    let order = [
-        A::Inspect,
-        A::Focus,
-        A::Nudge,
-        A::Mail,
-        A::Handover,
-        A::Stop,
-        A::Restore,
-        A::OpenWorktree,
-        A::Evidence,
-        A::Retry,
-        A::Dismiss,
-    ];
-    let restore_reason = || {
-        if !facts.ended {
-            Some(MENU_STILL_RUNNING.to_string())
-        } else if !facts.has_request {
-            Some(MENU_NO_REQUEST.to_string())
-        } else {
-            None
-        }
-    };
+    let available = actions::menu_actions(&facts.action_context());
+    let order: Vec<ui::MenuAction> = available.iter().map(|(action, _)| *action).collect();
     let letters = ui::menu_letters(&order);
-    order
-        .iter()
+    available
+        .into_iter()
         .zip(letters)
-        .map(|(action, letter)| {
-            let disabled = match action {
-                // The inspector and its evidence section are read-only reports
-                // over cached facts: there is no row they cannot describe.
-                A::Inspect | A::Evidence | A::Mail => None,
-                A::Focus | A::Handover | A::Stop => (!(facts.attached && !facts.ended))
-                    .then_some(if facts.ended {
-                        MENU_ENDED
-                    } else {
-                        MENU_NOT_ATTACHED
-                    })
-                    .map(str::to_string),
-                // A nudge reaches a view-only registry session too
-                // (`sessions::run_nudge_with`'s headless marker path), so
-                // "alive" is the real gate here, not "attached".
-                A::Nudge => (!facts.alive).then(|| MENU_ENDED.to_string()),
-                A::Restore => restore_reason(),
-                A::Retry => match restore_reason() {
-                    Some(reason) => Some(reason),
-                    None if facts.exit_code.unwrap_or(0) == 0 => {
-                        Some(MENU_EXITED_CLEAN.to_string())
-                    }
-                    None => None,
-                },
-                A::OpenWorktree => facts.cwd.is_none().then(|| MENU_NO_CWD.to_string()),
-                A::Dismiss => (!facts.retained).then(|| MENU_NOT_RETAINED.to_string()),
-            };
-            ui::MenuEntry {
-                action: *action,
-                disabled,
-                letter,
-            }
+        .map(|((action, availability), letter)| ui::MenuEntry {
+            action,
+            disabled: availability.reason().map(str::to_string),
+            letter,
         })
         .collect()
 }
@@ -6768,13 +6808,18 @@ fn build_inspector_view(
 
 /// Pure: one keystroke against the inspector. Read-only, like the errors
 /// overlay -- there is no effect type, only "still open" or "closed".
+///
+/// Issue #354 phase 4 (deliverable D): `Enter` closes it too. A read-only
+/// report has nothing to activate, and the one rule that now holds in every
+/// dialog is that `Esc` closes and `Enter` confirms -- an `Enter` that does
+/// nothing at all is exactly the inconsistency this phase removes.
 pub fn inspector_overlay_reduce(
     mut view: ui::InspectorView,
     key: KeyEvent,
 ) -> Option<ui::InspectorView> {
     let len = view.rows().len();
     match key.code {
-        KeyCode::Esc | KeyCode::Char('q') => None,
+        KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => None,
         KeyCode::Down | KeyCode::Char('j') => {
             view.cursor = move_cursor(view.cursor, len, 1);
             Some(view)
@@ -6785,6 +6830,108 @@ pub fn inspector_overlay_reduce(
         }
         _ => Some(view),
     }
+}
+
+/// What activating a palette row asks the caller to do: run the descriptor
+/// under the caret. The palette itself stays pure -- turning an
+/// [`actions::ActionId`] into either a `DashAction` (a global chord, replayed
+/// through the exact dispatch the keyboard uses) or a `ui::MenuAction`
+/// (a row action, replayed through the exact path the context menu uses)
+/// happens at the call site, which is the only place with the roster, the
+/// panes and the state directory in hand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PaletteEffect(pub actions::ActionId);
+
+/// Pure: one keystroke against the palette (`^A p`) or the help screen
+/// (`^A ?`), which is the same dialog in read-only mode.
+///
+/// `Esc` closes without running anything. `Enter` runs the caret's own action
+/// -- and in help mode simply closes, since a key reference must never fire
+/// an action an operator only meant to read about. Up/Down move the caret,
+/// skipping section headings; Backspace edits the query and every other
+/// printable character extends it. Nothing typed here is ever forwarded to
+/// the child: an open overlay owns every keystroke, and the palette's query
+/// is the clearest case of why that rule exists.
+pub fn palette_overlay_reduce(
+    mut view: ui::PaletteView,
+    key: KeyEvent,
+) -> (Option<ui::PaletteView>, Option<PaletteEffect>) {
+    let refresh = |view: &mut ui::PaletteView| {
+        let rows = view.rows();
+        // A query that no longer matches what the caret was on puts the
+        // caret back on the first row that does -- never off the end of the
+        // list, and never parked on a heading.
+        if !rows
+            .get(view.cursor)
+            .is_some_and(actions::PaletteRow::selectable)
+        {
+            view.cursor = actions::palette_first(&rows);
+        }
+        // A new query is a new list: back to the top of it.
+        view.offset = 0;
+    };
+    match key.code {
+        KeyCode::Esc => (None, None),
+        KeyCode::Enter => match view.activated() {
+            Some(id) => (None, Some(PaletteEffect(id))),
+            // Help mode, a section heading, a disabled row, or an empty
+            // result: Enter closes rather than doing nothing at all.
+            None => (None, None),
+        },
+        KeyCode::Up => {
+            let rows = view.rows();
+            view.cursor = actions::palette_step(&rows, view.cursor, -1);
+            (Some(view), None)
+        }
+        KeyCode::Down => {
+            let rows = view.rows();
+            view.cursor = actions::palette_step(&rows, view.cursor, 1);
+            (Some(view), None)
+        }
+        KeyCode::Backspace => {
+            view.query.pop();
+            refresh(&mut view);
+            (Some(view), None)
+        }
+        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            view.query.push(c);
+            refresh(&mut view);
+            (Some(view), None)
+        }
+        _ => (Some(view), None),
+    }
+}
+
+/// The availability snapshot for whatever row the sidebar cursor is on --
+/// exactly the facts the context menu decides from, so the palette can never
+/// offer an action the menu says is unavailable (or the other way round).
+/// An empty roster yields the default context, in which every row action is
+/// `Hidden` and only the dashboard-wide ones are listed.
+fn selected_action_context(
+    rows: &[ui::SidebarRow],
+    selected: usize,
+    panes: &[Pane],
+    retained: &VecDeque<EndedRow>,
+) -> actions::ActionContext {
+    match rows.get(selected) {
+        Some(row) => menu_facts_for(row, panes, retained).action_context(),
+        None => actions::ActionContext::default(),
+    }
+}
+
+/// Builds the palette (or the help screen, which is the same list read-only)
+/// over whatever row is selected right now. `ctx` is snapshotted here, the
+/// same convention every other overlay follows.
+fn build_palette_view(mode: ui::PaletteMode, ctx: actions::ActionContext) -> ui::PaletteView {
+    let mut view = ui::PaletteView {
+        mode,
+        query: String::new(),
+        ctx,
+        cursor: 0,
+        offset: 0,
+    };
+    view.cursor = actions::palette_first(&view.rows());
+    view
 }
 
 /// What confirming/cancelling the quit confirmation dialog means -- pulled
@@ -8357,6 +8504,14 @@ pub fn run_dashboard(
     // double-click-activates rule. `route_mouse` stays pure; this is the only
     // thing holding a clock.
     let mut last_overlay_click: Option<(usize, Instant)> = None;
+    // Review of 9314156 (finding 2, MEDIUM): the double-click state above is
+    // keyed on a row INDEX, which means nothing outside the dialog it was
+    // clicked in. Without this, single-clicking entry N in one dialog,
+    // closing it and single-clicking entry N in a different one within
+    // `DOUBLE_CLICK` replayed `Enter` and activated an entry the operator
+    // had clicked exactly once. The identity is re-read before every event
+    // and any change -- opened, replaced, closed -- drops the pending click.
+    let mut last_overlay_ident = overlay_identity(&ui::Overlay::None);
     let mut zoomed = false;
     let mut prefix_armed = false;
     // `Ctrl+A v` (`DashAction::ToggleSelectMode`)'s own state: whether the
@@ -8389,6 +8544,15 @@ pub fn run_dashboard(
     // itself counts as activity and the dashboard starts in the hot window
     // rather than the flat 50ms idle wait.
     let mut last_activity = Instant::now();
+    // Issue #354 phase 4 (finding F15): the first-run tip. Shown once, in the
+    // header's middle slot, until any prefixed key is used or Esc dismisses
+    // it. The flag is written the moment the dashboard decides to show it --
+    // best effort, so a read-only or missing state directory costs nothing
+    // but a tip shown again next launch, never an error and never a panic.
+    let mut first_run_tip = !first_run_tip_seen(state);
+    if first_run_tip {
+        mark_first_run_tip_seen(state);
+    }
     let mut overlay = if restore_candidates.is_empty() {
         ui::Overlay::None
     } else {
@@ -8739,6 +8903,16 @@ pub fn run_dashboard(
                     // the retained rows and the kept requests are all
                     // reachable again.
                     let mut apply_menu_action: Option<(String, ui::MenuAction)> = None;
+                    // Review of 9314156 (finding 2): a pending single click
+                    // belongs to the dialog it was made in. The instant that
+                    // dialog is opened, replaced or closed, the click is
+                    // stale and must never be able to complete a
+                    // double-click somewhere else.
+                    let overlay_ident = overlay_identity(&overlay);
+                    if overlay_ident != last_overlay_ident {
+                        last_overlay_click = None;
+                        last_overlay_ident = overlay_ident;
+                    }
                     // Activity, for the adaptive poll wait above: a keyboard
                     // or mouse event, whatever `filter_key`/the overlay below
                     // goes on to decide it means.
@@ -8893,7 +9067,13 @@ pub fn run_dashboard(
                                 }
                                 _ => key,
                             };
-                            if !matches!(overlay, ui::Overlay::None) {
+                            // Issue #354 phase 4: an open overlay still owns the
+                            // keystroke, but the palette can hand ONE action
+                            // back out (as `mouse_action`) to be run by the
+                            // dispatch below in this same tick -- which is why
+                            // this is two `if`s rather than an if/else.
+                            let overlay_was_open = !matches!(overlay, ui::Overlay::None);
+                            if overlay_was_open {
                                 let current = std::mem::take(&mut overlay);
                                 // Task 2: what the slot held on the way in, so
                                 // the `OVERLAY` line below can report the swap
@@ -9293,11 +9473,47 @@ pub fn run_dashboard(
                                             }
                                         }
                                     }
-                                    // Any key closes it (tmux's own key-list
-                                    // convention): `overlay` was already reset
-                                    // to `None` by the `mem::take` above, so
-                                    // there is nothing to reassign here.
-                                    ui::Overlay::Help => {}
+                                    // Issue #354 phase 4: the palette and the
+                                    // help screen. Enter on a runnable row
+                                    // replays that descriptor through the
+                                    // EXACT path the keyboard or the context
+                                    // menu already takes -- `mouse_action`
+                                    // for a global chord (the dispatch below
+                                    // runs in the same tick), `apply_menu_
+                                    // action` for a row action. No third
+                                    // dispatch, and nothing the palette can
+                                    // reach that a chord could not.
+                                    ui::Overlay::Palette(view) => {
+                                        let (next, effect) = palette_overlay_reduce(view, key);
+                                        overlay = match next {
+                                            Some(v) => ui::Overlay::Palette(v),
+                                            None => ui::Overlay::None,
+                                        };
+                                        if let Some(PaletteEffect(id)) = effect
+                                            && let Some(descriptor) = actions::descriptor(id)
+                                        {
+                                            match (descriptor.dash_action(), descriptor.menu) {
+                                                (Some(action), _) => mouse_action = Some(action),
+                                                (None, Some(menu)) => {
+                                                    match rows
+                                                        .get(selected)
+                                                        .map(|row| row.short.clone())
+                                                    {
+                                                        Some(target) => {
+                                                            apply_menu_action =
+                                                                Some((target, menu));
+                                                        }
+                                                        None => push_notice(
+                                                            &mut notices,
+                                                            Instant::now(),
+                                                            "no session row is selected".into(),
+                                                        ),
+                                                    }
+                                                }
+                                                (None, None) => {}
+                                            }
+                                        }
+                                    }
                                     ui::Overlay::Errors(view) => {
                                         overlay = match errors_overlay_reduce(view, key) {
                                             Some(v) => ui::Overlay::Errors(v),
@@ -9517,13 +9733,26 @@ pub fn run_dashboard(
                                         }
                                     }
                                 }
-                            } else {
+                            }
+                            if !overlay_was_open || mouse_action.is_some() {
                                 let (armed, verdict) = mouse_action
                                     .take()
                                     .map(|action| (false, InputVerdict::Dash(action)))
                                     .unwrap_or_else(|| filter_key(prefix_armed, key));
                                 let armed_before = prefix_armed;
                                 prefix_armed = armed;
+                                // Issue #354 phase 4: the first-run tip has
+                                // done its job the moment the operator uses a
+                                // prefixed key -- or says so with Esc. It is
+                                // never shown again in this session, and the
+                                // flag file makes sure it is never shown in
+                                // another one either.
+                                if first_run_tip
+                                    && (matches!(verdict, InputVerdict::Dash(_))
+                                        || key.code == KeyCode::Esc)
+                                {
+                                    first_run_tip = false;
+                                }
                                 // Task 2: what the loop ACTUALLY stored and
                                 // ACTUALLY decided -- every DashAction, not
                                 // only the interesting ones. Paired with
@@ -9912,8 +10141,28 @@ pub fn run_dashboard(
                                     InputVerdict::Dash(DashAction::ShowErrors) => {
                                         overlay = ui::Overlay::Errors(build_errors_view(&errors));
                                     }
-                                    InputVerdict::Dash(DashAction::Help) => {
-                                        overlay = ui::Overlay::Help;
+                                    // Issue #354 phase 4: help and the palette
+                                    // are one dialog over one table. Both
+                                    // snapshot the selected row's own
+                                    // availability as they open, so a row
+                                    // action is listed with the reason it
+                                    // cannot be used on THIS row.
+                                    InputVerdict::Dash(
+                                        action @ (DashAction::Help | DashAction::Palette),
+                                    ) => {
+                                        let mode = if action == DashAction::Help {
+                                            ui::PaletteMode::Help
+                                        } else {
+                                            ui::PaletteMode::Run
+                                        };
+                                        let ctx = selected_action_context(
+                                            &rows,
+                                            selected,
+                                            &panes,
+                                            &retained_ended,
+                                        );
+                                        overlay =
+                                            ui::Overlay::Palette(build_palette_view(mode, ctx));
                                     }
                                     InputVerdict::Dash(DashAction::ToggleSelectMode) => {
                                         if !cfg.dash.mouse {
@@ -10359,6 +10608,9 @@ pub fn run_dashboard(
         // doc comment). `last_exited` (codex review finding 1) is what makes
         // the dead-pane variant reachable once `reap_ended_panes` has
         // already removed the row `focused` used to name.
+        // Issue #354 phase 4: the first-run tip, lowest precedence of the
+        // three things the header's middle slot can carry.
+        facts.tip = first_run_tip.then_some(ui::FIRST_RUN_TIP);
         facts.hints.alive = rows
             .get(selected)
             .is_some_and(|r| r.state != ui::RowState::Dead);
@@ -10678,6 +10930,9 @@ fn shutdown_all(panes: &mut [Pane], cfg: &CtxConfig, errors: &mut Vec<String>) {
 
 #[cfg(test)]
 mod tests {
+    use super::actions::{
+        MENU_ENDED, MENU_EXITED_CLEAN, MENU_NOT_ATTACHED, MENU_NOT_RETAINED, MENU_STILL_RUNNING,
+    };
     use super::*;
     use std::path::PathBuf;
 
@@ -10936,7 +11191,17 @@ mod tests {
             overlay_name(&ui::Overlay::Restore(ui::RestoreView::default())),
             "restore"
         );
-        assert_eq!(overlay_name(&ui::Overlay::Help), "help");
+        assert_eq!(
+            overlay_name(&ui::Overlay::Palette(ui::PaletteView {
+                mode: ui::PaletteMode::Help,
+                ..ui::PaletteView::default()
+            })),
+            "help"
+        );
+        assert_eq!(
+            overlay_name(&ui::Overlay::Palette(ui::PaletteView::default())),
+            "palette"
+        );
     }
 
     /// The diagnostic must be completely inert unless the env var names a
@@ -23022,5 +23287,596 @@ mod tests {
                 .iter()
                 .any(|(k, v)| k == "branch" && v == style::PLACEHOLDER)
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Issue #354 phase 4: the palette/help overlay, the Esc/Enter contract
+    // and the first-run tip.
+    // ------------------------------------------------------------------
+
+    fn live_ctx() -> actions::ActionContext {
+        actions::ActionContext {
+            selected: true,
+            attached: true,
+            alive: true,
+            ..actions::ActionContext::default()
+        }
+    }
+
+    fn open_palette(mode: ui::PaletteMode) -> ui::PaletteView {
+        build_palette_view(mode, live_ctx())
+    }
+
+    fn typed(mut view: ui::PaletteView, text: &str) -> ui::PaletteView {
+        for c in text.chars() {
+            let (next, effect) =
+                palette_overlay_reduce(view, key(KeyCode::Char(c), KeyModifiers::NONE));
+            assert!(effect.is_none(), "typing must never run an action");
+            view = next.expect("typing never closes the palette");
+        }
+        view
+    }
+
+    /// `^A p` and `^A ?` are real bindings, and `p` did not used to be one.
+    #[test]
+    fn ctrl_a_p_opens_the_palette_and_ctrl_a_question_opens_help() {
+        assert_eq!(
+            filter_key(true, key(KeyCode::Char('p'), KeyModifiers::NONE)).1,
+            InputVerdict::Dash(DashAction::Palette)
+        );
+        for code in [KeyCode::Char('?'), KeyCode::Char('h'), KeyCode::Char('H')] {
+            assert_eq!(
+                filter_key(true, key(code, KeyModifiers::NONE)).1,
+                InputVerdict::Dash(DashAction::Help)
+            );
+        }
+    }
+
+    /// Typing filters; Enter runs the caret's own descriptor, and the effect
+    /// resolves to exactly the `DashAction` the chord would have produced.
+    #[test]
+    fn enter_runs_the_selected_palette_row_as_its_own_chord_would() {
+        let view = typed(open_palette(ui::PaletteMode::Run), "spawn");
+        let rows = view.rows();
+        assert!(
+            rows.iter().all(|r| match r {
+                actions::PaletteRow::Action { label, .. } => *label == "spawn",
+                actions::PaletteRow::Section(_) => false,
+            }),
+            "the query must filter the list: {rows:?}"
+        );
+        let (next, effect) = palette_overlay_reduce(view, key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(next.is_none(), "running an action closes the palette");
+        let id = effect.expect("an effect").0;
+        let descriptor = actions::descriptor(id).expect("descriptor");
+        assert_eq!(descriptor.dash_action(), Some(DashAction::Spawn));
+        // And that action is exactly what the keyboard produces, so the
+        // palette can reach no code path a chord could not.
+        assert_eq!(
+            filter_key(true, key(KeyCode::Char('s'), KeyModifiers::NONE)).1,
+            InputVerdict::Dash(DashAction::Spawn)
+        );
+    }
+
+    /// A row action with no chord of its own comes back as a menu action --
+    /// the same effect the context menu produces for the same entry.
+    #[test]
+    fn a_chordless_palette_row_runs_through_the_context_menu_path() {
+        let view = typed(
+            open_palette(ui::PaletteMode::Run),
+            "give this row the keyboard",
+        );
+        let (_, effect) = palette_overlay_reduce(view, key(KeyCode::Enter, KeyModifiers::NONE));
+        let descriptor = actions::descriptor(effect.expect("an effect").0).expect("descriptor");
+        assert_eq!(descriptor.dash_action(), None);
+        assert_eq!(descriptor.menu, Some(ui::MenuAction::Focus));
+    }
+
+    /// A disabled row is inert: Enter on it closes the palette with nothing
+    /// to run, exactly as a disabled context-menu entry does nothing.
+    #[test]
+    fn enter_on_a_disabled_palette_row_runs_nothing() {
+        let view = typed(open_palette(ui::PaletteMode::Run), "relaunch an ended row");
+        assert!(
+            view.rows().iter().any(|r| matches!(
+                r,
+                actions::PaletteRow::Action {
+                    disabled: Some(_),
+                    ..
+                }
+            )),
+            "a live row cannot be restored, so the row must be disabled"
+        );
+        assert_eq!(view.activated(), None);
+        let (next, effect) = palette_overlay_reduce(view, key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(next.is_none());
+        assert!(effect.is_none());
+    }
+
+    /// Esc closes with nothing run. Focus is never touched by any overlay --
+    /// the palette owns no pane index at all, which is what makes "returns
+    /// focus to the previously focused pane" structurally true.
+    #[test]
+    fn esc_closes_the_palette_without_running_anything() {
+        let view = typed(open_palette(ui::PaletteMode::Run), "quit");
+        let (next, effect) = palette_overlay_reduce(view, key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(next.is_none());
+        assert!(effect.is_none());
+    }
+
+    /// Backspace edits the query, and a query that no longer matches the
+    /// caret's row moves the caret rather than leaving it off the list.
+    #[test]
+    fn backspace_edits_the_query_and_keeps_the_caret_on_a_real_row() {
+        let mut view = typed(open_palette(ui::PaletteMode::Run), "spawn");
+        assert_eq!(view.query, "spawn");
+        for _ in 0..3 {
+            let (next, _) =
+                palette_overlay_reduce(view, key(KeyCode::Backspace, KeyModifiers::NONE));
+            view = next.expect("backspace never closes the palette");
+        }
+        assert_eq!(view.query, "sp");
+        let rows = view.rows();
+        assert!(rows[view.cursor].selectable(), "{rows:?}");
+    }
+
+    /// Up/Down walk only real rows, never the section headings an empty
+    /// query draws.
+    #[test]
+    fn the_palette_caret_never_lands_on_a_section_heading() {
+        let mut view = open_palette(ui::PaletteMode::Run);
+        for _ in 0..40 {
+            let (next, _) = palette_overlay_reduce(view, key(KeyCode::Down, KeyModifiers::NONE));
+            view = next.expect("still open");
+            assert!(view.rows()[view.cursor].selectable());
+        }
+        for _ in 0..60 {
+            let (next, _) = palette_overlay_reduce(view, key(KeyCode::Up, KeyModifiers::NONE));
+            view = next.expect("still open");
+            assert!(view.rows()[view.cursor].selectable());
+        }
+    }
+
+    /// Finding F06's own rule, extended to the palette: while it is open the
+    /// pointer reaches nothing underneath it, so a query typed into it
+    /// cannot possibly be routed to a child. (The keyboard half is
+    /// structural -- the event loop's overlay branch never calls
+    /// `write_operator_input` -- and every reducer above returns the query
+    /// in its own view rather than any bytes.)
+    #[test]
+    fn nothing_reaches_the_child_while_the_palette_is_open() {
+        let snap = hit::FrameSnapshot {
+            frame: Rect::new(0, 0, 120, 40),
+            sidebar: Rect::new(0, 2, 44, 36),
+            grid: Rect::new(45, 2, 75, 36),
+            divider: Rect::new(44, 2, 1, 36),
+            overlay: Some(Rect::new(30, 5, 60, 30)),
+            ..Default::default()
+        };
+        for (x, y) in [(0u16, 0u16), (5, 3), (50, 10), (119, 39), (44, 20)] {
+            for kind in [
+                MouseEventKind::ScrollUp,
+                MouseEventKind::ScrollDown,
+                MouseEventKind::Down(MouseButton::Left),
+                MouseEventKind::Down(MouseButton::Right),
+            ] {
+                let route = route_mouse(
+                    &snap,
+                    event::MouseEvent {
+                        kind,
+                        column: x,
+                        row: y,
+                        modifiers: KeyModifiers::NONE,
+                    },
+                    true,
+                    true,
+                    false,
+                );
+                assert_ne!(
+                    route,
+                    MouseRoute::Grid,
+                    "({x}, {y}) {kind:?} reached the child"
+                );
+            }
+        }
+        // And every printable key the palette is given comes back inside its
+        // own view -- there is no byte path out of the reducer at all.
+        let view = typed(open_palette(ui::PaletteMode::Run), "rm -rf /");
+        assert_eq!(view.query, "rm -rf /");
+    }
+
+    /// Deliverable D: the Esc/Enter matrix, one assertion pair per overlay.
+    ///
+    /// Esc always closes the topmost layer (or cancels an inline confirm or
+    /// compose buffer); Enter always confirms or activates. Deliberately
+    /// left as they are, and asserted here as such: mail/memory compose
+    /// buffers and the menu's inline stop confirmation, where Esc cancels
+    /// that inner layer rather than the whole dialog, and Restore, whose Esc
+    /// is labelled `skip` because closing it IS skipping the restore.
+    #[test]
+    fn every_overlay_closes_on_esc_and_confirms_on_enter() {
+        let esc = key(KeyCode::Esc, KeyModifiers::NONE);
+        let enter = key(KeyCode::Enter, KeyModifiers::NONE);
+
+        // QuitConfirm.
+        assert!(quit_confirm_reduce(vec!["w".into()], esc).0.is_none());
+        assert_eq!(
+            quit_confirm_reduce(vec!["w".into()], enter).1,
+            Some(QuitConfirmEffect::Confirm)
+        );
+
+        // Spawn.
+        let draft = ui::SpawnDraft {
+            input: "claude do the thing".into(),
+            items: Vec::new(),
+            cursor: 0,
+        };
+        assert!(spawn_overlay_reduce(draft.clone(), esc).0.is_none());
+        assert!(matches!(
+            spawn_overlay_reduce(draft, enter).1,
+            Some(SpawnEffect::Submit { .. })
+        ));
+
+        // Nudge.
+        let nudge = ui::NudgeDraft {
+            target: ui::NudgeTarget::AttachedPane("aaaa1111".into()),
+            input: "go".into(),
+        };
+        assert!(nudge_overlay_reduce(nudge.clone(), esc).0.is_none());
+        assert!(nudge_overlay_reduce(nudge, enter).1.is_some());
+
+        // Mail: browsing, then its compose buffer (Esc cancels the buffer,
+        // not the overlay -- deliberate, and asserted).
+        let mail = ui::MailView {
+            items: vec![(PathBuf::from("/mail/1.md"), "claude".into(), "body".into())],
+            cursor: 0,
+            offset: 0,
+            compose: None,
+        };
+        assert!(mail_overlay_reduce(mail.clone(), esc).0.is_none());
+        assert!(matches!(
+            mail_overlay_reduce(mail.clone(), enter).1,
+            Some(ui::MailEffect::Consume(_))
+        ));
+        let composing = ui::MailView {
+            compose: Some(ui::ComposeDraft {
+                to: "any".into(),
+                body: "hi".into(),
+            }),
+            ..mail
+        };
+        let (back, _) = mail_overlay_reduce(composing.clone(), esc);
+        assert!(
+            back.is_some_and(|v| v.compose.is_none()),
+            "Esc cancels the compose buffer, not the whole dialog"
+        );
+        assert!(matches!(
+            mail_overlay_reduce(composing, enter).1,
+            Some(ui::MailEffect::Send(_))
+        ));
+
+        // Memory: the same shape, including its edit buffer.
+        let memory = ui::MemoryView {
+            entries: vec![("k".into(), "1m".into(), "body".into())],
+            cursor: 0,
+            offset: 0,
+            input: None,
+        };
+        assert!(memory_overlay_reduce(memory.clone(), esc).0.is_none());
+        let editing = ui::MemoryView {
+            input: Some("new".into()),
+            ..memory
+        };
+        let (back, _) = memory_overlay_reduce(editing.clone(), esc);
+        assert!(back.is_some_and(|v| v.input.is_none()));
+        assert!(matches!(
+            memory_overlay_reduce(editing, enter).1,
+            Some(ui::MemoryEffect::Remember { .. })
+        ));
+
+        // Restore: Esc closes with no effect (that is what `skip` means),
+        // Enter confirms whatever is checked.
+        let restore = ui::RestoreView {
+            entries: vec![ui::RestoreEntry {
+                label: "w".into(),
+                checked: true,
+            }],
+            cursor: 0,
+            offset: 0,
+        };
+        let (next, effect) = restore_overlay_reduce(restore.clone(), esc);
+        assert!(next.is_none() && effect.is_none());
+        assert_eq!(
+            restore_overlay_reduce(restore, enter).1,
+            Some(RestoreEffect::Confirm(vec![0]))
+        );
+
+        // Handover.
+        let handover = ui::HandoverDraft {
+            items: vec![("claude".into(), "worker".into(), "sonnet".into())],
+            cursor: 0,
+            offset: 0,
+            target_short: "aaaa1111".into(),
+        };
+        assert!(handover_overlay_reduce(handover.clone(), esc).0.is_none());
+        assert!(handover_overlay_reduce(handover, enter).1.is_some());
+
+        // Errors: read-only, so Enter closes rather than doing nothing.
+        let errors = ui::ErrorsView {
+            items: vec!["boom".into()],
+            cursor: 0,
+            offset: 0,
+        };
+        assert!(errors_overlay_reduce(errors.clone(), esc).is_none());
+        assert!(errors_overlay_reduce(errors, enter).is_none());
+
+        // Inspector: likewise.
+        let inspector = ui::InspectorView {
+            target: "aaaa1111".into(),
+            subject: "aaaa1111 \u{b7} worker".into(),
+            sections: vec![ui::InspectorSection {
+                name: "identity".into(),
+                lines: vec!["short  aaaa1111".into()],
+            }],
+            cursor: 0,
+            offset: 0,
+        };
+        assert!(inspector_overlay_reduce(inspector.clone(), esc).is_none());
+        assert!(inspector_overlay_reduce(inspector, enter).is_none());
+
+        // Menu: Esc backs out, Enter activates -- and Esc on the inline stop
+        // confirmation cancels only that confirmation.
+        let menu = ui::MenuView {
+            target: "aaaa1111".into(),
+            subject: "aaaa1111 \u{b7} worker".into(),
+            entries: vec![
+                ui::MenuEntry {
+                    action: ui::MenuAction::Inspect,
+                    disabled: None,
+                    letter: Some('i'),
+                },
+                ui::MenuEntry {
+                    action: ui::MenuAction::Stop,
+                    disabled: None,
+                    letter: Some('s'),
+                },
+            ],
+            cursor: 0,
+            offset: 0,
+            confirm: None,
+        };
+        assert!(menu_overlay_reduce(menu.clone(), esc).0.is_none());
+        assert_eq!(
+            menu_overlay_reduce(menu.clone(), enter).1,
+            Some(MenuEffect {
+                target: "aaaa1111".into(),
+                action: ui::MenuAction::Inspect,
+            })
+        );
+        let armed = ui::MenuView {
+            confirm: Some(1),
+            cursor: 1,
+            ..menu
+        };
+        let (back, effect) = menu_overlay_reduce(armed, esc);
+        assert!(
+            back.is_some_and(|v| v.confirm.is_none()) && effect.is_none(),
+            "Esc cancels the inline stop confirmation, not the menu"
+        );
+
+        // Palette and help.
+        assert!(
+            palette_overlay_reduce(open_palette(ui::PaletteMode::Run), esc)
+                .0
+                .is_none()
+        );
+        assert!(
+            palette_overlay_reduce(open_palette(ui::PaletteMode::Run), enter)
+                .1
+                .is_some()
+        );
+        let (next, effect) = palette_overlay_reduce(open_palette(ui::PaletteMode::Help), enter);
+        assert!(
+            next.is_none() && effect.is_none(),
+            "help confirms by closing, and never runs anything"
+        );
+    }
+
+    /// The first-run tip: absent flag shows it, and the flag is written once
+    /// so the next launch never shows it again.
+    #[test]
+    fn the_first_run_tip_is_shown_once_and_then_flagged() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(dir.path().to_path_buf());
+        assert!(
+            !first_run_tip_seen(&state),
+            "a fresh operator has not seen it"
+        );
+        mark_first_run_tip_seen(&state);
+        assert!(first_run_tip_seen(&state));
+        let flag = first_run_tip_flag(&state);
+        assert!(flag.starts_with(state.dash()), "{flag:?}");
+        assert_eq!(flag.file_name().and_then(|n| n.to_str()), Some("tip-seen"));
+        // Writing it twice is idempotent, never an error.
+        mark_first_run_tip_seen(&state);
+        assert!(first_run_tip_seen(&state));
+    }
+
+    /// A state directory that cannot be created (a plain FILE where the
+    /// state root should be) must cost nothing: no panic, no error, the tip
+    /// simply shows again next launch.
+    #[test]
+    fn an_unwritable_state_dir_never_fails_the_first_run_tip() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let blocked = dir.path().join("not-a-dir");
+        std::fs::write(&blocked, b"i am a file").expect("write");
+        let state = StateDir::from_root(blocked);
+        assert!(!first_run_tip_seen(&state));
+        mark_first_run_tip_seen(&state);
+        assert!(
+            !first_run_tip_seen(&state),
+            "an unwritable state dir must leave the flag unset, not error"
+        );
+    }
+
+    /// The dismissal rule, as the event loop applies it: any prefixed key
+    /// (anything `filter_key` turns into a `DashAction`) or a bare `Esc`
+    /// clears the tip; ordinary typing to the child does not.
+    #[test]
+    fn the_first_run_tip_is_dismissed_by_a_prefixed_key_or_esc() {
+        let dismisses = |armed: bool, k: KeyEvent| {
+            let (_, verdict) = filter_key(armed, k);
+            matches!(verdict, InputVerdict::Dash(_)) || k.code == KeyCode::Esc
+        };
+        assert!(dismisses(true, key(KeyCode::Char('?'), KeyModifiers::NONE)));
+        assert!(dismisses(true, key(KeyCode::Char('p'), KeyModifiers::NONE)));
+        assert!(dismisses(false, key(KeyCode::Esc, KeyModifiers::NONE)));
+        assert!(!dismisses(
+            false,
+            key(KeyCode::Char('x'), KeyModifiers::NONE)
+        ));
+        assert!(!dismisses(
+            false,
+            key(KeyCode::Char('a'), KeyModifiers::CONTROL)
+        ));
+    }
+
+    /// Review of 9314156, finding 1: opening the inspector on a LIVE
+    /// attached pane that is merely selected must not clear its `◆`. Only
+    /// focus plus an unoccluded render does that, and a row that can never
+    /// be focused (ended, or not attached) is the only one the inspector may
+    /// acknowledge on its own.
+    #[test]
+    fn the_inspector_never_acknowledges_a_live_attached_pane() {
+        use super::super::attention::{Authority, Lifecycle, Observation, compose};
+        let done = compose(
+            Some(&compose(
+                None,
+                &[Observation::new(Authority::QuietHeuristic, "busy", 40, 100)
+                    .with_lifecycle(Lifecycle::Working)],
+                100,
+            )),
+            &[
+                Observation::new(Authority::QuietHeuristic, "quiet", 40, 200)
+                    .with_lifecycle(Lifecycle::Settled),
+            ],
+            200,
+        );
+
+        // A live, attached, selected-but-unfocused pane showing `◆`.
+        let panes = vec![pane_row("aaa11111", "claude")];
+        let mut rows = assemble_sidebar(&panes, &[], &HashMap::new(), 0, 1, DASHBOARD_PID, 900);
+        let mut disk = DiskFacts::default();
+        disk.attention.insert("aaa11111".into(), done.clone());
+        enrich_sidebar(&mut rows, &disk, 900);
+        assert_eq!(ui::glyph_for(&rows[0]), ui::Glyph::DoneUnread);
+        assert!(rows[0].attached && rows[0].exit_code.is_none());
+        assert_eq!(
+            inspect_ack_candidate(&rows[0]),
+            None,
+            "a live attached pane is acknowledged by viewing it, not by the inspector"
+        );
+
+        // The same status on a RETAINED ENDED row -- one that can never be
+        // focused, so no render of it can ever acknowledge it. That row is
+        // the inspector's to clear, and still is.
+        let ended = vec![ended_pane_row("bbb22222", 0, 190)];
+        let mut rows = assemble_sidebar(&ended, &[], &HashMap::new(), 0, 0, DASHBOARD_PID, 900);
+        disk.attention.insert("bbb22222".into(), done.clone());
+        enrich_sidebar(&mut rows, &disk, 900);
+        assert_eq!(ui::glyph_for(&rows[0]), ui::Glyph::DoneUnread);
+        assert_eq!(
+            inspect_ack_candidate(&rows[0]),
+            Some(("bbb22222".to_string(), done.revision)),
+            "a row this dashboard cannot focus is the inspector's to acknowledge"
+        );
+    }
+
+    /// Review of 9314156, finding 2: a pending single click belongs to the
+    /// dialog it was made in. Two different dialogs -- and the same dialog
+    /// reopened -- never share an identity, so the loop's identity check
+    /// drops the stale click before a second click anywhere else can
+    /// complete a double.
+    #[test]
+    fn a_pending_overlay_click_never_survives_into_another_dialog() {
+        let menu = |target: &str| {
+            ui::Overlay::Menu(ui::MenuView {
+                target: target.into(),
+                subject: format!("{target} \u{b7} worker"),
+                entries: Vec::new(),
+                cursor: 0,
+                offset: 0,
+                confirm: None,
+            })
+        };
+        let errors = ui::Overlay::Errors(ui::ErrorsView {
+            items: vec!["boom".into()],
+            cursor: 0,
+            offset: 0,
+        });
+        let none = ui::Overlay::None;
+
+        // Different dialogs, the same dialog on a different row, and the
+        // closed state in between are each their own identity.
+        assert_ne!(overlay_identity(&menu("aaa")), overlay_identity(&errors));
+        assert_ne!(
+            overlay_identity(&menu("aaa")),
+            overlay_identity(&menu("bbb"))
+        );
+        assert_ne!(overlay_identity(&menu("aaa")), overlay_identity(&none));
+        assert_eq!(
+            overlay_identity(&menu("aaa")),
+            overlay_identity(&menu("aaa"))
+        );
+
+        // The loop's own rule, replayed: a click made in one dialog is
+        // dropped the moment the identity changes -- which includes the
+        // `Overlay::None` a close leaves behind, so close-then-reopen never
+        // completes a double-click either.
+        let mut last_click: Option<(usize, Instant)> = None;
+        let mut last_ident = overlay_identity(&none);
+        let mut step = |overlay: &ui::Overlay,
+                        click: Option<usize>,
+                        last_click: &mut Option<(usize, Instant)>|
+         -> bool {
+            let ident = overlay_identity(overlay);
+            if ident != last_ident {
+                *last_click = None;
+                last_ident = ident;
+            }
+            match click {
+                Some(index) => {
+                    let double = last_click.is_some_and(|(last, at)| {
+                        last == index
+                            && Instant::now().saturating_duration_since(at) <= DOUBLE_CLICK
+                    });
+                    // Exactly the loop's own bookkeeping: a completed
+                    // double-click consumes the pending one.
+                    *last_click = if double {
+                        None
+                    } else {
+                        Some((index, Instant::now()))
+                    };
+                    double
+                }
+                None => false,
+            }
+        };
+        assert!(!step(&menu("aaa"), Some(3), &mut last_click));
+        assert!(
+            step(&menu("aaa"), Some(3), &mut last_click),
+            "same dialog doubles"
+        );
+        assert!(!step(&menu("aaa"), Some(3), &mut last_click));
+        // Close it, then open a different dialog within the double-click
+        // window and click the same index once: not a double.
+        assert!(!step(&none, None, &mut last_click));
+        assert!(
+            !step(&errors, Some(3), &mut last_click),
+            "a click from another dialog must not complete a double here"
+        );
+        // Same dialog, reopened: still not a double.
+        assert!(!step(&none, None, &mut last_click));
+        assert!(!step(&errors, Some(3), &mut last_click));
     }
 }
