@@ -214,6 +214,10 @@ fn route_mouse(
                 HintId::Nudge => DashAction::Nudge,
                 HintId::Mail => DashAction::Mail,
                 HintId::Errors => DashAction::ShowErrors,
+                // Phase 3 gives `^A i` its own inspector; until then it lands
+                // on the same errors/evidence overlay the keyboard's own
+                // `^A i` does, so the drawn hint is never inert.
+                HintId::Inspect => DashAction::ShowErrors,
                 HintId::Help => DashAction::Help,
             })
         }
@@ -311,6 +315,10 @@ fn navigate_roster(
 /// the placeholder `assemble_sidebar` put there.
 fn enrich_sidebar(rows: &mut [ui::SidebarRow], disk: &DiskFacts, now: u64) {
     for row in rows {
+        // Issue #354 phase 2: the glyph column, the rollups and the `reason`
+        // line all read this one cached value. It is looked up here, on the
+        // facts cadence's own output -- never loaded per frame.
+        row.status = disk.attention.get(&row.short).cloned();
         if let Some(group) = row.group.as_mut()
             && let Some(cached) = disk.groups.get(&group.id)
         {
@@ -319,13 +327,42 @@ fn enrich_sidebar(rows: &mut [ui::SidebarRow], disk: &DiskFacts, now: u64) {
                 *value = value.replacen(style::PLACEHOLDER, &group.scope, 1);
             }
         }
-        if let Some((_, at)) = disk.state_since.get(&row.short)
+        // Issue #354 phase 2: `reason` is the composed status's own explanation
+        // rather than phase 1's `none · <state>`. A row with no status (or one
+        // that projects `Unknown`, which is what a missing file reads back as)
+        // keeps the phase 1 text -- never a fabricated reason.
+        if let Some(status) = row.status.as_ref()
+            && let Some((_, value)) = row.disclosure.iter_mut().find(|(key, _)| key == "reason")
+            && let Some(text) = disclosure_reason(status)
+        {
+            *value = text;
+        }
+        // A retained ended row's `since` is already final (`exited <age> ·
+        // exit <code>`, built by `assemble_sidebar` from facts frozen at the
+        // reap); nothing cached may overwrite it.
+        if row.exit_code.is_some() {
+            continue;
+        }
+        // `since` prefers the attention model's own last transition -- the
+        // moment the projection actually changed, which is what "waiting 1m"
+        // in the approved frame means -- and falls back to the dashboard's own
+        // observed `RowState` clock when no status has ever been recorded.
+        let transition = row
+            .status
+            .as_ref()
+            .filter(|s| s.last_transition > 0)
+            .map(|s| (lifecycle_word(s.lifecycle), s.last_transition))
+            .or_else(|| {
+                disk.state_since
+                    .get(&row.short)
+                    .map(|(_, at)| (row_state_label(row.state), *at))
+            });
+        if let Some((word, at)) = transition
             && let Some((_, value)) = row.disclosure.iter_mut().find(|(key, _)| key == "since")
         {
             *value = format!(
-                "{} {} \u{b7} started {} ago",
-                row_state_label(row.state),
-                style::format_age(now.saturating_sub(*at)),
+                "{word} {} \u{b7} started {} ago",
+                style::format_age(now.saturating_sub(at)),
                 row.age_secs
                     .map(style::format_age)
                     .unwrap_or_else(|| style::PLACEHOLDER.into())
@@ -404,6 +441,13 @@ pub fn filter_key(prefix_armed: bool, key: KeyEvent) -> (bool, InputVerdict) {
         KeyCode::Char('M') => Some(DashAction::Memory),
         KeyCode::Char('o') => Some(DashAction::Handover),
         KeyCode::Char('e') => Some(DashAction::ShowErrors),
+        // Issue #354 phase 2: the header offers `^A i inspect` for a row that
+        // needs action or has ended, so the chord has to lead somewhere. The
+        // real per-session inspector is phase 3; until then it opens the
+        // errors/evidence overlay -- the closest thing the dashboard has to
+        // "show me what happened here" -- rather than being drawn and doing
+        // nothing. See [[Known Issues]].
+        KeyCode::Char('i') => Some(DashAction::ShowErrors),
         KeyCode::Char('z') => Some(DashAction::Zoom),
         KeyCode::Char('v') => Some(DashAction::ToggleSelectMode),
         KeyCode::Char('q') => Some(DashAction::Quit),
@@ -914,6 +958,68 @@ struct PaneRowMeta {
     /// through so the footer's supervision segment can render the truth
     /// instead of an assumed `supervised`.
     supervised: bool,
+    /// Issue #354 phase 2: `Some` for a **retained ended row** -- a completed
+    /// pane whose `Pane` `reap_ended_panes` has already dropped but whose row
+    /// the roster keeps. `None` for every live pane.
+    ended: Option<EndedMeta>,
+}
+
+/// Issue #354 phase 2: what a retained ended row knows that a live pane's row
+/// does not. Frozen at the moment of the reap: the session's registry record
+/// is released there, so nothing can be re-derived from it afterwards.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EndedMeta {
+    /// The child's own exit code. A nonzero one is `✗`; a clean one is `◆`
+    /// until seen and `●` afterwards -- see `ui::glyph_for`.
+    exit_code: i32,
+    /// When the pane exited, in epoch seconds -- what the `since` disclosure
+    /// counts up from.
+    exited_at: u64,
+    /// The row's age at the instant it exited, frozen: a finished worker's
+    /// "how long did it run" must not keep ticking up after it stopped
+    /// running. `None` when no registry record was found for it at reap time.
+    age_secs: Option<u64>,
+}
+
+/// Issue #354 phase 2: one completed pane's retained sidebar row.
+///
+/// A reaped pane used to vanish from the roster in the same tick its child
+/// exited, which is exactly when an operator wants to see what happened to it.
+/// The row survives the `Pane` -- glyph from the exit code, age frozen, role
+/// and model retained -- until the cap below drops it or the dashboard exits.
+/// It is deliberately *not* attached: it is selectable (so its disclosure can
+/// be read) and never focusable, since there is no child left to type into.
+#[derive(Debug, Clone)]
+struct EndedRow {
+    short: String,
+    role: String,
+    model: Option<String>,
+    harness: String,
+    group_id: Option<String>,
+    parent: Option<String>,
+    /// The pane's last `budget`/`writer` disclosure values, captured before it
+    /// was dropped rather than re-derived from a `Pane` that no longer exists.
+    budget: String,
+    writer: String,
+    meta: EndedMeta,
+}
+
+/// How many retained ended rows the roster keeps at once, oldest dropped
+/// first. A long orchestration session can reap dozens of workers, and an
+/// unbounded list would push every live pane off the bottom of the sidebar --
+/// the exact failure the pre-#354 reap was introduced to avoid (see
+/// `reap_fixup`'s own doc comment on R2). Eight is one screenful's worth of
+/// recent history on the smallest dashboard-eligible terminal.
+const MAX_RETAINED_ENDED_ROWS: usize = 8;
+
+/// Pure: appends `row` to the retained list, dropping the oldest once the list
+/// is over [`MAX_RETAINED_ENDED_ROWS`]. Split out so the cap is testable
+/// without reaping a real pane.
+fn push_retained_ended(retained: &mut VecDeque<EndedRow>, row: EndedRow, cap: usize) {
+    retained.push_back(row);
+    while retained.len() > cap {
+        retained.pop_front();
+    }
 }
 
 /// Combines this dashboard's own panes (attached, in pane order) with every
@@ -960,36 +1066,54 @@ fn assemble_sidebar(
         .collect();
     let age_of = |short: &str| started_at.get(short).map(|at| now_secs.saturating_sub(*at));
 
-    let mut rows: Vec<ui::SidebarRow> = panes
-        .iter()
-        .map(|p| ui::SidebarRow {
-            role: display_role(&p.role).into(),
-            model: p.model.clone(),
-            group: p.group_id.as_ref().map(|id| ui::GroupRef {
-                id: id.clone(),
-                scope: style::PLACEHOLDER.into(),
-                lead_short: panes
-                    .iter()
-                    .find(|lead| {
-                        lead.group_id.as_ref() == Some(id) && lead.role == "sub-orchestrator"
-                    })
-                    .or_else(|| panes.iter().find(|lead| lead.group_id.as_ref() == Some(id)))
-                    .map(|lead| lead.short.clone())
-                    .unwrap_or_default(),
-            }),
-            tree: ui::TreePos::Flat,
-            disclosure: Vec::new(),
-            short: p.short.clone(),
-            harness: p.harness.clone(),
-            age_secs: age_of(&p.short),
-            score: scores.get(&p.short).copied(),
-            state: p.state,
-            attached: true,
-            selected: false,
-            focused: false,
-            supervised: p.supervised,
-        })
-        .collect();
+    // Issue #354 phase 2: the retained ended rows sit at the very END of the
+    // roster -- after the view-only registry rows, not immediately after the
+    // live panes. That keeps `reap_fixup`'s index arithmetic exactly right:
+    // reaping still removes one row from the middle and shifts everything
+    // after it down by one, and the row retained in its place is appended
+    // where no existing selection points. A retained row that still carries a
+    // work group is drawn under that group's header regardless
+    // (`ui::roster_frame` gathers a group's members from the whole row list),
+    // so only an ungrouped one actually sits at the bottom.
+    let (live_panes, ended_panes): (Vec<&PaneRowMeta>, Vec<&PaneRowMeta>) =
+        panes.iter().partition(|p| p.ended.is_none());
+    let row_of = |p: &PaneRowMeta| ui::SidebarRow {
+        role: display_role(&p.role).into(),
+        model: p.model.clone(),
+        group: p.group_id.as_ref().map(|id| ui::GroupRef {
+            id: id.clone(),
+            scope: style::PLACEHOLDER.into(),
+            lead_short: panes
+                .iter()
+                .find(|lead| lead.group_id.as_ref() == Some(id) && lead.role == "sub-orchestrator")
+                .or_else(|| panes.iter().find(|lead| lead.group_id.as_ref() == Some(id)))
+                .map(|lead| lead.short.clone())
+                .unwrap_or_default(),
+        }),
+        tree: ui::TreePos::Flat,
+        disclosure: Vec::new(),
+        short: p.short.clone(),
+        harness: p.harness.clone(),
+        // Issue #354 phase 2: a retained ended row's age is frozen at the
+        // instant it exited. Its registry record was released by the same
+        // reap that retained it, so `age_of` would report the placeholder
+        // here anyway -- but frozen is the honest answer either way.
+        age_secs: match &p.ended {
+            Some(ended) => ended.age_secs,
+            None => age_of(&p.short),
+        },
+        score: scores.get(&p.short).copied(),
+        state: p.state,
+        status: None,
+        exit_code: p.ended.map(|e| e.exit_code),
+        // A retained ended row is selectable but never focusable: there is
+        // no child left to receive a keystroke.
+        attached: p.ended.is_none(),
+        selected: false,
+        focused: false,
+        supervised: p.supervised,
+    };
+    let mut rows: Vec<ui::SidebarRow> = live_panes.iter().copied().map(row_of).collect();
 
     if let Some(row) = rows.get_mut(focused) {
         row.focused = true;
@@ -1021,6 +1145,8 @@ fn assemble_sidebar(
             age_secs: Some(now_secs.saturating_sub(record.started_at)),
             score: scores.get(&record.short).copied(),
             state: ui::RowState::Unknown,
+            status: None,
+            exit_code: None,
             attached: false,
             selected: false,
             focused: false,
@@ -1029,6 +1155,8 @@ fn assemble_sidebar(
             supervised: true,
         });
     }
+
+    rows.extend(ended_panes.into_iter().map(row_of));
 
     if let Some(row) = rows.get_mut(selected) {
         row.selected = true;
@@ -1076,13 +1204,25 @@ fn assemble_sidebar(
             ),
             (
                 "since".into(),
-                format!(
-                    "{state} {} · started {} ago",
-                    style::PLACEHOLDER,
-                    row.age_secs
-                        .map(style::format_age)
-                        .unwrap_or_else(|| style::PLACEHOLDER.into())
-                ),
+                // Issue #354 phase 2: a retained ended row says how long ago
+                // it exited and with what -- the two facts that are actually
+                // still true about it. A live row keeps the placeholder
+                // `enrich_sidebar` fills in from the cached attention status
+                // (or, with none, from `DiskFacts::state_since`).
+                match pane.and_then(|p| p.ended) {
+                    Some(ended) => format!(
+                        "exited {} \u{b7} exit {}",
+                        style::format_age(now_secs.saturating_sub(ended.exited_at)),
+                        ended.exit_code
+                    ),
+                    None => format!(
+                        "{state} {} · started {} ago",
+                        style::PLACEHOLDER,
+                        row.age_secs
+                            .map(style::format_age)
+                            .unwrap_or_else(|| style::PLACEHOLDER.into())
+                    ),
+                },
             ),
             (
                 "signal".into(),
@@ -1110,10 +1250,10 @@ fn display_role(role: &str) -> &str {
     }
 }
 
-/// Pure: the word a disclosure line uses for a row's state. Phase 1 has only
-/// [`ui::RowState`] to work from; phase 2 replaces this with the composed
-/// `attention::SessionStatus`, which is what makes `reason` more than
-/// `none · <state>`.
+/// Pure: the word a disclosure line uses for a row's state when the composed
+/// attention model has nothing to say about it. Phase 2's [`lifecycle_word`]
+/// is the richer answer whenever a `SessionStatus` exists; this stays the
+/// fallback for a row that has never been observed by an issue #349 writer.
 fn row_state_label(state: ui::RowState) -> &'static str {
     match state {
         ui::RowState::Working => "working",
@@ -1121,6 +1261,81 @@ fn row_state_label(state: ui::RowState) -> &'static str {
         ui::RowState::Dead => "ended",
         ui::RowState::Unknown => "unknown",
     }
+}
+
+/// Pure: the word the `since` disclosure line leads with, from the composed
+/// model's own lifecycle axis -- `waiting 1m · started 9m ago` in the approved
+/// frame. Deliberately the LIFECYCLE, not the projection: "waiting" and
+/// "working" are what an operator reads as elapsed-time-in-state, whereas the
+/// projection (which folds attention in) is what the `reason` line says.
+fn lifecycle_word(lifecycle: super::attention::Lifecycle) -> &'static str {
+    use super::attention::Lifecycle;
+    match lifecycle {
+        Lifecycle::Starting => "starting",
+        Lifecycle::Working => "working",
+        Lifecycle::Waiting => "waiting",
+        Lifecycle::Settled => "idle",
+        Lifecycle::Exited => "exited",
+        Lifecycle::Unknown => "unknown",
+    }
+}
+
+/// Pure: the word the `reason` disclosure line leads with -- the projection's
+/// own name, with `Blocked`'s payload spelled out (that IS the reason, and
+/// `blocked` on its own says nothing an operator can act on).
+fn projection_word(projection: super::attention::Projection) -> String {
+    use super::attention::{Attention, Projection};
+    match projection {
+        Projection::Blocked(Attention::None) => "waiting".to_string(),
+        Projection::Blocked(attention) => spaced_lowercase(&format!("{attention:?}")),
+        other => other.label().to_string(),
+    }
+}
+
+/// Pure: `WorkflowGate` -> `workflow gate`. The composed model's enums are
+/// `CamelCase` on the wire; a sidebar reads in words.
+fn spaced_lowercase(camel: &str) -> String {
+    let mut out = String::with_capacity(camel.len() + 2);
+    for (i, ch) in camel.chars().enumerate() {
+        if ch.is_uppercase() && i > 0 {
+            out.push(' ');
+        }
+        out.extend(ch.to_lowercase());
+    }
+    out
+}
+
+/// Pure: the `reason` disclosure line for `status` -- `approval · workflow
+/// gate`: the projection's own word, then whatever evidence the winning
+/// authority recorded, capped at the 30 display columns the disclosure
+/// contract allows.
+///
+/// `None` for a status that projects `Unknown`, which is exactly what a
+/// missing or never-written attention file loads back as: the caller then
+/// keeps phase 1's `none · <state>` rather than printing a reason nobody
+/// recorded.
+fn disclosure_reason(status: &super::attention::SessionStatus) -> Option<String> {
+    let projection = super::attention::project(status);
+    if projection == super::attention::Projection::Unknown {
+        return None;
+    }
+    let word = projection_word(projection);
+    // `attention::reason` is the one place the "prefer recorded evidence,
+    // else a generic sentence" rule lives; this only re-shapes its answer for
+    // a 30-column field. Its `Attention: evidence` prefix is dropped because
+    // `word` already carries that half.
+    let detail = super::attention::reason(status);
+    let prefix = format!("{:?}: ", status.attention);
+    let detail = detail
+        .strip_prefix(&prefix)
+        .map(str::to_string)
+        .unwrap_or(detail);
+    let text = if detail.is_empty() || detail.eq_ignore_ascii_case(&word) {
+        word
+    } else {
+        format!("{word} \u{b7} {detail}")
+    };
+    Some(style::truncate_display(&text, 30).into_owned())
 }
 
 /// Pure: one navigation action's effect on the `(selected, focused)` pair.
@@ -1439,6 +1654,17 @@ struct DiskFacts {
     /// a property of what the *dashboard* has observed across ticks, and it
     /// is pruned to the live panes on every refresh.
     state_since: HashMap<String, (ui::RowState, u64)>,
+    /// Issue #354 phase 2: the composed `attention::SessionStatus` behind
+    /// every row's glyph, its rollups and its `reason` line -- one
+    /// `attention::load` (a single small JSON read) per drawable row, on this
+    /// same throttled tick and NEVER per frame. Filled by
+    /// [`FactsCache::refresh_attention`], which the event loop calls only on a
+    /// tick where [`FactsCache::refresh_if_due`] actually re-read. A missing
+    /// or corrupt file loads back as `SessionStatus::default()`, which
+    /// projects `Unknown` -- and `ui::glyph_for` treats that exactly like no
+    /// entry at all, so a dashboard with no issue #349 writers renders the
+    /// phase 1 sidebar unchanged.
+    attention: HashMap<String, super::attention::SessionStatus>,
 }
 
 /// Issue #264: [`DiskFacts::spend`]'s own shape.
@@ -1485,6 +1711,12 @@ impl FactsCache {
     /// Every disk read the header and sidebar need, at most once per
     /// `FACTS_THROTTLE`. `panes` is only walked when a refresh is actually
     /// due, so a throttled tick costs the `due` comparison and nothing else.
+    ///
+    /// Returns whether it actually re-read. Issue #354 phase 2 hangs
+    /// [`FactsCache::refresh_attention`] off that answer rather than off a
+    /// second throttle of its own: the attention statuses have to be exactly
+    /// as fresh as the registry listing they are keyed against, and a second
+    /// clock could only ever drift them apart.
     fn refresh_if_due(
         &mut self,
         cfg: &CtxConfig,
@@ -1492,9 +1724,9 @@ impl FactsCache {
         owner: FactsOwner<'_>,
         panes: &[Pane],
         now: Instant,
-    ) {
+    ) -> bool {
         if !due(self.last_refresh, now, FACTS_THROTTLE) {
-            return;
+            return false;
         }
         self.last_refresh = now;
 
@@ -1725,7 +1957,186 @@ impl FactsCache {
                 self.disk.stalled.insert(record.short.clone());
             }
         }
+        true
     }
+
+    /// Issue #354 phase 2: re-reads the composed attention status for exactly
+    /// the rows the sidebar can draw. Called only on a tick where
+    /// [`FactsCache::refresh_if_due`] returned `true`, so a frame never costs
+    /// a read; `load` is a seam purely so a test can count how often that
+    /// actually happens.
+    ///
+    /// Rebuilt rather than updated in place, for the same reason `scores` and
+    /// `mail_by_session` are: a reaped, un-retained pane's status must drop
+    /// out of the map rather than linger against a short id something else may
+    /// reuse.
+    fn refresh_attention(
+        &mut self,
+        shorts: &[String],
+        load: &dyn Fn(&str) -> super::attention::SessionStatus,
+    ) {
+        self.disk.attention.clear();
+        for short in shorts {
+            self.disk.attention.insert(short.clone(), load(short));
+        }
+    }
+}
+
+/// Pure: every session short id the sidebar can draw a glyph for, deduped and
+/// in row order -- this dashboard's own panes, its retained ended rows, and
+/// every live registry session it owns. Exactly the rows `assemble_sidebar`
+/// builds, so no status is ever read for a row that will not be drawn.
+fn attention_row_shorts(
+    pane_shorts: &[String],
+    retained: &VecDeque<EndedRow>,
+    registry: &[(sessions::Record, sessions::Liveness)],
+    dashboard_pid: u32,
+) -> Vec<String> {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut shorts = Vec::new();
+    let push = |short: &str, seen: &mut HashSet<String>, shorts: &mut Vec<String>| {
+        if seen.insert(short.to_string()) {
+            shorts.push(short.to_string());
+        }
+    };
+    for short in pane_shorts {
+        push(short, &mut seen, &mut shorts);
+    }
+    for row in retained {
+        push(&row.short, &mut seen, &mut shorts);
+    }
+    for (record, liveness) in registry {
+        if *liveness == sessions::Liveness::Live && record.owner_pid == Some(dashboard_pid) {
+            push(&record.short, &mut seen, &mut shorts);
+        }
+    }
+    shorts
+}
+
+/// Which way [`fold_group`] moves a work group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GroupFold {
+    Collapse,
+    Expand,
+    Toggle,
+}
+
+/// Pure: folds a work group shut or open again, returning whether it is
+/// collapsed afterwards.
+///
+/// The single reducer both `^A Left`/`^A Right` and a click on a group
+/// header's disclosure triangle go through, so the keyboard and the pointer
+/// can never disagree about what "collapsed" means. Collapsing never touches
+/// focus -- the group's children stop being drawn, but whichever pane owns the
+/// keyboard keeps it.
+fn fold_group(collapsed: &mut HashSet<String>, id: &str, fold: GroupFold) -> bool {
+    match fold {
+        GroupFold::Collapse => {
+            collapsed.insert(id.to_string());
+            true
+        }
+        GroupFold::Expand => {
+            collapsed.remove(id);
+            false
+        }
+        GroupFold::Toggle => {
+            if collapsed.remove(id) {
+                false
+            } else {
+                collapsed.insert(id.to_string());
+                true
+            }
+        }
+    }
+}
+
+/// Pure: which work group `^A Left`/`^A Right` acts on -- the one the cursor
+/// is parked on when it sits on a group header, else the one the selected
+/// session belongs to. `None` on a flat (ungrouped) row or the summary line,
+/// which is what makes both keys no-ops there rather than folding whichever
+/// group happened to be nearby.
+fn group_under_cursor(
+    chrome: Option<&Hit>,
+    rows: &[ui::SidebarRow],
+    selected: usize,
+) -> Option<String> {
+    match chrome {
+        Some(Hit::GroupToggle(id)) => Some(id.clone()),
+        Some(_) => None,
+        None => rows
+            .get(selected)
+            .and_then(|row| row.group.as_ref())
+            .map(|group| group.id.clone()),
+    }
+}
+
+/// Issue #354 phase 2: the done-unread (`◆`) acknowledgement gate.
+///
+/// `Visibility::Unseen` is latched by a `Working -> Settled` transition and
+/// only [`super::attention::mark_seen`] ever clears it, so whatever calls it
+/// is asserting "an operator has actually looked at this session". Phase 1
+/// called it on every focus change, which asserts something weaker and often
+/// false: arrowing past a pane, or clicking it while a modal covers the whole
+/// grid, cleared a badge nobody read.
+///
+/// The rule now is a *render* rule, not an input rule: the pane must be the
+/// focused one, no overlay may be covering it, and it must be at its live
+/// scroll position (a pane scrolled back into history is showing something
+/// else entirely). [`ack_candidate`] decides that against one drawn frame;
+/// this remembers the `(short, revision)` it qualified at and hands it back
+/// exactly once, on the next tick, so the write happens off the render path.
+#[derive(Debug, Default)]
+struct DoneUnreadAck {
+    /// The `(short, revision)` a qualifying render observed, waiting for the
+    /// next tick to act on.
+    pending: Option<(String, u64)>,
+    /// Every `(short, revision)` already acknowledged. Keyed by revision, so a
+    /// session that settles again later latches `Unseen` again at a NEW
+    /// revision and is acknowledged again -- while the same revision is never
+    /// written twice, however many frames it survives.
+    acked: HashSet<(String, u64)>,
+}
+
+impl DoneUnreadAck {
+    /// Pure: records what the frame just drawn qualifies for.
+    fn observe(&mut self, candidate: Option<(String, u64)>) {
+        self.pending = candidate.filter(|key| !self.acked.contains(key));
+    }
+
+    /// Pure: the short id whose `mark_seen_io` is now due, at most once per
+    /// `(short, revision)`.
+    fn take_due(&mut self) -> Option<String> {
+        let (short, revision) = self.pending.take()?;
+        self.acked.insert((short.clone(), revision));
+        Some(short)
+    }
+}
+
+/// Pure: the `(short, revision)` one completed, unoccluded render of the
+/// focused pane qualifies for acknowledgement -- `None` for every render that
+/// does not.
+///
+/// `focused` is `(short, scrollback)` for the pane the frame actually drew;
+/// `status` is that pane's cached status. Note what is deliberately absent:
+/// there is no path here from *selection*. A row the cursor merely walked onto
+/// is not a row anybody read.
+fn ack_candidate(
+    overlay_open: bool,
+    focused: Option<(&str, usize)>,
+    status: Option<&super::attention::SessionStatus>,
+) -> Option<(String, u64)> {
+    if overlay_open {
+        return None;
+    }
+    let (short, scrollback) = focused?;
+    if scrollback != 0 {
+        return None;
+    }
+    let status = status?;
+    if super::attention::project(status) != super::attention::Projection::DoneUnread {
+        return None;
+    }
+    Some((short.to_string(), status.revision))
 }
 
 /// Pure: `(focused, selected)` after the pane at `removed` has been taken out
@@ -1905,6 +2316,7 @@ fn reap_ended_panes(
     reaped_codes: &mut Vec<i32>,
     reaped_recent: &mut HashSet<String>,
     last_exited: &mut Option<LastExited>,
+    retained: &mut VecDeque<EndedRow>,
 ) {
     let mut index = 0;
     while index < panes.len() {
@@ -1912,12 +2324,58 @@ fn reap_ended_panes(
             index += 1;
             continue;
         };
+        // Issue #354 phase 2: the row survives the pane, so everything it will
+        // ever need is captured HERE -- before `shutdown` below releases the
+        // registry record the age comes from, and before the `Pane` itself is
+        // dropped. Nothing about a finished worker can be re-derived a tick
+        // later.
+        let now_secs = super::state::now_secs();
+        let ended_meta = EndedMeta {
+            exit_code: code,
+            exited_at: now_secs,
+            age_secs: sessions::load_record(state, panes[index].short())
+                .map(|record| now_secs.saturating_sub(record.started_at)),
+        };
         let quit_sequence = adapters::select(Some(panes[index].agent()), &[], cfg)
             .map(|adapter| adapter.quit_sequence())
             .unwrap_or("");
         if let Err(e) = panes[index].shutdown(quit_sequence) {
             push_error(errors, format!("reap {}: {e}", panes[index].short()));
         }
+        let retained_row = EndedRow {
+            short: panes[index].short().to_string(),
+            role: panes[index].role().label().to_string(),
+            model: panes[index].launch_model().map(str::to_string),
+            harness: panes[index].agent().to_string(),
+            group_id: panes[index].work_group_id().map(str::to_string),
+            parent: panes[index].parent_session().map(str::to_string),
+            budget: style::PLACEHOLDER.to_string(),
+            writer: format!(
+                "{} \u{b7} {}",
+                style::PLACEHOLDER,
+                panes[index].cwd().display()
+            ),
+            meta: ended_meta,
+        };
+        // Issue #349: the dashboard's own quiet-heuristic sync never sees this
+        // pane again (it is about to leave `panes`), so the one authority that
+        // can say the child is gone files it here instead -- a `Supervisor`
+        // observation, the same rank `exec`/`wrap` use for a process exit.
+        // Without it the retained row's cached status would still claim the
+        // session was working.
+        let _ = super::attention::record(
+            state,
+            &retained_row.short,
+            super::attention::Observation::new(
+                super::attention::Authority::Supervisor,
+                format!("pane exited with code {code}"),
+                90,
+                ended_meta.exited_at,
+            )
+            .with_lifecycle(super::attention::Lifecycle::Exited),
+            ended_meta.exited_at,
+        );
+        push_retained_ended(retained, retained_row, MAX_RETAINED_ENDED_ROWS);
         let pane = panes.remove(index);
         // Review finding (2026-09), finding 2a: captured before `pane` is
         // consumed below, so the worktree-reclaim check after this pane is
@@ -6724,10 +7182,18 @@ fn restorable_candidates(taken: roster::Roster) -> Vec<roster::RosterPane> {
         .collect()
 }
 
-/// The `PaneRowMeta` list for every pane this dashboard currently owns, in
-/// pane order -- shared by the pre-input (routing) and post-input
-/// (rendering) calls to `assemble_sidebar` each tick.
-fn build_pane_rows(panes: &[Pane]) -> Vec<PaneRowMeta> {
+/// The `PaneRowMeta` list for every row this dashboard owns, in pane order
+/// followed by its retained ended rows (issue #354 phase 2) in reap order --
+/// shared by the pre-input (routing) and post-input (rendering) calls to
+/// `assemble_sidebar` each tick.
+///
+/// The retained rows come after the live panes rather than staying at the
+/// index the pane held: `focused` indexes into `panes` alone, so anything
+/// appended past its end cannot disturb it, and a completed worker reading as
+/// the most recent thing to have finished is what an operator scanning the
+/// bottom of the roster expects. A retained row that still carries its work
+/// group is still drawn under that group's header, wherever the header sits.
+fn build_pane_rows(panes: &[Pane], ended: &VecDeque<EndedRow>) -> Vec<PaneRowMeta> {
     panes
         .iter()
         .map(|pane| PaneRowMeta {
@@ -6760,7 +7226,24 @@ fn build_pane_rows(panes: &[Pane]) -> Vec<PaneRowMeta> {
             harness: pane.agent().to_string(),
             state: ui::row_state_for(&pane.state()),
             supervised: pane.reachable(),
+            ended: None,
         })
+        .chain(ended.iter().map(|row| PaneRowMeta {
+            role: row.role.clone(),
+            model: row.model.clone(),
+            group_id: row.group_id.clone(),
+            parent: row.parent.clone(),
+            budget: row.budget.clone(),
+            writer: row.writer.clone(),
+            short: row.short.clone(),
+            harness: row.harness.clone(),
+            state: ui::RowState::Dead,
+            // There is no socket left to be reachable on; the footer only ever
+            // reads this off the FOCUSED row, which a retained row can never
+            // be, but the honest value is the one to carry.
+            supervised: false,
+            ended: Some(row.meta),
+        }))
         .collect()
 }
 
@@ -7180,6 +7663,11 @@ pub fn run_dashboard(
     let mut sidebar_offset = 0usize;
     let mut chrome_selection: Option<Hit> = None;
     let mut collapsed_groups = HashSet::new();
+    // Issue #354 phase 2: completed panes keep a row (oldest dropped past
+    // `MAX_RETAINED_ENDED_ROWS`), and `◆` is only cleared by a render that
+    // actually showed the operator the pane -- see `DoneUnreadAck`.
+    let mut retained_ended: VecDeque<EndedRow> = VecDeque::new();
+    let mut done_unread_ack = DoneUnreadAck::default();
     let mut frame_snapshot = hit::FrameSnapshot::default();
     let mut reveal_sidebar = true;
     // The row a context menu was asked for. Phase 3 opens the menu on it;
@@ -7350,6 +7838,7 @@ pub fn run_dashboard(
             &mut reaped_codes,
             &mut reaped_recent,
             &mut last_exited,
+            &mut retained_ended,
         );
 
         // The geometry any pane spawned during this tick gets -- the terminal
@@ -7468,7 +7957,19 @@ pub fn run_dashboard(
         // onto its own spawn requests (`requested_by`) and onto the header's
         // per-session counts -- or, with no panes left at all, an empty
         // string.
-        facts_cache.refresh_if_due(
+        // Issue #354 phase 2: the acknowledgement the LAST frame earned, acted
+        // on here -- off the render path, before this tick's own reads, and at
+        // most once per `(session, revision)`. A write inside `terminal.draw`
+        // would put a state-dir round trip on the hot path for every frame a
+        // done-unread pane stayed focused.
+        if let Some(short) = done_unread_ack.take_due() {
+            let acked = super::attention::mark_seen_io(state, &short);
+            // Keep the cached copy in step rather than waiting up to a full
+            // `FACTS_THROTTLE` for the glyph to stop saying `◆` at something
+            // the operator has demonstrably now read.
+            facts_cache.disk.attention.insert(short, acked);
+        }
+        let facts_refreshed = facts_cache.refresh_if_due(
             cfg,
             state,
             FactsOwner {
@@ -7479,6 +7980,19 @@ pub fn run_dashboard(
             &panes,
             Instant::now(),
         );
+        if facts_refreshed {
+            // Exactly the rows the sidebar can draw, and only on the tick the
+            // rest of the facts were re-read: the glyph column must never put
+            // a file read on a frame.
+            let pane_shorts: Vec<String> = panes.iter().map(|p| p.short().to_string()).collect();
+            let shorts = attention_row_shorts(
+                &pane_shorts,
+                &retained_ended,
+                &facts_cache.registry,
+                std::process::id(),
+            );
+            facts_cache.refresh_attention(&shorts, &|short| super::attention::load(state, short));
+        }
         // L19: drop any recently-reaped short the registry snapshot no longer
         // carries -- once a refresh clears the released record, the exclusion
         // is no longer needed. What remains is the set the (still-stale)
@@ -7505,7 +8019,7 @@ pub fn run_dashboard(
         // it there would double-fire for the same tick's own transition.
         sync_quiet_heuristic_attention(&panes, state, &mut quiet_lifecycle);
         let rows = assemble_sidebar(
-            &build_pane_rows(&panes),
+            &build_pane_rows(&panes, &retained_ended),
             &visible_registry,
             &facts_cache.disk.scores,
             selected,
@@ -7579,17 +8093,16 @@ pub fn run_dashboard(
                         match route {
                             MouseRoute::Grid | MouseRoute::Consume => {}
                             MouseRoute::Select(id) => {
+                                // Issue #354 phase 2: selecting (or focusing)
+                                // a pane no longer clears its `◆` on its own
+                                // -- only a render that actually showed it
+                                // does, via `DoneUnreadAck`.
                                 (selected, focused) = select_row(&id, &rows, selected, focused);
                                 chrome_selection = None;
-                                if let Some(pane) = panes.get(focused) {
-                                    let _ = super::attention::mark_seen_io(state, pane.short());
-                                }
                             }
                             MouseRoute::Summary => chrome_selection = Some(Hit::SidebarSummary),
                             MouseRoute::Toggle(id) => {
-                                if !collapsed_groups.remove(&id) {
-                                    collapsed_groups.insert(id.clone());
-                                }
+                                fold_group(&mut collapsed_groups, &id, GroupFold::Toggle);
                                 chrome_selection = Some(Hit::GroupToggle(id));
                             }
                             MouseRoute::ScrollRoster(delta) => {
@@ -8073,19 +8586,28 @@ pub fn run_dashboard(
                                         action @ (DashAction::CollapseGroup
                                         | DashAction::ExpandGroup),
                                     ) => {
-                                        let id = match &chrome_selection {
-                                            Some(Hit::GroupToggle(id)) => Some(id.clone()),
-                                            _ => rows
-                                                .get(selected)
-                                                .and_then(|row| row.group.as_ref())
-                                                .map(|g| g.id.clone()),
-                                        };
+                                        let id = group_under_cursor(
+                                            chrome_selection.as_ref(),
+                                            &rows,
+                                            selected,
+                                        );
+                                        // The same reducer a click on the
+                                        // header's disclosure triangle goes
+                                        // through, so the two can never drift.
+                                        // A flat row (no group) is a no-op.
                                         if let Some(id) = id {
-                                            if action == DashAction::CollapseGroup {
-                                                collapsed_groups.insert(id.clone());
-                                                chrome_selection = Some(Hit::GroupToggle(id));
+                                            let fold = if action == DashAction::CollapseGroup {
+                                                GroupFold::Collapse
                                             } else {
-                                                collapsed_groups.remove(&id);
+                                                GroupFold::Expand
+                                            };
+                                            if fold_group(&mut collapsed_groups, &id, fold) {
+                                                // Collapsing folds the cursor's
+                                                // own row away, so the cursor
+                                                // moves up onto the header --
+                                                // never onto another session,
+                                                // and never touching focus.
+                                                chrome_selection = Some(Hit::GroupToggle(id));
                                             }
                                             reveal_sidebar = true;
                                         }
@@ -8136,16 +8658,15 @@ pub fn run_dashboard(
                                             focused,
                                             &mut chrome_selection,
                                         );
-                                        // Issue #349: the operator just looked
-                                        // at this pane -- the only thing that
-                                        // may ever clear the `Unseen` latch.
-                                        // Best-effort, like every other
-                                        // attention write: a focus change must
-                                        // never fail just because this did.
-                                        if let Some(pane) = panes.get(focused) {
-                                            let _ =
-                                                super::attention::mark_seen_io(state, pane.short());
-                                        }
+                                        // Issue #354 phase 2: navigation no
+                                        // longer clears the `Unseen` latch.
+                                        // Arrowing past a pane is not reading
+                                        // it, and the old unconditional
+                                        // `mark_seen_io` here cleared `◆` for
+                                        // every row the cursor merely passed
+                                        // over. `DoneUnreadAck` now waits for
+                                        // an unoccluded render of the focused
+                                        // pane instead.
                                     }
                                     // Scrollback, on the focused pane, for every
                                     // terminal that does not deliver wheel events
@@ -8758,7 +9279,7 @@ pub fn run_dashboard(
         // `visible_registry` (L19: ghost-reaped rows filtered) is reused from
         // the pre-input pass -- the snapshot has not changed within the tick.
         let rows = assemble_sidebar(
-            &build_pane_rows(&panes),
+            &build_pane_rows(&panes, &retained_ended),
             &visible_registry,
             &facts_cache.disk.scores,
             selected,
@@ -8796,6 +9317,14 @@ pub fn run_dashboard(
         facts.hints.alive = rows
             .get(selected)
             .is_some_and(|r| r.state != ui::RowState::Dead);
+        // Issue #354 phase 2: the cluster follows the selected row's own
+        // glyph, so a row waiting on the operator offers `^A i`/`^A n` and an
+        // ended one offers only what still applies to it.
+        facts.hints.needs_action =
+            rows.get(selected).map(ui::glyph_for) == Some(ui::Glyph::NeedsAction);
+        facts.hints.ended = rows
+            .get(selected)
+            .is_some_and(|r| r.state == ui::RowState::Dead);
         let focused_row = rows.iter().find(|r| r.focused);
         // Codex review finding 2: the focused pane's OWN mail queue, not
         // the dashboard's fixed launch identity's -- see `MailMap`'s own
@@ -8905,7 +9434,7 @@ pub fn run_dashboard(
             roster = ui::roster_frame(layout.sidebar, &rows, &summary, &view);
         }
         let next_snapshot =
-            ui::frame_snapshot(frame_area, &layout, zoomed, &roster, &facts.hints, &overlay);
+            ui::frame_snapshot(frame_area, &layout, zoomed, &roster, &facts, &overlay);
         let focus_cwd = panes.get(focused).map(|p| p.cwd().display().to_string());
         let draw = terminal.draw(|f| {
             if !zoomed {
@@ -8970,6 +9499,19 @@ pub fn run_dashboard(
             push_error(&mut errors, format!("draw: {e}"));
         } else {
             frame_snapshot = next_snapshot;
+            // Issue #354 phase 2: this frame COMPLETED, so whatever it showed
+            // the operator counts as having been seen. Only the focused pane,
+            // only with no overlay over it, and only at its live scroll
+            // position -- and the acknowledgement itself happens on the next
+            // tick, never here (see `DoneUnreadAck`).
+            let focused_pane = panes
+                .get(focused)
+                .map(|pane| (pane.short(), pane.scrollback()));
+            done_unread_ack.observe(ack_candidate(
+                !matches!(overlay, ui::Overlay::None),
+                focused_pane,
+                focused_pane.and_then(|(short, _)| facts_cache.disk.attention.get(short)),
+            ));
         }
     };
 
@@ -10055,6 +10597,22 @@ mod tests {
             harness: harness.to_string(),
             state: ui::RowState::Idle,
             supervised: true,
+            ended: None,
+        }
+    }
+
+    /// Issue #354 phase 2: the same row, retained after its pane exited with
+    /// `code` -- what `build_pane_rows` appends for an `EndedRow`.
+    fn ended_pane_row(short: &str, code: i32, exited_at: u64) -> PaneRowMeta {
+        PaneRowMeta {
+            state: ui::RowState::Dead,
+            supervised: false,
+            ended: Some(EndedMeta {
+                exit_code: code,
+                exited_at,
+                age_secs: Some(300),
+            }),
+            ..pane_row(short, "claude")
         }
     }
 
@@ -10237,6 +10795,496 @@ mod tests {
         assert_eq!(rows[2].score, Some(12), "view-only registry row, scored");
     }
 
+    // ------------------------------------------------------------------
+    // Issue #354 phase 2: attention glyphs, done-unread acknowledgement,
+    // retained completed-worker rows, group collapse keys.
+    // ------------------------------------------------------------------
+
+    /// A `SessionStatus` that projects `Blocked(WorkflowGate)` with recorded
+    /// evidence -- the approved frame's own `approval · workflow gate` case.
+    fn blocked_status(revision: u64) -> super::super::attention::SessionStatus {
+        super::super::attention::SessionStatus {
+            lifecycle: super::super::attention::Lifecycle::Waiting,
+            attention: super::super::attention::Attention::Approval,
+            authority: super::super::attention::Authority::Workflow,
+            evidence: "workflow gate".into(),
+            last_transition: 200,
+            revision,
+            ..Default::default()
+        }
+    }
+
+    fn done_unread_status(revision: u64) -> super::super::attention::SessionStatus {
+        super::super::attention::SessionStatus {
+            lifecycle: super::super::attention::Lifecycle::Settled,
+            visibility: super::super::attention::Visibility::Unseen,
+            last_transition: 200,
+            revision,
+            ..Default::default()
+        }
+    }
+
+    /// The `reason` line is the projection's own word plus the winning
+    /// authority's evidence -- `approval · workflow gate` -- capped at the 30
+    /// display columns the disclosure contract allows.
+    #[test]
+    fn the_reason_line_names_the_attention_and_its_evidence() {
+        assert_eq!(
+            disclosure_reason(&blocked_status(1)).as_deref(),
+            Some("approval \u{b7} workflow gate")
+        );
+        // A camel-cased attention variant reads as words.
+        let mut gate = blocked_status(1);
+        gate.attention = super::super::attention::Attention::WorkflowGate;
+        gate.evidence = "verify step 3".into();
+        assert_eq!(
+            disclosure_reason(&gate).as_deref(),
+            Some("workflow gate \u{b7} verify step 3")
+        );
+        // No evidence recorded: the word alone, never a duplicated sentence.
+        let mut bare = blocked_status(1);
+        bare.evidence.clear();
+        assert_eq!(disclosure_reason(&bare).as_deref(), Some("approval"));
+        // Never wider than the 30-column disclosure field.
+        let mut long = blocked_status(1);
+        long.evidence = "a".repeat(200);
+        assert_eq!(style::display_width(&disclosure_reason(&long).unwrap()), 30);
+        // And a status nobody has ever written keeps phase 1's own text.
+        assert_eq!(
+            disclosure_reason(&super::super::attention::SessionStatus::default()),
+            None
+        );
+    }
+
+    #[test]
+    fn the_lifecycle_word_is_the_axis_the_since_line_counts_from() {
+        use super::super::attention::Lifecycle;
+        assert_eq!(lifecycle_word(Lifecycle::Waiting), "waiting");
+        assert_eq!(lifecycle_word(Lifecycle::Working), "working");
+        assert_eq!(lifecycle_word(Lifecycle::Settled), "idle");
+        assert_eq!(lifecycle_word(Lifecycle::Exited), "exited");
+        assert_eq!(spaced_lowercase("WriterConflict"), "writer conflict");
+        assert_eq!(spaced_lowercase("Approval"), "approval");
+    }
+
+    /// `enrich_sidebar` folds the cached status onto the row: the glyph's own
+    /// source, the `reason` line and the `since` line's `<lifecycle word>
+    /// <age since last_transition> · started <age>` shape.
+    #[test]
+    fn enrich_sidebar_folds_the_cached_attention_status_onto_the_row() {
+        let panes = vec![pane_row("aaa11111", "claude")];
+        let mut record = registry_record("aaa11111", "claude", Some(DASHBOARD_PID));
+        record.started_at = 100;
+        let registry = vec![(record, sessions::Liveness::Live)];
+        let mut rows =
+            assemble_sidebar(&panes, &registry, &HashMap::new(), 0, 0, DASHBOARD_PID, 740);
+        let mut disk = DiskFacts::default();
+        disk.attention.insert("aaa11111".into(), blocked_status(3));
+        enrich_sidebar(&mut rows, &disk, 740);
+
+        assert_eq!(ui::glyph_for(&rows[0]), ui::Glyph::NeedsAction);
+        let value = |key: &str| {
+            rows[0]
+                .disclosure
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.clone())
+                .unwrap()
+        };
+        assert_eq!(value("reason"), "approval \u{b7} workflow gate");
+        // 740 - 200 = 9m in state; 740 - 100 = 10m since it started.
+        assert_eq!(value("since"), "waiting 9m \u{b7} started 10m ago");
+    }
+
+    /// With nothing cached, every disclosure line and the glyph stay exactly
+    /// what phase 1 produced -- a dashboard with no issue #349 writers sees no
+    /// change at all.
+    #[test]
+    fn enrich_sidebar_leaves_a_row_with_no_status_exactly_as_phase_one_drew_it() {
+        let panes = vec![pane_row("aaa11111", "claude")];
+        let mut rows = assemble_sidebar(&panes, &[], &HashMap::new(), 0, 0, DASHBOARD_PID, 740);
+        let before = rows[0].disclosure.clone();
+        enrich_sidebar(&mut rows, &DiskFacts::default(), 740);
+        assert_eq!(rows[0].disclosure, before);
+        assert!(rows[0].status.is_none());
+        assert_eq!(ui::glyph_for(&rows[0]), ui::Glyph::Idle);
+    }
+
+    /// A retained ended row is selectable but never focusable, keeps its role
+    /// and model, freezes its age, and says how it ended.
+    #[test]
+    fn a_retained_ended_row_is_selectable_but_never_focusable() {
+        let panes = vec![
+            pane_row("aaa11111", "claude"),
+            ended_pane_row("bbb22222", 2, 600),
+        ];
+        let rows = assemble_sidebar(&panes, &[], &HashMap::new(), 1, 0, DASHBOARD_PID, 900);
+        assert_eq!(rows.len(), 2);
+        assert!(rows[1].selected, "the cursor may sit on it");
+        assert!(!rows[1].attached, "but the keyboard can never follow");
+        assert!(!rows[1].focused);
+        assert_eq!(rows[1].role, "worker", "role is retained");
+        assert_eq!(rows[1].age_secs, Some(300), "age is frozen at the exit");
+        assert_eq!(rows[1].exit_code, Some(2));
+        assert_eq!(ui::glyph_for(&rows[1]), ui::Glyph::Failed);
+        let since = rows[1]
+            .disclosure
+            .iter()
+            .find(|(k, _)| k == "since")
+            .map(|(_, v)| v.clone())
+            .unwrap();
+        assert_eq!(since, "exited 5m \u{b7} exit 2");
+
+        // Clicking it selects only -- `focused` never moves off the live pane.
+        let (selected, focused) = select_row("bbb22222", &rows, 0, 0);
+        assert_eq!((selected, focused), (1, 0));
+    }
+
+    /// Retained rows go LAST, after the view-only registry rows: a reap then
+    /// still removes one row from the middle and shifts everything after it
+    /// down by exactly one (`reap_fixup`), and the row retained in its place
+    /// lands where no existing selection points.
+    #[test]
+    fn retained_ended_rows_sit_after_the_view_only_rows_so_reap_fixup_still_holds() {
+        let panes = vec![
+            pane_row("aaa11111", "claude"),
+            ended_pane_row("bbb22222", 0, 600),
+        ];
+        let registry = vec![(
+            registry_record("ccc33333", "claude", Some(DASHBOARD_PID)),
+            sessions::Liveness::Live,
+        )];
+        let rows = assemble_sidebar(&panes, &registry, &HashMap::new(), 0, 0, DASHBOARD_PID, 900);
+        let order: Vec<&str> = rows.iter().map(|r| r.short.as_str()).collect();
+        assert_eq!(order, vec!["aaa11111", "ccc33333", "bbb22222"]);
+        assert!(rows[0].focused, "focused still indexes the live pane block");
+        assert!(!rows[2].attached);
+        // And the retained row's own short is never re-listed as a view-only
+        // registry row.
+        let registry = vec![(
+            registry_record("bbb22222", "claude", Some(DASHBOARD_PID)),
+            sessions::Liveness::Live,
+        )];
+        let rows = assemble_sidebar(&panes, &registry, &HashMap::new(), 0, 0, DASHBOARD_PID, 900);
+        assert_eq!(rows.len(), 2);
+    }
+
+    /// A clean exit is `◆` until it has been seen and `●` afterwards, and its
+    /// `since` line is never overwritten by the cached status's own clock.
+    #[test]
+    fn a_cleanly_ended_retained_row_reads_done_unread_then_idle() {
+        let panes = vec![ended_pane_row("bbb22222", 0, 600)];
+        let mut rows = assemble_sidebar(&panes, &[], &HashMap::new(), 0, 0, DASHBOARD_PID, 900);
+        let mut disk = DiskFacts::default();
+        // What `reap_ended_panes` files: an `Exited` lifecycle, still unseen.
+        let mut exited = done_unread_status(4);
+        exited.lifecycle = super::super::attention::Lifecycle::Exited;
+        disk.attention.insert("bbb22222".into(), exited.clone());
+        enrich_sidebar(&mut rows, &disk, 900);
+        assert_eq!(ui::glyph_for(&rows[0]), ui::Glyph::DoneUnread);
+        let since = |rows: &[ui::SidebarRow]| {
+            rows[0]
+                .disclosure
+                .iter()
+                .find(|(k, _)| k == "since")
+                .map(|(_, v)| v.clone())
+                .unwrap()
+        };
+        assert_eq!(since(&rows), "exited 5m \u{b7} exit 0");
+
+        let mut seen = exited;
+        seen.visibility = super::super::attention::Visibility::Seen;
+        disk.attention.insert("bbb22222".into(), seen);
+        let mut rows = assemble_sidebar(&panes, &[], &HashMap::new(), 0, 0, DASHBOARD_PID, 900);
+        enrich_sidebar(&mut rows, &disk, 900);
+        assert_eq!(ui::glyph_for(&rows[0]), ui::Glyph::Idle);
+    }
+
+    /// The retained list is capped, oldest dropped first, so a long session
+    /// cannot push every live pane off the bottom of the sidebar.
+    #[test]
+    fn retained_ended_rows_are_capped_oldest_first() {
+        let mut retained: VecDeque<EndedRow> = VecDeque::new();
+        for i in 0..MAX_RETAINED_ENDED_ROWS + 4 {
+            push_retained_ended(
+                &mut retained,
+                EndedRow {
+                    short: format!("sess{i:04}"),
+                    role: "worker".into(),
+                    model: None,
+                    harness: "claude".into(),
+                    group_id: None,
+                    parent: None,
+                    budget: style::PLACEHOLDER.into(),
+                    writer: style::PLACEHOLDER.into(),
+                    meta: EndedMeta {
+                        exit_code: 0,
+                        exited_at: i as u64,
+                        age_secs: Some(10),
+                    },
+                },
+                MAX_RETAINED_ENDED_ROWS,
+            );
+        }
+        assert_eq!(retained.len(), MAX_RETAINED_ENDED_ROWS);
+        assert_eq!(retained.front().unwrap().short, "sess0004");
+        assert_eq!(retained.back().unwrap().short, "sess0011");
+        // And they are rows, not panes: the final-pane auto-exit reads the
+        // live pane vector alone, so a roster full of retained rows still
+        // closes the dashboard when the last real pane goes.
+        assert_eq!(
+            build_pane_rows(&[], &retained).len(),
+            MAX_RETAINED_ENDED_ROWS
+        );
+        assert!(should_exit_empty(0, false));
+    }
+
+    // -- done-unread acknowledgement --------------------------------------
+
+    #[test]
+    fn done_unread_is_acknowledged_only_by_an_unoccluded_render_of_the_focused_pane() {
+        let status = done_unread_status(5);
+        // The qualifying case: focused, no overlay, live scroll.
+        assert_eq!(
+            ack_candidate(false, Some(("aaa11111", 0)), Some(&status)),
+            Some(("aaa11111".to_string(), 5))
+        );
+        // An open dialog covers the grid: nothing was read.
+        assert_eq!(
+            ack_candidate(true, Some(("aaa11111", 0)), Some(&status)),
+            None
+        );
+        // Scrolled back into history: the pane is showing something else.
+        assert_eq!(
+            ack_candidate(false, Some(("aaa11111", 12)), Some(&status)),
+            None
+        );
+        // Nothing focused at all, and a pane that is not done-unread.
+        assert_eq!(ack_candidate(false, None, Some(&status)), None);
+        assert_eq!(
+            ack_candidate(false, Some(("aaa11111", 0)), Some(&blocked_status(5))),
+            None
+        );
+        assert_eq!(ack_candidate(false, Some(("aaa11111", 0)), None), None);
+    }
+
+    /// One write per revision, however many frames the pane stays focused --
+    /// and a fresh `Unseen` latch at a NEW revision is acknowledged again.
+    #[test]
+    fn done_unread_acknowledgement_fires_once_per_revision() {
+        let mut ack = DoneUnreadAck::default();
+        let focused = Some(("aaa11111", 0usize));
+        let status = done_unread_status(5);
+
+        for _ in 0..10 {
+            ack.observe(ack_candidate(false, focused, Some(&status)));
+        }
+        assert_eq!(ack.take_due().as_deref(), Some("aaa11111"));
+        // Every later frame at the same revision is a no-op.
+        for _ in 0..10 {
+            ack.observe(ack_candidate(false, focused, Some(&status)));
+            assert_eq!(ack.take_due(), None);
+        }
+        // The session works and settles again: a new revision, acknowledged
+        // on its own.
+        let again = done_unread_status(6);
+        ack.observe(ack_candidate(false, focused, Some(&again)));
+        assert_eq!(ack.take_due().as_deref(), Some("aaa11111"));
+    }
+
+    /// Selecting a row is not reading it: only the pane the frame actually
+    /// drew can be acknowledged, and a frame drawn under an overlay
+    /// acknowledges nothing at all.
+    #[test]
+    fn selecting_a_row_never_acknowledges_it() {
+        let mut ack = DoneUnreadAck::default();
+        let status = done_unread_status(5);
+        // The cursor is on `bbb22222` while `aaa11111` is focused: the render
+        // can only ever qualify the focused pane.
+        ack.observe(ack_candidate(false, Some(("aaa11111", 0)), Some(&status)));
+        assert_eq!(ack.take_due().as_deref(), Some("aaa11111"));
+        // And with a dialog open, nothing qualifies however long it is up.
+        let mut ack = DoneUnreadAck::default();
+        for _ in 0..5 {
+            ack.observe(ack_candidate(true, Some(("bbb22222", 0)), Some(&status)));
+        }
+        assert_eq!(ack.take_due(), None);
+    }
+
+    // -- group collapse ----------------------------------------------------
+
+    #[test]
+    fn fold_group_is_one_reducer_for_the_keyboard_and_the_pointer() {
+        let mut collapsed = HashSet::new();
+        assert!(fold_group(&mut collapsed, "g", GroupFold::Collapse));
+        assert!(collapsed.contains("g"));
+        // Collapsing an already-collapsed group is idempotent, not a toggle.
+        assert!(fold_group(&mut collapsed, "g", GroupFold::Collapse));
+        assert!(!fold_group(&mut collapsed, "g", GroupFold::Expand));
+        assert!(!collapsed.contains("g"));
+        assert!(!fold_group(&mut collapsed, "g", GroupFold::Expand));
+        // The header click's own toggle shares the same state.
+        assert!(fold_group(&mut collapsed, "g", GroupFold::Toggle));
+        assert!(!fold_group(&mut collapsed, "g", GroupFold::Toggle));
+    }
+
+    /// `^A Left`/`^A Right` act on the group the cursor is in -- the header it
+    /// is parked on, else the selected session's own group -- and are no-ops
+    /// on a flat row or the summary line.
+    #[test]
+    fn the_collapse_keys_resolve_the_group_under_the_cursor_and_no_ops_elsewhere() {
+        let mut grouped = pane_row("aaa11111", "claude");
+        grouped.group_id = Some("g".into());
+        let rows = assemble_sidebar(
+            &[grouped, pane_row("bbb22222", "claude")],
+            &[],
+            &HashMap::new(),
+            0,
+            0,
+            DASHBOARD_PID,
+            0,
+        );
+        assert_eq!(
+            group_under_cursor(None, &rows, 0).as_deref(),
+            Some("g"),
+            "a grouped row folds its own group"
+        );
+        assert_eq!(
+            group_under_cursor(None, &rows, 1),
+            None,
+            "a flat row is a no-op"
+        );
+        assert_eq!(
+            group_under_cursor(Some(&Hit::GroupToggle("g".into())), &rows, 1).as_deref(),
+            Some("g"),
+            "the cursor parked on a header folds that header's group"
+        );
+        assert_eq!(
+            group_under_cursor(Some(&Hit::SidebarSummary), &rows, 0),
+            None,
+            "the summary line owns no group"
+        );
+        // A collapsed group stays addressable from its own header, so `^A
+        // Right` can open it again.
+        let mut collapsed = HashSet::from(["g".to_string()]);
+        let id = group_under_cursor(Some(&Hit::GroupToggle("g".into())), &rows, 0).unwrap();
+        assert!(!fold_group(&mut collapsed, &id, GroupFold::Expand));
+    }
+
+    #[test]
+    fn ctrl_a_left_and_right_are_bound_to_the_fold_actions() {
+        assert_eq!(
+            filter_key(true, KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)).1,
+            InputVerdict::Dash(DashAction::CollapseGroup)
+        );
+        assert_eq!(
+            filter_key(true, KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)).1,
+            InputVerdict::Dash(DashAction::ExpandGroup)
+        );
+        // Issue #354 phase 2: `^A i` is the header's `inspect` hint, mapped
+        // onto the errors/evidence overlay until phase 3's real inspector.
+        assert_eq!(
+            filter_key(true, KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE)).1,
+            InputVerdict::Dash(DashAction::ShowErrors)
+        );
+    }
+
+    // -- attention reads stay on the facts cadence -------------------------
+
+    #[test]
+    fn attention_row_shorts_covers_every_drawable_row_once() {
+        let mut retained: VecDeque<EndedRow> = VecDeque::new();
+        push_retained_ended(
+            &mut retained,
+            EndedRow {
+                short: "bbb22222".into(),
+                role: "worker".into(),
+                model: None,
+                harness: "claude".into(),
+                group_id: None,
+                parent: None,
+                budget: style::PLACEHOLDER.into(),
+                writer: style::PLACEHOLDER.into(),
+                meta: EndedMeta {
+                    exit_code: 0,
+                    exited_at: 1,
+                    age_secs: None,
+                },
+            },
+            MAX_RETAINED_ENDED_ROWS,
+        );
+        let registry = vec![
+            // Already a pane: never listed twice.
+            (
+                registry_record("aaa11111", "claude", Some(DASHBOARD_PID)),
+                sessions::Liveness::Live,
+            ),
+            (
+                registry_record("ccc33333", "claude", Some(DASHBOARD_PID)),
+                sessions::Liveness::Live,
+            ),
+            // Another dashboard's session, and a stale one: neither is drawn,
+            // so neither is read.
+            (
+                registry_record("ddd44444", "claude", Some(DASHBOARD_PID + 1)),
+                sessions::Liveness::Live,
+            ),
+            (
+                registry_record("eee55555", "claude", Some(DASHBOARD_PID)),
+                sessions::Liveness::Stale,
+            ),
+        ];
+        let shorts = attention_row_shorts(
+            &["aaa11111".to_string()],
+            &retained,
+            &registry,
+            DASHBOARD_PID,
+        );
+        assert_eq!(shorts, vec!["aaa11111", "bbb22222", "ccc33333"]);
+    }
+
+    /// The glyph column must never put a file read on a frame: the statuses
+    /// are loaded exactly as often as the rest of the throttled facts are,
+    /// however many frames the dashboard draws in between.
+    #[test]
+    fn attention_statuses_are_read_on_the_facts_cadence_never_per_frame() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        let cfg = CtxConfig::default();
+        let shorts = vec!["aaa11111".to_string()];
+        let loads = std::cell::Cell::new(0usize);
+        let counting = |_: &str| -> super::super::attention::SessionStatus {
+            loads.set(loads.get() + 1);
+            super::super::attention::SessionStatus::default()
+        };
+
+        let start = Instant::now();
+        let mut cache = FactsCache::new(start);
+        // 40 frames inside one throttle window -- the dashboard's own poll is
+        // 10-50ms, so this is well under a second of real time.
+        for _ in 0..40 {
+            if cache.refresh_if_due(&cfg, &state, owner(&repo), &[], start) {
+                cache.refresh_attention(&shorts, &counting);
+            }
+        }
+        assert_eq!(
+            loads.get(),
+            1,
+            "one read per throttle window, not per frame"
+        );
+
+        // The next window reads again, and only once more.
+        let later = start + FACTS_THROTTLE + Duration::from_millis(1);
+        for _ in 0..40 {
+            if cache.refresh_if_due(&cfg, &state, owner(&repo), &[], later) {
+                cache.refresh_attention(&shorts, &counting);
+            }
+        }
+        assert_eq!(loads.get(), 2);
+        assert!(cache.disk.attention.contains_key("aaa11111"));
+    }
+
     #[test]
     fn assemble_header_facts_carries_select_mode_live_and_total_through() {
         let facts = assemble_header_facts("claude".to_string(), false, 2, 5, 0, None, None);
@@ -10294,6 +11342,8 @@ mod tests {
             age_secs: Some(90),
             score,
             state: ui::RowState::Idle,
+            status: None,
+            exit_code: None,
             attached: true,
             selected: false,
             focused: true,
@@ -11208,6 +12258,7 @@ mod tests {
                 &mut Vec::new(),
                 &mut HashSet::new(),
                 &mut None,
+                &mut VecDeque::new(),
             );
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -11391,6 +12442,7 @@ mod tests {
                 &mut Vec::new(),
                 &mut HashSet::new(),
                 &mut last_exited,
+                &mut VecDeque::new(),
             );
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -17191,6 +18243,7 @@ mod tests {
                 &mut reaped_codes,
                 &mut reaped_recent,
                 &mut None,
+                &mut VecDeque::new(),
             );
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -17320,6 +18373,7 @@ mod tests {
                 &mut Vec::new(),
                 &mut HashSet::new(),
                 &mut None,
+                &mut VecDeque::new(),
             );
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -17429,6 +18483,7 @@ mod tests {
                 &mut Vec::new(),
                 &mut HashSet::new(),
                 &mut None,
+                &mut VecDeque::new(),
             );
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -18622,6 +19677,7 @@ mod tests {
                 &mut Vec::new(),
                 &mut HashSet::new(),
                 &mut None,
+                &mut VecDeque::new(),
             );
             std::thread::sleep(Duration::from_millis(50));
         }

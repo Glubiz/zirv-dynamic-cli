@@ -28,6 +28,11 @@ pub enum HintId {
     Nudge,
     Mail,
     Errors,
+    /// `^A i` -- the per-session inspector. The full evidence inspector is
+    /// phase 3; until it exists this resolves to the errors/evidence overlay
+    /// the dashboard already has, so the hint never names an action that does
+    /// nothing (see `dash::route_mouse` and [[Known Issues]]).
+    Inspect,
     Help,
 }
 
