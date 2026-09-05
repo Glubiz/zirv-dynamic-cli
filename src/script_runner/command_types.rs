@@ -25,9 +25,9 @@ impl CommandTypes {
         let describe = |e: serde_yaml_ng::Error| e.to_string();
 
         if value.is_sequence() {
-            return serde_yaml_ng::from_value(value)
-                .map(CommandTypes::Commands)
-                .map_err(describe);
+            let commands: Vec<Command> = serde_yaml_ng::from_value(value).map_err(describe)?;
+            validate_concurrent_block(&commands)?;
+            return Ok(CommandTypes::Commands(commands));
         }
         let Some(map) = value.as_mapping() else {
             return Err("expected a mapping with 'command' or 'agent', \
@@ -62,6 +62,43 @@ impl<'de> Deserialize<'de> for CommandTypes {
         let value = serde_yaml_ng::Value::deserialize(deserializer)?;
         Self::from_value(value).map_err(de::Error::custom)
     }
+}
+
+/// G-8: a concurrent block runs each entry inside a detached terminal window
+/// it never waits on, so `capture` (nothing in-process to read stdout from),
+/// `fallback` (no in-process failure handling once the window owns the
+/// command), and `interactive` (the window owns the terminal, not the
+/// script's own stdio) can never be honored -- checked at load time, the
+/// same as `AgentCommand::validate`, so a script naming one of these fails
+/// the same way on `--dry-run` and a real run.
+fn validate_concurrent_block(commands: &[Command]) -> Result<(), String> {
+    for cmd in commands {
+        if cmd.capture.is_some() {
+            return Err(format!(
+                "a concurrent-commands block cannot honor 'capture' (on '{}'); \
+                 move this command out of the block",
+                cmd.command
+            ));
+        }
+        let Some(options) = &cmd.options else {
+            continue;
+        };
+        if options.fallback.is_some() {
+            return Err(format!(
+                "a concurrent-commands block cannot honor 'fallback' (on '{}'); \
+                 move this command out of the block",
+                cmd.command
+            ));
+        }
+        if options.interactive {
+            return Err(format!(
+                "a concurrent-commands block cannot honor 'interactive' (on '{}'); \
+                 move this command out of the block",
+                cmd.command
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// A step does not know its own position, so the list is what names it. Worth
@@ -115,34 +152,15 @@ impl CommandTypes {
                     return Ok(None);
                 }
 
-                let mut substituted = cmds.clone();
-                for cmd in &mut substituted {
-                    for (key, value) in context.iter() {
-                        let placeholder = format!("${{{key}}}");
-                        cmd.command = cmd.command.replace(&placeholder, value);
-                    }
-                }
-
-                let re = regex::Regex::new(r"\$\{([^}]+)\}").unwrap();
-                for cmd in &substituted {
-                    let unresolved: Vec<&str> = re
-                        .captures_iter(&cmd.command)
-                        .map(|c| c.get(1).unwrap().as_str())
-                        .collect();
-                    if !unresolved.is_empty() {
-                        return Err(format!(
-                            "Unresolved placeholders in '{}': {}",
-                            cmd.command,
-                            unresolved.join(", ")
-                        ));
-                    }
-                }
-
-                let joined = substituted
-                    .into_iter()
-                    .map(|c| c.command)
-                    .collect::<Vec<_>>()
-                    .join(" && ");
+                // G-8: `operating_system` (the one per-command option a
+                // concurrent block CAN honor, since it decides membership
+                // rather than requiring in-process control once the block's
+                // terminal window is open) is applied here, before the join
+                // -- a filtered entry must be dropped from the line
+                // entirely, not merely left to run inside the shared window.
+                let Some(joined) = build_concurrent_command(cmds, context)? else {
+                    return Ok(Some("Command skipped due to OS filter".to_string()));
+                };
 
                 let cwd = context.get("cwd").cloned().unwrap_or_else(|| {
                     std::env::current_dir()
@@ -164,6 +182,61 @@ impl CommandTypes {
             }
         }
     }
+}
+
+/// Builds the `&&`-joined command line a concurrent block will run in its
+/// new terminal window: drops any entry whose `operating_system` filter
+/// excludes the current platform, substitutes `${var}` from `context` in
+/// the rest, and hard-errors on any placeholder left unresolved. `None`
+/// means every entry was filtered out, so the caller must not open an empty
+/// terminal window at all.
+///
+/// G-8: a concurrent block used to discard every per-command `options` --
+/// only `cmd.command` was ever joined -- so an entry filtered for the other
+/// platform still ran inside the block's shared window regardless.
+fn build_concurrent_command(
+    cmds: &[Command],
+    context: &HashMap<String, String>,
+) -> Result<Option<String>, String> {
+    let mut substituted: Vec<Command> = cmds
+        .iter()
+        .filter(|cmd| !cmd.options.as_ref().is_some_and(|o| o.skip_for_os()))
+        .cloned()
+        .collect();
+
+    if substituted.is_empty() {
+        return Ok(None);
+    }
+
+    for cmd in &mut substituted {
+        for (key, value) in context.iter() {
+            let placeholder = format!("${{{key}}}");
+            cmd.command = cmd.command.replace(&placeholder, value);
+        }
+    }
+
+    let re = regex::Regex::new(r"\$\{([^}]+)\}").unwrap();
+    for cmd in &substituted {
+        let unresolved: Vec<&str> = re
+            .captures_iter(&cmd.command)
+            .map(|c| c.get(1).unwrap().as_str())
+            .collect();
+        if !unresolved.is_empty() {
+            return Err(format!(
+                "Unresolved placeholders in '{}': {}",
+                cmd.command,
+                unresolved.join(", ")
+            ));
+        }
+    }
+
+    Ok(Some(
+        substituted
+            .into_iter()
+            .map(|c| c.command)
+            .collect::<Vec<_>>()
+            .join(" && "),
+    ))
 }
 
 /// Tries each `(binary, args)` candidate in order, returning `Ok(())` on the
@@ -358,6 +431,100 @@ commands:
                 "expected {expected:?} in: {message}"
             );
         }
+    }
+
+    /// G-8: a concurrent-commands block discarded every per-command
+    /// `options` -- only `cmd.command` was ever joined -- so an entry
+    /// filtered for the other platform still ran inside the block's shared
+    /// terminal window. `operating_system` must be honored the same way a
+    /// plain `Command` step honors it: dropped from the joined line
+    /// entirely.
+    #[test]
+    fn build_concurrent_command_drops_an_entry_filtered_for_the_other_os() {
+        let other_os = if cfg!(windows) {
+            crate::script_runner::operating_system::OperatingSystem::Linux
+        } else {
+            crate::script_runner::operating_system::OperatingSystem::Windows
+        };
+        let cmds = vec![
+            Command {
+                command: "echo keep".to_string(),
+                capture: None,
+                description: None,
+                options: None,
+            },
+            Command {
+                command: "echo filtered".to_string(),
+                capture: None,
+                description: None,
+                options: Some(crate::script_runner::options::Options {
+                    operating_system: Some(other_os),
+                    ..Default::default()
+                }),
+            },
+        ];
+        let context = HashMap::new();
+
+        let joined = build_concurrent_command(&cmds, &context)
+            .expect("no unresolved placeholders")
+            .expect("at least one entry survives the filter");
+        assert!(joined.contains("echo keep"), "got {joined}");
+        assert!(!joined.contains("echo filtered"), "got {joined}");
+    }
+
+    /// When every entry is filtered out, the block must not open an empty
+    /// terminal window at all.
+    #[test]
+    fn build_concurrent_command_is_none_when_every_entry_is_filtered_out() {
+        let other_os = if cfg!(windows) {
+            crate::script_runner::operating_system::OperatingSystem::Linux
+        } else {
+            crate::script_runner::operating_system::OperatingSystem::Windows
+        };
+        let cmds = vec![Command {
+            command: "echo filtered".to_string(),
+            capture: None,
+            description: None,
+            options: Some(crate::script_runner::options::Options {
+                operating_system: Some(other_os),
+                ..Default::default()
+            }),
+        }];
+        let context = HashMap::new();
+
+        let result = build_concurrent_command(&cmds, &context).expect("no unresolved placeholders");
+        assert!(result.is_none(), "got {result:?}");
+    }
+
+    /// G-8: a concurrent block cannot honor `capture` (there is no in-process
+    /// stdout to read from a detached terminal window) -- it must be a
+    /// load-time error naming the offending command, not a silently dropped
+    /// option.
+    #[test]
+    fn a_concurrent_block_entry_with_capture_is_rejected_at_load_time() {
+        let message =
+            parse_error("name: t\ncommands:\n  - - command: echo hi\n      capture: out\n");
+        assert!(message.contains("capture"), "{message}");
+    }
+
+    /// Same reasoning for `fallback` (no in-process failure handling for a
+    /// command running inside a detached terminal window).
+    #[test]
+    fn a_concurrent_block_entry_with_fallback_is_rejected_at_load_time() {
+        let message = parse_error(
+            "name: t\ncommands:\n  - - command: echo hi\n      options:\n          fallback:\n            - command: echo fallback\n",
+        );
+        assert!(message.contains("fallback"), "{message}");
+    }
+
+    /// Same reasoning for `interactive` (the block's window, not the
+    /// script's own stdio, owns the terminal).
+    #[test]
+    fn a_concurrent_block_entry_with_interactive_is_rejected_at_load_time() {
+        let message = parse_error(
+            "name: t\ncommands:\n  - - command: echo hi\n      options:\n          interactive: true\n",
+        );
+        assert!(message.contains("interactive"), "{message}");
     }
 
     /// The dispatch reads a self-describing value, so the other supported

@@ -34,9 +34,9 @@ impl Command {
         let command = self.substituted_command(context);
         self.check_unresolved_placeholders(context)?;
 
-        if let Some(rest) = command.trim_start().strip_prefix("cd ") {
-            let dir = rest.trim();
-
+        if let Some(rest) = command.trim_start().strip_prefix("cd ")
+            && let Some(dir) = bare_cd_target(rest)
+        {
             let mut path = std::path::PathBuf::new();
             if let Some(cwd) = context.get("cwd") {
                 path.push(cwd);
@@ -44,10 +44,10 @@ impl Command {
                 path.push(cwd);
             }
 
-            if std::path::Path::new(dir).is_absolute() {
-                path = std::path::PathBuf::from(dir);
+            if std::path::Path::new(&dir).is_absolute() {
+                path = std::path::PathBuf::from(&dir);
             } else {
-                path.push(dir);
+                path.push(&dir);
             }
 
             if let Ok(p) = path.canonicalize() {
@@ -61,15 +61,23 @@ impl Command {
 
         let invoke = self.invoke(&command, context).await;
 
+        // G-7: a fallback that itself fails used to return `Err` straight
+        // out of the loop, before `proceed_on_failure` was ever consulted --
+        // contradicting Script Files.md's own "proceed_on_failure still
+        // applies after fallback runs". The failure (main command, or main
+        // command plus fallback) is tracked instead, and `proceed_on_failure`
+        // always gets the final say over whether it is fatal.
         if let Err(e) = invoke {
+            let mut failure = format!("Command '{}' failed: {}", command, e);
             if let Some(options) = &self.options {
                 if let Some(commands) = &options.fallback {
                     for cmd in commands {
-                        if let Err(fallback_error) = cmd.invoke().await {
-                            return Err(format!(
+                        if let Err(fallback_error) = cmd.invoke(context).await {
+                            failure = format!(
                                 "Command '{}' failed and fallback '{}' also failed: {}",
                                 command, cmd.command, fallback_error
-                            ));
+                            );
+                            break;
                         }
                     }
                 }
@@ -80,7 +88,7 @@ impl Command {
                     ));
                 }
             }
-            return Err(format!("Command '{}' failed: {}", command, e));
+            return Err(failure);
         }
 
         if let Some(options) = &self.options
@@ -178,8 +186,7 @@ impl Command {
         &self,
         context: &HashMap<String, String>,
     ) -> Result<(), String> {
-        let substituted = self.substituted_command(context);
-        check_unresolved(&self.command, &substituted)
+        check_unresolved(&self.command, context)
     }
 }
 
@@ -348,26 +355,72 @@ fn permit_label(env: &impl Fn(&str) -> Option<String>, command: &str) -> String 
     }
 }
 
+/// G-5: whether `rest` (the text after a `cd ` prefix) is a bare
+/// single-argument directory the `cd` fast path can handle without a shell
+/// -- and if so, that directory with any matching surrounding quotes
+/// stripped. Anything else (shell chaining like `cd frontend && npm ci`, a
+/// flag like `cd /d D:\repo`, an unmatched quote) returns `None` so the
+/// caller falls through to spawning a real shell instead of hard-failing on
+/// a literal directory lookup for the whole remainder of the line.
+fn bare_cd_target(rest: &str) -> Option<String> {
+    let rest = rest.trim();
+    if rest.is_empty() {
+        return None;
+    }
+    for quote in ['"', '\''] {
+        if let Some(inner) = rest.strip_prefix(quote)
+            && let Some(inner) = inner.strip_suffix(quote)
+        {
+            return Some(inner.to_string());
+        }
+    }
+    if rest.chars().any(|c| c.is_whitespace()) {
+        return None;
+    }
+    Some(rest.to_string())
+}
+
 /// Replaces every `${key}` placeholder in `template` with its value from
 /// `context`. Shared by `Command` and agent steps so both honor the same
 /// substitution syntax.
+///
+/// G-1: this used to loop over the `HashMap` (random iteration order) and
+/// call `String::replace` once per entry, re-scanning the whole
+/// (partially-substituted) string on every pass -- so a value that itself
+/// contained `${other}`-shaped text was expanded or not depending on hash
+/// order. `Regex::replace_all` instead makes a single pass over `template`
+/// only; a value is substituted in but never itself re-scanned for further
+/// placeholders, so the result no longer depends on map order.
 pub(crate) fn substitute(template: &str, context: &HashMap<String, String>) -> String {
-    let mut result = template.to_string();
-    for (key, value) in context {
-        let placeholder = format!("${{{key}}}");
-        result = result.replace(&placeholder, value);
-    }
-    result
+    let re = regex::Regex::new(r"\$\{([^}]+)\}").unwrap();
+    re.replace_all(template, |caps: &regex::Captures| {
+        let key = &caps[1];
+        context
+            .get(key)
+            .cloned()
+            .unwrap_or_else(|| caps[0].to_string())
+    })
+    .into_owned()
 }
 
-/// Hard error naming any `${...}` placeholder left in `substituted` after
-/// substitution ran. `original` is the pre-substitution text, quoted in the
-/// error so the message points at the offending line in the script.
-pub(crate) fn check_unresolved(original: &str, substituted: &str) -> Result<(), String> {
+/// Hard error naming any `${key}` placeholder in `original` (the
+/// pre-substitution template) whose key is absent from `context`.
+///
+/// G-10 (same root cause as G-1): this used to re-scan the *substituted*
+/// text for `${...}`, so a `${VERSION}`-shaped literal arriving inside a
+/// captured/param value was reported as unresolved even though the
+/// template itself had no such placeholder left. Checking the template's
+/// own placeholder names against `context` means a value is never mistaken
+/// for a placeholder the template never asked to leave unresolved.
+pub(crate) fn check_unresolved(
+    original: &str,
+    context: &HashMap<String, String>,
+) -> Result<(), String> {
     let re = regex::Regex::new(r"\$\{([^}]+)\}").unwrap();
     let unresolved: Vec<&str> = re
-        .captures_iter(substituted)
+        .captures_iter(original)
         .map(|c| c.get(1).unwrap().as_str())
+        .filter(|key| !context.contains_key(*key))
         .collect();
     if unresolved.is_empty() {
         return Ok(());
@@ -382,6 +435,32 @@ pub(crate) fn check_unresolved(original: &str, substituted: &str) -> Result<(), 
 mod tests {
     use super::*;
     use hashbrown::HashMap;
+
+    /// G-1: `substitute` used to loop over the context `HashMap` and replace
+    /// each `${key}` placeholder in turn, re-scanning the whole (partially
+    /// substituted) string on every iteration -- so a value that itself
+    /// contained `${other}` text (e.g. a param carrying a literal `${db_
+    /// password}` string) was expanded or not depending on hash-iteration
+    /// order, which hashbrown randomizes per `HashMap`. A single pass over
+    /// the template only, with values treated as opaque data, must produce
+    /// the same literal result every time regardless of map order.
+    #[test]
+    fn substitute_never_rescans_a_value_that_looks_like_a_placeholder() {
+        for _ in 0..200 {
+            let mut context: HashMap<String, String> = HashMap::new();
+            for i in 0..16 {
+                context.insert(format!("k{i}"), format!("v{i}"));
+            }
+            context.insert("a".to_string(), "${secret}".to_string());
+            context.insert("secret".to_string(), "hunter2".to_string());
+
+            let result = substitute("x ${a}", &context);
+            assert_eq!(
+                result, "x ${secret}",
+                "a value must never be rescanned for further placeholders"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn test_unresolved_placeholder_detected() {
@@ -416,6 +495,28 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    /// G-10 (same root cause as G-1): `check_unresolved` used to scan the
+    /// *substituted* text for `${...}`, so a `${VERSION}`-shaped literal
+    /// arriving inside a captured/param value was reported as an unresolved
+    /// placeholder even though the template itself had none left. It must
+    /// check the template's own placeholder names against the context
+    /// instead.
+    #[tokio::test]
+    async fn a_value_shaped_like_a_placeholder_is_not_reported_unresolved() {
+        let command = Command {
+            command: "echo ${manifest}".to_string(),
+            capture: None,
+            description: None,
+            options: None,
+        };
+
+        let mut context = HashMap::new();
+        context.insert("manifest".to_string(), "v=${VERSION}".to_string());
+
+        let result = command.check_unresolved_placeholders(&context);
+        assert!(result.is_ok(), "got {result:?}");
+    }
+
     #[tokio::test]
     async fn test_substituted_command() {
         let command = Command {
@@ -432,6 +533,92 @@ mod tests {
         let result = command.substituted_command(&params);
 
         assert_eq!(result, "echo Alice is 30 years old");
+    }
+
+    /// G-5: the `cd ` fast path used to treat everything after `cd ` as a
+    /// literal directory, so `cd . && echo hi` tried to canonicalize the
+    /// literal string `". && echo hi"` and hard-failed with "Failed to
+    /// change directory to". The fast path must apply only to a bare
+    /// single-argument `cd <dir>`; anything else (shell chaining, flags like
+    /// `/d`) has to fall through to the shell.
+    ///
+    /// Uses `;` rather than the finding's own `cd . && echo hi`: this
+    /// environment's `powershell` is Windows PowerShell 5.1, which rejects
+    /// `&&` as a statement separator entirely (`InvalidEndOfLine`) --
+    /// independent of this bug, and true of any `&&`-joined command, not
+    /// just `cd`. `;` exercises the identical interception decision (the
+    /// text after `cd ` is not a bare single argument) while actually
+    /// running on this machine's real shell.
+    #[tokio::test]
+    async fn cd_with_shell_chaining_falls_through_to_the_shell() {
+        let command = Command {
+            command: "cd . ; echo hi".to_string(),
+            capture: Some("out".to_string()),
+            description: None,
+            options: None,
+        };
+        let mut context = HashMap::new();
+
+        let result = command.execute(&mut context).await;
+        assert!(result.is_ok(), "got {result:?}");
+        assert_eq!(context.get("out").map(String::as_str), Some("hi"));
+    }
+
+    /// A bare single-argument `cd <dir>` with matching surrounding quotes
+    /// (e.g. a path containing a space) must still take the fast path, with
+    /// the quotes stripped before the directory is resolved.
+    #[tokio::test]
+    async fn cd_strips_matching_surrounding_quotes_for_a_bare_target() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let target = tmp.path().join("a dir with spaces");
+        std::fs::create_dir_all(&target).expect("mkdir");
+
+        let command = Command {
+            command: format!("cd \"{}\"", target.display()),
+            capture: None,
+            description: None,
+            options: None,
+        };
+        let mut context = HashMap::new();
+
+        let result = command.execute(&mut context).await;
+        assert!(result.is_ok(), "got {result:?}");
+        let expected = target.canonicalize().expect("canonicalize");
+        let got = context.get("cwd").expect("cwd must be set");
+        assert_eq!(
+            std::path::PathBuf::from(got),
+            expected,
+            "quotes must be stripped before the directory is resolved"
+        );
+    }
+
+    /// G-7: a fallback command that itself fails used to return `Err`
+    /// straight out of the fallback loop, before `proceed_on_failure` was
+    /// ever consulted -- contradicting Script Files.md's own documented
+    /// contract ("proceed_on_failure still applies after fallback runs").
+    #[tokio::test]
+    async fn proceed_on_failure_still_applies_when_the_fallback_also_fails() {
+        let command = Command {
+            command: "exit 1".to_string(),
+            capture: None,
+            description: None,
+            options: Some(Options {
+                proceed_on_failure: true,
+                fallback: Some(vec![
+                    crate::script_runner::fallback_command::FallbackCommand {
+                        command: "exit 1".to_string(),
+                        description: None,
+                        options: None,
+                    },
+                ]),
+                ..Default::default()
+            }),
+        };
+        let mut context = HashMap::new();
+
+        let result = command.execute(&mut context).await;
+        assert!(result.is_ok(), "got {result:?}");
+        assert!(result.unwrap().is_some());
     }
 
     /// Issue #155: a classified heavy command acquires a permit for as long

@@ -78,9 +78,19 @@ pub struct Shortcuts {
     pub shortcuts: HashMap<String, String>,
 }
 
+/// G-9: on Windows, `USERPROFILE` wins over `HOME` -- Git Bash sets `HOME`
+/// to a POSIX-shaped path, so preferring it unconditionally made global
+/// script lookups (`~/.zirv`) resolve a different directory under Git Bash
+/// than every other Windows shell (cmd, PowerShell) uses. Elsewhere `HOME`
+/// still wins, as before.
 pub fn home_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
-    env::var("HOME")
-        .or_else(|_| env::var("USERPROFILE"))
+    let (first, second) = if cfg!(windows) {
+        ("USERPROFILE", "HOME")
+    } else {
+        ("HOME", "USERPROFILE")
+    };
+    env::var(first)
+        .or_else(|_| env::var(second))
         .map(PathBuf::from)
         .map_err(|_| "Could not determine home directory".into())
 }
@@ -544,6 +554,20 @@ mod tests {
 
         let missing = script_like_files_at_root(&temp_dir.path().join("does-not-exist"));
         assert!(missing.is_empty());
+    }
+
+    /// G-9: `home_dir` preferred `HOME` over `USERPROFILE` unconditionally,
+    /// so under Git Bash on Windows (which sets a POSIX-shaped `HOME`)
+    /// global script lookups resolved a different directory than every
+    /// other Windows shell uses. On Windows, `USERPROFILE` must win.
+    #[test]
+    #[cfg(windows)]
+    fn on_windows_userprofile_wins_when_both_are_set() {
+        let _home = crate::commands::ctx::testenv::VarGuard::set(&[
+            ("HOME", Some("C:/git-bash/home/fake")),
+            ("USERPROFILE", Some("C:/Users/fake")),
+        ]);
+        assert_eq!(home_dir().unwrap(), PathBuf::from("C:/Users/fake"));
     }
 
     #[test]

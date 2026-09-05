@@ -90,9 +90,15 @@ fn validate_name(name: &str) -> Result<(), Box<dyn std::error::Error>> {
     if name.trim().is_empty() {
         return Err("a script name is required".into());
     }
-    if name.contains(std::path::is_separator) || name == ".." {
+    // G-6 (Windows): a drive-relative name like `C:evil` has no path
+    // separator at all, so the separator check alone missed it --
+    // `target_dir.join("C:evil.yaml")` replaces the whole base path rather
+    // than appending to it (see `PathBuf::push`'s own Windows behavior),
+    // writing outside `.zirv/commands/` entirely. Rejecting any ':' closes
+    // this regardless of platform.
+    if name.contains(std::path::is_separator) || name.contains(':') || name == ".." {
         return Err(format!(
-            "'{name}' is not a script name: it must not contain a path separator or be '..'"
+            "'{name}' is not a script name: it must not contain a path separator, ':', or be '..'"
         )
         .into());
     }
@@ -197,6 +203,16 @@ where
 
     let file_name = format!("{name}.yaml");
     let script_path = target_dir.join(&file_name);
+    // G-6: defense in depth. `validate_name` already rejects a name that
+    // could make this join escape `target_dir` (drive-relative, `..`, a
+    // separator), but this is the check that actually decides whether the
+    // write is safe -- it must never trust the join blindly.
+    if !script_path.starts_with(&target_dir) {
+        return Err(format!(
+            "'{name}' is not a script name: it would write to {script_path:?}, outside {target_dir:?}"
+        )
+        .into());
+    }
     if script_path.exists() {
         crate::output::note(format!("Script file already exists: {script_path:?}"));
     } else {
@@ -252,6 +268,36 @@ mod tests {
         }
         // A dot in the middle is a perfectly ordinary name.
         assert!(validate_name("deploy.staging").is_ok());
+    }
+
+    /// G-6 (Windows): a name with no path separator can still be
+    /// drive-relative -- `C:evil` has none, so the separator check alone let
+    /// it through. `target_dir.join("C:evil.yaml")` *replaces* the base
+    /// path on Windows (a drive-relative component is treated as rooted
+    /// enough to discard the join target), writing outside `.zirv/commands/`
+    /// entirely. Rejecting any ':' in the name closes this regardless of
+    /// platform.
+    #[test]
+    fn a_drive_relative_name_is_rejected() {
+        assert!(validate_name("C:escaped").is_err());
+        assert!(validate_name("C:").is_err());
+    }
+
+    /// Demonstrates the actual escape mechanism `validate_name`'s ':' check
+    /// closes, without touching the real filesystem: `PathBuf::join` treats
+    /// a drive-relative component (`C:escaped.yaml`, a prefix with no root)
+    /// as replacing the whole base path rather than appending to it, so the
+    /// joined path no longer starts with `target_dir` at all. This is why
+    /// `create_script_core` also double-checks `starts_with` on the joined
+    /// path before ever writing to it, as defense in depth.
+    #[test]
+    fn a_drive_relative_join_would_escape_the_target_directory() {
+        let target_dir = PathBuf::from(r"D:\some\zirv\commands");
+        let joined = target_dir.join("C:escaped.yaml");
+        assert!(
+            !joined.starts_with(&target_dir),
+            "got {joined:?}, expected the join to escape target_dir entirely"
+        );
     }
 
     /// The separator check alone lets a bare `..` through: splitting a string

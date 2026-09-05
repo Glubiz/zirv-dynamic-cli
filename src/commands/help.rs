@@ -41,8 +41,25 @@ fn write_scripts<W: Write>(
                 .and_then(|n| n.to_str())
                 .is_some_and(is_reserved_zirv_file)
         {
-            let content = fs::read_to_string(&path)?;
-            let script = parse_script_content(&content, ext)?;
+            // G-3: a single malformed script used to abort the whole
+            // listing via `?`, hiding every other script behind one typo.
+            // `input.rs`'s `find_script_in_dir` already warns-and-continues
+            // for a malformed `.shortcuts.yaml`; a bad script file gets the
+            // same treatment -- skipped, named in a warning, rather than
+            // taking down `zirv help` with exit 1.
+            let script = match fs::read_to_string(&path)
+                .map_err(|e| e.to_string())
+                .and_then(|content| parse_script_content(&content, ext).map_err(|e| e.to_string()))
+            {
+                Ok(script) => script,
+                Err(err) => {
+                    crate::output::warn(format!(
+                        "{} could not be parsed ({err}); skipping it in this listing",
+                        path.display()
+                    ));
+                    continue;
+                }
+            };
 
             let file_name = path.file_name().unwrap().to_string_lossy();
             let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
@@ -86,8 +103,23 @@ fn write_shortcuts<W: Write>(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let shortcuts_path = dir.join(".shortcuts.yaml");
     if shortcuts_path.exists() {
-        let content = fs::read_to_string(shortcuts_path)?;
-        let shortcuts: Shortcuts = serde_yaml_ng::from_str(&content)?;
+        // G-3: same fix as `write_scripts` -- a malformed `.shortcuts.yaml`
+        // used to abort the whole `zirv help` listing via `?` instead of
+        // being skipped with a warning, the way `input.rs`'s script lookup
+        // already treats this exact file.
+        let shortcuts: Shortcuts = match fs::read_to_string(&shortcuts_path)
+            .map_err(|e| e.to_string())
+            .and_then(|content| serde_yaml_ng::from_str(&content).map_err(|e| e.to_string()))
+        {
+            Ok(shortcuts) => shortcuts,
+            Err(err) => {
+                crate::output::warn(format!(
+                    "{} could not be parsed ({err}); skipping shortcuts in this listing",
+                    shortcuts_path.display()
+                ));
+                return Ok(());
+            }
+        };
         for (key, value) in shortcuts.shortcuts {
             let shadowed = if is_reserved_command(&key) {
                 style::paint(SHADOWED_NOTE, Tone::Warn, colour)
@@ -737,6 +769,68 @@ shortcuts:
         let output = String::from_utf8(buffer.into_inner())?;
         assert!(output.contains("Test Script"));
         assert!(!output.contains(".Settings.toml"));
+
+        Ok(())
+    }
+
+    /// G-3: one malformed script (or a malformed `.shortcuts.yaml`) used to
+    /// abort the whole `zirv help` listing with `?`, so a single typo hid
+    /// every other script from the listing too. `input.rs`'s `find_script_in_
+    /// dir` already warns-and-continues for a malformed `.shortcuts.yaml`;
+    /// `help` must do the same for scripts, skipping the bad file rather
+    /// than propagating its parse error.
+    #[test]
+    fn a_malformed_script_is_skipped_with_a_warning_not_a_hard_error()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempdir()?;
+        let temp_path = temp_dir.path().to_path_buf();
+        let zirv_dir = setup_zirv_dir(&temp_path);
+        let commands_dir = setup_commands_dir(&zirv_dir);
+
+        write(
+            commands_dir.join("good.yaml"),
+            "name: \"Good Script\"\ncommands: []\n",
+        )?;
+        write(commands_dir.join("broken.yaml"), "not: [valid, yaml for,")?;
+
+        let _cwd = crate::commands::ctx::testenv::CwdGuard::enter(&temp_path)?;
+        let mut buffer = Cursor::new(Vec::new());
+        let result = show_help(&mut buffer, false);
+        result?;
+
+        let output = String::from_utf8(buffer.into_inner())?;
+        assert!(output.contains("Good Script"), "got {output}");
+        assert!(
+            !output.contains("File: broken.yaml"),
+            "a malformed script must not be listed as if it parsed: {output}"
+        );
+
+        Ok(())
+    }
+
+    /// Same guarantee for a malformed `.shortcuts.yaml`: it must not take
+    /// down the whole listing, and any scripts alongside it must still show.
+    #[test]
+    fn a_malformed_shortcuts_file_is_skipped_with_a_warning_not_a_hard_error()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempdir()?;
+        let temp_path = temp_dir.path().to_path_buf();
+        let zirv_dir = setup_zirv_dir(&temp_path);
+        let commands_dir = setup_commands_dir(&zirv_dir);
+
+        write(
+            commands_dir.join("good.yaml"),
+            "name: \"Good Script\"\ncommands: []\n",
+        )?;
+        write(zirv_dir.join(".shortcuts.yaml"), "not: [valid, yaml for,")?;
+
+        let _cwd = crate::commands::ctx::testenv::CwdGuard::enter(&temp_path)?;
+        let mut buffer = Cursor::new(Vec::new());
+        let result = show_help(&mut buffer, false);
+        result?;
+
+        let output = String::from_utf8(buffer.into_inner())?;
+        assert!(output.contains("Good Script"), "got {output}");
 
         Ok(())
     }
