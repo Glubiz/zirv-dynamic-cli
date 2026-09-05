@@ -18,8 +18,14 @@ jobs:
     # the 6-hour default.
     timeout-minutes: 45
     steps:
+      # fetch-depth: 0 (full history, not the default shallow depth-1 clone):
+      # ZCHK-VERSION-BUMP's `git merge-base HEAD origin/main` needs a common
+      # ancestor with main actually present in history, which a depth-1
+      # checkout of just the PR ref would not have.
       - name: Checkout Code
         uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
 
       - name: Set Up Rust Toolchain
         uses: actions-rs/toolchain@v1
@@ -46,6 +52,14 @@ jobs:
       # cargo test alone never builds target/debug/zirv; some ctx tests spawn it as a subprocess.
       - name: Build Binary
         run: cargo build
+
+      # Issue #276: the built-in self-check registry (proves/fix/origin-
+      # labeled invariants like version-bump and argv shape) runs from the
+      # branch binary, not just as unit tests -- a regression that only
+      # shows up when the checks run for real (a source file the check
+      # itself expects to exist, say) fails the PR gate here.
+      - name: Run built-in self-checks (zirv verify --builtin)
+        run: ./target/debug/zirv verify --builtin --json
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@v2

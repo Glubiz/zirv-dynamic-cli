@@ -2689,6 +2689,11 @@ pub enum TestCommand {
 pub struct VerifyArgs {
     #[command(flatten)]
     pub run: RunArgs,
+    /// Issue #276: run only the built-in self-check registry
+    /// (`workflow::checks`), skipping `.zirv/verify.toml`/discovered checks
+    /// entirely. Without this flag, plain `zirv verify` runs both.
+    #[arg(long)]
+    pub builtin: bool,
 }
 
 fn resolved_repo(path: Option<&Path>) -> CtxResult<PathBuf> {
@@ -2767,13 +2772,141 @@ pub fn run_test(args: &TestArgs, writer: &mut impl Write) -> CtxResult<i32> {
     }
 }
 
+/// Renders a builtin check's Fail/Inconclusive detail lines (`proves:`/
+/// `fix:`/`origin:`), scrubbed like every other operator-facing string this
+/// module prints -- `docs.rs`'s/`decision_graph.rs`'s own `details` can
+/// quote text extracted from committed vault docs, which, like a repo
+/// check's `command`, is text this process did not author.
+fn write_builtin_lines(
+    writer: &mut impl Write,
+    builtins: &[super::checks::BuiltinCheckResult],
+) -> CtxResult<()> {
+    for check in builtins {
+        writeln!(
+            writer,
+            "{}\t{}\t{}",
+            scrub_line(check.id),
+            check.outcome.as_str(),
+            scrub_line(&check.details)
+        )?;
+        if check.outcome != super::checks::BuiltinOutcome::Pass {
+            writeln!(writer, "  proves: {}", scrub_line(check.proves))?;
+            writeln!(writer, "  fix: {}", scrub_line(check.fix))?;
+            writeln!(writer, "  origin: {}", scrub_line(check.origin))?;
+        }
+    }
+    Ok(())
+}
+
+/// `zirv verify --builtin`'s own output: just the builtin registry, no
+/// `.zirv/verify.toml`/discovered checks at all.
+fn write_builtin_report(
+    writer: &mut impl Write,
+    builtins: &[super::checks::BuiltinCheckResult],
+    json: bool,
+) -> CtxResult<()> {
+    if json {
+        serde_json::to_writer_pretty(&mut *writer, builtins)?;
+        writeln!(writer)?;
+    } else {
+        write_builtin_lines(writer, builtins)?;
+    }
+    Ok(())
+}
+
+/// Plain `zirv verify`'s combined output: the builtin registry alongside the
+/// ordinary `VerificationReport`. `--json` extends the report's own object
+/// with one new `builtin` array key via `#[serde(flatten)]` -- every existing
+/// key stays exactly where callers already look for it.
+fn write_verify_report(
+    writer: &mut impl Write,
+    report: &VerificationReport,
+    builtins: &[super::checks::BuiltinCheckResult],
+    json: bool,
+) -> CtxResult<()> {
+    if json {
+        #[derive(Serialize)]
+        struct VerifyOutput<'a> {
+            #[serde(flatten)]
+            report: &'a VerificationReport,
+            builtin: &'a [super::checks::BuiltinCheckResult],
+        }
+        serde_json::to_writer_pretty(
+            &mut *writer,
+            &VerifyOutput {
+                report,
+                builtin: builtins,
+            },
+        )?;
+        writeln!(writer)?;
+    } else {
+        write_builtin_lines(writer, builtins)?;
+        write_report(writer, report, false)?;
+    }
+    Ok(())
+}
+
 pub fn run_verify(args: &VerifyArgs, writer: &mut impl Write) -> CtxResult<i32> {
-    run_and_report(
-        &resolved_repo(args.run.repo.as_deref())?,
+    let repo = resolved_repo(args.run.repo.as_deref())?;
+    // Not `?`: same reasoning as `run_mode`'s own `repo_gates` call -- an
+    // unparseable ctx.toml closes the gate (and announces itself) rather
+    // than bricking `zirv verify` outright.
+    let repo_gates = super::repo_gates(&repo);
+    for excluded in &repo_gates.builtin_checks_exclude {
+        if !super::checks::ALL_IDS.contains(&excluded.as_str()) {
+            crate::output::warn(format!(
+                "workflow.builtin_checks_exclude names unknown check id '{excluded}' -- see \
+                 `zirv verify --builtin` for the current id list; a typo silently excludes \
+                 nothing"
+            ));
+        }
+    }
+    let builtins = super::checks::run_all(&repo, &repo_gates.builtin_checks_exclude);
+    let builtins_passed = builtins
+        .iter()
+        .all(|check| check.outcome == super::checks::BuiltinOutcome::Pass);
+
+    if args.builtin {
+        if let Err(error) = write_builtin_report(writer, &builtins, args.run.json) {
+            if !is_broken_pipe(error.as_ref()) {
+                return Err(error);
+            }
+            crate::output::warn("verification output was cut short (broken pipe)");
+        }
+        return Ok(if builtins_passed { 0 } else { 1 });
+    }
+
+    let mut report = run_mode(
+        &repo,
         VerificationMode::Final,
-        &args.run,
-        writer,
-    )
+        &args.run.checks,
+        args.run.dry_run,
+    )?;
+    if !args.run.dry_run
+        && let Some(note) = update_baseline_after_run(&repo, &report)
+    {
+        report.notes.push(note);
+    }
+    if let Err(error) = write_verify_report(writer, &report, &builtins, args.run.json) {
+        if !is_broken_pipe(error.as_ref()) {
+            return Err(error);
+        }
+        crate::output::warn("verification output was cut short (broken pipe)");
+    }
+    if !args.run.dry_run
+        && let Err(error) = persist(&report, &repo, VerificationMode::Final)
+    {
+        crate::output::warn(format!(
+            "verification results were not persisted: {error}; the next step gate will ask for a \
+             fresh run"
+        ));
+    }
+    let code = if args.run.dry_run || (report.passed() && builtins_passed) {
+        0
+    } else {
+        1
+    };
+    Ok(code)
 }
 
 #[cfg(test)]

@@ -2761,7 +2761,10 @@ fn run_required_checks(
         }
         WorkflowPhase::Verify => {
             super::verification::run_verify(
-                &super::verification::VerifyArgs { run: run_args },
+                &super::verification::VerifyArgs {
+                    run: run_args,
+                    builtin: false,
+                },
                 writer,
             )?;
             true

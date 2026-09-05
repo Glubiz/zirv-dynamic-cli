@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-09-04
+last-verified: 2026-09-05
 ---
 
 # Decision Log
@@ -20,9 +20,17 @@ last-verified: 2026-09-04
 - Self-contained: a reader should understand the entry without reading three prior ones; link prior context, don't recap it.
 - No generic rationale: cut "for simplicity" / "to reduce complexity"; state the actual constraint that made the other option worse.
 - Supersede by deletion, not by appending: if a later decision overrides an earlier one, delete the superseded entry; git log preserves history.
+- **Optional `**Supersedes:**` link (issue #276):** when deletion isn't appropriate yet (the superseded entry is still useful context, or the supersession is partial), add a line `**Supersedes:** <exact heading text of the prior entry, without the leading "### YYYY-MM-DD -- ">` anywhere in the new entry's body. Comma-separate more than one target. `ZCHK-DECISION-GRAPH` (`zirv verify --builtin`, [[Built-in Commands]]) parses every such link, fails the build on a dangling reference (a target heading that doesn't exist) or a cycle, and passes vacuously when nothing uses the field at all — which is most entries, since deletion stays the default.
 - If the entry is longer than the cap, the "why" is a spec, not an ADR — write it under `docs/superpowers/specs/` and link to it.
 
 ## Decisions
+
+### 2026-09-05 -- A built-in self-check registry, run by `zirv verify`, replaces prose checklist items
+**Context:** Issue #276 (Ruflo round-2 analysis, #278). Several of this repository's own hard-won rules -- codex/claude headless argv shape, every new `ctx.toml` key that widens capability belongs in `REPO_FORBIDDEN`, `Cargo.toml`'s version must exceed the base branch, doc surfaces restating verb/count lists that drift from the real source -- were prose in `CLAUDE.md`/the vault, violated by agents more than once because nothing actually checked them.
+**Decision:** `src/commands/workflow/checks/` is a small library of named invariants (`ZCHK-*` ids), each a `fn run(repo) -> BuiltinCheckResult` returning a three-valued `Pass`/`Fail`/`Inconclusive` outcome plus `proves:`/`fix:`/`origin:` labels -- a new, purpose-built `BuiltinOutcome` rather than reusing `GateOutcome` directly, since `InconclusiveReason`'s variants are scoped to test-runner-output classification and none of them describe "no git available" or "the doc's anchor comments are missing". `zirv verify --builtin` runs only these; plain `zirv verify` runs them alongside `.zirv/verify.toml`/discovered checks. The argv/hook checks call the in-binary builders and hook tables directly rather than probing an installed binary, so they never flake on whether `codex`/`claude` happens to be on the machine running `zirv verify`.
+**Rejected:** Reusing `GateOutcome`/`InconclusiveReason` verbatim -- would force every builtin check's "why inconclusive" into a test-runner-shaped reason that doesn't fit ("dangling decision-log reference" is not `ToolMissing`). A plugin/marketplace surface for third-party checks -- repo-defined checks already have a narrow-only home in `.zirv/verify.toml`; this registry is deliberately zirv-owned and capped at nine ids to avoid lint noise (issue #276's own "discipline" section).
+**Consequences:** A new builtin check must cite an `origin` (issue/commit) and ship a fixture that fails without the fix, same discipline as this repo's `#[cfg(test)]` convention generally. `[workflow] builtin_checks_exclude` (`REPO_FORBIDDEN`) is the only way to skip an id, so the untrusted checkout these checks exist to police can never turn one off for itself.
+**Spec / link:** [[Built-in Commands]]'s "zirv verify --builtin" section, [[Untrusted Configuration]].
 
 ### 2026-09-04 -- Usage headroom ranks a spawn, it never refuses or delays one
 **Context:** Issue #358 T9. `pace::spawn_gate`'s `SpawnGate::Refuse` at the hard spawn ceiling used to be a real refusal/delay for a NEW delegation or interactive launch -- distinct from the runtime park that follows a session's own confirmed vendor refusal. Combined with `fallback::earliest_reset_choice`'s pre-launch wait-for-a-seat-to-clear, an operator whose whole `fallback.order` sat at the ceiling could not even START a session, however briefly the block might last.

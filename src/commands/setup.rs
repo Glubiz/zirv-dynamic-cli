@@ -11,7 +11,7 @@ use super::ctx;
 
 type SetupResult<T> = Result<T, Box<dyn Error>>;
 
-const HARNESS_HOOKS: [(&str, Option<&str>, &str); 4] = [
+pub(crate) const HARNESS_HOOKS: [(&str, Option<&str>, &str); 4] = [
     ("Stop", None, "zirv ctx hook stop"),
     ("UserPromptSubmit", None, "zirv ctx hook prompt"),
     ("PreCompact", None, "zirv ctx hook pre-compact"),
@@ -34,7 +34,7 @@ const HARNESS_HOOKS: [(&str, Option<&str>, &str); 4] = [
 /// <command>` argv, and always exits 0 -- see `safety::run_check`'s own doc
 /// comment for why (the decision is expressed in the JSON envelope, not the
 /// exit code, mirroring `hook::run_pretool`).
-const CLAUDE_SAFETY_HOOK: (&str, Option<&str>, &str) = (
+pub(crate) const CLAUDE_SAFETY_HOOK: (&str, Option<&str>, &str) = (
     "PreToolUse",
     Some("Bash|PowerShell"),
     "zirv ctx safety check",
@@ -46,7 +46,7 @@ const CLAUDE_SAFETY_HOOK: (&str, Option<&str>, &str) = (
 /// `docs/design/2026-09-01-hook-surface-gap-analysis.md`'s own gap table),
 /// so wiring it into `install_codex_hooks` -- which shares `HARNESS_HOOKS`
 /// with the claude path -- would write a hook codex has no event to fire.
-const CLAUDE_SESSION_START_HOOK: (&str, Option<&str>, &str) = (
+pub(crate) const CLAUDE_SESSION_START_HOOK: (&str, Option<&str>, &str) = (
     "SessionStart",
     Some("resume|clear"),
     "zirv ctx hook session-start",
@@ -54,7 +54,7 @@ const CLAUDE_SESSION_START_HOOK: (&str, Option<&str>, &str) = (
 
 /// Every claude-only hook (`install_claude_integration`), never wired into
 /// `install_codex_hooks`.
-const CLAUDE_ONLY_HOOKS: [(&str, Option<&str>, &str); 2] =
+pub(crate) const CLAUDE_ONLY_HOOKS: [(&str, Option<&str>, &str); 2] =
     [CLAUDE_SAFETY_HOOK, CLAUDE_SESSION_START_HOOK];
 
 /// Total claude hooks `zirv setup` installs/reports on: `HARNESS_HOOKS`

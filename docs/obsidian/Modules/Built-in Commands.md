@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-09-04
+last-verified: 2026-09-05
 ---
 
 # Built-in Commands
@@ -12,6 +12,32 @@ last-verified: 2026-09-04
 - **Tests:** inline `#[cfg(test)] mod tests` in each file (`main::tests`, `input::tests`, `create::tests`, `init::tests`, `help::tests`; `version.rs` has no dedicated module dependency beyond its own version string)
 - **If changed:** [[Script Resolution]], [[Shortcuts]], [[Getting Started]], [[Ctx Supervisors]] (the dashboard `zirv chat` opens on a capable terminal)
 - **Gotchas:** `zirv ctx …`, `zirv memory …`, `zirv setup …`, `zirv report …`, `zirv chat`/`zirv agent`, `zirv skill`/`workflow`/`test`/`verify`/`artifact`/`frontend`, `zirv --skill`/`zirv commands`, a bare `zirv`, and top-level `zirv --help`/`-h` are all matched against raw `argv` *before* clap parses anything — a `.zirv/commands/ctx.yaml` (or `memory.yaml`/`setup.yaml`/`report.yaml`/`chat.yaml`/`agent.yaml`/`workflow.yaml`/`commands.yaml`) script is permanently shadowed, and clap's own auto-generated help for the `Input` struct never fires. A bare `zirv` used to be a clap usage error (exit 2, missing the required `command` argument) — it is now an alias, a deliberate behavior change (see below). **`zirv skill` is now two different things depending on what follows it (issue #355, v3.20.0):** a bare `zirv skill` (or top-level `zirv --skill`) prints the bundled release-matched operator skill and is intercepted on raw argv exactly like `ctx`/`memory` above, ahead of `zirv skill list|show <id>`'s own pre-existing engineering-skill inspection tree, which still falls through to `commands::workflow::dispatch` unchanged — a bare `zirv skill` used to be a clap usage error there (a required subcommand missing), so repurposing that one previously-erroring shape breaks no working invocation.
+
+## `zirv ctx` verb list (ZCHK-DOC-VERBS)
+
+The complete set of `zirv ctx <verb>` names, kept in sync with `CtxVerb` (`src/commands/ctx/mod.rs`) by the built-in self-check `ZCHK-DOC-VERBS` (issue #276, `src/commands/workflow/checks/docs.rs`): it reads the real subcommand names straight off `CtxCli::command()` (the same `clap::CommandFactory` introspection `zirv commands` uses) and fails `zirv verify`/`zirv verify --builtin` the moment this list and the clap tree disagree in either direction. Alphabetical, one word or hyphenated verb per backtick span; edit this list, don't hand-copy it elsewhere.
+
+<!-- zchk-doc-verbs:start -->
+`agent`, `chat`, `compile`, `exec`, `explain-status`, `forget`, `group`, `handoff`, `handover`, `hook`, `inbox`, `kill`, `loop`, `nudge`, `objective`, `optimize`, `permissions`, `recall`, `remember`, `resume`, `safety`, `score`, `search`, `send`, `snapshot`, `spend`, `status`, `swarm`, `task`, `usage`, `wait`, `worktree`, `wrap`
+<!-- zchk-doc-verbs:end -->
+
+## `zirv verify --builtin`: the built-in self-check registry (issue #276)
+
+`src/commands/workflow/checks/` is a small library of named, zirv-owned invariants -- each one a past bug frozen so it cannot silently regress -- run by `zirv verify` alongside `.zirv/verify.toml`/discovered checks, or alone with `zirv verify --builtin`. `--json` extends `VerificationReport`'s existing JSON shape (`verification.rs`) with one new `builtin` array key (`#[serde(flatten)]`); every existing key stays where callers already look for it. Text output prints one `id  outcome  details` line per check, and -- only on `fail`/`inconclusive`, to keep a passing run's output short -- `proves:`/`fix:`/`origin:` lines explaining what the check proves, how to fix it, and which incident it exists to prevent. The operator-only `[workflow] builtin_checks_exclude = [...]` (`REPO_FORBIDDEN`, `ZIRV_CTX_WORKFLOW_BUILTIN_CHECKS_EXCLUDE`) drops named ids from the run entirely -- see [[Untrusted Configuration]]. Each check's own outcome is three-valued (`Pass`/`Fail`/`Inconclusive`, mirroring `GateOutcome`'s issue #268 shape): missing tooling or an unreadable source file is `Inconclusive`, never a silent `Pass`.
+
+| id | invariant | module |
+|---|---|---|
+| `ZCHK-VERSION-BUMP` | `Cargo.toml`'s version is above the base branch's (`git merge-base`); `Cargo.lock`'s own `zirv` entry matches | `version_bump.rs` |
+| `ZCHK-ARGV-CODEX-EXEC` | codex's headless argv opens with `exec`, carries the prompt, and adds `--sandbox` when `shell_exec` is denied | `argv.rs` |
+| `ZCHK-ARGV-CLAUDE-HEADLESS` | claude's headless argv carries `-p`/`--session-id`/the prompt, and no `--dangerously-*` flag under the default policy | `argv.rs` |
+| `ZCHK-FORBIDDEN-WIDENING` | every `ctx.toml` key `config.rs`'s `ENV_MAP` enumerates is `REPO_FORBIDDEN` or on an explicit narrow-only allow-list | `forbidden.rs` |
+| `ZCHK-UNIX-TESTS-DOC` | `wrap.rs`'s `#[cfg(unix)]` test count matches what `Known Issues.md` states, or that doc points at this check instead | `docs.rs` |
+| `ZCHK-DOC-VERBS` | the ctx verbs above match the real clap tree, in both directions | `docs.rs` |
+| `ZCHK-DECISION-GRAPH` | `Decision Log.md`'s `**Supersedes:**` links resolve and contain no cycle | `decision_graph.rs` |
+| `ZCHK-HOOK-WINDOWS` | every hook command `zirv setup apply` installs is a plain `zirv ...` invocation, no bash-only syntax | `hooks.rs` |
+| `ZCHK-EOL-PINS` | `.gitattributes` still carries issue #247's anchored EOL pins | `eol.rs` |
+
+CI runs `./target/debug/zirv verify --builtin --json` right after the build step (`.github/workflows/ci.yaml`), so a regression in one of these invariants fails the PR gate even before a reviewer looks at the diff.
 
 ## Purpose
 

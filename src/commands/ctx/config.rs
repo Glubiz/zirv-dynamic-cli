@@ -943,6 +943,14 @@ pub struct WorkflowConfig {
     /// `REPO_FORBIDDEN`: an untrusted checkout must not be able to declare
     /// its own missing/empty `verify.toml` a pass.
     pub allow_empty_verify: bool,
+    /// Issue #276: `zirv verify`'s built-in self-check registry
+    /// (`workflow::checks`) runs every registered id unless its dotted name
+    /// is listed here. `REPO_FORBIDDEN`, same reasoning as
+    /// `check_env_passthrough` above: the untrusted checkout these checks
+    /// exist to police (adapter argv shape, `REPO_FORBIDDEN` widening,
+    /// doc-verb drift, ...) must never be the one that turns them off.
+    /// Empty by default, so every builtin runs.
+    pub builtin_checks_exclude: Vec<String>,
 }
 
 impl Default for WorkflowConfig {
@@ -962,6 +970,7 @@ impl Default for WorkflowConfig {
             review_worker_max_tool_calls: None,
             auto_spawn_on_gate: false,
             allow_empty_verify: false,
+            builtin_checks_exclude: Vec::new(),
         }
     }
 }
@@ -2879,6 +2888,13 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
         &["workflow", "allow_empty_verify"],
         "ZIRV_CTX_WORKFLOW_ALLOW_EMPTY_VERIFY",
     ),
+    // Issue #276: the untrusted checkout `zirv verify`'s builtin self-check
+    // registry exists to police must never be the one that turns a check
+    // off for itself.
+    (
+        &["workflow", "builtin_checks_exclude"],
+        "ZIRV_CTX_WORKFLOW_BUILTIN_CHECKS_EXCLUDE",
+    ),
     // A repo checkout must not be able to switch either memory scope's own
     // gate on or off for itself, grow its cap, or turn on automatic
     // harvesting -- this is about the CONFIGURATION, not the shared scope's
@@ -4096,6 +4112,14 @@ impl CtxConfig {
         // point of use, never a replacement for those built-in defaults.
         if let Some(raw) = env("ZIRV_CTX_WORKFLOW_CHECK_ENV_PASSTHROUGH") {
             cfg.workflow.check_env_passthrough = split_csv_list(&raw);
+        }
+
+        // Same operator-only override shape, for issue #276's builtin
+        // self-check exclude list: `ZIRV_CTX_WORKFLOW_BUILTIN_CHECKS_EXCLUDE`
+        // replaces whatever `workflow.builtin_checks_exclude` the merged TOML
+        // layers produced.
+        if let Some(raw) = env("ZIRV_CTX_WORKFLOW_BUILTIN_CHECKS_EXCLUDE") {
+            cfg.workflow.builtin_checks_exclude = split_csv_list(&raw);
         }
 
         // Same union as `extra_deny` above, for `heavy_command_patterns`: the
@@ -8082,6 +8106,7 @@ mod tests {
         ("workflow", "review_worker_max_tool_calls"),
         ("workflow", "auto_spawn_on_gate"),
         ("workflow", "allow_empty_verify"),
+        ("workflow", "builtin_checks_exclude"),
         ("policy", "repo_fs_write"),
         ("policy", "outside_repo_fs_write"),
         ("policy", "shell_exec"),

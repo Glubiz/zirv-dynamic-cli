@@ -15,6 +15,7 @@ pub mod adoption;
 pub mod agents;
 pub mod artifact;
 pub mod capability;
+pub mod checks;
 pub mod classify;
 pub mod deploy;
 pub mod engine;
@@ -95,6 +96,12 @@ pub(crate) struct RepoGates {
     /// `false` (the stricter, fail-closed reading) when the config could
     /// not even be read, same posture as `checks`/`skills`/`agents` above.
     pub allow_empty_verify: bool,
+    /// Operator-owned `[workflow] builtin_checks_exclude` (REPO_FORBIDDEN,
+    /// `~/.zirv/ctx.toml`/`ZIRV_CTX_WORKFLOW_BUILTIN_CHECKS_EXCLUDE`/flags
+    /// only, issue #276) -- dotted ids of `verification::checks`'s built-in
+    /// self-checks to skip. Empty (every builtin runs) when the config
+    /// could not even be read, same fail-closed posture as the other gates.
+    pub builtin_checks_exclude: Vec<String>,
 }
 
 /// Resolves both gates, failing **closed** when the configuration cannot be
@@ -118,6 +125,7 @@ pub(crate) fn repo_gates(repo: &std::path::Path) -> RepoGates {
             agents: cfg.workflow.repo_agents_enabled,
             check_env_passthrough: cfg.workflow.check_env_passthrough,
             allow_empty_verify: cfg.workflow.allow_empty_verify,
+            builtin_checks_exclude: cfg.workflow.builtin_checks_exclude,
         },
         Err(error) => {
             announce_unreadable_config(&error.to_string());
@@ -127,6 +135,7 @@ pub(crate) fn repo_gates(repo: &std::path::Path) -> RepoGates {
                 agents: false,
                 check_env_passthrough: Vec::new(),
                 allow_empty_verify: false,
+                builtin_checks_exclude: Vec::new(),
             }
         }
     }
