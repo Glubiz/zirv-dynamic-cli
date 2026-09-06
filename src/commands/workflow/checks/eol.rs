@@ -30,9 +30,18 @@ const REQUIRED_LINES: &[&str] = &[
 ];
 
 pub fn run(repo: &Path) -> BuiltinCheckResult {
+    if !super::is_zirv_repo(repo) {
+        return BuiltinCheckResult::not_applicable(
+            ID,
+            PROVES,
+            FIX,
+            ORIGIN,
+            super::not_the_zirv_repo(repo),
+        );
+    }
     let path = repo.join(".gitattributes");
     if !path.exists() {
-        return BuiltinCheckResult::not_applicable(
+        return BuiltinCheckResult::inconclusive(
             ID,
             PROVES,
             FIX,
@@ -87,11 +96,37 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    /// R9: applicability is a fact about the REPOSITORY, so an ordinary crate
+    /// is skipped whether or not it owns a `.gitattributes` of its own.
     #[test]
-    fn missing_file_is_not_applicable() {
+    fn another_repository_is_not_applicable_with_or_without_the_file() {
+        for gitattributes in [None, Some("* text=auto\n")] {
+            let repo = tempdir().unwrap();
+            super::super::write_manifest(repo.path(), "some-other-crate");
+            if let Some(body) = gitattributes {
+                std::fs::write(repo.path().join(".gitattributes"), body).unwrap();
+            }
+            let result = run(repo.path());
+            assert_eq!(
+                result.outcome,
+                super::super::BuiltinOutcome::NotApplicable,
+                "{result:?}"
+            );
+        }
+    }
+
+    /// Inside zirv's own checkout the same absence is a real problem, so it
+    /// must block rather than quietly not apply.
+    #[test]
+    fn a_missing_file_inside_the_zirv_repo_is_inconclusive() {
         let repo = tempdir().unwrap();
+        super::super::write_manifest(repo.path(), "zirv");
         let result = run(repo.path());
-        assert_eq!(result.outcome, super::super::BuiltinOutcome::NotApplicable);
+        assert_eq!(
+            result.outcome,
+            super::super::BuiltinOutcome::Inconclusive,
+            "{result:?}"
+        );
     }
 
     #[test]

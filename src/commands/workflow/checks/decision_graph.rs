@@ -31,9 +31,18 @@ const HEADING_RE_SOURCE: &str = r"(?m)^### \d{4}-\d{2}-\d{2}(?:/\d{2})?\s*--\s*(
 const SUPERSEDES_RE_SOURCE: &str = r"(?mi)^\*\*Supersedes:\*\*\s*(.+)$";
 
 pub fn run(repo: &Path) -> BuiltinCheckResult {
+    if !super::is_zirv_repo(repo) {
+        return BuiltinCheckResult::not_applicable(
+            ID,
+            PROVES,
+            FIX,
+            ORIGIN,
+            super::not_the_zirv_repo(repo),
+        );
+    }
     let path = repo.join("docs/obsidian/Development/Decision Log.md");
     if !path.exists() {
-        return BuiltinCheckResult::not_applicable(
+        return BuiltinCheckResult::inconclusive(
             ID,
             PROVES,
             FIX,
@@ -213,6 +222,7 @@ mod tests {
     use tempfile::tempdir;
 
     fn write_log(repo: &Path, body: &str) {
+        super::super::write_manifest(repo, "zirv");
         std::fs::create_dir_all(repo.join("docs/obsidian/Development")).unwrap();
         std::fs::write(repo.join("docs/obsidian/Development/Decision Log.md"), body).unwrap();
     }
@@ -284,11 +294,37 @@ mod tests {
         assert!(result.details.contains("cycle"), "{result:?}");
     }
 
+    /// R9: another repository is skipped even when it owns a Decision Log of
+    /// its own, written to some other convention entirely.
     #[test]
-    fn missing_file_is_not_applicable() {
+    fn another_repository_is_not_applicable_with_or_without_the_file() {
+        for log in [None, Some("# Decisions\n\n- we chose X\n")] {
+            let repo = tempdir().unwrap();
+            super::super::write_manifest(repo.path(), "some-other-crate");
+            if let Some(body) = log {
+                std::fs::create_dir_all(repo.path().join("docs/obsidian/Development")).unwrap();
+                std::fs::write(
+                    repo.path()
+                        .join("docs/obsidian/Development/Decision Log.md"),
+                    body,
+                )
+                .unwrap();
+            }
+            let result = run(repo.path());
+            assert_eq!(
+                result.outcome,
+                super::super::BuiltinOutcome::NotApplicable,
+                "{result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_missing_file_inside_the_zirv_repo_is_inconclusive() {
         let repo = tempdir().unwrap();
+        super::super::write_manifest(repo.path(), "zirv");
         let result = run(repo.path());
-        assert_eq!(result.outcome, super::super::BuiltinOutcome::NotApplicable);
+        assert_eq!(result.outcome, super::super::BuiltinOutcome::Inconclusive);
     }
 
     #[test]
