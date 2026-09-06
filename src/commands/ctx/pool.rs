@@ -263,7 +263,12 @@ pub fn build(
         .iter()
         .map(|harness| {
             let provider_capacity = snapshot.provider(&harness.provider);
-            let binding = provider_capacity.and_then(|p| p.binding.and_then(|i| p.windows.get(i)));
+            // Audit finding G2: the row reports the reading the allocator
+            // actually ranks this harness on, which past `collector_max_age_
+            // secs` is a stale-but-live one rather than nothing at all --
+            // `signal_quality_for` then says `stale`, not `unknown`, and the
+            // percentages stop reading `--`.
+            let binding = provider_capacity.and_then(allocator::ranking_window);
             let projected_headroom_pct =
                 provider_capacity.and_then(|p| allocator::projected_headroom(p, cfg, 0));
             let reserved_tokens = providers

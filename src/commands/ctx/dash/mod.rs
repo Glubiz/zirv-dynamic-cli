@@ -2201,14 +2201,26 @@ impl FactsCache {
             .harnesses
             .iter()
             .map(|harness| {
-                let headroom_pct = pool_snapshot
+                // Audit finding G2: the strip reports the reading the
+                // allocator ranks on, so an idle codex whose rollout
+                // snapshot has aged past `collector_max_age_secs` reads
+                // `stale 53%` rather than the old `unknown --`. `harness.
+                // state` itself is unchanged -- `classify` still refuses an
+                // unbinding reading as a hard-gate authority.
+                let ranking = pool_snapshot
                     .provider(&harness.provider)
-                    .and_then(|p| p.binding.and_then(|i| p.windows.get(i)))
-                    .map(|w| w.headroom_pct);
+                    .and_then(super::allocator::ranking_window);
+                let state = if harness.state == super::allocator::HarnessState::Unknown
+                    && ranking.is_some()
+                {
+                    "stale".to_string()
+                } else {
+                    harness.state.as_str().to_string()
+                };
                 ui::HarnessStrip {
                     name: harness.name.clone(),
-                    state: harness.state.as_str().to_string(),
-                    headroom_pct,
+                    state,
+                    headroom_pct: ranking.map(|w| w.headroom_pct),
                 }
             })
             .collect();
