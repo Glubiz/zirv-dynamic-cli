@@ -502,6 +502,19 @@ pub fn filter_key(prefix_armed: bool, key: KeyEvent) -> (bool, InputVerdict) {
         return (false, InputVerdict::Dash(DashAction::LiteralPrefix));
     }
 
+    // A chord is an UNMODIFIED key. The table below matches `key.code` alone,
+    // so without this `^A` followed by `Ctrl+Q` quit the dashboard -- and every
+    // pane's child with it -- when the operator only meant to send a control
+    // byte; `Ctrl+C`/`Ctrl+S`/`Ctrl+Z` fired their chords the same way. Only
+    // the literal-prefix case above carries a modifier and still means
+    // something here.
+    if key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+    {
+        return (false, InputVerdict::ToChild(Vec::new()));
+    }
+
     let action = match key.code {
         KeyCode::Tab => Some(DashAction::NextPane),
         KeyCode::Up => Some(DashAction::SelectUp),
@@ -12185,6 +12198,23 @@ mod tests {
         let (armed, v) = filter_key(true, key(KeyCode::Char('x'), KeyModifiers::NONE));
         assert!(!armed);
         assert!(matches!(v, InputVerdict::ToChild(b) if b.is_empty()));
+    }
+
+    /// The chord table matched `KeyCode` alone, so `^A` then `Ctrl+Q` quit the
+    /// whole dashboard -- every pane's child with it -- when the operator was
+    /// only sending a control byte. A chord is an unmodified key.
+    #[test]
+    fn an_armed_prefix_followed_by_a_modified_key_is_not_a_chord() {
+        let (armed, v) = filter_key(true, key(KeyCode::Char('q'), KeyModifiers::CONTROL));
+        assert!(!armed);
+        assert!(
+            matches!(v, InputVerdict::ToChild(ref b) if b.is_empty()),
+            "got {v:?}"
+        );
+
+        let (armed, v) = filter_key(true, key(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert!(!armed);
+        assert!(matches!(v, InputVerdict::Dash(DashAction::Quit)));
     }
 
     /// The ALT fast-path runs before the CONTROL arm, so `Ctrl+Alt+<x>` used
