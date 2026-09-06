@@ -1556,7 +1556,8 @@ fn run_with_clock_inner<W: Write>(
             nudge_restarts,
             cfg.supervise.max_nudges,
             can_restart,
-            &transcript,
+            &mut transcript,
+            &|| derive_transcript(&session),
             worker_budget,
             &prior_usage,
             prior_tool_calls,
@@ -3088,7 +3089,18 @@ fn supervise_run(
     // into `scorer`'s own bounded fold, because a budget needs this child's
     // whole cumulative spend, which `RotState`'s windowed segments do not
     // retain once the window has moved past them.
-    transcript: &Path,
+    transcript: &mut PathBuf,
+    // Review round 1 (R4): the path above is derived BEFORE the child is
+    // spawned, and `codex exec` mints its own session id and writes its
+    // rollout's `session_meta` only once it is running -- so the derivation
+    // answers a `rollout-<zirv id>.jsonl` that never appears, and every
+    // budget/rot/spend read for the whole run lands on a missing file. This
+    // asks the adapter again, but only while the current path does not exist
+    // and only accepting an answer that names a DIFFERENT file which does:
+    // one `exists()` per tick in the steady state, and never a redirect away
+    // from a transcript that is genuinely being written (an operator's own
+    // `--transcript` included).
+    resolve_transcript: &dyn Fn() -> PathBuf,
     budget: agent::WorkerBudget,
     // Issue #169.2: every prior child's own already-harvested spend this
     // invocation has superseded, folded into every check below alongside
@@ -3142,6 +3154,13 @@ fn supervise_run(
     let mut stall_latch: Option<super::stall::StallLatch> = None;
     let mut last_mail_activity: Option<(usize, usize)> = None;
     let mut tick = || {
+        if !transcript.exists() {
+            let candidate = resolve_transcript();
+            if candidate != *transcript && candidate.is_file() {
+                *scorer = score::IncrementalScorer::new(candidate.clone());
+                *transcript = candidate;
+            }
+        }
         let lines = tap.try_lines();
         *account_pattern = account_pattern.or_else(|| pace::scan_for_account_exhausted(&lines));
         *capacity_pattern = capacity_pattern.or_else(|| pace::scan_for_capacity_error(&lines));
@@ -3413,7 +3432,13 @@ fn supervise_run(
         // transcript read entirely when no ceiling is configured (every
         // delegation before 2.35.0, and the common case even after), so a
         // run that never asked to be bounded pays nothing extra here.
-        match evaluate_worker_budget(adapter, budget, transcript, prior_usage, prior_tool_calls) {
+        match evaluate_worker_budget(
+            adapter,
+            budget,
+            transcript.as_path(),
+            prior_usage,
+            prior_tool_calls,
+        ) {
             Some(agent::BudgetState::HardStop { used, limit }) => {
                 // Issue #203: give a child that is about to exit on its own
                 // one poll's worth of room to do so, so `try_wait` -- not
@@ -3508,8 +3533,13 @@ fn supervise_run(
     // with the budget at all.
     if !*budget_exhausted
         && matches!(outcome, Outcome::Exited(0))
-        && let Some(agent::BudgetState::HardStop { used, limit }) =
-            evaluate_worker_budget(adapter, budget, transcript, prior_usage, prior_tool_calls)
+        && let Some(agent::BudgetState::HardStop { used, limit }) = evaluate_worker_budget(
+            adapter,
+            budget,
+            transcript.as_path(),
+            prior_usage,
+            prior_tool_calls,
+        )
     {
         eprintln!(
             "zirv ctx exec: token/tool-call budget exhausted ({used}/{limit}) in the child's \
@@ -5367,6 +5397,55 @@ mod tests {
         );
         let log = std::fs::read_to_string(state.join("logs/decisions.jsonl")).expect("log");
         assert!(log.contains("\"verdict\":\"budget\""), "got {log}");
+    }
+
+    /// Review round 1 (R4): `exec` derives the transcript path ONCE, before
+    /// the child is spawned. For `codex exec` the rollout does not exist yet
+    /// at that moment (codex mints its own id and writes `session_meta` only
+    /// after it starts), so `pinned_rollout` answers `None` and the whole run
+    /// polls a `rollout-<zirv id>.jsonl` that never appears -- budgets, rot
+    /// and spend all blind. A real codex cannot be driven in-process, so the
+    /// same shape is reproduced here: a transcript pinned at spawn that is
+    /// never written, while the child writes the one the adapter can resolve.
+    /// The budget must still fire.
+    #[test]
+    fn a_transcript_missing_at_spawn_is_re_resolved_once_the_child_writes_one() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let state = tmp.path().join("state");
+        let session = "99999999-2222-4333-8444-555555555555";
+        let mut env = base_env(&state);
+        env.insert("ZIRV_CTX_POLL_MS".to_string(), "50".to_string());
+
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        unsafe {
+            std::env::set_var("FAKE_AGENT_MODE", "hang");
+        }
+        let args = ExecArgs {
+            agent: Some("claude".to_string()),
+            session_id: Some(session.to_string()),
+            transcript: Some(tmp.path().join("never-written.jsonl")),
+            prompt: Some("do the work".to_string()),
+            max_restarts: Some(0),
+            budget_tokens: Some(10_000),
+            max_tool_calls: None,
+            objective: None,
+            timeout_secs: Some(15),
+            simple: false,
+            reservation_id: None,
+            command: fake_agent_command(session),
+        };
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE");
+        }
+
+        assert_eq!(
+            code.expect("runs"),
+            EXIT_BUDGET_EXHAUSTED,
+            "a transcript that never appears must be re-resolved, not polled forever"
+        );
     }
 
     /// C1 (issue #155 review finding): `supervise_child` checks `try_wait`
