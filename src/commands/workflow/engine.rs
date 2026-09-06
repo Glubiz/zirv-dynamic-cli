@@ -1647,6 +1647,19 @@ pub fn advance_with_evidence(
     evidence: Option<&TransitionEvidence>,
     accept_preexisting_findings: bool,
 ) -> CtxResult<WorkflowState> {
+    // Checked against the as-loaded status, before `refresh_deploy_tier`:
+    // `apply_effective_deploy_tier` unconditionally recomputes `status` from
+    // the current step's position, which would otherwise silently revive a
+    // terminal `Closed`/`Failed`/`Completed` workflow back to
+    // `Running`/`AwaitingApproval` (mirrors the `Resume` handler's guard).
+    // `Running`/`AwaitingApproval` themselves still go through the refresh
+    // and artifact-drift checks below, unchanged.
+    if !matches!(
+        state.status,
+        WorkflowStatus::Running | WorkflowStatus::AwaitingApproval
+    ) {
+        return Err(format!("workflow is {:?}, not running", state.status).into());
+    }
     refresh_deploy_tier(&mut state)?;
     if let Some(stage) = artifact_drift(&state)? {
         reopen_artifact_gate(&mut state, stage)?;
@@ -1682,6 +1695,7 @@ pub fn advance_with_evidence(
                 && !super::frontend_detector::latest_is_fresh_and_passing(
                     state_dir,
                     &frontend_root,
+                    matches!(current.phase, WorkflowPhase::Review | WorkflowPhase::Verify),
                 )?
             {
                 let report = super::frontend_detector::detect_for_workflow(
@@ -1984,10 +1998,12 @@ pub fn advance_with_evidence(
 }
 
 pub fn approve(state_dir: &StateDir, mut state: WorkflowState) -> CtxResult<WorkflowState> {
-    refresh_deploy_tier(&mut state)?;
+    // Checked against the as-loaded status, before `refresh_deploy_tier`: see
+    // `advance_with_evidence`'s identical guard for why.
     if state.status != WorkflowStatus::AwaitingApproval {
         return Err("workflow is not awaiting approval".into());
     }
+    refresh_deploy_tier(&mut state)?;
 
     if let Some(stage) = state.current().and_then(|step| step.artifact) {
         // Accepted predecessor artifacts must still be the exact bytes that
@@ -5139,6 +5155,26 @@ mod tests {
             WorkflowPhase::Verify,
             "the test step must have advanced on the baselined report"
         );
+
+        // H-2: the just-persisted Test-phase report is itself gate-passing
+        // (baseline-covered), but `run_required_checks`'s own
+        // `last_failure_fingerprint` guard used to treat any `passed():
+        // false` report as "the previous failed attempt" regardless of the
+        // baseline -- with the worktree still byte-identical, that made the
+        // Verify step's own `--run-checks` return `Unchanged` and never
+        // actually run, instead of running (and passing, via the same
+        // baseline) as it must here.
+        let code_again = run(&args, &mut out).unwrap();
+        assert_eq!(
+            code_again, 0,
+            "the Verify step's own baselined run must advance, not report Unchanged"
+        );
+        let reloaded_again = load(&state_dir, repo.path(), &id).unwrap();
+        assert_eq!(
+            reloaded_again.current().unwrap().phase,
+            WorkflowPhase::Deploy,
+            "the Verify step must have advanced on its own baselined report"
+        );
     }
 
     /// Fail-open regression: a stale, still-fingerprint-fresh PASSING report
@@ -7103,6 +7139,28 @@ mod tests {
         // The state itself is still readable by id, just no longer active.
         let reloaded = load(&state_dir, repo.path(), &closed.id).unwrap();
         assert_eq!(reloaded.status, WorkflowStatus::Closed);
+    }
+
+    #[test]
+    fn advance_with_evidence_refuses_a_closed_workflow_instead_of_resurrecting_it() {
+        let repo = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+        let state = WorkflowState::start(
+            repo.path().to_path_buf(),
+            "small feature".into(),
+            WorkflowKind::Feature,
+            None,
+            true,
+            low_classification(),
+        );
+        save(&state_dir, &state, true).unwrap();
+        let closed = close(&state_dir, state, Some("done".into())).unwrap();
+        assert_eq!(closed.status, WorkflowStatus::Closed);
+
+        let error = advance_with_evidence(&state_dir, closed, StepOutcome::Success, None, false)
+            .unwrap_err();
+        assert!(error.to_string().contains("Closed"), "{error}");
     }
 
     #[test]

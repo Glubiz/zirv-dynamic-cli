@@ -364,10 +364,25 @@ pub fn load_latest(state: &StateDir, repo: &Path) -> CtxResult<Option<DetectorRe
     Ok(Some(report))
 }
 
-pub fn latest_is_fresh_and_passing(state: &StateDir, repo: &Path) -> CtxResult<bool> {
+/// H-3: `require_full_surface` mirrors `detect_for_workflow`'s own parameter
+/// -- a Review/Verify gate needs a full-repository (`DetectorScope::All`)
+/// scan, and a cached `Changed`/`Explicit`-scope report (e.g. from the Test
+/// step, or a bare `zirv frontend check --path one.tsx`) must not be accepted
+/// as satisfying it, even when it is otherwise fresh and passing: it never
+/// looked at most of the repository. A `Changed`-scope requirement (the Test
+/// gate) still accepts any scope, since a broader scan is strictly more
+/// evidence than a narrower requirement needs.
+pub fn latest_is_fresh_and_passing(
+    state: &StateDir,
+    repo: &Path,
+    require_full_surface: bool,
+) -> CtxResult<bool> {
     let Some(report) = load_latest(state, repo)? else {
         return Ok(false);
     };
+    if require_full_surface && report.scope != DetectorScope::All {
+        return Ok(false);
+    }
     let profile = super::frontend::ensure_profile(state, repo)?;
     Ok(report.passed()
         && !report.truncated
@@ -2259,7 +2274,7 @@ mod tests {
         save_report(&state, &report).unwrap();
 
         assert!(
-            latest_is_fresh_and_passing(&state, &repo_path).unwrap(),
+            latest_is_fresh_and_passing(&state, &repo_path, false).unwrap(),
             "a cached not-applicable report must be reused as fresh and passing"
         );
 
@@ -2268,8 +2283,70 @@ mod tests {
         // still `not_applicable`.
         std::fs::write(repo.path().join("other.txt"), "changed\n").unwrap();
         assert!(
-            !latest_is_fresh_and_passing(&state, &repo_path).unwrap(),
+            !latest_is_fresh_and_passing(&state, &repo_path, false).unwrap(),
             "a stale change fingerprint must still force a re-run"
+        );
+    }
+
+    /// H-3: a Review/Verify gate requires a full-surface (`DetectorScope::
+    /// All`) scan. A fresh, passing `Changed`/`Explicit`-scope report (e.g.
+    /// from the Test step, or a bare `zirv frontend check --path one.tsx`)
+    /// never looked at most of the repository and must not satisfy it.
+    #[test]
+    fn full_surface_gate_refuses_a_fresh_passing_explicit_scope_report() {
+        let repo = tempfile::tempdir().expect("repo");
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.email=t@example.com",
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(repo.path())
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(repo.path().join("README.md"), "hello\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "base"]);
+
+        let root = tempfile::tempdir().expect("state root");
+        let state = StateDir::from_root(root.path().to_path_buf());
+        let repo_path = repo.path().canonicalize().unwrap();
+        let profile = super::super::frontend::ensure_profile(&state, &repo_path).unwrap();
+        let fingerprint = super::super::verification::change_fingerprint(&repo_path).unwrap();
+
+        let report = DetectorReport {
+            schema_version: DETECTOR_REPORT_SCHEMA_VERSION,
+            id: uuid::Uuid::new_v4().to_string(),
+            repo: repo_path.clone(),
+            change_fingerprint: fingerprint,
+            profile_fingerprint: profile.source_fingerprint,
+            scope: DetectorScope::Explicit,
+            generated_at: now_secs(),
+            analyzed_files: vec![PathBuf::from("one.tsx")],
+            analyzed_bytes: 10,
+            truncated: false,
+            findings: Vec::new(),
+            waivers_loaded: 0,
+            waivers_rejected: 0,
+            not_applicable: false,
+        };
+        save_report(&state, &report).unwrap();
+
+        assert!(
+            latest_is_fresh_and_passing(&state, &repo_path, false).unwrap(),
+            "an Explicit-scope report still satisfies a Changed-scope (Test) requirement"
+        );
+        assert!(
+            !latest_is_fresh_and_passing(&state, &repo_path, true).unwrap(),
+            "an Explicit-scope report must not satisfy a full-surface (Review/Verify) gate"
         );
     }
 

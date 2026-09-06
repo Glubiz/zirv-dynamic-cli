@@ -178,8 +178,18 @@ fn merge_base_ref(repo: &Path) -> Result<String, String> {
 
 /// Compares two dotted-numeric version strings (`"3.22.0"`) component-wise,
 /// `None` when either side has a non-numeric component this repo's own
-/// versions never use -- callers treat that as `Inconclusive`, never as a
-/// guessed ordering.
+/// versions never use, OR when the two sides have a different number of
+/// components -- callers treat that as `Inconclusive`, never as a guessed
+/// ordering. I-8: without the arity check, `Vec<u64>::cmp` also orders on
+/// LENGTH once every shared component is equal, so `"3.22"` (missing the
+/// patch component) compares as strictly *less than* `"3.22.0"` -- and, in
+/// the opposite and more dangerous direction, `"3.22.0"` as strictly
+/// *greater than* `"3.22"`, letting a Cargo.toml edit that changed nothing
+/// about the actual version pass as a valid bump. This repo's own versions
+/// are always exactly three components (`X.Y.Z`); a mismatched count on
+/// either side is a shape neither `head_version` nor `base_version` should
+/// ever actually take, so it is reported precisely rather than compared
+/// numerically as if trailing components defaulted to zero.
 fn compare_dotted_versions(left: &str, right: &str) -> Option<Ordering> {
     let parse = |raw: &str| -> Option<Vec<u64>> {
         raw.split('.')
@@ -188,6 +198,9 @@ fn compare_dotted_versions(left: &str, right: &str) -> Option<Ordering> {
     };
     let left = parse(left)?;
     let right = parse(right)?;
+    if left.len() != right.len() {
+        return None;
+    }
     Some(left.cmp(&right))
 }
 
@@ -299,6 +312,55 @@ mod tests {
         assert_eq!(
             compare_dotted_versions("3.9.0", "3.10.0"),
             Some(Ordering::Less)
+        );
+    }
+
+    /// I-8: `"3.22"` and `"3.22.0"` are the same version with a missing
+    /// patch component, not two comparable numeric versions -- a bare
+    /// `Vec<u64>::cmp` orders on length once every shared component is
+    /// equal, so `"3.22"` (head) would wrongly compare as *less than*
+    /// `"3.22.0"` (base), and in the opposite, more dangerous direction a
+    /// head of `"3.22.0"` against a base of `"3.22"` would wrongly compare
+    /// as a valid bump even though nothing about the version actually
+    /// changed. Mismatched component counts must be incomparable.
+    #[test]
+    fn mismatched_component_counts_are_not_comparable() {
+        assert_eq!(compare_dotted_versions("3.22", "3.22.0"), None);
+        assert_eq!(compare_dotted_versions("3.22.0", "3.22"), None);
+    }
+
+    /// The same scenario through the whole `run` check: a `Cargo.toml`
+    /// missing its patch component against a base that has one is not a
+    /// valid bump, and must be reported (Inconclusive, not a false Pass or
+    /// a misleading Fail) rather than silently ordered as if the missing
+    /// component defaulted to zero.
+    #[test]
+    fn a_component_count_mismatch_against_the_base_is_not_a_valid_bump() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let repo = tempdir().unwrap();
+        git(repo.path(), &["init", "-q"]);
+        git(repo.path(), &["config", "user.email", "t@example.com"]);
+        git(repo.path(), &["config", "user.name", "t"]);
+        write_cargo_toml(repo.path(), "3.22.0");
+        git(repo.path(), &["add", "."]);
+        git(repo.path(), &["commit", "-q", "-m", "base"]);
+        git(repo.path(), &["branch", "-q", "main"]);
+
+        write_cargo_toml(repo.path(), "3.22");
+        std::fs::write(
+            repo.path().join("Cargo.lock"),
+            "[[package]]\nname = \"zirv\"\nversion = \"3.22\"\n",
+        )
+        .unwrap();
+
+        let result = run(repo.path());
+        assert_ne!(
+            result.outcome,
+            BuiltinOutcome::Pass,
+            "a missing patch component must never look like a valid bump: {result:?}"
         );
     }
 }

@@ -116,8 +116,23 @@ fn finding_key(finding: &ReviewFinding) -> String {
     }
 }
 
+/// H-7: "recurred" means the same finding identity survived across a fix
+/// pass into a *later* review round, not merely that two findings from the
+/// same round happen to share a location. `build_review_findings` stamps
+/// every finding from one reviewer run with the identical `created_at` it is
+/// called with, so a distinct `created_at` is this module's own round
+/// marker -- two findings sharing a key only count as recurrence once they
+/// carry at least two distinct `created_at` values.
+/// H-7: "recurred" means the same finding identity survived across a fix
+/// pass into a *later* review round, not merely that two findings from the
+/// same round happen to share a location. `build_review_findings` stamps
+/// every finding from one reviewer run with the identical `created_at` it is
+/// called with, so a distinct `created_at` is this module's own round
+/// marker -- two findings sharing a key only count as recurrence once they
+/// carry at least two distinct `created_at` values.
 fn has_repeated_meaningful_finding(findings: &[ReviewFinding]) -> bool {
-    let mut seen = std::collections::BTreeSet::new();
+    let mut seen: std::collections::BTreeMap<String, std::collections::BTreeSet<u64>> =
+        std::collections::BTreeMap::new();
     findings
         .iter()
         .filter(|finding| {
@@ -126,8 +141,11 @@ fn has_repeated_meaningful_finding(findings: &[ReviewFinding]) -> bool {
                 FindingSeverity::Major | FindingSeverity::Critical
             ) && finding.disposition != FindingDisposition::Dismissed
         })
-        .map(finding_key)
-        .any(|key| !seen.insert(key))
+        .any(|finding| {
+            let rounds = seen.entry(finding_key(finding)).or_default();
+            rounds.insert(finding.created_at);
+            rounds.len() > 1
+        })
 }
 
 /// How many of `incoming` are findings this workflow has not already
@@ -4371,13 +4389,17 @@ checksum = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f80"
         );
     }
 
+    /// H-7: recurrence is keyed on `created_at` too -- "one" (round 1, now
+    /// fixed) and "two" (round 2, reintroducing the same defect) carry
+    /// distinct round markers, which is what makes this genuine recurrence
+    /// across rounds rather than two findings from a single round.
     #[test]
     fn repeated_major_findings_escalate_but_dismissals_do_not() {
         let repo = tempdir().unwrap();
         let root = tempdir().unwrap();
         let state_dir = StateDir::from_root(root.path().to_path_buf());
         let mut state = review_workflow(repo.path(), &state_dir);
-        let finding = |id: &str, disposition| ReviewFinding {
+        let finding = |id: &str, disposition, created_at| ReviewFinding {
             id: id.into(),
             severity: FindingSeverity::Major,
             summary: "same defect".into(),
@@ -4385,17 +4407,47 @@ checksum = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f80"
             line: Some(12),
             disposition,
             recommended_disposition: None,
-            created_at: now_secs(),
+            created_at,
         };
         state
             .review_findings
-            .push(finding("one", FindingDisposition::Fixed));
+            .push(finding("one", FindingDisposition::Fixed, 1));
         state
             .review_findings
-            .push(finding("two", FindingDisposition::Open));
+            .push(finding("two", FindingDisposition::Open, 2));
         assert_eq!(required_independent_reviews_for(&state), 2);
         state.review_findings[1].disposition = FindingDisposition::Dismissed;
         assert_eq!(required_independent_reviews_for(&state), 1);
+    }
+
+    /// H-7: two Major/Open findings sharing a location but reported in the
+    /// SAME round (identical `created_at`, as `build_review_findings` stamps
+    /// every finding from one reviewer run) must not be mistaken for
+    /// cross-round recurrence -- that escalated to two independent reviewers
+    /// on nothing more than one reviewer naming the same spot twice.
+    #[test]
+    fn two_findings_from_the_same_round_do_not_escalate() {
+        let repo = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+        let mut state = review_workflow(repo.path(), &state_dir);
+        let finding = |id: &str| ReviewFinding {
+            id: id.into(),
+            severity: FindingSeverity::Major,
+            summary: "same defect".into(),
+            path: Some(PathBuf::from("src/a.rs")),
+            line: Some(10),
+            disposition: FindingDisposition::Open,
+            recommended_disposition: None,
+            created_at: 1,
+        };
+        state.review_findings.push(finding("one"));
+        state.review_findings.push(finding("two"));
+        assert_eq!(
+            required_independent_reviews_for(&state),
+            1,
+            "same-round duplicates must not be treated as cross-round recurrence"
+        );
     }
 
     /// Builds a `ReviewFinding` at a fixed path:line -- the identity

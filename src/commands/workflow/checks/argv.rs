@@ -35,7 +35,15 @@ const CODEX_ORIGIN: &str = "adapter argv regressions -- Ruflo round-2 audit-code
 /// builds (`policy_support`'s `Capability::ShellExec` arm; see
 /// `adapters::codex`'s own doc comments).
 pub fn run_codex_exec(_repo: &Path) -> BuiltinCheckResult {
-    let adapter = CodexAdapter::new(None);
+    codex_exec_result(&CodexAdapter::new(None))
+}
+
+/// The pure evaluation `run_codex_exec` runs against the real, default-
+/// installed adapter -- split out so a test can pass a `CodexAdapter` whose
+/// `program` is forced to resolve to a Windows `.cmd` shim (I-2) without
+/// depending on what `codex` actually resolves to via `PATH` on the machine
+/// running the suite.
+fn codex_exec_result(adapter: &CodexAdapter) -> BuiltinCheckResult {
     let policy = EffectivePolicy {
         shell_exec: Stance::Deny,
         ..EffectivePolicy::default()
@@ -44,15 +52,19 @@ pub fn run_codex_exec(_repo: &Path) -> BuiltinCheckResult {
     let session = SessionId::new_v4();
     let prompt = "zchk-argv-codex-exec probe prompt";
     let cmd = adapter.headless_cmd(prompt, &session, &extra);
-    let args: Vec<String> = cmd
-        .get_args()
-        .map(|arg| arg.to_string_lossy().into_owned())
-        .collect();
+    // I-2: on a Windows machine where `codex` resolves to an npm-installed
+    // `.cmd` shim, `resolve_program` routes the launch through `cmd.exe /c
+    // <shim>`, so the raw argv starts with that zirv-controlled launcher
+    // prefix rather than `exec` -- `built_args` strips it the same way the
+    // adapters' own tests do, so this check keeps asserting the invariant
+    // (`exec` first) rather than an argv shape that depends on how `codex`
+    // happens to be installed on the machine running `zirv verify`.
+    let args: Vec<String> = crate::commands::ctx::adapters::built_args(adapter.program(), &cmd);
 
     let mut problems = Vec::new();
     if args.first().map(String::as_str) != Some("exec") {
         problems.push(format!(
-            "first argv token must be 'exec', got {:?}",
+            "first argv token after any launcher prefix must be 'exec', got {:?}",
             args.first()
         ));
     }
@@ -153,6 +165,21 @@ mod tests {
     fn codex_exec_passes_against_the_real_adapter() {
         let repo = tempfile::tempdir().unwrap();
         let result = run_codex_exec(repo.path());
+        assert_eq!(result.outcome, BuiltinOutcome::Pass, "{result:?}");
+    }
+
+    /// I-2: on a Windows npm install, `codex` on `PATH` is `codex.cmd`, which
+    /// `resolve_program` rewrites to `cmd.exe /c <shim>` -- the check must
+    /// look past that zirv-controlled launcher prefix rather than asserting
+    /// `exec` is the literal first argv token.
+    #[test]
+    #[cfg(windows)]
+    fn codex_exec_passes_when_the_program_resolves_to_a_cmd_shim() {
+        let dir = tempfile::tempdir().unwrap();
+        let shim = dir.path().join("codex.cmd");
+        std::fs::write(&shim, "@echo off\r\n").unwrap();
+        let adapter = CodexAdapter::new(Some(&shim.display().to_string()));
+        let result = codex_exec_result(&adapter);
         assert_eq!(result.outcome, BuiltinOutcome::Pass, "{result:?}");
     }
 
