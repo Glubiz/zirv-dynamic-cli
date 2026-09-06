@@ -835,6 +835,14 @@ pub struct Pane {
     reservation_id: Option<String>,
     budget_soft_warned: bool,
     budget_grace_given: bool,
+    /// 2026-09-06: the wall clock this pane's child must finish inside
+    /// (`spawnreq::SpawnRequest::timeout_secs`, i.e. `zirv ctx agent
+    /// --timeout-secs`), or `None` for the unbounded pane every spawn before
+    /// that field existed was. The pane-side mirror of `exec::run_with`'s own
+    /// timeout: the adapter's quit sequence, then `exec::EXIT_TIMEOUT`. Set
+    /// once, right after `Pane::spawn`, the same way `set_budget_tokens` is;
+    /// swept by `dash::mod::enforce_pane_deadlines`.
+    deadline: Option<Instant>,
     /// Issue #249: this pane's own server-verified supervising session
     /// (`dash::mod::fulfill_spawn_request`'s `verified_parent` -- the
     /// requester identity the per-pane intake-channel gate already proved,
@@ -1144,6 +1152,7 @@ impl Pane {
             reservation_id: None,
             budget_soft_warned: false,
             budget_grace_given: false,
+            deadline: None,
             parent_session: None,
             report_reminder_sent: false,
             pending_submit: None,
@@ -1654,6 +1663,47 @@ impl Pane {
 
     pub fn budget_tokens(&self) -> Option<u64> {
         self.budget_tokens
+    }
+
+    /// 2026-09-06: arms this pane's wall clock from the requester's own
+    /// `--timeout-secs`, measured from `started` (the caller passes
+    /// `Instant::now()` right after the spawn). `None` leaves the pane
+    /// unbounded, exactly as before the field existed.
+    pub fn set_timeout(&mut self, started: Instant, timeout_secs: Option<u64>) {
+        self.deadline = timeout_secs.map(|secs| started + Duration::from_secs(secs));
+    }
+
+    /// The armed wall clock, if any.
+    pub fn deadline(&self) -> Option<Instant> {
+        self.deadline
+    }
+
+    /// Stops a pane whose wall clock has run out, the same way
+    /// [`Self::enforce_token_budget`]'s hard stop does: the adapter's quit
+    /// sequence, then `exec::EXIT_TIMEOUT` -- the identical exit code
+    /// `exec::run_with` reports for an inline supervised child that outran
+    /// `--timeout-secs`. `Ok(true)` exactly once, on the sweep that actually
+    /// stopped it: the deadline is disarmed in the same step, so a pane is
+    /// never stopped (or reported) twice, and a child that already failed on
+    /// its own keeps its own exit code.
+    pub fn enforce_deadline(&mut self, now: Instant, quit_sequence: &str) -> CtxResult<bool> {
+        let Some(deadline) = self.deadline else {
+            return Ok(false);
+        };
+        if now < deadline {
+            return Ok(false);
+        }
+        self.deadline = None;
+        if self.exit_code.is_some_and(|code| code != 0) {
+            return Ok(false);
+        }
+        if self.exit_code == Some(0) {
+            self.exit_code = Some(super::super::exec::EXIT_TIMEOUT);
+            return Ok(true);
+        }
+        self.shutdown(quit_sequence)?;
+        self.exit_code = Some(super::super::exec::EXIT_TIMEOUT);
+        Ok(true)
     }
 
     /// Issue #358 (task T3): records the provider-level token-reservation
@@ -3765,6 +3815,75 @@ pub(crate) mod tests {
                 Some(PaneBudgetNotice::SoftWarn { .. })
             ),
             "the successor is a new child and must get its own soft warning"
+        );
+
+        pane.finish_shutdown().expect("shutdown");
+    }
+
+    /// 2026-09-06: a pane-bound delegation carrying `--timeout-secs` used to
+    /// hard-error rather than spawn a pane. It spawns one now, and this is
+    /// the ceiling being real: the child is stopped with the same
+    /// `exec::EXIT_TIMEOUT` an inline supervised run reports, exactly once.
+    #[cfg(unix)]
+    #[test]
+    fn an_armed_deadline_stops_the_pane_once_with_the_timeout_exit_code() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+
+        let mut spec = test_spec("66666666-2222-4333-8444-666666666666");
+        spec.argv = long_lived_argv();
+        spec.agent_name = "claude".to_string();
+        let mut pane = Pane::spawn(
+            spec,
+            &state,
+            &repo,
+            &repo,
+            (80, 24),
+            &[],
+            true,
+            DEFAULT_IDLE_QUIET,
+        )
+        .expect("spawn");
+
+        let started = Instant::now();
+        pane.set_timeout(started, None);
+        assert!(pane.deadline().is_none(), "no ceiling leaves it unbounded");
+        assert!(
+            !pane.enforce_deadline(started, "").expect("enforce"),
+            "an unbounded pane is never stopped"
+        );
+
+        pane.set_timeout(started, Some(60));
+        assert!(pane.deadline().is_some());
+        assert!(
+            !pane.enforce_deadline(started, "").expect("enforce"),
+            "the wall clock has not run out yet"
+        );
+
+        assert!(
+            pane.enforce_deadline(started + Duration::from_secs(61), "")
+                .expect("enforce"),
+            "past the deadline the pane is stopped"
+        );
+        assert!(
+            matches!(
+                pane.state(),
+                PaneState::Ended(code) if code == crate::commands::ctx::exec::EXIT_TIMEOUT
+            ),
+            "the pane reports the same exit code an inline supervised timeout does: {:?}",
+            pane.state()
+        );
+        assert!(
+            pane.deadline().is_none(),
+            "and the deadline is disarmed, so the sweep never reports it twice"
+        );
+        assert!(
+            !pane
+                .enforce_deadline(started + Duration::from_secs(120), "")
+                .expect("enforce"),
+            "a second sweep says nothing"
         );
 
         pane.finish_shutdown().expect("shutdown");

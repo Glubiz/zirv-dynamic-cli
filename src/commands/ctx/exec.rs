@@ -1253,12 +1253,17 @@ fn run_with_clock_inner<W: Write>(
         for (key, value) in turn_env_for(session) {
             command.env(key, value);
         }
-        // Issue #236: this module supervises only headless runs, so every
-        // child it spawns gets this marker, read by `engine::refusal_for` to
-        // refuse the interactive `brainstorm` skill. Scrubbed by
-        // `scrub_supervision_env_cmd` above first, so a nested headless
+        // Issue #236: this module supervises only `LaunchMode::Headless`
+        // runs -- nobody is present to answer a permission prompt -- so
+        // every child it spawns gets that mode's marker, read by
+        // `engine::refusal_for` to refuse the interactive `brainstorm`
+        // skill. Derived from the mode itself (2026-09-06) rather than
+        // hardcoded here, so this seam and a pane's own cannot drift.
+        // Scrubbed by `scrub_supervision_env_cmd` above first, so a nested
         // launch never inherits a stale copy before this sets its own.
-        command.env(adapters::HEADLESS_ENV, "1");
+        if let Some((key, value)) = adapters::headless_marker_env(adapters::LaunchMode::Headless) {
+            command.env(key, value);
+        }
     };
 
     // FIX B: on a Windows npm `.cmd` shim launch, `cmd.exe /c <shim>` reparses

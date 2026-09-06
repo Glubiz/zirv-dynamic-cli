@@ -134,15 +134,20 @@ pub const LAUNCH_MODE_ENV: &str = "ZIRV_CTX_LAUNCH_MODE";
 /// the fail-closed default, not a second, spoofable "false" value.
 pub const LAUNCH_MODE_INTERACTIVE_VALUE: &str = "interactive";
 
-/// Set to `"1"` on every child a headless supervisor (`exec::run_with`)
-/// spawns, read by `workflow::engine::refusal_for` to refuse the
-/// interactive `brainstorm` skill. Listed in `sessions::SUPERVISION_ENV` so
-/// an INTERACTIVE launch (`wrap`, `chat`, a dashboard pane) scrubs it rather
-/// than inheriting it from whatever spawned that session -- only the exact
-/// value `"1"` counts as headless (`engine::is_headless_env`), never mere
-/// presence. A distinct mechanism from [`LAUNCH_MODE_ENV`] above (which
-/// proves the opposite: that a launch IS interactive, for the safety-policy
-/// permission mode), not a duplicate of it.
+/// Set to `"1"` on every child launched with [`LaunchMode::Headless`], read
+/// by `workflow::engine::refusal_for` to refuse the interactive `brainstorm`
+/// skill. Listed in `sessions::SUPERVISION_ENV` so an INTERACTIVE launch
+/// (`wrap`, `chat`, a human-vouched dashboard pane) scrubs it rather than
+/// inheriting it from whatever spawned that session -- only the exact value
+/// `"1"` counts as headless (`engine::is_headless_env`), never mere presence.
+///
+/// 2026-09-06: it means "nobody is present to answer a prompt", NOT "this run
+/// has no visible terminal". Spawn topology stopped being a thing zirv has an
+/// opinion about when `--headless` was removed; permission-prompt
+/// answerability did not. The marker is therefore derived from the launch
+/// mode itself ([`headless_marker_env`]), which is exactly what
+/// `dash::mod::trusted_launch_mode` already decides for a pane and what
+/// `exec.rs` has always been.
 pub const HEADLESS_ENV: &str = "ZIRV_CTX_HEADLESS";
 
 /// The `(key, value)` pair a real interactive-launch seam pushes into its
@@ -156,6 +161,18 @@ pub fn launch_mode_pin_env(mode: LaunchMode) -> Option<(String, String)> {
             LAUNCH_MODE_INTERACTIVE_VALUE.to_string(),
         )),
         LaunchMode::Headless => None,
+    }
+}
+
+/// The mirror image of [`launch_mode_pin_env`]: the `(key, value)` pair a
+/// launch seam pushes to mark its child as unattended -- `Some` for
+/// [`LaunchMode::Headless`], `None` for a launch a human is watching. Every
+/// seam that resolves a `LaunchMode` gets the marker from this one function
+/// rather than deciding for itself whether it counts as headless.
+pub fn headless_marker_env(mode: LaunchMode) -> Option<(String, String)> {
+    match mode {
+        LaunchMode::Interactive => None,
+        LaunchMode::Headless => Some((HEADLESS_ENV.to_string(), "1".to_string())),
     }
 }
 
