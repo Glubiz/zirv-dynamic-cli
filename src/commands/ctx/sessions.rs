@@ -3287,6 +3287,53 @@ mod tests {
         );
     }
 
+    /// 3.25.0 startup freeze: `sweep_orphan_socket_paths` (new in 3.25.0)
+    /// probes every leftover `socket-path-<short>` file through
+    /// `signal::probe`, and the Windows `win::connect` behind it treats
+    /// `ERROR_FILE_NOT_FOUND` -- "there is no such pipe", the definitive
+    /// answer for a *probe* -- as transient and keeps retrying for a full
+    /// `CONNECT_RETRY` second per file. `sessions::list` runs on the
+    /// dashboard's startup path before the first frame is ever drawn, so a
+    /// machine carrying the leftovers this sweep exists to clean (the sweep's
+    /// own doc comment counts 46 on one real machine) paid one second each
+    /// with nothing on screen. A probe must answer at once, on every
+    /// platform: unix `connect` to a missing socket already returns ENOENT
+    /// immediately, so this budget only ever bites on Windows.
+    #[test]
+    fn an_orphan_socket_path_sweep_does_not_block_on_dead_endpoints() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = state_in(tmp.path());
+        let _ = super::super::state::create_private_dir_all(&state.sessions());
+        const ORPHANS: usize = 8;
+        let published = |i: usize| {
+            state.root().join(format!(
+                "{}dead{i:04}",
+                super::super::wrap::SOCKET_PATH_PREFIX
+            ))
+        };
+        for i in 0..ORPHANS {
+            // A socket naming a pipe nothing has ever bound, unique to this
+            // process so no sibling test's live endpoint can answer it.
+            let socket = tmp
+                .path()
+                .join(format!("gone-{}-{i}.sock", std::process::id()));
+            super::super::state::write_private(&published(i), &socket.display().to_string())
+                .expect("publish");
+        }
+
+        let started = std::time::Instant::now();
+        let _ = list(&state);
+        let elapsed = started.elapsed();
+
+        for i in 0..ORPHANS {
+            assert!(!published(i).exists(), "orphan {i} must still be swept");
+        }
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "{ORPHANS} dead endpoints took {elapsed:?} to probe; a probe must not retry a              nonexistent endpoint (one second each here blocks the dashboard before its              first frame)"
+        );
+    }
+
     /// Both markers are read by OTHER processes while their owner rewrites
     /// them -- `claim_nudge_marker` could hand back an empty sender, and
     /// `stall_marker` could lose the latch for a tick -- so neither may be
