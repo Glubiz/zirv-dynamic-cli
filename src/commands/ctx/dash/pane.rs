@@ -2261,6 +2261,17 @@ impl Pane {
         // a pty/spawn failure) left a dead pane still pinned to the
         // dashboard's own pid with no child to show for it. Now, on any
         // `?` below, `self` is untouched and the old child keeps running.
+        //
+        // Review round 2 (S2): the rollout floor is READ here, before the
+        // successor exists, and only WRITTEN once the swap has committed (see
+        // `forget_transcript_pin` at the end). `resolve_rollout` excludes
+        // every rollout stamped before the floor and codex writes its
+        // `session_meta` the instant it starts, so a floor taken after the
+        // spawn -- with `quit_child`'s grace, up to `QUIT_GRACE` later --
+        // would exclude the successor's OWN rollout and leave the pane blind
+        // for the rest of its life. `wrap::perform_handover_swap` floors
+        // before its own relaunch for the same reason.
+        let handover_at = super::super::state::now_secs();
         let (cols, rows) = size;
         let pair = native_pty_system().openpty(PtySize {
             rows,
@@ -2411,11 +2422,13 @@ impl Pane {
         // for every later usage/budget read. Dropped here, after the
         // successor is committed and nothing below can fail: a swap that
         // aborted earlier leaves the old child running, and its own pin with
-        // it.
+        // it. S2: the floor it records is `handover_at`, taken before the
+        // successor was spawned, so the successor's own rollout is never the
+        // one excluded.
         super::super::adapters::codex::forget_transcript_pin(
             &self.state_dir,
             self.short(),
-            super::super::state::now_secs(),
+            handover_at,
         );
 
         Ok(())
@@ -3794,6 +3807,96 @@ pub(crate) mod tests {
         // the same kill. `finish_shutdown` is the escalation half on its own
         // -- already public, already used by the batched-shutdown path -- so
         // teardown here is immediate instead of a real multi-second wait.
+        pane.finish_shutdown().expect("shutdown");
+    }
+
+    /// Review round 2 (S2): the rollout floor a handover records must be the
+    /// instant BEFORE the successor was spawned, not after. `resolve_rollout`
+    /// drops every rollout whose `session_meta` predates the floor, codex
+    /// writes that meta the moment it starts, and the swap spends up to
+    /// `QUIT_GRACE` retiring the old child between the two -- so a floor
+    /// captured at the end of `handover` excludes the successor's own rollout
+    /// and `pinned_rollout` answers `None` for the rest of the pane's life.
+    /// The old child here never reads its pty, so the quit really does burn
+    /// the full grace: the window the bug lived in is genuinely open.
+    #[test]
+    fn a_pane_handover_floors_the_rollout_pin_before_the_successor_spawns() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+
+        let session_id = "33333333-2222-4333-8444-555555555555";
+        let mut spec = test_spec(session_id);
+        spec.argv = long_lived_argv();
+        spec.agent_name = "claude".to_string();
+        let mut pane = Pane::spawn(
+            spec,
+            &state,
+            &repo,
+            &repo,
+            (80, 24),
+            &[],
+            true,
+            DEFAULT_IDLE_QUIET,
+        )
+        .expect("spawn");
+        let short = pane.short().to_string();
+
+        // A successor that spawns (so the swap commits and the floor is
+        // written) without needing to survive: only the ORDER is under test.
+        #[cfg(windows)]
+        let successor_bin = "ping";
+        #[cfg(not(windows))]
+        let successor_bin = "sleep";
+        let cfg = crate::commands::ctx::config::CtxConfig {
+            agent_bin: Some(successor_bin.to_string()),
+            ..Default::default()
+        };
+        let req = crate::commands::ctx::handover::HandoverRequest {
+            target_agent: "claude".to_string(),
+            target_model: None,
+            force: true,
+            requested_at: 0,
+            interactive: false,
+            automatic: false,
+            generation: None,
+            structural_only: false,
+        };
+        let handoff_note = crate::commands::ctx::handoff::Handoff::default();
+
+        let before = crate::commands::ctx::state::now_secs();
+        pane.handover(
+            &cfg,
+            &req,
+            &handoff_note,
+            PromptRole::Worker,
+            &repo,
+            (80, 24),
+        )
+        .expect("handover succeeds");
+        let after = crate::commands::ctx::state::now_secs();
+
+        assert!(
+            after.saturating_sub(before) >= 2,
+            "test premise: the swap must actually span the quit grace, else an end-of-handover \
+             floor would be indistinguishable from a pre-spawn one (took {}s)",
+            after.saturating_sub(before)
+        );
+        let floor_ms: u64 =
+            std::fs::read_to_string(state.rollouts().join(format!("{short}.floor")))
+                .expect("the swap records a handover floor")
+                .trim()
+                .parse()
+                .expect("the floor is epoch milliseconds");
+        assert!(
+            floor_ms <= before.saturating_add(1).saturating_mul(1_000),
+            "the floor must be captured before the successor spawns: floor {floor_ms}ms vs the \
+             pre-spawn instant {before}s (swap ended at {after}s)"
+        );
+
+        // Test-plumbing only, as in the sibling handover tests above: the old
+        // child never read its pty, and the successor may already be gone.
         pane.finish_shutdown().expect("shutdown");
     }
 
