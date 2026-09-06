@@ -701,7 +701,8 @@ pub fn run_forget_with<W: Write>(
     let slug = repo_slug(repo);
     let scope = scope_of(args.shared, args.global);
     let label = scope_label(scope);
-    if memory::forget_scoped(scope, repo, &state, &slug, &args.key)? {
+    let outcome = memory::forget_scoped(scope, repo, &state, &slug, &args.key)?;
+    if outcome.removed {
         writeln!(
             w,
             "zirv memory forget: removed '{}' from the {label} bank",
@@ -714,7 +715,7 @@ pub fn run_forget_with<W: Write>(
             args.key
         )?;
     }
-    Ok(0)
+    memory::report_still_claimed(w, "zirv memory forget", &args.key, &outcome)
 }
 
 pub fn run_forget<W: Write>(args: &ForgetArgs, w: &mut W) -> CtxResult<i32> {
@@ -2241,6 +2242,81 @@ mod tests {
         .expect("forget shared while disabled");
         assert_eq!(code, 0);
         assert!(String::from_utf8(out).expect("utf8").contains("removed"));
+    }
+
+    /// A second `.zirv/memory/*.md` file whose own `Key:` header claims the
+    /// same key is never deleted (by design), so after the canonical file is
+    /// removed the fact is still live -- still listed, still compiled into
+    /// every prompt, and a later `remember --shared` still hard-errors
+    /// "already claimed". The CLI must name the surviving file and exit
+    /// non-zero rather than report an unqualified removal.
+    #[test]
+    fn run_forget_warns_when_a_stray_file_still_claims_the_key() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = HomeGuard::set(home.path());
+        let state_dir = repo.path().join("state");
+        let env = env_map(&[(state::STATE_ENV, state_dir.to_str().expect("utf8"))]);
+        let mut stdin = std::io::Cursor::new(Vec::<u8>::new());
+
+        run_remember_with(
+            &RememberArgs {
+                key: "build-cmd".to_string(),
+                text: "cargo build".to_string(),
+                shared: true,
+                global: false,
+                importance: None,
+                confidence: None,
+                tags: Vec::new(),
+                allow_sensitive: false,
+                if_unchanged: None,
+            },
+            &mut Vec::new(),
+            repo.path(),
+            &|k| env.get(k).cloned(),
+            &mut stdin,
+        )
+        .expect("remember shared");
+
+        let stray = Entry {
+            key: "build-cmd".to_string(),
+            written_by: "human".to_string(),
+            written: 2,
+            verified: 2,
+            source: "explicit".to_string(),
+            body: "hand-written notes".to_string(),
+            importance: None,
+            confidence: None,
+            tags: Vec::new(),
+            paths: Vec::new(),
+        };
+        std::fs::write(
+            repo.path().join(".zirv").join("memory").join("notes.md"),
+            stray.to_markdown(),
+        )
+        .expect("write stray");
+
+        let mut out = Vec::new();
+        let code = run_forget_with(
+            &ForgetArgs {
+                key: "build-cmd".to_string(),
+                shared: true,
+                global: false,
+            },
+            &mut out,
+            repo.path(),
+            &|k| env.get(k).cloned(),
+        )
+        .expect("forget");
+        let text = String::from_utf8(out).expect("utf8");
+        assert_ne!(
+            code, 0,
+            "the key is still claimed, so the forget did not take effect: {text}"
+        );
+        assert!(
+            text.contains("notes.md") && text.contains("still claimed"),
+            "the surviving file and the still-claimed key are named: {text}"
+        );
     }
 
     #[test]

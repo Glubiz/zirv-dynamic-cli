@@ -1417,19 +1417,25 @@ fn is_sensitive_name(path: &Path) -> bool {
 static TOKEN_SHAPE_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(concat!(
         r"(?:^|[^A-Za-z0-9])(?P<openai>sk-[A-Za-z0-9_-]{20,})",
+        r"|(?:^|[^A-Za-z0-9])(?P<stripe>sk_(?:live|test)_[A-Za-z0-9]{16,})",
         r"|(?:^|[^A-Za-z0-9])(?P<ghp>ghp_[A-Za-z0-9]{20,})",
         r"|(?:^|[^A-Za-z0-9])(?P<gho>gho_[A-Za-z0-9]{20,})",
         r"|(?:^|[^A-Za-z0-9])(?P<ghpat>github_pat_[A-Za-z0-9_]{20,})",
         r"|(?:^|[^A-Za-z0-9])(?P<slack>xox[baprs]-[A-Za-z0-9-]{10,})",
+        r"|(?P<slackhook>https://hooks\.slack\.com/services/[A-Za-z0-9/_-]{10,})",
+        r"|(?:^|[^A-Za-z0-9])(?P<google>AIza[A-Za-z0-9_-]{20,})",
+        r"|(?:^|[^A-Za-z0-9])(?P<npm>npm_[A-Za-z0-9]{20,})",
         r"|(?:^|[^A-Za-z0-9])(?P<aws>A[SK]IA[0-9A-Z]{16})",
         r"|(?P<pem>-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----)",
         r"|(?:^|[^A-Za-z0-9])(?P<jwt>eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,})",
+        r"|(?P<userinfo>[A-Za-z][A-Za-z0-9+.-]*://[^\s/:@]+:[^\s/@]+@[^\s/]+)",
     ))
     .expect("valid secret token-shape regex")
 });
 
 const TOKEN_SHAPE_FAMILIES: &[(&str, &str)] = &[
     ("openai", "OpenAI-style secret key (sk-...)"),
+    ("stripe", "Stripe-style secret key (sk_live_/sk_test_...)"),
     ("ghp", "GitHub personal access token (ghp_...)"),
     ("gho", "GitHub OAuth token (gho_...)"),
     (
@@ -1437,9 +1443,13 @@ const TOKEN_SHAPE_FAMILIES: &[(&str, &str)] = &[
         "GitHub fine-grained personal access token (github_pat_...)",
     ),
     ("slack", "Slack token (xox[baprs]-...)"),
+    ("slackhook", "Slack incoming-webhook URL"),
+    ("google", "Google API key (AIza...)"),
+    ("npm", "npm access token (npm_...)"),
     ("aws", "AWS access key id (AKIA/ASIA...)"),
     ("pem", "PEM private key block"),
     ("jwt", "JSON Web Token"),
+    ("userinfo", "URL with an embedded password (user:pass@host)"),
 ];
 
 pub(crate) fn detect_token_shape(text: &str) -> Option<&'static str> {

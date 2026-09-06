@@ -102,6 +102,22 @@ impl Entry {
     }
 }
 
+/// Truncates `entry`'s body to `cap` bytes with a visible `[truncated]`
+/// marker -- the per-entry cap every tier's writer applies just before
+/// storing, factored out so `rollback`'s multi-entry restore applies the
+/// identical rule rather than a fourth copy of it.
+fn cap_body(entry: &Entry, cap: usize) -> Entry {
+    let mut entry = entry.clone();
+    if entry.body.len() > cap {
+        const MARKER: &str = "\n[truncated]";
+        let keep = cap.saturating_sub(MARKER.len());
+        let mut truncated = crate::utils::truncate_bytes(entry.body.clone(), Some(keep));
+        truncated.push_str(MARKER);
+        entry.body = truncated;
+    }
+    entry
+}
+
 /// Same bullet styles `mail::strip_bullet` accepts. Duplicated locally
 /// (rather than made `pub(crate)` elsewhere) to keep this file's edits
 /// isolated from files other tasks are actively working in.
@@ -822,37 +838,62 @@ pub(crate) fn validate_shared_key(key: &str) -> CtxResult<()> {
 /// (demonstrated directly, independent of this guard, by
 /// `a_header_rendered_field_with_an_embedded_newline_would_inject_a_fake_
 /// header_line`). Checked for every field `to_markdown` interpolates into a
-/// header line: `written_by`, `source`, `importance`/`confidence` (if set),
-/// and every individual tag/path (each one still ends up on the SAME
+/// header line: `key`, `written_by`, `source`, `importance`/`confidence` (if
+/// set), and every individual tag/path (each one still ends up on the SAME
 /// rendered line, joined by `", "`, so a newline inside any single one of
-/// them still breaks that line in two). `key` is excluded: `validate_shared_
-/// key`'s charset already rules out `\n`/`\r` there. `body` is excluded too:
-/// N2's header-terminates-at-the-first-blank-line rule already means
-/// anything after the header, including a body that itself contains
-/// newlines, can never be read back as a header line.
+/// them still breaks that line in two). `body` is excluded: N2's
+/// header-terminates-at-the-first-blank-line rule already means anything
+/// after the header, including a body that itself contains newlines, can
+/// never be read back as a header line.
+///
+/// `key` used to be excluded here on the grounds that `validate_shared_key`'s
+/// charset already rules `\n`/`\r` out. That was true of the SHARED tier
+/// alone: `remember_inner`/`remember_session_inner` call neither validator,
+/// so a private- or session-tier `remember` accepted a forged key and
+/// `promote --shared` re-parsed the injected header lines back out and
+/// laundered them into the committed bank. Those two now run
+/// [`no_header_newline`] on the key themselves, and it is checked here too so
+/// the shared tier does not depend on a sibling validator for it.
 fn validate_shared_entry_fields(entry: &Entry) -> CtxResult<()> {
-    let no_newline = |value: &str, field: &str| -> CtxResult<()> {
-        if value.contains(['\n', '\r']) {
+    no_header_newline(&entry.key, "key")?;
+    no_header_newline(&entry.written_by, "written_by")?;
+    no_header_newline(&entry.source, "source")?;
+    if let Some(importance) = &entry.importance {
+        no_header_newline(importance, "importance")?;
+    }
+    if let Some(confidence) = &entry.confidence {
+        no_header_newline(confidence, "confidence")?;
+    }
+    for tag in &entry.tags {
+        no_header_newline(tag, "tags")?;
+        // `to_markdown` renders the tags as one `", "`-joined line and the
+        // reader splits it back apart with `config::split_csv_list`, so a
+        // comma inside a single tag round-trips as two tags -- one of them
+        // never written, and matching recalls it was never meant to.
+        if tag.contains(',') {
             return Err(format!(
-                "memory entry field `{field}` must not contain a newline (it would inject a fake header line into the stored file)"
+                "memory entry tag '{tag}' must not contain a comma (tags are stored as one comma-separated line, so it would read back as two tags)"
             )
             .into());
         }
-        Ok(())
-    };
-    no_newline(&entry.written_by, "written_by")?;
-    no_newline(&entry.source, "source")?;
-    if let Some(importance) = &entry.importance {
-        no_newline(importance, "importance")?;
-    }
-    if let Some(confidence) = &entry.confidence {
-        no_newline(confidence, "confidence")?;
-    }
-    for tag in &entry.tags {
-        no_newline(tag, "tags")?;
     }
     for path in &entry.paths {
-        no_newline(path, "paths")?;
+        no_header_newline(path, "paths")?;
+    }
+    Ok(())
+}
+
+/// Refuses `\n`/`\r` in one field `to_markdown` interpolates into a
+/// `## Memory` header line. Standalone (rather than a closure inside
+/// `validate_shared_entry_fields`) so the private and session tiers, which
+/// have no shared-scope validation of their own, can apply the identical rule
+/// to `key` without pulling in the whole shared-entry check.
+fn no_header_newline(value: &str, field: &str) -> CtxResult<()> {
+    if value.contains(['\n', '\r']) {
+        return Err(format!(
+            "memory entry field `{field}` must not contain a newline (it would inject a fake header line into the stored file)"
+        )
+        .into());
     }
     Ok(())
 }
@@ -941,19 +982,31 @@ fn sensitive_shared_term(haystack: &str) -> Option<&'static str> {
         .find(|term| lower.contains(term))
 }
 
-/// Runs both halves of the shared-scope credential check
-/// (`sensitive_shared_term`'s deny-list and `review::detect_token_shape`'s
-/// regex families -- OpenAI/GitHub/Slack/AWS-style keys, a PEM private-key
-/// block, a JWT, reused rather than duplicated since the `regex` crate and
-/// these exact families are already a workspace dependency) against one
+/// Runs all three halves of the shared-scope credential check against one
 /// field, named `label` in the returned message for `sensitive_shared_match`
-/// below. `None` means nothing matched in this field.
+/// below: `sensitive_shared_term`'s deny-list, then
+/// `review::detect_token_shape`'s regex families (OpenAI/Stripe/GitHub/
+/// Slack/Google/npm/AWS-style keys, a Slack webhook URL, a URL with an
+/// embedded password, a PEM private-key block, a JWT -- reused rather than
+/// duplicated since the `regex` crate and these exact families are already a
+/// workspace dependency), then `review::detect_high_entropy_run` for a
+/// credential of no known shape at all. `None` means nothing matched here.
+///
+/// The entropy arm is parity with `screen.rs`, which has always run
+/// `detect_token_shape(text) || detect_high_entropy_run(text)` -- and screens
+/// only machine-local mail. This bank is committed to the repository and
+/// readable by everyone who can clone it, so it cannot be the one with the
+/// weaker screen: an unlabeled random-looking secret stored clean here is
+/// unrecoverable from every future clone's history.
 fn sensitive_shared_field(label: &str, value: &str) -> Option<String> {
     if let Some(term) = sensitive_shared_term(value) {
         return Some(format!("the term '{term}' in its {label}"));
     }
-    crate::commands::workflow::review::detect_token_shape(value)
-        .map(|family| format!("a {family} in its {label}"))
+    if let Some(family) = crate::commands::workflow::review::detect_token_shape(value) {
+        return Some(format!("a {family} in its {label}"));
+    }
+    crate::commands::workflow::review::detect_high_entropy_run(value)
+        .map(|run| format!("a {run} in its {label}"))
 }
 
 /// Whether `entry` looks credential-shaped rather than a durable,
@@ -1065,15 +1118,7 @@ pub(crate) fn upsert_shared_inner(
     // unbounded than in the private bank -- checked (and, on the private
     // path, only checked) against the ORIGINAL body above, then truncated
     // here for storage, so the credential guard always sees the full text.
-    let mut entry = entry.clone();
-    let cap = cfg.memory.max_entry_bytes;
-    if entry.body.len() > cap {
-        const MARKER: &str = "\n[truncated]";
-        let keep = cap.saturating_sub(MARKER.len());
-        let mut truncated = crate::utils::truncate_bytes(entry.body.clone(), Some(keep));
-        truncated.push_str(MARKER);
-        entry.body = truncated;
-    }
+    let entry = cap_body(entry, cfg.memory.max_entry_bytes);
 
     // Issue #295/#322 (Hermes round): guard the overwrite, and capture
     // `before_body` for the journal, BEFORE touching the file. A file that
@@ -1192,6 +1237,31 @@ pub fn upsert_scoped(
     }
 }
 
+/// What a `forget_scoped` call actually accomplished. `removed` is the old
+/// boolean return: whether the scope's own file for this key was deleted.
+/// `still_claimed_by` names any OTHER shared-bank file whose own `Key:`
+/// header still claims the key after that delete -- empty for every other
+/// scope, and empty for the shared scope unless a pre-existing collision is
+/// present. A non-empty `still_claimed_by` means the requested effect did
+/// NOT happen: the fact stays live (still listed by `list_scoped`, still
+/// compiled into every prompt) and a later `upsert_shared` under the same
+/// key still hard-errors "already claimed", so a caller must report that
+/// rather than print an unqualified success.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ForgetOutcome {
+    pub removed: bool,
+    pub still_claimed_by: Vec<PathBuf>,
+}
+
+impl ForgetOutcome {
+    fn removed(removed: bool) -> Self {
+        Self {
+            removed,
+            still_claimed_by: Vec::new(),
+        }
+    }
+}
+
 /// Scope-aware forget: `Private` delegates unchanged to `forget` above.
 /// `Shared` removes only the canonical file (see the collision policy on
 /// `get_scoped` above) -- nothing else in the directory is ever touched, so
@@ -1200,10 +1270,10 @@ pub fn upsert_scoped(
 /// removing the canonical file, some OTHER file still claims this key (a
 /// pre-existing collision `upsert_shared` could never have created itself),
 /// that fact is written to the decision log as `forget-collision-left`
-/// (naming the key and the surviving path) rather than passed over in
-/// silence -- the boolean return value still only reports whether the
-/// canonical file itself was removed, since it carries no room for a
-/// structured warning. Deliberately does not gate on `cfg.memory.
+/// (naming the key and the surviving path) AND returned in
+/// `ForgetOutcome::still_claimed_by`, so the CLI can report that the key is
+/// still claimed instead of a removal that did not take effect.
+/// Deliberately does not gate on `cfg.memory.
 /// shared_enabled` either, the same "disabling a feature must never trap
 /// data" contract the private scope's own `forget` already follows --
 /// forgetting must still work while the scope is switched off.
@@ -1213,13 +1283,13 @@ pub fn forget_scoped(
     state: &StateDir,
     slug: &str,
     key: &str,
-) -> CtxResult<bool> {
+) -> CtxResult<ForgetOutcome> {
     match scope {
-        MemoryScope::Private => forget(state, slug, key),
-        MemoryScope::Global => forget(state, GLOBAL_SLUG, key),
+        MemoryScope::Private => forget(state, slug, key).map(ForgetOutcome::removed),
+        MemoryScope::Global => forget(state, GLOBAL_SLUG, key).map(ForgetOutcome::removed),
         // See `upsert_scoped`'s own `Session` arm: no session id to resolve
         // a directory from here. Callers use `forget_session` directly.
-        MemoryScope::Session => Ok(false),
+        MemoryScope::Session => Ok(ForgetOutcome::removed(false)),
         MemoryScope::Shared => {
             // Review round 2, finding 1: a shared-bank writer, so it takes
             // the same bank lock every other shared writer does.
@@ -1240,9 +1310,9 @@ fn forget_shared_locked(
     state: &StateDir,
     key: &str,
     _lock: &BankLock,
-) -> CtxResult<bool> {
+) -> CtxResult<ForgetOutcome> {
     let Some(path) = shared_canonical_path(repo, key) else {
-        return Ok(false);
+        return Ok(ForgetOutcome::removed(false));
     };
     let removed = if path.is_file() {
         std::fs::remove_file(&path)?;
@@ -1251,18 +1321,23 @@ fn forget_shared_locked(
         false
     };
 
+    let mut still_claimed_by: Vec<PathBuf> = Vec::new();
     if let Some(dir) = safe_shared_dir(repo) {
         // Best-effort (fix round 2): this is an ADVISORY scan after
         // the canonical delete already succeeded -- a scan failure
         // (e.g. the directory becomes unreadable mid-call) must not
         // turn an already-completed forget into an `Err`.
-        let stray: Vec<String> = read_entries(&dir)
+        still_claimed_by = read_entries(&dir)
             .unwrap_or_default()
             .into_iter()
             .filter(|(other_path, other)| other.key == key && *other_path != path)
-            .map(|(other_path, _)| other_path.display().to_string())
+            .map(|(other_path, _)| other_path)
             .collect();
-        if !stray.is_empty() {
+        if !still_claimed_by.is_empty() {
+            let stray: Vec<String> = still_claimed_by
+                .iter()
+                .map(|other_path| other_path.display().to_string())
+                .collect();
             let _ = super::log::append(
                 state,
                 &super::log::Decision {
@@ -1279,7 +1354,10 @@ fn forget_shared_locked(
         }
     }
 
-    Ok(removed)
+    Ok(ForgetOutcome {
+        removed,
+        still_claimed_by,
+    })
 }
 
 /// Scope-aware verify: `Private` delegates unchanged to `verify` above,
@@ -1572,6 +1650,17 @@ pub struct JournalRecord {
     pub before_sha256: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub before_body: Option<String>,
+    /// EVERY body the write this record describes removed, in the order the
+    /// bank listed them; `before_body` is its first element. Normally at most
+    /// one -- a key addresses one entry -- but two concurrent `remember`s on
+    /// one key can each miss the other's not-yet-written file and leave two
+    /// (see `remember_inner`'s own collapse loop), and the removal loop then
+    /// deletes BOTH. Journaling only the first made every other one
+    /// unrecoverable: `rollback` restores each element of this list.
+    /// `#[serde(default)]` so a record written before this field existed
+    /// still reads back, falling back to `before_body` alone.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub before_bodies: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub after_body: Option<String>,
     pub source: String,
@@ -1605,6 +1694,7 @@ impl JournalRecord {
         written_by: &str,
     ) -> Self {
         let before_sha256 = before_body.as_deref().map(sha256_hex);
+        let before_bodies = before_body.iter().cloned().collect();
         Self {
             id: journal_id(),
             ts: now_secs(),
@@ -1613,6 +1703,7 @@ impl JournalRecord {
             key: key.to_string(),
             before_sha256,
             before_body,
+            before_bodies,
             after_body,
             source: source.to_string(),
             written_by: written_by.to_string(),
@@ -1823,32 +1914,25 @@ fn remember_inner(
     journal: bool,
     _lock: &BankLock,
 ) -> CtxResult<PathBuf> {
+    no_header_newline(&entry.key, "key")?;
     let dir = state.memory().join(slug);
     super::state::create_private_dir_all(&dir)?;
 
     // Issue #295: captured before the old file(s) are removed, so the
     // journal record for this write carries the exact prior serialized
-    // entry -- `rollback`'s only source of truth for restoring it.
-    let before_body = list(state, slug)?
-        .into_iter()
-        .find(|(_, existing)| existing.key == entry.key)
-        .map(|(_, existing)| existing.to_markdown());
-
+    // entries -- `rollback`'s only source of truth for restoring them. EVERY
+    // one, not just the first: the loop below deletes every entry under the
+    // key, a state the collapse loop further down documents two concurrent
+    // `remember`s can reach.
+    let mut before_bodies: Vec<String> = Vec::new();
     for (path, existing) in list(state, slug)? {
         if existing.key == entry.key {
+            before_bodies.push(existing.to_markdown());
             let _ = std::fs::remove_file(&path);
         }
     }
 
-    let mut entry = entry.clone();
-    let cap = cfg.memory.max_entry_bytes;
-    if entry.body.len() > cap {
-        const MARKER: &str = "\n[truncated]";
-        let keep = cap.saturating_sub(MARKER.len());
-        let mut truncated = crate::utils::truncate_bytes(entry.body.clone(), Some(keep));
-        truncated.push_str(MARKER);
-        entry.body = truncated;
-    }
+    let entry = cap_body(entry, cfg.memory.max_entry_bytes);
 
     let after_body = entry.to_markdown();
     let base = format!("{:010}-{}", entry.written, slug_key(&entry.key));
@@ -1883,20 +1967,22 @@ fn remember_inner(
 
     if journal {
         let scope = private_or_global_scope(slug);
+        let mut record = JournalRecord::new(
+            "remember",
+            scope,
+            &entry.key,
+            before_bodies.first().cloned(),
+            Some(after_body),
+            &entry.source,
+            &entry.written_by,
+        );
+        record.before_bodies = before_bodies;
         // Review round 1, finding 4: propagate a journal-append failure --
         // the write above already landed and is not undone.
         append_journal(
             state,
             journal_slug_for(scope, slug),
-            &JournalRecord::new(
-                "remember",
-                scope,
-                &entry.key,
-                before_body,
-                Some(after_body),
-                &entry.source,
-                &entry.written_by,
-            ),
+            &record,
             cfg.memory.journal_max_entries,
         )
         .map_err(|e| {
@@ -2191,29 +2277,20 @@ fn remember_session_inner(
     journal: bool,
     _lock: &BankLock,
 ) -> CtxResult<PathBuf> {
+    no_header_newline(&entry.key, "key")?;
     let dir = session_dir(state, slug, session_id);
     super::state::create_private_dir_all(&dir)?;
 
-    let before_body = read_entries(&dir)?
-        .into_iter()
-        .find(|(_, existing)| existing.key == entry.key)
-        .map(|(_, existing)| existing.to_markdown());
-
+    // Every removed body, for the reason `remember_inner` documents.
+    let mut before_bodies: Vec<String> = Vec::new();
     for (path, existing) in read_entries(&dir)? {
         if existing.key == entry.key {
+            before_bodies.push(existing.to_markdown());
             let _ = std::fs::remove_file(&path);
         }
     }
 
-    let mut entry = entry.clone();
-    let cap = cfg.memory.max_entry_bytes;
-    if entry.body.len() > cap {
-        const MARKER: &str = "\n[truncated]";
-        let keep = cap.saturating_sub(MARKER.len());
-        let mut truncated = crate::utils::truncate_bytes(entry.body.clone(), Some(keep));
-        truncated.push_str(MARKER);
-        entry.body = truncated;
-    }
+    let entry = cap_body(entry, cfg.memory.max_entry_bytes);
 
     let after_body = entry.to_markdown();
     let base = format!("{:010}-{}", entry.written, slug_key(&entry.key));
@@ -2226,11 +2303,12 @@ fn remember_session_inner(
             "remember",
             MemoryScope::Session,
             &entry.key,
-            before_body,
+            before_bodies.first().cloned(),
             Some(after_body),
             &entry.source,
             &entry.written_by,
         );
+        record.before_bodies = before_bodies;
         record.session_id = Some(session_id.to_string());
         // Review round 1, finding 4: propagate a journal-append failure --
         // the write above already landed on disk.
@@ -3442,7 +3520,15 @@ pub fn rollback(
             .into());
         }
 
-        match &record.before_body {
+        // A record written before `before_bodies` existed carries only the
+        // single `before_body`; the two are otherwise the same list.
+        let before_bodies: Vec<String> = if record.before_bodies.is_empty() {
+            record.before_body.iter().cloned().collect()
+        } else {
+            record.before_bodies.clone()
+        };
+
+        match before_bodies.split_first() {
             None => {
                 // The record introduced this key; its inverse deletes it.
                 // Non-journaling (review round 1, finding 5): the
@@ -3471,10 +3557,12 @@ pub fn rollback(
                     }
                 }
             }
-            Some(markdown) => {
+            Some((markdown, extra)) => {
                 let restored = parse_markdown(markdown);
                 match scope {
                     MemoryScope::Shared => {
+                        // A shared key addresses exactly one canonical file,
+                        // so `extra` is always empty here.
                         upsert_shared_inner(
                             repo,
                             state,
@@ -3502,9 +3590,15 @@ pub fn rollback(
                             false,
                             &lock,
                         )?;
+                        restore_extra_entries(
+                            &session_dir(state, journal_slug, session_id),
+                            extra,
+                            cfg,
+                        )?;
                     }
                     MemoryScope::Private | MemoryScope::Global => {
                         remember_inner(state, journal_slug, &restored, cfg, false, &lock)?;
+                        restore_extra_entries(&state.memory().join(journal_slug), extra, cfg)?;
                     }
                 }
             }
@@ -3533,6 +3627,25 @@ pub fn rollback(
     }
 
     Err(format!("zirv memory rollback: no journal record found for id '{id}'").into())
+}
+
+/// Puts back the EXTRA entries an overwrite removed, once its first one has
+/// already been restored through the ordinary write path. Replaying these
+/// through `remember_inner` instead would be self-defeating: that clears
+/// every entry under the key before writing, so each restore would delete the
+/// sibling the previous one just put back. Each is written directly beside
+/// it, under the same body cap and prune a fresh write gets.
+fn restore_extra_entries(dir: &Path, bodies: &[String], cfg: &CtxConfig) -> CtxResult<()> {
+    if bodies.is_empty() {
+        return Ok(());
+    }
+    for markdown in bodies {
+        let entry = cap_body(&parse_markdown(markdown), cfg.memory.max_entry_bytes);
+        let base = format!("{:010}-{}", entry.written, slug_key(&entry.key));
+        claim_and_write(dir, &base, &entry.to_markdown())?;
+    }
+    prune_to_cap(dir, cfg.memory.max_entries);
+    Ok(())
 }
 
 #[derive(Debug, clap::Args)]
@@ -3998,7 +4111,8 @@ pub fn run_forget_with<W: Write>(
     };
     let scope = MemoryScope::from_flags(args.repo, args.global);
     let bank_label = ctx_scope_label(scope);
-    if forget_scoped(scope, repo, &state, &slug, key)? {
+    let outcome = forget_scoped(scope, repo, &state, &slug, key)?;
+    if outcome.removed {
         writeln!(
             w,
             "zirv ctx forget: removed '{key}' from the {bank_label} bank"
@@ -4009,7 +4123,36 @@ pub fn run_forget_with<W: Write>(
             "zirv ctx forget: no entry for '{key}' in the {bank_label} bank"
         )?;
     }
-    Ok(0)
+    report_still_claimed(w, "zirv ctx forget", key, &outcome)
+}
+
+/// Shared reporting for both `forget` CLI surfaces (`zirv ctx forget` and
+/// `zirv memory forget`): names every file that still claims `key` after the
+/// canonical one was removed, and yields the process exit code -- non-zero
+/// when anything survives, because the requested effect did not happen (the
+/// fact is still listed and recalled, and a later `remember --shared` still
+/// refuses the key as already claimed).
+pub(crate) fn report_still_claimed<W: Write>(
+    w: &mut W,
+    verb: &str,
+    key: &str,
+    outcome: &ForgetOutcome,
+) -> CtxResult<i32> {
+    if outcome.still_claimed_by.is_empty() {
+        return Ok(0);
+    }
+    for path in &outcome.still_claimed_by {
+        writeln!(
+            w,
+            "{verb}: warning: {} still claims '{key}'; only the canonical <key>.md file is ever deleted",
+            path.display()
+        )?;
+    }
+    writeln!(
+        w,
+        "{verb}: '{key}' is still claimed and still recalled -- remove or re-key the file(s) above by hand"
+    )?;
+    Ok(1)
 }
 
 pub fn run_forget<W: Write>(args: &ForgetArgs, w: &mut W) -> CtxResult<i32> {
@@ -7214,6 +7357,128 @@ This is part of the body too.\n";
         assert!(validate_shared_key("con-fig").is_ok());
     }
 
+    /// `validate_shared_key`'s charset rules a newline out of a SHARED key,
+    /// but the private and session tiers never ran either validator, so a
+    /// key like `k\n- Importance: high` rendered forged `## Memory` header
+    /// lines that `parse_markdown` reads back as real -- and `promote
+    /// --shared` re-parsed them and laundered them into the committed bank,
+    /// changing recall ranking with flags nobody ever passed.
+    #[test]
+    fn a_key_with_an_embedded_newline_is_refused_on_every_tier() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let cfg = CtxConfig::default();
+
+        let mut entry = sample("build-cmd", 1);
+        entry.key = "build-cmd\n- Importance: high\n- Confidence: high".to_string();
+        entry.importance = Some("low".to_string());
+
+        let lock = lock_bank(MemoryScope::Private, &state, "slug").expect("lock");
+        remember_inner(&state, "slug", &entry, &cfg, true, &lock)
+            .expect_err("the private tier refuses a forged key");
+        remember_session_inner(&state, "slug", "sess", &entry, &cfg, true, &lock)
+            .expect_err("the session tier refuses a forged key");
+        drop(lock);
+        let lock = lock_bank(MemoryScope::Shared, &state, "slug").expect("lock");
+        upsert_shared_inner(
+            repo.path(),
+            &state,
+            "slug",
+            &cfg,
+            &entry,
+            false,
+            true,
+            &lock,
+        )
+        .expect_err("the shared tier refuses a forged key");
+        drop(lock);
+
+        for path in walk_files(state.memory()) {
+            let text = std::fs::read_to_string(&path).unwrap_or_default();
+            assert!(
+                text.matches("- Importance:").count() < 2,
+                "{} carries a forged header line: {text}",
+                path.display()
+            );
+        }
+    }
+
+    fn walk_files(root: PathBuf) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        let Ok(entries) = std::fs::read_dir(&root) else {
+            return out;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                out.extend(walk_files(path));
+            } else {
+                out.push(path);
+            }
+        }
+        out
+    }
+
+    /// `remember_inner` journals only the FIRST body it found under the key
+    /// but its removal loop deletes EVERY one -- a state its own collapse
+    /// loop documents two concurrent `remember`s can reach -- so a rollback
+    /// used to restore one and lose the rest for good.
+    #[test]
+    fn an_overwrite_over_two_same_key_entries_journals_and_restores_both() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let cfg = CtxConfig::default();
+        let dir = state.memory().join("slug");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+
+        let mut first = sample("build-cmd", 1);
+        first.body = "ENTRY A".to_string();
+        let mut second = sample("build-cmd", 2);
+        second.body = "ENTRY B".to_string();
+        std::fs::write(dir.join("0000000001-build-cmd.md"), first.to_markdown()).expect("write a");
+        std::fs::write(dir.join("0000000002-build-cmd.md"), second.to_markdown()).expect("write b");
+
+        let mut fresh = sample("build-cmd", 3);
+        fresh.body = "ENTRY C".to_string();
+        remember(&state, "slug", &fresh, &cfg).expect("overwrite");
+
+        let after: Vec<String> = list(&state, "slug")
+            .expect("list")
+            .into_iter()
+            .map(|(_, entry)| entry.body)
+            .collect();
+        assert_eq!(
+            after,
+            vec!["ENTRY C".to_string()],
+            "the overwrite collapsed both"
+        );
+
+        let journal = std::fs::read_to_string(dir.join(JOURNAL_FILE)).expect("journal");
+        assert!(
+            journal.contains("ENTRY A") && journal.contains("ENTRY B"),
+            "every removed body is journaled, not just the first: {journal}"
+        );
+
+        let id = read_journal(&state, "slug")
+            .last()
+            .expect("record")
+            .id
+            .clone();
+        assert!(rollback(repo.path(), &state, "slug", &cfg, &id, "tester").expect("rollback"));
+
+        let mut restored: Vec<String> = list(&state, "slug")
+            .expect("list")
+            .into_iter()
+            .map(|(_, entry)| entry.body)
+            .collect();
+        restored.sort();
+        assert_eq!(
+            restored,
+            vec!["ENTRY A".to_string(), "ENTRY B".to_string()],
+            "both removed entries come back"
+        );
+    }
+
     /// IMPORTANT fix (review round 1): `upsert_shared` validated only
     /// `entry.key`, but `to_markdown` interpolates `written_by`/`source`/
     /// `importance`/`confidence`/`tags`/`paths` directly into `## Memory`
@@ -7511,6 +7776,71 @@ This is part of the body too.\n";
         )
         .expect_err("a GitHub-shaped token must be refused");
         assert!(err.to_string().contains("credential"), "got {err}");
+    }
+
+    /// The git-committed shared bank ran only the deny-list plus
+    /// `detect_token_shape`, while `screen.rs` -- guarding merely
+    /// machine-local mail -- also runs `detect_high_entropy_run`. So the
+    /// weaker screen sat in front of the stronger consequence: every one of
+    /// these stored clean into a file every future clone of the repository
+    /// gets.
+    #[test]
+    fn sensitive_shared_match_refuses_a_basic_auth_url_and_a_high_entropy_body() {
+        let refused = [
+            "clone with https://deploybot:Hunter2Xy9qQz@github.com/org/repo.git",
+            concat!("billing uses sk_", "live_51H8xYz2eZvKYlo2CqRtUvWxYzAbCdEfGh"),
+            concat!("alerts post to https://hooks.slack.com/", "services/T00000000/B11111111/aBcDeFgHiJkLmNoPqRsTuVwX"),
+            "maps calls use AIzaSyC1qR3tUvWxYzAbCdEfGhIjKlMnOpQrStU",
+            "the registry token is npm_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789",
+            // No known family at all -- only the entropy fallback
+            // `screen.rs` has always applied catches this one.
+            "the value is Zk3pQ7rW1xL9vB2nC5mT8yH4jF6dS0aG3eR7uI2oX5wN9bV4",
+        ];
+        for body in refused {
+            let mut entry = sample("deploy-notes", 1);
+            entry.body = body.to_string();
+            assert!(
+                sensitive_shared_match(&entry).is_some(),
+                "must be refused from the committed bank: {body}"
+            );
+        }
+
+        // The entropy arm must not start refusing ordinary prose: no run of
+        // word characters here is long enough to be a candidate.
+        let mut prose = sample("deploy-notes", 1);
+        prose.body = "the internationalization guidelines are unambiguously authoritative and \
+             the deployment checklist lives under docs/deployment/checklist.md"
+            .to_string();
+        assert!(
+            sensitive_shared_match(&prose).is_none(),
+            "ordinary prose with long words is still accepted: {:?}",
+            sensitive_shared_match(&prose)
+        );
+    }
+
+    /// `to_markdown` joins tags with `", "` and the reader splits the line
+    /// back apart with `config::split_csv_list`, so one tag holding a comma
+    /// silently round-trips as two -- a tag nobody wrote, matching recalls
+    /// nobody meant it to.
+    #[test]
+    fn a_tag_containing_a_comma_is_refused() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let cfg = CtxConfig::default();
+
+        let mut entry = sample("build-cmd", 1);
+        entry.tags = vec!["release,urgent".to_string()];
+
+        let err = upsert_scoped(
+            MemoryScope::Shared,
+            repo.path(),
+            &state,
+            "-irrelevant",
+            &cfg,
+            &entry,
+        )
+        .expect_err("a tag containing a comma must be refused");
+        assert!(err.to_string().contains("comma"), "got {err}");
     }
 
     #[test]
@@ -8087,6 +8417,7 @@ This is part of the body too.\n";
                 "build-cmd"
             )
             .expect("forget")
+            .removed
         );
         assert!(
             !repo
@@ -8104,7 +8435,8 @@ This is part of the body too.\n";
                 "-irrelevant",
                 "no-such-key"
             )
-            .expect("forget missing"),
+            .expect("forget missing")
+            .removed,
             "forgetting an absent key reports false, not an error"
         );
     }
@@ -8138,6 +8470,7 @@ This is part of the body too.\n";
                 "build-cmd"
             )
             .expect("forget while disabled")
+            .removed
         );
     }
 
@@ -8170,7 +8503,7 @@ This is part of the body too.\n";
         let stray = sample("build-cmd", 2);
         std::fs::write(dir.join("notes.md"), stray.to_markdown()).expect("write stray");
 
-        let removed = forget_scoped(
+        let outcome = forget_scoped(
             MemoryScope::Shared,
             repo.path(),
             &state,
@@ -8178,7 +8511,7 @@ This is part of the body too.\n";
             "build-cmd",
         )
         .expect("forget");
-        assert!(removed, "the canonical file was removed");
+        assert!(outcome.removed, "the canonical file was removed");
         assert!(
             !dir.join("build-cmd.md").exists(),
             "the canonical file is gone"
@@ -8193,6 +8526,101 @@ This is part of the body too.\n";
             log.contains("forget-collision-left") && log.contains("build-cmd"),
             "the surviving collision is reported in the decision log: {log}"
         );
+    }
+
+    /// The decision-log line is not enough: the CALLER has to learn that the
+    /// key survived, or the CLI reports a removal that never took effect.
+    #[test]
+    fn forget_scoped_shared_reports_the_keys_it_could_not_actually_remove() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let cfg = CtxConfig::default();
+        let dir = repo.path().join(".zirv").join("memory");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+
+        upsert_scoped(
+            MemoryScope::Shared,
+            repo.path(),
+            &state,
+            "-irrelevant",
+            &cfg,
+            &sample("build-cmd", 1),
+        )
+        .expect("upsert canonical");
+        std::fs::write(dir.join("notes.md"), sample("build-cmd", 2).to_markdown())
+            .expect("write stray");
+
+        let outcome = forget_scoped(
+            MemoryScope::Shared,
+            repo.path(),
+            &state,
+            "-irrelevant",
+            "build-cmd",
+        )
+        .expect("forget");
+        assert!(outcome.removed);
+        assert_eq!(
+            outcome.still_claimed_by,
+            vec![dir.join("notes.md")],
+            "the surviving claimant is returned, not only logged"
+        );
+
+        // The key really is still live: it lists, and it cannot be
+        // re-remembered.
+        let listed = list_scoped(
+            MemoryScope::Shared,
+            repo.path(),
+            &state,
+            "-irrelevant",
+            &cfg,
+        )
+        .expect("list");
+        assert!(
+            listed.iter().any(|(_, entry)| entry.key == "build-cmd"),
+            "the fact is still recalled: {listed:?}"
+        );
+        let err = upsert_scoped(
+            MemoryScope::Shared,
+            repo.path(),
+            &state,
+            "-irrelevant",
+            &cfg,
+            &sample("build-cmd", 3),
+        )
+        .expect_err("still claimed");
+        assert!(
+            err.to_string().contains("already claimed"),
+            "re-remembering the key still hard-errors: {err}"
+        );
+    }
+
+    /// A forget with no collision reports an empty `still_claimed_by`, so the
+    /// CLI's non-zero exit is reserved for the case that actually failed.
+    #[test]
+    fn forget_scoped_reports_no_surviving_claimant_on_the_ordinary_path() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let cfg = CtxConfig::default();
+        upsert_scoped(
+            MemoryScope::Shared,
+            repo.path(),
+            &state,
+            "-irrelevant",
+            &cfg,
+            &sample("build-cmd", 1),
+        )
+        .expect("upsert");
+
+        let outcome = forget_scoped(
+            MemoryScope::Shared,
+            repo.path(),
+            &state,
+            "-irrelevant",
+            "build-cmd",
+        )
+        .expect("forget");
+        assert!(outcome.removed);
+        assert!(outcome.still_claimed_by.is_empty());
     }
 
     #[test]
