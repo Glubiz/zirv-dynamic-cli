@@ -866,6 +866,16 @@ fn validate_shared_entry_fields(entry: &Entry) -> CtxResult<()> {
     }
     for tag in &entry.tags {
         no_header_newline(tag, "tags")?;
+        // `to_markdown` renders the tags as one `", "`-joined line and the
+        // reader splits it back apart with `config::split_csv_list`, so a
+        // comma inside a single tag round-trips as two tags -- one of them
+        // never written, and matching recalls it was never meant to.
+        if tag.contains(',') {
+            return Err(format!(
+                "memory entry tag '{tag}' must not contain a comma (tags are stored as one comma-separated line, so it would read back as two tags)"
+            )
+            .into());
+        }
     }
     for path in &entry.paths {
         no_header_newline(path, "paths")?;
@@ -7806,6 +7816,31 @@ This is part of the body too.\n";
             "ordinary prose with long words is still accepted: {:?}",
             sensitive_shared_match(&prose)
         );
+    }
+
+    /// `to_markdown` joins tags with `", "` and the reader splits the line
+    /// back apart with `config::split_csv_list`, so one tag holding a comma
+    /// silently round-trips as two -- a tag nobody wrote, matching recalls
+    /// nobody meant it to.
+    #[test]
+    fn a_tag_containing_a_comma_is_refused() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let cfg = CtxConfig::default();
+
+        let mut entry = sample("build-cmd", 1);
+        entry.tags = vec!["release,urgent".to_string()];
+
+        let err = upsert_scoped(
+            MemoryScope::Shared,
+            repo.path(),
+            &state,
+            "-irrelevant",
+            &cfg,
+            &entry,
+        )
+        .expect_err("a tag containing a comma must be refused");
+        assert!(err.to_string().contains("comma"), "got {err}");
     }
 
     #[test]
