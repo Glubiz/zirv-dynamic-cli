@@ -493,7 +493,8 @@ pub(crate) fn render_summary(
                 .collect::<Vec<_>>(),
         );
     }
-    if body.len() + optional.len() <= budget {
+    let tail_pushed = body.len() + optional.len() <= budget;
+    if tail_pushed {
         body.push_str(&optional);
     }
 
@@ -507,7 +508,16 @@ pub(crate) fn render_summary(
         if body.len() + head.len() <= budget {
             // The head goes ABOVE the tail when both are shown, so the
             // summary still reads in the order the output was produced.
-            let tail_at = body.len() - optional.len().min(body.len());
+            // Review finding 3: that subtraction is only valid when the tail
+            // was actually appended above -- when it did not fit the budget
+            // (`tail_pushed` false), `body` carries none of `optional`'s
+            // bytes at all, and subtracting its length spliced the head
+            // somewhere inside the mandatory block instead of after it.
+            let tail_at = if tail_pushed {
+                body.len() - optional.len().min(body.len())
+            } else {
+                body.len()
+            };
             body.insert_str(tail_at, &head);
         }
     }
@@ -590,7 +600,10 @@ const KNOWN_PROGRAMS: &[&str] = &[
 ];
 
 /// `git` subcommands that are progress logs rather than content reads.
-const KNOWN_GIT_SUBCOMMANDS: &[&str] = &["fetch", "pull", "push", "clone", "status"];
+/// `log` (without `-p`/`--patch`, which `classify_compaction` catches
+/// separately as `Verbatim`) is a commit-summary progress log in exactly
+/// this sense.
+const KNOWN_GIT_SUBCOMMANDS: &[&str] = &["fetch", "pull", "push", "clone", "status", "log"];
 
 /// How much of a command's output may be replaced by a summary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -602,6 +615,39 @@ pub(crate) enum CompactionScope {
     /// Everything else: compacted only past `compact_generic_min_bytes`, and
     /// the summary says explicitly which lines it omitted.
     Generic,
+}
+
+/// Global `git` flags that consume a SEPARATE value token (`-C dir`,
+/// `-c k=v`, `--git-dir x`, `--work-tree x`) rather than folding the value
+/// into the flag itself (`--git-dir=x`) or taking no value at all
+/// (`--no-pager`, `-p`, `--bare`). Not exhaustive of every global flag git
+/// accepts -- just common enough that a subcommand reader must not choke on
+/// it.
+const GIT_GLOBAL_VALUE_FLAGS: &[&str] = &["-C", "-c", "--git-dir", "--work-tree"];
+
+/// The index in `tokens` of the git SUBCOMMAND -- `tokens[0]` is always
+/// `git` itself -- skipping past any leading global flags first (`-C dir`,
+/// `-c k=v`, `--git-dir=x`, `--no-pager`, ...).
+///
+/// Reading `tokens[1]` unconditionally (the bug this replaces) took `-C`/
+/// `--no-pager`/etc. itself for the subcommand on `git -C dir diff` and
+/// `git --no-pager diff`, so neither ever matched
+/// [`VERBATIM_GIT_SUBCOMMANDS`] or [`KNOWN_GIT_SUBCOMMANDS`] and both fell
+/// through to [`CompactionScope::Generic`] -- a content-reading `git diff`
+/// silently became compactable.
+fn git_subcommand_index(tokens: &[&str]) -> usize {
+    let mut i = 1usize;
+    while let Some(token) = tokens.get(i) {
+        if !token.starts_with('-') {
+            break;
+        }
+        i += if GIT_GLOBAL_VALUE_FLAGS.contains(token) {
+            2
+        } else {
+            1
+        };
+    }
+    i
 }
 
 fn bare_program(token: &str) -> String {
@@ -646,7 +692,12 @@ pub(crate) fn classify_compaction(command: &str, extra_verbatim: &[String]) -> C
             continue;
         };
         let program = bare_program(first);
-        let sub = tokens.get(1).map(|t| t.to_ascii_lowercase());
+        let sub_index = if program == "git" {
+            git_subcommand_index(&tokens)
+        } else {
+            1
+        };
+        let sub = tokens.get(sub_index).map(|t| t.to_ascii_lowercase());
         let sub = sub.as_deref();
 
         if program == "zirv"
@@ -684,7 +735,13 @@ pub(crate) fn classify_compaction(command: &str, extra_verbatim: &[String]) -> C
         }
 
         if KNOWN_PROGRAMS.contains(&program.as_str()) {
-            known = program != "git" || sub.is_some_and(|sub| KNOWN_GIT_SUBCOMMANDS.contains(&sub));
+            // Review finding 5: OR'd across every segment/candidate this
+            // loop visits, never assigned outright -- an unrecognised git
+            // subcommand in one candidate (or the same command's own
+            // "whole" candidate) must never erase a `Known` match an
+            // earlier segment already established.
+            known |=
+                program != "git" || sub.is_some_and(|sub| KNOWN_GIT_SUBCOMMANDS.contains(&sub));
         }
     }
     if known {
@@ -1110,6 +1167,21 @@ fn show_output<W: Write>(
         // BYTES within that line instead, and the hint names the next byte
         // offset rather than a line number that would return the same cut.
         let slice = slice_from(&line, byte_start);
+        // Review finding 4: `byte_end` used to do nothing but stop the LINE
+        // loop after this iteration -- the slice itself was never truncated
+        // to the requested window, so `--bytes 5-10` returned everything
+        // from byte 5 to the end of the line rather than exactly bytes 5
+        // through 10. Truncating here (char-boundary-safe, like every other
+        // cut in this function) keeps the existing continuation-hint
+        // semantics below: a truncation that still leaves more of the line
+        // unread is reported exactly the way a budget-driven mid-line cut
+        // already is.
+        let slice = if byte_end == usize::MAX {
+            slice
+        } else {
+            let requested = byte_end.saturating_sub(byte_start);
+            &slice[..floor_boundary(slice, requested)]
+        };
         if slice.len() > budget.saturating_sub(body.len()).max(1) && body.is_empty() {
             let room = budget.max(1);
             let cut = floor_boundary(slice, room);
@@ -1484,6 +1556,61 @@ mod tests {
         );
     }
 
+    /// Review finding 3: `tail_at` assumed the tail had actually been
+    /// appended to `body` and always subtracted `optional.len()` when
+    /// splicing the head in -- so when the tail did NOT fit the budget (and
+    /// was therefore never pushed) but the head did, the head landed at
+    /// whatever position that wrong subtraction produced, potentially before
+    /// the mandatory header itself, rather than after the mandatory block.
+    #[test]
+    fn a_head_that_fits_lands_after_the_mandatory_block_when_the_tail_does_not() {
+        let scan = DisplayScan {
+            total_lines: 100,
+            total_bytes: 100_000,
+            head: (0..5).map(|i| format!("h{i}")).collect(),
+            tail: (0..TAIL_LINES).map(|_| "x".repeat(60)).collect(),
+            ..DisplayScan::default()
+        };
+        let retrieval = retrieval_line("id1");
+        // Comfortably fits the mandatory header plus the (tiny) head
+        // section, but nowhere near enough for the (huge) tail section --
+        // chosen with a wide margin so the exact byte counts of the
+        // mandatory header never matter.
+        let internal_budget = 200usize;
+        let max_bytes = retrieval.len() + 1 + internal_budget;
+        let summary = render_summary(
+            "id1",
+            "gen",
+            None,
+            &scan,
+            &BTreeSet::new(),
+            false,
+            max_bytes,
+        )
+        .expect("the mandatory content fits");
+        assert!(
+            summary.starts_with("zirv compacted output:"),
+            "the mandatory header must stay first, never get spliced after a head that \
+             lands before it: {summary}"
+        );
+        assert!(
+            summary.contains("head (5 of 100):"),
+            "the head must still be shown when it fits: {summary}"
+        );
+        assert!(
+            !summary.contains("tail ("),
+            "the tail must not appear at all when it does not fit the budget: {summary}"
+        );
+        let header_pos = summary
+            .find("captured 100 lines")
+            .expect("the mandatory captured-lines line");
+        let head_pos = summary.find("head (5 of 100):").expect("the head section");
+        assert!(
+            header_pos < head_pos,
+            "the head must land AFTER the mandatory block, not spliced inside it: {summary}"
+        );
+    }
+
     /// `run --compact` honours that same fail-open by printing the raw tail
     /// and the retrieval line instead of a misleading summary.
     #[test]
@@ -1620,6 +1747,42 @@ mod tests {
         );
     }
 
+    /// Review finding 4: `--bytes START-END`'s END only ever stopped the LINE
+    /// loop -- the selected line's own slice was never truncated to the
+    /// requested window, so `--bytes 5-10` returned everything from byte 5 to
+    /// the end of the line instead of exactly bytes 5 through 10.
+    #[test]
+    fn output_show_bytes_end_truncates_to_the_requested_window() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("outputs");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let line: String = (0..50).map(|i| char::from(b'a' + (i % 26) as u8)).collect();
+        std::fs::write(dir.join("beef04.log"), format!("{line}\n")).expect("write");
+
+        let mut out = Vec::new();
+        show_output(
+            &ShowArgs {
+                id: "beef04".to_string(),
+                range: Some("1-1".to_string()),
+                bytes: Some("5-10".to_string()),
+            },
+            &mut out,
+            &dir,
+            4096,
+        )
+        .expect("show");
+        let text = String::from_utf8(out).expect("utf8");
+        let body_line = text
+            .lines()
+            .nth(1)
+            .expect("the body line, after the header");
+        assert_eq!(
+            body_line,
+            &line[4..10],
+            "--bytes 5-10 must return exactly those 6 bytes, not the rest of the line: {text}"
+        );
+    }
+
     /// Review finding 6: a reader's output is never compacted, a known
     /// build/test family is compacted early, and anything else only past the
     /// much higher generic threshold.
@@ -1673,6 +1836,40 @@ mod tests {
         assert_eq!(
             classify_compaction("mydump --all", &["mydump".to_string()]),
             CompactionScope::Verbatim
+        );
+    }
+
+    /// Review finding 2: `classify_compaction` used to read `tokens[1]`
+    /// unconditionally as the git subcommand, so a leading global flag
+    /// (`-C dir`, `--no-pager`, `-c k=v`) was mistaken for the subcommand
+    /// itself and a content-reading `git diff` silently fell through to
+    /// `Generic` (compactable).
+    #[test]
+    fn a_git_global_flag_never_hides_the_subcommand() {
+        for command in ["git -C some/dir diff", "git --no-pager diff"] {
+            assert_eq!(
+                classify_compaction(command, &[]),
+                CompactionScope::Verbatim,
+                "{command} must still be recognised as a content-reading git diff"
+            );
+        }
+        assert_eq!(
+            classify_compaction("git -c a=b log", &[]),
+            CompactionScope::Known,
+            "git -c a=b log must still be recognised as a modelled git subcommand"
+        );
+    }
+
+    /// Review finding 5: `known` used to be overwritten per candidate instead
+    /// of OR'd across every candidate `classify_compaction` visits, so a
+    /// `Known` match from one segment could be erased by a later candidate's
+    /// unrecognised git subcommand.
+    #[test]
+    fn known_is_or_ed_across_every_segment_not_overwritten() {
+        assert_eq!(
+            classify_compaction("cargo test && git frobnicate-subcommand", &[]),
+            CompactionScope::Known,
+            "an unrecognised git subcommand must never erase an earlier Known match"
         );
     }
 
