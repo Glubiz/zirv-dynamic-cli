@@ -5231,10 +5231,17 @@ mod tests {
         .expect("store usage");
 
         let mut env = base_env(&state_dir);
-        env.insert(
-            "ZIRV_CTX_PACE_FIVE_HOUR_BUDGET_TOKENS".to_string(),
-            "1000".to_string(),
-        );
+        // Audit finding G3: this used to name `ZIRV_CTX_PACE_FIVE_HOUR_
+        // BUDGET_TOKENS`, which `ENV_MAP` has never heard of -- so the budget
+        // stayed 0, `pace::headroom_limit_tokens` returned `None`, the ceiling
+        // check was disabled outright and this test passed without ever
+        // reaching `reserve_within`'s refusal. `ZIRV_CTX_FIVE_HOUR_BUDGET` is
+        // the real name (see `config::every_pace_env_name_referenced_in_the_
+        // crate_exists_in_env_map`).
+        env.insert("ZIRV_CTX_FIVE_HOUR_BUDGET".to_string(), "1000".to_string());
+        // Only the collector reading above may decide this: an estimator
+        // layer would be a second source for the same ceiling.
+        env.insert("ZIRV_CTX_PACE_ESTIMATOR".to_string(), "false".to_string());
         // Rerouting is orthogonal to this test: with cross-harness fallback
         // on, claude's own low headroom here would otherwise steer this
         // delegation onto codex before reservation is ever reached.
@@ -5246,6 +5253,28 @@ mod tests {
         // completes rather than being stopped by an unrelated budget-
         // exhausted check.
         args.budget_tokens = Some(500_000);
+
+        // The ceiling is real before the run: 5% headroom of a 1000-token
+        // budget, which this delegation's own 500k ceiling cannot fit. Pinned
+        // here so a future change that silently disables the check again
+        // (a renamed variable, a zeroed budget) fails on this line rather
+        // than passing vacuously the way this test did before G3.
+        let pace_cfg =
+            crate::commands::ctx::config::CtxConfig::load(tmp.path(), &|k| env.get(k).cloned())
+                .expect("load")
+                .pace;
+        let (collector, estimator) =
+            crate::commands::ctx::pace::current_windows(&state, &pace_cfg, now, "anthropic");
+        assert_eq!(
+            crate::commands::ctx::pace::headroom_limit_tokens(
+                &collector,
+                estimator.as_ref(),
+                now,
+                &pace_cfg,
+            ),
+            Some(50),
+            "the reservation ceiling must actually be configured, not None"
+        );
 
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned())

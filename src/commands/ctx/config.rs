@@ -4765,6 +4765,65 @@ mod tests {
             .collect()
     }
 
+    fn rust_sources_under(dir: &Path, into: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                rust_sources_under(&path, into);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                into.push(path);
+            }
+        }
+    }
+
+    /// Audit finding G3: two `agent.rs` tests set `ZIRV_CTX_PACE_FIVE_HOUR_
+    /// BUDGET_TOKENS` and `ZIRV_CTX_PACE_ESTIMATOR` -- names `ENV_MAP` had
+    /// never heard of, so the config they meant to pin stayed at its default
+    /// and the test passed without exercising the branch it was written for.
+    /// A misspelt `ZIRV_CTX_PACE*` name is silent by construction (an
+    /// unmatched variable is simply ignored), so it needs a check rather than
+    /// a reviewer's memory. Scoped to `[pace]`'s own prefix and to quoted
+    /// string literals: doc comments legitimately wrap a name mid-word, and
+    /// several other families (`ZIRV_CTX_HANDOVER_<AGENT>_<TIER>`,
+    /// `ZIRV_CTX_POLICY_*`) are built by `format!` from a prefix rather than
+    /// written out, so a crate-wide scan would need an allow-list larger than
+    /// the property it proves.
+    #[test]
+    fn every_pace_env_name_referenced_in_the_crate_exists_in_env_map() {
+        // Assembled rather than written out, so this test's own pattern
+        // literal is not itself a hit when it scans this file.
+        let prefix = concat!("ZIRV_CTX_", "PACE");
+        let re = regex::Regex::new(&format!("\"({prefix}[A-Z0-9_]*)\"")).expect("regex");
+
+        let mut sources = Vec::new();
+        rust_sources_under(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut sources,
+        );
+        assert!(!sources.is_empty(), "no sources found to scan");
+
+        let mut unknown: Vec<String> = Vec::new();
+        for source in &sources {
+            let text = std::fs::read_to_string(source).expect("read source");
+            for capture in re.captures_iter(&text) {
+                let name = &capture[1];
+                if ENV_MAP.iter().any(|(variable, _, _)| *variable == name) {
+                    continue;
+                }
+                unknown.push(format!("{}: {name}", source.display()));
+            }
+        }
+        unknown.sort();
+        unknown.dedup();
+        assert!(
+            unknown.is_empty(),
+            "{prefix}* names that ENV_MAP would silently ignore: {unknown:?}"
+        );
+    }
+
     /// SECURITY: `safety.sql` joins `safety.allow`/`safety.default`/
     /// `safety.interactive_default` as operator-only. Turning the SQL
     /// classifier off removes the `Ask` narrowing it applies to a write
