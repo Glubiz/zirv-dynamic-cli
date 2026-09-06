@@ -1,7 +1,7 @@
 use std::process::Command as StdCommand;
 
 use super::agent_command::AgentCommand;
-use super::command::Command;
+use super::command::{self, Command};
 use hashbrown::HashMap;
 use serde::de::{self, Deserializer};
 use serde::{Deserialize, Serialize};
@@ -187,13 +187,18 @@ impl CommandTypes {
 /// Builds the `&&`-joined command line a concurrent block will run in its
 /// new terminal window: drops any entry whose `operating_system` filter
 /// excludes the current platform, substitutes `${var}` from `context` in
-/// the rest, and hard-errors on any placeholder left unresolved. `None`
-/// means every entry was filtered out, so the caller must not open an empty
-/// terminal window at all.
+/// the rest, and hard-errors on any placeholder the template names that
+/// `context` has no value for. `None` means every entry was filtered out, so
+/// the caller must not open an empty terminal window at all.
 ///
 /// G-8: a concurrent block used to discard every per-command `options` --
 /// only `cmd.command` was ever joined -- so an entry filtered for the other
 /// platform still ran inside the block's shared window regardless.
+///
+/// A-2/D-1: substitution and the unresolved check go through the same
+/// `command::substitute`/`command::check_unresolved` a single `Command` step
+/// uses (G-1/G-10), rather than this block's own hash-ordered replace loop
+/// plus a re-scan of the already-substituted text.
 fn build_concurrent_command(
     cmds: &[Command],
     context: &HashMap<String, String>,
@@ -209,25 +214,8 @@ fn build_concurrent_command(
     }
 
     for cmd in &mut substituted {
-        for (key, value) in context.iter() {
-            let placeholder = format!("${{{key}}}");
-            cmd.command = cmd.command.replace(&placeholder, value);
-        }
-    }
-
-    let re = regex::Regex::new(r"\$\{([^}]+)\}").unwrap();
-    for cmd in &substituted {
-        let unresolved: Vec<&str> = re
-            .captures_iter(&cmd.command)
-            .map(|c| c.get(1).unwrap().as_str())
-            .collect();
-        if !unresolved.is_empty() {
-            return Err(format!(
-                "Unresolved placeholders in '{}': {}",
-                cmd.command,
-                unresolved.join(", ")
-            ));
-        }
+        command::check_unresolved(&cmd.command, context)?;
+        cmd.command = command::substitute(&cmd.command, context);
     }
 
     Ok(Some(
@@ -494,6 +482,37 @@ commands:
 
         let result = build_concurrent_command(&cmds, &context).expect("no unresolved placeholders");
         assert!(result.is_none(), "got {result:?}");
+    }
+
+    /// A-2/D-1: a concurrent block kept the pre-G-1 substitution -- a
+    /// hash-ordered `String::replace` per context entry, then a regex
+    /// re-scan of the *substituted* text -- so a value whose own text
+    /// contains `${...}` was either re-expanded (splicing a secret into the
+    /// spawned window's command line) or falsely reported as unresolved,
+    /// depending on `HashMap` iteration order. It must resolve exactly the
+    /// way a single `Command` step does.
+    #[test]
+    fn a_concurrent_block_substitutes_like_a_single_command() {
+        let cmds = vec![Command {
+            command: "echo ${a}".to_string(),
+            capture: None,
+            description: None,
+            options: None,
+        }];
+
+        // A fresh map per iteration: iteration order is a property of the
+        // map instance, so reusing one would only ever exercise a single
+        // order and let the old hash-ordered loop pass by luck.
+        for _ in 0..200 {
+            let mut context = HashMap::new();
+            context.insert("a".to_string(), "${secret}".to_string());
+            context.insert("secret".to_string(), "hunter2".to_string());
+            for i in 0..14 {
+                context.insert(format!("filler{i}"), format!("v{i}"));
+            }
+            let joined = build_concurrent_command(&cmds, &context);
+            assert_eq!(joined, Ok(Some("echo ${secret}".to_string())));
+        }
     }
 
     /// G-8: a concurrent block cannot honor `capture` (there is no in-process
