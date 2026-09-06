@@ -1375,7 +1375,13 @@ fn sidechain_usage_since(
         return None;
     }
     let body = read_transcript_range(&path, checkpoint.transcript_bytes, end)?;
+    // The in-file branch is legacy: current Claude Code writes no
+    // `isSidechain` rows into the main transcript at all, keeping subagent
+    // turns in a sibling `subagents/` directory instead. Preferred when it
+    // answers, so a transcript recorded by an older harness still reads
+    // exactly as before.
     crate::commands::ctx::adapters::claude::sidechain_transcript_usage(&body)
+        .or_else(|| crate::commands::ctx::adapters::claude::subagent_transcript_usage(&path, &body))
 }
 
 fn enrich_transition_evidence(
@@ -6805,6 +6811,83 @@ mod tests {
             sidechain_usage_since(repo.path(), &codex_checkpoint),
             None,
             "sidechain rows are a claude transcript concept, not a general adapter one"
+        );
+    }
+
+    /// Current Claude Code writes NO `isSidechain` rows into the main
+    /// transcript at all (0 of 15,510 rows across 12 recorded real sessions);
+    /// subagent turns live in `<transcript-dir>/<session-id>/subagents/
+    /// agent-<id>.jsonl` instead. With only the in-file branch, phase
+    /// telemetry's sidechain bucket was permanently `None`.
+    #[test]
+    fn sidechain_usage_reads_the_subagents_directory() {
+        let home = tempdir().unwrap();
+        let repo = crate::commands::ctx::testenv::repo();
+        let _home = crate::commands::ctx::testenv::EnvGuard::set(home.path(), None);
+        let session_id = "11111111-2222-4333-8444-555555555556";
+        let path = transcript_path(repo.path(), session_id, "claude").expect("path");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"type":"assistant","timestamp":"2026-09-06T09:00:00.000Z","message":{"id":"m0","usage":{"input_tokens":1}}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        let checkpoint = UsageCheckpoint {
+            session_id: session_id.into(),
+            adapter: "claude".into(),
+            transcript_bytes: std::fs::metadata(&path).unwrap().len(),
+            cumulative_input_tokens: 0,
+            cumulative_cache_creation_input_tokens: 0,
+            cumulative_cache_read_input_tokens: 0,
+            cumulative_output_tokens: 0,
+        };
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"assistant","timestamp":"2026-09-06T10:00:00.000Z","message":{{"id":"m1","usage":{{"input_tokens":5}}}}}}"#
+        )
+        .unwrap();
+
+        let subagents = path.parent().unwrap().join(session_id).join("subagents");
+        std::fs::create_dir_all(&subagents).unwrap();
+        std::fs::write(
+            subagents.join("agent-aaaa.jsonl"),
+            concat!(
+                // Before the phase boundary: another phase's subagent.
+                r#"{"type":"assistant","isSidechain":true,"timestamp":"2026-09-06T08:00:00.000Z","message":{"id":"s0","usage":{"input_tokens":777}}}"#,
+                "\n",
+                // Inside the phase, split across three content-block rows.
+                r#"{"type":"assistant","isSidechain":true,"timestamp":"2026-09-06T10:30:00.000Z","message":{"id":"s1","usage":{"input_tokens":40,"cache_read_input_tokens":12000,"output_tokens":90}}}"#,
+                "\n",
+                r#"{"type":"assistant","isSidechain":true,"timestamp":"2026-09-06T10:30:00.000Z","message":{"id":"s1","usage":{"input_tokens":40,"cache_read_input_tokens":12000,"output_tokens":90}}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            subagents.join("agent-bbbb.jsonl"),
+            concat!(
+                r#"{"type":"assistant","isSidechain":true,"timestamp":"2026-09-06T11:00:00.000Z","message":{"id":"s2","usage":{"input_tokens":3,"output_tokens":4}}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+
+        let usage = sidechain_usage_since(repo.path(), &checkpoint).expect("sidechain usage");
+        assert_eq!(
+            usage,
+            crate::commands::ctx::event::TranscriptUsage {
+                input_tokens: 43,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 12_000,
+                output_tokens: 94,
+            }
         );
     }
 

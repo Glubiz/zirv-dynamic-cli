@@ -596,6 +596,13 @@ pub fn response_identity(row: &Value) -> Option<&str> {
 /// only the first of a run contributes. Tracking the last-seen id rather than
 /// a set keeps this streaming-safe over an append-only transcript.
 fn fold_assistant_usage(jsonl: &str, want_sidechain: bool) -> Option<TranscriptUsage> {
+    fold_usage_rows(jsonl, |row| {
+        (row.get("isSidechain").and_then(Value::as_bool) == Some(true)) == want_sidechain
+    })
+}
+
+/// The fold itself, over every `assistant` row `keep` accepts.
+fn fold_usage_rows(jsonl: &str, keep: impl Fn(&Value) -> bool) -> Option<TranscriptUsage> {
     let mut usage = TranscriptUsage::default();
     let mut observed = false;
     let mut last_id: Option<String> = None;
@@ -603,10 +610,7 @@ fn fold_assistant_usage(jsonl: &str, want_sidechain: bool) -> Option<TranscriptU
         let Ok(row) = serde_json::from_str::<Value>(line.trim()) else {
             continue;
         };
-        let is_sidechain = row.get("isSidechain").and_then(Value::as_bool) == Some(true);
-        if row.get("type").and_then(Value::as_str) != Some("assistant")
-            || is_sidechain != want_sidechain
-        {
+        if row.get("type").and_then(Value::as_str) != Some("assistant") || !keep(&row) {
             continue;
         }
         let Some(current) = row.get("message").and_then(|message| message.get("usage")) else {
@@ -642,6 +646,104 @@ pub fn transcript_usage(jsonl: &str) -> Option<TranscriptUsage> {
 /// `observed` flag draws.
 pub fn sidechain_transcript_usage(jsonl: &str) -> Option<TranscriptUsage> {
     fold_assistant_usage(jsonl, true)
+}
+
+/// How many subagent transcripts one call will open, and how many of their
+/// bytes it will read. Bounds a directory that accumulates one file per
+/// dispatch for the life of a session; a phase that overruns either bound
+/// reports what it read rather than stalling the caller.
+const MAX_SUBAGENT_TRANSCRIPTS: usize = 256;
+const MAX_SUBAGENT_BYTES: u64 = 32 * 1024 * 1024;
+
+/// The modern home of subagent spend (2026-09-06). Current Claude Code writes
+/// NO `isSidechain` rows into the main transcript at all -- 0 of 15,510 rows
+/// across twelve recorded real sessions -- so [`sidechain_transcript_usage`]'s
+/// in-file fold is now a legacy branch that answers `None` for every live
+/// session. Subagent turns live in sibling files instead:
+/// `<transcript-dir>/<session-id>/subagents/agent-<id>.jsonl`, whose rows do
+/// carry `isSidechain: true`.
+///
+/// `main_range` is the caller's own phase slice of the MAIN transcript; its
+/// first parseable `timestamp` is the phase boundary this fold floors at, so
+/// the answer keeps the "since the checkpoint" meaning the byte-range read
+/// gave the legacy branch. A range with no parseable timestamp yields `None`
+/// -- an honest "cannot place this window", never the whole session's subagent
+/// spend attributed to one phase. A subagent row with no timestamp of its own
+/// cannot be placed either and is skipped, the same convention
+/// `window::sum_file` already applies.
+pub fn subagent_transcript_usage(transcript: &Path, main_range: &str) -> Option<TranscriptUsage> {
+    let since_ms = first_timestamp_ms(main_range)?;
+    let dir = subagents_dir(transcript)?;
+    let mut usage = TranscriptUsage::default();
+    let mut observed = false;
+    let mut files = 0usize;
+    let mut bytes = 0u64;
+    let mut entries: Vec<(std::time::SystemTime, u64, PathBuf)> = std::fs::read_dir(&dir)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
+        .filter_map(|path| {
+            let meta = std::fs::metadata(&path).ok()?;
+            Some((
+                meta.modified().unwrap_or(std::time::UNIX_EPOCH),
+                meta.len(),
+                path,
+            ))
+        })
+        .collect();
+    // Newest first, so a session whose directory outgrows the caps keeps the
+    // files a recent phase can actually have written to. Ordering only: which
+    // rows count is decided by `since_ms` against each row's own timestamp,
+    // never by a file's mtime.
+    entries.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.2.cmp(&b.2)));
+    for (_, len, path) in entries {
+        if files >= MAX_SUBAGENT_TRANSCRIPTS || bytes >= MAX_SUBAGENT_BYTES {
+            break;
+        }
+        let Ok(body) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        files += 1;
+        bytes = bytes.saturating_add(len);
+        let Some(file_usage) = fold_usage_rows(&body, |row| {
+            row.get("timestamp")
+                .and_then(Value::as_str)
+                .and_then(parse_iso8601_utc_ms)
+                .is_some_and(|at| at >= since_ms)
+        }) else {
+            continue;
+        };
+        observed = true;
+        usage.input_tokens = usage.input_tokens.saturating_add(file_usage.input_tokens);
+        usage.cache_creation_input_tokens = usage
+            .cache_creation_input_tokens
+            .saturating_add(file_usage.cache_creation_input_tokens);
+        usage.cache_read_input_tokens = usage
+            .cache_read_input_tokens
+            .saturating_add(file_usage.cache_read_input_tokens);
+        usage.output_tokens = usage.output_tokens.saturating_add(file_usage.output_tokens);
+    }
+    observed.then_some(usage)
+}
+
+/// `<transcript-dir>/<session-id>/subagents`, derived from the main
+/// transcript's own path rather than recomputed from a `SessionRef`, so the
+/// scan-fallback path `transcript_path` may have resolved is honoured.
+fn subagents_dir(transcript: &Path) -> Option<PathBuf> {
+    let stem = transcript.file_stem()?;
+    Some(transcript.parent()?.join(stem).join("subagents"))
+}
+
+/// The first parseable row `timestamp` in `jsonl`, in unix milliseconds.
+fn first_timestamp_ms(jsonl: &str) -> Option<u64> {
+    jsonl.lines().find_map(|line| {
+        serde_json::from_str::<Value>(line.trim())
+            .ok()?
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .and_then(parse_iso8601_utc_ms)
+    })
 }
 
 const FILE_KEYS: &[&str] = &["file_path", "notebook_path", "path"];
