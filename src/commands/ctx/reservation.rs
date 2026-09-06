@@ -17,11 +17,12 @@
 //! and `task.rs`, and every mutation is a load-modify-write under that lock.
 //! Owner liveness reuses the permit pool's own discipline
 //! (`permit::permit_record_is_alive`'s bare `sessions::is_alive(pid)`
-//! check, not `sessions::record_is_alive`'s fuller start-time
-//! disambiguation, which needs a whole `sessions::Record` this ledger has
-//! no reason to carry) -- a reservation whose owning process is gone is
-//! excluded from [`outstanding`] and swept the next time this provider's
-//! ledger is locked for a write, exactly like a permit slot swept in
+//! check) plus, since audit finding G4, `sessions::record_is_alive`'s own
+//! start-time comparison against the `pid_start_time` each entry already
+//! stamps -- a recycled pid would otherwise answer the bare probe as its own
+//! live owner. A reservation whose owning process is gone is excluded from
+//! [`outstanding`] and swept the next time this provider's ledger is locked
+//! for a write, exactly like a permit slot swept in
 //! `permit::live_records_in`.
 
 use std::path::PathBuf;
@@ -44,10 +45,9 @@ fn current_schema_version() -> u32 {
 /// acquisition" shape `permit::PermitRecord::pid` already holds.
 /// `pid_start_time` is [`sessions::process_start_secs`]'s own reading at
 /// reservation time, kept for a future finer-grained disambiguator the way
-/// `sessions::Record::start_time` already is for session records; today's
-/// liveness check ([`outstanding`]) is deliberately the plainer
-/// permit-style `sessions::is_alive(pid)` alone, so this field is not yet
-/// consulted.
+/// `sessions::Record::start_time` already is for session records, and read
+/// by [`is_owner_alive`] since audit finding G4 to tell a recycled pid from
+/// the real owner wherever both start times are readable.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Reservation {
     pub id: String,
@@ -134,11 +134,25 @@ fn save(state: &StateDir, provider: &str, ledger: &Ledger) -> CtxResult<()> {
 /// Permit-style liveness: alive exactly when the owning process still is,
 /// per `sessions::is_alive`'s bare signal-0 (Unix) / `OpenProcess` (Windows)
 /// probe -- the same check `permit::permit_record_is_alive` bases its own
-/// parent-pid half on. No `sessions::Record` exists for a reservation's
-/// owner, so the fuller start-time disambiguation `sessions::record_is_alive`
-/// offers is not available here.
+/// parent-pid half on -- sharpened (audit finding G4) by the `pid_start_time`
+/// every reservation already stamped and nothing ever read: a pid the OS
+/// recycled answers the bare probe as its own live owner and keeps the
+/// reservation outstanding forever. `sessions::record_is_alive`'s own
+/// comparison is reused rather than reimplemented, so the tolerance stays
+/// one constant.
 fn is_owner_alive(entry: &Reservation) -> bool {
+    owner_is_alive_with(entry, sessions::process_start_secs(entry.pid))
+}
+
+/// [`is_owner_alive`] with its one environmental read lifted into a
+/// parameter: `current_start` is whatever process holds `entry.pid` right
+/// now. `None` on either side means "cannot tell" and falls back to the bare
+/// pid probe alone -- which is every case off unix, where `sessions::
+/// process_start_secs` has no portable reader, so this is a unix-only
+/// sharpening in practice.
+fn owner_is_alive_with(entry: &Reservation, current_start: Option<u64>) -> bool {
     sessions::is_alive(entry.pid)
+        && !sessions::start_time_disambiguates_dead(entry.pid_start_time, current_start)
 }
 
 /// Drops every entry whose owner is no longer alive. Called at the top of
@@ -325,6 +339,39 @@ mod tests {
 
     fn sample_ledger_path(state: &StateDir, provider: &str) -> PathBuf {
         ledger_path(state, provider)
+    }
+
+    /// Audit finding G4: `pid_start_time` was stamped by every reservation
+    /// and read by nothing, so a pid the OS had already recycled answered the
+    /// bare signal-0 probe as its own live owner and kept a settled-in-spirit
+    /// reservation outstanding forever. `record_is_alive`'s own comparison
+    /// (shared, not duplicated, so the tolerance stays one constant) now
+    /// disambiguates it whenever both sides can be read.
+    #[test]
+    fn a_recycled_pid_with_a_different_start_time_is_not_a_live_owner() {
+        let entry = Reservation {
+            id: "r-1".to_string(),
+            session: "sess-a".to_string(),
+            // This test's own process: genuinely alive, so only the start
+            // time can decide.
+            pid: std::process::id(),
+            pid_start_time: Some(1_000),
+            tokens: 100,
+            created_at: 1_700_000_000,
+        };
+
+        assert!(
+            owner_is_alive_with(&entry, Some(1_000)),
+            "the process that took the reservation is still the owner"
+        );
+        assert!(
+            !owner_is_alive_with(&entry, Some(1_000 + 3_600)),
+            "a live pid whose process started an hour later is a recycled pid"
+        );
+        assert!(
+            owner_is_alive_with(&entry, None),
+            "a platform with no readable start time falls back to the pid probe alone"
+        );
     }
 
     #[test]

@@ -369,4 +369,3 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
         );
     }
 }
-
