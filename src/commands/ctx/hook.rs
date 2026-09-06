@@ -1609,11 +1609,64 @@ pub fn session_start_output(additional_context: &str) -> String {
     .to_string()
 }
 
+/// The short id embedded in a stored handoff's own file name
+/// (`"<timestamp>-<short>.md"`, see `handoff::store`) -- the same 8-char
+/// ASCII-alphanumeric truncation `sessions::short_id` derives from a full
+/// session id, so it can be compared against a live registry record's own
+/// `short` field directly. `None` for a name that does not match the shape at
+/// all (never expected in practice; a caller degrades to "no identity known"
+/// rather than erroring).
+fn producing_short_id(path: &std::path::Path) -> Option<String> {
+    let stem = path.file_stem()?.to_str()?;
+    let (_, short) = stem.split_once('-')?;
+    (!short.is_empty()).then(|| short.to_string())
+}
+
+/// Issue #326 B9: whether `handoff_path`'s own producing session is a
+/// DIFFERENT session from the one resuming/clearing right now, and that
+/// producer is still alive -- the case where injecting would leak up to tens
+/// of KiB of another, currently-active session's own context into this one,
+/// rather than the intended "hand off from a session that already ended"
+/// continuity. `current_short` is derived from the SAME identity precedence
+/// every other hook handler in this file already uses (`SESSION_ENV` -- this
+/// process's own zirv identity when supervised -- falling back to the
+/// harness's native `payload.session_id`), so a session's own supervised
+/// restart (which mints a fresh id, but is not what this guard exists to
+/// catch) is unaffected: this only refuses when the file names a DIFFERENT
+/// short id AND the registry says that other short id is still `Live` in
+/// THIS repo. A producer this repository's registry has no record of at all
+/// (the common case: a crashed or long-exited session) is never refused --
+/// this is a narrowing guard against a proven-live conflict, not a
+/// whitelist.
+fn handoff_produced_by_another_live_session(
+    state: &StateDir,
+    repo: &std::path::Path,
+    handoff_path: &std::path::Path,
+    current_short: &str,
+) -> bool {
+    let Some(producer_short) = producing_short_id(handoff_path) else {
+        return false;
+    };
+    if producer_short == current_short {
+        return false;
+    }
+    let repo_slug = super::state::repo_slug(repo);
+    super::sessions::list(state)
+        .into_iter()
+        .any(|(record, liveness)| {
+            liveness == super::sessions::Liveness::Live
+                && record.short == producer_short
+                && record.repo_slug == repo_slug
+        })
+}
+
 /// The latest stored handoff for `payload`'s repo, labeled and screened for
 /// injection (`handoff::labeled_for_injection_with_working_set` -- the same
 /// shared assembly helper `resume::resume_prompt` uses, so the two paths
 /// cannot drift), or `None` when the state dir cannot be resolved, no
-/// handoff exists, or the latest one is not usable (`Handoff::is_usable`).
+/// handoff exists, the latest one is not usable (`Handoff::is_usable`), or
+/// (issue #326 B9) it was produced by a DIFFERENT session that is still
+/// alive in this same repo -- see `handoff_produced_by_another_live_session`.
 ///
 /// Issue #281: no longer purely read-only. The base handoff read is still
 /// idempotent (repeated resumes re-read the same file and re-inject the
@@ -1626,10 +1679,15 @@ pub fn session_start_output(additional_context: &str) -> String {
 fn latest_handoff_for_injection(payload: &HookPayload, env: EnvLookup<'_>) -> Option<String> {
     let state = StateDir::resolve(env).ok()?;
     let repo = payload.repo();
-    let (_, handoff) = super::handoff::latest_for_repo(&state, &repo)
+    let (path, handoff) = super::handoff::latest_for_repo(&state, &repo)
         .ok()
         .flatten()?;
     if !handoff.is_usable() {
+        return None;
+    }
+    let current_short =
+        super::sessions::short_id(&env(SESSION_ENV).unwrap_or_else(|| payload.session_id.clone()));
+    if handoff_produced_by_another_live_session(&state, &repo, &path, &current_short) {
         return None;
     }
     let working_set = super::handoff::working_set(&state, &repo, &payload.session_id);
@@ -2986,6 +3044,91 @@ mod tests {
                 "SessionStart"
             );
         }
+    }
+
+    /// Issue #326 B9: `latest_for_repo` returns the latest handoff for the
+    /// WHOLE REPO, with no notion of which of possibly several CONCURRENT
+    /// sessions it belongs to. Before this fix, a `/clear` in ANY session in
+    /// this repo injected it regardless -- including one produced moments
+    /// ago by a DIFFERENT, still-running session working on something
+    /// unrelated, leaking up to tens of KiB of that other session's own
+    /// context.
+    #[test]
+    fn session_start_never_injects_a_handoff_still_owned_by_another_live_session() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = tempfile::tempdir().expect("repo");
+        let state = StateDir::from_root(dir.path().to_path_buf());
+
+        // A DIFFERENT session, "producer-session", produced this handoff --
+        // and it is still alive: registered, carrying this TEST PROCESS's
+        // own pid (via `Record::new`), never dropped or removed.
+        let producer_record = crate::commands::ctx::sessions::Record::new(
+            "producer-session",
+            "claude",
+            repo.path(),
+            crate::commands::ctx::sessions::Verb::Wrap,
+        );
+        let _producer_guard =
+            crate::commands::ctx::sessions::SessionGuard::register(&state, producer_record);
+        crate::commands::ctx::handoff::store(
+            &state,
+            repo.path(),
+            "producer-session",
+            &usable_handoff(),
+        )
+        .expect("store handoff");
+
+        let env = |key: &str| {
+            (key == crate::commands::ctx::state::STATE_ENV)
+                .then(|| dir.path().display().to_string())
+        };
+
+        // A DIFFERENT session, "resuming-session", is the one that just ran
+        // Claude's own `/clear` -- not the producer.
+        let mut payload = session_start_payload(repo.path(), "resume");
+        payload.session_id = "resuming-session".to_string();
+        let mut out = Vec::new();
+        run_session_start(&mut out, &serde_json::to_string(&payload).unwrap(), &env).unwrap();
+        assert!(
+            out.is_empty(),
+            "a handoff still owned by another live session must not be injected: {out:?}"
+        );
+    }
+
+    /// Companion to the guard above: once the producing session is no
+    /// longer alive (the common case this whole mechanism exists for -- it
+    /// crashed, rotted, or simply exited), the SAME handoff must still be
+    /// injected for a genuinely different resuming session. This is a
+    /// narrowing guard against a PROVEN live conflict, never a whitelist
+    /// that would otherwise quietly break the ordinary continuity case.
+    #[test]
+    fn session_start_still_injects_a_handoff_whose_producer_is_no_longer_alive() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = tempfile::tempdir().expect("repo");
+        let state = StateDir::from_root(dir.path().to_path_buf());
+        // No registry record at all for "producer-session": it already
+        // exited (the ordinary rot-restart/crash case).
+        crate::commands::ctx::handoff::store(
+            &state,
+            repo.path(),
+            "producer-session",
+            &usable_handoff(),
+        )
+        .expect("store handoff");
+
+        let env = |key: &str| {
+            (key == crate::commands::ctx::state::STATE_ENV)
+                .then(|| dir.path().display().to_string())
+        };
+        let mut payload = session_start_payload(repo.path(), "resume");
+        payload.session_id = "resuming-session".to_string();
+        let mut out = Vec::new();
+        run_session_start(&mut out, &serde_json::to_string(&payload).unwrap(), &env).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("ship the thing"),
+            "a handoff whose producer is gone must still be injected: {text}"
+        );
     }
 
     /// Issue #244 follow-up: the injected handoff must carry the same

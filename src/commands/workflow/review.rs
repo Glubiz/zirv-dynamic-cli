@@ -29,6 +29,13 @@ const MAX_REVIEW_FINDINGS: usize = 256;
 const MAX_FINDINGS_PER_RUN: usize = 64;
 const MAX_FINDING_SUMMARY_BYTES: usize = 4 * 1024;
 const MAX_FINDING_PATH_BYTES: usize = 4 * 1024;
+/// Issue #326 B2: aggregate cap across every summary in a package's
+/// `existing_findings` -- `MAX_FINDING_SUMMARY_BYTES` bounds one finding's
+/// own summary and `MAX_REVIEW_FINDINGS` bounds how many findings a workflow
+/// may carry, but neither bounds their SUM: up to 256 findings at 4 KB each
+/// is a megabyte of prose resent to a reviewer every single round. See
+/// `cap_findings_payload`.
+const MAX_REVIEW_FINDINGS_PAYLOAD_BYTES: usize = 64 * 1024;
 const MAX_REVIEW_OUTPUT_BYTES: usize = 64 * 1024;
 const MAX_FIX_REVIEW_ROUNDS: u8 = 3;
 const REVIEW_RESULT_PREFIX: &str = "ZIRV_REVIEW_RESULT ";
@@ -428,17 +435,34 @@ fn review_round(state: &WorkflowState, current_fingerprint: u64) -> u8 {
     evidence_round.max(attempt_round)
 }
 
-/// The most recently completed review round's evidence, if any: the same
-/// "latest round, then latest completion within it" selection `delta_base`
-/// has always used to pick the sha a later round diffs from. Factored out
-/// (T2) so `delta_existing_findings` can read the SAME round's `finding_
-/// dispositions` snapshot that `delta_base` reads `head_sha` from, rather
-/// than risking the two ever disagreeing about which round is "the previous
-/// one".
-fn previous_round_evidence(state: &WorkflowState) -> Option<&ReviewRunEvidence> {
+/// The most recently completed evidence from a round STRICTLY BEFORE
+/// `before_round`, if any: "latest round below `before_round`, then latest
+/// completion within it". Factored out (T2) so `delta_existing_findings` can
+/// read the SAME round's `finding_dispositions` snapshot that `delta_base`
+/// reads `head_sha` from, rather than risking the two ever disagreeing about
+/// which round is "the previous one".
+///
+/// Issue #326 B5: this used to pick the single most recent evidence overall
+/// (`max_by_key((review_round, completed_at))`, no `before_round` filter),
+/// which is wrong once a round requires more than one independent reviewer.
+/// Each reviewer invocation is its own `package()`/evidence-append call, so
+/// on round >= 2 the SECOND required reviewer's own `package()` ran after the
+/// FIRST reviewer of the SAME round had already appended its evidence --
+/// "most recent overall" then picked that sibling's own just-recorded
+/// evidence instead of the previous round's, collapsing the second
+/// reviewer's delta (diff and existing-findings both) to near-empty, since
+/// nothing changed between the two reviewers. Filtering to `review_round <
+/// before_round` -- the round `package()`'s own caller is CURRENTLY
+/// computing a delta for -- makes the lookup reviewer-slot aware: a sibling's
+/// evidence from the same round in progress can never be mistaken for the
+/// previous round's, however many reviewers that round has already recorded.
+/// Round 1's own behavior (`delta_base` returns `None` before this is ever
+/// called) is unchanged.
+fn previous_round_evidence(state: &WorkflowState, before_round: u8) -> Option<&ReviewRunEvidence> {
     state
         .review_evidence
         .iter()
+        .filter(|evidence| evidence.review_round < before_round)
         .max_by_key(|evidence| (evidence.review_round, evidence.completed_at))
 }
 
@@ -460,7 +484,9 @@ fn delta_base(state: &WorkflowState, repo: &Path, review_round: u8) -> Option<St
     if review_round <= 1 {
         return None;
     }
-    let tree_sha = previous_round_evidence(state)?.reviewed_tree_sha.clone()?;
+    let tree_sha = previous_round_evidence(state, review_round)?
+        .reviewed_tree_sha
+        .clone()?;
     // Must still resolve to a tree object in THIS repository, or the diff
     // below would fail outright rather than degrade.
     git(repo, &["cat-file", "-e", &format!("{tree_sha}^{{tree}}")]).ok()?;
@@ -482,8 +508,14 @@ fn delta_base(state: &WorkflowState, repo: &Path, review_round: u8) -> Option<St
 /// was empty" -- both look identical here (every finding treated as
 /// changed), which is the correct, safe answer for the first but a needless
 /// full resend for the second when the caller already knows better.
-fn delta_existing_findings(state: &WorkflowState) -> (Vec<ReviewFinding>, usize) {
-    let previous = previous_round_evidence(state)
+///
+/// `review_round` (issue #326 B5) is the round THIS package is being built
+/// for, passed straight through to `previous_round_evidence` so it reads the
+/// same "strictly before this round" snapshot `delta_base` computed its own
+/// tree sha from -- never a sibling reviewer's own evidence from this same
+/// round.
+fn delta_existing_findings(state: &WorkflowState, review_round: u8) -> (Vec<ReviewFinding>, usize) {
+    let previous = previous_round_evidence(state, review_round)
         .map(|evidence| &evidence.finding_dispositions)
         .cloned()
         .unwrap_or_default();
@@ -1630,6 +1662,41 @@ fn untracked_exclusion(path: &Path, metadata: &std::fs::Metadata) -> Option<Stri
     None
 }
 
+/// Issue #326 B2: trims `findings`' own summary text so the aggregate never
+/// exceeds `budget` bytes, without ever dropping a finding outright --
+/// `id`/`severity`/`disposition`/`path`/`line` survive regardless of
+/// trimming, so a reviewer can always see WHICH findings exist even once
+/// their prose is gone. Trimming order mirrors triage priority: a finding
+/// whose disposition already means it is no longer an open concern (anything
+/// but `Open`) is trimmed before any `Open` one, oldest (`created_at`) first
+/// within each group -- an `Open` finding a reviewer still has to act on
+/// keeps its full text as long as the budget allows. Trims only as many
+/// findings as it takes to fit, and only when trimming would actually shrink
+/// a summary (a already-short summary is left alone). A no-op, returned
+/// unchanged, when the aggregate already fits.
+fn cap_findings_payload(mut findings: Vec<ReviewFinding>, budget: usize) -> Vec<ReviewFinding> {
+    const TRIMMED_NOTE: &str = "[summary trimmed to fit the aggregate review-findings budget]";
+    let total_bytes =
+        |items: &[ReviewFinding]| -> usize { items.iter().map(|f| f.summary.len()).sum() };
+    if total_bytes(&findings) <= budget {
+        return findings;
+    }
+    let mut order: Vec<usize> = (0..findings.len()).collect();
+    order.sort_by_key(|&i| {
+        let f = &findings[i];
+        (f.disposition == FindingDisposition::Open, f.created_at)
+    });
+    for i in order {
+        if total_bytes(&findings) <= budget {
+            break;
+        }
+        if findings[i].summary.len() > TRIMMED_NOTE.len() {
+            findings[i].summary = TRIMMED_NOTE.to_string();
+        }
+    }
+    findings
+}
+
 pub fn package(
     state_dir: &StateDir,
     state: &WorkflowState,
@@ -1725,10 +1792,14 @@ pub fn package(
     changed_paths.extend(untracked);
     let changed_paths = changed_paths.into_iter().collect();
     let (existing_findings, unchanged_existing_findings) = if diff_is_delta {
-        delta_existing_findings(state)
+        delta_existing_findings(state, review_round)
     } else {
         (state.review_findings.clone(), 0)
     };
+    // Issue #326 B2: bounds the aggregate size of what just got selected
+    // above, regardless of which branch selected it.
+    let existing_findings =
+        cap_findings_payload(existing_findings, MAX_REVIEW_FINDINGS_PAYLOAD_BYTES);
     let verification = verification::load_latest(state_dir, &state.repo)?
         .map(|report| VerificationEvidence::from_report(report, current_fingerprint, &state.repo));
     let required_reviews = required_independent_reviews_for(state);
@@ -4541,6 +4612,103 @@ checksum = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f80"
         }
     }
 
+    fn finding_with(
+        disposition: FindingDisposition,
+        created_at: u64,
+        summary_bytes: usize,
+    ) -> ReviewFinding {
+        ReviewFinding {
+            id: uuid::Uuid::new_v4().to_string(),
+            severity: FindingSeverity::Major,
+            summary: "s".repeat(summary_bytes),
+            path: Some(PathBuf::from("src/lib.rs")),
+            line: Some(1),
+            disposition,
+            recommended_disposition: None,
+            created_at,
+        }
+    }
+
+    /// Issue #326 B2: `MAX_FINDING_SUMMARY_BYTES` bounds one finding's own
+    /// summary and `MAX_REVIEW_FINDINGS` bounds the count, but neither bounds
+    /// their SUM -- this is the aggregate cap that closes that gap. Every
+    /// disposition survives the trim; only the non-`Open` finding's own
+    /// summary is replaced with the trimmed note.
+    #[test]
+    fn cap_findings_payload_trims_non_open_findings_before_open_ones() {
+        let findings = vec![
+            finding_with(FindingDisposition::Open, 1, 40_000),
+            finding_with(FindingDisposition::Fixed, 2, 40_000),
+        ];
+        let total_before: usize = findings.iter().map(|f| f.summary.len()).sum();
+        assert!(total_before > MAX_REVIEW_FINDINGS_PAYLOAD_BYTES, "premise");
+
+        let capped = cap_findings_payload(findings, MAX_REVIEW_FINDINGS_PAYLOAD_BYTES);
+
+        assert_eq!(capped.len(), 2, "no finding is ever dropped outright");
+        let open = capped
+            .iter()
+            .find(|f| f.disposition == FindingDisposition::Open)
+            .expect("the Open finding must still be present");
+        let fixed = capped
+            .iter()
+            .find(|f| f.disposition == FindingDisposition::Fixed)
+            .expect("the Fixed finding must still be present");
+        assert_eq!(
+            open.summary.len(),
+            40_000,
+            "the Open finding's summary must survive in full while budget allows"
+        );
+        assert!(
+            fixed.summary.len() < 40_000,
+            "the Fixed (non-open) finding's summary must be trimmed first: {} bytes",
+            fixed.summary.len()
+        );
+        let total_after: usize = capped.iter().map(|f| f.summary.len()).sum();
+        assert!(
+            total_after <= MAX_REVIEW_FINDINGS_PAYLOAD_BYTES,
+            "the aggregate must fit the budget: {total_after}"
+        );
+    }
+
+    /// Issue #326 B2: once every non-open finding is exhausted, trimming
+    /// continues into `Open` findings too, oldest first -- the aggregate cap
+    /// must actually bind even when everything is still open.
+    #[test]
+    fn cap_findings_payload_falls_back_to_the_oldest_open_finding_when_no_non_open_ones_remain() {
+        let findings = vec![
+            finding_with(FindingDisposition::Open, 1, 40_000), // oldest
+            finding_with(FindingDisposition::Open, 2, 40_000), // newest
+        ];
+        let capped = cap_findings_payload(findings, MAX_REVIEW_FINDINGS_PAYLOAD_BYTES);
+        assert_eq!(capped.len(), 2, "no finding is ever dropped outright");
+        let oldest = capped.iter().find(|f| f.created_at == 1).expect("oldest");
+        let newest = capped.iter().find(|f| f.created_at == 2).expect("newest");
+        assert!(
+            oldest.summary.len() < 40_000,
+            "the oldest Open finding must be trimmed once nothing else is left: {} bytes",
+            oldest.summary.len()
+        );
+        assert_eq!(
+            newest.summary.len(),
+            40_000,
+            "the newest Open finding keeps its full text as long as possible"
+        );
+        let total_after: usize = capped.iter().map(|f| f.summary.len()).sum();
+        assert!(total_after <= MAX_REVIEW_FINDINGS_PAYLOAD_BYTES);
+    }
+
+    /// A no-op when the aggregate already fits: no summary is touched.
+    #[test]
+    fn cap_findings_payload_is_a_no_op_under_budget() {
+        let findings = vec![
+            finding_with(FindingDisposition::Open, 1, 100),
+            finding_with(FindingDisposition::Fixed, 2, 100),
+        ];
+        let capped = cap_findings_payload(findings.clone(), MAX_REVIEW_FINDINGS_PAYLOAD_BYTES);
+        assert_eq!(capped, findings);
+    }
+
     /// Issue #155, Phase 4(c): "stop when a round yields no new findings" was
     /// prompt text only. A converged change still burned rounds 2 and 3 --
     /// each one a full reviewer launch over a 96 KiB diff.
@@ -5236,6 +5404,132 @@ checksum = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f80"
             package.changed_paths,
             vec![PathBuf::from("file_b.txt")],
             "changed_paths must not resend file_a.txt, already sent and unchanged since round 1"
+        );
+    }
+
+    /// Issue #326 B5: the bug. `required_independent_reviews_for` can demand
+    /// TWO independent reviewers on the same round (a `StrongIndependentReview`,
+    /// or an escalated one) -- each reviewer invocation is its own `package()`
+    /// call, so on round >= 2 the SECOND required reviewer's own `package()`
+    /// runs after the FIRST reviewer of the SAME round already appended its
+    /// own evidence. Before the fix, `previous_round_evidence` picked the
+    /// single most recent evidence overall regardless of round, so the second
+    /// reviewer's delta collapsed to near-empty against the FIRST reviewer's
+    /// own just-recorded evidence -- both `diff` (nothing changed between the
+    /// two reviewer calls) and `existing_findings` (the first reviewer's own
+    /// new finding reads as "already known" against its own snapshot).
+    ///
+    /// Both required reviewers on the same round must see the SAME previous
+    /// round's tree, and BOTH must see a finding the first reviewer just
+    /// added as new, not "already known".
+    #[test]
+    fn both_required_reviewers_on_the_same_round_receive_the_same_delta_base() {
+        let repo = tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let status = Command::new("git")
+                .args([
+                    "-c",
+                    "user.email=t@example.com",
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(repo.path())
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(repo.path().join("file_a.txt"), "base\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "base"]);
+
+        // The change round 1 actually reviewed.
+        std::fs::write(repo.path().join("file_a.txt"), "first change\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "first change"]);
+
+        // The fix landed after round 1's review, before round 2 starts.
+        std::fs::write(repo.path().join("file_b.txt"), "fix after review\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "fix after review"]);
+
+        let shas = git_log_shas(repo.path());
+        let round_one_tree = tree_sha_of(repo.path(), &shas[1]);
+        let mut state = running_review_state(repo.path(), &shas[0]);
+        let finding1 = finding_at("src/lib.rs", 1, "round 1's own finding");
+        state.review_findings.push(finding1.clone());
+        state.review_evidence.push(ReviewRunEvidence {
+            id: "ev-round1".to_string(),
+            change_fingerprint: 1,
+            adapter: "codex".to_string(),
+            review_round: 1,
+            completed_at: 10,
+            head_sha: Some(shas[1].clone()),
+            reviewed_tree_sha: Some(round_one_tree.clone()),
+            finding_dispositions: [(finding1.id.clone(), FindingDisposition::Open)].into(),
+        });
+        let state_dir =
+            StateDir::from_root(tempfile::tempdir().expect("tempdir").path().to_path_buf());
+
+        // Reviewer A: the first required reviewer of round 2.
+        let package_a = package(&state_dir, &state, Some(&shas[0])).expect("reviewer A package");
+        assert_eq!(package_a.review_round, 2, "premise: this is round 2");
+        assert!(
+            package_a.diff_is_delta,
+            "premise: round 2 with an intact chain is a delta"
+        );
+
+        // Reviewer A completes, surfacing one NEW finding, and its evidence
+        // is recorded -- nothing else about the repo changes before reviewer
+        // B runs.
+        let finding2 = finding_at("src/new.rs", 1, "reviewer A's own new finding");
+        state.review_findings.push(finding2.clone());
+        state.review_evidence.push(ReviewRunEvidence {
+            id: "ev-round2-reviewer-a".to_string(),
+            change_fingerprint: package_a.change_fingerprint,
+            adapter: "claude".to_string(),
+            review_round: 2,
+            completed_at: 20,
+            head_sha: Some(shas[2].clone()),
+            reviewed_tree_sha: package_a.reviewed_tree_sha.clone(),
+            finding_dispositions: [
+                (finding1.id.clone(), FindingDisposition::Open),
+                (finding2.id.clone(), FindingDisposition::Open),
+            ]
+            .into(),
+        });
+
+        // Reviewer B: the second required reviewer of the SAME round 2.
+        let package_b = package(&state_dir, &state, Some(&shas[0])).expect("reviewer B package");
+
+        assert_eq!(
+            package_b.review_round, 2,
+            "reviewer B is still reviewing round 2, not a phantom round 3"
+        );
+        assert_eq!(
+            package_b.diff_base_sha, package_a.diff_base_sha,
+            "both required reviewers on the same round must diff from the SAME previous-round \
+             tree, never from a sibling reviewer's own just-recorded evidence"
+        );
+        assert!(
+            package_b.diff.contains("fix after review"),
+            "reviewer B must still see round 2's own change, not an empty delta collapsed \
+             against reviewer A's own just-recorded evidence: got {:?}",
+            package_b.diff
+        );
+        let existing_ids: std::collections::BTreeSet<&str> = package_b
+            .existing_findings
+            .iter()
+            .map(|f| f.id.as_str())
+            .collect();
+        assert!(
+            existing_ids.contains(finding2.id.as_str()),
+            "reviewer A's own new finding must reach reviewer B as new, not as \
+             already-known-and-unchanged against reviewer A's own snapshot: {:?}",
+            package_b.existing_findings
         );
     }
 

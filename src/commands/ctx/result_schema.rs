@@ -216,19 +216,26 @@ pub fn render_contract_block(schema: &Schema) -> String {
     lines.join("\n")
 }
 
+/// Issue #326 B7: a field only gets its own field-list line when it carries a
+/// constraint [`example_value`]'s JSON example genuinely cannot show --
+/// whether the field is `required` (the example fills in a placeholder value
+/// for every field regardless of requiredness) or an `enum`'s full set of
+/// allowed values (the example can only show one of them). For every other
+/// field -- an optional, non-enum one -- the example's own name/value pair
+/// already says everything the field list would have repeated, so the OUTPUT
+/// CONTRACT block no longer names it twice.
 fn render_fields(fields: &[Field], indent: usize, lines: &mut Vec<String>) {
     let pad = "  ".repeat(indent);
     for field in fields {
-        let requirement = if field.required {
-            "required"
-        } else {
-            "optional"
-        };
-        lines.push(format!(
-            "{pad}- {}: {} ({requirement})",
-            field.name,
-            kind_description(&field.kind)
-        ));
+        let is_enum = matches!(field.kind, Kind::Enum(_));
+        if field.required || is_enum {
+            let requirement = if field.required { " (required)" } else { "" };
+            lines.push(format!(
+                "{pad}- {}: {}{requirement}",
+                field.name,
+                kind_description(&field.kind)
+            ));
+        }
         if let Kind::ObjArray(nested) = &field.kind {
             render_fields(nested, indent + 1, lines);
         }
@@ -666,7 +673,15 @@ mod tests {
         let block = render_contract_block(&schema);
         assert!(block.starts_with("OUTPUT CONTRACT (machine-validated)"));
         assert!(block.contains("status: enum [done, blocked] (required)"));
-        assert!(block.contains("findings: array of objects (optional)"));
+        // Issue #326 B7: `findings` is optional and not an enum, so the JSON
+        // example alone already says everything about it -- the redundant
+        // field-list line is gone, but its name still appears once, via the
+        // example.
+        assert!(
+            !block.contains("findings: "),
+            "an optional non-enum field must not get its own redundant field-list line: {block}"
+        );
+        assert_eq!(block.matches("findings").count(), 1, "got {block}");
         assert!(block.contains("file: string (required)"));
         assert!(block.contains("fenced json block"));
         assert!(block.contains("```json"));
@@ -675,6 +690,68 @@ mod tests {
         let example: serde_json::Value =
             serde_json::from_str(block[example_start..example_end].trim()).expect("valid json");
         assert!(validate(&schema, &example).is_empty(), "{example:?}");
+    }
+
+    /// Issue #326 B7: the block used to render every field's name twice --
+    /// once in the field list, once in the JSON example -- with the field
+    /// list wholly redundant for a plain optional field (the example alone
+    /// already shows its name and a representative value). Each field name
+    /// must now appear exactly once, except where the field list conveys a
+    /// constraint the example genuinely cannot show (whether a field is
+    /// `required`, or an `enum`'s full set of allowed values) -- those two
+    /// still get a field-list line IN ADDITION to the example, so the field
+    /// name legitimately appears twice only for those.
+    #[test]
+    fn render_contract_block_names_each_field_exactly_once_unless_a_constraint_needs_repeating() {
+        let schema = Schema {
+            fields: vec![
+                Field {
+                    name: "status".to_string(),
+                    kind: Kind::Enum(vec!["done".to_string(), "blocked".to_string()]),
+                    required: true,
+                },
+                Field {
+                    // `Kind::Bool`, not `Kind::Str`: a string field's own
+                    // example value is `"<name>"`, which would embed this
+                    // field's own name a SECOND time inside the placeholder
+                    // itself, an artifact of `example_field_value`'s
+                    // formatting rather than a genuine second field-list
+                    // line -- a bool's example value (`true`) carries no
+                    // such self-reference, so counting occurrences of the
+                    // name is an honest test of the field list alone.
+                    name: "verified".to_string(),
+                    kind: Kind::Bool,
+                    required: false,
+                },
+                Field {
+                    name: "confidence".to_string(),
+                    kind: Kind::Int,
+                    required: true,
+                },
+            ],
+        };
+        let block = render_contract_block(&schema);
+        // A plain optional field with no enum: the example alone says
+        // everything, so the field list must not repeat its name.
+        assert_eq!(
+            block.matches("verified").count(),
+            1,
+            "an optional non-enum field's name must appear only in the JSON example: {block}"
+        );
+        // `required` is a constraint the example cannot show (it fills in a
+        // value for every field regardless), so this one legitimately
+        // appears in both the field list and the example.
+        assert_eq!(
+            block.matches("confidence").count(),
+            2,
+            "a required field's name may appear in both the field list and the example: {block}"
+        );
+        assert_eq!(
+            block.matches("status").count(),
+            2,
+            "an enum field's name may appear in both the field list (with its allowed values) \
+             and the example: {block}"
+        );
     }
 
     #[test]

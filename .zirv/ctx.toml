@@ -188,6 +188,9 @@ model = "fable"
 # session_enabled = true             # REPO-FORBIDDEN (ZIRV_CTX_MEMORY_SESSION): whether the per-session ephemeral tier is read at all, underneath the enabled master switch above. Default: true.
 # journal_max_entries = 500          # REPO-FORBIDDEN (ZIRV_CTX_MEMORY_JOURNAL_MAX_ENTRIES): lines each memory bank's own journal.jsonl keeps before the oldest are pruned. Default: 500.
 
+# [task]                             # every key below is REPO-FORBIDDEN
+# max_parent_outcome_bytes = 4096    # REPO-FORBIDDEN (ZIRV_CTX_TASK_MAX_PARENT_OUTCOME_BYTES): byte budget on the `## PARENT OUTCOMES` block a `--task` delegation appends to a worker's own prompt; most recently updated parents are kept first and in full, the rest dropped with a `[truncated N bytes]` note. Default: 4096.
+
 # [setup]                            # not REPO-FORBIDDEN: bookkeeping for the guided `zirv setup` flow, written only to ~/.zirv/ctx.toml.
 # backup_retention_runs = 20         # count cap on .zirv/backups/ai-reset runs, applied on the next write; the oldest run is always pinned outside this cap. Default: 20.
 # memory_harvest_offered = false     # set once the guided flow has asked about automatic memory harvest, so a decline is not re-asked. Default: false.

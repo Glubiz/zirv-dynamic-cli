@@ -1157,6 +1157,32 @@ impl Default for MemoryConfig {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TaskConfig {
+    /// Issue #326 B1: byte budget on the combined `## PARENT OUTCOMES` block
+    /// `task::compile_task_prompt` appends to a delegated worker's own
+    /// prompt (`agent::attach_task_context_to_prompt`) -- every ancestor
+    /// card's `outcome` used to be appended verbatim, uncapped, so a task
+    /// tree a few levels deep could inject an unbounded amount of prior
+    /// prose into a fresh worker's very first turn. The most recently
+    /// updated parents are kept first and in full; once the budget is
+    /// spent, the rest are dropped with an explicit `[truncated N bytes]`
+    /// note naming how much was cut, never a silent one. `REPO_FORBIDDEN`
+    /// (`ZIRV_CTX_TASK_MAX_PARENT_OUTCOME_BYTES`): without that, a repo
+    /// checkout could simply raise its own cap, making it decorative, the
+    /// same reasoning as `mail.max_delivered_bytes`/`memory.max_entry_bytes`.
+    pub max_parent_outcome_bytes: usize,
+}
+
+impl Default for TaskConfig {
+    fn default() -> Self {
+        Self {
+            max_parent_outcome_bytes: 4096,
+        }
+    }
+}
+
 /// Bookkeeping for the guided `zirv setup` flow (issues #87, #93, #95). Not
 /// `REPO_FORBIDDEN`: unlike the workflow/memory tables above, nothing here
 /// gates execution of repository content or spend on the operator's
@@ -1843,6 +1869,7 @@ pub struct CtxConfig {
     pub sandbox: SandboxConfig,
     pub objective: ObjectiveConfig,
     pub screen: ScreenConfig,
+    pub task: TaskConfig,
     /// Per-agent enable/disable state from `.settings.toml`, a file this type
     /// deliberately never deserializes (see `crate::settings`): loaded
     /// separately at the end of `load`, and rejected outright if it appears
@@ -2525,6 +2552,11 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         "ZIRV_CTX_COMPACT_ADVISORY_WINDOW_FRACTION",
         &["compact_advisory", "window_fraction"],
         EnvKind::Float,
+    ),
+    (
+        "ZIRV_CTX_TASK_MAX_PARENT_OUTCOME_BYTES",
+        &["task", "max_parent_outcome_bytes"],
+        EnvKind::Int,
     ),
 ];
 
@@ -3532,6 +3564,14 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     (
         &["fallback", "rollover_cooldown_secs"],
         "ZIRV_CTX_FALLBACK_ROLLOVER_COOLDOWN_SECS",
+    ),
+    // Issue #326 B1: without this a repo checkout could simply raise its own
+    // parent-outcome budget, making the cap decorative -- same reasoning as
+    // every other byte cap in this table (`mail.max_delivered_bytes`,
+    // `memory.max_entry_bytes`, ...).
+    (
+        &["task", "max_parent_outcome_bytes"],
+        "ZIRV_CTX_TASK_MAX_PARENT_OUTCOME_BYTES",
     ),
 ];
 
@@ -7337,6 +7377,47 @@ mod tests {
         assert_eq!(cfg.memory.journal_max_entries, 77);
     }
 
+    /// Issue #326 B1: default budget for `task::compile_task_prompt`'s own
+    /// `## PARENT OUTCOMES` block.
+    #[test]
+    fn task_config_defaults_to_a_4096_byte_parent_outcome_budget() {
+        assert_eq!(TaskConfig::default().max_parent_outcome_bytes, 4096);
+    }
+
+    #[test]
+    fn task_max_parent_outcome_bytes_reads_from_its_own_env_var() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let env = env_map(&[("ZIRV_CTX_TASK_MAX_PARENT_OUTCOME_BYTES", "128")]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert_eq!(cfg.task.max_parent_outcome_bytes, 128);
+    }
+
+    /// Issue #326 B1: without this a repo checkout could simply raise its
+    /// own parent-outcome budget back up, making the cap decorative -- same
+    /// reasoning `memory_session_enabled_and_journal_max_entries_are_repo_
+    /// forbidden` already established for `memory.*`.
+    #[test]
+    fn task_max_parent_outcome_bytes_is_repo_forbidden() {
+        let empty = env_map(&[]);
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[task]\nmax_parent_outcome_bytes = 999999\n",
+        )
+        .expect("write");
+
+        let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+            .expect_err("a repository must not be able to raise task.max_parent_outcome_bytes");
+        assert!(
+            is_repo_forbidden(err.as_ref()),
+            "task.max_parent_outcome_bytes must be rejected as REPO_FORBIDDEN: {err}"
+        );
+    }
+
     /// N4: `supervise.max_nudges` reads from its own env var like every
     /// other `supervise.*` key.
     #[test]
@@ -8957,6 +9038,7 @@ mod tests {
         ("safety", "denial_breaker_threshold"),
         ("safety", "identical_command_warn_after"),
         ("safety", "identical_command_refuse_after"),
+        ("task", "max_parent_outcome_bytes"),
     ];
 
     /// The lines belonging to table `path` in a sample-config file like

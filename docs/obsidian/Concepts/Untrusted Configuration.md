@@ -82,6 +82,7 @@ Plus a third, read-only case: `zirv ctx optimize` reads the repo's own CLAUDE.md
 | `memory.harvest_max_bytes` | `ZIRV_CTX_MEMORY_HARVEST_MAX_BYTES` |
 | `memory.session_enabled` | `ZIRV_CTX_MEMORY_SESSION` |
 | `memory.journal_max_entries` | `ZIRV_CTX_MEMORY_JOURNAL_MAX_ENTRIES` |
+| `task.max_parent_outcome_bytes` | `ZIRV_CTX_TASK_MAX_PARENT_OUTCOME_BYTES` |
 | `dash.enabled` | `ZIRV_CTX_DASH` |
 | `dash.sidebar_cols` | `ZIRV_CTX_DASH_SIDEBAR_COLS` |
 | `dash.roster_max_age_secs` | `ZIRV_CTX_DASH_ROSTER_MAX_AGE_SECS` |
@@ -313,6 +314,10 @@ The same two habits apply, adapted to what memory actually is:
 `zirv ctx optimize` reports the bank's *size* (count, byte total, oldest/newest age, staleness, a duplicate-key check) in its own report, but this is deliberately not the same thing as the CLAUDE.md-reading path above: the bank is read directly by `optimize::memory_bank_summary`, never folded into `collect_surfaces` or the judgment model's own prompt, and the summary renderer never emits an entry's key or body — only the counts. A memory entry is repository-scoped, cross-session data with nothing to do with what `optimize` is reviewing (the instruction files), so it stays out of that model call entirely rather than being labeled-and-included the way mail and CLAUDE.md are for their own respective consumers.
 
 Issue #37 tightens automatic harvesting further: clean exits and distilled rot handoffs share one `memory::harvest_durable` path, and harvesting requires `memory.enabled`, `memory.harvest`, and `memory.shared_enabled` before a model is started. Candidates are filtered deterministically for durable repository facts, capped by `harvest_max_entries` and `harvest_max_bytes`, written only to the git-reviewable shared bank, and never overwrite an entry whose `Source` is `explicit`. Issue #38's `zirv memory optimize` remains report-only unless `--apply` is explicit; even then it only consolidates safe duplicate groups and never deletes entries or invokes git.
+
+## Task cards: parent-outcome chain, capped (issue #326 B1)
+
+`task::compile_task_prompt` (see [[Ctx Subsystem]]'s task-card section) is the last unbounded case of a familiar shape: `agent::attach_task_context_to_prompt` appends a `--task` delegation's own brief plus every resolved ancestor card's `outcome` to the worker's prompt, verbatim, before this fix. A task tree several levels deep could inject an unbounded amount of prior sessions' own prose into a fresh worker's very first turn, the same class of problem `mail.max_delivered_bytes`/`memory.max_entry_bytes` already close for their own surfaces. `cfg.task.max_parent_outcome_bytes` (default 4096, `REPO_FORBIDDEN`/`ZIRV_CTX_TASK_MAX_PARENT_OUTCOME_BYTES` — see the table above) now bounds the combined `## PARENT OUTCOMES` block: parents are ordered by their own `updated_at` (most recently updated first) and rendered in full for as long as the budget lasts; once a parent's line would exceed what remains, every parent from there on — always the older ones, never a more-recent one skipped over an older one that happened to fit — is left out, and a single trailing line names exactly how many bytes and how many parents were cut (`[truncated N bytes: M older parent outcome(s) omitted ...]`), never a silent cut.
 
 ## Screening is a fourth habit alongside capping and labeling (issue #243, v3.5.0)
 

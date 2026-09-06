@@ -534,6 +534,30 @@ fn strip_bullet(line: &str) -> Option<String> {
     None
 }
 
+/// Issue #326 B4: byte cap applied to `Handoff::task`/`verification`/
+/// `next_step` at PARSE time (`parse_markdown`), not only at render time.
+/// `normalize_rendered_line`'s own 200-char cap (below) only ever ran on list
+/// bullets and the rendered `Verification` line when `to_markdown` produced
+/// them fresh -- a handoff read back from disk (or from a distiller's own
+/// answer) took these three scalar fields verbatim, so a single oversized
+/// one could still reach a successor session's prompt unbounded. Larger than
+/// [`VERIFICATION_LINE_CHAR_CAP`] on purpose: these three fields carry the
+/// successor's own actual instructions (what to do, whether it passed, what
+/// to do next), not a one-line label, so they get more room before being cut.
+const PARSED_SCALAR_FIELD_CAP_BYTES: usize = 2048;
+
+/// Truncates `text` to [`PARSED_SCALAR_FIELD_CAP_BYTES`] with an explicit
+/// `[truncated N bytes]` note -- never a silent cut. A no-op, returned
+/// unchanged, when `text` already fits.
+fn capped_scalar_field(text: &str) -> String {
+    if text.len() <= PARSED_SCALAR_FIELD_CAP_BYTES {
+        return text.to_string();
+    }
+    let kept = crate::utils::truncate_bytes(text.to_string(), Some(PARSED_SCALAR_FIELD_CAP_BYTES));
+    let omitted = text.len() - kept.len();
+    format!("{kept} [truncated {omitted} bytes]")
+}
+
 pub fn parse_markdown(md: &str) -> Handoff {
     let mut handoff = Handoff::default();
     let mut section: Option<&str> = None;
@@ -558,17 +582,20 @@ pub fn parse_markdown(md: &str) -> Handoff {
         match current {
             "Task" => {
                 if handoff.task.is_empty() && !plain.is_empty() {
-                    handoff.task = bullet.unwrap_or_else(|| plain.to_string());
+                    handoff.task =
+                        capped_scalar_field(&bullet.unwrap_or_else(|| plain.to_string()));
                 }
             }
             "Verification" => {
                 if handoff.verification.is_empty() && !plain.is_empty() {
-                    handoff.verification = bullet.unwrap_or_else(|| plain.to_string());
+                    handoff.verification =
+                        capped_scalar_field(&bullet.unwrap_or_else(|| plain.to_string()));
                 }
             }
             "Next step" => {
                 if handoff.next_step.is_empty() && !plain.is_empty() {
-                    handoff.next_step = bullet.unwrap_or_else(|| plain.to_string());
+                    handoff.next_step =
+                        capped_scalar_field(&bullet.unwrap_or_else(|| plain.to_string()));
                 }
             }
             "Constraints" => handoff.constraints.extend(bullet),
@@ -718,11 +745,38 @@ pub fn structural(ctx: &StructuralContext) -> Handoff {
 
 pub const DISTILL_PROMPT_VERSION: &str = "v3";
 
+/// Issue #326 B3: per-item byte cap applied when `distill_prompt` renders one
+/// of its transcript excerpts (`user_messages`/`assistant_texts`/`files_read`/
+/// `files_modified`/`tool_errors`) as a bullet list. `tool_errors` already
+/// carries its own, smaller cap from extraction (`adapters::claude::ERROR_
+/// SNIPPET`, 200 chars) before it ever reaches here, so this is a no-op for
+/// that category in practice -- the other four had no per-item cap at all: a
+/// single oversized item (a huge pasted prompt, a giant assistant reply)
+/// could blow the whole distill prompt's own budget on its own, no matter how
+/// small `StructuralContext::keep_last` kept the *count*.
+const BULLET_ITEM_CAP_BYTES: usize = 400;
+
 fn bullets(items: &[String]) -> String {
     if items.is_empty() {
         return "(none)\n".to_string();
     }
-    items.iter().map(|i| format!("- {i}\n")).collect()
+    items
+        .iter()
+        .map(|i| format!("- {}\n", capped_bullet_item(i)))
+        .collect()
+}
+
+/// Truncates one bullet item to [`BULLET_ITEM_CAP_BYTES`] with an explicit
+/// `[truncated N bytes]` note -- mirrors [`bounded_model_answer`]'s own
+/// visible-truncation contract (never a silent cut). A no-op, returned
+/// unchanged, when `text` already fits.
+fn capped_bullet_item(text: &str) -> String {
+    if text.len() <= BULLET_ITEM_CAP_BYTES {
+        return text.to_string();
+    }
+    let kept = crate::utils::truncate_bytes(text.to_string(), Some(BULLET_ITEM_CAP_BYTES));
+    let omitted = text.len() - kept.len();
+    format!("{kept} [truncated {omitted} bytes]")
 }
 
 /// Unions two already-bounded file lists -- previous first, then current,
@@ -756,11 +810,70 @@ Remaining item to Done only when the context below actually shows it happened. P
 file paths, commands, and error text verbatim, never paraphrased. Drop only what the context \
 below demonstrably shows is no longer relevant.";
 
+/// Issue #326 B6: byte budget on the PREVIOUS handoff's own carry-over block
+/// inside `distill_prompt` -- `to_markdown()`'s full render used to be
+/// embedded verbatim with no aggregate cap of its own (only each individual
+/// list item was already bounded, by `normalize_rendered_line`'s 200-char
+/// cap). A handoff carrying enough `Constraints`/`Done`/`Key decisions`/
+/// `Gotchas` entries could still grow the carry-over block itself into the
+/// tens of KB every restart, distinct from (and in addition to) B3's own
+/// per-item cap on the CURRENT session's own transcript excerpts below it.
+const PREVIOUS_HANDOFF_CAP_BYTES: usize = 8192;
+
+/// The non-protected sections of `prev.to_markdown()`, in the same order
+/// `to_markdown` itself renders them -- everything except `task`/
+/// `remaining`/`blocked`/`next_step`, which `capped_previous_handoff_
+/// markdown` renders separately and always keeps in full.
+fn rest_sections_markdown(prev: &Handoff) -> String {
+    let mut out = String::new();
+    write_list(&mut out, "Constraints", &prev.constraints);
+    write_list(&mut out, "Done", &prev.done);
+    write_list(&mut out, "Key decisions", &prev.key_decisions);
+    out.push_str(&format!("## Verification\n{}\n\n", prev.verification));
+    write_list(&mut out, "Files read", &prev.files_read);
+    write_list(&mut out, "Files modified", &prev.files_modified);
+    write_list(&mut out, "Gotchas learned", &prev.gotchas);
+    out
+}
+
+/// Issue #326 B6: `prev.to_markdown()` capped to `budget` bytes -- but
+/// `task`/`remaining`/`blocked`/`next_step` (what the successor must do, and
+/// what is still outstanding) always survive in full regardless of budget;
+/// only the other, more historical sections (`Constraints`/`Done`/`Key
+/// decisions`/`Verification`/`Files read`/`Files modified`/`Gotchas
+/// learned`) are truncated, with an explicit "[truncated N bytes]" note,
+/// never a silent cut. A no-op, returning `prev.to_markdown()` unchanged,
+/// when the whole document already fits.
+fn capped_previous_handoff_markdown(prev: &Handoff, budget: usize) -> String {
+    let full = prev.to_markdown();
+    if full.len() <= budget {
+        return full;
+    }
+    let mut protected = String::new();
+    protected.push_str(&format!("## Task\n{}\n\n", prev.task));
+    write_list(&mut protected, "Remaining", &prev.remaining);
+    write_list(&mut protected, "Blocked", &prev.blocked);
+    protected.push_str(&format!("## Next step\n{}\n\n", prev.next_step));
+
+    let rest = rest_sections_markdown(prev);
+    let rest_budget = budget.saturating_sub(protected.len());
+    let kept_rest = crate::utils::truncate_bytes(rest.clone(), Some(rest_budget));
+    let omitted_bytes = rest.len().saturating_sub(kept_rest.len());
+    if omitted_bytes == 0 {
+        format!("{protected}{kept_rest}")
+    } else {
+        format!(
+            "{protected}{kept_rest}[truncated {omitted_bytes} bytes of prior-session context \
+to fit the {budget} byte carry-over budget]\n"
+        )
+    }
+}
+
 pub fn distill_prompt(ctx: &StructuralContext, previous: Option<&Handoff>) -> String {
     let previous_block = match previous {
         Some(prev) => format!(
             "### Previous handoff\n{}\n{PRESERVE_UPDATE_RULES}\n\n",
-            prev.to_markdown()
+            capped_previous_handoff_markdown(prev, PREVIOUS_HANDOFF_CAP_BYTES)
         ),
         None => String::new(),
     };
@@ -1371,6 +1484,35 @@ mod tests {
         );
     }
 
+    /// Issue #326 B3: `tool_errors` already carries its own 200-char cap from
+    /// extraction (`ERROR_SNIPPET`), but `user_messages`/`assistant_texts`/
+    /// `files_read`/`files_modified` did not -- a single oversized item used
+    /// to be rendered into the distill prompt verbatim. Every category must
+    /// now be capped uniformly, with an explicit truncation note, never a
+    /// silent cut.
+    #[test]
+    fn the_prompt_caps_an_oversized_item_in_every_bulleted_category() {
+        let huge = "x".repeat(10_000);
+        let ctx = StructuralContext {
+            user_messages: vec![huge.clone()],
+            assistant_texts: vec![huge.clone()],
+            files_read: vec![huge.clone()],
+            files_modified: vec![huge.clone()],
+            tool_errors: vec!["short error".to_string()],
+            ..StructuralContext::default()
+        };
+        let prompt = distill_prompt(&ctx, None);
+        assert!(
+            !prompt.contains(&huge),
+            "an oversized item must never survive verbatim: {prompt}"
+        );
+        assert_eq!(
+            prompt.matches("[truncated").count(),
+            4,
+            "one truncation note per oversized category (user/assistant/read/modified): {prompt}"
+        );
+    }
+
     /// Issue #280: with a previous handoff in hand, the prompt renders it
     /// under its own block plus Prime's preserve/update rules restated for
     /// zirv's section set.
@@ -1392,6 +1534,59 @@ mod tests {
                 "preserve/update rules should mention '{needle}': {prompt}"
             );
         }
+    }
+
+    /// Issue #326 B6: `to_markdown()`'s full render of the previous handoff
+    /// used to be embedded into the distill prompt verbatim with no
+    /// aggregate cap -- a handoff carrying enough `Constraints`/`Done`/`Key
+    /// decisions`/`Gotchas` entries could grow the carry-over block itself
+    /// into the tens of KB every restart. A 32 KiB previous doc must still
+    /// yield a bounded carry-over block, with `next_step` (the successor's
+    /// own actual instruction) surviving verbatim regardless.
+    #[test]
+    fn the_previous_handoff_carry_over_is_capped_but_keeps_next_step_verbatim() {
+        let huge_item = "x".repeat(300);
+        let previous = Handoff {
+            task: "Ship the webhook".to_string(),
+            constraints: vec![huge_item.clone(); 100],
+            done: vec![huge_item.clone(); 100],
+            key_decisions: vec![huge_item.clone(); 40],
+            gotchas: vec![huge_item; 40],
+            remaining: vec!["Signature verification".to_string()],
+            next_step: "Add a failing test for an invalid signature".to_string(),
+            ..Handoff::default()
+        };
+        assert!(
+            previous.to_markdown().len() > 32 * 1024,
+            "the fixture must actually exceed 32 KiB to be a test of the cap: {} bytes",
+            previous.to_markdown().len()
+        );
+
+        let prompt = distill_prompt(&ctx_sample(), Some(&previous));
+        let block_start = prompt
+            .find("### Previous handoff")
+            .expect("previous block present");
+        let block_end = prompt
+            .find(PRESERVE_UPDATE_RULES)
+            .expect("preserve/update rules present");
+        let block = &prompt[block_start..block_end];
+        assert!(
+            block.len() <= PREVIOUS_HANDOFF_CAP_BYTES + 512,
+            "the previous-doc carry-over block must be bounded: {} bytes",
+            block.len()
+        );
+        assert!(
+            prompt.contains("Add a failing test for an invalid signature"),
+            "next_step must survive verbatim regardless of the cap: {prompt}"
+        );
+        assert!(
+            prompt.contains("Signature verification"),
+            "remaining (an open obligation) must survive verbatim regardless of the cap: {prompt}"
+        );
+        assert!(
+            block.contains("[truncated"),
+            "the cut historical sections must be noted explicitly, never silent: {block}"
+        );
     }
 
     #[test]
@@ -1993,6 +2188,33 @@ mod tests {
     fn markdown_round_trips() {
         let original = sample();
         assert_eq!(parse_markdown(&original.to_markdown()), original);
+    }
+
+    /// Issue #326 B4: `task`/`verification`/`next_step` are capped at PARSE
+    /// time too, not only when `to_markdown` renders a list bullet -- a
+    /// handoff read back from disk (or a distiller's own raw answer) must
+    /// never carry one of these three scalar fields unbounded.
+    #[test]
+    fn parsing_caps_an_oversized_task_verification_and_next_step_field() {
+        let huge = "x".repeat(93 * 1024);
+        let md = format!("## Task\n{huge}\n\n## Verification\n{huge}\n\n## Next step\n{huge}\n");
+        let parsed = parse_markdown(&md);
+        assert!(
+            parsed.task.len() < huge.len(),
+            "task must be capped: {} bytes",
+            parsed.task.len()
+        );
+        assert!(parsed.task.contains("[truncated"), "got {}", parsed.task);
+        assert!(
+            parsed.verification.contains("[truncated"),
+            "got {}",
+            parsed.verification
+        );
+        assert!(
+            parsed.next_step.contains("[truncated"),
+            "got {}",
+            parsed.next_step
+        );
     }
 
     #[test]
