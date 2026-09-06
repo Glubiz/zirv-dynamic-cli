@@ -571,14 +571,34 @@ pub fn model_hint(jsonl: &str) -> Option<String> {
     None
 }
 
+/// The identity of the API response an assistant row belongs to, for
+/// [`fold_assistant_usage`]'s dedup. Claude Code >= 2.1.209 splits one
+/// response across one transcript row per content block (thinking, text,
+/// tool_use), each repeating the response's identical `usage` object under
+/// the same `message.id`. `requestId` is the fallback for a row carrying no
+/// message id; `None` means this row has no response identity at all and is
+/// counted on its own, which is exactly the pre-split behaviour.
+fn response_identity(row: &Value) -> Option<&str> {
+    row.get("message")
+        .and_then(|message| message.get("id"))
+        .and_then(Value::as_str)
+        .or_else(|| row.get("requestId").and_then(Value::as_str))
+}
+
 /// The shared fold behind [`transcript_usage`] and [`sidechain_transcript_usage`]:
 /// every assistant row whose `isSidechain` flag matches `want_sidechain`,
 /// summed into the four raw classes. One fold, two filters, so the main and
 /// sidechain readers can never drift on what counts as an assistant usage
 /// row.
+///
+/// Usage is folded once per API RESPONSE, not once per row: consecutive rows
+/// sharing a [`response_identity`] repeat one response's own usage object, so
+/// only the first of a run contributes. Tracking the last-seen id rather than
+/// a set keeps this streaming-safe over an append-only transcript.
 fn fold_assistant_usage(jsonl: &str, want_sidechain: bool) -> Option<TranscriptUsage> {
     let mut usage = TranscriptUsage::default();
     let mut observed = false;
+    let mut last_id: Option<String> = None;
     for line in jsonl.lines() {
         let Ok(row) = serde_json::from_str::<Value>(line.trim()) else {
             continue;
@@ -593,6 +613,11 @@ fn fold_assistant_usage(jsonl: &str, want_sidechain: bool) -> Option<TranscriptU
             continue;
         };
         observed = true;
+        let id = response_identity(&row).map(str::to_string);
+        if id.is_some() && id == last_id {
+            continue;
+        }
+        last_id = id;
         let row = usage_categories(current);
         usage.input_tokens = usage.input_tokens.saturating_add(row.input_tokens);
         usage.cache_creation_input_tokens = usage
@@ -2570,6 +2595,64 @@ mod tests {
             None,
             "no sidechain rows means None, not a zeroed reading"
         );
+    }
+
+    /// Claude Code >= 2.1.209 writes one transcript row per CONTENT BLOCK of
+    /// one API response (thinking, text, tool_use), each repeating that
+    /// response's identical `usage` object under the same `message.id`.
+    /// Summing per row therefore multiplies a session's real spend by however
+    /// many blocks its responses happened to carry.
+    #[test]
+    fn usage_is_counted_once_per_api_response_not_once_per_row() {
+        let jsonl = concat!(
+            r#"{"type":"assistant","message":{"id":"msg_x","usage":{"input_tokens":10,"cache_creation_input_tokens":20,"cache_read_input_tokens":30,"output_tokens":40}}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"id":"msg_x","usage":{"input_tokens":10,"cache_creation_input_tokens":20,"cache_read_input_tokens":30,"output_tokens":40}}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"id":"msg_x","usage":{"input_tokens":10,"cache_creation_input_tokens":20,"cache_read_input_tokens":30,"output_tokens":40}}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"id":"msg_y","usage":{"input_tokens":1,"output_tokens":2}}}"#,
+        );
+        let usage = transcript_usage(jsonl).expect("usage");
+        assert_eq!(
+            usage,
+            TranscriptUsage {
+                input_tokens: 11,
+                cache_creation_input_tokens: 20,
+                cache_read_input_tokens: 30,
+                output_tokens: 42,
+            }
+        );
+    }
+
+    /// The same rule against the recorded real session: 48 assistant rows,
+    /// 20 distinct `message.id`s. Summing per row reports 10_592_616 -- 2.15x
+    /// the 4_922_703 the account was actually charged.
+    #[test]
+    fn real_session_fixture_usage_matches_its_distinct_message_ids() {
+        let jsonl =
+            std::fs::read_to_string(fixture_path("claude-real-session.jsonl")).expect("fixture");
+        let usage = transcript_usage(&jsonl).expect("usage");
+        let total = usage.input_tokens
+            + usage.cache_creation_input_tokens
+            + usage.cache_read_input_tokens
+            + usage.output_tokens;
+        assert_eq!(total, 4_922_703);
+    }
+
+    /// A row with neither `message.id` nor `requestId` has no response
+    /// identity to dedupe on, so it still counts on its own -- the fallback
+    /// preserves every pre-block-split transcript's reading exactly.
+    #[test]
+    fn rows_without_a_response_id_still_count_individually() {
+        let jsonl = concat!(
+            r#"{"type":"assistant","message":{"usage":{"input_tokens":5,"output_tokens":1}}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"usage":{"input_tokens":5,"output_tokens":1}}}"#,
+        );
+        let usage = transcript_usage(jsonl).expect("usage");
+        assert_eq!(usage.input_tokens, 10);
+        assert_eq!(usage.output_tokens, 2);
     }
 
     #[test]
