@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-31
+last-verified: 2026-09-06
 ---
 
 # Script Files
@@ -50,19 +50,19 @@ Each list entry is dispatched by which key it has — `command`, a nested list, 
       - command: echo "fmt failed, continuing anyway"
 ```
 
-Runs via `powershell -Command` on Windows or `sh -c` elsewhere. `${key}` placeholders in `command` are substituted from the current context before execution; any `${...}` still present afterward (a typo, or a param that doesn't exist) is a hard error naming the unresolved key(s).
+Runs via `powershell -Command` on Windows or `sh -c` elsewhere. `${key}` placeholders in `command` are substituted from the current context before execution; any `${...}` still present afterward (a typo, or a param that doesn't exist) is a hard error naming the unresolved key(s). Substitution is a single pass over the script's own template text — a param/secret/capture value that itself contains `${...}`-shaped text (e.g. a literal secret placeholder) is inserted as opaque data, never expanded again and never reported as an unresolved placeholder the template didn't actually leave open.
 
 **Per-command options** (`script_runner/options.rs`):
 
 | Option | Effect |
 |---|---|
-| `proceed_on_failure` | if `true`, a failing command doesn't stop the script |
+| `proceed_on_failure` | if `true`, a failing command doesn't stop the script — applies even when a listed `fallback` was also tried and also failed |
 | `delay_ms` | sleep this many milliseconds after the command succeeds |
 | `interactive` | inherit stdin/stdout/stderr instead of capturing them |
 | `operating_system` (alias `os`) | skip the step entirely unless it matches the current OS (`linux`/`windows`/`macos`) |
-| `fallback` | a list of commands run if the main command fails; if a fallback also fails, the error names both; `proceed_on_failure` still applies after fallback runs |
+| `fallback` | a list of commands run if the main command fails; each substitutes `${var}` and honors the tracked `cwd`, its own `operating_system`, `proceed_on_failure`, and `delay_ms`; if a fallback also fails, the error names both |
 
-`cd <dir>` is intercepted specially: rather than spawning a subprocess (whose directory change wouldn't outlive it), it resolves `<dir>` against the context's current `cwd` (or the process's actual cwd if none is set yet), canonicalizes it, and stores the result back into `cwd` for every subsequent step.
+`cd <dir>` is intercepted specially only for a **bare single-argument** `cd` — one whitespace-free token, optionally wrapped in one pair of matching quotes (stripped before resolving). Rather than spawning a subprocess (whose directory change wouldn't outlive it), it resolves `<dir>` against the context's current `cwd` (or the process's actual cwd if none is set yet), canonicalizes it, and stores the result back into `cwd` for every subsequent step. Anything else after `cd ` — shell chaining (`cd frontend && npm ci`), a flag (`cd /d D:\repo`), an unmatched quote — falls through to the real shell instead of being treated as a literal directory to canonicalize.
 
 ### Concurrent block
 
@@ -74,7 +74,7 @@ commands:
     - command: ls -a
 ```
 
-A list-of-lists entry (`CommandTypes::Commands`) joins its inner commands with `&&` and opens them in a new terminal window (`cmd /K` on Windows, `osascript`/Terminal.app on macOS, `gnome-terminal`/`x-terminal-emulator`/`xterm` on Linux) rather than running inline — it requires a desktop/GUI session and errors clearly when none is available (e.g. over SSH). See `.zirv/commands/test-concurrentcy.yaml` in this repo for a minimal example.
+A list-of-lists entry (`CommandTypes::Commands`) joins its inner commands with `&&` and opens them in a new terminal window (`cmd /K` on Windows, `osascript`/Terminal.app on macOS, `gnome-terminal`/`x-terminal-emulator`/`xterm` on Linux) rather than running inline — it requires a desktop/GUI session and errors clearly when none is available (e.g. over SSH). See `.zirv/commands/test-concurrentcy.yaml` in this repo for a minimal example. An entry's `operating_system` filter is honored — it's dropped from the joined line (and the whole block is skipped if every entry is filtered out) rather than running regardless of platform — but `capture`, `fallback`, and `interactive` are **hard errors at load time**: none of the three can be honored once a command is handed off to a detached terminal window the script never waits on.
 
 ### Agent step
 

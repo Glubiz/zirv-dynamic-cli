@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-09-05
+last-verified: 2026-09-06
 ---
 
 # Known Issues
@@ -14,6 +14,7 @@ Each entry gets a changelog comment at the top of the file, newest first:
 <!-- Updated YYYY-MM-DD (branch, state): what changed -->
 ```
 
+<!-- Updated 2026-09-06 (feat/inner-workings-audit, T3/T4/T8 fix tracks): recorded four residuals from the 2026-09-05 full-codebase audit's fix tracks -- wrap's automatic-rollover ack-suppression gate (T4/C-3) has no test on either platform; chat.rs's own `--resume` prompt composition still calls the consuming `resume_prompt` before its launch can fail (T4/C-5 covered `resume::run_with` only); a dismissed retained ended row's cursor-follow (push_retained_ended, T8) still shifts a cursor parked on a later retained row when the oldest one drops off the cap; and two scheduling audit findings (D-8, D-10) were investigated and not reproduced, documented as non-bugs rather than fixed -->
 <!-- Updated 2026-09-05 (release/3.22.0-harness-batch-7, issue #295 review round 2): resolved the session-tier directory-naming version gap round 1's finding-6 fix opened -- `list_session`/`forget_session_all` now also read/clean up the legacy unsuffixed `sessions/<sanitized-id>/` directory a pre-round-1 binary would have created, closing the entry below the same round it was found -->
 <!-- Updated 2026-09-05 (release/3.22.0-harness-batch-7, issue #295): recorded that session-tier memory entries are recalled by `zirv ctx recall` but not yet injected into any compiled prompt layer -- `compile.rs`/`compile_with_harness_roster` resolve a session's prompt before that session is registered, so wiring this in needs a session id threaded through every launch call site -->
 <!-- Updated 2026-09-05 (release/3.22.0-harness-batch-7, issue #272 review round 2): closed the handoff.rs residual -- `screen_thresholds` now threads through exec.rs/wrap.rs (restart/relaunch/handover), resume.rs/chat.rs (--resume), hook.rs (SessionStart, resolves its own CtxConfig), and context_status.rs's handoff preview; only search.rs/snapshot.rs's per-line redaction still uses the default, deliberately -->
@@ -99,6 +100,22 @@ Each entry gets a changelog comment at the top of the file, newest first:
 <!-- Updated 2026-08-13 (feat/dashboard, docs sweep): dashboard panes carry no rot score yet -->
 <!-- Updated 2026-08-13 (feat/agent-coordination, review round): markdown header absorption; registry short is a stable address; supervision env scrubbed on every spawn -->
 <!-- Updated 2026-08-13 (feat/agent-coordination, console-safety round): portable-pty do_kill inversion; ConPTY control-byte broadcast; empty nudge prefixes -->
+
+## Wrap's automatic-rollover ack-suppression gate has no test on either platform
+
+Recorded 2026-09-06 (`feat/inner-workings-audit`, T4/C-3 fix track). `pump`'s handover ack-writing arms now write an ack only for a request carrying `generation: Some(_)` (a manual `zirv ctx handover`) and skip it for an automatic rollover (`generation: None`), closing the stale-ack bug where an automatic swap's own `ok: true` sat on disk and answered the operator's NEXT manual handover request instead. The fix's own regression coverage is `handover.rs`'s stale-ack test, which drives the scenario through `handover::run_with` directly; there is no test that exercises `wrap::pump`'s own success/refusal ack-writing arms end to end, on either Windows or unix, to confirm the `generation.is_none()` branch actually skips the write inside a real pump loop rather than only in the isolated unit the current test covers. See [[Ctx Supervisors]]'s "`zirv ctx handover`" section.
+
+## `chat.rs`'s own `--resume` prompt composition still consumes the crash witness before its launch can fail
+
+Recorded 2026-09-06 (`feat/inner-workings-audit`, T4/C-5 fix track). `resume::run_with` now peeks the one-shot `<zirv_interrupted>` crash witness while composing and consumes it only once the launch actually commits (`sessions::launch_consuming_interrupted`, restoring it on a failed spawn/exec). `chat.rs`'s own `zirv chat --resume` prompt-composition path (`working_set`, around line 231, calling the CONSUMING `resume::resume_prompt` rather than `resume_prompt_dry_run`) was not covered by that fix — it still consumes the marker before `chat`'s own launch can fail, so a bad `--agent`, a shim refusal, or a spawn failure on the `chat --resume` path can still destroy the `<zirv_interrupted>` block for a resume that never actually happened. Not yet fixed; would need the same peek-then-consume-on-commit restructuring `resume.rs` now has, threaded through `chat.rs`'s own launch path. See [[Ctx Supervisors]]'s "`in_flight` witnesses a mid-turn crash" section.
+
+## A dismissed retained ended row can still shift a cursor parked on a later retained row
+
+Recorded 2026-09-06 (`feat/inner-workings-audit`, T8/#354 fix track). `restore_fixup` (2026-09-05) keeps the cursor on the same session across a `^A r` restore by folding both the `panes` growth and the `retained` shrink into one index move. The dashboard's own cap eviction (`push_retained_ended`, `MAX_RETAINED_ENDED_ROWS` = 8, oldest dropped first) has no equivalent fixup: dropping the oldest retained row to make room for a new one shifts every later retained row's own index down by one, so a cursor parked on one of those later rows silently re-aims at whichever row slides into its old slot. Fixing this properly needs the sidebar cursor to select by the row's own stable short id rather than by index — the same class of fix `restore_fixup` applied to restoration, not yet applied to cap eviction. See [[Ctx Supervisors]]'s "Completed workers keep a row" paragraph.
+
+## Two scheduling-audit findings were investigated and not reproduced
+
+Recorded 2026-09-06 (`feat/inner-workings-audit`, T3 fix track). The 2026-09-05 full-codebase audit's scheduling pass raised ten numbered findings (D-1 through D-10) against the allocator/seat/rollover machinery; eight were confirmed and fixed (see the 2026-09-05 [[Decision Log]] entry reversing issue #358 (d) and [[Usage and Pacing]]/[[Ctx Supervisors]] for the mechanics). D-8 (a suspected gap in how the requested-harness half of a routing decision behaves) and D-10 were each investigated during the fix track and could not be reproduced against the current codebase — documented here as non-bugs rather than silently dropped, so a future audit does not re-raise the identical suspicion without knowing it was already checked once.
 
 ## Session-tier memory entries are recalled but not yet injected into any compiled prompt layer
 
