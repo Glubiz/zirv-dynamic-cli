@@ -3291,18 +3291,76 @@ fn print_restore_list<W: Write>(
     Ok(())
 }
 
-fn restore_target(backup_path: &Path, dest: &Path) -> SetupResult<()> {
-    if let Ok(metadata) = std::fs::symlink_metadata(dest) {
-        if metadata.file_type().is_symlink() {
-            return Err(format!("refusing to restore over symlink {}", dest.display()).into());
+/// The sibling path a restore stages its copy at before swapping it into
+/// place. Deterministic (not unique-per-run) so a staging path left behind by
+/// an interrupted restore is reclaimed by the next one rather than
+/// accumulating.
+fn restore_staging_path(dest: &Path) -> SetupResult<PathBuf> {
+    let parent = dest.parent().ok_or_else(|| {
+        format!(
+            "refusing to restore over {}: it has no parent",
+            dest.display()
+        )
+    })?;
+    let name = dest.file_name().ok_or_else(|| {
+        format!(
+            "refusing to restore over {}: it has no file name",
+            dest.display()
+        )
+    })?;
+    Ok(parent.join(format!(".{}.zirv-restore-tmp", name.to_string_lossy())))
+}
+
+fn remove_staged(path: &Path) {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => {
+            let _ = std::fs::remove_dir_all(path);
         }
-        if metadata.is_dir() {
-            std::fs::remove_dir_all(dest)?;
-        } else {
-            std::fs::remove_file(dest)?;
+        Ok(_) => {
+            let _ = std::fs::remove_file(path);
         }
+        Err(_) => {}
     }
-    copy_for_backup(backup_path, dest)
+}
+
+/// Copy first, swap second: the backup is copied to a sibling staging path
+/// and only then does the current destination get removed and the staged copy
+/// renamed into place. Removing the destination up front (as this used to)
+/// meant an unreadable backup source -- an incomplete `files/` tree, a
+/// permission change under it -- destroyed the very file it was supposed to
+/// be replacing. See
+/// `restore_leaves_the_destination_intact_when_the_backup_source_is_unreadable`.
+fn restore_target(backup_path: &Path, dest: &Path) -> SetupResult<()> {
+    if std::fs::symlink_metadata(dest).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        return Err(format!("refusing to restore over symlink {}", dest.display()).into());
+    }
+
+    let staging = restore_staging_path(dest)?;
+    remove_staged(&staging);
+    if let Err(error) = copy_for_backup(backup_path, &staging) {
+        remove_staged(&staging);
+        return Err(error);
+    }
+
+    let removal = match std::fs::symlink_metadata(dest) {
+        Ok(metadata) if metadata.is_dir() => std::fs::remove_dir_all(dest),
+        Ok(_) => std::fs::remove_file(dest),
+        Err(_) => Ok(()),
+    };
+    if let Err(error) = removal {
+        remove_staged(&staging);
+        return Err(error.into());
+    }
+
+    // The destination is gone at this point, so a failed rename must leave
+    // the staged copy where an operator can still recover it by hand.
+    std::fs::rename(&staging, dest).map_err(|error| {
+        format!(
+            "restored copy is staged at {} but could not be moved into place: {error}",
+            staging.display()
+        )
+        .into()
+    })
 }
 
 fn restore_run<W: Write>(writer: &mut W, run: &BackupRun, args: &RestoreArgs) -> SetupResult<i32> {
@@ -5064,6 +5122,35 @@ mod tests {
             remaining,
             BTreeSet::from(["a".to_string(), "d".to_string(), "e".to_string()]),
             "the oldest run must survive even though the cap alone would have excluded it"
+        );
+    }
+
+    /// A restore that cannot read its backup source must leave the current
+    /// state exactly where it was: the destination used to be removed before
+    /// a single byte of the backup was read, so an incomplete `files/` tree
+    /// (or a permission change under it) destroyed the very file it was
+    /// supposed to be replacing.
+    #[test]
+    fn restore_leaves_the_destination_intact_when_the_backup_source_is_unreadable() {
+        let root = tempfile::tempdir().expect("root");
+
+        let file_dest = root.path().join("CLAUDE.md");
+        std::fs::write(&file_dest, "current\n").expect("file dest");
+        restore_target(&root.path().join("run/files/CLAUDE.md"), &file_dest)
+            .expect_err("an unreadable backup must fail");
+        assert_eq!(
+            std::fs::read_to_string(&file_dest).expect("file dest survives"),
+            "current\n"
+        );
+
+        let dir_dest = root.path().join(".claude");
+        std::fs::create_dir_all(&dir_dest).expect("dir dest");
+        std::fs::write(dir_dest.join("settings.json"), "{}\n").expect("dir dest file");
+        restore_target(&root.path().join("run/files/.claude"), &dir_dest)
+            .expect_err("an unreadable backup directory must fail");
+        assert_eq!(
+            std::fs::read_to_string(dir_dest.join("settings.json")).expect("dir dest survives"),
+            "{}\n"
         );
     }
 
