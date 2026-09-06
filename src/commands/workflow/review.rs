@@ -2364,16 +2364,23 @@ pub(crate) fn reviewer_argv(
     let read_only = crate::commands::ctx::adapters::read_only_args_for_agent_name(agent)
         .ok_or_else(|| format!("unknown adapter '{agent}'; cannot pin the reviewer read-only"))?;
     seat_args.extend(read_only);
-    // The reviewer is a supervised headless worker by construction: it
-    // reads the package from stdin and needs the trailing harness flags
-    // below, which a dashboard pane cannot carry. Say so explicitly, or a
-    // `review run` issued from inside a dashboard is refused by the pane
-    // gate instead of running (#228 made that refusal loud on purpose).
+    // 2026-09-06: no `--headless`. The package still travels on this child's
+    // own stdin (`-`) -- `zirv ctx agent` resolves the prompt in-process,
+    // before it ever chooses between a pane and an inline run, so the pane
+    // fork carries the identical package as `SpawnRequest::prompt`. What a
+    // pane cannot carry is the trailing `-- <seat_args>` below, whose
+    // load-bearing half is the read-only floor; `--mode read-only` states
+    // that as a request field instead, which `dash::worker_pane_extra_args`
+    // re-applies server-side from this adapter's own read-only pin. A
+    // pane-fulfilled review is already a first-class outcome here --
+    // `ReviewerRun::dashboard_spawn` records no evidence and waits for the
+    // worker's own report -- so this stays one argv, not two paths.
     let mut argv = vec![
         "agent".to_string(),
         agent.to_string(),
         "-".to_string(),
-        "--headless".to_string(),
+        "--mode".to_string(),
+        "read-only".to_string(),
     ];
     // Must land before `--`: these are `zirv agent`'s own flags, not the
     // adapter's passthrough.
@@ -3788,10 +3795,14 @@ mod tests {
         let _home_guard = crate::commands::ctx::testenv::HomeGuard::set(home.path());
         let claude = reviewer_argv("claude", repo.path(), false, None, None).unwrap();
         assert_eq!(
-            &claude[..5],
-            ["agent", "claude", "-", "--headless", "--"],
-            "the reviewer must ask for a headless worker explicitly: inside a \
-             dashboard the pane gate refuses trailing harness flags otherwise"
+            &claude[..6],
+            ["agent", "claude", "-", "--mode", "read-only", "--"],
+            "2026-09-06: no `--headless` -- the reviewer states its read-only floor as a request \
+             field, so a pane fulfilling it re-applies the pin server-side"
+        );
+        assert!(
+            !claude.iter().any(|arg| arg == "--headless"),
+            "`--headless` no longer exists: {claude:?}"
         );
         assert_eq!(
             claude.last().map(String::as_str),
@@ -3824,7 +3835,10 @@ mod tests {
         );
 
         let codex = reviewer_argv("codex", repo.path(), false, None, None).unwrap();
-        assert_eq!(&codex[..5], ["agent", "codex", "-", "--headless", "--"]);
+        assert_eq!(
+            &codex[..6],
+            ["agent", "codex", "-", "--mode", "read-only", "--"]
+        );
         assert!(
             codex
                 .windows(2)
