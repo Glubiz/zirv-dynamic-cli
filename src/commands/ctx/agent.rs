@@ -1724,7 +1724,7 @@ pub fn exit_note(code: i32) -> Option<String> {
 /// `exit_note`'s own special cases: those are zirv giving up (or, for
 /// `EXIT_BUDGET_EXHAUSTED`, zirv stopping the run on purpose), not the
 /// worker failing, and they cost very differently.
-fn delegation_outcome(code: i32) -> &'static str {
+pub(crate) fn delegation_outcome(code: i32) -> &'static str {
     match code {
         0 => "ok",
         exec::EXIT_ROT_EXHAUSTED => "rot-exhausted",

@@ -2202,9 +2202,12 @@ impl FactsCache {
         // A1-4: a `stat`, not a full read-and-re-price of every delegation
         // row, on the overwhelmingly common tick where the append-only
         // ledger has not moved since the last one.
-        self.refresh_spend_with(delegation_ledger_fingerprint(state), cfg, session_short, || {
-            super::log::read_delegations(state, usize::MAX)
-        });
+        self.refresh_spend_with(
+            delegation_ledger_fingerprint(state),
+            cfg,
+            session_short,
+            || super::log::read_delegations(state, usize::MAX),
+        );
 
         // Rebuilt rather than updated in place: a reaped pane or a released
         // registry record must drop out of the map, not linger as a stale
@@ -2674,10 +2677,54 @@ fn enforce_pane_deadlines(
     }
 }
 
-fn account_reaped_pane_spend(pane: &Pane, cfg: &CtxConfig, state: &StateDir, repo: &Path) {
+/// Settles this pane's reservations against what it actually spent, and --
+/// 2026-09-06 -- writes the `log::Delegation` row for it.
+///
+/// The row belongs here rather than on the requesting side: `agent::run_with`
+/// returns at `Dispatch::Answered` as soon as the dashboard acknowledges the
+/// spawn, which is before the pane has run a single turn, so the requester
+/// never learns this delegation's usage, exit code or model at all. Since
+/// headless spawns were removed, a delegation made while any dashboard is
+/// live is ALWAYS a pane -- so with nothing appended here,
+/// `logs/delegations.jsonl` simply stopped growing and every cost line read
+/// `$0.00`. One row per completed pane delegation, attributed to the
+/// requester, carrying the same fields the inline supervised path writes.
+fn account_reaped_pane_spend(
+    pane: &Pane,
+    cfg: &CtxConfig,
+    state: &StateDir,
+    repo: &Path,
+    exit_code: i32,
+) {
     let Some(usage) = pane_transcript_usage(pane, cfg, repo) else {
         return;
     };
+    if let Some(facts) = pane.delegation() {
+        let _ = super::log::append_delegation(
+            state,
+            &super::log::Delegation {
+                ts: super::state::now_secs(),
+                session: pane.session_id(),
+                parent_session: &facts.requester,
+                work_group_id: pane.work_group_id(),
+                agent: pane.agent(),
+                model: pane.launch_model(),
+                input_tokens: usage.input_tokens,
+                cache_creation_input_tokens: usage.cache_creation_input_tokens,
+                cache_read_input_tokens: usage.cache_read_input_tokens,
+                output_tokens: usage.output_tokens,
+                wall_ms: u64::try_from(facts.started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+                exit_code,
+                outcome: super::agent::delegation_outcome(exit_code),
+                mode: Some(facts.mode),
+                // A `SpawnRequest` carries no `--task-class`; the field is
+                // honestly unknown for a pane rather than guessed at.
+                task_class: None,
+                principal: &facts.principal,
+                envelope_sha256: facts.envelope_sha256.as_deref(),
+            },
+        );
+    }
     let actual = super::agent::token_spend(&usage);
     if let Some(group_id) = pane.work_group_id() {
         // Issue #301: `pane.budget_tokens()` is exactly the ceiling
@@ -2885,7 +2932,7 @@ fn reap_ended_panes(
         let pane_cwd = pane.cwd().to_path_buf();
         let pane_owns_cwd = pane.owns_cwd();
         let pane_short = pane.short().to_string();
-        account_reaped_pane_spend(&pane, cfg, state, repo);
+        account_reaped_pane_spend(&pane, cfg, state, repo, code);
         close_claimed_group(&pane, state);
         if index < queues.len() {
             queues.remove(index);
@@ -6224,6 +6271,26 @@ fn fulfill_spawn_request(
     // process and so never re-reads `PARENT_SESSION_ENV` off anything) can
     // label this pane's parent mail without a filesystem round trip.
     pane.set_parent_session(verified_parent.clone());
+    // 2026-09-06: what this pane owes the cost ledger once its child exits
+    // (`account_reaped_pane_spend`). `verified_parent` first -- the identity
+    // this request's own intake channel proved -- falling back to what the
+    // request claimed, because the shared drop directory proves nothing and
+    // an orchestrator seat that is not itself a pane delegates through
+    // exactly that channel. Attribution only; nothing here grants authority.
+    pane.set_delegation(pane::DelegationFacts {
+        requester: verified_parent
+            .clone()
+            .or_else(|| {
+                req.parent_session
+                    .clone()
+                    .filter(|id| prompt::is_addressable_short(id))
+            })
+            .unwrap_or_default(),
+        mode: req.mode,
+        principal: child_envelope.principal.clone(),
+        envelope_sha256: envelope::digest(&child_envelope).ok(),
+        started_at: Instant::now(),
+    });
     // Issue #264 (EXTRA): the pane exists now, so the writer permit acquired
     // above (if any) is tied to its real child pid -- the same `set_child_
     // pid` discipline `agent::run_with`'s headless fork applies -- and handed
@@ -22407,6 +22474,83 @@ mod tests {
                 .any(|(record, _)| record.short == short),
             "so `zirv ctx sessions` no longer lists it at all"
         );
+    }
+
+    /// 2026-09-06: `agent::run_with` returns at `Dispatch::Answered` the
+    /// moment a dashboard acknowledges the spawn -- 600-odd lines before the
+    /// only `log::append_delegation` call it has -- so a delegation the
+    /// dashboard accepted as a pane was never written to the ledger at all.
+    /// With headless spawns gone that is every delegation made while a
+    /// dashboard is live, which is why `logs/delegations.jsonl` stopped
+    /// growing and `zirv ctx status` reported `$0.00 this session`.
+    #[test]
+    fn reaping_a_pane_delegation_writes_exactly_one_ledger_row_for_its_requester() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().to_path_buf();
+
+        let session_id = "5a5a5a5a-2222-4333-8444-555555555555";
+        let spec = PaneSpec {
+            agent_name: "claude".to_string(),
+            argv: trivial_argv(),
+            role: prompt::PromptRole::Worker,
+            verb: sessions::Verb::Dash,
+            session_id: session_id.to_string(),
+            title: "wrk claude".to_string(),
+        };
+        let mut pane = Pane::spawn(
+            spec,
+            &state,
+            &repo,
+            &repo,
+            (80, 24),
+            &[],
+            true,
+            pane::DEFAULT_IDLE_QUIET,
+        )
+        .expect("spawn");
+        pane.set_work_group_id(Some("wg-ledger".to_string()));
+        pane.set_delegation(pane::DelegationFacts {
+            requester: "orch0001".to_string(),
+            mode: crate::commands::ctx::permit::WorkerMode::Writing,
+            principal: "root/aaaa1111".to_string(),
+            envelope_sha256: Some("deadbeef".to_string()),
+            started_at: Instant::now(),
+        });
+
+        let cfg = CtxConfig::default();
+        let adapter = adapters::select(Some("claude"), &[], &cfg).expect("adapter");
+        let transcript = adapter.transcript_path(&SessionRef {
+            id: SessionId::parse(session_id),
+            cwd: repo.clone(),
+        });
+        std::fs::create_dir_all(transcript.parent().expect("transcript parent"))
+            .expect("create transcript dir");
+        std::fs::write(
+            &transcript,
+            r#"{"type":"assistant","message":{"usage":{"input_tokens":10,"cache_creation_input_tokens":20,"cache_read_input_tokens":30,"output_tokens":5}}}"#,
+        )
+        .expect("write transcript");
+
+        account_reaped_pane_spend(&pane, &cfg, &state, &repo, 0);
+        let _ = pane.finish_shutdown();
+
+        let rows = crate::commands::ctx::log::read_delegations(&state, usize::MAX);
+        assert_eq!(rows.len(), 1, "exactly one row per completed delegation");
+        let row = &rows[0];
+        assert_eq!(
+            row.parent_session, "orch0001",
+            "the row is attributed to the session that delegated it"
+        );
+        assert_eq!(row.session, session_id);
+        assert_eq!(row.work_group_id.as_deref(), Some("wg-ledger"));
+        assert_eq!(row.input_tokens, 10);
+        assert_eq!(row.cache_creation_input_tokens, 20);
+        assert_eq!(row.cache_read_input_tokens, 30);
+        assert_eq!(row.output_tokens, 5);
+        assert_eq!(row.outcome, "ok");
     }
 
     #[cfg(unix)]
