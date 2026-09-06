@@ -3920,6 +3920,16 @@ const OPERATOR_CONFIG_DESTINATION_PROGRAMS: &[&str] = &[
 /// place of a trailing positional operand.
 const DESTINATION_FLAGS: &[&str] = &["-destination", "-dest", "-t", "--target-directory"];
 
+/// Splits a `-flag=value`/`-Flag:value` token into its two halves. Both GNU
+/// long options and PowerShell parameters accept the joined spelling, which
+/// carries the write target inside a single token that starts with `-` --
+/// invisible to any scan that filters flags out before looking at paths.
+fn joined_flag_value(token: &str) -> Option<(&str, &str)> {
+    let rest = token.strip_prefix('-')?;
+    let index = rest.find(['=', ':'])?;
+    Some((&token[..=index], &rest[index + 1..]))
+}
+
 /// Whether `command` writes to or deletes anything under the operator's own
 /// `~/.zirv/`, in any of the spellings this module can resolve statically:
 /// an output redirection, or a write/delete program naming the path as an
@@ -3945,17 +3955,28 @@ fn writes_into_operator_zirv_config(command: &str) -> bool {
         .map(String::as_str)
         .filter(|token| !token.starts_with('-'))
         .collect();
+    let joined: Vec<(&str, &str)> = tokens
+        .iter()
+        .skip(1)
+        .filter_map(|token| joined_flag_value(token.as_str()))
+        .collect();
     if OPERATOR_CONFIG_WRITE_PROGRAMS.contains(&program.as_str()) {
-        return operands.iter().copied().any(operator_zirv_path);
+        return operands.iter().copied().any(operator_zirv_path)
+            || joined.iter().any(|(_, value)| operator_zirv_path(value));
     }
     if OPERATOR_CONFIG_DESTINATION_PROGRAMS.contains(&program.as_str()) {
+        let names_destination = |flag: &str| {
+            DESTINATION_FLAGS
+                .iter()
+                .any(|known| flag.eq_ignore_ascii_case(known))
+        };
         return operands.last().copied().is_some_and(operator_zirv_path)
-            || tokens.windows(2).any(|pair| {
-                DESTINATION_FLAGS
-                    .iter()
-                    .any(|flag| pair[0].eq_ignore_ascii_case(flag))
-                    && operator_zirv_path(&pair[1])
-            });
+            || tokens
+                .windows(2)
+                .any(|pair| names_destination(&pair[0]) && operator_zirv_path(&pair[1]))
+            || joined
+                .iter()
+                .any(|(flag, value)| names_destination(flag) && operator_zirv_path(value));
     }
     false
 }
@@ -11694,6 +11715,13 @@ mod tests {
             r"del %USERPROFILE%\.zirv\ctx.toml",
             "rm /home/josj/.zirv/ctx.toml",
             r"cp evil.toml C:\Users\josj\.zirv\ctx.toml",
+            // Review round 1 (R2): a destination flag joined to its value by
+            // `=` or `:` is one token, and one starting with `-` was dropped
+            // before any path was inspected.
+            "cp evil.toml --target-directory=~/.zirv",
+            "cp evil.toml -t=$HOME/.zirv",
+            "Copy-Item evil.toml -Destination:~/.zirv/ctx.toml",
+            "Remove-Item -Path:~/.zirv/ctx.toml",
         ] {
             assert_eq!(
                 evaluate(&policy, command, LaunchMode::Interactive).verdict,
