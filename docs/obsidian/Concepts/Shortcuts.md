@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-31
+last-verified: 2026-09-06
 ---
 
 # Shortcuts
@@ -24,6 +24,10 @@ shortcuts:
 
 1. As a literal path relative to `commands/` (`commands_dir.join(mapped_file)`).
 2. With each supported extension appended in turn (`yaml`, `yml`, `json`, `toml`), so `tp: test-params` works the same as `tp: test-params.yaml`.
+
+## Target confinement
+
+`.shortcuts.yaml` is repo-owned, untrusted config (see [[Untrusted Configuration]]) and may only narrow what a lookup reaches, so `input::shortcut_target_is_confined` checks the mapped value *before* it is ever joined against `commands/`. A target is refused, loudly and by name, when it is rooted or absolute (`/x`, `C:\x`, `\x`), contains a `..` component, **or contains a `:`** — the last covering a Windows drive-relative target such as `C:legacy.yaml`, which has neither a root nor a `..` yet still makes `commands_dir.join(..)` discard the base path entirely and resolve against that drive's own current directory (refused since 2026-09-06; the same guard `create::validate_name` applies to a script name). The `:` rule applies on every platform, so the outcome does not depend on which platform parses the path.
 
 ## When it's consulted
 
