@@ -2381,7 +2381,23 @@ pub fn run_posttool<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> Ctx
         PathBuf::from(&payload.cwd)
     };
     let cfg = cfg_or_operator_only_gate(&cwd, env);
-    if !cfg.output.compact || combined.len() < cfg.output.compact_min_bytes {
+    if !cfg.output.compact {
+        return Ok(0);
+    }
+    // How much of THIS command's output may be replaced at all. A reader --
+    // `cat`, `sed -n`, `rg`, `git diff`, an operator's own `[output]
+    // verbatim` entry, or zirv's own retrieval surface -- is never compacted:
+    // a model reads that output verbatim before editing against it, so a
+    // head/tail summary would silently corrupt the edit rather than merely
+    // cost tokens.
+    let threshold =
+        match super::output::classify_compaction(&payload.tool_input.command, &cfg.output.verbatim)
+        {
+            super::output::CompactionScope::Verbatim => return Ok(0),
+            super::output::CompactionScope::Known => cfg.output.compact_min_bytes,
+            super::output::CompactionScope::Generic => cfg.output.compact_generic_min_bytes,
+        };
+    if combined.len() < threshold {
         return Ok(0);
     }
     let Ok(state) = StateDir::resolve(env) else {
@@ -2403,6 +2419,13 @@ pub fn run_posttool<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> Ctx
         // Nothing was stored, so nothing may be replaced: handing back a
         // summary whose retrieval line names a file that does not exist would
         // turn this from compression into loss.
+        return Ok(0);
+    };
+    // `None` means the summary could not carry its own MANDATORY failure
+    // content inside the cap. Replacing a result with a summary that had
+    // silently dropped a `fatal:` is strictly worse than not replacing it, so
+    // this fails open like every other path in here.
+    let Some(summary) = summary else {
         return Ok(0);
     };
     let _ = writeln!(w, "{}", posttool_output(&summary, response.interrupted));
@@ -5716,6 +5739,158 @@ mod tests {
             ),
         );
         assert!(out.is_empty(), "{out}");
+    }
+
+    /// Review finding 6: a model reads a READER's output verbatim before
+    /// editing against it, so head/tail there does not cost tokens, it
+    /// corrupts the edit. These are never compacted at any size.
+    #[test]
+    fn posttool_never_compacts_a_reader_command() {
+        let rig = posttool_rig(&[]);
+        let big: String = (1..=2000)
+            .map(|i| format!("line {i} of the file\n"))
+            .collect();
+        assert!(
+            big.len() > 20_000,
+            "the fixture must be past every threshold"
+        );
+        for command in [
+            "cat src/lib.rs",
+            "sed -n '1,400p' src/lib.rs",
+            "rg TODO src",
+            "git diff HEAD~1",
+            "git show HEAD",
+            "cargo test | tail -20",
+        ] {
+            let out = run_post(
+                &rig,
+                &posttool_stdin(
+                    &rig.repo,
+                    "Bash",
+                    command,
+                    serde_json::json!({
+                        "stdout": big.clone(),
+                        "stderr": "",
+                        "interrupted": false,
+                        "isImage": false,
+                    }),
+                ),
+            );
+            assert!(
+                out.is_empty(),
+                "{command} must reach the model verbatim: {out}"
+            );
+        }
+    }
+
+    /// Review finding 4: zirv's own retrieval surface must never be
+    /// compacted. It used to be, so `output show --range 1-1` on one huge
+    /// captured line came back as a SECOND summary and no range could ever
+    /// reach the original.
+    #[test]
+    fn posttool_never_compacts_its_own_retrieval_surface() {
+        let rig = posttool_rig(&[]);
+        let big: String = (1..=2000).map(|i| format!("stored line {i}\n")).collect();
+        for command in [
+            "zirv ctx output show abc123 --range 1-1",
+            "zirv ctx output list",
+            "zirv ctx run --full -- cargo test",
+        ] {
+            let out = run_post(
+                &rig,
+                &posttool_stdin(
+                    &rig.repo,
+                    "Bash",
+                    command,
+                    serde_json::json!({
+                        "stdout": big.clone(),
+                        "stderr": "",
+                        "interrupted": false,
+                        "isImage": false,
+                    }),
+                ),
+            );
+            assert!(
+                out.is_empty(),
+                "{command} hands back text on purpose: {out}"
+            );
+        }
+    }
+
+    /// Review finding 6b/6c: a modelled build/test family is compacted from
+    /// the low threshold, because the summary provably keeps the lines that
+    /// matter; an unrecognised producer only past the much higher generic
+    /// threshold, and its summary says which lines it dropped.
+    #[test]
+    fn posttool_paces_a_known_family_and_an_unknown_one_differently() {
+        let rig = posttool_rig(&[]);
+        let five_kb: String = (1..=250)
+            .map(|i| format!("compiling crate number {i}\n"))
+            .collect();
+        assert!((4096..16384).contains(&five_kb.len()), "{}", five_kb.len());
+
+        let known = run_post(
+            &rig,
+            &posttool_stdin(
+                &rig.repo,
+                "Bash",
+                "cargo test",
+                serde_json::json!({
+                    "stdout": five_kb.clone(),
+                    "stderr": "",
+                    "interrupted": false,
+                    "isImage": false,
+                }),
+            ),
+        );
+        assert!(!known.is_empty(), "cargo test at 5 KB must be compacted");
+
+        let unknown = run_post(
+            &rig,
+            &posttool_stdin(
+                &rig.repo,
+                "Bash",
+                "some-tool --report",
+                serde_json::json!({
+                    "stdout": five_kb,
+                    "stderr": "",
+                    "interrupted": false,
+                    "isImage": false,
+                }),
+            ),
+        );
+        assert!(
+            unknown.is_empty(),
+            "an unrecognised 5 KB result stays verbatim: {unknown}"
+        );
+
+        let twenty_kb: String = (1..=1000)
+            .map(|i| format!("some tool output line {i}\n"))
+            .collect();
+        assert!(twenty_kb.len() > 16384);
+        let big_unknown = run_post(
+            &rig,
+            &posttool_stdin(
+                &rig.repo,
+                "Bash",
+                "some-tool --report",
+                serde_json::json!({
+                    "stdout": twenty_kb,
+                    "stderr": "",
+                    "interrupted": false,
+                    "isImage": false,
+                }),
+            ),
+        );
+        let parsed: serde_json::Value = serde_json::from_str(big_unknown.trim()).expect("json");
+        let summary = parsed["hookSpecificOutput"]["updatedToolOutput"]["stdout"]
+            .as_str()
+            .expect("a summary");
+        assert!(
+            summary.contains("lines omitted between line"),
+            "an unrecognised shape's summary must say what it cut: {summary}"
+        );
+        assert!(summary.contains("zirv ctx output show"), "{summary}");
     }
 
     /// `interrupted` is a fact about the run, not about the output, so it

@@ -246,7 +246,9 @@ model = "fable"
 
 # [output]
 # compact = true                     # REPO-FORBIDDEN (ZIRV_CTX_OUTPUT_COMPACT): whether claude's PostToolUse hook replaces a large Bash tool result with a compact summary. Forbidden in BOTH directions. Default: true.
-# compact_min_bytes = 4096           # REPO-FORBIDDEN (ZIRV_CTX_OUTPUT_COMPACT_MIN_BYTES): how many bytes of combined stdout+stderr a Bash result needs before it is compacted at all. Forbidden in BOTH directions. Default: 4096.
+# compact_min_bytes = 4096           # REPO-FORBIDDEN (ZIRV_CTX_OUTPUT_COMPACT_MIN_BYTES): bytes a KNOWN build/test/log family's result needs before it is compacted. Forbidden in BOTH directions. Default: 4096.
+# compact_generic_min_bytes = 16384  # REPO-FORBIDDEN (ZIRV_CTX_OUTPUT_COMPACT_GENERIC_MIN_BYTES): the same threshold for a command whose output shape zirv does not recognise. Default: 16384.
+# verbatim = []                      # REPO-FORBIDDEN (ZIRV_CTX_OUTPUT_VERBATIM): extra program names NEVER compacted, added to the built-in reader set (cat, sed, grep, git diff, ...). Additive only. Default: [].
 # max_summary_bytes = 4096           # REPO-FORBIDDEN (ZIRV_CTX_OUTPUT_MAX_SUMMARY_BYTES): hard cap on one compact summary. The `zirv ctx output show <id>` retrieval line always survives it. Default: 4096.
 
 # [policy]                           # zirv's own canonical permissions policy (src/commands/ctx/policy.rs).
