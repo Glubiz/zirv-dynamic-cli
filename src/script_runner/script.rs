@@ -43,6 +43,15 @@ impl Script {
                     ));
                     return Err(e);
                 }
+                // R7: only `execute` registers a `capture:` variable, so
+                // without this every later step naming one was rejected as
+                // unresolved -- a dry run refusing a script the real run
+                // completes. The stand-in is deliberately visible in the
+                // printed command line: a dry run must never look like it
+                // knows a value it cannot have.
+                if let Some(var) = step.captured_var() {
+                    context.insert(var.to_string(), format!("<capture:{var}>"));
+                }
                 continue;
             }
             crate::output::step(index, total, &cmd_display);
@@ -125,6 +134,45 @@ mod tests {
         assert!(real.is_err(), "the real run must reject it: {real:?}");
         let message = dry.expect_err("the dry run must reject it too");
         assert!(message.contains("missing"), "got: {message}");
+    }
+
+    /// Review round 1 (R7): the other half of the same rule. Only `execute`
+    /// registers a `capture:` variable, so a dry run rejected every later step
+    /// that referenced one -- a script the real run completes cleanly could
+    /// not be dry-run at all.
+    #[tokio::test]
+    async fn a_dry_run_accepts_a_placeholder_captured_by_an_earlier_step() {
+        let script = Script {
+            name: "Captured".to_string(),
+            description: None,
+            params: None,
+            secrets: None,
+            commands: vec![
+                CommandTypes::Command(Command {
+                    command: "echo hello".to_string(),
+                    capture: Some("greeting".to_string()),
+                    description: None,
+                    options: None,
+                }),
+                CommandTypes::Command(Command {
+                    command: "echo ${greeting}".to_string(),
+                    capture: None,
+                    description: None,
+                    options: None,
+                }),
+            ],
+        };
+
+        let mut context = HashMap::new();
+        script
+            .run(&mut context, true)
+            .await
+            .expect("a dry run resolves what an earlier step captures");
+        assert_eq!(
+            context.get("greeting").map(String::as_str),
+            Some("<capture:greeting>"),
+            "the placeholder is visibly a dry-run stand-in, not a real value"
+        );
     }
 
     #[tokio::test]

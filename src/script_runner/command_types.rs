@@ -150,6 +150,18 @@ impl CommandTypes {
         }
     }
 
+    /// The variable a real run of this step would define through `capture:`,
+    /// so `--dry-run` can stand a placeholder in for it and let later steps
+    /// resolve (review round 1, R7). `None` for the two step kinds that never
+    /// capture: an agent step rejects `capture` at load time, and a
+    /// concurrent block spawns a terminal window it never reads back.
+    pub fn captured_var(&self) -> Option<&str> {
+        match self {
+            CommandTypes::Command(cmd) if !cmd.skipped_for_os() => cmd.capture.as_deref(),
+            CommandTypes::Command(_) | CommandTypes::Commands(_) | CommandTypes::Agent(_) => None,
+        }
+    }
+
     pub fn description(&self) -> Option<String> {
         match self {
             CommandTypes::Command(cmd) => cmd.description.clone(),
