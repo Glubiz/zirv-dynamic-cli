@@ -822,37 +822,52 @@ pub(crate) fn validate_shared_key(key: &str) -> CtxResult<()> {
 /// (demonstrated directly, independent of this guard, by
 /// `a_header_rendered_field_with_an_embedded_newline_would_inject_a_fake_
 /// header_line`). Checked for every field `to_markdown` interpolates into a
-/// header line: `written_by`, `source`, `importance`/`confidence` (if set),
-/// and every individual tag/path (each one still ends up on the SAME
+/// header line: `key`, `written_by`, `source`, `importance`/`confidence` (if
+/// set), and every individual tag/path (each one still ends up on the SAME
 /// rendered line, joined by `", "`, so a newline inside any single one of
-/// them still breaks that line in two). `key` is excluded: `validate_shared_
-/// key`'s charset already rules out `\n`/`\r` there. `body` is excluded too:
-/// N2's header-terminates-at-the-first-blank-line rule already means
-/// anything after the header, including a body that itself contains
-/// newlines, can never be read back as a header line.
+/// them still breaks that line in two). `body` is excluded: N2's
+/// header-terminates-at-the-first-blank-line rule already means anything
+/// after the header, including a body that itself contains newlines, can
+/// never be read back as a header line.
+///
+/// `key` used to be excluded here on the grounds that `validate_shared_key`'s
+/// charset already rules `\n`/`\r` out. That was true of the SHARED tier
+/// alone: `remember_inner`/`remember_session_inner` call neither validator,
+/// so a private- or session-tier `remember` accepted a forged key and
+/// `promote --shared` re-parsed the injected header lines back out and
+/// laundered them into the committed bank. Those two now run
+/// [`no_header_newline`] on the key themselves, and it is checked here too so
+/// the shared tier does not depend on a sibling validator for it.
 fn validate_shared_entry_fields(entry: &Entry) -> CtxResult<()> {
-    let no_newline = |value: &str, field: &str| -> CtxResult<()> {
-        if value.contains(['\n', '\r']) {
-            return Err(format!(
-                "memory entry field `{field}` must not contain a newline (it would inject a fake header line into the stored file)"
-            )
-            .into());
-        }
-        Ok(())
-    };
-    no_newline(&entry.written_by, "written_by")?;
-    no_newline(&entry.source, "source")?;
+    no_header_newline(&entry.key, "key")?;
+    no_header_newline(&entry.written_by, "written_by")?;
+    no_header_newline(&entry.source, "source")?;
     if let Some(importance) = &entry.importance {
-        no_newline(importance, "importance")?;
+        no_header_newline(importance, "importance")?;
     }
     if let Some(confidence) = &entry.confidence {
-        no_newline(confidence, "confidence")?;
+        no_header_newline(confidence, "confidence")?;
     }
     for tag in &entry.tags {
-        no_newline(tag, "tags")?;
+        no_header_newline(tag, "tags")?;
     }
     for path in &entry.paths {
-        no_newline(path, "paths")?;
+        no_header_newline(path, "paths")?;
+    }
+    Ok(())
+}
+
+/// Refuses `\n`/`\r` in one field `to_markdown` interpolates into a
+/// `## Memory` header line. Standalone (rather than a closure inside
+/// `validate_shared_entry_fields`) so the private and session tiers, which
+/// have no shared-scope validation of their own, can apply the identical rule
+/// to `key` without pulling in the whole shared-entry check.
+fn no_header_newline(value: &str, field: &str) -> CtxResult<()> {
+    if value.contains(['\n', '\r']) {
+        return Err(format!(
+            "memory entry field `{field}` must not contain a newline (it would inject a fake header line into the stored file)"
+        )
+        .into());
     }
     Ok(())
 }
@@ -1856,6 +1871,7 @@ fn remember_inner(
     journal: bool,
     _lock: &BankLock,
 ) -> CtxResult<PathBuf> {
+    no_header_newline(&entry.key, "key")?;
     let dir = state.memory().join(slug);
     super::state::create_private_dir_all(&dir)?;
 
@@ -2224,6 +2240,7 @@ fn remember_session_inner(
     journal: bool,
     _lock: &BankLock,
 ) -> CtxResult<PathBuf> {
+    no_header_newline(&entry.key, "key")?;
     let dir = session_dir(state, slug, session_id);
     super::state::create_private_dir_all(&dir)?;
 
@@ -7275,6 +7292,68 @@ This is part of the body too.\n";
         // Windows matches the whole base name, never a substring.
         assert!(validate_shared_key("console").is_ok());
         assert!(validate_shared_key("con-fig").is_ok());
+    }
+
+    /// `validate_shared_key`'s charset rules a newline out of a SHARED key,
+    /// but the private and session tiers never ran either validator, so a
+    /// key like `k\n- Importance: high` rendered forged `## Memory` header
+    /// lines that `parse_markdown` reads back as real -- and `promote
+    /// --shared` re-parsed them and laundered them into the committed bank,
+    /// changing recall ranking with flags nobody ever passed.
+    #[test]
+    fn a_key_with_an_embedded_newline_is_refused_on_every_tier() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let cfg = CtxConfig::default();
+
+        let mut entry = sample("build-cmd", 1);
+        entry.key = "build-cmd\n- Importance: high\n- Confidence: high".to_string();
+        entry.importance = Some("low".to_string());
+
+        let lock = lock_bank(MemoryScope::Private, &state, "slug").expect("lock");
+        remember_inner(&state, "slug", &entry, &cfg, true, &lock)
+            .expect_err("the private tier refuses a forged key");
+        remember_session_inner(&state, "slug", "sess", &entry, &cfg, true, &lock)
+            .expect_err("the session tier refuses a forged key");
+        drop(lock);
+        let lock = lock_bank(MemoryScope::Shared, &state, "slug").expect("lock");
+        upsert_shared_inner(
+            repo.path(),
+            &state,
+            "slug",
+            &cfg,
+            &entry,
+            false,
+            true,
+            &lock,
+        )
+        .expect_err("the shared tier refuses a forged key");
+        drop(lock);
+
+        for path in walk_files(state.memory()) {
+            let text = std::fs::read_to_string(&path).unwrap_or_default();
+            assert!(
+                text.matches("- Importance:").count() < 2,
+                "{} carries a forged header line: {text}",
+                path.display()
+            );
+        }
+    }
+
+    fn walk_files(root: PathBuf) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        let Ok(entries) = std::fs::read_dir(&root) else {
+            return out;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                out.extend(walk_files(path));
+            } else {
+                out.push(path);
+            }
+        }
+        out
     }
 
     /// IMPORTANT fix (review round 1): `upsert_shared` validated only
