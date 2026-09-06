@@ -1378,6 +1378,39 @@ pub fn note_failure(
     }
 }
 
+/// Issue #310 parity for `wrap`'s own rot restart. `exec` records every respawn
+/// on the cross-process restart chain and refuses to auto-resume once the
+/// breaker trips; `wrap`'s `Action::Restart` arm recorded nothing and asked
+/// nothing, so a session that rots, restarts, and rots again immediately kept
+/// relaunching forever -- and did it under a per-process budget `wrap` does not
+/// have either. Same chain key (the repo slug) and same class (`Crash`, which
+/// is where a rot-triggered restart belongs: neither a stall nor a vendor-side
+/// condition) as `exec`, so the two supervisors share one breaker over one
+/// repository rather than each keeping half a picture.
+///
+/// `Some(boots)` means "do not relaunch"; the caller degrades to passthrough.
+/// Everything about the decision lives here so the PTY arm that calls it stays
+/// the only part that needs a real terminal to exercise.
+fn tripped_restart_chain(
+    state: &StateDir,
+    repo: &Path,
+    cfg: &CtxConfig,
+    now_secs: u64,
+) -> Option<u32> {
+    match super::chain::record_boot_and_evaluate(
+        state,
+        &super::state::repo_slug(repo),
+        super::chain::FailureClass::Crash,
+        false,
+        now_secs,
+        cfg.supervise.chain_max_restarts,
+        cfg.supervise.chain_max_gap_secs,
+    ) {
+        super::chain::ChainVerdict::Tripped { boots } => Some(boots),
+        super::chain::ChainVerdict::Ok => None,
+    }
+}
+
 /// Polls until `child` exits or `deadline` passes, returning whether it exited.
 fn wait_for_exit(
     child: &mut Box<dyn portable_pty::Child + Send + Sync>,
@@ -3667,8 +3700,45 @@ fn pump(
                     },
                 );
             }
-            Action::Restart => {
+            Action::Restart => 'restart: {
                 supervision.cooldown_at_signal = Some(supervision.signals_seen);
+
+                // Before anything is torn down: a restart chain that has
+                // already tripped means this session is in a loop that
+                // relaunching will not break, so `wrap` stands down to plain
+                // passthrough (the child keeps running, untouched) rather than
+                // spending another distiller call and another pty on it. Same
+                // breaker `exec` gates on -- see `tripped_restart_chain`.
+                if let Some(boots) =
+                    tripped_restart_chain(state_dir, repo, cfg, super::state::now_secs())
+                {
+                    let _ = super::log::append(
+                        state_dir,
+                        &super::log::Decision {
+                            ts: super::state::now_secs(),
+                            session: session.as_str(),
+                            verb: "wrap",
+                            verdict: "restart",
+                            score: supervision.score,
+                            action: "chain-tripped",
+                            detail: &format!(
+                                "{boots} unplanned restarts within the configured gap; not \
+                                 relaunching"
+                            ),
+                            observed_at: None,
+                        },
+                    );
+                    note_failure(
+                        supervision,
+                        Some((state_dir, session.as_str())),
+                        &format!(
+                            "restart-chain breaker tripped ({boots} restarts within the \
+                             configured gap); supervising no further -- run `zirv ctx status`"
+                        ),
+                        announcer,
+                    );
+                    break 'restart;
+                }
 
                 // P5: park the record on zirv's own (unquestionably alive) pid
                 // for the duration of the restart. Everything from here to the
@@ -8274,6 +8344,31 @@ mod tests {
         let mut supervision = InjectionState::new();
         note_failure(&mut supervision, None, "no state dir", &Announcer::silent());
         assert!(supervision.degraded);
+    }
+
+    /// Issue #310 parity: `exec` records every respawn on the cross-process
+    /// restart chain and stands down once the breaker trips; `wrap`'s own
+    /// `Action::Restart` arm recorded nothing and asked nothing, so a session
+    /// that rots straight back into a restart relaunched forever, on no budget
+    /// at all.
+    #[test]
+    fn a_tripped_restart_chain_stops_wraps_own_relaunches() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        let cfg = CtxConfig::default();
+
+        assert_eq!(
+            tripped_restart_chain(&state, &repo, &cfg, 1_000),
+            None,
+            "the first restart is never the pattern"
+        );
+        assert_eq!(tripped_restart_chain(&state, &repo, &cfg, 1_010), None);
+        assert_eq!(
+            tripped_restart_chain(&state, &repo, &cfg, 1_020),
+            Some(cfg.supervise.chain_max_restarts),
+            "three restarts inside the configured gap is the loop the breaker exists for"
+        );
     }
 
     #[cfg(unix)]
