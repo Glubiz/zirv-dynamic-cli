@@ -2033,15 +2033,29 @@ impl FactsCache {
     /// A1-4: folds the delegation ledger into `disk.spend`, but only when the
     /// ledger's own fingerprint moved since the last fold. `read_rows` is
     /// injected so the skip is testable without a ledger on disk.
-    fn refresh_spend_with<F>(&mut self, fingerprint: (u64, u64), cfg: &CtxConfig, read_rows: F)
-    where
+    fn refresh_spend_with<F>(
+        &mut self,
+        fingerprint: (u64, u64),
+        cfg: &CtxConfig,
+        session_short: &str,
+        read_rows: F,
+    ) where
         F: FnOnce() -> Vec<super::log::DelegationRow>,
     {
         if self.spend_key == Some(fingerprint) {
             return;
         }
         self.spend_key = Some(fingerprint);
-        let delegation_rows = read_rows();
+        // 2026-09-06: the footer renders this as "$<cost> this session", so
+        // it is filtered by the same predicate `status::spend_status_line`
+        // uses for its own "this session" figure -- `parent_session`, the
+        // session that DELEGATED the row. Unfiltered, the footer summed the
+        // whole machine-wide ledger and disagreed with `zirv ctx status` on
+        // the same dashboard.
+        let delegation_rows: Vec<_> = read_rows()
+            .into_iter()
+            .filter(|row| row.parent_session == session_short)
+            .collect();
         self.disk.spend = if delegation_rows.is_empty() {
             None
         } else {
@@ -2212,7 +2226,7 @@ impl FactsCache {
         // A1-4: a `stat`, not a full read-and-re-price of every delegation
         // row, on the overwhelmingly common tick where the append-only
         // ledger has not moved since the last one.
-        self.refresh_spend_with(delegation_ledger_fingerprint(state), cfg, || {
+        self.refresh_spend_with(delegation_ledger_fingerprint(state), cfg, session_short, || {
             super::log::read_delegations(state, usize::MAX)
         });
 
@@ -15426,7 +15440,7 @@ mod tests {
         let mut reads = 0usize;
 
         for _ in 0..5 {
-            cache.refresh_spend_with((128, 42), &cfg, || {
+            cache.refresh_spend_with((128, 42), &cfg, "orch0001", || {
                 reads += 1;
                 Vec::new()
             });
@@ -15436,11 +15450,53 @@ mod tests {
             "an unchanged ledger is folded once, not once per throttled tick"
         );
 
-        cache.refresh_spend_with((256, 43), &cfg, || {
+        cache.refresh_spend_with((256, 43), &cfg, "orch0001", || {
             reads += 1;
             Vec::new()
         });
         assert_eq!(reads, 2, "a grown ledger is re-read and re-priced");
+    }
+
+    /// The footer says "$<spend> this session", so it has to mean what
+    /// `status::spend_status_line` means by it -- the rows THIS dashboard's
+    /// own session delegated -- rather than every row any session on this
+    /// machine ever logged. The two disagreeing is what made `zirv ctx
+    /// status` and the dashboard footer report different money.
+    #[test]
+    fn the_footer_spend_counts_only_this_sessions_own_delegations() {
+        let cfg = CtxConfig::default();
+        let mut cache = FactsCache::new(Instant::now());
+        let row = |parent: &str, outcome: &str| -> super::super::log::DelegationRow {
+            serde_json::from_value(serde_json::json!({
+                "ts": 1_700_000_000u64,
+                "session": "child001",
+                "parent_session": parent,
+                "agent": "claude",
+                "model": "sonnet",
+                "input_tokens": 0u64,
+                "cache_creation_input_tokens": 0u64,
+                "cache_read_input_tokens": 0u64,
+                "output_tokens": 1_000_000u64,
+                "wall_ms": 1000u64,
+                "exit_code": 0,
+                "outcome": outcome,
+            }))
+            .expect("row")
+        };
+
+        cache.refresh_spend_with((1, 1), &cfg, "orch0001", || {
+            vec![row("orch0001", "ok"), row("other999", "failed")]
+        });
+
+        let spend = cache.disk.spend.expect("the owner's own row is not empty");
+        assert_eq!(
+            spend.cost_micros, 15_000_000,
+            "only the owner's own 1M sonnet output tokens ($15) may be counted"
+        );
+        assert_eq!(
+            spend.failed, 0,
+            "another session's failed delegation is not this footer's failure"
+        );
     }
 
     /// A1-2: restoring a retained ended row grows `panes` and shrinks

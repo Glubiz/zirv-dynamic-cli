@@ -140,10 +140,10 @@ pub struct DelegationRow {
     #[allow(dead_code)]
     pub ts: u64,
     pub session: String,
-    /// Kept for parity with `Delegation`; no caller has needed a delegation's
-    /// parent yet -- `status::group_tree_lines` already knows which group
-    /// (and thus which parent) a row belongs to via `work_group_id`.
-    #[allow(dead_code)]
+    /// Who delegated this row. `status::spend_status_line` and the
+    /// dashboard footer (`dash::mod::FactsCache::refresh_spend_with`) both
+    /// filter their "this session" figure on it, which is the only reason
+    /// the two agree on the money they report.
     pub parent_session: String,
     #[serde(default)]
     pub work_group_id: Option<String>,
