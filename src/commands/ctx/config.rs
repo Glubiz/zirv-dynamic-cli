@@ -1734,10 +1734,12 @@ impl FallbackConfig {
 /// Both fields default to `None`, meaning "use the global `fallback.*`
 /// limits unchanged" -- an entry only needs to name the field it actually
 /// wants to override. Repo narrowing (`narrow_fallback_harness`) is per
-/// field, not whole-entry: `max_active` may only be lowered, `reserve_
-/// headroom_pct` may only be raised, and a repo-only entry for a harness the
-/// home layer never mentioned simply applies, since `None` on the home side
-/// already means "no cap", and any repo value narrows that.
+/// field, not whole-entry: `max_active` may only be lowered and `reserve_
+/// headroom_pct` may only be raised. A repo-only `max_active` simply
+/// applies, since `None` on the home side means "no cap" and any repo value
+/// narrows that -- but a repo-only `reserve_headroom_pct` is clamped to the
+/// global `min_candidate_headroom_pct` floor, because there `None` means
+/// "use that floor", so a lower repo value would be a widening (A-2/D-3).
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct HarnessLimits {
@@ -2571,12 +2573,23 @@ fn fallback_harness_map_at(
 /// (`max`, repo may only demand more of a safety margin) -- the same two
 /// polarities `fallback.predictive_headroom_pct`/`fallback.min_candidate_
 /// headroom_pct` already use, applied per harness instead of globally. A
-/// harness named by only one layer keeps that layer's own values outright:
-/// `None` on the missing side already means "no override, use the global
-/// limits", so the other layer's value is itself the narrowing.
+/// harness named by only one layer keeps that layer's own `max_active`
+/// outright: `None` on the missing side already means "no override, use the
+/// global limits", so the other layer's value is itself the narrowing.
+///
+/// A-2/D-3: that reasoning does NOT hold for `reserve_headroom_pct`, whose
+/// absent side means "use the global `min_candidate_headroom_pct` floor" --
+/// a real number, not "no limit". A repo-only entry naming a reserve below
+/// that floor was therefore strictly *widening*: `FallbackConfig::
+/// reserve_headroom_pct` hands it straight to the allocator's refusal gate
+/// in place of the floor the repo layer may only ever raise (the global fold
+/// is `home.max(repo)`). A repo reserve on a harness the home layer never
+/// mentioned is clamped to `global_floor` for that reason; a home-set
+/// reserve is the operator's own and stands as written.
 fn narrow_fallback_harness(
     home: std::collections::BTreeMap<String, (Option<i64>, Option<f64>)>,
     repo: std::collections::BTreeMap<String, (Option<i64>, Option<f64>)>,
+    global_floor: f64,
 ) -> std::collections::BTreeMap<String, (Option<i64>, Option<f64>)> {
     let mut names: std::collections::BTreeSet<String> = home.keys().cloned().collect();
     names.extend(repo.keys().cloned());
@@ -2592,7 +2605,8 @@ fn narrow_fallback_harness(
             };
             let reserve = match (home_reserve, repo_reserve) {
                 (Some(h), Some(r)) => Some(h.max(r)),
-                (Some(v), None) | (None, Some(v)) => Some(v),
+                (Some(v), None) => Some(v),
+                (None, Some(r)) => Some(r.max(global_floor)),
                 (None, None) => None,
             };
             (name, (max_active, reserve))
@@ -4176,14 +4190,13 @@ impl CtxConfig {
                     .min(repo_fallback_predictive.unwrap_or(f64::INFINITY)),
             ),
         );
+        let merged_min_candidate = home_fallback_min_candidate
+            .unwrap_or(default_fallback.min_candidate_headroom_pct)
+            .max(repo_fallback_min_candidate.unwrap_or(f64::NEG_INFINITY));
         insert_path(
             &mut merged,
             &["fallback", "min_candidate_headroom_pct"],
-            toml::Value::Float(
-                home_fallback_min_candidate
-                    .unwrap_or(default_fallback.min_candidate_headroom_pct)
-                    .max(repo_fallback_min_candidate.unwrap_or(f64::NEG_INFINITY)),
-            ),
+            toml::Value::Float(merged_min_candidate),
         );
         insert_path(
             &mut merged,
@@ -4243,7 +4256,11 @@ impl CtxConfig {
                 toml::Value::Boolean(value),
             );
         }
-        let merged_harness = narrow_fallback_harness(home_fallback_harness, repo_fallback_harness);
+        let merged_harness = narrow_fallback_harness(
+            home_fallback_harness,
+            repo_fallback_harness,
+            merged_min_candidate,
+        );
         insert_path(
             &mut merged,
             &["fallback", "harness"],
@@ -9116,6 +9133,33 @@ mod tests {
         assert_eq!(codex.max_active, Some(2));
         assert_eq!(codex.reserve_headroom_pct, Some(50.0));
         assert_eq!(cfg.fallback.reserve_headroom_pct("codex"), 50.0);
+    }
+
+    /// A-2/D-3: a harness entry only the repo layer names was folded through
+    /// verbatim (`(None, Some(v)) => Some(v)`), so a repo could set
+    /// `reserve_headroom_pct = 0.5` and drop that harness's refusal gate
+    /// below the global `min_candidate_headroom_pct` floor -- which the repo
+    /// layer may only ever raise. A repo-only entry must still be clamped to
+    /// the effective global floor.
+    #[test]
+    fn a_repo_only_harness_entry_may_not_lower_the_reserve_below_the_global_floor() {
+        let home = tempfile::tempdir().expect("home");
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(home.path().join(".zirv/ctx.toml"), "").expect("write home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let repo = tempfile::tempdir().expect("repo");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[fallback.harness.claude]\nreserve_headroom_pct = 0.5\n",
+        )
+        .expect("write repo");
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+
+        assert_eq!(cfg.fallback.min_candidate_headroom_pct, 10.0);
+        assert_eq!(cfg.fallback.reserve_headroom_pct("claude"), 10.0);
     }
 
     #[test]

@@ -1,5 +1,6 @@
 use dialoguer::Confirm;
 use std::fs;
+use std::io::IsTerminal;
 use std::path::Path;
 
 use crate::utils::{COMMANDS_DIR_NAME, home_dir};
@@ -90,8 +91,28 @@ where
     Ok(())
 }
 
-/// Production version: calls init_zirv_with using dialoguer to ask the user.
-pub fn init_zirv() -> Result<(), Box<dyn std::error::Error>> {
+/// Production version: calls `init_zirv_with` using dialoguer to ask the
+/// user. `assume_yes` is `--yes` -- it pre-resolves every confirmation to
+/// "yes", which is the only way to run `zirv init` where nothing can answer
+/// a prompt.
+///
+/// A-2/D-6: the non-TTY refusal comes BEFORE `init_zirv_with`, which starts
+/// by scaffolding the home layer. Without it an unguarded `dialoguer::
+/// Confirm` left `~/.zirv`, `~/.zirv/commands/` and `~/.zirv/.shortcuts.
+/// yaml` behind and only then failed with `IO error: not a terminal`,
+/// naming nothing the operator could do about it.
+pub fn init_zirv(assume_yes: bool) -> Result<(), Box<dyn std::error::Error>> {
+    if assume_yes {
+        return init_zirv_with(|| Ok(true));
+    }
+    if !std::io::stdin().is_terminal() {
+        return Err(
+            "`zirv init` asks whether to create .zirv in the current directory, \
+                    and stdin is not a terminal; re-run as `zirv init --yes` to answer \
+                    yes to every question"
+                .into(),
+        );
+    }
     init_zirv_with(|| {
         Confirm::new()
             .with_prompt("Would you like to initialize .zirv in the current directory?")
@@ -217,6 +238,67 @@ mod tests {
 
         let current_content = read_to_string(current_shortcuts).unwrap();
         assert_eq!(current_content, DEFAULT_SHORTCUTS_CONTENT);
+
+        Ok(())
+    }
+
+    /// A-2/D-6: `--yes` pre-resolves the confirmations, so `zirv init`
+    /// completes with nothing able to answer a prompt -- the same
+    /// scaffolding a "yes" at the prompt produces, reached through the real
+    /// entry point rather than only through `init_zirv_with`'s seam.
+    #[test]
+    fn init_is_non_interactive_when_answers_are_supplied() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let fake_home_dir = tempdir()?;
+        let fake_home_path = fake_home_dir.path().to_path_buf();
+        let fake_current_dir = tempdir()?;
+        let fake_current_path = fake_current_dir.path().to_path_buf();
+
+        let _guard =
+            crate::commands::ctx::testenv::EnvGuard::set(&fake_home_path, Some(&fake_current_path));
+
+        init_zirv(true)?;
+
+        for root in [&fake_home_path, &fake_current_path] {
+            let zirv = root.join(".zirv");
+            assert!(zirv.is_dir(), "{zirv:?} should have been created");
+            assert!(zirv.join(COMMANDS_DIR_NAME).is_dir(), "{zirv:?}/commands");
+            assert!(zirv.join(".shortcuts.yaml").is_file(), "{zirv:?}/shortcuts");
+        }
+
+        Ok(())
+    }
+
+    /// A-2/D-6: with a non-TTY stdin, `zirv init` scaffolded `~/.zirv`,
+    /// `~/.zirv/commands/` and `~/.zirv/.shortcuts.yaml` and only THEN died
+    /// on an unguarded `dialoguer::Confirm` with `IO error: not a terminal`,
+    /// leaving a half-finished home layer behind and never naming a way to
+    /// answer. The guard has to come before any write, and it has to say
+    /// `--yes`.
+    #[test]
+    fn the_non_tty_guard_writes_nothing() -> Result<(), Box<dyn std::error::Error>> {
+        let fake_home_dir = tempdir()?;
+        let fake_home_path = fake_home_dir.path().to_path_buf();
+        let fake_current_dir = tempdir()?;
+        let fake_current_path = fake_current_dir.path().to_path_buf();
+
+        let _guard =
+            crate::commands::ctx::testenv::EnvGuard::set(&fake_home_path, Some(&fake_current_path));
+
+        let err = init_zirv(false).expect_err("a non-TTY init with no --yes must refuse");
+        let message = err.to_string();
+        assert!(
+            message.contains("--yes"),
+            "the error must name the way to answer, got: {message}"
+        );
+        assert!(
+            !fake_home_path.join(".zirv").exists(),
+            "the home .zirv must not be scaffolded before the guard refuses"
+        );
+        assert!(
+            !fake_current_path.join(".zirv").exists(),
+            "the local .zirv must not be scaffolded before the guard refuses"
+        );
 
         Ok(())
     }

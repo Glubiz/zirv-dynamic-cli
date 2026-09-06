@@ -26,6 +26,11 @@ pub struct Input {
     /// means true; pass `--global false` to skip the prompt with "no".
     #[arg(long, num_args = 0..=1, default_missing_value = "true")]
     pub global: Option<bool>,
+    /// (`init` only) Answer yes to every confirmation, so `init` needs no
+    /// terminal to read from. Without it, a non-TTY stdin is refused before
+    /// anything is written.
+    #[arg(long, default_value_t = false)]
+    pub yes: bool,
 }
 
 impl Input {
@@ -132,8 +137,10 @@ fn find_script_in_dir(
 
 /// Whether a `.shortcuts.yaml` mapped target stays confined to the directory
 /// it is about to be joined against: never rooted/absolute (Unix `/x`,
-/// Windows `C:\x` or a driveless `\x`, both caught by `Path::has_root`) and
-/// never containing a `..` component. `.shortcuts.yaml` is repo-owned,
+/// Windows `C:\x` or a driveless `\x`, both caught by `Path::has_root`),
+/// never drive-relative (`C:x`, which `has_root` does *not* catch -- see
+/// below), and never containing a `..` component. `.shortcuts.yaml` is
+/// repo-owned,
 /// untrusted config (see `Untrusted Configuration` in the vault) that must
 /// only ever narrow, never widen, what a lookup can reach.
 ///
@@ -147,9 +154,16 @@ fn find_script_in_dir(
 /// reviving the exact pre-3.0 root layout the hard cutover was meant to
 /// retire -- while a longer `../../x.yaml` or an absolute path can still
 /// walk out past `.zirv` altogether. This closes both at the new boundary.
+///
+/// A-2/D-2, the same class as `create::validate_name`'s G-6: a Windows
+/// drive-relative target (`C:legacy.yaml`) has neither a root nor a
+/// `ParentDir` component, yet `commands_dir.join(..)` still discards the
+/// whole base path for it and resolves against that drive's own current
+/// directory instead. Any ':' is refused, on every platform, so the rule
+/// does not depend on which platform parses the path.
 fn shortcut_target_is_confined(mapped_file: &str) -> bool {
     let path = Path::new(mapped_file);
-    if path.has_root() {
+    if path.has_root() || mapped_file.contains(':') {
         return false;
     }
     !path
@@ -489,6 +503,69 @@ mod tests {
                 .expect("a shortcut whose target lives inside commands/ must still resolve");
             assert!(path.ends_with("safe.yaml"), "got: {}", path.display());
         });
+    }
+
+    /// A-2/D-2 (Windows), the same class as `create::validate_name`'s G-6: a
+    /// drive-relative target like `C:outside.yaml` has no root
+    /// (`Path::has_root` is false) and no `..` component, so the confinement
+    /// check passed it -- and `commands_dir.join("C:outside.yaml")` then
+    /// *discards* the base path because of the drive prefix, resolving
+    /// against the current directory of that drive instead. A repo-owned
+    /// `.shortcuts.yaml` could therefore reach a script outside
+    /// `.zirv/commands/` entirely. The drive letter is taken from the fake
+    /// cwd itself so the escape lands there whichever volume TEMP is on.
+    #[test]
+    #[cfg(windows)]
+    fn a_drive_relative_shortcut_target_is_refused() {
+        let fake_home = tempdir().unwrap();
+        let fake_cwd = tempdir().unwrap();
+        let cwd = fake_cwd.path().to_path_buf();
+        let drive = match cwd.components().next() {
+            Some(std::path::Component::Prefix(prefix)) => prefix
+                .as_os_str()
+                .to_string_lossy()
+                .trim_end_matches(':')
+                .to_string(),
+            other => panic!("expected a drive prefix, got {other:?}"),
+        };
+
+        let zirv_dir = cwd.join(SCRIPT_DIR_NAME);
+        let commands_dir = zirv_dir.join(COMMANDS_DIR_NAME);
+        create_dir_all(&commands_dir).unwrap();
+        // Outside `.zirv/commands/` -- exactly where `<drive>:outside.yaml`
+        // lands once the join has thrown the base away.
+        write(cwd.join("outside.yaml"), "name: Outside\ncommands: []\n").unwrap();
+        write(
+            zirv_dir.join(".shortcuts.yaml"),
+            format!("shortcuts:\n  esc: \"{drive}:outside.yaml\"\n"),
+        )
+        .unwrap();
+
+        with_fake_env(fake_home.path(), &cwd, || {
+            let escaping = Input {
+                command: "esc".to_string(),
+                ..Default::default()
+            };
+            let err = escaping
+                .get_file_path()
+                .expect_err("a drive-relative shortcut target must not resolve");
+            let message = err.to_string();
+            assert!(
+                message.contains("esc") && message.contains("outside.yaml"),
+                "expected the shortcut and its target to be named, got: {message}"
+            );
+        });
+    }
+
+    /// The platform-independent half of the same finding: a ':' in a mapped
+    /// target is refused everywhere, mirroring `create::validate_name`, so
+    /// the rule does not depend on which platform parses the path.
+    #[test]
+    fn a_shortcut_target_containing_a_colon_is_not_confined() {
+        assert!(!shortcut_target_is_confined("C:outside.yaml"));
+        assert!(!shortcut_target_is_confined("C:"));
+        assert!(shortcut_target_is_confined("safe.yaml"));
+        assert!(shortcut_target_is_confined("nested/safe.yaml"));
     }
 
     /// `zirv .settings` must not resolve to `.zirv/.settings.toml`: that file
