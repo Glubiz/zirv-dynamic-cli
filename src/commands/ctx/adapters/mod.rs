@@ -1825,15 +1825,15 @@ pub fn resolve_program(program: &str) -> Result<ResolvedProgram, String> {
 /// I: the flags an adapter-built command carries, with any launcher prefix
 /// dropped. On a Windows machine where the adapter's own program resolves to
 /// a real npm `.cmd` shim, every command an adapter builds starts `cmd.exe /c
-/// <shim>`, and those tokens are not what a test about agent flags is
-/// asserting on. `program` is the adapter's own `program` field (each
-/// adapter's `base()` resolves exactly this string) -- a shared helper takes
-/// it as a plain `&str` rather than `&dyn AgentAdapter` because nothing else
-/// about the adapter is needed, and because `program` is private to each
-/// adapter's own module, so only that module's own tests can pass it in
-/// anyway. Was duplicated byte-for-byte in `claude.rs` and `codex.rs`'s own
-/// test modules before this; both now call this one copy.
-#[cfg(test)]
+/// <shim>`, and those tokens are not what a caller asserting on agent flags
+/// means to inspect. `program` is a plain `&str` (rather than `&dyn
+/// AgentAdapter`) since nothing else about the adapter is needed -- callers
+/// get it from the adapter's own public `AgentAdapter::program()`. Was
+/// duplicated byte-for-byte in `claude.rs` and `codex.rs`'s own test modules
+/// before this; both now call this one copy. No longer test-only (issue
+/// I-2): `checks::argv::run_codex_exec` (`zirv verify`'s own
+/// `ZCHK-ARGV-CODEX-EXEC`) needs the identical launcher-stripping to avoid
+/// failing on the operator's own Windows `.cmd`-shim install.
 pub(crate) fn built_args(program: &str, cmd: &std::process::Command) -> Vec<String> {
     let launcher = resolve_program(program)
         .map(|resolved| resolved.prefix.len())
