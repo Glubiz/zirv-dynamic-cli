@@ -1378,6 +1378,39 @@ pub fn note_failure(
     }
 }
 
+/// Issue #310 parity for `wrap`'s own rot restart. `exec` records every respawn
+/// on the cross-process restart chain and refuses to auto-resume once the
+/// breaker trips; `wrap`'s `Action::Restart` arm recorded nothing and asked
+/// nothing, so a session that rots, restarts, and rots again immediately kept
+/// relaunching forever -- and did it under a per-process budget `wrap` does not
+/// have either. Same chain key (the repo slug) and same class (`Crash`, which
+/// is where a rot-triggered restart belongs: neither a stall nor a vendor-side
+/// condition) as `exec`, so the two supervisors share one breaker over one
+/// repository rather than each keeping half a picture.
+///
+/// `Some(boots)` means "do not relaunch"; the caller degrades to passthrough.
+/// Everything about the decision lives here so the PTY arm that calls it stays
+/// the only part that needs a real terminal to exercise.
+fn tripped_restart_chain(
+    state: &StateDir,
+    repo: &Path,
+    cfg: &CtxConfig,
+    now_secs: u64,
+) -> Option<u32> {
+    match super::chain::record_boot_and_evaluate(
+        state,
+        &super::state::repo_slug(repo),
+        super::chain::FailureClass::Crash,
+        false,
+        now_secs,
+        cfg.supervise.chain_max_restarts,
+        cfg.supervise.chain_max_gap_secs,
+    ) {
+        super::chain::ChainVerdict::Tripped { boots } => Some(boots),
+        super::chain::ChainVerdict::Ok => None,
+    }
+}
+
 /// Polls until `child` exits or `deadline` passes, returning whether it exited.
 fn wait_for_exit(
     child: &mut Box<dyn portable_pty::Child + Send + Sync>,
@@ -1554,13 +1587,33 @@ type RelaunchedSession = (
 
 /// The handoff plus whatever the user themselves wrapped: `wrap -- claude
 /// --model opus` has to come back as an opus session, not a default one.
+///
+/// Issue #220: the handoff no longer goes on argv when the adapter can take it
+/// through the system-prompt file `extra` already names -- a restart prompt is
+/// always multi-line, and on a Windows npm `.cmd` install `guard_cmd_shim_
+/// reparse` refused every one of them (`\n` is a cmd.exe metacharacter), so the
+/// rot restart this whole supervisor exists for could never fire there. The
+/// returned `extra` is `extra` with that one flag repointed, never mutated in
+/// place: each restart re-derives it from the launch's own composed file, so
+/// the handoff cannot compound across restarts.
 fn relaunch_command(
     adapter: &dyn AgentAdapter,
     handoff: &Handoff,
     extra: &[String],
     screen_thresholds: &super::screen::Thresholds,
+    state: &StateDir,
+    session: &str,
 ) -> std::process::Command {
-    adapter.interactive_cmd(Some(&restart_prompt(handoff, screen_thresholds)), extra)
+    let mut args = extra.to_vec();
+    let prompt = super::prompt::interactive_handoff_prompt(
+        adapter,
+        &[],
+        &mut args,
+        &restart_prompt(handoff, screen_thresholds),
+        state,
+        session,
+    );
+    adapter.interactive_cmd(Some(&prompt), &args)
 }
 
 /// The user's own flags, minus everything a restart regenerates for itself.
@@ -1598,6 +1651,7 @@ fn relaunch_size(bar: &BarRuntime, terminal_size: (u16, u16)) -> (u16, u16) {
     super::chrome::reserved_pty_size(terminal_size, bar.active())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn relaunch(
     adapter: &dyn AgentAdapter,
     repo: &Path,
@@ -1606,6 +1660,8 @@ fn relaunch(
     turn_env: &[(String, String)],
     size: (u16, u16),
     screen_thresholds: &super::screen::Thresholds,
+    state: &StateDir,
+    session: &str,
 ) -> CtxResult<RelaunchedSession> {
     let pair = native_pty_system().openpty(PtySize {
         rows: size.1,
@@ -1614,7 +1670,7 @@ fn relaunch(
         pixel_height: 0,
     })?;
 
-    let command = relaunch_command(adapter, handoff, extra, screen_thresholds);
+    let command = relaunch_command(adapter, handoff, extra, screen_thresholds, state, session);
     // FIX 2a (command-injection defense): the relaunch rebuilds its own
     // CommandBuilder from the adapter's Command, so -- like the first launch
     // below and the dashboard pane -- it must clear the cmd.exe argv-reparse
@@ -2967,6 +3023,8 @@ fn perform_handover_swap(
         &new_turn_env,
         relaunch_size(bar, last_size),
         &cfg.screen.thresholds(),
+        state_dir,
+        session.as_str(),
     )?;
     spawn_output_thread(
         fresh_reader,
@@ -3642,8 +3700,45 @@ fn pump(
                     },
                 );
             }
-            Action::Restart => {
+            Action::Restart => 'restart: {
                 supervision.cooldown_at_signal = Some(supervision.signals_seen);
+
+                // Before anything is torn down: a restart chain that has
+                // already tripped means this session is in a loop that
+                // relaunching will not break, so `wrap` stands down to plain
+                // passthrough (the child keeps running, untouched) rather than
+                // spending another distiller call and another pty on it. Same
+                // breaker `exec` gates on -- see `tripped_restart_chain`.
+                if let Some(boots) =
+                    tripped_restart_chain(state_dir, repo, cfg, super::state::now_secs())
+                {
+                    let _ = super::log::append(
+                        state_dir,
+                        &super::log::Decision {
+                            ts: super::state::now_secs(),
+                            session: session.as_str(),
+                            verb: "wrap",
+                            verdict: "restart",
+                            score: supervision.score,
+                            action: "chain-tripped",
+                            detail: &format!(
+                                "{boots} unplanned restarts within the configured gap; not \
+                                 relaunching"
+                            ),
+                            observed_at: None,
+                        },
+                    );
+                    note_failure(
+                        supervision,
+                        Some((state_dir, session.as_str())),
+                        &format!(
+                            "restart-chain breaker tripped ({boots} restarts within the \
+                             configured gap); supervising no further -- run `zirv ctx status`"
+                        ),
+                        announcer,
+                    );
+                    break 'restart;
+                }
 
                 // P5: park the record on zirv's own (unquestionably alive) pid
                 // for the duration of the restart. Everything from here to the
@@ -3740,6 +3835,8 @@ fn pump(
                             turn_env.as_slice(),
                             relaunch_size(bar, last_size),
                             &cfg.screen.thresholds(),
+                            state_dir,
+                            session.as_str(),
                         ) {
                             Ok((fresh_pair, fresh_child, fresh_reader, fresh_writer)) => {
                                 spawn_output_thread(
@@ -7647,8 +7744,15 @@ mod tests {
 
     use crate::commands::ctx::handoff::Handoff;
 
+    /// A `StateDir` under a fresh tempdir, for the pure `relaunch_command`
+    /// tests: the handoff may be written there rather than onto argv.
+    fn relaunch_state(tmp: &tempfile::TempDir) -> StateDir {
+        StateDir::from_root(tmp.path().join("state"))
+    }
+
     #[test]
     fn the_relaunch_command_keeps_the_flags_the_user_wrapped() {
+        let tmp = tempfile::tempdir().expect("tempdir");
         let adapter = ClaudeAdapter::new(Some("/tmp/fake-claude"));
         let handoff = Handoff {
             task: "Wire the webhook".to_string(),
@@ -7660,6 +7764,8 @@ mod tests {
             &handoff,
             &["--model".to_string(), "opus".to_string()],
             &super::super::screen::Thresholds::default(),
+            &relaunch_state(&tmp),
+            "sess-flags",
         );
         let args: Vec<String> = command
             .get_args()
@@ -7697,6 +7803,9 @@ mod tests {
             ..Handoff::default()
         };
 
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = relaunch_state(&tmp);
+
         // claude -> codex
         let codex = CodexAdapter::new(None);
         let to_codex = relaunch_command(
@@ -7704,6 +7813,8 @@ mod tests {
             &handoff,
             &[],
             &super::super::screen::Thresholds::default(),
+            &state,
+            "sess-to-codex",
         );
         let codex_args: Vec<String> = to_codex
             .get_args()
@@ -7728,6 +7839,8 @@ mod tests {
             &handoff,
             &[],
             &super::super::screen::Thresholds::default(),
+            &state,
+            "sess-to-claude",
         );
         let claude_args: Vec<String> = to_claude
             .get_args()
@@ -7736,6 +7849,104 @@ mod tests {
         assert!(
             claude_args.iter().any(|a| a.contains("Wire the webhook")),
             "claude must receive the packet positionally too: {claude_args:?}"
+        );
+    }
+
+    /// Issue #220: the rot restart hands the handoff to a fresh interactive
+    /// session, and a stored handoff grows across restarts (`handoff::
+    /// distill_prompt` carries the previous one forward). Nothing bounded what
+    /// went on argv, so a large one built a command line Windows refuses to
+    /// spawn at all (`os error 206`) and the restart failed outright. Pure: the
+    /// invariant is the argv this builds, not what any installed binary does
+    /// with it.
+    #[test]
+    fn a_restart_prompt_over_the_argv_budget_is_bounded() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let adapter = ClaudeAdapter::new(Some("/tmp/fake-claude"));
+        let handoff = Handoff {
+            task: "x".repeat(93 * 1024),
+            next_step: "Write the failing test".to_string(),
+            ..Handoff::default()
+        };
+        let command = relaunch_command(
+            &adapter,
+            &handoff,
+            &[],
+            &super::super::screen::Thresholds::default(),
+            &relaunch_state(&tmp),
+            "sess-budget",
+        );
+        // Every argument lands on one command line together, separated and
+        // quoted, so the whole assembled length is what has to fit.
+        let total: usize = command.get_program().to_string_lossy().len()
+            + command
+                .get_args()
+                .map(|arg| arg.to_string_lossy().len() + 3)
+                .sum::<usize>();
+        assert!(
+            total <= 32 * 1024,
+            "a relaunch command line of {total} bytes is one Windows refuses to spawn"
+        );
+    }
+
+    /// Issue #220, the half that made `wrap` useless on the ordinary Windows
+    /// install: `guard_cmd_shim_reparse` refuses any argument carrying a
+    /// cmd.exe metacharacter on a `cmd.exe /c <shim>` launch, `\n` is one of
+    /// them, and `restart_prompt` is always multi-line -- so on an npm `.cmd`
+    /// install every handoff-carrying relaunch was refused, `relaunch` failed,
+    /// and `note_failure` degraded supervision one-way. The rot restart, which
+    /// is what this supervisor exists for, could never fire there.
+    #[cfg(windows)]
+    #[test]
+    fn a_multiline_handoff_relaunch_is_not_refused_on_a_cmd_shim() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let shim = tmp.path().join("fake-claude.cmd");
+        std::fs::write(&shim, "@echo off\r\n").expect("write the shim");
+        let handoff = Handoff {
+            task: "Wire the webhook".to_string(),
+            next_step: "Write the failing test".to_string(),
+            ..Handoff::default()
+        };
+        assert!(
+            restart_prompt(&handoff, &super::super::screen::Thresholds::default()).contains('\n'),
+            "the premise: a restart prompt is always multi-line"
+        );
+
+        let adapter = ClaudeAdapter::new(Some(&shim.display().to_string()));
+        let command = relaunch_command(
+            &adapter,
+            &handoff,
+            &[],
+            &super::super::screen::Thresholds::default(),
+            &relaunch_state(&tmp),
+            "sess-shim",
+        );
+        let program = command.get_program().to_string_lossy().to_string();
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect();
+        let argv: Vec<String> = std::iter::once(program.clone())
+            .chain(args.iter().cloned())
+            .collect();
+        assert!(
+            adapters::launch_reparses_through_shim(&argv),
+            "the fixture must actually resolve through the Windows launcher: {argv:?}"
+        );
+
+        adapters::guard_cmd_shim_reparse(&program, &args)
+            .expect("a handoff relaunch must be launchable on a .cmd shim install");
+
+        let delivered = args
+            .iter()
+            .position(|arg| arg == "--append-system-prompt-file")
+            .and_then(|at| args.get(at + 1))
+            .expect("the handoff has to travel off argv, so a file must name it");
+        assert!(
+            std::fs::read_to_string(delivered)
+                .expect("the handoff file")
+                .contains("Wire the webhook"),
+            "the handoff itself must still reach the fresh session"
         );
     }
 
@@ -8133,6 +8344,31 @@ mod tests {
         let mut supervision = InjectionState::new();
         note_failure(&mut supervision, None, "no state dir", &Announcer::silent());
         assert!(supervision.degraded);
+    }
+
+    /// Issue #310 parity: `exec` records every respawn on the cross-process
+    /// restart chain and stands down once the breaker trips; `wrap`'s own
+    /// `Action::Restart` arm recorded nothing and asked nothing, so a session
+    /// that rots straight back into a restart relaunched forever, on no budget
+    /// at all.
+    #[test]
+    fn a_tripped_restart_chain_stops_wraps_own_relaunches() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        let cfg = CtxConfig::default();
+
+        assert_eq!(
+            tripped_restart_chain(&state, &repo, &cfg, 1_000),
+            None,
+            "the first restart is never the pattern"
+        );
+        assert_eq!(tripped_restart_chain(&state, &repo, &cfg, 1_010), None);
+        assert_eq!(
+            tripped_restart_chain(&state, &repo, &cfg, 1_020),
+            Some(cfg.supervise.chain_max_restarts),
+            "three restarts inside the configured gap is the loop the breaker exists for"
+        );
     }
 
     #[cfg(unix)]

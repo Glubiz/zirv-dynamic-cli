@@ -791,6 +791,35 @@ const DISTILL_POLL: Duration = Duration::from_millis(25);
 const MODEL_STDERR_CAPTURE_BYTES: usize = 8 * 1024;
 const MODEL_STDERR_REPORT_BYTES: usize = 2 * 1024;
 
+/// How much of a distiller's stdout is kept. Stderr has been bounded since it
+/// was first captured; stdout was read to the end, and nothing downstream
+/// capped it either -- `store` writes whatever came back, `distill_prompt`
+/// carries the previous handoff forward into the next one, so a distiller that
+/// will not stop generating compounds across restarts until the stored handoff
+/// is too large to deliver at all (issue #220's `os error 206`). Generous
+/// enough that a real handoff -- kilobytes, not hundreds of them -- is never
+/// touched.
+const MODEL_STDOUT_CAPTURE_BYTES: usize = 256 * 1024;
+
+/// Appended to an answer that hit [`MODEL_STDOUT_CAPTURE_BYTES`], so the
+/// truncation is visible in the stored handoff rather than looking like a model
+/// that simply stopped mid-sentence.
+const MODEL_ANSWER_TRUNCATED_NOTE: &str =
+    "\n\n[zirv: the model's answer was truncated at its capture limit.]\n";
+
+/// Decodes a distiller's captured stdout, saying so when the capture actually
+/// hit its limit. Truncation is on a char boundary, so the markdown parser
+/// downstream never sees a split codepoint.
+fn bounded_model_answer(captured: Vec<u8>, limit: usize) -> String {
+    let truncated = captured.len() >= limit;
+    let text = String::from_utf8_lossy(&captured).to_string();
+    if !truncated {
+        return text;
+    }
+    let kept = crate::utils::truncate_bytes(text, Some(limit));
+    format!("{kept}{MODEL_ANSWER_TRUNCATED_NOTE}")
+}
+
 fn read_bounded<R: Read>(mut reader: R, limit: usize) -> Vec<u8> {
     let mut captured = Vec::with_capacity(limit);
     let mut chunk = [0_u8; 1024];
@@ -902,11 +931,13 @@ pub fn run_model(
     super::supervise::guard_cmd_shim_reparse(&command)?;
     let mut child = command.spawn()?;
 
-    let mut stdout = child.stdout.take().ok_or("model stdout unavailable")?;
+    let stdout = child.stdout.take().ok_or("model stdout unavailable")?;
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let mut buffer = Vec::new();
-        let _ = stdout.read_to_end(&mut buffer);
+        // Bounded exactly like stderr below: the reader still drains to EOF, so
+        // a model writing more than this never blocks on a full pipe, but only
+        // the first `MODEL_STDOUT_CAPTURE_BYTES` are kept.
+        let buffer = read_bounded(stdout, MODEL_STDOUT_CAPTURE_BYTES);
         let _ = tx.send(buffer);
     });
 
@@ -970,7 +1001,7 @@ pub fn run_model(
     }
 
     let answer = rx.recv_timeout(timeout).unwrap_or_default();
-    Ok(String::from_utf8_lossy(&answer).to_string())
+    Ok(bounded_model_answer(answer, MODEL_STDOUT_CAPTURE_BYTES))
 }
 
 /// Runs a fresh, cheap model over the context. The rotted session is never
@@ -1762,6 +1793,40 @@ mod tests {
         assert!(
             answer.contains("## Task"),
             "raw markdown, unparsed: {answer}"
+        );
+    }
+
+    /// Issue #220's mechanism: stderr has been bounded since it was first
+    /// captured, but stdout was read to the end and nothing downstream capped
+    /// it -- `store` writes whatever came back and `distill_prompt` carries the
+    /// previous handoff into the next one, so one runaway answer compounds
+    /// across every later restart until the handoff can no longer be delivered
+    /// at all.
+    #[test]
+    fn a_runaway_distiller_answer_is_bounded_before_it_is_stored() {
+        // SAFETY: CI runs tests single-threaded.
+        unsafe {
+            std::env::set_var("FAKE_MODEL_MODE", "runaway");
+        }
+        let adapter = fake_model_adapter();
+        let result = run_model(&adapter, "haiku", "anything", TEST_TIMEOUT);
+        unsafe {
+            std::env::remove_var("FAKE_MODEL_MODE");
+        }
+
+        let answer = result.expect("a runaway model still exits cleanly");
+        assert!(
+            answer.len() <= MODEL_STDOUT_CAPTURE_BYTES + MODEL_ANSWER_TRUNCATED_NOTE.len(),
+            "unbounded: the distiller answer came back at {} bytes",
+            answer.len()
+        );
+        assert!(
+            answer.contains("truncated"),
+            "a truncated handoff has to say so rather than look like a short answer"
+        );
+        assert!(
+            parse_markdown(&answer).task.contains("Ship the webhook"),
+            "the head of the answer is still parseable"
         );
     }
 

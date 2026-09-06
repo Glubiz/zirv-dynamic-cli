@@ -11,6 +11,8 @@
 #   flood   writes past a pipe buffer's worth of output *before* reading any
 #           of stdin, the way a model that starts answering before the
 #           caller has finished sending the prompt looks from the outside
+#   runaway a well-formed handoff whose body runs to hundreds of KB, the way a
+#           distiller that will not stop generating looks from the outside
 #   harvest a well-formed set of `key: body` durable-fact lines, for
 #           memory::harvest_from_handoff tests
 #   harvest_with_credential  like `harvest`, but with one extra
@@ -72,6 +74,17 @@ case "${FAKE_MODEL_MODE:-good}" in
     ;;
   partial)
     printf '## Task\nShip the webhook\n\n## Done\n- wrote the route\n'
+    ;;
+  runaway)
+    printf '## Task\nShip the webhook\n\n'
+    printf '## Next step\nAdd a failing test for an invalid signature\n\n'
+    printf '## Done\n'
+    line=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+    line_count=0
+    while [ "$line_count" -lt 4096 ]; do
+      printf -- '- %s\n' "$line"
+      line_count=$((line_count + 1))
+    done
     ;;
   *)
     printf '## Task\nShip the webhook\n\n'
