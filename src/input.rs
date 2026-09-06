@@ -26,6 +26,11 @@ pub struct Input {
     /// means true; pass `--global false` to skip the prompt with "no".
     #[arg(long, num_args = 0..=1, default_missing_value = "true")]
     pub global: Option<bool>,
+    /// (`init` only) Answer yes to every confirmation, so `init` needs no
+    /// terminal to read from. Without it, a non-TTY stdin is refused before
+    /// anything is written.
+    #[arg(long, default_value_t = false)]
+    pub yes: bool,
 }
 
 impl Input {
