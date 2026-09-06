@@ -86,7 +86,6 @@ pub const NARROW_ONLY_ALLOWLIST: &[&str] = &[
     "mail.max_message_bytes",
     "optimize.enabled",
     "optimize.sessions_sampled",
-    "pace.collector_max_age_secs", // G1: narrow-only fold, repo may only SHORTEN the horizon.
     "pace.enabled",
     "pace.fallback_delay_secs",
     "pace.jitter_secs",
