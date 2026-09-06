@@ -1,12 +1,22 @@
 //! `zirv ctx agent <name> <prompt> [-- flags]`: a one-shot delegation to a
-//! supervised headless worker on another enabled harness. Builds the same
-//! `ExecArgs` a hand-written `zirv ctx exec --agent <name> --prompt <text> --
-//! ...` invocation would, and drives it through `exec::run_with` directly, so
-//! a delegated run gets the identical pacing, rot detection and
-//! restart-with-handoff behavior as running `zirv ctx exec` from the command
-//! line. The prompt always travels as `ExecArgs::prompt` (data), never
-//! encoded into the trailing `command` argv: a prompt shaped like a flag must
-//! never be misread as one.
+//! supervised worker on another enabled harness.
+//!
+//! A delegation is one of exactly two visible shapes, never a third invisible
+//! one: a DASHBOARD PANE when any dashboard is live on this machine
+//! (`try_join_dashboard`, which prefers the channel this process inherited,
+//! then a dashboard hosting this repo, then any live one), or an INLINE
+//! supervised run in this terminal when none is, announced by
+//! [`inline_notice`]'s single line. `--headless` -- which used to force the
+//! second shape even from inside a dashboard -- was removed on 2026-09-06:
+//! delegating work is not a reason for it to disappear.
+//!
+//! The inline shape builds the same `ExecArgs` a hand-written `zirv ctx exec
+//! --agent <name> --prompt <text> -- ...` invocation would, and drives it
+//! through `exec::run_with` directly, so it gets the identical pacing, rot
+//! detection and restart-with-handoff behavior as running `zirv ctx exec`
+//! from the command line. The prompt always travels as `ExecArgs::prompt`
+//! (data), never encoded into the trailing `command` argv: a prompt shaped
+//! like a flag must never be misread as one.
 //!
 //! Always a worker session (`exec::run_with` never takes a `PromptRole`; it
 //! is hardcoded to `Worker`), which is what keeps a delegated run from being
@@ -132,20 +142,6 @@ pub struct AgentArgs {
     /// so has no tree to isolate.
     #[arg(long, default_value_t = false)]
     pub worktree: bool,
-    /// Issue #228: forces the headless supervised path even from inside a
-    /// dashboard pane, skipping `try_join_dashboard` entirely. Preserves the
-    /// pre-#228 capability of running with restart/timeout/tool-call ceilings
-    /// or arbitrary trailing flags from inside a dashboard -- but only on
-    /// explicit request now, since any of those would otherwise hard-error
-    /// rather than silently demote (see `try_join_dashboard`'s own doc
-    /// comment).
-    ///
-    /// Decision (#328, 2026-09-04): headless stays as this explicit opt-in
-    /// and as the fallback when no live dashboard can host a pane
-    /// (announced on stderr); inside a live dashboard, delegation is always
-    /// a visible pane.
-    #[arg(long, default_value_t = false)]
-    pub headless: bool,
     /// Attach the repo's accepted workflow artifact for this stage to the
     /// worker's task prompt: resolves `--workflow` (or the repo's own
     /// active workflow when unstated), reads its accepted intent/spec/plan
@@ -2021,52 +2017,59 @@ fn wait_out_a_claimed_request<W: Write>(
 /// like any other -- the message on stdout is what says which kind.
 const EXIT_DASH_UNCONFIRMED: i32 = 1;
 
-/// When this process is itself a dashboard pane's own child
-/// (`spawnreq::DASH_REQUESTS_ENV` set, and the directory it names still
-/// exists -- the dashboard deletes it on quit, see `dash::on_quit`), asks
-/// the dashboard to spawn `name` as a fresh pane instead of running headless
-/// in this process's own subshell: writes a `spawnreq::SpawnRequest`
-/// carrying `prompt` as data (never argv, the same discipline every other
-/// delegation path in this codebase already holds), then waits up to
-/// `DASH_ACK_TIMEOUT` for the matching ack.
+/// Where one delegation actually runs, as decided by [`try_join_dashboard`].
+#[derive(Debug)]
+enum Dispatch {
+    /// A live dashboard gave a definitive answer -- a pane was spawned, the
+    /// request was refused on policy grounds, or it was *claimed* and then
+    /// never confirmed even after `DASH_CLAIM_EXTENSION` (O3). The caller
+    /// returns this verbatim and never runs the task itself.
+    Answered(CtxResult<i32>),
+    /// The caller runs the supervised child in this process instead
+    /// ([`exec::run_with_report`], unchanged). `no_dashboard` is true only
+    /// when no live dashboard could be found anywhere on this machine, which
+    /// is the one case that gets [`inline_notice`]'s single line -- every
+    /// other fall-through (a prompt that would be misread as a flag, a
+    /// request that could not be written, an unclaimed ack timeout, a
+    /// `retryable` refusal) has already printed its own reason.
+    Inline { no_dashboard: bool },
+}
+
+#[cfg(test)]
+impl Dispatch {
+    fn is_inline(&self) -> bool {
+        matches!(self, Dispatch::Inline { .. })
+    }
+
+    fn expect_answer(self, message: &str) -> CtxResult<i32> {
+        match self {
+            Dispatch::Answered(result) => result,
+            Dispatch::Inline { no_dashboard } => {
+                panic!("{message} (fell through inline, no_dashboard={no_dashboard})")
+            }
+        }
+    }
+}
+
+/// Asks a live dashboard to spawn `name` as a fresh pane instead of running
+/// the supervised child inline in this process: writes a
+/// `spawnreq::SpawnRequest` carrying `prompt` as data (never argv, the same
+/// discipline every other delegation path in this codebase already holds),
+/// then waits up to `DASH_ACK_TIMEOUT` for the matching ack.
 ///
-/// `Some(Ok(_))`/most of `Some(Err(_))` mean the dashboard gave a definitive
-/// answer -- a pane was spawned, the request was refused on policy grounds,
-/// or it was *claimed* and then never confirmed even after
-/// `DASH_CLAIM_EXTENSION` (O3) -- and the caller's own headless path must
-/// NOT run. Issue #228 adds one more `Some(Err(_))` case that is NOT a
-/// dashboard answer at all: an operator-facing hard error raised by THIS
-/// process, before any request is ever written, when the operator asked for
-/// options a pane structurally cannot honour (below) -- see that case's own
-/// note for why it hard-errors rather than joining the "falls through"
-/// list.
+/// 2026-09-06 (headless removal): "a live dashboard" no longer means "the
+/// one this process was spawned inside". `live_join_target` prefers the
+/// inherited channel (`spawnreq::DASH_REQUESTS_ENV`), then a live dashboard
+/// whose own repo matches this one, then any live dashboard at all -- so a
+/// delegation issued from a plain terminal still lands in a visible pane
+/// rather than disappearing into a captured subprocess.
 ///
-/// `None` means the caller falls through to today's headless behavior
-/// unchanged, which covers: no dashboard channel at all (`DASH_REQUESTS_ENV`
-/// unset -- silent, byte-for-byte the pre-Task-11 behavior); the inherited
-/// directory absent or its owner dead, AND issue #145's own fallback scan of
-/// every other `<state>/dash/*` token directory (`live_join_target`) also
-/// found nothing live (notice printed, naming every candidate considered); a
-/// prompt that would be misread as a flag (notice printed); a request that
-/// could not even be written (notice printed); an unclaimed ack timeout
-/// (notice printed, since that is a live channel that simply did not
-/// respond); and a `retryable` refusal, where the dashboard has answered
-/// that it spawned nothing for a reason that says nothing about whether the
-/// task may run (O2).
-///
-/// Issue #228: options a pane structurally cannot honour (`--max-restarts`/
-/// `--timeout-secs`/`--max-tool-calls`/`--flags` other
-/// than a lone `--model` pin) USED TO print a notice and silently demote to
-/// headless (F9) -- an operator who was inside a dashboard specifically to
-/// get a pane could lose that without ever noticing. Now `Some(Err(_))`,
-/// naming what was refused and pointing at the new `--headless` flag (an
-/// explicit, loud way to keep the pre-#228 capability), so the demotion can
-/// never be silent. This function is never even reached for `--headless`:
-/// `run_with` checks it first and skips straight to the headless path.
-/// `--role`/`--group` are NOT in this list: both travel on the
-/// `SpawnRequest` itself, see its own fields. Neither is `--workdir`: panes
-/// support it directly (`SpawnRequest::workdir`), so it never reaches this
-/// gate at all.
+/// Every ceiling the operator typed travels on the request now
+/// (`--max-restarts`/`--timeout-secs`/`--max-tool-calls`, and the trailing
+/// `-- <flags>`); the hard error that used to refuse them here, pointing at
+/// `--headless`, is gone with the flag itself. What a pane cannot enforce is
+/// announced on stderr by [`pane_ceiling_notices`] rather than refused or
+/// silently dropped (the F9 rule: never a silent demotion).
 // Issue #318 added `result_schema` as this function's 8th parameter, over
 // clippy's default 7-argument threshold -- every argument here is already an
 // independent, unrelated piece of one delegation's own dashboard-join
@@ -2083,7 +2086,7 @@ fn try_join_dashboard<W: Write>(
     ack_timeout: Duration,
     claim_extension: Duration,
     result_schema: Option<&Schema>,
-) -> Option<CtxResult<i32>> {
+) -> Dispatch {
     // Issue #262: recomputed here rather than threaded in as a parameter --
     // `run_with` already resolved (and, on depth 0, already refused before
     // ever reaching this function) the identical value from the identical
@@ -2102,71 +2105,35 @@ fn try_join_dashboard<W: Write>(
         })
         .unwrap_or_else(envelope::WorkerEnvelope::locked);
     let parent_envelope = &parent_envelope;
-    let inherited = env(spawnreq::DASH_REQUESTS_ENV).map(std::path::PathBuf::from)?;
-    let dir = live_join_target(&inherited, env)?;
-    // A pane is not a supervised headless run: the restart budget, the
-    // wall-clock limit and the trailing `-- flags` all belong to
-    // `exec::run_with`, and a `SpawnRequest` carries none of them. Silently
-    // dropping an operator's `--timeout-secs` would be worse than not using
-    // the dashboard at all, so this falls back to the path that honours them.
-    // `--quiet` is deliberately still allowed: it only shapes the
-    // announcement channel of a run that is not happening in this process
-    // anyway.
-    // A model pin is the one trailing flag a pane *can* honour -- it travels
-    // in the request and the pane builds it into its own argv -- and the
-    // harness layer now teaches orchestrators to write one on every
-    // delegation, so declining the pane for it would cost a dashboard session
-    // a visible pane per delegated task. Anything else in `flags` still
-    // declines: honouring some of what the operator typed and dropping the
-    // rest would be worse than not using the dashboard at all.
+    let inherited = env(spawnreq::DASH_REQUESTS_ENV).map(std::path::PathBuf::from);
+    let Some(dir) = live_join_target(inherited.as_deref(), env, repo) else {
+        return Dispatch::Inline { no_dashboard: true };
+    };
+    // A model pin is the one trailing flag a pane can carry across the
+    // untrusted request channel -- it travels in `SpawnRequest::model` and
+    // the pane re-checks it before building its own argv (`dash::mod::
+    // pane_model_args`). Everything else in `flags` is announced as dropped
+    // by `pane_ceiling_notices` below rather than refused: an operator who
+    // asked for a pane gets one, and finds out on stderr what the pane could
+    // not carry.
     let pinned_model = super::adapters::model_only_flags(&args.flags);
-    // `--max-tool-calls` remains unsupported because dashboard panes have no
-    // verified tool-call counter. Token ceilings do travel on the request
-    // and are enforced from the pane's transcript.
-    // Issue #228: this used to print a notice and silently fall back to
-    // headless (F9) -- an operator who explicitly asked for a pane-capable
-    // run (by being inside a dashboard at all) got a demotion they might
-    // never notice in scrollback. Now it hard-errors, naming exactly what
-    // was refused, and says how to get either half of what was actually
-    // typed: drop the offending flags to keep the pane, or pass the new
-    // `--headless` flag (checked by `run_with` before this function is ever
-    // called) to keep them and run supervised headless instead. `--workdir`
-    // is deliberately NOT in this list -- panes support it (see
-    // `SpawnRequest::workdir`), so it never reaches this gate at all.
-    let mut offending: Vec<String> = Vec::new();
-    if args.max_restarts.is_some() {
-        offending.push("--max-restarts".to_string());
-    }
-    if args.timeout_secs.is_some() {
-        offending.push("--timeout-secs".to_string());
-    }
-    if args.max_tool_calls.is_some() {
-        offending.push("--max-tool-calls".to_string());
-    }
-    if !args.flags.is_empty() && pinned_model.is_none() {
-        offending.push(format!("-- {}", args.flags.join(" ")));
-    }
-    if !offending.is_empty() {
-        return Some(Err(format!(
-            "zirv ctx agent: dashboard panes don't support {} -- drop {}, or pass --headless to \
-             run a supervised headless worker instead",
-            offending.join(", "),
-            if offending.len() == 1 { "it" } else { "them" }
-        )
-        .into()));
+    for notice in pane_ceiling_notices(args) {
+        eprintln!("zirv ctx agent: {notice}");
     }
     // Defense in depth for the same rule `dash::fulfill_spawn_request`
     // enforces at the authority side: the request's prompt is encoded
     // positionally into the pane's argv, so a prompt shaped like a flag
-    // would arrive at the real harness child as one. The headless path this
+    // would arrive at the real harness child as one. The inline path this
     // falls back to is safe by construction -- there the prompt travels as
     // the `-p <value>` data it is.
     if super::dash::argv_unsafe_prompt(prompt) {
         eprintln!(
             "zirv ctx agent: a prompt beginning with '-' cannot be spawned as a dashboard pane; \
-             running headless"
+             running inline in this terminal"
         );
-        return None;
+        return Dispatch::Inline {
+            no_dashboard: false,
+        };
     }
     let requested_by = env(super::adapters::SESSION_ENV)
         .map(|s| super::sessions::short_id(&s))
@@ -2223,30 +2190,56 @@ fn try_join_dashboard<W: Write>(
         path_scope: args.path_scope.clone(),
         no_network: args.no_network,
         depth: args.depth,
+        // 2026-09-06: the ceilings a pane spawn used to hard-error on. They
+        // only ever NARROW the pane's own supervision, so the fulfilment
+        // side honours them even from this untrusted file drop -- see each
+        // field's own doc comment for which of the three a pane can
+        // actually hold.
+        max_restarts: args.max_restarts,
+        timeout_secs: args.timeout_secs,
+        max_tool_calls: args.max_tool_calls,
+        // Carried verbatim, and CLEARED again at the fulfilment side for
+        // every file-dropped request (`dash::mod::
+        // sanitize_file_dropped_request`) because trailing flags become argv
+        // on the pane's real harness child. `pane_ceiling_notices` above
+        // already told the operator so.
+        flags: args.flags.clone(),
     };
     let path = match spawnreq::write_request(&dir, &req) {
         Ok(path) => path,
         Err(e) => {
             eprintln!(
-                "zirv ctx agent: could not write a spawn request into {}: {e}; running headless",
+                "zirv ctx agent: could not write a spawn request into {}: {e}; running inline in \
+                 this terminal",
                 dir.display()
             );
-            return None;
+            return Dispatch::Inline {
+                no_dashboard: false,
+            };
         }
     };
     let Some(stem) = spawnreq::request_stem(&path) else {
         eprintln!(
-            "zirv ctx agent: could not derive a request stem from {}; running headless",
+            "zirv ctx agent: could not derive a request stem from {}; running inline in this \
+             terminal",
             path.display()
         );
-        return None;
+        return Dispatch::Inline {
+            no_dashboard: false,
+        };
     };
     // Issue #307.3: computed once, here, and threaded through both this
     // ack and `wait_out_a_claimed_request`'s own -- a nudge for THIS
     // session's own visibility into `--workdir`, not the worker's.
     let workdir_hint = workdir_visibility_hint(args.workdir.as_deref(), repo, env);
+    let inline = Dispatch::Inline {
+        no_dashboard: false,
+    };
     match spawnreq::wait_for_ack(&dir, &stem, ack_timeout) {
-        Some(ack) => answer_for_ack(ack, w, workdir_hint.as_deref()),
+        Some(ack) => match answer_for_ack(ack, w, workdir_hint.as_deref()) {
+            Some(result) => Dispatch::Answered(result),
+            None => inline,
+        },
         // F10: `take_requests` takes the request the moment the dashboard
         // picks it up, so a timeout here is ambiguous -- nobody was listening,
         // or somebody took it and is still spawning. Both ends acting on that
@@ -2275,14 +2268,59 @@ fn try_join_dashboard<W: Write>(
             if std::fs::remove_file(&path).is_ok() {
                 eprintln!(
                     "zirv ctx agent: dashboard did not answer within {ack_timeout:?} (request \
-                     was {}); running headless",
+                     was {}); running inline in this terminal",
                     path.display()
                 );
-                return None;
+                return inline;
             }
-            wait_out_a_claimed_request(&dir, &stem, claim_extension, w, workdir_hint.as_deref())
+            match wait_out_a_claimed_request(
+                &dir,
+                &stem,
+                claim_extension,
+                w,
+                workdir_hint.as_deref(),
+            ) {
+                Some(result) => Dispatch::Answered(result),
+                None => inline,
+            }
         }
     }
+}
+
+/// The stderr notices a pane spawn owes an operator for everything they
+/// typed that a dashboard pane cannot hold exactly the way the inline
+/// supervised path would. Never a refusal and never silence -- the F9 rule:
+/// a demotion the operator cannot see is worse than either.
+///
+/// `--max-restarts` and `--timeout-secs` are absent on purpose: a pane's
+/// child is never restarted by zirv at all (so any restart budget is already
+/// satisfied) and its wall-clock ceiling IS enforced, by `dash::mod::
+/// enforce_pane_deadlines`. Only the two genuinely unhonoured asks appear.
+fn pane_ceiling_notices(args: &AgentArgs) -> Vec<String> {
+    let mut notices = Vec::new();
+    if args.max_tool_calls.is_some() {
+        notices.push(
+            "--max-tool-calls is not enforced on a dashboard pane (no verified tool-call \
+             counter); the token budget still is"
+                .to_string(),
+        );
+    }
+    if !args.flags.is_empty() && super::adapters::model_only_flags(&args.flags).is_none() {
+        notices.push(format!(
+            "a dashboard pane carries only a `--model` pin out of `-- {}`; the rest is dropped \
+             because a spawn request's trailing flags would become argv on the pane's own harness \
+             child",
+            args.flags.join(" ")
+        ));
+    }
+    notices
+}
+
+/// Rule 3's single line: no live dashboard exists anywhere on this machine,
+/// so this delegation runs its supervised child in this terminal. Never a
+/// refusal, and this process never launches a dashboard of its own.
+fn inline_notice(name: &str) -> String {
+    format!("zirv ctx agent: no live dashboard -- running {name} inline in this terminal")
 }
 
 /// The requests directory `try_join_dashboard` should actually offer the
@@ -2333,39 +2371,108 @@ fn inherited_dashboard_liveness(inherited: &Path) -> Option<super::sessions::Own
         .then(|| super::sessions::dashboard_owner_liveness(inherited))
 }
 
-fn live_join_target(inherited: &Path, env: EnvLookup<'_>) -> Option<PathBuf> {
-    match inherited_dashboard_liveness(inherited) {
-        Some(super::sessions::OwnerLiveness::Live) => return Some(inherited.to_path_buf()),
-        Some(super::sessions::OwnerLiveness::Dead(pid)) => {
+/// The dashboard registry short id encoded in a `<state>/dash/<dash_short>-
+/// <token>/requests` path -- the directory name up to its first `-`, which
+/// is exactly `spawnreq::request_dir_for`'s own format (a short id is hex,
+/// so it never contains one itself).
+fn dash_short_of(requests_dir: &Path) -> Option<String> {
+    let token_dir = requests_dir.parent()?.file_name()?.to_str()?;
+    let (short, _token) = token_dir.split_once('-')?;
+    (!short.is_empty()).then(|| short.to_string())
+}
+
+/// Pure: whether `candidate` is a live dashboard whose own registry row
+/// names `repo`. `dash_shorts_for_repo` is the set of dashboard short ids
+/// registered against this repository, resolved once by the caller.
+fn candidate_hosts_repo(
+    candidate: &super::dash::DashCandidate,
+    dash_shorts_for_repo: &[String],
+) -> bool {
+    dash_short_of(&candidate.requests_dir)
+        .is_some_and(|short| dash_shorts_for_repo.contains(&short))
+}
+
+/// The dashboard sessions currently registered against `repo`, by short id.
+/// Best-effort: an unreadable registry simply yields no preference, and the
+/// caller falls back to the machine-wide selection rule.
+fn dash_shorts_for_repo(state: &super::state::StateDir, repo: &Path) -> Vec<String> {
+    let canonical = std::fs::canonicalize(repo).unwrap_or_else(|_| repo.to_path_buf());
+    super::sessions::list(state)
+        .into_iter()
+        .filter(|(record, _)| record.verb == super::sessions::Verb::Dash)
+        .filter(|(record, _)| {
+            let record_repo =
+                std::fs::canonicalize(&record.repo).unwrap_or_else(|_| record.repo.clone());
+            record_repo == canonical
+        })
+        .map(|(record, _)| record.short)
+        .collect()
+}
+
+/// Which live dashboard this delegation joins: one hosting THIS repository
+/// first (its pane lands in the sidebar the operator is already watching for
+/// this work), then `dash::select_live_dash_dir`'s machine-wide rule (the
+/// most recently started live dashboard). Joining a dashboard that hosts a
+/// different repo is display-only and can never misroute the task's working
+/// directory -- see `dash::discover_live_dash_dirs`'s own doc comment -- so
+/// it stays the fallback rather than a refusal.
+fn select_join_target<'a>(
+    state: &super::state::StateDir,
+    candidates: &'a [super::dash::DashCandidate],
+    repo: &Path,
+) -> Option<&'a super::dash::DashCandidate> {
+    let shorts = dash_shorts_for_repo(state, repo);
+    if !shorts.is_empty() {
+        let own_repo: Vec<super::dash::DashCandidate> = candidates
+            .iter()
+            .filter(|c| candidate_hosts_repo(c, &shorts))
+            .cloned()
+            .collect();
+        if let Some(winner) = super::dash::select_live_dash_dir(&own_repo) {
+            let chosen = winner.requests_dir.clone();
+            return candidates.iter().find(|c| c.requests_dir == chosen);
+        }
+    }
+    super::dash::select_live_dash_dir(candidates)
+}
+
+fn live_join_target(inherited: Option<&Path>, env: EnvLookup<'_>, repo: &Path) -> Option<PathBuf> {
+    match inherited.map(|dir| (dir, inherited_dashboard_liveness(dir))) {
+        Some((dir, Some(super::sessions::OwnerLiveness::Live))) => return Some(dir.to_path_buf()),
+        Some((dir, Some(super::sessions::OwnerLiveness::Dead(pid)))) => {
             eprintln!(
                 "zirv ctx agent: {} names a dashboard that already quit (owner.pid names \
                  dead pid {pid}); looking for another live dashboard",
-                inherited.display()
+                dir.display()
             );
         }
-        Some(super::sessions::OwnerLiveness::Missing) => {
+        Some((dir, Some(super::sessions::OwnerLiveness::Missing))) => {
             eprintln!(
                 "zirv ctx agent: {} has no readable owner.pid, so no dashboard can be \
                  confirmed live; looking for another live dashboard",
-                inherited.display()
+                dir.display()
             );
         }
-        None => {
+        Some((dir, None)) => {
             eprintln!(
                 "zirv ctx agent: {} (inherited via {}) no longer exists; looking for another live \
                  dashboard",
-                inherited.display(),
+                dir.display(),
                 spawnreq::DASH_REQUESTS_ENV
             );
         }
+        // Not inside a dashboard pane at all. Silent: this is the ordinary
+        // shape of `zirv agent` from a plain terminal, and the scan below is
+        // now its normal path rather than a recovery from something wrong.
+        None => {}
     }
 
     let state = match super::state::StateDir::resolve(env) {
         Ok(state) => state,
         Err(e) => {
             eprintln!(
-                "zirv ctx agent: could not resolve the state dir to look for another live \
-                 dashboard: {e}; running headless"
+                "zirv ctx agent: could not resolve the state dir to look for a live \
+                 dashboard: {e}"
             );
             return None;
         }
@@ -2376,7 +2483,7 @@ fn live_join_target(inherited: &Path, env: EnvLookup<'_>) -> Option<PathBuf> {
     // whose rejection reason was just printed.
     let others: Vec<super::dash::DashCandidate> = super::dash::discover_live_dash_dirs(&state)
         .into_iter()
-        .filter(|c| c.requests_dir != inherited)
+        .filter(|c| Some(c.requests_dir.as_path()) != inherited)
         .collect();
     // Selected before the log loop below, not after: whether a live candidate
     // is the winner or merely a live-but-passed-over sibling changes what
@@ -2384,7 +2491,7 @@ fn live_join_target(inherited: &Path, env: EnvLookup<'_>) -> Option<PathBuf> {
     // appear exactly once. See this function's own doc comment: "every
     // candidate ... is logged, live or not", which a silent `Live => {}` arm
     // here used to violate for every live sibling that lost the selection.
-    let winner = super::dash::select_live_dash_dir(&others);
+    let winner = select_join_target(&state, &others, repo);
     for candidate in &others {
         let is_winner = winner.is_some_and(|w| w.requests_dir == candidate.requests_dir);
         match candidate.status {
@@ -2417,7 +2524,7 @@ fn live_join_target(inherited: &Path, env: EnvLookup<'_>) -> Option<PathBuf> {
                 .map(|c| c.requests_dir.display().to_string())
                 .collect();
             eprintln!(
-                "zirv ctx agent: no other live dashboard found under {} ({}); running headless",
+                "zirv ctx agent: no live dashboard found under {} ({})",
                 state.dash().display(),
                 if considered.is_empty() {
                     "no other candidates".to_string()
@@ -2687,7 +2794,15 @@ pub fn run_with<W: Write>(
         .map(PathBuf::from)
         .and_then(|path| inherited_dashboard_liveness(&path))
         .is_some_and(|liveness| matches!(liveness, super::sessions::OwnerLiveness::Live));
-    let seat = if !args.headless && live_inherited_dashboard {
+    // 2026-09-06: a delegation is a pane seat whenever ANY live dashboard can
+    // host it, not only when this process was itself spawned inside one --
+    // the same widening `live_join_target` applies below. Reporting only
+    // (`route.detail`/`automatic_route_message`), so the extra directory
+    // read costs nothing a routing decision depends on.
+    let seat = if live_inherited_dashboard
+        || super::dash::select_live_dash_dir(&super::dash::discover_live_dash_dirs(&state))
+            .is_some()
+    {
         pace::Seat::Pane
     } else {
         pace::Seat::Cli
@@ -2872,55 +2987,61 @@ pub fn run_with<W: Write>(
         }
     };
 
-    // Issue #228: `--headless` skips the dashboard-join attempt entirely,
-    // even from inside a live dashboard -- the one way to keep every option
-    // `try_join_dashboard` would otherwise hard-error on (restart budget,
-    // wall-clock timeout, tool-call ceilings, arbitrary trailing flags) while
-    // still asking for a pane-capable session to host the supervised run.
-    if !args.headless
-        && let Some(result) = try_join_dashboard(
-            args,
-            &prompt,
-            w,
-            repo,
-            env,
-            DASH_ACK_TIMEOUT,
-            DASH_CLAIM_EXTENSION,
-            result_schema.as_ref(),
-        )
-    {
-        // Finding 4: the dashboard answered definitively, and only `Ok(0)`
-        // (`answer_for_ack`'s spawned-a-pane arm) means work actually
-        // started. A refusal spawned nothing, so a group minted for it
-        // moments ago holds nothing -- and `discard_if_unused` still checks
-        // that for itself, so the genuinely ambiguous "claimed but never
-        // confirmed" answer cannot delete a group a pane really did claim.
-        //
-        // Bounded race on `Ok(EXIT_DASH_UNCONFIRMED)`: the dashboard has
-        // already taken the request (so it will not be retried) but a slow
-        // dashboard may not yet have reached `admit_child` on this group when
-        // the discard below runs. If it lands in that window the still-
-        // pristine group is deleted out from under the in-flight admission,
-        // which then finds no group and refuses ("no work group") instead of
-        // spawning. Accepted: a clean refusal here is preferable to leaving
-        // group cleanup dependent on winning a race with a dashboard that may
-        // be arbitrarily slow or may never answer at all.
-        if matches!(result, Ok(0) | Ok(EXIT_DASH_UNCONFIRMED)) {
-            // Review finding (2026-09), finding 2a: a pane was actually
-            // spawned into this worktree -- ownership passes to it, and
-            // `dash::mod::reap_ended_panes` reclaims it once that pane's
-            // child exits. This delegation's own guard must not also try.
-            // Review round 3: the same holds for the unconfirmed answer --
-            // the dashboard has taken the request and may still spawn into
-            // this exact path moments later, so the guard must leave it
-            // alone; a clean directory left behind in that rare race is
-            // preferable to deleting a tree out from under a live spawn.
-            worktree_guard.disarm();
+    // 2026-09-06: there is no opt-out any more. A delegation is a visible
+    // pane whenever any live dashboard can host it, and the supervised child
+    // runs in this terminal only when none can (`Dispatch::Inline`, which
+    // announces itself). It is never an invisible stdout-captured child.
+    match try_join_dashboard(
+        args,
+        &prompt,
+        w,
+        repo,
+        env,
+        DASH_ACK_TIMEOUT,
+        DASH_CLAIM_EXTENSION,
+        result_schema.as_ref(),
+    ) {
+        Dispatch::Inline { no_dashboard } => {
+            if no_dashboard {
+                eprintln!("{}", inline_notice(&args.name));
+            }
         }
-        if !matches!(result, Ok(0)) {
-            discard_minted_group();
+        Dispatch::Answered(result) => {
+            // Finding 4: the dashboard answered definitively, and only `Ok(0)`
+            // (`answer_for_ack`'s spawned-a-pane arm) means work actually
+            // started. A refusal spawned nothing, so a group minted for it
+            // moments ago holds nothing -- and `discard_if_unused` still
+            // checks that for itself, so the genuinely ambiguous "claimed but
+            // never confirmed" answer cannot delete a group a pane really did
+            // claim.
+            //
+            // Bounded race on `Ok(EXIT_DASH_UNCONFIRMED)`: the dashboard has
+            // already taken the request (so it will not be retried) but a slow
+            // dashboard may not yet have reached `admit_child` on this group
+            // when the discard below runs. If it lands in that window the
+            // still-pristine group is deleted out from under the in-flight
+            // admission, which then finds no group and refuses ("no work
+            // group") instead of spawning. Accepted: a clean refusal here is
+            // preferable to leaving group cleanup dependent on winning a race
+            // with a dashboard that may be arbitrarily slow or may never
+            // answer at all.
+            if matches!(result, Ok(0) | Ok(EXIT_DASH_UNCONFIRMED)) {
+                // Review finding (2026-09), finding 2a: a pane was actually
+                // spawned into this worktree -- ownership passes to it, and
+                // `dash::mod::reap_ended_panes` reclaims it once that pane's
+                // child exits. This delegation's own guard must not also try.
+                // Review round 3: the same holds for the unconfirmed answer --
+                // the dashboard has taken the request and may still spawn into
+                // this exact path moments later, so the guard must leave it
+                // alone; a clean directory left behind in that rare race is
+                // preferable to deleting a tree out from under a live spawn.
+                worktree_guard.disarm();
+            }
+            if !matches!(result, Ok(0)) {
+                discard_minted_group();
+            }
+            return result;
         }
-        return result;
     }
 
     let announcer = Announcer::new(
@@ -4419,8 +4540,7 @@ mod tests {
         .expect("stale reading");
         let mut env = base_env(&state_dir);
         env.insert("ZIRV_CTX_FALLBACK".to_string(), "false".to_string());
-        let mut args = args_for("codex", "go");
-        args.headless = true;
+        let args = args_for("codex", "go");
         let result = run_with(&args, &mut Vec::new(), tmp.path(), &|key| {
             env.get(key).cloned()
         });
@@ -4513,8 +4633,7 @@ mod tests {
             format!("sh {}", fixture("fake-codex-agent.sh").display()),
         );
         env.insert("ZIRV_CTX_PACE_ESTIMATOR".to_string(), "false".to_string());
-        let mut args = args_for("codex", "go");
-        args.headless = true;
+        let args = args_for("codex", "go");
         let mut out = Vec::new();
         let result = run_with(&args, &mut out, tmp.path(), &|key| env.get(key).cloned());
 
@@ -5591,7 +5710,6 @@ mod tests {
             workdir: None,
             mode: WorkerMode::Writing,
             worktree: false,
-            headless: false,
             attach_artifact: None,
             workflow: None,
             task_class: None,
@@ -8490,6 +8608,152 @@ mod tests {
         (requests_dir, env)
     }
 
+    /// A live dashboard this process was never told about: a token directory
+    /// under `<state>/dash` with a live `owner.pid`, and deliberately NO
+    /// `DASH_REQUESTS_ENV` in the environment at all.
+    fn uninherited_live_dashboard(root: &Path) -> (PathBuf, HashMap<String, String>) {
+        let state_dir = root.join("state");
+        let requests_dir = state_dir
+            .join("dash")
+            .join("aaaa1111-0123456789abcdef")
+            .join("requests");
+        std::fs::create_dir_all(&requests_dir).expect("mkdir requests");
+        std::fs::write(
+            requests_dir.parent().expect("parent").join("owner.pid"),
+            std::process::id().to_string(),
+        )
+        .expect("write owner.pid");
+        (requests_dir, base_env(&state_dir))
+    }
+
+    /// 2026-09-06: `--headless` is gone as a spawn topology, so the flag must
+    /// not parse at all -- a script still passing it fails loudly rather than
+    /// being silently ignored and getting the opposite of what it asked for.
+    #[test]
+    fn the_headless_flag_no_longer_parses() {
+        use clap::Parser;
+
+        #[derive(Debug, clap::Parser)]
+        struct OnlyAgent {
+            #[command(flatten)]
+            #[allow(dead_code)]
+            args: AgentArgs,
+        }
+
+        assert!(
+            OnlyAgent::try_parse_from(["zirv", "claude", "go"]).is_ok(),
+            "the delegation itself still parses"
+        );
+        let err = OnlyAgent::try_parse_from(["zirv", "claude", "go", "--headless"])
+            .expect_err("--headless must be rejected outright");
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::UnknownArgument,
+            "got {err}"
+        );
+    }
+
+    /// Rule 2: a live dashboard is joined even when this process was never
+    /// spawned inside one -- no `DASH_REQUESTS_ENV`, just a live token dir
+    /// under `<state>/dash`. The request lands there and the ack path answers
+    /// exactly as it does for an inherited channel.
+    #[test]
+    fn a_live_dashboard_this_process_never_inherited_is_still_joined() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let (requests_dir, env) = uninherited_live_dashboard(tmp.path());
+        assert!(
+            !env.contains_key(crate::commands::ctx::dash::spawnreq::DASH_REQUESTS_ENV),
+            "this process inherits no dashboard channel"
+        );
+
+        let responder = std::thread::spawn({
+            let dir = requests_dir.clone();
+            move || respond_to_next_request(dir, r#"{"ok":true,"short":"abcd1234","reason":null}"#)
+        });
+
+        let args = joinable_args("claude", "a task from a plain terminal");
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned())
+            .expect("the uninherited dashboard join runs");
+        let request_body = responder.join().expect("responder thread");
+
+        assert_eq!(code, 0);
+        assert!(
+            String::from_utf8_lossy(&out).contains("spawned in dashboard as abcd1234"),
+            "got {}",
+            String::from_utf8_lossy(&out)
+        );
+        assert!(
+            request_body.contains("a task from a plain terminal"),
+            "the prompt travels as data: {request_body}"
+        );
+    }
+
+    /// Rule 3: no live dashboard anywhere means the supervised child runs in
+    /// this terminal, announced by exactly one line. Never a refusal, and
+    /// this process never launches a dashboard of its own.
+    #[test]
+    fn no_live_dashboard_anywhere_runs_inline_behind_one_notice_line() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let env = base_env(&tmp.path().join("state"));
+
+        let args = joinable_args("claude", "go");
+        let mut out = Vec::new();
+        let dispatch = try_join_dashboard(
+            &args,
+            &args.prompt,
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            Duration::from_millis(50),
+            Duration::from_millis(50),
+            None,
+        );
+
+        assert!(
+            matches!(dispatch, Dispatch::Inline { no_dashboard: true }),
+            "got {dispatch:?}"
+        );
+        assert!(out.is_empty(), "nothing is reported as spawned");
+
+        let notice = inline_notice(&args.name);
+        assert_eq!(notice.lines().count(), 1, "exactly one line: {notice}");
+        assert!(notice.contains("no live dashboard"), "got {notice}");
+        assert!(notice.contains("claude"), "must name the agent: {notice}");
+    }
+
+    /// Rule 2's preference order: a dashboard whose own registry row names
+    /// THIS repository wins over any other live one. These two pure helpers
+    /// are what turns a `<state>/dash/<short>-<token>/requests` path back
+    /// into the dashboard short id the registry is keyed by.
+    #[test]
+    fn a_dash_candidates_repo_is_matched_through_its_short_id() {
+        let dir = Path::new("/state/dash/aaaa1111-0123456789abcdef/requests");
+        assert_eq!(dash_short_of(dir).as_deref(), Some("aaaa1111"));
+        assert_eq!(dash_short_of(Path::new("requests")), None);
+
+        let candidate = super::super::dash::DashCandidate {
+            requests_dir: dir.to_path_buf(),
+            status: super::super::dash::CandidateStatus::NoOwnerPid,
+        };
+        assert!(candidate_hosts_repo(
+            &candidate,
+            &["aaaa1111".to_string(), "bbbb2222".to_string()]
+        ));
+        assert!(
+            !candidate_hosts_repo(&candidate, &["bbbb2222".to_string()]),
+            "a dashboard registered against another repo is not a repo match"
+        );
+        assert!(
+            !candidate_hosts_repo(&candidate, &[]),
+            "no registered dashboard for this repo means no preference at all"
+        );
+    }
+
     /// F2 (defense in depth): the request's prompt is encoded positionally
     /// into the pane's argv, so a prompt shaped like a flag would reach the
     /// real harness child as one. The dashboard refuses such a request at the
@@ -8517,7 +8781,7 @@ mod tests {
         );
 
         assert!(
-            joined.is_none(),
+            joined.is_inline(),
             "must fall through to the safe headless path"
         );
         assert!(out.is_empty(), "nothing is reported as spawned");
@@ -8531,131 +8795,76 @@ mod tests {
         );
     }
 
-    /// Issue #228: `--max-restarts`, `--timeout-secs`, `--max-tool-calls`
-    /// and trailing `-- flags` beyond a lone `--model` pin are all honoured
-    /// by `exec::run_with` and carried by nothing in a `SpawnRequest`. This
-    /// USED TO print a notice and silently fall back to headless (F9) --
-    /// now it hard-errors instead, naming what was refused, so a demotion an
-    /// operator explicitly asked to avoid (by being inside a dashboard at
-    /// all) can never slip past unnoticed. `--quiet` and `--workdir` stay
-    /// allowed: neither is in this list at all (see the separate `--workdir`
-    /// and `--headless` tests below).
+    /// 2026-09-06: `--max-restarts`/`--timeout-secs`/`--max-tool-calls` and
+    /// the trailing `-- flags` USED TO hard-error here, telling the operator
+    /// to pass `--headless`. With headless gone as a spawn topology they all
+    /// travel on the request instead, and the delegation still gets its
+    /// visible pane.
     #[test]
-    fn options_a_pane_cannot_honour_now_hard_error_instead_of_silently_demoting() {
+    fn supervision_ceilings_travel_on_the_request_instead_of_hard_erroring() {
         let tmp = crate::commands::ctx::testenv::repo();
         let home = tmp.path().join("home");
         let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
         let (requests_dir, env) = live_dashboard_dir(tmp.path());
 
-        for (mutate, must_name) in [
-            (
-                (|a: &mut AgentArgs| a.max_restarts = Some(2)) as fn(&mut AgentArgs),
-                "--max-restarts",
-            ),
-            (
-                |a: &mut AgentArgs| a.timeout_secs = Some(90),
-                "--timeout-secs",
-            ),
-            (
-                |a: &mut AgentArgs| a.flags = vec!["--verbose".to_string()],
-                "--verbose",
-            ),
-            // A model pin plus anything else is still refused: honouring
-            // half of what the operator typed is worse than not using the
-            // dashboard at all.
-            (
-                |a: &mut AgentArgs| {
-                    a.flags = vec![
-                        "--model".to_string(),
-                        "haiku".to_string(),
-                        "--verbose".to_string(),
-                    ]
-                },
-                "--verbose",
-            ),
-            (
-                |a: &mut AgentArgs| a.max_tool_calls = Some(50),
-                "--max-tool-calls",
-            ),
-        ] {
-            let mut args = joinable_args("claude", "go");
-            mutate(&mut args);
-            let mut out = Vec::new();
-            let joined = try_join_dashboard(
-                &args,
-                &args.prompt,
-                &mut out,
-                tmp.path(),
-                &|k| env.get(k).cloned(),
-                Duration::from_millis(200),
-                Duration::from_millis(200),
-                None,
-            );
-            let err = joined
-                .expect("must answer definitively, not silently fall back")
-                .expect_err("must hard-error rather than demote");
-            let msg = err.to_string();
-            assert!(msg.contains(must_name), "got {msg}");
-            assert!(
-                msg.contains("--headless"),
-                "must say how to keep the flag and still run supervised: {msg}"
-            );
-            assert!(
-                std::fs::read_dir(&requests_dir)
-                    .expect("read requests dir")
-                    .flatten()
-                    .next()
-                    .is_none(),
-                "and must not have written a request either"
-            );
-        }
+        let responder = std::thread::spawn({
+            let dir = requests_dir.clone();
+            move || respond_to_next_request(dir, r#"{"ok":true,"short":"abcd1234","reason":null}"#)
+        });
 
-        // The control: the same call with none of them set does reach the
-        // channel (it writes a request, then times out unanswered) -- the
-        // hard-error gate must not fire on a plain, pane-compatible request.
-        let args = joinable_args("claude", "go");
+        let mut args = joinable_args("claude", "go");
+        args.max_restarts = Some(2);
+        args.timeout_secs = Some(90);
+        args.max_tool_calls = Some(50);
+        args.flags = vec!["--model".to_string(), "haiku".to_string()];
+
         let mut out = Vec::new();
-        let joined = try_join_dashboard(
-            &args,
-            &args.prompt,
-            &mut out,
-            tmp.path(),
-            &|k| env.get(k).cloned(),
-            Duration::from_millis(200),
-            Duration::from_millis(200),
-            None,
-        );
-        assert!(joined.is_none(), "an unanswered request still falls back");
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned())
+            .expect("the delegation must reach the pane, not a hard error");
+        let request_body = responder.join().expect("responder thread");
+
+        assert_eq!(code, 0);
+        let req: spawnreq::SpawnRequest =
+            serde_json::from_str(&request_body).expect("the request parses");
+        assert_eq!(req.max_restarts, Some(2));
+        assert_eq!(req.timeout_secs, Some(90));
+        assert_eq!(req.max_tool_calls, Some(50));
+        assert_eq!(req.flags, vec!["--model".to_string(), "haiku".to_string()]);
     }
 
-    /// Issue #228: `--headless` skips the dashboard-join attempt entirely --
-    /// checked in `run_with`, before `try_join_dashboard` is ever called --
-    /// so an operator can keep e.g. `--max-restarts` from inside a dashboard
-    /// on explicit request, exactly the pre-#228 capability, rather than
-    /// hitting the hard error the gate above now raises for it.
+    /// The F9 rule survives the removal: what a pane cannot hold exactly the
+    /// way the inline path would is ANNOUNCED, never refused and never
+    /// silently dropped. `--max-restarts`/`--timeout-secs` are absent because
+    /// a pane genuinely honours both (it never restarts its child, and
+    /// `dash::enforce_pane_deadlines` enforces the wall clock).
     #[test]
-    fn headless_flag_bypasses_the_dashboard_join_and_keeps_pane_incompatible_options() {
-        let tmp = crate::commands::ctx::testenv::repo();
-        let home = tmp.path().join("home");
-        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
-        let (requests_dir, env) = live_dashboard_dir(tmp.path());
-
+    fn a_pane_announces_only_the_ceilings_it_genuinely_cannot_hold() {
         let mut args = args_for("claude", "go");
-        args.headless = true;
-        args.max_restarts = Some(0);
-        args.timeout_secs = Some(1);
-        let mut out = Vec::new();
-        // `run_with` itself, not `try_join_dashboard` directly: `--headless`
-        // is checked at `run_with`'s own call site, ahead of the function
-        // under test above.
-        let _ = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        args.max_restarts = Some(2);
+        args.timeout_secs = Some(90);
+        args.max_tool_calls = None;
+        args.flags = Vec::new();
         assert!(
-            std::fs::read_dir(&requests_dir)
-                .expect("read requests dir")
-                .flatten()
-                .next()
-                .is_none(),
-            "--headless must never even attempt the dashboard-join channel"
+            pane_ceiling_notices(&args).is_empty(),
+            "a restart budget and a wall clock are both honoured on a pane"
+        );
+
+        args.max_tool_calls = Some(50);
+        args.flags = vec!["--model".to_string(), "haiku".to_string()];
+        let notices = pane_ceiling_notices(&args);
+        assert_eq!(notices.len(), 1, "a lone model pin travels: {notices:?}");
+        assert!(notices[0].contains("--max-tool-calls"), "got {notices:?}");
+
+        args.flags = vec![
+            "--model".to_string(),
+            "haiku".to_string(),
+            "--verbose".to_string(),
+        ];
+        let notices = pane_ceiling_notices(&args);
+        assert_eq!(notices.len(), 2, "got {notices:?}");
+        assert!(
+            notices[1].contains("--verbose"),
+            "the dropped flags must be named: {notices:?}"
         );
     }
 
@@ -8684,7 +8893,7 @@ mod tests {
             Duration::from_millis(200),
             None,
         );
-        assert!(joined.is_none(), "nobody answered, so this runs headless");
+        assert!(joined.is_inline(), "nobody answered, so this runs headless");
 
         let leftover: Vec<PathBuf> = std::fs::read_dir(&requests_dir)
             .expect("read requests dir")
@@ -8736,7 +8945,7 @@ mod tests {
             None,
         );
         assert!(
-            joined.is_none(),
+            joined.is_inline(),
             "no live dashboard owns this directory; falls back to headless"
         );
         assert!(
@@ -8790,7 +8999,7 @@ mod tests {
             None,
         );
         assert!(
-            joined.is_none(),
+            joined.is_inline(),
             "no owner.pid means no dashboard can be confirmed live; falls back to headless"
         );
         assert!(
@@ -8868,7 +9077,7 @@ mod tests {
         taker.join().expect("taker thread");
 
         let code = joined
-            .expect("a request this process could not take back must not fall back to headless")
+            .expect_answer("a request this process could not take back must not run inline")
             .expect("writes its line");
         assert_eq!(code, 1, "an unconfirmed spawn is a failure, not a success");
         assert!(
@@ -8929,7 +9138,7 @@ mod tests {
         claimer.join().expect("claimer thread");
 
         let code = joined
-            .expect("a claimed request must not fall back to headless")
+            .expect_answer("a claimed request must not run inline")
             .expect("writes its line");
         assert_eq!(code, 1, "an unconfirmed spawn is a failure, not a success");
         let printed = String::from_utf8_lossy(&out);
@@ -8980,7 +9189,7 @@ mod tests {
         responder.join().expect("responder thread");
 
         let code = joined
-            .expect("claimed, then acked")
+            .expect_answer("claimed, then acked")
             .expect("writes its line");
         assert_eq!(code, 0);
         assert!(
@@ -9026,7 +9235,7 @@ mod tests {
         responder.join().expect("responder thread");
 
         assert!(
-            joined.is_none(),
+            joined.is_inline(),
             "a channel-level failure must not suppress the headless path"
         );
         assert!(out.is_empty(), "nothing is reported as spawned");
@@ -9066,7 +9275,9 @@ mod tests {
         );
         responder.join().expect("responder thread");
 
-        let code = joined.expect("a refusal is definitive").expect("writes");
+        let code = joined
+            .expect_answer("a refusal is definitive")
+            .expect("writes");
         assert_eq!(code, 1);
         assert!(
             String::from_utf8_lossy(&out).contains("disabled"),
@@ -9096,7 +9307,7 @@ mod tests {
             Duration::from_millis(200),
             None,
         );
-        assert!(joined.is_none());
+        assert!(joined.is_inline());
         assert!(out.is_empty());
     }
 
@@ -9347,7 +9558,11 @@ mod tests {
             .join("requests");
         let env = base_env(&state_dir);
 
-        let target = live_join_target(&inherited, &|k| env.get(k).cloned());
+        let target = live_join_target(
+            Some(inherited.as_path()),
+            &|k| env.get(k).cloned(),
+            std::path::Path::new("."),
+        );
         assert!(
             target.is_none(),
             "no live dashboard exists anywhere, so the fallback must give up"
