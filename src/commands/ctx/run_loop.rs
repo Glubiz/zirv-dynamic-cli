@@ -212,6 +212,7 @@ pub(crate) fn run_with_clock<W: Write>(
     // every later trip (an ordinary cycle, or resuming after an objective
     // park) paces normally instead of being read as another fresh launch.
     let mut initial_launch = true;
+    let mut last_unread_counts = None;
     loop {
         if let Some(limit) = args.cycles
             && cycle >= limit
@@ -502,12 +503,20 @@ pub(crate) fn run_with_clock<W: Write>(
             // Item 3: consumed right after the first spawn that actually
             // carried this cycle's prompt. The drain makes every in-place
             // continuation a no-op here.
+            //
+            // T4 (I-1): as the STABLE registry short -- the same identity
+            // `delivery_filter` above listed under. A fan-out's read marker
+            // is `<stem>.read/<reader>` (see `mail::consume_and_log`), so
+            // consuming as this cycle's own fresh `session_short` filed the
+            // marker under an id that rotates every cycle: the message stayed
+            // unread forever and was re-delivered, and re-counted as "new
+            // mail", on every single cycle.
             for (path, _) in mail_entries.drain(..) {
                 let _ = super::mail::consume_and_log(
                     &state,
                     &mail_slug,
                     &path,
-                    &session_short,
+                    registry_short.as_deref().unwrap_or(&session_short),
                     "loop",
                     "loop:cycle-prompt",
                 );
@@ -876,21 +885,22 @@ pub(crate) fn run_with_clock<W: Write>(
         }
 
         // Issue #311: new mail is a reset trigger alongside a digest change,
-        // but is only worth the extra `mail::list` scan when self-pacing is
-        // actually engaged and the cycle succeeded -- a failing cycle resets
-        // the self-paced wait unconditionally inside `handle_cycle_outcome`
-        // regardless of mail, and a run launched with an explicit
-        // `--interval` never consults this at all.
-        let new_mail = self_pace_state.is_some()
-            && !failed
-            && mail::unread_counts(
+        // and tracks unread counts even across failures so an old unread
+        // message cannot keep resetting the wait after recovery. An explicit
+        // `--interval` never consults mail for pacing.
+        let unread_counts = if self_pace_state.is_some() {
+            mail::unread_counts(
                 &state,
                 repo,
                 adapter.name(),
                 &nudge_address,
                 cfg.mail.enabled,
             )
-            .is_some_and(|(broadcast, direct)| broadcast + direct > 0);
+        } else {
+            None
+        };
+        let new_mail = mail_arrived_since(last_unread_counts, unread_counts);
+        last_unread_counts = unread_counts;
         let self_pace = self_pace_state.as_mut().map(|pace_state| SelfPaceInput {
             state: pace_state,
             ceiling: Duration::from_secs(cfg.supervise.loop_backoff_ceiling_secs),
@@ -1316,6 +1326,30 @@ pub enum PaceReason {
     /// The digest matched the previous cycle's and no new mail arrived: the
     /// wait grows geometrically toward the ceiling.
     Unchanged,
+}
+
+/// Issue #311 (T4/I-1): whether mail ARRIVED since the previous cycle, from
+/// the two `mail::unread_counts` readings either side of it. Pure, so the
+/// edge-vs-level distinction is a plain unit test.
+///
+/// This is deliberately an EDGE, not a level: `next_pace`'s `new_mail` used
+/// to be `unread > 0`, which pinned a self-paced loop at its floor forever
+/// the moment one message sat in the mailbox unconsumed (a park, a refused
+/// launch, or -- before the same fix's other half -- a fan-out the cycle
+/// delivered under a reader id that never marked it read). A message that is
+/// still merely PRESENT is not news; only a count that GREW is.
+///
+/// Broadcast and direct counts are compared independently so a fan-out
+/// arriving in the same cycle a directed message is consumed still reads as
+/// new mail. `None` (mail disabled, or self-pacing off) is never new mail,
+/// and an absent previous reading is treated as `(0, 0)` -- anything unread
+/// on the first cycle is genuinely news to this run.
+fn mail_arrived_since(previous: Option<(usize, usize)>, current: Option<(usize, usize)>) -> bool {
+    let Some((broadcast, direct)) = current else {
+        return false;
+    };
+    let (previous_broadcast, previous_direct) = previous.unwrap_or_default();
+    broadcast > previous_broadcast || direct > previous_direct
 }
 
 /// Issue #311: the next wait between `zirv ctx loop` cycles when no explicit
@@ -2029,6 +2063,109 @@ mod tests {
         assert!(
             !log.contains("\"action\":\"loop-pace\""),
             "self-pacing must never engage without --interval being omitted, got {log}"
+        );
+    }
+
+    #[test]
+    fn fanout_mail_is_consumed_once_and_does_not_pin_loop_pacing() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let _fake =
+            crate::commands::ctx::testenv::VarGuard::set(&[("FAKE_AGENT_MODE", Some("healthy"))]);
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let slug = super::super::state::repo_slug(tmp.path());
+        let mut args = args_for(2);
+        args.interval_secs = None;
+        let mut env = base_env(state.root());
+        env.insert("ZIRV_CTX_PACE".into(), "false".into());
+        let mut out = Vec::new();
+        let delivered = std::cell::Cell::new(false);
+        run_with_clock(
+            &args,
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            &|| 100,
+            &|_| {
+                if !delivered.replace(true) {
+                    super::super::mail::store_fanout(
+                        &state,
+                        &slug,
+                        &slug,
+                        &super::super::mail::Message {
+                            from_session: "sender".into(),
+                            from_agent: "claude".into(),
+                            to: "any".into(),
+                            to_session: None,
+                            sent: 1,
+                            body: "check the pending work".into(),
+                        },
+                        &CtxConfig::default(),
+                    )
+                    .expect("fanout mail");
+                }
+            },
+        )
+        .expect("runs");
+        let log = std::fs::read_to_string(state.logs().join("decisions.jsonl")).expect("log");
+        let decisions: Vec<serde_json::Value> = log
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("decision"))
+            .filter(|entry| entry["action"] == "loop-pace")
+            .collect();
+        assert_eq!(decisions.len(), 2);
+        assert!(
+            decisions[1]["detail"]
+                .as_str()
+                .expect("detail")
+                .starts_with("unchanged x1,"),
+            "consumed fanout must not pin pacing: {}",
+            decisions[1]
+        );
+        let short =
+            super::super::sessions::short_id(decisions[0]["session"].as_str().expect("session"));
+        assert!(
+            super::super::mail::list(&state, &slug, Some("claude"), Some(&short))
+                .expect("mail")
+                .is_empty(),
+            "fanout must be consumed under the stable registry identity"
+        );
+    }
+
+    /// Issue #311 (T4/I-1): the other half of the same defect -- mail that
+    /// merely SITS unread must not be read as "new mail" on every cycle, or
+    /// self-pacing never grows past its floor. The pre-fix predicate was
+    /// `broadcast + direct > 0`, which is true for every row below.
+    #[test]
+    fn unconsumed_mail_is_only_new_on_the_cycle_it_arrives() {
+        assert!(
+            !mail_arrived_since(Some((1, 0)), Some((1, 0))),
+            "an unchanged unread count must never keep resetting the wait"
+        );
+        assert!(
+            !mail_arrived_since(Some((2, 3)), Some((2, 3))),
+            "neither must an unchanged count of several messages"
+        );
+        assert!(
+            !mail_arrived_since(Some((1, 1)), Some((0, 1))),
+            "consuming mail is not new mail either"
+        );
+        assert!(
+            mail_arrived_since(Some((0, 0)), Some((1, 0))),
+            "a fan-out that just arrived is new mail"
+        );
+        assert!(
+            mail_arrived_since(Some((1, 0)), Some((1, 1))),
+            "a directed message arriving alongside an unread fan-out is new mail"
+        );
+        assert!(
+            mail_arrived_since(None, Some((0, 1))),
+            "with no previous reading, anything unread is news to this run"
+        );
+        assert!(
+            !mail_arrived_since(None, None),
+            "mail disabled (or self-pacing off) is never new mail"
         );
     }
 

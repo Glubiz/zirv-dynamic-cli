@@ -55,11 +55,16 @@ pub enum Event {
     /// growth, or mail activity for `idle_secs`, and this is the ONE time the
     /// once-only banner fires for this stall episode (`sessions::write_stall_
     /// marker`'s own claim-once idiom is what keeps this from repeating every
-    /// poll). A steering nudge is sent at the same moment this is emitted;
-    /// if no progress is observed within the configured grace period the
-    /// session is terminated, which is its own, separate log/report, not a
-    /// second `Stalled` event.
-    Stalled { idle_secs: u64 },
+    /// poll). If no progress is observed within the configured grace period
+    /// the session is terminated, which is its own, separate log/report, not
+    /// a second `Stalled` event.
+    ///
+    /// T4 (C-2): `nudged` is whether a steering nudge was actually delivered
+    /// (queued in the session's mailbox) at this same moment. It used to be
+    /// announced unconditionally, and nothing was ever delivered at all --
+    /// the banner has to be able to say so when mail is disabled or the
+    /// write failed, rather than promising a nudge that never arrived.
+    Stalled { idle_secs: u64, nudged: bool },
     /// Unread mail is waiting in the mailbox (the T8 advisory `wrap`'s pump
     /// used to build by hand).
     MailWaiting { count: usize },
@@ -335,10 +340,16 @@ impl Event {
             Event::Restart { style, stored } => {
                 format!("session restarted with a {style} handoff, stored at {stored}")
             }
-            Event::Stalled { idle_secs } => format!(
-                "no progress for {idle_secs}s; sending a steering nudge and terminating if it \
-                 stays unresponsive"
-            ),
+            Event::Stalled { idle_secs, nudged } => {
+                let nudge = if *nudged {
+                    "a steering nudge is waiting in this session's mailbox (`zirv ctx inbox`)"
+                } else {
+                    "no channel was available to send a steering nudge"
+                };
+                format!(
+                    "no progress for {idle_secs}s; {nudge}; terminating if it stays unresponsive"
+                )
+            }
             Event::MailWaiting { count } => {
                 let plural = if *count == 1 { "" } else { "s" };
                 format!(
@@ -803,10 +814,31 @@ mod tests {
     /// Issue #310: the stalled banner names how long the session went quiet.
     #[test]
     fn a_stalled_announcement_names_the_idle_duration() {
-        let event = Event::Stalled { idle_secs: 450 };
+        let event = Event::Stalled {
+            idle_secs: 450,
+            nudged: true,
+        };
         let line = event.line();
         assert!(line.contains("450"), "got {line}");
         assert!(line.contains("nudge"), "got {line}");
+    }
+
+    /// T4 (C-2): the banner used to promise a steering nudge unconditionally
+    /// while `exec` delivered nothing at all. It must never claim a nudge is
+    /// waiting when none was queued.
+    #[test]
+    fn a_stalled_announcement_never_promises_a_nudge_that_was_not_delivered() {
+        let line = Event::Stalled {
+            idle_secs: 450,
+            nudged: false,
+        }
+        .line();
+        assert!(line.contains("450"), "got {line}");
+        assert!(
+            !line.contains("waiting in this session's mailbox"),
+            "got {line}"
+        );
+        assert!(line.contains("no channel was available"), "got {line}");
     }
 
     #[test]

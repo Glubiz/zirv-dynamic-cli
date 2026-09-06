@@ -1519,6 +1519,8 @@ fn run_with_clock_inner<W: Write>(
         // above -- a restart mints a fresh child, so its own stall clock
         // starts over along with it.
         let mut stalled = false;
+        let mut capacity_pattern = None;
+        let mut account_pattern = None;
         let outcome = supervise_run(
             &mut child,
             Instant::now() + timeout,
@@ -1542,6 +1544,8 @@ fn run_with_clock_inner<W: Write>(
             &mut progressed,
             &tap,
             &mut limit_hit,
+            &mut capacity_pattern,
+            &mut account_pattern,
             &mut limit_confirmation_detail,
             &mut nudged_by,
             nudge_restarts,
@@ -1554,7 +1558,7 @@ fn run_with_clock_inner<W: Write>(
             &mut budget_soft_warned,
             &mut budget_exhausted,
             repo,
-            cfg.mail.enabled,
+            &cfg,
             Duration::from_secs(cfg.supervise.idle_no_tool_secs),
             Duration::from_secs(cfg.supervise.in_tool_secs),
             Duration::from_secs(cfg.supervise.stall_grace_secs),
@@ -1613,18 +1617,21 @@ fn run_with_clock_inner<W: Write>(
         // repro in `supervise.rs`'s own test module, not by inspection alone).
         // Issue #227: a provider capacity/overload error and an account/
         // billing exhaustion are both text-tail conditions, exactly like a
-        // vendor usage-limit message, so they are read off the same final
-        // drain rather than a second read of the tap (which would lose
-        // lines: `drain_to_eof` is destructive). Checked only when `limit_
-        // hit` is still false: a vendor-confirmed usage-limit message always
-        // wins the classification on the rare tail that somehow carries more
-        // than one of these phrasings. `account_pattern` wins over `capacity_
-        // pattern` for the same reason -- burning the restart budget on a
-        // capacity retry when the account itself is empty would just fail
-        // again immediately.
-        let mut capacity_pattern: Option<&'static str> = None;
-        let mut account_pattern: Option<&'static str> = None;
-        if !limit_hit {
+        // vendor usage-limit message. T4 (C-4): they are now ALSO scanned in
+        // the tick, because the tick's own `tap.try_lines()` is destructive --
+        // a capacity line printed more than one poll before the exit never
+        // reached this final drain at all, and the run was misclassified as a
+        // timeout/crash and restarted with no backoff. The two readings are
+        // merged here rather than replacing one another. A vendor-confirmed
+        // usage-limit message still wins the classification outright (both
+        // labels are dropped below when `limit_hit` holds), and `account_
+        // pattern` still wins over `capacity_pattern` -- burning the restart
+        // budget on a capacity retry when the account itself is empty would
+        // just fail again immediately.
+        if limit_hit {
+            capacity_pattern = None;
+            account_pattern = None;
+        } else {
             let final_lines = tap.drain_to_eof(supervise::FINAL_DRAIN_BUDGET);
             let limit_text_seen = pace::scan_for_limit(
                 &final_lines,
@@ -1653,9 +1660,11 @@ fn run_with_clock_inner<W: Write>(
                 }
             }
             if !limit_hit {
-                account_pattern = pace::scan_for_account_exhausted(&final_lines);
+                account_pattern =
+                    account_pattern.or_else(|| pace::scan_for_account_exhausted(&final_lines));
                 if account_pattern.is_none() {
-                    capacity_pattern = pace::scan_for_capacity_error(&final_lines);
+                    capacity_pattern =
+                        capacity_pattern.or_else(|| pace::scan_for_capacity_error(&final_lines));
                 }
             }
         }
@@ -1859,9 +1868,14 @@ fn run_with_clock_inner<W: Write>(
         // cap, so this arm always follows through rather than needing its
         // own "no prompt"/"over budget" fallbacks the way rot's restart does.
         if let Some(nudged_from) = nudged_by.take() {
+            // T4 (C-6): unreachable by construction (`supervise_run` only ever
+            // sets `nudged` when a prompt is known), but a hot restart path
+            // must not carry an `expect` -- the release profile is
+            // `panic = "abort"`, so a wrong assumption here would kill the
+            // supervised session rather than ending the run honestly.
             let prompt_text = prompt
                 .clone()
-                .expect("supervise_run only sets `nudged` when a prompt is known");
+                .ok_or_else(|| "cannot relaunch after a nudge: no prompt is known".to_string())?;
 
             let jsonl = std::fs::read_to_string(&transcript).unwrap_or_default();
             let ctx = adapter.structural_context(&jsonl, cfg.handoff.tail_items);
@@ -2289,7 +2303,13 @@ fn run_with_clock_inner<W: Write>(
                     "zirv ctx exec: usage limit hit; continuing on another harness ({detail})"
                 )?;
 
-                let prompt_text = prompt.clone().expect("route requires a known prompt");
+                // T4 (C-6): same reasoning as the nudge relaunch above --
+                // routing is only ever reached with a resolved prompt, and a
+                // hot restart path must end the run honestly rather than
+                // abort the process on a broken assumption.
+                let prompt_text = prompt.clone().ok_or_else(|| {
+                    "cannot continue on another harness: no prompt is known".to_string()
+                })?;
                 let continuation = format!(
                     "{prompt_text}\n\nThe previous harness exhausted its usage window. Continue from this handoff without redoing completed work:\n\n{}",
                     handoff::labeled_for_injection(&note, &cfg.screen.thresholds())
@@ -3048,6 +3068,8 @@ fn supervise_run(
     progressed: &mut bool,
     tap: &supervise::OutputTap,
     limit_hit: &mut bool,
+    capacity_pattern: &mut Option<&'static str>,
+    account_pattern: &mut Option<&'static str>,
     limit_confirmation_detail: &mut Option<String>,
     nudged_by: &mut Option<String>,
     nudges_used: u32,
@@ -3068,16 +3090,19 @@ fn supervise_run(
     soft_warned: &mut bool,
     budget_exhausted: &mut bool,
     // Issue #310 (3a): progress-clock inputs and the once-only stall latch.
-    // `repo`/`mail_enabled` feed the mail-activity progress signal
-    // (`mail::unread_counts`); the three durations are `cfg.supervise.
-    // {idle_no_tool,in_tool,stall_grace}_secs`, read once by the caller so
-    // this function -- like every other decision seam in this module --
-    // never reads `cfg` itself. `stalled` mirrors `rotted` above: set the
-    // instant the grace period elapses with no observed progress, so the
-    // caller's own `reason`/chain-recording logic can tell this restart
-    // apart from an ordinary rot/timeout one.
+    // `repo`/`cfg` feed the mail-activity progress signal (`mail::unread_
+    // counts`) and, since T4 (C-2), the steering nudge the latch actually
+    // delivers; the three durations are `cfg.supervise.{idle_no_tool,in_tool,
+    // stall_grace}_secs`, still read once by the caller and passed narrowly,
+    // like `score_cfg`/`pace_cfg` above. `cfg` is the ONE whole-config
+    // parameter here, and only because `mail::store_to` takes a `&CtxConfig`
+    // of its own -- no decision in this function reads anything off it but
+    // `mail.enabled`. `stalled` mirrors `rotted` above: set the instant the
+    // grace period elapses with no observed progress, so the caller's own
+    // `reason`/chain-recording logic can tell this restart apart from an
+    // ordinary rot/timeout one.
     repo: &Path,
-    mail_enabled: bool,
+    cfg: &CtxConfig,
     idle_no_tool: Duration,
     in_tool: Duration,
     stall_grace: Duration,
@@ -3110,6 +3135,8 @@ fn supervise_run(
     let mut last_mail_activity: Option<(usize, usize)> = None;
     let mut tick = || {
         let lines = tap.try_lines();
+        *account_pattern = account_pattern.or_else(|| pace::scan_for_account_exhausted(&lines));
+        *capacity_pattern = capacity_pattern.or_else(|| pace::scan_for_capacity_error(&lines));
         if !lines.is_empty() {
             stall_signals.last_output = Some(Instant::now());
         }
@@ -3202,11 +3229,33 @@ fn supervise_run(
         // channel -- a CHANGE in the unread counts (new mail arrived, or was
         // just consumed by the nudge check above) counts as progress, not
         // merely mail existing.
-        let mail_activity =
-            super::mail::unread_counts(state, repo, adapter.name(), registry_short, mail_enabled);
+        let mail_activity = super::mail::unread_counts(
+            state,
+            repo,
+            adapter.name(),
+            registry_short,
+            cfg.mail.enabled,
+        );
         if mail_activity != last_mail_activity {
             stall_signals.last_mail = Some(Instant::now());
             last_mail_activity = mail_activity;
+        }
+        // T4 (C-1): transcript growth is the progress clock's turn channel
+        // ("Stop hook / transcript-growth signal"), and this poll is already
+        // reading exactly the bytes that prove it -- `IncrementalScorer::
+        // poll` answers `Some(report)` only for a poll that genuinely
+        // consumed new bytes (or saw the transcript restart). Without this,
+        // the only channels were stdout, a turn signal and a mail-count
+        // change: a healthy `claude -p` worker prints nothing until the very
+        // end and posts its Stop hook only then, so 20 minutes of real tool
+        // work tripped `in_tool_secs` and was terminated after the grace.
+        // Polled HERE, ahead of `stall::decide`, so this tick's own growth
+        // counts toward this tick's verdict; the result is consumed by the
+        // screening/verdict arms below exactly as before, and a scoring
+        // failure still must never kill a healthy run.
+        let poll_result = scorer.poll(adapter, score_cfg, screen_thresholds);
+        if let Ok((_, Some(_))) = &poll_result {
+            stall_signals.last_turn = Some(Instant::now());
         }
         match super::stall::decide(
             stall_latch,
@@ -3266,7 +3315,58 @@ fn supervise_run(
                     .with_attention(super::attention::Attention::Stalled),
                     now_secs(),
                 );
-                announcer.emit(&super::announce::Event::Stalled { idle_secs });
+                // Issue #310 / T4 (C-2): the latch used to write a marker,
+                // announce "sending a steering nudge" and log `stall-nudge`
+                // while delivering NOTHING to the child -- the announcement
+                // and the log line described a nudge that did not exist.
+                // Deliver it over the one channel a headless child actually
+                // consumes: a directed message in this run's own mailbox,
+                // addressed to the stable registry short so the next nudge
+                // relaunch (or `zirv ctx inbox`) picks it up. `nudged`
+                // carries the truth of that delivery into the banner rather
+                // than letting it claim something that did not happen.
+                let slug = super::state::repo_slug(repo);
+                let nudge = super::mail::Message {
+                    from_session: "supervisor".into(),
+                    from_agent: "zirv".into(),
+                    to: adapter.name().into(),
+                    to_session: Some(registry_short.into()),
+                    sent: now_secs(),
+                    body: format!(
+                        "No progress has been observed for {idle_secs}s. Checkpoint your work and report any blocker before continuing."
+                    ),
+                };
+                let (nudged, detail) = if !cfg.mail.enabled {
+                    (
+                        false,
+                        "no progress observed; mail is disabled, so no steering nudge could be \
+                         delivered"
+                            .to_string(),
+                    )
+                } else {
+                    match super::mail::store_to(state, &slug, &slug, &nudge, cfg) {
+                        Ok(_) => (
+                            true,
+                            "no progress observed; steering nudge queued for the session"
+                                .to_string(),
+                        ),
+                        Err(err) => (
+                            false,
+                            format!(
+                                "no progress observed; could not queue the steering nudge: {err}"
+                            ),
+                        ),
+                    }
+                };
+                announcer.emit(&super::announce::Event::Stalled { idle_secs, nudged });
+                // Our own nudge is not evidence that the child progressed.
+                last_mail_activity = super::mail::unread_counts(
+                    state,
+                    repo,
+                    adapter.name(),
+                    registry_short,
+                    cfg.mail.enabled,
+                );
                 let _ = log::append(
                     state,
                     &log::Decision {
@@ -3276,7 +3376,7 @@ fn supervise_run(
                         verdict: "n/a",
                         score: 0,
                         action: "stall-nudge",
-                        detail: "no progress observed; latching and sending a steering nudge",
+                        detail: &detail,
                         observed_at: None,
                     },
                 );
@@ -3330,8 +3430,6 @@ fn supervise_run(
             }
             Some(agent::BudgetState::SoftWarn { .. } | agent::BudgetState::Ok) | None => {}
         }
-        // A scoring failure must never kill a healthy run.
-        let poll_result = scorer.poll(adapter, score_cfg, screen_thresholds);
         // Issue #243 (review round, F3/F5): consumes the screening half of
         // every poll that actually read new bytes -- persisted and, when
         // it changed, announced -- through the same shared helper the Stop
@@ -4142,6 +4240,161 @@ mod tests {
             0,
             "exec ran the child rather than refusing: {}",
             String::from_utf8_lossy(&out)
+        );
+    }
+
+    #[test]
+    fn transcript_growth_keeps_a_silent_worker_alive() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state = tmp.path().join("state");
+        let transcript = tmp.path().join("transcript.jsonl");
+        let mut env = base_env(&state);
+        env.insert("ZIRV_CTX_POLL_MS".into(), "100".into());
+        env.insert("ZIRV_CTX_SUPERVISE_IN_TOOL_SECS".into(), "1".into());
+        env.insert("ZIRV_CTX_SUPERVISE_STALL_GRACE_SECS".into(), "1".into());
+        let args = ExecArgs {
+            agent: Some("claude".into()),
+            session_id: Some("11111111-2222-4333-8444-555555555555".into()),
+            transcript: Some(transcript.clone()),
+            prompt: Some("do the work".into()),
+            max_restarts: Some(0),
+            budget_tokens: None,
+            max_tool_calls: None,
+            objective: None,
+            timeout_secs: Some(15),
+            simple: true,
+            reservation_id: None,
+            command: vec![
+                "sh".into(), "-c".into(),
+                "for i in 1 2 3 4 5 6 7 8 9 10 11 12; do printf '{}\\n' >> \"$1\"; /bin/sleep 0.25; done".into(),
+                "worker".into(), transcript.display().to_string(),
+            ],
+        };
+        let code = run_with(&args, &mut Vec::new(), tmp.path(), &|k| env.get(k).cloned());
+        assert_eq!(
+            code.expect("runs"),
+            0,
+            "transcript growth must prevent a stall"
+        );
+        let log = std::fs::read_to_string(state.join("logs/decisions.jsonl")).expect("log");
+        assert!(
+            !log.contains("stall-nudge"),
+            "healthy work must never latch: {log}"
+        );
+    }
+
+    #[test]
+    fn a_stall_delivers_one_steering_mail() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state = tmp.path().join("state");
+        let mut env = base_env(&state);
+        env.insert("ZIRV_CTX_POLL_MS".into(), "100".into());
+        env.insert("ZIRV_CTX_SUPERVISE_IN_TOOL_SECS".into(), "1".into());
+        env.insert("ZIRV_CTX_SUPERVISE_STALL_GRACE_SECS".into(), "1".into());
+        let args = ExecArgs {
+            agent: Some("claude".into()),
+            session_id: Some("11111111-2222-4333-8444-555555555555".into()),
+            transcript: Some(tmp.path().join("transcript.jsonl")),
+            prompt: Some("do the work".into()),
+            max_restarts: Some(0),
+            budget_tokens: None,
+            max_tool_calls: None,
+            objective: None,
+            timeout_secs: Some(15),
+            simple: true,
+            reservation_id: None,
+            command: vec!["sh".into(), "-c".into(), "/bin/sleep 5".into()],
+        };
+        let code =
+            run_with(&args, &mut Vec::new(), tmp.path(), &|k| env.get(k).cloned()).expect("runs");
+        assert_eq!(code, EXIT_STALLED);
+        let state = StateDir::from_root(state);
+        let unread = super::super::mail::list(
+            &state,
+            &super::super::state::repo_slug(tmp.path()),
+            Some("claude"),
+            Some("11111111"),
+        )
+        .expect("mail");
+        assert_eq!(
+            unread.len(),
+            1,
+            "a stall must deliver exactly one steering mail"
+        );
+        assert_eq!(unread[0].1.to_session.as_deref(), Some("11111111"));
+    }
+
+    #[test]
+    fn live_capacity_text_survives_until_exit() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state = tmp.path().join("state");
+        let mut env = base_env(&state);
+        env.insert("ZIRV_CTX_POLL_MS".into(), "100".into());
+
+        let args = ExecArgs {
+            agent: Some("claude".into()),
+            session_id: Some("11111111-2222-4333-8444-555555555555".into()),
+            transcript: Some(tmp.path().join("transcript.jsonl")),
+            prompt: Some("do the work".into()),
+            max_restarts: Some(0),
+            budget_tokens: None,
+            max_tool_calls: None,
+            objective: None,
+            timeout_secs: Some(15),
+            simple: true,
+            reservation_id: None,
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                "printf 'Selected model is at capacity\\n'; /bin/sleep 3; exit 2".into(),
+            ],
+        };
+        let code =
+            run_with(&args, &mut Vec::new(), tmp.path(), &|k| env.get(k).cloned()).expect("runs");
+        assert_eq!(
+            code, EXIT_CAPACITY_EXHAUSTED,
+            "live capacity text must survive the final drain"
+        );
+    }
+
+    #[test]
+    fn live_account_text_survives_until_exit() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state = tmp.path().join("state");
+        let mut env = base_env(&state);
+        env.insert("ZIRV_CTX_POLL_MS".into(), "100".into());
+
+        let args = ExecArgs {
+            agent: Some("claude".into()),
+            session_id: Some("11111111-2222-4333-8444-555555555555".into()),
+            transcript: Some(tmp.path().join("transcript.jsonl")),
+            prompt: Some("do the work".into()),
+            max_restarts: Some(0),
+            budget_tokens: None,
+            max_tool_calls: None,
+            objective: None,
+            timeout_secs: Some(15),
+            simple: true,
+            reservation_id: None,
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                "printf 'insufficient_quota\\n'; /bin/sleep 3; exit 2".into(),
+            ],
+        };
+        let code =
+            run_with(&args, &mut Vec::new(), tmp.path(), &|k| env.get(k).cloned()).expect("runs");
+        assert_eq!(
+            code, EXIT_ACCOUNT_EXHAUSTED,
+            "live account text must survive the final drain"
         );
     }
 

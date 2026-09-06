@@ -3372,26 +3372,34 @@ fn pump(
                         // actually answered -- watched from the tick below,
                         // never blocked on here (a blocking probe would
                         // freeze the operator's own terminal).
+                        // T4 (C-3): only a manual request has a `zirv ctx
+                        // handover` process waiting on an ack -- writing one
+                        // for an automatic rollover leaves a stale `ok: true`
+                        // on disk that the operator's NEXT handover would
+                        // read as an answer to its own request. Same
+                        // manual/automatic discriminator the refusal arm
+                        // above already uses.
                         if let Some(generation) = req.generation {
                             pending_rollover = Some(PendingRollover {
                                 generation,
                                 signals_at_swap: supervision.signals_seen,
                                 started: Instant::now(),
                             });
+                        } else {
+                            super::handover::write_ack(
+                                state_dir,
+                                &bar.session_short,
+                                &super::handover::HandoverAck {
+                                    ok: true,
+                                    reason: None,
+                                    from_agent: Some(outcome.from_agent.clone()),
+                                    from_model: Some(outcome.from_model.clone()),
+                                    to_agent: Some(outcome.to_agent.clone()),
+                                    to_model: Some(outcome.to_model.clone()),
+                                    stored: Some(stored_text.clone()),
+                                },
+                            );
                         }
-                        super::handover::write_ack(
-                            state_dir,
-                            &bar.session_short,
-                            &super::handover::HandoverAck {
-                                ok: true,
-                                reason: None,
-                                from_agent: Some(outcome.from_agent.clone()),
-                                from_model: Some(outcome.from_model.clone()),
-                                to_agent: Some(outcome.to_agent.clone()),
-                                to_model: Some(outcome.to_model.clone()),
-                                stored: Some(stored_text.clone()),
-                            },
-                        );
                         announcer.emit(&Event::Handover {
                             from_agent: outcome.from_agent.clone(),
                             from_model: outcome.from_model.clone(),
@@ -3427,6 +3435,9 @@ fn pump(
                         // successor that failed, so `seat::abort`'s own visit
                         // record keeps the next evaluation at this same epoch
                         // from picking it again.
+                        // T4 (C-3): as in the refusal arm above -- an automatic
+                        // rollover closes its own transaction and has nobody
+                        // waiting on an ack; only a manual request writes one.
                         if let Some(generation) = req.generation {
                             let _ = super::rollover::fail(
                                 state_dir,
@@ -3436,16 +3447,17 @@ fn pump(
                                 &reason,
                                 super::state::now_secs(),
                             );
+                        } else {
+                            super::handover::write_ack(
+                                state_dir,
+                                &bar.session_short,
+                                &super::handover::HandoverAck {
+                                    ok: false,
+                                    reason: Some(reason.clone()),
+                                    ..Default::default()
+                                },
+                            );
                         }
-                        super::handover::write_ack(
-                            state_dir,
-                            &bar.session_short,
-                            &super::handover::HandoverAck {
-                                ok: false,
-                                reason: Some(reason.clone()),
-                                ..Default::default()
-                            },
-                        );
                         note_failure(
                             supervision,
                             Some((state_dir, session.as_str())),

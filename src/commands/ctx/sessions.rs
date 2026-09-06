@@ -1138,6 +1138,39 @@ pub fn peek_interrupted_in_flight(state: &StateDir, repo: &Path) -> Option<InFli
 }
 
 fn interrupted_in_flight(state: &StateDir, repo: &Path, consume: bool) -> Option<InFlight> {
+    let (path, mut record) = interrupted_record(state, repo)?;
+    let in_flight = record.in_flight.take()?;
+    if consume && let Ok(json) = serde_json::to_string_pretty(&record) {
+        let _ = super::state::write_private(&path, &json);
+    }
+    Some(in_flight)
+}
+
+/// Consume the crash witness at launch, restoring it if spawning/exec fails.
+pub(super) fn launch_consuming_interrupted<T>(
+    state: &StateDir,
+    repo: &Path,
+    launch: impl FnOnce() -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    let interrupted = interrupted_record(state, repo);
+    if let Some((path, record)) = &interrupted {
+        let mut cleared = record.clone();
+        cleared.in_flight = None;
+        if let Ok(json) = serde_json::to_string_pretty(&cleared) {
+            let _ = super::state::write_private(path, &json);
+        }
+    }
+    let result = launch();
+    if result.is_err()
+        && let Some((path, record)) = interrupted
+        && let Ok(json) = serde_json::to_string_pretty(&record)
+    {
+        let _ = super::state::write_private(&path, &json);
+    }
+    result
+}
+
+fn interrupted_record(state: &StateDir, repo: &Path) -> Option<(PathBuf, Record)> {
     let repo_slug = super::state::repo_slug(repo);
     let entries = std::fs::read_dir(state.sessions()).ok()?;
     for entry in entries.flatten() {
@@ -1148,19 +1181,16 @@ fn interrupted_in_flight(state: &StateDir, repo: &Path, consume: bool) -> Option
         let Ok(contents) = std::fs::read_to_string(&path) else {
             continue;
         };
-        let Ok(mut record) = serde_json::from_str::<Record>(&contents) else {
+        let Ok(record) = serde_json::from_str::<Record>(&contents) else {
             continue;
         };
         if record.repo_slug != repo_slug || record_is_alive(&record) {
             continue;
         }
-        let Some(in_flight) = record.in_flight.take() else {
+        if record.in_flight.is_none() {
             continue;
-        };
-        if consume && let Ok(json) = serde_json::to_string_pretty(&record) {
-            let _ = super::state::write_private(&path, &json);
         }
-        return Some(in_flight);
+        return Some((path, record));
     }
     None
 }
@@ -4325,6 +4355,50 @@ mod tests {
     /// A dead pid with `in_flight` set is exactly the crash this witness
     /// exists to catch: the process stopped mid-turn, never reaching the
     /// clean boundary that would have cleared the marker.
+    #[test]
+    fn a_failed_launch_restores_the_interrupted_turn() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = state_in(tmp.path());
+        let repo = tmp.path().join("repo");
+        write_record(
+            &state,
+            &in_flight_record(
+                &repo,
+                super::super::testenv::dead_pid(),
+                Some(sample_in_flight()),
+            ),
+        );
+        let result = launch_consuming_interrupted::<()>(&state, &repo, || {
+            assert!(peek_interrupted_in_flight(&state, &repo).is_none());
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "agent missing",
+            ))
+        });
+        assert!(result.is_err());
+        assert_eq!(
+            peek_interrupted_in_flight(&state, &repo),
+            Some(sample_in_flight())
+        );
+    }
+
+    #[test]
+    fn a_successful_launch_consumes_the_interrupted_turn() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = state_in(tmp.path());
+        let repo = tmp.path().join("repo");
+        write_record(
+            &state,
+            &in_flight_record(
+                &repo,
+                super::super::testenv::dead_pid(),
+                Some(sample_in_flight()),
+            ),
+        );
+        launch_consuming_interrupted(&state, &repo, || Ok(())).expect("launch");
+        assert!(peek_interrupted_in_flight(&state, &repo).is_none());
+    }
+
     #[test]
     fn a_dead_pid_with_in_flight_set_is_reported_once() {
         use super::super::testenv::dead_pid;
