@@ -102,6 +102,22 @@ impl Entry {
     }
 }
 
+/// Truncates `entry`'s body to `cap` bytes with a visible `[truncated]`
+/// marker -- the per-entry cap every tier's writer applies just before
+/// storing, factored out so `rollback`'s multi-entry restore applies the
+/// identical rule rather than a fourth copy of it.
+fn cap_body(entry: &Entry, cap: usize) -> Entry {
+    let mut entry = entry.clone();
+    if entry.body.len() > cap {
+        const MARKER: &str = "\n[truncated]";
+        let keep = cap.saturating_sub(MARKER.len());
+        let mut truncated = crate::utils::truncate_bytes(entry.body.clone(), Some(keep));
+        truncated.push_str(MARKER);
+        entry.body = truncated;
+    }
+    entry
+}
+
 /// Same bullet styles `mail::strip_bullet` accepts. Duplicated locally
 /// (rather than made `pub(crate)` elsewhere) to keep this file's edits
 /// isolated from files other tasks are actively working in.
@@ -1080,15 +1096,7 @@ pub(crate) fn upsert_shared_inner(
     // unbounded than in the private bank -- checked (and, on the private
     // path, only checked) against the ORIGINAL body above, then truncated
     // here for storage, so the credential guard always sees the full text.
-    let mut entry = entry.clone();
-    let cap = cfg.memory.max_entry_bytes;
-    if entry.body.len() > cap {
-        const MARKER: &str = "\n[truncated]";
-        let keep = cap.saturating_sub(MARKER.len());
-        let mut truncated = crate::utils::truncate_bytes(entry.body.clone(), Some(keep));
-        truncated.push_str(MARKER);
-        entry.body = truncated;
-    }
+    let entry = cap_body(entry, cfg.memory.max_entry_bytes);
 
     // Issue #295/#322 (Hermes round): guard the overwrite, and capture
     // `before_body` for the journal, BEFORE touching the file. A file that
@@ -1620,6 +1628,17 @@ pub struct JournalRecord {
     pub before_sha256: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub before_body: Option<String>,
+    /// EVERY body the write this record describes removed, in the order the
+    /// bank listed them; `before_body` is its first element. Normally at most
+    /// one -- a key addresses one entry -- but two concurrent `remember`s on
+    /// one key can each miss the other's not-yet-written file and leave two
+    /// (see `remember_inner`'s own collapse loop), and the removal loop then
+    /// deletes BOTH. Journaling only the first made every other one
+    /// unrecoverable: `rollback` restores each element of this list.
+    /// `#[serde(default)]` so a record written before this field existed
+    /// still reads back, falling back to `before_body` alone.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub before_bodies: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub after_body: Option<String>,
     pub source: String,
@@ -1653,6 +1672,7 @@ impl JournalRecord {
         written_by: &str,
     ) -> Self {
         let before_sha256 = before_body.as_deref().map(sha256_hex);
+        let before_bodies = before_body.iter().cloned().collect();
         Self {
             id: journal_id(),
             ts: now_secs(),
@@ -1661,6 +1681,7 @@ impl JournalRecord {
             key: key.to_string(),
             before_sha256,
             before_body,
+            before_bodies,
             after_body,
             source: source.to_string(),
             written_by: written_by.to_string(),
@@ -1877,27 +1898,19 @@ fn remember_inner(
 
     // Issue #295: captured before the old file(s) are removed, so the
     // journal record for this write carries the exact prior serialized
-    // entry -- `rollback`'s only source of truth for restoring it.
-    let before_body = list(state, slug)?
-        .into_iter()
-        .find(|(_, existing)| existing.key == entry.key)
-        .map(|(_, existing)| existing.to_markdown());
-
+    // entries -- `rollback`'s only source of truth for restoring them. EVERY
+    // one, not just the first: the loop below deletes every entry under the
+    // key, a state the collapse loop further down documents two concurrent
+    // `remember`s can reach.
+    let mut before_bodies: Vec<String> = Vec::new();
     for (path, existing) in list(state, slug)? {
         if existing.key == entry.key {
+            before_bodies.push(existing.to_markdown());
             let _ = std::fs::remove_file(&path);
         }
     }
 
-    let mut entry = entry.clone();
-    let cap = cfg.memory.max_entry_bytes;
-    if entry.body.len() > cap {
-        const MARKER: &str = "\n[truncated]";
-        let keep = cap.saturating_sub(MARKER.len());
-        let mut truncated = crate::utils::truncate_bytes(entry.body.clone(), Some(keep));
-        truncated.push_str(MARKER);
-        entry.body = truncated;
-    }
+    let entry = cap_body(entry, cfg.memory.max_entry_bytes);
 
     let after_body = entry.to_markdown();
     let base = format!("{:010}-{}", entry.written, slug_key(&entry.key));
@@ -1932,20 +1945,22 @@ fn remember_inner(
 
     if journal {
         let scope = private_or_global_scope(slug);
+        let mut record = JournalRecord::new(
+            "remember",
+            scope,
+            &entry.key,
+            before_bodies.first().cloned(),
+            Some(after_body),
+            &entry.source,
+            &entry.written_by,
+        );
+        record.before_bodies = before_bodies;
         // Review round 1, finding 4: propagate a journal-append failure --
         // the write above already landed and is not undone.
         append_journal(
             state,
             journal_slug_for(scope, slug),
-            &JournalRecord::new(
-                "remember",
-                scope,
-                &entry.key,
-                before_body,
-                Some(after_body),
-                &entry.source,
-                &entry.written_by,
-            ),
+            &record,
             cfg.memory.journal_max_entries,
         )
         .map_err(|e| {
@@ -2244,26 +2259,16 @@ fn remember_session_inner(
     let dir = session_dir(state, slug, session_id);
     super::state::create_private_dir_all(&dir)?;
 
-    let before_body = read_entries(&dir)?
-        .into_iter()
-        .find(|(_, existing)| existing.key == entry.key)
-        .map(|(_, existing)| existing.to_markdown());
-
+    // Every removed body, for the reason `remember_inner` documents.
+    let mut before_bodies: Vec<String> = Vec::new();
     for (path, existing) in read_entries(&dir)? {
         if existing.key == entry.key {
+            before_bodies.push(existing.to_markdown());
             let _ = std::fs::remove_file(&path);
         }
     }
 
-    let mut entry = entry.clone();
-    let cap = cfg.memory.max_entry_bytes;
-    if entry.body.len() > cap {
-        const MARKER: &str = "\n[truncated]";
-        let keep = cap.saturating_sub(MARKER.len());
-        let mut truncated = crate::utils::truncate_bytes(entry.body.clone(), Some(keep));
-        truncated.push_str(MARKER);
-        entry.body = truncated;
-    }
+    let entry = cap_body(entry, cfg.memory.max_entry_bytes);
 
     let after_body = entry.to_markdown();
     let base = format!("{:010}-{}", entry.written, slug_key(&entry.key));
@@ -2276,11 +2281,12 @@ fn remember_session_inner(
             "remember",
             MemoryScope::Session,
             &entry.key,
-            before_body,
+            before_bodies.first().cloned(),
             Some(after_body),
             &entry.source,
             &entry.written_by,
         );
+        record.before_bodies = before_bodies;
         record.session_id = Some(session_id.to_string());
         // Review round 1, finding 4: propagate a journal-append failure --
         // the write above already landed on disk.
@@ -3492,7 +3498,15 @@ pub fn rollback(
             .into());
         }
 
-        match &record.before_body {
+        // A record written before `before_bodies` existed carries only the
+        // single `before_body`; the two are otherwise the same list.
+        let before_bodies: Vec<String> = if record.before_bodies.is_empty() {
+            record.before_body.iter().cloned().collect()
+        } else {
+            record.before_bodies.clone()
+        };
+
+        match before_bodies.split_first() {
             None => {
                 // The record introduced this key; its inverse deletes it.
                 // Non-journaling (review round 1, finding 5): the
@@ -3521,10 +3535,12 @@ pub fn rollback(
                     }
                 }
             }
-            Some(markdown) => {
+            Some((markdown, extra)) => {
                 let restored = parse_markdown(markdown);
                 match scope {
                     MemoryScope::Shared => {
+                        // A shared key addresses exactly one canonical file,
+                        // so `extra` is always empty here.
                         upsert_shared_inner(
                             repo,
                             state,
@@ -3552,9 +3568,15 @@ pub fn rollback(
                             false,
                             &lock,
                         )?;
+                        restore_extra_entries(
+                            &session_dir(state, journal_slug, session_id),
+                            extra,
+                            cfg,
+                        )?;
                     }
                     MemoryScope::Private | MemoryScope::Global => {
                         remember_inner(state, journal_slug, &restored, cfg, false, &lock)?;
+                        restore_extra_entries(&state.memory().join(journal_slug), extra, cfg)?;
                     }
                 }
             }
@@ -3583,6 +3605,25 @@ pub fn rollback(
     }
 
     Err(format!("zirv memory rollback: no journal record found for id '{id}'").into())
+}
+
+/// Puts back the EXTRA entries an overwrite removed, once its first one has
+/// already been restored through the ordinary write path. Replaying these
+/// through `remember_inner` instead would be self-defeating: that clears
+/// every entry under the key before writing, so each restore would delete the
+/// sibling the previous one just put back. Each is written directly beside
+/// it, under the same body cap and prune a fresh write gets.
+fn restore_extra_entries(dir: &Path, bodies: &[String], cfg: &CtxConfig) -> CtxResult<()> {
+    if bodies.is_empty() {
+        return Ok(());
+    }
+    for markdown in bodies {
+        let entry = cap_body(&parse_markdown(markdown), cfg.memory.max_entry_bytes);
+        let base = format!("{:010}-{}", entry.written, slug_key(&entry.key));
+        claim_and_write(dir, &base, &entry.to_markdown())?;
+    }
+    prune_to_cap(dir, cfg.memory.max_entries);
+    Ok(())
 }
 
 #[derive(Debug, clap::Args)]
@@ -7354,6 +7395,66 @@ This is part of the body too.\n";
             }
         }
         out
+    }
+
+    /// `remember_inner` journals only the FIRST body it found under the key
+    /// but its removal loop deletes EVERY one -- a state its own collapse
+    /// loop documents two concurrent `remember`s can reach -- so a rollback
+    /// used to restore one and lose the rest for good.
+    #[test]
+    fn an_overwrite_over_two_same_key_entries_journals_and_restores_both() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let cfg = CtxConfig::default();
+        let dir = state.memory().join("slug");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+
+        let mut first = sample("build-cmd", 1);
+        first.body = "ENTRY A".to_string();
+        let mut second = sample("build-cmd", 2);
+        second.body = "ENTRY B".to_string();
+        std::fs::write(dir.join("0000000001-build-cmd.md"), first.to_markdown()).expect("write a");
+        std::fs::write(dir.join("0000000002-build-cmd.md"), second.to_markdown()).expect("write b");
+
+        let mut fresh = sample("build-cmd", 3);
+        fresh.body = "ENTRY C".to_string();
+        remember(&state, "slug", &fresh, &cfg).expect("overwrite");
+
+        let after: Vec<String> = list(&state, "slug")
+            .expect("list")
+            .into_iter()
+            .map(|(_, entry)| entry.body)
+            .collect();
+        assert_eq!(
+            after,
+            vec!["ENTRY C".to_string()],
+            "the overwrite collapsed both"
+        );
+
+        let journal = std::fs::read_to_string(dir.join(JOURNAL_FILE)).expect("journal");
+        assert!(
+            journal.contains("ENTRY A") && journal.contains("ENTRY B"),
+            "every removed body is journaled, not just the first: {journal}"
+        );
+
+        let id = read_journal(&state, "slug")
+            .last()
+            .expect("record")
+            .id
+            .clone();
+        assert!(rollback(repo.path(), &state, "slug", &cfg, &id, "tester").expect("rollback"));
+
+        let mut restored: Vec<String> = list(&state, "slug")
+            .expect("list")
+            .into_iter()
+            .map(|(_, entry)| entry.body)
+            .collect();
+        restored.sort();
+        assert_eq!(
+            restored,
+            vec!["ENTRY A".to_string(), "ENTRY B".to_string()],
+            "both removed entries come back"
+        );
     }
 
     /// IMPORTANT fix (review round 1): `upsert_shared` validated only
