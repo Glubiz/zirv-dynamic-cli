@@ -20509,10 +20509,10 @@ mod tests {
         let overlay = ui::Overlay::Inspector(view);
         for (w, h) in [(80u16, 20u16), (120, 40), (200, 50)] {
             let text = render_overlay_text(w, h, &overlay);
-            assert!(
-                text.contains("dashboard") || text.contains("a0000001"),
-                "{w}x{h}: {text}"
-            );
+            // A2-3: the second operand used to repeat the first verbatim, so
+            // the subject the dialog is opened ON was never asserted at all.
+            assert!(text.contains("dashboard"), "{w}x{h}: {text}");
+            assert!(text.contains("a0000001"), "{w}x{h}: {text}");
             assert!(text.contains("harness"), "{w}x{h}: {text}");
         }
     }
