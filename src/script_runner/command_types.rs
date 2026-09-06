@@ -140,13 +140,43 @@ impl CommandTypes {
     /// same script. That is the same reasoning `AgentCommand::validate`
     /// already applies at load time; unlike `validate` this one needs the
     /// resolved context, so it runs per step at dry-run time instead.
+    ///
+    /// Review round 1 (R8): a step `execute` would skip for its
+    /// `operating_system` filter resolves nothing, so there is nothing here
+    /// to reject either -- a Linux-only step naming a Linux-only variable
+    /// failed every dry run on Windows. The same `Command::skipped_for_os`
+    /// predicate `execute` and `build_concurrent_command` apply, so the three
+    /// can never disagree about which steps this platform runs.
     pub fn check(&self, context: &HashMap<String, String>) -> Result<(), String> {
         match self {
+            CommandTypes::Command(cmd) if cmd.skipped_for_os() => Ok(()),
             CommandTypes::Command(cmd) => cmd.check_unresolved_placeholders(context),
             CommandTypes::Commands(cmds) => cmds
                 .iter()
+                .filter(|cmd| !cmd.skipped_for_os())
                 .try_for_each(|cmd| cmd.check_unresolved_placeholders(context)),
-            CommandTypes::Agent(agent) => command::check_unresolved(&agent.prompt, context),
+            CommandTypes::Agent(agent) => {
+                if agent
+                    .options
+                    .as_ref()
+                    .is_some_and(super::options::Options::skip_for_os)
+                {
+                    return Ok(());
+                }
+                command::check_unresolved(&agent.prompt, context)
+            }
+        }
+    }
+
+    /// The variable a real run of this step would define through `capture:`,
+    /// so `--dry-run` can stand a placeholder in for it and let later steps
+    /// resolve (review round 1, R7). `None` for the two step kinds that never
+    /// capture: an agent step rejects `capture` at load time, and a
+    /// concurrent block spawns a terminal window it never reads back.
+    pub fn captured_var(&self) -> Option<&str> {
+        match self {
+            CommandTypes::Command(cmd) if !cmd.skipped_for_os() => cmd.capture.as_deref(),
+            CommandTypes::Command(_) | CommandTypes::Commands(_) | CommandTypes::Agent(_) => None,
         }
     }
 
@@ -437,6 +467,64 @@ commands:
                 "expected {expected:?} in: {message}"
             );
         }
+    }
+
+    /// Review round 1 (R8): `execute` skips a step whose `operating_system`
+    /// filter excludes this platform without resolving anything, so `check`
+    /// must not reject its `${var}` either -- a Linux-only step naming a
+    /// Linux-only variable made every dry run on Windows fail on a step that
+    /// platform never runs. Both step shapes that carry the filter are
+    /// covered: a plain `Command`, and one entry of a concurrent block (which
+    /// `build_concurrent_command` drops from the joined line).
+    #[test]
+    fn a_dry_run_skips_the_check_for_a_step_filtered_out_on_this_os() {
+        let other_os = if cfg!(windows) {
+            crate::script_runner::operating_system::OperatingSystem::Linux
+        } else {
+            crate::script_runner::operating_system::OperatingSystem::Windows
+        };
+        let filtered = |command: &str| Command {
+            command: command.to_string(),
+            capture: None,
+            description: None,
+            options: Some(crate::script_runner::options::Options {
+                operating_system: Some(other_os.clone()),
+                ..Default::default()
+            }),
+        };
+        let context = HashMap::new();
+
+        assert!(
+            CommandTypes::Command(filtered("echo ${linux_only_var}"))
+                .check(&context)
+                .is_ok(),
+            "a step this platform never runs resolves nothing to check"
+        );
+        assert!(
+            CommandTypes::Commands(vec![
+                Command {
+                    command: "echo keep".to_string(),
+                    capture: None,
+                    description: None,
+                    options: None,
+                },
+                filtered("echo ${linux_only_var}"),
+            ])
+            .check(&context)
+            .is_ok(),
+            "a filtered block entry is dropped from the joined line, so it checks nothing"
+        );
+        assert!(
+            CommandTypes::Command(Command {
+                command: "echo ${missing}".to_string(),
+                capture: None,
+                description: None,
+                options: None,
+            })
+            .check(&context)
+            .is_err(),
+            "an unfiltered step is still checked"
+        );
     }
 
     /// G-8: a concurrent-commands block discarded every per-command

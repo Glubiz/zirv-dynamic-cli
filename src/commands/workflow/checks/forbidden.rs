@@ -86,7 +86,6 @@ pub const NARROW_ONLY_ALLOWLIST: &[&str] = &[
     "mail.max_message_bytes",
     "optimize.enabled",
     "optimize.sessions_sampled",
-    "pace.collector_max_age_secs", // G1: narrow-only fold, repo may only SHORTEN the horizon.
     "pace.enabled",
     "pace.fallback_delay_secs",
     "pace.jitter_secs",
@@ -111,9 +110,18 @@ pub const NARROW_ONLY_ALLOWLIST: &[&str] = &[
 ];
 
 pub fn run(repo: &Path) -> BuiltinCheckResult {
+    if !super::is_zirv_repo(repo) {
+        return BuiltinCheckResult::not_applicable(
+            ID,
+            PROVES,
+            FIX,
+            ORIGIN,
+            super::not_the_zirv_repo(repo),
+        );
+    }
     let path = repo.join("src/commands/ctx/config.rs");
     if !path.exists() {
-        return BuiltinCheckResult::not_applicable(
+        return BuiltinCheckResult::inconclusive(
             ID,
             PROVES,
             FIX,
@@ -287,15 +295,25 @@ mod tests {
     use tempfile::tempdir;
 
     fn write_config_rs(repo: &Path, body: &str) {
+        super::super::write_manifest(repo, "zirv");
         std::fs::create_dir_all(repo.join("src/commands/ctx")).unwrap();
         std::fs::write(repo.join("src/commands/ctx/config.rs"), body).unwrap();
     }
 
     #[test]
-    fn missing_config_rs_is_not_applicable() {
+    fn another_repository_is_not_applicable() {
         let repo = tempdir().unwrap();
+        super::super::write_manifest(repo.path(), "some-other-crate");
         let result = run(repo.path());
         assert_eq!(result.outcome, super::super::BuiltinOutcome::NotApplicable);
+    }
+
+    #[test]
+    fn a_missing_config_rs_inside_the_zirv_repo_is_inconclusive() {
+        let repo = tempdir().unwrap();
+        super::super::write_manifest(repo.path(), "zirv");
+        let result = run(repo.path());
+        assert_eq!(result.outcome, super::super::BuiltinOutcome::Inconclusive);
     }
 
     /// A `config.rs` that EXISTS but whose tables this check can no longer

@@ -22,16 +22,20 @@ const ORIGIN: &str = "CD duplicate-tag failures -- reminded twice (Development/D
      also enforced in CI by .github/workflows/ci.yaml's version-bump job";
 
 pub fn run(repo: &Path) -> BuiltinCheckResult {
-    let manifest_path = repo.join("Cargo.toml");
-    if !manifest_path.exists() {
+    // What this check actually guards is zirv's OWN release pipeline (every
+    // merge to main publishes a release, and CD fails on a duplicate tag).
+    // Another crate's versioning policy is none of its business -- and a
+    // repository with no manifest at all is not this crate either.
+    if !super::is_zirv_repo(repo) {
         return BuiltinCheckResult::not_applicable(
             ID,
             PROVES,
             FIX,
             ORIGIN,
-            super::absent_input(&manifest_path),
+            super::not_the_zirv_repo(repo),
         );
     }
+    let manifest_path = repo.join("Cargo.toml");
     let manifest = match std::fs::read_to_string(&manifest_path) {
         Ok(text) => text,
         Err(err) => {
@@ -44,24 +48,6 @@ pub fn run(repo: &Path) -> BuiltinCheckResult {
             );
         }
     };
-    // What this check actually guards is zirv's OWN release pipeline (every
-    // merge to main publishes a release, and CD fails on a duplicate tag).
-    // Another crate's versioning policy is none of its business.
-    let package_name = parse_package_field(&manifest, "name");
-    if package_name.as_deref() != Some("zirv") {
-        return BuiltinCheckResult::not_applicable(
-            ID,
-            PROVES,
-            FIX,
-            ORIGIN,
-            format!(
-                "{} is not the zirv crate (package name {}) -- this check guards zirv's own \
-                 release pipeline",
-                manifest_path.display(),
-                package_name.as_deref().unwrap_or("absent")
-            ),
-        );
-    }
     let head_version = match parse_package_field(&manifest, "version") {
         Some(version) => version,
         None => {
@@ -152,7 +138,7 @@ fn toml_package_version_at(repo: &Path, rev: &str) -> Result<String, String> {
         .ok_or_else(|| format!("{rev}:Cargo.toml has no readable [package] version"))
 }
 
-fn parse_package_field(text: &str, field: &str) -> Option<String> {
+pub(super) fn parse_package_field(text: &str, field: &str) -> Option<String> {
     let value: toml::Value = toml::from_str(text).ok()?;
     value
         .get("package")?

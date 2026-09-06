@@ -2583,15 +2583,16 @@ fn reap_fixup(removed: usize, focused: usize, selected: usize) -> (usize, usize)
     (focused, selected)
 }
 
-fn pane_transcript_usage(
-    pane: &Pane,
-    cfg: &CtxConfig,
-    repo: &Path,
-) -> Option<super::event::TranscriptUsage> {
+/// Review round 1 (R5): resolved against the PANE's own cwd, not the
+/// dashboard's `repo`. Both adapters key a transcript on the directory the
+/// session runs in -- claude by project slug, codex by the `cwd` its rollout's
+/// `session_meta` records -- so a worktree-hosted pane priced off the root
+/// repo read another pane's transcript, or none.
+fn pane_transcript_usage(pane: &Pane, cfg: &CtxConfig) -> Option<super::event::TranscriptUsage> {
     let adapter = adapters::select(Some(pane.agent()), &[], cfg).ok()?;
     let transcript = adapter.transcript_path(&SessionRef {
         id: SessionId::parse(pane.session_id()),
-        cwd: repo.to_path_buf(),
+        cwd: pane.cwd().to_path_buf(),
     });
     let body = std::fs::read_to_string(transcript).ok()?;
     adapter.transcript_usage(&body)
@@ -2600,13 +2601,12 @@ fn pane_transcript_usage(
 fn enforce_pane_token_budgets(
     panes: &mut [Pane],
     cfg: &CtxConfig,
-    repo: &Path,
     errors: &mut ErrorLog,
     last_sweep: &mut Instant,
     now: Instant,
 ) {
     enforce_pane_token_budgets_with(panes, cfg, errors, last_sweep, now, |pane| {
-        pane_transcript_usage(pane, cfg, repo)
+        pane_transcript_usage(pane, cfg)
     });
 }
 
@@ -2725,14 +2725,8 @@ fn enforce_pane_deadlines(
 /// `logs/delegations.jsonl` simply stopped growing and every cost line read
 /// `$0.00`. One row per completed pane delegation, attributed to the
 /// requester, carrying the same fields the inline supervised path writes.
-fn account_reaped_pane_spend(
-    pane: &Pane,
-    cfg: &CtxConfig,
-    state: &StateDir,
-    repo: &Path,
-    exit_code: i32,
-) {
-    let Some(usage) = pane_transcript_usage(pane, cfg, repo) else {
+fn account_reaped_pane_spend(pane: &Pane, cfg: &CtxConfig, state: &StateDir, exit_code: i32) {
+    let Some(usage) = pane_transcript_usage(pane, cfg) else {
         return;
     };
     if let Some(facts) = pane.delegation() {
@@ -2968,7 +2962,7 @@ fn reap_ended_panes(
         let pane_cwd = pane.cwd().to_path_buf();
         let pane_owns_cwd = pane.owns_cwd();
         let pane_short = pane.short().to_string();
-        account_reaped_pane_spend(&pane, cfg, state, repo, code);
+        account_reaped_pane_spend(&pane, cfg, state, code);
         close_claimed_group(&pane, state);
         if index < queues.len() {
             queues.remove(index);
@@ -9706,7 +9700,6 @@ pub fn run_dashboard(
         enforce_pane_token_budgets(
             &mut panes,
             cfg,
-            repo,
             &mut errors,
             &mut last_budget_sweep,
             Instant::now(),
@@ -15507,6 +15500,67 @@ mod tests {
         for pane in &mut panes {
             let _ = pane.finish_shutdown();
         }
+    }
+
+    /// Review round 1 (R5): `pane_transcript_usage` resolved every pane's
+    /// transcript against the DASHBOARD's repo, so a worktree-hosted pane was
+    /// priced off whichever transcript lives under the root repo's own
+    /// project slug -- another pane's spend, or none at all. Both slugs hold a
+    /// transcript here, so the answer proves which cwd was used rather than
+    /// merely that something was found.
+    #[test]
+    fn a_worktree_panes_transcript_is_resolved_against_its_own_cwd() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        let worktree = tmp.path().join("worktree");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        std::fs::create_dir_all(&worktree).expect("mkdir worktree");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let cfg = CtxConfig::default();
+        let session = "5f5f5f5f-2222-4333-8444-555555555555";
+
+        for (cwd, output) in [(&repo, 111u64), (&worktree, 222u64)] {
+            let dir = home
+                .join(".claude/projects")
+                .join(crate::commands::ctx::adapters::claude::project_slug(cwd));
+            std::fs::create_dir_all(&dir).expect("mkdir projects");
+            std::fs::write(
+                dir.join(format!("{session}.jsonl")),
+                format!(
+                    "{{\"type\":\"assistant\",\"message\":{{\"usage\":{{\"output_tokens\":{output}}}}}}}\n"
+                ),
+            )
+            .expect("write transcript");
+        }
+
+        let mut pane = Pane::spawn(
+            PaneSpec {
+                agent_name: "claude".to_string(),
+                argv: trivial_argv(),
+                role: prompt::PromptRole::Worker,
+                verb: sessions::Verb::Dash,
+                session_id: session.to_string(),
+                title: "worktree".to_string(),
+            },
+            &state,
+            &worktree,
+            &repo,
+            (80, 24),
+            &[],
+            true,
+            pane::DEFAULT_IDLE_QUIET,
+        )
+        .expect("spawn");
+
+        let usage = pane_transcript_usage(&pane, &cfg).expect("the pane's own transcript");
+        assert_eq!(
+            usage.output_tokens, 222,
+            "a worktree pane is priced off its own cwd's transcript, not the dashboard repo's"
+        );
+
+        let _ = pane.finish_shutdown();
     }
 
     /// A1-4: the delegation ledger is append-only, so an unchanged
@@ -22604,7 +22658,7 @@ mod tests {
         )
         .expect("write transcript");
 
-        account_reaped_pane_spend(&pane, &cfg, &state, &repo, 0);
+        account_reaped_pane_spend(&pane, &cfg, &state, 0);
         let _ = pane.finish_shutdown();
 
         let rows = crate::commands::ctx::log::read_delegations(&state, usize::MAX);

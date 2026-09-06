@@ -2807,33 +2807,84 @@ pub(crate) fn unwrap_env_prefix(segment: &str) -> Option<String> {
 
 /// The ordinary process launchers that go on to run some OTHER program.
 /// [`SHELL_PIPE_WRAPPER_PROGRAMS`] already knew this much for a pipe TARGET;
-/// a leading prefix needs two more facts per launcher: which of its own
-/// flags take a SEPARATE value, and how many positional operands belong to
+/// a leading prefix needs three more facts per launcher: which of its own
+/// flags take a SEPARATE value, which flags mean it re-targets an EXISTING
+/// process and launches nothing, and how many positional operands belong to
 /// the launcher itself (`timeout <duration>`, `flock <file>`,
 /// `chrt <priority>`, `taskset <mask>`) before the wrapped command starts.
-const LAUNCHER_PREFIXES: &[(&str, &[&str], usize)] = &[
-    ("nohup", &[], 0),
-    ("setsid", &[], 0),
-    (
-        "stdbuf",
-        &["-i", "-o", "-e", "--input", "--output", "--error"],
-        0,
-    ),
-    ("nice", &["-n", "--adjustment"], 0),
-    (
-        "ionice",
-        &["-c", "-n", "-p", "--class", "--classdata", "--pid"],
-        0,
-    ),
-    ("doas", &["-a", "-C", "-u"], 0),
-    ("timeout", &["-k", "--kill-after", "-s", "--signal"], 1),
-    (
-        "flock",
-        &["-w", "--wait", "--timeout", "-E", "--conflict-exit-code"],
-        1,
-    ),
-    ("chrt", &["-p", "--pid"], 1),
-    ("taskset", &["-c", "--cpu-list", "-p", "--pid"], 1),
+///
+/// A flag must never appear in the value list AND leave the positional count
+/// standing when it is the positional it consumes: `taskset -c 0 <cmd>`
+/// spells its CPU list as that one positional, so counting both ate `<cmd>`
+/// itself (review round 1, R3).
+struct LauncherPrefix {
+    program: &'static str,
+    value_flags: &'static [&'static str],
+    no_command_flags: &'static [&'static str],
+    operands: usize,
+}
+
+const LAUNCHER_PREFIXES: &[LauncherPrefix] = &[
+    LauncherPrefix {
+        program: "nohup",
+        value_flags: &[],
+        no_command_flags: &[],
+        operands: 0,
+    },
+    LauncherPrefix {
+        program: "setsid",
+        value_flags: &[],
+        no_command_flags: &[],
+        operands: 0,
+    },
+    LauncherPrefix {
+        program: "stdbuf",
+        value_flags: &["-i", "-o", "-e", "--input", "--output", "--error"],
+        no_command_flags: &[],
+        operands: 0,
+    },
+    LauncherPrefix {
+        program: "nice",
+        value_flags: &["-n", "--adjustment"],
+        no_command_flags: &[],
+        operands: 0,
+    },
+    LauncherPrefix {
+        program: "ionice",
+        value_flags: &["-c", "-n", "-p", "--class", "--classdata", "--pid"],
+        no_command_flags: &["-p", "--pid"],
+        operands: 0,
+    },
+    LauncherPrefix {
+        program: "doas",
+        value_flags: &["-a", "-C", "-u"],
+        no_command_flags: &[],
+        operands: 0,
+    },
+    LauncherPrefix {
+        program: "timeout",
+        value_flags: &["-k", "--kill-after", "-s", "--signal"],
+        no_command_flags: &[],
+        operands: 1,
+    },
+    LauncherPrefix {
+        program: "flock",
+        value_flags: &["-w", "--wait", "--timeout", "-E", "--conflict-exit-code"],
+        no_command_flags: &[],
+        operands: 1,
+    },
+    LauncherPrefix {
+        program: "chrt",
+        value_flags: &[],
+        no_command_flags: &["-p", "--pid"],
+        operands: 1,
+    },
+    LauncherPrefix {
+        program: "taskset",
+        value_flags: &[],
+        no_command_flags: &["-p", "--pid"],
+        operands: 1,
+    },
 ];
 
 /// One layer of launcher-prefix unwrapping -- [`unwrap_env_prefix`]'s
@@ -2850,15 +2901,23 @@ pub(crate) fn unwrap_launcher_prefix(segment: &str) -> Option<String> {
     let collapsed = collapse_whitespace(&bare);
     let tokens: Vec<&str> = collapsed.split(' ').filter(|t| !t.is_empty()).collect();
     let program = sql_program_name(tokens.first()?);
-    let (_, value_flags, operands) = LAUNCHER_PREFIXES
+    let launcher = LAUNCHER_PREFIXES
         .iter()
-        .find(|(name, _, _)| *name == program)?;
+        .find(|entry| entry.program == program)?;
     let mut i = 1usize;
     while let Some(token) = tokens.get(i) {
         if !token.starts_with('-') {
             break;
         }
-        i += if value_flags
+        if launcher
+            .no_command_flags
+            .iter()
+            .any(|flag| token.eq_ignore_ascii_case(flag))
+        {
+            return None;
+        }
+        i += if launcher
+            .value_flags
             .iter()
             .any(|flag| token.eq_ignore_ascii_case(flag))
         {
@@ -2867,7 +2926,7 @@ pub(crate) fn unwrap_launcher_prefix(segment: &str) -> Option<String> {
             1
         };
     }
-    i = i.saturating_add(*operands);
+    i = i.saturating_add(launcher.operands);
     (i < tokens.len()).then(|| tokens[i..].join(" "))
 }
 
@@ -3920,6 +3979,16 @@ const OPERATOR_CONFIG_DESTINATION_PROGRAMS: &[&str] = &[
 /// place of a trailing positional operand.
 const DESTINATION_FLAGS: &[&str] = &["-destination", "-dest", "-t", "--target-directory"];
 
+/// Splits a `-flag=value`/`-Flag:value` token into its two halves. Both GNU
+/// long options and PowerShell parameters accept the joined spelling, which
+/// carries the write target inside a single token that starts with `-` --
+/// invisible to any scan that filters flags out before looking at paths.
+fn joined_flag_value(token: &str) -> Option<(&str, &str)> {
+    let rest = token.strip_prefix('-')?;
+    let index = rest.find(['=', ':'])?;
+    Some((&token[..=index], &rest[index + 1..]))
+}
+
 /// Whether `command` writes to or deletes anything under the operator's own
 /// `~/.zirv/`, in any of the spellings this module can resolve statically:
 /// an output redirection, or a write/delete program naming the path as an
@@ -3945,17 +4014,28 @@ fn writes_into_operator_zirv_config(command: &str) -> bool {
         .map(String::as_str)
         .filter(|token| !token.starts_with('-'))
         .collect();
+    let joined: Vec<(&str, &str)> = tokens
+        .iter()
+        .skip(1)
+        .filter_map(|token| joined_flag_value(token.as_str()))
+        .collect();
     if OPERATOR_CONFIG_WRITE_PROGRAMS.contains(&program.as_str()) {
-        return operands.iter().copied().any(operator_zirv_path);
+        return operands.iter().copied().any(operator_zirv_path)
+            || joined.iter().any(|(_, value)| operator_zirv_path(value));
     }
     if OPERATOR_CONFIG_DESTINATION_PROGRAMS.contains(&program.as_str()) {
+        let names_destination = |flag: &str| {
+            DESTINATION_FLAGS
+                .iter()
+                .any(|known| flag.eq_ignore_ascii_case(known))
+        };
         return operands.last().copied().is_some_and(operator_zirv_path)
-            || tokens.windows(2).any(|pair| {
-                DESTINATION_FLAGS
-                    .iter()
-                    .any(|flag| pair[0].eq_ignore_ascii_case(flag))
-                    && operator_zirv_path(&pair[1])
-            });
+            || tokens
+                .windows(2)
+                .any(|pair| names_destination(&pair[0]) && operator_zirv_path(&pair[1]))
+            || joined
+                .iter()
+                .any(|(flag, value)| names_destination(flag) && operator_zirv_path(value));
     }
     false
 }
@@ -11694,6 +11774,13 @@ mod tests {
             r"del %USERPROFILE%\.zirv\ctx.toml",
             "rm /home/josj/.zirv/ctx.toml",
             r"cp evil.toml C:\Users\josj\.zirv\ctx.toml",
+            // Review round 1 (R2): a destination flag joined to its value by
+            // `=` or `:` is one token, and one starting with `-` was dropped
+            // before any path was inspected.
+            "cp evil.toml --target-directory=~/.zirv",
+            "cp evil.toml -t=$HOME/.zirv",
+            "Copy-Item evil.toml -Destination:~/.zirv/ctx.toml",
+            "Remove-Item -Path:~/.zirv/ctx.toml",
         ] {
             assert_eq!(
                 evaluate(&policy, command, LaunchMode::Interactive).verdict,
@@ -11713,6 +11800,41 @@ mod tests {
                 evaluate(&policy, command, LaunchMode::Interactive).verdict,
                 Verdict::Allow,
                 "{command} is a read or a repository-local write"
+            );
+        }
+    }
+
+    /// Review round 1 (R3): `taskset`/`chrt` were given their flags AND a
+    /// positional operand count of 1, but `-c`/`--cpu-list` take no separate
+    /// value of their own -- the CPU list IS the positional. Consuming both
+    /// ate the child executable, so `taskset -c 0 gh repo delete o/r`
+    /// unwrapped to `repo delete o/r` and matched nothing. `-p`/`--pid`
+    /// re-target an existing process instead, launching nothing at all.
+    #[test]
+    fn taskset_and_chrt_keep_the_child_executable() {
+        let policy = SafetyPolicy::default();
+        for launched in [
+            "taskset -c 0 gh repo delete o/r",
+            "taskset --cpu-list 0-3 gh repo delete o/r",
+            "taskset 0x3 gh repo delete o/r",
+            "chrt -f 10 gh repo delete o/r",
+            "chrt 10 gh repo delete o/r",
+        ] {
+            assert_eq!(
+                unwrap_launcher_prefix(launched).as_deref(),
+                Some("gh repo delete o/r"),
+                "{launched} launches the whole child command"
+            );
+            assert_eq!(
+                evaluate(&policy, launched, LaunchMode::Interactive).verdict,
+                Verdict::Deny,
+                "{launched} must classify like the child it launches"
+            );
+        }
+        for command in ["taskset -p 0x1 1234", "chrt -p 10 1234", "chrt -p 1234"] {
+            assert!(
+                unwrap_launcher_prefix(command).is_none(),
+                "{command} re-targets a running process and launches nothing"
             );
         }
     }

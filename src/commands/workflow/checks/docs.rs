@@ -78,9 +78,18 @@ fn count_cfg_unix_tests(source: &str) -> usize {
 }
 
 pub fn run_unix_tests_doc(repo: &Path) -> BuiltinCheckResult {
+    if !super::is_zirv_repo(repo) {
+        return BuiltinCheckResult::not_applicable(
+            UNIX_TESTS_ID,
+            UNIX_TESTS_PROVES,
+            UNIX_TESTS_FIX,
+            UNIX_TESTS_ORIGIN,
+            super::not_the_zirv_repo(repo),
+        );
+    }
     let wrap_path = repo.join("src/commands/ctx/wrap.rs");
     if !wrap_path.exists() {
-        return BuiltinCheckResult::not_applicable(
+        return BuiltinCheckResult::inconclusive(
             UNIX_TESTS_ID,
             UNIX_TESTS_PROVES,
             UNIX_TESTS_FIX,
@@ -104,7 +113,7 @@ pub fn run_unix_tests_doc(repo: &Path) -> BuiltinCheckResult {
 
     let known_issues_path = repo.join("docs/obsidian/Development/Known Issues.md");
     if !known_issues_path.exists() {
-        return BuiltinCheckResult::not_applicable(
+        return BuiltinCheckResult::inconclusive(
             UNIX_TESTS_ID,
             UNIX_TESTS_PROVES,
             UNIX_TESTS_FIX,
@@ -215,6 +224,15 @@ const ANCHOR_START: &str = "<!-- zchk-doc-verbs:start -->";
 const ANCHOR_END: &str = "<!-- zchk-doc-verbs:end -->";
 
 pub fn run_doc_verbs(repo: &Path) -> BuiltinCheckResult {
+    if !super::is_zirv_repo(repo) {
+        return BuiltinCheckResult::not_applicable(
+            DOC_VERBS_ID,
+            DOC_VERBS_PROVES,
+            DOC_VERBS_FIX,
+            DOC_VERBS_ORIGIN,
+            super::not_the_zirv_repo(repo),
+        );
+    }
     let cmd = crate::commands::ctx::CtxCli::command();
     let mut clap_verbs: BTreeSet<String> = cmd
         .get_subcommands()
@@ -229,7 +247,7 @@ pub fn run_doc_verbs(repo: &Path) -> BuiltinCheckResult {
 
     let doc_path = repo.join("docs/obsidian/Modules/Built-in Commands.md");
     if !doc_path.exists() {
-        return BuiltinCheckResult::not_applicable(
+        return BuiltinCheckResult::inconclusive(
             DOC_VERBS_ID,
             DOC_VERBS_PROVES,
             DOC_VERBS_FIX,
@@ -356,13 +374,23 @@ fn cfg_after_test_still_counts() {
     }
 
     #[test]
-    fn missing_wrap_rs_is_not_applicable() {
+    fn another_repository_is_not_applicable() {
         let repo = tempdir().unwrap();
+        super::super::write_manifest(repo.path(), "some-other-crate");
         let result = run_unix_tests_doc(repo.path());
         assert_eq!(result.outcome, super::super::BuiltinOutcome::NotApplicable);
     }
 
+    #[test]
+    fn a_missing_wrap_rs_inside_the_zirv_repo_is_inconclusive() {
+        let repo = tempdir().unwrap();
+        super::super::write_manifest(repo.path(), "zirv");
+        let result = run_unix_tests_doc(repo.path());
+        assert_eq!(result.outcome, super::super::BuiltinOutcome::Inconclusive);
+    }
+
     fn write_wrap_rs(repo: &Path, unix_test_count: usize) {
+        super::super::write_manifest(repo, "zirv");
         std::fs::create_dir_all(repo.join("src/commands/ctx")).unwrap();
         let mut body = String::new();
         for i in 0..unix_test_count {
@@ -374,6 +402,7 @@ fn cfg_after_test_still_counts() {
     }
 
     fn write_known_issues(repo: &Path, body: &str) {
+        super::super::write_manifest(repo, "zirv");
         std::fs::create_dir_all(repo.join("docs/obsidian/Development")).unwrap();
         std::fs::write(repo.join("docs/obsidian/Development/Known Issues.md"), body).unwrap();
     }
@@ -448,6 +477,7 @@ fn cfg_after_test_still_counts() {
     }
 
     fn write_doc_verbs(repo: &Path, between: &str) {
+        super::super::write_manifest(repo, "zirv");
         std::fs::create_dir_all(repo.join("docs/obsidian/Modules")).unwrap();
         std::fs::write(
             repo.join("docs/obsidian/Modules/Built-in Commands.md"),
@@ -459,6 +489,7 @@ fn cfg_after_test_still_counts() {
     #[test]
     fn missing_anchors_are_inconclusive() {
         let repo = tempdir().unwrap();
+        super::super::write_manifest(repo.path(), "zirv");
         std::fs::create_dir_all(repo.path().join("docs/obsidian/Modules")).unwrap();
         std::fs::write(
             repo.path()

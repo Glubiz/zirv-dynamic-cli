@@ -1282,6 +1282,7 @@ checkout:
 | `pace.spawn_hard_pct` | `ZIRV_CTX_PACE_SPAWN_HARD_PCT` |
 | `pace.run_budget_tokens` | `ZIRV_CTX_PACE_RUN_BUDGET_TOKENS` |
 | `pace.estimator` | `ZIRV_CTX_PACE_ESTIMATOR` |
+| `pace.collector_max_age_secs` | `ZIRV_CTX_PACE_COLLECTOR_MAX_AGE_SECS` |
 | `pace.five_hour_budget_tokens` | `ZIRV_CTX_FIVE_HOUR_BUDGET` |
 | `pace.seven_day_budget_tokens` | `ZIRV_CTX_SEVEN_DAY_BUDGET` |
 | `pace.count_cache_reads` | `ZIRV_CTX_PACE_COUNT_CACHE_READS` |

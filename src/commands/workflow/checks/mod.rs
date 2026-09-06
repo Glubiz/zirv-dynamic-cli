@@ -31,11 +31,12 @@ use serde::Serialize;
 /// available", "no base branch", "the doc's anchor comments are missing").
 ///
 /// `NotApplicable` is the fourth verdict and the only non-blocking one
-/// besides `Pass`: most checks here read zirv's OWN files, and their absence
-/// in some other repository is a statement about the repository, not about
-/// the invariant. `Inconclusive` stays reserved for an input that EXISTS but
-/// could not be read or parsed -- that really is a degraded gate, and issue
-/// #268's ban still applies to it.
+/// besides `Pass`: most checks here guard zirv's OWN source and vault
+/// invariants, which are a statement about this repository and no other. See
+/// [`is_zirv_repo`], which decides that once, for every such check.
+/// `Inconclusive` stays reserved for an input this repository is supposed to
+/// have but that could not be found, read or parsed -- that really is a
+/// degraded gate, and issue #268's ban still applies to it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum BuiltinOutcome {
@@ -147,14 +148,39 @@ impl BuiltinCheckResult {
 }
 
 /// The `details` text every check uses when one of the zirv-repository files
-/// it reads is simply not there -- one wording, so `not-applicable` always
-/// names the missing input and says why that is not a verdict about the
-/// repository being verified.
+/// it reads is simply not there.
 pub fn absent_input(path: &Path) -> String {
     format!(
-        "{} is absent -- this check reads zirv's own source/vault files, so it does not apply to \
-         this repository",
+        "{} is absent -- this check reads zirv's own source/vault files",
         path.display()
+    )
+}
+
+/// Whether `repo` IS the zirv checkout, read from its own `[package] name`.
+///
+/// Review round 1 (R9): every zirv-specific check keyed `NotApplicable` on
+/// its input FILE being absent, which answers the wrong question in both
+/// directions -- an ordinary repository that happens to own a
+/// `.gitattributes` (or a `Decision Log.md`) was judged against zirv's
+/// invariants and FAILED, while deleting one of those files inside the zirv
+/// checkout made the check that guards it silently pass. Applicability is a
+/// fact about the repository, so it is decided here, once, before any input
+/// is read; an absent input inside the zirv repo stays `Inconclusive`.
+pub fn is_zirv_repo(repo: &Path) -> bool {
+    std::fs::read_to_string(repo.join("Cargo.toml"))
+        .ok()
+        .and_then(|manifest| version_bump::parse_package_field(&manifest, "name"))
+        .as_deref()
+        == Some("zirv")
+}
+
+/// The `details` text a zirv-specific check reports when `repo` is some other
+/// repository entirely -- the one `NotApplicable` reason that is a statement
+/// about the repository rather than about the invariant.
+pub fn not_the_zirv_repo(repo: &Path) -> String {
+    format!(
+        "{} is not the zirv repository -- this check guards zirv's own source/vault invariants",
+        repo.display()
     )
 }
 
@@ -191,6 +217,18 @@ pub fn run_all(repo: &Path, exclude: &[String]) -> Vec<BuiltinCheckResult> {
     ];
     checks.retain(|check| !exclude.iter().any(|excluded| excluded == check.id));
     checks
+}
+
+/// Test fixtures declare which repository they stand for the same way
+/// [`is_zirv_repo`] reads it, so a check module's own fixture is explicit
+/// about whether zirv's invariants apply to it at all.
+#[cfg(test)]
+fn write_manifest(repo: &Path, name: &str) {
+    std::fs::write(
+        repo.join("Cargo.toml"),
+        format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\n"),
+    )
+    .expect("write Cargo.toml");
 }
 
 #[cfg(test)]
@@ -252,6 +290,67 @@ mod tests {
             ],
             "the repo-independent checks (argv, hooks) must still report a real verdict"
         );
+    }
+
+    use super::write_manifest as manifest;
+
+    /// Review round 1 (R9): keying `NotApplicable` on the input FILE being
+    /// absent answers the wrong question. An ordinary repository that happens
+    /// to own a `.gitattributes` (or a `Decision Log.md`) was judged against
+    /// zirv's own invariants and FAILED -- the very "cannot exit 0 anywhere
+    /// outside the zirv checkout" symptom the verdict was added to fix, just
+    /// moved to the repositories that do have such a file.
+    #[test]
+    fn a_non_zirv_repo_that_owns_a_lookalike_input_is_still_not_applicable() {
+        let repo = tempfile::tempdir().unwrap();
+        manifest(repo.path(), "some-other-crate");
+        std::fs::write(repo.path().join(".gitattributes"), "* text=auto\n").unwrap();
+        std::fs::create_dir_all(repo.path().join("docs/obsidian/Development")).unwrap();
+        std::fs::write(
+            repo.path()
+                .join("docs/obsidian/Development/Decision Log.md"),
+            "# Decisions\n",
+        )
+        .unwrap();
+
+        let produced = run_all(repo.path(), &[]);
+        let blocking: Vec<(&str, &str, &str)> = produced
+            .iter()
+            .filter(|check| !check.outcome.is_passing())
+            .map(|check| (check.id, check.outcome.as_str(), check.details.as_str()))
+            .collect();
+        assert!(
+            blocking.is_empty(),
+            "zirv's own invariants must not be judged against another repository: {blocking:?}"
+        );
+    }
+
+    /// The other direction of the same rule: inside the zirv checkout an
+    /// absent input is a real problem (someone deleted `.gitattributes`), so
+    /// it must never be the non-blocking `NotApplicable` verdict.
+    #[test]
+    fn an_absent_input_inside_the_zirv_repo_is_not_a_pass() {
+        let repo = tempfile::tempdir().unwrap();
+        manifest(repo.path(), "zirv");
+
+        let produced = run_all(repo.path(), &[]);
+        for id in [
+            forbidden::ID,
+            docs::UNIX_TESTS_ID,
+            docs::DOC_VERBS_ID,
+            decision_graph::ID,
+            eol::ID,
+        ] {
+            let check = produced
+                .iter()
+                .find(|check| check.id == id)
+                .expect("every id is produced");
+            assert_eq!(
+                check.outcome,
+                BuiltinOutcome::Inconclusive,
+                "a missing input inside zirv's own checkout is not a pass: {check:?}"
+            );
+        }
     }
 
     #[test]

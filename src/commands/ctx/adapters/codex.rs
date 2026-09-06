@@ -539,17 +539,52 @@ impl CodexAdapter {
             }
         }
         let record = super::super::sessions::load_record(&state, &short)?;
+        // Review round 1 (R6): a handover keeps the same session id, so the
+        // registration floor below would keep admitting the DEAD child's
+        // rollout (earliest wins). `forget_transcript_pin` records the swap's
+        // own moment here; `max` of the two is this child's real floor.
+        let handover_floor_ms = std::fs::read_to_string(handover_floor(&state, &short))
+            .ok()
+            .and_then(|text| text.trim().parse::<u64>().ok())
+            .unwrap_or(0);
         // Truncated-to-the-second epoch, so this floor already sits up to a
         // second BEFORE the registration it describes -- which is the right
         // direction: a pane registers its record moments after the child is
         // spawned, so codex's own `session_meta` can legitimately be stamped
         // a few hundred milliseconds earlier than the registration.
-        let started_ms = record.started_at.saturating_mul(1_000);
+        let started_ms = record
+            .started_at
+            .saturating_mul(1_000)
+            .max(handover_floor_ms);
         let resolved = resolve_rollout(sessions_root, started_ms, &session.cwd)?;
         if super::super::state::create_private_dir_all(&state.rollouts()).is_ok() {
             let _ = super::super::state::write_private(&pin, &resolved.display().to_string());
         }
         Some(resolved)
+    }
+}
+
+/// Where [`forget_transcript_pin`] records the moment a handover superseded
+/// this session's child, beside the pin it drops.
+fn handover_floor(state: &super::super::state::StateDir, short: &str) -> PathBuf {
+    state.rollouts().join(format!("{short}.floor"))
+}
+
+/// Review round 1 (R6): drops this session's rollout pin and floors any later
+/// resolution at `now_secs`. A handover -- `dash::pane::Pane::handover` or
+/// `wrap`'s own swap -- replaces the child but keeps the zirv session id, so
+/// without this the pin kept answering the DEAD child's rollout forever, and
+/// merely deleting it re-resolved onto that same file (the registration floor
+/// still admits it, and earliest wins). Best-effort throughout: a floor that
+/// cannot be written costs a stale resolution, never a wrong session.
+pub fn forget_transcript_pin(state: &super::super::state::StateDir, short: &str, now_secs: u64) {
+    let rollouts = state.rollouts();
+    let _ = std::fs::remove_file(rollouts.join(format!("{short}.path")));
+    if super::super::state::create_private_dir_all(&rollouts).is_ok() {
+        let _ = super::super::state::write_private(
+            &handover_floor(state, short),
+            &now_secs.saturating_mul(1_000).to_string(),
+        );
     }
 }
 
@@ -3702,6 +3737,90 @@ mod tests {
             adapter.transcript_path(&session),
             mine,
             "a pinned rollout stays pinned once a later codex run appears"
+        );
+    }
+
+    /// Review round 1 (R6): a handover keeps the SAME zirv session id, so the
+    /// pin the previous child resolved kept answering for the successor --
+    /// forever. Clearing the pin alone does not fix it either: resolution 3
+    /// floors on the session's REGISTRATION time, which a handover does not
+    /// move, so the dead child's rollout simply wins again and is re-pinned.
+    /// `forget_transcript_pin` moves that floor to the swap's own moment.
+    #[test]
+    fn a_handover_drops_the_previous_childs_rollout_pin() {
+        let home = tempfile::tempdir().expect("home");
+        let state_root = tempfile::tempdir().expect("state");
+        let day_dir = home.path().join(".codex/sessions/2026/09/06");
+        std::fs::create_dir_all(&day_dir).expect("mkdir");
+
+        let rollout = |name: &str, started: &str| -> PathBuf {
+            let path = day_dir.join(name);
+            let meta = serde_json::json!({
+                "timestamp": started,
+                "type": "session_meta",
+                "payload": {"id": "x", "timestamp": started, "cwd": "/work/repo"},
+            });
+            std::fs::write(&path, format!("{meta}\n")).expect("write rollout");
+            path
+        };
+
+        let session_id = "11111111-2222-4333-8444-555555555555";
+        let short = crate::commands::ctx::sessions::short_id(session_id);
+        let state =
+            crate::commands::ctx::state::StateDir::from_root(state_root.path().to_path_buf());
+        std::fs::create_dir_all(state.sessions()).expect("mkdir sessions");
+        let mut record = crate::commands::ctx::sessions::Record::new(
+            session_id,
+            "codex",
+            std::path::Path::new("/work/repo"),
+            crate::commands::ctx::sessions::Verb::Dash,
+        );
+        record.started_at = 1_788_674_400; // 2026-09-06T06:00:00Z
+        std::fs::write(
+            state.sessions().join(format!("{short}.json")),
+            serde_json::to_string(&record).expect("record json"),
+        )
+        .expect("write record");
+
+        let adapter = CodexAdapter::new(None)
+            .with_home(home.path().to_path_buf())
+            .with_state_root(state_root.path().to_path_buf());
+        let session = SessionRef {
+            id: SessionId::parse(session_id),
+            cwd: std::path::PathBuf::from("/work/repo"),
+        };
+
+        let first = rollout(
+            "rollout-2026-09-06T06-00-10-bbbbbbbb-2222-7222-8222-222222222222.jsonl",
+            "2026-09-06T06:00:10.000Z",
+        );
+        assert_eq!(adapter.transcript_path(&session), first, "the first child");
+
+        // The successor codex the handover launched, an hour later.
+        let second = rollout(
+            "rollout-2026-09-06T07-00-10-cccccccc-3333-7333-8333-333333333333.jsonl",
+            "2026-09-06T07:00:10.000Z",
+        );
+        assert_eq!(
+            adapter.transcript_path(&session),
+            first,
+            "the pin still answers the dead child's rollout"
+        );
+
+        // Deleting the pin is not enough on its own -- the registration floor
+        // still admits the dead child's rollout, which is earliest and wins.
+        std::fs::remove_file(state.rollouts().join(format!("{short}.path"))).expect("drop pin");
+        assert_eq!(
+            adapter.transcript_path(&session),
+            first,
+            "clearing the pin alone re-resolves onto the very same rollout"
+        );
+
+        forget_transcript_pin(&state, &short, 1_788_678_000); // 2026-09-06T07:00:00Z
+        assert_eq!(
+            adapter.transcript_path(&session),
+            second,
+            "after a handover the successor's own rollout is resolved"
         );
     }
 

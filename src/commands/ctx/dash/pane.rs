@@ -2406,6 +2406,17 @@ impl Pane {
         // its own reminder -- unlike a restore (F3), which resurrects the
         // SAME logical session and must therefore keep its sent flag.
         self.report_reminder_sent = false;
+        // R6: this pane keeps its session id across the swap, so codex's
+        // rollout pin would otherwise keep answering the retired child's file
+        // for every later usage/budget read. Dropped here, after the
+        // successor is committed and nothing below can fail: a swap that
+        // aborted earlier leaves the old child running, and its own pin with
+        // it.
+        super::super::adapters::codex::forget_transcript_pin(
+            &self.state_dir,
+            self.short(),
+            super::super::state::now_secs(),
+        );
 
         Ok(())
     }
