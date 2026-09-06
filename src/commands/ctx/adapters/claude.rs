@@ -300,6 +300,51 @@ pub fn context_tokens_of(usage: &Value) -> u64 {
     usage_categories(usage).context_total()
 }
 
+/// This codebase's own rough token estimate, shared with `compile.rs` and
+/// `context_status.rs`: four bytes to a token.
+const THINKING_BYTES_PER_TOKEN: u64 = 4;
+
+/// The literal size of an assistant message's own thinking text, or `None`
+/// when the row carries no thinking block with any text left in it -- the
+/// shape every live transcript now has, which [`reported_thinking_bytes`]
+/// answers instead.
+fn thinking_text_bytes(message: &Value) -> Option<u64> {
+    let total: u64 = message
+        .get("content")
+        .and_then(Value::as_array)?
+        .iter()
+        .filter(|b| b.get("type").and_then(Value::as_str) == Some("thinking"))
+        .filter_map(|b| b.get("thinking").and_then(Value::as_str))
+        .map(|t| t.len() as u64)
+        .sum();
+    (total > 0).then_some(total)
+}
+
+/// The response's reported thinking size on the byte scale, for a row whose
+/// thinking text was stripped to a bare `signature` (or redacted outright).
+/// `None` unless the row actually carries such a block, so a row that never
+/// thought is never credited with the response's thinking tokens.
+fn reported_thinking_bytes(message: &Value) -> Option<u64> {
+    let stripped = message
+        .get("content")
+        .and_then(Value::as_array)?
+        .iter()
+        .any(|b| match b.get("type").and_then(Value::as_str) {
+            Some("thinking") => b.get("signature").is_some(),
+            Some("redacted_thinking") => true,
+            _ => false,
+        });
+    if !stripped {
+        return None;
+    }
+    let tokens = message
+        .get("usage")?
+        .get("output_tokens_details")?
+        .get("thinking_tokens")
+        .and_then(Value::as_u64)?;
+    Some(tokens.saturating_mul(THINKING_BYTES_PER_TOKEN))
+}
+
 pub fn parse_events(jsonl: &str) -> Vec<NormalizedEvent> {
     let mut events = Vec::new();
 
@@ -423,17 +468,18 @@ pub fn parse_events(jsonl: &str) -> Vec<NormalizedEvent> {
                 // blocks entirely when building `AssistantFinal::text`, so
                 // without this sibling event that content is invisible to
                 // `breakdown::attribute_window`'s `thinking` bucket.
-                let thinking_bytes: u64 = message
-                    .get("content")
-                    .and_then(Value::as_array)
-                    .map(|blocks| {
-                        blocks
-                            .iter()
-                            .filter(|b| b.get("type").and_then(Value::as_str) == Some("thinking"))
-                            .filter_map(|b| b.get("thinking").and_then(Value::as_str))
-                            .map(|t| t.len() as u64)
-                            .sum()
-                    })
+                //
+                // Current Claude Code writes every thinking block with its
+                // text stripped to `""` and only a `signature` (or as a
+                // `redacted_thinking` block), so that sum is now zero for a
+                // live session no matter how much the model thought. The
+                // response's own `usage.output_tokens_details.thinking_tokens`
+                // still reports the real count; scaled here to the BYTE unit
+                // every other `breakdown::attribute_window` weight is in, at
+                // this codebase's own 4-bytes-per-token estimate (see
+                // `context_status::BYTES_PER_TOKEN`).
+                let thinking_bytes = thinking_text_bytes(&message)
+                    .or_else(|| reported_thinking_bytes(&message))
                     .unwrap_or(0);
                 if thinking_bytes > 0 {
                     events.push(NormalizedEvent::AssistantThinking {
@@ -2740,6 +2786,40 @@ mod tests {
             + usage.cache_read_input_tokens
             + usage.output_tokens;
         assert_eq!(total, 4_922_703);
+    }
+
+    /// Current Claude Code strips a thinking block's text and keeps only its
+    /// `signature` (124 of 124 blocks across six recorded real sessions), so
+    /// sizing the event by that text reports zero thinking for every session
+    /// that thought. The response's own
+    /// `usage.output_tokens_details.thinking_tokens` still carries the count.
+    #[test]
+    fn thinking_bytes_fall_back_to_reported_thinking_tokens_when_the_text_is_stripped() {
+        let stripped = concat!(
+            r#"{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"","signature":"EucMCqgBCBEY"}],"#,
+            r#""usage":{"output_tokens":100,"output_tokens_details":{"thinking_tokens":50}}}}"#,
+        );
+        assert!(
+            parse_events(stripped).contains(&NormalizedEvent::AssistantThinking { byte_len: 200 }),
+            "50 reported thinking tokens on this repo's own 4-bytes-per-token scale"
+        );
+
+        let intact = concat!(
+            r#"{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"abcde"}],"#,
+            r#""usage":{"output_tokens":100,"output_tokens_details":{"thinking_tokens":50}}}}"#,
+        );
+        assert!(
+            parse_events(intact).contains(&NormalizedEvent::AssistantThinking { byte_len: 5 }),
+            "real thinking text still sizes itself, never the reported estimate"
+        );
+
+        let neither = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"hi"}],"usage":{"output_tokens":1}}}"#;
+        assert!(
+            !parse_events(neither)
+                .iter()
+                .any(|e| matches!(e, NormalizedEvent::AssistantThinking { .. })),
+            "a row that carries no thinking block emits no thinking event"
+        );
     }
 
     /// A row with neither `message.id` nor `requestId` has no response
