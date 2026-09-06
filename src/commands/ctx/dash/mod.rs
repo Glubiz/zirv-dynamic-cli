@@ -1847,6 +1847,23 @@ fn due(last: Instant, now: Instant, interval: Duration) -> bool {
     now.duration_since(last) >= interval
 }
 
+/// The delegation ledger's `(len, mtime_secs)`, or `(0, 0)` when there is no
+/// ledger yet. A1-4: one `stat` standing in for a full read-and-re-price of
+/// every row the ledger holds -- see [`FactsCache::spend_key`].
+fn delegation_ledger_fingerprint(state: &StateDir) -> (u64, u64) {
+    let path = state.logs().join(super::log::DELEGATION_FILE);
+    let Ok(meta) = std::fs::metadata(&path) else {
+        return (0, 0);
+    };
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    (meta.len(), mtime)
+}
+
 /// The disk-backed part of the header's facts: everything `FactsCache::
 /// refresh_if_due` re-reads on the throttle. Kept separate from
 /// `ui::HeaderFacts` itself because the harness/error line and the live
@@ -1967,6 +1984,12 @@ struct FactsCache {
     disk: DiskFacts,
     registry: Vec<(sessions::Record, sessions::Liveness)>,
     last_refresh: Instant,
+    /// A1-4: the delegation ledger's `(len, mtime_secs)` as of the last time
+    /// `disk.spend` was actually folded. `None` until the first fold. The
+    /// ledger is append-only and grows on every row, so an unchanged
+    /// fingerprint means an unchanged file -- and re-reading and re-pricing
+    /// every row once a second, forever, buys nothing.
+    spend_key: Option<(u64, u64)>,
 }
 
 impl FactsCache {
@@ -1979,7 +2002,49 @@ impl FactsCache {
             disk: DiskFacts::default(),
             registry: Vec::new(),
             last_refresh: now.checked_sub(FACTS_THROTTLE).unwrap_or(now),
+            spend_key: None,
         }
+    }
+
+    /// A1-4: folds the delegation ledger into `disk.spend`, but only when the
+    /// ledger's own fingerprint moved since the last fold. `read_rows` is
+    /// injected so the skip is testable without a ledger on disk.
+    fn refresh_spend_with<F>(&mut self, fingerprint: (u64, u64), cfg: &CtxConfig, read_rows: F)
+    where
+        F: FnOnce() -> Vec<super::log::DelegationRow>,
+    {
+        if self.spend_key == Some(fingerprint) {
+            return;
+        }
+        self.spend_key = Some(fingerprint);
+        let delegation_rows = read_rows();
+        self.disk.spend = if delegation_rows.is_empty() {
+            None
+        } else {
+            let table = super::price::resolve_table(cfg);
+            let failed = delegation_rows
+                .iter()
+                .filter(|row| row.outcome != "ok")
+                .count() as u64;
+            let mut cost_micros: u64 = 0;
+            for row in &delegation_rows {
+                if let Some(model) = row.model.as_deref() {
+                    let usage = super::event::TranscriptUsage {
+                        input_tokens: row.input_tokens,
+                        cache_creation_input_tokens: row.cache_creation_input_tokens,
+                        cache_read_input_tokens: row.cache_read_input_tokens,
+                        output_tokens: row.output_tokens,
+                    };
+                    if let Some(cost) = super::price::price(model, &usage, &table) {
+                        cost_micros = cost_micros.saturating_add(cost);
+                    }
+                }
+            }
+            Some(AggregateSpendFacts {
+                failed,
+                cost_micros,
+            })
+        };
     }
 
     /// Every disk read the header and sidebar need, at most once per
@@ -2120,34 +2185,12 @@ impl FactsCache {
         // file read, same as `usage` right above -- never a scan, a poll, or
         // a network call. `None` when the ledger has no rows at all, so the
         // aggregate row renders `--` rather than a phantom `0`/`$0.00`.
-        let delegation_rows = super::log::read_delegations(state, usize::MAX);
-        self.disk.spend = if delegation_rows.is_empty() {
-            None
-        } else {
-            let table = super::price::resolve_table(cfg);
-            let failed = delegation_rows
-                .iter()
-                .filter(|row| row.outcome != "ok")
-                .count() as u64;
-            let mut cost_micros: u64 = 0;
-            for row in &delegation_rows {
-                if let Some(model) = row.model.as_deref() {
-                    let usage = super::event::TranscriptUsage {
-                        input_tokens: row.input_tokens,
-                        cache_creation_input_tokens: row.cache_creation_input_tokens,
-                        cache_read_input_tokens: row.cache_read_input_tokens,
-                        output_tokens: row.output_tokens,
-                    };
-                    if let Some(cost) = super::price::price(model, &usage, &table) {
-                        cost_micros = cost_micros.saturating_add(cost);
-                    }
-                }
-            }
-            Some(AggregateSpendFacts {
-                failed,
-                cost_micros,
-            })
-        };
+        // A1-4: a `stat`, not a full read-and-re-price of every delegation
+        // row, on the overwhelmingly common tick where the append-only
+        // ledger has not moved since the last one.
+        self.refresh_spend_with(delegation_ledger_fingerprint(state), cfg, || {
+            super::log::read_delegations(state, usize::MAX)
+        });
 
         // Rebuilt rather than updated in place: a reaped pane or a released
         // registry record must drop out of the map, not linger as a stale
@@ -15074,6 +15117,33 @@ mod tests {
         for pane in &mut panes {
             let _ = pane.finish_shutdown();
         }
+    }
+
+    /// A1-4: the delegation ledger is append-only, so an unchanged
+    /// `(len, mtime)` means unchanged rows. Re-reading the whole file and
+    /// re-pricing every row once a second, forever, bought nothing.
+    #[test]
+    fn the_delegation_ledger_is_re_priced_only_when_it_actually_changed() {
+        let cfg = CtxConfig::default();
+        let mut cache = FactsCache::new(Instant::now());
+        let mut reads = 0usize;
+
+        for _ in 0..5 {
+            cache.refresh_spend_with((128, 42), &cfg, || {
+                reads += 1;
+                Vec::new()
+            });
+        }
+        assert_eq!(
+            reads, 1,
+            "an unchanged ledger is folded once, not once per throttled tick"
+        );
+
+        cache.refresh_spend_with((256, 43), &cfg, || {
+            reads += 1;
+            Vec::new()
+        });
+        assert_eq!(reads, 2, "a grown ledger is re-read and re-priced");
     }
 
     /// A1-2: restoring a retained ended row grows `panes` and shrinks
