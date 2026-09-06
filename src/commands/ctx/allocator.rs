@@ -185,6 +185,11 @@ pub struct Candidate {
     pub headroom_pct: f64,
     pub projected_headroom_pct: f64,
     pub assumed: bool,
+    /// Audit finding G2: the reading this candidate was ranked on is real
+    /// but older than `pace.collector_max_age_secs`, so nothing binds it.
+    /// Distinct from `assumed` (no reading at all, `unknown_headroom_pct`
+    /// stood in for one) and reported as `stale` rather than `unknown`.
+    pub stale: bool,
     pub binding_window: Option<String>,
 }
 
@@ -299,6 +304,30 @@ fn binding_headroom(provider: &ProviderCapacity) -> (f64, Option<String>) {
         Some(w) => (w.headroom_pct, Some(w.window.clone())),
         None => (0.0, None),
     }
+}
+
+/// The reading a provider is RANKED on. The binding window when one binds;
+/// otherwise (audit finding G2) the tightest reading still stored for this
+/// provider -- real, still-live numbers that `pace::binding` dropped only
+/// because nothing has refreshed them inside `collector_max_age_secs`.
+/// Codex is the motivating case: its rollout files are written only during a
+/// turn, so a provider sitting on 47% used goes "unknown" 15 minutes after
+/// the last one and ranked at the blanket `unknown_headroom_pct` instead.
+///
+/// Ranking only. `classify` still keys `HarnessState::Unknown` off
+/// `provider.binding` alone, so a reading nothing binds can never authorise
+/// a hard gate -- it can only order candidates that were already admissible.
+pub fn ranking_window(provider: &ProviderCapacity) -> Option<&WindowReading> {
+    provider
+        .binding
+        .and_then(|i| provider.windows.get(i))
+        .or_else(|| {
+            provider.windows.iter().min_by(|a, b| {
+                a.headroom_pct
+                    .partial_cmp(&b.headroom_pct)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+        })
 }
 
 /// Every window that has a configured budget must have enough projected
@@ -428,6 +457,7 @@ pub fn place(
                         headroom_pct,
                         projected_headroom_pct: projected,
                         assumed: false,
+                        stale: ranking_window(provider).is_some_and(|w| w.stale),
                         binding_window,
                     }),
                     keep_requested: true,
@@ -539,17 +569,36 @@ pub fn place(
             continue;
         };
 
-        let (headroom_pct, assumed, binding_window) = if harness.state == HarnessState::Unknown {
-            let pct = cfg.fallback.unknown_headroom_pct;
-            if pct <= 0.0 {
-                exclusions.push((name.clone(), Exclusion::UnknownHeadroomOptedOut));
-                continue;
-            }
-            (pct, true, None)
-        } else {
-            let (raw, window_name) = binding_headroom(provider);
-            (raw, false, window_name)
-        };
+        let (headroom_pct, assumed, stale, binding_window) =
+            match (harness.state, ranking_window(provider)) {
+                // G2: a real reading nothing binds still ranks on its own
+                // numbers -- stale, never assumed. The `unknown_headroom_pct`
+                // opt-out below governs the genuinely blind case only, so it
+                // does not apply here.
+                (HarnessState::Unknown, Some(reading)) => (
+                    reading.headroom_pct,
+                    false,
+                    true,
+                    Some(reading.window.clone()),
+                ),
+                (HarnessState::Unknown, None) => {
+                    let pct = cfg.fallback.unknown_headroom_pct;
+                    if pct <= 0.0 {
+                        exclusions.push((name.clone(), Exclusion::UnknownHeadroomOptedOut));
+                        continue;
+                    }
+                    (pct, true, false, None)
+                }
+                _ => {
+                    let (raw, window_name) = binding_headroom(provider);
+                    (
+                        raw,
+                        false,
+                        ranking_window(provider).is_some_and(|w| w.stale),
+                        window_name,
+                    )
+                }
+            };
 
         if !assumed && !fits_all_windows(provider, &unit.bounds, cfg, unit.expected_tokens) {
             let (have, need) =
@@ -599,6 +648,7 @@ pub fn place(
                 headroom_pct,
                 projected_headroom_pct: projected,
                 assumed,
+                stale,
                 binding_window,
             },
         ));
@@ -829,6 +879,62 @@ mod tests {
 
     fn always_model(_: &str) -> Option<String> {
         Some("model".to_string())
+    }
+
+    /// Audit finding G2: codex's only usage source is its own rollout files,
+    /// written only during a turn, so `pace::binding` drops the reading
+    /// roughly `collector_max_age_secs` after the last one and `classify`
+    /// reports `Unknown` -- even though the reading is real, its window has
+    /// not reset, and `window::available` still shows it. Ranking then used
+    /// the configured `unknown_headroom_pct` (25) in place of the 53% the
+    /// provider actually has. For RANKING that reading now contributes its
+    /// own headroom, marked stale rather than assumed; `classify` still
+    /// refuses it as a hard-gate authority.
+    #[test]
+    fn an_available_but_unbinding_reading_ranks_on_its_real_headroom() {
+        let cfg = base_cfg();
+        let mut aged = window("five_hour", 53.0);
+        aged.age_secs = 7_200;
+        aged.stale = true;
+
+        let snapshot = classify_all(
+            &cfg,
+            vec![
+                provider("anthropic", vec![window("five_hour", 5.0)], Some(0)),
+                provider("openai", vec![aged], None),
+            ],
+            vec![
+                harness("claude", "anthropic", 0, None),
+                harness("codex", "openai", 0, None),
+            ],
+        );
+        assert_eq!(
+            snapshot.harness("codex").expect("codex row").state,
+            HarnessState::Unknown,
+            "a reading nothing binds is still no hard-gate authority"
+        );
+
+        let placement = place(
+            &snapshot,
+            &cfg,
+            &unit("u1", "claude", 0),
+            &[],
+            &always_model,
+        );
+        let selected = placement.selected.expect("codex is the only alternative");
+        assert_eq!(selected.name, "codex");
+        assert_eq!(
+            cfg.fallback.unknown_headroom_pct, 25.0,
+            "the blanket assumption this replaces"
+        );
+        assert_eq!(
+            selected.headroom_pct, 53.0,
+            "ranks on the headroom the provider actually reported"
+        );
+        assert_eq!(selected.projected_headroom_pct, 53.0);
+        assert!(!selected.assumed, "a real reading is not an assumption");
+        assert!(selected.stale, "but it is stale, and says so");
+        assert_eq!(selected.binding_window.as_deref(), Some("five_hour"));
     }
 
     #[test]
