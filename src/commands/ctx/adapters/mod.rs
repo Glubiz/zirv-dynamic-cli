@@ -1120,6 +1120,23 @@ pub trait AgentAdapter: std::fmt::Debug {
     /// inherit "no restriction" by omission.
     fn read_only_args(&self) -> Vec<String>;
 
+    /// The interactive-launch counterpart of [`read_only_args`](Self::
+    /// read_only_args): the same restriction, but never carrying a flag that
+    /// only an `exec`-style (non-interactive) launch surface accepts. Bug
+    /// fix (2026-09-06): codex's `--ignore-rules`/`--ignore-user-config`
+    /// exist only on `codex exec --help`; the top-level interactive `codex
+    /// [OPTIONS] [PROMPT]` launch a dashboard pane uses rejects both with a
+    /// clap usage error (exit 2), which killed a `--mode read-only` pane
+    /// instantly, before it ever registered a session -- see
+    /// `CodexAdapter`'s own override.
+    ///
+    /// Defaults to `read_only_args()` unchanged, which is correct for any
+    /// adapter whose read-only pin does not vary by launch surface (claude's
+    /// `--disallowedTools=...` works identically either way).
+    fn interactive_read_only_args(&self) -> Vec<String> {
+        self.read_only_args()
+    }
+
     /// Build a provider-neutral workflow-seat launch. Agent manifests describe
     /// required capabilities and methodology but never grant authority: this
     /// default re-loads the effective canonical policy, applies the normal
@@ -2481,12 +2498,19 @@ pub fn provider_for_agent_name(name: Option<&str>) -> &'static str {
         .unwrap_or(super::window::LEGACY_USAGE_PROVIDER)
 }
 
-/// `AgentAdapter::read_only_args` for a registered adapter name, without
-/// requiring that adapter to be enabled or ready -- the same static-fact
-/// lookup through `ADAPTERS` that `provider_for_agent_name` does. `None` for
-/// an unknown name, so a caller that must not launch an unpinned child can
-/// refuse rather than guess an empty restriction.
-pub fn read_only_args_for_agent_name(name: &str) -> Option<Vec<String>> {
+/// `AgentAdapter::read_only_args`/`interactive_read_only_args` for a
+/// registered adapter name, without requiring that adapter to be enabled or
+/// ready -- the same static-fact lookup through `ADAPTERS` that
+/// `provider_for_agent_name` does. `None` for an unknown name, so a caller
+/// that must not launch an unpinned child can refuse rather than guess an
+/// empty restriction.
+///
+/// `mode` picks which of the two floors applies: bug fix (2026-09-06),
+/// `dash::worker_pane_extra_args` used to call this with no mode at all and
+/// always got the `exec`-only floor, which carried codex's `--ignore-rules`/
+/// `--ignore-user-config` onto an interactive pane launch that rejects both
+/// -- see `AgentAdapter::interactive_read_only_args`'s own doc comment.
+pub fn read_only_args_for_agent_name(name: &str, mode: LaunchMode) -> Option<Vec<String>> {
     ADAPTERS
         .iter()
         .find(|(adapter_name, _)| *adapter_name == name)
@@ -2503,7 +2527,11 @@ pub fn read_only_args_for_agent_name(name: &str) -> Option<Vec<String>> {
             // `Announcer` itself does not re-check here -- see the
             // documented residual on `announce_sandbox_residual_once`.
             announce_sandbox_residual_once(adapter.as_ref(), true);
-            adapter.read_only_args()
+            if mode.is_interactive() {
+                adapter.interactive_read_only_args()
+            } else {
+                adapter.read_only_args()
+            }
         })
 }
 

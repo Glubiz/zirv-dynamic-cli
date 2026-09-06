@@ -2373,8 +2373,17 @@ pub(crate) fn reviewer_argv(
     // Keep the existing static read-only resolver as the enforcement seam:
     // it also reports adapter-specific sandbox residuals. Append it last so
     // no system/model argument can weaken the floor.
-    let read_only = crate::commands::ctx::adapters::read_only_args_for_agent_name(agent)
-        .ok_or_else(|| format!("unknown adapter '{agent}'; cannot pin the reviewer read-only"))?;
+    // This forks through `codex exec` (see this fn's own doc comment: "no
+    // `--headless`... resolves prompt in-process, before it ever chooses
+    // between a pane and an inline run"), never the interactive TUI, so the
+    // `exec`-only floor is always correct here -- a pane fork drops these
+    // trailing flags entirely and re-derives its own via
+    // `dash::worker_pane_extra_args`, which is mode-aware.
+    let read_only = crate::commands::ctx::adapters::read_only_args_for_agent_name(
+        agent,
+        crate::commands::ctx::adapters::LaunchMode::Headless,
+    )
+    .ok_or_else(|| format!("unknown adapter '{agent}'; cannot pin the reviewer read-only"))?;
     seat_args.extend(read_only);
     // 2026-09-06: no `--headless`. The package still travels on this child's
     // own stdin (`-`) -- `zirv ctx agent` resolves the prompt in-process,
