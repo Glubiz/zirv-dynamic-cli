@@ -852,6 +852,50 @@ impl Default for SearchConfig {
     }
 }
 
+/// Issue #326: the compact-output knobs -- whether claude's `PostToolUse`
+/// hook replaces a verbose Bash tool result with a summary at all, how big a
+/// result has to be before that is worth doing, and the hard ceiling on the
+/// summary itself.
+///
+/// All three are `REPO_FORBIDDEN`. `max_summary_bytes` is the same trust
+/// asymmetry as every other byte cap in this file: a checked-out repository
+/// raising the cap on text that lands directly in a supervised session's
+/// context window is exactly the flooding these caps exist to prevent.
+/// `compact` and `compact_min_bytes` are forbidden in BOTH directions, unlike
+/// the narrowing-only switches elsewhere: turning compaction *on* lets a
+/// repository decide that what its own build prints reaches the session only
+/// through a summary zirv wrote, and turning it *off* (or raising the
+/// threshold past anything it ever emits) lets a repository that floods on
+/// purpose opt itself out of being compacted. Neither is the checkout's call.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct OutputConfig {
+    /// Whether claude's `PostToolUse` hook (`hook::run_posttool`) replaces a
+    /// large `Bash` tool result with a compact summary before the model ever
+    /// sees it. Default `true`. `zirv ctx run --compact` is unaffected: it is
+    /// an explicit invocation, not an interception.
+    pub compact: bool,
+    /// How many bytes of combined stdout+stderr a `Bash` result needs before
+    /// the `PostToolUse` hook compacts it. Below this the original output is
+    /// left exactly as it is -- compacting a short result spends a stored
+    /// file and a retrieval round trip to save nothing. Default `4096`.
+    pub compact_min_bytes: usize,
+    /// Hard cap, in bytes, on one compact summary
+    /// (`output::render_summary`). The retrieval line is the floor and
+    /// survives the cap regardless. Default `4096`.
+    pub max_summary_bytes: usize,
+}
+
+impl Default for OutputConfig {
+    fn default() -> Self {
+        Self {
+            compact: true,
+            compact_min_bytes: 4096,
+            max_summary_bytes: 4096,
+        }
+    }
+}
+
 /// Issue #264: the cost ledger's own pricing knobs. Both fields are
 /// `REPO_FORBIDDEN` -- a repo checkout must not be able to widen how long a
 /// stale price table is presented as trustworthy, or point pricing at a file
@@ -1786,6 +1830,7 @@ pub struct CtxConfig {
     pub workflow: WorkflowConfig,
     pub report: ReportConfig,
     pub search: SearchConfig,
+    pub output: OutputConfig,
     pub memory: MemoryConfig,
     pub setup: SetupConfig,
     pub chrome: ChromeConfig,
@@ -2242,6 +2287,21 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
     (
         "ZIRV_CTX_SEARCH_MAX_OUTPUT_BYTES",
         &["search", "max_output_bytes"],
+        EnvKind::Int,
+    ),
+    (
+        "ZIRV_CTX_OUTPUT_COMPACT",
+        &["output", "compact"],
+        EnvKind::Bool,
+    ),
+    (
+        "ZIRV_CTX_OUTPUT_COMPACT_MIN_BYTES",
+        &["output", "compact_min_bytes"],
+        EnvKind::Int,
+    ),
+    (
+        "ZIRV_CTX_OUTPUT_MAX_SUMMARY_BYTES",
+        &["output", "max_summary_bytes"],
         EnvKind::Int,
     ),
     (
@@ -3444,6 +3504,18 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     (
         &["search", "max_output_bytes"],
         "ZIRV_CTX_SEARCH_MAX_OUTPUT_BYTES",
+    ),
+    // Issue #326: the compact-summary cap is the same byte-cap asymmetry as
+    // `search.max_output_bytes` above, and the two compaction switches are
+    // forbidden in BOTH directions -- see `OutputConfig`'s own doc comment.
+    (&["output", "compact"], "ZIRV_CTX_OUTPUT_COMPACT"),
+    (
+        &["output", "compact_min_bytes"],
+        "ZIRV_CTX_OUTPUT_COMPACT_MIN_BYTES",
+    ),
+    (
+        &["output", "max_summary_bytes"],
+        "ZIRV_CTX_OUTPUT_MAX_SUMMARY_BYTES",
     ),
     // Issue #358: rolling the orchestrator seat itself onto another harness
     // is the same class of decision `handoff.model`/`optimize.model` already
@@ -8656,6 +8728,50 @@ mod tests {
         assert!(is_repo_forbidden(err.as_ref()), "got: {err}");
     }
 
+    /// Issue #326: every `[output]` key defaults as documented, an operator's
+    /// env var wins, and a repository checkout may set none of them -- the cap
+    /// for the same reason every other byte cap is operator-only, and the two
+    /// compaction switches in both directions (see `OutputConfig`'s own doc
+    /// comment).
+    #[test]
+    fn output_keys_default_and_are_operator_only() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tempfile::tempdir().expect("repo");
+
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|key| empty.get(key).cloned()).expect("load");
+        assert!(cfg.output.compact);
+        assert_eq!(cfg.output.compact_min_bytes, 4096);
+        assert_eq!(cfg.output.max_summary_bytes, 4096);
+
+        let env = env_map(&[
+            ("ZIRV_CTX_OUTPUT_COMPACT", "false"),
+            ("ZIRV_CTX_OUTPUT_COMPACT_MIN_BYTES", "1024"),
+            ("ZIRV_CTX_OUTPUT_MAX_SUMMARY_BYTES", "2048"),
+        ]);
+        let cfg = CtxConfig::load(repo.path(), &|key| env.get(key).cloned()).expect("load");
+        assert!(!cfg.output.compact);
+        assert_eq!(cfg.output.compact_min_bytes, 1024);
+        assert_eq!(cfg.output.max_summary_bytes, 2048);
+
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        for line in [
+            "max_summary_bytes = 999999",
+            "compact = false",
+            "compact_min_bytes = 999999",
+        ] {
+            std::fs::write(
+                repo.path().join(".zirv/ctx.toml"),
+                format!("[output]\n{line}\n"),
+            )
+            .expect("write");
+            let err = CtxConfig::load(repo.path(), &|key| empty.get(key).cloned())
+                .expect_err("a repository must not be able to set `{line}`");
+            assert!(is_repo_forbidden(err.as_ref()), "got: {err}");
+        }
+    }
+
     /// Every configurable key in `CtxConfig`'s tree, as (table path, key)
     /// pairs. `table path` is dot-joined to match how a nested table's
     /// header appears in the sample-config file (`"pace.use_credits"`); the
@@ -8812,6 +8928,9 @@ mod tests {
         ("workflow.maintain", "timeout_secs"),
         ("report", "repository"),
         ("search", "max_output_bytes"),
+        ("output", "compact"),
+        ("output", "compact_min_bytes"),
+        ("output", "max_summary_bytes"),
         ("workflow", "telemetry_enabled"),
         ("workflow", "telemetry_max_events"),
         ("workflow", "telemetry_retention_days"),

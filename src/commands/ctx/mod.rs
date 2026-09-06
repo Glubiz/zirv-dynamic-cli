@@ -35,6 +35,7 @@ pub mod memory_cli;
 pub mod memory_optimize;
 pub mod objective;
 pub mod optimize;
+pub mod output;
 pub mod pace;
 pub mod permissions;
 pub mod permit;
@@ -425,6 +426,13 @@ pub enum CtxVerb {
     Exec(exec::ExecArgs),
     /// Supervise an interactive TUI through a PTY.
     Wrap(wrap::WrapArgs),
+    /// Run one command directly (no shell), store its full output under the
+    /// state dir, and print a compact, reversible summary instead of the
+    /// output itself (issue #326).
+    Run(output::RunArgs),
+    /// Retrieve output `zirv ctx run` stored: `show <id> [--range A-B]`,
+    /// `list` (issue #326).
+    Output(output::OutputArgs),
     /// Report usage windows, or tee the statusline to record them.
     Usage(usage::UsageArgs),
     /// Analyse the configuration surfaces that steer every session.
@@ -566,6 +574,8 @@ pub fn dispatch(args: &[String]) -> i32 {
         CtxVerb::Loop(a) => run_loop::run(a, &mut out),
         CtxVerb::Exec(a) => exec::run(a, &mut out),
         CtxVerb::Wrap(a) => wrap::run(a, &mut out),
+        CtxVerb::Run(a) => output::run(a, &mut out),
+        CtxVerb::Output(a) => output::run_output(a, &mut out),
         CtxVerb::Usage(a) => usage::run(a, &mut out),
         CtxVerb::Optimize(a) => optimize::run(a, &mut out),
         CtxVerb::Chat(a) => chat::run(a, &mut out),
@@ -777,6 +787,71 @@ mod tests {
             }
             other => panic!("expected Exec, got {other:?}"),
         }
+    }
+
+    /// Issue #326, the same hazard `exec_verb_parses_own_flags_before_the_
+    /// separator_and_command_after` above exists for: `run`'s own flags come
+    /// before `--`, the command after, and only real argv parsing checks
+    /// clap's `trailing_var_arg` + `last` debug assertion -- a bad attribute
+    /// combination PANICS the whole process here rather than surfacing as a
+    /// parse error, which is exactly how this was caught the first time.
+    #[test]
+    fn run_verb_parses_own_flags_before_the_separator_and_command_after() {
+        let cli = CtxCli::try_parse_from([
+            "zirv ctx",
+            "run",
+            "--compact",
+            "--",
+            "cargo",
+            "test",
+            "--",
+            "--test-threads=1",
+        ])
+        .expect("run should parse flags before -- and a command after it");
+        match cli.verb {
+            CtxVerb::Run(args) => {
+                assert!(args.compact);
+                assert!(!args.full);
+                assert_eq!(
+                    args.command,
+                    vec![
+                        "cargo".to_string(),
+                        "test".to_string(),
+                        "--".to_string(),
+                        "--test-threads=1".to_string()
+                    ]
+                );
+            }
+            other => panic!("expected Run, got {other:?}"),
+        }
+    }
+
+    /// Issue #326: the retrieval surface parses as printed on the summary's
+    /// own last line.
+    #[test]
+    fn output_verb_parses_show_with_a_range_and_list() {
+        let cli =
+            CtxCli::try_parse_from(["zirv ctx", "output", "show", "abc123", "--range", "5-9"])
+                .expect("output show should parse");
+        match cli.verb {
+            CtxVerb::Output(a) => match a.command {
+                output::OutputVerb::Show(show) => {
+                    assert_eq!(show.id, "abc123");
+                    assert_eq!(show.range.as_deref(), Some("5-9"));
+                }
+                other => panic!("expected Show, got {other:?}"),
+            },
+            other => panic!("expected Output, got {other:?}"),
+        }
+
+        let cli = CtxCli::try_parse_from(["zirv ctx", "output", "list"])
+            .expect("output list should parse");
+        assert!(matches!(
+            cli.verb,
+            CtxVerb::Output(output::OutputArgs {
+                command: output::OutputVerb::List(_)
+            })
+        ));
     }
 
     /// Issue #267: `--mode` unstated defaults to `Writing` -- a wrong

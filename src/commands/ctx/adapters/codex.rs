@@ -199,7 +199,9 @@ foreground.
 - Run code-review or verification passes only when your brief asks for them; the orchestrator \
 that spawned you owns review rounds.
 - Your final message is your report: lead with the outcome, keep it self-contained, and never \
-dump raw file contents into it.";
+dump raw file contents into it.
+- For test, build and log commands, run `zirv ctx run --compact -- <cmd>`: it keeps the full output \
+on disk and gives you a summary plus the id to retrieve it.";
 
 /// Codex's own layer for a `PromptRole::SubOrchestrator` session (see
 /// `AgentAdapter::sub_orchestrator_system_prompt`), spliced in place of
