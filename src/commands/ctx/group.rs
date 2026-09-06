@@ -254,7 +254,12 @@ pub fn is_admission_exhausted(error: &(dyn std::error::Error + 'static)) -> bool
 /// override) exactly as `agent::resolve_budget_tokens` already tightens a
 /// group ceiling outside admission. Returned as the second tuple element,
 /// `None` only when neither the group nor the caller impose any ceiling at
-/// all. Without reserving this atomically here, two children admitted
+/// all. A ceiling that resolves to `Some(0)` is refused as
+/// `AdmissionExhausted` instead of granted -- without consuming a child slot
+/// or reserving anything -- since a zero ceiling means the child could not
+/// spend a token, and downstream (`agent::budget_state`) it is a hard stop
+/// from the first tick. Without reserving this atomically here, two children
+/// admitted
 /// concurrently could each be handed the group's entire remaining budget,
 /// since neither's spend had rolled up when the other was admitted. The
 /// caller settles this exact amount later via [`settle_reservation`], or
@@ -303,10 +308,17 @@ pub fn admit_child(
             .saturating_sub(group.reserved_tokens);
         explicit_budget_tokens.map_or(remaining, |explicit| remaining.min(explicit))
     });
-    if let Some(ceiling) = group_ceiling {
-        group.reserved_tokens = group.reserved_tokens.saturating_add(ceiling);
-    }
     let ceiling = group_ceiling.or(explicit_budget_tokens);
+    if ceiling == Some(0) {
+        return Err(Box::new(AdmissionExhausted(format!(
+            "work group '{id}' token budget is exhausted ({} tokens spent, {} reserved for \
+             children already admitted)",
+            group.spent_tokens, group.reserved_tokens
+        ))));
+    }
+    if let Some(reserved) = group_ceiling {
+        group.reserved_tokens = group.reserved_tokens.saturating_add(reserved);
+    }
     group.admitted_children += 1;
     create(state, &group)?;
     Ok((group, ceiling))
@@ -829,7 +841,9 @@ mod tests {
     fn admit_child_succeeds_and_advances_the_count_under_the_limit() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(tmp.path().to_path_buf());
-        create(&state, &sample_group("wg-1")).expect("create"); // child_limit: 3
+        let mut group = sample_group("wg-1"); // child_limit: 3
+        group.token_budget = None; // this is the count's own test, not the budget's
+        create(&state, &group).expect("create");
 
         admit_child(&state, "wg-1", 1_700_000_100, None).expect("first child admitted");
         let group = load(&state, "wg-1").expect("load").expect("present");
@@ -865,18 +879,43 @@ mod tests {
             "the first admission still sees the whole budget"
         );
 
-        let (group_after_second, second_ceiling) =
-            admit_child(&state, "wg-1", 1_700_000_100, None).expect("second child admitted");
-        assert_ne!(
-            second_ceiling, first_ceiling,
-            "the second admission must not receive the same full remainder"
-        );
-        assert_eq!(
-            second_ceiling,
-            Some(0),
+        let refused = admit_child(&state, "wg-1", 1_700_000_100, None)
+            .expect_err("the second admission must not receive the same full remainder");
+        assert!(
+            is_admission_exhausted(refused.as_ref()),
             "nothing is left unreserved once the first admission claimed it all"
         );
+        let group_after_second = load(&state, "wg-1").expect("load").expect("group");
         assert_eq!(group_after_second.reserved_tokens, 400_000);
+    }
+
+    /// A ceiling of zero is no ceiling at all downstream (`agent::budget_state`
+    /// treats a zero limit as an immediate hard stop, and older callers read it
+    /// as "unbounded"), so admission refuses outright rather than handing a
+    /// child a budget it cannot spend a token of -- without consuming a child
+    /// slot or reserving anything for it.
+    #[test]
+    fn admit_child_refuses_once_reservations_leave_no_remaining_budget() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let mut group = sample_group("wg-1"); // token_budget: Some(400_000)
+        group.child_limit = 2;
+        create(&state, &group).expect("create");
+
+        admit_child(&state, "wg-1", 1_700_000_100, None).expect("first child admitted");
+        let refused =
+            admit_child(&state, "wg-1", 1_700_000_100, None).expect_err("second child refused");
+        assert!(is_admission_exhausted(refused.as_ref()));
+
+        let after = load(&state, "wg-1").expect("load").expect("group");
+        assert_eq!(
+            after.admitted_children, 1,
+            "a refused admission must not consume a child slot"
+        );
+        assert_eq!(
+            after.reserved_tokens, 400_000,
+            "a refused admission must not reserve anything"
+        );
     }
 
     /// The reserved ceiling is further tightened by an explicit
@@ -1014,7 +1053,9 @@ mod tests {
     fn rollback_admission_undoes_exactly_one_admitted_child() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(tmp.path().to_path_buf());
-        create(&state, &sample_group("wg-1")).expect("create");
+        let mut group = sample_group("wg-1");
+        group.token_budget = None; // two admissions, no reservation in the way
+        create(&state, &group).expect("create");
 
         admit_child(&state, "wg-1", 1_700_000_100, None).expect("first child admitted");
         admit_child(&state, "wg-1", 1_700_000_100, None).expect("second child admitted");

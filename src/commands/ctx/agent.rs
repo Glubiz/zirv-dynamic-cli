@@ -791,6 +791,9 @@ fn rank(state: BudgetState) -> u8 {
 /// as "switch to a cheaper model" -- that path does not exist, on purpose
 /// (issue #155's own architect ruling: a cheaper answer to the wrong
 /// question is not a saving, and an automatic downshift is out of scope).
+///
+/// A ceiling of `Some(0)` is a ceiling, not an absent one: it hard-stops from
+/// the first tick. "No ceiling" is spelled `None`, and only `None`.
 pub fn budget_state(
     budget: &WorkerBudget,
     usage: &TranscriptUsage,
@@ -799,9 +802,6 @@ pub fn budget_state(
     let spent = token_spend(usage);
     let mut worst = BudgetState::Ok;
     let mut consider = |used: u64, limit: u64| {
-        if limit == 0 {
-            return;
-        }
         let soft = (limit as f64 * BUDGET_SOFT_FRACTION) as u64;
         let state = if used >= limit {
             BudgetState::HardStop { used, limit }
@@ -4873,6 +4873,32 @@ mod tests {
         assert_eq!(budget_state(&budget, &huge, u32::MAX), BudgetState::Ok);
     }
 
+    /// A ceiling of zero is a ceiling: the worker may spend nothing. Treating
+    /// it as an absent limit would hand an exhausted group's child an
+    /// unbounded run, the exact opposite of what the zero says.
+    #[test]
+    fn a_zero_token_ceiling_is_a_hard_stop_not_an_absent_limit() {
+        let budget = WorkerBudget {
+            tokens: Some(0),
+            tool_calls: None,
+        };
+        assert!(matches!(
+            budget_state(&budget, &TranscriptUsage::default(), 0),
+            BudgetState::HardStop { limit: 0, .. }
+        ));
+        assert!(matches!(
+            budget_state(
+                &budget,
+                &TranscriptUsage {
+                    input_tokens: 10_000,
+                    ..Default::default()
+                },
+                0
+            ),
+            BudgetState::HardStop { limit: 0, .. }
+        ));
+    }
+
     /// A `--group` supplies defaults the flags may only TIGHTEN. A worker
     /// must not be able to talk its way past the group's own ceiling by
     /// passing a larger `--budget-tokens`.
@@ -4985,12 +5011,11 @@ mod tests {
 
         let mut second = args_for("claude", "go");
         second.group = Some("wg-concurrent".to_string());
-        let (second_budget, _) =
-            resolve_worker_budget(&|k| env.get(k).cloned(), &second).expect("second admission");
-        assert_eq!(
-            second_budget.tokens,
-            Some(0),
-            "nothing is left unreserved for a second concurrent admission"
+        let refused = resolve_worker_budget(&|k| env.get(k).cloned(), &second)
+            .expect_err("nothing is left unreserved for a second concurrent admission");
+        assert!(
+            crate::commands::ctx::group::is_admission_exhausted(refused.as_ref()),
+            "a zero remainder is an exhausted budget, not an unbounded one: {refused}"
         );
     }
 
