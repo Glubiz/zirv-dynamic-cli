@@ -291,6 +291,7 @@ mod tests {
     /// `create_script_core` also double-checks `starts_with` on the joined
     /// path before ever writing to it, as defense in depth.
     #[test]
+    #[cfg(windows)]
     fn a_drive_relative_join_would_escape_the_target_directory() {
         let target_dir = PathBuf::from(r"D:\some\zirv\commands");
         let joined = target_dir.join("C:escaped.yaml");
