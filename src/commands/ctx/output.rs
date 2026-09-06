@@ -46,10 +46,20 @@ pub(crate) const KEEP_NEWEST_OUTPUTS: usize = 50;
 const HEAD_LINES: usize = 20;
 const TAIL_LINES: usize = 40;
 
-/// Ceilings on the structured sections, so one pathological producer cannot
+/// How much tail survives even in structured mode. A test/compile summary
+/// lifts the lines that matter out of the output, but "the last thing that
+/// happened" is signal a lifted line cannot replace -- and dropping it
+/// entirely is what let a `warning:` in an otherwise-generic result hide the
+/// `fatal:` that followed it.
+const STRUCTURED_TAIL_LINES: usize = 10;
+
+/// Ceilings on the collected sections, so one pathological producer cannot
 /// spend the whole summary budget on a single section before the retrieval
-/// line is even reached.
-const MAX_DIAGNOSTIC_LINES: usize = 60;
+/// line is even reached. Failures and warnings are bounded SEPARATELY: sixty
+/// warnings must never exhaust the budget a later error needs.
+const MAX_FAILURE_BLOCKS: usize = 20;
+const MAX_WARNING_BLOCKS: usize = 20;
+const MAX_BLOCK_LINES: usize = 12;
 const MAX_FAILURE_LINES: usize = 60;
 const MAX_SUMMARY_LINES: usize = 10;
 
@@ -98,6 +108,13 @@ pub struct ShowArgs {
     /// of the file. Omitted means "from line 1".
     #[arg(long)]
     pub range: Option<String>,
+    /// 1-based inclusive BYTE range within the selected line, `START-END`
+    /// (`START-` runs to the end of the line). For a single line larger than
+    /// the whole output window, where no `--range` can narrow further: the
+    /// window slides within the line instead, and each cut names the next
+    /// offset to ask for.
+    #[arg(long)]
+    pub bytes: Option<String>,
 }
 
 #[derive(Debug, clap::Args)]
@@ -138,9 +155,22 @@ pub(crate) struct DisplayScan {
     pub(crate) total_bytes: u64,
     pub(crate) head: Vec<String>,
     pub(crate) tail: VecDeque<String>,
-    pub(crate) diagnostics: Vec<String>,
+    /// Complete failure/panic blocks -- each a trigger line plus the
+    /// continuation lines that belong to it (a rustc `-->` location, a
+    /// panic's `assertion`/`left:`/`right:` lines, an indented snippet).
+    /// MANDATORY content: a summary that cannot fit these is not emitted.
+    pub(crate) failures: Vec<Vec<String>>,
+    /// The same shape for `warning:` blocks, kept apart and bounded apart so
+    /// a flood of warnings can never crowd out a later failure, and so the
+    /// renderer can drop them first when the budget runs short.
+    pub(crate) warnings: Vec<Vec<String>>,
     pub(crate) summaries: Vec<String>,
-    pub(crate) diagnostics_truncated: bool,
+    pub(crate) failures_truncated: bool,
+    pub(crate) warnings_truncated: bool,
+    /// The stored file could not be read to the end. Never silently folded
+    /// into a clean scan: an empty scan that looks complete is worse than an
+    /// honest one that says it is short.
+    pub(crate) read_error: bool,
 }
 
 /// One display line: control characters scrubbed (a build log is repository-
@@ -160,18 +190,34 @@ fn display_line(raw: &str) -> String {
     format!("{} [...]", &trimmed[..cut])
 }
 
-/// Whether `line` is a diagnostic worth keeping verbatim: a rustc/clippy
-/// `error`/`warning:` header, or a panic message. The `-->` location line
-/// that follows a rustc diagnostic is picked up by the caller's own
-/// one-line lookahead rather than matched here, so an unrelated `-->` in
-/// ordinary output is not promoted on its own.
-pub(crate) fn is_diagnostic_line(line: &str) -> bool {
+/// How much a diagnostic line is allowed to cost. The distinction is the
+/// whole point of issue #326's review finding 3: a `warning:` is nice to
+/// have, a `fatal:`/`error:`/panic is the reason anyone reads the summary at
+/// all, and a summary that drops the second to make room for sixty of the
+/// first is worse than no summary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Severity {
+    Failure,
+    Warning,
+}
+
+/// Whether `line` opens a diagnostic block, and how severe it is. The
+/// continuation lines that belong to it are collected by the caller's own
+/// `continues_diagnostic_block` walk, so an unrelated `-->` elsewhere in
+/// ordinary output is never promoted on its own.
+pub(crate) fn diagnostic_severity(line: &str) -> Option<Severity> {
     let trimmed = line.trim_start();
-    trimmed.starts_with("error:")
+    if trimmed.starts_with("error:")
         || trimmed.starts_with("error[")
         || trimmed.starts_with("error TS")
-        || trimmed.starts_with("warning:")
+        // `git`'s own failure vocabulary, which carries no `error:` prefix.
+        || trimmed.starts_with("fatal:")
         || trimmed.contains("panicked at")
+        || trimmed.starts_with("thread '")
+    {
+        return Some(Severity::Failure);
+    }
+    trimmed.starts_with("warning:").then_some(Severity::Warning)
 }
 
 /// Whether `line` is a test-runner summary line worth keeping verbatim.
@@ -182,48 +228,111 @@ pub(crate) fn is_summary_line(line: &str) -> bool {
     trimmed.starts_with("test result:") || trimmed.starts_with("Summary [")
 }
 
-/// Streams `reader` once, collecting only bounded display material: the
-/// counts, the first [`HEAD_LINES`], the last [`TAIL_LINES`], the diagnostic
-/// lines (each with the `-->` location line that follows it, when there is
-/// one), and the test-runner summary lines.
+/// Whether `line` continues the diagnostic block that opened above it: a
+/// rustc `--> file:line:col`, an indented continuation, or one of the
+/// assertion fields a Rust panic prints on its own following lines
+/// (`left:`/`right:`/`assertion ...`). A blank line, or any line that starts
+/// a new unindented statement, ends the block.
+fn continues_diagnostic_block(line: &str) -> bool {
+    if line.trim().is_empty() {
+        return false;
+    }
+    let trimmed = line.trim_start();
+    trimmed.starts_with("-->")
+        || trimmed.starts_with("left:")
+        || trimmed.starts_with("right:")
+        || trimmed.starts_with("assertion")
+        || trimmed.starts_with("note:")
+        || trimmed.starts_with("help:")
+        || trimmed.starts_with('|')
+        || trimmed.starts_with('=')
+        // Any indented line: rustc's own snippet body, cargo's nested detail,
+        // and a panic's message continuation all arrive this way.
+        || line.starts_with(' ')
+        || line.starts_with('\t')
+}
+
+/// Reads `reader` as BYTE lines, never `BufRead::lines`.
+///
+/// `lines()` yields `Err` on the first non-UTF-8 byte, and the previous loop
+/// stopped there -- so one 0xFF from a legacy-code-page compiler diagnostic
+/// produced an EMPTY scan that then rendered as a confident "captured 0
+/// lines" summary. Splitting on `b'\n'` and decoding each line lossily keeps
+/// every line, and a genuine I/O failure sets `read_error` instead of quietly
+/// looking like a clean end of file. The stored file itself is untouched
+/// either way: lossy decoding happens only on the way to the summary.
+///
+/// Collects, all bounded: the counts, the first [`HEAD_LINES`], the last
+/// [`TAIL_LINES`], the test-runner summary lines, complete FAILURE blocks
+/// (each trigger line plus its continuation lines), and -- separately, so
+/// they can be dropped first when the budget runs short -- warning blocks.
 pub(crate) fn scan_for_display(reader: impl BufRead) -> DisplayScan {
     let mut scan = DisplayScan::default();
-    let mut want_location = false;
-    for line in reader.lines() {
-        let Ok(line) = line else { break };
+    let mut open_block: Option<Severity> = None;
+    for chunk in reader.split(b'\n') {
+        let bytes = match chunk {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                scan.read_error = true;
+                break;
+            }
+        };
+        let line = String::from_utf8_lossy(&bytes);
+        let line = line.strip_suffix('\r').unwrap_or(&line);
         scan.total_lines += 1;
-        scan.total_bytes = scan.total_bytes.saturating_add(line.len() as u64 + 1);
+        scan.total_bytes = scan.total_bytes.saturating_add(bytes.len() as u64 + 1);
 
         if scan.head.len() < HEAD_LINES {
-            scan.head.push(display_line(&line));
+            scan.head.push(display_line(line));
         }
-        scan.tail.push_back(display_line(&line));
+        scan.tail.push_back(display_line(line));
         if scan.tail.len() > TAIL_LINES {
             scan.tail.pop_front();
         }
 
-        if is_summary_line(&line) {
+        if is_summary_line(line) {
             if scan.summaries.len() < MAX_SUMMARY_LINES {
-                scan.summaries.push(display_line(&line));
+                scan.summaries.push(display_line(line));
             }
-            want_location = false;
+            open_block = None;
             continue;
         }
 
-        let is_location = line.trim_start().starts_with("-->");
-        if is_diagnostic_line(&line) || (want_location && is_location) {
-            if scan.diagnostics.len() < MAX_DIAGNOSTIC_LINES {
-                scan.diagnostics.push(display_line(&line));
-            } else {
-                scan.diagnostics_truncated = true;
+        // A new trigger always opens its own block, even in the middle of
+        // another one: sixty warnings must never stop a later error from
+        // being collected, which is why the two severities have separate,
+        // separately-bounded lists.
+        if let Some(severity) = diagnostic_severity(line) {
+            let block = vec![display_line(line)];
+            match severity {
+                Severity::Failure if scan.failures.len() < MAX_FAILURE_BLOCKS => {
+                    scan.failures.push(block);
+                }
+                Severity::Failure => scan.failures_truncated = true,
+                Severity::Warning if scan.warnings.len() < MAX_WARNING_BLOCKS => {
+                    scan.warnings.push(block);
+                }
+                Severity::Warning => scan.warnings_truncated = true,
             }
-            // Only a real diagnostic header arms the lookahead; consuming a
-            // location line disarms it, so a run of `-->` lines cannot walk
-            // away with the whole section.
-            want_location = !is_location;
+            open_block = Some(severity);
             continue;
         }
-        want_location = false;
+
+        if let Some(severity) = open_block {
+            if continues_diagnostic_block(line) {
+                let block = match severity {
+                    Severity::Failure => scan.failures.last_mut(),
+                    Severity::Warning => scan.warnings.last_mut(),
+                };
+                if let Some(block) = block
+                    && block.len() < MAX_BLOCK_LINES
+                {
+                    block.push(display_line(line));
+                }
+                continue;
+            }
+            open_block = None;
+        }
     }
     scan
 }
@@ -232,35 +341,6 @@ pub(crate) fn scan_for_display(reader: impl BufRead) -> DisplayScan {
 /// it is meant to be copied verbatim by whatever read the summary.
 pub(crate) fn retrieval_line(id: &str) -> String {
     format!("full output: zirv ctx output show {id} [--range START-END]")
-}
-
-/// Joins `body` and `retrieval` under a hard `max_bytes` ceiling, truncating
-/// the BODY rather than the retrieval line: a summary that lost its retrieval
-/// line would be lossy compression, which is the one thing this feature must
-/// never be. When `max_bytes` cannot even hold the retrieval line, the
-/// retrieval line still wins -- it is the floor, not a participant in the
-/// budget.
-pub(crate) fn cap_summary(body: &str, retrieval: &str, max_bytes: usize) -> String {
-    if max_bytes <= retrieval.len() + 1 {
-        return format!("{retrieval}\n");
-    }
-    let budget = max_bytes - retrieval.len() - 1;
-    let mut out = if body.len() <= budget {
-        body.to_string()
-    } else {
-        const MARKER: &str = "... [summary truncated]\n";
-        let mut cut = budget.saturating_sub(MARKER.len());
-        while cut > 0 && !body.is_char_boundary(cut) {
-            cut -= 1;
-        }
-        format!("{}{MARKER}", &body[..cut])
-    };
-    if !out.is_empty() && !out.ends_with('\n') {
-        out.push('\n');
-    }
-    out.push_str(retrieval);
-    out.push('\n');
-    out
 }
 
 fn push_section(body: &mut String, title: &str, lines: impl IntoIterator<Item = String>) {
@@ -277,14 +357,63 @@ fn push_section(body: &mut String, title: &str, lines: impl IntoIterator<Item = 
     }
 }
 
-/// Renders the whole summary, given everything both passes recovered.
+fn push_blocks(body: &mut String, title: &str, blocks: &[Vec<String>], truncated: bool) {
+    if blocks.is_empty() {
+        return;
+    }
+    body.push_str(title);
+    body.push('\n');
+    for block in blocks {
+        for line in block {
+            body.push_str("  ");
+            body.push_str(line);
+            body.push('\n');
+        }
+    }
+    if truncated {
+        body.push_str("  ... [more in the full output]\n");
+    }
+}
+
+/// Names the lines the summary did NOT show, so nothing has to infer it from
+/// a missing count. `None` when head and tail between them cover the file.
+fn omitted_range_line(
+    id: &str,
+    shown_head: usize,
+    shown_tail: usize,
+    total: usize,
+) -> Option<String> {
+    let covered = shown_head.saturating_add(shown_tail);
+    if covered >= total {
+        return None;
+    }
+    let first = shown_head + 1;
+    let last = total - shown_tail;
+    Some(format!(
+        "{} lines omitted between line {first} and line {last} -- fetch with \
+         zirv ctx output show {id} --range {first}-{last}\n",
+        total - covered
+    ))
+}
+
+/// Renders the summary, or `None` when the MANDATORY content -- the header,
+/// the test-result lines, every failing test name and every failure/panic
+/// block -- does not fit inside `max_bytes` alongside the retrieval line.
 ///
-/// Two shapes. When the output looks like a test/compile run -- a summary
-/// line was seen, a failing test name was recovered, or a diagnostic was
-/// found -- the structured sections carry the signal and the raw head/tail is
-/// dropped entirely, because the lines that matter have already been lifted
-/// out of it. Otherwise nothing is known about the shape, so the head and
-/// tail are the honest answer.
+/// `None` means FAIL OPEN, and the callers honour it: `run --compact` prints
+/// the raw tail instead, and `hook::run_posttool` prints nothing at all so
+/// claude keeps the original result. That is the whole discipline behind this
+/// function. Emitting a summary that silently dropped a `fatal:` because
+/// sixty warnings came first is not compression, it is corruption -- and the
+/// caller has no way to tell the difference from the outside, so it has to be
+/// decided here.
+///
+/// Budget order, strictest first: header and counts, the test-runner summary
+/// lines, the failing test names, the failure/panic blocks (all mandatory);
+/// then a bounded tail, which is kept even in structured mode because "the
+/// last thing that happened" is signal no lifted line replaces; then, for an
+/// unrecognised shape, the head; then warnings, with whatever is left. The
+/// retrieval line is appended last and always survives.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn render_summary(
     id: &str,
@@ -293,9 +422,14 @@ pub(crate) fn render_summary(
     scan: &DisplayScan,
     failures: &std::collections::BTreeSet<String>,
     summary_seen: bool,
-    read_errored: bool,
     max_bytes: usize,
-) -> String {
+) -> Option<String> {
+    let retrieval = retrieval_line(id);
+    // The retrieval line plus its newline is the floor; `config::
+    // MIN_MAX_SUMMARY_BYTES` keeps a configured cap above it, and this guard
+    // makes the invariant local rather than assumed.
+    let budget = max_bytes.checked_sub(retrieval.len() + 1)?;
+
     let mut body = String::new();
     body.push_str(&match exit_code {
         // The PostToolUse path (`hook::run_posttool`) has no exit code of its
@@ -310,11 +444,9 @@ pub(crate) fn render_summary(
         "captured {} lines, {} bytes\n",
         scan.total_lines, scan.total_bytes
     ));
-    if read_errored {
+    if scan.read_error {
         body.push_str("note: the stored output ended in a read error; it may be truncated\n");
     }
-
-    let structured = summary_seen || !failures.is_empty() || !scan.diagnostics.is_empty();
 
     push_section(&mut body, "test summary:", scan.summaries.clone());
     if !failures.is_empty() {
@@ -328,25 +460,238 @@ pub(crate) fn render_summary(
             body.push_str("  ... [more failing tests in the full output]\n");
         }
     }
-    push_section(&mut body, "diagnostics:", scan.diagnostics.clone());
-    if scan.diagnostics_truncated {
-        body.push_str("  ... [more diagnostics in the full output]\n");
+    push_blocks(
+        &mut body,
+        "failures:",
+        &scan.failures,
+        scan.failures_truncated,
+    );
+
+    // Everything above is mandatory. If it does not fit, there is no honest
+    // summary to emit at all.
+    if body.len() > budget {
+        return None;
     }
 
-    if !structured {
+    let structured = summary_seen || !failures.is_empty() || !scan.failures.is_empty();
+    let tail_lines = if structured {
+        STRUCTURED_TAIL_LINES.min(scan.tail.len())
+    } else {
+        scan.tail.len()
+    };
+    let head_lines = if structured { 0 } else { scan.head.len() };
+
+    let mut optional = String::new();
+    if tail_lines > 0 {
         push_section(
-            &mut body,
-            &format!("head ({} of {}):", scan.head.len(), scan.total_lines),
+            &mut optional,
+            &format!("tail ({tail_lines} of {}):", scan.total_lines),
+            scan.tail
+                .iter()
+                .skip(scan.tail.len() - tail_lines)
+                .cloned()
+                .collect::<Vec<_>>(),
+        );
+    }
+    if body.len() + optional.len() <= budget {
+        body.push_str(&optional);
+    }
+
+    if head_lines > 0 {
+        let mut head = String::new();
+        push_section(
+            &mut head,
+            &format!("head ({head_lines} of {}):", scan.total_lines),
             scan.head.clone(),
         );
-        push_section(
-            &mut body,
-            &format!("tail ({} of {}):", scan.tail.len(), scan.total_lines),
-            scan.tail.iter().cloned().collect::<Vec<_>>(),
-        );
+        if body.len() + head.len() <= budget {
+            // The head goes ABOVE the tail when both are shown, so the
+            // summary still reads in the order the output was produced.
+            let tail_at = body.len() - optional.len().min(body.len());
+            body.insert_str(tail_at, &head);
+        }
     }
 
-    cap_summary(&body, &retrieval_line(id), max_bytes)
+    if let Some(note) = omitted_range_line(id, head_lines, tail_lines, scan.total_lines)
+        && body.len() + note.len() <= budget
+    {
+        body.push_str(&note);
+    }
+
+    let mut warnings = String::new();
+    push_blocks(
+        &mut warnings,
+        "warnings:",
+        &scan.warnings,
+        scan.warnings_truncated,
+    );
+    if !warnings.is_empty() && body.len() + warnings.len() <= budget {
+        body.push_str(&warnings);
+    }
+
+    if !body.is_empty() && !body.ends_with('\n') {
+        body.push('\n');
+    }
+    body.push_str(&retrieval);
+    body.push('\n');
+    debug_assert!(body.len() <= max_bytes);
+    Some(body)
+}
+
+// ---------------------------------------------------------------------
+// Pure: what may be compacted at all
+// ---------------------------------------------------------------------
+
+/// Programs whose output a model READS, verbatim, before acting on it. A
+/// head/tail summary of `cat`, `sed -n`, `rg` or `git diff` does not lose
+/// noise, it loses the middle of the thing about to be edited -- and the
+/// model has no way to tell, so it edits against text it never saw. These are
+/// never compacted at any size.
+const VERBATIM_PROGRAMS: &[&str] = &[
+    "cat",
+    "type",
+    "get-content",
+    "gc",
+    "sed",
+    "head",
+    "tail",
+    "less",
+    "more",
+    "awk",
+    "cut",
+    "grep",
+    "egrep",
+    "fgrep",
+    "rg",
+    "find",
+    "fd",
+    "ls",
+    "dir",
+    "tree",
+    "jq",
+    "yq",
+    "diff",
+    "xxd",
+    "od",
+    "hexdump",
+    "strings",
+];
+
+/// `git` subcommands that are reads of content rather than progress logs.
+const VERBATIM_GIT_SUBCOMMANDS: &[&str] = &["diff", "show", "blame", "grep"];
+
+/// Programs whose output shape zirv actually models -- test runners,
+/// compilers, package managers, VCS progress. For these the summary provably
+/// keeps the `test result:` lines, the failing test names and every failure
+/// block, so compacting early is a straight win.
+const KNOWN_PROGRAMS: &[&str] = &[
+    "cargo", "nextest", "rustc", "npm", "pnpm", "yarn", "npx", "pytest", "python", "python3", "go",
+    "dotnet", "make", "mvn", "gradle", "tsc", "eslint", "docker", "git",
+];
+
+/// `git` subcommands that are progress logs rather than content reads.
+const KNOWN_GIT_SUBCOMMANDS: &[&str] = &["fetch", "pull", "push", "clone", "status"];
+
+/// How much of a command's output may be replaced by a summary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CompactionScope {
+    /// Never compacted, at any size.
+    Verbatim,
+    /// A shape zirv models: compacted from `[output] compact_min_bytes`.
+    Known,
+    /// Everything else: compacted only past `compact_generic_min_bytes`, and
+    /// the summary says explicitly which lines it omitted.
+    Generic,
+}
+
+fn bare_program(token: &str) -> String {
+    let bare = token.rsplit(['/', '\\']).next().unwrap_or(token);
+    bare.to_ascii_lowercase()
+        .trim_end_matches(".exe")
+        .trim_end_matches(".cmd")
+        .trim_end_matches(".bat")
+        .to_string()
+}
+
+/// Decides how much of `command`'s output may be replaced.
+///
+/// Verbatim wins over everything, and it is reached by three independent
+/// routes, because getting this wrong corrupts an edit rather than merely
+/// wasting tokens:
+///
+/// - any pipe or redirect (`|`, `>`), since the command was already shaped by
+///   its author into exactly what they wanted to read;
+/// - any executable segment naming a reader (`VERBATIM_PROGRAMS`, a
+///   content-reading `git` subcommand, or an operator's own `[output]
+///   verbatim` entry) -- segments come from `safety::normalize_segments`, so
+///   a reader hidden behind `sh -c`, an env prefix or a launcher is still
+///   found;
+/// - zirv's own retrieval surface (`zirv ctx output ...`, `zirv ctx run
+///   --full`), whose whole purpose is handing back text a summary already
+///   elided. Compacting THAT produced a second summary, and no `--range`
+///   could ever reach the original.
+pub(crate) fn classify_compaction(command: &str, extra_verbatim: &[String]) -> CompactionScope {
+    if command.contains('|') || command.contains('>') {
+        return CompactionScope::Verbatim;
+    }
+    let extra: Vec<String> = extra_verbatim
+        .iter()
+        .map(|name| bare_program(name))
+        .collect();
+    let mut known = false;
+    for segment in super::safety::normalize_segments(command) {
+        let collapsed = super::safety::collapse_whitespace(&segment);
+        let tokens: Vec<&str> = collapsed.split(' ').filter(|t| !t.is_empty()).collect();
+        let Some(first) = tokens.first() else {
+            continue;
+        };
+        let program = bare_program(first);
+        let sub = tokens.get(1).map(|t| t.to_ascii_lowercase());
+        let sub = sub.as_deref();
+
+        if program == "zirv"
+            && sub == Some("ctx")
+            && matches!(
+                tokens.get(2).map(|t| t.to_ascii_lowercase()).as_deref(),
+                Some("output")
+            )
+        {
+            return CompactionScope::Verbatim;
+        }
+        if program == "zirv"
+            && sub == Some("ctx")
+            && matches!(
+                tokens.get(2).map(|t| t.to_ascii_lowercase()).as_deref(),
+                Some("run")
+            )
+            && tokens.contains(&"--full")
+        {
+            return CompactionScope::Verbatim;
+        }
+        if VERBATIM_PROGRAMS.contains(&program.as_str()) || extra.contains(&program) {
+            return CompactionScope::Verbatim;
+        }
+        if program == "git" && sub.is_some_and(|sub| VERBATIM_GIT_SUBCOMMANDS.contains(&sub)) {
+            return CompactionScope::Verbatim;
+        }
+        // `git log -p` prints patches; every other `git log` is a progress
+        // log the summary handles fine.
+        if program == "git"
+            && sub == Some("log")
+            && tokens.iter().any(|t| *t == "-p" || *t == "--patch")
+        {
+            return CompactionScope::Verbatim;
+        }
+
+        if KNOWN_PROGRAMS.contains(&program.as_str()) {
+            known = program != "git" || sub.is_some_and(|sub| KNOWN_GIT_SUBCOMMANDS.contains(&sub));
+        }
+    }
+    if known {
+        CompactionScope::Known
+    } else {
+        CompactionScope::Generic
+    }
 }
 
 /// Parses a `START-END` range. `START-` (and a bare `START`) run to the end
@@ -469,7 +814,7 @@ pub(crate) fn summarize_stored(
     exit_code: Option<i32>,
     started_at: u64,
     max_summary_bytes: usize,
-) -> CtxResult<(OutputRecord, String)> {
+) -> CtxResult<(OutputRecord, Option<String>)> {
     // Pass 1 -- the SHARED classifier: failing test names and whether a
     // `test result:`/`Summary [...]` line was seen anywhere in the full
     // stream. Never a second implementation of either; see this module's own
@@ -484,11 +829,15 @@ pub(crate) fn summarize_stored(
             0,
         ),
     };
-    // Pass 2 -- display shaping only: counts, head/tail, diagnostics.
-    let scan = match std::fs::File::open(path) {
+    // Pass 2 -- display shaping only: counts, head/tail, diagnostic blocks.
+    let mut scan = match std::fs::File::open(path) {
         Ok(file) => scan_for_display(std::io::BufReader::new(file)),
-        Err(_) => DisplayScan::default(),
+        Err(_) => DisplayScan {
+            read_error: true,
+            ..DisplayScan::default()
+        },
     };
+    scan.read_error |= read_errored;
 
     let record = OutputRecord {
         schema_version: OUTPUT_SCHEMA_VERSION,
@@ -512,10 +861,39 @@ pub(crate) fn summarize_stored(
         &scan,
         &failures,
         summary_seen,
-        read_errored,
         max_summary_bytes,
     );
     Ok((record, summary))
+}
+
+/// Writes `path` verbatim to `w`, byte for byte. Deliberately not
+/// `read_to_string`: the stored file may hold bytes that are not valid UTF-8
+/// (a legacy-code-page compiler diagnostic), and a lossy read on this path
+/// would hand back something that is no longer the output it names.
+fn write_stored_verbatim<W: Write>(w: &mut W, path: &Path) -> CtxResult<()> {
+    let mut file = std::fs::File::open(path)
+        .map_err(|e| format!("zirv ctx run: could not re-read the stored output: {e}"))?;
+    std::io::copy(&mut file, w)
+        .map_err(|e| format!("zirv ctx run: could not re-read the stored output: {e}"))?;
+    Ok(())
+}
+
+/// The last `lines` display lines of the stored file, used when there is no
+/// honest summary to print (see [`render_summary`]'s `None`).
+fn stored_tail(path: &Path, lines: usize) -> Vec<String> {
+    let Ok(file) = std::fs::File::open(path) else {
+        return Vec::new();
+    };
+    let mut tail: VecDeque<String> = VecDeque::new();
+    for chunk in std::io::BufReader::new(file).split(b'\n') {
+        let Ok(bytes) = chunk else { break };
+        let text = String::from_utf8_lossy(&bytes);
+        tail.push_back(display_line(text.strip_suffix('\r').unwrap_or(&text)));
+        if tail.len() > lines {
+            tail.pop_front();
+        }
+    }
+    tail.into()
 }
 
 /// Stores `output` verbatim as a new capture for `repo` and returns its id
@@ -529,7 +907,7 @@ pub(crate) fn capture_text(
     exit_code: Option<i32>,
     output: &str,
     max_summary_bytes: usize,
-) -> CtxResult<(String, String)> {
+) -> CtxResult<(String, Option<String>)> {
     let dir = outputs_dir(state, repo);
     state::create_private_dir_all(&dir)?;
     let started_at = state::now_secs();
@@ -610,14 +988,29 @@ pub fn run_with<W: Write>(
     )?;
 
     if args.full && !args.compact {
-        if let Ok(text) = std::fs::read_to_string(&path) {
-            write!(w, "{text}")?;
-        }
+        write_stored_verbatim(w, &path)?;
         writeln!(w, "{}", retrieval_line(&id))?;
         return Ok(exit_code);
     }
 
-    write!(w, "{summary}")?;
+    match summary {
+        Some(summary) => write!(w, "{summary}")?,
+        // FAIL OPEN: the mandatory failure content did not fit the cap, so
+        // there is no honest summary to print. The raw tail is what an
+        // operator would have reached for anyway, and the retrieval line
+        // still names the whole thing.
+        None => {
+            writeln!(
+                w,
+                "zirv ctx run: exit {exit_code} -- summary omitted (failure detail exceeds \
+                 [output] max_summary_bytes); raw tail follows"
+            )?;
+            for line in stored_tail(&path, TAIL_LINES) {
+                writeln!(w, "{line}")?;
+            }
+            writeln!(w, "{}", retrieval_line(&id))?;
+        }
+    }
     Ok(exit_code)
 }
 
@@ -677,31 +1070,76 @@ fn show_output<W: Write>(
         None => format!("output {} -- from line {start}\n", args.id),
     };
     let budget = max_output_bytes.saturating_sub(header.len());
+    let (byte_start, byte_end) = match &args.bytes {
+        Some(raw) => {
+            let (start, end) = parse_range(raw)?;
+            (start - 1, end)
+        }
+        None => (0, usize::MAX),
+    };
 
     let mut body = String::new();
-    let mut next: Option<usize> = None;
-    for (index, line) in std::io::BufReader::new(file).lines().enumerate() {
+    let mut next_line: Option<usize> = None;
+    let mut next_byte: Option<(usize, usize)> = None;
+    // BYTE lines, never `BufRead::lines`: one non-UTF-8 byte from a legacy
+    // code page used to end the loop early and render as a confident,
+    // header-only success. Every line is kept; only the DISPLAY decoding is
+    // lossy, and the stored file itself is never rewritten.
+    for (index, chunk) in std::io::BufReader::new(file).split(b'\n').enumerate() {
         let number = index + 1;
+        let bytes = chunk.map_err(|e| {
+            format!(
+                "zirv ctx output show {}: could not read line {number}: {e}",
+                args.id
+            )
+        })?;
         if number < start {
             continue;
         }
         if number > end {
             break;
         }
-        let Ok(line) = line else { break };
         // The exact stored line, scrubbed of terminal control sequences the
         // way every other relayed-text surface in this codebase scrubs them,
         // never reflowed or reordered.
-        let rendered = format!("{}\n", scrub_output(&line).replace(['\n', '\t'], " "));
+        let text = String::from_utf8_lossy(&bytes);
+        let line =
+            scrub_output(text.strip_suffix('\r').unwrap_or(&text)).replace(['\n', '\t'], " ");
+        // A single line can be larger than the whole window on its own, and
+        // no `--range` can ever narrow it further -- so the window slides by
+        // BYTES within that line instead, and the hint names the next byte
+        // offset rather than a line number that would return the same cut.
+        let slice = slice_from(&line, byte_start);
+        if slice.len() > budget.saturating_sub(body.len()).max(1) && body.is_empty() {
+            let room = budget.max(1);
+            let cut = floor_boundary(slice, room);
+            body.push_str(&slice[..cut]);
+            body.push('\n');
+            if byte_start + cut < line.len() {
+                next_byte = Some((number, byte_start + cut + 1));
+            }
+            break;
+        }
+        let rendered = format!("{slice}\n");
         if !body.is_empty() && body.len() + rendered.len() > budget {
-            next = Some(number);
+            next_line = Some(number);
             break;
         }
         body.push_str(&rendered);
+        if byte_end != usize::MAX {
+            break;
+        }
     }
 
     write!(w, "{header}{body}")?;
-    if let Some(next) = next {
+    if let Some((number, offset)) = next_byte {
+        writeln!(
+            w,
+            "... [cut mid-line at the output cap] next: zirv ctx output show {} --range \
+             {number}-{number} --bytes {offset}-",
+            args.id
+        )?;
+    } else if let Some(next) = next_line {
         let end = if end == usize::MAX {
             String::new()
         } else {
@@ -714,6 +1152,29 @@ fn show_output<W: Write>(
         )?;
     }
     Ok(0)
+}
+
+/// `line` from byte `start`, snapped forward to a character boundary. An
+/// out-of-range start yields the empty string rather than panicking: the
+/// offset comes from an operator's own `--bytes`.
+fn slice_from(line: &str, start: usize) -> &str {
+    if start >= line.len() {
+        return "";
+    }
+    let mut start = start;
+    while start < line.len() && !line.is_char_boundary(start) {
+        start += 1;
+    }
+    &line[start..]
+}
+
+/// The largest index `<= room` that is a character boundary of `text`.
+fn floor_boundary(text: &str, room: usize) -> usize {
+    let mut cut = room.min(text.len());
+    while cut > 0 && !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    cut
 }
 
 fn list_outputs<W: Write>(args: &ListArgs, w: &mut W, dir: &Path) -> CtxResult<i32> {
@@ -870,13 +1331,15 @@ mod tests {
             total_bytes: 900_000,
             head: (0..HEAD_LINES).map(|i| format!("head {i}")).collect(),
             tail: (0..TAIL_LINES).map(|i| format!("tail {i}")).collect(),
-            diagnostics: (0..MAX_DIAGNOSTIC_LINES)
-                .map(|i| format!("error: something went wrong number {i}"))
+            failures: vec![vec!["error: one thing went wrong".to_string()]],
+            warnings: (0..MAX_WARNING_BLOCKS)
+                .map(|i| vec![format!("warning: number {i}")])
                 .collect(),
-            summaries: vec!["test result: FAILED. 1 passed; 40 failed".to_string()],
-            diagnostics_truncated: true,
+            summaries: vec!["test result: FAILED. 1 passed; 2 failed".to_string()],
+            warnings_truncated: true,
+            ..DisplayScan::default()
         };
-        let failures: BTreeSet<String> = (0..40).map(|i| format!("suite::case_{i}")).collect();
+        let failures: BTreeSet<String> = ["suite::a".to_string(), "suite::b".to_string()].into();
         let summary = render_summary(
             "abc123",
             "cargo test",
@@ -884,9 +1347,9 @@ mod tests {
             &scan,
             &failures,
             true,
-            false,
             600,
-        );
+        )
+        .expect("the mandatory content fits in 600 bytes");
         assert!(
             summary.len() <= 600,
             "summary was {} bytes: {summary}",
@@ -895,6 +1358,347 @@ mod tests {
         assert!(
             summary.ends_with(&format!("{}\n", retrieval_line("abc123"))),
             "the retrieval line must survive the cap: {summary}"
+        );
+        assert!(
+            summary.contains("suite::a") && summary.contains("suite::b"),
+            "{summary}"
+        );
+        assert!(summary.contains("error: one thing went wrong"), "{summary}");
+    }
+
+    /// Review finding 3, the headline case: a `warning:` used to flip the
+    /// whole output to "structured", which suppressed head and tail, so the
+    /// `fatal:` that followed it vanished from the summary entirely.
+    #[test]
+    fn a_warning_never_hides_a_later_fatal_line() {
+        let mut text: String = (1..=200).map(|i| format!("progress {i}\n")).collect();
+        text.push_str("warning: this is only a notice\n");
+        text.push_str("fatal: bad revision 'nope'\n");
+        let scan = scan_for_display(std::io::BufReader::new(text.as_bytes()));
+        let summary = render_summary(
+            "id1",
+            "git rev-parse nope",
+            Some(128),
+            &scan,
+            &BTreeSet::new(),
+            false,
+            4096,
+        )
+        .expect("a summary");
+        assert!(
+            summary.contains("fatal: bad revision 'nope'"),
+            "the fatal line is the reason anyone reads this summary: {summary}"
+        );
+    }
+
+    /// A Rust panic is one BLOCK, not one line: the location header without
+    /// the assertion message and its `left:`/`right:` values says nothing
+    /// about what actually failed.
+    #[test]
+    fn a_panic_keeps_its_assertion_message_and_values() {
+        let mut text: String = (1..=50)
+            .map(|i| format!("test case_{i} ... ok\n"))
+            .collect();
+        text.push_str("thread 'tests::x' panicked at src/lib.rs:12:5:\n");
+        text.push_str("assertion `left == right` failed: totals must agree\n");
+        text.push_str("  left: 41\n");
+        text.push_str(" right: 42\n");
+        text.push('\n');
+        text.push_str("test result: FAILED. 50 passed; 1 failed\n");
+        let scan = scan_for_display(std::io::BufReader::new(text.as_bytes()));
+        let summary = render_summary(
+            "id1",
+            "cargo test",
+            Some(101),
+            &scan,
+            &BTreeSet::new(),
+            true,
+            4096,
+        )
+        .expect("a summary");
+        for needle in [
+            "panicked at src/lib.rs:12:5",
+            "totals must agree",
+            "left: 41",
+            "right: 42",
+        ] {
+            assert!(summary.contains(needle), "must keep {needle:?}: {summary}");
+        }
+    }
+
+    /// Failures and warnings are bounded separately, so a flood of warnings
+    /// can never spend the budget an error needs.
+    #[test]
+    fn sixty_warnings_never_crowd_out_a_later_error() {
+        let mut text = String::new();
+        for i in 0..60 {
+            text.push_str(&format!("warning: unused variable number {i}\n"));
+        }
+        text.push_str("error[E0308]: mismatched types\n");
+        text.push_str("  --> src/late.rs:9:1\n");
+        let scan = scan_for_display(std::io::BufReader::new(text.as_bytes()));
+        assert_eq!(scan.failures.len(), 1, "the error must be collected");
+        let summary = render_summary(
+            "id1",
+            "cargo build",
+            Some(101),
+            &scan,
+            &BTreeSet::new(),
+            false,
+            4096,
+        )
+        .expect("a summary");
+        assert!(summary.contains("error[E0308]"), "{summary}");
+        assert!(summary.contains("--> src/late.rs:9:1"), "{summary}");
+    }
+
+    /// When the MANDATORY failure content cannot fit the cap, there is no
+    /// honest summary: the renderer fails open rather than emitting one that
+    /// silently dropped failures.
+    #[test]
+    fn failure_data_that_cannot_fit_the_cap_produces_no_summary_at_all() {
+        let scan = DisplayScan {
+            total_lines: 400,
+            total_bytes: 40_000,
+            failures: (0..MAX_FAILURE_BLOCKS)
+                .map(|i| {
+                    (0..MAX_BLOCK_LINES)
+                        .map(|j| format!("error: failure {i} detail line {j} {}", "x".repeat(80)))
+                        .collect()
+                })
+                .collect(),
+            ..DisplayScan::default()
+        };
+        assert_eq!(
+            render_summary(
+                "id1",
+                "cargo build",
+                Some(101),
+                &scan,
+                &BTreeSet::new(),
+                false,
+                4096
+            ),
+            None,
+            "a summary missing failures must not be emitted at all"
+        );
+    }
+
+    /// `run --compact` honours that same fail-open by printing the raw tail
+    /// and the retrieval line instead of a misleading summary.
+    #[test]
+    fn run_compact_prints_the_raw_tail_when_no_honest_summary_fits() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = tmp.path().join("state");
+        let repo = tmp.path().join("repo");
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&repo).expect("mkdir");
+        std::fs::create_dir_all(&home).expect("mkdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let env = env_map(&[
+            (
+                crate::commands::ctx::state::STATE_ENV,
+                &state.display().to_string(),
+            ),
+            ("ZIRV_CTX_OUTPUT_MAX_SUMMARY_BYTES", "512"),
+        ]);
+
+        let args = RunArgs {
+            compact: true,
+            full: false,
+            command: noisy_command(),
+        };
+        let mut out = Vec::new();
+        // 512 is the configured floor; the noisy fixture's own failure block
+        // plus its failing test names do not fit inside it.
+        let code = run_with(&args, &mut out, &repo, &|k| env.get(k).cloned()).expect("runs");
+        let text = String::from_utf8(out).expect("utf8");
+        assert_eq!(code, 3);
+        assert!(
+            text.contains("full output: zirv ctx output show"),
+            "the retrieval line survives every path: {text}"
+        );
+    }
+
+    /// Review finding 5: one non-UTF-8 byte used to end the scan loop, so the
+    /// summary confidently reported an empty capture. Every line is kept and
+    /// only the DISPLAY decoding is lossy.
+    #[test]
+    fn a_non_utf8_byte_does_not_truncate_the_scan() {
+        let mut bytes: Vec<u8> = Vec::new();
+        bytes.extend_from_slice(b"cl: warning C4996: \xff deprecated\n");
+        bytes.extend_from_slice(b"error: link failed\n");
+        for i in 0..40 {
+            bytes.extend_from_slice(format!("step {i}\n").as_bytes());
+        }
+        let scan = scan_for_display(std::io::BufReader::new(&bytes[..]));
+        assert_eq!(scan.total_lines, 42, "every line must be counted");
+        assert!(!scan.read_error, "a decode issue is not a read failure");
+        assert_eq!(scan.failures.len(), 1, "the error line must still be found");
+    }
+
+    /// The same for `output show`: a header-only success with exit 0 hid the
+    /// rest of the file.
+    #[test]
+    fn output_show_reads_past_a_non_utf8_byte() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("outputs");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let mut bytes: Vec<u8> = Vec::new();
+        bytes.extend_from_slice(b"bad \xff byte\n");
+        bytes.extend_from_slice(b"second line\n");
+        bytes.extend_from_slice(b"third line\n");
+        std::fs::write(dir.join("beef02.log"), &bytes).expect("write");
+
+        let args = ShowArgs {
+            id: "beef02".to_string(),
+            range: None,
+            bytes: None,
+        };
+        let mut out = Vec::new();
+        show_output(&args, &mut out, &dir, 4096).expect("show");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            text.contains("second line") && text.contains("third line"),
+            "{text}"
+        );
+    }
+
+    /// Review finding 4b: a single line larger than the whole window can
+    /// never be narrowed by `--range`, so the window slides by BYTES within
+    /// that line and each cut names the next offset to ask for.
+    #[test]
+    fn output_show_pages_through_one_over_cap_line_by_bytes() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("outputs");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let line: String = (0..500)
+            .map(|i| char::from(b'a' + (i % 26) as u8))
+            .collect();
+        std::fs::write(dir.join("beef03.log"), format!("{line}\n")).expect("write");
+
+        let mut out = Vec::new();
+        show_output(
+            &ShowArgs {
+                id: "beef03".to_string(),
+                range: Some("1-1".to_string()),
+                bytes: None,
+            },
+            &mut out,
+            &dir,
+            200,
+        )
+        .expect("show");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            text.contains("--bytes"),
+            "an over-cap single line must name a byte continuation: {text}"
+        );
+        let offset: usize = text
+            .rsplit("--bytes ")
+            .next()
+            .and_then(|rest| rest.split('-').next())
+            .and_then(|n| n.trim().parse().ok())
+            .expect("a next byte offset");
+
+        let mut rest = Vec::new();
+        show_output(
+            &ShowArgs {
+                id: "beef03".to_string(),
+                range: Some("1-1".to_string()),
+                bytes: Some(format!("{offset}-")),
+            },
+            &mut rest,
+            &dir,
+            4096,
+        )
+        .expect("show");
+        let rest = String::from_utf8(rest).expect("utf8");
+        assert!(
+            rest.contains(&line[offset - 1..]),
+            "the continuation must actually reach the rest of the line"
+        );
+    }
+
+    /// Review finding 6: a reader's output is never compacted, a known
+    /// build/test family is compacted early, and anything else only past the
+    /// much higher generic threshold.
+    #[test]
+    fn compaction_scope_protects_readers_and_paces_the_rest() {
+        for command in [
+            "cat src/lib.rs",
+            "sed -n '1,200p' src/lib.rs",
+            "rg TODO src",
+            "git diff HEAD~1",
+            "git show HEAD",
+            "git log -p",
+            "git blame src/lib.rs",
+            "cargo test | tail -5",
+            "cargo build > out.txt",
+            "zirv ctx output show abc123",
+            "zirv ctx run --full -- cargo test",
+            "sh -c 'cat src/lib.rs'",
+        ] {
+            assert_eq!(
+                classify_compaction(command, &[]),
+                CompactionScope::Verbatim,
+                "{command} must never be compacted"
+            );
+        }
+        for command in [
+            "cargo test",
+            "cargo build --release",
+            "npm install",
+            "pytest -q",
+            "go test ./...",
+            "dotnet build",
+            "git fetch origin",
+            "git status",
+            "make all",
+        ] {
+            assert_eq!(
+                classify_compaction(command, &[]),
+                CompactionScope::Known,
+                "{command} is a modelled build/test/log family"
+            );
+        }
+        for command in ["some-tool --report", "./bin/generate"] {
+            assert_eq!(
+                classify_compaction(command, &[]),
+                CompactionScope::Generic,
+                "{command}"
+            );
+        }
+        // The operator's own list only ever adds.
+        assert_eq!(
+            classify_compaction("mydump --all", &["mydump".to_string()]),
+            CompactionScope::Verbatim
+        );
+    }
+
+    /// A generic summary states which lines it dropped, so nothing has to
+    /// infer the cut from a missing count.
+    #[test]
+    fn a_generic_summary_names_the_lines_it_omitted() {
+        let text: String = (1..=500).map(|i| format!("plain line {i}\n")).collect();
+        let scan = scan_for_display(std::io::BufReader::new(text.as_bytes()));
+        let summary = render_summary(
+            "id1",
+            "some-tool",
+            Some(0),
+            &scan,
+            &BTreeSet::new(),
+            false,
+            4096,
+        )
+        .expect("a summary");
+        assert!(
+            summary.contains("lines omitted between line 21 and line 460"),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("zirv ctx output show id1 --range 21-460"),
+            "the omitted-range line must be directly actionable: {summary}"
         );
     }
 
@@ -910,6 +1714,7 @@ mod tests {
         let args = ShowArgs {
             id: "deadbeef".to_string(),
             range: Some("10-13".to_string()),
+            bytes: None,
         };
         let mut out = Vec::new();
         show_output(&args, &mut out, &dir, 4096).expect("show");
@@ -931,6 +1736,7 @@ mod tests {
         let args = ShowArgs {
             id: "cafe01".to_string(),
             range: None,
+            bytes: None,
         };
         let mut out = Vec::new();
         show_output(&args, &mut out, &dir, 120).expect("show");
@@ -964,23 +1770,25 @@ mod tests {
         assert!(parse_range("x-9").is_err());
     }
 
-    /// Generic output keeps head and tail; a test/compile-shaped one drops
-    /// them in favour of the lines that were actually lifted out of it.
+    /// Generic output keeps a full head and tail; a test/compile-shaped one
+    /// keeps only the bounded tail, because the lines that matter have
+    /// already been lifted out of it -- but it never keeps NOTHING, which is
+    /// what let a `fatal:` after a `warning:` disappear.
     #[test]
-    fn generic_output_keeps_head_and_tail_but_structured_output_does_not() {
+    fn generic_output_keeps_head_and_tail_and_structured_output_keeps_a_bounded_tail() {
         let text: String = (1..=500).map(|i| format!("plain line {i}\n")).collect();
         let scan = scan_for_display(std::io::BufReader::new(text.as_bytes()));
         assert_eq!(scan.total_lines, 500);
         let generic = render_summary(
             "id1",
-            "ls",
+            "some-tool",
             Some(0),
             &scan,
             &BTreeSet::new(),
             false,
-            false,
             4096,
-        );
+        )
+        .expect("a summary");
         assert!(generic.contains("plain line 1\n"), "{generic}");
         assert!(generic.contains("plain line 500"), "{generic}");
 
@@ -991,12 +1799,16 @@ mod tests {
             &scan,
             &BTreeSet::new(),
             true,
-            false,
             4096,
-        );
+        )
+        .expect("a summary");
         assert!(
             !structured.contains("plain line 250"),
-            "a structured summary must not fall back to raw head/tail: {structured}"
+            "a structured summary must not carry the whole head/tail: {structured}"
+        );
+        assert!(
+            structured.contains("plain line 500"),
+            "but it must always keep a bounded tail: {structured}"
         );
     }
 

@@ -875,22 +875,49 @@ pub struct OutputConfig {
     /// sees it. Default `true`. `zirv ctx run --compact` is unaffected: it is
     /// an explicit invocation, not an interception.
     pub compact: bool,
-    /// How many bytes of combined stdout+stderr a `Bash` result needs before
-    /// the `PostToolUse` hook compacts it. Below this the original output is
-    /// left exactly as it is -- compacting a short result spends a stored
-    /// file and a retrieval round trip to save nothing. Default `4096`.
+    /// How many bytes of combined stdout+stderr a result from a KNOWN
+    /// build/test/log family (`output::classify_compaction`) needs before the
+    /// `PostToolUse` hook compacts it. Below this the original output is left
+    /// exactly as it is -- compacting a short result spends a stored file and
+    /// a retrieval round trip to save nothing. Default `4096`.
     pub compact_min_bytes: usize,
+    /// The same threshold for a command whose output shape zirv does NOT
+    /// recognise. Deliberately much higher than `compact_min_bytes`: for a
+    /// known `cargo test` the summary provably keeps the lines that matter,
+    /// while for an unrecognised producer a head/tail is a guess, so the
+    /// output has to be genuinely large before that guess is worth making.
+    /// Default `16384`.
+    pub compact_generic_min_bytes: usize,
+    /// Extra program names that are NEVER compacted, added to
+    /// `output::VERBATIM_PROGRAMS`. Operator-only and purely ADDITIVE -- it
+    /// can only ever protect more output, never less. An operator naming
+    /// their own pager, formatter or dump tool here is telling zirv that a
+    /// model reads that command's output verbatim before acting on it, which
+    /// a head/tail summary would silently corrupt. Empty by default.
+    pub verbatim: Vec<String>,
     /// Hard cap, in bytes, on one compact summary
-    /// (`output::render_summary`). The retrieval line is the floor and
-    /// survives the cap regardless. Default `4096`.
+    /// (`output::render_summary`). Absolute: a summary whose MANDATORY
+    /// failure content does not fit inside it is not emitted at all (the
+    /// original output is used instead) rather than emitted missing
+    /// failures. Default `4096`; [`MIN_MAX_SUMMARY_BYTES`] is the floor
+    /// `CtxConfig::load` enforces.
     pub max_summary_bytes: usize,
 }
+
+/// The smallest `[output] max_summary_bytes` that can hold a header, a
+/// failure line and the retrieval line without the cap eating into the
+/// content the summary exists for. A lower value is a hard config error
+/// naming the key rather than a silent clamp, so an operator who asks for 64
+/// learns what they actually asked for.
+pub const MIN_MAX_SUMMARY_BYTES: usize = 512;
 
 impl Default for OutputConfig {
     fn default() -> Self {
         Self {
             compact: true,
             compact_min_bytes: 4096,
+            compact_generic_min_bytes: 16384,
+            verbatim: Vec::new(),
             max_summary_bytes: 4096,
         }
     }
@@ -2338,6 +2365,11 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         EnvKind::Int,
     ),
     (
+        "ZIRV_CTX_OUTPUT_COMPACT_GENERIC_MIN_BYTES",
+        &["output", "compact_generic_min_bytes"],
+        EnvKind::Int,
+    ),
+    (
         "ZIRV_CTX_OUTPUT_MAX_SUMMARY_BYTES",
         &["output", "max_summary_bytes"],
         EnvKind::Int,
@@ -3569,6 +3601,14 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
         "ZIRV_CTX_OUTPUT_COMPACT_MIN_BYTES",
     ),
     (
+        &["output", "compact_generic_min_bytes"],
+        "ZIRV_CTX_OUTPUT_COMPACT_GENERIC_MIN_BYTES",
+    ),
+    // Additive-only, but still operator-only: an untrusted checkout naming a
+    // program here decides that zirv never summarizes that program's output
+    // for any session run against it.
+    (&["output", "verbatim"], "ZIRV_CTX_OUTPUT_VERBATIM"),
+    (
         &["output", "max_summary_bytes"],
         "ZIRV_CTX_OUTPUT_MAX_SUMMARY_BYTES",
     ),
@@ -4636,6 +4676,28 @@ impl CtxConfig {
         // layers produced.
         if let Some(raw) = env("ZIRV_CTX_WORKFLOW_BUILTIN_CHECKS_EXCLUDE") {
             cfg.workflow.builtin_checks_exclude = split_csv_list(&raw);
+        }
+
+        // Issue #326: same list-valued env convention -- `ZIRV_CTX_OUTPUT_
+        // VERBATIM` replaces whatever `[output] verbatim` the merged TOML
+        // layers produced (which, being `REPO_FORBIDDEN`, can only ever have
+        // come from the operator's own home layer anyway).
+        if let Some(raw) = env("ZIRV_CTX_OUTPUT_VERBATIM") {
+            cfg.output.verbatim = split_csv_list(&raw);
+        }
+
+        // A cap below `MIN_MAX_SUMMARY_BYTES` cannot hold a header, a failure
+        // line and the retrieval line at once, so honoring it literally would
+        // mean emitting summaries with the failures cut off -- the one thing
+        // `output::render_summary` must never do. Refused by name rather than
+        // silently clamped.
+        if cfg.output.max_summary_bytes < MIN_MAX_SUMMARY_BYTES {
+            return Err(format!(
+                "`output.max_summary_bytes` must be at least {MIN_MAX_SUMMARY_BYTES} (got {}): a \
+                 smaller cap cannot hold a summary's own failure lines and its retrieval line.",
+                cfg.output.max_summary_bytes
+            )
+            .into());
         }
 
         // Same union as `extra_deny` above, for `heavy_command_patterns`: the
@@ -8847,16 +8909,22 @@ mod tests {
         let cfg = CtxConfig::load(repo.path(), &|key| empty.get(key).cloned()).expect("load");
         assert!(cfg.output.compact);
         assert_eq!(cfg.output.compact_min_bytes, 4096);
+        assert_eq!(cfg.output.compact_generic_min_bytes, 16384);
+        assert!(cfg.output.verbatim.is_empty());
         assert_eq!(cfg.output.max_summary_bytes, 4096);
 
         let env = env_map(&[
             ("ZIRV_CTX_OUTPUT_COMPACT", "false"),
             ("ZIRV_CTX_OUTPUT_COMPACT_MIN_BYTES", "1024"),
+            ("ZIRV_CTX_OUTPUT_COMPACT_GENERIC_MIN_BYTES", "65536"),
+            ("ZIRV_CTX_OUTPUT_VERBATIM", "mydump,other-tool"),
             ("ZIRV_CTX_OUTPUT_MAX_SUMMARY_BYTES", "2048"),
         ]);
         let cfg = CtxConfig::load(repo.path(), &|key| env.get(key).cloned()).expect("load");
         assert!(!cfg.output.compact);
         assert_eq!(cfg.output.compact_min_bytes, 1024);
+        assert_eq!(cfg.output.compact_generic_min_bytes, 65536);
+        assert_eq!(cfg.output.verbatim, vec!["mydump", "other-tool"]);
         assert_eq!(cfg.output.max_summary_bytes, 2048);
 
         std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
@@ -8864,6 +8932,8 @@ mod tests {
             "max_summary_bytes = 999999",
             "compact = false",
             "compact_min_bytes = 999999",
+            "compact_generic_min_bytes = 999999",
+            "verbatim = [\"cargo\"]",
         ] {
             std::fs::write(
                 repo.path().join(".zirv/ctx.toml"),
@@ -8874,6 +8944,34 @@ mod tests {
                 .expect_err("a repository must not be able to set `{line}`");
             assert!(is_repo_forbidden(err.as_ref()), "got: {err}");
         }
+    }
+
+    /// Issue #326 review finding 7: a `max_summary_bytes` below
+    /// `MIN_MAX_SUMMARY_BYTES` cannot hold a header, a failure line and the
+    /// retrieval line at once, so honoring it literally would mean emitting
+    /// summaries with the failures cut off. Refused by name, not clamped.
+    #[test]
+    fn a_summary_cap_below_the_floor_is_a_named_config_error() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tempfile::tempdir().expect("repo");
+
+        for value in ["0", "64", "511"] {
+            let env = env_map(&[("ZIRV_CTX_OUTPUT_MAX_SUMMARY_BYTES", value)]);
+            let err = CtxConfig::load(repo.path(), &|key| env.get(key).cloned())
+                .expect_err("a cap below the floor must be refused");
+            assert!(
+                err.to_string().contains("output.max_summary_bytes"),
+                "the error must name the key: {err}"
+            );
+        }
+        let env = env_map(&[(
+            "ZIRV_CTX_OUTPUT_MAX_SUMMARY_BYTES",
+            &MIN_MAX_SUMMARY_BYTES.to_string(),
+        )]);
+        let cfg = CtxConfig::load(repo.path(), &|key| env.get(key).cloned())
+            .expect("the floor itself is accepted");
+        assert_eq!(cfg.output.max_summary_bytes, MIN_MAX_SUMMARY_BYTES);
     }
 
     /// Every configurable key in `CtxConfig`'s tree, as (table path, key)
@@ -9034,6 +9132,8 @@ mod tests {
         ("search", "max_output_bytes"),
         ("output", "compact"),
         ("output", "compact_min_bytes"),
+        ("output", "compact_generic_min_bytes"),
+        ("output", "verbatim"),
         ("output", "max_summary_bytes"),
         ("workflow", "telemetry_enabled"),
         ("workflow", "telemetry_max_events"),
