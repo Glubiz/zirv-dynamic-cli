@@ -24,10 +24,7 @@ impl Command {
         &self,
         context: &mut HashMap<String, String>,
     ) -> Result<Option<String>, String> {
-        if let Some(options) = &self.options
-            && let Some(os) = &options.operating_system
-            && !os.is_current()
-        {
+        if self.skipped_for_os() {
             return Ok(Some("Command skipped due to OS filter".to_string()));
         }
 
@@ -176,6 +173,17 @@ impl Command {
 
             Ok(())
         }
+    }
+
+    /// Whether an `operating_system` filter excludes this step on this
+    /// platform, so `execute` would skip it without running or resolving
+    /// anything. The single predicate every caller shares -- `execute`,
+    /// `CommandTypes::check` and `build_concurrent_command` -- so a dry run
+    /// can never judge a step the real run would not even look at.
+    pub fn skipped_for_os(&self) -> bool {
+        self.options
+            .as_ref()
+            .is_some_and(super::options::Options::skip_for_os)
     }
 
     pub fn substituted_command(&self, params: &HashMap<String, String>) -> String {
