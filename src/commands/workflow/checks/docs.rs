@@ -120,24 +120,46 @@ pub fn run_unix_tests_doc(repo: &Path) -> BuiltinCheckResult {
         );
     }
 
-    // "N as of YYYY-MM-DD" is the wording this doc already uses -- match the
-    // leading integer right before "as of" or "#[cfg(unix)]" wherever it
-    // appears near the section this check cares about, rather than requiring
-    // one exact sentence shape.
-    let stated_re = Regex::new(r"(\d+)\s*(?:\([^)]*\)\s*)?as of").unwrap();
-    let Some(captures) = stated_re.captures(&known_issues) else {
+    // I-6: the "N as of YYYY-MM-DD" wording this doc already uses is only
+    // meaningful when it appears in the paragraph that actually discusses
+    // `wrap.rs`'s `#[cfg(unix)]` test count -- unscoped, the regex used to
+    // grab the FIRST such phrase anywhere in the whole file, which could just
+    // as easily belong to an unrelated section (a different bug's failure
+    // count, say). `#[cfg(unix)]` is this section's own stable marker (the
+    // same phrase the doc uses to describe itself); a doc with no such
+    // marker at all has nothing for this check to scope to, so it is
+    // Inconclusive rather than guessing from an unrelated number.
+    const MARKER: &str = "#[cfg(unix)]";
+    if !known_issues.contains(MARKER) {
         return BuiltinCheckResult::inconclusive(
             UNIX_TESTS_ID,
             UNIX_TESTS_PROVES,
             UNIX_TESTS_FIX,
             UNIX_TESTS_ORIGIN,
             format!(
-                "Known Issues.md states no parseable count and does not mention {UNIX_TESTS_ID} \
-                 -- actual count is {actual}"
+                "Known Issues.md does not mention {UNIX_TESTS_ID} or contain a '{MARKER}' \
+                 section to scope a stated count to -- actual count is {actual}"
+            ),
+        );
+    }
+    let stated_re = Regex::new(r"(\d+)\s*(?:\([^)]*\)\s*)?as of").unwrap();
+    let stated_in_marker_paragraph = known_issues
+        .split("\n\n")
+        .filter(|paragraph| paragraph.contains(MARKER))
+        .find_map(|paragraph| stated_re.captures(paragraph))
+        .and_then(|captures| captures[1].parse::<usize>().ok());
+    let Some(stated) = stated_in_marker_paragraph else {
+        return BuiltinCheckResult::inconclusive(
+            UNIX_TESTS_ID,
+            UNIX_TESTS_PROVES,
+            UNIX_TESTS_FIX,
+            UNIX_TESTS_ORIGIN,
+            format!(
+                "Known Issues.md mentions '{MARKER}' but no paragraph containing it states a \
+                 parseable count -- actual count is {actual}"
             ),
         );
     };
-    let stated: usize = captures[1].parse().unwrap_or(usize::MAX);
 
     if stated == actual {
         BuiltinCheckResult::pass(
@@ -373,6 +395,27 @@ fn cfg_after_test_still_counts() {
         assert_eq!(
             result.outcome,
             super::super::BuiltinOutcome::Pass,
+            "{result:?}"
+        );
+    }
+
+    /// I-6: an unrelated "N as of DATE" phrase elsewhere in the doc, with no
+    /// `#[cfg(unix)]` marker anywhere at all, must not be mistaken for the
+    /// wrap.rs PTY test count -- the check has nothing to scope to here, so
+    /// it must be Inconclusive rather than comparing against a stale/foreign
+    /// number.
+    #[test]
+    fn an_unrelated_as_of_count_with_no_marker_is_inconclusive() {
+        let repo = tempdir().unwrap();
+        write_wrap_rs(repo.path(), 3);
+        write_known_issues(
+            repo.path(),
+            "An unrelated defect count, nothing to do with wrap.rs: 5 as of 2026-01-01.",
+        );
+        let result = run_unix_tests_doc(repo.path());
+        assert_eq!(
+            result.outcome,
+            super::super::BuiltinOutcome::Inconclusive,
             "{result:?}"
         );
     }

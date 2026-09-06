@@ -1263,7 +1263,7 @@ pub fn review(state: &StateDir, repo: &Path, args: &VisualReviewArgs) -> CtxResu
     if !render.passed() || render.change_fingerprint != fingerprint {
         return Err("visual review requires a fresh passing frontend render".into());
     }
-    if !super::frontend_detector::latest_is_fresh_and_passing(state, &repo)? {
+    if !super::frontend_detector::latest_is_fresh_and_passing(state, &repo, true)? {
         return Err("visual review requires a fresh passing frontend detector report".into());
     }
     let workflow = super::engine::load_active(state, &repo)?;

@@ -489,6 +489,16 @@ pub struct PhaseStats {
     /// carry as `None`, never a manufactured 0%.
     #[serde(default)]
     pub cache_events: usize,
+    /// H-6: `input_tokens` summed only over the same `cache_events` that
+    /// contribute to `cache_read_input_tokens` -- `cache_hit_ratio`'s own
+    /// denominator. An event whose adapter/schema version never reports
+    /// cache data at all still adds to `input_tokens` (the phase's real
+    /// token total), but must not dilute the ratio as if it were a 100%
+    /// cache miss; mixing that event's tokens into the denominator while its
+    /// (nonexistent) cache reads never reach the numerator deflates the
+    /// ratio below what the events that actually reported cache data show.
+    #[serde(default)]
+    pub cache_eligible_input_tokens: u64,
     /// Same formula and same "no data, no ratio" contract as
     /// `TelemetryEvent::cache_hit_ratio`, applied to this phase's summed
     /// totals -- a real field (via `cache_hit_ratio_from`), not a method, so
@@ -517,6 +527,9 @@ pub struct AdapterStats {
     /// See `PhaseStats::cache_events`.
     #[serde(default)]
     pub cache_events: usize,
+    /// See `PhaseStats::cache_eligible_input_tokens`.
+    #[serde(default)]
+    pub cache_eligible_input_tokens: u64,
     /// See `PhaseStats::cache_hit_ratio`.
     #[serde(default)]
     pub cache_hit_ratio: Option<f64>,
@@ -646,9 +659,10 @@ pub struct StatsReport {
     /// review-confirmed defect rates" accounting hook issue #155 asks for.
     pub review_defect_rate: Option<f64>,
     /// Issue #225: combined input tokens across every event that reported
-    /// one, regardless of whether it also carried a `phase`/`adapter` --
-    /// the ground truth `overall_cache_hit_ratio` is computed from, and a
-    /// wider set than either `phases` or `adapters` covers alone.
+    /// one, regardless of whether it also carried a `phase`/`adapter` -- a
+    /// wider set than either `phases` or `adapters` covers alone. No longer
+    /// `overall_cache_hit_ratio`'s own denominator -- see
+    /// `overall_cache_eligible_input_tokens` (H-6).
     #[serde(default)]
     pub overall_input_tokens: u64,
     /// See `PhaseStats::cache_read_input_tokens`, summed over every event.
@@ -658,6 +672,10 @@ pub struct StatsReport {
     /// `overall_cache_hit_ratio` must be `None`, never a manufactured 0%.
     #[serde(default)]
     pub overall_cache_events: usize,
+    /// See `PhaseStats::cache_eligible_input_tokens`, summed over every
+    /// event -- `overall_cache_hit_ratio`'s own denominator.
+    #[serde(default)]
+    pub overall_cache_eligible_input_tokens: u64,
     /// The schema-v2 cache-hit formula (`cache_read_input_tokens /
     /// input_tokens`, `input_tokens` already the combined total) applied
     /// across every event in this report, not just those with a phase or an
@@ -713,6 +731,7 @@ pub fn aggregate(events: &[TelemetryEvent]) -> StatsReport {
     let mut overall_input_tokens = 0u64;
     let mut overall_cache_read_input_tokens = 0u64;
     let mut overall_cache_events = 0usize;
+    let mut overall_cache_eligible_input_tokens = 0u64;
     let mut overall_cost_micros: Option<u64> = None;
     let mut overall_price_as_of: Option<String> = None;
     let mut speed_samples = 0usize;
@@ -737,6 +756,12 @@ pub fn aggregate(events: &[TelemetryEvent]) -> StatsReport {
             overall_cache_read_input_tokens = overall_cache_read_input_tokens
                 .saturating_add(event.cache_read_input_tokens.unwrap_or(0));
             overall_cache_events += 1;
+            // H-6: only an event that itself reported cache data contributes
+            // to the ratio's denominator -- an event whose adapter/schema
+            // version never reports cache data at all must not dilute the
+            // ratio as if its tokens were a 100% cache miss.
+            overall_cache_eligible_input_tokens =
+                overall_cache_eligible_input_tokens.saturating_add(event.input_tokens.unwrap_or(0));
         }
         if let Some(cost) = event.cost_micros {
             overall_cost_micros = Some(overall_cost_micros.unwrap_or(0).saturating_add(cost));
@@ -762,6 +787,9 @@ pub fn aggregate(events: &[TelemetryEvent]) -> StatsReport {
                     .cache_read_input_tokens
                     .saturating_add(event.cache_read_input_tokens.unwrap_or(0));
                 entry.cache_events += 1;
+                entry.cache_eligible_input_tokens = entry
+                    .cache_eligible_input_tokens
+                    .saturating_add(event.input_tokens.unwrap_or(0));
             }
             if event.succeeded == Some(false) {
                 entry.failures += 1;
@@ -790,6 +818,9 @@ pub fn aggregate(events: &[TelemetryEvent]) -> StatsReport {
                     .cache_read_input_tokens
                     .saturating_add(event.cache_read_input_tokens.unwrap_or(0));
                 entry.cache_events += 1;
+                entry.cache_eligible_input_tokens = entry
+                    .cache_eligible_input_tokens
+                    .saturating_add(event.input_tokens.unwrap_or(0));
             }
             if event.succeeded == Some(false) {
                 entry.failures += 1;
@@ -936,20 +967,20 @@ pub fn aggregate(events: &[TelemetryEvent]) -> StatsReport {
         stats.cache_hit_ratio = cache_hit_ratio_from(
             stats.cache_events,
             stats.cache_read_input_tokens,
-            stats.input_tokens,
+            stats.cache_eligible_input_tokens,
         );
     }
     for stats in adapters.values_mut() {
         stats.cache_hit_ratio = cache_hit_ratio_from(
             stats.cache_events,
             stats.cache_read_input_tokens,
-            stats.input_tokens,
+            stats.cache_eligible_input_tokens,
         );
     }
     let overall_cache_hit_ratio = cache_hit_ratio_from(
         overall_cache_events,
         overall_cache_read_input_tokens,
-        overall_input_tokens,
+        overall_cache_eligible_input_tokens,
     );
     let review_defect_rate =
         (review_runs > 0).then(|| findings_meaningful as f64 / review_runs as f64);
@@ -1000,6 +1031,7 @@ pub fn aggregate(events: &[TelemetryEvent]) -> StatsReport {
         overall_input_tokens,
         overall_cache_read_input_tokens,
         overall_cache_events,
+        overall_cache_eligible_input_tokens,
         overall_cache_hit_ratio,
         overall_cost_micros,
         overall_price_as_of,
@@ -1846,6 +1878,35 @@ mod tests {
         assert!((phase.cache_hit_ratio.expect("has cache data") - expected).abs() < 1e-9);
         let adapter = &report.adapters["claude"];
         assert!((adapter.cache_hit_ratio.expect("has cache data") - expected).abs() < 1e-9);
+    }
+
+    /// H-6: an event whose adapter/schema version never reports cache data at
+    /// all must not dilute the ratio as if its tokens were a 100% cache miss
+    /// -- the denominator must only ever be the input tokens of events that
+    /// themselves reported cache data.
+    #[test]
+    fn a_cache_less_event_does_not_deflate_the_cache_hit_ratio() {
+        let mut with_cache_data = TelemetryEvent::new(TelemetryKind::PhaseCompleted);
+        with_cache_data.adapter = Some("claude".into());
+        with_cache_data.phase = Some(WorkflowPhase::Implement);
+        with_cache_data.input_tokens = Some(100);
+        with_cache_data.cache_read_input_tokens = Some(50);
+
+        let mut without_cache_data = TelemetryEvent::new(TelemetryKind::PhaseCompleted);
+        without_cache_data.adapter = Some("claude".into());
+        without_cache_data.phase = Some(WorkflowPhase::Implement);
+        without_cache_data.input_tokens = Some(100);
+        // No cache_read_input_tokens set at all.
+
+        let report = aggregate(&[with_cache_data, without_cache_data]);
+
+        assert_eq!(
+            report.overall_cache_hit_ratio,
+            Some(0.5),
+            "the cache-less event's 100 input tokens must not join the denominator"
+        );
+        assert_eq!(report.phases["implement"].cache_hit_ratio, Some(0.5));
+        assert_eq!(report.adapters["claude"].cache_hit_ratio, Some(0.5));
     }
 
     /// Never a manufactured 0%: an event that carries `input_tokens` but no

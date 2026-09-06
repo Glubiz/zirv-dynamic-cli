@@ -1419,6 +1419,23 @@ fn write_baseline(repo: &Path, baseline: &TestBaseline) -> CtxResult<()> {
 /// Returns an operator-facing note naming how many entries just became
 /// prune-eligible, if any -- the `zirv test changed` hint the issue's design
 /// asks for.
+///
+/// The ids of checks `run_mode` reused verbatim from an earlier report
+/// (`reusable_test_evidence`) instead of actually executing in this run --
+/// parsed from the one note `run_mode` itself writes in that exact shape
+/// (`"reused test evidence from report ... for: <ids>"`, ids being
+/// `CheckSpec::validate`-restricted to lowercase/digits/`-`/`_`, so a plain
+/// `", "` split is unambiguous). H-5: a reused result is not a fresh
+/// execution, so `update_baseline_after_run` must not count it.
+fn reused_check_ids_from_notes(notes: &[String]) -> std::collections::BTreeSet<&str> {
+    notes
+        .iter()
+        .filter(|note| note.starts_with("reused test evidence from report"))
+        .filter_map(|note| note.split(" for: ").nth(1))
+        .flat_map(|ids| ids.split(", "))
+        .collect()
+}
+
 fn update_baseline_after_run(repo: &Path, report: &VerificationReport) -> Option<String> {
     // No baseline, no opinion -- and no lock file either: this runs after
     // every evaluation in every repository (test fixtures included), so it
@@ -1432,10 +1449,20 @@ fn update_baseline_after_run(repo: &Path, report: &VerificationReport) -> Option
     if baseline.failing_tests.is_empty() {
         return None;
     }
+    let reused = reused_check_ids_from_notes(&report.notes);
     let unit_checks: Vec<&CheckResult> = report
         .checks
         .iter()
-        .filter(|check| check.kind == CheckKind::Unit && !check.source.repo_supplied())
+        .filter(|check| {
+            check.kind == CheckKind::Unit
+                && !check.source.repo_supplied()
+                // H-5: a reused `CheckResult` was copied verbatim from an
+                // earlier report (`run_mode`'s `Final`-mode evidence reuse)
+                // rather than actually executed here -- it is not a fresh
+                // observation, so it must not advance (or reset) a streak a
+                // second time for the same real execution.
+                && !reused.contains(check.id.as_str())
+        })
         .collect();
     if unit_checks.is_empty()
         || unit_checks.iter().any(|check| {
@@ -2057,6 +2084,15 @@ pub fn last_failure_fingerprint(
     if report.passed() {
         return Ok(None);
     }
+    // #302/H-2: a report whose only failures are covered by the operator's
+    // recorded baseline is gate-passing evidence (`latest_is_fresh_and_passing`
+    // treats it the same way), so it must not be mistaken for "the previous
+    // failed attempt" here -- that would make `run_required_checks` report
+    // `Unchanged` and burn an attempt on a report that actually satisfies the
+    // gate.
+    if evaluate_against_operator_baseline(&report, repo).gate_passed {
+        return Ok(None);
+    }
     Ok(Some(report.change_fingerprint))
 }
 
@@ -2574,7 +2610,24 @@ fn run_baseline(repo: &Path, args: &BaselineArgs, writer: &mut impl Write) -> Ct
         failing.extend(names);
     }
     let count = failing.len();
-    let baseline = save_baseline(repo, failing)?;
+    // A narrowed run (`--check <id>...`) only ever observed the checks it
+    // selected -- `save_baseline` otherwise replaces `failing_tests`
+    // wholesale, which would silently delete every name a *different* check
+    // previously recorded (H-4). Merge into the existing baseline instead so
+    // a narrowed recording can only ever add names, never drop ones it never
+    // looked at; a full, unnarrowed run keeps the existing replace-wholesale
+    // semantics, since that run did observe everything.
+    let to_record = if report.narrowed_to.is_empty() {
+        failing
+    } else {
+        let mut merged: std::collections::BTreeSet<String> = load_baseline(repo)
+            .unwrap_or(None)
+            .map(|baseline| baseline.failing_tests.into_iter().collect())
+            .unwrap_or_default();
+        merged.extend(failing);
+        merged
+    };
+    let baseline = save_baseline(repo, to_record)?;
     writeln!(
         writer,
         "recorded baseline for {}: {count} failing test name(s) at {}",
@@ -4987,6 +5040,36 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; 
         );
     }
 
+    /// H-2: a failing report whose only failing test names are all covered
+    /// by the operator's recorded baseline is gate-passing evidence (see
+    /// `latest_is_fresh_and_passing`), so it must not be treated as "the
+    /// previous failed attempt" here.
+    #[test]
+    fn last_failure_fingerprint_is_none_when_the_only_failure_is_baselined() {
+        let repo = git_repo();
+        let state_root = tempdir().unwrap();
+        let state = StateDir::from_root(state_root.path().to_path_buf());
+        let fingerprint = change_fingerprint(repo.path()).unwrap();
+        let mut report = report_with_checks(vec![unit_check(
+            "test",
+            CheckStatus::Failed,
+            Some(&cargo_failure_output("wrap::tests::a")),
+        )]);
+        report.repo = repo.path().to_path_buf();
+        report.change_fingerprint = fingerprint;
+        save_report(&state, &report).unwrap();
+        save_baseline(
+            repo.path(),
+            std::collections::BTreeSet::from(["wrap::tests::a".to_string()]),
+        )
+        .unwrap();
+        assert_eq!(
+            last_failure_fingerprint(&state, repo.path(), "step-1").unwrap(),
+            None,
+            "a baselined-only failure is operator-acknowledged, not the previous failed attempt"
+        );
+    }
+
     /// #287: retargeting a symlink between two files with identical content
     /// must still move `change_fingerprint` -- `git hash-object` alone
     /// follows the link and would hash the same bytes either way.
@@ -5267,6 +5350,52 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; 
         );
     }
 
+    /// H-5: `run_mode(Final)` reuses a prior `Changed` report's `CheckResult`
+    /// verbatim for an unchanged worktree (`reusable_test_evidence`) rather
+    /// than re-executing it -- one real execution. `update_baseline_after_run`
+    /// runs once per persisted report, so without skipping reused results the
+    /// same green evidence would advance the streak twice for a single test
+    /// run followed by a verify against an unchanged worktree.
+    #[test]
+    fn a_reused_check_result_does_not_double_count_the_green_streak() {
+        let repo = git_repo();
+        let home = tempdir().unwrap();
+        let _home_guard = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        save_baseline(
+            repo.path(),
+            std::collections::BTreeSet::from(["wrap::tests::a".to_string()]),
+        )
+        .unwrap();
+
+        // The `zirv test changed` run: a real execution, no reuse note.
+        let changed_report =
+            report_with_checks(vec![unit_check("test", CheckStatus::Passed, None)]);
+        update_baseline_after_run(repo.path(), &changed_report);
+
+        // The immediately-following `zirv verify` (Final) against the same,
+        // unchanged worktree: `run_mode` reused the `test` check's result
+        // verbatim and recorded exactly the note it writes in that shape.
+        let mut verify_report =
+            report_with_checks(vec![unit_check("test", CheckStatus::Passed, None)]);
+        verify_report.notes.push(
+            "reused test evidence from report evaluate (fingerprint 0000000000000001, \
+             finished_at 0) for: test"
+                .to_string(),
+        );
+        update_baseline_after_run(repo.path(), &verify_report);
+
+        assert_eq!(
+            load_baseline(repo.path())
+                .unwrap()
+                .unwrap()
+                .green_streaks
+                .get("wrap::tests::a")
+                .copied(),
+            Some(1),
+            "a reused result must not count as a second real execution"
+        );
+    }
+
     /// An `Inconclusive`/`TimedOut` `Unit` check's own run must never
     /// advance (or reset) any baselined name's streak -- an unreliable run
     /// has no opinion on whether a name is actually clean.
@@ -5340,6 +5469,53 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; 
         assert!(
             load_baseline(repo.path()).unwrap().is_none(),
             "nothing must be recorded from an inconclusive run"
+        );
+    }
+
+    /// H-4: a `--check`-narrowed `zirv test baseline` run only ever observed
+    /// the checks it selected, so it must not wipe out names a *different*
+    /// check previously recorded -- `save_baseline` otherwise replaces
+    /// `failing_tests` wholesale from this run's (empty, since the narrowed
+    /// check is a `Format`-kind check that never contributes Unit names)
+    /// findings alone.
+    #[test]
+    fn run_baseline_with_a_narrowed_check_does_not_erase_other_recorded_names() {
+        let repo = git_repo();
+        let state_root = tempdir().unwrap();
+        let home = tempdir().unwrap();
+        let _home_guard = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        save_baseline(
+            repo.path(),
+            std::collections::BTreeSet::from(["a::one".to_string(), "b::two".to_string()]),
+        )
+        .unwrap();
+        write_verify_toml(
+            repo.path(),
+            "schema_version=1\n[[checks]]\nid='fmt'\nkind='format'\ncommand='true'\n",
+        );
+        let mut out = Vec::new();
+        let code = with_state(state_root.path(), || {
+            run_baseline(
+                repo.path(),
+                &BaselineArgs {
+                    run: RunArgs {
+                        repo: None,
+                        checks: vec!["fmt".to_string()],
+                        dry_run: false,
+                        json: false,
+                    },
+                    prune: false,
+                },
+                &mut out,
+            )
+            .expect("must not hard-error")
+        });
+        assert_eq!(code, 0);
+        let baseline = load_baseline(repo.path()).unwrap().unwrap();
+        assert_eq!(
+            baseline.failing_tests,
+            vec!["a::one".to_string(), "b::two".to_string()],
+            "a narrowed run must not erase names it never observed"
         );
     }
 
