@@ -253,6 +253,12 @@ pub fn built_in_table() -> PriceTable {
         // codex's coding-specific product model, named directly by workers
         // that pin it rather than going through the tier ladder.
         ("gpt-5-codex".to_string(), TERRA),
+        // The generation above the ladder above, named directly by a worker
+        // that pins it. Priced AT the `sol` rung -- the top codex rate this
+        // table can actually verify -- for exactly the reason `FABLE` is
+        // priced at the opus rate above: unpriced reads as `None`, which
+        // silently omits the most expensive codex seat from every cost line.
+        ("gpt-6-astra".to_string(), SOL),
     ]);
 
     PriceTable {
@@ -451,6 +457,7 @@ mod tests {
             "gpt-5.6-luna",
             "gpt-5.4-mini",
             "gpt-5-codex",
+            "gpt-6-astra",
         ] {
             let rate = table
                 .models
