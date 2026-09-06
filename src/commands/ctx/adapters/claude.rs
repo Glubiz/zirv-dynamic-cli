@@ -300,6 +300,51 @@ pub fn context_tokens_of(usage: &Value) -> u64 {
     usage_categories(usage).context_total()
 }
 
+/// This codebase's own rough token estimate, shared with `compile.rs` and
+/// `context_status.rs`: four bytes to a token.
+const THINKING_BYTES_PER_TOKEN: u64 = 4;
+
+/// The literal size of an assistant message's own thinking text, or `None`
+/// when the row carries no thinking block with any text left in it -- the
+/// shape every live transcript now has, which [`reported_thinking_bytes`]
+/// answers instead.
+fn thinking_text_bytes(message: &Value) -> Option<u64> {
+    let total: u64 = message
+        .get("content")
+        .and_then(Value::as_array)?
+        .iter()
+        .filter(|b| b.get("type").and_then(Value::as_str) == Some("thinking"))
+        .filter_map(|b| b.get("thinking").and_then(Value::as_str))
+        .map(|t| t.len() as u64)
+        .sum();
+    (total > 0).then_some(total)
+}
+
+/// The response's reported thinking size on the byte scale, for a row whose
+/// thinking text was stripped to a bare `signature` (or redacted outright).
+/// `None` unless the row actually carries such a block, so a row that never
+/// thought is never credited with the response's thinking tokens.
+fn reported_thinking_bytes(message: &Value) -> Option<u64> {
+    let stripped = message
+        .get("content")
+        .and_then(Value::as_array)?
+        .iter()
+        .any(|b| match b.get("type").and_then(Value::as_str) {
+            Some("thinking") => b.get("signature").is_some(),
+            Some("redacted_thinking") => true,
+            _ => false,
+        });
+    if !stripped {
+        return None;
+    }
+    let tokens = message
+        .get("usage")?
+        .get("output_tokens_details")?
+        .get("thinking_tokens")
+        .and_then(Value::as_u64)?;
+    Some(tokens.saturating_mul(THINKING_BYTES_PER_TOKEN))
+}
+
 pub fn parse_events(jsonl: &str) -> Vec<NormalizedEvent> {
     let mut events = Vec::new();
 
@@ -423,17 +468,18 @@ pub fn parse_events(jsonl: &str) -> Vec<NormalizedEvent> {
                 // blocks entirely when building `AssistantFinal::text`, so
                 // without this sibling event that content is invisible to
                 // `breakdown::attribute_window`'s `thinking` bucket.
-                let thinking_bytes: u64 = message
-                    .get("content")
-                    .and_then(Value::as_array)
-                    .map(|blocks| {
-                        blocks
-                            .iter()
-                            .filter(|b| b.get("type").and_then(Value::as_str) == Some("thinking"))
-                            .filter_map(|b| b.get("thinking").and_then(Value::as_str))
-                            .map(|t| t.len() as u64)
-                            .sum()
-                    })
+                //
+                // Current Claude Code writes every thinking block with its
+                // text stripped to `""` and only a `signature` (or as a
+                // `redacted_thinking` block), so that sum is now zero for a
+                // live session no matter how much the model thought. The
+                // response's own `usage.output_tokens_details.thinking_tokens`
+                // still reports the real count; scaled here to the BYTE unit
+                // every other `breakdown::attribute_window` weight is in, at
+                // this codebase's own 4-bytes-per-token estimate (see
+                // `context_status::BYTES_PER_TOKEN`).
+                let thinking_bytes = thinking_text_bytes(&message)
+                    .or_else(|| reported_thinking_bytes(&message))
                     .unwrap_or(0);
                 if thinking_bytes > 0 {
                     events.push(NormalizedEvent::AssistantThinking {
@@ -571,28 +617,57 @@ pub fn model_hint(jsonl: &str) -> Option<String> {
     None
 }
 
+/// The identity of the API response an assistant row belongs to, for
+/// [`fold_assistant_usage`]'s dedup. Claude Code >= 2.1.209 splits one
+/// response across one transcript row per content block (thinking, text,
+/// tool_use), each repeating the response's identical `usage` object under
+/// the same `message.id`. `requestId` is the fallback for a row carrying no
+/// message id; `None` means this row has no response identity at all and is
+/// counted on its own, which is exactly the pre-split behaviour.
+pub fn response_identity(row: &Value) -> Option<&str> {
+    row.get("message")
+        .and_then(|message| message.get("id"))
+        .and_then(Value::as_str)
+        .or_else(|| row.get("requestId").and_then(Value::as_str))
+}
+
 /// The shared fold behind [`transcript_usage`] and [`sidechain_transcript_usage`]:
 /// every assistant row whose `isSidechain` flag matches `want_sidechain`,
 /// summed into the four raw classes. One fold, two filters, so the main and
 /// sidechain readers can never drift on what counts as an assistant usage
 /// row.
+///
+/// Usage is folded once per API RESPONSE, not once per row: consecutive rows
+/// sharing a [`response_identity`] repeat one response's own usage object, so
+/// only the first of a run contributes. Tracking the last-seen id rather than
+/// a set keeps this streaming-safe over an append-only transcript.
 fn fold_assistant_usage(jsonl: &str, want_sidechain: bool) -> Option<TranscriptUsage> {
+    fold_usage_rows(jsonl, |row| {
+        (row.get("isSidechain").and_then(Value::as_bool) == Some(true)) == want_sidechain
+    })
+}
+
+/// The fold itself, over every `assistant` row `keep` accepts.
+fn fold_usage_rows(jsonl: &str, keep: impl Fn(&Value) -> bool) -> Option<TranscriptUsage> {
     let mut usage = TranscriptUsage::default();
     let mut observed = false;
+    let mut last_id: Option<String> = None;
     for line in jsonl.lines() {
         let Ok(row) = serde_json::from_str::<Value>(line.trim()) else {
             continue;
         };
-        let is_sidechain = row.get("isSidechain").and_then(Value::as_bool) == Some(true);
-        if row.get("type").and_then(Value::as_str) != Some("assistant")
-            || is_sidechain != want_sidechain
-        {
+        if row.get("type").and_then(Value::as_str) != Some("assistant") || !keep(&row) {
             continue;
         }
         let Some(current) = row.get("message").and_then(|message| message.get("usage")) else {
             continue;
         };
         observed = true;
+        let id = response_identity(&row).map(str::to_string);
+        if id.is_some() && id == last_id {
+            continue;
+        }
+        last_id = id;
         let row = usage_categories(current);
         usage.input_tokens = usage.input_tokens.saturating_add(row.input_tokens);
         usage.cache_creation_input_tokens = usage
@@ -617,6 +692,104 @@ pub fn transcript_usage(jsonl: &str) -> Option<TranscriptUsage> {
 /// `observed` flag draws.
 pub fn sidechain_transcript_usage(jsonl: &str) -> Option<TranscriptUsage> {
     fold_assistant_usage(jsonl, true)
+}
+
+/// How many subagent transcripts one call will open, and how many of their
+/// bytes it will read. Bounds a directory that accumulates one file per
+/// dispatch for the life of a session; a phase that overruns either bound
+/// reports what it read rather than stalling the caller.
+const MAX_SUBAGENT_TRANSCRIPTS: usize = 256;
+const MAX_SUBAGENT_BYTES: u64 = 32 * 1024 * 1024;
+
+/// The modern home of subagent spend (2026-09-06). Current Claude Code writes
+/// NO `isSidechain` rows into the main transcript at all -- 0 of 15,510 rows
+/// across twelve recorded real sessions -- so [`sidechain_transcript_usage`]'s
+/// in-file fold is now a legacy branch that answers `None` for every live
+/// session. Subagent turns live in sibling files instead:
+/// `<transcript-dir>/<session-id>/subagents/agent-<id>.jsonl`, whose rows do
+/// carry `isSidechain: true`.
+///
+/// `main_range` is the caller's own phase slice of the MAIN transcript; its
+/// first parseable `timestamp` is the phase boundary this fold floors at, so
+/// the answer keeps the "since the checkpoint" meaning the byte-range read
+/// gave the legacy branch. A range with no parseable timestamp yields `None`
+/// -- an honest "cannot place this window", never the whole session's subagent
+/// spend attributed to one phase. A subagent row with no timestamp of its own
+/// cannot be placed either and is skipped, the same convention
+/// `window::sum_file` already applies.
+pub fn subagent_transcript_usage(transcript: &Path, main_range: &str) -> Option<TranscriptUsage> {
+    let since_ms = first_timestamp_ms(main_range)?;
+    let dir = subagents_dir(transcript)?;
+    let mut usage = TranscriptUsage::default();
+    let mut observed = false;
+    let mut files = 0usize;
+    let mut bytes = 0u64;
+    let mut entries: Vec<(std::time::SystemTime, u64, PathBuf)> = std::fs::read_dir(&dir)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
+        .filter_map(|path| {
+            let meta = std::fs::metadata(&path).ok()?;
+            Some((
+                meta.modified().unwrap_or(std::time::UNIX_EPOCH),
+                meta.len(),
+                path,
+            ))
+        })
+        .collect();
+    // Newest first, so a session whose directory outgrows the caps keeps the
+    // files a recent phase can actually have written to. Ordering only: which
+    // rows count is decided by `since_ms` against each row's own timestamp,
+    // never by a file's mtime.
+    entries.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.2.cmp(&b.2)));
+    for (_, len, path) in entries {
+        if files >= MAX_SUBAGENT_TRANSCRIPTS || bytes >= MAX_SUBAGENT_BYTES {
+            break;
+        }
+        let Ok(body) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        files += 1;
+        bytes = bytes.saturating_add(len);
+        let Some(file_usage) = fold_usage_rows(&body, |row| {
+            row.get("timestamp")
+                .and_then(Value::as_str)
+                .and_then(parse_iso8601_utc_ms)
+                .is_some_and(|at| at >= since_ms)
+        }) else {
+            continue;
+        };
+        observed = true;
+        usage.input_tokens = usage.input_tokens.saturating_add(file_usage.input_tokens);
+        usage.cache_creation_input_tokens = usage
+            .cache_creation_input_tokens
+            .saturating_add(file_usage.cache_creation_input_tokens);
+        usage.cache_read_input_tokens = usage
+            .cache_read_input_tokens
+            .saturating_add(file_usage.cache_read_input_tokens);
+        usage.output_tokens = usage.output_tokens.saturating_add(file_usage.output_tokens);
+    }
+    observed.then_some(usage)
+}
+
+/// `<transcript-dir>/<session-id>/subagents`, derived from the main
+/// transcript's own path rather than recomputed from a `SessionRef`, so the
+/// scan-fallback path `transcript_path` may have resolved is honoured.
+fn subagents_dir(transcript: &Path) -> Option<PathBuf> {
+    let stem = transcript.file_stem()?;
+    Some(transcript.parent()?.join(stem).join("subagents"))
+}
+
+/// The first parseable row `timestamp` in `jsonl`, in unix milliseconds.
+fn first_timestamp_ms(jsonl: &str) -> Option<u64> {
+    jsonl.lines().find_map(|line| {
+        serde_json::from_str::<Value>(line.trim())
+            .ok()?
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .and_then(parse_iso8601_utc_ms)
+    })
 }
 
 const FILE_KEYS: &[&str] = &["file_path", "notebook_path", "path"];
@@ -2570,6 +2743,98 @@ mod tests {
             None,
             "no sidechain rows means None, not a zeroed reading"
         );
+    }
+
+    /// Claude Code >= 2.1.209 writes one transcript row per CONTENT BLOCK of
+    /// one API response (thinking, text, tool_use), each repeating that
+    /// response's identical `usage` object under the same `message.id`.
+    /// Summing per row therefore multiplies a session's real spend by however
+    /// many blocks its responses happened to carry.
+    #[test]
+    fn usage_is_counted_once_per_api_response_not_once_per_row() {
+        let jsonl = concat!(
+            r#"{"type":"assistant","message":{"id":"msg_x","usage":{"input_tokens":10,"cache_creation_input_tokens":20,"cache_read_input_tokens":30,"output_tokens":40}}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"id":"msg_x","usage":{"input_tokens":10,"cache_creation_input_tokens":20,"cache_read_input_tokens":30,"output_tokens":40}}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"id":"msg_x","usage":{"input_tokens":10,"cache_creation_input_tokens":20,"cache_read_input_tokens":30,"output_tokens":40}}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"id":"msg_y","usage":{"input_tokens":1,"output_tokens":2}}}"#,
+        );
+        let usage = transcript_usage(jsonl).expect("usage");
+        assert_eq!(
+            usage,
+            TranscriptUsage {
+                input_tokens: 11,
+                cache_creation_input_tokens: 20,
+                cache_read_input_tokens: 30,
+                output_tokens: 42,
+            }
+        );
+    }
+
+    /// The same rule against the recorded real session: 48 assistant rows,
+    /// 20 distinct `message.id`s. Summing per row reports 10_592_616 -- 2.15x
+    /// the 4_922_703 the account was actually charged.
+    #[test]
+    fn real_session_fixture_usage_matches_its_distinct_message_ids() {
+        let jsonl =
+            std::fs::read_to_string(fixture_path("claude-real-session.jsonl")).expect("fixture");
+        let usage = transcript_usage(&jsonl).expect("usage");
+        let total = usage.input_tokens
+            + usage.cache_creation_input_tokens
+            + usage.cache_read_input_tokens
+            + usage.output_tokens;
+        assert_eq!(total, 4_922_703);
+    }
+
+    /// Current Claude Code strips a thinking block's text and keeps only its
+    /// `signature` (124 of 124 blocks across six recorded real sessions), so
+    /// sizing the event by that text reports zero thinking for every session
+    /// that thought. The response's own
+    /// `usage.output_tokens_details.thinking_tokens` still carries the count.
+    #[test]
+    fn thinking_bytes_fall_back_to_reported_thinking_tokens_when_the_text_is_stripped() {
+        let stripped = concat!(
+            r#"{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"","signature":"EucMCqgBCBEY"}],"#,
+            r#""usage":{"output_tokens":100,"output_tokens_details":{"thinking_tokens":50}}}}"#,
+        );
+        assert!(
+            parse_events(stripped).contains(&NormalizedEvent::AssistantThinking { byte_len: 200 }),
+            "50 reported thinking tokens on this repo's own 4-bytes-per-token scale"
+        );
+
+        let intact = concat!(
+            r#"{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"abcde"}],"#,
+            r#""usage":{"output_tokens":100,"output_tokens_details":{"thinking_tokens":50}}}}"#,
+        );
+        assert!(
+            parse_events(intact).contains(&NormalizedEvent::AssistantThinking { byte_len: 5 }),
+            "real thinking text still sizes itself, never the reported estimate"
+        );
+
+        let neither = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"hi"}],"usage":{"output_tokens":1}}}"#;
+        assert!(
+            !parse_events(neither)
+                .iter()
+                .any(|e| matches!(e, NormalizedEvent::AssistantThinking { .. })),
+            "a row that carries no thinking block emits no thinking event"
+        );
+    }
+
+    /// A row with neither `message.id` nor `requestId` has no response
+    /// identity to dedupe on, so it still counts on its own -- the fallback
+    /// preserves every pre-block-split transcript's reading exactly.
+    #[test]
+    fn rows_without_a_response_id_still_count_individually() {
+        let jsonl = concat!(
+            r#"{"type":"assistant","message":{"usage":{"input_tokens":5,"output_tokens":1}}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"usage":{"input_tokens":5,"output_tokens":1}}}"#,
+        );
+        let usage = transcript_usage(jsonl).expect("usage");
+        assert_eq!(usage.input_tokens, 10);
+        assert_eq!(usage.output_tokens, 2);
     }
 
     #[test]

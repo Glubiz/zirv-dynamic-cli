@@ -309,10 +309,28 @@ fn note_oldest(slot: &mut u64, at: u64) {
     }
 }
 
+/// Whether `row` repeats the API response the previous assistant row already
+/// contributed. Claude Code >= 2.1.209 writes one row per content block of one
+/// response, each carrying that response's identical `usage` object, so a
+/// per-row sum multiplies real spend by the block count -- the same defect
+/// `claude::fold_assistant_usage` deduplicates, applied here so the trailing
+/// usage windows and the per-session spend breakdown agree with it. Advances
+/// `last_id` as a side effect; a row with no response identity at all counts
+/// on its own, exactly as before the split.
+fn same_api_response(row: &Value, last_id: &mut Option<String>) -> bool {
+    let id = super::adapters::claude::response_identity(row).map(str::to_string);
+    if id.is_some() && id == *last_id {
+        return true;
+    }
+    *last_id = id;
+    false
+}
+
 /// Accumulates one transcript's assistant usage into the trailing windows.
 /// Events without a parseable timestamp cannot be placed in a window and are
 /// skipped rather than counted at the wrong time.
 pub fn sum_file(jsonl: &str, now: u64, count_cache_reads: bool, into: &mut TokenSums) {
+    let mut last_id: Option<String> = None;
     for line in jsonl.lines() {
         let line = line.trim();
         if line.is_empty() {
@@ -322,6 +340,9 @@ pub fn sum_file(jsonl: &str, now: u64, count_cache_reads: bool, into: &mut Token
             continue;
         };
         if row.get("type").and_then(Value::as_str) != Some("assistant") {
+            continue;
+        }
+        if same_api_response(&row, &mut last_id) {
             continue;
         }
         let Some(at) = row
@@ -397,6 +418,7 @@ fn session_spend_of(
         newest_at: 0,
     };
 
+    let mut last_id: Option<String> = None;
     for line in jsonl.lines() {
         let line = line.trim();
         if line.is_empty() {
@@ -406,6 +428,9 @@ fn session_spend_of(
             continue;
         };
         if row.get("type").and_then(Value::as_str) != Some("assistant") {
+            continue;
+        }
+        if same_api_response(&row, &mut last_id) {
             continue;
         }
         let Some(at) = row
@@ -1722,6 +1747,37 @@ mod tests {
             "the event with no timestamp cannot be placed"
         );
         assert_eq!(sums.events_counted, 1);
+    }
+
+    /// The same per-content-block row split `claude::fold_assistant_usage`
+    /// deduplicates: one API response, one usage object, repeated across the
+    /// rows for its thinking/text/tool_use blocks. Summing per row inflates
+    /// the trailing usage windows by however many blocks a response carried.
+    #[test]
+    fn one_api_responses_repeated_rows_are_counted_once() {
+        let now = 1_785_507_315;
+        let at = iso_of(now - 600);
+        let row = |id: &str, tokens: u64| {
+            format!(
+                "{{\"type\":\"assistant\",\"timestamp\":\"{at}\",\"message\":{{\"id\":\"{id}\",\"usage\":{{\"input_tokens\":{tokens}}}}}}}\n"
+            )
+        };
+        let jsonl = format!(
+            "{}{}{}{}",
+            row("msg_a", 100),
+            row("msg_a", 100),
+            row("msg_a", 100),
+            row("msg_b", 7)
+        );
+
+        let mut sums = TokenSums::default();
+        sum_file(&jsonl, now, false, &mut sums);
+        assert_eq!(sums.five_hour, 107);
+        assert_eq!(sums.events_counted, 2);
+
+        let spend = session_spend_of("sess", &jsonl, now, FIVE_HOUR_SECS).expect("spend");
+        assert_eq!(spend.input_tokens, 107);
+        assert_eq!(spend.events, 2);
     }
 
     #[test]
