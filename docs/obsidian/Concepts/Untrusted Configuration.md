@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-09-05
+last-verified: 2026-09-06
 ---
 
 # Untrusted Configuration
@@ -321,7 +321,7 @@ Coverage is exactly the three surfaces issue #243 names — mail, repo-provided 
 
 Issue #358 adds five more keys to the same fold, each documented on `FallbackConfig`'s own fields (`config.rs`):
 - `adaptive_delegation` (default `true`) gets the identical AND fold `enabled` already uses: a repo may disable adaptive background steering, never re-enable it for an operator who turned it off.
-- `auto_orchestrator_rollover` (default `false`) gets the same AND fold: a repo may disable automatic orchestrator-seat rollover, never enable it.
+- `auto_orchestrator_rollover` (`Option<bool>`, default `None` -- resolves via `CtxConfig::auto_orchestrator_rollover()` to ON for a multi-harness roster, reversing the original "off by default" decision, 2026-09-05 -- see [[Decision Log]]) still gets the same AND-shaped fold, adapted for the tri-state: a repo may narrow an unset value to `false` (sticks), but a repo `true` on an unset home layer is a widening and is discarded, leaving the roster default in force; an explicit home value still ANDs against the repo's own value exactly as before.
 - `orchestrator_rollover_headroom_pct` and `rollover_cooldown_secs` are `REPO_FORBIDDEN` outright, not narrowed — see the forbidden-key table above and its own rationale sentence: tuning an already-enabled rollover's timing is the operator's call, the same as `handoff.model`/`optimize.model`.
 - `harness` (`[fallback.harness.<name>]`, keyed by adapter name) folds per field, not per whole entry: `max_active` may only be lowered (`min`) and `reserve_headroom_pct` may only be raised (`max`) for a name either layer names; a name only one layer configures keeps that layer's own values outright, since the missing side's implicit `None` already means "no override, use the global limits" and any concrete value narrows that baseline. Unknown harness names (anything outside `adapters::ADAPTERS`) and an out-of-range `reserve_headroom_pct` both fail validation the same way an unknown `fallback.order` entry already does.
 

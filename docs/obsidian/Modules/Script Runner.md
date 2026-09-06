@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-31
+last-verified: 2026-09-06
 ---
 
 # Script Runner
@@ -11,7 +11,7 @@ last-verified: 2026-08-31
 - **Depends on:** [[Utilities]] (`utils::file_to_script` parses a file into a `Script` before `execute` ever runs), [[Ctx Subsystem]] and [[Ctx Supervisors]] (an `Agent` step drives `zirv ctx exec`'s own entry point in-process)
 - **Tests:** inline `#[cfg(test)] mod tests` in every file listed above (e.g. `script_runner::mod::tests`, `command_types::tests`, `agent_command::tests`)
 - **If changed:** [[Script Files]], [[Script Resolution]], [[Built-in Commands]], [[Ctx Adapters]]
-- **Gotchas:** `CommandTypes` is deserialized by hand (not serde's `untagged`) so a step's error names the missing/misspelled key; `${var}` left unresolved after substitution is a hard error, not a silent pass-through; an `Agent` step is validated at *load* time so `--dry-run` and a real run reject the same scripts.
+- **Gotchas:** `CommandTypes` is deserialized by hand (not serde's `untagged`) so a step's error names the missing/misspelled key; `${var}` left unresolved after substitution is a hard error, not a silent pass-through; an `Agent` step is validated at *load* time so `--dry-run` and a real run reject the same scripts. `substitute()`/`check_unresolved()` operate over the *template* in a single pass — a param/secret/capture value that itself contains `${...}`-shaped text is never re-scanned for further placeholders and never misreported as unresolved (fixed 2026-09-05, was hash-order dependent and could splice a secret's own value into a command line).
 
 ## Purpose
 
@@ -34,22 +34,22 @@ The result is a flat `HashMap<String, String>` that every step's `${var}` substi
 
 ### Step dispatch (`command_types.rs`)
 
-`CommandTypes` has three variants: `Command`, `Commands(Vec<Command>)`, `Agent`. Parsing dispatches on which key a step's mapping has (`command` vs `agent`), rather than serde's `untagged` fallback, because untagged silently picks the first variant that fits and reports only "data did not match any variant" — a step with both `command` and `agent` used to run as a shell command and threw the agent half away with no warning. `Commands` (a plain YAML sequence of command strings) is the "concurrent commands" feature: it substitutes `${var}` in each, joins with `&&`, and spawns a *new terminal window* — `cmd /K` on Windows, an AppleScript `Terminal` `do script` on macOS, and the first of `gnome-terminal`/`x-terminal-emulator`/`xterm` on Linux (fails clearly if no `DISPLAY`/`WAYLAND_DISPLAY`, i.e. a headless/SSH session).
+`CommandTypes` has three variants: `Command`, `Commands(Vec<Command>)`, `Agent`. Parsing dispatches on which key a step's mapping has (`command` vs `agent`), rather than serde's `untagged` fallback, because untagged silently picks the first variant that fits and reports only "data did not match any variant" — a step with both `command` and `agent` used to run as a shell command and threw the agent half away with no warning. `Commands` (a plain YAML sequence of command strings) is the "concurrent commands" feature: at *load* time it hard-errors if any entry carries `capture`, `options.fallback`, or `options.interactive` — none of the three can be honored once a command runs detached inside its own terminal window (`validate_concurrent_block`, same load-time-not-run-time treatment as `AgentCommand::validate`). At run time, `build_concurrent_command` first drops any entry whose `options.operating_system` filters out the current platform (the block skips entirely, printing "Command skipped due to OS filter", if every entry is filtered out), then substitutes `${var}` in what's left, joins with `&&`, and spawns a *new terminal window* — `cmd /K` on Windows, an AppleScript `Terminal` `do script` on macOS, and the first of `gnome-terminal`/`x-terminal-emulator`/`xterm` on Linux (fails clearly if no `DISPLAY`/`WAYLAND_DISPLAY`, i.e. a headless/SSH session).
 
 ### Single command execution (`command.rs`)
 
 `Command { command, capture, description, options }`. `execute`:
 - Skips (with a message, not an error) when `options.operating_system` doesn't match the current OS.
-- Substitutes `${var}` via the shared `substitute()`, then hard-errors on any placeholder still present via `check_unresolved()` — both are `pub(crate)` and reused by `AgentCommand`.
-- Special-cases a leading `cd `: updates the context's `cwd` key (canonicalized) instead of spawning a process, so subsequent steps in the same script inherit the new working directory.
+- Substitutes `${var}` via the shared `substitute()`, then hard-errors on any placeholder still present via `check_unresolved()` — both are `pub(crate)` and reused by `AgentCommand`. Both operate over the *template* (`self.command`) in one `Regex::replace_all` pass: `substitute()` never rescans a substituted-in value for further `${...}` text, and `check_unresolved()` checks the template's own placeholder names against the context directly instead of re-scanning the substituted output — so a captured/param value that happens to contain `${...}`-shaped text (e.g. a literal secret placeholder) is neither expanded a second time nor misreported as an unresolved placeholder the template never actually left open.
+- Special-cases a leading `cd `: only when the rest of the line is a *bare single-argument* directory (`bare_cd_target` — one whitespace-free token, or a token wrapped in one pair of matching quotes with the quotes stripped) does it update the context's `cwd` key (canonicalized) instead of spawning a process; `cd dir && next` and `cd /d C:\path` don't match and fall through to the real shell instead of hard-failing on a literal-string canonicalize.
 - Otherwise spawns via `powershell -Command` (Windows) or `sh -c` (Unix) through Tokio's async `Command`, honoring `cwd` from the context and `options.interactive` (inherits stdio).
 - `capture` stores trimmed stdout into the context under that variable name instead of streaming it to the terminal.
-- On failure: runs any `options.fallback` commands in order (a fallback that also fails is itself an error), then respects `options.proceed_on_failure` (converts failure to a skip message) before finally erroring.
+- On failure: runs any `options.fallback` commands in order, then respects `options.proceed_on_failure` (converts the failure — main command, or main command plus a fallback that also failed — to a skip message) before finally erroring. `proceed_on_failure` applies even when the fallback itself also fails; it used to short-circuit with a hard error before `proceed_on_failure` was ever consulted.
 - `options.delay_ms` sleeps after a successful run.
 
 ### Options (`options.rs`, `fallback_command.rs`, `operating_system.rs`, `secret.rs`)
 
-`Options { proceed_on_failure, delay_ms, interactive, operating_system, fallback }`. `operating_system` accepts the legacy `os` key as a serde alias (the README once documented that name; it used to be silently ignored as an unknown key). `skip_for_os()` is the shared "does this filter exclude the current platform" check used by both `Command` and `AgentCommand`. `FallbackCommand` is a smaller sibling of `Command` (no capture, no OS filter) run when the main command's `invoke` fails. `OperatingSystem` is a three-value enum (`Linux`/`Windows`/`MacOS`) matched against `std::env::consts::OS`. `Secret { name, env_var }` is the params-file declaration resolved during context building.
+`Options { proceed_on_failure, delay_ms, interactive, operating_system, fallback }`. `operating_system` accepts the legacy `os` key as a serde alias (the README once documented that name; it used to be silently ignored as an unknown key). `skip_for_os()` is the shared "does this filter exclude the current platform" check used by both `Command` and `AgentCommand`. `FallbackCommand` is a smaller sibling of `Command` run when the main command's `invoke` fails — it now takes the script's own context and substitutes `${var}` in its command, honors the tracked `cwd`, `options.operating_system` (skipped, not run, when filtered), `options.proceed_on_failure` (a failing fallback with this set is itself treated as success), and `options.delay_ms`; it has no `capture` field of its own. `OperatingSystem` is a three-value enum (`Linux`/`Windows`/`MacOS`) matched against `std::env::consts::OS`. `Secret { name, env_var }` is the params-file declaration resolved during context building.
 
 ### Agent steps (`agent_command.rs`)
 
