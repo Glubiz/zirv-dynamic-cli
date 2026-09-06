@@ -364,13 +364,24 @@ pub struct PaceConfig {
     pub enabled: bool,
     /// A supervised window is kept at or below this percentage.
     pub max_percent: f64,
-    /// Collector readings older than this are treated as stale.
+    /// Collector readings older than this are treated as stale. Repo-
+    /// narrowing only (`narrow_collector_max_age_secs`, plain `min`): a
+    /// checkout may shorten the horizon, never lengthen one so a reading it
+    /// controls keeps binding for hours.
     pub collector_max_age_secs: u64,
+    /// `REPO_FORBIDDEN`: the fallback source the gate paces on when no
+    /// collector reading binds, measured against the budgets below -- a
+    /// checkout choosing both chooses the whole reading.
     pub estimator: bool,
     /// `0` disables the estimator for that window: a plan's real allowance is
-    /// undocumented, so there is no honest default.
+    /// undocumented, so there is no honest default. `REPO_FORBIDDEN`, same
+    /// reasoning as `estimator`.
     pub five_hour_budget_tokens: u64,
+    /// `REPO_FORBIDDEN`, same reasoning as `five_hour_budget_tokens`.
     pub seven_day_budget_tokens: u64,
+    /// `REPO_FORBIDDEN`: cache reads are the dominant token class in a cached
+    /// session, so this toggle alone moves the estimator's own percentage far
+    /// enough to change a pacing verdict.
     pub count_cache_reads: bool,
     pub jitter_secs: u64,
     /// Used when a window's `resets_at` is unknown.
@@ -1984,6 +1995,21 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
     ),
     ("ZIRV_CTX_PACE", &["pace", "enabled"], EnvKind::Bool),
     (
+        "ZIRV_CTX_PACE_COLLECTOR_MAX_AGE_SECS",
+        &["pace", "collector_max_age_secs"],
+        EnvKind::Int,
+    ),
+    (
+        "ZIRV_CTX_PACE_ESTIMATOR",
+        &["pace", "estimator"],
+        EnvKind::Bool,
+    ),
+    (
+        "ZIRV_CTX_PACE_COUNT_CACHE_READS",
+        &["pace", "count_cache_reads"],
+        EnvKind::Bool,
+    ),
+    (
         "ZIRV_CTX_PACE_MAX_PERCENT",
         &["pace", "max_percent"],
         EnvKind::Float,
@@ -2640,6 +2666,18 @@ fn narrow_pace_percent(home: f64, repo: Option<f64>) -> f64 {
     home.min(repo.unwrap_or(f64::INFINITY))
 }
 
+/// Audit finding G1: the repo-narrowing fold for `pace.collector_max_age_
+/// secs` -- lower is stricter (a shorter horizon lets `pace::binding` hold
+/// fewer readings authoritative, so the gate falls back to the honest
+/// unknown path sooner), the `u64` mirror of `narrow_loop_backoff_ceiling_
+/// secs`. Not `REPO_FORBIDDEN`, unlike the estimator/budget keys beside it:
+/// a repo asking to trust LESS stale data can never widen what the operator
+/// already allowed, while a repo naming an absurd age could otherwise keep
+/// an hours-old reading binding indefinitely.
+fn narrow_collector_max_age_secs(home: u64, repo: Option<u64>) -> u64 {
+    home.min(repo.unwrap_or(u64::MAX))
+}
+
 /// Issue #358 T8: the repo-narrowing fold for `supervise.orchestrator_
 /// writes` -- `OrchestratorWrites`'s own declared `Allow < Advise < Deny`
 /// order makes `Deny` the strict end, the same shape `deploy::DeployTier`
@@ -3234,6 +3272,28 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
         &["pace", "run_budget_tokens"],
         "ZIRV_CTX_PACE_RUN_BUDGET_TOKENS",
     ),
+    // Audit finding G1: the estimator layer is what the gate falls back to
+    // when no collector reading binds, and its two window budgets are what
+    // turn a raw token sum into the percentage the gate then paces on. A
+    // repo checkout able to set all three chooses BOTH the fallback source
+    // and the scale it is measured against -- it can hand itself an
+    // arbitrary "plenty of headroom" reading with no vendor data involved at
+    // all. `count_cache_reads` moves the same number by including or
+    // excluding the dominant token class in a cached session. All four are
+    // the operator's own spend picture, not the checkout's.
+    (&["pace", "estimator"], "ZIRV_CTX_PACE_ESTIMATOR"),
+    (
+        &["pace", "five_hour_budget_tokens"],
+        "ZIRV_CTX_FIVE_HOUR_BUDGET",
+    ),
+    (
+        &["pace", "seven_day_budget_tokens"],
+        "ZIRV_CTX_SEVEN_DAY_BUDGET",
+    ),
+    (
+        &["pace", "count_cache_reads"],
+        "ZIRV_CTX_PACE_COUNT_CACHE_READS",
+    ),
     // `chat.model` is deliberately ABSENT from this list. See `ChatConfig`'s
     // own doc comment and the spec's "Orchestrator model" section
     // (docs/superpowers/specs/2026-08-13-zirv-dashboard-design.md): unlike
@@ -3580,6 +3640,10 @@ impl CtxConfig {
         let home_pace_enabled = bool_at(take_nested(&mut merged, "pace", "enabled"));
         let home_pace_max_percent = float_at(take_nested(&mut merged, "pace", "max_percent"));
         let home_pace_soft_percent = float_at(take_nested(&mut merged, "pace", "soft_percent"));
+        // Audit finding G1: `pace.collector_max_age_secs` joins the same
+        // lift-before-merge fold -- see `narrow_collector_max_age_secs`.
+        let home_pace_collector_max_age =
+            integer_at(take_nested(&mut merged, "pace", "collector_max_age_secs"));
         // Issue #155, Phase 3: `context.dedupe_native` gets the identical
         // lift-before-merge treatment as `pace.enabled` right above, folded
         // by `narrow_dedupe_bool` instead of `narrow_pace_bool` -- see that
@@ -3754,6 +3818,11 @@ impl CtxConfig {
         let repo_pace_enabled = bool_at(take_nested(&mut repo_layer, "pace", "enabled"));
         let repo_pace_max_percent = float_at(take_nested(&mut repo_layer, "pace", "max_percent"));
         let repo_pace_soft_percent = float_at(take_nested(&mut repo_layer, "pace", "soft_percent"));
+        let repo_pace_collector_max_age = integer_at(take_nested(
+            &mut repo_layer,
+            "pace",
+            "collector_max_age_secs",
+        ));
         let repo_context_dedupe_native =
             bool_at(take_nested(&mut repo_layer, "context", "dedupe_native"));
         let repo_verify_on_stop_enabled =
@@ -3949,6 +4018,19 @@ impl CtxConfig {
                 home_pace_soft_percent.unwrap_or(default_pace.soft_percent),
                 repo_pace_soft_percent,
             )),
+        );
+        insert_path(
+            &mut merged,
+            &["pace", "collector_max_age_secs"],
+            toml::Value::Integer(
+                i64::try_from(narrow_collector_max_age_secs(
+                    home_pace_collector_max_age
+                        .and_then(|v| u64::try_from(v).ok())
+                        .unwrap_or(default_pace.collector_max_age_secs),
+                    repo_pace_collector_max_age.and_then(|v| u64::try_from(v).ok()),
+                ))
+                .unwrap_or(i64::MAX),
+            ),
         );
         let default_context = ContextConfig::default();
         insert_path(
@@ -5310,7 +5392,7 @@ mod tests {
         std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
         std::fs::write(
             repo.path().join(".zirv/ctx.toml"),
-            "[pace]\nenabled = false\nmax_percent = 80.5\nfive_hour_budget_tokens = 500000\ncount_cache_reads = true\n",
+            "[pace]\nenabled = false\nmax_percent = 80.5\ncollector_max_age_secs = 120\n",
         )
         .expect("write");
 
@@ -5321,16 +5403,19 @@ mod tests {
         // merge -- this repo's own `enabled = false` is a weakening attempt
         // against the (enabled) default and is silently ineffective, while
         // `max_percent = 80.5` genuinely tightens the default 99.0% ceiling
-        // and still lands. Every other key in this repo layer (still
-        // ordinary merge) is untouched proof the fold is scoped to exactly
-        // these two/three keys, not the whole `[pace]` table.
+        // and still lands, as does G1's own `collector_max_age_secs`. Every
+        // other key in this repo layer (still ordinary merge) is untouched
+        // proof the fold is scoped to exactly these keys, not the whole
+        // `[pace]` table.
         assert!(
             cfg.pace.enabled,
             "a repo may not disable pacing (T9 narrowing)"
         );
         assert_eq!(cfg.pace.max_percent, 80.5, "a repo may tighten the ceiling");
-        assert_eq!(cfg.pace.five_hour_budget_tokens, 500_000);
-        assert!(cfg.pace.count_cache_reads);
+        assert_eq!(
+            cfg.pace.collector_max_age_secs, 120,
+            "a repo may shorten the staleness horizon (G1 narrowing)"
+        );
         assert_eq!(
             cfg.pace.fallback_delay_secs, 900,
             "untouched keys keep defaults"
@@ -5523,6 +5608,101 @@ mod tests {
         assert!(cfg.pace.poll_enabled);
         assert_eq!(cfg.pace.poll_min_interval_secs, 60);
         assert!(!cfg.pace.use_credits.claude);
+    }
+
+    /// Audit finding G1: the estimator switch, both window budgets and the
+    /// cache-read toggle were plain repo-mergeable, so a checkout could turn
+    /// the estimator on against a budget of its own choosing and have the
+    /// gate pace on numbers it wrote itself. They are `REPO_FORBIDDEN` now.
+    /// `collector_max_age_secs` stays repo-settable but narrows only (lower
+    /// is stricter: a shorter staleness horizon binds less data), so a repo
+    /// can no longer keep an hours-old reading binding by naming an absurd
+    /// age.
+    #[test]
+    fn repo_layer_cannot_widen_pace_collector_max_age_or_budgets() {
+        for (toml, key, variable) in [
+            (
+                "[pace]\nestimator = true\n",
+                "pace.estimator",
+                "ZIRV_CTX_PACE_ESTIMATOR",
+            ),
+            (
+                "[pace]\nfive_hour_budget_tokens = 987654321\n",
+                "pace.five_hour_budget_tokens",
+                "ZIRV_CTX_FIVE_HOUR_BUDGET",
+            ),
+            (
+                "[pace]\nseven_day_budget_tokens = 987654321\n",
+                "pace.seven_day_budget_tokens",
+                "ZIRV_CTX_SEVEN_DAY_BUDGET",
+            ),
+            (
+                "[pace]\ncount_cache_reads = true\n",
+                "pace.count_cache_reads",
+                "ZIRV_CTX_PACE_COUNT_CACHE_READS",
+            ),
+        ] {
+            let repo = tempfile::tempdir().expect("tempdir");
+            let home = tempfile::tempdir().expect("tempdir");
+            let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+            std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+            std::fs::write(repo.path().join(".zirv/ctx.toml"), toml).expect("write");
+            let empty = env_map(&[]);
+            let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+                .expect_err(&format!("a repo may not set: {toml}"));
+            assert!(
+                is_repo_forbidden(err.as_ref()),
+                "must be a security refusal for {toml}: {err}"
+            );
+            let message = err.to_string();
+            assert!(message.contains(key), "name the offending key: {message}");
+            assert!(
+                message.contains(variable),
+                "names the operator escape hatch: {message}"
+            );
+        }
+
+        for (toml, expected, why) in [
+            (
+                "[pace]\ncollector_max_age_secs = 99999999\n",
+                900,
+                "a repo may not widen the staleness horizon",
+            ),
+            (
+                "[pace]\ncollector_max_age_secs = 60\n",
+                60,
+                "a repo may tighten the staleness horizon",
+            ),
+        ] {
+            let repo = tempfile::tempdir().expect("tempdir");
+            let home = tempfile::tempdir().expect("tempdir");
+            let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+            std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+            std::fs::write(repo.path().join(".zirv/ctx.toml"), toml).expect("write");
+            let empty = env_map(&[]);
+            let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+            assert_eq!(cfg.pace.collector_max_age_secs, expected, "{why}");
+        }
+
+        // The operator's own env still overrides both layers outright.
+        let repo = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[pace]\ncollector_max_age_secs = 60\n",
+        )
+        .expect("write");
+        let env = env_map(&[
+            ("ZIRV_CTX_PACE_COLLECTOR_MAX_AGE_SECS", "7200"),
+            ("ZIRV_CTX_PACE_ESTIMATOR", "false"),
+            ("ZIRV_CTX_PACE_COUNT_CACHE_READS", "true"),
+        ]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert_eq!(cfg.pace.collector_max_age_secs, 7200);
+        assert!(!cfg.pace.estimator);
+        assert!(cfg.pace.count_cache_reads);
     }
 
     /// T9: the fold rule itself, pure and direct -- no config file, no env,
