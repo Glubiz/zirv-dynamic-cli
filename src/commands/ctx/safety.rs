@@ -2532,11 +2532,7 @@ pub(crate) fn unwrap_shell_wrapper(segment: &str) -> Option<String> {
         return find_inline_command_flag(rest);
     }
     if matches!(program.as_str(), "cmd" | "cmd.exe") {
-        let after_flag = rest
-            .strip_prefix("/c")
-            .or_else(|| rest.strip_prefix("/C"))
-            .map(str::trim_start)?;
-        return Some(strip_quotes(after_flag).to_string());
+        return find_cmd_inline_command_flag(rest);
     }
     if matches!(
         program.as_str(),
@@ -2562,6 +2558,41 @@ fn find_inline_command_flag(rest: &str) -> Option<String> {
         if is_inline_command_flag(&token) {
             let after: String = chars[end..].iter().collect();
             return Some(strip_quotes(after.trim_start()).to_string());
+        }
+    }
+    None
+}
+
+/// `cmd.exe`'s no-argument switches, any number of which may legally precede
+/// the inline-command one -- `cmd /d /s /c "<payload>"` is what Node's own
+/// `child_process` emits. `/e:`, `/f:`, `/v:` and `/t:` carry their value in
+/// the same token, so they take no separate operand either.
+fn is_cmd_no_argument_switch(token: &str) -> bool {
+    let lower = token.to_ascii_lowercase();
+    matches!(lower.as_str(), "/d" | "/s" | "/q" | "/a" | "/u")
+        || ["/e:", "/f:", "/v:", "/t:"]
+            .iter()
+            .any(|prefix| lower.starts_with(prefix))
+}
+
+/// `cmd.exe`'s counterpart to [`find_inline_command_flag`]: a quote-aware
+/// token scan for the first `/c` or `/k` -- both run their argument, `/k`
+/// only differing by keeping the console open afterwards -- skipping the
+/// no-argument switches that may precede it. Any other token stops the scan
+/// rather than being skipped: an unrecognised switch may take an operand,
+/// and guessing past it would misidentify that operand as the command.
+fn find_cmd_inline_command_flag(rest: &str) -> Option<String> {
+    let chars: Vec<char> = rest.chars().collect();
+    for (start, end) in token_spans(&chars) {
+        let token: String = chars[start..end].iter().collect();
+        let lower = token.to_ascii_lowercase();
+        if lower.starts_with("/c") || lower.starts_with("/k") {
+            let glued: String = chars[start + 2..end].iter().collect();
+            let after: String = chars[end..].iter().collect();
+            return Some(strip_quotes(format!("{glued}{after}").trim()).to_string());
+        }
+        if !is_cmd_no_argument_switch(&token) {
+            return None;
         }
     }
     None
@@ -11240,6 +11271,38 @@ mod tests {
             .verdict,
             Verdict::Ask,
             "powershell -Command must be unwrapped"
+        );
+    }
+
+    /// A2 (2026-09-06 audit): `cmd.exe` accepts its no-argument switches
+    /// before the inline-command one, and `cmd /d /s /c "<payload>"` is what
+    /// Node's own `child_process` emits. Anchoring the unwrap at the very
+    /// start of the argument list meant every such spelling -- and `/k`,
+    /// which also runs its argument -- left the payload unclassified.
+    #[test]
+    fn cmd_inline_command_flag_is_found_after_leading_switches() {
+        let policy = SafetyPolicy::default();
+        for wrapper in [
+            "cmd /c",
+            "cmd /s /c",
+            "cmd /d /s /c",
+            "cmd.exe /Q /C",
+            "cmd /k",
+        ] {
+            let command = format!("{wrapper} \"rm -rf /\"");
+            assert_eq!(
+                evaluate(&policy, &command, LaunchMode::Interactive).verdict,
+                Verdict::Ask,
+                "{command} must be unwrapped like a leading cmd /c"
+            );
+        }
+        assert!(
+            unwrap_shell_wrapper("cmd").is_none(),
+            "a bare cmd wraps no command"
+        );
+        assert!(
+            unwrap_shell_wrapper("cmd /?").is_none(),
+            "cmd /? prints help and wraps no command"
         );
     }
 
