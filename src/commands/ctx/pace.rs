@@ -974,9 +974,10 @@ pub fn describe(decision: &PaceDecision) -> String {
 /// Where a usage message is being written, because the fallback reroute's own
 /// override wording differs between the two (issue #337; see `Route::detail`
 /// in `fallback.rs`, the one remaining consumer of `override_hint`). A pane's
-/// own spawn request carries untrusted `force` JSON, so the only real
-/// override from there is to leave the dashboard channel (`--headless
-/// --force`) or move the ceiling. Issue #358 (T9): no longer consulted by
+/// own spawn request carries untrusted `force` JSON -- cleared outright by
+/// `dash::mod::sanitize_file_dropped_request` (2026-09-06) -- so the only
+/// real override from there is to move the ceiling. Issue #358 (T9): no
+/// longer consulted by
 /// `describe_spawn_gate` below -- a `SpawnGate::Refuse` note has nothing left
 /// to override, since usage headroom never blocks a spawn any more.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -991,9 +992,7 @@ impl Seat {
     pub fn override_hint(self) -> &'static str {
         match self {
             Self::Cli => "pass --force",
-            Self::Pane => {
-                "pass --headless --force, or raise pace.spawn_hard_pct in ~/.zirv/ctx.toml"
-            }
+            Self::Pane => "raise pace.spawn_hard_pct in ~/.zirv/ctx.toml",
         }
     }
 }
