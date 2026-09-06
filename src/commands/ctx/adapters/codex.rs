@@ -512,18 +512,16 @@ impl CodexAdapter {
     /// platform state directory can be resolved at all, which
     /// [`AgentAdapter::transcript_path`] treats as "pin nothing, resolve
     /// nothing".
+    #[cfg(test)]
     fn state_dir(&self) -> Option<super::super::state::StateDir> {
-        #[cfg(test)]
-        {
-            return self
-                .forced_state_root
-                .clone()
-                .map(super::super::state::StateDir::from_root);
-        }
-        #[cfg(not(test))]
-        {
-            super::super::state::StateDir::resolve(&super::super::config::env_from_process()).ok()
-        }
+        self.forced_state_root
+            .clone()
+            .map(super::super::state::StateDir::from_root)
+    }
+
+    #[cfg(not(test))]
+    fn state_dir(&self) -> Option<super::super::state::StateDir> {
+        super::super::state::StateDir::resolve(&super::super::config::env_from_process()).ok()
     }
 
     /// Resolution 2 and 3 of [`AgentAdapter::transcript_path`] -- see its own
