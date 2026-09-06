@@ -38,7 +38,7 @@ semantic verb unless raw control is specifically needed.
 
 ## One line per capability
 
-- `zirv ctx status` (`--brief --diff` for a cheap repeat check): what is
+- `zirv ctx status` (brief + changed-sections by default; `--full` for the whole report): what is
   running and why.
 - `zirv ctx agent`: delegate one task to a session; it runs to completion
   and returns, so no separate wait/poll verb exists. `--worktree` isolates
