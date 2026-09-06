@@ -972,19 +972,31 @@ fn sensitive_shared_term(haystack: &str) -> Option<&'static str> {
         .find(|term| lower.contains(term))
 }
 
-/// Runs both halves of the shared-scope credential check
-/// (`sensitive_shared_term`'s deny-list and `review::detect_token_shape`'s
-/// regex families -- OpenAI/GitHub/Slack/AWS-style keys, a PEM private-key
-/// block, a JWT, reused rather than duplicated since the `regex` crate and
-/// these exact families are already a workspace dependency) against one
+/// Runs all three halves of the shared-scope credential check against one
 /// field, named `label` in the returned message for `sensitive_shared_match`
-/// below. `None` means nothing matched in this field.
+/// below: `sensitive_shared_term`'s deny-list, then
+/// `review::detect_token_shape`'s regex families (OpenAI/Stripe/GitHub/
+/// Slack/Google/npm/AWS-style keys, a Slack webhook URL, a URL with an
+/// embedded password, a PEM private-key block, a JWT -- reused rather than
+/// duplicated since the `regex` crate and these exact families are already a
+/// workspace dependency), then `review::detect_high_entropy_run` for a
+/// credential of no known shape at all. `None` means nothing matched here.
+///
+/// The entropy arm is parity with `screen.rs`, which has always run
+/// `detect_token_shape(text) || detect_high_entropy_run(text)` -- and screens
+/// only machine-local mail. This bank is committed to the repository and
+/// readable by everyone who can clone it, so it cannot be the one with the
+/// weaker screen: an unlabeled random-looking secret stored clean here is
+/// unrecoverable from every future clone's history.
 fn sensitive_shared_field(label: &str, value: &str) -> Option<String> {
     if let Some(term) = sensitive_shared_term(value) {
         return Some(format!("the term '{term}' in its {label}"));
     }
-    crate::commands::workflow::review::detect_token_shape(value)
-        .map(|family| format!("a {family} in its {label}"))
+    if let Some(family) = crate::commands::workflow::review::detect_token_shape(value) {
+        return Some(format!("a {family} in its {label}"));
+    }
+    crate::commands::workflow::review::detect_high_entropy_run(value)
+        .map(|run| format!("a {run} in its {label}"))
 }
 
 /// Whether `entry` looks credential-shaped rather than a durable,
@@ -7754,6 +7766,46 @@ This is part of the body too.\n";
         )
         .expect_err("a GitHub-shaped token must be refused");
         assert!(err.to_string().contains("credential"), "got {err}");
+    }
+
+    /// The git-committed shared bank ran only the deny-list plus
+    /// `detect_token_shape`, while `screen.rs` -- guarding merely
+    /// machine-local mail -- also runs `detect_high_entropy_run`. So the
+    /// weaker screen sat in front of the stronger consequence: every one of
+    /// these stored clean into a file every future clone of the repository
+    /// gets.
+    #[test]
+    fn sensitive_shared_match_refuses_a_basic_auth_url_and_a_high_entropy_body() {
+        let refused = [
+            "clone with https://deploybot:Hunter2Xy9qQz@github.com/org/repo.git",
+            concat!("billing uses sk_", "live_51H8xYz2eZvKYlo2CqRtUvWxYzAbCdEfGh"),
+            concat!("alerts post to https://hooks.slack.com/", "services/T00000000/B11111111/aBcDeFgHiJkLmNoPqRsTuVwX"),
+            "maps calls use AIzaSyC1qR3tUvWxYzAbCdEfGhIjKlMnOpQrStU",
+            "the registry token is npm_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789",
+            // No known family at all -- only the entropy fallback
+            // `screen.rs` has always applied catches this one.
+            "the value is Zk3pQ7rW1xL9vB2nC5mT8yH4jF6dS0aG3eR7uI2oX5wN9bV4",
+        ];
+        for body in refused {
+            let mut entry = sample("deploy-notes", 1);
+            entry.body = body.to_string();
+            assert!(
+                sensitive_shared_match(&entry).is_some(),
+                "must be refused from the committed bank: {body}"
+            );
+        }
+
+        // The entropy arm must not start refusing ordinary prose: no run of
+        // word characters here is long enough to be a candidate.
+        let mut prose = sample("deploy-notes", 1);
+        prose.body = "the internationalization guidelines are unambiguously authoritative and \
+             the deployment checklist lives under docs/deployment/checklist.md"
+            .to_string();
+        assert!(
+            sensitive_shared_match(&prose).is_none(),
+            "ordinary prose with long words is still accepted: {:?}",
+            sensitive_shared_match(&prose)
+        );
     }
 
     #[test]
