@@ -3012,6 +3012,13 @@ fn perform_handover_swap(
     // writing is now a dead file, and the successor reports its own on its
     // first turn.
     transcript.forget();
+    // R6: the successor keeps this session's id, so codex's rollout pin would
+    // otherwise keep answering the dead child's file for the rest of the run.
+    super::adapters::codex::forget_transcript_pin(
+        state_dir,
+        &super::sessions::short_id(session.as_str()),
+        super::state::now_secs(),
+    );
     quit?;
     let new_generation = new_generation.ok_or("generation not bumped; pty writer poisoned")?;
 
