@@ -6695,6 +6695,48 @@ mod tests {
         assert!(record.spent_tokens >= 50_000, "got {}", record.spent_tokens);
     }
 
+    /// The restart hook advances the durable objective with THIS process's
+    /// own `prior_usage` total, which restarts from zero every time `exec`
+    /// relaunches -- while `roll_up_spend` has been accumulating the whole
+    /// run's spend into the same record. Persisting the smaller figure would
+    /// erase the rolled-up total and hand the next child a budget line that
+    /// says it has room it does not have.
+    #[test]
+    fn an_objective_restart_layer_never_regresses_a_rolled_up_spend() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let key = super::super::state::repo_slug(tmp.path());
+        objective::store(
+            &state,
+            &key,
+            &objective::Objective {
+                schema_version: objective::SCHEMA_VERSION,
+                objective: "finish the batch".to_string(),
+                budget_tokens: Some(200_000),
+                deadline_secs: None,
+                spent_tokens: 300_000,
+                started_at: 1_700_000_000,
+                status: objective::Status::BudgetLimited,
+                pending_note: None,
+                evidence: Vec::new(),
+            },
+        )
+        .expect("store objective");
+
+        let text = objective_layer_for_restart(&state, tmp.path(), 1_700_000_100, 50_000)
+            .expect("a live objective renders a layer");
+        assert!(
+            text.contains("300000 / 200000 tokens spent"),
+            "the layer must show the durable total, not this process's own: {text}"
+        );
+
+        let record = objective::load(&state, &key)
+            .expect("load")
+            .expect("still present");
+        assert_eq!(record.spent_tokens, 300_000);
+        assert_eq!(record.status, objective::Status::BudgetLimited);
+    }
+
     /// M8: a restart used to rebuild the headless command from scratch with
     /// only zirv's own added flags (the system prompt), silently dropping any
     /// extra flag the operator themselves had passed after `--`. Only lines

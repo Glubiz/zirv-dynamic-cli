@@ -100,10 +100,18 @@ pub fn store(state: &StateDir, key: &str, record: &Objective) -> CtxResult<()> {
 /// never reseeds back to a live status no matter what `now`/`spent` say --
 /// closing asserts the whole objective is done (see `run_close`'s own
 /// verification gate), and nothing here may undo that.
+///
+/// The spend counter is durable and MONOTONE: `spent` is a floor, never an
+/// overwrite. [`roll_up_spend`] accumulates the whole run's spend into the
+/// record, while `exec`'s restart hook (`objective_layer_for_restart`) can
+/// only supply the CURRENT process's own total, which starts back at zero
+/// after every restart -- writing that absolutely would erase the rolled-up
+/// history and un-trip a budget that had already fired.
 pub fn advance(mut record: Objective, now: u64, spent: u64) -> Objective {
     if record.status == Status::Closed {
         return record;
     }
+    let spent = spent.max(record.spent_tokens);
     record.spent_tokens = spent;
     record.status = if record.budget_tokens.is_some_and(|budget| spent >= budget) {
         Status::BudgetLimited
@@ -427,6 +435,29 @@ mod tests {
         let at = advance(record, 1_700_000_100, 100_000);
         assert_eq!(at.status, Status::BudgetLimited);
         assert_eq!(at.spent_tokens, 100_000);
+    }
+
+    /// The durable counter is the whole run's, rolled up by every cycle
+    /// (`roll_up_spend`); `exec`'s restart hook advances it with the CURRENT
+    /// process's own total, which starts from zero after a restart. Writing
+    /// that absolutely would erase the rolled-up history and un-trip a budget
+    /// that had already fired, so the counter only ever climbs.
+    #[test]
+    fn advance_never_lowers_the_durable_spend() {
+        let mut record = sample(1_700_000_000); // budget_tokens: Some(100_000)
+        record.spent_tokens = 300_000;
+        record.status = Status::BudgetLimited;
+
+        let advanced = advance(record, 1_700_000_100, 50_000);
+        assert_eq!(
+            advanced.spent_tokens, 300_000,
+            "a fresh process's own smaller total must not overwrite the rolled-up one"
+        );
+        assert_eq!(
+            advanced.status,
+            Status::BudgetLimited,
+            "and the budget it already crossed stays crossed"
+        );
     }
 
     #[test]
