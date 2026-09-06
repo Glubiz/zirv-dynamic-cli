@@ -264,7 +264,9 @@ pub fn candidate_allowed_by_capacity(cfg: &CtxConfig, name: &str, bounds: TaskBo
 /// excluded from every harness's live `active` count so a session never
 /// counts its own registry row as capacity already spent -- `None` when the
 /// caller has no session identity to exclude (a dashboard authority path,
-/// for instance).
+/// for instance). Matched through [`is_same_session`], because the production
+/// caller (`agent::run_with`) passes a SHORT id while the registry rows hold
+/// full session ids.
 pub fn capacity_snapshot(
     state: &StateDir,
     cfg: &CtxConfig,
@@ -317,7 +319,7 @@ pub fn capacity_snapshot(
             .filter(|(record, liveness)| {
                 *liveness == sessions::Liveness::Live
                     && record.agent.eq_ignore_ascii_case(name)
-                    && requester.is_none_or(|req| record.session != req)
+                    && requester.is_none_or(|req| !is_same_session(&record.session, req))
             })
             .count() as u32;
         let limits = cfg.fallback.harness_limits(name);
@@ -383,7 +385,20 @@ fn refresh_ranked_providers(state: &StateDir, cfg: &CtxConfig, now: u64, names: 
         // No poller: a capacity snapshot is a ranking read, not a gating
         // one, and must never spend the operator's OAuth token on an
         // outbound vendor request of its own. Passive sources only.
-        let mut flags = pace::PaceGateFlags::default();
+        //
+        // R1-2 (2026-09-06 review): the scan-attempt clock comes from (and
+        // goes back into) this process's own ledger rather than a fresh
+        // zeroed `PaceGateFlags`. `refresh_sources` floors codex's rollout
+        // scan on `flags.last_codex_scan`, so a per-call default of `0`
+        // opened that floor on EVERY snapshot -- and the dashboard takes one
+        // per second on its UI thread (`FactsCache`), so a stale stored
+        // reading with no newer rollout on disk re-walked and re-sorted the
+        // whole `~/.codex/sessions` tree once a second, synchronously, in
+        // front of every pane.
+        let mut flags = pace::PaceGateFlags {
+            last_codex_scan: last_scan_attempt(&provider),
+            ..pace::PaceGateFlags::default()
+        };
         pace::refresh_sources(
             state,
             &cfg.pace,
@@ -396,7 +411,69 @@ fn refresh_ranked_providers(state: &StateDir, cfg: &CtxConfig, now: u64, names: 
             },
             &mut flags,
         );
+        record_scan_attempt(&provider, flags.last_codex_scan);
     }
+}
+
+/// R1-2: this process's own "when did a capacity snapshot last ATTEMPT a
+/// passive rollout scan for this provider" ledger, keyed by provider name.
+///
+/// Process-wide rather than persisted: the floor exists to stop one process
+/// (a dashboard, a wait loop) re-walking a session tree many times a second,
+/// which is a per-process problem; a fresh process paying one scan on its
+/// first snapshot is the behaviour `refresh_sources` already documents for
+/// its own `PaceGateFlags`. A poisoned lock degrades to "never scanned",
+/// which is exactly today's behaviour and never blocks a ranking read.
+static SCAN_ATTEMPTS: std::sync::Mutex<Vec<(String, u64)>> = std::sync::Mutex::new(Vec::new());
+
+/// Test-only: clears the process-wide ledger. Every test that depends on
+/// whether a snapshot actually scans has to start from a known clock, because
+/// a serial (`--test-threads=1`) run shares this process with every other
+/// test that took a snapshot before it.
+#[cfg(test)]
+fn reset_scan_attempts() {
+    if let Ok(mut ledger) = SCAN_ATTEMPTS.lock() {
+        ledger.clear();
+    }
+}
+
+fn last_scan_attempt(provider: &str) -> u64 {
+    SCAN_ATTEMPTS
+        .lock()
+        .ok()
+        .and_then(|ledger| {
+            ledger
+                .iter()
+                .find(|(name, _)| name == provider)
+                .map(|(_, at)| *at)
+        })
+        .unwrap_or(0)
+}
+
+fn record_scan_attempt(provider: &str, at: u64) {
+    let Ok(mut ledger) = SCAN_ATTEMPTS.lock() else {
+        return;
+    };
+    match ledger.iter_mut().find(|(name, _)| name == provider) {
+        // Monotonic: a caller passing an older `now` (a test clock, a
+        // snapshot built for a historical instant) must never re-open the
+        // floor for the callers using the real one.
+        Some((_, stored)) => *stored = (*stored).max(at),
+        None => ledger.push((provider.to_string(), at)),
+    }
+}
+
+/// Whether a registry row's `session` and a caller-supplied `requester`
+/// name the same session. R1-3 (2026-09-06 review): `agent::run_with` builds
+/// its `RouteRequest.requester` from `mail::session_identity`, which yields a
+/// SHORT id (`sessions::short_id`), while `sessions::Record::session` holds
+/// the full one -- so the production path's exclusion never matched and a
+/// session with `max_active = 1` still counted itself, exactly the bug the
+/// exclusion was added to fix. Comparing shorts covers both spellings:
+/// `short_id` of an already-short id is that id.
+fn is_same_session(record_session: &str, requester: &str) -> bool {
+    record_session == requester
+        || sessions::short_id(record_session) == sessions::short_id(requester)
 }
 
 fn build_provider_capacity(
@@ -1774,6 +1851,7 @@ mod tests {
     /// reported `Unknown` forever.
     #[test]
     fn capacity_snapshot_refreshes_every_provider_in_the_order() {
+        reset_scan_attempts();
         let tmp = tempfile::tempdir().expect("tempdir");
         let home = tempfile::tempdir().expect("home tempdir");
         let state = StateDir::from_root(tmp.path().join("state"));
@@ -1861,6 +1939,165 @@ mod tests {
         assert_eq!(
             route, None,
             "a session must never count its own registry row as capacity already spent"
+        );
+    }
+
+    /// R1-3: the production caller (`agent::run_with`) builds `requester`
+    /// from `mail::session_identity`, which is a SHORT id, while the registry
+    /// row holds the full session id -- so the exclusion above never actually
+    /// fired on the path it was written for, and a `max_active = 1` harness
+    /// still counted the requester against itself. The test above passes the
+    /// full id and so could not see it; this one passes what production does.
+    #[test]
+    fn a_requesting_session_is_excluded_when_it_names_itself_by_short_id() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("home tempdir");
+        let _home = crate::commands::ctx::testenv::EnvGuard::set(home.path(), None);
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let mut cfg = test_cfg_with_ready_adapters();
+        cfg.fallback.harness.insert(
+            "claude".to_string(),
+            crate::commands::ctx::config::HarnessLimits {
+                max_active: Some(1),
+                reserve_headroom_pct: None,
+            },
+        );
+        let now = 1_700_000_000;
+        store_usage(&state, "anthropic", 10.0, now + 3_600, now);
+        store_usage(&state, "openai", 10.0, now + 3_600, now);
+
+        let record = sessions::Record::new(
+            "11111111-2222-4333-8444-555555555555",
+            "claude",
+            tmp.path(),
+            sessions::Verb::Wrap,
+        );
+        let session = record.session.clone();
+        let _guard = sessions::SessionGuard::register(&state, record);
+
+        // Exactly what `mail::session_identity` hands `RouteRequest`.
+        let short = sessions::short_id(&session);
+        assert_ne!(short, session, "sanity: the short id is not the full id");
+
+        let snapshot = capacity_snapshot(&state, &cfg, now, Some(&short), Some("claude"));
+        let claude = snapshot.harness("claude").expect("claude in the snapshot");
+        assert_eq!(
+            claude.active, 0,
+            "a session addressed by its own short id is still itself: {}",
+            claude.state_reason
+        );
+
+        let route = route_new_delegation(
+            &state,
+            &cfg,
+            RouteRequest {
+                requested: "claude",
+                source_model: Some("sonnet"),
+                source_model_explicit: false,
+                delegation: true,
+                bounds: TaskBounds {
+                    tokens: None,
+                    tool_calls: None,
+                },
+                now,
+                exclude: None,
+                requester: Some(&short),
+            },
+            false,
+        );
+        assert_eq!(
+            route, None,
+            "and so it is never rerouted off its own harness for capacity it is itself"
+        );
+    }
+
+    /// R1-2: every snapshot used to start from a zeroed `PaceGateFlags`, so
+    /// `refresh_sources`' codex scan floor never applied ACROSS snapshots --
+    /// and the dashboard takes one per second on its UI thread. A stale
+    /// stored reading with no newer rollout on disk therefore re-walked the
+    /// whole `~/.codex/sessions` tree once a second, synchronously.
+    ///
+    /// `collector_max_age_secs = 1` keeps `refresh_codex_usage`'s own inner
+    /// staleness gate wide open, isolating the outer floor as the only thing
+    /// that can explain a skipped scan -- the same isolation `pace.rs`'s own
+    /// floor test uses.
+    #[test]
+    fn two_snapshots_inside_the_scan_floor_walk_the_codex_tree_once() {
+        reset_scan_attempts();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("home tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let mut cfg = test_cfg_with_ready_adapters();
+        cfg.pace.collector_max_age_secs = 1;
+
+        let day = home
+            .path()
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("02")
+            .join("26");
+        std::fs::create_dir_all(&day).expect("sessions dir");
+        let rollout = |ts: &str, percent: f64| {
+            format!(
+                "{{\"timestamp\":\"{ts}\",\"type\":\"event_msg\",\"payload\":{{\"type\":\
+                 \"token_count\",\"rate_limits\":{{\"primary\":{{\"used_percent\":{percent},\
+                 \"window_minutes\":300,\"resets_at\":1772135737}}}}}}}}\n"
+            )
+        };
+        std::fs::write(day.join("a.jsonl"), rollout("2026-02-26T18:52:21Z", 12.0))
+            .expect("rollout a");
+
+        let observed = crate::commands::ctx::window::parse_rfc3339_utc("2026-02-26T18:52:21Z")
+            .expect("fixture timestamp");
+        let now = observed + 60;
+
+        let _home = crate::commands::ctx::testenv::EnvGuard::set(home.path(), None);
+        let _ = capacity_snapshot(&state, &cfg, now, None, Some("claude"));
+        let after_first = crate::commands::ctx::window::load_for(
+            &state,
+            crate::commands::ctx::window::CODEX_USAGE_PROVIDER,
+        )
+        .and_then(|w| w.five_hour)
+        .expect("the first snapshot scans, since nothing has been scanned yet");
+        assert_eq!(after_first.used_percentage, 12.0);
+
+        // A fresher rollout appears, and a second snapshot lands well inside
+        // the floor -- the dashboard's own cadence is one per second.
+        std::fs::write(day.join("b.jsonl"), rollout("2026-02-26T18:57:21Z", 99.0))
+            .expect("rollout b");
+
+        let _ = capacity_snapshot(&state, &cfg, now + 1, None, Some("claude"));
+
+        let after_second = crate::commands::ctx::window::load_for(
+            &state,
+            crate::commands::ctx::window::CODEX_USAGE_PROVIDER,
+        )
+        .and_then(|w| w.five_hour)
+        .expect("still stored");
+        assert_eq!(
+            after_second.used_percentage, 12.0,
+            "a second snapshot one second later must not re-walk the sessions tree"
+        );
+
+        // And once the floor has elapsed, the scan is due again -- throttled,
+        // never disabled.
+        let _ = capacity_snapshot(
+            &state,
+            &cfg,
+            now + crate::commands::ctx::window::CODEX_SCAN_FLOOR_SECS + 1,
+            None,
+            Some("claude"),
+        );
+        let after_third = crate::commands::ctx::window::load_for(
+            &state,
+            crate::commands::ctx::window::CODEX_USAGE_PROVIDER,
+        )
+        .and_then(|w| w.five_hour)
+        .expect("still stored");
+        assert_eq!(
+            after_third.used_percentage, 99.0,
+            "past the floor the newer rollout is picked up"
         );
     }
 

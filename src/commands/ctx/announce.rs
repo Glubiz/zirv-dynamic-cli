@@ -137,8 +137,9 @@ pub enum Event {
     /// Context health is slipping (the rot advisory `wrap`'s pump used to
     /// build by hand as `advisory_line`).
     RotAdvisory { score: u32, tokens: u64 },
-    /// A delegated headless run (`zirv ctx agent`, or an `agent:` script
-    /// step) started on another harness.
+    /// A delegated supervised run (`zirv ctx agent`, or an `agent:` script
+    /// step) started on another harness -- inline in this terminal, or as a
+    /// pane on a live dashboard.
     DelegatedStart { agent: String },
     /// A delegated run finished, naming the human-readable meaning of its
     /// exit (`exec::describe_exit`'s own text for the two supervisor exit

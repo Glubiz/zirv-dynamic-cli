@@ -123,13 +123,6 @@ fn finding_key(finding: &ReviewFinding) -> String {
 /// called with, so a distinct `created_at` is this module's own round
 /// marker -- two findings sharing a key only count as recurrence once they
 /// carry at least two distinct `created_at` values.
-/// H-7: "recurred" means the same finding identity survived across a fix
-/// pass into a *later* review round, not merely that two findings from the
-/// same round happen to share a location. `build_review_findings` stamps
-/// every finding from one reviewer run with the identical `created_at` it is
-/// called with, so a distinct `created_at` is this module's own round
-/// marker -- two findings sharing a key only count as recurrence once they
-/// carry at least two distinct `created_at` values.
 fn has_repeated_meaningful_finding(findings: &[ReviewFinding]) -> bool {
     let mut seen: std::collections::BTreeMap<String, std::collections::BTreeSet<u64>> =
         std::collections::BTreeMap::new();
@@ -2339,7 +2332,16 @@ pub(crate) fn reviewer_argv(
         seat.manifest.role,
         seat.manifest.instructions.trim()
     );
-    let mut seat_args = adapter.system_prompt_args(&system_prompt);
+    // R1-4 (2026-09-06 review): the seat instructions travel as `zirv ctx
+    // agent`'s own `--system-prompt`, not as a trailing `--append-system-
+    // prompt` in `seat_args` below. Trailing flags become argv on the real
+    // harness child, so `dash::mod::sanitize_file_dropped_request` clears
+    // them -- which silently ran every pane-fulfilled review with NO seat
+    // instructions at all. As a zirv flag the text reaches BOTH forks: an
+    // inline run renders it through this same `system_prompt_args` seam
+    // (`agent::flags_with_system_prompt`), and a pane carries it as
+    // `SpawnRequest::system_prompt`.
+    let mut seat_args: Vec<String> = Vec::new();
     // Enforce the same review-model resolution `review_roster_line` only
     // ADVISES the orchestrator with (operator's own `review.<agent>` first,
     // else the adapter's own ladder default one tier below `chat.model`) --
@@ -2375,12 +2377,18 @@ pub(crate) fn reviewer_argv(
     // pane-fulfilled review is already a first-class outcome here --
     // `ReviewerRun::dashboard_spawn` records no evidence and waits for the
     // worker's own report -- so this stays one argv, not two paths.
+    //
+    // R1-4: the seat instructions state that the same way -- `--system-
+    // prompt`, a zirv flag, which travels on the request as data instead of
+    // being dropped with the trailing flags.
     let mut argv = vec![
         "agent".to_string(),
         agent.to_string(),
         "-".to_string(),
         "--mode".to_string(),
         "read-only".to_string(),
+        "--system-prompt".to_string(),
+        system_prompt,
     ];
     // Must land before `--`: these are `zirv agent`'s own flags, not the
     // adapter's passthrough.
@@ -3796,9 +3804,22 @@ mod tests {
         let claude = reviewer_argv("claude", repo.path(), false, None, None).unwrap();
         assert_eq!(
             &claude[..6],
-            ["agent", "claude", "-", "--mode", "read-only", "--"],
-            "2026-09-06: no `--headless` -- the reviewer states its read-only floor as a request \
-             field, so a pane fulfilling it re-applies the pin server-side"
+            [
+                "agent",
+                "claude",
+                "-",
+                "--mode",
+                "read-only",
+                "--system-prompt"
+            ],
+            "2026-09-06: no `--headless` -- the reviewer states its read-only floor and (R1-4) its \
+             seat instructions as request fields, so a pane fulfilling it re-applies both \
+             server-side"
+        );
+        assert_eq!(
+            claude.get(7).map(String::as_str),
+            Some("--"),
+            "the seat text is one argv token, and the passthrough separator follows it: {claude:?}"
         );
         assert!(
             !claude.iter().any(|arg| arg == "--headless"),
@@ -3837,7 +3858,14 @@ mod tests {
         let codex = reviewer_argv("codex", repo.path(), false, None, None).unwrap();
         assert_eq!(
             &codex[..6],
-            ["agent", "codex", "-", "--mode", "read-only", "--"]
+            [
+                "agent",
+                "codex",
+                "-",
+                "--mode",
+                "read-only",
+                "--system-prompt"
+            ]
         );
         assert!(
             codex
