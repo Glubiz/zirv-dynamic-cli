@@ -3042,6 +3042,21 @@ fn generated_path(path: &str) -> bool {
     )
 }
 
+/// The deletion program behind `first`, with PowerShell's own aliases
+/// resolved to the cmdlet name -- `ri` is a live alias for `Remove-Item`, so
+/// both spellings must reach the same classifier arm. Shared by
+/// [`is_recursive_delete`] and [`provably_generated_cleanup`] so the two
+/// cannot learn different alias sets. `del`/`erase`/`rmdir`/`rd`/`rm` keep
+/// their own names: those arms already carry the cmd.exe and POSIX flag
+/// semantics that go with each spelling.
+fn normalized_delete_program(first: &str) -> String {
+    let program = sql_program_name(first);
+    match program.as_str() {
+        "ri" => "remove-item".to_string(),
+        _ => program,
+    }
+}
+
 fn is_recursive_delete(command: &str) -> bool {
     let Some(tokens) = sql_tokens(&collapse_whitespace(command)) else {
         return false;
@@ -3049,7 +3064,7 @@ fn is_recursive_delete(command: &str) -> bool {
     let Some(first) = tokens.first() else {
         return false;
     };
-    let program = sql_program_name(first);
+    let program = normalized_delete_program(first);
     match program.as_str() {
         "rm" => tokens.iter().skip(1).any(|token| {
             token == "--recursive"
@@ -3080,7 +3095,7 @@ fn provably_generated_cleanup(command: &str) -> bool {
     let Some(first) = tokens.first() else {
         return false;
     };
-    let program = sql_program_name(first);
+    let program = normalized_delete_program(first);
     let mut recursive = false;
     let mut targets = Vec::new();
     for token in tokens.iter().skip(1) {
@@ -11535,6 +11550,38 @@ mod tests {
             Verdict::Ask,
             "powershell -Command must be unwrapped"
         );
+    }
+
+    /// A6 (2026-09-06 audit): both deletion classifiers knew
+    /// `Remove-Item` but not `ri`, PowerShell's own live alias for it, so
+    /// `ri -Recurse -Force C:\work` classified as an unknown command while
+    /// the cmdlet spelling asked. One shared normalizer now feeds both arms.
+    #[test]
+    fn the_powershell_remove_item_alias_ri_classifies_like_remove_item() {
+        let policy = SafetyPolicy::default();
+        for (alias, cmdlet, expected) in [
+            (
+                r"ri -Recurse -Force C:\work",
+                r"Remove-Item -Recurse -Force C:\work",
+                Verdict::Ask,
+            ),
+            (
+                "ri -Recurse -Force target",
+                "Remove-Item -Recurse -Force target",
+                Verdict::Allow,
+            ),
+        ] {
+            assert_eq!(
+                evaluate(&policy, cmdlet, LaunchMode::Interactive).verdict,
+                expected,
+                "{cmdlet} is the reference spelling"
+            );
+            assert_eq!(
+                evaluate(&policy, alias, LaunchMode::Interactive).verdict,
+                expected,
+                "{alias} must classify like {cmdlet}"
+            );
+        }
     }
 
     /// A5 (2026-09-06 audit): the docker arm knew only `* prune` and
