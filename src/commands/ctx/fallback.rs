@@ -182,6 +182,16 @@ pub struct RouteRequest<'a> {
     /// worker's own vendor-blocked reroute (`route_blocked_session`) is not
     /// an orchestrator-seat delegation and excludes nothing extra.
     pub exclude: Option<&'a str>,
+    /// The requesting session's own identity (`mail::session_identity`'s
+    /// shape), excluded from its harness's live `active` count by
+    /// [`capacity_snapshot`] so a session never counts its own registry row
+    /// as capacity already spent -- `pool.rs` and `rollover.rs` always
+    /// passed one, these two paths did not, which made
+    /// `fallback.harness.<name>.max_active = 1` read as permanently
+    /// `Draining` for that harness's own delegations. `None` for a caller
+    /// with no session identity to exclude (the dashboard's own Spawn
+    /// overlay authority path).
+    pub requester: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -269,6 +279,8 @@ pub fn capacity_snapshot(
         names.push(requested.to_string());
     }
 
+    refresh_ranked_providers(state, cfg, now, &names);
+
     let mut provider_names: Vec<String> = Vec::new();
     let mut providers: Vec<allocator::ProviderCapacity> = Vec::new();
     // Raw (pre-`binding()`-filter) observed_at per provider, so a divergence
@@ -345,6 +357,48 @@ pub fn capacity_snapshot(
     }
 }
 
+/// Refreshes every provider this snapshot is about to rank, not merely the
+/// one the caller asked about.
+///
+/// [`build_provider_capacity`] is a pure read of whatever `pace::current_
+/// windows` already has on disk, and `pace::refresh_sources` only ever
+/// refreshes the single provider named to it -- which each caller resolved
+/// from its OWN requested harness. So while claude held the seat, nothing on
+/// this path ever refreshed codex's `usage-openai.json`: its windows aged
+/// out, `pace::binding` dropped them, `ProviderCapacity.windows` came back
+/// empty and `allocator::classify` reported `Unknown` forever, which is
+/// exactly the "work is never distributed to codex" half of the operator's
+/// report. Each provider is refreshed at most once per snapshot, and every
+/// refresh is itself floored/short-circuited by `refresh_sources` (a codex
+/// rollout scan is skipped outright while the stored reading is fresher than
+/// `collector_max_age_secs`), so this adds no I/O in the steady state.
+fn refresh_ranked_providers(state: &StateDir, cfg: &CtxConfig, now: u64, names: &[String]) {
+    let mut seen: Vec<String> = Vec::new();
+    for name in names {
+        let provider = adapters::provider_for_agent_name(Some(name)).to_string();
+        if seen.contains(&provider) {
+            continue;
+        }
+        seen.push(provider.clone());
+        // No poller: a capacity snapshot is a ranking read, not a gating
+        // one, and must never spend the operator's OAuth token on an
+        // outbound vendor request of its own. Passive sources only.
+        let mut flags = pace::PaceGateFlags::default();
+        pace::refresh_sources(
+            state,
+            &cfg.pace,
+            now,
+            &provider,
+            &pace::PaceGate {
+                use_credits: false,
+                poller: None,
+                initial_launch: false,
+            },
+            &mut flags,
+        );
+    }
+}
+
 fn build_provider_capacity(
     state: &StateDir,
     cfg: &CtxConfig,
@@ -389,7 +443,15 @@ fn build_provider_capacity(
         pace::spawn_gate(&collector, estimator.as_ref(), now, &cfg.pace),
         SpawnGate::Refuse { .. }
     );
-    let degraded = windows.iter().any(|w| w.stale);
+    // A provider whose readings were ALL dropped (stale past their own
+    // window, or reset) has no usable signal at all -- strictly worse than
+    // one holding a stale-but-still-binding reading, and the old
+    // `any(|w| w.stale)` reported exactly that case as healthy because
+    // `windows` was empty. `raw_observed_at` is the pre-filter evidence that
+    // a reading existed at all, which is what tells "dropped" apart from
+    // "this provider was never observed".
+    let degraded =
+        windows.iter().any(|w| w.stale) || (windows.is_empty() && !raw_observed_at.is_empty());
 
     (
         allocator::ProviderCapacity {
@@ -420,8 +482,12 @@ fn best_alternate(
 ) -> Option<(String, String, CandidateHeadroom)> {
     let mut best: Option<(usize, String, String, CandidateHeadroom)> = None;
     for (order_index, name) in cfg.fallback.order.iter().enumerate() {
-        if name == request.requested
-            || excluded.iter().any(|seen| seen == name)
+        // Case-insensitively, like `request.exclude` right below and like
+        // `allocator::place`'s own order walk: `excluded` is parsed from
+        // `VISITED_ENV`, whose spelling this process does not control, and a
+        // harness is never an alternate to itself under a different case.
+        if name.eq_ignore_ascii_case(request.requested)
+            || excluded.iter().any(|seen| seen.eq_ignore_ascii_case(name))
             || request
                 .exclude
                 .is_some_and(|excl| excl.eq_ignore_ascii_case(name))
@@ -537,7 +603,13 @@ pub fn route_new_delegation(
     };
 
     if cfg.fallback.adaptive_delegation {
-        let snapshot = capacity_snapshot(state, cfg, request.now, None, Some(request.requested));
+        let snapshot = capacity_snapshot(
+            state,
+            cfg,
+            request.now,
+            request.requester,
+            Some(request.requested),
+        );
         let concurrency_triggered = snapshot.harness(request.requested).is_some_and(|harness| {
             matches!(
                 harness.state,
@@ -548,7 +620,15 @@ pub fn route_new_delegation(
             return None;
         }
         let unit = work_unit_for(request);
-        let exclude = request.exclude.into_iter().collect::<Vec<_>>();
+        let mut exclude = request.exclude.into_iter().collect::<Vec<_>>();
+        // A trigger has already fired, so rule (a) of `allocator::place` --
+        // "keep the requested harness whenever it is merely `Ready`" -- must
+        // not silently overrule it. `Ready` covers every headroom above the
+        // reserve floor (10% by default), so without this the whole
+        // `predictive_headroom_pct` band was dead in adaptive mode: a
+        // delegation only ever steered at the reserve floor or the hard
+        // spawn ceiling, never at the 20% threshold the legacy path honours.
+        exclude.push(request.requested);
         let models = |name: &str| translated_model_for(request, name, cfg);
         let placement = super::allocator::place(&snapshot, cfg, &unit, &exclude, &models);
         let candidate = placement.selected.filter(|_| !placement.keep_requested)?;
@@ -684,8 +764,10 @@ pub fn earliest_reset_choice(
     let mut best_order = usize::MAX;
 
     for (order_index, name) in cfg.fallback.order.iter().enumerate() {
-        if name == request.requested
-            || excluded.iter().any(|seen| seen == name)
+        // Same case-insensitive rule as `best_alternate`, for the same
+        // reasons.
+        if name.eq_ignore_ascii_case(request.requested)
+            || excluded.iter().any(|seen| seen.eq_ignore_ascii_case(name))
             || request
                 .exclude
                 .is_some_and(|excl| excl.eq_ignore_ascii_case(name))
@@ -764,7 +846,13 @@ pub fn route_blocked_session(
     let requested_reading = requested_reading(state, cfg, request.requested, request.now);
 
     if cfg.fallback.adaptive_delegation {
-        let snapshot = capacity_snapshot(state, cfg, request.now, None, Some(request.requested));
+        let snapshot = capacity_snapshot(
+            state,
+            cfg,
+            request.now,
+            request.requester,
+            Some(request.requested),
+        );
         let unit = work_unit_for(request);
         let mut exclude: Vec<&str> = excluded.iter().map(String::as_str).collect();
         if let Some(excl) = request.exclude {
@@ -915,6 +1003,7 @@ mod tests {
                 },
                 now,
                 exclude: None,
+                requester: None,
             },
             &[],
         )
@@ -952,6 +1041,7 @@ mod tests {
                 },
                 now,
                 exclude: None,
+                requester: None,
             },
             false,
         )
@@ -997,6 +1087,7 @@ mod tests {
                 },
                 now,
                 exclude: None,
+                requester: None,
             },
             false,
         );
@@ -1047,6 +1138,7 @@ mod tests {
                 },
                 now,
                 exclude: None,
+                requester: None,
             },
             false,
         )
@@ -1082,6 +1174,7 @@ mod tests {
                 },
                 now,
                 exclude: None,
+                requester: None,
             },
             &[],
         )
@@ -1129,6 +1222,7 @@ mod tests {
                 },
                 now,
                 exclude: Some("codex"),
+                requester: None,
             },
             false,
         );
@@ -1166,6 +1260,7 @@ mod tests {
                 },
                 now,
                 exclude: Some("Codex"),
+                requester: None,
             },
             false,
         );
@@ -1203,6 +1298,7 @@ mod tests {
                 },
                 now,
                 exclude: Some("codex"),
+                requester: None,
             },
             &[],
         )
@@ -1242,6 +1338,7 @@ mod tests {
                 },
                 now,
                 exclude: None,
+                requester: None,
             },
             false,
         )
@@ -1335,6 +1432,7 @@ mod tests {
             },
             now,
             exclude: None,
+            requester: None,
         };
         let implicit = route_new_delegation(&state, &cfg, request(false), false)
             .expect("implicit worker model reroutes");
@@ -1382,6 +1480,7 @@ mod tests {
                 },
                 now,
                 exclude: None,
+                requester: None,
             },
             false,
         )
@@ -1431,6 +1530,7 @@ mod tests {
                 },
                 now,
                 exclude: None,
+                requester: None,
             },
             false,
         );
@@ -1465,6 +1565,7 @@ mod tests {
                 },
                 now,
                 exclude: None,
+                requester: None,
             },
             &[],
         )
@@ -1522,6 +1623,7 @@ mod tests {
                 },
                 now,
                 exclude: None,
+                requester: None,
             },
             false,
         )
@@ -1622,5 +1724,243 @@ mod tests {
             allocator::place(&snapshot, &cfg, &unit, &[], &|_| Some("model".to_string()));
         assert!(placement.keep_requested);
         assert_eq!(placement.selected.expect("kept").name, "claude");
+    }
+
+    /// D-1: in adaptive mode the predictive threshold was dead. Rule (a) of
+    /// `allocator::place` keeps the requested harness whenever it is merely
+    /// `Ready`, and `Ready` covers every headroom above the reserve floor,
+    /// so a fired predictive trigger was discarded and steering only ever
+    /// happened at the 10% floor or the 95% hard ceiling.
+    #[test]
+    fn predictive_steering_fires_in_adaptive_mode() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("home tempdir");
+        let _home = crate::commands::ctx::testenv::EnvGuard::set(home.path(), None);
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = test_cfg_with_ready_adapters();
+        assert!(cfg.fallback.adaptive_delegation, "the default path");
+        let now = 1_700_000_000;
+        // 15% headroom: at or below the 20% predictive threshold, but well
+        // above the 10% reserve floor, so `classify` still calls it `Ready`.
+        store_usage(&state, "anthropic", 85.0, now + 3_600, now);
+
+        let route = route_new_delegation(
+            &state,
+            &cfg,
+            RouteRequest {
+                requested: "claude",
+                source_model: Some("sonnet"),
+                source_model_explicit: false,
+                delegation: true,
+                bounds: TaskBounds {
+                    tokens: None,
+                    tool_calls: None,
+                },
+                now,
+                exclude: None,
+                requester: None,
+            },
+            false,
+        )
+        .expect("a fired predictive trigger must steer a new delegation away");
+        assert_eq!(route.selected, "codex");
+        assert_eq!(route.reason, RouteReason::Predictive);
+    }
+
+    /// D-3: `build_provider_capacity` is a pure read of what is already on
+    /// disk, and `pace::refresh_sources` only ever refreshes the ONE
+    /// provider a caller named -- so while claude held the seat, codex's own
+    /// `usage-openai.json` aged out, `binding()` dropped it, and `classify`
+    /// reported `Unknown` forever.
+    #[test]
+    fn capacity_snapshot_refreshes_every_provider_in_the_order() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("home tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = test_cfg_with_ready_adapters();
+        let observed = crate::commands::ctx::window::parse_rfc3339_utc("2026-02-26T18:52:21Z")
+            .expect("fixture timestamp");
+        let now = observed + 60;
+        store_usage(&state, "anthropic", 10.0, now + 3_600, now);
+        // Stored hours ago: stale enough that nothing binds it any more.
+        store_usage(&state, "openai", 40.0, now + 3_600, now - 7_200);
+
+        let day = home
+            .path()
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("02")
+            .join("26");
+        std::fs::create_dir_all(&day).expect("sessions dir");
+        let line = format!(
+            "{}\n",
+            r#"{"timestamp":"2026-02-26T18:52:21Z","type":"event_msg","payload":{"type":"token_count","rate_limits":{"primary":{"used_percent":30.0,"window_minutes":300,"resets_at":1772135737}}}}"#
+        );
+        std::fs::write(day.join("rollout.jsonl"), line).expect("rollout");
+
+        let _home = crate::commands::ctx::testenv::EnvGuard::set(home.path(), None);
+        let snapshot = capacity_snapshot(&state, &cfg, now, None, Some("claude"));
+        let codex = snapshot.harness("codex").expect("codex in the snapshot");
+        assert_ne!(
+            codex.state,
+            allocator::HarnessState::Unknown,
+            "the snapshot must refresh every provider it ranks, not just the requested one: {}",
+            codex.state_reason
+        );
+    }
+
+    /// D-6: the requesting session's own registry row counted toward its own
+    /// harness's `active`, so `fallback.harness.<name>.max_active = 1` made
+    /// that harness permanently `Draining` for its own delegations.
+    #[test]
+    fn a_requesting_session_does_not_count_against_its_own_max_active() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("home tempdir");
+        let _home = crate::commands::ctx::testenv::EnvGuard::set(home.path(), None);
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let mut cfg = test_cfg_with_ready_adapters();
+        cfg.fallback.harness.insert(
+            "claude".to_string(),
+            crate::commands::ctx::config::HarnessLimits {
+                max_active: Some(1),
+                reserve_headroom_pct: None,
+            },
+        );
+        let now = 1_700_000_000;
+        store_usage(&state, "anthropic", 10.0, now + 3_600, now);
+        store_usage(&state, "openai", 10.0, now + 3_600, now);
+
+        let record = sessions::Record::new(
+            "11111111-2222-4333-8444-555555555555",
+            "claude",
+            tmp.path(),
+            sessions::Verb::Wrap,
+        );
+        let session = record.session.clone();
+        let _guard = sessions::SessionGuard::register(&state, record);
+
+        let route = route_new_delegation(
+            &state,
+            &cfg,
+            RouteRequest {
+                requested: "claude",
+                source_model: Some("sonnet"),
+                source_model_explicit: false,
+                delegation: true,
+                bounds: TaskBounds {
+                    tokens: None,
+                    tool_calls: None,
+                },
+                now,
+                exclude: None,
+                requester: Some(&session),
+            },
+            false,
+        );
+        assert_eq!(
+            route, None,
+            "a session must never count its own registry row as capacity already spent"
+        );
+    }
+
+    /// D-7: `degraded` was `windows.iter().any(|w| w.stale)`, which is
+    /// `false` for the "every reading was dropped as stale" case -- the pool
+    /// view and `zirv ctx status` then reported a provider with no usable
+    /// reading at all as healthy.
+    #[test]
+    fn a_provider_whose_only_reading_was_dropped_reports_degraded() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("home tempdir");
+        let _home = crate::commands::ctx::testenv::EnvGuard::set(home.path(), None);
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let mut cfg = test_cfg_with_ready_adapters();
+        cfg.fallback.order = vec!["claude".to_string()];
+        let now = 1_700_000_000;
+        // Seven hours old and long past its own reset: nothing binds it.
+        store_usage(&state, "anthropic", 30.0, now - 3_600, now - 25_200);
+
+        let snapshot = capacity_snapshot(&state, &cfg, now, None, Some("claude"));
+        let provider = snapshot.provider("anthropic").expect("anthropic");
+        assert!(provider.windows.is_empty(), "the reading was dropped");
+        assert!(
+            provider.degraded,
+            "a provider whose only reading was dropped has no usable signal at all"
+        );
+        assert!(snapshot.degraded);
+    }
+
+    /// D-8: the visited list (`VISITED_ENV`, whose spelling this process
+    /// does not control) was matched case-sensitively while every sibling
+    /// check in the same condition used `eq_ignore_ascii_case`, so an
+    /// already-visited harness could be handed the same work a second time.
+    #[test]
+    fn an_already_visited_harness_is_excluded_whatever_its_spelling() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("home tempdir");
+        let _home = crate::commands::ctx::testenv::EnvGuard::set(home.path(), None);
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = test_cfg_with_ready_adapters();
+        let now = 1_700_000_000;
+        store_usage(&state, "anthropic", 10.0, now + 3_600, now);
+        store_usage(&state, "openai", 10.0, now + 3_600, now);
+        let request = RouteRequest {
+            requested: "claude",
+            source_model: Some("sonnet"),
+            source_model_explicit: false,
+            delegation: true,
+            bounds: TaskBounds {
+                tokens: None,
+                tool_calls: None,
+            },
+            now,
+            exclude: None,
+            requester: None,
+        };
+        let visited = vec!["Codex".to_string()];
+
+        assert_eq!(
+            best_alternate(&state, &cfg, request, &visited).map(|(name, _, _)| name),
+            None,
+            "a visited harness is never offered again, whatever its spelling"
+        );
+    }
+
+    /// D-8, the same case-sensitivity in `earliest_reset_choice`'s own copy
+    /// of that condition.
+    #[test]
+    fn an_already_visited_harness_never_wins_the_earliest_reset() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("home tempdir");
+        let _home = crate::commands::ctx::testenv::EnvGuard::set(home.path(), None);
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = test_cfg_with_ready_adapters();
+        let now = 1_700_000_000;
+        store_usage(&state, "anthropic", 100.0, now + 3_600, now);
+        store_usage(&state, "openai", 100.0, now + 600, now);
+
+        let choice = earliest_reset_choice(
+            &state,
+            &cfg,
+            RouteRequest {
+                requested: "claude",
+                source_model: Some("sonnet"),
+                source_model_explicit: false,
+                delegation: true,
+                bounds: TaskBounds {
+                    tokens: None,
+                    tool_calls: None,
+                },
+                now,
+                exclude: None,
+                requester: None,
+            },
+            &["Codex".to_string()],
+        )
+        .expect("both seats are hard blocked");
+        assert_eq!(
+            choice.selected, "claude",
+            "codex was already visited, whatever its spelling"
+        );
     }
 }

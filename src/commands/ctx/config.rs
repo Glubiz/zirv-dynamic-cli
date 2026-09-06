@@ -1626,12 +1626,26 @@ pub struct FallbackConfig {
     /// dispatch time. Repo narrowing is AND, the same as `enabled`: a repo
     /// checkout may disable it, never enable it for an operator who did not.
     pub adaptive_delegation: bool,
-    /// Issue #358: whether the orchestrator seat itself may roll over onto
-    /// the next fallback candidate automatically, not just newly-dispatched
-    /// background work. Off by default -- moving the operator's own seat is
-    /// a bigger step than steering a new delegation. Repo narrowing is AND,
-    /// same as `enabled`/`adaptive_delegation`.
-    pub auto_orchestrator_rollover: bool,
+    /// Whether the orchestrator seat itself may roll over onto the next
+    /// fallback candidate automatically, not just newly-dispatched
+    /// background work.
+    ///
+    /// `None` -- the default -- means "decide from the roster", and
+    /// [`CtxConfig::auto_orchestrator_rollover`] is the one place that
+    /// decision is made: ON whenever more than one harness in
+    /// `fallback.order` is enabled, OFF when there is nowhere to roll over
+    /// to. That reverses issue #358's own "off by default" (Decision Log
+    /// (d)): with one harness the switch is meaningless, and with two an
+    /// operator who set up cross-harness fallback at all wants the seat to
+    /// follow the capacity, not to sit on an exhausted account until they
+    /// notice. An explicit `false` in `~/.zirv/ctx.toml` (or
+    /// `ZIRV_CTX_FALLBACK_AUTO_ORCHESTRATOR_ROLLOVER`) still wins outright.
+    ///
+    /// Repo narrowing is AND, same as `enabled`/`adaptive_delegation`, and
+    /// keeps working against an unset home layer: a repo may set `false`
+    /// (narrowing, so it sticks), and a repo `true` is discarded (widening),
+    /// leaving the roster default in force.
+    pub auto_orchestrator_rollover: Option<bool>,
     /// Issue #358: the headroom threshold that triggers `auto_orchestrator_
     /// rollover`. `None` (the default) means "inherit `predictive_headroom_
     /// pct`" -- see `rollover_headroom_pct`. `REPO_FORBIDDEN`: rolling the
@@ -1663,7 +1677,7 @@ impl Default for FallbackConfig {
             small_task_max_tokens: 40_000,
             small_task_max_tool_calls: 24,
             adaptive_delegation: true,
-            auto_orchestrator_rollover: false,
+            auto_orchestrator_rollover: None,
             orchestrator_rollover_headroom_pct: None,
             rollover_cooldown_secs: 600,
             harness: std::collections::BTreeMap::new(),
@@ -3485,6 +3499,24 @@ fn read_layer(
 }
 
 impl CtxConfig {
+    /// Whether the orchestrator seat may roll over automatically, resolving
+    /// `fallback.auto_orchestrator_rollover`'s "decide from the roster"
+    /// default: ON whenever more than one harness named in `fallback.order`
+    /// is enabled by the agent gate, OFF otherwise (a single-harness roster
+    /// has nowhere to roll over to, which `rollover::evaluate` refuses on
+    /// its own anyway). An explicit value from any layer wins outright --
+    /// see the field's own doc comment for the narrowing rules.
+    pub fn auto_orchestrator_rollover(&self) -> bool {
+        self.fallback.auto_orchestrator_rollover.unwrap_or_else(|| {
+            self.fallback
+                .order
+                .iter()
+                .filter(|name| self.agents.is_enabled(name))
+                .count()
+                >= 2
+        })
+    }
+
     /// Layers `~/.zirv/ctx.toml`, then `<repo>/.zirv/ctx.toml`, then
     /// `ZIRV_CTX_*`. Flags are applied by each verb after loading.
     ///
@@ -4193,13 +4225,24 @@ impl CtxConfig {
             &["fallback", "adaptive_delegation"],
             toml::Value::Boolean(home_adaptive && repo_fallback_adaptive.unwrap_or(true)),
         );
-        let home_auto_rollover =
-            home_fallback_auto_rollover.unwrap_or(default_fallback.auto_orchestrator_rollover);
-        insert_path(
-            &mut merged,
-            &["fallback", "auto_orchestrator_rollover"],
-            toml::Value::Boolean(home_auto_rollover && repo_fallback_auto_rollover.unwrap_or(true)),
-        );
+        // Left ABSENT when neither layer decided, so the roster default in
+        // `CtxConfig::auto_orchestrator_rollover` applies: writing the
+        // struct default back in would freeze today's answer into the merged
+        // table. A repo `true` on an unset home layer is a widening and is
+        // discarded; a repo `false` narrows and sticks.
+        let merged_auto_rollover = match (home_fallback_auto_rollover, repo_fallback_auto_rollover)
+        {
+            (Some(home), repo) => Some(home && repo.unwrap_or(true)),
+            (None, Some(false)) => Some(false),
+            (None, _) => None,
+        };
+        if let Some(value) = merged_auto_rollover {
+            insert_path(
+                &mut merged,
+                &["fallback", "auto_orchestrator_rollover"],
+                toml::Value::Boolean(value),
+            );
+        }
         let merged_harness = narrow_fallback_harness(home_fallback_harness, repo_fallback_harness);
         insert_path(
             &mut merged,
@@ -8943,7 +8986,10 @@ mod tests {
         assert_eq!(cfg.small_task_max_tool_calls, 24);
         // Issue #358.
         assert!(cfg.adaptive_delegation);
-        assert!(!cfg.auto_orchestrator_rollover);
+        assert_eq!(
+            cfg.auto_orchestrator_rollover, None,
+            "unset: decided from the roster"
+        );
         assert_eq!(cfg.orchestrator_rollover_headroom_pct, None);
         assert_eq!(cfg.rollover_cooldown_secs, 600);
         assert!(cfg.harness.is_empty());
@@ -9009,7 +9055,7 @@ mod tests {
         // Issue #358: a repo cannot flip either switch on for an operator
         // who turned it off, even though both repo values above try to.
         assert!(!cfg.fallback.adaptive_delegation);
-        assert!(!cfg.fallback.auto_orchestrator_rollover);
+        assert_eq!(cfg.fallback.auto_orchestrator_rollover, Some(false));
     }
 
     #[test]
@@ -9187,10 +9233,73 @@ mod tests {
         ]);
         let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
         assert!(cfg.fallback.adaptive_delegation);
-        assert!(cfg.fallback.auto_orchestrator_rollover);
+        assert_eq!(cfg.fallback.auto_orchestrator_rollover, Some(true));
         assert_eq!(cfg.fallback.orchestrator_rollover_headroom_pct, Some(12.5));
         assert_eq!(cfg.fallback.rollover_cooldown_secs, 45);
         assert_eq!(cfg.fallback.rollover_headroom_pct(), 12.5);
+    }
+
+    /// The operator decision reversing issue #358 (d): with the switch
+    /// unset, more than one enabled harness turns automatic orchestrator
+    /// rollover ON, a single-harness roster leaves it off, and an explicit
+    /// value from any layer still wins.
+    #[test]
+    fn auto_orchestrator_rollover_defaults_to_the_roster() {
+        let mut cfg = CtxConfig::default();
+        assert_eq!(cfg.fallback.auto_orchestrator_rollover, None);
+        assert_eq!(cfg.fallback.order, vec!["claude", "codex"]);
+        assert!(
+            cfg.auto_orchestrator_rollover(),
+            "two enabled harnesses roll over automatically"
+        );
+
+        cfg.fallback.order = vec!["claude".to_string()];
+        assert!(
+            !cfg.auto_orchestrator_rollover(),
+            "a single-harness roster has nowhere to roll over to"
+        );
+
+        cfg.fallback.order = vec!["claude".to_string(), "codex".to_string()];
+        cfg.fallback.auto_orchestrator_rollover = Some(false);
+        assert!(
+            !cfg.auto_orchestrator_rollover(),
+            "an explicit false still wins"
+        );
+    }
+
+    /// The repo layer may narrow the switch to `false` even when the
+    /// operator never set it, but a repo `true` is a widening and leaves the
+    /// roster default in force.
+    #[test]
+    fn a_repo_may_only_narrow_an_unset_auto_orchestrator_rollover() {
+        let home = tempfile::tempdir().expect("home");
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let empty = env_map(&[]);
+
+        let repo_off = tempfile::tempdir().expect("repo");
+        std::fs::create_dir_all(repo_off.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo_off.path().join(".zirv/ctx.toml"),
+            "[fallback]\nauto_orchestrator_rollover = false\n",
+        )
+        .expect("write repo");
+        let cfg = CtxConfig::load(repo_off.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert_eq!(cfg.fallback.auto_orchestrator_rollover, Some(false));
+        assert!(!cfg.auto_orchestrator_rollover());
+
+        let repo_on = tempfile::tempdir().expect("repo");
+        std::fs::create_dir_all(repo_on.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo_on.path().join(".zirv/ctx.toml"),
+            "[fallback]\nauto_orchestrator_rollover = true\n",
+        )
+        .expect("write repo");
+        let cfg = CtxConfig::load(repo_on.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert_eq!(
+            cfg.fallback.auto_orchestrator_rollover, None,
+            "a repo may not widen; the roster default stays in force"
+        );
     }
 
     #[test]

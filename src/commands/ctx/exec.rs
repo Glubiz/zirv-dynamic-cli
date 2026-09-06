@@ -2148,6 +2148,9 @@ fn run_with_clock_inner<W: Write>(
                 // orchestrator-seat delegation (issue #328's exclusion is
                 // scoped to `agent::run_with` specifically).
                 exclude: None,
+                // This very session is the one being rerouted, so its own
+                // registry row is not competing capacity.
+                requester: Some(session.as_str()),
             };
             let route = (adapter_builds_launch && prompt.is_some())
                 .then(|| {

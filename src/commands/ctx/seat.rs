@@ -68,8 +68,23 @@ pub struct Visit {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Cause {
-    Proactive { headroom_pct: f64, observed_at: u64 },
-    Reactive { detail: String, observed_at: u64 },
+    Proactive {
+        headroom_pct: f64,
+        observed_at: u64,
+    },
+    Reactive {
+        detail: String,
+        observed_at: u64,
+    },
+    /// The seat is healthy but sitting on a fallback harness, and
+    /// `fallback.order[0]` has recovered enough measured headroom to take it
+    /// back -- the "distribute back to claude once the limits reset" half of
+    /// the balancing loop. `headroom_pct` is the SEAT's own reading, the
+    /// number the primary had to beat.
+    Reclaim {
+        headroom_pct: f64,
+        observed_at: u64,
+    },
     Manual,
 }
 
@@ -80,9 +95,9 @@ impl Cause {
     /// `Manual`, since there is no reading to key the visit against.
     pub fn observed_at(&self) -> Option<u64> {
         match self {
-            Cause::Proactive { observed_at, .. } | Cause::Reactive { observed_at, .. } => {
-                Some(*observed_at)
-            }
+            Cause::Proactive { observed_at, .. }
+            | Cause::Reactive { observed_at, .. }
+            | Cause::Reclaim { observed_at, .. } => Some(*observed_at),
             Cause::Manual => None,
         }
     }
@@ -630,6 +645,13 @@ pub struct RolloverInputs<'a> {
     /// from under one that has not is exactly the kind of session-worsening
     /// `wrap`/`dash::pane` may never do.
     pub idle: bool,
+    /// The third, independent trigger: this seat is not on
+    /// `cfg.fallback.order[0]` and that primary has since recovered enough
+    /// MEASURED headroom to take the seat back (`rollover::evaluate` owns
+    /// the capacity snapshot, so it computes this). Gated by the same idle
+    /// boundary and cooldown the proactive path uses -- a reclaim is a
+    /// convenience, never an emergency.
+    pub reclaim: bool,
     pub candidates: &'a [CandidateHeadroom],
 }
 
@@ -669,6 +691,11 @@ pub enum RolloverDecision {
 ///    real evidence a soft-threshold cooldown was never meant to gate, and
 ///    unlike the idle boundary a cooldown is this seat's own hysteresis, not
 ///    a live turn's correctness.
+///    `inputs.reclaim` is the third trigger, considered only when neither of
+///    the other two fired: the seat is healthy but sitting on a fallback
+///    harness whose primary has since recovered. It is gated exactly like the
+///    proactive path (idle boundary AND cooldown) and yields
+///    [`Cause::Reclaim`].
 /// 3. Otherwise, the proactive path triggers only from a KNOWN reading at or
 ///    under `cfg.fallback.rollover_headroom_pct()` -- `None` (unknown/stale)
 ///    never triggers it, matching this codebase's existing "never migrate on
@@ -718,10 +745,12 @@ pub fn decide(inputs: &RolloverInputs<'_>, cfg: &CtxConfig) -> RolloverDecision 
     let threshold = cfg.fallback.rollover_headroom_pct();
     let reactive = inputs.source_hard_blocked;
     let proactive_triggered = inputs.source_headroom_pct.is_some_and(|h| h <= threshold);
+    let reclaim = inputs.reclaim && !reactive && !proactive_triggered;
 
-    if !reactive && !proactive_triggered {
+    if !reactive && !proactive_triggered && !reclaim {
         return RolloverDecision::Wait(
-            "no rollover trigger: source is neither hard-blocked nor below headroom threshold"
+            "no rollover trigger: source is neither hard-blocked, below the headroom threshold, \
+             nor holding a seat its primary has reclaimed"
                 .to_string(),
         );
     }
@@ -774,9 +803,23 @@ pub fn decide(inputs: &RolloverInputs<'_>, cfg: &CtxConfig) -> RolloverDecision 
             ));
             continue;
         }
-        if !(c.projected_headroom_pct >= threshold + min_headroom
-            && c.projected_headroom_pct >= source_floor + min_headroom)
-        {
+        // The hysteresis floor is a rule about MEASURED readings: it exists
+        // so headroom noise near the threshold cannot bounce the seat back
+        // and forth. `unknown_headroom_pct` is a fixed, noise-free constant
+        // and at its default (25) can never clear `rollover_headroom_pct +
+        // min_candidate_headroom_pct` (30), so holding an assumed candidate
+        // to it refused every one of them unconditionally -- which, on the
+        // reactive path where an assumed reading is the ONLY kind a harness
+        // with no usage source of its own can offer, meant a hard-blocked
+        // seat parked instead of rolling over. An assumed candidate clears
+        // `min_candidate_headroom_pct` alone; the reactive-only gate above
+        // is what keeps it out of the proactive path entirely.
+        let floor = if c.assumed {
+            min_headroom
+        } else {
+            (threshold + min_headroom).max(source_floor + min_headroom)
+        };
+        if c.projected_headroom_pct < floor {
             excluded.push(format!(
                 "{}: projected headroom {:.1}% does not clear the hysteresis floor",
                 c.agent, c.projected_headroom_pct
@@ -808,6 +851,11 @@ pub fn decide(inputs: &RolloverInputs<'_>, cfg: &CtxConfig) -> RolloverDecision 
             let cause = if reactive {
                 Cause::Reactive {
                     detail: "source session is hard-blocked".to_string(),
+                    observed_at: epoch,
+                }
+            } else if reclaim {
+                Cause::Reclaim {
+                    headroom_pct: inputs.source_headroom_pct.unwrap_or(0.0),
                     observed_at: epoch,
                 }
             } else {
@@ -1173,6 +1221,7 @@ mod tests {
             source_hard_blocked: false,
             auto_enabled: false,
             idle: true,
+            reclaim: false,
             candidates: &candidates,
         };
         assert!(matches!(
@@ -1190,6 +1239,7 @@ mod tests {
             source_hard_blocked: false,
             auto_enabled: true,
             idle: true,
+            reclaim: false,
             candidates: &candidates,
         };
         assert!(matches!(
@@ -1211,6 +1261,7 @@ mod tests {
             source_hard_blocked: false,
             auto_enabled: true,
             idle: true,
+            reclaim: false,
             candidates: &candidates,
         };
         assert!(matches!(decide(&inputs, &cfg), RolloverDecision::Wait(_)));
@@ -1229,6 +1280,7 @@ mod tests {
             source_hard_blocked: false,
             auto_enabled: true,
             idle: false,
+            reclaim: false,
             candidates: &candidates,
         };
         assert_eq!(
@@ -1251,6 +1303,7 @@ mod tests {
             source_hard_blocked: false,
             auto_enabled: true,
             idle: true,
+            reclaim: false,
             candidates: &candidates,
         };
         assert_eq!(
@@ -1277,6 +1330,7 @@ mod tests {
             source_hard_blocked: true,
             auto_enabled: true,
             idle: true,
+            reclaim: false,
             candidates: &candidates,
         };
         assert!(matches!(
@@ -1304,6 +1358,7 @@ mod tests {
             source_hard_blocked: true,
             auto_enabled: true,
             idle: false,
+            reclaim: false,
             candidates: &candidates,
         };
         assert_eq!(
@@ -1335,6 +1390,7 @@ mod tests {
             // before candidate filtering ever ran, proving nothing about
             // epochs at all.
             idle: true,
+            reclaim: false,
             candidates: &candidates,
         };
         assert!(matches!(decide(&inputs, &cfg), RolloverDecision::Refuse(_)));
@@ -1364,6 +1420,7 @@ mod tests {
             source_hard_blocked: false,
             auto_enabled: true,
             idle: true,
+            reclaim: false,
             candidates: &candidates,
         };
         assert!(matches!(decide(&inputs, &cfg), RolloverDecision::Refuse(_)));
@@ -1385,6 +1442,7 @@ mod tests {
             source_hard_blocked: false,
             auto_enabled: true,
             idle: true,
+            reclaim: false,
             candidates: &candidates,
         };
         assert!(matches!(
@@ -1416,6 +1474,7 @@ mod tests {
             source_hard_blocked: false,
             auto_enabled: true,
             idle: true,
+            reclaim: false,
             candidates: &candidates,
         };
         match decide(&inputs, &cfg) {
@@ -1454,6 +1513,7 @@ mod tests {
             // test is about the visited-epoch flap invariant, not the idle
             // boundary (the reactive path no longer skips it).
             idle: true,
+            reclaim: false,
             candidates: &candidates,
         };
         let RolloverDecision::Proceed { agent, cause, .. } = decide(&inputs, &cfg) else {
@@ -1475,6 +1535,7 @@ mod tests {
             source_hard_blocked: true,
             auto_enabled: true,
             idle: true,
+            reclaim: false,
             candidates: &candidates_back,
         };
         assert!(matches!(
@@ -1638,5 +1699,42 @@ mod tests {
             let round_tripped: Seat = serde_json::from_str(&json).expect("deserialize");
             assert_eq!(round_tripped.phase, phase);
         }
+    }
+
+    /// D-2: `unknown_headroom_pct` (25 by default) can never clear
+    /// `rollover_headroom_pct + min_candidate_headroom_pct` (30), so a
+    /// hard-blocked seat whose only candidate reads `assumed` -- the normal
+    /// shape for a harness with no usage source of its own -- was refused
+    /// and parked instead of rolling over.
+    #[test]
+    fn an_assumed_candidate_takes_a_hard_blocked_seat() {
+        let cfg = cfg();
+        let seat = base_seat();
+        let candidates = vec![CandidateHeadroom {
+            agent: "codex".to_string(),
+            model: Some("gpt-5.6-terra".to_string()),
+            projected_headroom_pct: cfg.fallback.unknown_headroom_pct,
+            assumed: true,
+            observed_at: 1_000,
+        }];
+        let inputs = RolloverInputs {
+            seat: &seat,
+            now: 2_000,
+            source_headroom_pct: None,
+            source_observed_at: 500,
+            source_hard_blocked: true,
+            auto_enabled: true,
+            idle: true,
+            reclaim: false,
+            candidates: &candidates,
+        };
+        assert!(
+            matches!(
+                decide(&inputs, &cfg),
+                RolloverDecision::Proceed { ref agent, .. } if agent == "codex"
+            ),
+            "got {:?}",
+            decide(&inputs, &cfg)
+        );
     }
 }

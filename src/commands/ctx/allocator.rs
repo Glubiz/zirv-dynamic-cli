@@ -402,10 +402,19 @@ pub fn place(
     models: &dyn Fn(&str) -> Option<String>,
 ) -> Placement {
     let mut exclusions: Vec<(String, Exclusion)> = Vec::new();
+    // Rule (a) is subject to `exclude` like every other candidate: a caller
+    // that named the requested harness there (a `VISITED_ENV` entry, an
+    // orchestrator seat's own harness, or a trigger that has already decided
+    // this harness must not keep the work) must never have it handed back.
+    let requested_excluded = exclude
+        .iter()
+        .any(|excl| excl.eq_ignore_ascii_case(&unit.requested));
 
     if let Some(requested) = snapshot.harness(&unit.requested) {
         if let Some(provider) = snapshot.provider(&requested.provider) {
-            if requested.state == HarnessState::Ready
+            if requested_excluded {
+                exclusions.push((requested.name.clone(), Exclusion::Excluded));
+            } else if requested.state == HarnessState::Ready
                 && fits_all_windows(provider, &unit.bounds, cfg, unit.expected_tokens)
             {
                 let (headroom_pct, binding_window) = binding_headroom(provider);
@@ -424,11 +433,12 @@ pub fn place(
                     keep_requested: true,
                     exclusions,
                 };
+            } else {
+                exclusions.push((
+                    requested.name.clone(),
+                    requested_unfit_reason(requested, provider, cfg, unit),
+                ));
             }
-            exclusions.push((
-                requested.name.clone(),
-                requested_unfit_reason(requested, provider, cfg, unit),
-            ));
         } else {
             exclusions.push((
                 requested.name.clone(),
@@ -1254,5 +1264,34 @@ mod tests {
         let h = harness("claude", "anthropic", 0, None);
         let p = provider("anthropic", vec![window("five_hour", 90.0)], Some(0));
         assert_eq!(classify(&h, &p, &cfg).0, HarnessState::Ready);
+    }
+
+    /// D-5: rule (a) never consulted `exclude`, so `route_blocked_session`
+    /// could keep the very harness its caller had just excluded (a
+    /// `VISITED_ENV` entry, or the orchestrator seat's own harness).
+    #[test]
+    fn rule_a_never_keeps_an_excluded_requested_harness() {
+        let cfg = base_cfg();
+        let snapshot = classify_all(
+            &cfg,
+            vec![
+                provider("anthropic", vec![window("five_hour", 90.0)], Some(0)),
+                provider("openai", vec![window("five_hour", 50.0)], Some(0)),
+            ],
+            vec![
+                harness("claude", "anthropic", 0, None),
+                harness("codex", "openai", 0, None),
+            ],
+        );
+        let unit = unit("u1", "claude", 0);
+        let placement = place(&snapshot, &cfg, &unit, &["claude"], &always_model);
+        assert!(
+            !placement.keep_requested,
+            "an excluded harness may never be kept by rule (a)"
+        );
+        assert_eq!(
+            placement.selected.map(|c| c.name),
+            Some("codex".to_string())
+        );
     }
 }

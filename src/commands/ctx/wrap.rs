@@ -3093,7 +3093,7 @@ fn pump(
     let mut pending_rollover: Option<PendingRollover> = None;
     let seat_short = bar.session_short.clone();
     let seat_rollover_enabled =
-        cfg.fallback.auto_orchestrator_rollover && role == PromptRole::Orchestrator;
+        cfg.auto_orchestrator_rollover() && role == PromptRole::Orchestrator;
 
     loop {
         if let Some(status) = child.try_wait()? {
