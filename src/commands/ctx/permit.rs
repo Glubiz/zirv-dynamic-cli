@@ -285,7 +285,12 @@ impl HeavyPermit {
         };
         record.child_pid = Some(child_pid);
         if let Ok(json) = serde_json::to_string_pretty(&record) {
-            let _ = std::fs::write(path, json);
+            // Atomic temp-then-rename, never a truncating write: other
+            // processes read this file concurrently via `live_records_in`,
+            // which REMOVES a file it cannot parse once past the grace
+            // window -- so a crash (or merely a read) inside a truncate
+            // window would free a slot whose heavy child is still running.
+            let _ = super::state::write_private(path, &json);
         }
     }
 }
@@ -809,6 +814,62 @@ mod tests {
     /// consumed the whole default budget of 1 -- which meant one parked
     /// delegation blocked every subsequent one, and the orchestrator did the
     /// work itself on the expensive seat.
+    /// A permit slot file is read by other processes while its owner may be
+    /// updating the child pid into it, and `live_records_in` REMOVES a file
+    /// it cannot parse once it is past the grace window -- so a truncating
+    /// write here can free a slot whose heavy child is still running. The
+    /// update must therefore never leave the file unreadable for an instant.
+    #[test]
+    fn updating_a_child_pid_never_leaves_a_slot_file_unreadable() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("slot-0.json");
+        let record = PermitRecord {
+            pid: 4242,
+            child_pid: None,
+            label: "cargo build".to_string(),
+            acquired_at: state::now_secs(),
+            kind: PermitKind::Heavy,
+            tree: None,
+        };
+        state::write_private(
+            &path,
+            &serde_json::to_string_pretty(&record).expect("serialize"),
+        )
+        .expect("write");
+
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader = {
+            let path = path.clone();
+            let stop = std::sync::Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let mut unreadable = 0usize;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    if let Ok(contents) = std::fs::read_to_string(&path)
+                        && serde_json::from_str::<PermitRecord>(&contents).is_err()
+                    {
+                        unreadable += 1;
+                    }
+                }
+                unreadable
+            })
+        };
+
+        for child_pid in 1..600u32 {
+            HeavyPermit::write_child_pid(&path, child_pid);
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let unreadable = reader.join().expect("reader thread");
+
+        assert_eq!(
+            unreadable, 0,
+            "a concurrent reader saw the slot file unparseable {unreadable} time(s)"
+        );
+        let final_record: PermitRecord =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read"))
+                .expect("final parse");
+        assert_eq!(final_record.child_pid, Some(599));
+    }
+
     #[test]
     fn heavy_classification_is_about_the_command_not_the_session() {
         let none: Vec<String> = Vec::new();
