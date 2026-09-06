@@ -99,16 +99,40 @@ fn record_path(state: &StateDir, key: &str) -> PathBuf {
     state.restart_chains().join(format!("{key}.json"))
 }
 
-/// `Ok(None)` both for a missing file and for one that fails to parse -- a
-/// caller cannot tell "never recorded" apart from "malformed" anyway. A file
-/// that fails to parse is left on disk: reading must never destroy an
-/// operator's state to make itself succeed. Mirrors `objective::load`
-/// exactly.
-pub fn load(state: &StateDir, key: &str) -> CtxResult<Option<ChainRecord>> {
+/// What `<state>/restart-chains/<key>.json` held. A reader that only wants
+/// the record collapses the two failure arms via [`load`]; the one caller
+/// that WRITES back ([`record_boot_and_evaluate`]) must keep them apart, so
+/// it never overwrites a record it merely failed to parse.
+pub enum Loaded {
+    /// No file at all -- this key has never recorded a boot.
+    Missing,
+    /// A file this build cannot parse (schema drift between an installed
+    /// binary and a branch one is the plausible cause, not corruption).
+    Malformed,
+    Found(ChainRecord),
+}
+
+/// Reads the record, keeping "never recorded" and "cannot parse" distinct.
+/// A file that fails to parse is left on disk in either case: reading must
+/// never destroy an operator's state to make itself succeed.
+pub fn load_state(state: &StateDir, key: &str) -> Loaded {
     let Ok(contents) = std::fs::read_to_string(record_path(state, key)) else {
-        return Ok(None);
+        return Loaded::Missing;
     };
-    Ok(serde_json::from_str(&contents).ok())
+    match serde_json::from_str(&contents) {
+        Ok(record) => Loaded::Found(record),
+        Err(_) => Loaded::Malformed,
+    }
+}
+
+/// `Ok(None)` both for a missing file and for one that fails to parse -- a
+/// read-only caller cannot act on the difference anyway. Mirrors
+/// `objective::load` exactly.
+pub fn load(state: &StateDir, key: &str) -> CtxResult<Option<ChainRecord>> {
+    Ok(match load_state(state, key) {
+        Loaded::Found(record) => Some(record),
+        Loaded::Missing | Loaded::Malformed => None,
+    })
 }
 
 /// Writes a chain record. Matches `objective::store`'s own
@@ -194,12 +218,20 @@ pub fn counts_by_class(record: &ChainRecord) -> BTreeMap<FailureClass, u32> {
     counts
 }
 
-/// I/O wrapper: load the chain (a missing/unreadable one reads as empty),
-/// append this boot, store it back, then evaluate the freshly updated record
-/// against `class`. The one seam a caller (`exec.rs`) actually needs.
-/// Best-effort like every other piece of state-dir housekeeping in this
-/// codebase: a store failure never blocks the restart decision itself, it
-/// only means this boot silently did not count toward the breaker.
+/// I/O wrapper: load the chain (a missing one reads as empty), append this
+/// boot, store it back, then evaluate the freshly updated record against
+/// `class`. The one seam a caller (`exec.rs`) actually needs. Best-effort
+/// like every other piece of state-dir housekeeping in this codebase: a
+/// store failure never blocks the restart decision itself, it only means
+/// this boot silently did not count toward the breaker.
+///
+/// A record this build cannot PARSE is neither read as empty nor written
+/// over: it used to be, which silently reset an operator's restart-loop
+/// breaker on the first schema drift between an installed binary and a
+/// branch one. The honest answer for a breaker that cannot read its own
+/// history is that it cannot evaluate -- so the boot is allowed
+/// ([`ChainVerdict::Ok`]) and the file is left exactly as it was found,
+/// rather than a `Tripped` this has no evidence for or a clobbered chain.
 pub fn record_boot_and_evaluate(
     state: &StateDir,
     key: &str,
@@ -209,7 +241,11 @@ pub fn record_boot_and_evaluate(
     max_restarts: u32,
     max_gap_secs: u64,
 ) -> ChainVerdict {
-    let existing = load(state, key).ok().flatten().unwrap_or_default();
+    let existing = match load_state(state, key) {
+        Loaded::Found(record) => record,
+        Loaded::Missing => ChainRecord::default(),
+        Loaded::Malformed => return ChainVerdict::Ok,
+    };
     let updated = push_boot(
         existing,
         Boot {
@@ -241,6 +277,32 @@ mod tests {
             schema_version: SCHEMA_VERSION,
             boots,
         }
+    }
+
+    /// A malformed record -- schema drift between an installed binary and a
+    /// branch one, most plausibly -- used to read as `default()` and then be
+    /// clobbered by the unconditional store, silently resetting the
+    /// restart-loop breaker. Reading must never destroy an operator's state:
+    /// the boot is allowed (the breaker cannot evaluate what it cannot read)
+    /// and the file is left exactly as it was found.
+    #[test]
+    fn a_malformed_chain_record_is_not_overwritten_by_the_next_boot() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        create_private_dir_all(&state.restart_chains()).expect("mkdir");
+        let path = record_path(&state, "repo");
+        let original = r#"{"schema_version":99,"boots":[{"at_secs":"not-a-number"}]}"#;
+        std::fs::write(&path, original).expect("write");
+
+        let verdict =
+            record_boot_and_evaluate(&state, "repo", FailureClass::Crash, false, 1_000, 1, 600);
+
+        assert_eq!(verdict, ChainVerdict::Ok);
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            original,
+            "a record this build cannot parse must be left byte-for-byte alone"
+        );
     }
 
     #[test]
