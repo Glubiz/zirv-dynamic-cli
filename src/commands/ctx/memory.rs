@@ -1192,6 +1192,31 @@ pub fn upsert_scoped(
     }
 }
 
+/// What a `forget_scoped` call actually accomplished. `removed` is the old
+/// boolean return: whether the scope's own file for this key was deleted.
+/// `still_claimed_by` names any OTHER shared-bank file whose own `Key:`
+/// header still claims the key after that delete -- empty for every other
+/// scope, and empty for the shared scope unless a pre-existing collision is
+/// present. A non-empty `still_claimed_by` means the requested effect did
+/// NOT happen: the fact stays live (still listed by `list_scoped`, still
+/// compiled into every prompt) and a later `upsert_shared` under the same
+/// key still hard-errors "already claimed", so a caller must report that
+/// rather than print an unqualified success.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ForgetOutcome {
+    pub removed: bool,
+    pub still_claimed_by: Vec<PathBuf>,
+}
+
+impl ForgetOutcome {
+    fn removed(removed: bool) -> Self {
+        Self {
+            removed,
+            still_claimed_by: Vec::new(),
+        }
+    }
+}
+
 /// Scope-aware forget: `Private` delegates unchanged to `forget` above.
 /// `Shared` removes only the canonical file (see the collision policy on
 /// `get_scoped` above) -- nothing else in the directory is ever touched, so
@@ -1200,10 +1225,10 @@ pub fn upsert_scoped(
 /// removing the canonical file, some OTHER file still claims this key (a
 /// pre-existing collision `upsert_shared` could never have created itself),
 /// that fact is written to the decision log as `forget-collision-left`
-/// (naming the key and the surviving path) rather than passed over in
-/// silence -- the boolean return value still only reports whether the
-/// canonical file itself was removed, since it carries no room for a
-/// structured warning. Deliberately does not gate on `cfg.memory.
+/// (naming the key and the surviving path) AND returned in
+/// `ForgetOutcome::still_claimed_by`, so the CLI can report that the key is
+/// still claimed instead of a removal that did not take effect.
+/// Deliberately does not gate on `cfg.memory.
 /// shared_enabled` either, the same "disabling a feature must never trap
 /// data" contract the private scope's own `forget` already follows --
 /// forgetting must still work while the scope is switched off.
@@ -1213,13 +1238,13 @@ pub fn forget_scoped(
     state: &StateDir,
     slug: &str,
     key: &str,
-) -> CtxResult<bool> {
+) -> CtxResult<ForgetOutcome> {
     match scope {
-        MemoryScope::Private => forget(state, slug, key),
-        MemoryScope::Global => forget(state, GLOBAL_SLUG, key),
+        MemoryScope::Private => forget(state, slug, key).map(ForgetOutcome::removed),
+        MemoryScope::Global => forget(state, GLOBAL_SLUG, key).map(ForgetOutcome::removed),
         // See `upsert_scoped`'s own `Session` arm: no session id to resolve
         // a directory from here. Callers use `forget_session` directly.
-        MemoryScope::Session => Ok(false),
+        MemoryScope::Session => Ok(ForgetOutcome::removed(false)),
         MemoryScope::Shared => {
             // Review round 2, finding 1: a shared-bank writer, so it takes
             // the same bank lock every other shared writer does.
@@ -1240,9 +1265,9 @@ fn forget_shared_locked(
     state: &StateDir,
     key: &str,
     _lock: &BankLock,
-) -> CtxResult<bool> {
+) -> CtxResult<ForgetOutcome> {
     let Some(path) = shared_canonical_path(repo, key) else {
-        return Ok(false);
+        return Ok(ForgetOutcome::removed(false));
     };
     let removed = if path.is_file() {
         std::fs::remove_file(&path)?;
@@ -1251,18 +1276,23 @@ fn forget_shared_locked(
         false
     };
 
+    let mut still_claimed_by: Vec<PathBuf> = Vec::new();
     if let Some(dir) = safe_shared_dir(repo) {
         // Best-effort (fix round 2): this is an ADVISORY scan after
         // the canonical delete already succeeded -- a scan failure
         // (e.g. the directory becomes unreadable mid-call) must not
         // turn an already-completed forget into an `Err`.
-        let stray: Vec<String> = read_entries(&dir)
+        still_claimed_by = read_entries(&dir)
             .unwrap_or_default()
             .into_iter()
             .filter(|(other_path, other)| other.key == key && *other_path != path)
-            .map(|(other_path, _)| other_path.display().to_string())
+            .map(|(other_path, _)| other_path)
             .collect();
-        if !stray.is_empty() {
+        if !still_claimed_by.is_empty() {
+            let stray: Vec<String> = still_claimed_by
+                .iter()
+                .map(|other_path| other_path.display().to_string())
+                .collect();
             let _ = super::log::append(
                 state,
                 &super::log::Decision {
@@ -1279,7 +1309,10 @@ fn forget_shared_locked(
         }
     }
 
-    Ok(removed)
+    Ok(ForgetOutcome {
+        removed,
+        still_claimed_by,
+    })
 }
 
 /// Scope-aware verify: `Private` delegates unchanged to `verify` above,
@@ -3998,7 +4031,8 @@ pub fn run_forget_with<W: Write>(
     };
     let scope = MemoryScope::from_flags(args.repo, args.global);
     let bank_label = ctx_scope_label(scope);
-    if forget_scoped(scope, repo, &state, &slug, key)? {
+    let outcome = forget_scoped(scope, repo, &state, &slug, key)?;
+    if outcome.removed {
         writeln!(
             w,
             "zirv ctx forget: removed '{key}' from the {bank_label} bank"
@@ -4009,7 +4043,36 @@ pub fn run_forget_with<W: Write>(
             "zirv ctx forget: no entry for '{key}' in the {bank_label} bank"
         )?;
     }
-    Ok(0)
+    report_still_claimed(w, "zirv ctx forget", key, &outcome)
+}
+
+/// Shared reporting for both `forget` CLI surfaces (`zirv ctx forget` and
+/// `zirv memory forget`): names every file that still claims `key` after the
+/// canonical one was removed, and yields the process exit code -- non-zero
+/// when anything survives, because the requested effect did not happen (the
+/// fact is still listed and recalled, and a later `remember --shared` still
+/// refuses the key as already claimed).
+pub(crate) fn report_still_claimed<W: Write>(
+    w: &mut W,
+    verb: &str,
+    key: &str,
+    outcome: &ForgetOutcome,
+) -> CtxResult<i32> {
+    if outcome.still_claimed_by.is_empty() {
+        return Ok(0);
+    }
+    for path in &outcome.still_claimed_by {
+        writeln!(
+            w,
+            "{verb}: warning: {} still claims '{key}'; only the canonical <key>.md file is ever deleted",
+            path.display()
+        )?;
+    }
+    writeln!(
+        w,
+        "{verb}: '{key}' is still claimed and still recalled -- remove or re-key the file(s) above by hand"
+    )?;
+    Ok(1)
 }
 
 pub fn run_forget<W: Write>(args: &ForgetArgs, w: &mut W) -> CtxResult<i32> {
@@ -8087,6 +8150,7 @@ This is part of the body too.\n";
                 "build-cmd"
             )
             .expect("forget")
+            .removed
         );
         assert!(
             !repo
@@ -8104,7 +8168,8 @@ This is part of the body too.\n";
                 "-irrelevant",
                 "no-such-key"
             )
-            .expect("forget missing"),
+            .expect("forget missing")
+            .removed,
             "forgetting an absent key reports false, not an error"
         );
     }
@@ -8138,6 +8203,7 @@ This is part of the body too.\n";
                 "build-cmd"
             )
             .expect("forget while disabled")
+            .removed
         );
     }
 
@@ -8170,7 +8236,7 @@ This is part of the body too.\n";
         let stray = sample("build-cmd", 2);
         std::fs::write(dir.join("notes.md"), stray.to_markdown()).expect("write stray");
 
-        let removed = forget_scoped(
+        let outcome = forget_scoped(
             MemoryScope::Shared,
             repo.path(),
             &state,
@@ -8178,7 +8244,7 @@ This is part of the body too.\n";
             "build-cmd",
         )
         .expect("forget");
-        assert!(removed, "the canonical file was removed");
+        assert!(outcome.removed, "the canonical file was removed");
         assert!(
             !dir.join("build-cmd.md").exists(),
             "the canonical file is gone"
@@ -8193,6 +8259,101 @@ This is part of the body too.\n";
             log.contains("forget-collision-left") && log.contains("build-cmd"),
             "the surviving collision is reported in the decision log: {log}"
         );
+    }
+
+    /// The decision-log line is not enough: the CALLER has to learn that the
+    /// key survived, or the CLI reports a removal that never took effect.
+    #[test]
+    fn forget_scoped_shared_reports_the_keys_it_could_not_actually_remove() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let cfg = CtxConfig::default();
+        let dir = repo.path().join(".zirv").join("memory");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+
+        upsert_scoped(
+            MemoryScope::Shared,
+            repo.path(),
+            &state,
+            "-irrelevant",
+            &cfg,
+            &sample("build-cmd", 1),
+        )
+        .expect("upsert canonical");
+        std::fs::write(dir.join("notes.md"), sample("build-cmd", 2).to_markdown())
+            .expect("write stray");
+
+        let outcome = forget_scoped(
+            MemoryScope::Shared,
+            repo.path(),
+            &state,
+            "-irrelevant",
+            "build-cmd",
+        )
+        .expect("forget");
+        assert!(outcome.removed);
+        assert_eq!(
+            outcome.still_claimed_by,
+            vec![dir.join("notes.md")],
+            "the surviving claimant is returned, not only logged"
+        );
+
+        // The key really is still live: it lists, and it cannot be
+        // re-remembered.
+        let listed = list_scoped(
+            MemoryScope::Shared,
+            repo.path(),
+            &state,
+            "-irrelevant",
+            &cfg,
+        )
+        .expect("list");
+        assert!(
+            listed.iter().any(|(_, entry)| entry.key == "build-cmd"),
+            "the fact is still recalled: {listed:?}"
+        );
+        let err = upsert_scoped(
+            MemoryScope::Shared,
+            repo.path(),
+            &state,
+            "-irrelevant",
+            &cfg,
+            &sample("build-cmd", 3),
+        )
+        .expect_err("still claimed");
+        assert!(
+            err.to_string().contains("already claimed"),
+            "re-remembering the key still hard-errors: {err}"
+        );
+    }
+
+    /// A forget with no collision reports an empty `still_claimed_by`, so the
+    /// CLI's non-zero exit is reserved for the case that actually failed.
+    #[test]
+    fn forget_scoped_reports_no_surviving_claimant_on_the_ordinary_path() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let cfg = CtxConfig::default();
+        upsert_scoped(
+            MemoryScope::Shared,
+            repo.path(),
+            &state,
+            "-irrelevant",
+            &cfg,
+            &sample("build-cmd", 1),
+        )
+        .expect("upsert");
+
+        let outcome = forget_scoped(
+            MemoryScope::Shared,
+            repo.path(),
+            &state,
+            "-irrelevant",
+            "build-cmd",
+        )
+        .expect("forget");
+        assert!(outcome.removed);
+        assert!(outcome.still_claimed_by.is_empty());
     }
 
     #[test]
