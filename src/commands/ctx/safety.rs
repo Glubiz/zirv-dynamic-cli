@@ -1122,6 +1122,7 @@ fn evaluate_candidate_outcome(
     let base = evaluate_single(policy, candidate, fallback);
     let outcome = apply_sql_outcome(policy, candidate, base);
     let outcome = apply_credential_outcome(candidate, outcome);
+    let outcome = apply_operator_config_outcome(candidate, outcome);
     let outcome = apply_network_outcome(candidate, outcome);
     let outcome = apply_recursive_delete_outcome(candidate, outcome);
     let outcome = apply_vcs_outcome(candidate, outcome, scratchpad_roots);
@@ -1229,6 +1230,30 @@ fn apply_credential_outcome(command: &str, base: Outcome) -> Outcome {
         verdict: Verdict::Deny,
         matched: Some(Rule {
             pattern: "<credential: sensitive-file access>".to_string(),
+            origin: Origin::BuiltIn,
+        }),
+    }
+}
+
+/// A3 (2026-09-06 audit): the operator's own `~/.zirv/` is the single
+/// configuration layer a repository may never contribute to (see `resolve`),
+/// and `zirv ctx permissions compile` is not the only way to reach it -- an
+/// ordinary redirection, copy, move or delete naming that path rewrites the
+/// policy governing the writer just as effectively. `Deny` for the same
+/// reason [`permissions_compile_write_deny_rule`] denies rather than asks: a
+/// headless-silenced `Ask` would be outrun by the broad `echo *`/`cp *`
+/// allow rules these spellings already match, and this runs after
+/// `evaluate_single` precisely so such an allow rule cannot short-circuit
+/// it. Reads stay silent, and a repository's own `.zirv/` is a different
+/// directory entirely.
+fn apply_operator_config_outcome(command: &str, base: Outcome) -> Outcome {
+    if base.verdict == Verdict::Deny || !writes_into_operator_zirv_config(command) {
+        return base;
+    }
+    Outcome {
+        verdict: Verdict::Deny,
+        matched: Some(Rule {
+            pattern: "<config: operator ~/.zirv write>".to_string(),
             origin: Origin::BuiltIn,
         }),
     }
@@ -2532,20 +2557,13 @@ pub(crate) fn unwrap_shell_wrapper(segment: &str) -> Option<String> {
         return find_inline_command_flag(rest);
     }
     if matches!(program.as_str(), "cmd" | "cmd.exe") {
-        let after_flag = rest
-            .strip_prefix("/c")
-            .or_else(|| rest.strip_prefix("/C"))
-            .map(str::trim_start)?;
-        return Some(strip_quotes(after_flag).to_string());
+        return find_cmd_inline_command_flag(rest);
     }
     if matches!(
         program.as_str(),
         "powershell" | "powershell.exe" | "pwsh" | "pwsh.exe"
     ) {
-        let lower_rest = rest.to_ascii_lowercase();
-        let pos = lower_rest.find("-command")?;
-        let after = &rest[pos + "-command".len()..];
-        return Some(strip_quotes(after.trim()).to_string());
+        return find_powershell_command_flag(rest);
     }
     None
 }
@@ -2560,6 +2578,57 @@ pub(crate) fn unwrap_shell_wrapper(segment: &str) -> Option<String> {
 /// mistaken for the inline-command flag itself.
 fn find_inline_command_flag(rest: &str) -> Option<String> {
     let chars: Vec<char> = rest.chars().collect();
+    for (start, end) in token_spans(&chars) {
+        let token: String = chars[start..end].iter().collect();
+        if is_inline_command_flag(&token) {
+            let after: String = chars[end..].iter().collect();
+            return Some(strip_quotes(after.trim_start()).to_string());
+        }
+    }
+    None
+}
+
+/// `cmd.exe`'s no-argument switches, any number of which may legally precede
+/// the inline-command one -- `cmd /d /s /c "<payload>"` is what Node's own
+/// `child_process` emits. `/e:`, `/f:`, `/v:` and `/t:` carry their value in
+/// the same token, so they take no separate operand either.
+fn is_cmd_no_argument_switch(token: &str) -> bool {
+    let lower = token.to_ascii_lowercase();
+    matches!(lower.as_str(), "/d" | "/s" | "/q" | "/a" | "/u")
+        || ["/e:", "/f:", "/v:", "/t:"]
+            .iter()
+            .any(|prefix| lower.starts_with(prefix))
+}
+
+/// `cmd.exe`'s counterpart to [`find_inline_command_flag`]: a quote-aware
+/// token scan for the first `/c` or `/k` -- both run their argument, `/k`
+/// only differing by keeping the console open afterwards -- skipping the
+/// no-argument switches that may precede it. Any other token stops the scan
+/// rather than being skipped: an unrecognised switch may take an operand,
+/// and guessing past it would misidentify that operand as the command.
+fn find_cmd_inline_command_flag(rest: &str) -> Option<String> {
+    let chars: Vec<char> = rest.chars().collect();
+    for (start, end) in token_spans(&chars) {
+        let token: String = chars[start..end].iter().collect();
+        let lower = token.to_ascii_lowercase();
+        if lower.starts_with("/c") || lower.starts_with("/k") {
+            let glued: String = chars[start + 2..end].iter().collect();
+            let after: String = chars[end..].iter().collect();
+            return Some(strip_quotes(format!("{glued}{after}").trim()).to_string());
+        }
+        if !is_cmd_no_argument_switch(&token) {
+            return None;
+        }
+    }
+    None
+}
+
+/// Quote-aware argv token spans over `chars`: one `(start, end)` char-index
+/// pair per whitespace-separated token, a quoted run kept whole. Shared by
+/// every inline-command-flag scanner in this module so they cannot disagree
+/// about where one token ends and the next begins.
+fn token_spans(chars: &[char]) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
     let mut i = 0usize;
     while i < chars.len() {
         while i < chars.len() && chars[i].is_whitespace() {
@@ -2589,11 +2658,55 @@ fn find_inline_command_flag(rest: &str) -> Option<String> {
             }
             i += 1;
         }
-        let token: String = chars[start..i].iter().collect();
-        if is_inline_command_flag(&token) {
-            let after: String = chars[i..].iter().collect();
-            return Some(strip_quotes(after.trim_start()).to_string());
+        spans.push((start, i));
+    }
+    spans
+}
+
+/// Whether `name` (a switch token with its leading `-`/`/` already removed,
+/// and any `:value` suffix already split off) selects PowerShell's inline-
+/// command switch. `powershell.exe`/`pwsh` resolve any unambiguous PREFIX of
+/// a parameter name and special-case the bare `-c` to `-Command`, so `-c`,
+/// `-Com` and `-comm` all execute their argument exactly like the full
+/// spelling. Every other `-C...` switch (`-EncodedCommand`,
+/// `-ConfigurationName`, `-CustomPipeName`) fails this test because its name
+/// is not a prefix of `command`. `-CommandWithArgs`/`-cwa` is a different
+/// switch with the identical "the argument is a command line" payload, so it
+/// is accepted too.
+fn is_powershell_command_flag(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    if matches!(name.as_str(), "cwa" | "commandwithargs") {
+        return true;
+    }
+    !name.is_empty() && "command".starts_with(&name)
+}
+
+/// PowerShell's counterpart to [`find_inline_command_flag`]: a quote-aware
+/// token scan for the inline-command switch in any spelling
+/// [`is_powershell_command_flag`] accepts, including PowerShell's own
+/// `-Command:<value>` colon form. Returns everything after the switch,
+/// quote-stripped.
+fn find_powershell_command_flag(rest: &str) -> Option<String> {
+    let chars: Vec<char> = rest.chars().collect();
+    for (start, end) in token_spans(&chars) {
+        let token: String = chars[start..end].iter().collect();
+        let Some(body) = token.strip_prefix(['-', '/']) else {
+            continue;
+        };
+        let (name, colon) = match body.split_once(':') {
+            Some((name, _)) => (name, true),
+            None => (body, false),
+        };
+        if !is_powershell_command_flag(name) {
+            continue;
         }
+        let value_start = if colon {
+            start + 1 + name.chars().count() + 1
+        } else {
+            end
+        };
+        let after: String = chars[value_start..].iter().collect();
+        return Some(strip_quotes(after.trim_start()).to_string());
     }
     None
 }
@@ -2692,6 +2805,72 @@ pub(crate) fn unwrap_env_prefix(segment: &str) -> Option<String> {
     Some(tokens[i..].join(" "))
 }
 
+/// The ordinary process launchers that go on to run some OTHER program.
+/// [`SHELL_PIPE_WRAPPER_PROGRAMS`] already knew this much for a pipe TARGET;
+/// a leading prefix needs two more facts per launcher: which of its own
+/// flags take a SEPARATE value, and how many positional operands belong to
+/// the launcher itself (`timeout <duration>`, `flock <file>`,
+/// `chrt <priority>`, `taskset <mask>`) before the wrapped command starts.
+const LAUNCHER_PREFIXES: &[(&str, &[&str], usize)] = &[
+    ("nohup", &[], 0),
+    ("setsid", &[], 0),
+    (
+        "stdbuf",
+        &["-i", "-o", "-e", "--input", "--output", "--error"],
+        0,
+    ),
+    ("nice", &["-n", "--adjustment"], 0),
+    (
+        "ionice",
+        &["-c", "-n", "-p", "--class", "--classdata", "--pid"],
+        0,
+    ),
+    ("doas", &["-a", "-C", "-u"], 0),
+    ("timeout", &["-k", "--kill-after", "-s", "--signal"], 1),
+    (
+        "flock",
+        &["-w", "--wait", "--timeout", "-E", "--conflict-exit-code"],
+        1,
+    ),
+    ("chrt", &["-p", "--pid"], 1),
+    ("taskset", &["-c", "--cpu-list", "-p", "--pid"], 1),
+];
+
+/// One layer of launcher-prefix unwrapping -- [`unwrap_env_prefix`]'s
+/// sibling for every launcher that is not `env`. Peels the launcher's own
+/// flags (and their separate values) plus the positional operands that
+/// belong to it, and returns the command it goes on to run. `None` when
+/// `segment` names no launcher from [`LAUNCHER_PREFIXES`] or when nothing is
+/// left after the prefix: `timeout 5` and a bare `nice` launch nothing.
+/// Pushing the remainder as one more candidate can only NARROW a verdict --
+/// [`evaluate_candidates`] folds the most restrictive answer across every
+/// candidate it is given.
+pub(crate) fn unwrap_launcher_prefix(segment: &str) -> Option<String> {
+    let bare = strip_program_dir(segment);
+    let collapsed = collapse_whitespace(&bare);
+    let tokens: Vec<&str> = collapsed.split(' ').filter(|t| !t.is_empty()).collect();
+    let program = sql_program_name(tokens.first()?);
+    let (_, value_flags, operands) = LAUNCHER_PREFIXES
+        .iter()
+        .find(|(name, _, _)| *name == program)?;
+    let mut i = 1usize;
+    while let Some(token) = tokens.get(i) {
+        if !token.starts_with('-') {
+            break;
+        }
+        i += if value_flags
+            .iter()
+            .any(|flag| token.eq_ignore_ascii_case(flag))
+        {
+            2
+        } else {
+            1
+        };
+    }
+    i = i.saturating_add(*operands);
+    (i < tokens.len()).then(|| tokens[i..].join(" "))
+}
+
 fn push_candidate(candidates: &mut Vec<String>, candidate: String) {
     if candidates.len() < MAX_STRUCTURAL_CANDIDATES && !candidates.contains(&candidate) {
         candidates.push(candidate);
@@ -2744,6 +2923,9 @@ fn visit_executable_nodes(command: &str, depth: usize, candidates: &mut Vec<Stri
             visit_executable_nodes(&inner, depth + 1, candidates);
         }
         if let Some(inner) = unwrap_env_prefix(collapsed) {
+            visit_executable_nodes(&inner, depth + 1, candidates);
+        }
+        if let Some(inner) = unwrap_launcher_prefix(collapsed) {
             visit_executable_nodes(&inner, depth + 1, candidates);
         }
         // ISSUE #136: extraction runs against `raw_segment` -- the
@@ -2860,6 +3042,21 @@ fn generated_path(path: &str) -> bool {
     )
 }
 
+/// The deletion program behind `first`, with PowerShell's own aliases
+/// resolved to the cmdlet name -- `ri` is a live alias for `Remove-Item`, so
+/// both spellings must reach the same classifier arm. Shared by
+/// [`is_recursive_delete`] and [`provably_generated_cleanup`] so the two
+/// cannot learn different alias sets. `del`/`erase`/`rmdir`/`rd`/`rm` keep
+/// their own names: those arms already carry the cmd.exe and POSIX flag
+/// semantics that go with each spelling.
+fn normalized_delete_program(first: &str) -> String {
+    let program = sql_program_name(first);
+    match program.as_str() {
+        "ri" => "remove-item".to_string(),
+        _ => program,
+    }
+}
+
 fn is_recursive_delete(command: &str) -> bool {
     let Some(tokens) = sql_tokens(&collapse_whitespace(command)) else {
         return false;
@@ -2867,7 +3064,7 @@ fn is_recursive_delete(command: &str) -> bool {
     let Some(first) = tokens.first() else {
         return false;
     };
-    let program = sql_program_name(first);
+    let program = normalized_delete_program(first);
     match program.as_str() {
         "rm" => tokens.iter().skip(1).any(|token| {
             token == "--recursive"
@@ -2898,7 +3095,7 @@ fn provably_generated_cleanup(command: &str) -> bool {
     let Some(first) = tokens.first() else {
         return false;
     };
-    let program = sql_program_name(first);
+    let program = normalized_delete_program(first);
     let mut recursive = false;
     let mut targets = Vec::new();
     for token in tokens.iter().skip(1) {
@@ -3046,31 +3243,57 @@ fn is_destructive_orchestrator_action(command: &str) -> bool {
             matches!(action.to_ascii_lowercase().as_str(), "uninstall" | "delete")
         }),
         "docker" => {
-            let prune = lower.windows(2).any(|pair| {
-                matches!(
-                    pair[0].as_str(),
-                    "system" | "builder" | "container" | "image" | "network" | "volume"
-                ) && pair[1] == "prune"
-            });
+            let noun_verb = |verb: &str| {
+                lower.windows(2).any(|pair| {
+                    matches!(
+                        pair[0].as_str(),
+                        "system" | "builder" | "container" | "image" | "network" | "volume"
+                    ) && pair[1] == verb
+                })
+            };
+            // A5 (2026-09-06 audit): a named `rm` tears the resource down as
+            // irrecoverably as the `prune` beside it, and a FORCED top-level
+            // `rm`/`rmi` removes a running container or an in-use image the
+            // daemon would otherwise have refused. A plain `docker rm <id>`
+            // of a stopped container stays silent -- that is ordinary
+            // cleanup the daemon itself already guards.
+            let forced_removal = first_positional(&tokens, &[])
+                .is_some_and(|action| matches!(action.to_ascii_lowercase().as_str(), "rm" | "rmi"))
+                && lower
+                    .iter()
+                    .any(|token| matches!(token.as_str(), "-f" | "--force"));
             let compose_volumes = lower.first().is_some_and(|token| token == "compose")
                 && lower.iter().any(|token| token == "down")
                 && lower
                     .iter()
                     .any(|token| matches!(token.as_str(), "-v" | "--volumes"));
-            prune || compose_volumes
+            noun_verb("prune") || noun_verb("rm") || forced_removal || compose_volumes
         }
-        "aws" => lower.iter().any(|token| {
-            [
-                "delete-",
-                "terminate-",
-                "deregister-",
-                "disable-",
-                "remove-",
-                "revoke-",
-            ]
-            .iter()
-            .any(|prefix| token.starts_with(prefix))
-        }),
+        "aws" => {
+            // A5: `s3 rb` removes a bucket and `s3 rm --recursive` empties a
+            // prefix; neither spells a `delete-`/`terminate-` verb, so the
+            // prefix scan below never saw them. A single-object `s3 rm` and
+            // every read verb stay silent.
+            let s3_verb = |verb: &str| {
+                lower
+                    .windows(2)
+                    .any(|pair| pair[0] == "s3" && pair[1] == verb)
+            };
+            s3_verb("rb")
+                || (s3_verb("rm") && lower.iter().any(|token| token == "--recursive"))
+                || lower.iter().any(|token| {
+                    [
+                        "delete-",
+                        "terminate-",
+                        "deregister-",
+                        "disable-",
+                        "remove-",
+                        "revoke-",
+                    ]
+                    .iter()
+                    .any(|prefix| token.starts_with(prefix))
+                })
+        }
         "az" | "gcloud" => lower
             .iter()
             .any(|token| matches!(token.as_str(), "delete" | "purge" | "destroy" | "remove")),
@@ -3592,6 +3815,149 @@ fn is_sensitive_credential_access(command: &str) -> bool {
             .iter()
             .skip(1)
             .any(|token| sensitive_credential_path(token))
+}
+
+/// Path prefixes that name the operator's own home directory in the shells
+/// this module classifies, so `~/.zirv`, `$HOME/.zirv`, `%USERPROFILE%` and
+/// `$env:USERPROFILE` spellings all resolve to the same directory.
+const HOME_PATH_PREFIXES: &[&str] = &[
+    "~",
+    "$home",
+    "${home}",
+    "$env:home",
+    "$env:userprofile",
+    "$userprofile",
+    "%home%",
+    "%userprofile%",
+];
+
+/// Whether `path` -- already slash-normalized, lowercased and without a
+/// trailing separator -- is a user's home directory itself. An
+/// already-expanded `.zirv` path is the OPERATOR's configuration layer only
+/// when it sits directly in one; `/srv/repo/.zirv` is a checkout's own
+/// directory and stays writable.
+fn is_home_directory_path(path: &str) -> bool {
+    let path = path.strip_prefix('/').unwrap_or(path);
+    let path = match path.split_once(':') {
+        Some((drive, rest)) if drive.len() == 1 => rest.strip_prefix('/').unwrap_or(rest),
+        _ => path,
+    };
+    let segments: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
+    matches!(segments.as_slice(), ["root"] | ["home", _] | ["users", _])
+}
+
+/// Whether `raw` names a path under the operator's own `~/.zirv/` -- the one
+/// configuration layer `resolve` never lets a repository contribute to. An
+/// explicit home prefix proves it outright; an already-expanded absolute
+/// path qualifies only when [`is_home_directory_path`] holds for the
+/// directory containing `.zirv`, so a repository's own `.zirv/` is never
+/// mistaken for it.
+fn operator_zirv_path(raw: &str) -> bool {
+    let path = raw
+        .trim_start_matches('@')
+        .trim_matches(['\'', '"'])
+        .replace('\\', "/")
+        .to_ascii_lowercase();
+    let path = path.trim_end_matches('/');
+    if HOME_PATH_PREFIXES.iter().any(|prefix| {
+        path.strip_prefix(prefix)
+            .is_some_and(|rest| rest == "/.zirv" || rest.starts_with("/.zirv/"))
+    }) {
+        return true;
+    }
+    let parent = if let Some(parent) = path.strip_suffix("/.zirv") {
+        parent
+    } else if let Some(index) = path.find("/.zirv/") {
+        &path[..index]
+    } else {
+        return false;
+    };
+    is_home_directory_path(parent)
+}
+
+/// Programs whose every non-flag operand is a path they write to or delete,
+/// so any of them landing in the operator's `~/.zirv/` is an attempt on that
+/// layer. `mv` belongs here rather than beside `cp`: a move deletes its
+/// source as well as writing its destination.
+const OPERATOR_CONFIG_WRITE_PROGRAMS: &[&str] = &[
+    "rm",
+    "del",
+    "erase",
+    "rmdir",
+    "rd",
+    "unlink",
+    "shred",
+    "truncate",
+    "remove-item",
+    "ri",
+    "mv",
+    "move",
+    "move-item",
+    "mi",
+    "tee",
+    "set-content",
+    "add-content",
+    "out-file",
+    "new-item",
+    "ni",
+];
+
+/// Programs that READ their leading operands and write only the last one, or
+/// an explicit destination flag: copying the operator's own config OUT is an
+/// ordinary read and stays silent.
+const OPERATOR_CONFIG_DESTINATION_PROGRAMS: &[&str] = &[
+    "cp",
+    "copy",
+    "copy-item",
+    "cpi",
+    "install",
+    "ln",
+    "rsync",
+    "scp",
+];
+
+/// The destination flags [`OPERATOR_CONFIG_DESTINATION_PROGRAMS`] accept in
+/// place of a trailing positional operand.
+const DESTINATION_FLAGS: &[&str] = &["-destination", "-dest", "-t", "--target-directory"];
+
+/// Whether `command` writes to or deletes anything under the operator's own
+/// `~/.zirv/`, in any of the spellings this module can resolve statically:
+/// an output redirection, or a write/delete program naming the path as an
+/// operand. Reads name no write target and never qualify.
+fn writes_into_operator_zirv_config(command: &str) -> bool {
+    if scan_redirection_targets(command)
+        .unwrap_or_default()
+        .iter()
+        .any(|target| operator_zirv_path(target))
+    {
+        return true;
+    }
+    let Some(tokens) = sql_tokens(&collapse_whitespace(command)) else {
+        return false;
+    };
+    let Some(first) = tokens.first() else {
+        return false;
+    };
+    let program = sql_program_name(first);
+    let operands: Vec<&str> = tokens
+        .iter()
+        .skip(1)
+        .map(String::as_str)
+        .filter(|token| !token.starts_with('-'))
+        .collect();
+    if OPERATOR_CONFIG_WRITE_PROGRAMS.contains(&program.as_str()) {
+        return operands.iter().copied().any(operator_zirv_path);
+    }
+    if OPERATOR_CONFIG_DESTINATION_PROGRAMS.contains(&program.as_str()) {
+        return operands.last().copied().is_some_and(operator_zirv_path)
+            || tokens.windows(2).any(|pair| {
+                DESTINATION_FLAGS
+                    .iter()
+                    .any(|flag| pair[0].eq_ignore_ascii_case(flag))
+                    && operator_zirv_path(&pair[1])
+            });
+    }
+    false
 }
 
 fn network_rule(verdict: Verdict, pattern: &str) -> Outcome {
@@ -11184,6 +11550,237 @@ mod tests {
             Verdict::Ask,
             "powershell -Command must be unwrapped"
         );
+    }
+
+    /// A6 (2026-09-06 audit): both deletion classifiers knew
+    /// `Remove-Item` but not `ri`, PowerShell's own live alias for it, so
+    /// `ri -Recurse -Force C:\work` classified as an unknown command while
+    /// the cmdlet spelling asked. One shared normalizer now feeds both arms.
+    #[test]
+    fn the_powershell_remove_item_alias_ri_classifies_like_remove_item() {
+        let policy = SafetyPolicy::default();
+        for (alias, cmdlet, expected) in [
+            (
+                r"ri -Recurse -Force C:\work",
+                r"Remove-Item -Recurse -Force C:\work",
+                Verdict::Ask,
+            ),
+            (
+                "ri -Recurse -Force target",
+                "Remove-Item -Recurse -Force target",
+                Verdict::Allow,
+            ),
+        ] {
+            assert_eq!(
+                evaluate(&policy, cmdlet, LaunchMode::Interactive).verdict,
+                expected,
+                "{cmdlet} is the reference spelling"
+            );
+            assert_eq!(
+                evaluate(&policy, alias, LaunchMode::Interactive).verdict,
+                expected,
+                "{alias} must classify like {cmdlet}"
+            );
+        }
+    }
+
+    /// A5 (2026-09-06 audit): the docker arm knew only `* prune` and
+    /// `compose down -v`, and the aws arm only the `delete-`/`terminate-`
+    /// verb prefixes, so the ordinary teardown spellings ran silently while
+    /// [[Command Safety]] promised "destructive Docker pruning/volume
+    /// teardown, cloud delete/terminate families ... ask".
+    #[test]
+    fn docker_and_aws_teardown_verbs_ask_like_their_prune_siblings() {
+        let policy = SafetyPolicy::default();
+        for command in [
+            "docker volume rm data",
+            "docker network rm bridge0",
+            "docker image rm app:latest",
+            "docker container rm web",
+            "docker rm -f c",
+            "docker rmi --force i",
+            "aws s3 rb s3://bucket --force",
+            "aws s3 rm s3://bucket --recursive",
+        ] {
+            assert_eq!(
+                evaluate(&policy, command, LaunchMode::Interactive).verdict,
+                Verdict::Ask,
+                "{command} tears down state the same way a prune does"
+            );
+        }
+        for command in [
+            "docker ps -a",
+            "docker volume ls",
+            "docker rm c",
+            "aws s3 ls",
+            "aws s3 cp report.json s3://bucket/report.json",
+        ] {
+            assert_eq!(
+                evaluate(&policy, command, LaunchMode::Interactive).verdict,
+                Verdict::Allow,
+                "{command} is an ordinary read or a recoverable single-object action"
+            );
+        }
+    }
+
+    /// A4 (2026-09-06 audit): `unwrap_env_prefix` saw through `env` and bare
+    /// `VAR=value` prefixes only, so every other ordinary launcher --
+    /// `timeout`, `nohup`, `setsid`, `nice`, `stdbuf`, `flock`, ... -- hid
+    /// the program it launched from every classifier in this module.
+    #[test]
+    fn a_launcher_prefix_never_hides_the_program_it_launches() {
+        let policy = SafetyPolicy::default();
+        for (launched, bare) in [
+            ("timeout 5 gh repo delete o/r", "gh repo delete o/r"),
+            ("nohup cargo publish", "cargo publish"),
+            ("setsid gh auth token", "gh auth token"),
+            ("nice -n 5 cat ~/.ssh/id_rsa", "cat ~/.ssh/id_rsa"),
+            ("stdbuf -o0 rm -rf /", "rm -rf /"),
+            ("flock /tmp/lock rm -rf /", "rm -rf /"),
+            ("ionice -c 3 rm -rf /", "rm -rf /"),
+            ("chrt -f 10 rm -rf /", "rm -rf /"),
+            ("taskset 0x1 rm -rf /", "rm -rf /"),
+        ] {
+            let expected = evaluate(&policy, bare, LaunchMode::Interactive).verdict;
+            assert_ne!(
+                expected,
+                Verdict::Allow,
+                "{bare} must not be silent to begin with"
+            );
+            assert_eq!(
+                evaluate(&policy, launched, LaunchMode::Interactive).verdict,
+                expected,
+                "{launched} must classify like {bare}"
+            );
+        }
+        assert_eq!(
+            evaluate(&policy, "doas rm -rf /", LaunchMode::Interactive).verdict,
+            Verdict::Deny,
+            "doas escalates privilege exactly like sudo"
+        );
+        for command in ["timeout 5", "nice", "flock /tmp/lock"] {
+            assert!(
+                unwrap_launcher_prefix(command).is_none(),
+                "{command} launches no command of its own"
+            );
+        }
+        for command in ["timeout 5 cargo build", "nice -n 5 cargo test"] {
+            assert_eq!(
+                evaluate(&policy, command, LaunchMode::Interactive).verdict,
+                Verdict::Allow,
+                "{command} is ordinary paced development work"
+            );
+        }
+    }
+
+    /// A3 (2026-09-06 audit): `zirv ctx permissions compile` was the only
+    /// spelling of "write the operator's own `~/.zirv/ctx.toml`" this module
+    /// recognised, so an ordinary redirection, copy, move or delete naming
+    /// that same file widened (or destroyed) the operator-only policy layer
+    /// with no prompt at all. A repository's own `.zirv/` is a different
+    /// directory and stays writable; reads stay silent.
+    #[test]
+    fn a_direct_write_into_the_operator_ctx_toml_is_denied_in_every_spelling() {
+        let policy = SafetyPolicy::default();
+        for command in [
+            "echo 'allow = [\"*\"]' >> ~/.zirv/ctx.toml",
+            "printf 'allow' > $HOME/.zirv/ctx.toml",
+            "cp evil.toml ~/.zirv/ctx.toml",
+            "mv evil.toml ~/.zirv/ctx.toml",
+            "tee ~/.zirv/ctx.toml < evil.toml",
+            "Set-Content -Path ~/.zirv/ctx.toml -Value x",
+            r"Out-File -FilePath $env:USERPROFILE\.zirv\ctx.toml",
+            "rm ~/.zirv/ctx.toml",
+            r"del %USERPROFILE%\.zirv\ctx.toml",
+            "rm /home/josj/.zirv/ctx.toml",
+            r"cp evil.toml C:\Users\josj\.zirv\ctx.toml",
+        ] {
+            assert_eq!(
+                evaluate(&policy, command, LaunchMode::Interactive).verdict,
+                Verdict::Deny,
+                "{command} writes the operator-only policy layer"
+            );
+        }
+        for command in [
+            "cat ~/.zirv/ctx.toml",
+            "grep allow ~/.zirv/ctx.toml",
+            "echo 'x' > .zirv/ctx.toml",
+            "cp template.toml .zirv/ctx.toml",
+            "rm .zirv/work/old.json",
+            "zirv ctx status",
+        ] {
+            assert_eq!(
+                evaluate(&policy, command, LaunchMode::Interactive).verdict,
+                Verdict::Allow,
+                "{command} is a read or a repository-local write"
+            );
+        }
+    }
+
+    /// A2 (2026-09-06 audit): `cmd.exe` accepts its no-argument switches
+    /// before the inline-command one, and `cmd /d /s /c "<payload>"` is what
+    /// Node's own `child_process` emits. Anchoring the unwrap at the very
+    /// start of the argument list meant every such spelling -- and `/k`,
+    /// which also runs its argument -- left the payload unclassified.
+    #[test]
+    fn cmd_inline_command_flag_is_found_after_leading_switches() {
+        let policy = SafetyPolicy::default();
+        for wrapper in [
+            "cmd /c",
+            "cmd /s /c",
+            "cmd /d /s /c",
+            "cmd.exe /Q /C",
+            "cmd /k",
+        ] {
+            let command = format!("{wrapper} \"rm -rf /\"");
+            assert_eq!(
+                evaluate(&policy, &command, LaunchMode::Interactive).verdict,
+                Verdict::Ask,
+                "{command} must be unwrapped like a leading cmd /c"
+            );
+        }
+        assert!(
+            unwrap_shell_wrapper("cmd").is_none(),
+            "a bare cmd wraps no command"
+        );
+        assert!(
+            unwrap_shell_wrapper("cmd /?").is_none(),
+            "cmd /? prints help and wraps no command"
+        );
+    }
+
+    /// A1 (2026-09-06 audit): PowerShell resolves any unambiguous prefix of
+    /// `-Command`, and treats the bare `-c` as that switch outright, so
+    /// `powershell -c '<payload>'` runs exactly what `-Command '<payload>'`
+    /// runs. The substring search this arm used to do only recognised the
+    /// full spelling, so every abbreviation left the payload unclassified.
+    #[test]
+    fn powershell_command_flag_abbreviations_are_unwrapped_like_the_full_spelling() {
+        let policy = SafetyPolicy::default();
+        for (payload, expected) in [
+            ("rm -rf /", Verdict::Ask),
+            ("gh repo delete o/r", Verdict::Deny),
+            ("cat ~/.ssh/id_rsa", Verdict::Deny),
+        ] {
+            for program in ["powershell", "pwsh"] {
+                for flag in ["-Command", "-c", "-C", "-Com", "-comm"] {
+                    let command = format!("{program} {flag} \"{payload}\"");
+                    assert_eq!(
+                        evaluate(&policy, &command, LaunchMode::Interactive).verdict,
+                        expected,
+                        "{command} must classify like the -Command spelling"
+                    );
+                }
+            }
+        }
+        for flag in ["-EncodedCommand", "-ConfigurationName"] {
+            let command = format!("powershell {flag} \"rm -rf /\"");
+            assert_eq!(
+                evaluate(&policy, &command, LaunchMode::Interactive).verdict,
+                Verdict::Allow,
+                "{command} names a different switch and must not unwrap"
+            );
+        }
     }
 
     /// Issue #132 review (2026-08-25, code-review round): `unwrap_env_prefix`
