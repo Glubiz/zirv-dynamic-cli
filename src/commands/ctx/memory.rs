@@ -7788,8 +7788,14 @@ This is part of the body too.\n";
     fn sensitive_shared_match_refuses_a_basic_auth_url_and_a_high_entropy_body() {
         let refused = [
             "clone with https://deploybot:Hunter2Xy9qQz@github.com/org/repo.git",
-            concat!("billing uses sk_", "live_51H8xYz2eZvKYlo2CqRtUvWxYzAbCdEfGh"),
-            concat!("alerts post to https://hooks.slack.com/", "services/T00000000/B11111111/aBcDeFgHiJkLmNoPqRsTuVwX"),
+            concat!(
+                "billing uses sk_",
+                "live_51H8xYz2eZvKYlo2CqRtUvWxYzAbCdEfGh"
+            ),
+            concat!(
+                "alerts post to https://hooks.slack.com/",
+                "services/T00000000/B11111111/aBcDeFgHiJkLmNoPqRsTuVwX"
+            ),
             "maps calls use AIzaSyC1qR3tUvWxYzAbCdEfGhIjKlMnOpQrStU",
             "the registry token is npm_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789",
             // No known family at all -- only the entropy fallback
